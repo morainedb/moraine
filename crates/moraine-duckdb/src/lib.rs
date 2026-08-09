@@ -52,9 +52,10 @@
 //! merge — and returns a row per step. Every step but the sweep is opt-in
 //! at `ATTACH`, through `META_MAINTENANCE_*` options; an interval starts a
 //! timer thread that runs the same pass unattended, and
-//! `moraine_maintenance_status` serves the recent passes so an unattended
-//! failure stays visible. `moraine_compact_store` runs the merge alone, for
-//! a store that needs it once rather than on a cadence.
+//! `moraine_maintenance_status` serves the last 16 passes from the catalog,
+//! including after a process restart and from a read-only attach, so an
+//! unattended failure stays visible. `moraine_compact_store` runs the merge
+//! alone, for a store that needs it once rather than on a cadence.
 //!
 //! `CALL moraine_store_census('lake')` measures the store itself rather
 //! than the lake: one row per keyspace subspace, carrying physical bytes,
@@ -147,9 +148,9 @@
 //!
 //! Two table functions serve the same pass. `moraine_maintenance('lake')`
 //! runs one immediately and returns `(step, status, detail)`;
-//! `moraine_maintenance_status('lake')` reports the last 16 passes without
-//! running anything, adding `started_at` and whether each was `scheduled`
-//! or `manual`. Both accept either the lake name or the name of its
+//! `moraine_maintenance_status('lake')` reports the last 16 durable passes
+//! without running anything, adding `started_at` and whether each was
+//! `scheduled` or `manual`. Both accept either the lake name or the name of its
 //! metadata catalog. The trigger refuses inside an explicit transaction —
 //! it blocks while a second connection writes the catalog — and refuses on
 //! a read-only attach.

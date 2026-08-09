@@ -392,6 +392,26 @@ message MigrationValue {
   bytes cursor = 3;
 }
 
+// One step reported by a completed maintenance pass.
+message MaintenanceStatusStepValue {
+  string step = 1;
+  string status = 2;
+  string detail = 3;
+}
+
+// One completed maintenance pass. The containing singleton stores passes
+// oldest first so appending and trimming have one canonical representation.
+message MaintenanceStatusPassValue {
+  int64 started_at_micros = 1;
+  string trigger = 2;
+  repeated MaintenanceStatusStepValue steps = 3;
+}
+
+// sys/maintenance_status: the bounded durable history of completed passes.
+message MaintenanceStatusValue {
+  repeated MaintenanceStatusPassValue passes = 1;
+}
+
 // inline/schema: the Arrow IPC schema message, verbatim.
 message InlineSchemaValue {
   bytes arrow_schema = 1;

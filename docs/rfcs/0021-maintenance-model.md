@@ -305,6 +305,16 @@ copy — and it asks at bind, because a name checked only when a pass runs
 would let a typo attach cleanly and then fail every scheduled pass,
 unattended, for as long as it stood.
 
+**DuckLake compatibility is strict.** Each moraine build targets the DuckDB
+and DuckLake versions pinned by the repository, so the function names and
+parameter signatures above are part of that supported build combination. A
+missing function or changed signature is an incompatibility, not a capability
+to detect and silently degrade: the configured call fails clearly. New
+DuckLake parameters become available only when moraine exposes them and the
+pinned-version e2e suite exercises them. The pin checker prevents an
+unreviewed version drift, and the maintenance e2e cases make a signature
+change fail while updating a pin rather than in a supported release.
+
 **Defaults are the safe floor.** Steps 1–6 mutate the lake — writing
 Parquet, minting snapshots, or deleting bytes — so none has a default. Step 8
 destroys nothing a query can observe, but rewrites gigabytes and pays for
@@ -360,8 +370,26 @@ Three properties the scheduler must hold:
   / `failed`), and `detail`. Retaining a window rather than only the
   newest pass is load-bearing — with one slot a failure is erased by the
   next success, and a short interval would hide strictly more than a long
-  one. The window is in-memory per attach and bounded so a fast interval
-  cannot grow it without limit.
+  one. Sixteen is the binding cap: at eight fixed steps it is at most 128
+  small diagnostic rows, enough to preserve fifteen later successes after
+  one failure without turning status into an event log.
+
+  The window is durable **inside the catalog**, as one unversioned
+  `sys/maintenance_status` value holding the passes oldest-to-newest. A
+  completed pass atomically reads the value, appends itself, drops the oldest
+  overflow, and overwrites it. The status write is a separate durable SlateDB
+  transaction after the pass: it mints no DuckLake snapshot, does not move
+  `sys/head`, and therefore neither invalidates a catalog view nor appears in
+  time travel. The first write lazily stamps additive format 5 so older
+  binaries, which would otherwise silently omit the record, refuse the store.
+  A status-write failure is logged and does not rewrite the outcome of the
+  maintenance work that already completed.
+
+  Catalog storage wins over an external sidecar: it follows the lake through
+  moves and credentials, uses the existing writer fence and durability path,
+  and lets a read-only attach inspect the prior writer's failures. The value
+  is bounded and overwritten, so it adds neither an unbounded subspace nor a
+  cleanup policy.
 
 **Read-only attaches never schedule.** A `DbReader` never opens a writer, so
 no step runs — including step 8, whose merge only a writer's compactor could
@@ -633,6 +661,26 @@ pub struct MaintenanceReport {
 impl Catalog {
     pub async fn maintain(&self, request: MaintenanceRequest)
         -> Result<MaintenanceReport>;
+
+    pub async fn record_maintenance_pass(&self, pass: MaintenanceStatusPass)
+        -> Result<()>;
+}
+
+impl ReadOnlyCatalog {
+    pub async fn maintenance_status(&self)
+        -> Result<Vec<MaintenanceStatusPass>>;
+}
+
+pub struct MaintenanceStatusPass {
+    pub started_at: SystemTime,
+    pub trigger: String,
+    pub steps: Vec<MaintenanceStatusStep>,
+}
+
+pub struct MaintenanceStatusStep {
+    pub step: String,
+    pub status: String,
+    pub detail: String,
 }
 ```
 
@@ -834,8 +882,9 @@ Live (e2e):
   step disabled alongside its own parameter.
 - **Status retains earlier passes.** A pass that reclaimed stays visible
   after a later pass that did not, each carrying its trigger.
-- **Read-only never schedules.** A read-only attach starts no thread, so
-  its status window stays empty.
+- **Read-only never schedules but does report.** A read-only attach starts no
+  thread and refuses the trigger, but `moraine_maintenance_status` reads the
+  durable window left by the writer.
 - **A failed step does not suppress the sweep.** With a step DuckLake
   rejects, the later DuckLake steps report `skipped` naming what aborted
   them, and the sweep still reclaims its range.
@@ -864,14 +913,14 @@ Live (e2e):
   reports it `skipped`; a pass whose merge fails reports `failed` and leaves
   the lake queryable.
 
-The timer tests hold one session open across a real pause: the retained
-window is per-attach and in memory, so a second session would observe a
-fresh, empty one. Contention is provoked with shipped knobs rather than
-test-only scaffolding — `MAINTENANCE_BATCH_SIZE 1` makes the sweep take
-one durable commit per entry, each waiting out the WAL flush cadence, so
-a twenty-entry range reliably outruns a 100ms interval. Together they
-cost a few seconds of the suite, and the paused-session helper bounds its
-own wait so a deadlock fails loudly instead of wedging the gate.
+The timer tests hold one session open across a real pause so the scheduler
+remains alive long enough to run; a later session can read the durable passes
+but cannot reproduce live timer contention. Contention is provoked with
+shipped knobs rather than test-only scaffolding — `MAINTENANCE_BATCH_SIZE 1`
+makes the sweep take one durable commit per entry, each waiting out the WAL
+flush cadence, so a twenty-entry range reliably outruns a 100ms interval.
+Together they cost a few seconds of the suite, and the paused-session helper
+bounds its own wait so a deadlock fails loudly instead of wedging the gate.
 
 Counting passes would *not* pin single-flight: once the slow pass ends,
 later ticks correctly run fast empty passes for the rest of the window.

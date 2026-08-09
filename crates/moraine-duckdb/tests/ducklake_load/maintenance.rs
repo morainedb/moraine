@@ -1026,15 +1026,15 @@ fn attach_refuses_a_data_path_containing_the_catalog() {
 /// the next success.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
-fn maintenance_status_retains_earlier_passes() {
+fn maintenance_status_survives_restart_and_retains_earlier_passes() {
     let store = TempDir::new("maint-status-store");
     let data = TempDir::new("maint-status-data");
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
 
-    // The retained window is per-attach and in memory, so setup and the
-    // status query must share one session. Earlier statements emit rows
-    // of their own, so the status rows carry a marker to select on.
-    let output = run_ducklake_sql_with_options(
+    // Complete two passes and let the writer process exit before reading
+    // status. The second attach is read-only, proving both that the rows
+    // came from the catalog and that inspecting them schedules no work.
+    run_ducklake_sql_with_options(
         store.path(),
         data.path(),
         &meta,
@@ -1043,8 +1043,12 @@ fn maintenance_status_retains_earlier_passes() {
          SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],false);\
          SELECT * FROM moraine_index_drop('lake','main','t','by_a');\
          SELECT count(*) FROM moraine_maintenance('lake');\
-         SELECT count(*) FROM moraine_maintenance('lake');\
-         SELECT 'PASS' AS marker, trigger, detail FROM moraine_maintenance_status('lake') \
+         SELECT count(*) FROM moraine_maintenance('lake');",
+    );
+    let output = run_ducklake_read_only_sql(
+        store.path(),
+        data.path(),
+        "SELECT 'PASS' AS marker, trigger, detail FROM moraine_maintenance_status('lake') \
            WHERE step = 'sweep_indexes' ORDER BY started_at DESC;",
     );
     let passes: Vec<Vec<String>> = csv_rows(&output)
@@ -1066,9 +1070,9 @@ fn maintenance_status_retains_earlier_passes() {
     );
 }
 
-/// Maintenance mutates, so a read-only attach neither schedules a pass
-/// nor runs one on demand: the trigger refuses, and the status surface
-/// stays empty because no thread ever started.
+/// Maintenance mutates, so a read-only attach neither schedules a pass nor
+/// runs one on demand: the trigger refuses, and a fresh catalog with no prior
+/// writer pass keeps an empty durable status history.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
 fn maintenance_never_runs_on_a_read_only_attach() {
@@ -1092,7 +1096,7 @@ fn maintenance_never_runs_on_a_read_only_attach() {
     assert_eq!(
         csv_rows(&output),
         vec![vec!["0".to_string()]],
-        "a read-only attach must start no scheduler"
+        "a read-only attach must not add a status pass"
     );
 }
 

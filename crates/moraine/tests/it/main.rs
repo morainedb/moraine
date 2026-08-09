@@ -18,6 +18,7 @@ mod index_lookup;
 mod inline_data;
 mod interrupt;
 mod macros;
+mod maintenance_status;
 mod measure;
 mod partitioning;
 mod runtime;

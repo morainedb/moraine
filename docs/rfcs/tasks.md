@@ -100,14 +100,6 @@ deliberately not itemized here.
 
 ## 0021 — Maintenance orchestration
 
-- **DECISION** — Whether to persist the maintenance status window, and whether
-  inside the catalog or outside it, so an overnight failure in a
-  since-restarted process leaves a trace. Today it is a per-attach in-memory
-  deque. Settle the strawman size of 16 at the same time.
-- **DECISION** — Whether the shim should detect and degrade rather than fail
-  when DuckLake's maintenance function signatures or parameter names change,
-  and how new DuckLake parameters get exposed. Today a signature change is a
-  binder exception at attach, or an aborting failed step at pass time.
 - **DEFERRED** — Multi-tier scheduling: per-step cadences and step sets, so a
   cheap sweep interval can differ from an expensive
   `delete_orphaned_files` interval. One interval drives the whole fixed

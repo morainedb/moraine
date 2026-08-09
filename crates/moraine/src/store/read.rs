@@ -8,10 +8,10 @@ use crate::{
         key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
         proto::{
             ChangelogValue, ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue,
-            FormatValue, GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue,
-            MigrationValue, OptionScopeValue, PartitionValue, SchemaValue, SchemaVersionValue,
-            SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
-            ViewValue,
+            FormatValue, GcFileValue, HeadValue, IndexValue, MacroValue, MaintenanceStatusValue,
+            MappingValue, MigrationValue, OptionScopeValue, PartitionValue, SchemaValue,
+            SchemaVersionValue, SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue,
+            TableValue, TagValue, ViewValue,
         },
         value,
     },
@@ -129,6 +129,13 @@ pub(crate) async fn read_format(handle: ReadHandle<'_>) -> Result<Option<FormatV
 /// The structural-migration marker, present only mid-migration.
 pub(crate) async fn read_migration(handle: ReadHandle<'_>) -> Result<Option<MigrationValue>> {
     read_singleton(handle, Key::Sys(SysKey::Migration)).await
+}
+
+/// The bounded durable history of completed maintenance passes.
+pub(crate) async fn read_maintenance_status(
+    handle: ReadHandle<'_>,
+) -> Result<Option<MaintenanceStatusValue>> {
+    read_singleton(handle, Key::Sys(SysKey::MaintenanceStatus)).await
 }
 
 /// The head pointer: the latest committed snapshot id and batch count.

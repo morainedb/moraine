@@ -4,6 +4,7 @@
 pub(crate) mod commit;
 pub(crate) mod index_maintenance;
 pub(crate) mod inline;
+pub(crate) mod maintenance_status;
 pub(crate) mod migration;
 pub(crate) mod operations;
 pub(crate) mod staged;

@@ -9,7 +9,6 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -25,16 +24,6 @@ struct MaintenanceStep {
 	std::string step;
 	std::string status;
 	std::string detail;
-};
-
-// One completed pass. Retained so a failure stays visible: keeping only
-// the newest pass would let the next success erase it, and a short
-// interval would hide more than a long one.
-struct MaintenancePass {
-	duckdb::timestamp_t started_at;
-	// "scheduled" (the timer) or "manual" (the trigger).
-	std::string trigger;
-	std::vector<MaintenanceStep> steps;
 };
 
 // A DuckLake step the attach configured, with the arguments to pass.
@@ -97,20 +86,15 @@ public:
 	// report. If a pass is already running, waits for it and runs after.
 	std::vector<MaintenanceStep> RunNow();
 
-	// The retained passes, newest first — empty before the first one. An
-	// unattended pass has no one to return an error to, so this is how a
-	// failing schedule becomes visible.
-	std::vector<MaintenancePass> RecentPasses() const;
-
-	// How many passes are retained. Bounded because this is in-memory
-	// per attach, and a fast interval would otherwise grow without limit.
-	static constexpr size_t RETAINED_PASSES = 16;
-
 private:
 	void Loop();
 	// Runs the configured steps in order. `skip_if_busy` makes a tick
 	// yield to a pass already in flight rather than queueing behind it.
 	std::vector<MaintenanceStep> RunPass(bool skip_if_busy, const char *trigger);
+	// Persists one completed pass. A status-write failure is logged but
+	// cannot change maintenance work that has already completed.
+	void RecordPass(duckdb::timestamp_t started_at, const char *trigger,
+	                const std::vector<MaintenanceStep> &report) noexcept;
 	// Issues one `CALL ducklake_<step>(...)` on `connection`.
 	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
 	                                const DuckLakeStep &step);
@@ -131,10 +115,6 @@ private:
 	// Held for the duration of a pass, so the timer and the trigger can
 	// never overlap.
 	std::mutex pass_lock_;
-
-	mutable std::mutex report_lock_;
-	// Newest last; capped at RETAINED_PASSES.
-	std::deque<MaintenancePass> passes_;
 
 	std::mutex wake_lock_;
 	std::condition_variable wake_;

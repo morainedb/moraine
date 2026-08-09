@@ -444,12 +444,6 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunNow() {
 	return RunPass(false, "manual");
 }
 
-std::vector<MaintenancePass> MaintenanceScheduler::RecentPasses() const {
-	std::lock_guard<std::mutex> guard(report_lock_);
-	// Newest first: an operator reading the top rows wants the last pass.
-	return std::vector<MaintenancePass>(passes_.rbegin(), passes_.rend());
-}
-
 std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, const char *trigger) {
 	std::unique_lock<std::mutex> pass(pass_lock_, std::defer_lock);
 	if (skip_if_busy) {
@@ -512,13 +506,7 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	                     ? RunStoreMerge()
 	                     : MaintenanceStep {"compact_store", "skipped", "not configured at attach"});
 
-	{
-		std::lock_guard<std::mutex> guard(report_lock_);
-		passes_.push_back(MaintenancePass {started_at, trigger, report});
-		while (passes_.size() > RETAINED_PASSES) {
-			passes_.pop_front();
-		}
-	}
+	RecordPass(started_at, trigger, report);
 
 	// The pass ran with no ClientContext (its own connection, its own
 	// thread), so the core's events from the sweep and DuckLake steps sit
@@ -541,6 +529,36 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 		                std::string("maintenance pass (") + trigger + ") completed");
 	}
 	return report;
+}
+
+void MaintenanceScheduler::RecordPass(duckdb::timestamp_t started_at, const char *trigger,
+                                      const std::vector<MaintenanceStep> &report) noexcept {
+	try {
+		std::vector<MoraineMaintenanceStatusStepInput> steps;
+		steps.reserve(report.size());
+		for (auto &step : report) {
+			steps.push_back(MoraineMaintenanceStatusStepInput {step.step.c_str(), step.status.c_str(),
+			                                                   step.detail.c_str()});
+		}
+
+		MoraineError err {};
+		auto code = moraine_maintenance_status_record(handle_, started_at.value, trigger, steps.data(), steps.size(), &err);
+		if (code == MORAINE_OK) {
+			return;
+		}
+		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		WriteMoraineLog(db_, duckdb::LogLevel::LOG_WARNING,
+		                "maintenance pass completed but its status could not be persisted: " + message);
+	} catch (const std::exception &error) {
+		WriteMoraineLog(db_, duckdb::LogLevel::LOG_WARNING,
+		                "maintenance pass completed but its status could not be persisted: " + std::string(error.what()));
+	} catch (...) {
+		WriteMoraineLog(db_, duckdb::LogLevel::LOG_WARNING,
+		                "maintenance pass completed but its status could not be persisted: unknown error");
+	}
 }
 
 MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
@@ -694,10 +712,16 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MaintenanceInitGlobal(duckd
 
 	if (bind_data.status_only) {
 		state->with_pass_columns = true;
-		for (auto &pass : catalog.Scheduler().RecentPasses()) {
-			for (auto &step : pass.steps) {
-				state->rows.push_back(ReportRow {pass.started_at, pass.trigger, step});
-			}
+		OwnedArray<MoraineMaintenanceStatusRow> rows(moraine_maintenance_status_free);
+		MoraineError err {};
+		auto code = moraine_maintenance_status_rows(catalog.Handle(), rows.OutItems(), rows.OutLen(), &err);
+		if (code != MORAINE_OK) {
+			ThrowMoraineError(err);
+		}
+		for (auto &row : rows) {
+			state->rows.push_back(ReportRow {
+			    duckdb::timestamp_t(row.started_at_micros), std::string(row.trigger),
+			    MaintenanceStep {std::string(row.step), std::string(row.status), std::string(row.detail)}});
 		}
 		return std::move(state);
 	}
