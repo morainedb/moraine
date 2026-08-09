@@ -151,9 +151,10 @@ A loopback MinIO's PUT costs about a millisecond, so it lands in the
 `RTT ≈ 0` row of the table above and the flush cadence dominates everywhere:
 this *validates the composition against a real object-storage protocol*, but
 it understates S3, whose PUT is tens of milliseconds. For the number a given
-deployment will see, point the same harness at the real bucket
-(`MORAINE_S3_ENDPOINT`/`MORAINE_S3_BUCKET`); the injected-RTT table says what
-to expect before you do.
+deployment will see, dispatch the main-only
+[`Real S3 benchmark`](docs/real-s3-benchmark.md) workflow. It runs this same
+suite on an ephemeral worker in the bucket's AWS region; the injected-RTT table
+says what to expect before you do.
 
 ### Commit throughput vs. concurrency
 
