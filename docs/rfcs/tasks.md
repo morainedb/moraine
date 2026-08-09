@@ -29,15 +29,6 @@ Resolving an item means updating the owning RFC and deleting the entry.
 RFC 0022 (the commit log and the leader role) is wholly unimplemented and is
 deliberately not itemized here.
 
-## 0004 — Commit and transaction protocol
-
-- **MEASURE** — Commit latency against a *real* S3, not a loopback one. The
-  composition is settled and measured both ways (`BENCHMARK.md` → Core
-  measurements: `max(flush cadence, write RTT) + ~2 ms`, confirmed by an
-  injected-RTT sweep and validated against MinIO), so what remains is only
-  the absolute S3 PUT term the harness needs a real bucket to see:
-  point `object_storage.rs` at one and record the row.
-
 ## 0005 — Data inlining on SlateDB
 
 - **DEFERRED** — Auto-flush policy: when to trigger an inline flush. This RFC

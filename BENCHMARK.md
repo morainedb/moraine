@@ -149,12 +149,24 @@ release against a pinned MinIO):
 
 A loopback MinIO's PUT costs about a millisecond, so it lands in the
 `RTT ≈ 0` row of the table above and the flush cadence dominates everywhere:
-this *validates the composition against a real object-storage protocol*, but
-it understates S3, whose PUT is tens of milliseconds. For the number a given
-deployment will see, dispatch the main-only
-[`Real S3 benchmark`](docs/real-s3-benchmark.md) workflow. It runs this same
-suite on an ephemeral worker in the bucket's AWS region; the injected-RTT table
-says what to expect before you do.
+this validates the composition against a real object-storage protocol, but
+it understates S3.
+
+The main-only [`Real S3 benchmark`](docs/real-s3-benchmark.md) ran the same
+sweep from an ARM CodeBuild worker against AWS S3 in `us-west-2`, with the
+worker and bucket in the same region. Twenty sequential commits per interval
+on 2026-08-09 produced:
+
+| flush interval | median commit | min | max |
+|---|---|---|---|
+| 1 ms | 29.6 ms | 24.0 ms | 40.6 ms |
+| 25 ms | 28.1 ms | 22.2 ms | 35.7 ms |
+| 100 ms | 101.9 ms | 73.9 ms | 143.4 ms |
+
+The production endpoint puts the durable-write floor at roughly 28–30 ms for
+this deployment: lowering the cadence from 25 ms to 1 ms buys nothing, while
+the 100 ms cadence still binds. This is the real-endpoint row the injected-RTT
+model predicted, not a new term in the composition.
 
 ### Commit throughput vs. concurrency
 

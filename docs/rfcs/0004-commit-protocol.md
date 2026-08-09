@@ -630,6 +630,13 @@ concurrent commits land as two full batches at the same rate 64 do
 flush cadence, is what binds first under saturation, and it is the lever if
 a workload ever needs past it.
 
+The single-commit floor is measured against AWS S3 as well as the local and
+injected-latency stores. From a worker in the bucket's `us-west-2` region,
+1 ms and 25 ms flush cadences both land at roughly 28–30 ms median, while a
+100 ms cadence lands at 101.9 ms (`BENCHMARK.md`, "Durable-commit latency
+against a real endpoint"). The endpoint round trip therefore replaces the
+short cadence as the binding term; it does not add a second serial wait.
+
 The batch is the unit of failure. A member that fails discards the batch,
 and its other members re-run; a lost race re-runs every member, conflicting
 if any member's change set does; a crash leaves every member committed or
