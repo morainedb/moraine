@@ -349,6 +349,13 @@ struct LookupBindData : public duckdb::FunctionData {
 	}
 };
 
+template <class BindData>
+duckdb::unique_ptr<duckdb::NodeStatistics> ExactIndexCardinality(duckdb::ClientContext &,
+                                                                 const duckdb::FunctionData *bind_data) {
+	auto count = bind_data->Cast<BindData>().rows.size();
+	return duckdb::make_uniq<duckdb::NodeStatistics>(count, count);
+}
+
 // Backing storage for a `MoraineLookupValue`'s string/bytes fields, which
 // point into these members and so must outlive any use of the value.
 struct LookupValueBacking {
@@ -849,6 +856,7 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                              LogicalType::VARCHAR},
 	                             LookupImpl, LookupBind, LookupInitGlobal);
 	lookup.varargs = LogicalType::ANY;
+	lookup.cardinality = ExactIndexCardinality<LookupBindData>;
 	loader.RegisterFunction(lookup);
 
 	// A homogeneous scalar list addresses a one-column index. A list of
@@ -857,6 +865,7 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                          LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
 	                         LookupImpl, InBind, LookupInitGlobal);
+	in.cardinality = ExactIndexCardinality<LookupBindData>;
 	loader.RegisterFunction(in);
 
 	duckdb::TableFunction drop("moraine_index_drop",
@@ -873,6 +882,7 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, LogicalType::BOOLEAN},
 	                            RangeImpl, RangeBind, RangeInitGlobal);
 	range.named_parameters["reverse"] = LogicalType::BOOLEAN;
+	range.cardinality = ExactIndexCardinality<RangeBindData>;
 	loader.RegisterFunction(range);
 
 	// (catalog, schema, table, index, then a leading prefix of predicates as
@@ -883,6 +893,7 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                            NullsImpl, NullsBind, NullsInitGlobal);
 	nulls.varargs = LogicalType::ANY;
 	nulls.named_parameters["reverse"] = LogicalType::BOOLEAN;
+	nulls.cardinality = ExactIndexCardinality<NullsBindData>;
 	loader.RegisterFunction(nulls);
 }
 
