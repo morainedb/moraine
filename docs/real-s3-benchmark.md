@@ -16,6 +16,14 @@ seven days; GitHub keeps the downloaded result for 30 days.
 
 The account must have GitHub's OIDC provider registered with URL
 `https://token.actions.githubusercontent.com` and audience `sts.amazonaws.com`.
+Create it once per AWS account if it does not already exist:
+
+```sh
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com
+```
+
 Pass that provider's ARN to the repository template:
 
 ```sh
@@ -29,8 +37,21 @@ aws cloudformation deploy \
 
 The template creates the private lifecycle-managed bucket, the ephemeral
 CodeBuild project, its S3-only execution role, and an OIDC launcher role whose
-trust policy accepts only `morainedb/moraine`'s `main` ref. Override the GitHub
-organization or repository parameters for a fork.
+trust policy accepts only `morainedb/moraine`'s `main` ref. The subject includes
+GitHub's immutable organization and repository IDs, so a future rename,
+transfer, or reuse of either name cannot inherit the trust relationship.
+
+The parameter defaults target this repository:
+
+| Parameter | Default |
+|---|---|
+| `GitHubOrganization` | `morainedb` |
+| `GitHubOrganizationId` | `310371634` |
+| `GitHubRepository` | `moraine` |
+| `GitHubRepositoryId` | `1294736153` |
+
+Override all four for a fork. Obtain the IDs with `gh api users/OWNER --jq .id`
+and `gh api repos/OWNER/REPOSITORY --jq .id`.
 
 Copy the four stack outputs into repository Actions variables:
 

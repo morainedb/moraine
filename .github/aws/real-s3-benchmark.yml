@@ -8,9 +8,19 @@ Parameters:
   GitHubOrganization:
     Type: String
     Default: morainedb
+  GitHubOrganizationId:
+    Type: String
+    Default: '310371634'
+    AllowedPattern: '^[0-9]+$'
+    Description: Immutable numeric ID of the GitHub organization
   GitHubRepository:
     Type: String
     Default: moraine
+  GitHubRepositoryId:
+    Type: String
+    Default: '1294736153'
+    AllowedPattern: '^[0-9]+$'
+    Description: Immutable numeric ID of the GitHub repository
 Resources:
   BenchmarkBucket:
     Type: AWS::S3::Bucket
@@ -160,7 +170,7 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrganization}/${GitHubRepository}:ref:refs/heads/main'
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrganization}@${GitHubOrganizationId}/${GitHubRepository}@${GitHubRepositoryId}:ref:refs/heads/main'
       Policies:
         - PolicyName: LaunchBenchmark
           PolicyDocument:
