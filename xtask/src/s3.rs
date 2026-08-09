@@ -4,6 +4,7 @@
 //! catalog's public API over a real S3 endpoint.
 
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -89,6 +90,10 @@ pub fn s3() -> anyhow::Result<()> {
         true,
         &["--test-threads=1", "--nocapture"],
         &[
+            ("AWS_ACCESS_KEY_ID", OsStr::new("minioadmin")),
+            ("AWS_SECRET_ACCESS_KEY", OsStr::new("minioadmin")),
+            ("AWS_REGION", OsStr::new("us-east-1")),
+            ("AWS_ALLOW_HTTP", OsStr::new("true")),
             ("MORAINE_S3_ENDPOINT", endpoint.as_ref()),
             ("MORAINE_S3_BUCKET", S3_BUCKET.as_ref()),
         ],

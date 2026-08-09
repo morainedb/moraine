@@ -1,18 +1,20 @@
-//! Real object storage tests: public-API round-trips against an
+//! Real object storage tests: public-API round-trips against S3 or an
 //! S3-compatible endpoint. Ignored by default; `cargo xtask s3` starts
 //! MinIO and runs them with the endpoint environment set.
 //!
 //! Run manually against any S3-compatible endpoint:
 //!
 //! ```text
+//! AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+//! AWS_REGION=us-east-1 AWS_ALLOW_HTTP=true \
 //! MORAINE_S3_ENDPOINT=http://127.0.0.1:9124 MORAINE_S3_BUCKET=moraine \
 //! cargo test -p moraine --test object_storage -- --ignored
 //! ```
 //!
-//! Point it at a real bucket — credentials and all — to measure commit
-//! latency where the WAL PUT is a network round trip rather than a
-//! loopback one; `measure_commit_latency_against_the_endpoint` prints the
-//! table and says which endpoint produced it.
+//! Against AWS, omit `MORAINE_S3_ENDPOINT`, set `MORAINE_S3_BUCKET` and an
+//! optional unique `MORAINE_S3_PREFIX`, and use the standard AWS environment
+//! variables. The builder accepts temporary session and container-role
+//! credentials, so the benchmark needs no static access key.
 
 // The tests-exempt lints (`clippy.toml`) reach `#[test]` functions and
 // `#[cfg(test)]` modules, not an integration crate's plain helper
@@ -27,29 +29,41 @@ use std::{
 use moraine::{Catalog, CatalogOptions, ColumnDef};
 use object_store::{ObjectStore, aws::AmazonS3Builder};
 
-/// Credentials matching the MinIO server `cargo xtask s3` runs.
+#[test]
+fn catalog_path_is_scoped_to_the_run_prefix() {
+    assert_eq!(
+        catalog_path("runs/42/data/", "reopen"),
+        "runs/42/data/reopen"
+    );
+}
+
+#[test]
+fn catalog_path_works_without_a_run_prefix() {
+    assert_eq!(catalog_path("", "reopen"), "reopen");
+}
+
 fn s3_store() -> Arc<dyn ObjectStore> {
-    let endpoint = std::env::var("MORAINE_S3_ENDPOINT")
-        .expect("MORAINE_S3_ENDPOINT must be set (see this module's doc comment)");
     let bucket = std::env::var("MORAINE_S3_BUCKET")
         .expect("MORAINE_S3_BUCKET must be set (see this module's doc comment)");
-    Arc::new(
-        AmazonS3Builder::new()
-            .with_endpoint(endpoint)
-            .with_bucket_name(bucket)
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
-            .with_region("us-east-1")
-            .with_allow_http(true)
-            .build()
-            .expect("S3 store from test configuration"),
-    )
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    if let Ok(endpoint) = std::env::var("MORAINE_S3_ENDPOINT") {
+        builder = builder.with_endpoint(endpoint);
+    }
+    Arc::new(builder.build().expect("S3 store from test configuration"))
+}
+
+fn catalog_path(prefix: &str, path: &str) -> String {
+    match prefix.trim_matches('/') {
+        "" => path.to_string(),
+        prefix => format!("{prefix}/{path}"),
+    }
 }
 
 /// Options rooted at a per-test prefix so the suite shares one bucket.
 fn options_at(path: &str) -> CatalogOptions {
     let mut options = CatalogOptions::default();
-    options.path = path.to_string();
+    let prefix = std::env::var("MORAINE_S3_PREFIX").unwrap_or_default();
+    options.path = catalog_path(&prefix, path);
     options
 }
 
@@ -112,10 +126,15 @@ async fn measure_commit_latency_against_the_endpoint() {
     let intervals = [1u64, 25, 100];
 
     let store = s3_store();
-    println!(
-        "\n# 0004 durable-commit latency against {}",
-        std::env::var("MORAINE_S3_ENDPOINT").unwrap_or_default()
-    );
+    let target = std::env::var("MORAINE_S3_ENDPOINT").unwrap_or_else(|_| {
+        format!(
+            "AWS S3 in {}",
+            std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|_| "the configured region".into())
+        )
+    });
+    println!("\n# 0004 durable-commit latency against {target}");
     println!("# {COMMITS} sequential one-table commits per row, each await_durable\n");
     println!(
         "{:>10}  {:>11}  {:>9}  {:>9}",

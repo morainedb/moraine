@@ -1,0 +1,123 @@
+name: Real S3 benchmark
+
+# This is intentionally absent from push and pull_request. It spends AWS
+# resources and records an environment-specific measurement, not a merge gate.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: real-s3-benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Benchmark main on an ephemeral AWS worker
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.MORAINE_BENCHMARK_AWS_REGION }}
+      CODEBUILD_PROJECT: ${{ vars.MORAINE_BENCHMARK_CODEBUILD_PROJECT }}
+      MORAINE_S3_BUCKET: ${{ vars.MORAINE_BENCHMARK_S3_BUCKET }}
+      MORAINE_S3_PREFIX: benchmarks/runs/${{ github.run_id }}-${{ github.run_attempt }}/data
+      MORAINE_RESULTS_KEY: benchmark-results/${{ github.run_id }}-${{ github.run_attempt }}.txt
+    steps:
+      - name: Require main and repository configuration
+        env:
+          ROLE_ARN: ${{ vars.MORAINE_BENCHMARK_ROLE_ARN }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "This workflow may only run from main; selected ref was $GITHUB_REF." >&2
+            exit 1
+          fi
+          for name in AWS_REGION CODEBUILD_PROJECT MORAINE_S3_BUCKET ROLE_ARN; do
+            if [ -z "${!name}" ]; then
+              echo "Benchmark repository variables are incomplete; see docs/real-s3-benchmark.md." >&2
+              exit 1
+            fi
+          done
+
+      # The AWS trust policy independently restricts this token to main.
+      - name: Exchange GitHub OIDC token for the launcher role
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.MORAINE_BENCHMARK_ROLE_ARN }}
+          role-session-name: moraine-${{ github.run_id }}
+
+      - name: Start and wait for the ephemeral CodeBuild worker
+        id: build
+        env:
+          MORAINE_GIT_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}.git
+          MORAINE_GIT_SHA: ${{ github.sha }}
+        run: |
+          overrides=$(jq -n \
+            --arg repository "$MORAINE_GIT_REPOSITORY" \
+            --arg sha "$MORAINE_GIT_SHA" \
+            --arg bucket "$MORAINE_S3_BUCKET" \
+            --arg prefix "$MORAINE_S3_PREFIX" \
+            --arg result "$MORAINE_RESULTS_KEY" \
+            '[
+              {name:"MORAINE_GIT_REPOSITORY", value:$repository, type:"PLAINTEXT"},
+              {name:"MORAINE_GIT_SHA", value:$sha, type:"PLAINTEXT"},
+              {name:"MORAINE_S3_BUCKET", value:$bucket, type:"PLAINTEXT"},
+              {name:"MORAINE_S3_PREFIX", value:$prefix, type:"PLAINTEXT"},
+              {name:"MORAINE_RESULTS_KEY", value:$result, type:"PLAINTEXT"}
+            ]')
+          build_id=$(aws codebuild start-build \
+            --project-name "$CODEBUILD_PROJECT" \
+            --environment-variables-override "$overrides" \
+            --query 'build.id' --output text)
+          echo "build_id=$build_id" >> "$GITHUB_OUTPUT"
+          echo "Started $build_id"
+          trap 'aws codebuild stop-build --id "$build_id" >/dev/null || true' EXIT
+
+          while true; do
+            aws codebuild batch-get-builds --ids "$build_id" > codebuild.json
+            status=$(jq -r '.builds[0].buildStatus' codebuild.json)
+            case "$status" in
+              SUCCEEDED)
+                break
+                ;;
+              FAILED|FAULT|STOPPED|TIMED_OUT)
+                log_url=$(jq -r '.builds[0].logs.deepLink // ""' codebuild.json)
+                echo "CodeBuild ended with $status. Logs: $log_url" >&2
+                trap - EXIT
+                exit 1
+                ;;
+              *)
+                echo "CodeBuild status: $status"
+                sleep 15
+                ;;
+            esac
+          done
+          trap - EXIT
+
+          log_url=$(jq -r '.builds[0].logs.deepLink // ""' codebuild.json)
+          {
+            echo "### Real S3 benchmark"
+            echo
+            echo "CodeBuild completed successfully: [$build_id]($log_url)"
+            echo
+            echo "S3 data prefix: \`s3://$MORAINE_S3_BUCKET/$MORAINE_S3_PREFIX\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download benchmark output
+        if: always() && steps.build.outputs.build_id != ''
+        run: |
+          mkdir -p benchmark-results
+          aws s3 cp \
+            "s3://$MORAINE_S3_BUCKET/$MORAINE_RESULTS_KEY" \
+            benchmark-results/object-storage.txt
+          cp codebuild.json benchmark-results/codebuild.json
+
+      - name: Preserve benchmark output
+        if: always() && steps.build.outputs.build_id != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: real-s3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: benchmark-results
+          if-no-files-found: warn
+          retention-days: 30
