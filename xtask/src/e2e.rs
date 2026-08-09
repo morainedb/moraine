@@ -20,7 +20,7 @@ const DUCKDB_LOAD_TEST_NAME: &str = "attach_lists_and_scans_through_real_duckdb"
 /// `--exact`, since there are many). Needs network access to `INSTALL
 /// ducklake`. Adding a test there means bumping this count, or `e2e`
 /// fails — deliberate, so a silently-filtered test can never pass.
-const DUCKLAKE_LOAD_TEST_COUNT: &str = "110 passed";
+const DUCKLAKE_LOAD_TEST_COUNT: &str = "111 passed";
 
 /// Every file under `test/sql`, run together through DuckDB's own
 /// sqllogictest runner. Adding one means bumping this count, exactly as for

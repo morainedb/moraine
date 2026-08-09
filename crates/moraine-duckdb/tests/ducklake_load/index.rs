@@ -54,6 +54,41 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
     );
 }
 
+/// An absent lookup is known while its table function binds. The optimizer
+/// must turn that exact zero-row input into an empty result before DuckLake
+/// opens the table's Parquet files for the surrounding semi-join.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn absent_index_lookup_eliminates_the_ducklake_scan() {
+    let store = TempDir::new("index-empty-result-store");
+    let data = TempDir::new("index-empty-result-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    // More than DuckLake's inline threshold, so a scan would have to open a
+    // real Parquet file and report it in the analyzed plan.
+    run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+
+    // Contour prepares this shape once and supplies a different key on each
+    // execution. The rewrite must therefore see the execution-time bind, not
+    // rely on a literal being present in the original SQL text.
+    let plan = run("PREPARE absent_lookup AS \
+         SELECT count(*) FROM lake.main.t \
+         WHERE rowid IN (SELECT row_id FROM \
+             moraine_index_lookup('lake', 'main', 't', 'by_a', $1)); \
+         EXPLAIN ANALYZE EXECUTE absent_lookup(9999);");
+    assert!(
+        plan.contains("EMPTY_RESULT"),
+        "the known-empty lookup did not eliminate the join:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Total Files Read"),
+        "DuckLake opened data files for an absent index key:\n{plan}"
+    );
+}
+
 /// A composite index over `(a, b)` resolves a full multi-column equality key
 /// from SQL: the variadic values, in the index's column order, pin the one
 /// matching row, and an absent key resolves to none.
