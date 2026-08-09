@@ -143,6 +143,12 @@ conflict while appends and disjoint commits stay benign. A compaction
 that loses a race surfaces the `conflict`-substring error DuckLake's own
 retry loop scans for.
 
+Conflict classification remains at table grain. DuckLake's change records
+name the table, and no measured workload shows same-table compactions losing
+enough races to justify carrying and comparing file sets in the commit
+protocol. File-set-grain classification would be a replacement design backed
+by such a measurement, not latent behavior this protocol promises.
+
 ### Test obligations
 
 Core, against real SlateDB on in-memory `object_store`:

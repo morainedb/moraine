@@ -283,6 +283,12 @@ grace period has passed. A reader that held a view longer than the window
 may find its snapshot expired and must re-resolve from head
 (`SnapshotExpired`, RFC 0003/0009).
 
+moraine exposes no registry of live reader snapshots. Readers are
+cross-process and uncoordinated (RFC 0004), so an extension-local registry
+would be incomplete and could not safely derive a retention window. Operators
+set the window from the workload's externally observed transaction and scan
+durations; a process-local diagnostic would not change that contract.
+
 ### One reclamation path for flush and compaction
 
 Inline flush (RFC 0005) hard-deletes its consumed inline records itself.

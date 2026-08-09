@@ -310,6 +310,39 @@ merge asked for straight after an attach found every tree already being
 merged by the writer's own compactor and skipped them all; adopting the
 in-flight merge instead is what makes this column mean anything.
 
+### Cold attach against AWS S3
+
+The main-only real-S3 workflow ran that same catalog shape from an ARM
+CodeBuild worker against a bucket in the worker's `us-west-2` region: 40
+tables x 8 columns, 160 stats-rewrite rounds, then seven fresh read-only
+handles before and after `compact_store`. Open and first materialized view
+were timed separately; total excludes close.
+
+The census immediately before each timing row was:
+
+| state | subspace bytes / SSTs | `current` bytes / SSTs | WAL objects / bytes | manifest bytes |
+|---|---:|---:|---:|---:|
+| churned | 135 443 / 24 | 25 631 / 4 | 265 / 231 099 | 5 209 474 |
+| merged | 75 379 / 11 | 22 763 / 2 | 257 / 211 119 | 5 011 208 |
+
+And the cold timings, median of seven:
+
+| state | open | first view | total | total min | total max |
+|---|---:|---:|---:|---:|---:|
+| churned | 248.4 ms | 150.6 ms | 401.1 ms | 391.6 ms | 436.2 ms |
+| merged | 262.8 ms | 148.8 ms | 411.6 ms | 383.9 ms | 446.5 ms |
+
+**The absolute same-region endpoint number for this small catalog is about
+0.4 s, split roughly 0.25 s opening the reader and 0.15 s materializing its
+first view.** The merge completed four subspaces and removed 44% of subspace
+bytes and 54% of SSTs, but the timing distributions overlap completely; it
+bought no measurable attach improvement here. That does not contradict the
+injected-GET slope: this store is dominated in the census by object classes a
+subspace merge does not reclaim, and the fixed reader-open work is already
+larger than the materialization. It does make the operational rule concrete:
+use the census before merging, and do not treat a fall in total SST count as a
+promise of lower attach latency.
+
 ### Does a cold attach pay for the `index` subspace?
 
 A production store measured 3.364 GB in `index` — 75.6M live entries, 99.6%

@@ -715,6 +715,13 @@ block-grained), with every read path naming one. Foyer's admission picker
 repeats the rule at the disk device, so scan and compaction churn cannot
 wear it or evict the probe set.
 
+Bulk and probe scans use fixed 4 MiB read-ahead with eight fetches in flight.
+These are implementation constants, not attach policy: they remove the
+measured sequential-round-trip failure, while no local/S3 ladder demonstrates
+that per-attach tuning improves a supported workload. A different value needs
+that measurement and changes the implementation choice directly rather than
+adding speculative options.
+
 The attach options keep their surface (RFC 0006) and change machinery:
 
 - `CACHE_DIR` / `CACHE_SIZE` — the block slot's disk device and cap.

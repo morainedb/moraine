@@ -72,8 +72,8 @@ Non-goals:
   are complements only in the sense that they address different costs, and
   for a slow attach RFC 0009's is usually the one that matters. Step 8
   reduces dead bytes, and a store may have none.
-- **Checkpoint lifecycle** — an RFC 0017 / RFC 0006 concern; if it lands it
-  becomes a consumer of this surface.
+- **Checkpoint lifecycle.** SlateDB's built-in collector owns it; adding the
+  same read-modify-write operation to this pass would create a second owner.
 
 ## Background
 
@@ -411,9 +411,11 @@ effects stand, and the next tick re-runs from the top.
 
 Single-tier by design: one interval, one step set. Steps have genuinely
 different natural cadences — the sweep is two seeks when nothing was
-dropped, while `delete_orphaned_files` LISTs the entire data prefix — but
-encoding tiers into flat attach options is unwieldy, and a second attach
-with a different configuration covers the case. Deferred until asked for.
+dropped, while `delete_orphaned_files` LISTs the entire data prefix — but no
+measured deployment needs multiple in-process cadences. Encoding tiers into
+flat attach options would multiply scheduler state and lifecycle ownership,
+so this surface deliberately keeps one cadence. Evidence of missed work or
+material excess cost would motivate a replacement design.
 
 ### The on-demand trigger
 
@@ -644,6 +646,23 @@ actually reclaim, and whether the answer is instead a `cleanup_old_files` the
 lake never ran.
 
 The census serves read-only attaches. Both legs read; neither writes.
+
+Its scans use the core read profile: 4 MiB of read-ahead and eight fetches in
+flight. Those figures are fixed implementation choices, not maintenance
+attach options; RFC 0009 records the measurement required to replace them.
+
+The real-endpoint measurement pins the scale and the limit of this lever. An
+ARM worker and bucket in the same `us-west-2` region opened a deliberately
+churned 40-table catalog in 401.1 ms median over seven fresh read-only handles:
+248.4 ms to open the reader and 150.6 ms to materialize the first view. A full
+merge completed four subspaces, reducing their physical bytes from 135,443 to
+75,379 and their SST count from 24 to 11, yet the next seven handles took
+411.6 ms median, with wholly overlapping ranges. The census also showed 257
+WAL objects and 5,011,208 manifest bytes after the merge — object classes the
+subspace merge does not reclaim. So a merge's measured GET reduction remains
+real, but only matters when those GETs carry material weight in the attach;
+the census is a prerequisite, not merely post-hoc reporting (`BENCHMARK.md`,
+"Cold attach against AWS S3").
 
 ### The core verb
 
@@ -973,6 +992,11 @@ and sibling-versus-nested prefixes without needing a lake.
   error and continues (`garbage_collector.rs:384-398`) and `run_gc_once`
   returns `()`, so a wholly failed pass is indistinguishable from a clean
   one. Redundant, mildly racy, and unobservable.
+
+- **Checkpoint lifecycle as a maintenance-pass step.** Rejected for the same
+  ownership reason. SlateDB's built-in collector already expires checkpoints
+  on its own cadence; a pass step would create a second lifecycle owner and
+  race the read-modify-write operation instead of adding capability.
 
 - **Declining a forced-compaction lever**, as an earlier revision of this
   RFC did. It gave three reasons and each has since proved false. *Choosing
