@@ -24,7 +24,7 @@ pub(crate) const TAG_PREFIX_LEN: usize = 1;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum Key {
     /// Store-level singletons: format version, head pointer, migration
-    /// marker. Overwritten in place.
+    /// marker, and maintenance status. Overwritten in place.
     Sys(SysKey),
     /// One record per snapshot — `ducklake_snapshot` +
     /// `ducklake_snapshot_changes`, merged. Append-only.
@@ -100,6 +100,8 @@ pub(crate) enum SysKey {
     Head,
     /// Structural-migration marker. Reserved from format v1.
     Migration,
+    /// Bounded history of completed maintenance passes.
+    MaintenanceStatus,
 }
 
 /// A live record: a temporally versioned entity, or the `current`-only
@@ -747,6 +749,10 @@ mod tests {
         assert_eq!(Key::Sys(SysKey::Format).encode(), vec![0x02, 0x02]);
         assert_eq!(Key::Sys(SysKey::Head).encode(), vec![0x02, 0x03]);
         assert_eq!(Key::Sys(SysKey::Migration).encode(), vec![0x02, 0x04]);
+        assert_eq!(
+            Key::Sys(SysKey::MaintenanceStatus).encode(),
+            vec![0x02, 0x05]
+        );
     }
 
     #[test]
@@ -1408,6 +1414,7 @@ mod tests {
             Just(Key::Sys(SysKey::Format)),
             Just(Key::Sys(SysKey::Head)),
             Just(Key::Sys(SysKey::Migration)),
+            Just(Key::Sys(SysKey::MaintenanceStatus)),
             any::<u64>().prop_map(|snapshot_id| Key::Snapshot { snapshot_id }),
             arb_entity().prop_map(Key::current),
             (arb_entity(), any::<u64>()).prop_map(|(entity, end)| Key::history(entity, end)),

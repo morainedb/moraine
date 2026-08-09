@@ -53,6 +53,9 @@ pub fn decode_record(key_bytes: &[u8], value_bytes: &[u8]) {
         Key::Sys(SysKey::Migration) => {
             let _ = value::decode_value::<proto::MigrationValue>(value_bytes);
         }
+        Key::Sys(SysKey::MaintenanceStatus) => {
+            let _ = value::decode_value::<proto::MaintenanceStatusValue>(value_bytes);
+        }
         Key::Inline(_) | Key::Index(_) => {}
     }
 }

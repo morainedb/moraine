@@ -125,6 +125,12 @@ mod tests {
     codec_tests!(roundtrip_head, garbage_head, HeadValue);
     codec_tests!(roundtrip_migration, garbage_migration, MigrationValue);
     codec_tests!(
+        roundtrip_maintenance_status,
+        garbage_maintenance_status,
+        MaintenanceStatusValue,
+        16
+    );
+    codec_tests!(
         roundtrip_inline_schema,
         garbage_inline_schema,
         InlineSchemaValue

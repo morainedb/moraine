@@ -21,7 +21,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub use checkpoints::*;
@@ -2129,6 +2129,189 @@ pub unsafe extern "C" fn moraine_maintain(
     }
 }
 
+/// One borrowed step supplied to [`moraine_maintenance_status_record`].
+#[repr(C)]
+pub struct MoraineMaintenanceStatusStepInput {
+    /// Maintenance operation name.
+    pub step: *const c_char,
+    /// Outcome name.
+    pub status: *const c_char,
+    /// Human-readable outcome detail.
+    pub detail: *const c_char,
+}
+
+/// One flattened status row returned by [`moraine_maintenance_status_rows`].
+#[repr(C)]
+pub struct MoraineMaintenanceStatusRow {
+    /// Pass start time, in microseconds from the Unix epoch.
+    pub started_at_micros: i64,
+    /// Pass trigger, owned — free via [`moraine_maintenance_status_free`].
+    pub trigger: *mut c_char,
+    /// Maintenance operation name, owned.
+    pub step: *mut c_char,
+    /// Outcome name, owned.
+    pub status: *mut c_char,
+    /// Human-readable outcome detail, owned.
+    pub detail: *mut c_char,
+}
+
+/// Durably records one completed maintenance pass.
+///
+/// # Safety
+///
+/// `handle` must be a live writer handle, `trigger` a valid C string,
+/// `steps` either null with zero length or point to `steps_len` valid inputs,
+/// every string in those inputs must be valid, and `err`, if non-null, must
+/// be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_maintenance_status_record(
+    handle: *mut MoraineCatalogHandle,
+    started_at_micros: i64,
+    trigger: *const c_char,
+    steps: *const MoraineMaintenanceStatusStepInput,
+    steps_len: usize,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract.
+        let trigger = unsafe { borrow_str(trigger, "trigger") }?.to_owned();
+        let raw_steps = if steps.is_null() {
+            if steps_len != 0 {
+                return Err(AbiError::invalid_argument(
+                    "`steps` is null but its length is nonzero",
+                ));
+            }
+            &[]
+        } else {
+            // SAFETY: caller contract.
+            unsafe { std::slice::from_raw_parts(steps, steps_len) }
+        };
+        let status_steps = raw_steps
+            .iter()
+            .map(|input| {
+                // SAFETY: caller contract covers every input string.
+                Ok(moraine::MaintenanceStatusStep::new(
+                    unsafe { borrow_str(input.step, "step") }?,
+                    unsafe { borrow_str(input.status, "status") }?,
+                    unsafe { borrow_str(input.detail, "detail") }?,
+                ))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+        let started_at = time_from_micros(started_at_micros)?;
+        let pass = moraine::MaintenanceStatusPass::new(started_at, trigger, status_steps);
+
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        handle_ref.block_on(handle_ref.catalog.writer()?.record_maintenance_pass(pass))?;
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is the caller's contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Lists durable maintenance status, newest pass first and step order within
+/// each pass.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; output pointers and
+/// `err`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_maintenance_status_rows(
+    handle: *mut MoraineCatalogHandle,
+    out_items: *mut *mut MoraineMaintenanceStatusRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    let produce =
+        |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineMaintenanceStatusRow>, AbiError> {
+            let passes = handle_ref.block_on(handle_ref.catalog.reads().maintenance_status())?;
+            let mut owned = Vec::new();
+            for pass in passes {
+                let started_at_micros = time_to_micros(pass.started_at)?;
+                for step in pass.steps {
+                    owned.push((
+                        started_at_micros,
+                        to_c_string(&pass.trigger)?,
+                        to_c_string(&step.step)?,
+                        to_c_string(&step.status)?,
+                        to_c_string(&step.detail)?,
+                    ));
+                }
+            }
+            Ok(owned
+                .into_iter()
+                .map(|(started_at_micros, trigger, step, status, detail)| {
+                    MoraineMaintenanceStatusRow {
+                        started_at_micros,
+                        trigger: trigger.into_raw(),
+                        step: step.into_raw(),
+                        status: status.into_raw(),
+                        detail: detail.into_raw(),
+                    }
+                })
+                .collect())
+        };
+
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
+}
+
+/// Frees rows returned by [`moraine_maintenance_status_rows`].
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a matching
+/// status call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_maintenance_status_free(
+    items: *mut MoraineMaintenanceStatusRow,
+    len: usize,
+) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |row| {
+                free_c_string(row.trigger);
+                free_c_string(row.step);
+                free_c_string(row.status);
+                free_c_string(row.detail);
+            });
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+fn time_from_micros(micros: i64) -> Result<SystemTime, AbiError> {
+    let duration = Duration::from_micros(micros.unsigned_abs());
+    let time = if micros >= 0 {
+        UNIX_EPOCH.checked_add(duration)
+    } else {
+        UNIX_EPOCH.checked_sub(duration)
+    };
+    time.ok_or_else(|| AbiError::invalid_argument("maintenance timestamp is out of range"))
+}
+
+fn time_to_micros(time: SystemTime) -> Result<i64, AbiError> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_micros())
+            .map_err(|_| AbiError::new(codes::CORRUPTION, "maintenance timestamp is out of range")),
+        Err(error) => {
+            let magnitude = i64::try_from(error.duration().as_micros()).map_err(|_| {
+                AbiError::new(codes::CORRUPTION, "maintenance timestamp is out of range")
+            })?;
+            Ok(-magnitude)
+        }
+    }
+}
+
 /// One subspace's row of a store census, as returned by
 /// [`moraine_store_census`].
 #[repr(C)]
@@ -4053,6 +4236,68 @@ mod tests {
 
         // SAFETY: freed exactly once.
         unsafe { moraine_detach(handle) };
+    }
+
+    /// Completed passes cross the ABI as borrowed inputs and owned flattened
+    /// rows, preserving their timestamp and strings.
+    #[test]
+    fn maintenance_status_roundtrips_through_the_abi() {
+        let dir = TempDir::new("maintenance-status-abi");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+        let trigger = CString::new("scheduled").expect("no NUL");
+        let step = CString::new("sweep_indexes").expect("no NUL");
+        let status = CString::new("ran").expect("no NUL");
+        let detail = CString::new("reclaimed 3 entries").expect("no NUL");
+        let inputs = [MoraineMaintenanceStatusStepInput {
+            step: step.as_ptr(),
+            status: status.as_ptr(),
+            detail: detail.as_ptr(),
+        }];
+        let mut err = MoraineError::default();
+
+        // SAFETY: the live handle, strings, input slice, and error slot remain
+        // valid for the call.
+        let code = unsafe {
+            moraine_maintenance_status_record(
+                handle,
+                123,
+                trigger.as_ptr(),
+                inputs.as_ptr(),
+                inputs.len(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "record failed");
+
+        let mut rows: *mut MoraineMaintenanceStatusRow = ptr::null_mut();
+        let mut rows_len = 0;
+        // SAFETY: the handle is live and output/error slots are writable.
+        let code = unsafe {
+            moraine_maintenance_status_rows(handle, &raw mut rows, &raw mut rows_len, &raw mut err)
+        };
+        assert_eq!(code, codes::OK, "list failed");
+        assert_eq!(rows_len, 1);
+        // SAFETY: the successful list call returned one valid row.
+        let row = unsafe { &*rows };
+        assert_eq!(row.started_at_micros, 123);
+        for (actual, expected) in [
+            (row.trigger, "scheduled"),
+            (row.step, "sweep_indexes"),
+            (row.status, "ran"),
+            (row.detail, "reclaimed 3 entries"),
+        ] {
+            // SAFETY: every successful output string is live until the paired
+            // array free below.
+            let actual = unsafe { CStr::from_ptr(actual) }.to_str().unwrap();
+            assert_eq!(actual, expected);
+        }
+
+        // SAFETY: both allocations are released exactly once.
+        unsafe {
+            moraine_maintenance_status_free(rows, rows_len);
+            moraine_detach(handle);
+        }
     }
 
     /// The census ABI names every subspace, writes the manifest version

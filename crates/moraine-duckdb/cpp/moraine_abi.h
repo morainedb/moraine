@@ -200,6 +200,30 @@ typedef struct MoraineDataFileDesc {
   uint64_t footer_size;
 } MoraineDataFileDesc;
 
+// One borrowed step supplied to [`moraine_maintenance_status_record`].
+typedef struct MoraineMaintenanceStatusStepInput {
+  // Maintenance operation name.
+  const char *step;
+  // Outcome name.
+  const char *status;
+  // Human-readable outcome detail.
+  const char *detail;
+} MoraineMaintenanceStatusStepInput;
+
+// One flattened status row returned by [`moraine_maintenance_status_rows`].
+typedef struct MoraineMaintenanceStatusRow {
+  // Pass start time, in microseconds from the Unix epoch.
+  int64_t started_at_micros;
+  // Pass trigger, owned — free via [`moraine_maintenance_status_free`].
+  char *trigger;
+  // Maintenance operation name, owned.
+  char *step;
+  // Outcome name, owned.
+  char *status;
+  // Human-readable outcome detail, owned.
+  char *detail;
+} MoraineMaintenanceStatusRow;
+
 // One subspace's row of a store census, as returned by
 // [`moraine_store_census`].
 typedef struct MoraineSubspaceCensus {
@@ -1371,6 +1395,41 @@ int32_t moraine_maintain(struct MoraineCatalogHandle *handle,
                          MoraineInterruptProbe probe,
                          void *probe_ctx,
                          struct MoraineError *err);
+
+// Durably records one completed maintenance pass.
+//
+// # Safety
+//
+// `handle` must be a live writer handle, `trigger` a valid C string,
+// `steps` either null with zero length or point to `steps_len` valid inputs,
+// every string in those inputs must be valid, and `err`, if non-null, must
+// be writable.
+int32_t moraine_maintenance_status_record(struct MoraineCatalogHandle *handle,
+                                          int64_t started_at_micros,
+                                          const char *trigger,
+                                          const struct MoraineMaintenanceStatusStepInput *steps,
+                                          size_t steps_len,
+                                          struct MoraineError *err);
+
+// Lists durable maintenance status, newest pass first and step order within
+// each pass.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; output pointers and
+// `err`, if non-null, must be writable.
+int32_t moraine_maintenance_status_rows(struct MoraineCatalogHandle *handle,
+                                        struct MoraineMaintenanceStatusRow **out_items,
+                                        size_t *out_len,
+                                        struct MoraineError *err);
+
+// Frees rows returned by [`moraine_maintenance_status_rows`].
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written by a matching
+// status call, not yet freed.
+void moraine_maintenance_status_free(struct MoraineMaintenanceStatusRow *items, size_t len);
 
 // Measures the store, one row per subspace, and writes the manifest
 // version measured to `*out_manifest_id` and the store-wide object totals

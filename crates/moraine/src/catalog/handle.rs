@@ -8,7 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use futures::{StreamExt, TryStreamExt, stream};
@@ -318,6 +318,60 @@ pub struct MaintenanceReport {
     pub indexes_swept: u64,
     /// Entry keys deleted across those ranges.
     pub index_entries_reclaimed: u64,
+}
+
+/// One step reported by a completed maintenance pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceStatusStep {
+    /// Maintenance operation name.
+    pub step: String,
+    /// Outcome name, such as `ran`, `skipped`, or `failed`.
+    pub status: String,
+    /// Human-readable outcome detail.
+    pub detail: String,
+}
+
+impl MaintenanceStatusStep {
+    /// Builds one reported maintenance step.
+    #[must_use]
+    pub fn new(
+        step: impl Into<String>,
+        status: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            step: step.into(),
+            status: status.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+/// One completed maintenance pass in the catalog's durable status history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceStatusPass {
+    /// When the pass began, persisted at microsecond precision.
+    pub started_at: SystemTime,
+    /// What triggered the pass, such as `scheduled` or `manual`.
+    pub trigger: String,
+    /// Steps in execution order.
+    pub steps: Vec<MaintenanceStatusStep>,
+}
+
+impl MaintenanceStatusPass {
+    /// Builds one completed maintenance pass.
+    #[must_use]
+    pub fn new(
+        started_at: SystemTime,
+        trigger: impl Into<String>,
+        steps: Vec<MaintenanceStatusStep>,
+    ) -> Self {
+        Self {
+            started_at,
+            trigger: trigger.into(),
+            steps,
+        }
+    }
 }
 
 /// How a handle has served its reads, for the diagnostics a slow attach
@@ -658,6 +712,20 @@ impl std::ops::Deref for Catalog {
 }
 
 impl ReadOnlyCatalog {
+    /// Returns the last 16 completed maintenance passes, newest first.
+    ///
+    /// Status is stored in the catalog, so a read-only attach and a process
+    /// that reopens the store see passes completed by the previous writer.
+    /// Recording status does not create a DuckLake snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store or decoding error if the durable status cannot be
+    /// read.
+    pub async fn maintenance_status(&self) -> Result<Vec<MaintenanceStatusPass>> {
+        crate::transaction::maintenance_status::read(self).await
+    }
+
     /// The maintained-projection state shared by this handle's clones.
     pub(crate) fn projections(&self) -> &Arc<std::sync::RwLock<ProjectionCache>> {
         &self.projections
@@ -1923,6 +1991,18 @@ impl RowHolders {
 }
 
 impl Catalog {
+    /// Durably records a completed maintenance pass.
+    ///
+    /// The history retains the newest 16 passes. This is an unversioned
+    /// catalog update: it does not advance the DuckLake snapshot head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the status cannot be encoded or durably written.
+    pub async fn record_maintenance_pass(&self, pass: MaintenanceStatusPass) -> Result<()> {
+        crate::transaction::maintenance_status::record(self, pass).await
+    }
+
     /// The underlying store handle.
     ///
     /// A `Catalog` is only ever built around a `Store::Writer` — that is

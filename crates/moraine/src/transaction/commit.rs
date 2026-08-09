@@ -53,9 +53,13 @@ pub(crate) const FORMAT_WITH_STAGED_INDEX: u64 = 3;
 /// binary does not understand the deferred marker and could expose partial
 /// coverage as ready after rewriting the definition.
 pub(crate) const FORMAT_WITH_DEFERRED_INDEX: u64 = 4;
+/// Format stamped the first time durable maintenance status is recorded.
+/// Older binaries keep status only in process memory and would silently
+/// omit the durable history, so they must refuse this store.
+pub(crate) const FORMAT_WITH_MAINTENANCE_STATUS: u64 = 5;
 /// The highest format this binary understands. It opens any store in
 /// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
-pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_DEFERRED_INDEX;
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_MAINTENANCE_STATUS;
 /// The lowest structural format this binary reads directly. A store below
 /// this floor must be migrated up before an ordinary attach can use it.
 /// Every format so far is additive — each adds a subspace without moving an
@@ -81,7 +85,7 @@ const RETRY_BACKOFF_MAX_MICROS: u64 = 50_000;
 /// never waits). Exponential to the cap, plus jitter of up to the base delay
 /// so two writers that just collided do not back off in lockstep and collide
 /// again.
-fn retry_backoff(attempt: usize) -> Duration {
+pub(crate) fn retry_backoff(attempt: usize) -> Duration {
     if attempt == 0 {
         return Duration::ZERO;
     }
@@ -979,7 +983,14 @@ async fn format_stamp(
     db_tx: &DbTransaction,
     state: &CatalogSnapshot,
 ) -> Result<Option<StagedWrite>> {
-    let target_format = target_format(state);
+    format_stamp_to(db_tx, target_format(state)).await
+}
+
+/// The forward-only format stamp write required to reach `target_format`.
+pub(crate) async fn format_stamp_to(
+    db_tx: &DbTransaction,
+    target_format: u64,
+) -> Result<Option<StagedWrite>> {
     if target_format <= FORMAT_VERSION {
         return Ok(None);
     }
