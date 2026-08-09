@@ -253,6 +253,12 @@ v1→v2 then v2→v3, run in sequence, each with its own start/step/finish and i
 own cursor. There is no bespoke v1→v3 path to write or test; correctness of
 the composition follows from correctness of each link.
 
+The unit registry is intentionally empty while every shipped format change is
+additive. It is complete for the formats that exist, not a missing
+implementation. The change that first moves an existing key must add its
+`v_n → v_{n+1}` unit, raise `MIN_FORMAT_VERSION`, pin the registry chain, and
+drive that released unit through the SQL surface in the same change.
+
 There is **no automatic rollback**, by decision. Recovery from a failed
 migration is manual, resting on two mitigations already load-bearing elsewhere
 in the design:
@@ -299,10 +305,9 @@ one that may name a SQL function, turns the same error into one naming
 `moraine_migrate('<path>')`.
 
 Every migration is triggered by the explicit verb; nothing auto-runs on open.
-A **trivial metadata migration** (bounded, O(1)-ish, e.g. rewriting only the
-`system` records with no keyspace walk) carries none of the surprise and could
-later be allowed to auto-run, but that is deferred — the shipping behavior is
-explicit for every migration regardless of size.
+This includes bounded metadata-only rewrites: one trigger rule is easier to
+operate and audit than classifying which mutations are harmless enough to run
+as a side effect of attach.
 
 ### Test obligations
 
@@ -349,13 +354,14 @@ the post-migration assertions go through an ordinary attach.
 
 ## Alternatives considered
 
-- **Silent auto-migrate on open.** Rejected. A heavyweight, unbounded rewrite
-  should be the operator's explicit choice: triggered implicitly, the first
+- **Silent auto-migrate on open.** Rejected for migrations of every size. A
+  heavyweight, unbounded rewrite should be the operator's explicit choice:
+  triggered implicitly, the first
   upgraded node to attach begins rewriting the keyspace under every
   still-running old-binary reader, surprising a rolling fleet and coupling an
   operational decision to an incidental attach. Explicit opt-in makes the
-  cost and timing owned. (Trivial `system`-only migrations are the noted
-  exception.)
+  cost and timing owned, while one rule keeps bounded metadata rewrites
+  observable too.
 - **Lazy / online per-key migration on read.** Translate old keys to the new
   layout on the fly, forever, the way axis 1 translates old *values*.
   Rejected for key structure specifically: it leaves the store **permanently

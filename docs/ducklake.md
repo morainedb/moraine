@@ -6,8 +6,8 @@ version moraine pins, moraine keeps the documented workaround or omits the
 dependent feature.
 
 When an upstream change lands, update the owning RFC, add or adjust the
-end-to-end coverage, and remove the corresponding workaround or deferral from
-[`rfcs/tasks.md`](rfcs/tasks.md).
+end-to-end coverage, remove the corresponding workaround, and delete the
+request from this document.
 
 ## Catalog correctness and concurrency
 
@@ -42,21 +42,31 @@ Owner: [RFC 0004](rfcs/0004-commit-protocol.md).
 
 ## Scan pushdown
 
-### Preserve virtual-column filters during file pruning
+### Push filename filters into the file list
 
 DuckLake currently discards filters on `rowid`, `filename`, and `file_index`
-before they reach the file list. Consequently a row-id lookup opens every live
-file footer, even though each file's row-id interval is derivable from
-`row_id_start` and `record_count`.
+before they reach the file list. Consequently an external index lookup opens
+every live file footer before its row-id filter rejects unrelated rows.
 
-The upstream request is to retain virtual-column filters and use the available
-file metadata to prune files. At minimum, a `rowid` equality or bounded-range
-predicate should open only files whose row-id intervals intersect it. The
-behavior must apply consistently to `SELECT` and `DELETE`.
+A row id is not a physical locator. Rewrites preserve logical row ids while
+moving rows, and non-adjacent rewrites may store sparse absolute row ids in the
+replacement file. `file_index` is unsuitable too: its value changes when
+pruning changes the file-list order. `filename` is the existing stable
+per-snapshot locator and is already what DuckLake uses for late
+materialization.
+
+The upstream request is to apply static and dynamic equality/`IN` filters on
+the `filename` virtual column while constructing the DuckLake file list, before
+opening Parquet readers. An external index can then resolve its current
+`data_file_id` to a filename and join on `(filename, rowid)`, while the ordinary
+DuckLake scan continues to own snapshots, deletes, schema mapping, encryption,
+and inlined data. Dense positional files may additionally use safe row-id
+range pruning, but correctness must not infer a dense interval for a file with
+embedded row ids.
 
 This directly determines the read-side value of a moraine equality index:
-moraine can resolve an indexed value to row ids, but only DuckLake can avoid
-opening unrelated data files afterward.
+moraine resolves an indexed value to the row's current file and logical row
+id, but only DuckLake can avoid opening unrelated data files afterward.
 
 Owner: [RFC 0013](rfcs/0013-partitioning-sorting-and-pruning.md).
 

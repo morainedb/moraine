@@ -31,8 +31,9 @@ release.
 
 Non-goals:
 
-- Auto-flush policy (when to flush is an operational/maintenance concern;
-  this RFC defines only the mechanism).
+- Auto-flush policy. moraine exposes the flush mechanism; the caller owns when
+  to invoke it as part of its write and maintenance policy. No moraine-chosen
+  threshold or scheduler is part of this design.
 - Inlining `VARIANT` columns. Arrow cannot represent the type, so a
   `VARIANT` column is refused rather than inlined; carrying it would mean a
   second, non-Arrow value format.
