@@ -385,6 +385,12 @@ Three properties the scheduler must hold:
   A status-write failure is logged and does not rewrite the outcome of the
   maintenance work that already completed.
 
+  `started_at` is a `Timestamp`: microseconds from the Unix epoch, the width
+  the record stores and the ABI passes. Carrying that width end to end keeps
+  the conversion total in both directions, so neither the store boundary nor
+  the ABI needs a range check on a value DuckDB already hands over as a
+  microsecond count.
+
   Catalog storage wins over an external sidecar: it follows the lake through
   moves and credentials, uses the existing writer fence and durability path,
   and lets a read-only attach inspect the prior writer's failures. The value
@@ -691,7 +697,7 @@ impl ReadOnlyCatalog {
 }
 
 pub struct MaintenanceStatusPass {
-    pub started_at: SystemTime,
+    pub started_at: Timestamp,
     pub trigger: String,
     pub steps: Vec<MaintenanceStatusStep>,
 }

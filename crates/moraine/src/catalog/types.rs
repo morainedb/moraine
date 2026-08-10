@@ -85,6 +85,52 @@ id_type!(
     SortId
 );
 
+/// An instant, as microseconds from the Unix epoch in UTC — the precision
+/// the catalog persists and the extension ABI carries. Negative counts
+/// precede the epoch.
+///
+/// Conversion to and from the raw count is total in both directions, so a
+/// timestamp survives a round trip through storage or the ABI unchanged and
+/// neither boundary needs a range check.
+///
+/// ```
+/// use moraine::Timestamp;
+///
+/// let stamp = Timestamp::from_micros(1_700_000_000_000_000);
+/// assert_eq!(stamp.as_micros(), 1_700_000_000_000_000);
+/// assert!(stamp > Timestamp::UNIX_EPOCH);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp(i64);
+
+impl Timestamp {
+    /// The Unix epoch itself.
+    pub const UNIX_EPOCH: Self = Self(0);
+
+    /// Wraps a microsecond count from the Unix epoch.
+    #[must_use]
+    pub const fn from_micros(micros: i64) -> Self {
+        Self(micros)
+    }
+
+    /// The microsecond count from the Unix epoch.
+    #[must_use]
+    pub const fn as_micros(self) -> i64 {
+        self.0
+    }
+
+    /// Reads the system clock. Clamped, never panicking: a clock before the
+    /// epoch stamps the epoch.
+    #[must_use]
+    pub fn now() -> Self {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(Self::UNIX_EPOCH, |elapsed| {
+                Self(i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
+            })
+    }
+}
+
 /// A data file to register: the file already exists on object storage
 /// (data before metadata). `row_id_start` is allocated by the commit,
 /// never caller-provided.
@@ -848,7 +894,34 @@ impl OptionScope {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    proptest! {
+        /// The catalog persists a timestamp as its microsecond count and the
+        /// ABI carries the same count, so the conversion has to be total in
+        /// both directions — no clamping, no error path, pre-epoch included.
+        #[test]
+        fn timestamps_round_trip_through_their_micros(micros in any::<i64>()) {
+            prop_assert_eq!(Timestamp::from_micros(micros).as_micros(), micros);
+        }
+
+        /// Ordering timestamps is ordering their counts, which is what
+        /// sorting a status history newest-first relies on.
+        #[test]
+        fn timestamps_order_by_their_micros(left in any::<i64>(), right in any::<i64>()) {
+            prop_assert_eq!(
+                Timestamp::from_micros(left).cmp(&Timestamp::from_micros(right)),
+                left.cmp(&right)
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_now_is_after_the_epoch() {
+        assert!(Timestamp::now() > Timestamp::UNIX_EPOCH);
+    }
 
     #[test]
     fn ids_round_trip_and_display() {

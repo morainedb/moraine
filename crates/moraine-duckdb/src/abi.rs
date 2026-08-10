@@ -21,7 +21,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 pub use checkpoints::*;
@@ -2200,7 +2200,7 @@ pub unsafe extern "C" fn moraine_maintenance_status_record(
                 ))
             })
             .collect::<Result<Vec<_>, AbiError>>()?;
-        let started_at = time_from_micros(started_at_micros)?;
+        let started_at = moraine::Timestamp::from_micros(started_at_micros);
         let pass = moraine::MaintenanceStatusPass::new(started_at, trigger, status_steps);
 
         // SAFETY: caller contract for `handle`.
@@ -2235,7 +2235,7 @@ pub unsafe extern "C" fn moraine_maintenance_status_rows(
             let passes = handle_ref.block_on(handle_ref.catalog.reads().maintenance_status())?;
             let mut owned = Vec::new();
             for pass in passes {
-                let started_at_micros = time_to_micros(pass.started_at)?;
+                let started_at_micros = pass.started_at.as_micros();
                 for step in pass.steps {
                     owned.push((
                         started_at_micros,
@@ -2287,29 +2287,6 @@ pub unsafe extern "C" fn moraine_maintenance_status_free(
         }
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
-}
-
-fn time_from_micros(micros: i64) -> Result<SystemTime, AbiError> {
-    let duration = Duration::from_micros(micros.unsigned_abs());
-    let time = if micros >= 0 {
-        UNIX_EPOCH.checked_add(duration)
-    } else {
-        UNIX_EPOCH.checked_sub(duration)
-    };
-    time.ok_or_else(|| AbiError::invalid_argument("maintenance timestamp is out of range"))
-}
-
-fn time_to_micros(time: SystemTime) -> Result<i64, AbiError> {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_micros())
-            .map_err(|_| AbiError::new(codes::CORRUPTION, "maintenance timestamp is out of range")),
-        Err(error) => {
-            let magnitude = i64::try_from(error.duration().as_micros()).map_err(|_| {
-                AbiError::new(codes::CORRUPTION, "maintenance timestamp is out of range")
-            })?;
-            Ok(-magnitude)
-        }
-    }
 }
 
 /// One subspace's row of a store census, as returned by

@@ -1,11 +1,9 @@
 //! Durable, bounded maintenance-pass status.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use slatedb::ErrorKind;
 
 use crate::{
-    Catalog, MaintenanceStatusPass, MaintenanceStatusStep, ReadOnlyCatalog,
+    Catalog, MaintenanceStatusPass, MaintenanceStatusStep, ReadOnlyCatalog, Timestamp,
     error::{Error, Result},
     store::{
         handle::ReadHandle,
@@ -24,18 +22,18 @@ pub(crate) async fn read(catalog: &ReadOnlyCatalog) -> Result<Vec<MaintenanceSta
     let stored = read::read_maintenance_status(session.handle()).await;
     session.finish();
 
-    stored?
+    Ok(stored?
         .unwrap_or_default()
         .passes
         .into_iter()
         .rev()
         .map(decode_pass)
-        .collect()
+        .collect())
 }
 
 /// Appends one pass and durably retains the newest bounded window.
 pub(crate) async fn record(catalog: &Catalog, pass: MaintenanceStatusPass) -> Result<()> {
-    let encoded = encode_pass(pass)?;
+    let encoded = encode_pass(pass);
 
     for attempt in 0..MAX_COMMIT_ATTEMPTS {
         if attempt > 0 {
@@ -73,9 +71,9 @@ pub(crate) async fn record(catalog: &Catalog, pass: MaintenanceStatusPass) -> Re
     )))
 }
 
-fn encode_pass(pass: MaintenanceStatusPass) -> Result<MaintenanceStatusPassValue> {
-    Ok(MaintenanceStatusPassValue {
-        started_at_micros: encode_time(pass.started_at)?,
+fn encode_pass(pass: MaintenanceStatusPass) -> MaintenanceStatusPassValue {
+    MaintenanceStatusPassValue {
+        started_at_micros: pass.started_at.as_micros(),
         trigger: pass.trigger,
         steps: pass
             .steps
@@ -86,42 +84,16 @@ fn encode_pass(pass: MaintenanceStatusPass) -> Result<MaintenanceStatusPassValue
                 detail: step.detail,
             })
             .collect(),
-    })
+    }
 }
 
-fn decode_pass(pass: MaintenanceStatusPassValue) -> Result<MaintenanceStatusPass> {
-    Ok(MaintenanceStatusPass::new(
-        decode_time(pass.started_at_micros)?,
+fn decode_pass(pass: MaintenanceStatusPassValue) -> MaintenanceStatusPass {
+    MaintenanceStatusPass::new(
+        Timestamp::from_micros(pass.started_at_micros),
         pass.trigger,
         pass.steps
             .into_iter()
             .map(|step| MaintenanceStatusStep::new(step.step, step.status, step.detail))
             .collect(),
-    ))
-}
-
-fn encode_time(time: SystemTime) -> Result<i64> {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_micros()).map_err(|_| {
-            Error::Configuration("maintenance status timestamp is out of range".to_string())
-        }),
-        Err(error) => {
-            let magnitude = i64::try_from(error.duration().as_micros()).map_err(|_| {
-                Error::Configuration("maintenance status timestamp is out of range".to_string())
-            })?;
-            Ok(-magnitude)
-        }
-    }
-}
-
-fn decode_time(micros: i64) -> Result<SystemTime> {
-    let magnitude = Duration::from_micros(micros.unsigned_abs());
-    let time = if micros >= 0 {
-        UNIX_EPOCH.checked_add(magnitude)
-    } else {
-        UNIX_EPOCH.checked_sub(magnitude)
-    };
-    time.ok_or_else(|| {
-        Error::Corruption("maintenance status timestamp is out of range".to_string())
-    })
+    )
 }

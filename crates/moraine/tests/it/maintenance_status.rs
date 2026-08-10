@@ -1,14 +1,11 @@
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::sync::Arc;
 
-use moraine::{Catalog, CatalogOptions, MaintenanceStatusPass, MaintenanceStatusStep};
+use moraine::{Catalog, CatalogOptions, MaintenanceStatusPass, MaintenanceStatusStep, Timestamp};
 use object_store::{ObjectStore, memory::InMemory};
 
-fn pass(number: u64) -> MaintenanceStatusPass {
+fn pass(number: u32) -> MaintenanceStatusPass {
     MaintenanceStatusPass::new(
-        SystemTime::UNIX_EPOCH + Duration::from_secs(number),
+        Timestamp::from_micros(i64::from(number) * 1_000_000),
         if number.is_multiple_of(2) {
             "scheduled"
         } else {

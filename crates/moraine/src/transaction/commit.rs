@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     catalog::{
-        CatalogSnapshot, SnapshotId,
+        CatalogSnapshot, SnapshotId, Timestamp,
         projection::{
             ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch, held_head_view,
             install_head_view, install_head_view_at, invalidate_head_view,
@@ -97,12 +97,10 @@ pub(crate) fn retry_backoff(attempt: usize) -> Duration {
     Duration::from_micros(step.saturating_add(jitter))
 }
 
-/// Current time in microseconds since the Unix epoch. Clamped, never
-/// panicking: a clock before the epoch stamps 0.
+/// Current time in microseconds since the Unix epoch, the width the
+/// snapshot record stores.
 pub(crate) fn now_micros() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+    Timestamp::now().as_micros()
 }
 
 pub(crate) fn durable() -> WriteOptions {

@@ -31,5 +31,5 @@ pub use types::{
     MacroParameterDef, MappingId, MappingInfo, NameMappingDef, OptionScope, PartitionColumnDef,
     PartitionId, PartitionSpec, RecentRow, RowHolder, RowLocation, ScheduledDeletion, SchemaId,
     SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, TableId, TableInfo,
-    TableStats, TagEntry, TagTarget, ViewId, ViewInfo,
+    TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
 };
