@@ -8,7 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use futures::{StreamExt, TryStreamExt, stream};
@@ -21,7 +21,7 @@ use crate::{
     catalog::{
         BuildStep, CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, DataFileInfo,
         FileIndexEntry, IndexDef, IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexState,
-        RecentRow, RowHolder, RowLocation, SnapshotId, TableId,
+        RecentRow, RowHolder, RowLocation, SnapshotId, TableId, Timestamp,
         census::{
             CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
             MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
@@ -350,8 +350,8 @@ impl MaintenanceStatusStep {
 /// One completed maintenance pass in the catalog's durable status history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaintenanceStatusPass {
-    /// When the pass began, persisted at microsecond precision.
-    pub started_at: SystemTime,
+    /// When the pass began.
+    pub started_at: Timestamp,
     /// What triggered the pass, such as `scheduled` or `manual`.
     pub trigger: String,
     /// Steps in execution order.
@@ -362,7 +362,7 @@ impl MaintenanceStatusPass {
     /// Builds one completed maintenance pass.
     #[must_use]
     pub fn new(
-        started_at: SystemTime,
+        started_at: Timestamp,
         trigger: impl Into<String>,
         steps: Vec<MaintenanceStatusStep>,
     ) -> Self {

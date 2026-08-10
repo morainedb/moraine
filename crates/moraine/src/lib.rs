@@ -258,7 +258,7 @@ pub use catalog::{
     PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow, RowHolder, RowLocation,
     ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef,
     SortSpec, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId,
-    TableInfo, TableStats, TagEntry, TagTarget, ViewId, ViewInfo,
+    TableInfo, TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
 /// Fault injection: the crash seams a test drives a migration to and stops
