@@ -189,14 +189,14 @@ fn ducklake_problems(commit: &str) -> anyhow::Result<Vec<String>> {
     let short = commit.get(..SHORT_COMMIT).unwrap_or(commit);
     let mut problems = Vec::new();
 
-    match string_constant(&read(WIRE_CONTRACT)?, "DUCKLAKE_EXTENSION_VERSION") {
+    match string_constant(&read(WIRE_CONTRACT)?, "DUCKLAKE_SOURCE_COMMIT") {
         Some(pinned) if pinned == short => {}
         Some(pinned) => problems.push(format!(
             "{WIRE_CONTRACT} pins DuckLake `{pinned}`, but {DUCKLAKE_CONFIG} declares \
              `{short}` — re-verify every pin in that file against the new DuckLake"
         )),
         None => problems.push(format!(
-            "{WIRE_CONTRACT} declares no `DUCKLAKE_EXTENSION_VERSION`"
+            "{WIRE_CONTRACT} declares no `DUCKLAKE_SOURCE_COMMIT`"
         )),
     }
 

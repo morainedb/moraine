@@ -53,6 +53,18 @@ impl BuildPaths {
 /// Fetches the pinned DuckLake source and vcpkg, applies the tracked patch,
 /// and builds only the loadable DuckLake extension.
 pub fn build(arguments: &[String]) -> anyhow::Result<()> {
+    let artifact = build_artifact(arguments)?;
+    println!("ok: patched DuckLake extension at {}", artifact.display());
+    println!(
+        "load it into DuckDB {} with `duckdb -unsigned`, then `LOAD '{}';`",
+        duckdb::duckdb_pin(),
+        artifact.display()
+    );
+    Ok(())
+}
+
+/// Builds and validates the patched extension and returns its artifact path.
+pub fn build_artifact(arguments: &[String]) -> anyhow::Result<PathBuf> {
     let workspace = duckdb::workspace_root();
     let options = parse_arguments(&workspace, arguments)?;
     let paths = BuildPaths::new(options.root);
@@ -115,13 +127,7 @@ pub fn build(arguments: &[String]) -> anyhow::Result<()> {
     );
     verify_loadable(&artifact)?;
     run_row_id_regression(&workspace, &paths, &artifact)?;
-    println!("ok: patched DuckLake extension at {}", artifact.display());
-    println!(
-        "load it into DuckDB {} with `duckdb -unsigned`, then `LOAD '{}';`",
-        duckdb::duckdb_pin(),
-        artifact.display()
-    );
-    Ok(())
+    Ok(artifact)
 }
 
 fn parse_arguments(workspace: &Path, arguments: &[String]) -> anyhow::Result<Options> {

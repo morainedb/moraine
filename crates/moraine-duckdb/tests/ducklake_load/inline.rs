@@ -1,7 +1,7 @@
 use crate::helpers::*;
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_inline_data_round_trip_through_flush() {
     let dir = TempDir::new("inline-store");
     let data_dir = TempDir::new("inline-data");
@@ -115,7 +115,7 @@ fn ducklake_inline_data_round_trip_through_flush() {
 /// back through scalar extractors so the comma-splitting `csv_rows`
 /// never sees a nested value's internal commas.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_inline_nested_types_round_trip_through_flush() {
     let dir = TempDir::new("inline-nested-store");
     let data_dir = TempDir::new("inline-nested-data");
@@ -188,7 +188,7 @@ fn ducklake_inline_nested_types_round_trip_through_flush() {
 /// DuckLake issues an unqualified `DELETE FROM
 /// ducklake_inlined_delete_<table_id>` to do it.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_flush_clears_inlined_file_deletions() {
     let dir = TempDir::new("idel-flush-store");
     let data_dir = TempDir::new("idel-flush-data");
@@ -333,7 +333,7 @@ fn data_files_after_inserting(
 /// serves no option row of its own to displace it: a small insert inlines,
 /// a large one writes a file.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_inlining_defaults_to_ten_rows() {
     let small = TempDir::new("limit-small-store");
     let small_data = TempDir::new("limit-small-data");
@@ -360,7 +360,7 @@ fn ducklake_inlining_defaults_to_ten_rows() {
 /// moraine serves for this key silently outranks what the attach asked
 /// for. Serving none is what keeps the option meaningful.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_attach_option_raises_the_inlining_row_limit() {
     let dir = TempDir::new("limit-attach-store");
     let data_dir = TempDir::new("limit-attach-data");
@@ -380,7 +380,7 @@ fn ducklake_attach_option_raises_the_inlining_row_limit() {
 /// same shadowing question, reached through DuckDB's setting rather than
 /// through an ATTACH option.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_session_setting_raises_the_inlining_row_limit() {
     let dir = TempDir::new("limit-setting-store");
     let data_dir = TempDir::new("limit-setting-data");
@@ -408,7 +408,7 @@ fn ducklake_session_setting_raises_the_inlining_row_limit() {
 /// the two knobs above: `set_option` records a `ducklake_metadata` row,
 /// and a stored row is what DuckLake resolves before either of them.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_stored_option_raises_the_inlining_row_limit() {
     let dir = TempDir::new("limit-stored-store");
     let data_dir = TempDir::new("limit-stored-data");

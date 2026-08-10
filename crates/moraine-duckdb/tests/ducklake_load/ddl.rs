@@ -17,7 +17,7 @@ use crate::helpers::*;
 /// own catalog in a fresh CLI session, and the standalone `moraine:`
 /// attach's row-faithful projections.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_create_rename_drop_round_trip_through_staged_writes() {
     let dir = TempDir::new("write-store");
     let data_dir = TempDir::new("write-data");
@@ -110,7 +110,7 @@ fn ducklake_create_rename_drop_round_trip_through_staged_writes() {
 /// included; the standalone attach serves the row-faithful
 /// projections.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_add_data_files_maps_foreign_parquet() {
     let dir = TempDir::new("mapping-store");
     let data_dir = TempDir::new("mapping-data");
@@ -218,7 +218,7 @@ fn ducklake_add_data_files_maps_foreign_parquet() {
 /// the dropped definition; and the standalone attach serves the
 /// row-faithful `ducklake_macro*` projections.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 #[allow(clippy::too_many_lines)]
 fn ducklake_macros_round_trip_through_staged_writes() {
     let dir = TempDir::new("macro-store");
@@ -374,7 +374,7 @@ fn ducklake_macros_round_trip_through_staged_writes() {
 /// values verbatim. The verb path allocates them itself and is pinned by
 /// the core unit tests instead; a divergence there is invisible here.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_column_ids_and_positions_match_stock_ducklake() {
     let store = TempDir::new("colid-store");
     let data = TempDir::new("colid-data");
@@ -534,7 +534,7 @@ fn nested_columns_match_stock_ducklake(
 /// standalone row-faithful projection (live columns, ordered) and
 /// DuckLake's own reflection in a fresh session.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_column_schema_evolution_through_staged_writes() {
     let dir = TempDir::new("evolve-store");
     let data_dir = TempDir::new("evolve-data");
@@ -600,7 +600,7 @@ fn ducklake_column_schema_evolution_through_staged_writes() {
 /// new type by DuckLake — after the column is retyped and newer rows
 /// inline under the new version.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_column_type_promotion_over_inlined_data() {
     let dir = TempDir::new("promote-store");
     let data_dir = TempDir::new("promote-data");
@@ -659,7 +659,7 @@ fn ducklake_column_type_promotion_over_inlined_data() {
 ///   batching proof.
 /// - `BEGIN; INSERT; ROLLBACK;` discards the write and mints no snapshot.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_multi_statement_transaction_commits_atomically() {
     let dir = TempDir::new("tx-store");
     let data_dir = TempDir::new("tx-data");
@@ -746,7 +746,7 @@ fn ducklake_multi_statement_transaction_commits_atomically() {
 /// row-for-row identical to the reference, and comments survive a
 /// column rename.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_table_and_column_comments_round_trip() {
     let store = TempDir::new("tags-store");
     let data = TempDir::new("tags-data");

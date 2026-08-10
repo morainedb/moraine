@@ -73,7 +73,7 @@ fn referenced_file_names(store_dir: &std::path::Path) -> Vec<String> {
 /// What this adds is the engine's half: the bytes were already there when
 /// the process died, and the catalog is coherent without them.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn a_kill_before_the_commit_orphans_the_parquet_it_had_already_written() {
     let dir = TempDir::new("crash-store");
     let data_dir = TempDir::new("crash-data");
