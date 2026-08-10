@@ -349,6 +349,15 @@ $ duckdb -c "SET extension_directory='target/duckdb-extensions';" \
 `LOAD ducklake` for real on every invocation, against
 `crates/moraine-duckdb/tests/ducklake_load.rs`.
 
+For evaluating pre-reader pruning from moraine index row ids, the repository
+also carries a pinned downstream DuckLake patch and an extension-only build
+command. It records file-level row-id min/max statistics and pushes static and
+dynamic `rowid` filters into DuckLake's file-list query. Index-assisted reads
+remain a direct join on the stable row id; DuckLake owns file selection,
+inlined data, snapshots, and deletes. See
+[`patches/ducklake/`](../../patches/ducklake/README.md) for the build, load,
+and query shape.
+
 ## Serving as DuckLake's metadata catalog
 
 DuckLake drives moraine as its own metadata catalog by nesting an

@@ -6,8 +6,8 @@
 
 Adds a moraine-native **equality index**: a catalog object (`create_index` /
 `drop_index` on the [RFC 0003](0003-public-api-shape.md) verb surface) whose
-entries live in a new `index` subspace and serve two reads — **row location**
-(key values → row ids and the files/chunks that hold them) and **uniqueness
+entries live in a new `index` subspace and serve two reads — **row identity**
+(key values → stable row ids) and **uniqueness
 enforcement** at commit. DuckLake v1.0 models no indexes, so this is a native
 feature: real inside moraine, invisible to every DuckLake catalog scan.
 Entries are **live-only** (no temporal versioning) and point at **row ids**,
@@ -83,10 +83,11 @@ Three established facts carry most of this design:
 
 - **Row ids are stable identity.** DuckLake allocates row ids per table
   (`next_row_id` in `tstat`, RFC 0004) and preserves them across inline
-  flush, UPDATE's delete-and-rewrite, and compaction — row lineage. Every
-  data file records its row-id range, and RFC 0005's inlined chunks carry
-  `row_id_start`/`row_count`. A row id therefore resolves to its current
-  location(s) from the materialized catalog snapshot alone.
+  flush, UPDATE's delete-and-rewrite, and compaction — row lineage. Ordinary
+  files derive dense ids from `row_id_start`; rewrite and flush files may
+  instead carry arbitrary preserved ids in `_ducklake_internal_row_id`.
+  The row id is therefore the durable join key, while physical placement and
+  delete application remain DuckLake's responsibility.
 - **moraine does not read Parquet on the scan path** (RFC 0006 non-goal) —
   merge-on-read, lineage, and pushdown are DuckLake's. On the embedding API
   it sees row contents at exactly two moments: `inline_insert` and flush
@@ -449,13 +450,12 @@ schema history.
 
 The entry payload is a row id, not a location. Flush re-homes rows from
 chunks to Parquet; compaction and UPDATE rewrites re-home them across files;
-row ids survive all three. Resolution to a current location happens at read
-time against the materialized snapshot: chunks and files declare row-id
-ranges, so the lookup finds the holder by interval — in memory, at catalog
-scale. No maintenance operation rewrites an entry. This is why live-only
-entries plus row-id payloads is the whole design: every alternative payload
-(file id, chunk key) turns flush and compaction into index rewrites
-proportional to moved rows.
+row ids survive all three. Moraine returns that identity directly. DuckLake
+uses its own file statistics and delete metadata to locate and adjudicate the
+row under the scan's snapshot. No maintenance operation rewrites an entry.
+This is why live-only entries plus row-id payloads is the whole design: every
+alternative payload (file id, chunk key) turns flush and compaction into index
+rewrites proportional to moved rows.
 
 Nothing removes a live index's entries when a data file's *row* leaves the
 catalog, either — the maintenance sweep reclaims only the entries of
@@ -471,10 +471,10 @@ sources. Expiry and cleanup prune rows a replacement already covers. The
 whole sequence is held to the table's own answer by the e2e test
 `moraine_index_entries_survive_the_data_file_lifecycle`.
 
-A leaked entry would not be silent: a row id no live file's range holds
-resolves as `Inline` rather than being filtered out, so it surfaces as a
-lookup that still finds a deleted value — and, under a unique index, as a
-bogus duplicate rejection when that value is claimed again.
+A leaked entry would not be silent: the lookup table function exposes the
+stale row id directly and, under a unique index, the entry causes a bogus
+duplicate rejection when its value is claimed again. The ordinary DuckLake
+join still filters that identity when no live row carries it.
 
 ### Compaction derives nothing
 
@@ -519,23 +519,20 @@ One accessor family on `CatalogSnapshot`, served under the snapshot's pinned
 read handle so the lookup and the catalog it points into are one consistent
 cut:
 
-- `index_lookup(table, index, key_values) -> Vec<RowLocation>` — point-get
-  (unique) or prefix scan (non-unique) in `index`, then resolve each row id
-  against the snapshot's chunk and file ranges. A `RowLocation` names the
-  row id and its holder: an inlined chunk, or candidate data file(s) whose
-  live row-id range contains the id. The consumer applies delete files as
-  any DuckLake scan does — moraine returns candidates, not adjudicated rows.
-  The extension path surfaces this accessor as `moraine_index_lookup`.
-- `index_lookup_many(table, index, keys) -> Vec<RowLocation>` — the `IN`
+- `index_lookup(table, index, key_values) -> Vec<u64>` — point-get
+  (unique) or prefix scan (non-unique) in `index`. Consumers join the returned
+  row ids to DuckLake and let it select files and apply deletes. The extension
+  path surfaces this accessor as `moraine_index_lookup`.
+- `index_lookup_many(table, index, keys) -> Vec<u64>` — the `IN`
   accessor: deduplicate complete equality keys, resolve every distinct key
   under the same pinned read as one logical lookup, and return the union of
-  their row locations. An empty key set returns no rows after validating the
+  their row ids. An empty key set returns no rows after validating the
   index. The extension path surfaces this accessor as `moraine_index_in`.
-- `index_range(table, index, lower, upper) -> Vec<RowLocation>` — the
+- `index_range(table, index, lower, upper) -> Vec<u64>` — the
   comparison accessor (Range and comparison queries). Each bound is
   `Included`/`Excluded`/`Unbounded`; results come back in the index's stored
   order. The extension path surfaces it as `moraine_index_range`.
-- `index_nulls(table, index, prefix) -> Vec<RowLocation>` — the `IS NULL`
+- `index_nulls(table, index, prefix) -> Vec<u64>` — the `IS NULL`
   accessor. `prefix` is a leading run of `Some(value)` (equality) and `None`
   (`IS NULL`) predicates — `[None]` is `a IS NULL`, `[Some(5), None]` is
   `a = 5 AND b IS NULL`. At least one `None` is required; a gap (an
@@ -748,15 +745,17 @@ written `…` below for brevity.
 |---|---|
 | `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'], staged := b, maintenance := 'synchronous'\|'deferred', step_entries := n, step_bytes := n)` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST. `staged := true` runs the multi-commit build (Staged builds) — required past the single-commit bound, resumable by re-issuing the call. `maintenance := 'deferred'` opts a non-unique index into bounded post-commit SQL-write upkeep; unique indexes refuse it. `step_entries`/`step_bytes` bound one staged build step (Two bounds on a step); each must be positive |
 | `moraine_index_drop(…)` | end the definition (Reclamation) |
-| `moraine_index_lookup(…, v…)` | table function: row ids and holders for the equality key `v…` — one variadic value per indexed column, in the index's column order (a single value for a single-column index); the count must equal the index width |
-| `moraine_index_in(…, keys)` | table function: row ids and holders for the union of complete equality keys in `keys`. A single-column index takes a list of scalar values; a composite index takes a list of `row(...)` values in index-column order. Duplicate keys are one predicate, a key containing NULL matches no row, and an empty list returns no rows |
-| `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids and holders for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
-| `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids and holders for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
+| `moraine_index_lookup(…, v…)` | table function: row ids for the equality key `v…` — one variadic value per indexed column, in the index's column order (a single value for a single-column index); the count must equal the index width |
+| `moraine_index_in(…, keys)` | table function: row ids for the union of complete equality keys in `keys`. A single-column index takes a list of scalar values; a composite index takes a list of `row(...)` values in index-column order. Duplicate keys are one predicate, a key containing NULL matches no row, and an empty list returns no rows |
+| `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
+| `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
 | `moraine_indexes(catalog, schema, table)` | table function: index introspection |
 
 `moraine_index_in` binds `keys` as one constant list value (including a
 prepared-statement parameter), like the arguments of the other explicit
 lookup functions; it does not consume keys streamed from another relation.
+A DuckLake read joins on `row_id` alone, so UPDATE, compaction, inline flush,
+and delete semantics remain under DuckLake's snapshot-aware scan.
 
 A multi-column range bound is a tuple. Tuple windows require every named
 column to sort the same way; one byte range then spans them. With mixed

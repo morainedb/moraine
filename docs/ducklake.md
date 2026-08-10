@@ -42,7 +42,7 @@ Owner: [RFC 0004](rfcs/0004-commit-protocol.md).
 
 ## Scan pushdown
 
-### Push filename filters into the file list
+### Push row-id filters into the file list
 
 DuckLake currently discards filters on `rowid`, `filename`, and `file_index`
 before they reach the file list. Consequently an external index lookup opens
@@ -50,23 +50,29 @@ every live file footer before its row-id filter rejects unrelated rows.
 
 A row id is not a physical locator. Rewrites preserve logical row ids while
 moving rows, and non-adjacent rewrites may store sparse absolute row ids in the
-replacement file. `file_index` is unsuitable too: its value changes when
-pruning changes the file-list order. `filename` is the existing stable
-per-snapshot locator and is already what DuckLake uses for late
-materialization.
+replacement file. DuckLake already has the necessary safe abstraction:
+file-level min/max statistics. Dense files get the interval
+`[row_id_start, row_id_start + record_count - 1]`; files with embedded row ids
+retain the actual Parquet min/max. An absent statistics row means unknown and
+must include the file.
 
-The upstream request is to apply static and dynamic equality/`IN` filters on
-the `filename` virtual column while constructing the DuckLake file list, before
-opening Parquet readers. An external index can then resolve its current
-`data_file_id` to a filename and join on `(filename, rowid)`, while the ordinary
-DuckLake scan continues to own snapshots, deletes, schema mapping, encryption,
-and inlined data. Dense positional files may additionally use safe row-id
-range pruning, but correctness must not infer a dense interval for a file with
-embedded row ids.
+The upstream request is to retain those statistics under DuckDB's reserved
+internal row-ID field id and map static and dynamic `rowid` filters into
+DuckLake's existing file-statistics pruning query. Moraine lookup functions
+return only stable row ids. A single relational join supplies the dynamic
+filter to the ordinary DuckLake scan, which continues to own snapshots,
+deletes, schema mapping, encryption, and inlined data. Sparse files may admit
+false-positive reads when their min/max interval is broad, but never false
+negatives.
 
 This directly determines the read-side value of a moraine equality index:
-moraine resolves an indexed value to the row's current file and logical row
-id, but only DuckLake can avoid opening unrelated data files afterward.
+moraine resolves an indexed value to its logical row id, while DuckLake uses
+its own statistics to avoid opening unrelated data files.
+
+A pinned downstream evaluation patch, extension-only build command, and the
+one-query join live in
+[`patches/ducklake/`](../patches/ducklake/README.md). The patch remains an
+experiment until the scan contract is accepted upstream.
 
 Owner: [RFC 0013](rfcs/0013-partitioning-sorting-and-pruning.md).
 

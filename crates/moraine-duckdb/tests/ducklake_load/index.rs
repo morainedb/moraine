@@ -34,11 +34,25 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
         "the created unique index is listed"
     );
 
-    // A value that exists resolves to exactly one row; one that does not
-    // resolves to none.
-    let hit = csv_rows(&run("SELECT count(*) FROM \
+    let lookup = csv_rows(&run("SELECT * FROM \
          moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"));
-    assert_eq!(hit, vec![vec!["1".to_string()]], "value 42 is indexed");
+    assert_eq!(
+        lookup,
+        vec![vec!["42".to_string()]],
+        "a lookup surfaces only the stable row id"
+    );
+
+    // A value that exists reads through one relational query.
+    let hit = csv_rows(&run("SELECT data.a \
+         FROM lake.main.t data \
+         JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 42) hits \
+           ON hits.row_id = data.rowid;"));
+    assert_eq!(
+        hit,
+        vec![vec!["42".to_string()]],
+        "value 42 is read through its stable row id"
+    );
+    // A value that does not exist resolves to none.
     let miss = csv_rows(&run("SELECT count(*) FROM \
          moraine_index_lookup('lake', 'main', 't', 'by_a', 9999);"));
     assert_eq!(miss, vec![vec!["0".to_string()]], "value 9999 is absent");
@@ -56,7 +70,7 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
 
 /// An absent lookup is known while its table function binds. The optimizer
 /// must turn that exact zero-row input into an empty result before DuckLake
-/// opens the table's Parquet files for the surrounding semi-join.
+/// opens the table's Parquet files for the surrounding row-id join.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
 fn absent_index_lookup_eliminates_the_ducklake_scan() {
@@ -71,13 +85,13 @@ fn absent_index_lookup_eliminates_the_ducklake_scan() {
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
     run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
 
-    // Contour prepares this shape once and supplies a different key on each
-    // execution. The rewrite must therefore see the execution-time bind, not
-    // rely on a literal being present in the original SQL text.
+    // Prepared callers supply a different key on each execution. The rewrite
+    // must therefore see the execution-time bind, not rely on a literal in
+    // the original SQL text.
     let plan = run("PREPARE absent_lookup AS \
-         SELECT count(*) FROM lake.main.t \
-         WHERE rowid IN (SELECT row_id FROM \
-             moraine_index_lookup('lake', 'main', 't', 'by_a', $1)); \
+         SELECT count(*) FROM lake.main.t data \
+         JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', $1) hits \
+           ON hits.row_id = data.rowid; \
          EXPLAIN ANALYZE EXECUTE absent_lookup(9999);");
     assert!(
         plan.contains("EMPTY_RESULT"),
@@ -429,12 +443,14 @@ fn moraine_index_maintained_on_bulk_insert() {
     // A small INSERT (one row, under the 10-row inline limit) is inlined
     // as an Arrow chunk, not a Parquet file, and is maintained too.
     run("INSERT INTO lake.main.t VALUES (500, 'z');");
-    let inline = csv_rows(&run("SELECT count(*) FROM \
-         moraine_index_lookup('lake', 'main', 't', 'by_a', 500);"));
+    let inline = csv_rows(&run("SELECT data.a \
+         FROM lake.main.t data \
+         JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 500) hits \
+           ON hits.row_id = data.rowid;"));
     assert_eq!(
         inline,
-        vec![vec!["1".to_string()]],
-        "the inlined value 500 is indexed"
+        vec![vec!["500".to_string()]],
+        "the inlined value 500 is read through its stable row id"
     );
 
     // Duplicates are rejected on both write paths: a bulk (Parquet) INSERT
@@ -815,6 +831,15 @@ fn moraine_index_survives_update_and_compaction() {
     // preserved ids); the unchanged key still resolves exactly once.
     run("UPDATE lake.main.t SET b = 'updated' WHERE a = 7;");
     assert_eq!(lookup_count(7), vec![vec!["1".to_string()]]);
+    assert_eq!(
+        count(
+            "SELECT data.b FROM lake.main.t data \
+             JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 7) hits \
+               ON data.rowid = hits.row_id;"
+        ),
+        vec![vec!["updated".to_string()]],
+        "the row-id join follows the preserved id into the UPDATE file"
+    );
 
     // Deletes then rewrite: the compacted replacement re-derives its
     // surviving rows' entries as no-ops.
@@ -834,6 +859,15 @@ fn moraine_index_survives_update_and_compaction() {
     // A delete against the rewritten (per-row-id) file.
     run("DELETE FROM lake.main.t WHERE a = 50;");
     assert_eq!(lookup_count(50), vec![vec!["0".to_string()]]);
+    assert!(
+        count(
+            "SELECT data.a FROM lake.main.t data \
+             JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 50) hits \
+               ON data.rowid = hits.row_id;"
+        )
+        .is_empty(),
+        "DuckLake's scan applies the delete when reading through the row-id join"
+    );
 
     // Merge-adjacent over the mixed file set.
     run("INSERT INTO lake.main.t SELECT i, 'y' FROM range(100, 200) t(i);");
@@ -1055,9 +1089,9 @@ fn flushing_an_indexed_table_with_deleted_inlined_rows() {
 /// under their preserved row ids. This walks the full sequence and holds
 /// the index to the table's own answer at each step.
 ///
-/// A stale entry is visible here, not silent: a row id no live file's
-/// range holds resolves as `Inline` rather than being filtered out, so a
-/// leaked entry shows up as a lookup that still finds a deleted value.
+/// A stale entry is visible here, not silent: the lookup table function
+/// returns row ids directly, so a leaked entry still appears there even
+/// though the ordinary DuckLake join would filter it as a missing row.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
 fn moraine_index_entries_survive_the_data_file_lifecycle() {

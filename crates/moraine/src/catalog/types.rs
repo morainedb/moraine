@@ -680,26 +680,6 @@ impl Default for BuildStep {
     }
 }
 
-/// Where a row a lookup found currently lives. moraine returns candidates;
-/// the consumer applies delete files, as any DuckLake scan does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowHolder {
-    /// A data file whose live row-id range contains the row.
-    DataFile(DataFileId),
-    /// The row is inlined (or its holder is not a dense-range data file),
-    /// so it is not resolvable from data-file ranges alone.
-    Inline,
-}
-
-/// A row an index lookup resolved: its stable id and current holder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RowLocation {
-    /// The stable row id the entry points at.
-    pub row_id: u64,
-    /// The row's current holder in this snapshot.
-    pub holder: RowHolder,
-}
-
 /// A column definition: the input to table creation and column addition.
 ///
 /// A nested type is a *tree*, not a type string to parse: the parent carries

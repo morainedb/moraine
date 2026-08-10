@@ -322,6 +322,18 @@ duckdb::unique_ptr<duckdb::FunctionData> DropBind(duckdb::ClientContext &, duckd
 // moraine_index_lookup: resolves an equality key to the rows holding it. The
 // variadic values are one per indexed column, in the index's column order.
 
+struct IndexLookupRow {
+	int64_t row_id;
+};
+
+IndexLookupRow CopyIndexHit(const MoraineIndexHit &hit) {
+	return {static_cast<int64_t>(hit.row_id)};
+}
+
+void SetIndexHit(duckdb::DataChunk &output, duckdb::idx_t row_index, const IndexLookupRow &row) {
+	output.SetValue(0, row_index, duckdb::Value::BIGINT(row.row_id));
+}
+
 struct LookupBindData : public duckdb::FunctionData {
 	std::string catalog_name;
 	std::string schema_name;
@@ -330,12 +342,7 @@ struct LookupBindData : public duckdb::FunctionData {
 	// The looked-up values in text form, so `Equals` distinguishes lookups of
 	// different keys (the rows they resolve to differ).
 	std::string value_repr;
-	struct Row {
-		int64_t row_id;
-		int64_t data_file_id;
-		bool is_inline;
-	};
-	std::vector<Row> rows;
+	std::vector<IndexLookupRow> rows;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<LookupBindData>();
@@ -470,22 +477,21 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 	}
 
 	auto handle = ResolveHandle(context, bind_data->catalog_name);
-	OwnedArray<MoraineRowLocation> locations(moraine_index_lookup_free);
+	OwnedArray<MoraineIndexHit> hits(moraine_index_lookup_free);
 	MoraineError err {};
 	auto code = moraine_index_lookup(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
 	                                 bind_data->index_name.c_str(), values.data(), values.size(),
-	                                 locations.OutItems(), locations.OutLen(), moraine_shim_is_interrupted, &context,
+	                                 hits.OutItems(), hits.OutLen(), moraine_shim_is_interrupted, &context,
 	                                 &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
-	for (auto &location : locations) {
-		bind_data->rows.push_back({static_cast<int64_t>(location.row_id),
-		                           static_cast<int64_t>(location.data_file_id), location.is_inline});
+	for (auto &hit : hits) {
+		bind_data->rows.push_back(CopyIndexHit(hit));
 	}
 
-	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT, duckdb::LogicalType::BOOLEAN};
-	names = {"row_id", "data_file_id", "is_inline"};
+	return_types = {duckdb::LogicalType::BIGINT};
+	names = {"row_id"};
 	return std::move(bind_data);
 }
 
@@ -534,21 +540,20 @@ duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context,
 	}
 
 	auto handle = ResolveHandle(context, bind_data->catalog_name);
-	OwnedArray<MoraineRowLocation> locations(moraine_index_in_free);
+	OwnedArray<MoraineIndexHit> hits(moraine_index_in_free);
 	MoraineError err {};
 	auto code = moraine_index_in(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
-	                             bind_data->index_name.c_str(), keys.data(), keys.size(), locations.OutItems(),
-	                             locations.OutLen(), moraine_shim_is_interrupted, &context, &err);
+	                             bind_data->index_name.c_str(), keys.data(), keys.size(), hits.OutItems(), hits.OutLen(),
+	                             moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
-	for (auto &location : locations) {
-		bind_data->rows.push_back({static_cast<int64_t>(location.row_id),
-		                           static_cast<int64_t>(location.data_file_id), location.is_inline});
+	for (auto &hit : hits) {
+		bind_data->rows.push_back(CopyIndexHit(hit));
 	}
 
-	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT, duckdb::LogicalType::BOOLEAN};
-	names = {"row_id", "data_file_id", "is_inline"};
+	return_types = {duckdb::LogicalType::BIGINT};
+	names = {"row_id"};
 	return std::move(bind_data);
 }
 
@@ -574,9 +579,7 @@ void LookupImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
 	for (duckdb::idx_t i = 0; i < count; i++) {
 		auto &row = bind_data.rows[state.offset + i];
-		output.SetValue(0, i, duckdb::Value::BIGINT(row.row_id));
-		output.SetValue(1, i, duckdb::Value::BIGINT(row.data_file_id));
-		output.SetValue(2, i, duckdb::Value::BOOLEAN(row.is_inline));
+		SetIndexHit(output, i, row);
 	}
 	state.offset += count;
 	output.SetCardinality(count);
@@ -590,12 +593,7 @@ struct RangeBindData : public duckdb::FunctionData {
 	// Both bounds and their inclusivity in text form, so `Equals`
 	// distinguishes different ranges (they resolve to different rows).
 	std::string bounds_repr;
-	struct Row {
-		int64_t row_id;
-		int64_t data_file_id;
-		bool is_inline;
-	};
-	std::vector<Row> rows;
+	std::vector<IndexLookupRow> rows;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<RangeBindData>();
@@ -662,23 +660,21 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 	bind_data->bounds_repr += reverse ? "|rev" : "";
 
 	auto handle = ResolveHandle(context, bind_data->catalog_name);
-	OwnedArray<MoraineRowLocation> locations(moraine_index_range_free);
+	OwnedArray<MoraineIndexHit> hits(moraine_index_range_free);
 	MoraineError err {};
 	auto code = moraine_index_range(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
 	                                bind_data->index_name.c_str(), lower_values.data(), lower_values.size(),
 	                                lower_inclusive, upper_values.data(), upper_values.size(), upper_inclusive, reverse,
-	                                locations.OutItems(), locations.OutLen(), moraine_shim_is_interrupted, &context,
-	                                &err);
+	                                hits.OutItems(), hits.OutLen(), moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
-	for (auto &location : locations) {
-		bind_data->rows.push_back({static_cast<int64_t>(location.row_id),
-		                           static_cast<int64_t>(location.data_file_id), location.is_inline});
+	for (auto &hit : hits) {
+		bind_data->rows.push_back(CopyIndexHit(hit));
 	}
 
-	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT, duckdb::LogicalType::BOOLEAN};
-	names = {"row_id", "data_file_id", "is_inline"};
+	return_types = {duckdb::LogicalType::BIGINT};
+	names = {"row_id"};
 	return std::move(bind_data);
 }
 
@@ -704,9 +700,7 @@ void RangeImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
 	for (duckdb::idx_t i = 0; i < count; i++) {
 		auto &row = bind_data.rows[state.offset + i];
-		output.SetValue(0, i, duckdb::Value::BIGINT(row.row_id));
-		output.SetValue(1, i, duckdb::Value::BIGINT(row.data_file_id));
-		output.SetValue(2, i, duckdb::Value::BOOLEAN(row.is_inline));
+		SetIndexHit(output, i, row);
 	}
 	state.offset += count;
 	output.SetCardinality(count);
@@ -719,12 +713,7 @@ struct NullsBindData : public duckdb::FunctionData {
 	std::string index_name;
 	// The prefix predicates in text form, so `Equals` distinguishes queries.
 	std::string prefix_repr;
-	struct Row {
-		int64_t row_id;
-		int64_t data_file_id;
-		bool is_inline;
-	};
-	std::vector<Row> rows;
+	std::vector<IndexLookupRow> rows;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<NullsBindData>();
@@ -772,22 +761,20 @@ duckdb::unique_ptr<duckdb::FunctionData> NullsBind(duckdb::ClientContext &contex
 	bind_data->prefix_repr += reverse ? "rev" : "";
 
 	auto handle = ResolveHandle(context, bind_data->catalog_name);
-	OwnedArray<MoraineRowLocation> locations(moraine_index_nulls_free);
+	OwnedArray<MoraineIndexHit> hits(moraine_index_nulls_free);
 	MoraineError err {};
 	auto code = moraine_index_nulls(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
 	                                bind_data->index_name.c_str(), prefix.data(), prefix.size(), reverse,
-	                                locations.OutItems(), locations.OutLen(), moraine_shim_is_interrupted,
-	                                &context, &err);
+	                                hits.OutItems(), hits.OutLen(), moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
-	for (auto &location : locations) {
-		bind_data->rows.push_back({static_cast<int64_t>(location.row_id),
-		                           static_cast<int64_t>(location.data_file_id), location.is_inline});
+	for (auto &hit : hits) {
+		bind_data->rows.push_back(CopyIndexHit(hit));
 	}
 
-	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT, duckdb::LogicalType::BOOLEAN};
-	names = {"row_id", "data_file_id", "is_inline"};
+	return_types = {duckdb::LogicalType::BIGINT};
+	names = {"row_id"};
 	return std::move(bind_data);
 }
 
@@ -813,9 +800,7 @@ void NullsImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
 	for (duckdb::idx_t i = 0; i < count; i++) {
 		auto &row = bind_data.rows[state.offset + i];
-		output.SetValue(0, i, duckdb::Value::BIGINT(row.row_id));
-		output.SetValue(1, i, duckdb::Value::BIGINT(row.data_file_id));
-		output.SetValue(2, i, duckdb::Value::BOOLEAN(row.is_inline));
+		SetIndexHit(output, i, row);
 	}
 	state.offset += count;
 	output.SetCardinality(count);

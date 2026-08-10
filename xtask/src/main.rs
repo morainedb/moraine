@@ -13,12 +13,15 @@
 //!   every supported version on every published platform (see `release.rs`).
 //! - `bump-duckdb <version>` moves the primary pin to a new DuckDB release,
 //!   writing every place `check-pins` checks (see `bump.rs`).
+//! - `ducklake-patch` builds the repository's DuckLake patch as a loadable
+//!   extension for moraine's primary DuckDB pin (see `ducklake_patch.rs`).
 
 use anyhow::bail;
 
 mod bench;
 mod bump;
 mod duckdb;
+mod ducklake_patch;
 mod e2e;
 mod pins;
 mod release;
@@ -31,6 +34,7 @@ fn main() -> anyhow::Result<()> {
         Some("e2e") => e2e::e2e(),
         Some("bench") => bench::bench(&arguments),
         Some("s3") => s3::s3(),
+        Some("ducklake-patch") => ducklake_patch::build(&arguments),
         Some("check-pins") => pins::check_pins(),
         Some("check-release-assets") => release::check_release_assets(&arguments),
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
@@ -41,12 +45,12 @@ fn main() -> anyhow::Result<()> {
         Some(other) => {
             bail!(
                 "unknown task `{other}`; available: e2e, bench, s3, check-pins, \
-                 check-release-assets, version-matrix, bump-duckdb"
+                 check-release-assets, version-matrix, bump-duckdb, ducklake-patch"
             )
         }
         None => bail!(
             "usage: cargo xtask <task>; available: e2e, bench, s3, check-pins, \
-             check-release-assets, version-matrix, bump-duckdb"
+             check-release-assets, version-matrix, bump-duckdb, ducklake-patch"
         ),
     }
 }

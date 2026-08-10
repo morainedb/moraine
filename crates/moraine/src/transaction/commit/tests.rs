@@ -549,8 +549,7 @@ fn pair_entry(row_id: u64, first: i128, second: i128) -> crate::catalog::IndexEn
 }
 
 /// The row ids a query resolved, sorted — hit order is asserted separately.
-fn sorted_row_ids(hits: Vec<crate::catalog::RowLocation>) -> Vec<u64> {
-    let mut ids: Vec<u64> = hits.into_iter().map(|hit| hit.row_id).collect();
+fn sorted_row_ids(mut ids: Vec<u64>) -> Vec<u64> {
     ids.sort_unstable();
     ids
 }
@@ -799,10 +798,10 @@ async fn register_three_row_file(
 
 #[tokio::test]
 async fn index_lookup_resolves_unique_value_to_its_data_file_row() {
-    use crate::catalog::{ColumnId, IndexDef, RowHolder};
+    use crate::catalog::{ColumnId, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
     // Rows 0,1,2 land in this file (row_id_start = 0).
-    let file = register_three_row_file(&catalog, table).await;
+    register_three_row_file(&catalog, table).await;
 
     let index = std::cell::Cell::new(None);
     catalog
@@ -827,13 +826,7 @@ async fn index_lookup_resolves_unique_value_to_its_data_file_row() {
         .index_lookup(table, index, &[int_value(20)])
         .await
         .unwrap();
-    assert_eq!(
-        hits,
-        vec![crate::catalog::RowLocation {
-            row_id: 1,
-            holder: RowHolder::DataFile(file),
-        }]
-    );
+    assert_eq!(hits, vec![1]);
     // A value no row holds resolves to nothing.
     assert!(
         catalog
@@ -878,7 +871,6 @@ async fn index_lookup_returns_all_rows_for_a_non_unique_value() {
         .await
         .unwrap()
         .into_iter()
-        .map(|location| location.row_id)
         .collect();
     rows.sort_unstable();
     assert_eq!(rows, vec![0, 2]);
@@ -889,9 +881,9 @@ async fn index_lookup_returns_all_rows_for_a_non_unique_value() {
 async fn index_range_selects_unique_values_in_a_bounded_interval() {
     use std::ops::Bound;
 
-    use crate::catalog::{ColumnId, IndexDef, RowHolder};
+    use crate::catalog::{ColumnId, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
-    let file = register_three_row_file(&catalog, table).await;
+    register_three_row_file(&catalog, table).await;
 
     let index = std::cell::Cell::new(None);
     catalog
@@ -924,13 +916,7 @@ async fn index_range_selects_unique_values_in_a_bounded_interval() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        between,
-        vec![crate::catalog::RowLocation {
-            row_id: 1,
-            holder: RowHolder::DataFile(file),
-        }]
-    );
+    assert_eq!(between, vec![1]);
 
     // > 20 (half-open) — value 30 (row 2).
     let above = catalog
@@ -1001,9 +987,7 @@ async fn index_range_reverse_serves_the_opposite_order() {
         .unwrap();
     let index = index.get().unwrap();
 
-    let order = |query: Vec<crate::catalog::RowLocation>| {
-        query.into_iter().map(|hit| hit.row_id).collect::<Vec<_>>()
-    };
+    let order = |query: Vec<u64>| query;
 
     // Ascending index: default order is low-to-high, `reverse` is high-to-low.
     let ascending = catalog
@@ -1238,9 +1222,7 @@ async fn descending_index_scans_high_value_first() {
     let index = index.get().unwrap();
 
     // Results come back in the index's stored order — descending by value.
-    let order = |hits: Vec<crate::catalog::RowLocation>| {
-        hits.into_iter().map(|hit| hit.row_id).collect::<Vec<u64>>()
-    };
+    let order = |hits: Vec<u64>| hits;
 
     // Closed [10, 30]: 30, 20, 10 -> rows 2, 1, 0.
     let all = catalog
@@ -1290,9 +1272,9 @@ async fn descending_index_scans_high_value_first() {
 
 #[tokio::test]
 async fn unique_index_admits_null_rows_and_index_nulls_finds_them() {
-    use crate::catalog::{ColumnId, IndexDef, RowHolder};
+    use crate::catalog::{ColumnId, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
-    let file = register_three_row_file(&catalog, table).await;
+    register_three_row_file(&catalog, table).await;
 
     let index = std::cell::Cell::new(None);
     catalog
@@ -1321,7 +1303,6 @@ async fn unique_index_admits_null_rows_and_index_nulls_finds_them() {
         .await
         .unwrap()
         .into_iter()
-        .map(|hit| hit.row_id)
         .collect();
     nulls.sort_unstable();
     assert_eq!(nulls, vec![1, 2], "IS NULL finds both NULL rows");
@@ -1331,7 +1312,6 @@ async fn unique_index_admits_null_rows_and_index_nulls_finds_them() {
         .await
         .unwrap()
         .into_iter()
-        .map(|hit| hit.row_id)
         .collect::<Vec<_>>();
     assert_eq!(
         reversed_nulls,
@@ -1346,10 +1326,7 @@ async fn unique_index_admits_null_rows_and_index_nulls_finds_them() {
     }];
     assert_eq!(
         catalog.index_lookup(table, index, &value).await.unwrap(),
-        vec![crate::catalog::RowLocation {
-            row_id: 0,
-            holder: RowHolder::DataFile(file),
-        }]
+        vec![0]
     );
     // A pure-equality prefix through index_nulls is refused.
     let err = catalog
@@ -1513,17 +1490,11 @@ async fn index_range_spans_a_composite_prefix_and_window() {
     let forward = catalog
         .index_range(table, index, Bound::Unbounded, Bound::Unbounded, false)
         .await
-        .unwrap()
-        .into_iter()
-        .map(|hit| hit.row_id)
-        .collect::<Vec<_>>();
+        .unwrap();
     let reverse = catalog
         .index_range(table, index, Bound::Unbounded, Bound::Unbounded, true)
         .await
-        .unwrap()
-        .into_iter()
-        .map(|hit| hit.row_id)
-        .collect::<Vec<_>>();
+        .unwrap();
     assert_eq!(forward, vec![0, 1, 2]);
     assert_eq!(reverse, vec![2, 1, 0]);
 
@@ -1793,8 +1764,7 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
         .index_lookup(table, index, &[int_value(20)])
         .await
         .unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].row_id, 1);
+    assert_eq!(hits, vec![1]);
     catalog.close().await.unwrap();
 }
 
@@ -2382,8 +2352,7 @@ async fn scoped_read_covers_a_registration_end_to_end() {
         width: IntWidth::I64,
     };
     let hits = catalog.index_lookup(table, index, &[value]).await.unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].row_id, 1);
+    assert_eq!(hits, vec![1]);
     catalog.close().await.unwrap();
 }
 
@@ -2551,8 +2520,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
         .index_lookup(table_staged, staged_index, &[int_value(20)])
         .await
         .unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].row_id, 1);
+    assert_eq!(hits, vec![1]);
     assert_eq!(
         scan_index_entries(&single, single_index).await,
         scan_index_entries(&staged, staged_index).await
@@ -3013,13 +2981,7 @@ async fn maintain_spares_live_indexes_interleaved_by_id() {
             )
             .await
             .unwrap();
-        assert_eq!(
-            found
-                .iter()
-                .map(|location| location.row_id)
-                .collect::<Vec<_>>(),
-            vec![row_id]
-        );
+        assert_eq!(found, vec![row_id]);
     }
 
     catalog.close().await.unwrap();
