@@ -794,7 +794,8 @@ unrelated to the extension link, generating `cpp/moraine_abi.h` from the
 `extern "C"` surface with cbindgen so the header cannot drift from the
 Rust definitions. Two build details the toolchain needs supplied per
 target: a C++17 bump on the shim targets (it uses `std::optional`; DuckDB
-pins the global standard to C++11), and, on macOS, the `IOKit`/`Security`/
+pins the global standard to C++11), GCC 14 for Linux to match DuckLake's
+extension pipeline, and, on macOS, the `IOKit`/`Security`/
 `CoreFoundation`/`SystemConfiguration` frameworks the Rust dependency tree
 links.
 

@@ -5,7 +5,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::OnceLock,
 };
 
@@ -76,6 +76,45 @@ pub fn run(cmd: &mut Command) -> anyhow::Result<()> {
     let status = cmd.status().with_context(|| format!("spawning {cmd:?}"))?;
     ensure!(status.success(), "{cmd:?} exited with {status}");
     Ok(())
+}
+
+/// The GCC 14 executables used for Linux C++ builds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CppCompilers {
+    /// C compiler executable.
+    pub c: &'static str,
+    /// C++ compiler executable.
+    pub cxx: &'static str,
+}
+
+fn select_linux_gcc14(mut available: impl FnMut(&str) -> bool) -> Option<CppCompilers> {
+    [("gcc-14", "g++-14"), ("gcc14-gcc", "gcc14-g++")]
+        .into_iter()
+        .find(|(c, cxx)| available(c) && available(cxx))
+        .map(|(c, cxx)| CppCompilers { c, cxx })
+}
+
+/// Resolves the compiler pair for a DuckDB C++ build.
+///
+/// Linux uses the same GCC 14 generation as DuckLake's extension pipeline.
+/// Other platforms retain their native compiler.
+pub fn cpp_compilers() -> anyhow::Result<Option<CppCompilers>> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+
+    let available = |executable: &str| {
+        Command::new(executable)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    select_linux_gcc14(available).map(Some).context(
+        "GCC 14 is required for Linux C++ builds; install `gcc-14 g++-14` (Debian/Ubuntu) or \
+         `gcc14 gcc14-c++` (Amazon Linux)",
+    )
 }
 
 /// Runs one package's `#[ignore]`d test target with `envs` set, echoing
@@ -205,9 +244,27 @@ pub fn ensure_duckdb_cli() -> anyhow::Result<PathBuf> {
 pub fn build_and_package_extension() -> anyhow::Result<PathBuf> {
     // Stamp the artifact with the pinned DuckDB version explicitly.
     let override_describe = format!("OVERRIDE_GIT_DESCRIBE={}", duckdb_pin());
-    run(Command::new("make")
-        .args(["release", "GEN=ninja", &override_describe])
-        .current_dir(workspace_root()))?;
+    let compilers = cpp_compilers()?;
+    // CMake clears its cache and reconfigures when an existing build tree
+    // changes compiler. That internal reconfigure drops the extension-config
+    // argument, so run the idempotent Make target again to restore it. A fresh
+    // build makes the second invocation a no-op.
+    for _ in 0..2 {
+        let mut build = Command::new("make");
+        build
+            .args(["release", "GEN=ninja", &override_describe])
+            .current_dir(workspace_root());
+        if let Some(compilers) = &compilers {
+            build
+                .env("CC", compilers.c)
+                .env("CXX", compilers.cxx)
+                .arg(format!(
+                    "EXT_FLAGS=-DCMAKE_C_COMPILER={} -DCMAKE_CXX_COMPILER={}",
+                    compilers.c, compilers.cxx
+                ));
+        }
+        run(&mut build)?;
+    }
     let artifact =
         workspace_root().join("build/release/extension/moraine/moraine.duckdb_extension");
     ensure!(
@@ -273,5 +330,41 @@ fn cli_download_platform(pin: &str) -> anyhow::Result<&'static str> {
             "no pinned DuckDB {pin} CLI mapping for {os}/{arch}; add one in \
              xtask/src/duckdb.rs (see crates/moraine-duckdb/README.md's CLI URL list)"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_compiler_prefers_debian_names() {
+        let compilers = select_linux_gcc14(|name| matches!(name, "gcc-14" | "g++-14"));
+
+        assert_eq!(
+            compilers,
+            Some(CppCompilers {
+                c: "gcc-14",
+                cxx: "g++-14",
+            })
+        );
+    }
+
+    #[test]
+    fn linux_compiler_accepts_amazon_names() {
+        let compilers = select_linux_gcc14(|name| matches!(name, "gcc14-gcc" | "gcc14-g++"));
+
+        assert_eq!(
+            compilers,
+            Some(CppCompilers {
+                c: "gcc14-gcc",
+                cxx: "gcc14-g++",
+            })
+        );
+    }
+
+    #[test]
+    fn linux_compiler_requires_a_complete_pair() {
+        assert_eq!(select_linux_gcc14(|name| name == "gcc-14"), None);
     }
 }

@@ -650,7 +650,7 @@ struct MaintenanceBindData : public duckdb::FunctionData {
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<MaintenanceBindData>();
 		*result = *this;
-		return std::move(result);
+		return result;
 	}
 	bool Equals(const duckdb::FunctionData &other_p) const override {
 		auto &other = other_p.Cast<MaintenanceBindData>();
@@ -687,7 +687,7 @@ duckdb::unique_ptr<duckdb::FunctionData> MaintenanceBind(duckdb::ClientContext &
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
 	names = {"step", "status", "detail"};
-	return std::move(bind_data);
+	return bind_data;
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> StatusBind(duckdb::ClientContext &context,
@@ -723,7 +723,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MaintenanceInitGlobal(duckd
 			    duckdb::timestamp_t(row.started_at_micros), std::string(row.trigger),
 			    MaintenanceStep {std::string(row.step), std::string(row.status), std::string(row.detail)}});
 		}
-		return std::move(state);
+		return state;
 	}
 
 	if (catalog.GetAttached().IsReadOnly()) {
@@ -739,7 +739,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MaintenanceInitGlobal(duckd
 	for (auto &step : catalog.Scheduler().RunNow()) {
 		state->rows.push_back(ReportRow {duckdb::timestamp_t(0), "manual", step});
 	}
-	return std::move(state);
+	return state;
 }
 
 void MaintenanceImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
@@ -776,7 +776,7 @@ struct CompactBindData : public duckdb::FunctionData {
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<CompactBindData>();
 		*result = *this;
-		return std::move(result);
+		return result;
 	}
 	bool Equals(const duckdb::FunctionData &other_p) const override {
 		auto &other = other_p.Cast<CompactBindData>();
@@ -841,7 +841,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CompactBind(duckdb::ClientContext &,
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT,
 	                LogicalType::UBIGINT};
 	names = {"subspace", "outcome", "detail", "bytes_before", "bytes_after"};
-	return std::move(bind_data);
+	return bind_data;
 }
 
 struct CompactGlobalState : public duckdb::GlobalTableFunctionState {
@@ -883,7 +883,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CompactInitGlobal(duckdb::C
 		                       merge.detail != nullptr ? std::string(merge.detail) : std::string(),
 		                       merge.bytes_before, merge.has_bytes_after, merge.bytes_after});
 	}
-	return std::move(state);
+	return state;
 }
 
 void CompactImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {

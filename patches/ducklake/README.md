@@ -18,8 +18,12 @@ Initialize the DuckDB submodule and build moraine once:
 
 ```sh
 git submodule update --init duckdb
-make release GEN=ninja OVERRIDE_GIT_DESCRIBE=v1.5.5
+CC=gcc-14 CXX=g++-14 make release GEN=ninja OVERRIDE_GIT_DESCRIBE=v1.5.5
 ```
+
+The compiler names above are for Debian and Ubuntu. Amazon Linux packages
+the same pair as `gcc14-gcc` and `gcc14-g++`. macOS uses Apple Clang. Remove
+`build/release` first if that tree was configured with a different compiler.
 
 The first build supplies `build/release/src/libduckdb_static.a`. DuckDB's CLI
 does not export the C++ symbols required by a thin extension, so the patched
@@ -30,22 +34,21 @@ command compiles DuckLake, not DuckDB core:
 cargo xtask ducklake-patch
 ```
 
-The patch also contains three explicit `std::move` returns needed only by
-this standalone source build. DuckLake's local pointers have a derived type
-while the functions return a base type; the v1.5.5 standalone CMake path uses
-C++11, where DuckDB's custom `unique_ptr` does not apply the C++20 implicit
-move rule. These lines transfer ownership without changing projection or
-query-result behavior.
+On Linux, the command selects GCC 14 to match DuckLake's extension pipeline.
+This keeps the downstream source patch limited to row-ID statistics and
+pruning; it does not carry compiler-compatibility edits.
 
 The command:
 
 1. fetches the pinned DuckLake and vcpkg revisions under
    `target/patched-ducklake/`;
-2. applies and verifies the tracked patch;
+2. rejects a dirty DuckDB submodule, then applies the tracked patch and
+   verifies the cached checkout's complete diff byte-for-byte;
 3. builds only `ducklake_loadable_extension` against moraine's exact DuckDB
    submodule and prebuilt static library; and
 4. downloads the pinned DuckDB CLI if needed and verifies that the artifact
-   loads.
+   loads; then runs the patch's row-ID statistics and pruning sqllogictest
+   against that artifact.
 
 The resulting extension is:
 
@@ -99,15 +102,3 @@ The same shape works with `moraine_index_lookup`, `moraine_index_range`, and
 `moraine_index_nulls`. DuckDB turns the join key into a dynamic row-ID filter.
 The patched DuckLake maps it to the reserved internal row-ID field and applies
 its existing zone-map pruning while constructing the physical-file list.
-
-Dense files receive a synthesized interval of
-`[row_id_start, row_id_start + record_count - 1]`. Rewrite, UPDATE, and inline
-flush files retain the actual min/max produced for their embedded
-`_ducklake_internal_row_id` Parquet column. A legacy file with no row-ID stats
-is always included. Sparse files can therefore cause false-positive reads
-when their interval is broad, but cannot cause false negatives.
-
-An absent lookup has exact cardinality zero at bind time. Moraine's optimizer
-replaces it with `EMPTY_RESULT`, so DuckLake does not start a scan. For a hit,
-DuckLake's table-global row id identifies the exact row while its ordinary
-scan preserves delete, inline, and snapshot semantics.

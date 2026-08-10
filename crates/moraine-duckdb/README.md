@@ -194,8 +194,13 @@ The moraine Rust static library is bridged into CMake with
 `CMakeLists.txt` and `extension_config.cmake`). Build locally with:
 
 ```sh
-make release GEN=ninja   # needs ninja + a Rust toolchain
+CC=gcc-14 CXX=g++-14 make release GEN=ninja   # Linux; also needs Rust + ninja
 ```
+
+Linux builds use GCC 14, matching DuckLake's extension pipeline. macOS uses
+the platform Apple Clang toolchain. `cargo xtask e2e` selects the Linux
+compiler pair automatically. Remove `build/release` before the direct `make`
+command if that tree was configured with a different compiler.
 
 The loadable lands at `build/release/extension/moraine/moraine.duckdb_extension`
 (gitignored). `cargo xtask e2e` builds it that way and drives it through a
@@ -215,6 +220,7 @@ submodules, both workflow files, and the table below.
 | DuckDB | **v1.5.5** (git hash `d8cdaa33fd`, codename Variegata) |
 | Toolchain | `duckdb/extension-ci-tools` branch **v1.5.5** |
 | C++ standard | C++17 |
+| Linux C++ compiler | GCC 14 |
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/<version>/` (never committed) |
 | DuckLake extension | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
 

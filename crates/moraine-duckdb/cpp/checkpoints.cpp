@@ -41,7 +41,7 @@ struct CheckpointBindData : public duckdb::FunctionData {
 		copy->target = target;
 		copy->checkpoint_id = checkpoint_id;
 		copy->lifetime_ms = lifetime_ms;
-		return std::move(copy);
+		return copy;
 	}
 
 	bool Equals(const duckdb::FunctionData &other) const override {
@@ -102,7 +102,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CreateBind(duckdb::ClientContext &, duc
 		}
 	}
 	CheckpointReturnTypes(return_types, names);
-	return std::move(bind_data);
+	return bind_data;
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> ListBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
@@ -111,7 +111,7 @@ duckdb::unique_ptr<duckdb::FunctionData> ListBind(duckdb::ClientContext &, duckd
 	auto bind_data = duckdb::make_uniq<CheckpointBindData>();
 	bind_data->target = RequireArgument("moraine_checkpoints", "store path", input, 0);
 	CheckpointReturnTypes(return_types, names);
-	return std::move(bind_data);
+	return bind_data;
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> DeleteBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
@@ -125,7 +125,7 @@ duckdb::unique_ptr<duckdb::FunctionData> DeleteBind(duckdb::ClientContext &, duc
 	bind_data->checkpoint_id = input.inputs[1].GetValue<std::string>();
 	return_types = {duckdb::LogicalType::VARCHAR};
 	names = {"released"};
-	return std::move(bind_data);
+	return bind_data;
 }
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CreateInitGlobal(duckdb::ClientContext &context,
@@ -148,7 +148,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CreateInitGlobal(duckdb::Cl
 		moraine_string_free(id);
 	}
 	state->rows.push_back(std::move(row));
-	return std::move(state);
+	return state;
 }
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ListInitGlobal(duckdb::ClientContext &context,
@@ -176,7 +176,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ListInitGlobal(duckdb::Clie
 		}
 		state->rows.push_back(std::move(row));
 	}
-	return std::move(state);
+	return state;
 }
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DeleteInitGlobal(duckdb::ClientContext &context,
@@ -199,7 +199,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DeleteInitGlobal(duckdb::Cl
 	CheckpointRow row;
 	row.id = bind_data.checkpoint_id;
 	state->rows.push_back(std::move(row));
-	return std::move(state);
+	return state;
 }
 
 void CheckpointImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {

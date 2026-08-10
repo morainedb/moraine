@@ -4,7 +4,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
 };
 
 use anyhow::{Context, bail, ensure};
@@ -18,25 +18,7 @@ const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
 const PATCH_PATH: &str = "patches/ducklake/0001-perf-prune-DuckLake-files-by-row-id.patch";
 const CONFIG_PATH: &str = "patches/ducklake/extension_config.cmake";
-const PATCHED_FILES: [&str; 17] = [
-    "src/functions/ducklake_flush_inlined_data.cpp",
-    "src/metadata_manager/quack_metadata_manager.cpp",
-    "src/storage/ducklake_insert.cpp",
-    "src/storage/ducklake_multi_file_list.cpp",
-    "src/storage/ducklake_server_side_commit.cpp",
-    "src/storage/ducklake_stats.cpp",
-    "src/storage/ducklake_transaction.cpp",
-    "test/sql/add_files/add_files_complex_nested_stats_mre.test",
-    "test/sql/add_files/add_files_nested_list_struct_nulls.test",
-    "test/sql/geo/ducklake_geometry.test",
-    "test/sql/geo/ducklake_geometry_add_files.test",
-    "test/sql/geo/ducklake_geometry_nested_list.test",
-    "test/sql/geo/ducklake_geometry_nested_map.test",
-    "test/sql/geo/ducklake_geometry_nested_struct.test",
-    "test/sql/metadata/appender_data_files.test",
-    "test/sql/rowid/ducklake_row_id_file_pruning.test",
-    "test/sql/stats/variant_shredded_stats.test",
-];
+const ROW_ID_TEST_PATH: &str = "test/sql/rowid/ducklake_row_id_file_pruning.test";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
@@ -91,21 +73,23 @@ pub fn build(arguments: &[String]) -> anyhow::Result<()> {
     validate_duckdb_checkout(&workspace)?;
     ensure!(
         options.duckdb_static.exists(),
-        "DuckDB's static library is missing at {}; build moraine once with `make release GEN=ninja \
-         OVERRIDE_GIT_DESCRIBE={}` or pass `--duckdb-static PATH`",
+        "DuckDB's static library is missing at {}; build moraine once with `cargo xtask e2e` or \
+         pass `--duckdb-static PATH`",
         options.duckdb_static.display(),
-        duckdb::duckdb_pin()
     );
     prepare_checkout(&paths.source, DUCKLAKE_URL, DUCKLAKE_REVISION, "DuckLake")?;
     apply_patch(&workspace, &paths.source)?;
     prepare_checkout(&paths.vcpkg, VCPKG_URL, VCPKG_REVISION, "vcpkg")?;
     bootstrap_vcpkg(&paths.vcpkg)?;
 
+    let compilers = duckdb::cpp_compilers()?;
+    reset_build_for_compiler_change(&paths.build, compilers.as_ref())?;
     let cmake_args = cmake_arguments(
         &workspace,
         &paths,
         &options.duckdb_static,
         duckdb::duckdb_pin(),
+        compilers.as_ref(),
     );
     let mut configure = Command::new("cmake");
     configure.args(&cmake_args);
@@ -130,6 +114,7 @@ pub fn build(arguments: &[String]) -> anyhow::Result<()> {
         artifact.display()
     );
     verify_loadable(&artifact)?;
+    run_row_id_regression(&workspace, &paths, &artifact)?;
     println!("ok: patched DuckLake extension at {}", artifact.display());
     println!(
         "load it into DuckDB {} with `duckdb -unsigned`, then `LOAD '{}';`",
@@ -203,6 +188,7 @@ fn validate_duckdb_checkout(workspace: &Path) -> anyhow::Result<()> {
         actual.trim(),
         expected
     );
+    ensure_clean_checkout(&source, "DuckDB submodule")?;
     Ok(())
 }
 
@@ -270,15 +256,11 @@ fn ensure_directory_is_empty(path: &Path, name: &str) -> anyhow::Result<()> {
 
 fn apply_patch(workspace: &Path, source: &Path) -> anyhow::Result<()> {
     let patch = workspace.join(PATCH_PATH);
-    if command_succeeds(
-        Command::new("git")
-            .args(["apply", "--unidiff-zero", "--reverse", "--check"])
-            .arg(&patch)
-            .current_dir(source),
-    )? {
-        verify_patched_files(source)?;
+    if checkout_matches_patch(source, &patch)? {
         return Ok(());
     }
+
+    ensure_clean_checkout(source, "cached DuckLake checkout")?;
 
     duckdb::run(
         Command::new("git")
@@ -292,23 +274,55 @@ fn apply_patch(workspace: &Path, source: &Path) -> anyhow::Result<()> {
             .arg(&patch)
             .current_dir(source),
     )?;
-    verify_patched_files(source)
+    ensure!(
+        checkout_matches_patch(source, &patch)?,
+        "applying {} did not produce its exact tracked diff",
+        patch.display()
+    );
+    Ok(())
 }
 
-fn verify_patched_files(source: &Path) -> anyhow::Result<()> {
-    let changed = command_output(
+fn checkout_matches_patch(source: &Path, patch: &Path) -> anyhow::Result<bool> {
+    let expected = fs::read_to_string(patch)
+        .with_context(|| format!("reading tracked patch {}", patch.display()))?;
+    let actual = command_output(
         Command::new("git")
-            .args(["diff", "--name-only"])
+            .args([
+                "diff",
+                "--no-ext-diff",
+                "--binary",
+                "--full-index",
+                "--unified=0",
+                "HEAD",
+                "--",
+            ])
             .current_dir(source),
     )?;
-    let mut actual: Vec<&str> = changed.lines().collect();
-    let mut expected = PATCHED_FILES.to_vec();
-    actual.sort_unstable();
-    expected.sort_unstable();
+    let untracked = command_output(
+        Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .current_dir(source),
+    )?;
+    Ok(checkout_matches_patch_text(&expected, &actual, &untracked))
+}
+
+fn checkout_matches_patch_text(expected: &str, actual: &str, untracked: &str) -> bool {
+    expected == actual && untracked.trim().is_empty()
+}
+
+fn ensure_clean_checkout(source: &Path, name: &str) -> anyhow::Result<()> {
+    let status = command_output(
+        Command::new("git")
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .current_dir(source),
+    )?;
+    ensure_clean_checkout_status(name, &status)
+}
+
+fn ensure_clean_checkout_status(name: &str, status: &str) -> anyhow::Result<()> {
     ensure!(
-        actual == expected,
-        "patched DuckLake checkout has unexpected changes: {}",
-        actual.join(", ")
+        status.trim().is_empty(),
+        "{name} is dirty; commit, stash, or remove these changes before building:\n{status}"
     );
     Ok(())
 }
@@ -343,8 +357,9 @@ fn cmake_arguments(
     paths: &BuildPaths,
     duckdb_static: &Path,
     duckdb_pin: &str,
+    compilers: Option<&duckdb::CppCompilers>,
 ) -> Vec<String> {
-    vec![
+    let mut arguments = vec![
         "-G".to_string(),
         "Ninja".to_string(),
         "-S".to_string(),
@@ -369,7 +384,54 @@ fn cmake_arguments(
         ),
         format!("-DVCPKG_MANIFEST_DIR={}", paths.source.display()),
         format!("-DOVERRIDE_GIT_DESCRIBE={duckdb_pin}"),
-    ]
+    ];
+    if let Some(compilers) = compilers {
+        arguments.push(format!("-DCMAKE_C_COMPILER={}", compilers.c));
+        arguments.push(format!("-DCMAKE_CXX_COMPILER={}", compilers.cxx));
+    }
+    arguments
+}
+
+fn reset_build_for_compiler_change(
+    build: &Path,
+    compilers: Option<&duckdb::CppCompilers>,
+) -> anyhow::Result<()> {
+    let (Some(compilers), cache) = (compilers, build.join("CMakeCache.txt")) else {
+        return Ok(());
+    };
+    if !cache.exists() {
+        return Ok(());
+    }
+    let contents = fs::read_to_string(&cache)
+        .with_context(|| format!("reading CMake cache {}", cache.display()))?;
+    if cmake_cache_uses_compilers(&contents, compilers) {
+        return Ok(());
+    }
+
+    let metadata = fs::symlink_metadata(build)
+        .with_context(|| format!("inspecting generated build tree {}", build.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink(),
+        "refusing to remove compiler-stale build tree symlink {}",
+        build.display()
+    );
+    fs::remove_dir_all(build)
+        .with_context(|| format!("removing compiler-stale build tree {}", build.display()))?;
+    Ok(())
+}
+
+fn cmake_cache_uses_compilers(cache: &str, compilers: &duckdb::CppCompilers) -> bool {
+    cached_compiler_name(cache, "CMAKE_C_COMPILER:") == Some(compilers.c)
+        && cached_compiler_name(cache, "CMAKE_CXX_COMPILER:") == Some(compilers.cxx)
+}
+
+fn cached_compiler_name<'a>(cache: &'a str, key: &str) -> Option<&'a str> {
+    let value = cache
+        .lines()
+        .find(|line| line.starts_with(key))?
+        .split_once('=')?
+        .1;
+    Path::new(value).file_name()?.to_str()
 }
 
 fn verify_loadable(artifact: &Path) -> anyhow::Result<()> {
@@ -382,6 +444,93 @@ fn verify_loadable(artifact: &Path) -> anyhow::Result<()> {
             .arg(format!("LOAD '{artifact_literal}';")),
     )
     .context("the patched DuckLake artifact compiled but did not load in the pinned DuckDB CLI")
+}
+
+fn preload_ducklake_test(script: &str) -> anyhow::Result<String> {
+    const REQUIREMENT: &str = "require ducklake\n";
+    ensure!(
+        script.matches(REQUIREMENT).count() == 1,
+        "{ROW_ID_TEST_PATH} must contain exactly one `{}` directive",
+        REQUIREMENT.trim()
+    );
+    Ok(script.replacen(
+        REQUIREMENT,
+        "# ducklake is preloaded from the artifact under test\n",
+        1,
+    ))
+}
+
+fn run_row_id_regression(
+    workspace: &Path,
+    paths: &BuildPaths,
+    artifact: &Path,
+) -> anyhow::Result<()> {
+    let runner = workspace.join("build/release/test/unittest");
+    ensure!(
+        runner.exists(),
+        "the sqllogictest runner is missing at {}; `cargo xtask e2e` builds it",
+        runner.display()
+    );
+
+    let source_test = paths.source.join(ROW_ID_TEST_PATH);
+    let script = fs::read_to_string(&source_test)
+        .with_context(|| format!("reading patched test {}", source_test.display()))?;
+    let script = preload_ducklake_test(&script)?;
+    let test_root = TemporaryDirectory::create(&paths.root, "row-id-regression")?;
+    let copied_test = test_root.path().join(ROW_ID_TEST_PATH);
+    let parent = copied_test
+        .parent()
+        .context("the row-ID regression path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    fs::write(&copied_test, script)
+        .with_context(|| format!("writing {}", copied_test.display()))?;
+
+    let artifact_literal = artifact.display().to_string().replace('\'', "''");
+    let output = Command::new(&runner)
+        .args(["--test-dir"])
+        .arg(test_root.path())
+        .arg(ROW_ID_TEST_PATH)
+        .env("DUCKDB_TEST_ON_INIT", format!("LOAD '{artifact_literal}';"))
+        .output()
+        .with_context(|| format!("spawning {}", runner.display()))?;
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    ensure!(
+        output.status.success(),
+        "the patched DuckLake row-ID sqllogictest failed"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    ensure!(
+        stdout.contains("All tests passed") && stdout.contains("1 test case"),
+        "the patched DuckLake row-ID sqllogictest did not report one passing case"
+    );
+    Ok(())
+}
+
+struct TemporaryDirectory {
+    path: PathBuf,
+}
+
+impl TemporaryDirectory {
+    fn create(parent: &Path, name: &str) -> anyhow::Result<Self> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system time is before the Unix epoch")?
+            .as_nanos();
+        let path = parent.join(format!(".{name}-{}-{nonce}", std::process::id()));
+        fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 fn command_output(command: &mut Command) -> anyhow::Result<String> {
@@ -407,15 +556,6 @@ fn optional_command_output(command: &mut Command) -> anyhow::Result<Option<Strin
     String::from_utf8(output.stdout)
         .map(Some)
         .context("command output was not UTF-8")
-}
-
-fn command_succeeds(command: &mut Command) -> anyhow::Result<bool> {
-    let status = command
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("spawning {command:?}"))?;
-    Ok(status.success())
 }
 
 #[cfg(test)]
@@ -470,6 +610,63 @@ mod tests {
     }
 
     #[test]
+    fn cached_patch_requires_the_complete_tracked_diff() {
+        let patch = "diff --git a/source.cpp b/source.cpp\n+line\n";
+
+        assert!(checkout_matches_patch_text(patch, patch, ""));
+        assert!(!checkout_matches_patch_text(
+            patch,
+            &format!("{patch}extra edit\n"),
+            ""
+        ));
+    }
+
+    #[test]
+    fn cached_patch_rejects_untracked_files() {
+        let patch = "diff --git a/source.cpp b/source.cpp\n+line\n";
+
+        assert!(!checkout_matches_patch_text(
+            patch,
+            patch,
+            "untracked.cpp\n"
+        ));
+    }
+
+    #[test]
+    fn dirty_pinned_checkout_is_rejected() {
+        let error = ensure_clean_checkout_status("DuckDB submodule", " M CMakeLists.txt\n")
+            .expect_err("tracked edits must fail");
+
+        assert!(error.to_string().contains("DuckDB submodule is dirty"));
+        assert!(ensure_clean_checkout_status("DuckDB submodule", "").is_ok());
+    }
+
+    #[test]
+    fn patched_regression_preloads_only_ducklake() {
+        let script = "require ducklake\n\nrequire parquet\n\nstatement ok\nSELECT 1\n";
+        let transformed = preload_ducklake_test(script).expect("DuckLake requirement");
+
+        assert!(!transformed.contains("require ducklake"));
+        assert!(transformed.contains("require parquet"));
+        assert!(transformed.contains("statement ok\nSELECT 1"));
+    }
+
+    #[test]
+    fn cmake_cache_compilers_must_match_the_selected_pair() {
+        let selected = duckdb::CppCompilers {
+            c: "gcc14-gcc",
+            cxx: "gcc14-g++",
+        };
+        let gcc14 = "CMAKE_C_COMPILER:FILEPATH=/usr/bin/gcc14-gcc\n\
+                     CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/gcc14-g++\n";
+        let gcc11 = "CMAKE_C_COMPILER:FILEPATH=/usr/bin/gcc\n\
+                     CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/g++\n";
+
+        assert!(cmake_cache_uses_compilers(gcc14, &selected));
+        assert!(!cmake_cache_uses_compilers(gcc11, &selected));
+    }
+
+    #[test]
     fn extension_only_configuration_reuses_the_prebuilt_duckdb_core() {
         let paths = BuildPaths::new(PathBuf::from("/work"));
         let arguments = cmake_arguments(
@@ -477,6 +674,10 @@ mod tests {
             &paths,
             Path::new("/repo/build/libduckdb_static.a"),
             "v1.5.5",
+            Some(&duckdb::CppCompilers {
+                c: "gcc-14",
+                cxx: "g++-14",
+            }),
         );
 
         assert!(
@@ -498,6 +699,16 @@ mod tests {
             arguments
                 .iter()
                 .any(|arg| arg == "-DOVERRIDE_GIT_DESCRIBE=v1.5.5")
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|arg| arg == "-DCMAKE_C_COMPILER=gcc-14")
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|arg| arg == "-DCMAKE_CXX_COMPILER=g++-14")
         );
     }
 }

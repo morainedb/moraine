@@ -1,17 +1,3 @@
-diff --git a/src/functions/ducklake_flush_inlined_data.cpp b/src/functions/ducklake_flush_inlined_data.cpp
-index ba4ecec1618563af6c4a452353edcb5686290177..8cecb3508345c03556e697483800e1729cfc81c0 100644
---- a/src/functions/ducklake_flush_inlined_data.cpp
-+++ b/src/functions/ducklake_flush_inlined_data.cpp
-@@ -756 +756 @@ static unique_ptr<LogicalOperator> FlushInlinedDataBind(ClientContext &context,
--	return projection;
-+	return std::move(projection);
-diff --git a/src/metadata_manager/quack_metadata_manager.cpp b/src/metadata_manager/quack_metadata_manager.cpp
-index 665d0a9f0aa5316c496a5e2e3d252ea1035b972f..a3861db129effb92a489c531160cf9aded7fcb85 100644
---- a/src/metadata_manager/quack_metadata_manager.cpp
-+++ b/src/metadata_manager/quack_metadata_manager.cpp
-@@ -49 +49 @@ unique_ptr<QueryResult> QuackMetadataManager::AttachMetadata(const string &attac
--	return result;
-+	return std::move(result);
 diff --git a/src/storage/ducklake_insert.cpp b/src/storage/ducklake_insert.cpp
 index e15d40c9ccfad3513ac8697396bd7d7ec1cbba9e..fc51b4aa37d97e56bf6776ad6c0a6eec622217ad 100644
 --- a/src/storage/ducklake_insert.cpp
@@ -57,7 +43,7 @@ index 1d94d7ed8061f9611dcf61d32d3bb58ca909d4f1..aed20857cd66efb930dd43e1d1dac4e8
 +			continue;
 +		}
 diff --git a/src/storage/ducklake_transaction.cpp b/src/storage/ducklake_transaction.cpp
-index f5eef0f40f258d073cd4d8425faa2e2625cbbb4c..eb13308b6138eca5084a843af001512098d42e8f 100644
+index f5eef0f40f258d073cd4d8425faa2e2625cbbb4c..d61d9dbd97fee2caaae14ceedd72b59d7d0f462d 100644
 --- a/src/storage/ducklake_transaction.cpp
 +++ b/src/storage/ducklake_transaction.cpp
 @@ -6,0 +7 @@
@@ -81,9 +67,6 @@ index f5eef0f40f258d073cd4d8425faa2e2625cbbb4c..eb13308b6138eca5084a843af0015120
 +			data_file.column_stats.emplace(row_id_field, std::move(row_id_stats));
 +		}
 +	}
-@@ -1512 +1531 @@ unique_ptr<QueryResult> DuckLakeTransaction::ExecuteRaw(string query) {
--	return result;
-+	return std::move(result);
 diff --git a/test/sql/add_files/add_files_complex_nested_stats_mre.test b/test/sql/add_files/add_files_complex_nested_stats_mre.test
 index 257a4e675b69ef1376317e2d5cf5ba7afb9ff321..0d100b8cebbb5ae925ca6e50ac44496a47805d2d 100644
 --- a/test/sql/add_files/add_files_complex_nested_stats_mre.test

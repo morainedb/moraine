@@ -2879,17 +2879,17 @@ pub unsafe extern "C" fn moraine_indexes_free(items: *mut MoraineIndexDesc, len:
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
-/// One stable row id an index lookup resolved.
-#[repr(C)]
-pub struct MoraineIndexHit {
-    /// The row id the entry points at.
-    pub row_id: u64,
+/// One stable row id returned by an index lookup.
+#[repr(transparent)]
+pub struct MoraineRowId {
+    /// The numeric row id.
+    pub value: u64,
 }
 
-fn abi_index_hits(row_ids: Vec<u64>) -> Vec<MoraineIndexHit> {
+fn abi_row_ids(row_ids: Vec<u64>) -> Vec<MoraineRowId> {
     row_ids
         .into_iter()
-        .map(|row_id| MoraineIndexHit { row_id })
+        .map(|value| MoraineRowId { value })
         .collect()
 }
 
@@ -3037,13 +3037,13 @@ pub unsafe extern "C" fn moraine_index_lookup(
     index_name: *const c_char,
     values: *const MoraineLookupValue,
     values_len: usize,
-    out_items: *mut *mut MoraineIndexHit,
+    out_items: *mut *mut MoraineRowId,
     out_len: *mut usize,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineIndexHit>, AbiError> {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowId>, AbiError> {
         if values_len == 0 {
             return Err(AbiError::invalid_argument("index lookup: no value given"));
         }
@@ -3092,7 +3092,7 @@ pub unsafe extern "C" fn moraine_index_lookup(
                     .index_lookup(table_id, index.id, &key),
             )
         }?;
-        Ok(abi_index_hits(row_ids))
+        Ok(abi_row_ids(row_ids))
     };
 
     // SAFETY: caller contract for the pointers.
@@ -3106,7 +3106,7 @@ pub unsafe extern "C" fn moraine_index_lookup(
 /// `items`/`len` must be exactly the pointer and length written by a
 /// matching [`moraine_index_lookup`] call, not yet freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_index_lookup_free(items: *mut MoraineIndexHit, len: usize) {
+pub unsafe extern "C" fn moraine_index_lookup_free(items: *mut MoraineRowId, len: usize) {
     let attempt = || {
         // SAFETY: caller contract above. The descriptor owns no heap.
         unsafe {
@@ -3135,13 +3135,13 @@ pub unsafe extern "C" fn moraine_index_in(
     index_name: *const c_char,
     keys: *const MoraineLookupKey,
     keys_len: usize,
-    out_items: *mut *mut MoraineIndexHit,
+    out_items: *mut *mut MoraineRowId,
     out_len: *mut usize,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineIndexHit>, AbiError> {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowId>, AbiError> {
         if keys.is_null() && keys_len != 0 {
             return Err(AbiError::invalid_argument(
                 "`keys` is null but its length is nonzero",
@@ -3207,7 +3207,7 @@ pub unsafe extern "C" fn moraine_index_in(
                     .index_lookup_many(table_id, index.id, &coerced_keys),
             )
         }?;
-        Ok(abi_index_hits(row_ids))
+        Ok(abi_row_ids(row_ids))
     };
 
     // SAFETY: caller contract for the pointers.
@@ -3221,7 +3221,7 @@ pub unsafe extern "C" fn moraine_index_in(
 /// `items`/`len` must be exactly the pointer and length written by a matching
 /// [`moraine_index_in`] call, not yet freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_index_in_free(items: *mut MoraineIndexHit, len: usize) {
+pub unsafe extern "C" fn moraine_index_in_free(items: *mut MoraineRowId, len: usize) {
     let attempt = || {
         // SAFETY: caller contract above. The descriptor owns no heap.
         unsafe {
@@ -3258,7 +3258,7 @@ pub unsafe extern "C" fn moraine_index_range(
     upper_len: usize,
     upper_inclusive: bool,
     reverse: bool,
-    out_items: *mut *mut MoraineIndexHit,
+    out_items: *mut *mut MoraineRowId,
     out_len: *mut usize,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
@@ -3266,7 +3266,7 @@ pub unsafe extern "C" fn moraine_index_range(
 ) -> i32 {
     use std::ops::Bound;
 
-    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineIndexHit>, AbiError> {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowId>, AbiError> {
         let lower_empty = lower_values.is_null() || lower_len == 0;
         let upper_empty = upper_values.is_null() || upper_len == 0;
         if lower_empty && upper_empty {
@@ -3332,7 +3332,7 @@ pub unsafe extern "C" fn moraine_index_range(
                     .index_range(table_id, index.id, lower, upper, reverse),
             )
         }?;
-        Ok(abi_index_hits(row_ids))
+        Ok(abi_row_ids(row_ids))
     };
 
     // SAFETY: caller contract for the pointers.
@@ -3346,7 +3346,7 @@ pub unsafe extern "C" fn moraine_index_range(
 /// `items`/`len` must be exactly the pointer and length written by a matching
 /// [`moraine_index_range`] call, not yet freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_index_range_free(items: *mut MoraineIndexHit, len: usize) {
+pub unsafe extern "C" fn moraine_index_range_free(items: *mut MoraineRowId, len: usize) {
     let attempt = || {
         // SAFETY: caller contract above. The descriptor owns no heap.
         unsafe {
@@ -3376,13 +3376,13 @@ pub unsafe extern "C" fn moraine_index_nulls(
     prefix: *const MoraineLookupValue,
     prefix_len: usize,
     reverse: bool,
-    out_items: *mut *mut MoraineIndexHit,
+    out_items: *mut *mut MoraineRowId,
     out_len: *mut usize,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineIndexHit>, AbiError> {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowId>, AbiError> {
         if prefix_len == 0 {
             return Err(AbiError::invalid_argument(
                 "index nulls: the prefix names no predicate",
@@ -3429,7 +3429,7 @@ pub unsafe extern "C" fn moraine_index_nulls(
                     .index_nulls(table_id, index.id, values, reverse),
             )
         }?;
-        Ok(abi_index_hits(row_ids))
+        Ok(abi_row_ids(row_ids))
     };
 
     // SAFETY: caller contract for the pointers.
@@ -3443,7 +3443,7 @@ pub unsafe extern "C" fn moraine_index_nulls(
 /// `items`/`len` must be exactly the pointer and length written by a matching
 /// [`moraine_index_nulls`] call, not yet freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_index_nulls_free(items: *mut MoraineIndexHit, len: usize) {
+pub unsafe extern "C" fn moraine_index_nulls_free(items: *mut MoraineRowId, len: usize) {
     let attempt = || {
         // SAFETY: caller contract above. The descriptor owns no heap.
         unsafe {
@@ -3668,7 +3668,7 @@ mod tests {
         let c_schema = CString::new(schema).expect("no NUL");
         let c_table = CString::new(table).expect("no NUL");
         let c_index = CString::new(index).expect("no NUL");
-        let mut items: *mut MoraineIndexHit = ptr::null_mut();
+        let mut items: *mut MoraineRowId = ptr::null_mut();
         let mut len: usize = 0;
         let mut err = MoraineError::default();
         // SAFETY: `handle` is attached; the C strings and `values` slice are
@@ -3701,7 +3701,7 @@ mod tests {
         // SAFETY: on success `items`/`len` describe a valid slice.
         let rows = unsafe { std::slice::from_raw_parts(items, len) }
             .iter()
-            .map(|location| location.row_id)
+            .map(|row_id| row_id.value)
             .collect();
         // SAFETY: `items`/`len` are exactly what the call above wrote.
         unsafe { moraine_index_lookup_free(items, len) };
@@ -3783,7 +3783,7 @@ mod tests {
         let schema = CString::new("sales").expect("no NUL");
         let table = CString::new("t").expect("no NUL");
         let index = CString::new("by_ab").expect("no NUL");
-        let mut items: *mut MoraineIndexHit = ptr::null_mut();
+        let mut items: *mut MoraineRowId = ptr::null_mut();
         let mut len = 0;
         let mut err = MoraineError::default();
 
@@ -3808,7 +3808,7 @@ mod tests {
         // SAFETY: the successful call wrote `items`/`len` as one valid array.
         let rows = unsafe { std::slice::from_raw_parts(items, len) }
             .iter()
-            .map(|location| location.row_id)
+            .map(|row_id| row_id.value)
             .collect::<Vec<_>>();
         assert_eq!(rows, vec![0, 2]);
         // SAFETY: the array is freed exactly once by its matching function.
@@ -3835,7 +3835,7 @@ mod tests {
         let c_schema = CString::new(schema).expect("no NUL");
         let c_table = CString::new(table).expect("no NUL");
         let c_index = CString::new(index).expect("no NUL");
-        let mut items: *mut MoraineIndexHit = ptr::null_mut();
+        let mut items: *mut MoraineRowId = ptr::null_mut();
         let mut len: usize = 0;
         let mut err = MoraineError::default();
         // SAFETY: `handle` is attached; the C strings and bound slices are
@@ -3873,7 +3873,7 @@ mod tests {
         // SAFETY: on success `items`/`len` describe a valid slice.
         let mut rows: Vec<u64> = unsafe { std::slice::from_raw_parts(items, len) }
             .iter()
-            .map(|location| location.row_id)
+            .map(|row_id| row_id.value)
             .collect();
         // SAFETY: `items`/`len` are exactly what the call above wrote.
         unsafe { moraine_index_range_free(items, len) };
