@@ -499,9 +499,15 @@ impl StagedTransaction {
     async fn committed_entities(&self) -> Result<&Arc<Vec<read::EntityRecord>>> {
         self.committed
             .get_or_try_init(|| async {
+                let started = std::time::Instant::now();
                 let handle = ReadHandle::Tx(&self.db_tx);
                 let mut records = read::scan_current_entities(handle).await?;
                 records.extend(read::scan_history_entities(handle).await?);
+                debug!(
+                    records = records.len(),
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                    "scanned committed entities for staged transaction"
+                );
                 Ok(Arc::new(records))
             })
             .await
@@ -1008,7 +1014,7 @@ impl StagedTransaction {
                 .await?;
                 match landed {
                     commit::Landed::Committed => {
-                        staged_landed(result_id, staged_rows, started);
+                        staged_landed(result_id, staged_rows, staged_bytes, started);
                         Ok(SnapshotId::new(result_id))
                     }
                     commit::Landed::LostRace => Err(staged_lost_race(result_id, staged_rows)),
@@ -1074,10 +1080,16 @@ async fn stage_batch(
 }
 
 /// One landed staged commit's summary event.
-fn staged_landed(result_id: u64, staged_rows: usize, started: std::time::Instant) {
+fn staged_landed(
+    result_id: u64,
+    staged_rows: usize,
+    staged_bytes: StagedBytes,
+    started: std::time::Instant,
+) {
     debug!(
         snapshot = result_id,
         staged_rows,
+        staged_bytes = staged_bytes.0,
         elapsed_ms = started.elapsed().as_millis(),
         "staged commit landed"
     );

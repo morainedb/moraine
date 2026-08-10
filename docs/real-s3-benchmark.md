@@ -7,6 +7,22 @@ region, waits for it, and preserves the output as a GitHub artifact. A managed
 ARM CodeBuild container is the benchmark worker; no persistent self-hosted
 runner or long-lived AWS key is involved.
 
+For a focused DuckLake commit breakdown from a configured development host,
+run:
+
+```bash
+MORAINE_S3_BUCKET=... MORAINE_S3_PREFIX=... AWS_REGION=us-west-2 \
+  cargo xtask commit-bench --files 16,128 --commits 7 --flush-ms 25
+```
+
+The command keeps Parquet local so its object-store counters describe only the
+Moraine metadata path. It builds and loads the repository's patched DuckLake,
+then reports total UPDATE latency, DuckLake metadata statement time, the one
+committed-entity scan, Moraine commit time and staged bytes, the durable-write
+wait, and physical GET/PUT counts and latency. AWS credentials resolve through
+the normal credential chain. For MinIO, also set `MORAINE_S3_ENDPOINT`,
+`AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`.
+
 Pull requests continue to run `cargo xtask s3` against pinned MinIO. The AWS
 run uses the same ignored `object_storage` suite with CodeBuild's temporary
 service-role credentials and a unique prefix. Benchmark data expires after

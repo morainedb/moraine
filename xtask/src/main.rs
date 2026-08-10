@@ -4,6 +4,9 @@
 //!   `e2e.rs`).
 //! - `bench` compares DuckLake metadata catalogs — moraine's SlateDB store, a
 //!   stock DuckDB file, and Postgres — on identical workloads (see `bench.rs`).
+//! - `commit-bench` breaks an S3-backed DuckLake commit into DuckLake metadata
+//!   statements, Moraine core time, and physical object-store requests (see
+//!   `commit_bench.rs`).
 //! - `s3` runs the catalog's object storage suite against a pinned MinIO server
 //!   (see `s3.rs`).
 //! - `check-pins` verifies every place naming a DuckDB version agrees with
@@ -20,6 +23,7 @@ use anyhow::bail;
 
 mod bench;
 mod bump;
+mod commit_bench;
 mod duckdb;
 mod ducklake_patch;
 mod e2e;
@@ -33,6 +37,7 @@ fn main() -> anyhow::Result<()> {
     match task.as_deref() {
         Some("e2e") => e2e::e2e(),
         Some("bench") => bench::bench(&arguments),
+        Some("commit-bench") => commit_bench::run(&arguments),
         Some("s3") => s3::s3(),
         Some("ducklake-patch") => ducklake_patch::build(&arguments),
         Some("check-pins") => pins::check_pins(),
@@ -44,12 +49,12 @@ fn main() -> anyhow::Result<()> {
         }
         Some(other) => {
             bail!(
-                "unknown task `{other}`; available: e2e, bench, s3, check-pins, \
+                "unknown task `{other}`; available: e2e, bench, commit-bench, s3, check-pins, \
                  check-release-assets, version-matrix, bump-duckdb, ducklake-patch"
             )
         }
         None => bail!(
-            "usage: cargo xtask <task>; available: e2e, bench, s3, check-pins, \
+            "usage: cargo xtask <task>; available: e2e, bench, commit-bench, s3, check-pins, \
              check-release-assets, version-matrix, bump-duckdb, ducklake-patch"
         ),
     }

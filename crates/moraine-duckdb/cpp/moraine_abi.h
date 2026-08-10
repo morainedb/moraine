@@ -295,6 +295,37 @@ typedef struct MoraineSubspaceMerge {
   uint64_t bytes_after;
 } MoraineSubspaceMerge;
 
+// Physical object-store requests one catalog has issued, as returned by
+// [`moraine_catalog_object_store_tally`].
+typedef struct MoraineObjectStoreTally {
+  // Reads from the main store.
+  uint64_t main_gets;
+  // Summed main-store read latency, in nanoseconds.
+  uint64_t main_get_nanoseconds;
+  // Writes to the main store.
+  uint64_t main_puts;
+  // Summed main-store write latency, in nanoseconds.
+  uint64_t main_put_nanoseconds;
+  // Deletes from the main store.
+  uint64_t main_deletes;
+  // Summed main-store delete latency, in nanoseconds.
+  uint64_t main_delete_nanoseconds;
+  // Reads from the WAL store.
+  uint64_t wal_gets;
+  // Summed WAL-store read latency, in nanoseconds.
+  uint64_t wal_get_nanoseconds;
+  // Writes to the WAL store.
+  uint64_t wal_puts;
+  // Summed WAL-store write latency, in nanoseconds.
+  uint64_t wal_put_nanoseconds;
+  // Deletes from the WAL store.
+  uint64_t wal_deletes;
+  // Summed WAL-store delete latency, in nanoseconds.
+  uint64_t wal_delete_nanoseconds;
+  // Failed request attempts across both stores, including handled errors.
+  uint64_t errors;
+} MoraineObjectStoreTally;
+
 // One index, as returned by [`moraine_indexes`].
 typedef struct MoraineIndexDesc {
   // The index's id.
@@ -1536,6 +1567,19 @@ int32_t moraine_catalog_cache_tally(struct MoraineCatalogHandle *handle,
                                     uint64_t *out_block_hits,
                                     uint64_t *out_block_misses,
                                     uint64_t *out_errors);
+
+// Physical object-store requests one attached catalog has issued.
+//
+// Counts are the requests SlateDB sent, including retries. Durations are
+// summed request latency in nanoseconds and can exceed wall time when
+// requests overlap.
+//
+// # Safety
+//
+// `handle` must be a live handle from [`moraine_attach`] and `out_tally`
+// must be valid and writable for the duration of the call.
+int32_t moraine_catalog_object_store_tally(struct MoraineCatalogHandle *handle,
+                                           struct MoraineObjectStoreTally *out_tally);
 
 // The store state the catalog's dumps currently serve: the head
 // snapshot id and batch count. `out_present` is false on a store with no

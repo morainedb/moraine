@@ -244,6 +244,64 @@ void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 	output.SetCardinality(1);
 }
 
+duckdb::unique_ptr<duckdb::FunctionData> ObjectStoreTallyBind(duckdb::ClientContext &,
+                                                              duckdb::TableFunctionBindInput &input,
+                                                              duckdb::vector<duckdb::LogicalType> &return_types,
+                                                              duckdb::vector<duckdb::string> &names) {
+	if (input.inputs[0].IsNull()) {
+		throw duckdb::BinderException("moraine_object_store_tally: the lake name must not be NULL");
+	}
+	auto bind_data = duckdb::make_uniq<TallyBindData>();
+	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
+
+	names = {"main_gets",          "main_get_ms",     "main_puts",          "main_put_ms",
+	         "main_deletes",       "main_delete_ms",  "wal_gets",           "wal_get_ms",
+	         "wal_puts",           "wal_put_ms",      "wal_deletes",        "wal_delete_ms",
+	         "errors"};
+	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
+	                duckdb::LogicalType::UBIGINT};
+	return bind_data;
+}
+
+void ObjectStoreTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
+                          duckdb::DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<TallyBindData>();
+	auto &state = data.global_state->Cast<TallyGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+
+	MoraineObjectStoreTally tally {};
+	auto code = moraine_catalog_object_store_tally(ResolveMoraineCatalog(context, bind_data.catalog_name).Handle(),
+	                                                &tally);
+	if (code != MORAINE_OK) {
+		throw duckdb::InternalException("moraine_object_store_tally: could not read the object-store counters");
+	}
+
+	auto milliseconds = [](uint64_t nanoseconds) {
+		return duckdb::Value::DOUBLE(static_cast<double>(nanoseconds) / 1'000'000.0);
+	};
+	output.SetValue(0, 0, duckdb::Value::UBIGINT(tally.main_gets));
+	output.SetValue(1, 0, milliseconds(tally.main_get_nanoseconds));
+	output.SetValue(2, 0, duckdb::Value::UBIGINT(tally.main_puts));
+	output.SetValue(3, 0, milliseconds(tally.main_put_nanoseconds));
+	output.SetValue(4, 0, duckdb::Value::UBIGINT(tally.main_deletes));
+	output.SetValue(5, 0, milliseconds(tally.main_delete_nanoseconds));
+	output.SetValue(6, 0, duckdb::Value::UBIGINT(tally.wal_gets));
+	output.SetValue(7, 0, milliseconds(tally.wal_get_nanoseconds));
+	output.SetValue(8, 0, duckdb::Value::UBIGINT(tally.wal_puts));
+	output.SetValue(9, 0, milliseconds(tally.wal_put_nanoseconds));
+	output.SetValue(10, 0, duckdb::Value::UBIGINT(tally.wal_deletes));
+	output.SetValue(11, 0, milliseconds(tally.wal_delete_nanoseconds));
+	output.SetValue(12, 0, duckdb::Value::UBIGINT(tally.errors));
+	output.SetCardinality(1);
+}
+
 } // namespace
 
 void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader) {
@@ -257,6 +315,10 @@ void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader) {
 	tally.AddFunction(
 	    duckdb::TableFunction({duckdb::LogicalType::VARCHAR}, TallyImpl, TallyBind, TallyInitGlobal));
 	loader.RegisterFunction(tally);
+
+	duckdb::TableFunction object_store_tally("moraine_object_store_tally", {duckdb::LogicalType::VARCHAR},
+	                                         ObjectStoreTallyImpl, ObjectStoreTallyBind, TallyInitGlobal);
+	loader.RegisterFunction(object_store_tally);
 }
 
 } // namespace moraine_duckdb

@@ -36,7 +36,7 @@ use crate::{
     error::{Error, Result},
     store::{
         StagedBytes,
-        cache::{CacheCounters, CacheTally},
+        cache::{CacheCounters, CacheTally, ObjectStoreTally},
         census::{self as store_census, SegmentSize},
         compaction::{self as store_compaction, MergeEnd},
         handle::{ReadHandle, ReadSession, ScanShape},
@@ -760,6 +760,18 @@ impl ReadOnlyCatalog {
     #[must_use]
     pub fn cache_tally(&self) -> CacheTally {
         self.cache.tally()
+    }
+
+    /// Physical object-store requests this catalog has issued since it
+    /// attached.
+    ///
+    /// Counts include retries. Moraine's WAL objects use its main physical
+    /// store today, so their requests appear under `main_*`; `wal_*` is for
+    /// a separately configured WAL store. Durations are summed request
+    /// latency and can exceed wall-clock time when requests overlap.
+    #[must_use]
+    pub fn object_store_tally(&self) -> ObjectStoreTally {
+        self.cache.object_store_tally()
     }
 
     /// Records that the `current` half of the shared record set was

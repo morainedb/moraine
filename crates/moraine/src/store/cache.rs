@@ -18,6 +18,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use foyer::{
@@ -104,6 +105,45 @@ pub struct CacheTally {
     pub errors: u64,
 }
 
+/// Physical object-store requests SlateDB has issued for one catalog.
+///
+/// Counts include retries and every SlateDB component using the catalog.
+/// Moraine currently gives SlateDB one physical store, so its WAL objects
+/// are included in the `main_*` fields; `wal_*` remains available for a
+/// future separately configured WAL store. Durations are the sum of
+/// completed request latency, so concurrent requests can add up to more
+/// than wall-clock time.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectStoreTally {
+    /// Reads from the main store.
+    pub main_gets: u64,
+    /// Time spent in completed main-store reads.
+    pub main_get_duration: Duration,
+    /// Writes to the main store.
+    pub main_puts: u64,
+    /// Time spent in completed main-store writes.
+    pub main_put_duration: Duration,
+    /// Deletes from the main store.
+    pub main_deletes: u64,
+    /// Time spent in completed main-store deletes.
+    pub main_delete_duration: Duration,
+    /// Reads from the WAL store.
+    pub wal_gets: u64,
+    /// Time spent in completed WAL-store reads.
+    pub wal_get_duration: Duration,
+    /// Writes to the WAL store.
+    pub wal_puts: u64,
+    /// Time spent in completed WAL-store writes.
+    pub wal_put_duration: Duration,
+    /// Deletes from the WAL store.
+    pub wal_deletes: u64,
+    /// Time spent in completed WAL-store deletes.
+    pub wal_delete_duration: Duration,
+    /// Failed request attempts across both stores, including errors SlateDB
+    /// handles internally such as missing-object probes.
+    pub errors: u64,
+}
+
 impl CacheTally {
     /// The share of lookups the cache served, `None` before it has served
     /// any. Metadata and blocks are counted apart because they are sized
@@ -141,6 +181,19 @@ pub(crate) struct CacheCounters {
     block_hits: AtomicU64,
     block_misses: AtomicU64,
     errors: AtomicU64,
+    main_gets: AtomicU64,
+    main_get_nanoseconds: AtomicU64,
+    main_puts: AtomicU64,
+    main_put_nanoseconds: AtomicU64,
+    main_deletes: AtomicU64,
+    main_delete_nanoseconds: AtomicU64,
+    wal_gets: AtomicU64,
+    wal_get_nanoseconds: AtomicU64,
+    wal_puts: AtomicU64,
+    wal_put_nanoseconds: AtomicU64,
+    wal_deletes: AtomicU64,
+    wal_delete_nanoseconds: AtomicU64,
+    object_store_errors: AtomicU64,
 }
 
 impl CacheCounters {
@@ -154,6 +207,26 @@ impl CacheCounters {
         }
     }
 
+    pub(crate) fn object_store_tally(&self) -> ObjectStoreTally {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let duration = |counter: &AtomicU64| Duration::from_nanos(load(counter));
+        ObjectStoreTally {
+            main_gets: load(&self.main_gets),
+            main_get_duration: duration(&self.main_get_nanoseconds),
+            main_puts: load(&self.main_puts),
+            main_put_duration: duration(&self.main_put_nanoseconds),
+            main_deletes: load(&self.main_deletes),
+            main_delete_duration: duration(&self.main_delete_nanoseconds),
+            wal_gets: load(&self.wal_gets),
+            wal_get_duration: duration(&self.wal_get_nanoseconds),
+            wal_puts: load(&self.wal_puts),
+            wal_put_duration: duration(&self.wal_put_nanoseconds),
+            wal_deletes: load(&self.wal_deletes),
+            wal_delete_duration: duration(&self.wal_delete_nanoseconds),
+            errors: load(&self.object_store_errors),
+        }
+    }
+
     fn of(&self, which: Which) -> &AtomicU64 {
         match which {
             Which::MetadataHit => &self.metadata_hits,
@@ -161,6 +234,19 @@ impl CacheCounters {
             Which::BlockHit => &self.block_hits,
             Which::BlockMiss => &self.block_misses,
             Which::Error => &self.errors,
+            Which::MainGet => &self.main_gets,
+            Which::MainPut => &self.main_puts,
+            Which::MainDelete => &self.main_deletes,
+            Which::WalGet => &self.wal_gets,
+            Which::WalPut => &self.wal_puts,
+            Which::WalDelete => &self.wal_deletes,
+            Which::ObjectStoreError => &self.object_store_errors,
+            Which::MainGetDuration => &self.main_get_nanoseconds,
+            Which::MainPutDuration => &self.main_put_nanoseconds,
+            Which::MainDeleteDuration => &self.main_delete_nanoseconds,
+            Which::WalGetDuration => &self.wal_get_nanoseconds,
+            Which::WalPutDuration => &self.wal_put_nanoseconds,
+            Which::WalDeleteDuration => &self.wal_delete_nanoseconds,
         }
     }
 }
@@ -181,6 +267,19 @@ enum Which {
     BlockHit,
     BlockMiss,
     Error,
+    MainGet,
+    MainPut,
+    MainDelete,
+    WalGet,
+    WalPut,
+    WalDelete,
+    ObjectStoreError,
+    MainGetDuration,
+    MainPutDuration,
+    MainDeleteDuration,
+    WalGetDuration,
+    WalPutDuration,
+    WalDeleteDuration,
 }
 
 impl CounterFn for Slot {
@@ -194,8 +293,53 @@ impl CounterFn for Slot {
     }
 }
 
-/// Routes SlateDB's cache counters into [`CacheCounters`] and drops
-/// everything else on the floor.
+impl HistogramFn for Slot {
+    fn record(&self, value: f64) {
+        let Some(which) = self.which else {
+            return;
+        };
+        let Ok(duration) = Duration::try_from_secs_f64(value) else {
+            return;
+        };
+        let nanoseconds = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        for counters in [&self.store, &self.process] {
+            let counter = counters.of(which);
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(nanoseconds))
+            });
+        }
+    }
+}
+
+const OBJECT_STORE_REQUEST_COUNT: &str = "slatedb.object_store.request_count";
+const OBJECT_STORE_ERROR_COUNT: &str = "slatedb.object_store.error_count";
+const OBJECT_STORE_REQUEST_DURATION: &str = "slatedb.object_store.request_duration_seconds";
+
+fn object_store_metric(labels: &[(&str, &str)], duration: bool) -> Option<Which> {
+    let label = |key: &str| {
+        labels
+            .iter()
+            .find_map(|(name, value)| (*name == key).then_some(*value))
+    };
+    match (label("store_type"), label("op"), duration) {
+        (Some("main"), Some("get"), false) => Some(Which::MainGet),
+        (Some("main"), Some("put"), false) => Some(Which::MainPut),
+        (Some("main"), Some("delete"), false) => Some(Which::MainDelete),
+        (Some("wal"), Some("get"), false) => Some(Which::WalGet),
+        (Some("wal"), Some("put"), false) => Some(Which::WalPut),
+        (Some("wal"), Some("delete"), false) => Some(Which::WalDelete),
+        (Some("main"), Some("get"), true) => Some(Which::MainGetDuration),
+        (Some("main"), Some("put"), true) => Some(Which::MainPutDuration),
+        (Some("main"), Some("delete"), true) => Some(Which::MainDeleteDuration),
+        (Some("wal"), Some("get"), true) => Some(Which::WalGetDuration),
+        (Some("wal"), Some("put"), true) => Some(Which::WalPutDuration),
+        (Some("wal"), Some("delete"), true) => Some(Which::WalDeleteDuration),
+        _ => None,
+    }
+}
+
+/// Routes SlateDB's cache and object-store counters into
+/// [`CacheCounters`] and drops everything else on the floor.
 ///
 /// The cache reports one counter per `(entry_kind, result)` pair —
 /// `filter`, `index`, and `stats` are the meta slot's, `data_block` the
@@ -219,6 +363,8 @@ impl MetricsRecorder for CacheRecorder {
                 .find_map(|(name, value)| (*name == key).then_some(*value))
         };
         let which = match name {
+            OBJECT_STORE_REQUEST_COUNT => object_store_metric(labels, false),
+            OBJECT_STORE_ERROR_COUNT => Some(Which::ObjectStoreError),
             stats::ERROR_COUNT => Some(Which::Error),
             stats::ACCESS_COUNT => match (label("entry_kind"), label("result")) {
                 (Some("filter" | "index" | "stats"), Some("hit")) => Some(Which::MetadataHit),
@@ -251,12 +397,18 @@ impl MetricsRecorder for CacheRecorder {
 
     fn register_histogram(
         &self,
+        name: &str,
         _: &str,
-        _: &str,
-        _: &[(&str, &str)],
+        labels: &[(&str, &str)],
         _: &[f64],
     ) -> Arc<dyn HistogramFn> {
-        Arc::new(Sink)
+        Arc::new(Slot {
+            store: Arc::clone(&self.store),
+            process: Arc::clone(&COUNTERS),
+            which: (name == OBJECT_STORE_REQUEST_DURATION)
+                .then(|| object_store_metric(labels, true))
+                .flatten(),
+        })
     }
 }
 
@@ -681,6 +833,40 @@ mod tests {
         assert_eq!(tally.block_hits, 4);
         assert_eq!(tally.block_misses, 5);
         assert_eq!(tally.errors, 6);
+    }
+
+    /// The same recorder retains SlateDB's physical object-store metrics,
+    /// split between its main and WAL stores so a durable write is visible
+    /// apart from metadata reads.
+    #[test]
+    fn the_recorder_routes_object_store_requests_and_time() {
+        let counters = Arc::new(CacheCounters::default());
+        let recorder = CacheRecorder {
+            store: Arc::clone(&counters),
+        };
+        let labels = [
+            ("component", "db"),
+            ("store_type", "main"),
+            ("op", "get"),
+            ("api", "get_range"),
+        ];
+
+        recorder
+            .register_counter("slatedb.object_store.request_count", "", &labels)
+            .increment(3);
+        recorder
+            .register_histogram(
+                "slatedb.object_store.request_duration_seconds",
+                "",
+                &labels,
+                &[],
+            )
+            .record(0.025);
+
+        let tally = counters.object_store_tally();
+        assert_eq!(tally.main_gets, 3);
+        assert_eq!(tally.main_get_duration, Duration::from_millis(25));
+        assert_eq!(tally.wal_puts, 0);
     }
 
     /// Two stores share the cache but not the counters: what one store's

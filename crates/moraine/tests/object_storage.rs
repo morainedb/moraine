@@ -67,6 +67,12 @@ fn catalog_path_works_without_a_run_prefix() {
 }
 
 #[test]
+fn attach_cases_isolate_churned_and_merged_stores() {
+    assert_eq!(attach_case_path("churned"), "attach-latency-churned");
+    assert_eq!(attach_case_path("merged"), "attach-latency-merged");
+}
+
+#[test]
 fn timing_stats_reports_middle_and_extrema() {
     let stats = TimingStats::of(vec![
         Duration::from_millis(9),
@@ -240,26 +246,65 @@ async fn measure_fresh_attaches(
     )
 }
 
-/// 0021 — cold read-only attach against the endpoint's own GET latency.
-///
-/// This is the real-endpoint companion to
-/// `measure_attach_cost_under_get_latency`: the catalog shape is identical, but
-/// its object-store reads incur the configured endpoint's actual latency. A
-/// fresh handle and cache scope per sample keep the materialization cold. Open
-/// and first view are reported separately, along with the end-to-end sum an
-/// attach pays.
-///
-/// A measurement, not an assertion — it prints and passes.
-#[tokio::test]
-#[ignore = "needs a live S3 endpoint; run through `cargo xtask s3`"]
-async fn measure_attach_latency_against_the_endpoint() {
-    const TABLES: usize = 40;
-    const COLUMNS_PER_TABLE: usize = 8;
-    const ROUNDS: usize = 160;
-    const REPEATS: usize = 7;
+const ATTACH_TABLES: usize = 40;
+const ATTACH_COLUMNS_PER_TABLE: usize = 8;
+const ATTACH_ROUNDS: usize = 160;
+const ATTACH_REPEATS: usize = 7;
 
+#[derive(Clone, Copy)]
+enum AttachMode {
+    LiveFollowing,
+    FixedCheckpoint,
+}
+
+impl AttachMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LiveFollowing => "live",
+            Self::FixedCheckpoint => "fixed",
+        }
+    }
+}
+
+fn attach_case_path(state: &str) -> String {
+    format!("attach-latency-{state}")
+}
+
+async fn compact_attach_store(store: Arc<dyn ObjectStore>, options: &CatalogOptions) -> usize {
+    let mut writer_options = options.clone();
+    writer_options.flush_interval = Duration::from_millis(1);
+    let writer = Catalog::open(store, writer_options).await.unwrap();
+    let mut request = CompactStoreRequest::default();
+    request.wait = Some(Duration::from_secs(120));
+    let report = writer.compact_store(request).await.unwrap();
+    let completed = report
+        .merges
+        .iter()
+        .filter(|merge| merge.outcome == MergeOutcome::Completed)
+        .count();
+    writer.close().await.unwrap();
+    completed
+}
+
+async fn fixed_checkpoint_options(
+    store: Arc<dyn ObjectStore>,
+    options: &CatalogOptions,
+) -> (CatalogOptions, String) {
+    let mut reader_options = options.clone();
+    let mut writer_options = options.clone();
+    writer_options.flush_interval = Duration::from_millis(1);
+    let writer = Catalog::open(store, writer_options).await.unwrap();
+    let checkpoint = writer.create_checkpoint(None).await.unwrap();
+    writer.close().await.unwrap();
+    reader_options.checkpoint = Some(checkpoint.clone());
+    (reader_options, checkpoint)
+}
+
+/// Runs one endpoint attach instrument over independently seeded churned and
+/// merged stores. Separate prefixes keep one state's reader checkpoints from
+/// changing the manifest history measured by the other.
+async fn measure_attach_latency_against_endpoint() {
     let store = s3_store();
-    let options = options_at("attach-latency");
     let target = std::env::var("MORAINE_S3_ENDPOINT").unwrap_or_else(|_| {
         format!(
             "AWS S3 in {}",
@@ -269,14 +314,17 @@ async fn measure_attach_latency_against_the_endpoint() {
         )
     });
 
-    println!("\n# 0021 cold read-only attach against {target}");
+    println!("\n# 0021 fresh-handle attach against {target}");
     println!(
-        "# {TABLES} tables x {COLUMNS_PER_TABLE} columns, {ROUNDS} churn rounds; \
-         median of {REPEATS} fresh handles"
+        "# {ATTACH_TABLES} tables x {ATTACH_COLUMNS_PER_TABLE} columns, \
+         {ATTACH_ROUNDS} churn rounds; median of {ATTACH_REPEATS} fresh handles"
     );
-    println!("# total is open + first materialized view; close is not timed\n");
+    println!("# fixed opens an immutable checkpoint and writes nothing");
+    println!("# live follows latest and writes a manifest checkpoint; close is not timed");
+    println!("# total is open + first materialized view; states use separate prefixes\n");
     println!(
-        "{:>10}  {:>13}  {:>12}  {:>11}  {:>11}  {:>11}  {:>9}  {:>9}",
+        "{:>7}  {:>10}  {:>13}  {:>12}  {:>11}  {:>11}  {:>11}  {:>9}  {:>9}",
+        "reader",
         "state",
         "current_bytes",
         "current_ssts",
@@ -287,26 +335,24 @@ async fn measure_attach_latency_against_the_endpoint() {
         "total_max"
     );
 
-    seed_attach_measurement(store.clone(), &options, TABLES, COLUMNS_PER_TABLE, ROUNDS).await;
-
     for merged in [false, true] {
+        let state = if merged { "merged" } else { "churned" };
+        let options = options_at(&attach_case_path(state));
+        seed_attach_measurement(
+            store.clone(),
+            &options,
+            ATTACH_TABLES,
+            ATTACH_COLUMNS_PER_TABLE,
+            ATTACH_ROUNDS,
+        )
+        .await;
         if merged {
-            let mut writer_options = options.clone();
-            writer_options.flush_interval = Duration::from_millis(1);
-            let writer = Catalog::open(store.clone(), writer_options).await.unwrap();
-            let mut request = CompactStoreRequest::default();
-            request.wait = Some(Duration::from_secs(120));
-            let report = writer.compact_store(request).await.unwrap();
-            let completed = report
-                .merges
-                .iter()
-                .filter(|merge| merge.outcome == MergeOutcome::Completed)
-                .count();
+            let completed = compact_attach_store(store.clone(), &options).await;
             println!("# compact_store completed {completed} subspace merges");
-            writer.close().await.unwrap();
         }
 
-        let census_reader = Catalog::open_read_only(store.clone(), options.clone())
+        let (fixed_options, checkpoint) = fixed_checkpoint_options(store.clone(), &options).await;
+        let census_reader = Catalog::open_read_only(store.clone(), fixed_options.clone())
             .await
             .unwrap();
         let census = census_reader
@@ -326,27 +372,58 @@ async fn measure_attach_latency_against_the_endpoint() {
             .sum();
         let all_bytes = census.total_bytes();
         let objects = census.objects.expect("benchmark role can list its prefix");
+        let current_bytes = current.bytes;
         census_reader.close().await.unwrap();
 
-        let (open, view, total) = measure_fresh_attaches(store.clone(), &options, REPEATS).await;
-        let state = if merged { "merged" } else { "churned" };
         println!(
             "# {state} store: {all_bytes} subspace bytes/{all_ssts} SSTs; \
              {} WAL objects/{} bytes; {} manifest bytes",
             objects.wal_objects, objects.wal_bytes, objects.manifest_bytes
         );
-        println!(
-            "{state:>10}  {:>13}  {current_ssts:>12}  {:>11.1}  {:>11.1}  \
-             {:>11.1}  {:>9.1}  {:>9.1}",
-            current.bytes,
-            milliseconds(open.median),
-            milliseconds(view.median),
-            milliseconds(total.median),
-            milliseconds(total.min),
-            milliseconds(total.max)
-        );
+
+        // Fixed goes first: it writes nothing, so live begins from the same
+        // manifest. Live's own repeated checkpoint writes are the behavior it
+        // measures and cannot contaminate the fixed samples that precede it.
+        for mode in [AttachMode::FixedCheckpoint, AttachMode::LiveFollowing] {
+            let reader_options = match mode {
+                AttachMode::FixedCheckpoint => &fixed_options,
+                AttachMode::LiveFollowing => &options,
+            };
+            let (open, view, total) =
+                measure_fresh_attaches(store.clone(), reader_options, ATTACH_REPEATS).await;
+            let reader = mode.label();
+            println!(
+                "{reader:>7}  {state:>10}  {current_bytes:>13}  {current_ssts:>12}  \
+                 {:>11.1}  {:>11.1}  {:>11.1}  {:>9.1}  {:>9.1}",
+                milliseconds(open.median),
+                milliseconds(view.median),
+                milliseconds(total.median),
+                milliseconds(total.min),
+                milliseconds(total.max)
+            );
+        }
+
+        Catalog::delete_checkpoint(store.clone(), options, &checkpoint)
+            .await
+            .unwrap();
     }
     println!();
+}
+
+/// 0021 — fresh fixed-checkpoint and live-following attach against the
+/// endpoint.
+///
+/// Fixed readers go first against independently seeded churned and merged
+/// stores. They open one immutable checkpoint and write nothing. Live readers
+/// then measure the production path whose open and close maintain a manifest
+/// checkpoint. Reporting the modes separately keeps read-only endpoint cost
+/// distinct from the live checkpoint-write cost.
+///
+/// A measurement, not an assertion — it prints and passes.
+#[tokio::test]
+#[ignore = "needs a live S3 endpoint; run through `cargo xtask s3`"]
+async fn measure_attach_latency_against_the_endpoint() {
+    measure_attach_latency_against_endpoint().await;
 }
 
 /// 0004 — durable-commit latency where the WAL flush is a real PUT.

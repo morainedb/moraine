@@ -760,6 +760,17 @@ beside a healthy metadata one is a working set larger than the block
 slot. A rate is absent rather than zero before any lookup. Budgets are
 sized from these curves, not from the defaults.
 
+Object-store traffic is measured separately per attach through
+`moraine_object_store_tally('lake')` (RFC 0006). This is the physical
+counterpart to cache hit rates: it distinguishes time in store requests from
+time scanning and decoding the catalog, and it counts retries rather than
+inferring round trips from DuckLake's metadata-statement count. The commit
+breakdown benchmark keeps Parquet local, then reports DuckLake metadata SQL,
+the staged transaction's one committed-record scan, Moraine commit time, and
+staged bytes, its durable-write wait, and the exact main/WAL request counts and
+summed latency over the same commit window. These phases are nested
+measurements, not values to add together.
+
 **One cache means one shape per process.** The first store to open builds
 it and its numbers stand; a later attach asking for different ones shares
 what is there. That is the budget being the process's rather than the

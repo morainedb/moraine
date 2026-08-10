@@ -1186,8 +1186,15 @@ pub(crate) async fn commit_batch(
     if !head_advanced {
         invalidate_head_view(projections);
     }
+    let durable_started = Instant::now();
     match commit_durable(db_tx, "commit", staged_bytes).await {
         Ok(_) => {
+            debug!(
+                operation = "commit",
+                staged_bytes = staged_bytes.0,
+                elapsed_ms = durable_started.elapsed().as_secs_f64() * 1_000.0,
+                "durable commit landed"
+            );
             fold_committed_batch(projections, writes, head);
             if head_advanced {
                 refresh_head_view(projections, base, writes);
