@@ -10,7 +10,7 @@ use crate::{
         MacroParameterDef, MappingId, MappingInfo, NameMappingDef, OptionScope, PartitionColumnDef,
         PartitionId, PartitionSpec, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId,
         SnapshotInfo, SortId, SortKeyDef, SortSpec, TableId, TableInfo, TableStats, TagEntry,
-        ViewId, ViewInfo,
+        Timestamp, ViewId, ViewInfo,
     },
     error::{Error, Result},
     store::{
@@ -235,7 +235,7 @@ impl CatalogSnapshot {
     pub fn current_snapshot(&self) -> SnapshotInfo {
         SnapshotInfo {
             id: SnapshotId::new(self.snapshot.snapshot_id),
-            time_micros: self.snapshot.snapshot_time_micros,
+            time: Timestamp::from_micros(self.snapshot.snapshot_time_micros),
             schema_version: self.snapshot.schema_version,
         }
     }
@@ -524,7 +524,7 @@ impl CatalogSnapshot {
                 data_file_id: g.data_file_id,
                 path: g.path.clone(),
                 path_is_relative: g.path_is_relative,
-                schedule_start_micros: g.schedule_start_micros,
+                schedule_start: Timestamp::from_micros(g.schedule_start_micros),
             })
             .collect()
     }
@@ -1206,6 +1206,28 @@ mod tests {
         })];
         let view = CatalogSnapshot::build(snap(3), &[], &history, None);
         assert!(view.columns_of(TableId::new(1)).is_empty());
+    }
+
+    /// Both projected instants are `Timestamp`, and the projection is total:
+    /// a pre-epoch count survives it unchanged.
+    #[test]
+    fn instants_project_unchanged_including_before_the_epoch() {
+        let mut value = snap(7);
+        value.snapshot_time_micros = -1_000;
+
+        let mut view = CatalogSnapshot::build(value, &[], &[], None);
+        view.put_gc_file(GcFileValue {
+            data_file_id: 9,
+            path: "f9.parquet".into(),
+            path_is_relative: true,
+            schedule_start_micros: -2_000,
+        });
+
+        assert_eq!(view.current_snapshot().time, Timestamp::from_micros(-1_000));
+        assert_eq!(
+            view.scheduled_deletions()[0].schedule_start,
+            Timestamp::from_micros(-2_000)
+        );
     }
 
     #[test]

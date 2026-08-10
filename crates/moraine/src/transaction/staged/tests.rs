@@ -3451,6 +3451,11 @@ async fn expiry_prunes_history_and_schedules_files_without_advancing_head() {
     assert_eq!(schedule.len(), 1);
     assert_eq!(schedule[0].data_file_id, 9);
     assert_eq!(schedule[0].path, "f9.parquet");
+    assert_eq!(
+        schedule[0].schedule_start,
+        crate::catalog::Timestamp::from_micros(1_000),
+        "the staged instant reaches the projection unchanged"
+    );
 
     // The dead snapshot no longer resolves — below head with its record
     // reclaimed, so `SnapshotExpired`, not a plain miss; the survivor

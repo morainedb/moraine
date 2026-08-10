@@ -100,6 +100,12 @@ alongside `Error`/`Result`.
   machinery (retry, `WriteBatch` assembly, `current`↔`history` bookkeeping) lives in
   `transaction`; `Transaction` is its public face.
 
+Public catalog instants use `Timestamp`, a signed microsecond count from the
+Unix epoch. `SnapshotInfo::time`, `ScheduledDeletion::schedule_start`, and
+maintenance status pass start times carry that type so pre-epoch values and
+the full persisted `i64` range cross the core API unchanged. Storage records
+and host ABIs keep the raw microsecond count and convert only at the boundary.
+
 ### Front door
 
 ```rust

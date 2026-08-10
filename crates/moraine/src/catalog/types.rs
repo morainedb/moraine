@@ -766,8 +766,8 @@ pub struct ColumnAlteration {
 pub struct SnapshotInfo {
     /// The snapshot's id.
     pub id: SnapshotId,
-    /// Commit time, microseconds since the Unix epoch (UTC).
-    pub time_micros: i64,
+    /// When the snapshot was committed.
+    pub time: Timestamp,
     /// Catalog schema version: advances only when a commit changes the
     /// catalog's shape, so clients can key schema caches on it.
     pub schema_version: u64,
@@ -799,8 +799,8 @@ pub struct ScheduledDeletion {
     pub path: String,
     /// Whether `path` is relative to the table's data prefix.
     pub path_is_relative: bool,
-    /// Microseconds since epoch, UTC, when the file was scheduled.
-    pub schedule_start_micros: i64,
+    /// When the file was scheduled.
+    pub schedule_start: Timestamp,
 }
 
 /// A chunk of rows to inline: one Arrow IPC record-batch body over the
