@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/morainedb/moraine/compare/v0.4.6...v0.5.0) - 2026-08-10
+
+### Added
+
+- add real S3 benchmark workflow ([#118](https://github.com/morainedb/moraine/pull/118))
+- persist maintenance status across restarts ([#117](https://github.com/morainedb/moraine/pull/117))
+- settle staged index concurrency and reverse scans ([#114](https://github.com/morainedb/moraine/pull/114))
+- bound and defer index maintenance ([#112](https://github.com/morainedb/moraine/pull/112))
+- add batched SQL index lookups ([#109](https://github.com/morainedb/moraine/pull/109))
+
+### Fixed
+
+- prevent cross-catalog cache recovery ([#116](https://github.com/morainedb/moraine/pull/116))
+- avoid schema churn during staged index builds ([#111](https://github.com/morainedb/moraine/pull/111))
+- join maintenance scheduler on shutdown ([#115](https://github.com/morainedb/moraine/pull/115))
+
+### Other
+
+- prune DuckLake files by row id ([#123](https://github.com/morainedb/moraine/pull/123))
+- carry catalog timestamps as micros ([#122](https://github.com/morainedb/moraine/pull/122))
+- measure real S3 attach latency ([#119](https://github.com/morainedb/moraine/pull/119))
+- allow inserts during staged index steps ([#113](https://github.com/morainedb/moraine/pull/113))
+- elide scans for empty index lookups ([#121](https://github.com/morainedb/moraine/pull/121))
+
 ## [0.4.6](https://github.com/morainedb/moraine/compare/v0.4.5...v0.4.6) - 2026-08-07
 
 ### Added
