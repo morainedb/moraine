@@ -449,7 +449,7 @@ struct InlineDataScanBindData : public duckdb::FunctionData {
 		auto result = duckdb::make_uniq<InlineDataScanBindData>();
 		result->scan = scan;
 		result->table_entry = table_entry;
-		return std::move(result);
+		return result;
 	}
 
 	bool Equals(const duckdb::FunctionData &other) const override {
@@ -474,7 +474,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InlineDataScanInitGlobal(du
                                                                               duckdb::TableFunctionInitInput &input) {
 	auto state = duckdb::make_uniq<InlineDataScanGlobalState>();
 	state->column_ids = input.column_ids;
-	return std::move(state);
+	return state;
 }
 
 duckdb::BindInfo InlineDataScanBindInfo(const duckdb::optional_ptr<duckdb::FunctionData> bind_data) {

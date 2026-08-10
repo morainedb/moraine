@@ -10,7 +10,7 @@ use crate::helpers::*;
 /// moraine adds no feed logic — DuckLake computes everything from the
 /// served projections; the reference catalog is the semantic oracle.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 #[allow(clippy::too_many_lines)]
 fn ducklake_change_feed_attributes_inline_changes() {
     let store = TempDir::new("cdf-store");
@@ -152,7 +152,7 @@ fn ducklake_change_feed_attributes_inline_changes() {
 /// previous-delete subtraction), and update pairing — attribute
 /// correctly.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 #[allow(clippy::too_many_lines)]
 fn ducklake_change_feed_survives_flush_and_file_deletes() {
     let store = TempDir::new("cdf-flush-store");

@@ -107,7 +107,7 @@ jobs:
         with:
           submodules: recursive
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build ccache
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build ccache gcc-14 g++-14
       # The C++ half of the build. Caching ninja's build tree instead does
       # nothing: a checkout stamps every source with the current time, so
       # ninja sees restored objects as stale and recompiles all ~550 of
@@ -140,8 +140,9 @@ jobs:
         with:
           path: target/duckdb-cli
           key: duckdb-cli-${{ runner.os }}-${{ hashFiles('.github/duckdb-versions') }}
-      # `INSTALL ducklake` in the suite below downloads into this
-      # directory; caching it keeps 93 tests off the extension repository.
+      # Tests still install supporting extensions such as spatial and
+      # parquet into this directory; DuckLake itself is built from the
+      # repository patch and loaded by path.
       - uses: actions/cache@v6
         with:
           path: target/duckdb-extensions

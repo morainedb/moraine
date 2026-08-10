@@ -1320,7 +1320,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
                                                                             duckdb::TableFunctionInitInput &input) {
 	auto state = duckdb::make_uniq<MetadataScanGlobalState>();
 	state->column_ids = input.column_ids;
-	return std::move(state);
+	return state;
 }
 
 void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
@@ -1368,7 +1368,7 @@ duckdb::unique_ptr<duckdb::FunctionData> MetadataScanBindData::Copy() const {
 	auto result = duckdb::make_uniq<MetadataScanBindData>();
 	result->rows = rows;
 	result->table_entry = table_entry;
-	return std::move(result);
+	return result;
 }
 
 bool MetadataScanBindData::Equals(const duckdb::FunctionData &other_p) const {

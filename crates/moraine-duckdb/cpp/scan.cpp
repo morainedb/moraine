@@ -37,7 +37,7 @@ duckdb::unique_ptr<duckdb::FunctionData> MoraineScanBindData::Copy() const {
 	result->qualified_table_name = qualified_table_name;
 	result->store_path = store_path;
 	result->table_entry = table_entry;
-	return std::move(result);
+	return result;
 }
 
 bool MoraineScanBindData::Equals(const duckdb::FunctionData &other_p) const {

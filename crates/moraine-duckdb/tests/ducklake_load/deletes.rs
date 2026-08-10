@@ -76,7 +76,7 @@ fn rows_per_live_file(store: &std::path::Path) -> Vec<Vec<String>> {
 /// This is the expensive path: an object-store write per delete, and a
 /// full rewrite of the delete file on each subsequent one.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_partial_delete_of_flushed_inline_data_writes_a_delete_file() {
     let dir = TempDir::new("delete-partial-store");
     let data_dir = TempDir::new("delete-partial-data");
@@ -119,7 +119,7 @@ fn ducklake_partial_delete_of_flushed_inline_data_writes_a_delete_file() {
 /// independent of how the flush shaped the file — the limit is compared
 /// against the delete, not the file.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_narrow_delete_of_flushed_inline_data_inlines_its_deletions() {
     let dir = TempDir::new("delete-narrow-store");
     let data_dir = TempDir::new("delete-narrow-data");
@@ -163,7 +163,7 @@ fn ducklake_narrow_delete_of_flushed_inline_data_inlines_its_deletions() {
 /// write. The file is *ended* rather than removed, so time travel below
 /// the delete still reads it.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_partition_aligned_delete_drops_the_data_file() {
     let dir = TempDir::new("delete-aligned-store");
     let data_dir = TempDir::new("delete-aligned-data");
@@ -218,7 +218,7 @@ fn ducklake_partition_aligned_delete_drops_the_data_file() {
 /// written after all. Raising `data_inlining_row_limit` to catch small
 /// deletes therefore costs the drop on every file it touches.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_inlined_deletion_blocks_the_data_file_drop() {
     let dir = TempDir::new("delete-blocked-store");
     let data_dir = TempDir::new("delete-blocked-data");
@@ -272,7 +272,7 @@ fn ducklake_inlined_deletion_blocks_the_data_file_drop() {
 /// data file for the identical ones — strictly more than the delete
 /// alone. Skipping unchanged rows has to happen before the statement.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_no_change_update_still_writes_both_files() {
     let dir = TempDir::new("delete-noop-store");
     let data_dir = TempDir::new("delete-noop-data");
@@ -311,7 +311,7 @@ fn ducklake_no_change_update_still_writes_both_files() {
 /// rows are filtered out upstream, the resulting empty DELETE and
 /// INSERT cost nothing rather than costing an empty commit.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_zero_row_statements_mint_no_snapshot() {
     let dir = TempDir::new("delete-empty-store");
     let data_dir = TempDir::new("delete-empty-data");
@@ -347,7 +347,7 @@ fn ducklake_zero_row_statements_mint_no_snapshot() {
 /// and it merges within a partition — the merged file still holds one
 /// partition's rows, so a partition-aligned delete still drops it.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_merge_keeps_partition_files_droppable() {
     let dir = TempDir::new("delete-merged-store");
     let data_dir = TempDir::new("delete-merged-data");

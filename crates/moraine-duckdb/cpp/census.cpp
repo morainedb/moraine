@@ -45,7 +45,7 @@ struct CensusBindData : public duckdb::FunctionData {
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<CensusBindData>();
 		*result = *this;
-		return std::move(result);
+		return result;
 	}
 	bool Equals(const duckdb::FunctionData &other_p) const override {
 		auto &other = other_p.Cast<CensusBindData>();
@@ -92,7 +92,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CensusBind(duckdb::ClientContext &conte
 	         "sorted_runs",   "sorted_run_ssts",  "live_keys",       "live_key_bytes",
 	         "live_value_bytes", "scheduled_files", "store_total_bytes", "store_wal_bytes",
 	         "store_manifest_bytes", "store_sst_bytes"};
-	return std::move(bind_data);
+	return bind_data;
 }
 
 struct CensusGlobalState : public duckdb::GlobalTableFunctionState {
@@ -167,7 +167,7 @@ struct TallyBindData : public duckdb::FunctionData {
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<TallyBindData>();
 		*result = *this;
-		return std::move(result);
+		return result;
 	}
 	bool Equals(const duckdb::FunctionData &other_p) const override {
 		return catalog_name == other_p.Cast<TallyBindData>().catalog_name;
@@ -190,7 +190,7 @@ duckdb::unique_ptr<duckdb::FunctionData> TallyBind(duckdb::ClientContext &, duck
 		}
 		bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	}
-	return std::move(bind_data);
+	return bind_data;
 }
 
 struct TallyGlobalState : public duckdb::GlobalTableFunctionState {

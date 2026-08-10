@@ -19,9 +19,9 @@ use tracing::{info, warn};
 
 use crate::{
     catalog::{
-        BuildStep, CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, DataFileInfo,
-        FileIndexEntry, IndexDef, IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexState,
-        RecentRow, RowHolder, RowLocation, SnapshotId, TableId, Timestamp,
+        BuildStep, CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, FileIndexEntry, IndexDef,
+        IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexState, RecentRow, SnapshotId,
+        TableId, Timestamp,
         census::{
             CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
             MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
@@ -1154,9 +1154,8 @@ impl ReadOnlyCatalog {
     /// Head-only: the lookup materializes the current head and scans the
     /// `index` subspace under one read session, so the entries and the catalog
     /// they resolve against are one consistent cut. Entries are live-only,
-    /// so there is no time-travel variant. Returns candidate
-    /// [`RowLocation`]s; the caller applies delete files as any DuckLake
-    /// scan does.
+    /// so there is no time-travel variant. Returns stable row ids; the caller
+    /// applies delete files as any DuckLake scan does.
     ///
     /// # Errors
     ///
@@ -1169,7 +1168,7 @@ impl ReadOnlyCatalog {
         table: TableId,
         index: IndexId,
         values: &[IndexKeyValue],
-    ) -> Result<Vec<RowLocation>> {
+    ) -> Result<Vec<u64>> {
         self.index_lookup_many(table, index, &[values.to_vec()])
             .await
     }
@@ -1193,7 +1192,7 @@ impl ReadOnlyCatalog {
         table: TableId,
         index: IndexId,
         keys: &[Vec<IndexKeyValue>],
-    ) -> Result<Vec<RowLocation>> {
+    ) -> Result<Vec<u64>> {
         let session = self.begin_read().await?;
         let handle = session.handle();
 
@@ -1250,16 +1249,11 @@ impl ReadOnlyCatalog {
             .try_collect::<Vec<_>>()
             .await?;
 
-            let holders = RowHolders::of(&view.data_files_of(table));
             let mut seen = HashSet::new();
             Ok(row_id_groups
                 .into_iter()
                 .flatten()
                 .filter(|row_id| seen.insert(*row_id))
-                .map(|row_id| RowLocation {
-                    row_id,
-                    holder: holders.holder(row_id),
-                })
                 .collect())
         })
         .await;
@@ -1293,7 +1287,7 @@ impl ReadOnlyCatalog {
         lower: Bound<Vec<IndexKeyValue>>,
         upper: Bound<Vec<IndexKeyValue>>,
         reverse: bool,
-    ) -> Result<Vec<RowLocation>> {
+    ) -> Result<Vec<u64>> {
         let session = self.begin_read().await?;
         let handle = session.handle();
 
@@ -1336,14 +1330,7 @@ impl ReadOnlyCatalog {
                 crate::store::handle::ScanOrder::from_reverse(reverse),
             )
             .await?;
-            let holders = RowHolders::of(&view.data_files_of(table));
-            Ok(row_ids
-                .into_iter()
-                .map(|row_id| RowLocation {
-                    row_id,
-                    holder: holders.holder(row_id),
-                })
-                .collect())
+            Ok(row_ids)
         }
         .await;
         session.finish();
@@ -1374,7 +1361,7 @@ impl ReadOnlyCatalog {
         index: IndexId,
         prefix: Vec<Option<IndexKeyValue>>,
         reverse: bool,
-    ) -> Result<Vec<RowLocation>> {
+    ) -> Result<Vec<u64>> {
         let session = self.begin_read().await?;
         let handle = session.handle();
 
@@ -1424,15 +1411,7 @@ impl ReadOnlyCatalog {
                 crate::store::handle::ScanOrder::from_reverse(reverse),
             )
             .await?;
-            let holders = RowHolders::of(&view.data_files_of(table));
-
-            Ok(row_ids
-                .into_iter()
-                .map(|row_id| RowLocation {
-                    row_id,
-                    holder: holders.holder(row_id),
-                })
-                .collect())
+            Ok(row_ids)
         }
         .await;
         session.finish();
@@ -1953,41 +1932,6 @@ fn encode_range_bounds(
         (lower, upper)
     };
     Ok((encode_bound(byte_lower)?, encode_bound(byte_upper)?))
-}
-
-/// A table's dense row-id ranges, ordered for lookup. A query resolves every
-/// hit against the same table, so the ranges are built once and searched per
-/// row rather than rescanned; an index range can return far more rows than a
-/// table has files.
-struct RowHolders {
-    /// `(start, end, file)` per file carrying a dense range, sorted by start
-    /// and disjoint — each row id belongs to at most one file.
-    ranges: Vec<(u64, u64, DataFileId)>,
-}
-
-impl RowHolders {
-    fn of(files: &[DataFileInfo]) -> Self {
-        let mut ranges: Vec<_> = files
-            .iter()
-            .filter_map(|file| {
-                let start = file.row_id_start?;
-                Some((start, start.saturating_add(file.record_count), file.id))
-            })
-            .collect();
-        ranges.sort_unstable();
-        Self { ranges }
-    }
-
-    /// The file whose range holds `row_id`, else `Inline` — an inlined row,
-    /// or one in a file carrying explicit per-row ids rather than a range.
-    fn holder(&self, row_id: u64) -> RowHolder {
-        // Only the last range starting at or below `row_id` can contain it.
-        let above = self.ranges.partition_point(|(start, ..)| *start <= row_id);
-        match self.ranges[..above].last() {
-            Some(&(_, end, file)) if row_id < end => RowHolder::DataFile(file),
-            _ => RowHolder::Inline,
-        }
-    }
 }
 
 impl Catalog {

@@ -6,7 +6,7 @@ use crate::helpers::*;
 /// repartitioning ends the old spec while files keep the spec they
 /// were written under, and `RESET PARTITIONED BY` clears it.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_partitioning_specs_values_and_pruning() {
     let dir = TempDir::new("partition-store");
     let data_dir = TempDir::new("partition-data");
@@ -134,7 +134,7 @@ fn ducklake_partitioning_specs_values_and_pruning() {
 /// rewritten text and leaves the old one in history — which is why a
 /// stale live sort expression never arises for moraine to serve.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_partitioned_and_sorted_columns_resist_drop_but_allow_rename() {
     let dir = TempDir::new("evolve-store");
     let data_dir = TempDir::new("evolve-data");
@@ -232,7 +232,7 @@ fn ducklake_partitioned_and_sorted_columns_resist_drop_but_allow_rename() {
 /// clears it; and dropping a table with historical sort specs is
 /// clean.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_sort_specs_round_trip_and_reset() {
     let dir = TempDir::new("sort-store");
     let data_dir = TempDir::new("sort-data");

@@ -7,7 +7,7 @@
 
 use moraine::{
     Catalog, CatalogOptions, DataFile, Error, FileIndexEntry, FileIndexRemoval, FlushedDataFile,
-    IndexDef, IndexKeyValue, InlineChunk, IntWidth, RowHolder, SnapshotId, TableId,
+    IndexDef, IndexKeyValue, InlineChunk, IntWidth, SnapshotId, TableId,
 };
 
 use crate::fixtures::{col, datafile, seeded};
@@ -745,9 +745,8 @@ async fn an_uncovered_inline_insert_into_an_indexed_table_is_refused() {
     assert!(matches!(err, Error::Constraint(_)), "{err}");
 }
 
-/// A covered inlined row is findable by the index and reports itself as
-/// inlined; tombstoning it strips the entry, so the index never reports a
-/// row the table no longer has.
+/// A covered inlined row is findable by the index; tombstoning it strips the
+/// entry, so the index never reports a row the table no longer has.
 #[tokio::test]
 async fn a_covered_inlined_row_is_findable_until_it_is_tombstoned() {
     let (catalog, table, index) = indexed().await;
@@ -776,10 +775,7 @@ async fn a_covered_inlined_row_is_findable_until_it_is_tombstoned() {
 
     let twenty = [indexed_value(20)];
     let found = catalog.index_lookup(table, index, &twenty).await.unwrap();
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].row_id, 1);
-    assert_eq!(found[0].holder, RowHolder::Inline);
-
+    assert_eq!(found, vec![1]);
     catalog
         .commit(move |tx| {
             tx.inline_delete(

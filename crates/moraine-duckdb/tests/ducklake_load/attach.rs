@@ -41,7 +41,7 @@ fn moraine_prefix_attach_without_type_clause() {
 /// The full `ducklake:moraine:` chain: attach, read through DuckLake's
 /// own reader, count (pushdown), time travel, `ducklake_snapshots()`.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_attach_reads_through_moraine_metadata() {
     let dir = TempDir::new("store");
     let data_dir = TempDir::new("data");
@@ -95,14 +95,7 @@ fn ducklake_attach_reads_through_moraine_metadata() {
         .arg("-unsigned")
         .arg("-csv")
         .arg("-c")
-        .arg(format!(
-            "SET extension_directory='{}';",
-            extension_directory().display()
-        ))
-        .arg("-c")
-        .arg("INSTALL ducklake;")
-        .arg("-c")
-        .arg("LOAD ducklake;")
+        .arg(ducklake_load_statement(&ducklake_ext_path()))
         .arg("-c")
         .arg(format!("LOAD '{}';", ext_path().display()))
         .arg("-c")
@@ -135,7 +128,7 @@ fn ducklake_attach_reads_through_moraine_metadata() {
 /// and no-fencing are pinned by the core `tests/catalog.rs` suite, and
 /// DuckDB enforces the outer `READ_ONLY` at the SQL layer.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_read_only_attach_reads_through_a_reader() {
     let dir = TempDir::new("ro-store");
     let data_dir = TempDir::new("ro-data");
@@ -185,7 +178,7 @@ fn ducklake_read_only_attach_reads_through_a_reader() {
 /// on either side surfaces here rather than as a mystery fence in the
 /// field.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_forwards_read_only_into_the_metadata_attach() {
     let dir = TempDir::new("ro-forward-store");
     let data_dir = TempDir::new("ro-forward-data");
@@ -240,7 +233,7 @@ fn ducklake_forwards_read_only_into_the_metadata_attach() {
 /// commits land, and a plain re-attach (default cadence) reads them
 /// back.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_attach_flush_interval_option_is_applied() {
     let dir = TempDir::new("flush-store");
     let data_dir = TempDir::new("flush-data");
@@ -271,7 +264,7 @@ fn ducklake_attach_flush_interval_option_is_applied() {
 /// assertion is that the four are accepted, commits land through the capped
 /// cache, and the cache directory fills.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_attach_cache_options_are_applied() {
     let dir = TempDir::new("cache-size-store");
     let data_dir = TempDir::new("cache-size-data");
@@ -316,7 +309,7 @@ fn ducklake_attach_cache_options_are_applied() {
 /// Parquet-encrypted data files and records their keys in catalog
 /// rows; a later plain attach adopts the stored flag and decrypts.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_encrypted_writes_encrypted_files_and_reads_back() {
     let dir = TempDir::new("enc-store");
     let data_dir = TempDir::new("enc-data");

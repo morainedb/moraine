@@ -33,7 +33,7 @@ use crate::helpers::*;
 /// through the standalone projection, so a type that reads back but
 /// mis-names itself (a dropped `DECIMAL` suffix) is caught too.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 #[allow(clippy::too_many_lines)]
 fn ducklake_scalar_type_matrix_round_trip_through_flush() {
     let dir = TempDir::new("scalars-store");
@@ -168,7 +168,7 @@ fn ducklake_scalar_type_matrix_round_trip_through_flush() {
 /// DuckLake's `geometry`, and values survive both the inline keyspace and
 /// the Parquet flush. A `NULL` row proves null handling.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake/spatial"]
+#[ignore = "needs the downloaded DuckDB CLI, packaged Moraine and patched DuckLake extensions, and network access to INSTALL spatial"]
 fn ducklake_geometry_round_trip_through_flush() {
     let dir = TempDir::new("geom-store");
     let data_dir = TempDir::new("geom-data");
@@ -217,7 +217,7 @@ fn ducklake_geometry_round_trip_through_flush() {
 /// no VARIANT support (unlike GEOMETRY, which spatial registers). Vanilla
 /// DuckLake accepts VARIANT, so the error names the moraine-specific cause.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_variant_column_rejected_with_clear_error() {
     let dir = TempDir::new("variant-store");
     let data_dir = TempDir::new("variant-data");
@@ -243,7 +243,7 @@ fn ducklake_variant_column_rejected_with_clear_error() {
 /// `uint128` alike — as `DOUBLE`, losing precision beyond ~17 significant
 /// digits (a DuckDB limitation, not moraine's, unchanged by this mapping).
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_extended_scalar_types_map_through_probe() {
     let dir = TempDir::new("exttypes-store");
     let data_dir = TempDir::new("exttypes-data");

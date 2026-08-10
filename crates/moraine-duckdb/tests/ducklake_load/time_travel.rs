@@ -9,7 +9,7 @@ use crate::helpers::*;
 /// snapshot: 1 = CREATE, 2 = first INSERT, 3 = ADD COLUMN, 4 = second
 /// INSERT.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_time_travel_reads_past_data_and_schema() {
     let dir = TempDir::new("tt-store");
     let data_dir = TempDir::new("tt-data");
@@ -70,7 +70,7 @@ fn ducklake_time_travel_reads_past_data_and_schema() {
 /// so a past-snapshot scan is served the Parquet with a per-row filter —
 /// never double-counted, never lost.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_time_travel_survives_flush() {
     let dir = TempDir::new("ttf-store");
     let data_dir = TempDir::new("ttf-data");

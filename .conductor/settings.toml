@@ -7,6 +7,15 @@
 setup = '''
 set -e
 
+# DuckLake's Linux extension pipeline uses GCC 14. Match it here so the
+# extension shim and downstream patch exercise the same corrected C++11
+# implicit-move behavior as the published build.
+if [ "$(uname -s)" = "Linux" ] && command -v dnf >/dev/null 2>&1; then
+  if ! command -v gcc14-gcc >/dev/null 2>&1 || ! command -v gcc14-g++ >/dev/null 2>&1; then
+    sudo dnf install -y gcc14 gcc14-c++
+  fi
+fi
+
 # Cloud workspaces start bare; a developer machine already has a toolchain,
 # so this whole block is skipped there. The pinned channel installs itself
 # on first use from rust-toolchain.toml, but the gate's `cargo +nightly fmt`

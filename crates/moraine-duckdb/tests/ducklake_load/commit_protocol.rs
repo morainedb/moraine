@@ -88,7 +88,7 @@ fn one(rows: &[Vec<String>]) -> String {
 ///   `ducklake_merge_adjacent_files_preserves_rows_and_time_travel` pins over a
 ///   merge.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_row_id_allocation_matches_stock_ducklake() {
     let twin = Twin::new("rowid");
 
@@ -178,7 +178,7 @@ fn ducklake_row_id_allocation_matches_stock_ducklake() {
 /// (its own test below), and `set_option` neither bumps nor mints a
 /// snapshot at all — global or table-scoped — while still taking effect.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_schema_version_classification_matches_stock_ducklake() {
     let twin = Twin::new("schemaver");
     let history = || {
@@ -286,7 +286,7 @@ fn ducklake_schema_version_classification_matches_stock_ducklake() {
 /// value` — a spelling the staged path has to translate, or an option
 /// can be set exactly once and never corrected.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_set_option_overwrites_an_existing_option_row() {
     let twin = Twin::new("setopt-twice");
     let value = || {
@@ -312,7 +312,7 @@ fn ducklake_set_option_overwrites_an_existing_option_row() {
 /// scope — as every other raw-delete kind does, so the core has to decode
 /// that shape rather than a whole row.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_an_option_row_can_be_deleted() {
     let dir = TempDir::new("setopt-delete-store");
     let data_dir = TempDir::new("setopt-delete-data");
@@ -348,7 +348,7 @@ fn ducklake_an_option_row_can_be_deleted() {
 /// describes a *file*, not the table's shape, so DuckDB's cached column
 /// list stays valid.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_name_mapping_registration_carries_schema_version_forward() {
     let twin = Twin::new("mapping");
     let foreign = TempDir::new("mapping-foreign");
@@ -405,7 +405,7 @@ fn ducklake_name_mapping_registration_carries_schema_version_forward() {
 /// Differential throughout: every probe asserts moraine agrees with stock
 /// DuckLake row for row, so an over- or under-reclaim on either side fails.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn expiry_reclaims_the_mappings_of_a_dropped_table() {
     let twin = Twin::new("mapping-expiry");
     let foreign = TempDir::new("mapping-expiry-foreign");
@@ -473,7 +473,7 @@ fn expiry_reclaims_the_mappings_of_a_dropped_table() {
 /// Verb-path commits (here, a maintenance merge) are the ones moraine
 /// authors the field for, so those are compared to stock byte-for-byte.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_commit_retry_contract_and_change_grammar_hold() {
     let twin = Twin::new("retry");
 

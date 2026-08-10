@@ -219,8 +219,11 @@ async fn staged_build_spans_steps_and_finishes_ready() {
             .index_lookup(table, index, &[int(i128::from(value))])
             .await
             .unwrap();
-        assert_eq!(hits.len(), 1, "value {value} is indexed");
-        assert_eq!(hits[0].row_id, u64::try_from(value).unwrap());
+        assert_eq!(
+            hits,
+            vec![u64::try_from(value).unwrap()],
+            "value {value} is indexed"
+        );
     }
     catalog.close().await.unwrap();
 }

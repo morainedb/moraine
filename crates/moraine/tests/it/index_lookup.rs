@@ -1,4 +1,4 @@
-use moraine::{IndexDef, IndexEntry, IndexKeyValue, IntWidth, RowHolder};
+use moraine::{IndexDef, IndexEntry, IndexKeyValue, IntWidth};
 
 use crate::fixtures::{col, open_memory};
 
@@ -53,13 +53,7 @@ async fn index_lookup_many_returns_the_union_of_distinct_keys() {
         .await
         .unwrap();
 
-    assert_eq!(
-        found
-            .iter()
-            .map(|location| (location.row_id, location.holder))
-            .collect::<Vec<_>>(),
-        vec![(0, RowHolder::Inline), (1, RowHolder::Inline)]
-    );
+    assert_eq!(found, vec![0, 1]);
 }
 
 /// Empty `IN` lists are valid and resolve to the empty set.

@@ -5,14 +5,14 @@
 //! `moraine:` prefix dispatch and synthesized `ducklake_*` tables, and
 //! DuckLake's own reader — not this crate's scan — serves the data back.
 //!
-//! Ignored by default: needs the downloaded DuckDB CLI, the packaged
-//! `.duckdb_extension`, and network access to `INSTALL ducklake` (cached
-//! under `target/duckdb-extensions/`, gitignored). Run manually after
-//! `cargo xtask e2e` has produced the CLI/extension artifacts once:
+//! Ignored by default: needs the downloaded DuckDB CLI, the packaged Moraine
+//! extension, and the patched DuckLake extension. Run manually after
+//! `cargo xtask e2e` has produced the artifacts once:
 //!
 //! ```text
 //! MORAINE_DUCKDB_CLI=target/duckdb-cli/cli/duckdb \
 //! MORAINE_DUCKDB_EXT=build/release/extension/moraine/moraine.duckdb_extension \
+//! MORAINE_DUCKLAKE_EXT=target/patched-ducklake/build-extension-static/extension/ducklake/ducklake.duckdb_extension \
 //! cargo test -p moraine-duckdb --release --test ducklake_load -- --ignored
 //! ```
 

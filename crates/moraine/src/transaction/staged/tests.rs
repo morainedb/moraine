@@ -2216,7 +2216,7 @@ async fn create_index_backfills_inline_null_rows() {
         .await
         .unwrap();
     assert_eq!(
-        nulls.into_iter().map(|hit| hit.row_id).collect::<Vec<_>>(),
+        nulls,
         vec![1],
         "IS NULL finds the pre-existing inline NULL row"
     );
