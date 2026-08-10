@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "xtask"]
 
 [workspace.package]
-version = "0.4.6"
+version = "0.5.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alexpropp/moraine"
@@ -16,7 +16,7 @@ async-trait = "0.1"
 bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 parquet = { version = "59.1.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
-moraine = { path = "crates/moraine", version = "0.4.6" }
+moraine = { path = "crates/moraine", version = "0.5.0" }
 foyer = "0.22"
 object_store = "0.14"
 prost = "0.14"
