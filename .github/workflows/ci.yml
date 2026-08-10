@@ -140,8 +140,9 @@ jobs:
         with:
           path: target/duckdb-cli
           key: duckdb-cli-${{ runner.os }}-${{ hashFiles('.github/duckdb-versions') }}
-      # `INSTALL ducklake` in the suite below downloads into this
-      # directory; caching it keeps 93 tests off the extension repository.
+      # Tests still install supporting extensions such as spatial and
+      # parquet into this directory; DuckLake itself is built from the
+      # repository patch and loaded by path.
       - uses: actions/cache@v6
         with:
           path: target/duckdb-extensions

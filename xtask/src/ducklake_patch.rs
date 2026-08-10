@@ -289,31 +289,53 @@ fn apply_patch(workspace: &Path, source: &Path) -> anyhow::Result<()> {
 }
 
 fn checkout_matches_patch(source: &Path, patch: &Path) -> anyhow::Result<bool> {
-    let expected = fs::read_to_string(patch)
-        .with_context(|| format!("reading tracked patch {}", patch.display()))?;
-    let actual = command_output(
+    let parent = source
+        .parent()
+        .context("the DuckLake source checkout has no parent")?;
+    let indexes = TemporaryDirectory::create(parent, "patch-validation")?;
+    let expected_index = indexes.path().join("expected.index");
+    let actual_index = indexes.path().join("actual.index");
+
+    initialize_temporary_index(source, &expected_index)?;
+    command_output(
         Command::new("git")
-            .args([
-                "diff",
-                "--no-ext-diff",
-                "--binary",
-                "--full-index",
-                "--unified=0",
-                "HEAD",
-                "--",
-            ])
+            .args(["apply", "--cached", "--unidiff-zero"])
+            .arg(patch)
+            .env("GIT_INDEX_FILE", &expected_index)
             .current_dir(source),
     )?;
-    let untracked = command_output(
+    let expected_tree = write_temporary_tree(source, &expected_index)?;
+
+    initialize_temporary_index(source, &actual_index)?;
+    command_output(
         Command::new("git")
-            .args(["ls-files", "--others", "--exclude-standard"])
+            .args(["add", "--all", "--", "."])
+            .env("GIT_INDEX_FILE", &actual_index)
             .current_dir(source),
     )?;
-    Ok(checkout_matches_patch_text(&expected, &actual, &untracked))
+    let actual_tree = write_temporary_tree(source, &actual_index)?;
+
+    Ok(expected_tree == actual_tree)
 }
 
-fn checkout_matches_patch_text(expected: &str, actual: &str, untracked: &str) -> bool {
-    expected == actual && untracked.trim().is_empty()
+fn initialize_temporary_index(source: &Path, index: &Path) -> anyhow::Result<()> {
+    command_output(
+        Command::new("git")
+            .args(["read-tree", "HEAD"])
+            .env("GIT_INDEX_FILE", index)
+            .current_dir(source),
+    )?;
+    Ok(())
+}
+
+fn write_temporary_tree(source: &Path, index: &Path) -> anyhow::Result<String> {
+    command_output(
+        Command::new("git")
+            .arg("write-tree")
+            .env("GIT_INDEX_FILE", index)
+            .current_dir(source),
+    )
+    .map(|tree| tree.trim().to_string())
 }
 
 fn ensure_clean_checkout(source: &Path, name: &str) -> anyhow::Result<()> {
@@ -616,26 +638,59 @@ mod tests {
     }
 
     #[test]
-    fn cached_patch_requires_the_complete_tracked_diff() {
-        let patch = "diff --git a/source.cpp b/source.cpp\n+line\n";
+    fn cached_patch_requires_the_exact_resulting_tree() {
+        let root = TemporaryDirectory::create(&std::env::temp_dir(), "patch-tree-test")
+            .expect("temporary root");
+        let source = root.path().join("source");
+        fs::create_dir(&source).expect("source directory");
+        command_output(Command::new("git").arg("init").current_dir(&source))
+            .expect("initialize repository");
+        command_output(
+            Command::new("git")
+                .args(["config", "diff.noprefix", "true"])
+                .current_dir(&source),
+        )
+        .expect("configure alternate diff rendering");
+        fs::write(source.join("source.cpp"), "old\n").expect("source file");
+        fs::write(source.join("sibling.cpp"), "unchanged\n").expect("sibling file");
+        command_output(Command::new("git").args(["add", "."]).current_dir(&source))
+            .expect("stage baseline");
+        command_output(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Moraine Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "baseline",
+                ])
+                .current_dir(&source),
+        )
+        .expect("commit baseline");
 
-        assert!(checkout_matches_patch_text(patch, patch, ""));
-        assert!(!checkout_matches_patch_text(
-            patch,
-            &format!("{patch}extra edit\n"),
-            ""
-        ));
-    }
+        let patch = root.path().join("change.patch");
+        fs::write(
+            &patch,
+            "diff --git a/source.cpp b/source.cpp\n\
+             --- a/source.cpp\n\
+             +++ b/source.cpp\n\
+             @@ -1 +1 @@\n\
+             -old\n\
+             +new\n",
+        )
+        .expect("patch file");
+        fs::write(source.join("source.cpp"), "new\n").expect("apply expected edit");
 
-    #[test]
-    fn cached_patch_rejects_untracked_files() {
-        let patch = "diff --git a/source.cpp b/source.cpp\n+line\n";
+        assert!(checkout_matches_patch(&source, &patch).expect("matching tree"));
 
-        assert!(!checkout_matches_patch_text(
-            patch,
-            patch,
-            "untracked.cpp\n"
-        ));
+        fs::write(source.join("sibling.cpp"), "extra edit\n").expect("extra tracked edit");
+        assert!(!checkout_matches_patch(&source, &patch).expect("extra tracked edit"));
+
+        fs::write(source.join("sibling.cpp"), "unchanged\n").expect("restore sibling");
+        fs::write(source.join("untracked.cpp"), "extra\n").expect("extra untracked file");
+        assert!(!checkout_matches_patch(&source, &patch).expect("extra untracked file"));
     }
 
     #[test]
