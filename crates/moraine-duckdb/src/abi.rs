@@ -2345,6 +2345,63 @@ pub struct MoraineStoreObjects {
     pub other_bytes: u64,
 }
 
+/// Physical object-store requests one catalog has issued, as returned by
+/// [`moraine_catalog_object_store_tally`].
+#[repr(C)]
+#[derive(Default)]
+pub struct MoraineObjectStoreTally {
+    /// Reads from the main store.
+    pub main_gets: u64,
+    /// Summed main-store read latency, in nanoseconds.
+    pub main_get_nanoseconds: u64,
+    /// Writes to the main store.
+    pub main_puts: u64,
+    /// Summed main-store write latency, in nanoseconds.
+    pub main_put_nanoseconds: u64,
+    /// Deletes from the main store.
+    pub main_deletes: u64,
+    /// Summed main-store delete latency, in nanoseconds.
+    pub main_delete_nanoseconds: u64,
+    /// Reads from the WAL store.
+    pub wal_gets: u64,
+    /// Summed WAL-store read latency, in nanoseconds.
+    pub wal_get_nanoseconds: u64,
+    /// Writes to the WAL store.
+    pub wal_puts: u64,
+    /// Summed WAL-store write latency, in nanoseconds.
+    pub wal_put_nanoseconds: u64,
+    /// Deletes from the WAL store.
+    pub wal_deletes: u64,
+    /// Summed WAL-store delete latency, in nanoseconds.
+    pub wal_delete_nanoseconds: u64,
+    /// Failed request attempts across both stores, including handled errors.
+    pub errors: u64,
+}
+
+fn duration_nanoseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+impl From<moraine::ObjectStoreTally> for MoraineObjectStoreTally {
+    fn from(tally: moraine::ObjectStoreTally) -> Self {
+        Self {
+            main_gets: tally.main_gets,
+            main_get_nanoseconds: duration_nanoseconds(tally.main_get_duration),
+            main_puts: tally.main_puts,
+            main_put_nanoseconds: duration_nanoseconds(tally.main_put_duration),
+            main_deletes: tally.main_deletes,
+            main_delete_nanoseconds: duration_nanoseconds(tally.main_delete_duration),
+            wal_gets: tally.wal_gets,
+            wal_get_nanoseconds: duration_nanoseconds(tally.wal_get_duration),
+            wal_puts: tally.wal_puts,
+            wal_put_nanoseconds: duration_nanoseconds(tally.wal_put_duration),
+            wal_deletes: tally.wal_deletes,
+            wal_delete_nanoseconds: duration_nanoseconds(tally.wal_delete_duration),
+            errors: tally.errors,
+        }
+    }
+}
+
 /// Measures the store, one row per subspace, and writes the manifest
 /// version measured to `*out_manifest_id` and the store-wide object totals
 /// to `*out_objects`.
@@ -2693,6 +2750,36 @@ pub unsafe extern "C" fn moraine_catalog_cache_tally(
             *out_block_hits = tally.block_hits;
             *out_block_misses = tally.block_misses;
             *out_errors = tally.errors;
+        }
+        codes::OK
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(codes::INTERNAL)
+}
+
+/// Physical object-store requests one attached catalog has issued.
+///
+/// Counts are the requests SlateDB sent, including retries. Durations are
+/// summed request latency in nanoseconds and can exceed wall time when
+/// requests overlap.
+///
+/// # Safety
+///
+/// `handle` must be a live handle from [`moraine_attach`] and `out_tally`
+/// must be valid and writable for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_catalog_object_store_tally(
+    handle: *mut MoraineCatalogHandle,
+    out_tally: *mut MoraineObjectStoreTally,
+) -> i32 {
+    let attempt = || {
+        if handle.is_null() || out_tally.is_null() {
+            return codes::INVALID_ARGUMENT;
+        }
+        // SAFETY: caller contract for `handle`.
+        let tally = unsafe { &*handle }.catalog.reads().object_store_tally();
+        // SAFETY: checked non-null above; caller contract for validity.
+        unsafe {
+            *out_tally = tally.into();
         }
         codes::OK
     };

@@ -188,6 +188,24 @@ SELECT count(*) FROM moraine_cache_tally('lake');
 ----
 1
 
+# SlateDB's physical object-store requests are reported per attach. Local
+# storage uses the same instrumentation seam as S3, so this contract proves
+# the SQL surface without making the ordinary e2e gate network-dependent.
+query I
+SELECT count(*) FROM moraine_object_store_tally('lake');
+----
+1
+
+query I
+SELECT main_gets > 0 AND main_puts > 0
+   AND errors <= main_gets + main_puts + main_deletes
+              + wal_gets + wal_puts + wal_deletes
+   AND main_get_ms >= 0 AND main_put_ms >= 0 AND main_delete_ms >= 0
+   AND wal_get_ms >= 0 AND wal_put_ms >= 0 AND wal_delete_ms >= 0
+FROM moraine_object_store_tally('lake');
+----
+true
+
 # An attach cannot have served more than the process it reads through.
 query I
 SELECT (SELECT metadata_hits + block_hits FROM moraine_cache_tally('lake'))

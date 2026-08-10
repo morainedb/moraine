@@ -274,7 +274,7 @@ pub use fault::{CrashCase, CrashPoint, SyntheticMigration, inject_crash, install
 #[doc(hidden)]
 pub mod fuzz;
 pub use store::{
-    cache::{CacheTally, cache_tally},
+    cache::{CacheTally, ObjectStoreTally, cache_tally},
     index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder},
 };
 pub use transaction::{MigrationReport, Transaction};

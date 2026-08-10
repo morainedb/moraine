@@ -348,6 +348,26 @@ A rate is NULL, not zero, before anything has been looked up: zero would
 read as a cold cache to a monitoring query, and "nothing asked" is not
 the same fact.
 
+**`moraine_object_store_tally('lake')` — what SlateDB sent to storage.**
+One cumulative row per attach reports `main_gets`, `main_puts`, and
+`main_deletes`, the same three counts for a separately configured WAL store,
+and summed request time beside every count in milliseconds. Moraine currently
+uses one physical store, so WAL-object traffic appears in the `main_*` fields;
+the `wal_*` fields are reserved for an explicit second store. A GET includes
+the read-shaped APIs such as range, head, and list, and a PUT includes multipart
+operations. The instrumentation is inside SlateDB's retry loop, so attempts and
+their durations, not only logical calls, are counted.
+
+`errors` counts failed attempts, including errors SlateDB handles internally
+such as an expected missing-object probe; it is diagnostic, not a statement
+that the catalog operation failed. Durations are sums and can exceed wall time
+when requests overlap. The core surface is
+`ReadOnlyCatalog::object_store_tally`, carrying an `ObjectStoreTally`; the C ABI
+copies it through `moraine_catalog_object_store_tally` without exposing the
+metrics recorder. There is deliberately no process-wide SQL form: unlike the
+one shared cache budget, physical requests belong to the catalog handle that
+issued them.
+
 The data path needs none of this and gets none of it. Parquet reads are
 DuckDB's, not moraine's, and DuckDB caches them itself: a lake read goes
 through its caching file system, so data bytes sit under `memory_limit`
