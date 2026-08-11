@@ -76,10 +76,9 @@ fn decode_row_id(bytes: &[u8]) -> Result<u64> {
 
 /// How many uniqueness probes are in flight at once. Each probe is an
 /// independent point read, so running them one after another makes a batch
-/// cost one store round-trip of latency *per entry*. Bounding the fan-out
-/// instead keeps a single commit from monopolizing the store's request
-/// budget.
-const UNIQUENESS_PROBE_CONCURRENCY: usize = 64;
+/// cost one store round-trip of latency *per entry*. This covers an ordinary
+/// several-hundred-row flush in one window while keeping a bulk load bounded.
+const UNIQUENESS_PROBE_CONCURRENCY: usize = 512;
 
 /// How many probes are gathered before they are run and resolved. A batch
 /// can hold millions of entries, so probes are resolved in bounded groups
@@ -149,7 +148,7 @@ async fn resolve_probes(
     staged: &mut StagedBytes,
 ) -> Result<()> {
     let reader = ReadHandle::Tx(db_tx);
-    let held: Vec<Option<Bytes>> = stream::iter(0..pending.len())
+    let mut held: Vec<(usize, Option<Bytes>)> = stream::iter(0..pending.len())
         .map(|position| {
             let key_bytes = pending[position].key.clone();
             // A value this same batch deletes is free again, whatever the
@@ -157,20 +156,27 @@ async fn resolve_probes(
             let deleted = deleted_unique.contains(&key_bytes);
             async move {
                 if deleted {
-                    Ok(None)
+                    Ok((position, None))
                 } else {
-                    reader.get(key_bytes).await
+                    reader
+                        .get(key_bytes)
+                        .await
+                        .map(|present| (position, present))
                 }
             }
         })
-        .buffered(UNIQUENESS_PROBE_CONCURRENCY)
+        // Completion order carries no meaning. Replenishing the window when
+        // any probe finishes avoids making one slow key hold every later key
+        // behind it; results are restored to batch order below.
+        .buffer_unordered(UNIQUENESS_PROBE_CONCURRENCY)
         .try_collect()
         .await
         .map_err(Error::from)?;
+    held.sort_unstable_by_key(|(position, _)| *position);
 
     // Resolved in batch order, so which entry a rejection names does not
     // depend on which probe happened to finish first.
-    for (probe, present) in pending.drain(..).zip(held) {
+    for (probe, (_, present)) in pending.drain(..).zip(held) {
         if let Some(bytes) = present {
             if decode_row_id(&bytes)? != probe.row_id {
                 match collision(probe.index_id, probe.building, poisoned) {
@@ -592,6 +598,22 @@ pub(crate) async fn null_prefix_row_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A normal fact flush carries 250 source keys plus a handful of newly
+    /// discovered reference keys. They must all enter the first probe window:
+    /// leaving one or two for a second window charges a full remote-read tail
+    /// for almost no work.
+    #[test]
+    fn normal_flush_unique_probes_share_one_window() {
+        const FACTS_AND_REFERENCES: usize = 258;
+        let concurrency = std::hint::black_box(UNIQUENESS_PROBE_CONCURRENCY);
+
+        assert!(
+            concurrency >= FACTS_AND_REFERENCES,
+            "{FACTS_AND_REFERENCES} probes exceed the concurrency window of \
+             {concurrency}"
+        );
+    }
 
     /// The oversized-commit refusal must be terminal: DuckLake re-runs a
     /// commit whose error text carries any of four substrings, and

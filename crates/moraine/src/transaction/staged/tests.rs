@@ -143,6 +143,14 @@ impl CapturedCommitEvents {
         assert_eq!(matching.len(), 1, "events for {message}: {matching:?}");
         matching.into_iter().next().unwrap()
     }
+
+    fn phase_milliseconds(&self, transaction_id: u64, phase: &str) -> f64 {
+        self.one("staged commit landed", &transaction_id.to_string())
+            .get(phase)
+            .unwrap_or_else(|| panic!("commit event has no {phase}"))
+            .parse()
+            .unwrap_or_else(|err| panic!("commit event has invalid {phase}: {err}"))
+    }
 }
 
 fn captured_commit_events() -> &'static CapturedCommitEvents {
@@ -1168,14 +1176,22 @@ struct InFlightStore {
     inner: InMemory,
     in_flight: AtomicUsize,
     peak_in_flight: AtomicUsize,
+    reads: AtomicUsize,
+    read_delay: std::time::Duration,
 }
 
 impl InFlightStore {
     fn new() -> Self {
+        Self::with_read_delay(std::time::Duration::ZERO)
+    }
+
+    fn with_read_delay(read_delay: std::time::Duration) -> Self {
         Self {
             inner: InMemory::new(),
             in_flight: AtomicUsize::new(0),
             peak_in_flight: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
+            read_delay,
         }
     }
 
@@ -1183,10 +1199,15 @@ impl InFlightStore {
         self.peak_in_flight.load(Ordering::Relaxed)
     }
 
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+
     /// Forgets the reads a fixture's own setup issued, so a measurement
     /// covers only the commit under test.
     fn reset(&self) {
         self.peak_in_flight.store(0, Ordering::Relaxed);
+        self.reads.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1225,11 +1246,16 @@ impl ObjectStore for InFlightStore {
             return self.inner.get_opts(location, options).await;
         }
 
+        self.reads.fetch_add(1, Ordering::Relaxed);
         let held = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
         self.peak_in_flight.fetch_max(held, Ordering::AcqRel);
         // The suspension point a real store's round trip would have: a
         // concurrent caller reaches it on every read before any completes.
-        tokio::task::yield_now().await;
+        if self.read_delay.is_zero() {
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(self.read_delay).await;
+        }
         let result = self.inner.get_opts(location, options).await;
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
         result
@@ -1260,6 +1286,18 @@ impl ObjectStore for InFlightStore {
     }
 }
 
+const CONTROLLED_READ_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+fn assert_index_phase_covers_read_waves(milliseconds: f64, waves: usize) {
+    let waves = u32::try_from(waves).unwrap();
+    let minimum = CONTROLLED_READ_DELAY.as_secs_f64() * 1_000.0 * f64::from(waves);
+    assert!(
+        milliseconds >= minimum,
+        "index maintenance took {milliseconds:.3} ms, below {waves} controlled read waves \
+         ({minimum:.3} ms)"
+    );
+}
+
 /// Registers `files` Parquet data files of `rows_per_file` rows each on
 /// the indexed table, in one commit minting snapshot 3. Values are
 /// distinct throughout, so a unique index admits every row, and each file
@@ -1270,9 +1308,10 @@ async fn register_indexed_data_files(
     store: &Arc<InFlightStore>,
     files: usize,
     rows_per_file: usize,
-) {
+) -> u64 {
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let transaction_id = tx.diagnostic_id;
     for file in 0..files {
         let first = file * rows_per_file;
         let values: Vec<i64> = (first..first + rows_per_file)
@@ -1302,6 +1341,7 @@ async fn register_indexed_data_files(
         cells: snapshot_changes_row(3, "inserted_into_table:1"),
     });
     tx.commit().await.unwrap();
+    transaction_id
 }
 
 /// A DuckLake delete file naming `positions` in `target`.
@@ -1475,6 +1515,163 @@ async fn deletes_against_many_data_files_read_them_concurrently() {
         FILES,
         "every target file's scoped read is in flight at once"
     );
+}
+
+/// An append to an indexed table reads the newly registered data file once
+/// to derive its entries. The fixed-latency store makes that one read wave
+/// visible in the phase diagnostic.
+#[tokio::test]
+async fn append_only_index_maintenance_is_one_data_read_wave() {
+    let events = captured_commit_events();
+    let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+    let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
+
+    let transaction_id = register_indexed_data_files(&catalog, &store, 1, 3).await;
+    let milliseconds = events.phase_milliseconds(transaction_id, "index_maintenance_ms");
+
+    assert_eq!(store.reads(), 1, "the registered file is read once");
+    assert_index_phase_covers_read_waves(milliseconds, 1);
+    assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
+    eprintln!("append-only: reads=1 index_maintenance_ms={milliseconds:.3}");
+    catalog.close().await.unwrap();
+}
+
+/// A delete file on an indexed table costs two serial data-store waves: one
+/// to obtain the killed positions and one to recover their old index values
+/// from the committed target file.
+#[tokio::test]
+async fn delete_only_index_maintenance_is_two_data_read_waves() {
+    let events = captured_commit_events();
+    let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+    let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
+    register_indexed_data_files(&catalog, &store, 1, 3).await;
+    store.reset();
+
+    let size = write_delete_file(&store.inner, "delete.parquet", "f0.parquet", &[0]).await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let transaction_id = tx.diagnostic_id;
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: delete_file_row_at(2, "delete.parquet", 1, 1, size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+    let milliseconds = events.phase_milliseconds(transaction_id, "index_maintenance_ms");
+
+    assert_eq!(
+        store.reads(),
+        2,
+        "the delete file and its committed target are each read once"
+    );
+    assert_index_phase_covers_read_waves(milliseconds, 2);
+    assert_eq!(index_entry_count(&catalog, false, index_id).await, 2);
+    eprintln!("delete-only: reads=2 index_maintenance_ms={milliseconds:.3}");
+    catalog.close().await.unwrap();
+}
+
+/// A file-backed replacement pays three serial data-store waves: collect the
+/// delete positions, derive the new file's entries, then derive removals from
+/// the old target.
+#[tokio::test]
+async fn replace_index_maintenance_is_three_data_read_waves() {
+    let events = captured_commit_events();
+    let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+    let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
+    register_indexed_data_files(&catalog, &store, 1, 3).await;
+    store.reset();
+
+    let (_, replacement) = bigint_batch(&[10]);
+    let replacement_size =
+        write_parquet(&store.inner, "main/t/replacement.parquet", &replacement).await;
+    let delete_size = write_delete_file(&store.inner, "delete.parquet", "f0.parquet", &[0]).await;
+    let mut replacement_row =
+        indexed_data_file_row_at(2, "replacement.parquet", 1, replacement_size, 3);
+    replacement_row[2] = Cell::U64(4);
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let transaction_id = tx.diagnostic_id;
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: delete_file_row_at(3, "delete.parquet", 1, 1, delete_size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: replacement_row,
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1,inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+    let milliseconds = events.phase_milliseconds(transaction_id, "index_maintenance_ms");
+
+    assert_eq!(
+        store.reads(),
+        3,
+        "the delete file, replacement file, and old target are each read once"
+    );
+    assert_index_phase_covers_read_waves(milliseconds, 3);
+    assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
+    eprintln!("replace: reads=3 index_maintenance_ms={milliseconds:.3}");
+    catalog.close().await.unwrap();
+}
+
+/// A pure compaction preserves row ids and values, so it neither reads the
+/// replacement file nor stages index entries.
+#[tokio::test]
+async fn compaction_only_index_maintenance_reads_no_data() {
+    let events = captured_commit_events();
+    let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+    let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
+    register_indexed_data_files(&catalog, &store, 1, 3).await;
+    let before = index_entry_keys(&catalog, false, index_id).await;
+    store.reset();
+
+    let mut merged = rewrite_data_file_row(12, 4, "merged.parquet", 3, 1024);
+    merged[11] = Cell::U64(0);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let transaction_id = tx.diagnostic_id;
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: merged,
+    });
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(1), Cell::U64(4)],
+    });
+    tx.stage(RowOperation::UpdateSetBegin {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(12), Cell::U64(4)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "merge_adjacent:1"),
+    });
+    tx.commit().await.unwrap();
+    let milliseconds = events.phase_milliseconds(transaction_id, "index_maintenance_ms");
+
+    assert_eq!(store.reads(), 0, "compaction never reads the merged file");
+    assert_eq!(index_entry_keys(&catalog, false, index_id).await, before);
+    eprintln!("compaction-only: reads=0 index_maintenance_ms={milliseconds:.3}");
+    catalog.close().await.unwrap();
 }
 
 /// Writes a two-column Parquet of `values` beside their preserved
