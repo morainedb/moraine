@@ -1,5 +1,5 @@
-//! The block cache every store in the process shares: one instance, two
-//! slots, one budget.
+//! The caches every store in the process shares: one budget split between
+//! SlateDB metadata, SlateDB blocks, and auxiliary parsed metadata.
 //!
 //! The meta slot holds SST indexes, filters, and stats in memory and
 //! nothing evicts them but their own size — every point probe walks a
@@ -49,6 +49,14 @@ const DEFAULT_CACHE_MEMORY: u64 = 640 * 1024 * 1024;
 /// disagrees.
 const META_SHARE_DIVISOR: u64 = 5;
 
+/// At most this much of the metadata share is reserved for parsed metadata
+/// outside SlateDB.
+const MAX_AUXILIARY_METADATA_MEMORY: u64 = 8 * 1024 * 1024;
+
+/// One sixteenth of the metadata share goes to auxiliary parsed metadata,
+/// up to its fixed ceiling. The remainder continues to hold SlateDB metadata.
+const AUXILIARY_METADATA_SHARE_DIVISOR: u64 = 16;
+
 /// Bytes of disk the block slot's device takes when no cap is
 /// configured — SlateDB's own default for a store's cache.
 pub(crate) const DEFAULT_CACHE_DISK: u64 = 16 * 1024 * 1024 * 1024;
@@ -66,12 +74,25 @@ pub(crate) struct CacheConfig {
 }
 
 impl CacheConfig {
-    /// Bytes for the meta slot and the block slot's memory tier.
-    fn slots(&self) -> (u64, u64) {
+    /// Bytes for SlateDB metadata, scoped Parquet metadata, and the block
+    /// slot's memory tier.
+    fn slots(&self) -> (u64, u64, u64) {
         let budget = self.memory.unwrap_or(DEFAULT_CACHE_MEMORY).max(2);
-        let meta = (budget / META_SHARE_DIVISOR).max(1);
-        (meta, budget.saturating_sub(meta).max(1))
+        let metadata = (budget / META_SHARE_DIVISOR).max(1);
+        let auxiliary_metadata =
+            (metadata / AUXILIARY_METADATA_SHARE_DIVISOR).min(MAX_AUXILIARY_METADATA_MEMORY);
+        let slatedb_metadata = metadata.saturating_sub(auxiliary_metadata).max(1);
+        let blocks = budget.saturating_sub(metadata).max(1);
+        (slatedb_metadata, auxiliary_metadata, blocks)
     }
+}
+
+static AUXILIARY_METADATA_MEMORY: AtomicU64 = AtomicU64::new(MAX_AUXILIARY_METADATA_MEMORY);
+
+/// The process-wide allowance for auxiliary parsed metadata. It is reserved
+/// from the first attach's `CACHE_MEMORY` budget.
+pub(crate) fn auxiliary_metadata_memory() -> usize {
+    usize::try_from(AUXILIARY_METADATA_MEMORY.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
 }
 
 /// The process's cache, built on first use. A `OnceCell` rather than a
@@ -517,7 +538,8 @@ pub(crate) async fn shared(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
 static BUILT_WITH: std::sync::Mutex<Option<CacheConfig>> = std::sync::Mutex::new(None);
 
 async fn build(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
-    let (meta_bytes, block_bytes) = config.slots();
+    let (meta_bytes, auxiliary_metadata_bytes, block_bytes) = config.slots();
+    AUXILIARY_METADATA_MEMORY.store(auxiliary_metadata_bytes, Ordering::Relaxed);
 
     let meta: Arc<dyn DbCache> = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
         max_capacity: meta_bytes,
@@ -542,6 +564,7 @@ async fn build(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
 
     info!(
         meta_bytes,
+        auxiliary_metadata_bytes,
         block_bytes,
         disk = config.dir.is_some(),
         "built the shared block cache"
@@ -747,26 +770,27 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The budget splits into two slots that add up to it, and the meta
-    /// slot is the smaller one — data blocks are what needs the room.
+    /// The budget splits across both SlateDB slots and parsed Parquet
+    /// metadata, with data blocks retaining the largest share.
     #[test]
-    fn the_budget_splits_across_both_slots() {
+    fn the_budget_includes_auxiliary_metadata() {
         let config = CacheConfig {
             memory: Some(1_000),
             ..CacheConfig::default()
         };
-        let (meta, block) = config.slots();
-        assert_eq!(meta + block, 1_000);
-        assert!(meta < block, "meta {meta} should be the smaller slot");
+        let (meta, auxiliary, block) = config.slots();
+        assert_eq!(meta + auxiliary + block, 1_000);
+        assert!(meta + auxiliary < block);
     }
 
     /// An unset budget is what SlateDB gives one store, so a single-store
     /// host is unchanged by the move to a shared cache.
     #[test]
     fn an_unset_budget_matches_one_stores_defaults() {
-        let (meta, block) = CacheConfig::default().slots();
-        assert_eq!(meta + block, DEFAULT_CACHE_MEMORY);
-        assert_eq!(meta, 128 * 1024 * 1024);
+        let (meta, auxiliary, block) = CacheConfig::default().slots();
+        assert_eq!(meta + auxiliary + block, DEFAULT_CACHE_MEMORY);
+        assert_eq!(meta, 120 * 1024 * 1024);
+        assert_eq!(auxiliary, 8 * 1024 * 1024);
         assert_eq!(block, 512 * 1024 * 1024);
     }
 
@@ -922,7 +946,8 @@ mod tests {
             memory: Some(1),
             ..CacheConfig::default()
         };
-        let (meta, block) = config.slots();
+        let (meta, auxiliary, block) = config.slots();
         assert!(meta >= 1 && block >= 1);
+        assert_eq!(auxiliary, 0);
     }
 }

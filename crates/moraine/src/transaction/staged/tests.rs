@@ -685,8 +685,21 @@ async fn stages_inline_schema_and_sequential_inserts() {
     );
     assert_eq!(chunks[1].1.body, b"chunk-b");
 
+    let selected = store_inline::find_inline_chunks_for_rows(ReadHandle::Tx(&tx), 1, &[1, 2])
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.as_ref().map(Vec::len),
+        Some(2),
+        "new chunks must carry one row-range directory entry apiece"
+    );
+
     let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
         .await
+        .unwrap();
+    let format = read::read_format(ReadHandle::Tx(&tx))
+        .await
+        .unwrap()
         .unwrap();
     assert_eq!(
         schemas,
@@ -696,6 +709,10 @@ async fn stages_inline_schema_and_sequential_inserts() {
                 arrow_schema: b"schema".to_vec(),
             }
         )]
+    );
+    assert_eq!(
+        format.format_version,
+        commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY
     );
     tx.rollback();
 }
@@ -747,7 +764,7 @@ async fn stages_inline_idel_and_row_disappears_from_table_scan_after_it() {
     let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
-    let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), 1)
+    let inline_deletes = store_inline::scan_inline_deletes(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
     tx.rollback();
@@ -1084,11 +1101,20 @@ async fn inline_row_delete_removes_its_non_unique_index_entry() {
     );
 }
 
-/// Every index consumes a different slice of one decoded Arrow batch. The
-/// chunk itself is parsed once however many indexes cover its table.
+/// Every index consumes a different slice of one decoded Arrow batch. Each
+/// chunk is parsed once, while chunks of one table version share one decoded
+/// schema for the whole commit.
 #[tokio::test]
-async fn inline_chunk_is_decoded_once_for_all_indexes() {
-    use crate::catalog::{IndexDef, TableId, scoped_read::inline_batch_decode_count};
+async fn inline_chunks_share_one_schema_and_decode_once_each() {
+    use arrow::{
+        array::{Int64Array, RecordBatch},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    use crate::catalog::{
+        IndexDef, TableId,
+        scoped_read::{inline_batch_decode_count, inline_schema_decode_count},
+    };
 
     const ROW_ID_START: u64 = 9_000_000_004;
 
@@ -1111,15 +1137,70 @@ async fn inline_chunk_is_decoded_once_for_all_indexes() {
         .await
         .unwrap();
 
-    let before = inline_batch_decode_count(ROW_ID_START);
-    inline_insert(&catalog, 4, ROW_ID_START, &[7], true).await;
-    let after = inline_batch_decode_count(ROW_ID_START);
+    // A distinct field name gives this test a schema fingerprint no other
+    // concurrently running inline test can increment.
+    let schema = Schema::new(vec![Field::new(
+        "schema_cache_test_a",
+        DataType::Int64,
+        true,
+    )]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int64Array::from(vec![7]))],
+    )
+    .unwrap();
+    let schema_ipc = inline_schema_ipc(&schema);
+    let body = inline_body(&batch);
+    let before_schema = inline_schema_decode_count(&schema_ipc);
+    let before_first = inline_batch_decode_count(ROW_ID_START);
+    let before_second = inline_batch_decode_count(ROW_ID_START + 1);
 
-    assert_eq!(after - before, 1, "the Arrow chunk is decoded once");
-    assert_eq!(index_entry_count(&catalog, false, first_index_id).await, 1);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::InlineSchema {
+        table_id: 1,
+        schema_version: 0,
+        arrow_schema: schema_ipc.clone(),
+    });
+    for row_id_start in [ROW_ID_START, ROW_ID_START + 1] {
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 4,
+            row_id_start,
+            row_count: 1,
+            arrow_body: body.clone(),
+        });
+    }
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "inlined_insert:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        inline_schema_decode_count(&schema_ipc) - before_schema,
+        1,
+        "the shared schema is decoded once"
+    );
+    assert_eq!(
+        inline_batch_decode_count(ROW_ID_START) - before_first,
+        1,
+        "the first Arrow chunk is decoded once"
+    );
+    assert_eq!(
+        inline_batch_decode_count(ROW_ID_START + 1) - before_second,
+        1,
+        "the second Arrow chunk is decoded once"
+    );
+    assert_eq!(index_entry_count(&catalog, false, first_index_id).await, 2);
     assert_eq!(
         index_entry_count(&catalog, false, second_index_id.get().unwrap().get()).await,
-        1
+        2
     );
 }
 
@@ -3130,11 +3211,22 @@ async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
     let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
-    let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), 1)
+    let inline_deletes = store_inline::scan_inline_deletes(ReadHandle::Tx(&tx), 1)
+        .await
+        .unwrap();
+    let directory = tx
+        .get(
+            Key::Inline(InlineKey::ChunkRange {
+                table_id: 1,
+                row_id_end: 1,
+            })
+            .encode(),
+        )
         .await
         .unwrap();
     tx.rollback();
     assert!(chunks.is_empty(), "flushed chunk must be gone: {chunks:?}");
+    assert!(directory.is_none(), "flushed locator must be gone");
     assert!(
         inline_deletes.is_empty(),
         "consumed inline_delete must be gone: {inline_deletes:?}"
@@ -3201,10 +3293,21 @@ async fn stages_inline_drop_removes_every_record_for_the_table() {
     let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
+    let directory = tx
+        .get(
+            Key::Inline(InlineKey::ChunkRange {
+                table_id: 1,
+                row_id_end: 0,
+            })
+            .encode(),
+        )
+        .await
+        .unwrap();
     tx.rollback();
     assert!(chunks.is_empty());
     assert!(file_deletes.is_empty());
     assert!(schemas.is_empty());
+    assert!(directory.is_none());
 }
 
 /// `InlineSchemaDrop` removes only the named schema version's

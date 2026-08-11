@@ -44,8 +44,7 @@ pub(crate) async fn translate_inline_flush_delete(
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<HashSet<u64>> {
     let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
-    let inline_deletes =
-        store_inline::scan_inline_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?;
+    let inline_deletes = store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?;
 
     let scoped: Vec<(InlineOperation, proto::InlineChunkValue)> = chunks
         .into_iter()
@@ -54,11 +53,12 @@ pub(crate) async fn translate_inline_flush_delete(
         )
         .collect();
 
-    for (op, _) in &scoped {
+    for (op, chunk) in &scoped {
         if let InlineOperation::Insert { begin_snapshot, .. } = op
             && *begin_snapshot <= flush_snapshot
         {
             writes.push((Key::Inline(InlineKey::Live(*op)).encode(), None));
+            writes.push(inline_chunk_range_delete(table_id, chunk)?);
         }
     }
 
@@ -200,9 +200,19 @@ pub(super) async fn translate_inline_drop(
     for (op, _) in store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await? {
         writes.push((Key::Inline(InlineKey::Live(op)).encode(), None));
     }
-    for (row_id, _) in
-        store_inline::scan_inline_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?
+    for row_id_end in
+        store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id).await?
     {
+        writes.push((
+            Key::Inline(InlineKey::ChunkRange {
+                table_id,
+                row_id_end,
+            })
+            .encode(),
+            None,
+        ));
+    }
+    for (row_id, _) in store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id).await? {
         writes.push((
             Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
                 table_id,
@@ -296,6 +306,62 @@ pub(crate) fn inline_insert_write(
     )
 }
 
+fn inline_chunk_row_id_end(row_id_start: u64, row_count: u64) -> Option<u64> {
+    row_count
+        .checked_sub(1)
+        .and_then(|offset| row_id_start.checked_add(offset))
+}
+
+pub(crate) fn inline_chunk_range_write(
+    table_id: u64,
+    schema_version: u64,
+    begin_snapshot: u64,
+    chunk_seq: u64,
+    row_id_start: u64,
+    row_count: u64,
+) -> Result<commit::StagedWrite> {
+    let row_id_end = inline_chunk_row_id_end(row_id_start, row_count).ok_or_else(|| {
+        Error::Constraint(format!(
+            "inline chunk for table {table_id} has an empty or overflowing row-id range"
+        ))
+    })?;
+
+    Ok((
+        Key::Inline(InlineKey::ChunkRange {
+            table_id,
+            row_id_end,
+        })
+        .encode(),
+        Some(value::encode_value(&proto::InlineChunkRangeValue {
+            row_id_start,
+            schema_version,
+            begin_snapshot,
+            chunk_seq,
+        })),
+    ))
+}
+
+fn inline_chunk_range_delete(
+    table_id: u64,
+    chunk: &proto::InlineChunkValue,
+) -> Result<commit::StagedWrite> {
+    let row_id_end =
+        inline_chunk_row_id_end(chunk.row_id_start, chunk.row_count).ok_or_else(|| {
+            Error::Corruption(format!(
+                "inline chunk for table {table_id} has an empty or overflowing row-id range"
+            ))
+        })?;
+
+    Ok((
+        Key::Inline(InlineKey::ChunkRange {
+            table_id,
+            row_id_end,
+        })
+        .encode(),
+        None,
+    ))
+}
+
 pub(crate) fn inline_inline_delete_write(
     table_id: u64,
     row_id: u64,
@@ -383,6 +449,7 @@ fn gather_file_delete_removals(ops: &[RowOperation]) -> BTreeMap<u64, Vec<(u64, 
     removals
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn translate_inline(
     db_tx: &DbTransaction,
     ops: &[RowOperation],
@@ -431,6 +498,14 @@ pub(super) async fn translate_inline(
                     *row_count,
                     arrow_body,
                 ));
+                writes.push(inline_chunk_range_write(
+                    *table_id,
+                    *schema_version,
+                    *begin_snapshot,
+                    chunk_seq,
+                    *row_id_start,
+                    *row_count,
+                )?);
             }
             RowOperation::InlineInlineDelete {
                 table_id,

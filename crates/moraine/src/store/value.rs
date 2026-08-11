@@ -141,6 +141,11 @@ mod tests {
         InlineChunkValue
     );
     codec_tests!(
+        roundtrip_inline_chunk_range,
+        garbage_inline_chunk_range,
+        InlineChunkRangeValue
+    );
+    codec_tests!(
         roundtrip_inline_inline_delete,
         garbage_inline_inline_delete,
         InlineInlineDeleteValue

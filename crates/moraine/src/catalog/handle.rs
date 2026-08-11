@@ -476,10 +476,10 @@ pub struct CatalogOptions {
     /// default) leaves a cap of 16 GiB in force, and without a
     /// [`cache_dir`](Self::cache_dir) there is no device to bound.
     pub cache_size: Option<u64>,
-    /// How much memory that cache may hold across both of its slots — SST
-    /// metadata, which is pinned so a scan cannot evict the filters every
-    /// probe walks, and data blocks, which tier to the device when one is
-    /// configured. Process-wide, like [`cache_size`](Self::cache_size).
+    /// How much memory the process-wide caches may hold — SST metadata,
+    /// parsed Parquet metadata used by equality-index upkeep, and data
+    /// blocks, which tier to the device when one is configured.
+    /// Process-wide, like [`cache_size`](Self::cache_size).
     /// `None` (the default) takes what SlateDB gives a single store, now
     /// for the whole process. Never inert: the memory slots exist with or
     /// without a `cache_dir`, and this is the number to weigh against
@@ -1015,7 +1015,7 @@ impl ReadOnlyCatalog {
             None => commit::read_head_id(handle).await?,
         };
         let chunks = store_inline::scan_inline_chunks(handle, table.get()).await?;
-        let tombstones = store_inline::scan_inline_inline_deletes(handle, table.get()).await?;
+        let tombstones = store_inline::scan_inline_deletes(handle, table.get()).await?;
 
         let live = InlineScanKind::Table.select(
             &materialize_inline_rows(&chunks, &tombstones),
@@ -1587,7 +1587,7 @@ impl ReadOnlyCatalog {
             let mut entries = Vec::new();
             for file in snapshot.data_files_of(table) {
                 let path = resolve(&file.path, file.path_is_relative);
-                let scoped = scoped_read::scoped_read_entries(
+                let scoped = scoped_read::scoped_read_entries_with_footer(
                     Arc::clone(&object_store),
                     &path,
                     &positions,
@@ -1596,6 +1596,7 @@ impl ReadOnlyCatalog {
                         row_id_start: file.row_id_start,
                     },
                     Some(file.file_size_bytes),
+                    Some(file.footer_size),
                 )
                 .await?;
                 let dead_positions = killed_positions.get(&file.id.get());
@@ -1658,7 +1659,7 @@ impl ReadOnlyCatalog {
             // reinsert the same row id in the tombstone's snapshot, and that
             // newer value is live and must be indexed.
             let dead: HashMap<u64, u64> =
-                store_inline::scan_inline_inline_deletes(session.handle(), table.get())
+                store_inline::scan_inline_deletes(session.handle(), table.get())
                     .await?
                     .into_iter()
                     .map(|(row_id, deletion)| (row_id, deletion.end_snapshot))
@@ -2995,6 +2996,7 @@ impl Catalog {
                     .or_default()
                     .insert(row_id);
             }
+
             for delete in snapshot.delete_files_of(table) {
                 let path = resolve(&delete.path, delete.path_is_relative);
                 let positions =
@@ -3033,6 +3035,7 @@ impl Catalog {
                         row_id_start: file.row_id_start,
                     },
                     Some(file.file_size_bytes),
+                    Some(file.footer_size),
                     start,
                     &mut consumer,
                 )

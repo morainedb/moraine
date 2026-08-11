@@ -260,8 +260,9 @@ impl EntityKey {
 
 /// An inlined-data key: the per-schema-version Arrow schema, a live
 /// record, the archived (post-flush) form of a live record, or a
-/// delete-table existence marker. `Live` and `Arch` share [`InlineOp`], so
-/// an archive key has exactly the components of its live form.
+/// delete-table existence marker, or a live chunk's row-range locator.
+/// `Live` and `Arch` share [`InlineOperation`], so an archive key has exactly
+/// the components of its live form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum InlineKey {
     /// Arrow IPC schema message, once per `(table, schema_version)`. Has
@@ -288,6 +289,14 @@ pub(crate) enum InlineKey {
     FileDeleteTable {
         /// Owning table.
         table_id: u64,
+    },
+    /// One live inline chunk's inclusive row-id end. Appended last so every
+    /// previously shipped variant keeps its discriminant.
+    ChunkRange {
+        /// Owning table.
+        table_id: u64,
+        /// Inclusive end of the chunk's contiguous row-id range.
+        row_id_end: u64,
     },
 }
 
@@ -351,6 +360,35 @@ impl Key {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
         storekey::decode(bytes).map_err(|err| Error::Corruption(format!("key: {err}")))
     }
+}
+
+/// Encodes one equality-index entry from a borrowed canonical value. This is
+/// byte-identical to [`Key::Index`] but avoids constructing an owned key and
+/// cloning its potentially large canonical payload before serialization.
+pub(crate) fn encode_index_entry(
+    index_id: u64,
+    unique: bool,
+    key: &CanonicalKey,
+    row_id: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut writer = storekey::Writer::new(&mut bytes);
+    // Infallible by construction: a `Vec` sink raises no I/O error and these
+    // primitive/canonical encoders raise no custom error. The discriminants
+    // are the pinned `Key::Index` and `IndexKey::{Unique,Multi}` variants.
+    let result = (|| -> std::result::Result<(), storekey::EncodeError> {
+        writer.write_u8(7)?;
+        writer.write_u8(if unique { 2 } else { 3 })?;
+        writer.write_u64(index_id)?;
+        <CanonicalKey as Encode<()>>::encode(key, &mut writer)?;
+        if !unique {
+            writer.write_u64(row_id)?;
+        }
+        Ok(())
+    })();
+    #[allow(clippy::expect_used)]
+    result.expect("storekey encode into a Vec cannot fail");
+    bytes
 }
 
 /// A subspace, fieldless — for building scan prefixes without naming
@@ -578,6 +616,33 @@ pub(crate) fn inline_schema_prefix() -> Vec<u8> {
         }),
         INLINE_SCHEMA_PREFIX_LEN,
     )
+}
+
+/// Discriminant bytes preceding an `inline/chunk_range` key's components:
+/// subspace, then `InlineKey::ChunkRange`.
+const INLINE_CHUNK_RANGE_PREFIX_LEN: usize = 2;
+
+/// Byte prefix of every chunk-range locator scoped to `table_id`.
+pub(crate) fn inline_chunk_range_table_prefix(table_id: u64) -> Vec<u8> {
+    prefix_of(
+        &Key::Inline(InlineKey::ChunkRange {
+            table_id,
+            row_id_end: 0,
+        }),
+        INLINE_CHUNK_RANGE_PREFIX_LEN + size_of::<u64>(),
+    )
+}
+
+/// The range suffix that seeks to the first chunk ending at or after
+/// `row_id` within [`inline_chunk_range_table_prefix`].
+pub(crate) fn inline_chunk_range_suffix(table_id: u64, row_id: u64) -> Vec<u8> {
+    let prefix = inline_chunk_range_table_prefix(table_id);
+    let encoded = Key::Inline(InlineKey::ChunkRange {
+        table_id,
+        row_id_end: row_id,
+    })
+    .encode();
+    encoded[prefix.len()..].to_vec()
 }
 
 /// Discriminant bytes preceding an index entry's components: the `index`
@@ -884,6 +949,18 @@ mod tests {
     }
 
     #[test]
+    fn golden_inline_chunk_range_key() {
+        let mut expect = vec![0x06, 0x06];
+        expect.extend(be(7));
+        expect.extend(be(29));
+        let key = Key::Inline(InlineKey::ChunkRange {
+            table_id: 7,
+            row_id_end: 29,
+        });
+        assert_eq!(key.encode(), expect);
+    }
+
+    #[test]
     fn golden_arch_kinds_are_distinct_from_live() {
         let ops = [
             InlineOperation::Insert {
@@ -934,6 +1011,34 @@ mod tests {
         let mut prefix = vec![0x07, 0x02];
         prefix.extend(be(1));
         assert!(bytes.starts_with(&prefix), "{bytes:?}");
+    }
+
+    #[test]
+    fn borrowed_index_entry_encoder_matches_owned_key() {
+        let canonical = canon(&[
+            IndexKeyValue::Str("a\0\u{1}z".to_owned()),
+            IndexKeyValue::Bytes(vec![0, 1, 0xff]),
+        ]);
+        for unique in [false, true] {
+            for row_id in [0, 1_u64 << 56, u64::MAX] {
+                let owned = if unique {
+                    Key::Index(IndexKey::Unique {
+                        index_id: 7,
+                        key: canonical.clone(),
+                    })
+                } else {
+                    Key::Index(IndexKey::Multi {
+                        index_id: 7,
+                        key: canonical.clone(),
+                        row_id,
+                    })
+                };
+                assert_eq!(
+                    encode_index_entry(7, unique, &canonical, row_id),
+                    owned.encode()
+                );
+            }
+        }
     }
 
     /// A non-unique entry key ends in a raw row id, directly after the
@@ -1428,12 +1533,43 @@ mod tests {
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Live(op))),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Arch(op))),
             any::<u64>().prop_map(|table_id| Key::Inline(InlineKey::FileDeleteTable { table_id })),
+            any::<(u64, u64)>().prop_map(|(table_id, row_id_end)| {
+                Key::Inline(InlineKey::ChunkRange {
+                    table_id,
+                    row_id_end,
+                })
+            }),
             arb_index().prop_map(Key::Index),
             any::<u64>().prop_map(|snapshot_id| Key::Changelog { snapshot_id }),
         ]
     }
 
     proptest! {
+        #[test]
+        fn borrowed_index_entry_encoding_matches_owned(
+            index_id in any::<u64>(),
+            key in arb_canonical_key(),
+            row_id in any::<u64>(),
+            unique in any::<bool>(),
+        ) {
+            let owned = if unique {
+                Key::Index(IndexKey::Unique {
+                    index_id,
+                    key: key.clone(),
+                })
+            } else {
+                Key::Index(IndexKey::Multi {
+                    index_id,
+                    key: key.clone(),
+                    row_id,
+                })
+            };
+            prop_assert_eq!(
+                encode_index_entry(index_id, unique, &key, row_id),
+                owned.encode()
+            );
+        }
+
         #[test]
         fn roundtrip(key in arb_key()) {
             let decoded = Key::decode(&key.encode()).unwrap();

@@ -4,14 +4,16 @@
 
 use std::{collections::BTreeSet, future::Future, sync::LazyLock};
 
+use arrow::datatypes::SchemaRef;
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 
 use super::{
     Arc, CatalogSnapshot, Cell, ColumnInfo, DbTransaction, Error, HashMap, HashSet, IndexInfo,
-    InlineOperation, ObjectStore, ReadHandle, Result, RowOperation, ScopedReadEntry, StagedEntries,
+    InlineOperation, ObjectStore, ReadHandle, Result, RowOperation, StagedEntries,
     StagedIndexEntry, TableId, TableKind,
     decode::{Cursor, decode_data_file, decode_delete_file},
-    encode_ordered_values, proto, scoped_read, stage_index_entry_groups, store_inline,
+    proto, scoped_read, stage_index_entries, store_inline,
 };
 use crate::transaction::operations::ChangeSet;
 
@@ -29,6 +31,53 @@ const INLINE_DECODE_CONCURRENCY: usize = 8;
 
 static INLINE_DECODE_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(INLINE_DECODE_CONCURRENCY)));
+
+/// Decoded inline schemas shared by every chunk in one commit. Holding the
+/// mutex through the first catalog read guarantees concurrent chunks of one
+/// table version still decode its IPC exactly once.
+struct InlineSchemaCache<'a> {
+    pending: &'a HashMap<(u64, u64), &'a [u8]>,
+    decoded: tokio::sync::Mutex<HashMap<(u64, u64), SchemaRef>>,
+}
+
+impl<'a> InlineSchemaCache<'a> {
+    fn new(pending: &'a HashMap<(u64, u64), &'a [u8]>) -> Self {
+        Self {
+            pending,
+            decoded: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn get(
+        &self,
+        db_tx: &DbTransaction,
+        table_id: u64,
+        schema_version: u64,
+    ) -> Result<SchemaRef> {
+        let key = (table_id, schema_version);
+        let mut decoded = self.decoded.lock().await;
+        if let Some(schema) = decoded.get(&key) {
+            return Ok(Arc::clone(schema));
+        }
+
+        let schema_ipc = if let Some(bytes) = self.pending.get(&key) {
+            Bytes::copy_from_slice(bytes)
+        } else {
+            let stored =
+                store_inline::read_inline_schema(ReadHandle::Tx(db_tx), table_id, schema_version)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Corruption(format!(
+                            "no inline schema for table {table_id} version {schema_version}"
+                        ))
+                    })?;
+            Bytes::from(stored.arrow_schema)
+        };
+        let schema = scoped_read::decode_inline_schema(schema_ipc)?;
+        decoded.insert(key, Arc::clone(&schema));
+        Ok(schema)
+    }
+}
 
 /// Resolves independent reads concurrently and returns their results in
 /// target order. Keeping the order stable makes staging and error selection
@@ -139,7 +188,7 @@ pub(super) async fn data_file_index_entries(
     let path = data_file_object_path(base, &file, context.prefix)?;
     // Every row is wanted here: a registration indexes the file's whole
     // contents, minus the few this same commit kills.
-    let per_index = per_index_scoped_entries(
+    let scoped = scoped_index_entries(
         base,
         &indexes,
         table,
@@ -147,6 +196,7 @@ pub(super) async fn data_file_index_entries(
         &file,
         &path,
         scoped_read::ScopedRows::All,
+        killed,
     )
     .await?;
 
@@ -155,25 +205,14 @@ pub(super) async fn data_file_index_entries(
     // interchangeable: an entry's key carries no file, so a removal beside
     // an add would be indistinguishable from an UPDATE's — which rewrites
     // a row into a new file under its preserved id and must keep its entry.
-    let mut entries = Vec::new();
-    for (index, scoped) in indexes.iter().zip(per_index) {
-        let surviving = scoped
-            .into_iter()
-            .enumerate()
-            .filter(|(ordinal, _)| !killed.is_some_and(|k| k.contains(&(*ordinal as u64))))
-            .map(|(_, entry)| entry)
-            .collect();
-        push_index_entries(&mut entries, index, surviving, false)?;
-    }
-    Ok(entries)
+    staged_scoped_entries(&indexes, scoped, false)
 }
 
-/// One scoped read of `file` covering every index's columns at once — the
-/// footer and any shared column chunks are fetched a single time — split
-/// back into per-index entry lists, ordered as `indexes`. `rows` names which
-/// of the file's rows to decode, so a caller wanting a few of them pays for
-/// a few of them.
-pub(super) async fn per_index_scoped_entries(
+/// One scoped read of `file` covering every index's columns at once. The
+/// footer and shared column chunks are fetched once, and values become final
+/// canonical keys while their Arrow arrays are borrowed.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn scoped_index_entries(
     base: &CatalogSnapshot,
     indexes: &[IndexInfo],
     table: TableId,
@@ -181,42 +220,69 @@ pub(super) async fn per_index_scoped_entries(
     file: &proto::DataFileValue,
     path: &object_store::path::Path,
     rows: scoped_read::ScopedRows<'_>,
-) -> Result<Vec<Vec<ScopedReadEntry>>> {
+    excluded_ordinals: Option<&BTreeSet<u64>>,
+) -> Result<Vec<scoped_read::ScopedIndexEntry>> {
     let live_columns = base.columns_of(table);
-    let mut all_positions = Vec::new();
-    let mut spans = Vec::with_capacity(indexes.len());
-    for index in indexes {
-        let positions = index_positions(&live_columns, index, table)?;
-        spans.push((all_positions.len(), positions.len()));
-        all_positions.extend(positions);
-    }
-
-    // Values come back ordered exactly as `all_positions`, so each index's
-    // slice of a row's values is its own columns in its own order.
-    let scoped = scoped_read::scoped_read_entries(
+    let projections = index_projections(&live_columns, indexes, table)?;
+    scoped_read::scoped_read_index_entries(
         Arc::clone(data_store),
         path,
-        &all_positions,
+        &projections,
         rows,
         scoped_read::RowIdSource::Resolve {
             row_id_start: file.row_id_start,
         },
         Some(file.file_size_bytes),
+        Some(file.footer_size),
+        excluded_ordinals,
     )
-    .await?;
+    .await
+}
 
-    Ok(spans
-        .into_iter()
-        .map(|(start, len)| {
-            scoped
-                .iter()
-                .map(|entry| ScopedReadEntry {
-                    row_id: entry.row_id,
-                    values: entry.values[start..start + len].to_vec(),
-                })
-                .collect()
+/// Compiles one Arrow projection per index. Shared source positions are
+/// deduplicated by the scoped reader before Parquet columns are fetched.
+fn index_projections(
+    live_columns: &[ColumnInfo],
+    indexes: &[IndexInfo],
+    table: TableId,
+) -> Result<Vec<scoped_read::IndexProjection>> {
+    indexes
+        .iter()
+        .map(|index| {
+            Ok(scoped_read::IndexProjection {
+                index_id: index.id.get(),
+                unique: index.unique,
+                positions: index_positions(live_columns, index, table)?,
+                directions: index.directions.clone(),
+                nulls: index.nulls.clone(),
+            })
         })
-        .collect())
+        .collect()
+}
+
+/// Attaches index metadata to already encoded Arrow keys.
+fn staged_scoped_entries(
+    indexes: &[IndexInfo],
+    scoped: Vec<scoped_read::ScopedIndexEntry>,
+    delete: bool,
+) -> Result<Vec<StagedIndexEntry>> {
+    scoped
+        .into_iter()
+        .map(|entry| {
+            let index = indexes.get(entry.index).ok_or_else(|| {
+                Error::Corruption("scoped read returned an unknown index projection".to_owned())
+            })?;
+
+            Ok(StagedIndexEntry {
+                index_id: index.id.get(),
+                unique: entry.unique,
+                key: entry.key,
+                row_id: entry.row_id,
+                delete,
+                building: index.state != crate::catalog::IndexState::Ready,
+            })
+        })
+        .collect()
 }
 
 /// Returns the ids of any building indexes a duplicate poisoned — the
@@ -230,6 +296,7 @@ pub(super) async fn stage_index_maintenance(
     data_prefix: &str,
 ) -> Result<StagedEntries> {
     let pending_schemas = pending_inline_schemas(ops);
+    let inline_schemas = InlineSchemaCache::new(&pending_schemas);
     let context = FileContext {
         store: data_store,
         prefix: data_prefix,
@@ -263,8 +330,8 @@ pub(super) async fn stage_index_maintenance(
     // removal sources are independent. Resolve all three together, then
     // append in the historical order so staging and errors stay stable.
     let (additions, inline_removals, file_removals) = futures::try_join!(
-        derive_adds(db_tx, base, &pending_schemas, &context, &add_plan.adds),
-        derive_inline_removals(db_tx, base, ops, &pending_schemas, inline_targets),
+        derive_adds(db_tx, base, &inline_schemas, &context, &add_plan.adds),
+        derive_inline_removals(db_tx, base, ops, &inline_schemas, inline_targets),
         derive_file_removals(base, &context, targets),
     )?;
     let mut deferred = add_plan.deferred;
@@ -281,10 +348,11 @@ pub(super) async fn stage_index_maintenance(
             bytes: 0,
         });
     }
-    let mut staged = stage_index_entry_groups(db_tx, &entry_groups).await?;
+    let mut staged = stage_index_entries(db_tx, &entry_groups).await?;
     deferred.sort_unstable();
     deferred.dedup();
     staged.deferred = deferred;
+
     Ok(staged)
 }
 
@@ -361,6 +429,7 @@ fn plan_adds<'a>(
     let mut registered: HashSet<(u64, u64)> = HashSet::new();
     let mut deferred = Vec::new();
     let mut adds: Vec<Add<'_>> = Vec::new();
+
     for op in ops {
         match op {
             RowOperation::Insert {
@@ -438,7 +507,7 @@ fn plan_adds<'a>(
 async fn derive_adds(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
-    pending_schemas: &HashMap<(u64, u64), &[u8]>,
+    inline_schemas: &InlineSchemaCache<'_>,
     context: &FileContext<'_>,
     adds: &[Add<'_>],
 ) -> Result<Vec<StagedIndexEntry>> {
@@ -449,7 +518,7 @@ async fn derive_adds(
                     data_file_index_entries(base, cells, *killed, context).await
                 }
                 Add::Inline { table_id, chunk } => {
-                    inline_chunk_index_entries(db_tx, base, pending_schemas, *table_id, chunk, None)
+                    inline_chunk_index_entries(db_tx, base, inline_schemas, *table_id, chunk, None)
                         .await
                 }
             }
@@ -465,7 +534,7 @@ async fn derive_inline_removals(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
-    pending_schemas: &HashMap<(u64, u64), &[u8]>,
+    inline_schemas: &InlineSchemaCache<'_>,
     targets: Vec<(&u64, &Vec<u64>)>,
 ) -> Result<Vec<StagedIndexEntry>> {
     resolve_entries_in_order(
@@ -475,7 +544,7 @@ async fn derive_inline_removals(
                 db_tx,
                 base,
                 ops,
-                pending_schemas,
+                inline_schemas,
                 *table_id,
                 row_ids,
                 &mut entries,
@@ -633,34 +702,13 @@ mod concurrency_tests {
     }
 }
 
-/// One chunk version's Arrow IPC schema: this commit's staged record if it
-/// registered one, else the committed one.
-pub(super) async fn inline_schema_for<'a>(
-    db_tx: &DbTransaction,
-    pending_schemas: &HashMap<(u64, u64), &'a [u8]>,
-    table_id: u64,
-    schema_version: u64,
-) -> Result<std::borrow::Cow<'a, [u8]>> {
-    if let Some(bytes) = pending_schemas.get(&(table_id, schema_version)) {
-        return Ok(std::borrow::Cow::Borrowed(bytes));
-    }
-    let stored = store_inline::read_inline_schema(ReadHandle::Tx(db_tx), table_id, schema_version)
-        .await?
-        .ok_or_else(|| {
-            Error::Corruption(format!(
-                "no inline schema for table {table_id} version {schema_version}"
-            ))
-        })?;
-    Ok(std::borrow::Cow::Owned(stored.arrow_schema))
-}
-
 /// The index entries for one inline chunk's rows: every row when `held` is
 /// `None` (the chunk is being inserted), or just those rows when it is
 /// `Some` (they are being deleted, so their entries are removals).
-pub(super) async fn inline_chunk_index_entries(
+async fn inline_chunk_index_entries(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
-    pending_schemas: &HashMap<(u64, u64), &[u8]>,
+    inline_schemas: &InlineSchemaCache<'_>,
     table_id: u64,
     chunk: &InlineChunk<'_>,
     held: Option<&HashSet<u64>>,
@@ -677,12 +725,12 @@ pub(super) async fn inline_chunk_index_entries(
         return Ok(Vec::new());
     }
 
-    let schema_ipc = inline_schema_for(db_tx, pending_schemas, table_id, chunk.schema_version)
-        .await?
-        .into_owned();
+    let schema = inline_schemas
+        .get(db_tx, table_id, chunk.schema_version)
+        .await?;
     let plan = InlineDecodePlan {
-        schema_ipc,
-        body: chunk.body.to_vec(),
+        schema,
+        body: Bytes::copy_from_slice(chunk.body),
         live_columns: base.columns_of(table),
         indexes,
         row_id_start: chunk.row_id_start,
@@ -695,8 +743,8 @@ pub(super) async fn inline_chunk_index_entries(
 /// Owned input for one blocking Arrow decode. Ownership lets the work leave
 /// the async executor without tying a worker to the transaction's borrows.
 struct InlineDecodePlan {
-    schema_ipc: Vec<u8>,
-    body: Vec<u8>,
+    schema: SchemaRef,
+    body: Bytes,
     live_columns: Vec<ColumnInfo>,
     indexes: Vec<IndexInfo>,
     row_id_start: u64,
@@ -704,42 +752,24 @@ struct InlineDecodePlan {
 }
 
 impl InlineDecodePlan {
-    /// Decodes the chunk once, then slices each row's projected values back
-    /// into the index whose columns requested them.
+    /// Decodes the chunk once and writes each borrowed Arrow scalar directly
+    /// into its index's final canonical key.
     fn derive(self) -> Result<Vec<StagedIndexEntry>> {
-        let mut all_positions = Vec::new();
-        let mut spans = Vec::with_capacity(self.indexes.len());
-        for index in &self.indexes {
-            let positions = index_positions(&self.live_columns, index, index.table_id)?;
-            spans.push((all_positions.len(), positions.len()));
-            all_positions.extend(positions);
-        }
-
-        let scoped = scoped_read::inline_batch_entries(
-            &self.schema_ipc,
+        let table = self
+            .indexes
+            .first()
+            .map(|index| index.table_id)
+            .ok_or_else(|| Error::Corruption("inline index plan has no index".to_owned()))?;
+        let projections = index_projections(&self.live_columns, &self.indexes, table)?;
+        let scoped = scoped_read::inline_batch_index_entries(
+            self.schema,
             &self.body,
-            &all_positions,
+            &projections,
             self.row_id_start,
+            self.held.as_ref(),
         )?;
         let delete = self.held.is_some();
-        let mut entries = Vec::new();
-        for (index, (start, len)) in self.indexes.iter().zip(spans) {
-            let per_index = scoped
-                .iter()
-                .filter(|entry| {
-                    self.held
-                        .as_ref()
-                        .is_none_or(|rows| rows.contains(&entry.row_id))
-                })
-                .map(|entry| ScopedReadEntry {
-                    row_id: entry.row_id,
-                    values: entry.values[start..start + len].to_vec(),
-                })
-                .collect();
-            push_index_entries(&mut entries, index, per_index, delete)?;
-        }
-
-        Ok(entries)
+        staged_scoped_entries(&self.indexes, scoped, delete)
     }
 }
 
@@ -761,11 +791,11 @@ impl InlineChunk<'_> {
 /// Derives the entry removals for rows tombstoned out of inline chunks. A
 /// tombstoned row's indexed values come from the chunk holding it, so the
 /// removal rides the same batch that kills the row.
-pub(super) async fn stage_inline_delete_entries(
+async fn stage_inline_delete_entries(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
-    pending_schemas: &HashMap<(u64, u64), &[u8]>,
+    inline_schemas: &InlineSchemaCache<'_>,
     table_id: u64,
     row_ids: &[u64],
     entries: &mut Vec<StagedIndexEntry>,
@@ -776,7 +806,13 @@ pub(super) async fn stage_inline_delete_entries(
         return Ok(());
     }
 
-    let committed = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
+    let committed =
+        match store_inline::find_inline_chunks_for_rows(ReadHandle::Tx(db_tx), table_id, row_ids)
+            .await?
+        {
+            Some(chunks) => chunks,
+            None => store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?,
+        };
     let mut chunks: Vec<InlineChunk<'_>> = committed
         .iter()
         .filter_map(|(op, value)| match op {
@@ -828,7 +864,7 @@ pub(super) async fn stage_inline_delete_entries(
 
     let decoded = resolve_entries_in_order(
         targets.into_iter().map(|(chunk, held)| async move {
-            inline_chunk_index_entries(db_tx, base, pending_schemas, table_id, chunk, Some(&held))
+            inline_chunk_index_entries(db_tx, base, inline_schemas, table_id, chunk, Some(&held))
                 .await
         }),
         INLINE_DECODE_CONCURRENCY,
@@ -937,7 +973,7 @@ pub(super) async fn file_delete_index_entries(
     // positions are read: a delete costs the rows it removes rather than the
     // file holding them. The scoped read resolves each position to the row it
     // holds — one rule for dense and per-row-id targets alike.
-    let per_index = per_index_scoped_entries(
+    let scoped = scoped_index_entries(
         base,
         &indexes,
         table,
@@ -945,13 +981,10 @@ pub(super) async fn file_delete_index_entries(
         &file,
         &path,
         scoped_read::ScopedRows::At(&killed.positions),
+        None,
     )
     .await?;
-    let mut entries = Vec::new();
-    for (index, scoped) in indexes.iter().zip(per_index) {
-        push_index_entries(&mut entries, index, scoped, true)?;
-    }
-    Ok(entries)
+    staged_scoped_entries(&indexes, scoped, true)
 }
 
 /// One live data file of a table.
@@ -1059,30 +1092,4 @@ pub(super) fn index_positions(
                 .ok_or_else(|| Error::NotFound(format!("indexed column {column} of table {table}")))
         })
         .collect()
-}
-
-/// Turns scoped-read entries into staged index entries — puts when `delete`
-/// is false, removals when it is true. A row with a NULL indexed value is
-/// stored multi-shaped (so `IS NULL` finds it) rather than skipped.
-pub(super) fn push_index_entries(
-    entries: &mut Vec<StagedIndexEntry>,
-    index: &IndexInfo,
-    scoped: Vec<ScopedReadEntry>,
-    delete: bool,
-) -> Result<()> {
-    for entry in scoped {
-        // A row with any NULL indexed column is stored so `IS NULL` finds it,
-        // but multi-shaped and collision-exempt — a unique index still admits
-        // any number of NULL rows.
-        let has_null = entry.values.iter().any(Option::is_none);
-        entries.push(StagedIndexEntry {
-            index_id: index.id.get(),
-            unique: index.unique && !has_null,
-            key: encode_ordered_values(&entry.values, &index.directions, &index.nulls)?,
-            row_id: entry.row_id,
-            delete,
-            building: index.state != crate::catalog::IndexState::Ready,
-        });
-    }
-    Ok(())
 }

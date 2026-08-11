@@ -36,20 +36,19 @@ use crate::{
         CatalogSnapshot, ColumnInfo, IndexInfo, SnapshotId, TableId,
         inline::{InlineScanKind, materialize_inline_rows},
         projection::ProjectionCache,
-        scoped_read::{self, ScopedReadEntry},
+        scoped_read,
     },
     error::{Error, Result},
     store::{
         StagedBytes,
         handle::ReadHandle,
-        index_encoding::encode_ordered_values,
         inline as store_inline,
         key::{EntityKey, InlineKey, InlineOperation, Key},
         proto, read, value,
     },
     transaction::{
         commit,
-        index_maintenance::{StagedEntries, StagedIndexEntry, stage_index_entry_groups},
+        index_maintenance::{StagedEntries, StagedIndexEntry, stage_index_entries},
     },
 };
 
@@ -961,6 +960,7 @@ impl StagedTransaction {
     /// the head snapshot. Returns [`Error::CommitConflict`] — **never
     /// retried internally** — if a concurrent commit advanced the head
     /// first; the store is left unchanged by the loser.
+    #[allow(clippy::too_many_lines)]
     pub async fn commit(self) -> Result<SnapshotId> {
         let started = Instant::now();
         let Self {
@@ -973,6 +973,9 @@ impl StagedTransaction {
             data_prefix,
         } = self;
         let staged_rows = ops.len();
+        let uses_inline_chunk_directory = ops
+            .iter()
+            .any(|operation| matches!(operation, RowOperation::InlineInsert { .. }));
         let mut phases = CommitPhases::default();
 
         let phase_started = Instant::now();
@@ -1028,16 +1031,22 @@ impl StagedTransaction {
             Ok((result_id, mut writes)) => {
                 phases.translate = phase_started.elapsed();
                 let phase_started = Instant::now();
-                let staged_bytes =
-                    match stage_batch(&db_tx, &mut writes, inline_writes, result_id, entry_bytes)
-                        .await
-                    {
-                        Ok(staged) => staged,
-                        Err(err) => {
-                            db_tx.rollback();
-                            return Err(err);
-                        }
-                    };
+                let staged_bytes = match stage_batch(
+                    &db_tx,
+                    &mut writes,
+                    inline_writes,
+                    result_id,
+                    entry_bytes,
+                    uses_inline_chunk_directory,
+                )
+                .await
+                {
+                    Ok(staged) => staged,
+                    Err(err) => {
+                        db_tx.rollback();
+                        return Err(err);
+                    }
+                };
                 phases.stage = phase_started.elapsed();
                 // The same landing the verb path takes: one durable write,
                 // one head-race classification, one projection refresh.
@@ -1129,9 +1138,16 @@ async fn stage_batch(
     inline_writes: Vec<commit::StagedWrite>,
     result_id: u64,
     entry_bytes: u64,
+    uses_inline_chunk_directory: bool,
 ) -> Result<StagedBytes> {
     writes.push(commit::head_write(db_tx, result_id).await?);
     writes.extend(inline_writes);
+    if uses_inline_chunk_directory
+        && let Some(stamp) =
+            commit::format_stamp_to(db_tx, commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY).await?
+    {
+        writes.push(stamp);
+    }
     let mut staged = commit::stage_writes(db_tx, writes)?;
     staged.0 = staged.0.saturating_add(entry_bytes);
     Ok(staged)

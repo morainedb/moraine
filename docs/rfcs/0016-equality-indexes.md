@@ -621,6 +621,20 @@ entry set. Delete files and inline deletes are applied as each source is
 read. Each step ends at whichever `BuildStep` bound it reaches first (Two
 bounds on a step) and always carries at least one entry.
 
+SQL-write upkeep compiles one projection plan per live index, deduplicates
+shared Arrow columns, and decodes each Parquet or inline batch once. A scalar
+stays borrowed from its Arrow array while the store-layer canonical builder
+writes its NULL flag, canonical bytes, escaping, terminator, and direction
+transform directly into the final key. No row-wide value vector or per-index
+value copy crosses the batch boundary. NULL presence is accumulated by the
+same builder and selects the multi-shaped unique-NULL entry. The builder then
+expands those canonical bytes in place into the final physical `index` key;
+the staged entry retains no intermediate canonical value or second payload
+allocation. For inline input, each `(table, schema version)` IPC schema is
+decoded once per commit and shared by all of its chunks. A chunk's owning
+`Bytes` is sliced directly into Arrow's immutable data buffer, avoiding a
+second copy of the body after it moves to a blocking decode worker.
+
 Each step atomically advances a **source cursor** persisted in the definition
 value: the completed inline row watermark, then the data-file id and physical
 position most recently covered. Files are immutable and ids are monotonic, so
@@ -990,7 +1004,15 @@ tests against real SlateDB on in-memory `object_store`:
 - **Encoding roundtrips + goldens.** `decode(encode(k)) == k` for both entry
   kinds; golden vectors pin the `index` discriminant and the canonical
   encoding of every indexable type, including the float normalizations, NULL
-  skip, and composite framing (`("ab","c") ≠ ("a","bc")`).
+  skip, and composite framing (`("ab","c") ≠ ("a","bc")`). The borrowed
+  builder is differential-tested byte-for-byte against the former owned
+  encoder across all scalar categories, directions, NULL orders, composite
+  keys, NaNs, signed zero, and framing escape bytes. In-place physical
+  finalization is compared with the owned `Key::Index` encoder under arbitrary
+  values, index ids, unique shapes, NULLs, and row ids. Arrow extraction has
+  the same differential coverage across every supported Arrow representation
+  and overlapping projections; a multi-chunk commit proves every body is
+  decoded once while its table-version schema is decoded once for the commit.
 - **Order preservation.** For every indexable type, `encode(x) < encode(y)`
   iff `x < y` in the type's SQL order (proptest); `DESC` reverses it,
   variable-length strings included (`"ab" < "a"`); a mixed `(a ASC, b DESC)`

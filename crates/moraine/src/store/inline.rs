@@ -2,22 +2,153 @@
 //! per-schema-version schema records. Mirrors `store::read`'s decode-only
 //! contract — no DuckLake interpretation here.
 
+use std::collections::BTreeSet;
+
+use futures::{StreamExt, TryStreamExt, stream};
+
 use crate::{
     error::{Error, Result},
     store::{
         handle::{ReadHandle, ScanShape},
         key::{
-            InlineKey, InlineOperation, InlineOperationKind, Key, inline_live_table_prefix,
-            inline_schema_prefix, inline_schema_table_prefix,
+            InlineKey, InlineOperation, InlineOperationKind, Key, inline_chunk_range_suffix,
+            inline_chunk_range_table_prefix, inline_live_table_prefix, inline_schema_prefix,
+            inline_schema_table_prefix,
         },
         proto::{
-            InlineChunkValue, InlineFileDeleteTableValue, InlineFileDeleteValue,
-            InlineInlineDeleteValue, InlineSchemaValue,
+            InlineChunkRangeValue, InlineChunkValue, InlineFileDeleteTableValue,
+            InlineFileDeleteValue, InlineInlineDeleteValue, InlineSchemaValue,
         },
         read::{read_singleton, scan_decode},
         value,
     },
 };
+
+/// Point reads issued together after the range directory identifies chunks.
+const INLINE_CHUNK_READ_CONCURRENCY: usize = 64;
+
+/// Resolves the committed chunks that own `row_ids` through the per-chunk
+/// row-range directory. `None` means the directory is absent or incomplete,
+/// as it is for chunks written before the directory format was adopted; the
+/// caller must fall back to [`scan_inline_chunks`].
+pub(crate) async fn find_inline_chunks_for_rows(
+    handle: ReadHandle<'_>,
+    table_id: u64,
+    row_ids: &[u64],
+) -> Result<Option<Vec<(InlineOperation, InlineChunkValue)>>> {
+    let targets: Vec<u64> = row_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let Some(first) = targets.first().copied() else {
+        return Ok(Some(Vec::new()));
+    };
+
+    let prefix = inline_chunk_range_table_prefix(table_id);
+    let start = inline_chunk_range_suffix(table_id, first);
+    let mut iter = handle
+        .scan_prefix(prefix, start.., ScanShape::Probe)
+        .await?;
+    let mut target_index = 0usize;
+    let mut locators = Vec::new();
+
+    while target_index < targets.len() {
+        let Some(entry) = iter.next().await? else {
+            return Ok(None);
+        };
+        let row_id_end = match Key::decode(&entry.key)? {
+            Key::Inline(InlineKey::ChunkRange {
+                table_id: owner,
+                row_id_end,
+            }) if owner == table_id => row_id_end,
+            other => {
+                return Err(Error::Corruption(format!(
+                    "non-directory key in inline chunk-range scan: {other:?}"
+                )));
+            }
+        };
+        let locator: InlineChunkRangeValue = value::decode_value(&entry.value)?;
+        if locator.row_id_start > row_id_end {
+            return Err(Error::Corruption(format!(
+                "inline chunk directory for table {table_id} has inverted range {}..={row_id_end}",
+                locator.row_id_start
+            )));
+        }
+
+        let target = targets[target_index];
+        if target < locator.row_id_start {
+            return Ok(None);
+        }
+        if target > row_id_end {
+            continue;
+        }
+
+        let operation = InlineOperation::Insert {
+            table_id,
+            schema_version: locator.schema_version,
+            begin_snapshot: locator.begin_snapshot,
+            chunk_seq: locator.chunk_seq,
+        };
+        locators.push((operation, locator.row_id_start, row_id_end));
+        while target_index < targets.len() && targets[target_index] <= row_id_end {
+            if targets[target_index] < locator.row_id_start {
+                return Ok(None);
+            }
+            target_index += 1;
+        }
+    }
+
+    let chunks = stream::iter(locators.into_iter().map(
+        |(operation, row_id_start, row_id_end)| async move {
+            let Some(chunk): Option<InlineChunkValue> =
+                read_singleton(handle, Key::Inline(InlineKey::Live(operation))).await?
+            else {
+                return Err(Error::Corruption(format!(
+                    "inline chunk directory for table {table_id} names a missing chunk"
+                )));
+            };
+            let actual_end = chunk
+                .row_count
+                .checked_sub(1)
+                .and_then(|count| chunk.row_id_start.checked_add(count));
+            if chunk.row_id_start != row_id_start || actual_end != Some(row_id_end) {
+                return Err(Error::Corruption(format!(
+                    "inline chunk directory for table {table_id} disagrees with its chunk range"
+                )));
+            }
+            Ok((operation, chunk))
+        },
+    ))
+    .buffered(INLINE_CHUNK_READ_CONCURRENCY)
+    .try_collect()
+    .await?;
+
+    Ok(Some(chunks))
+}
+
+/// Every chunk-range locator for `table_id`, ordered by inclusive range end.
+pub(crate) async fn scan_inline_chunk_ranges(
+    handle: ReadHandle<'_>,
+    table_id: u64,
+) -> Result<Vec<u64>> {
+    scan_decode(
+        handle,
+        inline_chunk_range_table_prefix(table_id),
+        ScanShape::Probe,
+        |key, _| match key {
+            Key::Inline(InlineKey::ChunkRange {
+                table_id: owner,
+                row_id_end,
+            }) if owner == table_id => Ok(row_id_end),
+            other => Err(Error::Corruption(format!(
+                "non-directory key in inline chunk-range scan: {other:?}"
+            ))),
+        },
+    )
+    .await
+}
 
 /// Every inlined-insert chunk for `table_id`, across all schema versions,
 /// in key order (schema version, then commit snapshot, then chunk
@@ -43,7 +174,7 @@ pub(crate) async fn scan_inline_chunks(
 }
 
 /// Every inlined-insert-row tombstone for `table_id`, keyed by row id.
-pub(crate) async fn scan_inline_inline_deletes(
+pub(crate) async fn scan_inline_deletes(
     handle: ReadHandle<'_>,
     table_id: u64,
 ) -> Result<Vec<(u64, InlineInlineDeleteValue)>> {
@@ -166,6 +297,78 @@ mod tests {
 
     use super::*;
     use crate::store::open::StoreBuilder;
+
+    /// The range directory seeks to the chunk whose inclusive end covers a
+    /// row and returns only that immutable chunk body. A legacy table with
+    /// no directory reports `None`, allowing the caller to fall back to the
+    /// old full chunk scan during rolling adoption.
+    #[tokio::test]
+    async fn chunk_range_directory_selects_owners_and_detects_legacy_chunks() {
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+
+        for (table_id, row_id_start, row_id_end, chunk_seq) in [
+            (7, 0, 9, 0),
+            (7, 100, 109, 1),
+            (7, 1_000, 1_009, 2),
+            (8, 0, 9, 0),
+        ] {
+            tx.put(
+                Key::Inline(InlineKey::Live(InlineOperation::Insert {
+                    table_id,
+                    schema_version: 3,
+                    begin_snapshot: 11,
+                    chunk_seq,
+                }))
+                .encode(),
+                value::encode_value(&InlineChunkValue {
+                    body: format!("chunk-{table_id}-{chunk_seq}").into_bytes(),
+                    row_id_start,
+                    row_count: row_id_end - row_id_start + 1,
+                    data_file_id: None,
+                }),
+            )
+            .unwrap();
+            if table_id == 7 {
+                tx.put(
+                    Key::Inline(InlineKey::ChunkRange {
+                        table_id,
+                        row_id_end,
+                    })
+                    .encode(),
+                    value::encode_value(&InlineChunkRangeValue {
+                        row_id_start,
+                        schema_version: 3,
+                        begin_snapshot: 11,
+                        chunk_seq,
+                    }),
+                )
+                .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let selected = find_inline_chunks_for_rows(ReadHandle::Tx(&tx), 7, &[105, 1_005])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].1.row_id_start, 100);
+        assert_eq!(selected[1].1.row_id_start, 1_000);
+        assert_eq!(
+            find_inline_chunks_for_rows(ReadHandle::Tx(&tx), 8, &[5])
+                .await
+                .unwrap(),
+            None,
+        );
+
+        tx.rollback();
+        db.close().await.unwrap();
+    }
 
     /// Seeds inline records for two tables and one that overlaps chunk
     /// sequence numbers across two schema versions, then asserts every
@@ -341,9 +544,7 @@ mod tests {
             ]
         );
 
-        let inline_deletes = scan_inline_inline_deletes(ReadHandle::Tx(&tx), 7)
-            .await
-            .unwrap();
+        let inline_deletes = scan_inline_deletes(ReadHandle::Tx(&tx), 7).await.unwrap();
         assert_eq!(inline_deletes, vec![(3, inline_delete)]);
 
         let file_deletes = scan_inline_file_deletes(ReadHandle::Tx(&tx), 7)
