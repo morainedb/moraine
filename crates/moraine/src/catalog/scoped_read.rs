@@ -855,8 +855,36 @@ pub(crate) fn inline_batch_entries(
     positions: &[usize],
     row_id_start: u64,
 ) -> Result<Vec<ScopedReadEntry>> {
+    #[cfg(test)]
+    record_inline_batch_decode(row_id_start);
+
     let batch = decode_inline_batch(schema_ipc, body)?;
     record_batch_entries(&batch, positions, None, row_id_start, Ordinals::Dense, 0)
+}
+
+#[cfg(test)]
+fn inline_batch_decodes() -> &'static std::sync::Mutex<std::collections::HashMap<u64, usize>> {
+    static COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, usize>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_inline_batch_decode(row_id_start: u64) {
+    let mut counts = inline_batch_decodes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *counts.entry(row_id_start).or_default() += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn inline_batch_decode_count(row_id_start: u64) -> usize {
+    inline_batch_decodes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&row_id_start)
+        .copied()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

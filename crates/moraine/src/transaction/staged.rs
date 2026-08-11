@@ -49,7 +49,7 @@ use crate::{
     },
     transaction::{
         commit,
-        index_maintenance::{StagedEntries, StagedIndexEntry, stage_index_entries},
+        index_maintenance::{StagedEntries, StagedIndexEntry, stage_index_entry_groups},
     },
 };
 

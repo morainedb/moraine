@@ -220,21 +220,37 @@ pub(crate) async fn stage_index_entries(
     db_tx: &DbTransaction,
     entries: &[StagedIndexEntry],
 ) -> Result<StagedEntries> {
-    if entries.len() > MAX_INDEX_ENTRIES_PER_COMMIT {
+    stage_index_entry_groups(db_tx, &[entries]).await
+}
+
+/// Resolves several ordered entry groups without joining them into a second
+/// allocation. Group order is entry order.
+pub(crate) async fn stage_index_entry_groups(
+    db_tx: &DbTransaction,
+    groups: &[&[StagedIndexEntry]],
+) -> Result<StagedEntries> {
+    let entry_count = groups
+        .iter()
+        .fold(0_usize, |count, group| count.saturating_add(group.len()));
+    if entry_count > MAX_INDEX_ENTRIES_PER_COMMIT {
         // Logged as well as returned: the refusal is the guardrail firing,
         // and an operator reading logs after a failed bulk load should see
         // it without having to recover the SQL error text.
         warn!(
-            staged = entries.len(),
+            staged = entry_count,
             limit = MAX_INDEX_ENTRIES_PER_COMMIT,
             "refusing an oversized commit"
         );
-        return Err(oversized_commit(entries.len()));
+        return Err(oversized_commit(entry_count));
     }
 
     let mut staged = StagedBytes::default();
     let mut deleted_unique: HashSet<Vec<u8>> = HashSet::new();
-    for entry in entries.iter().filter(|entry| entry.delete) {
+    for entry in groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .filter(|entry| entry.delete)
+    {
         let key_bytes = entry_key(entry).encode();
         if entry.unique {
             deleted_unique.insert(key_bytes.clone());
@@ -251,7 +267,11 @@ pub(crate) async fn stage_index_entries(
     let mut pending: Vec<PendingProbe> = Vec::new();
     let mut claimed: HashMap<Vec<u8>, u64> = HashMap::new();
     let mut poisoned: Vec<u64> = Vec::new();
-    for entry in entries.iter().filter(|entry| !entry.delete) {
+    for entry in groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .filter(|entry| !entry.delete)
+    {
         let key_bytes = entry_key(entry).encode();
         if !entry.unique {
             // The row id lives in the key; the value is empty.
