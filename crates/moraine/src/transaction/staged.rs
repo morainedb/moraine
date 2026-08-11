@@ -48,7 +48,10 @@ use crate::{
     },
     transaction::{
         commit,
-        index_maintenance::{StagedEntries, StagedIndexEntry, stage_index_entries},
+        index_maintenance::{
+            StagedEntries, StagedIndexEntry, apply_deferred_maintenance, apply_poison,
+            stage_index_entry_stream,
+        },
     },
 };
 
@@ -388,6 +391,11 @@ pub enum RowOperation {
     },
 }
 
+type CommittedRecords = Arc<Vec<read::EntityRecord>>;
+type CommittedRecordCache = tokio::sync::Mutex<
+    HashMap<read::EntityRecordKind, Arc<tokio::sync::OnceCell<CommittedRecords>>>,
+>;
+
 /// A malformed staged row: wrong cell count or a cell of the wrong kind
 /// for its column. Never produced by a correct shim translation; this
 /// path fails loudly rather than guessing.
@@ -406,11 +414,8 @@ pub struct StagedTransaction {
     db_tx: DbTransaction,
     ops: Vec<RowOperation>,
     /// The committed records at this transaction's read point, scanned once
-    /// on the first `visible_*` call and shared by every later one.
-    /// Populating DuckLake's metadata tables inside a write transaction
-    /// issues one call per kind, and `db_tx` is snapshot-isolated, so the
-    /// scan cannot go stale under them.
-    committed: tokio::sync::OnceCell<Arc<Vec<read::EntityRecord>>>,
+    /// per requested kind and shared by later reads of that kind.
+    committed: CommittedRecordCache,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     /// The `DATA_PATH` object store and its bucket-relative prefix, present
     /// when the attach supplied `META_DATA_PATH`. Index maintenance
@@ -434,7 +439,7 @@ impl StagedTransaction {
             diagnostic_id: next_diagnostic_id(),
             db_tx,
             ops: Vec::new(),
-            committed: tokio::sync::OnceCell::new(),
+            committed: tokio::sync::Mutex::new(HashMap::new()),
             projections,
             data_store,
             data_prefix,
@@ -527,42 +532,53 @@ impl StagedTransaction {
             .collect())
     }
 
-    /// The committed entity records at this transaction's read point,
-    /// `current` and `history` together — the same pair a `dump_*` scans,
-    /// read through `db_tx` so the committed half and the staged half are
-    /// one consistent cut. Scanned once and shared: a metadata population
-    /// inside a write transaction asks for one kind after another.
-    async fn committed_entities(&self) -> Result<&Arc<Vec<read::EntityRecord>>> {
-        self.committed
+    /// The committed records of one kind at this transaction's read point,
+    /// read through `db_tx` so current and history are one consistent cut.
+    async fn committed_entities(&self, kind: read::EntityRecordKind) -> Result<CommittedRecords> {
+        let cell = {
+            let mut committed = self.committed.lock().await;
+            Arc::clone(
+                committed
+                    .entry(kind)
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
+        let records = cell
             .get_or_try_init(|| async {
                 let started = Instant::now();
-                let handle = ReadHandle::Tx(&self.db_tx);
-                let current = read::scan_current_entities(handle).await?;
-                let current_records = current.len();
-                let history = read::scan_history_entities(handle).await?;
-                let history_records = history.len();
-                let mut records = current;
-                records.extend(history);
+                let records = read::scan_entity_kind(ReadHandle::Tx(&self.db_tx), kind).await?;
+                let history_records = records
+                    .iter()
+                    .filter(|record| {
+                        record
+                            .lifecycle()
+                            .is_some_and(|(_, end_snapshot)| end_snapshot.is_some())
+                    })
+                    .count();
+                let current_records = records.len().saturating_sub(history_records);
                 debug!(
                     transaction_id = self.diagnostic_id,
+                    ?kind,
                     current_records,
                     history_records,
                     records = records.len(),
                     elapsed_ms = milliseconds(started.elapsed()),
                     "scanned committed entities for staged transaction"
                 );
-                Ok(Arc::new(records))
+                Ok::<_, Error>(Arc::new(records))
             })
-            .await
+            .await?;
+        Ok(Arc::clone(records))
     }
 
     /// The committed records of one kind, as the overlay's starting point.
     async fn committed_rows<T>(
         &self,
+        kind: read::EntityRecordKind,
         extract: impl Fn(&read::EntityRecord) -> Option<T>,
     ) -> Result<Vec<T>> {
         Ok(self
-            .committed_entities()
+            .committed_entities(kind)
             .await?
             .iter()
             .filter_map(extract)
@@ -577,7 +593,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_data_files(&self) -> Result<Vec<proto::DataFileValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::File, |r| match r {
                 read::EntityRecord::File(v) => Some(v.clone()),
                 _ => None,
             })
@@ -592,7 +608,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_delete_files(&self) -> Result<Vec<proto::DeleteFileValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::DeleteFile, |r| match r {
                 read::EntityRecord::DeleteFile(v) => Some(v.clone()),
                 _ => None,
             })
@@ -607,7 +623,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_columns(&self) -> Result<Vec<proto::ColumnValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::Column, |r| match r {
                 read::EntityRecord::Column(v) => Some(v.clone()),
                 _ => None,
             })
@@ -622,7 +638,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_tables(&self) -> Result<Vec<proto::TableValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::Table, |r| match r {
                 read::EntityRecord::Table(v) => Some(v.clone()),
                 _ => None,
             })
@@ -637,7 +653,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_file_column_stats(&self) -> Result<Vec<proto::FileColumnStatsValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::FileColumnStats, |r| match r {
                 read::EntityRecord::FileColumnStats(v) => Some(v.clone()),
                 _ => None,
             })
@@ -652,7 +668,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_schemas(&self) -> Result<Vec<proto::SchemaValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::Schema, |r| match r {
                 read::EntityRecord::Schema(v) => Some(v.clone()),
                 _ => None,
             })
@@ -667,7 +683,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_views(&self) -> Result<Vec<proto::ViewValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::View, |r| match r {
                 read::EntityRecord::View(v) => Some(v.clone()),
                 _ => None,
             })
@@ -682,7 +698,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_partition_info(&self) -> Result<Vec<proto::PartitionValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::Partition, |r| match r {
                 read::EntityRecord::Partition(v) => Some(v.clone()),
                 _ => None,
             })
@@ -697,7 +713,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_sort_info(&self) -> Result<Vec<proto::SortValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::Sort, |r| match r {
                 read::EntityRecord::Sort(v) => Some(v.clone()),
                 _ => None,
             })
@@ -712,7 +728,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_macros(&self) -> Result<Vec<proto::MacroValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::Macro, |r| match r {
                 read::EntityRecord::Macro(v) => Some(v.clone()),
                 _ => None,
             })
@@ -727,7 +743,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_table_stats(&self) -> Result<Vec<proto::TableStatsValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::TableStats, |r| match r {
                 read::EntityRecord::TableStats(v) => Some(*v),
                 _ => None,
             })
@@ -742,7 +758,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_table_column_stats(&self) -> Result<Vec<proto::TableColumnStatsValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::TableColumnStats, |r| match r {
                 read::EntityRecord::TableColumnStats(v) => Some(v.clone()),
                 _ => None,
             })
@@ -757,7 +773,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_mappings(&self) -> Result<Vec<proto::MappingValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::Mapping, |r| match r {
                 read::EntityRecord::Mapping(v) => Some(v.clone()),
                 _ => None,
             })
@@ -776,7 +792,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_tag_containers(&self) -> Result<Vec<proto::TagValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::Tag, |r| match r {
                 read::EntityRecord::Tag(v) => Some(v.clone()),
                 _ => None,
             })
@@ -793,7 +809,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_option_scopes(&self) -> Result<Vec<(u64, u64, proto::OptionScopeValue)>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::Option, |r| match r {
                 read::EntityRecord::Option {
                     scope_kind,
                     scope_id,
@@ -936,7 +952,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_scheduled_deletions(&self) -> Result<Vec<proto::GcFileValue>> {
         let committed = self
-            .committed_rows(|r| match r {
+            .committed_rows(read::EntityRecordKind::GcFile, |r| match r {
                 read::EntityRecord::GcFile(v) => Some(v.clone()),
                 _ => None,
             })
@@ -973,7 +989,7 @@ impl StagedTransaction {
             data_prefix,
         } = self;
         let staged_rows = ops.len();
-        let uses_inline_chunk_directory = ops
+        let mut uses_inline_chunk_directory = ops
             .iter()
             .any(|operation| matches!(operation, RowOperation::InlineInsert { .. }));
         let mut phases = CommitPhases::default();
@@ -1024,7 +1040,9 @@ impl StagedTransaction {
             poisoned,
             deferred,
             bytes: entry_bytes,
+            uses_inline_chunk_directory: repaired_inline_chunk_directory,
         } = entries;
+        uses_inline_chunk_directory |= repaired_inline_chunk_directory;
 
         let phase_started = Instant::now();
         match translate_batch(base_ref, &ops, &poisoned, &deferred, mints_snapshot) {
@@ -1296,10 +1314,8 @@ fn translate(
         }
     }
 
-    crate::transaction::index_maintenance::apply_poison(&mut state, poisoned);
-    crate::transaction::index_maintenance::apply_deferred_maintenance(
-        base, &mut state, deferred, new_id,
-    );
+    apply_poison(&mut state, poisoned);
+    apply_deferred_maintenance(base, &mut state, deferred, new_id);
 
     let mut writes = commit::diff_writes(base, &state, new_id);
     writes.extend(direct);

@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::{StreamExt, TryStreamExt, stream};
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -83,6 +84,9 @@ const RETRY_BACKOFF_BASE_MICROS: u64 = 2_000;
 /// milliseconds — enough for a competing commit to land, short enough that a
 /// caller waiting on a conflict is not left hanging.
 const RETRY_BACKOFF_MAX_MICROS: u64 = 50_000;
+
+/// Intervening snapshot records read concurrently after a lost head race.
+const INTERVENING_READ_CONCURRENCY: usize = 64;
 
 /// How long to wait before re-running `attempt` (0-based; the first attempt
 /// never waits). Exponential to the cap, plus jitter of up to the base delay
@@ -1098,7 +1102,8 @@ where
 
     // Entries stage before the entity diff so a poisoned definition rides
     // that diff rather than needing a write of its own.
-    let entries = index_maintenance::stage_index_entries(db_tx, &[&index_entries]).await?;
+    let index_entry_count = index_entries.len();
+    let entries = index_maintenance::stage_index_entries(db_tx, index_entries).await?;
     let poisoned = entries.poisoned;
     index_maintenance::apply_poison(&mut state, &poisoned);
 
@@ -1155,7 +1160,7 @@ where
     staged_bytes.0 = staged_bytes.0.saturating_add(entries.bytes);
     tracing::debug!(
         snapshot = new_id,
-        index_entries = index_entries.len(),
+        index_entries = index_entry_count,
         inline_ops = inline_ops.len(),
         catalog_writes = writes.len(),
         poisoned_indexes = poisoned.len(),
@@ -1353,26 +1358,19 @@ where
                     );
                     continue;
                 }
-                let intervening = intervening_changes(db, head_before).await?;
-                for (snapshot_id, theirs) in &intervening {
-                    // A group conflicts if any of its members does: they
-                    // share a batch, so they share a fate.
-                    if ours
-                        .iter()
-                        .any(|mine| crate::transaction::operations::conflicts(mine, theirs))
-                    {
-                        tracing::debug!(
-                            attempt,
-                            head_before,
-                            winner = snapshot_id,
-                            "commit conflicts with an intervening commit; surfacing"
-                        );
-                        return Err(Error::CommitConflict(format!(
-                            "concurrent commit {snapshot_id} touched the same state"
-                        )));
-                    }
+                let intervening = classify_intervening_changes(db, head_before, &ours).await?;
+                if let Some(snapshot_id) = intervening.conflict {
+                    tracing::debug!(
+                        attempt,
+                        head_before,
+                        winner = snapshot_id,
+                        "commit conflicts with an intervening commit; surfacing"
+                    );
+                    return Err(Error::CommitConflict(format!(
+                        "concurrent commit {snapshot_id} touched the same state"
+                    )));
                 }
-                last_intervening = intervening.iter().map(|(id, _)| *id).collect();
+                last_intervening = intervening.snapshot_ids;
                 tracing::debug!(
                     attempt,
                     head_before,
@@ -1398,50 +1396,113 @@ where
     )))
 }
 
-/// The change sets of every commit above `head_before`, read outside any
-/// transaction (the loser's is dead). A record that has already been
-/// expired by a racing maintenance commit classifies as an unknowable
-/// change (forcing the conflict path), never as corruption — the caller
-/// re-drives against the new head.
-async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, ChangeSet)>> {
+struct InterveningClassification {
+    conflict: Option<u64>,
+    snapshot_ids: Vec<u64>,
+}
+
+async fn read_head_snapshot_id(db: &Db) -> Result<u64> {
     let head_bytes = db
         .get(Key::Sys(SysKey::Head).encode())
         .await
         .map_err(Error::from)?
         .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?;
     let head: proto::HeadValue = value::decode_value(&head_bytes)?;
-    let mut changes = Vec::new();
+    Ok(head.snapshot_id)
+}
 
-    for snapshot_id in (head_before + 1)..=head.snapshot_id {
-        let change_set = match db
-            .get(Key::Snapshot { snapshot_id }.encode())
-            .await
-            .map_err(Error::from)?
-        {
-            Some(bytes) => {
-                let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
-                let mut change_set = ChangeSet::parse(&snapshot.changes_made);
-                // The grammar named the tables this commit deleted from;
-                // the record names the files. With both, a delete of ours
-                // classifies against it at file grain — without the file
-                // ids (a DuckLake-authored snapshot) it stays untargeted
-                // and table grain stands.
-                if !snapshot.deleted_data_file_ids.is_empty() {
-                    change_set.deleted_data_file_ids =
-                        snapshot.deleted_data_file_ids.iter().copied().collect();
-                    change_set.deletes_untargeted_files = false;
-                }
-                change_set
+async fn read_intervening_change(db: &Db, snapshot_id: u64) -> Result<(u64, ChangeSet)> {
+    let change_set = match db
+        .get(Key::Snapshot { snapshot_id }.encode())
+        .await
+        .map_err(Error::from)?
+    {
+        Some(bytes) => {
+            let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
+            let mut change_set = ChangeSet::parse(&snapshot.changes_made);
+            // The grammar named the tables this commit deleted from; the
+            // record names the files. Together they classify deletes at file
+            // grain rather than conservatively at table grain.
+            if !snapshot.deleted_data_file_ids.is_empty() {
+                change_set.deleted_data_file_ids =
+                    snapshot.deleted_data_file_ids.iter().copied().collect();
+                change_set.deletes_untargeted_files = false;
             }
-            None => ChangeSet {
-                has_unknown: true,
-                ..ChangeSet::default()
-            },
-        };
-        changes.push((snapshot_id, change_set));
-    }
+            change_set
+        }
+        None => ChangeSet {
+            has_unknown: true,
+            ..ChangeSet::default()
+        },
+    };
+    Ok((snapshot_id, change_set))
+}
 
-    Ok(changes)
+fn intervening_change_stream(
+    db: &Db,
+    first: u64,
+    last: u64,
+) -> impl futures::Stream<Item = Result<(u64, ChangeSet)>> + '_ {
+    stream::iter(
+        (first..=last)
+            .map(move |snapshot_id| async move { read_intervening_change(db, snapshot_id).await }),
+    )
+    .buffered(INTERVENING_READ_CONCURRENCY)
+}
+
+async fn classify_intervening_changes(
+    db: &Db,
+    head_before: u64,
+    ours: &[ChangeSet],
+) -> Result<InterveningClassification> {
+    let head = read_head_snapshot_id(db).await?;
+    if head_before >= head {
+        return Ok(InterveningClassification {
+            conflict: None,
+            snapshot_ids: Vec::new(),
+        });
+    }
+    let mut changes = std::pin::pin!(intervening_change_stream(
+        db,
+        head_before.saturating_add(1),
+        head,
+    ));
+    let mut snapshot_ids = Vec::new();
+    while let Some((snapshot_id, theirs)) = changes.try_next().await? {
+        snapshot_ids.push(snapshot_id);
+        // A group conflicts if any member does: they share one batch and
+        // therefore one fate. Ordered delivery makes the first verdict
+        // stable while pending later reads are dropped immediately.
+        if ours
+            .iter()
+            .any(|mine| crate::transaction::operations::conflicts(mine, &theirs))
+        {
+            return Ok(InterveningClassification {
+                conflict: Some(snapshot_id),
+                snapshot_ids,
+            });
+        }
+    }
+    Ok(InterveningClassification {
+        conflict: None,
+        snapshot_ids,
+    })
+}
+
+/// The change sets of every commit above `head_before`, read outside any
+/// transaction (the loser's is dead). A record that has already been
+/// expired by a racing maintenance commit classifies as an unknowable
+/// change (forcing the conflict path), never as corruption — the caller
+/// re-drives against the new head.
+#[cfg(test)]
+async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, ChangeSet)>> {
+    let head = read_head_snapshot_id(db).await?;
+    if head_before >= head {
+        return Ok(Vec::new());
+    }
+    intervening_change_stream(db, head_before.saturating_add(1), head)
+        .try_collect()
+        .await
 }
 
 #[cfg(test)]

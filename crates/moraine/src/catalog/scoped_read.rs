@@ -903,6 +903,123 @@ pub(crate) async fn scoped_read_index_entries(
     Ok(entries)
 }
 
+/// Receives one bounded group of already encoded index entries from a
+/// full-file scoped read.
+pub(crate) trait ScopedIndexEntryBatchConsumer {
+    /// Consumes one decoded group before the reader advances to the next.
+    async fn consume(&mut self, entries: Vec<ScopedIndexEntry>) -> Result<()>;
+}
+
+/// Streams a file's fused index entries to `consumer` in bounded Arrow
+/// batches. Shared columns are projected once and borrowed directly into
+/// their final keys, as in [`scoped_read_index_entries`], without retaining
+/// the whole file's encoded entries.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn scoped_read_index_entry_batches<C: ScopedIndexEntryBatchConsumer>(
+    object_store: Arc<dyn ObjectStore>,
+    path: &Path,
+    projections: &[IndexProjection],
+    row_id_source: RowIdSource,
+    file_size: Option<u64>,
+    footer_size: Option<u64>,
+    excluded_ordinals: Option<&BTreeSet<u64>>,
+    consumer: &mut C,
+) -> Result<()> {
+    if projections.is_empty() {
+        return Ok(());
+    }
+
+    let file_size = match file_size {
+        Some(size) => size,
+        None => {
+            object_store
+                .head(path)
+                .await
+                .map_err(corrupt("scoped read"))?
+                .size
+        }
+    };
+    let source_positions = index_positions(projections);
+
+    if file_size < WHOLE_OBJECT_THRESHOLD {
+        let bytes: Bytes = object_store
+            .get(path)
+            .await
+            .map_err(corrupt("scoped read"))?
+            .bytes()
+            .await
+            .map_err(corrupt("scoped read"))?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("scoped read"))?;
+        let (row_id_position, row_id_start) =
+            resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+        let (mask, indexed_output, row_id_output) =
+            projection(builder.parquet_schema(), &source_positions, row_id_position)?;
+        let projections = remap_index_projections(projections, &source_positions, &indexed_output)?;
+        let reader = builder
+            .with_projection(mask)
+            .with_batch_size(BUILD_READ_BATCH_ROWS)
+            .build()
+            .map_err(corrupt("scoped read"))?;
+        let mut emitted = 0usize;
+        for batch in reader {
+            let batch = batch.map_err(corrupt("scoped read"))?;
+            let entries = record_batch_index_entries(
+                &batch,
+                &projections,
+                row_id_output,
+                row_id_start,
+                Ordinals::Dense,
+                emitted,
+                excluded_ordinals,
+                None,
+            )?;
+            consumer.consume(entries).await?;
+            emitted = emitted.saturating_add(batch.num_rows());
+        }
+        return Ok(());
+    }
+
+    let reader = ObjectStoreReader {
+        store: object_store,
+        path: path.clone(),
+        file_size,
+        footer_size,
+        page_index: PageIndexPolicy::Skip,
+    };
+    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+        .await
+        .map_err(corrupt("scoped read"))?;
+    let (row_id_position, row_id_start) =
+        resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+    let (mask, indexed_output, row_id_output) =
+        projection(builder.parquet_schema(), &source_positions, row_id_position)?;
+    let projections = remap_index_projections(projections, &source_positions, &indexed_output)?;
+    let mut stream = builder
+        .with_projection(mask)
+        .with_batch_size(BUILD_READ_BATCH_ROWS)
+        .build()
+        .map_err(corrupt("scoped read"))?;
+    let mut emitted = 0usize;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(corrupt("scoped read"))?;
+        let entries = record_batch_index_entries(
+            &batch,
+            &projections,
+            row_id_output,
+            row_id_start,
+            Ordinals::Dense,
+            emitted,
+            excluded_ordinals,
+            None,
+        )?;
+        consumer.consume(entries).await?;
+        emitted = emitted.saturating_add(batch.num_rows());
+    }
+    Ok(())
+}
+
 /// Receives one bounded group of entries from a full-file scoped read.
 /// `first_ordinal` is the physical position of the group's first row.
 pub(crate) trait ScopedEntryBatchConsumer {
@@ -2410,6 +2527,67 @@ mod tests {
         assert_eq!(entries[1].row_id, 101);
         assert_eq!(entries[1].values[1], None);
         assert_eq!(entries[2].row_id, 102);
+    }
+
+    struct IndexBatchCollector {
+        batches: Vec<Vec<ScopedIndexEntry>>,
+    }
+
+    impl ScopedIndexEntryBatchConsumer for IndexBatchCollector {
+        async fn consume(&mut self, entries: Vec<ScopedIndexEntry>) -> Result<()> {
+            self.batches.push(entries);
+            Ok(())
+        }
+    }
+
+    /// Fused index encoding reaches its consumer one Arrow batch at a time;
+    /// a full-file upkeep read does not retain every encoded entry first.
+    #[tokio::test]
+    async fn streams_fused_index_entries_in_bounded_batches() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("streamed-index.parquet");
+        let (file_size, footer_size) =
+            write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
+        assert!(file_size > WHOLE_OBJECT_THRESHOLD);
+        let projections = [IndexProjection {
+            index_id: 7,
+            unique: false,
+            positions: vec![0],
+            directions: vec![Direction::Ascending],
+            nulls: vec![NullOrder::First],
+        }];
+        let mut collector = IndexBatchCollector {
+            batches: Vec::new(),
+        };
+
+        scoped_read_index_entry_batches(
+            store,
+            &path,
+            &projections,
+            RowIdSource::Resolve {
+                row_id_start: Some(100),
+            },
+            Some(file_size),
+            Some(footer_size),
+            None,
+            &mut collector,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(collector.batches.len(), 3);
+        assert!(
+            collector
+                .batches
+                .iter()
+                .all(|batch| batch.len() <= BUILD_READ_BATCH_ROWS)
+        );
+        assert_eq!(
+            collector.batches.iter().map(Vec::len).sum::<usize>(),
+            20_000
+        );
+        assert_eq!(collector.batches[0][0].row_id, 100);
+        assert_eq!(collector.batches[2].last().unwrap().row_id, 20_099);
     }
 
     /// Values come back ordered as the requested positions — duplicates and

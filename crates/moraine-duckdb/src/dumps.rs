@@ -88,8 +88,6 @@ pub(crate) fn opt_into_raw(s: Option<CString>) -> *mut c_char {
 /// non-null, must be safe to call with `probe_ctx` from any thread.
 /// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
 /// for the duration of the call.
-// Six of the eight parameters mirror the fixed C signature every dump
-// entry point exposes; grouping them would only obscure the mirror.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn dump_rows<Row, Rows>(
     handle: *mut MoraineCatalogHandle,
