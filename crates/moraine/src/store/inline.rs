@@ -4,8 +4,6 @@
 
 use std::collections::BTreeSet;
 
-use futures::{StreamExt, TryStreamExt, stream};
-
 use crate::{
     error::{Error, Result},
     store::{
@@ -24,18 +22,29 @@ use crate::{
     },
 };
 
-/// Point reads issued together after the range directory identifies chunks.
-const INLINE_CHUNK_READ_CONCURRENCY: usize = 64;
+/// One directory entry identifying an immutable inline chunk and its row
+/// range. Callers can begin work on each chunk as its point read completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InlineChunkLocator {
+    operation: InlineOperation,
+    row_id_start: u64,
+    row_id_end: u64,
+}
 
-/// Resolves the committed chunks that own `row_ids` through the per-chunk
-/// row-range directory. `None` means the directory is absent or incomplete,
-/// as it is for chunks written before the directory format was adopted; the
-/// caller must fall back to [`scan_inline_chunks`].
-pub(crate) async fn find_inline_chunks_for_rows(
+impl InlineChunkLocator {
+    /// Whether this chunk owns `row_id`.
+    pub(crate) fn holds(self, row_id: u64) -> bool {
+        row_id >= self.row_id_start && row_id <= self.row_id_end
+    }
+}
+
+/// Resolves the directory entries owning `row_ids` without fetching their
+/// chunk bodies. `None` means the directory is absent or incomplete.
+pub(crate) async fn find_inline_chunk_locators_for_rows(
     handle: ReadHandle<'_>,
     table_id: u64,
     row_ids: &[u64],
-) -> Result<Option<Vec<(InlineOperation, InlineChunkValue)>>> {
+) -> Result<Option<Vec<InlineChunkLocator>>> {
     let targets: Vec<u64> = row_ids
         .iter()
         .copied()
@@ -91,7 +100,11 @@ pub(crate) async fn find_inline_chunks_for_rows(
             begin_snapshot: locator.begin_snapshot,
             chunk_seq: locator.chunk_seq,
         };
-        locators.push((operation, locator.row_id_start, row_id_end));
+        locators.push(InlineChunkLocator {
+            operation,
+            row_id_start: locator.row_id_start,
+            row_id_end,
+        });
         while target_index < targets.len() && targets[target_index] <= row_id_end {
             if targets[target_index] < locator.row_id_start {
                 return Ok(None);
@@ -100,32 +113,32 @@ pub(crate) async fn find_inline_chunks_for_rows(
         }
     }
 
-    let chunks = stream::iter(locators.into_iter().map(
-        |(operation, row_id_start, row_id_end)| async move {
-            let Some(chunk): Option<InlineChunkValue> =
-                read_singleton(handle, Key::Inline(InlineKey::Live(operation))).await?
-            else {
-                return Err(Error::Corruption(format!(
-                    "inline chunk directory for table {table_id} names a missing chunk"
-                )));
-            };
-            let actual_end = chunk
-                .row_count
-                .checked_sub(1)
-                .and_then(|count| chunk.row_id_start.checked_add(count));
-            if chunk.row_id_start != row_id_start || actual_end != Some(row_id_end) {
-                return Err(Error::Corruption(format!(
-                    "inline chunk directory for table {table_id} disagrees with its chunk range"
-                )));
-            }
-            Ok((operation, chunk))
-        },
-    ))
-    .buffered(INLINE_CHUNK_READ_CONCURRENCY)
-    .try_collect()
-    .await?;
+    Ok(Some(locators))
+}
 
-    Ok(Some(chunks))
+/// Fetches and validates the immutable chunk named by `locator`.
+pub(crate) async fn read_inline_chunk_locator(
+    handle: ReadHandle<'_>,
+    table_id: u64,
+    locator: InlineChunkLocator,
+) -> Result<(InlineOperation, InlineChunkValue)> {
+    let Some(chunk): Option<InlineChunkValue> =
+        read_singleton(handle, Key::Inline(InlineKey::Live(locator.operation))).await?
+    else {
+        return Err(Error::Corruption(format!(
+            "inline chunk directory for table {table_id} names a missing chunk"
+        )));
+    };
+    let actual_end = chunk
+        .row_count
+        .checked_sub(1)
+        .and_then(|count| chunk.row_id_start.checked_add(count));
+    if chunk.row_id_start != locator.row_id_start || actual_end != Some(locator.row_id_end) {
+        return Err(Error::Corruption(format!(
+            "inline chunk directory for table {table_id} disagrees with its chunk range"
+        )));
+    }
+    Ok((locator.operation, chunk))
 }
 
 /// Every chunk-range locator for `table_id`, ordered by inclusive range end.
@@ -352,15 +365,19 @@ mod tests {
         tx.commit().await.unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        let selected = find_inline_chunks_for_rows(ReadHandle::Tx(&tx), 7, &[105, 1_005])
+        let selected = find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 7, &[105, 1_005])
             .await
             .unwrap()
             .unwrap();
         assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].1.row_id_start, 100);
-        assert_eq!(selected[1].1.row_id_start, 1_000);
+        assert_eq!(selected[0].row_id_start, 100);
+        assert_eq!(selected[1].row_id_start, 1_000);
+        let (_, first) = read_inline_chunk_locator(ReadHandle::Tx(&tx), 7, selected[0])
+            .await
+            .unwrap();
+        assert_eq!(first.body, b"chunk-7-1");
         assert_eq!(
-            find_inline_chunks_for_rows(ReadHandle::Tx(&tx), 8, &[5])
+            find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 8, &[5])
                 .await
                 .unwrap(),
             None,

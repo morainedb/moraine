@@ -216,11 +216,10 @@ mod tests {
     use super::*;
     use crate::{
         catalog::CatalogOptions,
-        transaction::staged::{RowOperation, StagedTransaction, TableKind},
+        transaction::staged::{Cell, RowOperation, StagedTransaction, TableKind},
     };
 
-    fn snapshot_row(id: u64) -> Vec<crate::transaction::staged::Cell> {
-        use crate::transaction::staged::Cell;
+    fn snapshot_row(id: u64) -> Vec<Cell> {
         vec![
             Cell::U64(id),
             Cell::I64(1),
@@ -230,8 +229,7 @@ mod tests {
         ]
     }
 
-    fn snapshot_changes_row(id: u64) -> Vec<crate::transaction::staged::Cell> {
-        use crate::transaction::staged::Cell;
+    fn snapshot_changes_row(id: u64) -> Vec<Cell> {
         vec![
             Cell::U64(id),
             Cell::Str("inlined_insert:1".to_string()),

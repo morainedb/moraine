@@ -258,6 +258,99 @@ impl EntityKey {
     }
 }
 
+/// One [`EntityKey`] variant, without the fields identifying a record.
+/// Used to derive a prefix that selects one catalog kind without scanning
+/// every entity in `current` or `history`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EntityKind {
+    /// `ducklake_schema`.
+    Schema,
+    /// `ducklake_table`.
+    Table,
+    /// `ducklake_view`.
+    View,
+    /// `ducklake_column`.
+    Column,
+    /// `ducklake_partition_info`.
+    Partition,
+    /// `ducklake_data_file`.
+    File,
+    /// `ducklake_delete_file`.
+    DeleteFile,
+    /// `ducklake_file_column_stats`.
+    FileColumnStats,
+    /// `ducklake_table_stats`.
+    TableStats,
+    /// `ducklake_table_column_stats`.
+    TableColumnStats,
+    /// `ducklake_tag`.
+    Tag,
+    /// `ducklake_metadata`.
+    Option,
+    /// `ducklake_sort_info`.
+    Sort,
+    /// `ducklake_macro`.
+    Macro,
+    /// `ducklake_column_mapping`.
+    Mapping,
+}
+
+impl EntityKind {
+    /// A minimal key of this kind for prefix derivation.
+    const fn sample(self) -> EntityKey {
+        match self {
+            Self::Schema => EntityKey::Schema { schema_id: 0 },
+            Self::Table => EntityKey::Table { table_id: 0 },
+            Self::View => EntityKey::View { view_id: 0 },
+            Self::Column => EntityKey::Column {
+                table_id: 0,
+                column_id: 0,
+            },
+            Self::Partition => EntityKey::Partition {
+                table_id: 0,
+                partition_id: 0,
+            },
+            Self::File => EntityKey::File {
+                table_id: 0,
+                data_file_id: 0,
+            },
+            Self::DeleteFile => EntityKey::DeleteFile {
+                table_id: 0,
+                delete_file_id: 0,
+            },
+            Self::FileColumnStats => EntityKey::FileColumnStats {
+                table_id: 0,
+                data_file_id: 0,
+                column_id: 0,
+            },
+            Self::TableStats => EntityKey::TableStats { table_id: 0 },
+            Self::TableColumnStats => EntityKey::TableColumnStats {
+                table_id: 0,
+                column_id: 0,
+            },
+            Self::Tag => EntityKey::Tag { object_id: 0 },
+            Self::Option => EntityKey::Option {
+                scope_kind: 0,
+                scope_id: 0,
+            },
+            Self::Sort => EntityKey::Sort {
+                table_id: 0,
+                sort_id: 0,
+            },
+            Self::Macro => EntityKey::Macro { macro_id: 0 },
+            Self::Mapping => EntityKey::Mapping {
+                table_id: 0,
+                mapping_id: 0,
+            },
+        }
+    }
+
+    /// Whether this kind has ended versions in `history`.
+    pub(crate) const fn is_versioned(self) -> bool {
+        self.sample().is_versioned()
+    }
+}
+
 /// An inlined-data key: the per-schema-version Arrow schema, a live
 /// record, the archived (post-flush) form of a live record, or a
 /// delete-table existence marker, or a live chunk's row-range locator.
@@ -535,6 +628,10 @@ impl TableScopedKind {
 #[allow(dead_code)]
 const CUR_KIND_PREFIX_LEN: usize = 3;
 
+/// Discriminant bytes preceding an entity's components in a history key:
+/// subspace, then entity kind.
+const HISTORY_KIND_PREFIX_LEN: usize = 2;
+
 /// The three live-record kinds inside the inline subspace — the only kinds
 /// [`inline_live_table_prefix`] builds a prefix for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -791,6 +888,21 @@ pub(crate) fn current_table_prefix(kind: TableScopedKind, table_id: u64) -> Vec<
         &Key::current(kind.sample(table_id)),
         CUR_KIND_PREFIX_LEN + size_of::<u64>(),
     )
+}
+
+/// Byte prefix of every live entity of `kind`.
+pub(crate) fn current_entity_kind_prefix(kind: EntityKind) -> Vec<u8> {
+    prefix_of(&Key::current(kind.sample()), CUR_KIND_PREFIX_LEN)
+}
+
+/// Byte prefix of every ended entity version of `kind`.
+pub(crate) fn history_entity_kind_prefix(kind: EntityKind) -> Vec<u8> {
+    prefix_of(&Key::history(kind.sample(), 0), HISTORY_KIND_PREFIX_LEN)
+}
+
+/// Byte prefix of every scheduled-file record in `current`.
+pub(crate) fn current_gc_file_prefix() -> Vec<u8> {
+    prefix_of(&Key::Current(CurrentKey::GcFile { data_file_id: 0 }), 2)
 }
 
 #[cfg(test)]
@@ -1327,6 +1439,28 @@ mod tests {
         assert!(!bytes.starts_with(&current_table_prefix(TableScopedKind::File, 2)));
         // A different kind's prefix must not match.
         assert!(!bytes.starts_with(&current_table_prefix(TableScopedKind::DeleteFile, 1)));
+    }
+
+    #[test]
+    fn entity_kind_prefixes_select_only_the_requested_kind() {
+        let current = Key::current(EntityKey::File {
+            table_id: 1,
+            data_file_id: 2,
+        })
+        .encode();
+        let history = Key::history(
+            EntityKey::File {
+                table_id: 1,
+                data_file_id: 2,
+            },
+            3,
+        )
+        .encode();
+
+        assert!(current.starts_with(&current_entity_kind_prefix(EntityKind::File)));
+        assert!(history.starts_with(&history_entity_kind_prefix(EntityKind::File)));
+        assert!(!current.starts_with(&current_entity_kind_prefix(EntityKind::Table)));
+        assert!(!history.starts_with(&history_entity_kind_prefix(EntityKind::Table)));
     }
 
     /// Every table-scoped kind's prefix matches a live key of that kind

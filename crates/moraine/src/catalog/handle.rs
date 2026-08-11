@@ -1257,16 +1257,15 @@ impl ReadOnlyCatalog {
             let row_id_groups = stream::iter(encoded.into_iter().map(|key| async move {
                 index_maintenance::lookup_row_ids(handle, index.get(), info.unique, &key).await
             }))
-            .buffered(INDEX_LOOKUP_CONCURRENCY)
-            .try_collect::<Vec<_>>()
-            .await?;
+            .buffered(INDEX_LOOKUP_CONCURRENCY);
+            let mut row_id_groups = std::pin::pin!(row_id_groups);
 
             let mut seen = HashSet::new();
-            Ok(row_id_groups
-                .into_iter()
-                .flatten()
-                .filter(|row_id| seen.insert(*row_id))
-                .collect())
+            let mut row_ids = Vec::new();
+            while let Some(group) = row_id_groups.try_next().await? {
+                row_ids.extend(group.into_iter().filter(|row_id| seen.insert(*row_id)));
+            }
+            Ok(row_ids)
         })
         .await;
         session.finish();

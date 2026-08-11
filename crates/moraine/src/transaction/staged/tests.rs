@@ -199,6 +199,7 @@ async fn staged_commit_diagnostics_join_scan_counts_and_commit_phases() {
         "scanned committed entities for staged transaction",
         &transaction_id,
     );
+    assert_eq!(scan.get("kind").map(String::as_str), Some("Table"));
     assert!(scan.contains_key("current_records"));
     assert!(scan.contains_key("history_records"));
     assert!(scan.contains_key("records"));
@@ -685,9 +686,10 @@ async fn stages_inline_schema_and_sequential_inserts() {
     );
     assert_eq!(chunks[1].1.body, b"chunk-b");
 
-    let selected = store_inline::find_inline_chunks_for_rows(ReadHandle::Tx(&tx), 1, &[1, 2])
-        .await
-        .unwrap();
+    let selected =
+        store_inline::find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 1, &[1, 2])
+            .await
+            .unwrap();
     assert_eq!(
         selected.as_ref().map(Vec::len),
         Some(2),
@@ -1020,6 +1022,56 @@ async fn inline_row_delete_removes_its_unique_index_entry() {
         0,
         "the delete removes the entry it killed"
     );
+}
+
+/// The first indexed delete that encounters chunks written before the
+/// row-range directory existed repairs every live chunk it had to scan.
+/// Later deletes can then resolve their owning chunk directly.
+#[tokio::test]
+async fn indexed_delete_lazily_repairs_legacy_inline_chunk_locators() {
+    let (catalog, _) = catalog_with_indexed_inline_table(true).await;
+
+    inline_insert(&catalog, 3, 0, &[7], true).await;
+    inline_insert(&catalog, 4, 1, &[8], false).await;
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    tx.delete(
+        Key::Inline(InlineKey::ChunkRange {
+            table_id: 1,
+            row_id_end: 0,
+        })
+        .encode(),
+    )
+    .unwrap();
+    tx.delete(
+        Key::Inline(InlineKey::ChunkRange {
+            table_id: 1,
+            row_id_end: 1,
+        })
+        .encode(),
+    )
+    .unwrap();
+    tx.commit_with_options(&commit::durable()).await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    assert!(
+        store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(&tx), 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    tx.rollback();
+
+    inline_row_delete(&catalog, 5, 0).await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    assert_eq!(
+        store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(&tx), 1)
+            .await
+            .unwrap(),
+        vec![0, 1]
+    );
+    tx.rollback();
 }
 
 /// The replace pattern a writer depends on: delete a row, then insert

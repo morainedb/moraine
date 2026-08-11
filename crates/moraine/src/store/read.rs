@@ -5,7 +5,10 @@ use crate::{
     error::{Error, Result},
     store::{
         handle::{ReadHandle, ScanShape},
-        key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
+        key::{
+            CurrentKey, EntityKey, EntityKind, Key, Subspace, SysKey, current_entity_kind_prefix,
+            current_gc_file_prefix, history_entity_kind_prefix, subspace_prefix,
+        },
         proto::{
             ChangelogValue, ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue,
             FormatValue, GcFileValue, HeadValue, IndexValue, MacroValue, MaintenanceStatusValue,
@@ -63,6 +66,51 @@ pub(crate) enum EntityRecord {
     /// A `ducklake_files_scheduled_for_deletion` row — `current`-only
     /// bookkeeping, not a temporal entity.
     GcFile(GcFileValue),
+}
+
+/// One decoded entity-record kind, used to read only the catalog table a
+/// transactional metadata scan requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EntityRecordKind {
+    Schema,
+    Table,
+    View,
+    Column,
+    File,
+    DeleteFile,
+    Partition,
+    Sort,
+    Macro,
+    Mapping,
+    FileColumnStats,
+    TableStats,
+    TableColumnStats,
+    Option,
+    Tag,
+    GcFile,
+}
+
+impl EntityRecordKind {
+    fn entity_kind(self) -> Option<EntityKind> {
+        match self {
+            Self::Schema => Some(EntityKind::Schema),
+            Self::Table => Some(EntityKind::Table),
+            Self::View => Some(EntityKind::View),
+            Self::Column => Some(EntityKind::Column),
+            Self::File => Some(EntityKind::File),
+            Self::DeleteFile => Some(EntityKind::DeleteFile),
+            Self::Partition => Some(EntityKind::Partition),
+            Self::Sort => Some(EntityKind::Sort),
+            Self::Macro => Some(EntityKind::Macro),
+            Self::Mapping => Some(EntityKind::Mapping),
+            Self::FileColumnStats => Some(EntityKind::FileColumnStats),
+            Self::TableStats => Some(EntityKind::TableStats),
+            Self::TableColumnStats => Some(EntityKind::TableColumnStats),
+            Self::Option => Some(EntityKind::Option),
+            Self::Tag => Some(EntityKind::Tag),
+            Self::GcFile => None,
+        }
+    }
 }
 
 impl EntityRecord {
@@ -320,6 +368,61 @@ pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<
     .await
 }
 
+/// Every current and ended record of one catalog kind. Unversioned kinds
+/// read only `current`; scheduled-file records use their sibling key kind
+/// there rather than an [`EntityKey`].
+pub(crate) async fn scan_entity_kind(
+    handle: ReadHandle<'_>,
+    kind: EntityRecordKind,
+) -> Result<Vec<EntityRecord>> {
+    let Some(entity_kind) = kind.entity_kind() else {
+        return scan_decode(
+            handle,
+            current_gc_file_prefix(),
+            ScanShape::Bulk,
+            |key, bytes| match key {
+                Key::Current(CurrentKey::GcFile { .. }) => {
+                    Ok(EntityRecord::GcFile(value::decode_value(bytes)?))
+                }
+                other => Err(Error::Corruption(format!(
+                    "non-gc-file key in scheduled-file scan: {other:?}"
+                ))),
+            },
+        )
+        .await;
+    };
+
+    let mut records = scan_decode(
+        handle,
+        current_entity_kind_prefix(entity_kind),
+        ScanShape::Bulk,
+        |key, bytes| match key {
+            Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
+            other => Err(Error::Corruption(format!(
+                "non-entity key in {kind:?} current scan: {other:?}"
+            ))),
+        },
+    )
+    .await?;
+    if entity_kind.is_versioned() {
+        let history = scan_decode(
+            handle,
+            history_entity_kind_prefix(entity_kind),
+            ScanShape::Bulk,
+            |key, bytes| match key {
+                Key::History(history) => decode_entity(history.entity, bytes),
+                other => Err(Error::Corruption(format!(
+                    "non-history key in {kind:?} history scan: {other:?}"
+                ))),
+            },
+        )
+        .await?;
+        records.extend(history);
+    }
+
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -455,8 +558,8 @@ mod tests {
 
         let current = scan_current_entities(ReadHandle::Tx(&tx)).await.unwrap();
         assert_eq!(current.len(), 5);
-        assert!(current.contains(&EntityRecord::Schema(schema)));
-        assert!(current.contains(&EntityRecord::File(file)));
+        assert!(current.contains(&EntityRecord::Schema(schema.clone())));
+        assert!(current.contains(&EntityRecord::File(file.clone())));
         assert!(current.contains(&EntityRecord::TableStats(tstat)));
         assert!(current.contains(&EntityRecord::View(view)));
         assert!(current.contains(&EntityRecord::Option {
@@ -465,7 +568,26 @@ mod tests {
             value: option,
         }));
         let history = scan_history_entities(ReadHandle::Tx(&tx)).await.unwrap();
-        assert_eq!(history, vec![EntityRecord::Schema(ended)]);
+        assert_eq!(history, vec![EntityRecord::Schema(ended.clone())]);
+
+        assert_eq!(
+            scan_entity_kind(ReadHandle::Tx(&tx), EntityRecordKind::Schema)
+                .await
+                .unwrap(),
+            vec![EntityRecord::Schema(schema), EntityRecord::Schema(ended),]
+        );
+        assert_eq!(
+            scan_entity_kind(ReadHandle::Tx(&tx), EntityRecordKind::File)
+                .await
+                .unwrap(),
+            vec![EntityRecord::File(file)]
+        );
+        assert_eq!(
+            scan_entity_kind(ReadHandle::Tx(&tx), EntityRecordKind::TableStats)
+                .await
+                .unwrap(),
+            vec![EntityRecord::TableStats(tstat)]
+        );
         tx.rollback();
         db.close().await.unwrap();
     }
