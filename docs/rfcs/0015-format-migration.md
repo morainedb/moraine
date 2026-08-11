@@ -99,7 +99,9 @@ Axis 2 splits again, and only one half needs this RFC's machinery.
 
 An **additive** structural change introduces a new subspace or a new kind and
 **moves no existing key**. The `index` subspace ([RFC 0016](0016-equality-indexes.md))
-is the worked example: a store that grows one is stamped a higher
+and the per-chunk inline row-range directory
+([RFC 0005](0005-data-inlining.md)) are worked examples: a store that grows
+either is stamped a higher
 `sys/format` so binaries that cannot name the new tag refuse it, but nothing
 already written is rewritten, and a binary that *does* know the tag reads the
 older store unchanged. The stamp is therefore **lazy** — written the first

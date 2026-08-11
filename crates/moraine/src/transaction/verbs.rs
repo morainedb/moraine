@@ -17,7 +17,7 @@ use crate::{
     },
     error::{Error, Result},
     store::{
-        index_encoding::{Direction, NullOrder, encode_ordered_values},
+        index_encoding::{Direction, NullOrder, encode_ordered_index_entry},
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FilePartitionValue,
             IndexValue, MacroImplementation, MacroParameter, MacroValue, PartitionColumn,
@@ -813,13 +813,19 @@ impl Transaction {
         // it, but always multi-shaped (row id in the key) and exempt from the
         // value collision — SQL treats NULLs as distinct, so a unique index
         // still admits any number of such rows.
-        let has_null = entry.values.iter().any(Option::is_none);
         let directions: Vec<_> = orders.iter().map(|order| order.direction).collect();
         let nulls: Vec<_> = orders.iter().map(|order| order.nulls).collect();
-        let key = encode_ordered_values(&entry.values, &directions, &nulls)?;
+        let (key, unique) = encode_ordered_index_entry(
+            &entry.values,
+            &directions,
+            &nulls,
+            index_id,
+            unique,
+            entry.row_id,
+        )?;
         self.index_entries.push(StagedIndexEntry {
             index_id,
-            unique: unique && !has_null,
+            unique,
             key,
             row_id: entry.row_id,
             delete,

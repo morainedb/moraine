@@ -23,8 +23,8 @@ use crate::{
         handle::{ReadHandle, ScanOrder, ScanShape},
         index_encoding::{CanonicalKey, NullOrder, non_null_flag_key},
         key::{
-            IndexKey, IndexKind, Key, index_index_prefix, index_multi_value_prefix,
-            index_value_above, index_value_body, index_value_suffix,
+            IndexKey, IndexKind, Key, encode_index_entry, index_index_prefix,
+            index_multi_value_prefix, index_value_above, index_value_body, index_value_suffix,
         },
     },
 };
@@ -37,8 +37,8 @@ pub(crate) struct StagedIndexEntry {
     pub(crate) index_id: u64,
     /// Whether the index is unique — selects the key shape and enforcement.
     pub(crate) unique: bool,
-    /// The canonical indexed value.
-    pub(crate) key: CanonicalKey,
+    /// The final encoded SlateDB entry key.
+    pub(crate) key: Bytes,
     /// The row the entry points at.
     pub(crate) row_id: u64,
     /// Whether this removes the entry (`true`) or adds it (`false`).
@@ -46,21 +46,6 @@ pub(crate) struct StagedIndexEntry {
     /// Whether the index is still building, so a collision poisons it
     /// instead of failing this commit.
     pub(crate) building: bool,
-}
-
-fn entry_key(entry: &StagedIndexEntry) -> Key {
-    if entry.unique {
-        Key::Index(IndexKey::Unique {
-            index_id: entry.index_id,
-            key: entry.key.clone(),
-        })
-    } else {
-        Key::Index(IndexKey::Multi {
-            index_id: entry.index_id,
-            key: entry.key.clone(),
-            row_id: entry.row_id,
-        })
-    }
 }
 
 /// A unique entry's value is the holding row id, big-endian.
@@ -117,7 +102,7 @@ pub(crate) struct StagedEntries {
 /// One unique put awaiting its probe.
 struct PendingProbe {
     /// The entry's encoded store key.
-    key: Vec<u8>,
+    key: Bytes,
     /// The row claiming the value.
     row_id: u64,
     /// The index the claim belongs to.
@@ -142,7 +127,7 @@ fn collision(probe_index_id: u64, building: bool, poisoned: &mut Vec<u64>) -> Op
 /// present with the same row id is a re-derived entry and stages nothing.
 async fn resolve_probes(
     db_tx: &DbTransaction,
-    deleted_unique: &HashSet<Vec<u8>>,
+    deleted_unique: &HashSet<Bytes>,
     pending: &mut Vec<PendingProbe>,
     poisoned: &mut Vec<u64>,
     staged: &mut StagedBytes,
@@ -190,6 +175,7 @@ async fn resolve_probes(
         staged.add(probe.key.len(), size_of::<u64>());
         db_tx.put(probe.key, probe.row_id.to_be_bytes())?;
     }
+
     Ok(())
 }
 
@@ -218,24 +204,31 @@ async fn resolve_probes(
 /// deletes-before-puts ordering above carries meaning.
 pub(crate) async fn stage_index_entries(
     db_tx: &DbTransaction,
-    entries: &[StagedIndexEntry],
+    entries: &[&[StagedIndexEntry]],
 ) -> Result<StagedEntries> {
-    if entries.len() > MAX_INDEX_ENTRIES_PER_COMMIT {
+    let entry_count = entries
+        .iter()
+        .fold(0_usize, |count, group| count.saturating_add(group.len()));
+    if entry_count > MAX_INDEX_ENTRIES_PER_COMMIT {
         // Logged as well as returned: the refusal is the guardrail firing,
         // and an operator reading logs after a failed bulk load should see
         // it without having to recover the SQL error text.
         warn!(
-            staged = entries.len(),
+            staged = entry_count,
             limit = MAX_INDEX_ENTRIES_PER_COMMIT,
             "refusing an oversized commit"
         );
-        return Err(oversized_commit(entries.len()));
+        return Err(oversized_commit(entry_count));
     }
 
     let mut staged = StagedBytes::default();
-    let mut deleted_unique: HashSet<Vec<u8>> = HashSet::new();
-    for entry in entries.iter().filter(|entry| entry.delete) {
-        let key_bytes = entry_key(entry).encode();
+    let mut deleted_unique: HashSet<Bytes> = HashSet::new();
+    for entry in entries
+        .iter()
+        .flat_map(|group| group.iter())
+        .filter(|entry| entry.delete)
+    {
+        let key_bytes = entry.key.clone();
         if entry.unique {
             deleted_unique.insert(key_bytes.clone());
         }
@@ -249,10 +242,14 @@ pub(crate) async fn stage_index_entries(
     // bounded group of concurrent point reads at a time, so peak memory is
     // one group of keys rather than the whole batch's.
     let mut pending: Vec<PendingProbe> = Vec::new();
-    let mut claimed: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut claimed: HashMap<Bytes, u64> = HashMap::new();
     let mut poisoned: Vec<u64> = Vec::new();
-    for entry in entries.iter().filter(|entry| !entry.delete) {
-        let key_bytes = entry_key(entry).encode();
+    for entry in entries
+        .iter()
+        .flat_map(|group| group.iter())
+        .filter(|entry| !entry.delete)
+    {
+        let key_bytes = entry.key.clone();
         if !entry.unique {
             // The row id lives in the key; the value is empty.
             staged.add(key_bytes.len(), 0);
@@ -286,6 +283,7 @@ pub(crate) async fn stage_index_entries(
             .await?;
         }
     }
+
     resolve_probes(
         db_tx,
         &deleted_unique,
@@ -297,6 +295,7 @@ pub(crate) async fn stage_index_entries(
 
     poisoned.sort_unstable();
     poisoned.dedup();
+
     Ok(StagedEntries {
         poisoned,
         deferred: Vec::new(),
@@ -458,11 +457,7 @@ pub(crate) async fn lookup_row_ids(
     key: &CanonicalKey,
 ) -> Result<Vec<u64>> {
     if unique {
-        let entry_key = Key::Index(IndexKey::Unique {
-            index_id,
-            key: key.clone(),
-        })
-        .encode();
+        let entry_key = encode_index_entry(index_id, true, key, 0);
         return match reader.get(entry_key).await.map_err(Error::from)? {
             Some(bytes) => Ok(vec![decode_row_id(&bytes)?]),
             None => Ok(Vec::new()),
@@ -485,6 +480,7 @@ pub(crate) async fn lookup_row_ids(
             }
         }
     }
+
     Ok(row_ids)
 }
 
@@ -558,6 +554,7 @@ pub(crate) async fn range_row_ids(
             }
         }
     }
+
     Ok(row_ids)
 }
 
@@ -592,6 +589,7 @@ pub(crate) async fn null_prefix_row_ids(
             }
         }
     }
+
     Ok(row_ids)
 }
 

@@ -571,6 +571,7 @@ The caches a moraine-backed query crosses, top to bottom:
 | DuckLake catalog cache | schema/catalog entries; the per-transaction snapshot | snapshot id + `schema_version` | live-catalog-sized | `schema_version` move; transaction end |
 | shim `MetadataRows` | decoded rows per synthesized table | head stamp at first scan | per transaction | transaction end |
 | core logical caches | `CatalogSnapshot`, entity record set, maintained projections | head stamp + install epoch | one catalog's decoded size | replaced on stamp move |
+| core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep | object-store identity + path + file size + page-index policy | process-wide share of `CACHE_MEMORY`, capped at 8 MiB | byte-bounded LRU |
 | SlateDB block + meta cache | decoded SST blocks, indexes, filters | scoped SST id + offset | process-shared memory + `CACHE_DIR` disk | LRU-ish (foyer) |
 
 Two findings drove this section. Before consolidation, one catalog byte could
@@ -805,11 +806,11 @@ GETs, where preload re-fetches. Recovery is also unsafe with attach-order
 scopes, so this loss is required for correctness until the upstream stable-
 scope work lands.
 
-### The data path is DuckDB's, and DuckDB caches it
+### The query data path is DuckDB's; index upkeep reads scoped metadata
 
-moraine never touches a data-file byte and adds no data cache, footer
-cache, or read-through layer: a lakehouse's data path belongs to the
-engine reading it, and duplicating DuckDB's would be the mistake this
+Ordinary lake scans never send data-file bytes through moraine and add no
+data-page cache or read-through layer: a lakehouse's query data path belongs
+to the engine reading it, and duplicating DuckDB's would be the mistake this
 RFC removes from the catalog tier.
 
 It does not have to. **A lake read goes through DuckDB's caching file
@@ -819,6 +820,20 @@ other allocation. Measured over a remote `DATA_PATH`: one query fetches
 the file's footer and its data ranges, a second differently shaped query
 over the same data fetches nothing, and the same pair under
 `enable_external_file_cache = false` fetches everything twice.
+
+Equality-index upkeep is the narrow exception. A commit deleting indexed
+rows must recover their indexed values, and its Rust scoped reader talks to
+`DATA_PATH` directly rather than entering DuckDB's Parquet reader. DuckLake's
+recorded `footer_size` lets the first read prefetch the serialized footer and
+its trailing length in one request. A process-wide byte-bounded cache retains
+the parsed footer and page indexes for repeated touches of the same immutable
+file; it is keyed by object-store identity, path, file size, and page-index
+policy, and holds only metadata. Its allowance is one sixteenth of
+`CACHE_MEMORY`'s metadata share, capped at 8 MiB, with the remainder of that
+share continuing to hold SlateDB metadata — one Moraine memory budget, not a
+third invisible one. Projected data-column ranges are never retained. This
+cache exists because DuckDB's metadata cache cannot be reached from the direct
+Rust reader, not as a second copy of metadata DuckDB served to it.
 
 **Data-block caching rides on the Parquet reader's prefetch, taken only
 for files that are not on local disk** — without it the reader issues a
@@ -833,11 +848,10 @@ measurement must avoid both: a lake `count(*)`, answered from catalog
 statistics without opening a file at all, and a local path's
 footer-only caching.
 
-So the data tier is *unified, not un-budgeted*: it is DuckDB's cache,
-inside DuckDB's budget. A host sizes two memory consumers, both visible
-to whoever sets them — DuckDB's `memory_limit` and moraine's
-`CACHE_MEMORY` — and a third only if an operator adds a filesystem
-cache.
+So the data-page tier is *unified, not un-budgeted*: it is DuckDB's cache,
+inside DuckDB's budget. A host sizes DuckDB's `memory_limit` and moraine's
+`CACHE_MEMORY`; the latter includes the scoped reader's parsed metadata. A
+further tier exists only if an operator adds a filesystem cache.
 
 That remains a real option, and its value is what the external-file
 cache does not do: survive the process. The external-file cache is
@@ -1019,10 +1033,11 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   evict filters, after which every probe pays a fetch to learn "not
   here". The metadata is small enough to pin; only data blocks need
   tiering.
-- **A moraine-level data-file or Parquet-footer cache.** Rejected:
-  DuckDB's external-file cache already holds data bytes inside
-  `memory_limit`; adding one re-creates the double-caching this RFC
-  removes.
+- **A moraine-level data-file byte cache.** Rejected: DuckDB's external-file
+  cache already holds data bytes inside `memory_limit`; adding one re-creates
+  the double-caching this RFC removes. The scoped equality-index reader's
+  bounded parsed-metadata cache is the exception above: that reader bypasses
+  DuckDB, and it never retains data pages.
 - **Setting DuckDB's cache settings from the attach.** Rejected: they are
   global, and an `ATTACH` that mutates global state reaches every other
   database in the process. Guidance over mutation.

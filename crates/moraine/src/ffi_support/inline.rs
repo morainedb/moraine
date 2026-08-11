@@ -65,7 +65,7 @@ pub async fn scan_inline(
 ) -> Result<InlineScanRecord> {
     let session = catalog.begin_read().await?;
     let chunks = store_inline::scan_inline_chunks(session.handle(), table_id).await;
-    let inline_deletes = store_inline::scan_inline_inline_deletes(session.handle(), table_id).await;
+    let inline_deletes = store_inline::scan_inline_deletes(session.handle(), table_id).await;
     session.finish();
     let chunks = chunks?;
     let inline_deletes = inline_deletes?;

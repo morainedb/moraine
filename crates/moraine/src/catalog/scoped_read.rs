@@ -4,7 +4,10 @@
 //! bounded, merge-free projection, not the scan path the no-Parquet-read
 //! rule guards.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet, VecDeque},
+    sync::{Arc, LazyLock, Mutex, Weak},
+};
 
 use arrow::{
     array::{
@@ -15,7 +18,7 @@ use arrow::{
         UInt16Array, UInt32Array, UInt64Array,
     },
     buffer::Buffer,
-    datatypes::{DataType, TimeUnit},
+    datatypes::{DataType, SchemaRef, TimeUnit},
     ipc::{
         reader::{StreamReader, read_record_batch},
         root_as_message,
@@ -39,7 +42,13 @@ use parquet::{
 
 use crate::{
     error::{Error, Result},
-    store::index_encoding::{IndexKeyValue, IntWidth},
+    store::{
+        cache,
+        index_encoding::{
+            BorrowedIndexKeyValue, CanonicalKeyBuilder, Direction, IndexKeyValue, IntWidth,
+            NullOrder,
+        },
+    },
 };
 
 /// One entry derived from a registered file: the row id and the canonical
@@ -50,6 +59,34 @@ pub(crate) struct ScopedReadEntry {
     pub(crate) row_id: u64,
     /// The indexed column values; a `None` is SQL NULL (stored multi-shaped).
     pub(crate) values: Vec<Option<IndexKeyValue>>,
+}
+
+/// One index's projection over an Arrow batch. Positions name Arrow columns
+/// in index-column order; ordering vectors run in parallel to them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexProjection {
+    /// Persistent id used in the physical entry prefix.
+    pub(crate) index_id: u64,
+    /// Whether non-NULL values use the unique entry shape.
+    pub(crate) unique: bool,
+    /// Arrow column positions in index-column order.
+    pub(crate) positions: Vec<usize>,
+    /// Per-column sort directions.
+    pub(crate) directions: Vec<Direction>,
+    /// Per-column NULL placement.
+    pub(crate) nulls: Vec<NullOrder>,
+}
+
+/// A final physical index key derived directly from an Arrow row.
+pub(crate) struct ScopedIndexEntry {
+    /// Position of the owning index in the supplied projection plans.
+    pub(crate) index: usize,
+    /// Stable row id carried by the entry.
+    pub(crate) row_id: u64,
+    /// Fully encoded SlateDB entry key.
+    pub(crate) key: Bytes,
+    /// Whether the key uses the unique physical shape.
+    pub(crate) unique: bool,
 }
 
 /// DuckDB's reserved Parquet field id tagging the embedded row-id column
@@ -307,6 +344,105 @@ fn array_value(array: &dyn Array, row: usize) -> Result<Option<IndexKeyValue>> {
     Ok(Some(value))
 }
 
+/// Borrows one Arrow scalar for immediate canonical-key construction.
+fn borrowed_array_value(
+    array: &dyn Array,
+    row: usize,
+) -> Result<Option<BorrowedIndexKeyValue<'_>>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+
+    let signed = |value: i128, width| BorrowedIndexKeyValue::Int { value, width };
+    let unsigned = |value: u128, width| BorrowedIndexKeyValue::UInt { value, width };
+    let value = match array.data_type() {
+        DataType::Int8 => signed(
+            i128::from(downcast::<Int8Array>(array)?.value(row)),
+            IntWidth::I8,
+        ),
+        DataType::Int16 => signed(
+            i128::from(downcast::<Int16Array>(array)?.value(row)),
+            IntWidth::I16,
+        ),
+        DataType::Int32 => signed(
+            i128::from(downcast::<Int32Array>(array)?.value(row)),
+            IntWidth::I32,
+        ),
+        DataType::Int64 => signed(
+            i128::from(downcast::<Int64Array>(array)?.value(row)),
+            IntWidth::I64,
+        ),
+        DataType::UInt8 => unsigned(
+            u128::from(downcast::<UInt8Array>(array)?.value(row)),
+            IntWidth::I8,
+        ),
+        DataType::UInt16 => unsigned(
+            u128::from(downcast::<UInt16Array>(array)?.value(row)),
+            IntWidth::I16,
+        ),
+        DataType::UInt32 => unsigned(
+            u128::from(downcast::<UInt32Array>(array)?.value(row)),
+            IntWidth::I32,
+        ),
+        DataType::UInt64 => unsigned(
+            u128::from(downcast::<UInt64Array>(array)?.value(row)),
+            IntWidth::I64,
+        ),
+        DataType::Float32 => {
+            BorrowedIndexKeyValue::F32(downcast::<Float32Array>(array)?.value(row))
+        }
+        DataType::Float64 => {
+            BorrowedIndexKeyValue::F64(downcast::<Float64Array>(array)?.value(row))
+        }
+        DataType::Boolean => {
+            BorrowedIndexKeyValue::Bool(downcast::<BooleanArray>(array)?.value(row))
+        }
+        DataType::Utf8 => BorrowedIndexKeyValue::Str(downcast::<StringArray>(array)?.value(row)),
+        DataType::LargeUtf8 => {
+            BorrowedIndexKeyValue::Str(downcast::<LargeStringArray>(array)?.value(row))
+        }
+        DataType::LargeBinary => {
+            BorrowedIndexKeyValue::Bytes(downcast::<LargeBinaryArray>(array)?.value(row))
+        }
+        DataType::Binary => {
+            BorrowedIndexKeyValue::Bytes(downcast::<BinaryArray>(array)?.value(row))
+        }
+        DataType::FixedSizeBinary(_) => {
+            BorrowedIndexKeyValue::Bytes(downcast::<FixedSizeBinaryArray>(array)?.value(row))
+        }
+        DataType::Date32 => signed(
+            i128::from(downcast::<Date32Array>(array)?.value(row)),
+            IntWidth::I32,
+        ),
+        DataType::Date64 => signed(
+            i128::from(downcast::<Date64Array>(array)?.value(row)),
+            IntWidth::I64,
+        ),
+        DataType::Timestamp(TimeUnit::Second, _) => signed(
+            i128::from(downcast::<TimestampSecondArray>(array)?.value(row)),
+            IntWidth::I64,
+        ),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => signed(
+            i128::from(downcast::<TimestampMillisecondArray>(array)?.value(row)),
+            IntWidth::I64,
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => signed(
+            i128::from(downcast::<TimestampMicrosecondArray>(array)?.value(row)),
+            IntWidth::I64,
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => signed(
+            i128::from(downcast::<TimestampNanosecondArray>(array)?.value(row)),
+            IntWidth::I64,
+        ),
+        other => {
+            return Err(Error::Constraint(format!(
+                "scoped read: column type {other:?} is not indexable"
+            )));
+        }
+    };
+    Ok(Some(value))
+}
+
 /// Reads a row id or row position at `row` as a `u64` (`Int64`/`UInt64`).
 fn row_id_value(array: &dyn Array, row: usize) -> Result<u64> {
     if array.is_null(row) {
@@ -334,9 +470,140 @@ struct ObjectStoreReader {
     path: Path,
     /// The object's total length, required to locate the footer.
     file_size: u64,
+    /// The serialized Parquet metadata length recorded by DuckLake. The
+    /// trailing length and magic occupy another eight bytes.
+    footer_size: Option<u64>,
     /// Whether to load the page index with the footer. A row selection
     /// needs it to skip pages; without one it is footer bytes for nothing.
     page_index: PageIndexPolicy,
+}
+
+/// Parsed metadata from immutable Parquet objects, bounded by its reported
+/// heap footprint. A weak store reference both prevents this process-wide
+/// cache from keeping catalogs alive and distinguishes equal paths belonging
+/// to different stores.
+struct MetadataCacheEntry {
+    store: Weak<dyn ObjectStore>,
+    path: Path,
+    file_size: u64,
+    page_index: PageIndexPolicy,
+    metadata: Arc<ParquetMetaData>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct MetadataCache {
+    entries: VecDeque<MetadataCacheEntry>,
+    bytes: usize,
+}
+
+impl MetadataCache {
+    fn get(
+        &mut self,
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        file_size: u64,
+        page_index: PageIndexPolicy,
+    ) -> Option<Arc<ParquetMetaData>> {
+        self.entries.retain(|entry| entry.store.strong_count() > 0);
+        self.bytes = self.entries.iter().map(|entry| entry.bytes).sum();
+        let capacity = cache::auxiliary_metadata_memory();
+        while self.bytes > capacity {
+            let evicted = self.entries.pop_front()?;
+            self.bytes = self.bytes.saturating_sub(evicted.bytes);
+        }
+
+        let weak = Arc::downgrade(store);
+        let position = self.entries.iter().position(|entry| {
+            Weak::ptr_eq(&entry.store, &weak)
+                && entry.path == *path
+                && entry.file_size == file_size
+                && entry.page_index == page_index
+        })?;
+        let entry = self.entries.remove(position)?;
+        let metadata = Arc::clone(&entry.metadata);
+        self.entries.push_back(entry);
+        Some(metadata)
+    }
+
+    fn insert(
+        &mut self,
+        store: &Arc<dyn ObjectStore>,
+        path: Path,
+        file_size: u64,
+        page_index: PageIndexPolicy,
+        metadata: Arc<ParquetMetaData>,
+    ) {
+        let bytes = metadata.memory_size();
+        let capacity = cache::auxiliary_metadata_memory();
+        if capacity == 0 || bytes > capacity {
+            return;
+        }
+
+        let weak = Arc::downgrade(store);
+        if let Some(position) = self.entries.iter().position(|entry| {
+            Weak::ptr_eq(&entry.store, &weak)
+                && entry.path == path
+                && entry.file_size == file_size
+                && entry.page_index == page_index
+        }) && let Some(replaced) = self.entries.remove(position)
+        {
+            self.bytes = self.bytes.saturating_sub(replaced.bytes);
+        }
+
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.push_back(MetadataCacheEntry {
+            store: weak,
+            path,
+            file_size,
+            page_index,
+            metadata,
+            bytes,
+        });
+        while self.bytes > capacity {
+            let Some(evicted) = self.entries.pop_front() else {
+                self.bytes = 0;
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.bytes);
+        }
+    }
+}
+
+static METADATA_CACHE: LazyLock<Mutex<MetadataCache>> =
+    LazyLock::new(|| Mutex::new(MetadataCache::default()));
+
+fn cached_metadata(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    file_size: u64,
+    page_index: PageIndexPolicy,
+) -> Option<Arc<ParquetMetaData>> {
+    METADATA_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(store, path, file_size, page_index)
+}
+
+fn cache_metadata(
+    store: &Arc<dyn ObjectStore>,
+    path: Path,
+    file_size: u64,
+    page_index: PageIndexPolicy,
+    metadata: Arc<ParquetMetaData>,
+) {
+    METADATA_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(store, path, file_size, page_index, metadata);
+}
+
+fn footer_prefetch_size(footer_size: Option<u64>, file_size: u64) -> Option<usize> {
+    footer_size
+        .filter(|size| *size > 0)
+        .and_then(|size| size.checked_add(8))
+        .filter(|size| *size <= file_size)
+        .and_then(|size| usize::try_from(size).ok())
 }
 
 impl AsyncFileReader for ObjectStoreReader {
@@ -372,14 +639,27 @@ impl AsyncFileReader for ObjectStoreReader {
         &'a mut self,
         _options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+        if let Some(metadata) =
+            cached_metadata(&self.store, &self.path, self.file_size, self.page_index)
+        {
+            return async move { Ok(metadata) }.boxed();
+        }
+
         let file_size = self.file_size;
+        let prefetch_size = footer_prefetch_size(self.footer_size, file_size);
         let page_index = self.page_index;
+        let store = Arc::clone(&self.store);
+        let path = self.path.clone();
         async move {
-            ParquetMetaDataReader::new()
-                .with_page_index_policy(page_index)
-                .load_and_finish(&mut *self, file_size)
-                .await
-                .map(Arc::new)
+            let metadata = Arc::new(
+                ParquetMetaDataReader::new()
+                    .with_page_index_policy(page_index)
+                    .with_prefetch_hint(prefetch_size)
+                    .load_and_finish(&mut *self, file_size)
+                    .await?,
+            );
+            cache_metadata(&store, path, file_size, page_index, Arc::clone(&metadata));
+            Ok(metadata)
         }
         .boxed()
     }
@@ -418,6 +698,31 @@ pub(crate) async fn scoped_read_entries(
     row_id_source: RowIdSource,
     file_size: Option<u64>,
 ) -> Result<Vec<ScopedReadEntry>> {
+    scoped_read_entries_with_footer(
+        object_store,
+        path,
+        indexed_positions,
+        rows,
+        row_id_source,
+        file_size,
+        None,
+    )
+    .await
+}
+
+/// The same scoped read with DuckLake's recorded serialized Parquet
+/// metadata length. A valid `footer_size` avoids the trailing footer-length
+/// probe before metadata is parsed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scoped_read_entries_with_footer(
+    object_store: Arc<dyn ObjectStore>,
+    path: &Path,
+    indexed_positions: &[usize],
+    rows: ScopedRows<'_>,
+    row_id_source: RowIdSource,
+    file_size: Option<u64>,
+    footer_size: Option<u64>,
+) -> Result<Vec<ScopedReadEntry>> {
     // A selection naming no row is answerable without reading anything.
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -454,6 +759,7 @@ pub(crate) async fn scoped_read_entries(
         store: object_store,
         path: path.clone(),
         file_size,
+        footer_size,
         page_index: rows.page_index_policy(),
     };
     let options = ArrowReaderOptions::new().with_page_index_policy(rows.page_index_policy());
@@ -500,6 +806,103 @@ pub(crate) async fn scoped_read_entries(
     Ok(entries)
 }
 
+/// Derives final canonical keys for several indexes in one Parquet read.
+/// Shared columns are projected once, and Arrow scalars are appended to the
+/// final key without materializing row-wide or per-index value vectors.
+/// Same-commit removed ordinals are skipped before any key bytes are built.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scoped_read_index_entries(
+    object_store: Arc<dyn ObjectStore>,
+    path: &Path,
+    projections: &[IndexProjection],
+    rows: ScopedRows<'_>,
+    row_id_source: RowIdSource,
+    file_size: Option<u64>,
+    footer_size: Option<u64>,
+    excluded_ordinals: Option<&BTreeSet<u64>>,
+) -> Result<Vec<ScopedIndexEntry>> {
+    if rows.is_empty() || projections.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let file_size = match file_size {
+        Some(size) => size,
+        None => {
+            object_store
+                .head(path)
+                .await
+                .map_err(corrupt("scoped read"))?
+                .size
+        }
+    };
+    let selected = rows.positions();
+    let ordinals = selected
+        .as_deref()
+        .map_or(Ordinals::Dense, Ordinals::Selected);
+    let source_positions = index_positions(projections);
+
+    if file_size < WHOLE_OBJECT_THRESHOLD {
+        return whole_object_index_entries(
+            object_store.as_ref(),
+            path,
+            projections,
+            &source_positions,
+            selected.as_deref(),
+            ordinals,
+            row_id_source,
+            excluded_ordinals,
+        )
+        .await;
+    }
+
+    let reader = ObjectStoreReader {
+        store: object_store,
+        path: path.clone(),
+        file_size,
+        footer_size,
+        page_index: rows.page_index_policy(),
+    };
+    let options = ArrowReaderOptions::new().with_page_index_policy(rows.page_index_policy());
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+        .await
+        .map_err(corrupt("scoped read"))?;
+    let (row_id_position, row_id_start) =
+        resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+    let (mask, indexed_output, row_id_output) =
+        projection(builder.parquet_schema(), &source_positions, row_id_position)?;
+    let projections = remap_index_projections(projections, &source_positions, &indexed_output)?;
+    let selection = match selected.as_deref() {
+        Some(positions) => Some(row_selection(
+            positions,
+            total_rows(builder.metadata(), path)?,
+        )?),
+        None => None,
+    };
+
+    let mut builder = builder.with_projection(mask);
+    if let Some(selection) = selection {
+        builder = builder.with_row_selection(selection);
+    }
+    let mut stream = builder.build().map_err(corrupt("scoped read"))?;
+    let mut entries = Vec::new();
+    let mut emitted = 0usize;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(corrupt("scoped read"))?;
+        entries.extend(record_batch_index_entries(
+            &batch,
+            &projections,
+            row_id_output,
+            row_id_start,
+            ordinals,
+            emitted,
+            excluded_ordinals,
+            None,
+        )?);
+        emitted = emitted.saturating_add(batch.num_rows());
+    }
+    Ok(entries)
+}
+
 /// Receives one bounded group of entries from a full-file scoped read.
 /// `first_ordinal` is the physical position of the group's first row.
 pub(crate) trait ScopedEntryBatchConsumer {
@@ -513,14 +916,16 @@ const BUILD_READ_BATCH_ROWS: usize = 8_192;
 
 /// Streams a file's projected index entries to `consumer` in bounded Arrow
 /// batches, starting at physical row `start_ordinal`. Unlike
-/// [`scoped_read_entries`], this never collects the whole file.
-#[allow(clippy::too_many_lines)]
+/// [`scoped_read_entries`], this never collects the whole file. DuckLake's
+/// recorded footer size is available to the metadata reader.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
     object_store: Arc<dyn ObjectStore>,
     path: &Path,
     indexed_positions: &[usize],
     row_id_source: RowIdSource,
     file_size: Option<u64>,
+    footer_size: Option<u64>,
     start_ordinal: u64,
     consumer: &mut C,
 ) -> Result<()> {
@@ -591,6 +996,7 @@ pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
         store: object_store,
         path: path.clone(),
         file_size,
+        footer_size,
         page_index: PageIndexPolicy::Optional,
     };
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
@@ -620,6 +1026,7 @@ pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
         .with_row_selection(selection)
         .build()
         .map_err(corrupt("scoped read"))?;
+
     let mut emitted = 0usize;
     while let Some(batch) = stream.next().await {
         let batch = batch.map_err(corrupt("scoped read"))?;
@@ -703,6 +1110,65 @@ async fn whole_object_entries(
     Ok(entries)
 }
 
+/// One-request counterpart of [`scoped_read_index_entries`] for small
+/// objects whose bytes are already cheaper than several remote ranges.
+#[allow(clippy::too_many_arguments)]
+async fn whole_object_index_entries(
+    object_store: &dyn ObjectStore,
+    path: &Path,
+    projections: &[IndexProjection],
+    source_positions: &[usize],
+    selected: Option<&[u64]>,
+    ordinals: Ordinals<'_>,
+    row_id_source: RowIdSource,
+    excluded_ordinals: Option<&BTreeSet<u64>>,
+) -> Result<Vec<ScopedIndexEntry>> {
+    let bytes: Bytes = object_store
+        .get(path)
+        .await
+        .map_err(corrupt("scoped read"))?
+        .bytes()
+        .await
+        .map_err(corrupt("scoped read"))?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("scoped read"))?;
+    let (row_id_position, row_id_start) =
+        resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+    let (mask, indexed_output, row_id_output) =
+        projection(builder.parquet_schema(), source_positions, row_id_position)?;
+    let projections = remap_index_projections(projections, source_positions, &indexed_output)?;
+    let selection = match selected {
+        Some(positions) => Some(row_selection(
+            positions,
+            total_rows(builder.metadata(), path)?,
+        )?),
+        None => None,
+    };
+
+    let mut builder = builder.with_projection(mask);
+    if let Some(selection) = selection {
+        builder = builder.with_row_selection(selection);
+    }
+    let reader = builder.build().map_err(corrupt("scoped read"))?;
+    let mut entries = Vec::new();
+    let mut emitted = 0usize;
+    for batch in reader {
+        let batch = batch.map_err(corrupt("scoped read"))?;
+        entries.extend(record_batch_index_entries(
+            &batch,
+            &projections,
+            row_id_output,
+            row_id_start,
+            ordinals,
+            emitted,
+            excluded_ordinals,
+            None,
+        )?);
+        emitted = emitted.saturating_add(batch.num_rows());
+    }
+    Ok(entries)
+}
+
 /// The projection over `schema` covering only the indexed and row-id
 /// columns, with each requested position mapped to its index in the
 /// projected output batch.
@@ -762,6 +1228,111 @@ fn record_batch_entries(
         .collect()
 }
 
+/// Unique Arrow positions needed by every index plan, sorted for stable
+/// Parquet projection and cheap remapping.
+fn index_positions(projections: &[IndexProjection]) -> Vec<usize> {
+    let mut positions: Vec<_> = projections
+        .iter()
+        .flat_map(|projection| projection.positions.iter().copied())
+        .collect();
+    positions.sort_unstable();
+    positions.dedup();
+    positions
+}
+
+/// Remaps plans from source-schema positions to columns in a projected
+/// `RecordBatch`. This runs once per reader, never once per row.
+fn remap_index_projections(
+    projections: &[IndexProjection],
+    source_positions: &[usize],
+    output_positions: &[usize],
+) -> Result<Vec<IndexProjection>> {
+    projections
+        .iter()
+        .map(|projection| {
+            let positions = projection
+                .positions
+                .iter()
+                .map(|position| {
+                    let source = source_positions.binary_search(position).map_err(|_| {
+                        Error::Corruption(
+                            "scoped read: index column vanished from projection".to_owned(),
+                        )
+                    })?;
+                    output_positions.get(source).copied().ok_or_else(|| {
+                        Error::Corruption(
+                            "scoped read: projected index column has no output".to_owned(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(IndexProjection {
+                index_id: projection.index_id,
+                unique: projection.unique,
+                positions,
+                directions: projection.directions.clone(),
+                nulls: projection.nulls.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Encodes every requested index key straight from one Arrow batch. Only the
+/// final canonical key survives the row: strings and blobs remain borrowed
+/// while their escaped bytes are appended.
+#[allow(clippy::too_many_arguments)]
+fn record_batch_index_entries(
+    batch: &RecordBatch,
+    projections: &[IndexProjection],
+    row_id_position: Option<usize>,
+    row_id_start: u64,
+    ordinals: Ordinals<'_>,
+    emitted: usize,
+    excluded_ordinals: Option<&BTreeSet<u64>>,
+    included_row_ids: Option<&HashSet<u64>>,
+) -> Result<Vec<ScopedIndexEntry>> {
+    let mut entries = Vec::with_capacity(batch.num_rows().saturating_mul(projections.len()));
+    for row in 0..batch.num_rows() {
+        let ordinal = ordinals.at(emitted.saturating_add(row))?;
+        let row_id = match row_id_position {
+            Some(position) => row_id_value(batch.column(position).as_ref(), row)?,
+            None => row_id_start.saturating_add(ordinal),
+        };
+        if excluded_ordinals.is_some_and(|excluded| excluded.contains(&ordinal))
+            || included_row_ids.is_some_and(|included| !included.contains(&row_id))
+        {
+            continue;
+        }
+        for (index, projection) in projections.iter().enumerate() {
+            let mut builder = CanonicalKeyBuilder::new();
+            for (column, &position) in projection.positions.iter().enumerate() {
+                builder.append(
+                    borrowed_array_value(batch.column(position).as_ref(), row)?,
+                    projection
+                        .directions
+                        .get(column)
+                        .copied()
+                        .unwrap_or(Direction::Ascending),
+                    projection
+                        .nulls
+                        .get(column)
+                        .copied()
+                        .unwrap_or(NullOrder::Last),
+                )?;
+            }
+            let (key, unique) =
+                builder.finish_index_entry(projection.index_id, projection.unique, row_id);
+            entries.push(ScopedIndexEntry {
+                index,
+                row_id,
+                key,
+                unique,
+            });
+        }
+    }
+    Ok(entries)
+}
+
 /// The row positions a DuckLake delete file marks dead, read from its `pos`
 /// column. A delete file names positions within one data file, so its
 /// `file_path` column carries no information the caller lacks.
@@ -809,14 +1380,25 @@ pub(crate) async fn delete_file_positions(
     Ok(positions)
 }
 
+/// Decodes one schema-only inline IPC stream. Callers cache the resulting
+/// Arrow schema per table version so chunks sharing it do not repeat the
+/// `FlatBuffer` work.
+pub(crate) fn decode_inline_schema(schema_ipc: Bytes) -> Result<SchemaRef> {
+    #[cfg(test)]
+    record_inline_schema_decode(&schema_ipc);
+
+    Ok(
+        StreamReader::try_new(std::io::Cursor::new(schema_ipc), None)
+            .map_err(corrupt("inline schema"))?
+            .schema(),
+    )
+}
+
 /// Decodes an inline-insert Arrow body — `[u32-le message length][record-
-/// batch message][arrow data buffers]` — against `schema_ipc`, the table's
-/// schema-only IPC stream, into a record batch. Inline chunks store the
-/// schema once per version, so the body carries none of its own.
-fn decode_inline_batch(schema_ipc: &[u8], body: &[u8]) -> Result<RecordBatch> {
-    let schema = StreamReader::try_new(std::io::Cursor::new(schema_ipc.to_vec()), None)
-        .map_err(corrupt("inline schema"))?
-        .schema();
+/// batch message][arrow data buffers]` — against its already-decoded table
+/// schema. The body becomes Arrow's immutable buffer by slicing the owning
+/// `Bytes`, so decoding does not copy its potentially large data region.
+fn decode_inline_batch(schema: SchemaRef, body: &Bytes) -> Result<RecordBatch> {
     if body.len() < 4 {
         return Err(Error::Corruption("inline body truncated".to_owned()));
     }
@@ -834,7 +1416,7 @@ fn decode_inline_batch(schema_ipc: &[u8], body: &[u8]) -> Result<RecordBatch> {
         .header_as_record_batch()
         .ok_or_else(|| Error::Corruption("inline body is not a record batch".to_owned()))?;
     let version = message.version();
-    let buffer = Buffer::from_vec(body[message_end..].to_vec());
+    let buffer = Buffer::from(body.slice(message_end..));
     read_record_batch(
         &buffer,
         record_batch,
@@ -855,8 +1437,101 @@ pub(crate) fn inline_batch_entries(
     positions: &[usize],
     row_id_start: u64,
 ) -> Result<Vec<ScopedReadEntry>> {
-    let batch = decode_inline_batch(schema_ipc, body)?;
+    #[cfg(test)]
+    record_inline_batch_decode(row_id_start);
+
+    let schema = decode_inline_schema(Bytes::copy_from_slice(schema_ipc))?;
+    let body = Bytes::copy_from_slice(body);
+    let batch = decode_inline_batch(schema, &body)?;
     record_batch_entries(&batch, positions, None, row_id_start, Ordinals::Dense, 0)
+}
+
+/// Decodes one inline Arrow chunk and constructs every requested index key
+/// directly from its arrays. Each chunk is decoded once regardless of how
+/// many indexes overlap its columns.
+pub(crate) fn inline_batch_index_entries(
+    schema: SchemaRef,
+    body: &Bytes,
+    projections: &[IndexProjection],
+    row_id_start: u64,
+    included_row_ids: Option<&HashSet<u64>>,
+) -> Result<Vec<ScopedIndexEntry>> {
+    #[cfg(test)]
+    record_inline_batch_decode(row_id_start);
+
+    let batch = decode_inline_batch(schema, body)?;
+    record_batch_index_entries(
+        &batch,
+        projections,
+        None,
+        row_id_start,
+        Ordinals::Dense,
+        0,
+        None,
+        included_row_ids,
+    )
+}
+
+#[cfg(test)]
+fn inline_batch_decodes() -> &'static std::sync::Mutex<std::collections::HashMap<u64, usize>> {
+    static COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, usize>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_inline_batch_decode(row_id_start: u64) {
+    let mut counts = inline_batch_decodes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *counts.entry(row_id_start).or_default() += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn inline_batch_decode_count(row_id_start: u64) -> usize {
+    inline_batch_decodes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&row_id_start)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn inline_schema_decodes() -> &'static std::sync::Mutex<std::collections::HashMap<u64, usize>> {
+    static COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, usize>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn inline_schema_fingerprint(schema_ipc: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    schema_ipc.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(test)]
+fn record_inline_schema_decode(schema_ipc: &[u8]) {
+    let mut counts = inline_schema_decodes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *counts
+        .entry(inline_schema_fingerprint(schema_ipc))
+        .or_default() += 1;
+}
+
+/// How often the named schema IPC bytes were decoded in this test process.
+#[cfg(test)]
+pub(crate) fn inline_schema_decode_count(schema_ipc: &[u8]) -> usize {
+    inline_schema_decodes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&inline_schema_fingerprint(schema_ipc))
+        .copied()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -997,7 +1672,11 @@ mod tests {
     /// A file wide enough that its indexed column is a small fraction of its
     /// bytes: one `Int64` id plus seven fat `Utf8` payload columns, `rows`
     /// rows. Returns the written object's size.
-    async fn write_wide_fixture(store: &dyn ObjectStore, path: &Path, rows: usize) -> u64 {
+    async fn write_wide_fixture_with_footer(
+        store: &dyn ObjectStore,
+        path: &Path,
+        rows: usize,
+    ) -> (u64, u64) {
         let mut fields = vec![Field::new("id", DataType::Int64, false)];
         for i in 0..7 {
             fields.push(Field::new(format!("payload{i}"), DataType::Utf8, false));
@@ -1022,8 +1701,60 @@ mod tests {
             writer.close().unwrap();
         }
         let object_len = buffer.len() as u64;
+        let footer_offset = buffer.len() - 8;
+        let footer_size = u64::from(u32::from_le_bytes(
+            buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+        ));
         store.put(path, buffer.into()).await.unwrap();
-        object_len
+        (object_len, footer_size)
+    }
+
+    async fn write_wide_fixture(store: &dyn ObjectStore, path: &Path, rows: usize) -> u64 {
+        write_wide_fixture_with_footer(store, path, rows).await.0
+    }
+
+    /// DuckLake's recorded footer size collapses the footer-length probe,
+    /// and immutable-file metadata is reused on the next read. The second
+    /// read therefore performs only the projected-column fetch.
+    #[tokio::test]
+    async fn recorded_footer_and_metadata_cache_remove_metadata_round_trips() {
+        let store = Arc::new(CountingStore::new());
+        let path = Path::from("cached-wide.parquet");
+        let (object_len, footer_size) =
+            write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
+        assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
+        let wanted: BTreeSet<u64> = [7, 19_000].into_iter().collect();
+
+        let first = scoped_read_entries_with_footer(
+            store.clone(),
+            &path,
+            &[0],
+            ScopedRows::At(&wanted),
+            RowIdSource::Ordinal,
+            Some(object_len),
+            Some(footer_size),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 2);
+        let first_requests = store.fetch_requests();
+
+        let second = scoped_read_entries_with_footer(
+            store.clone(),
+            &path,
+            &[0],
+            ScopedRows::At(&wanted),
+            RowIdSource::Ordinal,
+            Some(object_len),
+            Some(footer_size),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second, first);
+
+        let second_requests = store.fetch_requests() - first_requests;
+        assert_eq!(first_requests, 3, "footer, page index, projected columns");
+        assert_eq!(second_requests, 1, "projected columns only");
     }
 
     /// Above the whole-object threshold the read must fetch only the footer
@@ -1390,6 +2121,225 @@ mod tests {
             array_value(&array, 0).unwrap(),
             Some(IndexKeyValue::Bytes(uuid.to_vec())),
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fused_arrow_encoding_matches_owned_path_for_every_indexable_type() {
+        use arrow::array::{
+            ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Float32Array,
+            Float64Array, Int8Array, Int16Array, Int32Array, LargeBinaryArray, LargeStringArray,
+            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+            TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        };
+
+        let fixed = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [Some(vec![0, 1, 2, 3]), None].into_iter(),
+            4,
+        )
+        .unwrap();
+        let columns: Vec<(&str, ArrayRef)> = vec![
+            ("i8", Arc::new(Int8Array::from(vec![Some(-8), None]))),
+            ("i16", Arc::new(Int16Array::from(vec![Some(-16), None]))),
+            ("i32", Arc::new(Int32Array::from(vec![Some(-32), None]))),
+            ("i64", Arc::new(Int64Array::from(vec![Some(-64), None]))),
+            ("u8", Arc::new(UInt8Array::from(vec![Some(8), None]))),
+            ("u16", Arc::new(UInt16Array::from(vec![Some(16), None]))),
+            ("u32", Arc::new(UInt32Array::from(vec![Some(32), None]))),
+            ("u64", Arc::new(UInt64Array::from(vec![Some(64), None]))),
+            (
+                "f32",
+                Arc::new(Float32Array::from(vec![
+                    Some(f32::from_bits(0xffc0_0001)),
+                    None,
+                ])),
+            ),
+            (
+                "f64",
+                Arc::new(Float64Array::from(vec![
+                    Some(f64::from_bits(0x7ff8_0000_0000_0001)),
+                    None,
+                ])),
+            ),
+            ("bool", Arc::new(BooleanArray::from(vec![Some(true), None]))),
+            (
+                "utf8",
+                Arc::new(StringArray::from(vec![Some("a\0\u{1}z"), None])),
+            ),
+            (
+                "large_utf8",
+                Arc::new(LargeStringArray::from(vec![Some("large"), None])),
+            ),
+            (
+                "binary",
+                Arc::new(BinaryArray::from(vec![Some(&[0_u8, 1, 0xff][..]), None])),
+            ),
+            (
+                "large_binary",
+                Arc::new(LargeBinaryArray::from(vec![Some(&[1_u8, 0, 2][..]), None])),
+            ),
+            ("fixed_binary", Arc::new(fixed)),
+            ("date32", Arc::new(Date32Array::from(vec![Some(12), None]))),
+            ("date64", Arc::new(Date64Array::from(vec![Some(13), None]))),
+            (
+                "timestamp_s",
+                Arc::new(TimestampSecondArray::from(vec![Some(14), None])),
+            ),
+            (
+                "timestamp_ms",
+                Arc::new(TimestampMillisecondArray::from(vec![Some(15), None])),
+            ),
+            (
+                "timestamp_us",
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(16), None])),
+            ),
+            (
+                "timestamp_ns",
+                Arc::new(TimestampNanosecondArray::from(vec![Some(17), None])),
+            ),
+        ];
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        let all_positions: Vec<_> = (0..batch.num_columns()).collect();
+        let projections = vec![
+            IndexProjection {
+                index_id: 37,
+                unique: true,
+                directions: all_positions
+                    .iter()
+                    .enumerate()
+                    .map(|(position, _)| {
+                        if position % 2 == 0 {
+                            Direction::Ascending
+                        } else {
+                            Direction::Descending
+                        }
+                    })
+                    .collect(),
+                nulls: all_positions
+                    .iter()
+                    .enumerate()
+                    .map(|(position, _)| {
+                        if position % 3 == 0 {
+                            NullOrder::First
+                        } else {
+                            NullOrder::Last
+                        }
+                    })
+                    .collect(),
+                positions: all_positions,
+            },
+            // Overlapping text/blob/composite use verifies a shared Arrow
+            // column can feed several final keys without an owned scalar.
+            IndexProjection {
+                index_id: 38,
+                unique: false,
+                positions: vec![11, 13, 11],
+                directions: vec![
+                    Direction::Descending,
+                    Direction::Ascending,
+                    Direction::Ascending,
+                ],
+                nulls: vec![NullOrder::Last, NullOrder::First, NullOrder::Last],
+            },
+        ];
+
+        let actual = record_batch_index_entries(
+            &batch,
+            &projections,
+            None,
+            100,
+            Ordinals::Dense,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        for row in 0..batch.num_rows() {
+            for (index, projection) in projections.iter().enumerate() {
+                let values = projection
+                    .positions
+                    .iter()
+                    .map(|&position| array_value(batch.column(position).as_ref(), row))
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap();
+                let row_id = 100 + u64::try_from(row).unwrap();
+                let (key, unique) = crate::store::index_encoding::encode_ordered_index_entry(
+                    &values,
+                    &projection.directions,
+                    &projection.nulls,
+                    projection.index_id,
+                    projection.unique,
+                    row_id,
+                )
+                .unwrap();
+                expected.push((index, row_id, key, unique));
+            }
+        }
+
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.index, expected.0);
+            assert_eq!(actual.row_id, expected.1);
+            assert_eq!(actual.key, expected.2);
+            assert_eq!(actual.unique, expected.3);
+        }
+    }
+
+    #[test]
+    fn fused_arrow_encoding_normalizes_signed_zero_identically() {
+        use arrow::array::{ArrayRef, Float32Array, Float64Array};
+
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "f32",
+                Arc::new(Float32Array::from(vec![-0.0, 0.0])) as ArrayRef,
+            ),
+            (
+                "f64",
+                Arc::new(Float64Array::from(vec![-0.0, 0.0])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let projections = [IndexProjection {
+            index_id: 39,
+            unique: true,
+            positions: vec![0, 1],
+            directions: vec![Direction::Descending, Direction::Ascending],
+            nulls: vec![NullOrder::First, NullOrder::Last],
+        }];
+        let entries = record_batch_index_entries(
+            &batch,
+            &projections,
+            None,
+            0,
+            Ordinals::Dense,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(entries[0].key, entries[1].key);
+        for (row, entry) in entries.iter().enumerate() {
+            let values = [
+                array_value(batch.column(0).as_ref(), row).unwrap(),
+                array_value(batch.column(1).as_ref(), row).unwrap(),
+            ];
+            assert_eq!(
+                entry.key,
+                crate::store::index_encoding::encode_ordered_index_entry(
+                    &values,
+                    &projections[0].directions,
+                    &projections[0].nulls,
+                    projections[0].index_id,
+                    projections[0].unique,
+                    u64::try_from(row).unwrap(),
+                )
+                .unwrap()
+                .0
+            );
+        }
     }
 
     /// The row-id column DuckLake's rewrite and flush writers append:

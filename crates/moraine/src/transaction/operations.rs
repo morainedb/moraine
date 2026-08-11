@@ -370,6 +370,9 @@ pub(crate) struct ChangeSet {
     /// Parse-only legacy `compacted_table` kind; never emitted,
     /// classifies as compaction.
     pub(crate) compacted_tables: BTreeSet<u64>,
+    /// Parse-only DuckLake inline-flush kind. Moving inline rows and their
+    /// tombstones into files preserves every row id and indexed value.
+    pub(crate) inline_flush_tables: BTreeSet<u64>,
     /// Set when parsing met a kind or payload this binary does not
     /// model. Unknown changes classify as conflicting, never benign.
     pub(crate) has_unknown: bool,
@@ -585,6 +588,7 @@ impl ChangeSet {
                 "merge_adjacent" => id(&mut set.merge_adjacent_tables),
                 "rewrite_delete" => id(&mut set.rewrite_delete_tables),
                 "compacted_table" => id(&mut set.compacted_tables),
+                "inline_flush" | "flushed_inlined" => id(&mut set.inline_flush_tables),
                 _ => false,
             };
 
@@ -620,6 +624,21 @@ impl ChangeSet {
             .chain(std::mem::take(&mut rest.rewrite_delete_tables))
             .chain(std::mem::take(&mut rest.compacted_tables))
             .collect();
+
+        let inline_flushed = std::mem::take(&mut rest.inline_flush_tables);
+        let flush_deletes_are_mechanical = !inline_flushed.is_empty()
+            && rest.deleted_from_tables.is_subset(&inline_flushed)
+            && rest.deleted_data_file_ids.is_empty();
+        let compacted = if flush_deletes_are_mechanical {
+            rest.deleted_from_tables.clear();
+            rest.deletes_untargeted_files = false;
+            compacted.into_iter().chain(inline_flushed).collect()
+        } else {
+            // Keep the flush visible in `rest`: a flush mixed with an
+            // unrelated delete is not safe to classify as re-homing only.
+            rest.inline_flush_tables = inline_flushed;
+            compacted
+        };
 
         if rest.is_empty() {
             compacted
@@ -657,6 +676,7 @@ impl ChangeSet {
             .iter()
             .chain(self.rewrite_delete_tables.iter())
             .chain(self.compacted_tables.iter())
+            .chain(self.inline_flush_tables.iter())
             .copied()
             .collect();
         for &table_id in &compacted {
@@ -815,6 +835,23 @@ mod tests {
         assert_eq!(legacy.compaction_only_tables(), BTreeSet::from([9]));
     }
 
+    /// Moving inline rows and their existing tombstones into files preserves
+    /// every indexed row id and value. DuckLake reports the tombstone move as
+    /// an ordinary table delete beside the flush marker; together they are
+    /// still re-homing only.
+    #[test]
+    fn compaction_only_tables_names_an_inline_flush() {
+        let set = ChangeSet::parse(
+            "deleted_from_table:41,deleted_from_table:43,deleted_from_table:55,\
+             inline_flush:19,inline_flush:41,inline_flush:43,inline_flush:55",
+        );
+
+        assert_eq!(
+            set.compaction_only_tables(),
+            BTreeSet::from([19, 41, 43, 55])
+        );
+    }
+
     /// DuckLake never mixes the two, so a set that does is drift — and
     /// the caller must do the work it would otherwise skip.
     #[test]
@@ -823,8 +860,8 @@ mod tests {
             "merge_adjacent:9,inserted_into_table:9",
             "merge_adjacent:9,deleted_from_table:4",
             "merge_adjacent:9,altered_table:9",
-            // A kind this binary does not model.
-            "merge_adjacent:9,inline_flush:9",
+            "inline_flush:9,inserted_into_table:9",
+            "inline_flush:9,deleted_from_table:4",
             "",
         ] {
             assert!(
@@ -1039,10 +1076,10 @@ mod tests {
     }
 
     #[test]
-    fn known_ducklake_kind_moraine_does_not_model_is_unknown() {
+    fn inline_flush_is_a_known_ducklake_kind() {
         let parsed = ChangeSet::parse("inline_flush:7");
-        assert!(parsed.has_unknown);
-        assert!(conflicts(&ChangeSet::default(), &parsed));
+        assert!(!parsed.has_unknown);
+        assert_eq!(parsed.compaction_only_tables(), BTreeSet::from([7]));
     }
 
     #[test]

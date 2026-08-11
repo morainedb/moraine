@@ -57,9 +57,12 @@ pub(crate) const FORMAT_WITH_DEFERRED_INDEX: u64 = 4;
 /// Older binaries keep status only in process memory and would silently
 /// omit the durable history, so they must refuse this store.
 pub(crate) const FORMAT_WITH_MAINTENANCE_STATUS: u64 = 5;
+/// Format stamped the first time an inline chunk row-range locator is
+/// written. Older binaries do not remove these locators with their chunks.
+pub(crate) const FORMAT_WITH_INLINE_CHUNK_DIRECTORY: u64 = 6;
 /// The highest format this binary understands. It opens any store in
 /// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
-pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_MAINTENANCE_STATUS;
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_CHUNK_DIRECTORY;
 /// The lowest structural format this binary reads directly. A store below
 /// this floor must be migrated up before an ordinary attach can use it.
 /// Every format so far is additive — each adds a subspace without moving an
@@ -953,18 +956,17 @@ enum Prepared {
 
 /// The store format the staged state requires: deferred upkeep implies
 /// [`FORMAT_WITH_DEFERRED_INDEX`], a `building` index
-/// [`FORMAT_WITH_STAGED_INDEX`], any other index [`FORMAT_WITH_INDEX`], else
-/// the base [`FORMAT_VERSION`].
-fn target_format(state: &CatalogSnapshot) -> u64 {
-    if state
+/// [`FORMAT_WITH_STAGED_INDEX`], any other index [`FORMAT_WITH_INDEX`], and
+/// inline chunk locators [`FORMAT_WITH_INLINE_CHUNK_DIRECTORY`].
+fn target_format(state: &CatalogSnapshot, uses_inline_chunk_directory: bool) -> u64 {
+    let index_format = if state
         .indexes
         .values()
         .flat_map(BTreeMap::values)
         .any(|index| index.deferred_maintenance == Some(true))
     {
-        return FORMAT_WITH_DEFERRED_INDEX;
-    }
-    if state
+        FORMAT_WITH_DEFERRED_INDEX
+    } else if state
         .indexes
         .values()
         .flat_map(BTreeMap::values)
@@ -979,6 +981,12 @@ fn target_format(state: &CatalogSnapshot) -> u64 {
         FORMAT_WITH_INDEX
     } else {
         FORMAT_VERSION
+    };
+
+    if uses_inline_chunk_directory {
+        index_format.max(FORMAT_WITH_INLINE_CHUNK_DIRECTORY)
+    } else {
+        index_format
     }
 }
 
@@ -989,8 +997,9 @@ fn target_format(state: &CatalogSnapshot) -> u64 {
 async fn format_stamp(
     db_tx: &DbTransaction,
     state: &CatalogSnapshot,
+    uses_inline_chunk_directory: bool,
 ) -> Result<Option<StagedWrite>> {
-    format_stamp_to(db_tx, target_format(state)).await
+    format_stamp_to(db_tx, target_format(state, uses_inline_chunk_directory)).await
 }
 
 /// The forward-only format stamp write required to reach `target_format`.
@@ -1089,7 +1098,7 @@ where
 
     // Entries stage before the entity diff so a poisoned definition rides
     // that diff rather than needing a write of its own.
-    let entries = index_maintenance::stage_index_entries(db_tx, &index_entries).await?;
+    let entries = index_maintenance::stage_index_entries(db_tx, &[&index_entries]).await?;
     let poisoned = entries.poisoned;
     index_maintenance::apply_poison(&mut state, &poisoned);
 
@@ -1098,7 +1107,10 @@ where
     // rather than diffed — and translated against `db_tx`'s pre-commit
     // state, before any of this batch's writes are staged onto it.
     writes.extend(inline::stage_inline_writes(db_tx, &inline_ops).await?);
-    writes.extend(format_stamp(db_tx, &state).await?);
+    let uses_inline_chunk_directory = inline_ops
+        .iter()
+        .any(|operation| matches!(operation, inline::InlineStage::Insert { .. }));
+    writes.extend(format_stamp(db_tx, &state, uses_inline_chunk_directory).await?);
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
     let schema_changed_table_ids: Vec<u64> = operations
         .iter()

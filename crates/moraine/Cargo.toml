@@ -22,7 +22,7 @@ slatedb = { workspace = true }
 slatedb-common = { workspace = true }
 storekey = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 

@@ -685,8 +685,21 @@ async fn stages_inline_schema_and_sequential_inserts() {
     );
     assert_eq!(chunks[1].1.body, b"chunk-b");
 
+    let selected = store_inline::find_inline_chunks_for_rows(ReadHandle::Tx(&tx), 1, &[1, 2])
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.as_ref().map(Vec::len),
+        Some(2),
+        "new chunks must carry one row-range directory entry apiece"
+    );
+
     let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
         .await
+        .unwrap();
+    let format = read::read_format(ReadHandle::Tx(&tx))
+        .await
+        .unwrap()
         .unwrap();
     assert_eq!(
         schemas,
@@ -696,6 +709,10 @@ async fn stages_inline_schema_and_sequential_inserts() {
                 arrow_schema: b"schema".to_vec(),
             }
         )]
+    );
+    assert_eq!(
+        format.format_version,
+        commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY
     );
     tx.rollback();
 }
@@ -747,7 +764,7 @@ async fn stages_inline_idel_and_row_disappears_from_table_scan_after_it() {
     let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
-    let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), 1)
+    let inline_deletes = store_inline::scan_inline_deletes(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
     tx.rollback();
@@ -1081,6 +1098,109 @@ async fn inline_row_delete_removes_its_non_unique_index_entry() {
         index_entry_count(&catalog, false, index_id).await,
         1,
         "only the surviving row is still indexed"
+    );
+}
+
+/// Every index consumes a different slice of one decoded Arrow batch. Each
+/// chunk is parsed once, while chunks of one table version share one decoded
+/// schema for the whole commit.
+#[tokio::test]
+async fn inline_chunks_share_one_schema_and_decode_once_each() {
+    use arrow::{
+        array::{Int64Array, RecordBatch},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    use crate::catalog::{
+        IndexDef, TableId,
+        scoped_read::{inline_batch_decode_count, inline_schema_decode_count},
+    };
+
+    const ROW_ID_START: u64 = 9_000_000_004;
+
+    let (catalog, first_index_id) = catalog_with_indexed_inline_table(false).await;
+    let second_index_id = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let id = tx.create_index(
+                TableId::new(1),
+                &IndexDef {
+                    name: "also_by_a".into(),
+                    columns: vec![crate::catalog::ColumnId::new(1)],
+                    unique: false,
+                },
+                &[],
+            )?;
+            second_index_id.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // A distinct field name gives this test a schema fingerprint no other
+    // concurrently running inline test can increment.
+    let schema = Schema::new(vec![Field::new(
+        "schema_cache_test_a",
+        DataType::Int64,
+        true,
+    )]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int64Array::from(vec![7]))],
+    )
+    .unwrap();
+    let schema_ipc = inline_schema_ipc(&schema);
+    let body = inline_body(&batch);
+    let before_schema = inline_schema_decode_count(&schema_ipc);
+    let before_first = inline_batch_decode_count(ROW_ID_START);
+    let before_second = inline_batch_decode_count(ROW_ID_START + 1);
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::InlineSchema {
+        table_id: 1,
+        schema_version: 0,
+        arrow_schema: schema_ipc.clone(),
+    });
+    for row_id_start in [ROW_ID_START, ROW_ID_START + 1] {
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 4,
+            row_id_start,
+            row_count: 1,
+            arrow_body: body.clone(),
+        });
+    }
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "inlined_insert:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        inline_schema_decode_count(&schema_ipc) - before_schema,
+        1,
+        "the shared schema is decoded once"
+    );
+    assert_eq!(
+        inline_batch_decode_count(ROW_ID_START) - before_first,
+        1,
+        "the first Arrow chunk is decoded once"
+    );
+    assert_eq!(
+        inline_batch_decode_count(ROW_ID_START + 1) - before_second,
+        1,
+        "the second Arrow chunk is decoded once"
+    );
+    assert_eq!(index_entry_count(&catalog, false, first_index_id).await, 2);
+    assert_eq!(
+        index_entry_count(&catalog, false, second_index_id.get().unwrap().get()).await,
+        2
     );
 }
 
@@ -1577,11 +1697,11 @@ async fn delete_only_index_maintenance_is_two_data_read_waves() {
     catalog.close().await.unwrap();
 }
 
-/// A file-backed replacement pays three serial data-store waves: collect the
-/// delete positions, derive the new file's entries, then derive removals from
-/// the old target.
+/// A file-backed replacement pays two data-store waves: one to collect the
+/// delete positions, then one overlapping the new file's additions with the
+/// old target's removals.
 #[tokio::test]
-async fn replace_index_maintenance_is_three_data_read_waves() {
+async fn replace_index_maintenance_overlaps_adds_and_removals() {
     let events = captured_commit_events();
     let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
     let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
@@ -1623,7 +1743,12 @@ async fn replace_index_maintenance_is_three_data_read_waves() {
         3,
         "the delete file, replacement file, and old target are each read once"
     );
-    assert_index_phase_covers_read_waves(milliseconds, 3);
+    assert_eq!(
+        store.peak_in_flight(),
+        2,
+        "the replacement and old target are read together after collecting deletes"
+    );
+    assert_index_phase_covers_read_waves(milliseconds, 2);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
     eprintln!("replace: reads=3 index_maintenance_ms={milliseconds:.3}");
     catalog.close().await.unwrap();
@@ -1671,6 +1796,83 @@ async fn compaction_only_index_maintenance_reads_no_data() {
     assert_eq!(store.reads(), 0, "compaction never reads the merged file");
     assert_eq!(index_entry_keys(&catalog, false, index_id).await, before);
     eprintln!("compaction-only: reads=0 index_maintenance_ms={milliseconds:.3}");
+    catalog.close().await.unwrap();
+}
+
+/// Flushing inline rows into data and delete files only moves their physical
+/// representation. Their equality-index entries already name stable row ids,
+/// so the flush must not read either output file or rewrite those entries.
+#[tokio::test]
+async fn inline_flush_index_maintenance_reads_no_data() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+    let store = Arc::new(InFlightStore::new());
+
+    inline_insert(&catalog, 3, 0, &[0, 1, 2, 3, 4], true).await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    for row_id in [1, 3] {
+        tx.stage(RowOperation::InlineInlineDelete {
+            table_id: 1,
+            row_id,
+            end_snapshot: 4,
+        });
+    }
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "inlined_delete:1"),
+    });
+    tx.commit().await.unwrap();
+
+    let before = index_entry_keys(&catalog, false, index_id).await;
+    assert_eq!(before.len(), 3, "the tombstoned entries are already gone");
+
+    let file_size = write_parquet_with_row_ids(
+        &store.inner,
+        "main/t/flushed.parquet",
+        &[0, 1, 2, 3, 4],
+        &[0, 1, 2, 3, 4],
+    )
+    .await;
+    let delete_size = write_delete_file(
+        &store.inner,
+        "flushed-delete.parquet",
+        "flushed.parquet",
+        &[1, 3],
+    )
+    .await;
+    store.reset();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: rewrite_data_file_row(12, 3, "flushed.parquet", 5, file_size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: delete_file_row_at(13, "flushed-delete.parquet", 12, 2, delete_size),
+    });
+    tx.stage(RowOperation::InlineFlushDelete {
+        table_id: 1,
+        schema_version: 0,
+        flush_snapshot: 4,
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(5, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(5, "deleted_from_table:1,inline_flush:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(store.reads(), 0, "an inline flush re-homes indexed rows");
+    assert_eq!(index_entry_keys(&catalog, false, index_id).await, before);
     catalog.close().await.unwrap();
 }
 
@@ -3009,11 +3211,22 @@ async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
     let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
-    let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), 1)
+    let inline_deletes = store_inline::scan_inline_deletes(ReadHandle::Tx(&tx), 1)
+        .await
+        .unwrap();
+    let directory = tx
+        .get(
+            Key::Inline(InlineKey::ChunkRange {
+                table_id: 1,
+                row_id_end: 1,
+            })
+            .encode(),
+        )
         .await
         .unwrap();
     tx.rollback();
     assert!(chunks.is_empty(), "flushed chunk must be gone: {chunks:?}");
+    assert!(directory.is_none(), "flushed locator must be gone");
     assert!(
         inline_deletes.is_empty(),
         "consumed inline_delete must be gone: {inline_deletes:?}"
@@ -3080,10 +3293,21 @@ async fn stages_inline_drop_removes_every_record_for_the_table() {
     let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
+    let directory = tx
+        .get(
+            Key::Inline(InlineKey::ChunkRange {
+                table_id: 1,
+                row_id_end: 0,
+            })
+            .encode(),
+        )
+        .await
+        .unwrap();
     tx.rollback();
     assert!(chunks.is_empty());
     assert!(file_deletes.is_empty());
     assert!(schemas.is_empty());
+    assert!(directory.is_none());
 }
 
 /// `InlineSchemaDrop` removes only the named schema version's

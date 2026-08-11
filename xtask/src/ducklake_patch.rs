@@ -199,6 +199,16 @@ fn validate_duckdb_checkout(workspace: &Path) -> anyhow::Result<()> {
 }
 
 fn prepare_checkout(path: &Path, url: &str, revision: &str, name: &str) -> anyhow::Result<()> {
+    let git_directory = path.join(".git");
+    if git_directory.is_dir() && !git_directory.join("HEAD").exists() {
+        println!(
+            "repairing cached {name} checkout with stripped Git metadata at {}",
+            path.display()
+        );
+        fs::remove_dir_all(path)
+            .with_context(|| format!("removing incomplete cached {name} at {}", path.display()))?;
+    }
+
     if !path.join(".git").exists() {
         ensure_directory_is_empty(path, name)?;
         fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
@@ -592,6 +602,38 @@ mod tests {
 
     use super::*;
 
+    fn commit_fixture(repository: &Path, name: &str, contents: &str) -> String {
+        fs::write(repository.join(name), contents).expect("fixture file");
+        command_output(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(repository),
+        )
+        .expect("stage fixture");
+        command_output(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Moraine Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ])
+                .current_dir(repository),
+        )
+        .expect("commit fixture");
+        command_output(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repository),
+        )
+        .expect("fixture revision")
+        .trim()
+        .to_owned()
+    }
+
     #[test]
     fn default_output_stays_under_target() {
         let workspace = Path::new("/repo");
@@ -635,6 +677,71 @@ mod tests {
             .expect_err("unknown argument must fail");
 
         assert!(error.to_string().contains("unknown argument `--mystery`"));
+    }
+
+    #[test]
+    fn cache_with_stripped_nested_git_metadata_is_rebuilt() {
+        let root = TemporaryDirectory::create(&std::env::temp_dir(), "stripped-git-test")
+            .expect("temporary root");
+        let origin = root.path().join("origin");
+        fs::create_dir(&origin).expect("origin directory");
+        command_output(Command::new("git").arg("init").current_dir(&origin))
+            .expect("initialize origin");
+        let revision = commit_fixture(&origin, "pinned.txt", "pinned\n");
+
+        // Rust cache restoration can retain the nested `.git` directory but
+        // strip its contents. Git then walks up to the workspace repository
+        // and reports the PR merge commit as this checkout's HEAD.
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace directory");
+        command_output(Command::new("git").arg("init").current_dir(&workspace))
+            .expect("initialize workspace");
+        let workspace_revision = commit_fixture(&workspace, "workspace.txt", "workspace\n");
+        let source = workspace.join("target/patched-ducklake/source");
+        fs::create_dir_all(source.join(".git")).expect("stripped git marker");
+        fs::write(source.join("stale.txt"), "stale\n").expect("stale cache file");
+        let escaped = command_output(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&source),
+        )
+        .expect("parent revision escapes into nested cache");
+        assert_eq!(escaped.trim(), workspace_revision);
+
+        prepare_checkout(
+            &source,
+            origin.to_str().expect("UTF-8 origin path"),
+            &revision,
+            "fixture",
+        )
+        .expect("repair stripped cache");
+
+        let head = command_output(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&source),
+        )
+        .expect("repaired revision");
+        assert_eq!(head.trim(), revision);
+        assert!(source.join("pinned.txt").exists());
+        assert!(!source.join("stale.txt").exists());
+
+        let later_revision = commit_fixture(&origin, "later.txt", "later\n");
+        let error = prepare_checkout(
+            &source,
+            origin.to_str().expect("UTF-8 origin path"),
+            &later_revision,
+            "fixture",
+        )
+        .expect_err("a real checkout at another revision stays protected");
+        assert!(error.to_string().contains("cached fixture checkout"));
+        let preserved = command_output(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&source),
+        )
+        .expect("preserved revision");
+        assert_eq!(preserved.trim(), revision);
     }
 
     #[test]

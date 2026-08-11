@@ -16,8 +16,8 @@ use crate::{
     transaction::{
         commit::StagedWrite,
         staged::inline::{
-            inline_inline_delete_write, inline_insert_write, inline_schema_write,
-            translate_inline_flush_delete,
+            inline_chunk_range_write, inline_inline_delete_write, inline_insert_write,
+            inline_schema_write, translate_inline_flush_delete,
         },
     },
 };
@@ -154,15 +154,25 @@ pub(crate) async fn stage_inline_writes(
                 row_id_start,
                 row_count,
                 arrow_body,
-            } => writes.push(inline_insert_write(
-                *table_id,
-                *schema_version,
-                *begin_snapshot,
-                *chunk_seq,
-                *row_id_start,
-                *row_count,
-                arrow_body,
-            )),
+            } => {
+                writes.push(inline_insert_write(
+                    *table_id,
+                    *schema_version,
+                    *begin_snapshot,
+                    *chunk_seq,
+                    *row_id_start,
+                    *row_count,
+                    arrow_body,
+                ));
+                writes.push(inline_chunk_range_write(
+                    *table_id,
+                    *schema_version,
+                    *begin_snapshot,
+                    *chunk_seq,
+                    *row_id_start,
+                    *row_count,
+                )?);
+            }
             InlineStage::Tombstone {
                 table_id,
                 row_id,

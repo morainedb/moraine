@@ -1004,17 +1004,16 @@ fn moraine_index_create_staged_builds_over_existing_data() {
 }
 
 /// Flushing an indexed table whose inlined rows are partly deleted — the
-/// shape that reaches `stage_file_delete_entries` with a target the
-/// committed head has never seen.
+/// shape that carries a delete file targeting a data file the committed
+/// head has never seen.
 ///
 /// DuckLake's flush writes *every* inlined row into one Parquet file,
 /// tombstoned ones included, then writes a delete file naming the
 /// tombstoned rows' positions in that same just-written file. So one
 /// commit carries both the `ducklake_data_file` insert and a
-/// `ducklake_delete_file` insert against it, and index upkeep has to
-/// resolve the target through the commit's own rows rather than the head.
-/// It also derives an add and a removal of the killed rows' entries in
-/// that one batch, which must net to removed.
+/// `ducklake_delete_file` insert against it. The flush preserves row ids and
+/// values, and the tombstoned rows' index entries were removed by the earlier
+/// delete, so index upkeep must leave the whole output pair alone.
 ///
 /// Only an indexed table reaches any of this: upkeep returns early when
 /// the table carries no index, which is why the uninindexed flush tests in

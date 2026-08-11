@@ -427,6 +427,16 @@ message InlineChunkValue {
   optional uint64 data_file_id = 4;
 }
 
+// inline/chunk_range: one row-range locator per live inline chunk. The
+// inclusive range end lives in the key so a forward seek from a row id
+// finds its possible owner without reading earlier chunk bodies.
+message InlineChunkRangeValue {
+  uint64 row_id_start = 1;
+  uint64 schema_version = 2;
+  uint64 begin_snapshot = 3;
+  uint64 chunk_seq = 4;
+}
+
 // inline/inline_delete: tombstone for an inlined insert row.
 message InlineInlineDeleteValue {
   uint64 end_snapshot = 1;
