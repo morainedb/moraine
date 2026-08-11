@@ -799,10 +799,19 @@ use group::Outcome;
 /// What a batch's durable write did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Landed {
-    /// The batch is durable.
-    Committed,
+    /// The batch is durable, with its write and projection costs separated.
+    Committed(CommitTimings),
     /// A concurrent commit advanced the head first; nothing was written.
     LostRace,
+}
+
+/// Timings from the shared durable landing path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitTimings {
+    /// Time waiting for the store to make the batch durable.
+    pub(crate) durable: Duration,
+    /// Time folding the landed batch into the maintained projections.
+    pub(crate) projection: Duration,
 }
 
 /// The result of one attempt at a group.
@@ -1189,17 +1198,25 @@ pub(crate) async fn commit_batch(
     let durable_started = Instant::now();
     match commit_durable(db_tx, "commit", staged_bytes).await {
         Ok(_) => {
-            debug!(
-                operation = "commit",
-                staged_bytes = staged_bytes.0,
-                elapsed_ms = durable_started.elapsed().as_secs_f64() * 1_000.0,
-                "durable commit landed"
-            );
+            let durable = durable_started.elapsed();
+            let projection_started = Instant::now();
             fold_committed_batch(projections, writes, head);
             if head_advanced {
                 refresh_head_view(projections, base, writes);
             }
-            Ok(Landed::Committed)
+            let projection = projection_started.elapsed();
+            debug!(
+                operation = "commit",
+                snapshot = head,
+                staged_bytes = staged_bytes.0,
+                elapsed_ms = durable.as_secs_f64() * 1_000.0,
+                projection_ms = projection.as_secs_f64() * 1_000.0,
+                "durable commit landed"
+            );
+            Ok(Landed::Committed(CommitTimings {
+                durable,
+                projection,
+            }))
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(Landed::LostRace),
         Err(err) => {

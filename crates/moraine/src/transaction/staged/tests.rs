@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use futures::stream::BoxStream;
@@ -8,6 +11,8 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
 };
+use tracing::{Event, Subscriber, field::Visit};
+use tracing_subscriber::{layer::Context, prelude::*};
 
 use super::*;
 use crate::catalog::{Catalog, CatalogOptions};
@@ -79,6 +84,133 @@ async fn open() -> Catalog {
     Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
         .unwrap()
+}
+
+#[derive(Clone, Default)]
+struct CapturedCommitEvents(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+impl<S> tracing_subscriber::Layer<S> for CapturedCommitEvents
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        #[derive(Default)]
+        struct Fields(BTreeMap<String, String>);
+
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.0.insert(field.name().to_owned(), value.to_string());
+            }
+
+            fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+                self.0.insert(field.name().to_owned(), value.to_string());
+            }
+        }
+
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        if fields.0.get("message").is_some_and(|message| {
+            message == "scanned committed entities for staged transaction"
+                || message == "staged commit landed"
+        }) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(fields.0);
+        }
+    }
+}
+
+impl CapturedCommitEvents {
+    fn one(&self, message: &str, transaction_id: &str) -> BTreeMap<String, String> {
+        let matching = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|fields| {
+                fields.get("message").is_some_and(|value| value == message)
+                    && fields
+                        .get("transaction_id")
+                        .is_some_and(|value| value == transaction_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "events for {message}: {matching:?}");
+        matching.into_iter().next().unwrap()
+    }
+}
+
+fn captured_commit_events() -> &'static CapturedCommitEvents {
+    static EVENTS: OnceLock<CapturedCommitEvents> = OnceLock::new();
+    EVENTS.get_or_init(|| {
+        let events = CapturedCommitEvents::default();
+        let subscriber = tracing_subscriber::registry().with(events.clone());
+        assert!(
+            tracing::subscriber::set_global_default(subscriber).is_ok(),
+            "the unit test process installs only this tracing subscriber"
+        );
+        events
+    })
+}
+
+/// One identifier joins the pre-commit entity scan to the eventual commit,
+/// and the two events expose every phase needed to account for wall time.
+#[tokio::test]
+async fn staged_commit_diagnostics_join_scan_counts_and_commit_phases() {
+    let events = captured_commit_events();
+
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let transaction_id = tx.diagnostic_id.to_string();
+    tx.visible_tables().await.unwrap();
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 0),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+    });
+    tx.commit().await.unwrap();
+
+    let scan = events.one(
+        "scanned committed entities for staged transaction",
+        &transaction_id,
+    );
+    assert!(scan.contains_key("current_records"));
+    assert!(scan.contains_key("history_records"));
+    assert!(scan.contains_key("records"));
+
+    let commit = events.one("staged commit landed", &transaction_id);
+    assert_eq!(scan.get("transaction_id"), commit.get("transaction_id"));
+    for phase in [
+        "head_view_ms",
+        "inline_ms",
+        "index_maintenance_ms",
+        "translate_ms",
+        "stage_ms",
+        "land_ms",
+        "durable_ms",
+        "projection_ms",
+    ] {
+        assert!(commit.contains_key(phase), "missing {phase}: {commit:?}");
+    }
+
+    catalog.close().await.unwrap();
 }
 
 /// A DuckLake-shaped snapshot bump plus table create: table `t` (id

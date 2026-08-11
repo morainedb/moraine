@@ -328,7 +328,7 @@ impl Coalescer {
         )
         .await
         {
-            Ok(Landed::Committed) => Outcome::Committed,
+            Ok(Landed::Committed(_)) => Outcome::Committed,
             Ok(Landed::LostRace) => Outcome::LostRace,
             Err(err) => {
                 // The only record of this error. Its members re-attempt,

@@ -20,7 +20,11 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use object_store::ObjectStore;
@@ -64,6 +68,37 @@ use apply::{
 use decode::Cursor;
 use index_upkeep::stage_index_maintenance;
 use inline::translate_inline;
+
+fn next_diagnostic_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Default)]
+struct CommitPhases {
+    head_view: Duration,
+    inline: Duration,
+    index_maintenance: Duration,
+    translate: Duration,
+    stage: Duration,
+    land: Duration,
+}
+
+fn milliseconds(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn mints_snapshot(operations: &[RowOperation]) -> bool {
+    operations.iter().any(|operation| {
+        matches!(
+            operation,
+            RowOperation::Insert {
+                table: TableKind::Snapshot,
+                ..
+            }
+        )
+    })
+}
 
 /// Which `ducklake_*` table a staged row targets. `Snapshot`,
 /// `SnapshotChanges`, and `SchemaVersions` all fold into one moraine
@@ -368,6 +403,7 @@ fn corrupt_row(table: TableKind, detail: impl std::fmt::Display) -> Error {
 /// lands them all in one atomic batch, or [`rollback`](Self::rollback)
 /// discards them.
 pub struct StagedTransaction {
+    diagnostic_id: u64,
     db_tx: DbTransaction,
     ops: Vec<RowOperation>,
     /// The committed records at this transaction's read point, scanned once
@@ -396,6 +432,7 @@ impl StagedTransaction {
         data_prefix: String,
     ) -> Self {
         Self {
+            diagnostic_id: next_diagnostic_id(),
             db_tx,
             ops: Vec::new(),
             committed: tokio::sync::OnceCell::new(),
@@ -499,13 +536,20 @@ impl StagedTransaction {
     async fn committed_entities(&self) -> Result<&Arc<Vec<read::EntityRecord>>> {
         self.committed
             .get_or_try_init(|| async {
-                let started = std::time::Instant::now();
+                let started = Instant::now();
                 let handle = ReadHandle::Tx(&self.db_tx);
-                let mut records = read::scan_current_entities(handle).await?;
-                records.extend(read::scan_history_entities(handle).await?);
+                let current = read::scan_current_entities(handle).await?;
+                let current_records = current.len();
+                let history = read::scan_history_entities(handle).await?;
+                let history_records = history.len();
+                let mut records = current;
+                records.extend(history);
                 debug!(
+                    transaction_id = self.diagnostic_id,
+                    current_records,
+                    history_records,
                     records = records.len(),
-                    elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                    elapsed_ms = milliseconds(started.elapsed()),
                     "scanned committed entities for staged transaction"
                 );
                 Ok(Arc::new(records))
@@ -918,8 +962,9 @@ impl StagedTransaction {
     /// retried internally** — if a concurrent commit advanced the head
     /// first; the store is left unchanged by the loser.
     pub async fn commit(self) -> Result<SnapshotId> {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let Self {
+            diagnostic_id,
             db_tx,
             ops,
             committed: _,
@@ -928,7 +973,9 @@ impl StagedTransaction {
             data_prefix,
         } = self;
         let staged_rows = ops.len();
+        let mut phases = CommitPhases::default();
 
+        let phase_started = Instant::now();
         let base = match commit::head_view_for(&db_tx, &projections).await {
             Ok(base) => base,
             Err(err) => {
@@ -936,10 +983,12 @@ impl StagedTransaction {
                 return Err(err);
             }
         };
+        phases.head_view = phase_started.elapsed();
         let base_ref: &CatalogSnapshot = &base;
         // Read before any write in this commit is staged: `InlineFlushDelete`
         // /`InlineDrop` name a table, not keys, and resolve against
         // `db_tx`'s current state exactly like `base` above.
+        let phase_started = Instant::now();
         let inline_writes = match translate_inline(&db_tx, &ops).await {
             Ok(writes) => writes,
             Err(err) => {
@@ -947,16 +996,9 @@ impl StagedTransaction {
                 return Err(err);
             }
         };
+        phases.inline = phase_started.elapsed();
 
-        let mints_snapshot = ops.iter().any(|op| {
-            matches!(
-                op,
-                RowOperation::Insert {
-                    table: TableKind::Snapshot,
-                    ..
-                }
-            )
-        });
+        let mints_snapshot = mints_snapshot(&ops);
         // Maintain equality-index entries for any data file this commit
         // registered on an indexed table, by scoped-reading it from
         // `DATA_PATH`. Gated: a no-op unless a live index covers the file's
@@ -965,6 +1007,7 @@ impl StagedTransaction {
         // than under-covering the index. Staged before the translation so a
         // poisoned definition rides the writes it produces.
         let store = data_store.as_ref();
+        let phase_started = Instant::now();
         let entries =
             match stage_index_maintenance(&db_tx, base_ref, &ops, store, &data_prefix).await {
                 Ok(entries) => entries,
@@ -973,14 +1016,18 @@ impl StagedTransaction {
                     return Err(err);
                 }
             };
+        phases.index_maintenance = phase_started.elapsed();
         let StagedEntries {
             poisoned,
             deferred,
             bytes: entry_bytes,
         } = entries;
 
+        let phase_started = Instant::now();
         match translate_batch(base_ref, &ops, &poisoned, &deferred, mints_snapshot) {
             Ok((result_id, mut writes)) => {
+                phases.translate = phase_started.elapsed();
+                let phase_started = Instant::now();
                 let staged_bytes =
                     match stage_batch(&db_tx, &mut writes, inline_writes, result_id, entry_bytes)
                         .await
@@ -991,6 +1038,7 @@ impl StagedTransaction {
                             return Err(err);
                         }
                     };
+                phases.stage = phase_started.elapsed();
                 // The same landing the verb path takes: one durable write,
                 // one head-race classification, one projection refresh.
                 // This path never retries the loss — DuckLake authored the
@@ -1002,6 +1050,7 @@ impl StagedTransaction {
                 // interrupt races the wait for it rather than the write
                 // itself.
                 let head_before = base_ref.snapshot.snapshot_id;
+                let phase_started = Instant::now();
                 let landed = commit::commit_batch_off_task(
                     db_tx,
                     head_before,
@@ -1012,9 +1061,18 @@ impl StagedTransaction {
                     projections,
                 )
                 .await?;
+                phases.land = phase_started.elapsed();
                 match landed {
-                    commit::Landed::Committed => {
-                        staged_landed(result_id, staged_rows, staged_bytes, started);
+                    commit::Landed::Committed(commit_timings) => {
+                        staged_landed(
+                            diagnostic_id,
+                            result_id,
+                            staged_rows,
+                            staged_bytes,
+                            &phases,
+                            commit_timings,
+                            started,
+                        );
                         Ok(SnapshotId::new(result_id))
                     }
                     commit::Landed::LostRace => Err(staged_lost_race(result_id, staged_rows)),
@@ -1081,15 +1139,27 @@ async fn stage_batch(
 
 /// One landed staged commit's summary event.
 fn staged_landed(
+    transaction_id: u64,
     result_id: u64,
     staged_rows: usize,
     staged_bytes: StagedBytes,
-    started: std::time::Instant,
+    phases: &CommitPhases,
+    commit_timings: commit::CommitTimings,
+    started: Instant,
 ) {
     debug!(
+        transaction_id,
         snapshot = result_id,
         staged_rows,
         staged_bytes = staged_bytes.0,
+        head_view_ms = milliseconds(phases.head_view),
+        inline_ms = milliseconds(phases.inline),
+        index_maintenance_ms = milliseconds(phases.index_maintenance),
+        translate_ms = milliseconds(phases.translate),
+        stage_ms = milliseconds(phases.stage),
+        land_ms = milliseconds(phases.land),
+        durable_ms = milliseconds(commit_timings.durable),
+        projection_ms = milliseconds(commit_timings.projection),
         elapsed_ms = started.elapsed().as_millis(),
         "staged commit landed"
     );
