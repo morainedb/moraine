@@ -2,7 +2,7 @@
 //! removals from registered files and inline chunks by scoped-reading
 //! them.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, future::Future};
 
 use futures::{StreamExt, TryStreamExt, stream};
 
@@ -22,6 +22,20 @@ use crate::transaction::operations::ChangeSet;
 /// instead keeps a single commit from monopolizing the store's request
 /// budget.
 const FILE_READ_CONCURRENCY: usize = 64;
+
+/// Resolves independent reads concurrently and returns their results in
+/// target order. Keeping the order stable makes staging and error selection
+/// independent of remote completion timing.
+async fn resolve_in_order<T, I, F>(futures: I, concurrency: usize) -> Result<Vec<T>>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = Result<T>>,
+{
+    stream::iter(futures)
+        .buffered(concurrency)
+        .try_collect()
+        .await
+}
 
 /// What a commit's registered and targeted files need before their entries
 /// can be derived: where the bytes live, and which tables the commit merely
@@ -204,18 +218,33 @@ pub(super) async fn stage_index_maintenance(
     )
     .await?;
 
-    for (table_id, row_ids) in &inline_deletes {
-        stage_inline_delete_entries(
-            db_tx,
-            base,
-            ops,
-            &pending_schemas,
-            *table_id,
-            row_ids,
-            &mut entries,
-        )
-        .await?;
-    }
+    // Every table's old indexed values live in a disjoint inline range. Read
+    // those ranges together, then append them by table id so store latency is
+    // overlapped without making staging or failures timing-dependent.
+    let mut inline_targets: Vec<_> = inline_deletes.iter().collect();
+    inline_targets.sort_by_key(|(table_id, _)| *table_id);
+    let pending_schemas = &pending_schemas;
+    let inline_removals = resolve_in_order(
+        inline_targets
+            .into_iter()
+            .map(|(table_id, row_ids)| async move {
+                let mut target_entries = Vec::new();
+                stage_inline_delete_entries(
+                    db_tx,
+                    base,
+                    ops,
+                    pending_schemas,
+                    *table_id,
+                    row_ids,
+                    &mut target_entries,
+                )
+                .await?;
+                Ok(target_entries)
+            }),
+        FILE_READ_CONCURRENCY,
+    )
+    .await?;
+    entries.extend(inline_removals.into_iter().flatten());
     // A target already resolved at the add is skipped: the rows that delete
     // kills were left out of the file's entries rather than staged and
     // removed. The rest are sorted before they are read, so which target a
@@ -485,6 +514,41 @@ pub(super) fn pending_inline_schemas(ops: &[RowOperation]) -> HashMap<(u64, u64)
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    /// Old-entry derivations for separate deleted tables have no dependency
+    /// on one another. The shared collector overlaps them while retaining
+    /// target order for deterministic staging and errors.
+    #[tokio::test]
+    async fn old_index_lookups_overlap_and_restore_target_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let futures = (0..3).map(|target| {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            async move {
+                let held = active.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(held, Ordering::AcqRel);
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, Ordering::AcqRel);
+                Ok(target)
+            }
+        });
+
+        let resolved = resolve_in_order(futures, 3).await.unwrap();
+
+        assert_eq!(resolved, vec![0, 1, 2]);
+        assert_eq!(peak.load(Ordering::Relaxed), 3);
+    }
 }
 
 /// One chunk version's Arrow IPC schema: this commit's staged record if it
