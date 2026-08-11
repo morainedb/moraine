@@ -7,6 +7,29 @@ moraine pins, moraine keeps the documented limitation or fallback.
 When an upstream change lands, update the owning RFC and add or adjust the
 integration coverage.
 
+## Point reads
+
+### Batch exact-key reads through one read plan
+
+SlateDB 0.15 exposes single-key `get` operations and range scans, but no
+multi-get operation. A caller resolving hundreds of unrelated exact keys must
+issue concurrent `get` calls, each of which independently enters the read path.
+The caller cannot ask SlateDB to group those keys by level, SST, or block and
+coalesce repeated lookup or fetch work.
+
+Add a bounded batch point-read operation to `DbReadOps`, including support on
+`DbTransaction`. One call should resolve every key against one consistent read
+point, preserve each result's association with its input key, and group work by
+level, SST, and block so colocated keys do not repeat the same lookup or fetch.
+The transactional form must also see the transaction's own writes and retain
+the isolation and conflict behavior of individual `get` calls.
+
+Until that exists, moraine keeps a bounded window of `DbTransaction::get`
+futures in flight for uniqueness enforcement. This hides remote latency but
+does not reduce the underlying lookup amplification.
+
+Owner: [RFC 0016](rfcs/0016-equality-indexes.md).
+
 ## Cache identity
 
 ### Accept a caller-supplied stable cache scope
