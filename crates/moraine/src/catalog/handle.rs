@@ -1464,7 +1464,9 @@ impl ReadOnlyCatalog {
     /// scoped-reading it — DuckLake supplies none, so moraine reads them.
     /// The caller resolves each of the index's columns to its physical
     /// position in the file (through the column-mapping rules) and passes
-    /// them in the index's column order. The returned entries feed
+    /// them in the index's column order. `file_size` and `footer_size` are
+    /// DuckLake's recorded values; carrying both avoids discovery requests
+    /// before the projected read. The returned entries feed
     /// [`Transaction::register_data_file`] so registration stays covered.
     ///
     /// The file must not carry an embedded row-id column — its rows already
@@ -1481,16 +1483,16 @@ impl ReadOnlyCatalog {
         &self,
         object_store: Arc<dyn ObjectStore>,
         path: &Path,
+        file_size: u64,
+        footer_size: u64,
         index: IndexId,
         indexed_positions: &[usize],
     ) -> Result<Vec<FileIndexEntry>> {
-        let entries = scoped_read::scoped_read_entries(
-            object_store,
-            path,
+        let entries = scoped_read::scoped_read_recorded_entries(
+            scoped_read::ParquetFile::new(object_store, path.clone(), file_size, footer_size),
             indexed_positions,
             scoped_read::ScopedRows::All,
             scoped_read::RowIdSource::Ordinal,
-            None,
         )
         .await?;
         Ok(entries
@@ -1575,8 +1577,13 @@ impl ReadOnlyCatalog {
             }
             for delete in snapshot.delete_files_of(table) {
                 let path = resolve(&delete.path, delete.path_is_relative);
-                let positions =
-                    scoped_read::delete_file_positions(object_store.as_ref(), &path).await?;
+                let positions = scoped_read::delete_file_positions(scoped_read::ParquetFile::new(
+                    Arc::clone(&object_store),
+                    path,
+                    delete.file_size_bytes,
+                    delete.footer_size,
+                ))
+                .await?;
                 killed_positions
                     .entry(delete.data_file_id.get())
                     .or_default()
@@ -1586,16 +1593,18 @@ impl ReadOnlyCatalog {
             let mut entries = Vec::new();
             for file in snapshot.data_files_of(table) {
                 let path = resolve(&file.path, file.path_is_relative);
-                let scoped = scoped_read::scoped_read_entries_with_footer(
-                    Arc::clone(&object_store),
-                    &path,
+                let scoped = scoped_read::scoped_read_recorded_entries(
+                    scoped_read::ParquetFile::new(
+                        Arc::clone(&object_store),
+                        path,
+                        file.file_size_bytes,
+                        file.footer_size,
+                    ),
                     &positions,
                     scoped_read::ScopedRows::All,
                     scoped_read::RowIdSource::Resolve {
                         row_id_start: file.row_id_start,
                     },
-                    Some(file.file_size_bytes),
-                    Some(file.footer_size),
                 )
                 .await?;
                 let dead_positions = killed_positions.get(&file.id.get());
@@ -3009,8 +3018,13 @@ impl Catalog {
 
             for delete in snapshot.delete_files_of(table) {
                 let path = resolve(&delete.path, delete.path_is_relative);
-                let positions =
-                    scoped_read::delete_file_positions(object_store.as_ref(), &path).await?;
+                let positions = scoped_read::delete_file_positions(scoped_read::ParquetFile::new(
+                    Arc::clone(&object_store),
+                    path,
+                    delete.file_size_bytes,
+                    delete.footer_size,
+                ))
+                .await?;
                 killed_positions
                     .entry(delete.data_file_id.get())
                     .or_default()
@@ -3038,14 +3052,16 @@ impl Catalog {
                     legacy_row_cursor,
                 };
                 scoped_read::scoped_read_entry_batches(
-                    Arc::clone(&object_store),
-                    &path,
+                    scoped_read::ParquetFile::new(
+                        Arc::clone(&object_store),
+                        path,
+                        file.file_size_bytes,
+                        file.footer_size,
+                    ),
                     &positions,
                     scoped_read::RowIdSource::Resolve {
                         row_id_start: file.row_id_start,
                     },
-                    Some(file.file_size_bytes),
-                    Some(file.footer_size),
                     start,
                     &mut consumer,
                 )

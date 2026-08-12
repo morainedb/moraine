@@ -18,7 +18,7 @@ use arrow::{
         UInt16Array, UInt32Array, UInt64Array,
     },
     buffer::Buffer,
-    datatypes::{DataType, SchemaRef, TimeUnit},
+    datatypes::{DataType, Schema, SchemaRef, TimeUnit},
     ipc::{
         reader::{StreamReader, read_record_batch},
         root_as_message,
@@ -510,7 +510,7 @@ struct ObjectStoreReader {
     file_size: u64,
     /// The serialized Parquet metadata length recorded by DuckLake. The
     /// trailing length and magic occupy another eight bytes.
-    footer_size: Option<u64>,
+    footer_size: u64,
     /// Whether to load the page index with the footer. A row selection
     /// needs it to skip pages; without one it is footer bytes for nothing.
     page_index: PageIndexPolicy,
@@ -529,13 +529,64 @@ struct MetadataCacheEntry {
     bytes: usize,
 }
 
+type MetadataInFlightResult = std::result::Result<Arc<ParquetMetaData>, Arc<str>>;
+
+enum MetadataLookup {
+    Cached(Arc<ParquetMetaData>),
+    InFlight(MetadataInFlightLease),
+}
+
+/// One shared fill for a cache key. The cell owns only the parsed result;
+/// readers keep their own file reader and projected-column path.
+struct MetadataInFlight {
+    store: Weak<dyn ObjectStore>,
+    path: Path,
+    file_size: u64,
+    page_index: PageIndexPolicy,
+    result: Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+}
+
+struct MetadataInFlightLease {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    file_size: u64,
+    page_index: PageIndexPolicy,
+    result: Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+}
+
+impl Drop for MetadataInFlightLease {
+    fn drop(&mut self) {
+        release_metadata_in_flight(
+            &self.store,
+            &self.path,
+            self.file_size,
+            self.page_index,
+            &self.result,
+        );
+    }
+}
+
 #[derive(Default)]
 struct MetadataCache {
     entries: VecDeque<MetadataCacheEntry>,
     bytes: usize,
+    in_flight: Vec<MetadataInFlight>,
 }
 
 impl MetadataCache {
+    fn lookup(
+        &mut self,
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        file_size: u64,
+        page_index: PageIndexPolicy,
+    ) -> MetadataLookup {
+        match self.get(store, path, file_size, page_index) {
+            Some(metadata) => MetadataLookup::Cached(metadata),
+            None => MetadataLookup::InFlight(self.in_flight(store, path, file_size, page_index)),
+        }
+    }
+
     fn get(
         &mut self,
         store: &Arc<dyn ObjectStore>,
@@ -606,21 +657,89 @@ impl MetadataCache {
             self.bytes = self.bytes.saturating_sub(evicted.bytes);
         }
     }
+
+    fn in_flight(
+        &mut self,
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        file_size: u64,
+        page_index: PageIndexPolicy,
+    ) -> MetadataInFlightLease {
+        self.in_flight
+            .retain(|in_flight| in_flight.store.strong_count() > 0);
+        let weak = Arc::downgrade(store);
+        let result = if let Some(in_flight) = self.in_flight.iter().find(|in_flight| {
+            Weak::ptr_eq(&in_flight.store, &weak)
+                && in_flight.path == *path
+                && in_flight.file_size == file_size
+                && in_flight.page_index == page_index
+        }) {
+            Arc::clone(&in_flight.result)
+        } else {
+            let result = Arc::new(tokio::sync::OnceCell::new());
+            self.in_flight.push(MetadataInFlight {
+                store: weak,
+                path: path.clone(),
+                file_size,
+                page_index,
+                result: Arc::clone(&result),
+            });
+            result
+        };
+        MetadataInFlightLease {
+            store: Arc::clone(store),
+            path: path.clone(),
+            file_size,
+            page_index,
+            result,
+        }
+    }
+
+    fn finish_in_flight(
+        &mut self,
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        file_size: u64,
+        page_index: PageIndexPolicy,
+        result: &Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+    ) {
+        let weak = Arc::downgrade(store);
+        self.in_flight.retain(|in_flight| {
+            !(Weak::ptr_eq(&in_flight.store, &weak)
+                && in_flight.path == *path
+                && in_flight.file_size == file_size
+                && in_flight.page_index == page_index
+                && Arc::ptr_eq(&in_flight.result, result))
+        });
+    }
+
+    fn release_in_flight(
+        &mut self,
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        file_size: u64,
+        page_index: PageIndexPolicy,
+        result: &Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+    ) {
+        if result.get().is_some() || Arc::strong_count(result) == 2 {
+            self.finish_in_flight(store, path, file_size, page_index, result);
+        }
+    }
 }
 
 static METADATA_CACHE: LazyLock<Mutex<MetadataCache>> =
     LazyLock::new(|| Mutex::new(MetadataCache::default()));
 
-fn cached_metadata(
+fn metadata_lookup(
     store: &Arc<dyn ObjectStore>,
     path: &Path,
     file_size: u64,
     page_index: PageIndexPolicy,
-) -> Option<Arc<ParquetMetaData>> {
+) -> MetadataLookup {
     METADATA_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(store, path, file_size, page_index)
+        .lookup(store, path, file_size, page_index)
 }
 
 fn cache_metadata(
@@ -636,9 +755,35 @@ fn cache_metadata(
         .insert(store, path, file_size, page_index, metadata);
 }
 
-fn footer_prefetch_size(footer_size: Option<u64>, file_size: u64) -> Option<usize> {
-    footer_size
-        .filter(|size| *size > 0)
+fn finish_metadata_in_flight(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    file_size: u64,
+    page_index: PageIndexPolicy,
+    result: &Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+) {
+    METADATA_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish_in_flight(store, path, file_size, page_index, result);
+}
+
+fn release_metadata_in_flight(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    file_size: u64,
+    page_index: PageIndexPolicy,
+    result: &Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+) {
+    METADATA_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .release_in_flight(store, path, file_size, page_index, result);
+}
+
+fn footer_prefetch_size(footer_size: u64, file_size: u64) -> Option<usize> {
+    (footer_size > 0)
+        .then_some(footer_size)
         .and_then(|size| size.checked_add(8))
         .filter(|size| *size <= file_size)
         .and_then(|size| usize::try_from(size).ok())
@@ -677,11 +822,11 @@ impl AsyncFileReader for ObjectStoreReader {
         &'a mut self,
         _options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
-        if let Some(metadata) =
-            cached_metadata(&self.store, &self.path, self.file_size, self.page_index)
-        {
-            return async move { Ok(metadata) }.boxed();
-        }
+        let in_flight =
+            match metadata_lookup(&self.store, &self.path, self.file_size, self.page_index) {
+                MetadataLookup::Cached(metadata) => return async move { Ok(metadata) }.boxed(),
+                MetadataLookup::InFlight(in_flight) => in_flight,
+            };
 
         let file_size = self.file_size;
         let prefetch_size = footer_prefetch_size(self.footer_size, file_size);
@@ -689,15 +834,31 @@ impl AsyncFileReader for ObjectStoreReader {
         let store = Arc::clone(&self.store);
         let path = self.path.clone();
         async move {
-            let metadata = Arc::new(
-                ParquetMetaDataReader::new()
-                    .with_page_index_policy(page_index)
-                    .with_prefetch_hint(prefetch_size)
-                    .load_and_finish(&mut *self, file_size)
-                    .await?,
-            );
-            cache_metadata(&store, path, file_size, page_index, Arc::clone(&metadata));
-            Ok(metadata)
+            let fill_store = Arc::clone(&store);
+            let fill_path = path.clone();
+            let result = in_flight
+                .result
+                .get_or_init(|| async move {
+                    let metadata = ParquetMetaDataReader::new()
+                        .with_page_index_policy(page_index)
+                        .with_prefetch_hint(prefetch_size)
+                        .load_and_finish(&mut *self, file_size)
+                        .await
+                        .map(Arc::new)
+                        .map_err(|error| Arc::<str>::from(error.to_string()))?;
+                    cache_metadata(
+                        &fill_store,
+                        fill_path,
+                        file_size,
+                        page_index,
+                        Arc::clone(&metadata),
+                    );
+                    Ok(metadata)
+                })
+                .await
+                .clone();
+            finish_metadata_in_flight(&store, &path, file_size, page_index, &in_flight.result);
+            result.map_err(|error| ParquetError::General(error.to_string()))
         }
         .boxed()
     }
@@ -726,9 +887,10 @@ fn usize_as_u64(value: usize) -> u64 {
 /// reads, never the whole object. Row ids resolve per `row_id_source`: the
 /// field-id-tagged embedded column if present — rewrite files from UPDATE
 /// and compaction preserve old ids there — else `row_id_start + ordinal`,
-/// else refusal. `file_size` is the object's length when the caller knows
-/// it (DuckLake records it per data file); `None` costs one `head` request.
-pub(crate) async fn scoped_read_entries(
+/// else refusal. This test helper deliberately exercises the discovery path;
+/// production reads require DuckLake's recorded file and footer sizes.
+#[cfg(test)]
+async fn scoped_read_entries(
     object_store: Arc<dyn ObjectStore>,
     path: &Path,
     indexed_positions: &[usize],
@@ -736,38 +898,8 @@ pub(crate) async fn scoped_read_entries(
     row_id_source: RowIdSource,
     file_size: Option<u64>,
 ) -> Result<Vec<ScopedReadEntry>> {
-    scoped_read_entries_with_footer(
-        object_store,
-        path,
-        indexed_positions,
-        rows,
-        row_id_source,
-        file_size,
-        None,
-    )
-    .await
-}
-
-/// The same scoped read with DuckLake's recorded serialized Parquet
-/// metadata length. A valid `footer_size` avoids the trailing footer-length
-/// probe before metadata is parsed.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn scoped_read_entries_with_footer(
-    object_store: Arc<dyn ObjectStore>,
-    path: &Path,
-    indexed_positions: &[usize],
-    rows: ScopedRows<'_>,
-    row_id_source: RowIdSource,
-    file_size: Option<u64>,
-    footer_size: Option<u64>,
-) -> Result<Vec<ScopedReadEntry>> {
-    // A selection naming no row is answerable without reading anything.
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let file_size = match file_size {
-        Some(size) => size,
+        Some(file_size) => file_size,
         None => {
             object_store
                 .head(path)
@@ -776,6 +908,51 @@ pub(crate) async fn scoped_read_entries_with_footer(
                 .size
         }
     };
+    scoped_read_entries_inner(
+        object_store,
+        path,
+        indexed_positions,
+        rows,
+        row_id_source,
+        file_size,
+        0,
+    )
+    .await
+}
+
+/// Reads entries from one recorded Parquet object.
+pub(crate) async fn scoped_read_recorded_entries(
+    file: ParquetFile,
+    indexed_positions: &[usize],
+    rows: ScopedRows<'_>,
+    row_id_source: RowIdSource,
+) -> Result<Vec<ScopedReadEntry>> {
+    scoped_read_entries_inner(
+        file.object_store,
+        &file.path,
+        indexed_positions,
+        rows,
+        row_id_source,
+        file.file_size,
+        file.footer_size,
+    )
+    .await
+}
+
+async fn scoped_read_entries_inner(
+    object_store: Arc<dyn ObjectStore>,
+    path: &Path,
+    indexed_positions: &[usize],
+    rows: ScopedRows<'_>,
+    row_id_source: RowIdSource,
+    file_size: u64,
+    footer_size: u64,
+) -> Result<Vec<ScopedReadEntry>> {
+    // A selection naming no row is answerable without reading anything.
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let selected = rows.positions();
     let ordinals = selected.map_or(Ordinals::Dense, Ordinals::Selected);
 
@@ -855,17 +1032,17 @@ pub(crate) trait ScopedIndexEntryBatchConsumer {
 pub(crate) struct ParquetFile {
     object_store: Arc<dyn ObjectStore>,
     path: Path,
-    file_size: Option<u64>,
-    footer_size: Option<u64>,
+    file_size: u64,
+    footer_size: u64,
 }
 
 impl ParquetFile {
-    /// Describes one object; absent sizes are discovered by the reader.
+    /// Describes one object using DuckLake's recorded sizes.
     pub(crate) fn new(
         object_store: Arc<dyn ObjectStore>,
         path: Path,
-        file_size: Option<u64>,
-        footer_size: Option<u64>,
+        file_size: u64,
+        footer_size: u64,
     ) -> Self {
         Self {
             object_store,
@@ -892,16 +1069,7 @@ pub(crate) async fn scoped_read_index_entry_batches<C: ScopedIndexEntryBatchCons
         return Ok(());
     }
 
-    let file_size = match file.file_size {
-        Some(size) => size,
-        None => {
-            file.object_store
-                .head(&file.path)
-                .await
-                .map_err(corrupt("scoped read"))?
-                .size
-        }
-    };
+    let file_size = file.file_size;
     let source_positions = index_positions(projections);
     let selected = rows.positions();
     let ordinals = selected.map_or(Ordinals::Dense, Ordinals::Selected);
@@ -1017,33 +1185,26 @@ const BUILD_READ_BATCH_ROWS: usize = 8_192;
 
 /// Streams a file's projected index entries to `consumer` in bounded Arrow
 /// batches, starting at physical row `start_ordinal`. Unlike
-/// [`scoped_read_entries`], this never collects the whole file. DuckLake's
-/// recorded footer size is available to the metadata reader.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// [`scoped_read_recorded_entries`], this never collects the whole file.
+/// DuckLake's recorded footer size is available to the metadata reader.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
-    object_store: Arc<dyn ObjectStore>,
-    path: &Path,
+    file: ParquetFile,
     indexed_positions: &[usize],
     row_id_source: RowIdSource,
-    file_size: Option<u64>,
-    footer_size: Option<u64>,
     start_ordinal: u64,
     consumer: &mut C,
 ) -> Result<()> {
-    let file_size = match file_size {
-        Some(size) => size,
-        None => {
-            object_store
-                .head(path)
-                .await
-                .map_err(corrupt("scoped read"))?
-                .size
-        }
-    };
+    let ParquetFile {
+        object_store,
+        path,
+        file_size,
+        footer_size,
+    } = file;
 
     if file_size < WHOLE_OBJECT_THRESHOLD {
         let bytes: Bytes = object_store
-            .get(path)
+            .get(&path)
             .await
             .map_err(corrupt("scoped read"))?
             .bytes()
@@ -1051,7 +1212,7 @@ pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
             .map_err(corrupt("scoped read"))?;
         let builder =
             ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("scoped read"))?;
-        let total = total_rows(builder.metadata(), path)?;
+        let total = total_rows(builder.metadata(), &path)?;
         let start = usize::try_from(start_ordinal)
             .ok()
             .filter(|start| *start <= total)
@@ -1064,7 +1225,7 @@ pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
             return Ok(());
         }
         let (row_id_position, row_id_start) =
-            resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+            resolve_row_id_source(builder.parquet_schema(), row_id_source, &path)?;
         let (mask, indexed_output, row_id_output) =
             projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
         let selection = RowSelection::from_consecutive_ranges(std::iter::once(start..total), total);
@@ -1104,7 +1265,7 @@ pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
         .await
         .map_err(corrupt("scoped read"))?;
-    let total = total_rows(builder.metadata(), path)?;
+    let total = total_rows(builder.metadata(), &path)?;
     let start = usize::try_from(start_ordinal)
         .ok()
         .filter(|start| *start <= total)
@@ -1117,7 +1278,7 @@ pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
         return Ok(());
     }
     let (row_id_position, row_id_start) =
-        resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+        resolve_row_id_source(builder.parquet_schema(), row_id_source, &path)?;
     let (mask, indexed_output, row_id_output) =
         projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
     let selection = RowSelection::from_consecutive_ranges(std::iter::once(start..total), total);
@@ -1375,49 +1536,84 @@ fn record_batch_index_entries(
     Ok(entries)
 }
 
-/// The row positions a DuckLake delete file marks dead, read from its `pos`
-/// column. A delete file names positions within one data file, so its
-/// `file_path` column carries no information the caller lacks.
-pub(crate) async fn delete_file_positions(
-    object_store: &dyn ObjectStore,
-    path: &Path,
-) -> Result<Vec<u64>> {
-    let bytes: Bytes = object_store
-        .get(path)
-        .await
-        .map_err(corrupt("delete-file read"))?
-        .bytes()
-        .await
-        .map_err(corrupt("delete-file read"))?;
-
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("delete-file read"))?;
-
-    let position = builder
-        .schema()
+/// The position of a delete file's `pos` column.
+fn delete_position(schema: &Schema) -> Result<usize> {
+    schema
         .fields()
         .iter()
         .position(|field| field.name() == "pos")
-        .ok_or_else(|| Error::Corruption("delete file has no `pos` column".to_owned()))?;
+        .ok_or_else(|| Error::Corruption("delete file has no `pos` column".to_owned()))
+}
 
+/// Appends the non-NULL positions in `batch` to `positions`.
+fn append_delete_positions(batch: &RecordBatch, positions: &mut Vec<u64>) -> Result<()> {
+    let column = batch.column(0).as_ref();
+    for row in 0..batch.num_rows() {
+        if column.is_null(row) {
+            return Err(Error::Corruption(
+                "delete file has a NULL position".to_owned(),
+            ));
+        }
+        positions.push(row_id_value(column, row)?);
+    }
+    Ok(())
+}
+
+/// The row positions a DuckLake delete file marks dead, read from its `pos`
+/// column. A delete file names positions within one data file, so its
+/// `file_path` column carries no information the caller lacks. Small files
+/// cost one whole-object read; large files use the recorded sizes and shared
+/// metadata cache to fetch only the position column.
+pub(crate) async fn delete_file_positions(file: ParquetFile) -> Result<Vec<u64>> {
+    let ParquetFile {
+        object_store,
+        path,
+        file_size,
+        footer_size,
+    } = file;
+    let mut positions = Vec::new();
+
+    if file_size < WHOLE_OBJECT_THRESHOLD {
+        let bytes: Bytes = object_store
+            .get(&path)
+            .await
+            .map_err(corrupt("delete-file read"))?
+            .bytes()
+            .await
+            .map_err(corrupt("delete-file read"))?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("delete-file read"))?;
+        let position = delete_position(builder.schema().as_ref())?;
+        let mask = ProjectionMask::roots(builder.parquet_schema(), [position]);
+        let reader = builder
+            .with_projection(mask)
+            .build()
+            .map_err(corrupt("delete-file read"))?;
+        for batch in reader {
+            append_delete_positions(&batch.map_err(corrupt("delete-file read"))?, &mut positions)?;
+        }
+        return Ok(positions);
+    }
+
+    let reader = ObjectStoreReader {
+        store: object_store,
+        path: path.clone(),
+        file_size,
+        footer_size,
+        page_index: PageIndexPolicy::Skip,
+    };
+    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+        .await
+        .map_err(corrupt("delete-file read"))?;
+    let position = delete_position(builder.schema().as_ref())?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), [position]);
-    let reader = builder
+    let mut stream = builder
         .with_projection(mask)
         .build()
         .map_err(corrupt("delete-file read"))?;
-
-    let mut positions = Vec::new();
-    for batch in reader {
-        let batch = batch.map_err(corrupt("delete-file read"))?;
-        let column = batch.column(0).as_ref();
-        for row in 0..batch.num_rows() {
-            if column.is_null(row) {
-                return Err(Error::Corruption(
-                    "delete file has a NULL position".to_owned(),
-                ));
-            }
-            positions.push(row_id_value(column, row)?);
-        }
+    while let Some(batch) = stream.next().await {
+        append_delete_positions(&batch.map_err(corrupt("delete-file read"))?, &mut positions)?;
     }
     Ok(positions)
 }
@@ -1576,9 +1772,12 @@ pub(crate) fn inline_schema_decode_count(schema_ipc: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Duration,
     };
 
     use arrow::{
@@ -1603,6 +1802,7 @@ mod tests {
         inner: InMemory,
         fetched_bytes: AtomicU64,
         fetch_requests: AtomicU64,
+        fetch_delay: Option<Duration>,
     }
 
     impl CountingStore {
@@ -1611,6 +1811,14 @@ mod tests {
                 inner: InMemory::new(),
                 fetched_bytes: AtomicU64::new(0),
                 fetch_requests: AtomicU64::new(0),
+                fetch_delay: None,
+            }
+        }
+
+        fn with_fetch_delay(fetch_delay: Duration) -> Self {
+            Self {
+                fetch_delay: Some(fetch_delay),
+                ..Self::new()
             }
         }
 
@@ -1653,6 +1861,9 @@ mod tests {
             location: &Path,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
+            if let Some(delay) = self.fetch_delay {
+                tokio::time::sleep(delay).await;
+            }
             let head = options.head;
             let result = self.inner.get_opts(location, options).await?;
             if !head {
@@ -1668,6 +1879,9 @@ mod tests {
             location: &Path,
             ranges: &[std::ops::Range<u64>],
         ) -> object_store::Result<Vec<Bytes>> {
+            if let Some(delay) = self.fetch_delay {
+                tokio::time::sleep(delay).await;
+            }
             let results = self.inner.get_ranges(location, ranges).await?;
             self.fetch_requests.fetch_add(1, Ordering::Relaxed);
             let total: u64 = results.iter().map(|bytes| bytes.len() as u64).sum();
@@ -1706,15 +1920,16 @@ mod tests {
         }
     }
 
-    /// A file wide enough that its indexed column is a small fraction of its
-    /// bytes: one `Int64` id plus seven fat `Utf8` payload columns, `rows`
-    /// rows. Returns the written object's size.
-    async fn write_wide_fixture_with_footer(
+    /// A file wide enough that its first column is a small fraction of its
+    /// bytes: one `Int64` value plus seven fat `Utf8` payload columns, `rows`
+    /// rows. Returns the written object's size and footer size.
+    async fn write_wide_named_fixture_with_footer(
         store: &dyn ObjectStore,
         path: &Path,
         rows: usize,
+        first_column: &str,
     ) -> (u64, u64) {
-        let mut fields = vec![Field::new("id", DataType::Int64, false)];
+        let mut fields = vec![Field::new(first_column, DataType::Int64, false)];
         for i in 0..7 {
             fields.push(Field::new(format!("payload{i}"), DataType::Utf8, false));
         }
@@ -1746,6 +1961,14 @@ mod tests {
         (object_len, footer_size)
     }
 
+    async fn write_wide_fixture_with_footer(
+        store: &dyn ObjectStore,
+        path: &Path,
+        rows: usize,
+    ) -> (u64, u64) {
+        write_wide_named_fixture_with_footer(store, path, rows, "id").await
+    }
+
     async fn write_wide_fixture(store: &dyn ObjectStore, path: &Path, rows: usize) -> u64 {
         write_wide_fixture_with_footer(store, path, rows).await.0
     }
@@ -1762,28 +1985,22 @@ mod tests {
         assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
         let wanted: RowPositions = [7, 19_000].into_iter().collect();
 
-        let first = scoped_read_entries_with_footer(
-            store.clone(),
-            &path,
+        let first = scoped_read_recorded_entries(
+            ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
             &[0],
             ScopedRows::At(&wanted),
             RowIdSource::Ordinal,
-            Some(object_len),
-            Some(footer_size),
         )
         .await
         .unwrap();
         assert_eq!(first.len(), 2);
         let first_requests = store.fetch_requests();
 
-        let second = scoped_read_entries_with_footer(
-            store.clone(),
-            &path,
+        let second = scoped_read_recorded_entries(
+            ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
             &[0],
             ScopedRows::At(&wanted),
             RowIdSource::Ordinal,
-            Some(object_len),
-            Some(footer_size),
         )
         .await
         .unwrap();
@@ -1792,6 +2009,175 @@ mod tests {
         let second_requests = store.fetch_requests() - first_requests;
         assert_eq!(first_requests, 3, "footer, page index, projected columns");
         assert_eq!(second_requests, 1, "projected columns only");
+    }
+
+    /// A large delete file uses the range reader because only its `pos`
+    /// column is relevant. Its immutable footer is retained for the next
+    /// pass, while the position column remains an ordinary projected read.
+    #[tokio::test]
+    async fn large_delete_file_reads_only_positions_and_reuses_metadata() {
+        let store = Arc::new(CountingStore::new());
+        let path = Path::from("cached-wide-delete.parquet");
+        let (object_len, footer_size) =
+            write_wide_named_fixture_with_footer(store.as_ref(), &path, 20_000, "pos").await;
+        assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
+
+        let first = delete_file_positions(ParquetFile::new(
+            store.clone(),
+            path.clone(),
+            object_len,
+            footer_size,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 20_000);
+        assert_eq!(first[0], 0);
+        assert_eq!(first[19_999], 19_999);
+        let first_requests = store.fetch_requests();
+        let first_bytes = store.fetched_bytes();
+
+        let second = delete_file_positions(ParquetFile::new(
+            store.clone(),
+            path.clone(),
+            object_len,
+            footer_size,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(second, first);
+        let second_requests = store.fetch_requests() - first_requests;
+
+        assert_eq!(first_requests, 2, "footer and projected position column");
+        assert_eq!(second_requests, 1, "projected position column only");
+        assert!(
+            first_bytes < object_len / 4,
+            "fetched {first_bytes} of {object_len} bytes"
+        );
+    }
+
+    /// A delete file below the crossover stays on one whole-object request;
+    /// projecting it through the range reader would add latency without
+    /// saving meaningful transfer.
+    #[tokio::test]
+    async fn small_delete_file_stays_on_one_whole_object_read() {
+        let store = Arc::new(CountingStore::new());
+        let path = Path::from("small-delete.parquet");
+        let (object_len, footer_size) =
+            write_wide_named_fixture_with_footer(store.as_ref(), &path, 3, "pos").await;
+        assert!(object_len < WHOLE_OBJECT_THRESHOLD);
+
+        let positions = delete_file_positions(ParquetFile::new(
+            store.clone(),
+            path,
+            object_len,
+            footer_size,
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(positions, vec![0, 1, 2]);
+        assert_eq!(store.fetch_requests(), 1);
+        assert_eq!(store.fetched_bytes(), object_len);
+    }
+
+    /// Two readers missing the same immutable footer at once share one
+    /// metadata fill. Each still reads its own projected data column, while
+    /// the footer and page index are fetched only once between them.
+    #[tokio::test]
+    async fn concurrent_metadata_misses_share_one_in_flight_fill() {
+        let store = Arc::new(CountingStore::with_fetch_delay(Duration::from_millis(10)));
+        let path = Path::from("concurrent-cached-wide.parquet");
+        let (object_len, footer_size) =
+            write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
+        assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
+        let wanted: RowPositions = [7, 19_000].into_iter().collect();
+
+        let first = scoped_read_recorded_entries(
+            ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
+            &[0],
+            ScopedRows::At(&wanted),
+            RowIdSource::Ordinal,
+        );
+        let second = scoped_read_recorded_entries(
+            ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
+            &[0],
+            ScopedRows::At(&wanted),
+            RowIdSource::Ordinal,
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(
+            store.fetch_requests(),
+            4,
+            "one footer, one page-index, and two projected-column reads"
+        );
+    }
+
+    /// A failed shared fill wakes its callers but is not retained as a cache
+    /// entry. Immutable objects do not change in production; replacing the
+    /// fixture here proves a transient read failure can be retried.
+    #[tokio::test]
+    async fn failed_metadata_in_flight_fill_is_retryable() {
+        let store = Arc::new(CountingStore::new());
+        let path = Path::from("retry-cached-wide.parquet");
+        let (object_len, footer_size) =
+            write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
+        assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
+        let valid = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+        let mut corrupt = valid.to_vec();
+        *corrupt.last_mut().unwrap() ^= 0xff;
+        store.inner.put(&path, corrupt.into()).await.unwrap();
+        let wanted: RowPositions = [7].into_iter().collect();
+
+        let failed = scoped_read_recorded_entries(
+            ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
+            &[0],
+            ScopedRows::At(&wanted),
+            RowIdSource::Ordinal,
+        )
+        .await;
+        assert!(failed.is_err());
+
+        store.inner.put(&path, valid.into()).await.unwrap();
+        let retried = scoped_read_recorded_entries(
+            ParquetFile::new(store, path, object_len, footer_size),
+            &[0],
+            ScopedRows::At(&wanted),
+            RowIdSource::Ordinal,
+        )
+        .await
+        .unwrap();
+        assert_eq!(retried.len(), 1);
+    }
+
+    #[test]
+    fn abandoned_metadata_in_flight_entry_is_removed() {
+        let store: Arc<dyn ObjectStore> = Arc::new(CountingStore::new());
+        let path = Path::from("abandoned-in-flight.parquet");
+        let lookup = metadata_lookup(&store, &path, 100, PageIndexPolicy::Skip);
+        let MetadataLookup::InFlight(in_flight) = lookup else {
+            panic!("a unique store and path must start cold");
+        };
+        assert!(
+            METADATA_CACHE
+                .lock()
+                .unwrap()
+                .in_flight
+                .iter()
+                .any(|entry| Arc::ptr_eq(&entry.result, &in_flight.result))
+        );
+
+        drop(in_flight);
+
+        assert!(
+            !METADATA_CACHE
+                .lock()
+                .unwrap()
+                .in_flight
+                .iter()
+                .any(|entry| entry.path == path)
+        );
     }
 
     /// Above the whole-object threshold the read must fetch only the footer
@@ -2481,7 +2867,7 @@ mod tests {
         };
 
         scoped_read_index_entry_batches(
-            ParquetFile::new(store, path, Some(file_size), Some(footer_size)),
+            ParquetFile::new(store, path, file_size, footer_size),
             &projections,
             ScopedRows::All,
             RowIdSource::Resolve {
@@ -2538,7 +2924,7 @@ mod tests {
         };
 
         scoped_read_index_entry_batches(
-            ParquetFile::new(store, path, Some(file_size), Some(footer_size)),
+            ParquetFile::new(store, path, file_size, footer_size),
             &projections,
             ScopedRows::At(&selected),
             RowIdSource::Resolve {
