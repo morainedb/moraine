@@ -601,7 +601,9 @@ identity, value, and tiering contracts:
 - The scoped reader owns immutable `Arc<ParquetMetaData>` values keyed by
   object-store identity, path, recorded file size, and page-index policy. They
   are useful only inside this process, stay memory-only, and are evicted by
-  parsed byte weight.
+  parsed byte weight. Concurrent misses for one key share one in-flight fetch
+  and parse; the result enters the cache once, while a failed fill is shared
+  only with its current waiters and remains retryable.
 
 Putting either value into the other engine would erase one of those
 contracts: teaching SlateDB's closed entry type about Parquet couples the
@@ -1031,6 +1033,9 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   ordinary protobuf decoded by borrowing observes the same key order and
   errors at the same entry. Neither path copies the framed value in the scan
   loop.
+- **Concurrent parsed-metadata misses coalesce.** Two scoped readers starting
+  cold against the same file issue one footer/page-index fill and retain one
+  parsed value, while each continues to read its own projected data ranges.
 
 ## Alternatives considered
 

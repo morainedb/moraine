@@ -529,13 +529,64 @@ struct MetadataCacheEntry {
     bytes: usize,
 }
 
+type MetadataInFlightResult = std::result::Result<Arc<ParquetMetaData>, Arc<str>>;
+
+enum MetadataLookup {
+    Cached(Arc<ParquetMetaData>),
+    InFlight(MetadataInFlightLease),
+}
+
+/// One shared fill for a cache key. The cell owns only the parsed result;
+/// readers keep their own file reader and projected-column path.
+struct MetadataInFlight {
+    store: Weak<dyn ObjectStore>,
+    path: Path,
+    file_size: u64,
+    page_index: PageIndexPolicy,
+    result: Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+}
+
+struct MetadataInFlightLease {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    file_size: u64,
+    page_index: PageIndexPolicy,
+    result: Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+}
+
+impl Drop for MetadataInFlightLease {
+    fn drop(&mut self) {
+        release_metadata_in_flight(
+            &self.store,
+            &self.path,
+            self.file_size,
+            self.page_index,
+            &self.result,
+        );
+    }
+}
+
 #[derive(Default)]
 struct MetadataCache {
     entries: VecDeque<MetadataCacheEntry>,
     bytes: usize,
+    in_flight: Vec<MetadataInFlight>,
 }
 
 impl MetadataCache {
+    fn lookup(
+        &mut self,
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        file_size: u64,
+        page_index: PageIndexPolicy,
+    ) -> MetadataLookup {
+        match self.get(store, path, file_size, page_index) {
+            Some(metadata) => MetadataLookup::Cached(metadata),
+            None => MetadataLookup::InFlight(self.in_flight(store, path, file_size, page_index)),
+        }
+    }
+
     fn get(
         &mut self,
         store: &Arc<dyn ObjectStore>,
@@ -606,21 +657,89 @@ impl MetadataCache {
             self.bytes = self.bytes.saturating_sub(evicted.bytes);
         }
     }
+
+    fn in_flight(
+        &mut self,
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        file_size: u64,
+        page_index: PageIndexPolicy,
+    ) -> MetadataInFlightLease {
+        self.in_flight
+            .retain(|in_flight| in_flight.store.strong_count() > 0);
+        let weak = Arc::downgrade(store);
+        let result = if let Some(in_flight) = self.in_flight.iter().find(|in_flight| {
+            Weak::ptr_eq(&in_flight.store, &weak)
+                && in_flight.path == *path
+                && in_flight.file_size == file_size
+                && in_flight.page_index == page_index
+        }) {
+            Arc::clone(&in_flight.result)
+        } else {
+            let result = Arc::new(tokio::sync::OnceCell::new());
+            self.in_flight.push(MetadataInFlight {
+                store: weak,
+                path: path.clone(),
+                file_size,
+                page_index,
+                result: Arc::clone(&result),
+            });
+            result
+        };
+        MetadataInFlightLease {
+            store: Arc::clone(store),
+            path: path.clone(),
+            file_size,
+            page_index,
+            result,
+        }
+    }
+
+    fn finish_in_flight(
+        &mut self,
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        file_size: u64,
+        page_index: PageIndexPolicy,
+        result: &Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+    ) {
+        let weak = Arc::downgrade(store);
+        self.in_flight.retain(|in_flight| {
+            !(Weak::ptr_eq(&in_flight.store, &weak)
+                && in_flight.path == *path
+                && in_flight.file_size == file_size
+                && in_flight.page_index == page_index
+                && Arc::ptr_eq(&in_flight.result, result))
+        });
+    }
+
+    fn release_in_flight(
+        &mut self,
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        file_size: u64,
+        page_index: PageIndexPolicy,
+        result: &Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+    ) {
+        if result.get().is_some() || Arc::strong_count(result) == 2 {
+            self.finish_in_flight(store, path, file_size, page_index, result);
+        }
+    }
 }
 
 static METADATA_CACHE: LazyLock<Mutex<MetadataCache>> =
     LazyLock::new(|| Mutex::new(MetadataCache::default()));
 
-fn cached_metadata(
+fn metadata_lookup(
     store: &Arc<dyn ObjectStore>,
     path: &Path,
     file_size: u64,
     page_index: PageIndexPolicy,
-) -> Option<Arc<ParquetMetaData>> {
+) -> MetadataLookup {
     METADATA_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(store, path, file_size, page_index)
+        .lookup(store, path, file_size, page_index)
 }
 
 fn cache_metadata(
@@ -634,6 +753,32 @@ fn cache_metadata(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(store, path, file_size, page_index, metadata);
+}
+
+fn finish_metadata_in_flight(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    file_size: u64,
+    page_index: PageIndexPolicy,
+    result: &Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+) {
+    METADATA_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish_in_flight(store, path, file_size, page_index, result);
+}
+
+fn release_metadata_in_flight(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    file_size: u64,
+    page_index: PageIndexPolicy,
+    result: &Arc<tokio::sync::OnceCell<MetadataInFlightResult>>,
+) {
+    METADATA_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .release_in_flight(store, path, file_size, page_index, result);
 }
 
 fn footer_prefetch_size(footer_size: Option<u64>, file_size: u64) -> Option<usize> {
@@ -677,11 +822,11 @@ impl AsyncFileReader for ObjectStoreReader {
         &'a mut self,
         _options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
-        if let Some(metadata) =
-            cached_metadata(&self.store, &self.path, self.file_size, self.page_index)
-        {
-            return async move { Ok(metadata) }.boxed();
-        }
+        let in_flight =
+            match metadata_lookup(&self.store, &self.path, self.file_size, self.page_index) {
+                MetadataLookup::Cached(metadata) => return async move { Ok(metadata) }.boxed(),
+                MetadataLookup::InFlight(in_flight) => in_flight,
+            };
 
         let file_size = self.file_size;
         let prefetch_size = footer_prefetch_size(self.footer_size, file_size);
@@ -689,15 +834,31 @@ impl AsyncFileReader for ObjectStoreReader {
         let store = Arc::clone(&self.store);
         let path = self.path.clone();
         async move {
-            let metadata = Arc::new(
-                ParquetMetaDataReader::new()
-                    .with_page_index_policy(page_index)
-                    .with_prefetch_hint(prefetch_size)
-                    .load_and_finish(&mut *self, file_size)
-                    .await?,
-            );
-            cache_metadata(&store, path, file_size, page_index, Arc::clone(&metadata));
-            Ok(metadata)
+            let fill_store = Arc::clone(&store);
+            let fill_path = path.clone();
+            let result = in_flight
+                .result
+                .get_or_init(|| async move {
+                    let metadata = ParquetMetaDataReader::new()
+                        .with_page_index_policy(page_index)
+                        .with_prefetch_hint(prefetch_size)
+                        .load_and_finish(&mut *self, file_size)
+                        .await
+                        .map(Arc::new)
+                        .map_err(|error| Arc::<str>::from(error.to_string()))?;
+                    cache_metadata(
+                        &fill_store,
+                        fill_path,
+                        file_size,
+                        page_index,
+                        Arc::clone(&metadata),
+                    );
+                    Ok(metadata)
+                })
+                .await
+                .clone();
+            finish_metadata_in_flight(&store, &path, file_size, page_index, &in_flight.result);
+            result.map_err(|error| ParquetError::General(error.to_string()))
         }
         .boxed()
     }
@@ -1576,9 +1737,12 @@ pub(crate) fn inline_schema_decode_count(schema_ipc: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Duration,
     };
 
     use arrow::{
@@ -1603,6 +1767,7 @@ mod tests {
         inner: InMemory,
         fetched_bytes: AtomicU64,
         fetch_requests: AtomicU64,
+        fetch_delay: Option<Duration>,
     }
 
     impl CountingStore {
@@ -1611,6 +1776,14 @@ mod tests {
                 inner: InMemory::new(),
                 fetched_bytes: AtomicU64::new(0),
                 fetch_requests: AtomicU64::new(0),
+                fetch_delay: None,
+            }
+        }
+
+        fn with_fetch_delay(fetch_delay: Duration) -> Self {
+            Self {
+                fetch_delay: Some(fetch_delay),
+                ..Self::new()
             }
         }
 
@@ -1653,6 +1826,9 @@ mod tests {
             location: &Path,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
+            if let Some(delay) = self.fetch_delay {
+                tokio::time::sleep(delay).await;
+            }
             let head = options.head;
             let result = self.inner.get_opts(location, options).await?;
             if !head {
@@ -1668,6 +1844,9 @@ mod tests {
             location: &Path,
             ranges: &[std::ops::Range<u64>],
         ) -> object_store::Result<Vec<Bytes>> {
+            if let Some(delay) = self.fetch_delay {
+                tokio::time::sleep(delay).await;
+            }
             let results = self.inner.get_ranges(location, ranges).await?;
             self.fetch_requests.fetch_add(1, Ordering::Relaxed);
             let total: u64 = results.iter().map(|bytes| bytes.len() as u64).sum();
@@ -1792,6 +1971,118 @@ mod tests {
         let second_requests = store.fetch_requests() - first_requests;
         assert_eq!(first_requests, 3, "footer, page index, projected columns");
         assert_eq!(second_requests, 1, "projected columns only");
+    }
+
+    /// Two readers missing the same immutable footer at once share one
+    /// metadata fill. Each still reads its own projected data column, while
+    /// the footer and page index are fetched only once between them.
+    #[tokio::test]
+    async fn concurrent_metadata_misses_share_one_in_flight_fill() {
+        let store = Arc::new(CountingStore::with_fetch_delay(Duration::from_millis(10)));
+        let path = Path::from("concurrent-cached-wide.parquet");
+        let (object_len, footer_size) =
+            write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
+        assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
+        let wanted: RowPositions = [7, 19_000].into_iter().collect();
+
+        let first = scoped_read_entries_with_footer(
+            store.clone(),
+            &path,
+            &[0],
+            ScopedRows::At(&wanted),
+            RowIdSource::Ordinal,
+            Some(object_len),
+            Some(footer_size),
+        );
+        let second = scoped_read_entries_with_footer(
+            store.clone(),
+            &path,
+            &[0],
+            ScopedRows::At(&wanted),
+            RowIdSource::Ordinal,
+            Some(object_len),
+            Some(footer_size),
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(
+            store.fetch_requests(),
+            4,
+            "one footer, one page-index, and two projected-column reads"
+        );
+    }
+
+    /// A failed shared fill wakes its callers but is not retained as a cache
+    /// entry. Immutable objects do not change in production; replacing the
+    /// fixture here proves a transient read failure can be retried.
+    #[tokio::test]
+    async fn failed_metadata_in_flight_fill_is_retryable() {
+        let store = Arc::new(CountingStore::new());
+        let path = Path::from("retry-cached-wide.parquet");
+        let (object_len, footer_size) =
+            write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
+        assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
+        let valid = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+        let mut corrupt = valid.to_vec();
+        *corrupt.last_mut().unwrap() ^= 0xff;
+        store.inner.put(&path, corrupt.into()).await.unwrap();
+        let wanted: RowPositions = [7].into_iter().collect();
+
+        let failed = scoped_read_entries_with_footer(
+            store.clone(),
+            &path,
+            &[0],
+            ScopedRows::At(&wanted),
+            RowIdSource::Ordinal,
+            Some(object_len),
+            Some(footer_size),
+        )
+        .await;
+        assert!(failed.is_err());
+
+        store.inner.put(&path, valid.into()).await.unwrap();
+        let retried = scoped_read_entries_with_footer(
+            store,
+            &path,
+            &[0],
+            ScopedRows::At(&wanted),
+            RowIdSource::Ordinal,
+            Some(object_len),
+            Some(footer_size),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retried.len(), 1);
+    }
+
+    #[test]
+    fn abandoned_metadata_in_flight_entry_is_removed() {
+        let store: Arc<dyn ObjectStore> = Arc::new(CountingStore::new());
+        let path = Path::from("abandoned-in-flight.parquet");
+        let lookup = metadata_lookup(&store, &path, 100, PageIndexPolicy::Skip);
+        let MetadataLookup::InFlight(in_flight) = lookup else {
+            panic!("a unique store and path must start cold");
+        };
+        assert!(
+            METADATA_CACHE
+                .lock()
+                .unwrap()
+                .in_flight
+                .iter()
+                .any(|entry| Arc::ptr_eq(&entry.result, &in_flight.result))
+        );
+
+        drop(in_flight);
+
+        assert!(
+            !METADATA_CACHE
+                .lock()
+                .unwrap()
+                .in_flight
+                .iter()
+                .any(|entry| entry.path == path)
+        );
     }
 
     /// Above the whole-object threshold the read must fetch only the footer
