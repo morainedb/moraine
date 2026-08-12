@@ -316,28 +316,31 @@ pub(crate) async fn stage_index_entries(
     }
 
     let (deletes, puts): (Vec<_>, Vec<_>) = entries.into_iter().partition(|entry| entry.delete);
-    let puts = puts.into_iter().map(Ok);
-    stage_index_entry_stream(db_tx, deletes, stream::iter(puts), 0).await
+    let deletes = stream::iter(deletes.into_iter().map(Ok));
+    let puts = stream::iter(puts.into_iter().map(Ok));
+    stage_index_entry_stream(db_tx, deletes, puts, 0).await
 }
 
-/// Stages deletion entries, then consumes additions as a stream. Unique
-/// probes form one continuously replenished window across every derived
-/// source group; sequence numbers retain deterministic error selection even
-/// though successful reads stage in completion order.
-pub(crate) async fn stage_index_entry_stream<I, S>(
+/// Consumes deletion entries, then additions, as streams. Unique probes form
+/// one continuously replenished window across every derived source group;
+/// sequence numbers retain deterministic error selection even though
+/// successful reads stage in completion order.
+pub(crate) async fn stage_index_entry_stream<D, S>(
     db_tx: &DbTransaction,
-    deletes: I,
+    deletes: D,
     entries: S,
     prior_entry_count: usize,
 ) -> Result<StagedEntries>
 where
-    I: IntoIterator<Item = StagedIndexEntry>,
+    D: Stream<Item = Result<StagedIndexEntry>>,
     S: Stream<Item = Result<StagedIndexEntry>>,
 {
     let mut staged = StagedBytes::default();
     let mut deleted_unique = HashSet::new();
     let mut entry_count = prior_entry_count;
-    for entry in deletes {
+    let mut deletes = std::pin::pin!(deletes);
+    while let Some(entry) = deletes.next().await {
+        let entry = entry?;
         entry_count = entry_count.saturating_add(1);
         if entry_count > MAX_INDEX_ENTRIES_PER_COMMIT {
             return Err(oversized_commit(entry_count));
@@ -763,10 +766,9 @@ mod tests {
             })
         }));
 
-        let staged =
-            stage_index_entry_stream(&tx, std::iter::empty::<StagedIndexEntry>(), entries, 0)
-                .await
-                .unwrap();
+        let staged = stage_index_entry_stream(&tx, stream::empty(), entries, 0)
+            .await
+            .unwrap();
 
         assert_eq!(staged.bytes, u64::try_from(ENTRIES * 16).unwrap());
         tx.rollback();

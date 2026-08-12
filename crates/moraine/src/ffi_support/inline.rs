@@ -4,6 +4,8 @@
 //! otherwise-private `catalog`. Each function opens a fresh read-only
 //! transaction, scans, and rolls back.
 
+use bytes::Bytes;
+
 #[doc(hidden)]
 pub use crate::catalog::inline::InlineScanKind;
 use crate::{
@@ -44,7 +46,7 @@ pub struct InlineScanRecord {
     pub rows: Vec<InlineRowRecord>,
     /// The referenced chunks' full Arrow IPC record-batch bodies, each
     /// appearing once, indexed by [`InlineRowRecord::chunk_index`].
-    pub chunk_bodies: Vec<Vec<u8>>,
+    pub chunk_bodies: Vec<Bytes>,
 }
 
 /// Materializes `table_id`'s inlined rows and selects `kind`'s variant at
@@ -74,7 +76,7 @@ pub async fn scan_inline(
 
     // Referenced chunk bodies dense-index in first-reference order.
     let mut chunk_indexes: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
-    let mut chunk_bodies: Vec<Vec<u8>> = Vec::new();
+    let mut chunk_bodies: Vec<Bytes> = Vec::new();
     let selected = kind
         .select(&rows, snapshot, start)
         .into_iter()
@@ -118,10 +120,7 @@ pub async fn scan_inline(
 /// Returns an error if the underlying store scan fails or decodes
 /// corrupt bytes.
 #[doc(hidden)]
-pub async fn inline_schemas(
-    catalog: &ReadOnlyCatalog,
-    table_id: u64,
-) -> Result<Vec<(u64, Vec<u8>)>> {
+pub async fn inline_schemas(catalog: &ReadOnlyCatalog, table_id: u64) -> Result<Vec<(u64, Bytes)>> {
     let session = catalog.begin_read().await?;
     let schemas = store_inline::scan_inline_schemas(session.handle(), table_id).await;
     session.finish();
@@ -307,7 +306,7 @@ mod tests {
         let record = scan_inline(&catalog, 1, InlineScanKind::Table, 2, 0)
             .await
             .unwrap();
-        let mut by_id: Vec<(u64, Vec<u8>, u64)> = record
+        let mut by_id: Vec<(u64, Bytes, u64)> = record
             .rows
             .iter()
             .map(|r| {
@@ -321,13 +320,16 @@ mod tests {
         by_id.sort_by_key(|(id, ..)| *id);
         assert_eq!(
             by_id,
-            vec![(0, b"chunk-a".to_vec(), 0), (2, b"chunk-b".to_vec(), 0)]
+            vec![
+                (0, Bytes::from_static(b"chunk-a"), 0),
+                (2, Bytes::from_static(b"chunk-b"), 0)
+            ]
         );
         // Each referenced chunk's body crosses once.
         assert_eq!(record.chunk_bodies.len(), 2);
 
         let schemas = inline_schemas(&catalog, 1).await.unwrap();
-        assert_eq!(schemas, vec![(0, b"schema".to_vec())]);
+        assert_eq!(schemas, vec![(0, Bytes::from_static(b"schema"))]);
 
         let registered = inline_registered_tables(&catalog).await.unwrap();
         assert_eq!(registered, vec![(1, 0)]);

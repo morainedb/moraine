@@ -1873,6 +1873,7 @@ name = "moraine-duckdb"
 version = "0.5.1"
 dependencies = [
  "arrow",
+ "bytes",
  "cbindgen",
  "moraine",
  "object_store",

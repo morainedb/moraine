@@ -1,5 +1,6 @@
 //! Typed value codec: protobuf messages behind the framing header.
 
+use bytes::Bytes;
 use prost::Message;
 
 use crate::{
@@ -26,6 +27,13 @@ pub(crate) fn decode_value<M: Message + Default>(bytes: &[u8]) -> Result<M> {
     M::decode(payload).map_err(|err| Error::Corruption(format!("value: {err}")))
 }
 
+/// Validate the framing header and decode `M` while retaining shared byte
+/// fields as slices of the owned store buffer.
+pub(crate) fn decode_owned<M: Message + Default>(bytes: Bytes) -> Result<M> {
+    let payload = frame::unframe_owned(bytes)?;
+    M::decode(payload).map_err(|err| Error::Corruption(format!("value: {err}")))
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -47,6 +55,28 @@ mod tests {
         let framed = frame::frame(&[0x0a, 0xff]);
         let err = decode_value::<HeadValue>(&framed).unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    #[test]
+    fn owned_inline_decode_keeps_the_framed_allocation() {
+        let message = InlineChunkValue {
+            body: Bytes::from_static(b"owned inline body"),
+            row_id_start: 7,
+            row_count: 1,
+            data_file_id: None,
+        };
+        let framed = Bytes::from(encode_value(&message));
+        let allocation = framed.clone();
+
+        let decoded: InlineChunkValue = decode_owned(framed).unwrap();
+        let allocation_start = allocation.as_ptr() as usize;
+        let allocation_end = allocation_start + allocation.len();
+        let body_start = decoded.body.as_ptr() as usize;
+        let body_end = body_start + decoded.body.len();
+
+        assert!(body_start >= allocation_start);
+        assert!(body_end <= allocation_end);
+        assert_eq!(decoded.body, message.body);
     }
 
     proptest! {

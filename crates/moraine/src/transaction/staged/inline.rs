@@ -274,7 +274,7 @@ pub(crate) fn inline_schema_write(
         })
         .encode(),
         Some(value::encode_value(&proto::InlineSchemaValue {
-            arrow_schema: arrow_schema.to_vec(),
+            arrow_schema: arrow_schema.to_vec().into(),
         })),
     )
 }
@@ -298,7 +298,7 @@ pub(crate) fn inline_insert_write(
         }))
         .encode(),
         Some(value::encode_value(&proto::InlineChunkValue {
-            body: arrow_body.to_vec(),
+            body: arrow_body.to_vec().into(),
             row_id_start,
             row_count,
             data_file_id: None,

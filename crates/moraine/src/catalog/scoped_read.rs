@@ -5,7 +5,7 @@
 //! rule guards.
 
 use std::{
-    collections::{BTreeSet, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     sync::{Arc, LazyLock, Mutex, Weak},
 };
 
@@ -123,15 +123,15 @@ pub(crate) enum ScopedRows<'a> {
     /// Only the rows at these physical positions. Entries come back in
     /// position order, and the set's ordering is what lets the selection be
     /// built without sorting.
-    At(&'a BTreeSet<u64>),
+    At(&'a RowPositions),
 }
 
-impl ScopedRows<'_> {
+impl<'a> ScopedRows<'a> {
     /// The positions to read, or `None` when that is all of them.
-    fn positions(self) -> Option<Vec<u64>> {
+    fn positions(self) -> Option<&'a [u64]> {
         match self {
             Self::All => None,
-            Self::At(wanted) => Some(wanted.iter().copied().collect()),
+            Self::At(wanted) => Some(wanted.as_slice()),
         }
     }
 
@@ -147,6 +147,44 @@ impl ScopedRows<'_> {
             Self::All => PageIndexPolicy::Skip,
             Self::At(_) => PageIndexPolicy::Optional,
         }
+    }
+}
+
+/// Physical Parquet row positions, sorted and duplicate-free. Every selected
+/// read shares this representation, so constructing a row selection never
+/// repeats a tree-to-vector copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RowPositions(Vec<u64>);
+
+impl RowPositions {
+    /// Establishes the sorted/unique invariant for positions collected from
+    /// one or more delete sources.
+    pub(crate) fn from_unsorted(mut positions: Vec<u64>) -> Self {
+        positions.sort_unstable();
+        positions.dedup();
+        Self(positions)
+    }
+
+    /// The ordered positions used by Parquet row selection and ordinal
+    /// resolution.
+    pub(crate) fn as_slice(&self) -> &[u64] {
+        &self.0
+    }
+
+    /// Whether no physical row is selected.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether the selected set contains `position`.
+    pub(crate) fn contains(&self, position: u64) -> bool {
+        self.0.binary_search(&position).is_ok()
+    }
+}
+
+impl FromIterator<u64> for RowPositions {
+    fn from_iter<T: IntoIterator<Item = u64>>(iter: T) -> Self {
+        Self::from_unsorted(iter.into_iter().collect())
     }
 }
 
@@ -178,7 +216,7 @@ impl Ordinals<'_> {
 
 /// The row selection naming `positions` in a file of `total_rows`.
 ///
-/// Positions arrive ascending and unique (they come from a [`BTreeSet`]) and
+/// Positions arrive ascending and unique (they come from [`RowPositions`]) and
 /// are bounds-checked here, so the consecutive ranges handed over are
 /// ordered and in range — the two things the builder requires of them.
 fn row_selection(positions: &[u64], total_rows: usize) -> Result<RowSelection> {
@@ -739,16 +777,14 @@ pub(crate) async fn scoped_read_entries_with_footer(
         }
     };
     let selected = rows.positions();
-    let ordinals = selected
-        .as_deref()
-        .map_or(Ordinals::Dense, Ordinals::Selected);
+    let ordinals = selected.map_or(Ordinals::Dense, Ordinals::Selected);
 
     if file_size < WHOLE_OBJECT_THRESHOLD {
         return whole_object_entries(
             object_store.as_ref(),
             path,
             indexed_positions,
-            selected.as_deref(),
+            selected,
             ordinals,
             row_id_source,
         )
@@ -770,7 +806,7 @@ pub(crate) async fn scoped_read_entries_with_footer(
         resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
     let (mask, indexed_output, row_id_output) =
         projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
-    let selection = match selected.as_deref() {
+    let selection = match selected {
         Some(positions) => Some(row_selection(
             positions,
             total_rows(builder.metadata(), path)?,
@@ -806,144 +842,74 @@ pub(crate) async fn scoped_read_entries_with_footer(
     Ok(entries)
 }
 
-/// Derives final canonical keys for several indexes in one Parquet read.
-/// Shared columns are projected once, and Arrow scalars are appended to the
-/// final key without materializing row-wide or per-index value vectors.
-/// Same-commit removed ordinals are skipped before any key bytes are built.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn scoped_read_index_entries(
-    object_store: Arc<dyn ObjectStore>,
-    path: &Path,
-    projections: &[IndexProjection],
-    rows: ScopedRows<'_>,
-    row_id_source: RowIdSource,
-    file_size: Option<u64>,
-    footer_size: Option<u64>,
-    excluded_ordinals: Option<&BTreeSet<u64>>,
-) -> Result<Vec<ScopedIndexEntry>> {
-    if rows.is_empty() || projections.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let file_size = match file_size {
-        Some(size) => size,
-        None => {
-            object_store
-                .head(path)
-                .await
-                .map_err(corrupt("scoped read"))?
-                .size
-        }
-    };
-    let selected = rows.positions();
-    let ordinals = selected
-        .as_deref()
-        .map_or(Ordinals::Dense, Ordinals::Selected);
-    let source_positions = index_positions(projections);
-
-    if file_size < WHOLE_OBJECT_THRESHOLD {
-        return whole_object_index_entries(
-            object_store.as_ref(),
-            path,
-            projections,
-            &source_positions,
-            selected.as_deref(),
-            ordinals,
-            row_id_source,
-            excluded_ordinals,
-        )
-        .await;
-    }
-
-    let reader = ObjectStoreReader {
-        store: object_store,
-        path: path.clone(),
-        file_size,
-        footer_size,
-        page_index: rows.page_index_policy(),
-    };
-    let options = ArrowReaderOptions::new().with_page_index_policy(rows.page_index_policy());
-    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
-        .await
-        .map_err(corrupt("scoped read"))?;
-    let (row_id_position, row_id_start) =
-        resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
-    let (mask, indexed_output, row_id_output) =
-        projection(builder.parquet_schema(), &source_positions, row_id_position)?;
-    let projections = remap_index_projections(projections, &source_positions, &indexed_output)?;
-    let selection = match selected.as_deref() {
-        Some(positions) => Some(row_selection(
-            positions,
-            total_rows(builder.metadata(), path)?,
-        )?),
-        None => None,
-    };
-
-    let mut builder = builder.with_projection(mask);
-    if let Some(selection) = selection {
-        builder = builder.with_row_selection(selection);
-    }
-    let mut stream = builder.build().map_err(corrupt("scoped read"))?;
-    let mut entries = Vec::new();
-    let mut emitted = 0usize;
-    while let Some(batch) = stream.next().await {
-        let batch = batch.map_err(corrupt("scoped read"))?;
-        entries.extend(record_batch_index_entries(
-            &batch,
-            &projections,
-            row_id_output,
-            row_id_start,
-            ordinals,
-            emitted,
-            excluded_ordinals,
-            None,
-        )?);
-        emitted = emitted.saturating_add(batch.num_rows());
-    }
-    Ok(entries)
-}
-
 /// Receives one bounded group of already encoded index entries from a
-/// full-file scoped read.
+/// scoped read.
 pub(crate) trait ScopedIndexEntryBatchConsumer {
     /// Consumes one decoded group before the reader advances to the next.
     async fn consume(&mut self, entries: Vec<ScopedIndexEntry>) -> Result<()>;
 }
 
-/// Streams a file's fused index entries to `consumer` in bounded Arrow
-/// batches. Shared columns are projected once and borrowed directly into
-/// their final keys, as in [`scoped_read_index_entries`], without retaining
-/// the whole file's encoded entries.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(crate) async fn scoped_read_index_entry_batches<C: ScopedIndexEntryBatchConsumer>(
+/// One immutable Parquet object's location and recorded metadata. Keeping
+/// both sizes beside the path prevents a read path from silently dropping
+/// the footer size and reintroducing metadata round trips.
+pub(crate) struct ParquetFile {
     object_store: Arc<dyn ObjectStore>,
-    path: &Path,
-    projections: &[IndexProjection],
-    row_id_source: RowIdSource,
+    path: Path,
     file_size: Option<u64>,
     footer_size: Option<u64>,
-    excluded_ordinals: Option<&BTreeSet<u64>>,
+}
+
+impl ParquetFile {
+    /// Describes one object; absent sizes are discovered by the reader.
+    pub(crate) fn new(
+        object_store: Arc<dyn ObjectStore>,
+        path: Path,
+        file_size: Option<u64>,
+        footer_size: Option<u64>,
+    ) -> Self {
+        Self {
+            object_store,
+            path,
+            file_size,
+            footer_size,
+        }
+    }
+}
+
+/// Streams a file's fused index entries to `consumer` in bounded Arrow
+/// batches. Shared columns are projected once and borrowed directly into
+/// their final keys without retaining the whole file's encoded entries.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn scoped_read_index_entry_batches<C: ScopedIndexEntryBatchConsumer>(
+    file: ParquetFile,
+    projections: &[IndexProjection],
+    rows: ScopedRows<'_>,
+    row_id_source: RowIdSource,
+    excluded_ordinals: Option<&RowPositions>,
     consumer: &mut C,
 ) -> Result<()> {
-    if projections.is_empty() {
+    if rows.is_empty() || projections.is_empty() {
         return Ok(());
     }
 
-    let file_size = match file_size {
+    let file_size = match file.file_size {
         Some(size) => size,
         None => {
-            object_store
-                .head(path)
+            file.object_store
+                .head(&file.path)
                 .await
                 .map_err(corrupt("scoped read"))?
                 .size
         }
     };
     let source_positions = index_positions(projections);
+    let selected = rows.positions();
+    let ordinals = selected.map_or(Ordinals::Dense, Ordinals::Selected);
 
     if file_size < WHOLE_OBJECT_THRESHOLD {
-        let bytes: Bytes = object_store
-            .get(path)
+        let bytes: Bytes = file
+            .object_store
+            .get(&file.path)
             .await
             .map_err(corrupt("scoped read"))?
             .bytes()
@@ -952,15 +918,24 @@ pub(crate) async fn scoped_read_index_entry_batches<C: ScopedIndexEntryBatchCons
         let builder =
             ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("scoped read"))?;
         let (row_id_position, row_id_start) =
-            resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+            resolve_row_id_source(builder.parquet_schema(), row_id_source, &file.path)?;
         let (mask, indexed_output, row_id_output) =
             projection(builder.parquet_schema(), &source_positions, row_id_position)?;
         let projections = remap_index_projections(projections, &source_positions, &indexed_output)?;
-        let reader = builder
+        let selection = match selected {
+            Some(positions) => Some(row_selection(
+                positions,
+                total_rows(builder.metadata(), &file.path)?,
+            )?),
+            None => None,
+        };
+        let mut builder = builder
             .with_projection(mask)
-            .with_batch_size(BUILD_READ_BATCH_ROWS)
-            .build()
-            .map_err(corrupt("scoped read"))?;
+            .with_batch_size(BUILD_READ_BATCH_ROWS);
+        if let Some(selection) = selection {
+            builder = builder.with_row_selection(selection);
+        }
+        let reader = builder.build().map_err(corrupt("scoped read"))?;
         let mut emitted = 0usize;
         for batch in reader {
             let batch = batch.map_err(corrupt("scoped read"))?;
@@ -969,7 +944,7 @@ pub(crate) async fn scoped_read_index_entry_batches<C: ScopedIndexEntryBatchCons
                 &projections,
                 row_id_output,
                 row_id_start,
-                Ordinals::Dense,
+                ordinals,
                 emitted,
                 excluded_ordinals,
                 None,
@@ -981,26 +956,35 @@ pub(crate) async fn scoped_read_index_entry_batches<C: ScopedIndexEntryBatchCons
     }
 
     let reader = ObjectStoreReader {
-        store: object_store,
-        path: path.clone(),
+        store: file.object_store,
+        path: file.path.clone(),
         file_size,
-        footer_size,
-        page_index: PageIndexPolicy::Skip,
+        footer_size: file.footer_size,
+        page_index: rows.page_index_policy(),
     };
-    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+    let options = ArrowReaderOptions::new().with_page_index_policy(rows.page_index_policy());
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
         .await
         .map_err(corrupt("scoped read"))?;
     let (row_id_position, row_id_start) =
-        resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+        resolve_row_id_source(builder.parquet_schema(), row_id_source, &file.path)?;
     let (mask, indexed_output, row_id_output) =
         projection(builder.parquet_schema(), &source_positions, row_id_position)?;
     let projections = remap_index_projections(projections, &source_positions, &indexed_output)?;
-    let mut stream = builder
+    let selection = match selected {
+        Some(positions) => Some(row_selection(
+            positions,
+            total_rows(builder.metadata(), &file.path)?,
+        )?),
+        None => None,
+    };
+    let mut builder = builder
         .with_projection(mask)
-        .with_batch_size(BUILD_READ_BATCH_ROWS)
-        .build()
-        .map_err(corrupt("scoped read"))?;
+        .with_batch_size(BUILD_READ_BATCH_ROWS);
+    if let Some(selection) = selection {
+        builder = builder.with_row_selection(selection);
+    }
+    let mut stream = builder.build().map_err(corrupt("scoped read"))?;
     let mut emitted = 0usize;
     while let Some(batch) = stream.next().await {
         let batch = batch.map_err(corrupt("scoped read"))?;
@@ -1009,7 +993,7 @@ pub(crate) async fn scoped_read_index_entry_batches<C: ScopedIndexEntryBatchCons
             &projections,
             row_id_output,
             row_id_start,
-            Ordinals::Dense,
+            ordinals,
             emitted,
             excluded_ordinals,
             None,
@@ -1227,65 +1211,6 @@ async fn whole_object_entries(
     Ok(entries)
 }
 
-/// One-request counterpart of [`scoped_read_index_entries`] for small
-/// objects whose bytes are already cheaper than several remote ranges.
-#[allow(clippy::too_many_arguments)]
-async fn whole_object_index_entries(
-    object_store: &dyn ObjectStore,
-    path: &Path,
-    projections: &[IndexProjection],
-    source_positions: &[usize],
-    selected: Option<&[u64]>,
-    ordinals: Ordinals<'_>,
-    row_id_source: RowIdSource,
-    excluded_ordinals: Option<&BTreeSet<u64>>,
-) -> Result<Vec<ScopedIndexEntry>> {
-    let bytes: Bytes = object_store
-        .get(path)
-        .await
-        .map_err(corrupt("scoped read"))?
-        .bytes()
-        .await
-        .map_err(corrupt("scoped read"))?;
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("scoped read"))?;
-    let (row_id_position, row_id_start) =
-        resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
-    let (mask, indexed_output, row_id_output) =
-        projection(builder.parquet_schema(), source_positions, row_id_position)?;
-    let projections = remap_index_projections(projections, source_positions, &indexed_output)?;
-    let selection = match selected {
-        Some(positions) => Some(row_selection(
-            positions,
-            total_rows(builder.metadata(), path)?,
-        )?),
-        None => None,
-    };
-
-    let mut builder = builder.with_projection(mask);
-    if let Some(selection) = selection {
-        builder = builder.with_row_selection(selection);
-    }
-    let reader = builder.build().map_err(corrupt("scoped read"))?;
-    let mut entries = Vec::new();
-    let mut emitted = 0usize;
-    for batch in reader {
-        let batch = batch.map_err(corrupt("scoped read"))?;
-        entries.extend(record_batch_index_entries(
-            &batch,
-            &projections,
-            row_id_output,
-            row_id_start,
-            ordinals,
-            emitted,
-            excluded_ordinals,
-            None,
-        )?);
-        emitted = emitted.saturating_add(batch.num_rows());
-    }
-    Ok(entries)
-}
-
 /// The projection over `schema` covering only the indexed and row-id
 /// columns, with each requested position mapped to its index in the
 /// projected output batch.
@@ -1405,7 +1330,7 @@ fn record_batch_index_entries(
     row_id_start: u64,
     ordinals: Ordinals<'_>,
     emitted: usize,
-    excluded_ordinals: Option<&BTreeSet<u64>>,
+    excluded_ordinals: Option<&RowPositions>,
     included_row_ids: Option<&HashSet<u64>>,
 ) -> Result<Vec<ScopedIndexEntry>> {
     let mut entries = Vec::with_capacity(batch.num_rows().saturating_mul(projections.len()));
@@ -1415,7 +1340,7 @@ fn record_batch_index_entries(
             Some(position) => row_id_value(batch.column(position).as_ref(), row)?,
             None => row_id_start.saturating_add(ordinal),
         };
-        if excluded_ordinals.is_some_and(|excluded| excluded.contains(&ordinal))
+        if excluded_ordinals.is_some_and(|excluded| excluded.contains(ordinal))
             || included_row_ids.is_some_and(|included| !included.contains(&row_id))
         {
             continue;
@@ -1549,17 +1474,15 @@ fn decode_inline_batch(schema: SchemaRef, body: &Bytes) -> Result<RecordBatch> {
 /// schema, then reads the columns at `positions` per row with dense
 /// `row_id_start + ordinal` ids (inline chunks carry no row-id column).
 pub(crate) fn inline_batch_entries(
-    schema_ipc: &[u8],
-    body: &[u8],
+    schema: SchemaRef,
+    body: &Bytes,
     positions: &[usize],
     row_id_start: u64,
 ) -> Result<Vec<ScopedReadEntry>> {
     #[cfg(test)]
     record_inline_batch_decode(row_id_start);
 
-    let schema = decode_inline_schema(Bytes::copy_from_slice(schema_ipc))?;
-    let body = Bytes::copy_from_slice(body);
-    let batch = decode_inline_batch(schema, &body)?;
+    let batch = decode_inline_batch(schema, body)?;
     record_batch_entries(&batch, positions, None, row_id_start, Ordinals::Dense, 0)
 }
 
@@ -1653,12 +1576,9 @@ pub(crate) fn inline_schema_decode_count(schema_ipc: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeSet,
-        sync::{
-            Arc,
-            atomic::{AtomicU64, Ordering},
-        },
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
     };
 
     use arrow::{
@@ -1840,7 +1760,7 @@ mod tests {
         let (object_len, footer_size) =
             write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
         assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
-        let wanted: BTreeSet<u64> = [7, 19_000].into_iter().collect();
+        let wanted: RowPositions = [7, 19_000].into_iter().collect();
 
         let first = scoped_read_entries_with_footer(
             store.clone(),
@@ -2561,14 +2481,12 @@ mod tests {
         };
 
         scoped_read_index_entry_batches(
-            store,
-            &path,
+            ParquetFile::new(store, path, Some(file_size), Some(footer_size)),
             &projections,
+            ScopedRows::All,
             RowIdSource::Resolve {
                 row_id_start: Some(100),
             },
-            Some(file_size),
-            Some(footer_size),
             None,
             &mut collector,
         )
@@ -2588,6 +2506,57 @@ mod tests {
         );
         assert_eq!(collector.batches[0][0].row_id, 100);
         assert_eq!(collector.batches[2].last().unwrap().row_id, 20_099);
+    }
+
+    #[test]
+    fn row_positions_sort_and_deduplicate_once() {
+        let positions = RowPositions::from_unsorted(vec![9, 2, 9, 4, 2]);
+
+        assert_eq!(positions.as_slice(), &[2, 4, 9]);
+    }
+
+    /// Selected-row reads use the same bounded fused pipeline as full-file
+    /// additions instead of collecting the target's entries before its
+    /// consumer can begin.
+    #[tokio::test]
+    async fn streams_selected_fused_index_entries() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("streamed-selected-index.parquet");
+        let (file_size, footer_size) =
+            write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
+        assert!(file_size > WHOLE_OBJECT_THRESHOLD);
+        let projections = [IndexProjection {
+            index_id: 7,
+            unique: false,
+            positions: vec![0],
+            directions: vec![Direction::Ascending],
+            nulls: vec![NullOrder::First],
+        }];
+        let selected = RowPositions::from_unsorted(vec![19_999, 8_193, 1, 8_193]);
+        let mut collector = IndexBatchCollector {
+            batches: Vec::new(),
+        };
+
+        scoped_read_index_entry_batches(
+            ParquetFile::new(store, path, Some(file_size), Some(footer_size)),
+            &projections,
+            ScopedRows::At(&selected),
+            RowIdSource::Resolve {
+                row_id_start: Some(100),
+            },
+            None,
+            &mut collector,
+        )
+        .await
+        .unwrap();
+
+        let row_ids: Vec<_> = collector
+            .batches
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.row_id)
+            .collect();
+        assert_eq!(row_ids, vec![101, 8_293, 20_099]);
     }
 
     /// Values come back ordered as the requested positions — duplicates and
@@ -2742,7 +2711,7 @@ mod tests {
         let path = Path::from("narrow.parquet");
         write_narrow_fixture(store.as_ref(), &path, 10).await;
 
-        let wanted: BTreeSet<u64> = [2, 5, 7].into_iter().collect();
+        let wanted: RowPositions = [2, 5, 7].into_iter().collect();
         let entries = scoped_read_entries(
             store.clone(),
             &path,
@@ -2783,7 +2752,7 @@ mod tests {
         let path = Path::from("tagged.parquet");
         write_fixture(&store, &path, &tagged_fixture_batch()).await;
 
-        let wanted: BTreeSet<u64> = [0, 2].into_iter().collect();
+        let wanted: RowPositions = [0, 2].into_iter().collect();
         let entries = scoped_read_entries(
             store.clone(),
             &path,
@@ -2813,7 +2782,7 @@ mod tests {
             store.clone(),
             &path,
             &[0],
-            ScopedRows::At(&BTreeSet::new()),
+            ScopedRows::At(&RowPositions::default()),
             RowIdSource::Ordinal,
             None,
         )
@@ -2839,7 +2808,7 @@ mod tests {
     async fn selective_read_costs_a_fraction_of_a_full_read() {
         const ROWS: usize = 400_000;
         let path = Path::from("paged.parquet");
-        let wanted: BTreeSet<u64> = [7, 200_000, 399_999].into_iter().collect();
+        let wanted: RowPositions = [7, 200_000, 399_999].into_iter().collect();
 
         let full_store = Arc::new(CountingStore::new());
         let object_len = write_paged_fixture(full_store.as_ref(), &path, ROWS).await;
@@ -2877,6 +2846,7 @@ mod tests {
         assert_eq!(
             few,
             wanted
+                .as_slice()
                 .iter()
                 .map(|&position| full[usize::try_from(position).unwrap()].clone())
                 .collect::<Vec<_>>(),

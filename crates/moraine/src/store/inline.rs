@@ -78,7 +78,7 @@ pub(crate) async fn find_inline_chunk_locators_for_rows(
                 )));
             }
         };
-        let locator: InlineChunkRangeValue = value::decode_value(&entry.value)?;
+        let locator: InlineChunkRangeValue = value::decode_owned(entry.value)?;
         if locator.row_id_start > row_id_end {
             return Err(Error::Corruption(format!(
                 "inline chunk directory for table {table_id} has inverted range {}..={row_id_end}",
@@ -176,7 +176,7 @@ pub(crate) async fn scan_inline_chunks(
         ScanShape::Probe,
         |key, bytes| match key {
             Key::Inline(InlineKey::Live(op @ InlineOperation::Insert { .. })) => {
-                Ok((op, value::decode_value(bytes)?))
+                Ok((op, value::decode_owned(bytes)?))
             }
             other => Err(Error::Corruption(format!(
                 "non-insert key in inline chunk scan: {other:?}"
@@ -197,7 +197,7 @@ pub(crate) async fn scan_inline_deletes(
         ScanShape::Probe,
         |key, bytes| match key {
             Key::Inline(InlineKey::Live(InlineOperation::InlineDelete { row_id, .. })) => {
-                Ok((row_id, value::decode_value(bytes)?))
+                Ok((row_id, value::decode_owned(bytes)?))
             }
             other => Err(Error::Corruption(format!(
                 "non-inline_delete key in inline inline_delete scan: {other:?}"
@@ -222,7 +222,7 @@ pub(crate) async fn scan_inline_file_deletes(
                 data_file_id,
                 row_id,
                 ..
-            })) => Ok((data_file_id, row_id, value::decode_value(bytes)?)),
+            })) => Ok((data_file_id, row_id, value::decode_owned(bytes)?)),
             other => Err(Error::Corruption(format!(
                 "non-file_delete key in inline file delete scan: {other:?}"
             ))),
@@ -269,7 +269,7 @@ pub(crate) async fn scan_inline_schemas(
         ScanShape::Probe,
         |key, bytes| match key {
             Key::Inline(InlineKey::Schema { schema_version, .. }) => {
-                Ok((schema_version, value::decode_value(bytes)?))
+                Ok((schema_version, value::decode_owned(bytes)?))
             }
             other => Err(Error::Corruption(format!(
                 "non-schema key in inline schema scan: {other:?}"
@@ -292,7 +292,7 @@ pub(crate) async fn scan_all_inline_schemas(
             Key::Inline(InlineKey::Schema {
                 table_id,
                 schema_version,
-            }) => Ok((table_id, schema_version, value::decode_value(bytes)?)),
+            }) => Ok((table_id, schema_version, value::decode_owned(bytes)?)),
             other => Err(Error::Corruption(format!(
                 "non-schema key in all-table inline schema scan: {other:?}"
             ))),
@@ -338,7 +338,7 @@ mod tests {
                 }))
                 .encode(),
                 value::encode_value(&InlineChunkValue {
-                    body: format!("chunk-{table_id}-{chunk_seq}").into_bytes(),
+                    body: format!("chunk-{table_id}-{chunk_seq}").into_bytes().into(),
                     row_id_start,
                     row_count: row_id_end - row_id_start + 1,
                     data_file_id: None,
@@ -375,7 +375,7 @@ mod tests {
         let (_, first) = read_inline_chunk_locator(ReadHandle::Tx(&tx), 7, selected[0])
             .await
             .unwrap();
-        assert_eq!(first.body, b"chunk-7-1");
+        assert_eq!(first.body.as_ref(), b"chunk-7-1");
         assert_eq!(
             find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 8, &[5])
                 .await
@@ -400,32 +400,32 @@ mod tests {
             .unwrap();
 
         let schema_v0 = InlineSchemaValue {
-            arrow_schema: b"schema-v0".to_vec(),
+            arrow_schema: b"schema-v0".to_vec().into(),
         };
         let schema_v1 = InlineSchemaValue {
-            arrow_schema: b"schema-v1".to_vec(),
+            arrow_schema: b"schema-v1".to_vec().into(),
         };
 
         let chunk_v0_seq0 = InlineChunkValue {
-            body: b"chunk-v0-0".to_vec(),
+            body: b"chunk-v0-0".to_vec().into(),
             row_id_start: 0,
             row_count: 2,
             data_file_id: None,
         };
         let chunk_v0_seq1 = InlineChunkValue {
-            body: b"chunk-v0-1".to_vec(),
+            body: b"chunk-v0-1".to_vec().into(),
             row_id_start: 2,
             row_count: 3,
             data_file_id: None,
         };
         let chunk_v1_seq0 = InlineChunkValue {
-            body: b"chunk-v1-0".to_vec(),
+            body: b"chunk-v1-0".to_vec().into(),
             row_id_start: 5,
             row_count: 1,
             data_file_id: None,
         };
         let other_table_chunk = InlineChunkValue {
-            body: b"other-table".to_vec(),
+            body: b"other-table".to_vec().into(),
             row_id_start: 0,
             row_count: 1,
             data_file_id: None,
@@ -617,13 +617,13 @@ mod tests {
             .unwrap();
 
         let table_one_v0 = InlineSchemaValue {
-            arrow_schema: b"a-0".to_vec(),
+            arrow_schema: b"a-0".to_vec().into(),
         };
         let table_one_v1 = InlineSchemaValue {
-            arrow_schema: b"a-1".to_vec(),
+            arrow_schema: b"a-1".to_vec().into(),
         };
         let table_two_v0 = InlineSchemaValue {
-            arrow_schema: b"b-0".to_vec(),
+            arrow_schema: b"b-0".to_vec().into(),
         };
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();

@@ -103,8 +103,8 @@ std::optional<uint64_t> ParseInlinedDeleteTableName(const std::string &name) {
 	return ParseTrailingU64(name, prefix.size());
 }
 
-std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
-                                        const std::vector<DecodedInlineColumn> &user_columns) {
+MoraineArrowBytes EncodeInlineSchema(duckdb::ClientContext &context,
+                                     const std::vector<DecodedInlineColumn> &user_columns) {
 	duckdb::vector<duckdb::LogicalType> types;
 	duckdb::vector<std::string> names;
 	types.reserve(user_columns.size());
@@ -142,9 +142,7 @@ std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
 	if (moraine_arrow_encode_schema(&c_schema, &bytes, &err) != 0) {
 		ThrowMoraineError(err);
 	}
-	std::vector<uint8_t> out(bytes.data, bytes.data + bytes.len);
-	moraine_arrow_bytes_free(bytes);
-	return out;
+	return bytes;
 }
 
 std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &context, const uint8_t *data, size_t len) {
@@ -173,8 +171,8 @@ std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &conte
 	return result;
 }
 
-std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::DataChunk &chunk,
-                                           duckdb::idx_t user_col_start) {
+MoraineArrowBytes EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::DataChunk &chunk,
+                                        duckdb::idx_t user_col_start) {
 	auto user_count = chunk.ColumnCount() - user_col_start;
 	duckdb::vector<duckdb::LogicalType> types;
 	duckdb::vector<std::string> names;
@@ -212,18 +210,16 @@ std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckd
 	if (moraine_arrow_encode_chunk(&c_schema, &c_array, &bytes, &err) != 0) {
 		ThrowMoraineError(err);
 	}
-	std::vector<uint8_t> out(bytes.data, bytes.data + bytes.len);
-	moraine_arrow_bytes_free(bytes);
-	return out;
+	return bytes;
 }
 
 std::vector<duckdb::unique_ptr<duckdb::DataChunk>>
 DecodeInlineChunkPieces(duckdb::ClientContext &context, const uint8_t *schema_ipc, size_t schema_ipc_len,
-                        const uint8_t *data, size_t len, const std::vector<duckdb::LogicalType> &user_types) {
+                        MoraineInlineChunk &chunk, const std::vector<duckdb::LogicalType> &user_types) {
 	ArrowSchema c_schema;
 	ArrowArray c_array;
 	MoraineError err {};
-	if (moraine_arrow_decode_body(schema_ipc, schema_ipc_len, data, len, &c_schema, &c_array, &err) != 0) {
+	if (moraine_arrow_decode_inline_chunk(schema_ipc, schema_ipc_len, &chunk, &c_schema, &c_array, &err) != 0) {
 		ThrowMoraineError(err);
 	}
 
@@ -409,8 +405,7 @@ InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHand
 		if (with_values) {
 			if (first_piece[r.chunk_index] == std::numeric_limits<size_t>::max()) {
 				auto &chunk = scan.chunks[r.chunk_index];
-				auto decoded = DecodeInlineChunkPieces(context, schema_ipc, schema_ipc_len, chunk.body, chunk.body_len,
-				                                       user_types);
+				auto decoded = DecodeInlineChunkPieces(context, schema_ipc, schema_ipc_len, chunk, user_types);
 				first_piece[r.chunk_index] = result.pieces.size();
 				chunk_rows[r.chunk_index] = 0;
 				for (auto &p : decoded) {
@@ -764,8 +759,7 @@ duckdb::unique_ptr<duckdb::CatalogEntry> CreateInlineDataTable(duckdb::ClientCon
 	}
 	auto schema_bytes = EncodeInlineSchema(context, user_columns);
 	MoraineError stage_err {};
-	auto stage_code = moraine_tx_stage_inline_schema(tx, table_id, schema_version, schema_bytes.data(),
-	                                                 schema_bytes.size(), &stage_err);
+	auto stage_code = moraine_tx_stage_inline_schema_owned(tx, table_id, schema_version, schema_bytes, &stage_err);
 	if (stage_code != MORAINE_OK) {
 		ThrowMoraineError(stage_err);
 	}
@@ -885,8 +879,8 @@ public:
 		auto begin_snapshot = CellAsU64(chunk.GetValue(1, 0));
 		auto body = EncodeInlineChunkRows(context.client, chunk, /* user_col_start */ 3);
 		MoraineError err {};
-		auto code = moraine_tx_stage_inline_insert(tx, table_id_, schema_version_, begin_snapshot, row_id_start,
-		                                           chunk.size(), body.data(), body.size(), &err);
+		auto code = moraine_tx_stage_inline_insert_owned(tx, table_id_, schema_version_, begin_snapshot, row_id_start,
+		                                                 chunk.size(), body, &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
 		}

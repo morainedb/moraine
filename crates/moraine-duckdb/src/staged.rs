@@ -30,6 +30,7 @@ use tracing::warn;
 
 use crate::{
     abi::{borrow_bytes, borrow_str, guard, write_array},
+    arrow_ipc::MoraineArrowBytes,
     dumps::{
         MoraineColumnMappingRow, MoraineColumnRow, MoraineColumnTagRow, MoraineDataFileRow,
         MoraineDeleteFileRow, MoraineFileColumnStatsRow, MoraineFilePartitionValueRow,
@@ -1219,6 +1220,45 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_schema(
     }
 }
 
+/// Consumes an encoded Arrow schema buffer directly into the staged row.
+///
+/// # Safety
+///
+/// Same `tx`/`err` contract as [`moraine_tx_stage_inline_schema`].
+/// `arrow_schema` must be an unconsumed value returned by
+/// [`crate::arrow_ipc::moraine_arrow_encode_schema`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_stage_inline_schema_owned(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    schema_version: u64,
+    arrow_schema: MoraineArrowBytes,
+    err: *mut MoraineError,
+) -> i32 {
+    // Reclaim first so every return path consumes the caller's buffer.
+    // SAFETY: caller contract guarantees the buffer came from the encoder.
+    let arrow_schema = unsafe { arrow_schema.into_vec() };
+    let attempt = || -> Result<(), AbiError> {
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
+        }
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(RowOperation::InlineSchema {
+            table_id,
+            schema_version,
+            arrow_schema,
+        });
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
 /// Stages `inline/insert`: one Arrow record-batch chunk of inlined rows.
 ///
 /// # Safety
@@ -1257,6 +1297,52 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_insert(
             arrow_body: bytes.to_vec(),
         });
 
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Consumes an encoded Arrow chunk body directly into the staged row.
+///
+/// # Safety
+///
+/// Same metadata and `tx`/`err` contract as
+/// [`moraine_tx_stage_inline_insert`]. `arrow_body` must be an unconsumed
+/// value returned by [`crate::arrow_ipc::moraine_arrow_encode_chunk`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn moraine_tx_stage_inline_insert_owned(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    schema_version: u64,
+    begin_snapshot: u64,
+    row_id_start: u64,
+    row_count: u64,
+    arrow_body: MoraineArrowBytes,
+    err: *mut MoraineError,
+) -> i32 {
+    // Reclaim first so every return path consumes the caller's buffer.
+    // SAFETY: caller contract guarantees the buffer came from the encoder.
+    let arrow_body = unsafe { arrow_body.into_vec() };
+    let attempt = || -> Result<(), AbiError> {
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
+        }
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(RowOperation::InlineInsert {
+            table_id,
+            schema_version,
+            begin_snapshot,
+            row_id_start,
+            row_count,
+            arrow_body,
+        });
         Ok(())
     };
 
