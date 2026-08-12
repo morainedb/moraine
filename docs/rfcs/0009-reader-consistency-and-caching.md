@@ -584,6 +584,60 @@ subsections below take the row tiers (duplication), DuckLake's tier (composed
 with, not consolidated), the byte tier (consolidated), and the data tier
 (DuckDB's, untouched).
 
+### Shared budget, separate cache engines
+
+The SlateDB cache and the scoped reader's parsed-Parquet cache share a
+**budget and process lifetime, not an entry store**. `CACHE_MEMORY` is split
+once when the process cache is built: the auxiliary metadata allowance comes
+out of the metadata fifth, and SlateDB receives the remainder. No attach may
+construct another allowance or grow either cache beyond that split.
+
+Their storage engines remain separate because their entries have different
+identity, value, and tiering contracts:
+
+- SlateDB owns keys scoped to an opened database and values such as SST
+  filters, indexes, and decoded blocks. Its `DbCache` controls concurrent-fill
+  suppression, admission, and the optional Foyer disk tier.
+- The scoped reader owns immutable `Arc<ParquetMetaData>` values keyed by
+  object-store identity, path, recorded file size, and page-index policy. They
+  are useful only inside this process, stay memory-only, and are evicted by
+  parsed byte weight.
+
+Putting either value into the other engine would erase one of those
+contracts: teaching SlateDB's closed entry type about Parquet couples the
+catalog store to data-file decoding, while type-erasing both behind a new
+hybrid cache loses SlateDB's admission and disk behaviour. A common cache
+interface is therefore not a consolidation; it is a second implementation
+layer over two caches that still need their own keys and policies.
+
+The shared boundary is configuration and accounting. The slot calculation is
+the only source of capacity for both engines, and diagnostics must report the
+auxiliary allowance beside the SlateDB slots before it gains an independently
+tunable option. Parsed metadata never enters the block slot or its disk tier,
+and projected Parquet data never enters either Moraine cache.
+
+### One owned store scan loop
+
+SlateDB's scan iterator yields an owned, reference-counted `Bytes` value.
+Moraine therefore has one canonical scan/decode primitive that moves that
+value from the iterator into the extractor. An extractor whose protobuf has
+shared byte fields consumes it with the owned decoder, allowing those fields
+to remain slices of the store allocation. Every other extractor borrows
+`&bytes` for the duration of its ordinary decoder call. The scan loop neither
+clones nor copies the value in either case.
+
+This is an ownership seam, not another scan abstraction. It continues to:
+
+- decode and validate the key before invoking the extractor;
+- preserve SlateDB's key order and the caller's declared `ScanShape`;
+- stop at the first key, framing, protobuf, or extractor error; and
+- collect only the caller's decoded result, never a second byte buffer.
+
+There is no borrowed and owned pair of scan loops. A second loop would make
+ordering, admission, and error semantics changes that have to be maintained
+twice for no saving: moving `Bytes` is constant-time, and a decoder that does
+not retain it can borrow it locally.
+
 ### One scan pair per head
 
 View materialization and the entity dumps each scan the store and each
@@ -972,6 +1026,11 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   that routes lake reads around the caching file system fails the test. A
   lake `count(*)`, answered from catalog statistics, is pinned as reading
   no file at all: it is the shape that makes a working cache look absent.
+- **Owned and borrowed value decoding share one scan.** An inline protobuf's
+  shared body remains inside the allocation yielded by SlateDB, while an
+  ordinary protobuf decoded by borrowing observes the same key order and
+  errors at the same entry. Neither path copies the framed value in the scan
+  loop.
 
 ## Alternatives considered
 
@@ -1033,6 +1092,16 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   evict filters, after which every probe pays a fetch to learn "not
   here". The metadata is small enough to pin; only data blocks need
   tiering.
+- **One entry store for SlateDB and parsed Parquet metadata.** Rejected: the
+  former is a database-scoped encoded-block cache with admission and an
+  optional disk tier; the latter is an object-store-scoped typed-object cache
+  whose values are process-only. They share the one capacity calculation,
+  but merging their entries would require either changing SlateDB's closed
+  cache types or replacing its cache policy with a weaker type-erased one.
+- **Separate borrowed and owned store scan loops.** Rejected: SlateDB already
+  yields an owned `Bytes`, whose move is constant-time. One extractor may
+  consume it and another may borrow it locally without duplicating ordering,
+  admission, collection, and error handling.
 - **A moraine-level data-file byte cache.** Rejected: DuckDB's external-file
   cache already holds data bytes inside `memory_limit`; adding one re-creates
   the double-caching this RFC removes. The scoped equality-index reader's

@@ -1,6 +1,8 @@
 //! Typed reads over an open transaction: decode keys and values into the
 //! wire types. No interpretation — the domain layer owns meaning.
 
+use bytes::Bytes;
+
 use crate::{
     error::{Error, Result},
     store::{
@@ -147,23 +149,23 @@ pub(crate) async fn read_singleton<M: prost::Message + Default>(
     handle
         .get(key.encode())
         .await?
-        .map(|bytes| value::decode_value(&bytes))
+        .map(value::decode_owned)
         .transpose()
 }
 
-/// Scans every key under `prefix` with the admission behaviour `shape`
-/// names, decoding each entry with `extract`; `extract` rejects keys of
-/// the wrong kind with its scan's corruption error.
+/// Scans every key under `prefix`, moving each store value into `extract`.
+/// Extractors may retain shared fields from the store allocation or borrow
+/// the value for an ordinary decode.
 pub(crate) async fn scan_decode<T>(
     handle: ReadHandle<'_>,
     prefix: Vec<u8>,
     shape: ScanShape,
-    mut extract: impl FnMut(Key, &[u8]) -> Result<T>,
+    mut extract: impl FnMut(Key, Bytes) -> Result<T>,
 ) -> Result<Vec<T>> {
     let mut iter = handle.scan_prefix(prefix, .., shape).await?;
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await? {
-        records.push(extract(Key::decode(&entry.key)?, &entry.value)?);
+        records.push(extract(Key::decode(&entry.key)?, entry.value)?);
     }
 
     Ok(records)
@@ -260,7 +262,7 @@ pub(crate) async fn scan_snapshots(handle: ReadHandle<'_>) -> Result<Vec<Snapsho
         subspace_prefix(Subspace::Snapshot),
         ScanShape::Bulk,
         |key, bytes| match key {
-            Key::Snapshot { .. } => value::decode_value(bytes),
+            Key::Snapshot { .. } => value::decode_value(&bytes),
             other => Err(Error::Corruption(format!(
                 "non-snapshot key in snapshot scan: {other:?}"
             ))),
@@ -315,7 +317,7 @@ pub(crate) async fn scan_schema_versions(handle: ReadHandle<'_>) -> Result<Vec<(
                 table_id,
                 begin_snapshot,
             } => {
-                let value: SchemaVersionValue = value::decode_value(bytes)?;
+                let value: SchemaVersionValue = value::decode_value(&bytes)?;
                 Ok((table_id, begin_snapshot, value.schema_version))
             }
             other => Err(Error::Corruption(format!(
@@ -333,9 +335,9 @@ pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<
         subspace_prefix(Subspace::Current),
         ScanShape::Bulk,
         |key, bytes| match key {
-            Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
+            Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, &bytes),
             Key::Current(CurrentKey::GcFile { .. }) => {
-                Ok(EntityRecord::GcFile(value::decode_value(bytes)?))
+                Ok(EntityRecord::GcFile(value::decode_value(&bytes)?))
             }
             other => Err(Error::Corruption(format!(
                 "non-current key in current scan: {other:?}"
@@ -359,7 +361,7 @@ pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<
             Key::History(history) if !history.entity.is_versioned() => Err(Error::Corruption(
                 format!("unversioned key in history scan: {:?}", history.entity),
             )),
-            Key::History(history) => decode_entity(history.entity, bytes),
+            Key::History(history) => decode_entity(history.entity, &bytes),
             other => Err(Error::Corruption(format!(
                 "non-history key in history scan: {other:?}"
             ))),
@@ -382,7 +384,7 @@ pub(crate) async fn scan_entity_kind(
             ScanShape::Bulk,
             |key, bytes| match key {
                 Key::Current(CurrentKey::GcFile { .. }) => {
-                    Ok(EntityRecord::GcFile(value::decode_value(bytes)?))
+                    Ok(EntityRecord::GcFile(value::decode_value(&bytes)?))
                 }
                 other => Err(Error::Corruption(format!(
                     "non-gc-file key in scheduled-file scan: {other:?}"
@@ -397,7 +399,7 @@ pub(crate) async fn scan_entity_kind(
         current_entity_kind_prefix(entity_kind),
         ScanShape::Bulk,
         |key, bytes| match key {
-            Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
+            Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, &bytes),
             other => Err(Error::Corruption(format!(
                 "non-entity key in {kind:?} current scan: {other:?}"
             ))),
@@ -410,7 +412,7 @@ pub(crate) async fn scan_entity_kind(
             history_entity_kind_prefix(entity_kind),
             ScanShape::Bulk,
             |key, bytes| match key {
-                Key::History(history) => decode_entity(history.entity, bytes),
+                Key::History(history) => decode_entity(history.entity, &bytes),
                 other => Err(Error::Corruption(format!(
                     "non-history key in {kind:?} history scan: {other:?}"
                 ))),

@@ -126,7 +126,7 @@ mod tests {
 
     fn chunk(row_id_start: u64, row_count: u64) -> InlineChunkValue {
         InlineChunkValue {
-            body: Vec::new(),
+            body: Vec::new().into(),
             row_id_start,
             row_count,
             data_file_id: None,

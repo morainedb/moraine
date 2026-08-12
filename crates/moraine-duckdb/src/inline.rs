@@ -17,6 +17,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
+use bytes::Bytes;
 use moraine::ffi_support::inline::InlineScanKind;
 
 use crate::{
@@ -92,6 +93,55 @@ pub struct MoraineInlineChunk {
     pub body: *mut u8,
     /// `body`'s length in bytes.
     pub body_len: usize,
+    /// Opaque owner of `body`, consumed by Arrow decode or scan cleanup.
+    pub owner: *mut c_void,
+}
+
+impl MoraineInlineChunk {
+    pub(crate) fn from_bytes(body: Bytes) -> Self {
+        let data = body.as_ptr().cast_mut();
+        let body_len = body.len();
+        let owner = Box::into_raw(Box::new(body)).cast::<c_void>();
+        Self {
+            body: data,
+            body_len,
+            owner,
+        }
+    }
+
+    /// Moves the shared body allocation out of this ABI value.
+    ///
+    /// # Safety
+    ///
+    /// `self` must have been minted by [`Self::from_bytes`] and not consumed.
+    pub(crate) unsafe fn take_bytes(&mut self) -> Result<Bytes, AbiError> {
+        if self.owner.is_null() {
+            return Err(AbiError::invalid_argument(
+                "inline chunk body has already been consumed",
+            ));
+        }
+        let owner = std::mem::replace(&mut self.owner, std::ptr::null_mut());
+        self.body = std::ptr::null_mut();
+        self.body_len = 0;
+        // SAFETY: caller contract guarantees `owner` came from `from_bytes`
+        // and has not been consumed.
+        Ok(*unsafe { Box::from_raw(owner.cast::<Bytes>()) })
+    }
+
+    /// Releases an unconsumed shared body allocation.
+    ///
+    /// # Safety
+    ///
+    /// `self` must have been minted by [`Self::from_bytes`].
+    unsafe fn release(&mut self) {
+        if !self.owner.is_null() {
+            let owner = std::mem::replace(&mut self.owner, std::ptr::null_mut());
+            // SAFETY: caller contract guarantees the owner is live.
+            drop(unsafe { Box::from_raw(owner.cast::<Bytes>()) });
+        }
+        self.body = std::ptr::null_mut();
+        self.body_len = 0;
+    }
 }
 
 /// Materializes `table_id`'s inlined rows and selects the `scan_kind`
@@ -179,10 +229,7 @@ pub unsafe extern "C" fn moraine_inline_scan(
         let chunks = record
             .chunk_bodies
             .into_iter()
-            .map(|body| {
-                let (body, body_len) = into_owned_bytes(body);
-                MoraineInlineChunk { body, body_len }
-            })
+            .map(MoraineInlineChunk::from_bytes)
             .collect();
         Ok((rows, chunks))
     };
@@ -220,7 +267,7 @@ pub unsafe extern "C" fn moraine_inline_scan_free(
         unsafe {
             free_array(items, len, |_row| {});
             free_array(chunks, chunks_len, |c| {
-                free_owned_bytes(c.body, c.body_len);
+                c.release();
             });
         }
     };
@@ -275,7 +322,7 @@ pub unsafe extern "C" fn moraine_inline_schemas(
         Ok(schemas
             .into_iter()
             .map(|(schema_version, bytes)| {
-                let (arrow_schema, arrow_schema_len) = into_owned_bytes(bytes);
+                let (arrow_schema, arrow_schema_len) = into_owned_bytes(bytes.to_vec());
                 MoraineInlineSchemaRow {
                     schema_version,
                     arrow_schema,
@@ -557,15 +604,30 @@ mod tests {
     use super::*;
     use crate::{
         abi::moraine_detach,
+        arrow_ipc::MoraineArrowBytes,
         staged::{
             MoraineTxHandle, moraine_tx_stage_inline_flush_delete,
-            moraine_tx_stage_inline_inline_delete, moraine_tx_stage_inline_insert,
-            moraine_tx_stage_inline_schema,
+            moraine_tx_stage_inline_inline_delete, moraine_tx_stage_inline_insert_owned,
+            moraine_tx_stage_inline_schema_owned,
         },
         test_support::{
             StrArena, TempDir, attach_ok, begin, commit, i64_cell, null_cell, stage, u64_cell,
         },
     };
+
+    #[test]
+    fn inline_chunk_owner_moves_without_copying_the_body() {
+        let body = Bytes::from_static(b"inline body");
+        let body_pointer = body.as_ptr();
+        let mut chunk = MoraineInlineChunk::from_bytes(body);
+
+        assert_eq!(chunk.body.cast_const(), body_pointer);
+        // SAFETY: `chunk` owns one `Bytes` minted by `from_bytes`, consumed
+        // exactly once here.
+        let moved = unsafe { chunk.take_bytes() }.unwrap();
+        assert_eq!(moved.as_ptr(), body_pointer);
+        assert!(chunk.body.is_null());
+    }
 
     /// Stages the `ducklake_snapshot` + `ducklake_snapshot_changes` pair
     /// every commit needs, regardless of what else is staged alongside it.
@@ -675,12 +737,11 @@ mod tests {
         // SAFETY: `tx` is live; `schema_bytes` is a valid slice; outputs
         // are valid local slots.
         let code = unsafe {
-            moraine_tx_stage_inline_schema(
+            moraine_tx_stage_inline_schema_owned(
                 tx,
                 1,
                 0,
-                schema_bytes.as_ptr(),
-                schema_bytes.len(),
+                MoraineArrowBytes::from_vec(schema_bytes.to_vec()),
                 &raw mut err,
             )
         };
@@ -690,15 +751,14 @@ mod tests {
         // SAFETY: `tx` is live; `body` is a valid slice; outputs are
         // valid local slots.
         let code = unsafe {
-            moraine_tx_stage_inline_insert(
+            moraine_tx_stage_inline_insert_owned(
                 tx,
                 1,
                 0,
                 1,
                 0,
                 2,
-                body.as_ptr(),
-                body.len(),
+                MoraineArrowBytes::from_vec(body.to_vec()),
                 &raw mut err,
             )
         };

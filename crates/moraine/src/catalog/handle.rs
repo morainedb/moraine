@@ -1046,14 +1046,14 @@ impl ReadOnlyCatalog {
                             "no inline schema for table {table} version {schema_version}"
                         ))
                     })?;
-                let schema = Arc::new(schema.arrow_schema);
+                let schema = Arc::new(schema.arrow_schema.to_vec());
                 schemas.insert(*schema_version, Arc::clone(&schema));
                 schema
             };
             let chunk_body = Arc::clone(
                 bodies
                     .entry(row.chunk)
-                    .or_insert_with(|| Arc::new(chunk.body.clone())),
+                    .or_insert_with(|| Arc::new(chunk.body.to_vec())),
             );
 
             rows.push(RecentRow {
@@ -1665,6 +1665,7 @@ impl ReadOnlyCatalog {
                     .collect();
 
             let mut entries = Vec::new();
+            let mut schemas: HashMap<u64, arrow::datatypes::SchemaRef> = HashMap::new();
             for (op, chunk) in
                 store_inline::scan_inline_chunks(session.handle(), table.get()).await?
             {
@@ -1676,16 +1677,26 @@ impl ReadOnlyCatalog {
                 else {
                     continue;
                 };
-                let schema =
-                    store_inline::read_inline_schema(session.handle(), table.get(), schema_version)
-                        .await?
-                        .ok_or_else(|| {
-                            Error::Corruption(format!(
-                                "no inline schema for table {table} version {schema_version}"
-                            ))
-                        })?;
+                let schema = if let Some(schema) = schemas.get(&schema_version) {
+                    Arc::clone(schema)
+                } else {
+                    let record = store_inline::read_inline_schema(
+                        session.handle(),
+                        table.get(),
+                        schema_version,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Corruption(format!(
+                            "no inline schema for table {table} version {schema_version}"
+                        ))
+                    })?;
+                    let schema = scoped_read::decode_inline_schema(record.arrow_schema)?;
+                    schemas.insert(schema_version, Arc::clone(&schema));
+                    schema
+                };
                 let scoped = scoped_read::inline_batch_entries(
-                    &schema.arrow_schema,
+                    schema,
                     &chunk.body,
                     &positions,
                     chunk.row_id_start,

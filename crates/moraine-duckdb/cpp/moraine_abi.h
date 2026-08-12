@@ -389,6 +389,17 @@ typedef struct MoraineArrowBytes {
   size_t cap;
 } MoraineArrowBytes;
 
+// One referenced chunk's full Arrow IPC record-batch body, owned —
+// returned once per chunk however many rows reference it.
+typedef struct MoraineInlineChunk {
+  // The chunk's Arrow IPC record-batch body, owned.
+  uint8_t *body;
+  // `body`'s length in bytes.
+  size_t body_len;
+  // Opaque owner of `body`, consumed by Arrow decode or scan cleanup.
+  void *owner;
+} MoraineInlineChunk;
+
 // One `ducklake_schema` row, as returned by [`moraine_dump_schemas`].
 typedef struct MoraineSchemaRow {
   // `schema_id`.
@@ -935,15 +946,6 @@ typedef struct MoraineInlineRow {
   // The row's offset within its chunk.
   uint64_t offset_in_chunk;
 } MoraineInlineRow;
-
-// One referenced chunk's full Arrow IPC record-batch body, owned —
-// returned once per chunk however many rows reference it.
-typedef struct MoraineInlineChunk {
-  // The chunk's Arrow IPC record-batch body, owned.
-  uint8_t *body;
-  // `body`'s length in bytes.
-  size_t body_len;
-} MoraineInlineChunk;
 
 // One `(schema_version, arrow_schema)` pair, as returned by
 // [`moraine_inline_schemas`].
@@ -1896,6 +1898,22 @@ int32_t moraine_arrow_decode_body(const uint8_t *schema_ipc,
                                   ArrowSchema *out_schema,
                                   ArrowArray *out_array,
                                   struct MoraineError *err);
+
+// Decodes and consumes one chunk returned by
+// [`crate::inline::moraine_inline_scan`]. Its store-backed allocation becomes
+// Arrow's data buffer instead of being copied across the ABI first.
+//
+// # Safety
+//
+// `schema_ipc` points to `schema_ipc_len` readable bytes. `chunk` points to
+// one unconsumed [`MoraineInlineChunk`]. `out_schema`/`out_array` are writable
+// slots the caller releases; `err` is writable.
+int32_t moraine_arrow_decode_inline_chunk(const uint8_t *schema_ipc,
+                                          size_t schema_ipc_len,
+                                          struct MoraineInlineChunk *chunk,
+                                          ArrowSchema *out_schema,
+                                          ArrowArray *out_array,
+                                          struct MoraineError *err);
 
 // Decodes a self-contained IPC stream (from [`moraine_arrow_encode_chunk`],
 // or a schema-only stream from [`moraine_arrow_encode_schema`], which
@@ -3262,6 +3280,19 @@ int32_t moraine_tx_stage_inline_schema(struct MoraineTxHandle *tx,
                                        size_t arrow_schema_len,
                                        struct MoraineError *err);
 
+// Consumes an encoded Arrow schema buffer directly into the staged row.
+//
+// # Safety
+//
+// Same `tx`/`err` contract as [`moraine_tx_stage_inline_schema`].
+// `arrow_schema` must be an unconsumed value returned by
+// [`crate::arrow_ipc::moraine_arrow_encode_schema`].
+int32_t moraine_tx_stage_inline_schema_owned(struct MoraineTxHandle *tx,
+                                             uint64_t table_id,
+                                             uint64_t schema_version,
+                                             struct MoraineArrowBytes arrow_schema,
+                                             struct MoraineError *err);
+
 // Stages `inline/insert`: one Arrow record-batch chunk of inlined rows.
 //
 // # Safety
@@ -3279,6 +3310,22 @@ int32_t moraine_tx_stage_inline_insert(struct MoraineTxHandle *tx,
                                        const uint8_t *arrow_body,
                                        size_t arrow_body_len,
                                        struct MoraineError *err);
+
+// Consumes an encoded Arrow chunk body directly into the staged row.
+//
+// # Safety
+//
+// Same metadata and `tx`/`err` contract as
+// [`moraine_tx_stage_inline_insert`]. `arrow_body` must be an unconsumed
+// value returned by [`crate::arrow_ipc::moraine_arrow_encode_chunk`].
+int32_t moraine_tx_stage_inline_insert_owned(struct MoraineTxHandle *tx,
+                                             uint64_t table_id,
+                                             uint64_t schema_version,
+                                             uint64_t begin_snapshot,
+                                             uint64_t row_id_start,
+                                             uint64_t row_count,
+                                             struct MoraineArrowBytes arrow_body,
+                                             struct MoraineError *err);
 
 // Stages `inline/inline_delete`: tombstones one inlined-insert row.
 //

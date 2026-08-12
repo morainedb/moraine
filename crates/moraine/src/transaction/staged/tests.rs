@@ -672,7 +672,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
             chunk_seq: 0,
         }
     );
-    assert_eq!(chunks[0].1.body, b"chunk-a");
+    assert_eq!(chunks[0].1.body.as_ref(), b"chunk-a");
     assert_eq!(chunks[0].1.row_id_start, 0);
     assert_eq!(chunks[0].1.row_count, 2);
     assert_eq!(
@@ -684,7 +684,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
             chunk_seq: 1,
         }
     );
-    assert_eq!(chunks[1].1.body, b"chunk-b");
+    assert_eq!(chunks[1].1.body.as_ref(), b"chunk-b");
 
     let selected =
         store_inline::find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 1, &[1, 2])
@@ -708,7 +708,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
         vec![(
             0,
             proto::InlineSchemaValue {
-                arrow_schema: b"schema".to_vec(),
+                arrow_schema: b"schema".to_vec().into(),
             }
         )]
     );
@@ -3430,7 +3430,7 @@ async fn stages_inline_schema_drop_removes_only_the_named_schema_version() {
         vec![(
             1,
             proto::InlineSchemaValue {
-                arrow_schema: b"schema-v1".to_vec()
+                arrow_schema: b"schema-v1".to_vec().into()
             }
         )]
     );
