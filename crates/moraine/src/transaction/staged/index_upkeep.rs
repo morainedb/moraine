@@ -208,8 +208,8 @@ async fn stream_data_file_index_entries(
         scoped_read::ParquetFile::new(
             Arc::clone(data_store),
             path,
-            Some(file.file_size_bytes),
-            Some(file.footer_size),
+            file.file_size_bytes,
+            file.footer_size,
         ),
         &projections,
         scoped_read::ScopedRows::All,
@@ -1126,12 +1126,12 @@ pub(super) async fn delete_file_rows(
     })?;
 
     let path = delete_file_object_path(base, &delete_file, context.prefix)?;
-    let positions = scoped_read::delete_file_positions(
+    let positions = scoped_read::delete_file_positions(scoped_read::ParquetFile::new(
         Arc::clone(data_store),
-        &path,
+        path,
         delete_file.file_size_bytes,
         delete_file.footer_size,
-    )
+    ))
     .await?;
     Ok(Some((
         (delete_file.table_id, delete_file.data_file_id),
@@ -1187,8 +1187,8 @@ pub(super) async fn stream_file_delete_index_entries(
         scoped_read::ParquetFile::new(
             Arc::clone(data_store),
             path,
-            Some(file.file_size_bytes),
-            Some(file.footer_size),
+            file.file_size_bytes,
+            file.footer_size,
         ),
         &projections,
         scoped_read::ScopedRows::At(&killed.positions),

@@ -510,7 +510,7 @@ struct ObjectStoreReader {
     file_size: u64,
     /// The serialized Parquet metadata length recorded by DuckLake. The
     /// trailing length and magic occupy another eight bytes.
-    footer_size: Option<u64>,
+    footer_size: u64,
     /// Whether to load the page index with the footer. A row selection
     /// needs it to skip pages; without one it is footer bytes for nothing.
     page_index: PageIndexPolicy,
@@ -781,9 +781,9 @@ fn release_metadata_in_flight(
         .release_in_flight(store, path, file_size, page_index, result);
 }
 
-fn footer_prefetch_size(footer_size: Option<u64>, file_size: u64) -> Option<usize> {
-    footer_size
-        .filter(|size| *size > 0)
+fn footer_prefetch_size(footer_size: u64, file_size: u64) -> Option<usize> {
+    (footer_size > 0)
+        .then_some(footer_size)
         .and_then(|size| size.checked_add(8))
         .filter(|size| *size <= file_size)
         .and_then(|size| usize::try_from(size).ok())
@@ -887,8 +887,8 @@ fn usize_as_u64(value: usize) -> u64 {
 /// reads, never the whole object. Row ids resolve per `row_id_source`: the
 /// field-id-tagged embedded column if present — rewrite files from UPDATE
 /// and compaction preserve old ids there — else `row_id_start + ordinal`,
-/// else refusal. `file_size` is the object's length when the caller knows
-/// it (DuckLake records it per data file); `None` costs one `head` request.
+/// else refusal. This test helper deliberately exercises the discovery path;
+/// production reads require DuckLake's recorded file and footer sizes.
 #[cfg(test)]
 async fn scoped_read_entries(
     object_store: Arc<dyn ObjectStore>,
@@ -898,38 +898,8 @@ async fn scoped_read_entries(
     row_id_source: RowIdSource,
     file_size: Option<u64>,
 ) -> Result<Vec<ScopedReadEntry>> {
-    scoped_read_entries_with_footer(
-        object_store,
-        path,
-        indexed_positions,
-        rows,
-        row_id_source,
-        file_size,
-        None,
-    )
-    .await
-}
-
-/// The same scoped read with DuckLake's recorded serialized Parquet
-/// metadata length. A valid `footer_size` avoids the trailing footer-length
-/// probe before metadata is parsed.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn scoped_read_entries_with_footer(
-    object_store: Arc<dyn ObjectStore>,
-    path: &Path,
-    indexed_positions: &[usize],
-    rows: ScopedRows<'_>,
-    row_id_source: RowIdSource,
-    file_size: Option<u64>,
-    footer_size: Option<u64>,
-) -> Result<Vec<ScopedReadEntry>> {
-    // A selection naming no row is answerable without reading anything.
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let file_size = match file_size {
-        Some(size) => size,
+        Some(file_size) => file_size,
         None => {
             object_store
                 .head(path)
@@ -938,6 +908,51 @@ pub(crate) async fn scoped_read_entries_with_footer(
                 .size
         }
     };
+    scoped_read_entries_inner(
+        object_store,
+        path,
+        indexed_positions,
+        rows,
+        row_id_source,
+        file_size,
+        0,
+    )
+    .await
+}
+
+/// Reads entries from one recorded Parquet object.
+pub(crate) async fn scoped_read_recorded_entries(
+    file: ParquetFile,
+    indexed_positions: &[usize],
+    rows: ScopedRows<'_>,
+    row_id_source: RowIdSource,
+) -> Result<Vec<ScopedReadEntry>> {
+    scoped_read_entries_inner(
+        file.object_store,
+        &file.path,
+        indexed_positions,
+        rows,
+        row_id_source,
+        file.file_size,
+        file.footer_size,
+    )
+    .await
+}
+
+async fn scoped_read_entries_inner(
+    object_store: Arc<dyn ObjectStore>,
+    path: &Path,
+    indexed_positions: &[usize],
+    rows: ScopedRows<'_>,
+    row_id_source: RowIdSource,
+    file_size: u64,
+    footer_size: u64,
+) -> Result<Vec<ScopedReadEntry>> {
+    // A selection naming no row is answerable without reading anything.
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let selected = rows.positions();
     let ordinals = selected.map_or(Ordinals::Dense, Ordinals::Selected);
 
@@ -1017,17 +1032,17 @@ pub(crate) trait ScopedIndexEntryBatchConsumer {
 pub(crate) struct ParquetFile {
     object_store: Arc<dyn ObjectStore>,
     path: Path,
-    file_size: Option<u64>,
-    footer_size: Option<u64>,
+    file_size: u64,
+    footer_size: u64,
 }
 
 impl ParquetFile {
-    /// Describes one object; absent sizes are discovered by the reader.
+    /// Describes one object using DuckLake's recorded sizes.
     pub(crate) fn new(
         object_store: Arc<dyn ObjectStore>,
         path: Path,
-        file_size: Option<u64>,
-        footer_size: Option<u64>,
+        file_size: u64,
+        footer_size: u64,
     ) -> Self {
         Self {
             object_store,
@@ -1054,16 +1069,7 @@ pub(crate) async fn scoped_read_index_entry_batches<C: ScopedIndexEntryBatchCons
         return Ok(());
     }
 
-    let file_size = match file.file_size {
-        Some(size) => size,
-        None => {
-            file.object_store
-                .head(&file.path)
-                .await
-                .map_err(corrupt("scoped read"))?
-                .size
-        }
-    };
+    let file_size = file.file_size;
     let source_positions = index_positions(projections);
     let selected = rows.positions();
     let ordinals = selected.map_or(Ordinals::Dense, Ordinals::Selected);
@@ -1179,33 +1185,26 @@ const BUILD_READ_BATCH_ROWS: usize = 8_192;
 
 /// Streams a file's projected index entries to `consumer` in bounded Arrow
 /// batches, starting at physical row `start_ordinal`. Unlike
-/// [`scoped_read_entries_with_footer`], this never collects the whole file.
+/// [`scoped_read_recorded_entries`], this never collects the whole file.
 /// DuckLake's recorded footer size is available to the metadata reader.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
-    object_store: Arc<dyn ObjectStore>,
-    path: &Path,
+    file: ParquetFile,
     indexed_positions: &[usize],
     row_id_source: RowIdSource,
-    file_size: Option<u64>,
-    footer_size: Option<u64>,
     start_ordinal: u64,
     consumer: &mut C,
 ) -> Result<()> {
-    let file_size = match file_size {
-        Some(size) => size,
-        None => {
-            object_store
-                .head(path)
-                .await
-                .map_err(corrupt("scoped read"))?
-                .size
-        }
-    };
+    let ParquetFile {
+        object_store,
+        path,
+        file_size,
+        footer_size,
+    } = file;
 
     if file_size < WHOLE_OBJECT_THRESHOLD {
         let bytes: Bytes = object_store
-            .get(path)
+            .get(&path)
             .await
             .map_err(corrupt("scoped read"))?
             .bytes()
@@ -1213,7 +1212,7 @@ pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
             .map_err(corrupt("scoped read"))?;
         let builder =
             ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("scoped read"))?;
-        let total = total_rows(builder.metadata(), path)?;
+        let total = total_rows(builder.metadata(), &path)?;
         let start = usize::try_from(start_ordinal)
             .ok()
             .filter(|start| *start <= total)
@@ -1226,7 +1225,7 @@ pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
             return Ok(());
         }
         let (row_id_position, row_id_start) =
-            resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+            resolve_row_id_source(builder.parquet_schema(), row_id_source, &path)?;
         let (mask, indexed_output, row_id_output) =
             projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
         let selection = RowSelection::from_consecutive_ranges(std::iter::once(start..total), total);
@@ -1266,7 +1265,7 @@ pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
         .await
         .map_err(corrupt("scoped read"))?;
-    let total = total_rows(builder.metadata(), path)?;
+    let total = total_rows(builder.metadata(), &path)?;
     let start = usize::try_from(start_ordinal)
         .ok()
         .filter(|start| *start <= total)
@@ -1279,7 +1278,7 @@ pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
         return Ok(());
     }
     let (row_id_position, row_id_start) =
-        resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+        resolve_row_id_source(builder.parquet_schema(), row_id_source, &path)?;
     let (mask, indexed_output, row_id_output) =
         projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
     let selection = RowSelection::from_consecutive_ranges(std::iter::once(start..total), total);
@@ -1565,17 +1564,18 @@ fn append_delete_positions(batch: &RecordBatch, positions: &mut Vec<u64>) -> Res
 /// `file_path` column carries no information the caller lacks. Small files
 /// cost one whole-object read; large files use the recorded sizes and shared
 /// metadata cache to fetch only the position column.
-pub(crate) async fn delete_file_positions(
-    object_store: Arc<dyn ObjectStore>,
-    path: &Path,
-    file_size: u64,
-    footer_size: u64,
-) -> Result<Vec<u64>> {
+pub(crate) async fn delete_file_positions(file: ParquetFile) -> Result<Vec<u64>> {
+    let ParquetFile {
+        object_store,
+        path,
+        file_size,
+        footer_size,
+    } = file;
     let mut positions = Vec::new();
 
     if file_size < WHOLE_OBJECT_THRESHOLD {
         let bytes: Bytes = object_store
-            .get(path)
+            .get(&path)
             .await
             .map_err(corrupt("delete-file read"))?
             .bytes()
@@ -1599,7 +1599,7 @@ pub(crate) async fn delete_file_positions(
         store: object_store,
         path: path.clone(),
         file_size,
-        footer_size: Some(footer_size),
+        footer_size,
         page_index: PageIndexPolicy::Skip,
     };
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
@@ -1985,28 +1985,22 @@ mod tests {
         assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
         let wanted: RowPositions = [7, 19_000].into_iter().collect();
 
-        let first = scoped_read_entries_with_footer(
-            store.clone(),
-            &path,
+        let first = scoped_read_recorded_entries(
+            ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
             &[0],
             ScopedRows::At(&wanted),
             RowIdSource::Ordinal,
-            Some(object_len),
-            Some(footer_size),
         )
         .await
         .unwrap();
         assert_eq!(first.len(), 2);
         let first_requests = store.fetch_requests();
 
-        let second = scoped_read_entries_with_footer(
-            store.clone(),
-            &path,
+        let second = scoped_read_recorded_entries(
+            ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
             &[0],
             ScopedRows::At(&wanted),
             RowIdSource::Ordinal,
-            Some(object_len),
-            Some(footer_size),
         )
         .await
         .unwrap();
@@ -2028,18 +2022,28 @@ mod tests {
             write_wide_named_fixture_with_footer(store.as_ref(), &path, 20_000, "pos").await;
         assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
 
-        let first = delete_file_positions(store.clone(), &path, object_len, footer_size)
-            .await
-            .unwrap();
+        let first = delete_file_positions(ParquetFile::new(
+            store.clone(),
+            path.clone(),
+            object_len,
+            footer_size,
+        ))
+        .await
+        .unwrap();
         assert_eq!(first.len(), 20_000);
         assert_eq!(first[0], 0);
         assert_eq!(first[19_999], 19_999);
         let first_requests = store.fetch_requests();
         let first_bytes = store.fetched_bytes();
 
-        let second = delete_file_positions(store.clone(), &path, object_len, footer_size)
-            .await
-            .unwrap();
+        let second = delete_file_positions(ParquetFile::new(
+            store.clone(),
+            path.clone(),
+            object_len,
+            footer_size,
+        ))
+        .await
+        .unwrap();
         assert_eq!(second, first);
         let second_requests = store.fetch_requests() - first_requests;
 
@@ -2062,9 +2066,14 @@ mod tests {
             write_wide_named_fixture_with_footer(store.as_ref(), &path, 3, "pos").await;
         assert!(object_len < WHOLE_OBJECT_THRESHOLD);
 
-        let positions = delete_file_positions(store.clone(), &path, object_len, footer_size)
-            .await
-            .unwrap();
+        let positions = delete_file_positions(ParquetFile::new(
+            store.clone(),
+            path,
+            object_len,
+            footer_size,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(positions, vec![0, 1, 2]);
         assert_eq!(store.fetch_requests(), 1);
@@ -2083,23 +2092,17 @@ mod tests {
         assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
         let wanted: RowPositions = [7, 19_000].into_iter().collect();
 
-        let first = scoped_read_entries_with_footer(
-            store.clone(),
-            &path,
+        let first = scoped_read_recorded_entries(
+            ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
             &[0],
             ScopedRows::At(&wanted),
             RowIdSource::Ordinal,
-            Some(object_len),
-            Some(footer_size),
         );
-        let second = scoped_read_entries_with_footer(
-            store.clone(),
-            &path,
+        let second = scoped_read_recorded_entries(
+            ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
             &[0],
             ScopedRows::At(&wanted),
             RowIdSource::Ordinal,
-            Some(object_len),
-            Some(footer_size),
         );
         let (first, second) = tokio::join!(first, second);
 
@@ -2127,27 +2130,21 @@ mod tests {
         store.inner.put(&path, corrupt.into()).await.unwrap();
         let wanted: RowPositions = [7].into_iter().collect();
 
-        let failed = scoped_read_entries_with_footer(
-            store.clone(),
-            &path,
+        let failed = scoped_read_recorded_entries(
+            ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
             &[0],
             ScopedRows::At(&wanted),
             RowIdSource::Ordinal,
-            Some(object_len),
-            Some(footer_size),
         )
         .await;
         assert!(failed.is_err());
 
         store.inner.put(&path, valid.into()).await.unwrap();
-        let retried = scoped_read_entries_with_footer(
-            store,
-            &path,
+        let retried = scoped_read_recorded_entries(
+            ParquetFile::new(store, path, object_len, footer_size),
             &[0],
             ScopedRows::At(&wanted),
             RowIdSource::Ordinal,
-            Some(object_len),
-            Some(footer_size),
         )
         .await
         .unwrap();
@@ -2870,7 +2867,7 @@ mod tests {
         };
 
         scoped_read_index_entry_batches(
-            ParquetFile::new(store, path, Some(file_size), Some(footer_size)),
+            ParquetFile::new(store, path, file_size, footer_size),
             &projections,
             ScopedRows::All,
             RowIdSource::Resolve {
@@ -2927,7 +2924,7 @@ mod tests {
         };
 
         scoped_read_index_entry_batches(
-            ParquetFile::new(store, path, Some(file_size), Some(footer_size)),
+            ParquetFile::new(store, path, file_size, footer_size),
             &projections,
             ScopedRows::At(&selected),
             RowIdSource::Resolve {

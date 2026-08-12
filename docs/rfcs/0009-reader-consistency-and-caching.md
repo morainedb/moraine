@@ -881,7 +881,9 @@ Equality-index upkeep is the narrow exception. A commit deleting indexed
 rows must recover their indexed values, and its Rust scoped reader talks to
 `DATA_PATH` directly rather than entering DuckDB's Parquet reader. DuckLake's
 recorded file and footer sizes are carried into every registered data-file and
-delete-file read. For a large object, the footer size lets the first read
+delete-file read. The production scoped-reader API requires both values in one
+file descriptor; metadata discovery is not a production state. For a large
+object, the footer size lets the first read
 prefetch the serialized footer and its trailing length in one request; data
 files then fetch only indexed values and row ids, while delete files fetch only
 their position column. Objects below the measured crossover remain one
