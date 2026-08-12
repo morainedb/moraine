@@ -18,7 +18,7 @@ use arrow::{
         UInt16Array, UInt32Array, UInt64Array,
     },
     buffer::Buffer,
-    datatypes::{DataType, SchemaRef, TimeUnit},
+    datatypes::{DataType, Schema, SchemaRef, TimeUnit},
     ipc::{
         reader::{StreamReader, read_record_batch},
         root_as_message,
@@ -889,7 +889,8 @@ fn usize_as_u64(value: usize) -> u64 {
 /// and compaction preserve old ids there — else `row_id_start + ordinal`,
 /// else refusal. `file_size` is the object's length when the caller knows
 /// it (DuckLake records it per data file); `None` costs one `head` request.
-pub(crate) async fn scoped_read_entries(
+#[cfg(test)]
+async fn scoped_read_entries(
     object_store: Arc<dyn ObjectStore>,
     path: &Path,
     indexed_positions: &[usize],
@@ -1178,8 +1179,8 @@ const BUILD_READ_BATCH_ROWS: usize = 8_192;
 
 /// Streams a file's projected index entries to `consumer` in bounded Arrow
 /// batches, starting at physical row `start_ordinal`. Unlike
-/// [`scoped_read_entries`], this never collects the whole file. DuckLake's
-/// recorded footer size is available to the metadata reader.
+/// [`scoped_read_entries_with_footer`], this never collects the whole file.
+/// DuckLake's recorded footer size is available to the metadata reader.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
     object_store: Arc<dyn ObjectStore>,
@@ -1536,49 +1537,83 @@ fn record_batch_index_entries(
     Ok(entries)
 }
 
-/// The row positions a DuckLake delete file marks dead, read from its `pos`
-/// column. A delete file names positions within one data file, so its
-/// `file_path` column carries no information the caller lacks.
-pub(crate) async fn delete_file_positions(
-    object_store: &dyn ObjectStore,
-    path: &Path,
-) -> Result<Vec<u64>> {
-    let bytes: Bytes = object_store
-        .get(path)
-        .await
-        .map_err(corrupt("delete-file read"))?
-        .bytes()
-        .await
-        .map_err(corrupt("delete-file read"))?;
-
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("delete-file read"))?;
-
-    let position = builder
-        .schema()
+/// The position of a delete file's `pos` column.
+fn delete_position(schema: &Schema) -> Result<usize> {
+    schema
         .fields()
         .iter()
         .position(|field| field.name() == "pos")
-        .ok_or_else(|| Error::Corruption("delete file has no `pos` column".to_owned()))?;
+        .ok_or_else(|| Error::Corruption("delete file has no `pos` column".to_owned()))
+}
 
+/// Appends the non-NULL positions in `batch` to `positions`.
+fn append_delete_positions(batch: &RecordBatch, positions: &mut Vec<u64>) -> Result<()> {
+    let column = batch.column(0).as_ref();
+    for row in 0..batch.num_rows() {
+        if column.is_null(row) {
+            return Err(Error::Corruption(
+                "delete file has a NULL position".to_owned(),
+            ));
+        }
+        positions.push(row_id_value(column, row)?);
+    }
+    Ok(())
+}
+
+/// The row positions a DuckLake delete file marks dead, read from its `pos`
+/// column. A delete file names positions within one data file, so its
+/// `file_path` column carries no information the caller lacks. Small files
+/// cost one whole-object read; large files use the recorded sizes and shared
+/// metadata cache to fetch only the position column.
+pub(crate) async fn delete_file_positions(
+    object_store: Arc<dyn ObjectStore>,
+    path: &Path,
+    file_size: u64,
+    footer_size: u64,
+) -> Result<Vec<u64>> {
+    let mut positions = Vec::new();
+
+    if file_size < WHOLE_OBJECT_THRESHOLD {
+        let bytes: Bytes = object_store
+            .get(path)
+            .await
+            .map_err(corrupt("delete-file read"))?
+            .bytes()
+            .await
+            .map_err(corrupt("delete-file read"))?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("delete-file read"))?;
+        let position = delete_position(builder.schema().as_ref())?;
+        let mask = ProjectionMask::roots(builder.parquet_schema(), [position]);
+        let reader = builder
+            .with_projection(mask)
+            .build()
+            .map_err(corrupt("delete-file read"))?;
+        for batch in reader {
+            append_delete_positions(&batch.map_err(corrupt("delete-file read"))?, &mut positions)?;
+        }
+        return Ok(positions);
+    }
+
+    let reader = ObjectStoreReader {
+        store: object_store,
+        path: path.clone(),
+        file_size,
+        footer_size: Some(footer_size),
+        page_index: PageIndexPolicy::Skip,
+    };
+    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+        .await
+        .map_err(corrupt("delete-file read"))?;
+    let position = delete_position(builder.schema().as_ref())?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), [position]);
-    let reader = builder
+    let mut stream = builder
         .with_projection(mask)
         .build()
         .map_err(corrupt("delete-file read"))?;
-
-    let mut positions = Vec::new();
-    for batch in reader {
-        let batch = batch.map_err(corrupt("delete-file read"))?;
-        let column = batch.column(0).as_ref();
-        for row in 0..batch.num_rows() {
-            if column.is_null(row) {
-                return Err(Error::Corruption(
-                    "delete file has a NULL position".to_owned(),
-                ));
-            }
-            positions.push(row_id_value(column, row)?);
-        }
+    while let Some(batch) = stream.next().await {
+        append_delete_positions(&batch.map_err(corrupt("delete-file read"))?, &mut positions)?;
     }
     Ok(positions)
 }
@@ -1885,15 +1920,16 @@ mod tests {
         }
     }
 
-    /// A file wide enough that its indexed column is a small fraction of its
-    /// bytes: one `Int64` id plus seven fat `Utf8` payload columns, `rows`
-    /// rows. Returns the written object's size.
-    async fn write_wide_fixture_with_footer(
+    /// A file wide enough that its first column is a small fraction of its
+    /// bytes: one `Int64` value plus seven fat `Utf8` payload columns, `rows`
+    /// rows. Returns the written object's size and footer size.
+    async fn write_wide_named_fixture_with_footer(
         store: &dyn ObjectStore,
         path: &Path,
         rows: usize,
+        first_column: &str,
     ) -> (u64, u64) {
-        let mut fields = vec![Field::new("id", DataType::Int64, false)];
+        let mut fields = vec![Field::new(first_column, DataType::Int64, false)];
         for i in 0..7 {
             fields.push(Field::new(format!("payload{i}"), DataType::Utf8, false));
         }
@@ -1923,6 +1959,14 @@ mod tests {
         ));
         store.put(path, buffer.into()).await.unwrap();
         (object_len, footer_size)
+    }
+
+    async fn write_wide_fixture_with_footer(
+        store: &dyn ObjectStore,
+        path: &Path,
+        rows: usize,
+    ) -> (u64, u64) {
+        write_wide_named_fixture_with_footer(store, path, rows, "id").await
     }
 
     async fn write_wide_fixture(store: &dyn ObjectStore, path: &Path, rows: usize) -> u64 {
@@ -1971,6 +2015,60 @@ mod tests {
         let second_requests = store.fetch_requests() - first_requests;
         assert_eq!(first_requests, 3, "footer, page index, projected columns");
         assert_eq!(second_requests, 1, "projected columns only");
+    }
+
+    /// A large delete file uses the range reader because only its `pos`
+    /// column is relevant. Its immutable footer is retained for the next
+    /// pass, while the position column remains an ordinary projected read.
+    #[tokio::test]
+    async fn large_delete_file_reads_only_positions_and_reuses_metadata() {
+        let store = Arc::new(CountingStore::new());
+        let path = Path::from("cached-wide-delete.parquet");
+        let (object_len, footer_size) =
+            write_wide_named_fixture_with_footer(store.as_ref(), &path, 20_000, "pos").await;
+        assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
+
+        let first = delete_file_positions(store.clone(), &path, object_len, footer_size)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 20_000);
+        assert_eq!(first[0], 0);
+        assert_eq!(first[19_999], 19_999);
+        let first_requests = store.fetch_requests();
+        let first_bytes = store.fetched_bytes();
+
+        let second = delete_file_positions(store.clone(), &path, object_len, footer_size)
+            .await
+            .unwrap();
+        assert_eq!(second, first);
+        let second_requests = store.fetch_requests() - first_requests;
+
+        assert_eq!(first_requests, 2, "footer and projected position column");
+        assert_eq!(second_requests, 1, "projected position column only");
+        assert!(
+            first_bytes < object_len / 4,
+            "fetched {first_bytes} of {object_len} bytes"
+        );
+    }
+
+    /// A delete file below the crossover stays on one whole-object request;
+    /// projecting it through the range reader would add latency without
+    /// saving meaningful transfer.
+    #[tokio::test]
+    async fn small_delete_file_stays_on_one_whole_object_read() {
+        let store = Arc::new(CountingStore::new());
+        let path = Path::from("small-delete.parquet");
+        let (object_len, footer_size) =
+            write_wide_named_fixture_with_footer(store.as_ref(), &path, 3, "pos").await;
+        assert!(object_len < WHOLE_OBJECT_THRESHOLD);
+
+        let positions = delete_file_positions(store.clone(), &path, object_len, footer_size)
+            .await
+            .unwrap();
+
+        assert_eq!(positions, vec![0, 1, 2]);
+        assert_eq!(store.fetch_requests(), 1);
+        assert_eq!(store.fetched_bytes(), object_len);
     }
 
     /// Two readers missing the same immutable footer at once share one

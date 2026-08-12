@@ -2315,13 +2315,18 @@ async fn scoped_read_covers_a_registration_end_to_end() {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
     }
+    let file_size = buffer.len() as u64;
+    let footer_offset = buffer.len() - 8;
+    let footer_size = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
     data.put(&path, buffer.into()).await.unwrap();
 
     // moraine derives coverage entries by the scoped read (column "a"
     // at position 0), then registration lands them — DuckLake supplied
     // none, and the read stands in for the refusal.
     let entries = catalog
-        .scoped_file_index_entries(data.clone(), &path, index, &[0])
+        .scoped_file_index_entries(data.clone(), &path, file_size, footer_size, index, &[0])
         .await
         .unwrap();
     assert_eq!(entries.len(), 3);
@@ -2334,8 +2339,8 @@ async fn scoped_read_covers_a_registration_end_to_end() {
                     path_is_relative: true,
                     file_format: "parquet".into(),
                     record_count: 3,
-                    file_size_bytes: 30,
-                    footer_size: 4,
+                    file_size_bytes: file_size,
+                    footer_size,
                     encryption_key: None,
                     partition_values: vec![],
                     column_stats: vec![],

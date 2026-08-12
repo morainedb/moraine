@@ -1126,7 +1126,13 @@ pub(super) async fn delete_file_rows(
     })?;
 
     let path = delete_file_object_path(base, &delete_file, context.prefix)?;
-    let positions = scoped_read::delete_file_positions(data_store, &path).await?;
+    let positions = scoped_read::delete_file_positions(
+        Arc::clone(data_store),
+        &path,
+        delete_file.file_size_bytes,
+        delete_file.footer_size,
+    )
+    .await?;
     Ok(Some((
         (delete_file.table_id, delete_file.data_file_id),
         positions,

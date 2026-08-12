@@ -880,11 +880,15 @@ over the same data fetches nothing, and the same pair under
 Equality-index upkeep is the narrow exception. A commit deleting indexed
 rows must recover their indexed values, and its Rust scoped reader talks to
 `DATA_PATH` directly rather than entering DuckDB's Parquet reader. DuckLake's
-recorded `footer_size` lets the first read prefetch the serialized footer and
-its trailing length in one request. A process-wide byte-bounded cache retains
-the parsed footer and page indexes for repeated touches of the same immutable
-file; it is keyed by object-store identity, path, file size, and page-index
-policy, and holds only metadata. Its allowance is one sixteenth of
+recorded file and footer sizes are carried into every registered data-file and
+delete-file read. For a large object, the footer size lets the first read
+prefetch the serialized footer and its trailing length in one request; data
+files then fetch only indexed values and row ids, while delete files fetch only
+their position column. Objects below the measured crossover remain one
+whole-object request. A process-wide byte-bounded cache retains the parsed
+footer and page indexes for repeated touches of the same immutable file; it is
+keyed by object-store identity, path, file size, and page-index policy, and
+holds only metadata. Its allowance is one sixteenth of
 `CACHE_MEMORY`'s metadata share, capped at 8 MiB, with the remainder of that
 share continuing to hold SlateDB metadata — one Moraine memory budget, not a
 third invisible one. Projected data-column ranges are never retained. This
@@ -1036,6 +1040,9 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
 - **Concurrent parsed-metadata misses coalesce.** Two scoped readers starting
   cold against the same file issue one footer/page-index fill and retain one
   parsed value, while each continues to read its own projected data ranges.
+- **Delete-file reads preserve the crossover.** A small delete file is fetched
+  once in full. A large one uses its recorded file and footer sizes, fetches
+  only `pos`, and reuses parsed metadata on a later read.
 
 ## Alternatives considered
 
