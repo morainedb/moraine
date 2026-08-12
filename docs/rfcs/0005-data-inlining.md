@@ -360,8 +360,11 @@ brand-new file.
 
 Equality-index upkeep therefore resolves such a delete **at the add**: the
 rows it kills are left out of the file's entries as the file is read, so
-they are never indexed at all. The commit's deletes are collected before
-any add is derived, since nothing fixes the two rows' order in the batch.
+they are never indexed at all. The commit first groups delete sources by
+target without opening their objects. A newly registered target resolves its
+own delete files before deriving that target's additions, while unrelated
+additions and removals run beside that discovery. Nothing relies on the two
+catalog rows' order in the batch.
 
 Staging a removal beside the add instead would be wrong, not merely
 wasteful. An index entry's key carries no file, so an add and a removal of
