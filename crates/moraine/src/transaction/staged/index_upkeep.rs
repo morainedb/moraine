@@ -150,6 +150,8 @@ pub(super) struct FileContext<'a> {
     /// Tables this commit compacts and does nothing else to, whose
     /// registrations derive no entries at all.
     compacted: BTreeSet<u64>,
+    /// One commit-wide bound shared by delete-file position reads.
+    delete_file_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// Streams equality-index entries for one registered data file. Fused Arrow
@@ -159,7 +161,7 @@ pub(super) struct FileContext<'a> {
 async fn stream_data_file_index_entries(
     base: &CatalogSnapshot,
     cells: &[Cell],
-    killed: Option<&KilledRows>,
+    killed: Option<&TargetDeletes>,
     context: &FileContext<'_>,
     sender: &mut mpsc::Sender<Result<StagedIndexEntry>>,
 ) -> Result<()> {
@@ -185,9 +187,10 @@ async fn stream_data_file_index_entries(
     })?;
 
     let killed = match killed {
-        Some(killed) => {
-            refuse_out_of_range(killed, &file)?;
-            Some(&killed.positions)
+        Some(deletes) => {
+            let killed = resolve_target_deletes(base, context, deletes).await?;
+            refuse_out_of_range(&killed, &file)?;
+            Some(killed)
         }
         None => None,
     };
@@ -216,7 +219,7 @@ async fn stream_data_file_index_entries(
         scoped_read::RowIdSource::Resolve {
             row_id_start: file.row_id_start,
         },
-        killed,
+        killed.as_ref().map(|killed| &killed.positions),
         &mut consumer,
     )
     .await
@@ -309,29 +312,15 @@ pub(super) async fn stage_index_maintenance(
         store: data_store,
         prefix: data_prefix,
         compacted: compaction_only_tables(ops)?,
+        delete_file_permits: Arc::new(tokio::sync::Semaphore::new(FILE_READ_CONCURRENCY)),
     };
 
-    // Rows this commit kills, grouped by where their values must be read
-    // from: an inline chunk, or a position range of one data file.
-    let mut inline_deletes: HashMap<u64, Vec<u64>> = HashMap::new();
-    let mut file_delete_positions: HashMap<(u64, u64), Vec<u64>> = HashMap::new();
-
-    // Deletes are collected before any add is derived: a delete against a
-    // data file this same commit registers decides which of that file's
-    // rows are indexed at all, so it has to be known by the time the file
-    // is read. Nothing fixes the two rows' order within the batch.
-    collect_deletes(
-        base,
-        ops,
-        &context,
-        &mut inline_deletes,
-        &mut file_delete_positions,
-    )
-    .await?;
-    let file_deletes: HashMap<_, _> = file_delete_positions
-        .into_iter()
-        .map(|(target, positions)| (target, KilledRows::from_unsorted(positions)))
-        .collect();
+    // Classifying delete sources reads only the staged metadata. Each file
+    // target resolves its own position files later, beside independent adds.
+    let DeletePlan {
+        inline: inline_deletes,
+        files: file_deletes,
+    } = plan_deletes(base, ops, &context)?;
 
     let AddPlan {
         registered,
@@ -341,7 +330,7 @@ pub(super) async fn stage_index_maintenance(
 
     let mut inline_targets: Vec<_> = inline_deletes.iter().collect();
     inline_targets.sort_by_key(|(table_id, _)| *table_id);
-    let mut targets: Vec<(&(u64, u64), &KilledRows)> = file_deletes
+    let mut targets: Vec<(&(u64, u64), &TargetDeletes)> = file_deletes
         .iter()
         .filter(|((table_id, data_file_id), _)| !registered.contains(&(*table_id, *data_file_id)))
         .collect();
@@ -363,7 +352,7 @@ pub(super) async fn stage_index_maintenance(
         ));
     }
     let mut file_removal_futures = Vec::with_capacity(targets.len());
-    for ((table_id, data_file_id), killed) in targets {
+    for ((table_id, data_file_id), deletes) in targets {
         let (sender, receiver) = mpsc::channel(ENTRY_SOURCE_BUFFER);
         deletion_receivers.push(receiver);
         file_removal_futures.push(produce_file_removal(
@@ -371,7 +360,7 @@ pub(super) async fn stage_index_maintenance(
             &context,
             *table_id,
             *data_file_id,
-            killed,
+            deletes,
             sender,
         ));
     }
@@ -464,23 +453,32 @@ async fn produce_addition(
     }
 }
 
-/// Groups every row this commit kills: inlined rows by table, and file
-/// rows by the `(table_id, data_file_id)` whose positions they name.
-async fn collect_deletes(
+/// Classifies every staged delete without reading a data-store object.
+/// Inline positions are known immediately; each Parquet delete file remains
+/// attached to its target until that target's producer resolves it.
+fn plan_deletes(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     context: &FileContext<'_>,
-    inline_deletes: &mut HashMap<u64, Vec<u64>>,
-    file_deletes: &mut HashMap<(u64, u64), Vec<u64>>,
-) -> Result<()> {
-    let mut delete_files: Vec<&[Cell]> = Vec::new();
+) -> Result<DeletePlan> {
+    let mut plan = DeletePlan::default();
     for op in ops {
         match op {
             RowOperation::Insert {
                 table: TableKind::DeleteFile,
                 cells,
             } => {
-                delete_files.push(cells);
+                let delete_file = decode_delete_file(cells)?;
+                let table = TableId::new(delete_file.table_id);
+                if !context.compacted.contains(&delete_file.table_id)
+                    && !base.indexes_of(table).is_empty()
+                {
+                    plan.files
+                        .entry((delete_file.table_id, delete_file.data_file_id))
+                        .or_default()
+                        .files
+                        .push(delete_file);
+                }
             }
             RowOperation::InlineFileDelete {
                 table_id,
@@ -490,35 +488,22 @@ async fn collect_deletes(
             } if !context.compacted.contains(table_id) => {
                 // An inlined file-delete names a physical position in the
                 // file, exactly as a delete file's `pos` does.
-                file_deletes
+                plan.files
                     .entry((*table_id, *data_file_id))
                     .or_default()
+                    .positions
                     .push(*position);
             }
             RowOperation::InlineInlineDelete {
                 table_id, row_id, ..
             } if !context.compacted.contains(table_id) => {
-                inline_deletes.entry(*table_id).or_default().push(*row_id);
+                plan.inline.entry(*table_id).or_default().push(*row_id);
             }
             _ => {}
         }
     }
 
-    // Each delete file is its own fetch and names its own target, so the
-    // whole commit's are read together and merged in stage order. A
-    // target's positions are a set, so a merge order never changes them.
-    let futures: Vec<_> = delete_files
-        .into_iter()
-        .map(|cells| delete_file_rows(base, cells, context))
-        .collect();
-    let mut collected = std::pin::pin!(stream::iter(futures).buffered(FILE_READ_CONCURRENCY));
-    while let Some(killed) = collected.try_next().await? {
-        if let Some((target, positions)) = killed {
-            file_deletes.entry(target).or_default().extend(positions);
-        }
-    }
-
-    Ok(())
+    Ok(plan)
 }
 
 /// Plans entry additions without reading their bytes. The registered set is
@@ -527,7 +512,7 @@ async fn collect_deletes(
 fn plan_adds<'a>(
     base: &CatalogSnapshot,
     ops: &'a [RowOperation],
-    file_deletes: &'a HashMap<(u64, u64), KilledRows>,
+    file_deletes: &'a HashMap<(u64, u64), TargetDeletes>,
     context: &FileContext<'_>,
 ) -> Result<AddPlan<'a>> {
     let mut registered: HashSet<(u64, u64)> = HashSet::new();
@@ -638,15 +623,40 @@ async fn produce_file_removal(
     context: &FileContext<'_>,
     table_id: u64,
     data_file_id: u64,
-    killed: &KilledRows,
+    deletes: &TargetDeletes,
     mut sender: mpsc::Sender<Result<StagedIndexEntry>>,
 ) {
-    if let Err(error) =
-        stream_file_delete_index_entries(base, table_id, data_file_id, killed, context, &mut sender)
-            .await
-    {
+    let result = async {
+        let killed = resolve_target_deletes(base, context, deletes).await?;
+        stream_file_delete_index_entries(
+            base,
+            table_id,
+            data_file_id,
+            &killed,
+            context,
+            &mut sender,
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = result {
         let _ = sender.send(Err(error)).await;
     }
+}
+
+#[derive(Default)]
+struct DeletePlan {
+    inline: HashMap<u64, Vec<u64>>,
+    files: HashMap<(u64, u64), TargetDeletes>,
+}
+
+/// Every source of killed positions for one physical data file. The source
+/// metadata is cheap to group; its Parquet bodies stay unread until the
+/// target's add or removal producer starts.
+#[derive(Default)]
+struct TargetDeletes {
+    positions: Vec<u64>,
+    files: Vec<proto::DeleteFileValue>,
 }
 
 /// Addition reads and the metadata needed to exclude same-commit targets
@@ -663,7 +673,7 @@ enum Add<'a> {
     /// A registered data file, read from the data store.
     File {
         cells: &'a [Cell],
-        killed: Option<&'a KilledRows>,
+        killed: Option<&'a TargetDeletes>,
     },
     /// An inlined chunk, whose rows the commit already carries and whose
     /// schema comes from the catalog.
@@ -1096,27 +1106,40 @@ impl KilledRows {
     }
 }
 
-/// The target a staged `register_delete_file` names and the positions it
-/// kills, read out of the delete file verbatim — resolving them to row ids
-/// would bake in the dense assumption the target's scoped read decides.
-/// `None` when the table carries no index, so nothing is read.
-///
-/// Returns them rather than recording them, so a commit's delete files can
-/// be read concurrently and merged afterwards.
-pub(super) async fn delete_file_rows(
+/// Resolves every delete source for one data file. Delete files overlap, and
+/// the physical positions become sorted and unique only after all sources
+/// have contributed.
+async fn resolve_target_deletes(
     base: &CatalogSnapshot,
-    cells: &[Cell],
     context: &FileContext<'_>,
-) -> Result<Option<((u64, u64), Vec<u64>)>> {
-    let delete_file = decode_delete_file(cells)?;
-    if context.compacted.contains(&delete_file.table_id) {
-        return Ok(None);
+    deletes: &TargetDeletes,
+) -> Result<KilledRows> {
+    let mut positions = deletes.positions.clone();
+    let futures = deletes
+        .files
+        .iter()
+        .map(|delete_file| read_delete_file_positions(base, delete_file, context));
+    let mut resolved = std::pin::pin!(stream::iter(futures).buffered(FILE_READ_CONCURRENCY));
+    while let Some(delete_positions) = resolved.try_next().await? {
+        positions.extend(delete_positions);
     }
-    let table = TableId::new(delete_file.table_id);
-    if base.indexes_of(table).is_empty() {
-        return Ok(None);
-    }
+    Ok(KilledRows::from_unsorted(positions))
+}
 
+/// Reads physical positions from one already-decoded delete-file record.
+async fn read_delete_file_positions(
+    base: &CatalogSnapshot,
+    delete_file: &proto::DeleteFileValue,
+    context: &FileContext<'_>,
+) -> Result<Vec<u64>> {
+    let _permit = Arc::clone(&context.delete_file_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            Error::Interrupted(
+                "delete-file read limiter stopped before position discovery".to_owned(),
+            )
+        })?;
     let data_store = context.store.ok_or_else(|| {
         Error::Constraint(format!(
             "delete file {} on indexed table {} cannot be read to maintain its equality index: no \
@@ -1125,7 +1148,7 @@ pub(super) async fn delete_file_rows(
         ))
     })?;
 
-    let path = delete_file_object_path(base, &delete_file, context.prefix)?;
+    let path = delete_file_object_path(base, delete_file, context.prefix)?;
     let positions = scoped_read::delete_file_positions(scoped_read::ParquetFile::new(
         Arc::clone(data_store),
         path,
@@ -1133,10 +1156,7 @@ pub(super) async fn delete_file_rows(
         delete_file.footer_size,
     ))
     .await?;
-    Ok(Some((
-        (delete_file.table_id, delete_file.data_file_id),
-        positions,
-    )))
+    Ok(positions)
 }
 
 /// Derives the entry removals for rows killed inside one data file the

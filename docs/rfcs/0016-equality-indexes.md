@@ -635,6 +635,14 @@ decoded once per commit and shared by all of its chunks. A chunk's owning
 `Bytes` is sliced directly into Arrow's immutable data buffer, avoiding a
 second copy of the body after it moves to a blocking decode worker.
 
+Delete sources are grouped by physical target from their staged metadata
+before any object is opened. Each target resolves its own delete files, so
+independent additions and inline removals start beside delete discovery; only
+the target whose positions are still being discovered waits. Data-file
+additions and removals retain their bounded producer windows; nested
+delete-file reads share one commit-wide allowance rather than multiplying
+that bound per target.
+
 Each step atomically advances a **source cursor** persisted in the definition
 value: the completed inline row watermark, then the data-file id and physical
 position most recently covered. Files are immutable and ids are monotonic, so

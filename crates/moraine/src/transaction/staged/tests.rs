@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
@@ -1350,6 +1350,9 @@ struct InFlightStore {
     peak_in_flight: AtomicUsize,
     reads: AtomicUsize,
     read_delay: std::time::Duration,
+    path_delays: Mutex<BTreeMap<String, std::time::Duration>>,
+    active_paths: Mutex<BTreeMap<String, usize>>,
+    overlapping_paths: Mutex<BTreeSet<(String, String)>>,
 }
 
 impl InFlightStore {
@@ -1364,6 +1367,9 @@ impl InFlightStore {
             peak_in_flight: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
             read_delay,
+            path_delays: Mutex::new(BTreeMap::new()),
+            active_paths: Mutex::new(BTreeMap::new()),
+            overlapping_paths: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -1375,11 +1381,29 @@ impl InFlightStore {
         self.reads.load(Ordering::Relaxed)
     }
 
+    fn paths_overlapped(&self, first: &str, second: &str) -> bool {
+        let pair = if first <= second {
+            (first.to_owned(), second.to_owned())
+        } else {
+            (second.to_owned(), first.to_owned())
+        };
+        self.overlapping_paths.lock().unwrap().contains(&pair)
+    }
+
+    fn set_path_delay(&self, path: &str, delay: std::time::Duration) {
+        self.path_delays
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), delay);
+    }
+
     /// Forgets the reads a fixture's own setup issued, so a measurement
     /// covers only the commit under test.
     fn reset(&self) {
         self.peak_in_flight.store(0, Ordering::Relaxed);
         self.reads.store(0, Ordering::Relaxed);
+        self.active_paths.lock().unwrap().clear();
+        self.overlapping_paths.lock().unwrap().clear();
     }
 }
 
@@ -1421,14 +1445,42 @@ impl ObjectStore for InFlightStore {
         self.reads.fetch_add(1, Ordering::Relaxed);
         let held = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
         self.peak_in_flight.fetch_max(held, Ordering::AcqRel);
+        let path = location.to_string();
+        let read_delay = self
+            .path_delays
+            .lock()
+            .unwrap()
+            .get(&path)
+            .copied()
+            .unwrap_or(self.read_delay);
+        {
+            let mut active = self.active_paths.lock().unwrap();
+            let mut overlaps = self.overlapping_paths.lock().unwrap();
+            for other in active.keys() {
+                let pair = if other <= &path {
+                    (other.clone(), path.clone())
+                } else {
+                    (path.clone(), other.clone())
+                };
+                overlaps.insert(pair);
+            }
+            *active.entry(path.clone()).or_default() += 1;
+        }
         // The suspension point a real store's round trip would have: a
         // concurrent caller reaches it on every read before any completes.
-        if self.read_delay.is_zero() {
+        if read_delay.is_zero() {
             tokio::task::yield_now().await;
         } else {
-            tokio::time::sleep(self.read_delay).await;
+            tokio::time::sleep(read_delay).await;
         }
         let result = self.inner.get_opts(location, options).await;
+        let mut active = self.active_paths.lock().unwrap();
+        if let Some(count) = active.get_mut(&path) {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&path);
+            }
+        }
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
         result
     }
@@ -1689,6 +1741,47 @@ async fn deletes_against_many_data_files_read_them_concurrently() {
     );
 }
 
+/// Each committed target waits only for its own delete files. A fast target
+/// begins its scoped removal read while another target's slow delete-file
+/// discovery is still in flight.
+#[tokio::test]
+async fn target_removal_does_not_wait_for_unrelated_delete_discovery() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
+    register_indexed_data_files(&catalog, &store, 2, 1).await;
+    store.reset();
+
+    let first_size = write_delete_file(&store.inner, "d0.parquet", "f0.parquet", &[0]).await;
+    let second_size = write_delete_file(&store.inner, "d1.parquet", "f1.parquet", &[0]).await;
+    store.set_path_delay("main/t/d1.parquet", CONTROLLED_READ_DELAY.saturating_mul(4));
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: delete_file_row_at(3, "d0.parquet", 1, 1, first_size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: delete_file_row_at(4, "d1.parquet", 2, 1, second_size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert!(
+        store.paths_overlapped("main/t/f0.parquet", "main/t/d1.parquet"),
+        "the first target starts as soon as its own delete positions resolve"
+    );
+    assert_eq!(index_entry_count(&catalog, true, index_id).await, 0);
+}
+
 /// An append to an indexed table reads the newly registered data file once
 /// to derive its entries. The fixed-latency store makes that one read wave
 /// visible in the phase diagnostic.
@@ -1749,9 +1842,9 @@ async fn delete_only_index_maintenance_is_two_data_read_waves() {
     catalog.close().await.unwrap();
 }
 
-/// A file-backed replacement pays two data-store waves: one to collect the
-/// delete positions, then one overlapping the new file's additions with the
-/// old target's removals.
+/// A file-backed replacement starts its independent new-file read beside
+/// delete discovery. The old target still waits for the positions, leaving
+/// two dependent waves without putting the addition behind both of them.
 #[tokio::test]
 async fn replace_index_maintenance_overlaps_adds_and_removals() {
     let events = captured_commit_events();
@@ -1798,7 +1891,11 @@ async fn replace_index_maintenance_overlaps_adds_and_removals() {
     assert_eq!(
         store.peak_in_flight(),
         2,
-        "the replacement and old target are read together after collecting deletes"
+        "two independent paths are read together"
+    );
+    assert!(
+        store.paths_overlapped("main/t/delete.parquet", "main/t/replacement.parquet"),
+        "the replacement read starts without waiting for delete discovery"
     );
     assert_index_phase_covers_read_waves(milliseconds, 2);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
