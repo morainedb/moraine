@@ -121,7 +121,8 @@ impl ReadOnlyCatalog {
     /// them in the index's column order. `file_size` and `footer_size` are
     /// DuckLake's recorded values; carrying both avoids discovery requests
     /// before the projected read. The returned entries feed
-    /// [`Transaction::register_data_file`] so registration stays covered.
+    /// [`crate::Transaction::register_data_file`] so registration stays
+    /// covered.
     ///
     /// The file must not carry an embedded row-id column — its rows already
     /// have ids, and re-registering them under a fresh dense range would
