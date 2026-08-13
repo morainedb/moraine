@@ -880,6 +880,38 @@ fn compact_store_merges_on_demand() {
     );
 }
 
+/// An operator can require the targeted merge to finish rather than
+/// mistaking successful submission for successful compaction.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn compact_store_can_require_completion() {
+    let store = TempDir::new("compact-verified-store");
+    let data = TempDir::new("compact-verified-data");
+
+    let rows = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t VALUES (1);\
+         SELECT subspace, outcome FROM moraine_compact_store(\
+           'lake', subspace := 'index', timeout := 10, require_completed := true\
+         );",
+    ));
+    assert_eq!(rows, vec![vec!["index".to_string(), "skipped".to_string()]]);
+
+    let refused = run_ducklake_sql_expect_err(
+        store.path(),
+        data.path(),
+        "SELECT * FROM moraine_compact_store(\
+           'lake', subspace := 'index', require_completed := true\
+         );",
+    );
+    assert!(
+        refused.contains("require_completed needs a timeout"),
+        "got: {refused}"
+    );
+}
+
 /// The merge runs inside the writer, so a read-only attach refuses it
 /// while still serving the census.
 #[test]

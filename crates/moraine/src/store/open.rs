@@ -210,7 +210,8 @@ impl<'a> StoreBuilder<'a> {
                 .begin(slatedb::IsolationLevel::Snapshot)
                 .await
                 .map_err(Error::from)?;
-            self.warm(crate::store::handle::ReadHandle::Tx(&tx)).await;
+            self.warm(crate::store::handle::ReadHandle::Tx(&tx), &counters)
+                .await;
             tx.rollback();
         }
         Ok((db, counters))
@@ -242,7 +243,7 @@ impl<'a> StoreBuilder<'a> {
         }
         let reader = builder.build().await.map_err(Error::from)?;
         if self.cache_preload.is_some() {
-            self.warm(crate::store::handle::ReadHandle::Reader(&reader))
+            self.warm(crate::store::handle::ReadHandle::Reader(&reader), &counters)
                 .await;
         }
         Ok((reader, counters))
@@ -327,7 +328,11 @@ impl<'a> StoreBuilder<'a> {
     ///
     /// Best-effort throughout: a preload is an optimization, and no open
     /// should fail because one subspace could not be read.
-    async fn warm(&self, handle: crate::store::handle::ReadHandle<'_>) {
+    async fn warm(
+        &self,
+        handle: crate::store::handle::ReadHandle<'_>,
+        counters: &cache::CacheCounters,
+    ) {
         let Some(preload) = self.cache_preload else {
             return;
         };
@@ -351,6 +356,7 @@ impl<'a> StoreBuilder<'a> {
             key::Subspace::Changelog,
         ];
 
+        let before = counters.tally();
         let (warmed, failed) = stream::iter(metadata_only.into_iter().map(|subspace| {
             let deep = matches!(preload, CachePreload::All) && whole.contains(&subspace);
             warm_subspace(handle, subspace, deep)
@@ -363,6 +369,7 @@ impl<'a> StoreBuilder<'a> {
             }
         })
         .await;
+        counters.record_preload(before, counters.tally(), failed);
         info!(
             warmed,
             failed,

@@ -530,7 +530,10 @@ cut:
   accessor: deduplicate complete equality keys, resolve every distinct key
   under the same pinned read as one logical lookup, and return the union of
   their row ids. An empty key set returns no rows after validating the
-  index. The extension path surfaces this accessor as `moraine_index_in`.
+  index. The probes run through a continuously refilled bounded window of
+  512 futures, matching uniqueness enforcement: completion frees one slot
+  immediately rather than waiting for a fixed chunk's slowest read. The
+  extension path surfaces this accessor as `moraine_index_in`.
 - `index_range(table, index, lower, upper) -> Vec<u64>` — the
   comparison accessor (Range and comparison queries). Each bound is
   `Included`/`Excluded`/`Unbounded`; results come back in the index's stored
@@ -541,6 +544,13 @@ cut:
   `a = 5 AND b IS NULL`. At least one `None` is required; a gap (an
   unconstrained leading column, so a bare non-leading `IS NULL`) is not
   expressible and is left to a scan filter. Surfaced as `moraine_index_nulls`.
+
+Every equality lookup emits one `index lookup resolved` diagnostic event.
+Durations are integer milliseconds: total lookup, head view, probe wall
+window, and summed probe service. Counts include requested and deduplicated
+keys, hits, misses, peak in flight, metadata/block cache deltas, cache errors,
+and object-store GET count, duration, and errors. The event measures the
+whole pinned lookup without changing the SQL result surface.
 
 Lookups, ranges, and null queries are **head-only**: entries are live-only, so
 `snapshot_at(S)` fails with a typed error and time travel falls back to what

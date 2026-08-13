@@ -605,7 +605,7 @@ MaintenanceStep MaintenanceScheduler::RunStoreMerge() {
 	                                  config_.compact_store_subspace.empty()
 	                                      ? nullptr
 	                                      : config_.compact_store_subspace.c_str(),
-	                                  config_.compact_store_timeout_ms, merges.OutItems(), merges.OutLen(),
+	                                  config_.compact_store_timeout_ms, false, merges.OutItems(), merges.OutLen(),
 	                                  nullptr, nullptr, &err);
 	if (code != MORAINE_OK) {
 		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
@@ -772,6 +772,7 @@ struct CompactBindData : public duckdb::FunctionData {
 	std::string subspace;
 	// Zero returns as soon as the merges are submitted.
 	uint64_t timeout_ms = 0;
+	bool require_completed = false;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<CompactBindData>();
@@ -781,7 +782,7 @@ struct CompactBindData : public duckdb::FunctionData {
 	bool Equals(const duckdb::FunctionData &other_p) const override {
 		auto &other = other_p.Cast<CompactBindData>();
 		return catalog_name == other.catalog_name && subspace == other.subspace &&
-		       timeout_ms == other.timeout_ms;
+		       timeout_ms == other.timeout_ms && require_completed == other.require_completed;
 	}
 };
 
@@ -836,6 +837,13 @@ duckdb::unique_ptr<duckdb::FunctionData> CompactBind(duckdb::ClientContext &,
 			throw duckdb::BinderException("moraine_compact_store: timeout must be a positive duration");
 		}
 	}
+	auto require_completed = input.named_parameters.find("require_completed");
+	if (require_completed != input.named_parameters.end() && !require_completed->second.IsNull()) {
+		bind_data->require_completed = require_completed->second.GetValue<bool>();
+	}
+	if (bind_data->require_completed && bind_data->timeout_ms == 0) {
+		throw duckdb::BinderException("moraine_compact_store: require_completed needs a timeout");
+	}
 
 	using duckdb::LogicalType;
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT,
@@ -871,7 +879,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CompactInitGlobal(duckdb::C
 	MoraineError err {};
 	auto code = moraine_compact_store(catalog.Handle(), bind_data.subspace.empty() ? nullptr
 	                                                                               : bind_data.subspace.c_str(),
-	                                  bind_data.timeout_ms, merges.OutItems(), merges.OutLen(),
+	                                  bind_data.timeout_ms, bind_data.require_completed, merges.OutItems(), merges.OutLen(),
 	                                  moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -926,6 +934,7 @@ void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader) {
 	                              CompactBind, CompactInitGlobal);
 	compact.named_parameters["subspace"] = duckdb::LogicalType::VARCHAR;
 	compact.named_parameters["timeout"] = duckdb::LogicalType::ANY;
+	compact.named_parameters["require_completed"] = duckdb::LogicalType::BOOLEAN;
 	loader.RegisterFunction(compact);
 }
 

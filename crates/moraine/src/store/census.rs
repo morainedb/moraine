@@ -29,6 +29,9 @@ use crate::{
 pub(crate) struct SegmentSize {
     pub(crate) prefix: Vec<u8>,
     pub(crate) bytes: u64,
+    pub(crate) filter_bytes: u64,
+    pub(crate) index_bytes: u64,
+    pub(crate) stats_bytes: u64,
     pub(crate) l0_ssts: u32,
     pub(crate) sorted_runs: u32,
     pub(crate) sorted_run_ssts: u32,
@@ -197,9 +200,26 @@ fn census_of_manifest(manifest: &VersionedManifest) -> ManifestCensus {
     // A store created with the segment extractor keeps the root tree empty
     // by construction. Reporting it when it is not lets a census describe a
     // store written without one rather than hiding its bytes.
+    let root_views = || {
+        manifest.l0().iter().chain(
+            manifest
+                .compacted()
+                .iter()
+                .flat_map(|run| run.sst_views.iter()),
+        )
+    };
     let root = SegmentSize {
         prefix: Vec::new(),
-        bytes: total_bytes(manifest.l0().iter().map(SsTableView::estimate_size)),
+        bytes: total_bytes(
+            manifest
+                .l0()
+                .iter()
+                .map(SsTableView::estimate_size)
+                .chain(manifest.compacted().iter().map(SortedRun::estimate_size)),
+        ),
+        filter_bytes: total_bytes(root_views().map(|view| view.sst.info.filter_len)),
+        index_bytes: total_bytes(root_views().map(|view| view.sst.info.index_len)),
+        stats_bytes: total_bytes(root_views().map(|view| view.sst.info.stats_len)),
         l0_ssts: count(manifest.l0().len()),
         sorted_runs: count(manifest.compacted().len()),
         sorted_run_ssts: count(
@@ -222,12 +242,27 @@ fn census_of_manifest(manifest: &VersionedManifest) -> ManifestCensus {
 }
 
 fn size_of_segment(segment: &Segment) -> SegmentSize {
-    let l0 = segment.l0().iter().map(SsTableView::estimate_size);
-    let runs = segment.compacted().iter().map(SortedRun::estimate_size);
+    let views = || {
+        segment.l0().iter().chain(
+            segment
+                .compacted()
+                .iter()
+                .flat_map(|run| run.sst_views.iter()),
+        )
+    };
 
     SegmentSize {
         prefix: segment.prefix().to_vec(),
-        bytes: total_bytes(l0.chain(runs)),
+        bytes: total_bytes(
+            segment
+                .l0()
+                .iter()
+                .map(SsTableView::estimate_size)
+                .chain(segment.compacted().iter().map(SortedRun::estimate_size)),
+        ),
+        filter_bytes: total_bytes(views().map(|view| view.sst.info.filter_len)),
+        index_bytes: total_bytes(views().map(|view| view.sst.info.index_len)),
+        stats_bytes: total_bytes(views().map(|view| view.sst.info.stats_len)),
         l0_ssts: count(segment.l0().len()),
         sorted_runs: count(segment.compacted().len()),
         sorted_run_ssts: count(
@@ -334,6 +369,12 @@ mod tests {
             .segment(&subspace_prefix(Subspace::Current))
             .expect("current segment");
         assert!(current.bytes > 0, "current: {current:?}");
+        assert!(current.index_bytes > 0, "current: {current:?}");
+        assert!(
+            current.filter_bytes <= current.bytes,
+            "current: {current:?}"
+        );
+        assert!(current.stats_bytes <= current.bytes, "current: {current:?}");
         assert_eq!(current.l0_ssts, 1, "current: {current:?}");
         assert!(
             census

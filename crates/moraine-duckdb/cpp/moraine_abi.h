@@ -231,6 +231,12 @@ typedef struct MoraineSubspaceCensus {
   char *subspace;
   // Physical bytes across its SSTs.
   uint64_t bytes;
+  // Bloom-filter bytes across its SSTs.
+  uint64_t filter_bytes;
+  // Index-block bytes across its SSTs.
+  uint64_t index_bytes;
+  // Statistics-block bytes across its SSTs.
+  uint64_t stats_bytes;
   // SSTs not yet merged into a sorted run.
   uint32_t l0_ssts;
   // Sorted runs. A merge collapses these to one.
@@ -294,6 +300,32 @@ typedef struct MoraineSubspaceMerge {
   // Physical bytes after it committed.
   uint64_t bytes_after;
 } MoraineSubspaceMerge;
+
+// Process-wide cache capacity, occupancy, and eviction counters.
+typedef struct MoraineCacheStatus {
+  // Memory reserved for decoded SlateDB metadata.
+  uint64_t metadata_capacity_bytes;
+  // Memory currently occupied by decoded SlateDB metadata.
+  uint64_t metadata_occupancy_bytes;
+  // Decoded SlateDB metadata entries evicted from memory.
+  uint64_t metadata_evictions;
+  // Memory reserved for SlateDB data blocks.
+  uint64_t block_capacity_bytes;
+  // Memory currently occupied by SlateDB data blocks.
+  uint64_t block_occupancy_bytes;
+  // SlateDB data-block entries evicted from memory.
+  uint64_t block_evictions;
+  // Whether a disk tier is configured.
+  bool has_block_disk;
+  // Configured disk capacity when `has_block_disk` is true.
+  uint64_t block_disk_capacity_bytes;
+  // Memory reserved for parsed Parquet metadata.
+  uint64_t auxiliary_metadata_capacity_bytes;
+  // Memory currently occupied by parsed Parquet metadata.
+  uint64_t auxiliary_metadata_occupancy_bytes;
+  // Parsed Parquet metadata entries evicted from memory.
+  uint64_t auxiliary_metadata_evictions;
+} MoraineCacheStatus;
 
 // Physical object-store requests one catalog has issued, as returned by
 // [`moraine_catalog_object_store_tally`].
@@ -1500,6 +1532,7 @@ void moraine_store_census_free(struct MoraineSubspaceCensus *items, size_t len);
 int32_t moraine_compact_store(struct MoraineCatalogHandle *handle,
                               const char *subspace,
                               uint64_t wait_ms,
+                              bool require_completed,
                               struct MoraineSubspaceMerge **out_items,
                               size_t *out_len,
                               MoraineInterruptProbe probe,
@@ -1547,7 +1580,12 @@ int32_t moraine_cache_tally(uint64_t *out_metadata_hits,
                             uint64_t *out_metadata_misses,
                             uint64_t *out_block_hits,
                             uint64_t *out_block_misses,
-                            uint64_t *out_errors);
+                            uint64_t *out_errors,
+                            uint64_t *out_preload_metadata_hits,
+                            uint64_t *out_preload_metadata_misses,
+                            uint64_t *out_preload_block_hits,
+                            uint64_t *out_preload_block_misses,
+                            uint64_t *out_preload_failures);
 
 // What the process's block cache has served **for one attach** since it
 // attached.
@@ -1568,7 +1606,19 @@ int32_t moraine_catalog_cache_tally(struct MoraineCatalogHandle *handle,
                                     uint64_t *out_metadata_misses,
                                     uint64_t *out_block_hits,
                                     uint64_t *out_block_misses,
-                                    uint64_t *out_errors);
+                                    uint64_t *out_errors,
+                                    uint64_t *out_preload_metadata_hits,
+                                    uint64_t *out_preload_metadata_misses,
+                                    uint64_t *out_preload_block_hits,
+                                    uint64_t *out_preload_block_misses,
+                                    uint64_t *out_preload_failures);
+
+// Returns process-wide cache capacity, occupancy, and eviction counters.
+//
+// # Safety
+//
+// `out_status` must be valid and writable for the duration of the call.
+int32_t moraine_cache_status(struct MoraineCacheStatus *out_status);
 
 // Physical object-store requests one attached catalog has issued.
 //

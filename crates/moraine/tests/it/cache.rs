@@ -705,18 +705,27 @@ async fn a_preload_warms_before_the_first_read() {
     let mut options = CatalogOptions::default();
     options.cache_preload = Some(moraine::CachePreload::All);
 
-    let before = moraine::cache_tally();
     let reader = Catalog::open_read_only(object_store, options)
         .await
         .unwrap();
-    let after_open = moraine::cache_tally();
+    let after_open = reader.cache_tally();
 
     // The warm ran during the open, before any read was issued.
-    let warm_lookups = (after_open.metadata_hits + after_open.metadata_misses)
-        - (before.metadata_hits + before.metadata_misses);
+    let open_lookups = after_open.metadata_hits
+        + after_open.metadata_misses
+        + after_open.block_hits
+        + after_open.block_misses;
     assert!(
-        warm_lookups > 0,
-        "a preload consulted the cache not at all: {before:?} then {after_open:?}"
+        open_lookups > 0,
+        "a preload consulted the cache not at all: {after_open:?}"
+    );
+    let attributed = after_open.preload_metadata_hits
+        + after_open.preload_metadata_misses
+        + after_open.preload_block_hits
+        + after_open.preload_block_misses;
+    assert!(
+        attributed > 0 && attributed <= open_lookups,
+        "preload traffic was not attributed separately: {after_open:?}"
     );
 
     let view = reader.snapshot().await.unwrap();

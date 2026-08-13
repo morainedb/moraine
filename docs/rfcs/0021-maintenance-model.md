@@ -449,7 +449,14 @@ an operator needs a way to run one before a backup or after a bulk load
 without re-attaching.
 
 **The store merge gets a trigger of its own**, `CALL
-moraine_compact_store('lake')`, taking an optional `subspace` and `timeout`.
+moraine_compact_store('lake')`, taking an optional `subspace`, `timeout`, and
+`require_completed`. The last requires a timeout and turns any pending or
+failed target into a query error; a skipped tree with no sorted runs is a
+verified no-op. This is the operator-safe form for an index-only merge:
+`moraine_compact_store('lake', subspace := 'index', timeout := 600,
+require_completed := true)` cannot mistake successful submission for a
+completed merge.
+
 This is the one place a second configuration surface is worth its cost: the
 case that motivated the merge is a store that bloated once and needs merging
 once, and reaching it only through the pass would mean re-attaching a live

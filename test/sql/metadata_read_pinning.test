@@ -188,6 +188,20 @@ SELECT count(*) FROM moraine_cache_tally('lake');
 ----
 1
 
+# Cache sizing is process-wide and exposes actual in-memory occupancy.
+query I
+SELECT count(*) FROM moraine_cache_status();
+----
+1
+
+query I
+SELECT metadata_occupancy_bytes <= metadata_capacity_bytes
+   AND block_occupancy_bytes <= block_capacity_bytes
+   AND auxiliary_metadata_occupancy_bytes <= auxiliary_metadata_capacity_bytes
+FROM moraine_cache_status();
+----
+true
+
 # SlateDB's physical object-store requests are reported per attach. Local
 # storage uses the same instrumentation seam as S3, so this contract proves
 # the SQL surface without making the ordinary e2e gate network-dependent.

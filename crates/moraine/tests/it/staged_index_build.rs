@@ -51,11 +51,9 @@ where
 
         let mut fields = Fields::default();
         event.record(&mut fields);
-        if fields
-            .0
-            .get("message")
-            .is_some_and(|message| message.contains("staged index"))
-        {
+        if fields.0.get("message").is_some_and(|message| {
+            message.contains("staged index") || message == "index lookup resolved"
+        }) {
             self.0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -78,6 +76,26 @@ impl CapturedEvents {
             })
             .cloned()
             .collect()
+    }
+
+    fn lookup_with_requested_keys(&self, requested: u64) -> BTreeMap<String, String> {
+        let matching = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|fields| {
+                fields
+                    .get("message")
+                    .is_some_and(|value| value == "index lookup resolved")
+                    && fields
+                        .get("lookup_keys")
+                        .is_some_and(|value| value == &requested.to_string())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "lookup events: {matching:?}");
+        matching[0].clone()
     }
 }
 
@@ -146,6 +164,78 @@ async fn table_with_file(values: Vec<i64>) -> (Catalog, TableId, Arc<dyn ObjectS
         .unwrap();
 
     (catalog, created.get().unwrap(), data)
+}
+
+/// A large explicit lookup uses one continuously refilled 512-probe window,
+/// deduplicates keys before reads, and exposes the cache/store accounting
+/// needed to distinguish latency from read amplification.
+#[tokio::test]
+async fn explicit_lookup_reports_its_bounded_probe_window() {
+    let events = captured_events();
+    let catalog = open_memory().await;
+    let created = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "lookup_telemetry", &[col("a")])?;
+            let index = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "lookup_telemetry_index".to_owned(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+                &[],
+            )?;
+            created.set(Some((table, index)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (table, index) = created.get().expect("ids");
+    let mut keys = (0..600)
+        .map(|value| vec![int(i128::from(value))])
+        .collect::<Vec<_>>();
+    keys.push(vec![int(10)]);
+
+    assert!(
+        catalog
+            .index_lookup_many(table, index, &keys)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let event = events.lookup_with_requested_keys(601);
+    assert_eq!(
+        event.get("lookup_unique_keys").map(String::as_str),
+        Some("600")
+    );
+    assert_eq!(
+        event.get("lookup_peak_in_flight").map(String::as_str),
+        Some("512")
+    );
+    assert_eq!(event.get("lookup_hits").map(String::as_str), Some("0"));
+    assert_eq!(event.get("lookup_misses").map(String::as_str), Some("600"));
+    for field in [
+        "lookup_ms",
+        "lookup_head_ms",
+        "lookup_probe_window_ms",
+        "lookup_probe_service_ms",
+        "lookup_metadata_hits",
+        "lookup_metadata_misses",
+        "lookup_block_hits",
+        "lookup_block_misses",
+        "lookup_gets",
+        "lookup_get_ms",
+    ] {
+        assert!(
+            event
+                .get(field)
+                .is_some_and(|value| value.parse::<u64>().is_ok()),
+            "missing integer {field}: {event:?}"
+        );
+    }
 }
 
 fn def(unique: bool) -> IndexDef {

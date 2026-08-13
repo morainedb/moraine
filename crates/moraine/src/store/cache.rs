@@ -21,15 +21,13 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use foyer::{
-    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
-    RecoverMode, Spawner,
+    BlockEngineConfig, DeviceBuilder, Event, EventListener, FsDeviceBuilder, HybridCacheBuilder,
+    PsyncIoEngineConfig, RecoverMode, Spawner,
 };
 use slatedb::db_cache::{
-    CachedEntry, CachedKey, DbCache, SplitCache,
-    foyer::{FoyerCache, FoyerCacheOptions},
-    foyer_hybrid::FoyerHybridCache,
-    stats,
+    CacheLoader, CachedEntry, CachedKey, DbCache, SplitCache, foyer_hybrid::FoyerHybridCache, stats,
 };
 use slatedb_common::metrics::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn};
 use tokio::sync::OnceCell;
@@ -89,10 +87,25 @@ impl CacheConfig {
 
 static AUXILIARY_METADATA_MEMORY: AtomicU64 = AtomicU64::new(MAX_AUXILIARY_METADATA_MEMORY);
 
+static AUXILIARY_METADATA_USAGE: AtomicU64 = AtomicU64::new(0);
+static AUXILIARY_METADATA_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static METADATA_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static BLOCK_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
 /// The process-wide allowance for auxiliary parsed metadata. It is reserved
 /// from the first attach's `CACHE_MEMORY` budget.
 pub(crate) fn auxiliary_metadata_memory() -> usize {
     usize::try_from(AUXILIARY_METADATA_MEMORY.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
+}
+
+/// Records the parsed Parquet metadata cache's current heap footprint.
+pub(crate) fn set_auxiliary_metadata_usage(bytes: usize) {
+    AUXILIARY_METADATA_USAGE.store(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// Records one parsed Parquet metadata eviction.
+pub(crate) fn auxiliary_metadata_evicted() {
+    AUXILIARY_METADATA_EVICTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The process's cache, built on first use. A `OnceCell` rather than a
@@ -124,6 +137,46 @@ pub struct CacheTally {
     /// Lookups the cache itself failed, which read through rather than
     /// failing the caller.
     pub errors: u64,
+    /// Metadata-cache hits performed by attach-time preloads.
+    pub preload_metadata_hits: u64,
+    /// Metadata-cache misses performed by attach-time preloads.
+    pub preload_metadata_misses: u64,
+    /// Data-block cache hits performed by attach-time preloads.
+    pub preload_block_hits: u64,
+    /// Data-block cache misses performed by attach-time preloads.
+    pub preload_block_misses: u64,
+    /// Subspaces an attach-time preload could not warm.
+    pub preload_failures: u64,
+}
+
+/// Current size and pressure of the process-shared caches.
+///
+/// SlateDB metadata, SlateDB data blocks, and parsed Parquet metadata have
+/// separate admission policies, so each reports its own memory figures.
+/// The disk figure is a configured capacity: Foyer does not expose reliable
+/// live disk occupancy through its typed cache API.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStatus {
+    /// Memory reserved for decoded SlateDB filters, indexes, and stats.
+    pub metadata_capacity_bytes: u64,
+    /// Memory currently occupied by those entries.
+    pub metadata_occupancy_bytes: u64,
+    /// Metadata entries evicted from memory since the cache was built.
+    pub metadata_evictions: u64,
+    /// Memory reserved for SlateDB data blocks.
+    pub block_capacity_bytes: u64,
+    /// Memory currently occupied by SlateDB data blocks.
+    pub block_occupancy_bytes: u64,
+    /// Data-block entries evicted from memory since the cache was built.
+    pub block_evictions: u64,
+    /// Disk capacity configured for data blocks, or `None` without a disk tier.
+    pub block_disk_capacity_bytes: Option<u64>,
+    /// Memory reserved for parsed Parquet metadata.
+    pub auxiliary_metadata_capacity_bytes: u64,
+    /// Memory currently occupied by parsed Parquet metadata.
+    pub auxiliary_metadata_occupancy_bytes: u64,
+    /// Parsed Parquet metadata entries evicted since the cache was built.
+    pub auxiliary_metadata_evictions: u64,
 }
 
 /// Physical object-store requests SlateDB has issued for one catalog.
@@ -166,6 +219,31 @@ pub struct ObjectStoreTally {
 }
 
 impl CacheTally {
+    pub(crate) fn since(self, before: Self) -> Self {
+        Self {
+            metadata_hits: self.metadata_hits.saturating_sub(before.metadata_hits),
+            metadata_misses: self.metadata_misses.saturating_sub(before.metadata_misses),
+            block_hits: self.block_hits.saturating_sub(before.block_hits),
+            block_misses: self.block_misses.saturating_sub(before.block_misses),
+            errors: self.errors.saturating_sub(before.errors),
+            preload_metadata_hits: self
+                .preload_metadata_hits
+                .saturating_sub(before.preload_metadata_hits),
+            preload_metadata_misses: self
+                .preload_metadata_misses
+                .saturating_sub(before.preload_metadata_misses),
+            preload_block_hits: self
+                .preload_block_hits
+                .saturating_sub(before.preload_block_hits),
+            preload_block_misses: self
+                .preload_block_misses
+                .saturating_sub(before.preload_block_misses),
+            preload_failures: self
+                .preload_failures
+                .saturating_sub(before.preload_failures),
+        }
+    }
+
     /// The share of lookups the cache served, `None` before it has served
     /// any. Metadata and blocks are counted apart because they are sized
     /// apart: a healthy stack has metadata near 1.0 and blocks wherever
@@ -179,6 +257,38 @@ impl CacheTally {
     #[must_use]
     pub fn block_hit_rate(&self) -> Option<f64> {
         rate(self.block_hits, self.block_misses)
+    }
+}
+
+impl ObjectStoreTally {
+    pub(crate) fn since(self, before: Self) -> Self {
+        Self {
+            main_gets: self.main_gets.saturating_sub(before.main_gets),
+            main_get_duration: self
+                .main_get_duration
+                .saturating_sub(before.main_get_duration),
+            main_puts: self.main_puts.saturating_sub(before.main_puts),
+            main_put_duration: self
+                .main_put_duration
+                .saturating_sub(before.main_put_duration),
+            main_deletes: self.main_deletes.saturating_sub(before.main_deletes),
+            main_delete_duration: self
+                .main_delete_duration
+                .saturating_sub(before.main_delete_duration),
+            wal_gets: self.wal_gets.saturating_sub(before.wal_gets),
+            wal_get_duration: self
+                .wal_get_duration
+                .saturating_sub(before.wal_get_duration),
+            wal_puts: self.wal_puts.saturating_sub(before.wal_puts),
+            wal_put_duration: self
+                .wal_put_duration
+                .saturating_sub(before.wal_put_duration),
+            wal_deletes: self.wal_deletes.saturating_sub(before.wal_deletes),
+            wal_delete_duration: self
+                .wal_delete_duration
+                .saturating_sub(before.wal_delete_duration),
+            errors: self.errors.saturating_sub(before.errors),
+        }
     }
 }
 
@@ -202,6 +312,11 @@ pub(crate) struct CacheCounters {
     block_hits: AtomicU64,
     block_misses: AtomicU64,
     errors: AtomicU64,
+    preload_metadata_hits: AtomicU64,
+    preload_metadata_misses: AtomicU64,
+    preload_block_hits: AtomicU64,
+    preload_block_misses: AtomicU64,
+    preload_failures: AtomicU64,
     main_gets: AtomicU64,
     main_get_nanoseconds: AtomicU64,
     main_puts: AtomicU64,
@@ -225,6 +340,38 @@ impl CacheCounters {
             block_hits: self.block_hits.load(Ordering::Relaxed),
             block_misses: self.block_misses.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            preload_metadata_hits: self.preload_metadata_hits.load(Ordering::Relaxed),
+            preload_metadata_misses: self.preload_metadata_misses.load(Ordering::Relaxed),
+            preload_block_hits: self.preload_block_hits.load(Ordering::Relaxed),
+            preload_block_misses: self.preload_block_misses.load(Ordering::Relaxed),
+            preload_failures: self.preload_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Attributes cache traffic and failures from one completed preload to
+    /// this attach and to the process-wide totals.
+    pub(crate) fn record_preload(&self, before: CacheTally, after: CacheTally, failures: usize) {
+        let failures = u64::try_from(failures).unwrap_or(u64::MAX);
+        for counters in [self, COUNTERS.as_ref()] {
+            counters.preload_metadata_hits.fetch_add(
+                after.metadata_hits.saturating_sub(before.metadata_hits),
+                Ordering::Relaxed,
+            );
+            counters.preload_metadata_misses.fetch_add(
+                after.metadata_misses.saturating_sub(before.metadata_misses),
+                Ordering::Relaxed,
+            );
+            counters.preload_block_hits.fetch_add(
+                after.block_hits.saturating_sub(before.block_hits),
+                Ordering::Relaxed,
+            );
+            counters.preload_block_misses.fetch_add(
+                after.block_misses.saturating_sub(before.block_misses),
+                Ordering::Relaxed,
+            );
+            counters
+                .preload_failures
+                .fetch_add(failures, Ordering::Relaxed);
         }
     }
 
@@ -490,6 +637,168 @@ pub fn cache_tally() -> CacheTally {
     COUNTERS.tally()
 }
 
+type MemoryCache = foyer::Cache<CachedKey, CachedEntry>;
+type HybridCache = foyer::HybridCache<CachedKey, CachedEntry>;
+
+enum BlockObservation {
+    Memory(MemoryCache),
+    Hybrid(HybridCache),
+}
+
+struct CacheObservation {
+    metadata: MemoryCache,
+    block: BlockObservation,
+    disk_capacity: Option<u64>,
+}
+
+static OBSERVATION: OnceCell<CacheObservation> = OnceCell::const_new();
+
+/// Current process-wide cache sizing and occupancy.
+#[must_use]
+pub fn cache_status() -> CacheStatus {
+    let Some(observation) = OBSERVATION.get() else {
+        return CacheStatus::default();
+    };
+    let (block_capacity, block_occupancy) = match &observation.block {
+        BlockObservation::Memory(cache) => (cache.capacity(), cache.usage()),
+        BlockObservation::Hybrid(cache) => (cache.memory().capacity(), cache.memory().usage()),
+    };
+
+    CacheStatus {
+        metadata_capacity_bytes: u64::try_from(observation.metadata.capacity()).unwrap_or(u64::MAX),
+        metadata_occupancy_bytes: u64::try_from(observation.metadata.usage()).unwrap_or(u64::MAX),
+        metadata_evictions: METADATA_EVICTIONS.load(Ordering::Relaxed),
+        block_capacity_bytes: u64::try_from(block_capacity).unwrap_or(u64::MAX),
+        block_occupancy_bytes: u64::try_from(block_occupancy).unwrap_or(u64::MAX),
+        block_evictions: BLOCK_EVICTIONS.load(Ordering::Relaxed),
+        block_disk_capacity_bytes: observation.disk_capacity,
+        auxiliary_metadata_capacity_bytes: AUXILIARY_METADATA_MEMORY.load(Ordering::Relaxed),
+        auxiliary_metadata_occupancy_bytes: AUXILIARY_METADATA_USAGE.load(Ordering::Relaxed),
+        auxiliary_metadata_evictions: AUXILIARY_METADATA_EVICTIONS.load(Ordering::Relaxed),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CacheSlot {
+    Metadata,
+    Block,
+}
+
+struct EvictionCounter(CacheSlot);
+
+impl EventListener for EvictionCounter {
+    type Key = CachedKey;
+    type Value = CachedEntry;
+
+    fn on_leave(&self, reason: Event, _: &CachedKey, _: &CachedEntry) {
+        if reason != Event::Evict {
+            return;
+        }
+        match self.0 {
+            CacheSlot::Metadata => &METADATA_EVICTIONS,
+            CacheSlot::Block => &BLOCK_EVICTIONS,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct MemoryDbCache {
+    inner: MemoryCache,
+}
+
+impl MemoryDbCache {
+    async fn fetch(
+        &self,
+        key: CachedKey,
+        loader: CacheLoader,
+    ) -> Result<CachedEntry, slatedb::Error> {
+        self.inner
+            .get_or_fetch(&key, move || async move { loader().await })
+            .await
+            .map(|entry| entry.value().clone())
+            .map_err(|error| {
+                slatedb::Error::unavailable("cache fill failed".to_owned())
+                    .with_source(Box::new(error))
+            })
+    }
+}
+
+#[async_trait]
+impl DbCache for MemoryDbCache {
+    async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+        Ok(self.inner.get(key).map(|entry| entry.value().clone()))
+    }
+
+    async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+        self.get_block(key).await
+    }
+
+    async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+        self.get_block(key).await
+    }
+
+    async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+        self.get_block(key).await
+    }
+
+    async fn insert(&self, key: CachedKey, value: CachedEntry) {
+        self.inner.insert(key, value);
+    }
+
+    async fn remove(&self, key: &CachedKey) {
+        self.inner.remove(key);
+    }
+
+    fn entry_count(&self) -> u64 {
+        u64::try_from(self.inner.entries()).unwrap_or(u64::MAX)
+    }
+
+    async fn fetch_block(
+        &self,
+        key: CachedKey,
+        loader: CacheLoader,
+    ) -> Result<CachedEntry, slatedb::Error> {
+        self.fetch(key, loader).await
+    }
+
+    async fn fetch_index(
+        &self,
+        key: CachedKey,
+        loader: CacheLoader,
+    ) -> Result<CachedEntry, slatedb::Error> {
+        self.fetch(key, loader).await
+    }
+
+    async fn fetch_filter(
+        &self,
+        key: CachedKey,
+        loader: CacheLoader,
+    ) -> Result<CachedEntry, slatedb::Error> {
+        self.fetch(key, loader).await
+    }
+
+    async fn fetch_stats(
+        &self,
+        key: CachedKey,
+        loader: CacheLoader,
+    ) -> Result<CachedEntry, slatedb::Error> {
+        self.fetch(key, loader).await
+    }
+}
+
+fn memory_cache(capacity: u64, slot: CacheSlot) -> (Arc<dyn DbCache>, MemoryCache) {
+    let inner = foyer::CacheBuilder::new(usize::try_from(capacity).unwrap_or(usize::MAX))
+        .with_weighter(|_: &CachedKey, value: &CachedEntry| value.size())
+        .with_event_listener(Arc::new(EvictionCounter(slot)))
+        .build();
+    (
+        Arc::new(MemoryDbCache {
+            inner: inner.clone(),
+        }),
+        inner,
+    )
+}
+
 /// The cache every store in this process shares, built to `config` if
 /// nothing has built it yet. `None` when the disk tier could not be
 /// opened *and* nothing else was configured — never an error: a cache is
@@ -541,26 +850,29 @@ async fn build(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
     let (meta_bytes, auxiliary_metadata_bytes, block_bytes) = config.slots();
     AUXILIARY_METADATA_MEMORY.store(auxiliary_metadata_bytes, Ordering::Relaxed);
 
-    let meta: Arc<dyn DbCache> = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-        max_capacity: meta_bytes,
-        ..FoyerCacheOptions::default()
-    }));
+    let (meta, metadata_observation) = memory_cache(meta_bytes, CacheSlot::Metadata);
 
-    let block: Arc<dyn DbCache> = match &config.dir {
-        Some(dir) => match hybrid(dir, block_bytes, config.disk_size).await {
-            Some(cache) => cache,
+    let (block, block_observation) = if let Some(dir) = &config.dir {
+        if let Some(cache) = hybrid(dir, block_bytes, config.disk_size).await {
+            cache
+        } else {
             // The device is the only part that can fail, and a memory
             // tier alone is strictly better than no cache at all.
-            None => Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-                max_capacity: block_bytes,
-                ..FoyerCacheOptions::default()
-            })),
-        },
-        None => Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: block_bytes,
-            ..FoyerCacheOptions::default()
-        })),
+            let (cache, observation) = memory_cache(block_bytes, CacheSlot::Block);
+            (cache, BlockObservation::Memory(observation))
+        }
+    } else {
+        let (cache, observation) = memory_cache(block_bytes, CacheSlot::Block);
+        (cache, BlockObservation::Memory(observation))
     };
+
+    let disk_capacity = matches!(&block_observation, BlockObservation::Hybrid(_))
+        .then(|| config.disk_size.unwrap_or(DEFAULT_CACHE_DISK));
+    let _ = OBSERVATION.set(CacheObservation {
+        metadata: metadata_observation,
+        block: block_observation,
+        disk_capacity,
+    });
 
     info!(
         meta_bytes,
@@ -609,7 +921,11 @@ fn cache_runtime() -> Option<tokio::runtime::Runtime> {
 /// The block slot backed by memory over a disk device at `dir`. `None`
 /// if the device or its runtime will not open, which the caller degrades
 /// from rather than failing.
-async fn hybrid(dir: &PathBuf, memory: u64, disk: Option<u64>) -> Option<Arc<dyn DbCache>> {
+async fn hybrid(
+    dir: &PathBuf,
+    memory: u64,
+    disk: Option<u64>,
+) -> Option<(Arc<dyn DbCache>, BlockObservation)> {
     if let Err(error) = std::fs::create_dir_all(dir) {
         warn!(
             directory = %dir.display(),
@@ -633,6 +949,7 @@ async fn hybrid(dir: &PathBuf, memory: u64, disk: Option<u64>) -> Option<Arc<dyn
     };
 
     let built = HybridCacheBuilder::new()
+        .with_event_listener(Arc::new(EvictionCounter(CacheSlot::Block)))
         .memory(usize::try_from(memory).unwrap_or(usize::MAX))
         .with_weighter(|_: &CachedKey, value: &CachedEntry| value.size())
         .storage()
@@ -649,7 +966,10 @@ async fn hybrid(dir: &PathBuf, memory: u64, disk: Option<u64>) -> Option<Arc<dyn
         .await;
 
     match built {
-        Ok(cache) => Some(Arc::new(FoyerHybridCache::new_with_cache(cache))),
+        Ok(cache) => Some((
+            Arc::new(FoyerHybridCache::new_with_cache(cache.clone())),
+            BlockObservation::Hybrid(cache),
+        )),
         Err(error) => {
             warn!(
                 directory = %dir.display(),
@@ -712,7 +1032,7 @@ mod tests {
             std::process::exit(0);
         }
 
-        let cache = hybrid(&cache_root, 4 * 1024 * 1024, Some(64 * 1024 * 1024))
+        let (cache, _) = hybrid(&cache_root, 4 * 1024 * 1024, Some(64 * 1024 * 1024))
             .await
             .unwrap();
         let order = if phase == "warm" {
@@ -933,6 +1253,7 @@ mod tests {
             block_hits: 1,
             block_misses: 3,
             errors: 0,
+            ..CacheTally::default()
         };
         assert!((tally.metadata_hit_rate().unwrap() - 0.75).abs() < f64::EPSILON);
         assert!((tally.block_hit_rate().unwrap() - 0.25).abs() < f64::EPSILON);
@@ -949,5 +1270,20 @@ mod tests {
         let (meta, auxiliary, block) = config.slots();
         assert!(meta >= 1 && block >= 1);
         assert_eq!(auxiliary, 0);
+    }
+
+    /// The public status reports the actual live memory-cache dimensions,
+    /// and occupancy never exceeds the capacity enforcing it.
+    #[tokio::test]
+    async fn cache_status_reports_live_memory_dimensions() {
+        let _ = shared(&CacheConfig::default()).await;
+        let status = cache_status();
+        assert!(status.metadata_capacity_bytes > 0);
+        assert!(status.block_capacity_bytes > 0);
+        assert!(status.metadata_occupancy_bytes <= status.metadata_capacity_bytes);
+        assert!(status.block_occupancy_bytes <= status.block_capacity_bytes);
+        assert!(
+            status.auxiliary_metadata_occupancy_bytes <= status.auxiliary_metadata_capacity_bytes
+        );
     }
 }

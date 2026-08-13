@@ -145,6 +145,12 @@ pub struct SubspaceCensus {
     pub subspace: SubspaceName,
     /// Physical bytes across its SSTs.
     pub bytes: u64,
+    /// Bloom-filter bytes recorded across the subspace's SSTs.
+    pub filter_bytes: u64,
+    /// SST index-block bytes recorded across the subspace's SSTs.
+    pub index_bytes: u64,
+    /// SST statistics-block bytes recorded across the subspace's SSTs.
+    pub stats_bytes: u64,
     /// SSTs not yet merged into a sorted run.
     pub l0_ssts: u32,
     /// Sorted runs. A merge collapses these to one.
@@ -249,6 +255,9 @@ pub struct CompactStoreRequest {
     /// as soon as they are submitted. A merge that outlives the wait is not
     /// cancelled: it keeps running, and a later census shows the result.
     pub wait: Option<Duration>,
+    /// Return an error unless every targeted merge completed or had no
+    /// sorted runs to merge. Requires [`wait`](Self::wait).
+    pub require_completed: bool,
 }
 
 /// How one subspace's merge ended.
@@ -348,6 +357,9 @@ mod tests {
                 SubspaceCensus {
                     subspace: SubspaceName::Current,
                     bytes: 10,
+                    filter_bytes: 1,
+                    index_bytes: 2,
+                    stats_bytes: 3,
                     l0_ssts: 1,
                     sorted_runs: 0,
                     sorted_run_ssts: 0,
@@ -356,6 +368,9 @@ mod tests {
                 SubspaceCensus {
                     subspace: SubspaceName::Index,
                     bytes: 32,
+                    filter_bytes: 4,
+                    index_bytes: 5,
+                    stats_bytes: 6,
                     l0_ssts: 0,
                     sorted_runs: 1,
                     sorted_run_ssts: 2,

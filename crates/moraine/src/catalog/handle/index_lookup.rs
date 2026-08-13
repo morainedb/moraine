@@ -1,25 +1,136 @@
 //! Equality, range, and NULL index lookups.
 
-use std::ops::Bound;
+use std::{
+    ops::Bound,
+    time::{Duration, Instant},
+};
 
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, stream::FuturesUnordered};
+use tracing::debug;
 
 use super::ReadOnlyCatalog;
 use crate::{
     catalog::{IndexId, IndexInfo, IndexState, TableId},
     error::{Error, Result},
     store::{
-        handle::ScanOrder,
+        cache::{CacheTally, ObjectStoreTally},
+        handle::{ReadHandle, ScanOrder},
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
         },
         read,
     },
+    telemetry::milliseconds,
     transaction::index_maintenance,
 };
 
 /// Exact probes kept in flight by one batched index lookup.
-const INDEX_LOOKUP_CONCURRENCY: usize = 32;
+const INDEX_LOOKUP_CONCURRENCY: usize = 512;
+
+#[derive(Default)]
+struct LookupMetrics {
+    unique_keys: u64,
+    head: Duration,
+    probe_window: Duration,
+    probe_service: Duration,
+    hits: u64,
+    misses: u64,
+    peak_in_flight: u64,
+}
+
+struct LookupResolution {
+    row_ids: Vec<u64>,
+    metrics: LookupMetrics,
+}
+
+async fn resolve_encoded(
+    handle: ReadHandle<'_>,
+    index_id: u64,
+    unique: bool,
+    encoded: Vec<CanonicalKey>,
+) -> Result<LookupResolution> {
+    let mut metrics = LookupMetrics {
+        unique_keys: u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+        ..LookupMetrics::default()
+    };
+    let mut pending = encoded.into_iter();
+    let mut probes = FuturesUnordered::new();
+    let mut row_ids = Vec::new();
+    let mut first_probe = None;
+    let mut last_completion = None;
+    let mut exhausted = false;
+
+    loop {
+        while !exhausted && probes.len() < INDEX_LOOKUP_CONCURRENCY {
+            let Some(key) = pending.next() else {
+                exhausted = true;
+                break;
+            };
+            first_probe.get_or_insert_with(Instant::now);
+            probes.push(async move {
+                let started = Instant::now();
+                let found = index_maintenance::lookup_row_ids(handle, index_id, unique, &key).await;
+                (found, started.elapsed(), Instant::now())
+            });
+        }
+        metrics.peak_in_flight = metrics
+            .peak_in_flight
+            .max(u64::try_from(probes.len()).unwrap_or(u64::MAX));
+
+        let Some((found, service, completed)) = probes.next().await else {
+            break;
+        };
+        let found = found?;
+        metrics.probe_service = metrics.probe_service.saturating_add(service);
+        last_completion = Some(completed);
+        if found.is_empty() {
+            metrics.misses = metrics.misses.saturating_add(1);
+        } else {
+            metrics.hits = metrics.hits.saturating_add(1);
+            row_ids.extend(found);
+        }
+    }
+
+    if let (Some(first), Some(last)) = (first_probe, last_completion) {
+        metrics.probe_window = last.saturating_duration_since(first);
+    }
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    Ok(LookupResolution { row_ids, metrics })
+}
+
+fn log_lookup(
+    table: TableId,
+    index: IndexId,
+    requested_keys: usize,
+    elapsed: Duration,
+    metrics: &LookupMetrics,
+    cache: CacheTally,
+    store: ObjectStoreTally,
+) {
+    debug!(
+        table_id = table.get(),
+        index_id = index.get(),
+        lookup_keys = requested_keys,
+        lookup_unique_keys = metrics.unique_keys,
+        lookup_ms = milliseconds(elapsed),
+        lookup_head_ms = milliseconds(metrics.head),
+        lookup_probe_window_ms = milliseconds(metrics.probe_window),
+        lookup_probe_service_ms = milliseconds(metrics.probe_service),
+        lookup_hits = metrics.hits,
+        lookup_misses = metrics.misses,
+        lookup_peak_in_flight = metrics.peak_in_flight,
+        lookup_metadata_hits = cache.metadata_hits,
+        lookup_metadata_misses = cache.metadata_misses,
+        lookup_block_hits = cache.block_hits,
+        lookup_block_misses = cache.block_misses,
+        lookup_cache_errors = cache.errors,
+        lookup_gets = store.main_gets,
+        lookup_get_ms = milliseconds(store.main_get_duration),
+        lookup_store_errors = store.errors,
+        "index lookup resolved"
+    );
+}
 
 impl ReadOnlyCatalog {
     /// Resolves an equality lookup to the rows currently holding `values`.
@@ -66,11 +177,16 @@ impl ReadOnlyCatalog {
         index: IndexId,
         keys: &[Vec<IndexKeyValue>],
     ) -> Result<Vec<u64>> {
+        let started = Instant::now();
+        let cache_before = self.cache_tally();
+        let store_before = self.object_store_tally();
         let session = self.begin_read().await?;
         let handle = session.handle();
 
         let index_row_ids = read::consistent(handle, || async {
+            let head_started = Instant::now();
             let view = self.head_view(handle).await?;
+            let head = head_started.elapsed();
             let info = view
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
@@ -105,22 +221,28 @@ impl ReadOnlyCatalog {
             encoded.sort_unstable();
             encoded.dedup();
 
-            let mut row_ids = stream::iter(encoded)
-                .map(|key| async move {
-                    index_maintenance::lookup_row_ids(handle, index.get(), info.unique, &key).await
-                })
-                .buffer_unordered(INDEX_LOOKUP_CONCURRENCY)
-                .try_concat()
-                .await?;
-            row_ids.dedup();
-            row_ids.sort_unstable();
-
-            Ok(row_ids)
+            let mut resolution = resolve_encoded(handle, index.get(), info.unique, encoded).await?;
+            resolution.metrics.head = head;
+            Ok(resolution)
         })
         .await;
         session.finish();
 
-        index_row_ids
+        match index_row_ids {
+            Ok(resolution) => {
+                log_lookup(
+                    table,
+                    index,
+                    keys.len(),
+                    started.elapsed(),
+                    &resolution.metrics,
+                    self.cache_tally().since(cache_before),
+                    self.object_store_tally().since(store_before),
+                );
+                Ok(resolution.row_ids)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Resolves a comparison query to the rows whose indexed value falls
