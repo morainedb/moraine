@@ -9,9 +9,9 @@ row ids without taking ownership of DuckLake scans or physical placement.
 The patch is pinned separately to the DuckLake revisions selected by every
 DuckDB release moraine supports. It is released as an unsigned companion
 extension, not bundled into the moraine extension.
-Its zero-context diff is intentional: the exact source pin makes context
-unnecessary and keeps the patch file compatible with moraine's whitespace
-gate.
+Most hunks use zero context to satisfy moraine's whitespace gate across both
+source pins. The control-flow-sensitive row-ID statistics hunk replaces and
+re-emits its function's return so it cannot land after that return.
 
 The source mapping lives in `source-pins`. Each entry binds one DuckDB release
 to the upstream DuckLake commit that release selects. A DuckDB bump must add a
