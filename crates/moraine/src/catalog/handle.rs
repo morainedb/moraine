@@ -90,9 +90,9 @@ impl ReadTally {
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         let total = self.materialize_micros.fetch_add(micros, Ordering::Relaxed) + micros;
         info!(
-            elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
+            elapsed_ms = crate::telemetry::milliseconds(elapsed),
             materializations = count,
-            total_micros = total,
+            total_ms = crate::telemetry::milliseconds(Duration::from_micros(total)),
             cache_hits = self.cache_hits.load(Ordering::Relaxed),
             refreshes = self.refreshes.load(Ordering::Relaxed),
             head_reads = self.head_reads.load(Ordering::Relaxed),

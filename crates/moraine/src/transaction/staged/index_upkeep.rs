@@ -2,7 +2,7 @@
 //! removals from registered files and inline chunks by scoped-reading
 //! them.
 
-use std::{collections::BTreeSet, sync::LazyLock};
+use std::{collections::BTreeSet, time::Instant};
 
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
@@ -14,10 +14,10 @@ use futures::{
 use super::{
     Arc, CatalogSnapshot, Cell, ColumnInfo, DbTransaction, Error, HashMap, HashSet, IndexInfo,
     InlineOperation, ObjectStore, ReadHandle, Result, RowOperation, StagedEntries,
-    StagedIndexEntry, TableId, TableKind, commit,
+    StagedIndexEntry, TableId, TableKind, commit, data_file,
     decode::{Cursor, decode_data_file, decode_delete_file},
     inline::inline_chunk_range_write,
-    proto, scoped_read, stage_index_entry_stream, store_inline,
+    proto, stage_index_entry_stream, store_inline,
 };
 use crate::transaction::operations::ChangeSet;
 
@@ -29,12 +29,8 @@ use crate::transaction::operations::ChangeSet;
 /// budget.
 const FILE_READ_CONCURRENCY: usize = 64;
 
-/// Process-wide limit for Arrow decoding performed on blocking workers.
-/// Commits share it so concurrent writers cannot multiply CPU pressure.
+/// Per-commit fan-out into the process-wide Arrow encoding worker pool.
 const INLINE_DECODE_CONCURRENCY: usize = 8;
-
-static INLINE_DECODE_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
-    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(INLINE_DECODE_CONCURRENCY)));
 
 /// Decoded inline schemas shared by every chunk in one commit. Holding the
 /// mutex through the first catalog read guarantees concurrent chunks of one
@@ -77,27 +73,10 @@ impl<'a> InlineSchemaCache<'a> {
                     })?;
             stored.arrow_schema
         };
-        let schema = scoped_read::decode_inline_schema(schema_ipc)?;
+        let schema = data_file::decode_inline_schema(schema_ipc)?;
         decoded.insert(key, Arc::clone(&schema));
         Ok(schema)
     }
-}
-
-/// Runs synchronous decode work off the async executor under a shared bound.
-async fn run_bounded_blocking<T, F>(permits: Arc<tokio::sync::Semaphore>, work: F) -> Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T> + Send + 'static,
-{
-    let permit = permits.acquire_owned().await.map_err(|_| {
-        Error::Interrupted("inline index decode limiter stopped before work began".to_owned())
-    })?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        work()
-    })
-    .await
-    .map_err(|err| Error::Interrupted(format!("inline index decode worker stopped: {err}")))?
 }
 
 /// What a commit's registered and targeted files need before their entries
@@ -113,6 +92,7 @@ pub(super) struct FileContext<'a> {
     compacted: BTreeSet<u64>,
     /// One commit-wide bound shared by delete-file position reads.
     delete_file_permits: Arc<tokio::sync::Semaphore>,
+    metrics: Arc<data_file::ScopedReadMetrics>,
 }
 
 type IndexEntryStream<'a> = BoxStream<'a, Result<StagedIndexEntry>>;
@@ -167,16 +147,17 @@ async fn stream_data_file_index_entries(
     // a row into a new file under its preserved id and must keep its entry.
     let live_columns = base.columns_of(table);
     let projections = index_projections(&live_columns, &indexes, table)?;
-    let entries = scoped_read::scoped_read_index_entry_batches(
-        scoped_read::ParquetFile::new(
+    let entries = data_file::scoped_read_index_entry_batches(
+        data_file::ParquetFile::new(
             Arc::clone(data_store),
             path,
             file.file_size_bytes,
             file.footer_size,
-        ),
+        )
+        .with_metrics(Arc::clone(&context.metrics)),
         projections,
-        scoped_read::ScopedRows::All,
-        scoped_read::RowIdSource::Resolve {
+        data_file::ScopedRows::All,
+        data_file::RowIdSource::Resolve {
             row_id_start: file.row_id_start,
         },
         killed.as_ref().map(|killed| &killed.positions),
@@ -195,11 +176,11 @@ fn index_projections(
     live_columns: &[ColumnInfo],
     indexes: &[IndexInfo],
     table: TableId,
-) -> Result<Vec<scoped_read::IndexProjection>> {
+) -> Result<Vec<data_file::IndexProjection>> {
     indexes
         .iter()
         .map(|index| {
-            Ok(scoped_read::IndexProjection {
+            Ok(data_file::IndexProjection {
                 index_id: index.id.get(),
                 unique: index.unique,
                 positions: index_positions(live_columns, index, table)?,
@@ -213,7 +194,7 @@ fn index_projections(
 /// Attaches index metadata to already encoded Arrow keys.
 fn staged_scoped_entries(
     indexes: &[IndexInfo],
-    scoped: Vec<scoped_read::ScopedIndexEntry>,
+    scoped: Vec<data_file::ScopedIndexEntry>,
     delete: bool,
 ) -> Result<Vec<StagedIndexEntry>> {
     scoped
@@ -224,7 +205,7 @@ fn staged_scoped_entries(
 
 fn staged_scoped_entry(
     indexes: &[IndexInfo],
-    entry: scoped_read::ScopedIndexEntry,
+    entry: data_file::ScopedIndexEntry,
     delete: bool,
 ) -> Result<StagedIndexEntry> {
     let index = indexes.get(entry.index).ok_or_else(|| {
@@ -254,11 +235,13 @@ pub(super) async fn stage_index_maintenance(
 ) -> Result<StagedEntries> {
     let pending_schemas = pending_inline_schemas(ops);
     let inline_schemas = InlineSchemaCache::new(&pending_schemas);
+    let metrics = Arc::new(data_file::ScopedReadMetrics::default());
     let context = FileContext {
         store: data_store,
         prefix: data_prefix,
         compacted: compaction_only_tables(ops)?,
         delete_file_permits: Arc::new(tokio::sync::Semaphore::new(FILE_READ_CONCURRENCY)),
+        metrics: Arc::clone(&metrics),
     };
 
     // Classifying delete sources reads only the staged metadata. Each file
@@ -276,10 +259,12 @@ pub(super) async fn stage_index_maintenance(
 
     let locator_writes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let locator_writes_for_removals = Arc::clone(&locator_writes);
+    let metrics_for_inline_deletions = Arc::clone(&metrics);
     let inline_schemas_ref = &inline_schemas;
     let inline_deletions = stream::iter(inline_deletes)
         .map(move |(table_id, row_ids)| {
             let locator_writes = Arc::clone(&locator_writes_for_removals);
+            let metrics = Arc::clone(&metrics_for_inline_deletions);
             async move {
                 let (entries, writes) = stage_inline_delete_entries(
                     db_tx,
@@ -288,6 +273,7 @@ pub(super) async fn stage_index_maintenance(
                     inline_schemas_ref,
                     table_id,
                     &row_ids,
+                    metrics,
                 )
                 .await?;
                 locator_writes.lock().await.extend(writes);
@@ -320,6 +306,7 @@ pub(super) async fn stage_index_maintenance(
         .try_flatten_unordered(None);
 
     let mut staged = stage_index_entry_stream(db_tx, deletions, additions, 0).await?;
+    staged.metrics.scoped_read = metrics.tally();
     let locator_writes = locator_writes.lock().await;
     {
         let locator_bytes = commit::stage_writes(db_tx, &locator_writes)?;
@@ -345,9 +332,16 @@ async fn produce_addition(
             stream_data_file_index_entries(base, cells, killed, context).await
         }
         Add::Inline { table_id, chunk } => {
-            let entries =
-                inline_chunk_index_entries(db_tx, base, inline_schemas, table_id, chunk, None)
-                    .await?;
+            let entries = inline_chunk_index_entries(
+                db_tx,
+                base,
+                inline_schemas,
+                table_id,
+                chunk,
+                None,
+                Arc::clone(&context.metrics),
+            )
+            .await?;
             Ok(staged_entry_stream(entries))
         }
     }
@@ -569,11 +563,6 @@ pub(super) fn pending_inline_schemas(ops: &[RowOperation]) -> HashMap<(u64, u64)
 
 #[cfg(test)]
 mod concurrency_tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
     use super::*;
 
     /// A ready source must not wait behind an earlier source that has not
@@ -589,44 +578,6 @@ mod concurrency_tests {
             .unwrap();
 
         assert_eq!(next, Some(2));
-    }
-
-    /// Arrow decoding leaves the async executor and shares a process-wide
-    /// permit budget, so several chunks use CPU workers without an
-    /// unbounded task fan-out.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_work_overlaps_under_its_permit_bound() {
-        const PERMITS: usize = 2;
-        const TASKS: usize = 4;
-
-        let permits = Arc::new(tokio::sync::Semaphore::new(PERMITS));
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let futures = (0..TASKS).map(|position| {
-            let permits = Arc::clone(&permits);
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            async move {
-                run_bounded_blocking(permits, move || {
-                    let held = active.fetch_add(1, Ordering::AcqRel) + 1;
-                    peak.fetch_max(held, Ordering::AcqRel);
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    active.fetch_sub(1, Ordering::AcqRel);
-                    Ok(position)
-                })
-                .await
-            }
-        });
-
-        let mut resolved = stream::iter(futures)
-            .buffer_unordered(TASKS)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        resolved.sort_unstable();
-
-        assert_eq!(resolved, vec![0, 1, 2, 3]);
-        assert_eq!(peak.load(Ordering::Relaxed), PERMITS);
     }
 
     #[test]
@@ -650,6 +601,7 @@ async fn inline_chunk_index_entries(
     table_id: u64,
     chunk: InlineChunk<'_>,
     held: Option<&HashSet<u64>>,
+    metrics: Arc<data_file::ScopedReadMetrics>,
 ) -> Result<Vec<StagedIndexEntry>> {
     let table = TableId::new(table_id);
     let indexes: Vec<_> = base
@@ -675,7 +627,14 @@ async fn inline_chunk_index_entries(
         held: held.cloned(),
     };
 
-    run_bounded_blocking(Arc::clone(&INLINE_DECODE_PERMITS), move || plan.derive()).await
+    data_file::run_bounded_index_encoding(move || {
+        let started = Instant::now();
+        metrics.inline_chunk();
+        let result = plan.derive();
+        metrics.encoded(started.elapsed());
+        result
+    })
+    .await
 }
 
 /// Owned input for one blocking Arrow decode. Ownership lets the work leave
@@ -699,7 +658,7 @@ impl InlineDecodePlan {
             .map(|index| index.table_id)
             .ok_or_else(|| Error::Corruption("inline index plan has no index".to_owned()))?;
         let projections = index_projections(&self.live_columns, &self.indexes, table)?;
-        let scoped = scoped_read::inline_batch_index_entries(
+        let scoped = data_file::inline_batch_index_entries(
             self.schema,
             &self.body,
             &projections,
@@ -747,9 +706,11 @@ async fn derive_located_inline_removals(
     table_id: u64,
     row_ids: &[u64],
     locators: Vec<store_inline::InlineChunkLocator>,
+    metrics: Arc<data_file::ScopedReadMetrics>,
 ) -> Result<(Vec<StagedIndexEntry>, HashSet<u64>)> {
     let resolved = stream::iter(locators)
         .map(|locator| {
+            let metrics = Arc::clone(&metrics);
             let held: HashSet<u64> = row_ids
                 .iter()
                 .copied()
@@ -781,6 +742,7 @@ async fn derive_located_inline_removals(
                     table_id,
                     chunk,
                     Some(&held),
+                    metrics,
                 )
                 .await?;
 
@@ -804,6 +766,7 @@ async fn derive_inline_chunk_removals(
     table_id: u64,
     row_ids: &[u64],
     chunks: Vec<InlineChunk<'_>>,
+    metrics: Arc<data_file::ScopedReadMetrics>,
 ) -> Result<(Vec<StagedIndexEntry>, HashSet<u64>)> {
     let resolved = stream::iter(chunks)
         .filter_map(|chunk| {
@@ -815,18 +778,22 @@ async fn derive_inline_chunk_removals(
 
             async move { (!held.is_empty()).then_some((chunk, held)) }
         })
-        .map(|(chunk, held)| async move {
-            let entries = inline_chunk_index_entries(
-                db_tx,
-                base,
-                inline_schemas,
-                table_id,
-                chunk,
-                Some(&held),
-            )
-            .await?;
+        .map(|(chunk, held)| {
+            let metrics = Arc::clone(&metrics);
+            async move {
+                let entries = inline_chunk_index_entries(
+                    db_tx,
+                    base,
+                    inline_schemas,
+                    table_id,
+                    chunk,
+                    Some(&held),
+                    metrics,
+                )
+                .await?;
 
-            Ok::<_, Error>((entries, held))
+                Ok::<_, Error>((entries, held))
+            }
         })
         .buffer_unordered(INLINE_DECODE_CONCURRENCY)
         .try_collect::<Vec<_>>()
@@ -877,6 +844,7 @@ async fn stage_inline_delete_entries(
     inline_schemas: &InlineSchemaCache<'_>,
     table_id: u64,
     row_ids: &[u64],
+    metrics: Arc<data_file::ScopedReadMetrics>,
 ) -> Result<(Vec<StagedIndexEntry>, Vec<commit::StagedWrite>)> {
     if base.indexes_of(TableId::new(table_id)).is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -893,6 +861,7 @@ async fn stage_inline_delete_entries(
             table_id,
             row_ids,
             locators,
+            Arc::clone(&metrics),
         )
         .await?;
 
@@ -912,9 +881,16 @@ async fn stage_inline_delete_entries(
                 _ => None,
             })
             .collect();
-        let (entries, covered) =
-            derive_inline_chunk_removals(db_tx, base, inline_schemas, table_id, row_ids, chunks)
-                .await?;
+        let (entries, covered) = derive_inline_chunk_removals(
+            db_tx,
+            base,
+            inline_schemas,
+            table_id,
+            row_ids,
+            chunks,
+            Arc::clone(&metrics),
+        )
+        .await?;
 
         (entries, covered, locator_writes)
     };
@@ -947,6 +923,7 @@ async fn stage_inline_delete_entries(
         table_id,
         row_ids,
         staged_chunks,
+        metrics,
     )
     .await?;
     entries.extend(staged_entries);
@@ -970,7 +947,7 @@ async fn stage_inline_delete_entries(
 /// selection is built in file order.
 #[derive(Debug)]
 pub(super) struct KilledRows {
-    positions: scoped_read::RowPositions,
+    positions: data_file::RowPositions,
 }
 
 impl KilledRows {
@@ -978,7 +955,7 @@ impl KilledRows {
     /// source for a target has been collected.
     fn from_unsorted(positions: Vec<u64>) -> Self {
         Self {
-            positions: scoped_read::RowPositions::from_unsorted(positions),
+            positions: data_file::RowPositions::from_unsorted(positions),
         }
     }
 }
@@ -1033,12 +1010,15 @@ async fn read_delete_file_positions(
     })?;
 
     let path = delete_file_object_path(base, delete_file, context.prefix)?;
-    let positions = scoped_read::delete_file_positions(scoped_read::ParquetFile::new(
-        Arc::clone(data_store),
-        path,
-        delete_file.file_size_bytes,
-        delete_file.footer_size,
-    ))
+    let positions = data_file::delete_file_positions(
+        data_file::ParquetFile::new(
+            Arc::clone(data_store),
+            path,
+            delete_file.file_size_bytes,
+            delete_file.footer_size,
+        )
+        .with_metrics(Arc::clone(&context.metrics)),
+    )
     .await?;
 
     Ok(positions)
@@ -1082,16 +1062,17 @@ pub(super) async fn stream_file_delete_index_entries(
     // holds — one rule for dense and per-row-id targets alike.
     let live_columns = base.columns_of(table);
     let projections = index_projections(&live_columns, &indexes, table)?;
-    let entries = scoped_read::scoped_read_index_entry_batches(
-        scoped_read::ParquetFile::new(
+    let entries = data_file::scoped_read_index_entry_batches(
+        data_file::ParquetFile::new(
             Arc::clone(data_store),
             path,
             file.file_size_bytes,
             file.footer_size,
-        ),
+        )
+        .with_metrics(Arc::clone(&context.metrics)),
         projections,
-        scoped_read::ScopedRows::At(&killed.positions),
-        scoped_read::RowIdSource::Resolve {
+        data_file::ScopedRows::At(&killed.positions),
+        data_file::RowIdSource::Resolve {
             row_id_start: file.row_id_start,
         },
         None,

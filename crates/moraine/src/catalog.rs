@@ -9,7 +9,6 @@ pub(crate) mod index_policy;
 pub(crate) mod inline;
 pub(crate) mod inline_policy;
 pub(crate) mod projection;
-pub(crate) mod scoped_read;
 mod snapshot;
 mod types;
 

@@ -14,8 +14,9 @@ use super::{Catalog, backfill};
 use crate::{
     catalog::{
         BuildStep, ColumnId, ColumnOrder, DataFileId, IndexDef, IndexEntry, IndexId,
-        IndexMaintenance, IndexState, TableId, scoped_read, snapshot,
+        IndexMaintenance, IndexState, TableId, snapshot,
     },
+    data_file,
     error::{Error, Result},
     store::{
         index_encoding::{Direction, NullOrder},
@@ -141,7 +142,7 @@ impl BuildStepBuffer<'_> {
             source_file = ?source.map(|cursor| cursor.0),
             source_position = ?source.map(|cursor| cursor.1),
             is_final,
-            commit_ms = commit_started.elapsed().as_secs_f64() * 1_000.0,
+            commit_ms = crate::telemetry::milliseconds(commit_started.elapsed()),
             "staged index build step committed"
         );
         Ok(())
@@ -450,8 +451,8 @@ impl Catalog {
                         derivation_attempt = attempt,
                         total_entries = buffer.completed_entries,
                         peak_buffered_entries = buffer.peak_buffered_entries,
-                        derive_ms = derivation_started.elapsed().as_secs_f64() * 1_000.0,
-                        sort_ms = 0.0,
+                        derive_ms = crate::telemetry::milliseconds(derivation_started.elapsed()),
+                        sort_ms = 0_u64,
                         "staged index backfill derived"
                     );
                     return Ok(());
@@ -550,16 +551,16 @@ impl Catalog {
                 let file_id = file.id.get();
                 let dead_positions = killed_positions.get(&file_id);
                 let dead_row_ids = killed_row_ids.get(&file_id);
-                let mut batches = scoped_read::scoped_read_entry_batches(
-                    scoped_read::ParquetFile::new(
+                let mut batches = data_file::scoped_read_entry_batches(
+                    data_file::ParquetFile::new(
                         Arc::clone(&object_store),
                         path,
                         file.file_size_bytes,
                         file.footer_size,
                     ),
                     &positions,
-                    scoped_read::ScopedRows::From(start),
-                    scoped_read::RowIdSource::Resolve {
+                    data_file::ScopedRows::From(start),
+                    data_file::RowIdSource::Resolve {
                         row_id_start: file.row_id_start,
                     },
                 )
