@@ -372,7 +372,7 @@ async fn open_attempt(
     let started = Instant::now();
     let (db, counters) = store.open_writer().await.map_err(OpenFailure::Fatal)?;
     info!(
-        writer_open_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        writer_open_ms = crate::telemetry::milliseconds(started.elapsed()),
         "opened the store read-write"
     );
     let tx = begin_snapshot(&db).await?;
@@ -450,8 +450,8 @@ pub(crate) async fn open_reader_initialized(
     let started = Instant::now();
     let format = validate_format(ReadHandle::Reader(&reader)).await?;
     info!(
-        reader_open_ms = opened.as_secs_f64() * 1_000.0,
-        validate_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        reader_open_ms = crate::telemetry::milliseconds(opened),
+        validate_ms = crate::telemetry::milliseconds(started.elapsed()),
         "opened the store read-only"
     );
 
@@ -600,7 +600,7 @@ pub(crate) async fn materialize_capturing(
         let scanned = started.elapsed();
         info!(
             records = current.len(),
-            scan_ms = scanned.as_secs_f64() * 1_000.0,
+            scan_ms = crate::telemetry::milliseconds(scanned),
             "scanned `current`"
         );
 
@@ -1240,8 +1240,8 @@ pub(crate) async fn commit_batch(
                 operation = "commit",
                 snapshot = head,
                 staged_bytes = staged_bytes.0,
-                elapsed_ms = durable.as_secs_f64() * 1_000.0,
-                projection_ms = projection.as_secs_f64() * 1_000.0,
+                elapsed_ms = crate::telemetry::milliseconds(durable),
+                projection_ms = crate::telemetry::milliseconds(projection),
                 "durable commit landed"
             );
             Ok(Landed::Committed(CommitTimings {
@@ -1356,7 +1356,7 @@ where
                     snapshot = ids.last().map(|id| id.get()),
                     members = members.len(),
                     attempt,
-                    elapsed_ms = started.elapsed().as_millis(),
+                    elapsed_ms = crate::telemetry::milliseconds(started.elapsed()),
                     "commit landed"
                 );
                 return Ok(ids);

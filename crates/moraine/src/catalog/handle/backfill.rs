@@ -12,8 +12,8 @@ use super::{BACKFILL_FILE_READ_CONCURRENCY, ReadOnlyCatalog};
 use crate::{
     catalog::{
         ColumnId, DataFileInfo, DeleteFileInfo, FileIndexEntry, IndexEntry, IndexId, TableId,
-        scoped_read,
     },
+    data_file,
     error::{Error, Result},
     store::{inline as store_inline, key::InlineOperation},
     transaction::commit,
@@ -34,16 +34,16 @@ async fn collect_immediate_backfill<'a>(
             let dead_positions = killed_positions.get(&file.id.get()).cloned();
             let dead_row_ids = killed_row_ids.get(&file.id.get()).cloned();
             async move {
-                let batches = scoped_read::scoped_read_entry_batches(
-                    scoped_read::ParquetFile::new(
+                let batches = data_file::scoped_read_entry_batches(
+                    data_file::ParquetFile::new(
                         object_store,
                         path,
                         file.file_size_bytes,
                         file.footer_size,
                     ),
                     positions,
-                    scoped_read::ScopedRows::All,
-                    scoped_read::RowIdSource::Resolve {
+                    data_file::ScopedRows::All,
+                    data_file::RowIdSource::Resolve {
                         row_id_start: file.row_id_start,
                     },
                 )
@@ -92,7 +92,7 @@ pub(super) async fn collect_delete_positions<'a>(
         let path = resolve(&file.path, file.path_is_relative);
         let object_store = Arc::clone(&object_store);
         async move {
-            let positions = scoped_read::delete_file_positions(scoped_read::ParquetFile::new(
+            let positions = data_file::delete_file_positions(data_file::ParquetFile::new(
                 object_store,
                 path,
                 file.file_size_bytes,
@@ -143,11 +143,11 @@ impl ReadOnlyCatalog {
         index: IndexId,
         indexed_positions: &[usize],
     ) -> Result<Vec<FileIndexEntry>> {
-        let entries = scoped_read::scoped_read_recorded_entries(
-            scoped_read::ParquetFile::new(object_store, path.clone(), file_size, footer_size),
+        let entries = data_file::scoped_read_recorded_entries(
+            data_file::ParquetFile::new(object_store, path.clone(), file_size, footer_size),
             indexed_positions,
-            scoped_read::ScopedRows::All,
-            scoped_read::RowIdSource::Ordinal,
+            data_file::ScopedRows::All,
+            data_file::RowIdSource::Ordinal,
         )
         .await?
         .into_iter()
@@ -318,7 +318,7 @@ impl ReadOnlyCatalog {
                                     "no inline schema for table {table} version {schema_version}"
                                 ))
                             })?;
-                    let schema = scoped_read::decode_inline_schema(record.arrow_schema)?;
+                    let schema = data_file::decode_inline_schema(record.arrow_schema)?;
                     Ok::<_, Error>((schema_version, schema))
                 },
             ))
@@ -342,7 +342,7 @@ impl ReadOnlyCatalog {
                     ))
                 })?;
 
-                let scoped = scoped_read::inline_batch_entries(
+                let scoped = data_file::inline_batch_entries(
                     schema,
                     &chunk.body,
                     &positions,

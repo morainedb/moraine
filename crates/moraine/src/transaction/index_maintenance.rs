@@ -9,15 +9,16 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ops::Bound,
-    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::{FutureExt, Stream, StreamExt, future::BoxFuture, stream};
 use slatedb::DbTransaction;
 use tracing::warn;
 
 use crate::{
+    data_file::ScopedReadTally,
     error::{Error, Result},
     store::{
         StagedBytes,
@@ -99,6 +100,27 @@ pub(crate) struct StagedEntries {
     pub(crate) bytes: u64,
     /// Whether this batch wrote the inline chunk row-range directory.
     pub(crate) uses_inline_chunk_directory: bool,
+    /// Work inside index upkeep. Its wall-clock fields overlap by design.
+    pub(crate) metrics: IndexMaintenanceMetrics,
+}
+
+/// Per-commit equality-index work. Derivation and probe windows overlap, so
+/// these durations describe phases rather than an additive decomposition.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct IndexMaintenanceMetrics {
+    pub(crate) deletion_derivation: Duration,
+    pub(crate) addition_derivation: Duration,
+    pub(crate) probe_window: Duration,
+    pub(crate) probe_service: Duration,
+    pub(crate) staging: Duration,
+    pub(crate) scoped_read: ScopedReadTally,
+    pub(crate) additions: u64,
+    pub(crate) deletions: u64,
+    pub(crate) unique_probes: u64,
+    pub(crate) probe_hits: u64,
+    pub(crate) probe_misses: u64,
+    pub(crate) probe_peak_in_flight: u64,
+    pub(crate) probes_completed_during_deletions: u64,
 }
 
 /// One unique put awaiting its committed-state probe.
@@ -116,9 +138,8 @@ struct PendingProbe {
 
 /// Work one streamed index entry requires.
 enum ProbePlan {
-    /// Stage a put without a read: a non-unique entry, or a unique value
-    /// freed by this same batch.
-    Put { key: Bytes, row_id: Option<u64> },
+    /// Stage a non-unique put without a read.
+    Put(Bytes),
     /// Read committed state before deciding whether to stage the put.
     Probe(PendingProbe),
     /// A repeated claim by the same row needs no write.
@@ -130,40 +151,34 @@ enum ProbePlan {
 }
 
 /// A completed plan, carrying a probe's value when it needed a read.
-enum ProbeResolution {
-    Put {
-        key: Bytes,
-        row_id: Option<u64>,
-    },
-    Probed {
-        probe: PendingProbe,
-        present: Option<Bytes>,
-    },
-    Noop,
-    Collision {
-        index_id: u64,
-        building: bool,
-    },
-    Failure(Error),
+enum ReadyAddition {
+    Put(Bytes),
+    Probed(CompletedProbe),
+    Poison(u64),
+}
+
+struct CompletedProbe {
+    probe: PendingProbe,
+    present: Option<Bytes>,
+    service: Duration,
+    completed: Instant,
 }
 
 /// Sequential planning state. Claims are recorded before probes start, so
 /// concurrent reads cannot admit duplicate values from the same commit.
-struct ProbePlanner<'a> {
-    deleted_unique: &'a HashSet<Bytes>,
+struct ProbePlanner {
     claimed: HashMap<Bytes, u64>,
-    entry_count: usize,
 }
 
-impl ProbePlanner<'_> {
-    fn plan(&mut self, entry: Result<StagedIndexEntry>) -> ProbePlan {
+impl ProbePlanner {
+    fn plan(&mut self, entry: Result<StagedIndexEntry>, entry_count: &mut usize) -> ProbePlan {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => return ProbePlan::Failure(error),
         };
-        self.entry_count = self.entry_count.saturating_add(1);
-        if self.entry_count > MAX_INDEX_ENTRIES_PER_COMMIT {
-            return ProbePlan::Failure(oversized_commit(self.entry_count));
+        *entry_count = entry_count.saturating_add(1);
+        if *entry_count > MAX_INDEX_ENTRIES_PER_COMMIT {
+            return ProbePlan::Failure(oversized_commit(*entry_count));
         }
         if entry.delete {
             return ProbePlan::Failure(Error::Corruption(
@@ -171,10 +186,7 @@ impl ProbePlanner<'_> {
             ));
         }
         if !entry.unique {
-            return ProbePlan::Put {
-                key: entry.key,
-                row_id: None,
-            };
+            return ProbePlan::Put(entry.key);
         }
 
         if let Some(&holder) = self.claimed.get(&entry.key) {
@@ -189,20 +201,12 @@ impl ProbePlanner<'_> {
         }
         self.claimed.insert(entry.key.clone(), entry.row_id);
 
-        let probe = PendingProbe {
+        ProbePlan::Probe(PendingProbe {
             key: entry.key,
             row_id: entry.row_id,
             index_id: entry.index_id,
             building: entry.building,
-        };
-        if self.deleted_unique.contains(&probe.key) {
-            ProbePlan::Put {
-                key: probe.key,
-                row_id: Some(probe.row_id),
-            }
-        } else {
-            ProbePlan::Probe(probe)
-        }
+        })
     }
 }
 
@@ -215,19 +219,44 @@ fn collision(probe_index_id: u64, building: bool) -> Result<Option<u64>> {
     }
 }
 
-async fn resolve_probe_plan(reader: ReadHandle<'_>, plan: ProbePlan) -> ProbeResolution {
+async fn resolve_probe(reader: ReadHandle<'_>, probe: PendingProbe) -> Result<CompletedProbe> {
+    let started = Instant::now();
+    let present = reader.get(probe.key.clone()).await.map_err(Error::from)?;
+    Ok(CompletedProbe {
+        probe,
+        present,
+        service: started.elapsed(),
+        completed: Instant::now(),
+    })
+}
+
+fn schedule_probe_plan<'a>(
+    plan: ProbePlan,
+    reader: ReadHandle<'a>,
+    probes: &mut futures::stream::FuturesUnordered<BoxFuture<'a, Result<CompletedProbe>>>,
+    ready: &mut VecDeque<ReadyAddition>,
+    metrics: &mut IndexMaintenanceMetrics,
+    first_probe: &mut Option<Instant>,
+) -> Result<()> {
     match plan {
-        ProbePlan::Put { key, row_id } => ProbeResolution::Put { key, row_id },
-        ProbePlan::Probe(probe) => match reader.get(probe.key.clone()).await {
-            Ok(present) => ProbeResolution::Probed { probe, present },
-            Err(error) => ProbeResolution::Failure(Error::from(error)),
-        },
-        ProbePlan::Noop => ProbeResolution::Noop,
-        ProbePlan::Collision { index_id, building } => {
-            ProbeResolution::Collision { index_id, building }
+        ProbePlan::Put(key) => ready.push_back(ReadyAddition::Put(key)),
+        ProbePlan::Probe(probe) => {
+            first_probe.get_or_insert_with(Instant::now);
+            metrics.unique_probes = metrics.unique_probes.saturating_add(1);
+            probes.push(resolve_probe(reader, probe).boxed());
+            metrics.probe_peak_in_flight = metrics
+                .probe_peak_in_flight
+                .max(u64::try_from(probes.len()).unwrap_or(u64::MAX));
         }
-        ProbePlan::Failure(error) => ProbeResolution::Failure(error),
+        ProbePlan::Noop => {}
+        ProbePlan::Collision { index_id, building } => {
+            if let Some(index_id) = collision(index_id, building)? {
+                ready.push_back(ReadyAddition::Poison(index_id));
+            }
+        }
+        ProbePlan::Failure(error) => return Err(error),
     }
+    Ok(())
 }
 
 fn stage_probe_put(
@@ -306,28 +335,57 @@ where
     D: Stream<Item = Result<StagedIndexEntry>>,
     S: Stream<Item = Result<StagedIndexEntry>>,
 {
+    let started = Instant::now();
     let mut staged = StagedBytes::default();
     let mut deleted_unique = HashSet::new();
     let mut entry_count = prior_entry_count;
     let mut deletes = std::pin::pin!(deletes);
     let mut entries = std::pin::pin!(entries);
-    let mut prefetched = VecDeque::with_capacity(ADDITION_PREFETCH);
+    let mut ready = VecDeque::with_capacity(ADDITION_PREFETCH);
     let mut additions_done = false;
+    let mut planner = ProbePlanner {
+        claimed: HashMap::new(),
+    };
+    let reader = ReadHandle::Tx(db_tx);
+    let mut probes =
+        futures::stream::FuturesUnordered::<BoxFuture<'_, Result<CompletedProbe>>>::new();
+    let mut metrics = IndexMaintenanceMetrics::default();
+    let mut first_probe = None;
+    let mut last_probe_completion = None;
 
     loop {
-        let deletion = if additions_done || prefetched.len() == ADDITION_PREFETCH {
+        let buffered = ready.len().saturating_add(probes.len());
+        let deletion = if buffered >= ADDITION_PREFETCH {
             deletes.next().await
         } else {
             tokio::select! {
                 biased;
                 deletion = deletes.next() => deletion,
-                addition = entries.next() => if let Some(addition) = addition {
-                        prefetched.push_back(addition?);
-                        continue;
+                resolution = probes.next(), if !probes.is_empty() => {
+                    if let Some(resolution) = resolution {
+                        metrics.probes_completed_during_deletions = metrics
+                            .probes_completed_during_deletions
+                            .saturating_add(1);
+                        ready.push_back(ReadyAddition::Probed(resolution?));
+                    }
+                    continue;
+                },
+                addition = entries.next(), if !additions_done => if let Some(addition) = addition {
+                    metrics.additions = metrics.additions.saturating_add(1);
+                    let plan = planner.plan(addition, &mut entry_count);
+                    schedule_probe_plan(
+                        plan,
+                        reader,
+                        &mut probes,
+                        &mut ready,
+                        &mut metrics,
+                        &mut first_probe,
+                    )?;
+                    continue;
                 } else {
                     additions_done = true;
+                    metrics.addition_derivation = started.elapsed();
                         continue;
-
                 }
             }
         };
@@ -347,81 +405,95 @@ where
         if entry.unique {
             deleted_unique.insert(entry.key.clone());
         }
+        metrics.deletions = metrics.deletions.saturating_add(1);
+        let stage_started = Instant::now();
         staged.add(entry.key.len(), 0);
         db_tx.delete(entry.key).map_err(Error::from)?;
+        metrics.staging = metrics.staging.saturating_add(stage_started.elapsed());
     }
+    metrics.deletion_derivation = started.elapsed();
 
-    let entries = stream::iter(prefetched.into_iter().map(Ok)).chain(entries);
-    // Read at most the remaining budget plus one entry: the extra one
-    // produces the refusal without deriving an oversized stream to its end.
-    let stream_budget = MAX_INDEX_ENTRIES_PER_COMMIT
-        .saturating_sub(entry_count)
-        .saturating_add(1);
-    let planner = Arc::new(Mutex::new(ProbePlanner {
-        deleted_unique: &deleted_unique,
-        claimed: HashMap::new(),
-        entry_count,
-    }));
-    let reader = ReadHandle::Tx(db_tx);
-
-    let (poisoned, addition_bytes): (Vec<_>, Vec<_>) = entries
-        .take(stream_budget)
-        .map(|entry| {
-            let planner = planner.clone();
-            async move {
-                let plan = {
-                    let mut planner_guard =
-                        planner.lock().map_err(|_| Error::ConcurrentModification)?;
-                    planner_guard.plan(entry)
-                };
-
-                let mut addition_bytes = StagedBytes::default();
-                let poisoned = match resolve_probe_plan(reader, plan).await {
-                    ProbeResolution::Put { key, row_id } => {
-                        stage_probe_put(db_tx, &mut addition_bytes, key, row_id)?;
-                        None
-                    }
-                    ProbeResolution::Probed { probe, present } => {
-                        if let Some(bytes) = present {
-                            match decode_row_id(&bytes) {
-                                Ok(holder) if holder == probe.row_id => None,
-                                Ok(_) => {
-                                    return collision(probe.index_id, probe.building)
-                                        .map(|index_id| (index_id, addition_bytes));
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        } else {
-                            stage_probe_put(
-                                db_tx,
-                                &mut addition_bytes,
-                                probe.key,
-                                Some(probe.row_id),
-                            )?;
-                            None
-                        }
-                    }
-                    ProbeResolution::Noop => None,
-                    ProbeResolution::Collision { index_id, building } => {
-                        return collision(index_id, building)
-                            .map(|index_id| (index_id, addition_bytes));
-                    }
-                    ProbeResolution::Failure(error) => return Err(error),
-                };
-
-                Ok((poisoned, addition_bytes))
+    let mut poisoned = Vec::new();
+    loop {
+        let resolution = if let Some(resolution) = ready.pop_front() {
+            Some(resolution)
+        } else if additions_done || probes.len() >= UNIQUENESS_PROBE_CONCURRENCY {
+            probes.next().await.transpose()?.map(ReadyAddition::Probed)
+        } else {
+            tokio::select! {
+                biased;
+                resolution = probes.next(), if !probes.is_empty() => {
+                    resolution.transpose()?.map(ReadyAddition::Probed)
+                },
+                addition = entries.next() => if let Some(addition) = addition {
+                    metrics.additions = metrics.additions.saturating_add(1);
+                    let plan = planner.plan(addition, &mut entry_count);
+                    schedule_probe_plan(
+                        plan,
+                        reader,
+                        &mut probes,
+                        &mut ready,
+                        &mut metrics,
+                        &mut first_probe,
+                    )?;
+                    continue;
+                } else {
+                    additions_done = true;
+                    metrics.addition_derivation = started.elapsed();
+                    continue;
+                }
             }
-        })
-        .buffer_unordered(UNIQUENESS_PROBE_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?
-        .into_iter()
-        .unzip();
+        };
 
-    for bytes in addition_bytes {
-        staged.merge(bytes);
+        let Some(resolution) = resolution else {
+            break;
+        };
+        match resolution {
+            ReadyAddition::Put(key) => {
+                let stage_started = Instant::now();
+                stage_probe_put(db_tx, &mut staged, key, None)?;
+                metrics.staging = metrics.staging.saturating_add(stage_started.elapsed());
+            }
+            ReadyAddition::Probed(CompletedProbe {
+                probe,
+                present,
+                service,
+                completed,
+            }) => {
+                metrics.probe_service = metrics.probe_service.saturating_add(service);
+                last_probe_completion = Some(completed);
+                if present.is_some() {
+                    metrics.probe_hits = metrics.probe_hits.saturating_add(1);
+                } else {
+                    metrics.probe_misses = metrics.probe_misses.saturating_add(1);
+                }
+                if deleted_unique.contains(&probe.key) {
+                    let stage_started = Instant::now();
+                    stage_probe_put(db_tx, &mut staged, probe.key, Some(probe.row_id))?;
+                    metrics.staging = metrics.staging.saturating_add(stage_started.elapsed());
+                } else if let Some(bytes) = present {
+                    match decode_row_id(&bytes) {
+                        Ok(holder) if holder == probe.row_id => {}
+                        Ok(_) => {
+                            if let Some(index_id) = collision(probe.index_id, probe.building)? {
+                                poisoned.push(index_id);
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    let stage_started = Instant::now();
+                    stage_probe_put(db_tx, &mut staged, probe.key, Some(probe.row_id))?;
+                    metrics.staging = metrics.staging.saturating_add(stage_started.elapsed());
+                }
+            }
+            ReadyAddition::Poison(index_id) => poisoned.push(index_id),
+        }
     }
-    let mut poisoned = poisoned.into_iter().flatten().collect::<Vec<_>>();
+
+    if let (Some(first_probe), Some(last_probe_completion)) = (first_probe, last_probe_completion) {
+        metrics.probe_window = last_probe_completion.saturating_duration_since(first_probe);
+    }
     poisoned.sort_unstable();
     poisoned.dedup();
 
@@ -430,6 +502,7 @@ where
         deferred: Vec::new(),
         bytes: staged.0,
         uses_inline_chunk_directory: false,
+        metrics,
     })
 }
 
@@ -824,8 +897,13 @@ mod tests {
                 _ = &mut staging => panic!("staging finished before deletion release"),
                 observed = observed_addition => observed.unwrap(),
             }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             release_deletion.send(()).unwrap();
-            staging.as_mut().await.unwrap();
+            let staged = staging.as_mut().await.unwrap();
+            assert_eq!(staged.metrics.unique_probes, 1);
+            assert_eq!(staged.metrics.probes_completed_during_deletions, 1);
+            assert_eq!(staged.metrics.additions, 1);
+            assert_eq!(staged.metrics.deletions, 1);
         }
 
         assert_eq!(

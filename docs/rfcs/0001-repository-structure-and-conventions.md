@@ -85,11 +85,13 @@ src/
 ├── lib.rs            # crate docs + re-exports only; no logic
 ├── error.rs          # thiserror-based Error enum + crate Result alias
 ├── catalog.rs        # DuckLake domain: snapshots, schemas, tables, data-file metadata
+├── data_file.rs      # Parquet layer: scoped reads of registered data files
 ├── store.rs          # SlateDB layer: key layout, value codec
 └── transaction.rs            # commit protocol: catalog transaction → atomic SlateDB write
 ```
 
-- **Layering:** `catalog` never touches SlateDB directly; `store` knows nothing about DuckLake semantics. The small API between them keeps catalog logic testable against an in-memory store and concentrates key-encoding decisions in one reviewable place.
+- **Layering:** `catalog` never touches SlateDB directly; `store` knows nothing about DuckLake semantics; `data_file` is the only module that reads Parquet, and knows nothing about either. The small API between them keeps catalog logic testable against an in-memory store and concentrates key-encoding decisions in one reviewable place.
+- **Two kinds of read:** `store` reads the catalog's own keyspace out of SlateDB; `data_file` reads the Parquet objects DuckLake registers, fetching only the columns and rows an index entry needs. Keeping them separate is what makes the second one auditable — a bounded projection is a different thing from a scan, and the boundary is where that stays visible.
 - **Module growth:** start as `foo.rs`; split into `foo.rs` + `foo/` submodules when needed (no `mod.rs` files — enforced via clippy `mod_module_files`).
 - **Visibility:** private by default; `pub` only what `lib.rs` deliberately re-exports. `#![warn(missing_docs)]` on the core crate.
 - **Docs teach by example:** the crate root doc is a worked example, not a summary; key public items carry doctests (compiled by CI, so they can't rot); `examples/` holds at least one runnable end-to-end program. This is the single strongest habit of the best crates.

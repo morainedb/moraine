@@ -105,10 +105,6 @@ where
             fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
                 self.0.insert(field.name().to_owned(), value.to_string());
             }
-
-            fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-                self.0.insert(field.name().to_owned(), value.to_string());
-            }
         }
 
         let mut fields = Fields::default();
@@ -144,7 +140,7 @@ impl CapturedCommitEvents {
         matching.into_iter().next().unwrap()
     }
 
-    fn phase_milliseconds(&self, transaction_id: u64, phase: &str) -> f64 {
+    fn phase_milliseconds(&self, transaction_id: u64, phase: &str) -> u64 {
         self.one("staged commit landed", &transaction_id.to_string())
             .get(phase)
             .unwrap_or_else(|| panic!("commit event has no {phase}"))
@@ -215,8 +211,21 @@ async fn staged_commit_diagnostics_join_scan_counts_and_commit_phases() {
         "land_ms",
         "durable_ms",
         "projection_ms",
+        "index_delete_derivation_ms",
+        "index_add_derivation_ms",
+        "index_probe_window_ms",
+        "index_probe_service_ms",
+        "index_stage_ms",
+        "index_encode_ms",
+        "index_parquet_read_ms",
     ] {
-        assert!(commit.contains_key(phase), "missing {phase}: {commit:?}");
+        let value = commit
+            .get(phase)
+            .unwrap_or_else(|| panic!("missing {phase}: {commit:?}"));
+        assert!(
+            value.parse::<u64>().is_ok(),
+            "{phase} is not integer ms: {value}"
+        );
     }
 
     catalog.close().await.unwrap();
@@ -1065,17 +1074,17 @@ async fn indexed_delete_lazily_repairs_legacy_inline_chunk_locators() {
     );
     tx.rollback();
 
-    let first_decodes = crate::catalog::scoped_read::inline_batch_decode_count(FIRST_ROW);
-    let second_decodes = crate::catalog::scoped_read::inline_batch_decode_count(SECOND_ROW);
+    let first_decodes = crate::data_file::inline_batch_decode_count(FIRST_ROW);
+    let second_decodes = crate::data_file::inline_batch_decode_count(SECOND_ROW);
     inline_row_delete(&catalog, 5, FIRST_ROW).await.unwrap();
 
     assert_eq!(
-        crate::catalog::scoped_read::inline_batch_decode_count(FIRST_ROW) - first_decodes,
+        crate::data_file::inline_batch_decode_count(FIRST_ROW) - first_decodes,
         1,
         "the chunk holding the deleted row is decoded"
     );
     assert_eq!(
-        crate::catalog::scoped_read::inline_batch_decode_count(SECOND_ROW) - second_decodes,
+        crate::data_file::inline_batch_decode_count(SECOND_ROW) - second_decodes,
         0,
         "an unrelated legacy chunk is not decoded"
     );
@@ -1179,9 +1188,9 @@ async fn inline_chunks_share_one_schema_and_decode_once_each() {
         datatypes::{DataType, Field, Schema},
     };
 
-    use crate::catalog::{
-        IndexDef, TableId,
-        scoped_read::{inline_batch_decode_count, inline_schema_decode_count},
+    use crate::{
+        catalog::{IndexDef, TableId},
+        data_file::{inline_batch_decode_count, inline_schema_decode_count},
     };
 
     const ROW_ID_START: u64 = 9_000_000_004;
@@ -1545,13 +1554,13 @@ impl ObjectStore for InFlightStore {
 
 const CONTROLLED_READ_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
-fn assert_index_phase_covers_read_waves(milliseconds: f64, waves: usize) {
-    let waves = u32::try_from(waves).unwrap();
-    let minimum = CONTROLLED_READ_DELAY.as_secs_f64() * 1_000.0 * f64::from(waves);
+fn assert_index_phase_covers_read_waves(milliseconds: u64, waves: usize) {
+    let waves = u64::try_from(waves).unwrap();
+    let minimum = u64::try_from(CONTROLLED_READ_DELAY.as_millis()).unwrap() * waves;
     assert!(
         milliseconds >= minimum,
-        "index maintenance took {milliseconds:.3} ms, below {waves} controlled read waves \
-         ({minimum:.3} ms)"
+        "index maintenance took {milliseconds} ms, below {waves} controlled read waves \
+         ({minimum} ms)"
     );
 }
 
@@ -1834,7 +1843,7 @@ async fn append_only_index_maintenance_is_two_range_read_waves() {
     assert_eq!(store.reads(), 2, "footer and projected columns are read");
     assert_index_phase_covers_read_waves(milliseconds, 2);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
-    eprintln!("append-only: reads=2 index_maintenance_ms={milliseconds:.3}");
+    eprintln!("append-only: reads=2 index_maintenance_ms={milliseconds}");
     catalog.close().await.unwrap();
 }
 
@@ -1874,7 +1883,7 @@ async fn delete_only_index_maintenance_is_five_range_read_waves() {
     );
     assert_index_phase_covers_read_waves(milliseconds, 5);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 2);
-    eprintln!("delete-only: reads=5 index_maintenance_ms={milliseconds:.3}");
+    eprintln!("delete-only: reads=5 index_maintenance_ms={milliseconds}");
     catalog.close().await.unwrap();
 }
 
@@ -1935,7 +1944,7 @@ async fn replace_index_maintenance_overlaps_adds_and_removals() {
     );
     assert_index_phase_covers_read_waves(milliseconds, 5);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
-    eprintln!("replace: reads=7 index_maintenance_ms={milliseconds:.3}");
+    eprintln!("replace: reads=7 index_maintenance_ms={milliseconds}");
     catalog.close().await.unwrap();
 }
 
@@ -1981,7 +1990,7 @@ async fn compaction_only_index_maintenance_reads_no_data() {
 
     assert_eq!(store.reads(), 0, "compaction never reads the merged file");
     assert_eq!(index_entry_keys(&catalog, false, index_id).await, before);
-    eprintln!("compaction-only: reads=0 index_maintenance_ms={milliseconds:.3}");
+    eprintln!("compaction-only: reads=0 index_maintenance_ms={milliseconds}");
     catalog.close().await.unwrap();
 }
 

@@ -239,11 +239,13 @@
 #![forbid(unsafe_code)]
 
 mod catalog;
+mod data_file;
 mod error;
 mod fault;
 #[doc(hidden)]
 pub mod ffi_support;
 mod store;
+mod telemetry;
 mod transaction;
 
 pub use catalog::{

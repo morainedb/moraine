@@ -36,8 +36,8 @@ use crate::{
         CatalogSnapshot, ColumnInfo, IndexInfo, SnapshotId, TableId,
         inline::{InlineScanKind, materialize_inline_rows},
         projection::ProjectionCache,
-        scoped_read,
     },
+    data_file,
     error::{Error, Result},
     store::{
         StagedBytes,
@@ -49,8 +49,8 @@ use crate::{
     transaction::{
         commit,
         index_maintenance::{
-            StagedEntries, StagedIndexEntry, apply_deferred_maintenance, apply_poison,
-            stage_index_entry_stream,
+            IndexMaintenanceMetrics, StagedEntries, StagedIndexEntry, apply_deferred_maintenance,
+            apply_poison, stage_index_entry_stream,
         },
     },
 };
@@ -71,6 +71,8 @@ use decode::Cursor;
 use index_upkeep::stage_index_maintenance;
 use inline::translate_inline;
 
+use crate::telemetry::milliseconds;
+
 fn next_diagnostic_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -84,10 +86,7 @@ struct CommitPhases {
     translate: Duration,
     stage: Duration,
     land: Duration,
-}
-
-fn milliseconds(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1_000.0
+    index_metrics: IndexMaintenanceMetrics,
 }
 
 fn mints_snapshot(operations: &[RowOperation]) -> bool {
@@ -1041,7 +1040,9 @@ impl StagedTransaction {
             deferred,
             bytes: entry_bytes,
             uses_inline_chunk_directory: repaired_inline_chunk_directory,
+            metrics: index_metrics,
         } = entries;
+        phases.index_metrics = index_metrics;
         uses_inline_chunk_directory |= repaired_inline_chunk_directory;
 
         let phase_started = Instant::now();
@@ -1189,12 +1190,35 @@ fn staged_landed(
         head_view_ms = milliseconds(phases.head_view),
         inline_ms = milliseconds(phases.inline),
         index_maintenance_ms = milliseconds(phases.index_maintenance),
+        index_delete_derivation_ms = milliseconds(phases.index_metrics.deletion_derivation),
+        index_add_derivation_ms = milliseconds(phases.index_metrics.addition_derivation),
+        index_probe_window_ms = milliseconds(phases.index_metrics.probe_window),
+        index_probe_service_ms = milliseconds(phases.index_metrics.probe_service),
+        index_stage_ms = milliseconds(phases.index_metrics.staging),
+        index_encode_ms = milliseconds(phases.index_metrics.scoped_read.encode_duration),
+        index_parquet_read_ms = milliseconds(phases.index_metrics.scoped_read.range_duration),
+        index_additions = phases.index_metrics.additions,
+        index_deletions = phases.index_metrics.deletions,
+        index_unique_probes = phases.index_metrics.unique_probes,
+        index_probe_hits = phases.index_metrics.probe_hits,
+        index_probe_misses = phases.index_metrics.probe_misses,
+        index_probe_peak_in_flight = phases.index_metrics.probe_peak_in_flight,
+        index_probes_completed_during_deletions =
+            phases.index_metrics.probes_completed_during_deletions,
+        index_metadata_hits = phases.index_metrics.scoped_read.metadata_hits,
+        index_metadata_misses = phases.index_metrics.scoped_read.metadata_misses,
+        index_range_fetches = phases.index_metrics.scoped_read.range_fetches,
+        index_ranges = phases.index_metrics.scoped_read.ranges,
+        index_range_bytes = phases.index_metrics.scoped_read.range_bytes,
+        index_files = phases.index_metrics.scoped_read.parquet_files,
+        index_inline_chunks = phases.index_metrics.scoped_read.inline_chunks,
+        index_arrow_batches = phases.index_metrics.scoped_read.arrow_batches,
         translate_ms = milliseconds(phases.translate),
         stage_ms = milliseconds(phases.stage),
         land_ms = milliseconds(phases.land),
         durable_ms = milliseconds(commit_timings.durable),
         projection_ms = milliseconds(commit_timings.projection),
-        elapsed_ms = started.elapsed().as_millis(),
+        elapsed_ms = milliseconds(started.elapsed()),
         "staged commit landed"
     );
 }
