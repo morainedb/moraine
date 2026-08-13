@@ -1029,16 +1029,19 @@ async fn inline_row_delete_removes_its_unique_index_entry() {
 /// Later deletes can then resolve their owning chunk directly.
 #[tokio::test]
 async fn indexed_delete_lazily_repairs_legacy_inline_chunk_locators() {
+    const FIRST_ROW: u64 = 9_100_000_000;
+    const SECOND_ROW: u64 = FIRST_ROW + 1;
+
     let (catalog, _) = catalog_with_indexed_inline_table(true).await;
 
-    inline_insert(&catalog, 3, 0, &[7], true).await;
-    inline_insert(&catalog, 4, 1, &[8], false).await;
+    inline_insert(&catalog, 3, FIRST_ROW, &[7], true).await;
+    inline_insert(&catalog, 4, SECOND_ROW, &[8], false).await;
 
     let tx = catalog.begin_write_tx().await.unwrap();
     tx.delete(
         Key::Inline(InlineKey::ChunkRange {
             table_id: 1,
-            row_id_end: 0,
+            row_id_end: FIRST_ROW,
         })
         .encode(),
     )
@@ -1046,7 +1049,7 @@ async fn indexed_delete_lazily_repairs_legacy_inline_chunk_locators() {
     tx.delete(
         Key::Inline(InlineKey::ChunkRange {
             table_id: 1,
-            row_id_end: 1,
+            row_id_end: SECOND_ROW,
         })
         .encode(),
     )
@@ -1062,14 +1065,27 @@ async fn indexed_delete_lazily_repairs_legacy_inline_chunk_locators() {
     );
     tx.rollback();
 
-    inline_row_delete(&catalog, 5, 0).await.unwrap();
+    let first_decodes = crate::catalog::scoped_read::inline_batch_decode_count(FIRST_ROW);
+    let second_decodes = crate::catalog::scoped_read::inline_batch_decode_count(SECOND_ROW);
+    inline_row_delete(&catalog, 5, FIRST_ROW).await.unwrap();
+
+    assert_eq!(
+        crate::catalog::scoped_read::inline_batch_decode_count(FIRST_ROW) - first_decodes,
+        1,
+        "the chunk holding the deleted row is decoded"
+    );
+    assert_eq!(
+        crate::catalog::scoped_read::inline_batch_decode_count(SECOND_ROW) - second_decodes,
+        0,
+        "an unrelated legacy chunk is not decoded"
+    );
 
     let tx = catalog.begin_write_tx().await.unwrap();
     assert_eq!(
         store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap(),
-        vec![0, 1]
+        vec![FIRST_ROW, SECOND_ROW]
     );
     tx.rollback();
 }
@@ -1256,11 +1272,24 @@ async fn inline_chunks_share_one_schema_and_decode_once_each() {
     );
 }
 
-/// Writes `batch` to `path` on `store` as Parquet, returning the
-/// written object's size — the maintenance read locates the footer by
-/// the recorded `file_size_bytes`, so fixtures must record the truth,
-/// exactly as DuckLake records the real written size.
-async fn write_parquet(store: &InMemory, path: &str, batch: &arrow::array::RecordBatch) -> u64 {
+#[derive(Clone, Copy)]
+struct ParquetSize {
+    file: u64,
+    footer: u64,
+}
+
+impl ParquetSize {
+    const fn recorded(file: u64, footer: u64) -> Self {
+        Self { file, footer }
+    }
+}
+
+/// Writes `batch` to `path` and returns the two sizes DuckLake records.
+async fn write_parquet(
+    store: &InMemory,
+    path: &str,
+    batch: &arrow::array::RecordBatch,
+) -> ParquetSize {
     use object_store::ObjectStoreExt;
 
     let mut buffer = Vec::new();
@@ -1270,18 +1299,22 @@ async fn write_parquet(store: &InMemory, path: &str, batch: &arrow::array::Recor
         writer.write(batch).unwrap();
         writer.close().unwrap();
     }
-    let object_len = u64::try_from(buffer.len()).unwrap();
+    let footer_offset = buffer.len() - 8;
+    let footer = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
+    let file = u64::try_from(buffer.len()).unwrap();
     store
         .put(&object_store::path::Path::from(path), buffer.into())
         .await
         .unwrap();
-    object_len
+    ParquetSize { file, footer }
 }
 
 /// A `ducklake_data_file` row for a file of `record_count` rows and
 /// `file_size_bytes` bytes on the store.
-fn indexed_data_file_row(record_count: u64, file_size_bytes: u64) -> Vec<Cell> {
-    indexed_data_file_row_at(1, "data.parquet", record_count, file_size_bytes, 0)
+fn indexed_data_file_row(record_count: u64, size: ParquetSize) -> Vec<Cell> {
+    indexed_data_file_row_at(1, "data.parquet", record_count, size, 0)
 }
 
 /// As [`indexed_data_file_row`], for one of several files a commit
@@ -1290,7 +1323,7 @@ fn indexed_data_file_row_at(
     data_file_id: u64,
     path: &str,
     record_count: u64,
-    file_size_bytes: u64,
+    size: ParquetSize,
     row_id_start: u64,
 ) -> Vec<Cell> {
     vec![
@@ -1303,8 +1336,8 @@ fn indexed_data_file_row_at(
         Cell::Bool(true),
         Cell::Str("parquet".into()),
         Cell::U64(record_count),
-        Cell::U64(file_size_bytes),
-        Cell::U64(64),
+        Cell::U64(size.file),
+        Cell::U64(size.footer),
         Cell::U64(row_id_start),
         Cell::Null,
         Cell::Null,
@@ -1319,13 +1352,13 @@ async fn register_indexed_data_file(catalog: &Catalog, values: &[i64]) -> Arc<In
     let store = Arc::new(InMemory::new());
     let (_, batch) = bigint_batch(values);
     // `s/` and `t/` are the bootstrap schema and table path prefixes.
-    let file_size = write_parquet(&store, "main/t/data.parquet", &batch).await;
+    let size = write_parquet(&store, "main/t/data.parquet", &batch).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
-        cells: indexed_data_file_row(u64::try_from(values.len()).unwrap(), file_size),
+        cells: indexed_data_file_row(u64::try_from(values.len()).unwrap(), size),
     });
     tx.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -1569,7 +1602,12 @@ async fn register_indexed_data_files(
 }
 
 /// A DuckLake delete file naming `positions` in `target`.
-async fn write_delete_file(store: &InMemory, name: &str, target: &str, positions: &[usize]) -> u64 {
+async fn write_delete_file(
+    store: &InMemory,
+    name: &str,
+    target: &str,
+    positions: &[usize],
+) -> ParquetSize {
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema},
@@ -1601,7 +1639,7 @@ fn delete_file_row_at(
     path: &str,
     data_file_id: u64,
     delete_count: u64,
-    file_size_bytes: u64,
+    size: ParquetSize,
 ) -> Vec<Cell> {
     vec![
         Cell::U64(delete_file_id),
@@ -1613,8 +1651,8 @@ fn delete_file_row_at(
         Cell::Bool(true),
         Cell::Str("parquet".into()),
         Cell::U64(delete_count),
-        Cell::U64(file_size_bytes),
-        Cell::U64(64),
+        Cell::U64(size.file),
+        Cell::U64(size.footer),
         Cell::Null,
         Cell::Null,
     ]
@@ -1782,11 +1820,10 @@ async fn target_removal_does_not_wait_for_unrelated_delete_discovery() {
     assert_eq!(index_entry_count(&catalog, true, index_id).await, 0);
 }
 
-/// An append to an indexed table reads the newly registered data file once
-/// to derive its entries. The fixed-latency store makes that one read wave
-/// visible in the phase diagnostic.
+/// An append reads the registered file's footer and projected columns. The
+/// fixed-latency store makes those two serial range-read waves visible.
 #[tokio::test]
-async fn append_only_index_maintenance_is_one_data_read_wave() {
+async fn append_only_index_maintenance_is_two_range_read_waves() {
     let events = captured_commit_events();
     let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
     let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
@@ -1794,18 +1831,17 @@ async fn append_only_index_maintenance_is_one_data_read_wave() {
     let transaction_id = register_indexed_data_files(&catalog, &store, 1, 3).await;
     let milliseconds = events.phase_milliseconds(transaction_id, "index_maintenance_ms");
 
-    assert_eq!(store.reads(), 1, "the registered file is read once");
-    assert_index_phase_covers_read_waves(milliseconds, 1);
+    assert_eq!(store.reads(), 2, "footer and projected columns are read");
+    assert_index_phase_covers_read_waves(milliseconds, 2);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
-    eprintln!("append-only: reads=1 index_maintenance_ms={milliseconds:.3}");
+    eprintln!("append-only: reads=2 index_maintenance_ms={milliseconds:.3}");
     catalog.close().await.unwrap();
 }
 
-/// A delete file on an indexed table costs two serial data-store waves: one
-/// to obtain the killed positions and one to recover their old index values
-/// from the committed target file.
+/// A delete file costs two metadata/column reads for its positions, followed
+/// by metadata, page-index, and projected-column reads from its target.
 #[tokio::test]
-async fn delete_only_index_maintenance_is_two_data_read_waves() {
+async fn delete_only_index_maintenance_is_five_range_read_waves() {
     let events = captured_commit_events();
     let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
     let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
@@ -1833,12 +1869,12 @@ async fn delete_only_index_maintenance_is_two_data_read_waves() {
 
     assert_eq!(
         store.reads(),
-        2,
-        "the delete file and its committed target are each read once"
+        5,
+        "the delete file uses two ranges and its selected target uses three"
     );
-    assert_index_phase_covers_read_waves(milliseconds, 2);
+    assert_index_phase_covers_read_waves(milliseconds, 5);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 2);
-    eprintln!("delete-only: reads=2 index_maintenance_ms={milliseconds:.3}");
+    eprintln!("delete-only: reads=5 index_maintenance_ms={milliseconds:.3}");
     catalog.close().await.unwrap();
 }
 
@@ -1885,8 +1921,8 @@ async fn replace_index_maintenance_overlaps_adds_and_removals() {
 
     assert_eq!(
         store.reads(),
-        3,
-        "the delete file, replacement file, and old target are each read once"
+        7,
+        "the two full reads use two ranges each and the selected target uses three"
     );
     assert_eq!(
         store.peak_in_flight(),
@@ -1897,9 +1933,9 @@ async fn replace_index_maintenance_overlaps_adds_and_removals() {
         store.paths_overlapped("main/t/delete.parquet", "main/t/replacement.parquet"),
         "the replacement read starts without waiting for delete discovery"
     );
-    assert_index_phase_covers_read_waves(milliseconds, 2);
+    assert_index_phase_covers_read_waves(milliseconds, 5);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
-    eprintln!("replace: reads=3 index_maintenance_ms={milliseconds:.3}");
+    eprintln!("replace: reads=7 index_maintenance_ms={milliseconds:.3}");
     catalog.close().await.unwrap();
 }
 
@@ -1914,7 +1950,8 @@ async fn compaction_only_index_maintenance_reads_no_data() {
     let before = index_entry_keys(&catalog, false, index_id).await;
     store.reset();
 
-    let mut merged = rewrite_data_file_row(12, 4, "merged.parquet", 3, 1024);
+    let mut merged =
+        rewrite_data_file_row(12, 4, "merged.parquet", 3, ParquetSize::recorded(1024, 64));
     merged[11] = Cell::U64(0);
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
@@ -2033,7 +2070,7 @@ async fn write_parquet_with_row_ids(
     path: &str,
     values: &[i64],
     row_ids: &[i64],
-) -> u64 {
+) -> ParquetSize {
     use arrow::{
         array::{Int64Array, RecordBatch},
         datatypes::{DataType, Field, Schema},
@@ -2063,7 +2100,7 @@ fn rewrite_data_file_row(
     begin: u64,
     path: &str,
     record_count: u64,
-    file_size_bytes: u64,
+    size: ParquetSize,
 ) -> Vec<Cell> {
     vec![
         Cell::U64(data_file_id),
@@ -2075,8 +2112,8 @@ fn rewrite_data_file_row(
         Cell::Bool(true),
         Cell::Str("parquet".into()),
         Cell::U64(record_count),
-        Cell::U64(file_size_bytes),
-        Cell::U64(64),
+        Cell::U64(size.file),
+        Cell::U64(size.footer),
         Cell::Null, // row_id_start: this file carries per-row ids
         Cell::Null,
         Cell::Null,
@@ -2142,7 +2179,8 @@ async fn commit_compaction(
     changes: &str,
     row_id_start: Option<u64>,
 ) -> Result<SnapshotId> {
-    let mut cells = rewrite_data_file_row(12, 4, "merged.parquet", 3, 1024);
+    let mut cells =
+        rewrite_data_file_row(12, 4, "merged.parquet", 3, ParquetSize::recorded(1024, 64));
     if let Some(start) = row_id_start {
         cells[11] = Cell::U64(start);
     }
@@ -2359,7 +2397,7 @@ async fn delete_file_against_per_row_id_target_removes_named_positions() {
         ],
     )
     .unwrap();
-    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+    let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
@@ -2375,8 +2413,8 @@ async fn delete_file_against_per_row_id_target_removes_named_positions() {
             Cell::Bool(true),
             Cell::Str("parquet".into()),
             Cell::U64(1), // delete_count
-            Cell::U64(512),
-            Cell::U64(64),
+            Cell::U64(delete_size.file),
+            Cell::U64(delete_size.footer),
             Cell::Null,
             Cell::Null,
         ],
@@ -2649,7 +2687,7 @@ async fn ending_a_data_file_keeps_the_inlined_deletions_against_it() {
     });
     setup.stage(RowOperation::Insert {
         table: TableKind::DataFile,
-        cells: indexed_data_file_row(3, 512),
+        cells: indexed_data_file_row(3, ParquetSize::recorded(512, 64)),
     });
     setup.stage(RowOperation::InlineFileDelete {
         table_id: 1,
@@ -2801,6 +2839,34 @@ async fn backfill_derives_per_row_id_file_entries_under_embedded_ids() {
     assert_eq!(row_ids, vec![5, 9, 12], "ids come from the embedded column");
 }
 
+/// An immediate backfill overlaps immutable file reads without opening the
+/// whole table at once. The returned entry vector is the atomic commit's
+/// unavoidable payload; decoded batches behind it stay within the read cap.
+#[tokio::test]
+async fn immediate_backfill_overlaps_a_bounded_number_of_files() {
+    use crate::catalog::{ColumnId, TableId};
+
+    let (catalog, _) = catalog_with_indexed_inline_table(true).await;
+    let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
+    register_indexed_data_files(&catalog, &store, 12, 1).await;
+    store.reset();
+
+    let entries = catalog
+        .scoped_backfill_entries(store.clone(), "", TableId::new(1), &[ColumnId::new(1)])
+        .await
+        .unwrap();
+
+    assert_eq!(entries.len(), 12);
+    assert!(
+        store.peak_in_flight() > 1,
+        "independent files should overlap"
+    );
+    assert!(
+        store.peak_in_flight() <= crate::catalog::BACKFILL_FILE_READ_CONCURRENCY,
+        "the immediate builder must retain a bounded file window"
+    );
+}
+
 /// Creating an index over a table with pre-existing **inline** rows backfills
 /// them — including NULL rows, which become collision-exempt entries `IS NULL`
 /// can find. Regression: inline chunks were previously skipped at create.
@@ -2931,7 +2997,7 @@ async fn scoped_backfill_excludes_delete_file_rows() {
         ],
     )
     .unwrap();
-    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+    let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
@@ -2947,8 +3013,8 @@ async fn scoped_backfill_excludes_delete_file_rows() {
             Cell::Bool(true),
             Cell::Str("parquet".into()),
             Cell::U64(1),
-            Cell::U64(512),
-            Cell::U64(64),
+            Cell::U64(delete_size.file),
+            Cell::U64(delete_size.footer),
             Cell::Null,
             Cell::Null,
         ],
@@ -3038,7 +3104,7 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
         ],
     )
     .unwrap();
-    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+    let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
@@ -3054,8 +3120,8 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
             Cell::Bool(true),
             Cell::Str("parquet".into()),
             Cell::U64(2), // delete_count
-            Cell::U64(512),
-            Cell::U64(64),
+            Cell::U64(delete_size.file),
+            Cell::U64(delete_size.footer),
             Cell::Null,
             Cell::Null,
         ],
@@ -3108,7 +3174,7 @@ async fn delete_file_may_target_a_data_file_its_own_commit_registers() {
         ],
     )
     .unwrap();
-    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+    let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
@@ -3126,8 +3192,8 @@ async fn delete_file_may_target_a_data_file_its_own_commit_registers() {
             Cell::Bool(true),
             Cell::Str("parquet".into()),
             Cell::U64(2), // delete_count
-            Cell::U64(512),
-            Cell::U64(64),
+            Cell::U64(delete_size.file),
+            Cell::U64(delete_size.footer),
             Cell::Null,
             Cell::Null,
         ],
@@ -3189,7 +3255,7 @@ async fn a_row_deleted_out_of_the_file_its_own_commit_registers_is_never_indexed
         ],
     )
     .unwrap();
-    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+    let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
@@ -3209,8 +3275,8 @@ async fn a_row_deleted_out_of_the_file_its_own_commit_registers_is_never_indexed
             Cell::Bool(true),
             Cell::Str("parquet".into()),
             Cell::U64(1),
-            Cell::U64(512),
-            Cell::U64(64),
+            Cell::U64(delete_size.file),
+            Cell::U64(delete_size.footer),
             Cell::Null,
             Cell::Null,
         ],
@@ -3257,7 +3323,7 @@ async fn registered_delete_file_naming_an_out_of_range_position_is_refused() {
         ],
     )
     .unwrap();
-    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+    let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
@@ -3273,8 +3339,8 @@ async fn registered_delete_file_naming_an_out_of_range_position_is_refused() {
             Cell::Bool(true),
             Cell::Str("parquet".into()),
             Cell::U64(1), // delete_count
-            Cell::U64(512),
-            Cell::U64(64),
+            Cell::U64(delete_size.file),
+            Cell::U64(delete_size.footer),
             Cell::Null,
             Cell::Null,
         ],

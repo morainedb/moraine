@@ -2,11 +2,14 @@
 //! removals from registered files and inline chunks by scoped-reading
 //! them.
 
-use std::{collections::BTreeSet, future::Future, sync::LazyLock};
+use std::{collections::BTreeSet, sync::LazyLock};
 
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt, TryStreamExt, channel::mpsc, stream};
+use futures::{
+    StreamExt, TryStreamExt,
+    stream::{self, BoxStream},
+};
 
 use super::{
     Arc, CatalogSnapshot, Cell, ColumnInfo, DbTransaction, Error, HashMap, HashSet, IndexInfo,
@@ -25,15 +28,6 @@ use crate::transaction::operations::ChangeSet;
 /// instead keeps a single commit from monopolizing the store's request
 /// budget.
 const FILE_READ_CONCURRENCY: usize = 64;
-
-/// How many derived additions may wait behind uniqueness probes. This keeps
-/// file reads and Arrow decoding moving without retaining an unbounded
-/// commit's entries in memory.
-const DERIVED_ENTRY_BUFFER: usize = 512;
-
-/// Entries each concurrently read source may hold while an earlier source
-/// drains. Across the read window this equals [`DERIVED_ENTRY_BUFFER`].
-const ENTRY_SOURCE_BUFFER: usize = DERIVED_ENTRY_BUFFER / FILE_READ_CONCURRENCY;
 
 /// Process-wide limit for Arrow decoding performed on blocking workers.
 /// Commits share it so concurrent writers cannot multiply CPU pressure.
@@ -89,39 +83,6 @@ impl<'a> InlineSchemaCache<'a> {
     }
 }
 
-/// Resolves independent reads concurrently and returns their results in
-/// target order. Keeping the order stable makes staging and error selection
-/// independent of remote completion timing.
-#[cfg(test)]
-async fn resolve_in_order<T, I, F>(futures: I, concurrency: usize) -> Result<Vec<T>>
-where
-    I: IntoIterator<Item = F>,
-    F: Future<Output = Result<T>>,
-{
-    stream::iter(futures)
-        .buffered(concurrency)
-        .try_collect()
-        .await
-}
-
-/// Resolves independent entry groups in target order while moving each
-/// completed group directly into the final allocation.
-async fn resolve_entries_in_order<I, F>(
-    futures: I,
-    concurrency: usize,
-) -> Result<Vec<StagedIndexEntry>>
-where
-    I: IntoIterator<Item = F>,
-    F: Future<Output = Result<Vec<StagedIndexEntry>>>,
-{
-    let mut pending = std::pin::pin!(stream::iter(futures).buffered(concurrency));
-    let mut entries = Vec::new();
-    while let Some(group) = pending.try_next().await? {
-        entries.extend(group);
-    }
-    Ok(entries)
-}
-
 /// Runs synchronous decode work off the async executor under a shared bound.
 async fn run_bounded_blocking<T, F>(permits: Arc<tokio::sync::Semaphore>, work: F) -> Result<T>
 where
@@ -154,17 +115,21 @@ pub(super) struct FileContext<'a> {
     delete_file_permits: Arc<tokio::sync::Semaphore>,
 }
 
+type IndexEntryStream<'a> = BoxStream<'a, Result<StagedIndexEntry>>;
+
+fn staged_entry_stream(entries: Vec<StagedIndexEntry>) -> IndexEntryStream<'static> {
+    stream::iter(entries.into_iter().map(Ok)).boxed()
+}
+
 /// Streams equality-index entries for one registered data file. Fused Arrow
-/// encoding sends each bounded read batch before the reader advances, while
-/// the caller overlaps independent files and drains their channels in stage
-/// order.
+/// encoding yields each bounded read batch before the reader advances, while
+/// the caller overlaps independent file streams in completion order.
 async fn stream_data_file_index_entries(
     base: &CatalogSnapshot,
     cells: &[Cell],
     killed: Option<&TargetDeletes>,
     context: &FileContext<'_>,
-    sender: &mut mpsc::Sender<Result<StagedIndexEntry>>,
-) -> Result<()> {
+) -> Result<IndexEntryStream<'static>> {
     let file = decode_data_file(cells)?;
     let table = TableId::new(file.table_id);
     let indexes: Vec<_> = base
@@ -173,7 +138,7 @@ async fn stream_data_file_index_entries(
         .filter(|index| index.maintenance != crate::catalog::IndexMaintenance::Deferred)
         .collect();
     if indexes.is_empty() {
-        return Ok(());
+        return Ok(stream::empty().boxed());
     }
 
     // The file must be read to maintain the index; no store to read it means
@@ -202,45 +167,26 @@ async fn stream_data_file_index_entries(
     // a row into a new file under its preserved id and must keep its entry.
     let live_columns = base.columns_of(table);
     let projections = index_projections(&live_columns, &indexes, table)?;
-    let mut consumer = IndexEntryConsumer {
-        indexes: &indexes,
-        sender,
-        delete: false,
-    };
-    scoped_read::scoped_read_index_entry_batches(
+    let entries = scoped_read::scoped_read_index_entry_batches(
         scoped_read::ParquetFile::new(
             Arc::clone(data_store),
             path,
             file.file_size_bytes,
             file.footer_size,
         ),
-        &projections,
+        projections,
         scoped_read::ScopedRows::All,
         scoped_read::RowIdSource::Resolve {
             row_id_start: file.row_id_start,
         },
         killed.as_ref().map(|killed| &killed.positions),
-        &mut consumer,
     )
-    .await
-}
-
-struct IndexEntryConsumer<'a, 'b> {
-    indexes: &'a [IndexInfo],
-    sender: &'b mut mpsc::Sender<Result<StagedIndexEntry>>,
-    delete: bool,
-}
-
-impl scoped_read::ScopedIndexEntryBatchConsumer for IndexEntryConsumer<'_, '_> {
-    async fn consume(&mut self, entries: Vec<scoped_read::ScopedIndexEntry>) -> Result<()> {
-        for entry in entries {
-            let entry = staged_scoped_entry(self.indexes, entry, self.delete)?;
-            if self.sender.send(Ok(entry)).await.is_err() {
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
+    .await?;
+    Ok(entries
+        .map(move |batch| batch.and_then(|batch| staged_scoped_entries(&indexes, batch, false)))
+        .map_ok(|batch| stream::iter(batch.into_iter().map(Ok)))
+        .try_flatten()
+        .boxed())
 }
 
 /// Compiles one Arrow projection per index. Shared source positions are
@@ -328,76 +274,53 @@ pub(super) async fn stage_index_maintenance(
         adds,
     } = plan_adds(base, ops, &file_deletes, &context)?;
 
-    let mut inline_targets: Vec<_> = inline_deletes.iter().collect();
-    inline_targets.sort_by_key(|(table_id, _)| *table_id);
-    let mut targets: Vec<(&(u64, u64), &TargetDeletes)> = file_deletes
-        .iter()
-        .filter(|((table_id, data_file_id), _)| !registered.contains(&(*table_id, *data_file_id)))
-        .collect();
-    targets.sort_by_key(|(target, _)| *target);
-
-    let mut deletion_receivers = Vec::with_capacity(inline_targets.len() + targets.len());
-    let mut inline_removal_futures = Vec::with_capacity(inline_targets.len());
-    for (table_id, row_ids) in inline_targets {
-        let (sender, receiver) = mpsc::channel(ENTRY_SOURCE_BUFFER);
-        deletion_receivers.push(receiver);
-        inline_removal_futures.push(produce_inline_removal(
-            db_tx,
-            base,
-            ops,
-            &inline_schemas,
-            *table_id,
-            row_ids,
-            sender,
-        ));
-    }
-    let mut file_removal_futures = Vec::with_capacity(targets.len());
-    for ((table_id, data_file_id), deletes) in targets {
-        let (sender, receiver) = mpsc::channel(ENTRY_SOURCE_BUFFER);
-        deletion_receivers.push(receiver);
-        file_removal_futures.push(produce_file_removal(
-            base,
-            &context,
-            *table_id,
-            *data_file_id,
-            deletes,
-            sender,
-        ));
-    }
-    let deletions = stream::iter(deletion_receivers).flatten();
-
-    let mut addition_receivers = Vec::with_capacity(adds.len());
-    let mut addition_futures = Vec::with_capacity(adds.len());
-    for add in adds {
-        let (sender, receiver) = mpsc::channel(ENTRY_SOURCE_BUFFER);
-        addition_receivers.push(receiver);
-        addition_futures.push(produce_addition(
-            db_tx,
-            base,
-            &inline_schemas,
-            &context,
-            add,
-            sender,
-        ));
-    }
-    let produce_additions = stream::iter(addition_futures)
+    let locator_writes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let locator_writes_for_removals = Arc::clone(&locator_writes);
+    let inline_schemas_ref = &inline_schemas;
+    let inline_deletions = stream::iter(inline_deletes)
+        .map(move |(table_id, row_ids)| {
+            let locator_writes = Arc::clone(&locator_writes_for_removals);
+            async move {
+                let (entries, writes) = stage_inline_delete_entries(
+                    db_tx,
+                    base,
+                    ops,
+                    inline_schemas_ref,
+                    table_id,
+                    &row_ids,
+                )
+                .await?;
+                locator_writes.lock().await.extend(writes);
+                Result::Ok(staged_entry_stream(entries))
+            }
+        })
         .buffer_unordered(FILE_READ_CONCURRENCY)
-        .collect::<Vec<_>>();
-    let additions = stream::iter(addition_receivers).flatten();
+        .try_flatten_unordered(None);
 
-    let produce = async {
-        let inline_removals = stream::iter(inline_removal_futures)
-            .buffered(FILE_READ_CONCURRENCY)
-            .collect::<Vec<_>>();
-        let file_removals = stream::iter(file_removal_futures)
-            .buffer_unordered(FILE_READ_CONCURRENCY)
-            .collect::<Vec<_>>();
-        let (locator_groups, _, _) =
-            futures::join!(inline_removals, file_removals, produce_additions);
-        Ok::<_, Error>(locator_groups.into_iter().flatten().collect::<Vec<_>>())
-    };
-    let stage = stage_index_entry_stream(db_tx, deletions, additions, 0);
-    let (locator_writes, mut staged) = futures::try_join!(produce, stage)?;
+    let context_ref = &context;
+    let file_deletions =
+        stream::iter(file_deletes.iter().filter(|((table_id, data_file_id), _)| {
+            !registered.contains(&(*table_id, *data_file_id))
+        }))
+        .map(|((table_id, data_file_id), deletes)| async move {
+            let killed = resolve_target_deletes(base, context_ref, deletes).await?;
+            stream_file_delete_index_entries(base, *table_id, *data_file_id, &killed, context_ref)
+                .await
+        })
+        .buffer_unordered(FILE_READ_CONCURRENCY)
+        .try_flatten_unordered(None);
+
+    let deletions = stream::select(inline_deletions, file_deletions);
+
+    let inline_schemas_ref = &inline_schemas;
+    let context_ref = &context;
+    let additions = stream::iter(adds)
+        .map(move |add| produce_addition(db_tx, base, inline_schemas_ref, context_ref, add))
+        .buffer_unordered(FILE_READ_CONCURRENCY)
+        .try_flatten_unordered(None);
+
+    let mut staged = stage_index_entry_stream(db_tx, deletions, additions, 0).await?;
+    let locator_writes = locator_writes.lock().await;
     {
         let locator_bytes = commit::stage_writes(db_tx, &locator_writes)?;
         staged.bytes = staged.bytes.saturating_add(locator_bytes.0);
@@ -410,46 +333,23 @@ pub(super) async fn stage_index_maintenance(
     Ok(staged)
 }
 
-async fn send_entries(
-    sender: &mut mpsc::Sender<Result<StagedIndexEntry>>,
-    entries: Vec<StagedIndexEntry>,
-) -> bool {
-    for entry in entries {
-        if sender.send(Ok(entry)).await.is_err() {
-            return false;
-        }
-    }
-    true
-}
-
 async fn produce_addition(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
     inline_schemas: &InlineSchemaCache<'_>,
     context: &FileContext<'_>,
     add: Add<'_>,
-    mut sender: mpsc::Sender<Result<StagedIndexEntry>>,
-) {
-    let result = match add {
+) -> Result<IndexEntryStream<'static>> {
+    match add {
         Add::File { cells, killed } => {
-            stream_data_file_index_entries(base, cells, killed, context, &mut sender).await
+            stream_data_file_index_entries(base, cells, killed, context).await
         }
         Add::Inline { table_id, chunk } => {
-            match inline_chunk_index_entries(db_tx, base, inline_schemas, table_id, chunk, None)
-                .await
-            {
-                Ok(entries) => {
-                    if !send_entries(&mut sender, entries).await {
-                        return;
-                    }
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            }
+            let entries =
+                inline_chunk_index_entries(db_tx, base, inline_schemas, table_id, chunk, None)
+                    .await?;
+            Ok(staged_entry_stream(entries))
         }
-    };
-    if let Err(error) = result {
-        let _ = sender.send(Err(error)).await;
     }
 }
 
@@ -592,58 +492,6 @@ fn plan_adds<'a>(
     })
 }
 
-/// Streams one table's inline removals and returns any lazily repaired chunk
-/// locators. Errors travel through the same ordered channel as entries.
-async fn produce_inline_removal(
-    db_tx: &DbTransaction,
-    base: &CatalogSnapshot,
-    ops: &[RowOperation],
-    inline_schemas: &InlineSchemaCache<'_>,
-    table_id: u64,
-    row_ids: &[u64],
-    mut sender: mpsc::Sender<Result<StagedIndexEntry>>,
-) -> Vec<commit::StagedWrite> {
-    match stage_inline_delete_entries(db_tx, base, ops, inline_schemas, table_id, row_ids).await {
-        Ok((entries, locator_writes)) => {
-            let _ = send_entries(&mut sender, entries).await;
-            locator_writes
-        }
-        Err(error) => {
-            let _ = sender.send(Err(error)).await;
-            Vec::new()
-        }
-    }
-}
-
-/// Streams one committed data-file target's removals. Errors travel through
-/// the source's ordered channel, so staging observes them at the same point it
-/// would have observed a collected result.
-async fn produce_file_removal(
-    base: &CatalogSnapshot,
-    context: &FileContext<'_>,
-    table_id: u64,
-    data_file_id: u64,
-    deletes: &TargetDeletes,
-    mut sender: mpsc::Sender<Result<StagedIndexEntry>>,
-) {
-    let result = async {
-        let killed = resolve_target_deletes(base, context, deletes).await?;
-        stream_file_delete_index_entries(
-            base,
-            table_id,
-            data_file_id,
-            &killed,
-            context,
-            &mut sender,
-        )
-        .await
-    }
-    .await;
-    if let Err(error) = result {
-        let _ = sender.send(Err(error)).await;
-    }
-}
-
 #[derive(Default)]
 struct DeletePlan {
     inline: HashMap<u64, Vec<u64>>,
@@ -728,29 +576,19 @@ mod concurrency_tests {
 
     use super::*;
 
-    /// Old-entry derivations for separate deleted tables have no dependency
-    /// on one another. The shared collector overlaps them while retaining
-    /// target order for deterministic staging and errors.
+    /// A ready source must not wait behind an earlier source that has not
+    /// produced anything yet.
     #[tokio::test]
-    async fn old_index_lookups_overlap_and_restore_target_order() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let futures = (0..3).map(|target| {
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            async move {
-                let held = active.fetch_add(1, Ordering::AcqRel) + 1;
-                peak.fetch_max(held, Ordering::AcqRel);
-                tokio::task::yield_now().await;
-                active.fetch_sub(1, Ordering::AcqRel);
-                Ok(target)
-            }
-        });
+    async fn ready_source_bypasses_a_stalled_earlier_source() {
+        let first = stream::pending::<usize>();
+        let second = stream::once(async { 2 });
+        let merged = stream::select(first, second);
+        let mut merged = std::pin::pin!(merged);
+        let next = tokio::time::timeout(std::time::Duration::from_millis(20), merged.next())
+            .await
+            .unwrap();
 
-        let resolved = resolve_in_order(futures, 3).await.unwrap();
-
-        assert_eq!(resolved, vec![0, 1, 2]);
-        assert_eq!(peak.load(Ordering::Relaxed), 3);
+        assert_eq!(next, Some(2));
     }
 
     /// Arrow decoding leaves the async executor and shares a process-wide
@@ -780,7 +618,12 @@ mod concurrency_tests {
             }
         });
 
-        let resolved = resolve_in_order(futures, TASKS).await.unwrap();
+        let mut resolved = stream::iter(futures)
+            .buffer_unordered(TASKS)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        resolved.sort_unstable();
 
         assert_eq!(resolved, vec![0, 1, 2, 3]);
         assert_eq!(peak.load(Ordering::Relaxed), PERMITS);
@@ -905,36 +748,53 @@ async fn derive_located_inline_removals(
     row_ids: &[u64],
     locators: Vec<store_inline::InlineChunkLocator>,
 ) -> Result<(Vec<StagedIndexEntry>, HashSet<u64>)> {
-    let mut covered = HashSet::new();
-    let mut futures = Vec::with_capacity(locators.len());
-    for locator in locators {
-        let held: HashSet<u64> = row_ids
-            .iter()
-            .copied()
-            .filter(|&row_id| locator.holds(row_id))
-            .collect();
-        covered.extend(held.iter().copied());
-        futures.push(async move {
-            let (operation, value) =
-                store_inline::read_inline_chunk_locator(ReadHandle::Tx(db_tx), table_id, locator)
-                    .await?;
-            let InlineOperation::Insert { schema_version, .. } = operation else {
-                return Err(Error::Corruption(
-                    "inline chunk locator names a non-insert operation".to_owned(),
-                ));
-            };
-            let chunk = InlineChunk {
-                schema_version,
-                row_id_start: value.row_id_start,
-                row_count: value.row_count,
-                body: InlineBody::Owned(value.body),
-            };
-            inline_chunk_index_entries(db_tx, base, inline_schemas, table_id, chunk, Some(&held))
-                .await
-        });
-    }
-    let entries = resolve_entries_in_order(futures, INLINE_DECODE_CONCURRENCY).await?;
-    Ok((entries, covered))
+    let resolved = stream::iter(locators)
+        .map(|locator| {
+            let held: HashSet<u64> = row_ids
+                .iter()
+                .copied()
+                .filter(|&row_id| locator.holds(row_id))
+                .collect();
+
+            async move {
+                let (operation, value) = store_inline::read_inline_chunk_locator(
+                    ReadHandle::Tx(db_tx),
+                    table_id,
+                    locator,
+                )
+                .await?;
+                let InlineOperation::Insert { schema_version, .. } = operation else {
+                    return Err(Error::Corruption(
+                        "inline chunk locator names a non-insert operation".to_owned(),
+                    ));
+                };
+                let chunk = InlineChunk {
+                    schema_version,
+                    row_id_start: value.row_id_start,
+                    row_count: value.row_count,
+                    body: InlineBody::Owned(value.body),
+                };
+                let entries = inline_chunk_index_entries(
+                    db_tx,
+                    base,
+                    inline_schemas,
+                    table_id,
+                    chunk,
+                    Some(&held),
+                )
+                .await?;
+
+                Ok::<_, Error>((entries, held))
+            }
+        })
+        .buffer_unordered(INLINE_DECODE_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let (derived_vec, covered_vec): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
+    let derived = derived_vec.into_iter().flatten().collect::<Vec<_>>();
+    let covered = covered_vec.into_iter().flatten().collect::<HashSet<_>>();
+    Ok((derived, covered))
 }
 
 async fn derive_inline_chunk_removals(
@@ -945,51 +805,66 @@ async fn derive_inline_chunk_removals(
     row_ids: &[u64],
     chunks: Vec<InlineChunk<'_>>,
 ) -> Result<(Vec<StagedIndexEntry>, HashSet<u64>)> {
-    let mut covered = HashSet::new();
-    let mut targets = Vec::new();
-    for chunk in chunks {
-        let held: HashSet<u64> = row_ids
-            .iter()
-            .copied()
-            .filter(|&row_id| chunk.holds(row_id))
-            .collect();
-        if !held.is_empty() {
-            covered.extend(held.iter().copied());
-            targets.push((chunk, held));
-        }
-    }
-    let futures = targets.into_iter().map(|(chunk, held)| async move {
-        inline_chunk_index_entries(db_tx, base, inline_schemas, table_id, chunk, Some(&held)).await
-    });
-    let entries = resolve_entries_in_order(futures, INLINE_DECODE_CONCURRENCY).await?;
-    Ok((entries, covered))
+    let resolved = stream::iter(chunks)
+        .filter_map(|chunk| {
+            let held: HashSet<u64> = row_ids
+                .iter()
+                .copied()
+                .filter(|&row_id| chunk.holds(row_id))
+                .collect();
+
+            async move { (!held.is_empty()).then_some((chunk, held)) }
+        })
+        .map(|(chunk, held)| async move {
+            let entries = inline_chunk_index_entries(
+                db_tx,
+                base,
+                inline_schemas,
+                table_id,
+                chunk,
+                Some(&held),
+            )
+            .await?;
+
+            Ok::<_, Error>((entries, held))
+        })
+        .buffer_unordered(INLINE_DECODE_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let (derived_vec, covered_vec): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
+    let derived = derived_vec.into_iter().flatten().collect::<Vec<_>>();
+    let covered = covered_vec.into_iter().flatten().collect::<HashSet<_>>();
+    Ok((derived, covered))
 }
 
 fn legacy_inline_locator_writes(
     table_id: u64,
     chunks: &[(InlineOperation, proto::InlineChunkValue)],
 ) -> Result<Vec<commit::StagedWrite>> {
-    let mut writes = Vec::with_capacity(chunks.len());
-    for (operation, chunk) in chunks {
-        let InlineOperation::Insert {
-            schema_version,
-            begin_snapshot,
-            chunk_seq,
-            ..
-        } = operation
-        else {
-            continue;
-        };
-        writes.push(inline_chunk_range_write(
-            table_id,
-            *schema_version,
-            *begin_snapshot,
-            *chunk_seq,
-            chunk.row_id_start,
-            chunk.row_count,
-        )?);
-    }
-    Ok(writes)
+    chunks
+        .iter()
+        .filter_map(|(operation, chunk)| {
+            if let InlineOperation::Insert {
+                schema_version,
+                begin_snapshot,
+                chunk_seq,
+                ..
+            } = operation
+            {
+                Some(inline_chunk_range_write(
+                    table_id,
+                    *schema_version,
+                    *begin_snapshot,
+                    *chunk_seq,
+                    chunk.row_id_start,
+                    chunk.row_count,
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Derives the entry removals for rows tombstoned out of inline chunks. A
@@ -1020,6 +895,7 @@ async fn stage_inline_delete_entries(
             locators,
         )
         .await?;
+
         (entries, covered, Vec::new())
     } else {
         let committed = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
@@ -1039,6 +915,7 @@ async fn stage_inline_delete_entries(
         let (entries, covered) =
             derive_inline_chunk_removals(db_tx, base, inline_schemas, table_id, row_ids, chunks)
                 .await?;
+
         (entries, covered, locator_writes)
     };
 
@@ -1114,15 +991,22 @@ async fn resolve_target_deletes(
     context: &FileContext<'_>,
     deletes: &TargetDeletes,
 ) -> Result<KilledRows> {
-    let mut positions = deletes.positions.clone();
-    let futures = deletes
-        .files
-        .iter()
-        .map(|delete_file| read_delete_file_positions(base, delete_file, context));
-    let mut resolved = std::pin::pin!(stream::iter(futures).buffered(FILE_READ_CONCURRENCY));
-    while let Some(delete_positions) = resolved.try_next().await? {
-        positions.extend(delete_positions);
-    }
+    let positions = stream::iter(
+        deletes
+            .files
+            .iter()
+            .map(|delete_file| read_delete_file_positions(base, delete_file, context)),
+    )
+    .buffer_unordered(FILE_READ_CONCURRENCY)
+    .try_fold(
+        deletes.positions.clone(),
+        |mut positions, discovered| async move {
+            positions.extend(discovered);
+            Ok(positions)
+        },
+    )
+    .await?;
+
     Ok(KilledRows::from_unsorted(positions))
 }
 
@@ -1156,6 +1040,7 @@ async fn read_delete_file_positions(
         delete_file.footer_size,
     ))
     .await?;
+
     Ok(positions)
 }
 
@@ -1165,20 +1050,19 @@ async fn read_delete_file_positions(
 /// commit registers never reaches here — those rows are left unindexed at
 /// the add instead.
 ///
-/// Each bounded Arrow batch is sent before the reader advances. Target
-/// readers overlap, while their ordered receivers preserve staging order.
+/// Each bounded Arrow batch is yielded before the reader advances. Target
+/// readers overlap and feed staging as their batches become ready.
 pub(super) async fn stream_file_delete_index_entries(
     base: &CatalogSnapshot,
     table_id: u64,
     data_file_id: u64,
     killed: &KilledRows,
     context: &FileContext<'_>,
-    sender: &mut mpsc::Sender<Result<StagedIndexEntry>>,
-) -> Result<()> {
+) -> Result<IndexEntryStream<'static>> {
     let table = TableId::new(table_id);
     let indexes = base.indexes_of(table);
     if indexes.is_empty() {
-        return Ok(());
+        return Ok(stream::empty().boxed());
     }
 
     let file = live_data_file(base, table_id, data_file_id)?;
@@ -1198,27 +1082,27 @@ pub(super) async fn stream_file_delete_index_entries(
     // holds — one rule for dense and per-row-id targets alike.
     let live_columns = base.columns_of(table);
     let projections = index_projections(&live_columns, &indexes, table)?;
-    let mut consumer = IndexEntryConsumer {
-        indexes: &indexes,
-        sender,
-        delete: true,
-    };
-    scoped_read::scoped_read_index_entry_batches(
+    let entries = scoped_read::scoped_read_index_entry_batches(
         scoped_read::ParquetFile::new(
             Arc::clone(data_store),
             path,
             file.file_size_bytes,
             file.footer_size,
         ),
-        &projections,
+        projections,
         scoped_read::ScopedRows::At(&killed.positions),
         scoped_read::RowIdSource::Resolve {
             row_id_start: file.row_id_start,
         },
         None,
-        &mut consumer,
     )
-    .await
+    .await?;
+
+    Ok(entries
+        .map(move |batch| batch.and_then(|batch| staged_scoped_entries(&indexes, batch, true)))
+        .map_ok(|batch| stream::iter(batch.into_iter().map(Ok)))
+        .try_flatten()
+        .boxed())
 }
 
 /// One live data file of a table.
@@ -1305,6 +1189,7 @@ pub(super) fn table_object_path(
         (true, true) => format!("{table_prefix}{path}"),
         (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
     };
+
     Ok(object_store::path::Path::from(relative.as_str()))
 }
 

@@ -88,6 +88,10 @@ const RETRY_BACKOFF_MAX_MICROS: u64 = 50_000;
 /// Intervening snapshot records read concurrently after a lost head race.
 const INTERVENING_READ_CONCURRENCY: usize = 64;
 
+/// Changelog and current-record reads kept in flight by an incremental head
+/// refresh.
+const REFRESH_READ_CONCURRENCY: usize = 64;
+
 /// How long to wait before re-running `attempt` (0-based; the first attempt
 /// never waits). Exponential to the cap, plus jitter of up to the base delay
 /// so two writers that just collided do not back off in lockstep and collide
@@ -759,9 +763,14 @@ async fn replay(
         return Ok(None);
     }
 
+    let changelogs = stream::iter(
+        ((from + 1)..=head.snapshot_id).map(|snapshot_id| read::read_changelog(tx, snapshot_id)),
+    )
+    .buffer_unordered(REFRESH_READ_CONCURRENCY);
+    let mut changelogs = std::pin::pin!(changelogs);
     let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for snapshot_id in (from + 1)..=head.snapshot_id {
-        let Some(changelog) = read::read_changelog(tx, snapshot_id).await? else {
+    while let Some(changelog) = changelogs.try_next().await? {
+        let Some(changelog) = changelog else {
             return Ok(None);
         };
         keys.extend(changelog.keys);
@@ -778,11 +787,16 @@ async fn replay(
     // Each key's current value is its post-gap state; an absent one was
     // ended or reclaimed. That is exactly the write set a fold applies, so
     // the replay reuses the fold rather than restating every kind's rules.
-    let mut writes: Vec<StagedWrite> = Vec::with_capacity(keys.len());
-    for key in keys {
+    let mut writes: Vec<StagedWrite> = stream::iter(keys.into_iter().map(|key| async move {
         let value = tx.get(&key).await.map_err(Error::from)?;
-        writes.push((key, value.map(|bytes| bytes.to_vec())));
-    }
+        Ok::<_, Error>((key, value.map(|bytes| bytes.to_vec())))
+    }))
+    .buffer_unordered(REFRESH_READ_CONCURRENCY)
+    .try_collect()
+    .await?;
+    // Folding entity parents before their children is part of the existing
+    // replay contract; only the reads complete out of order.
+    writes.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
     let mut view = base.clone();
     fold::fold_batch(&mut view, &writes)?;
@@ -1447,7 +1461,7 @@ fn intervening_change_stream(
         (first..=last)
             .map(move |snapshot_id| async move { read_intervening_change(db, snapshot_id).await }),
     )
-    .buffered(INTERVENING_READ_CONCURRENCY)
+    .buffer_unordered(INTERVENING_READ_CONCURRENCY)
 }
 
 async fn classify_intervening_changes(
@@ -1471,8 +1485,8 @@ async fn classify_intervening_changes(
     while let Some((snapshot_id, theirs)) = changes.try_next().await? {
         snapshot_ids.push(snapshot_id);
         // A group conflicts if any member does: they share one batch and
-        // therefore one fate. Ordered delivery makes the first verdict
-        // stable while pending later reads are dropped immediately.
+        // therefore one fate. The first completed conflict ends the scan;
+        // pending reads are dropped immediately.
         if ours
             .iter()
             .any(|mine| crate::transaction::operations::conflicts(mine, &theirs))
@@ -1483,6 +1497,7 @@ async fn classify_intervening_changes(
             });
         }
     }
+    snapshot_ids.sort_unstable();
     Ok(InterveningClassification {
         conflict: None,
         snapshot_ids,
@@ -1500,9 +1515,11 @@ async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, Chan
     if head_before >= head {
         return Ok(Vec::new());
     }
-    intervening_change_stream(db, head_before.saturating_add(1), head)
+    let mut changes: Vec<_> = intervening_change_stream(db, head_before.saturating_add(1), head)
         .try_collect()
-        .await
+        .await?;
+    changes.sort_unstable_by_key(|(snapshot_id, _)| *snapshot_id);
+    Ok(changes)
 }
 
 #[cfg(test)]

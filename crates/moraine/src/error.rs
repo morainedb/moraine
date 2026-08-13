@@ -111,6 +111,10 @@ pub enum Error {
     /// The underlying store failed (SlateDB / object-store I/O).
     #[error("store error")]
     Store(#[source] Box<slatedb::Error>),
+
+    /// Concurrent modification detected during index maintenance.
+    #[error("concurrent modification")]
+    ConcurrentModification,
 }
 
 /// What SlateDB reports when a compare-and-swap loses to a version that
