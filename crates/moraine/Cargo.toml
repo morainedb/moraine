@@ -12,6 +12,7 @@ rust-version.workspace = true
 
 [dependencies]
 arrow = { workspace = true, features = ["ipc"] }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
@@ -39,7 +40,6 @@ protox = { workspace = true }
 [dev-dependencies]
 moraine = { path = ".", features = ["fault-injection"] }
 
-async-trait = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }

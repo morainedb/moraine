@@ -151,6 +151,20 @@ async fn an_unknown_subspace_is_not_a_merge_target() {
     assert!(matches!(refused, Error::Configuration(_)), "{refused:?}");
 }
 
+/// Verification without a wait cannot distinguish submission from a
+/// completed merge, so the core refuses that contradictory request.
+#[tokio::test]
+async fn verified_compaction_requires_a_wait_budget() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let mut request = merge_request(CompactionTarget::Subspace(SubspaceName::Index), None);
+    request.require_completed = true;
+
+    let error = catalog.compact_store(request).await.unwrap_err();
+    assert!(matches!(error, Error::Configuration(_)), "{error:?}");
+}
+
 /// A catalog with nothing to merge reports every measured subspace skipped
 /// rather than failing or reporting nothing at all.
 #[tokio::test]

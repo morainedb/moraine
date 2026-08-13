@@ -32,6 +32,9 @@ fn measure(subspace: SubspaceName, segment: Option<&SegmentSize>) -> SubspaceCen
     SubspaceCensus {
         subspace,
         bytes: segment.map_or(0, |segment| segment.bytes),
+        filter_bytes: segment.map_or(0, |segment| segment.filter_bytes),
+        index_bytes: segment.map_or(0, |segment| segment.index_bytes),
+        stats_bytes: segment.map_or(0, |segment| segment.stats_bytes),
         l0_ssts: segment.map_or(0, |segment| segment.l0_ssts),
         sorted_runs: segment.map_or(0, |segment| segment.sorted_runs),
         sorted_run_ssts: segment.map_or(0, |segment| segment.sorted_run_ssts),
@@ -79,6 +82,26 @@ fn bytes_of(census: &StoreCensus, subspace: &SubspaceName) -> u64 {
         .iter()
         .find(|measured| &measured.subspace == subspace)
         .map_or(0, |measured| measured.bytes)
+}
+
+fn verify_merges(merges: &[SubspaceMerge]) -> Result<()> {
+    let Some(merge) = merges.iter().find(|merge| {
+        matches!(
+            merge.outcome,
+            MergeOutcome::Pending | MergeOutcome::Failed(_)
+        )
+    }) else {
+        return Ok(());
+    };
+    let detail = match &merge.outcome {
+        MergeOutcome::Pending => "still pending".to_owned(),
+        MergeOutcome::Failed(detail) => detail.clone(),
+        MergeOutcome::Completed | MergeOutcome::Skipped(_) => String::new(),
+    };
+    Err(Error::Constraint(format!(
+        "store merge for {} did not complete: {detail}",
+        merge.subspace
+    )))
 }
 
 /// What a maintenance pass should reclaim.
@@ -455,8 +478,17 @@ impl Catalog {
     /// the compactor that executes a submitted merge runs inside the writer,
     /// so a reader would queue work nothing would run — or a store error if
     /// the merge cannot be submitted.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the method keeps one ordered submit, await, classify, and measure protocol"
+    )]
     pub async fn compact_store(&self, request: CompactStoreRequest) -> Result<CompactStoreReport> {
         self.writer()?;
+        if request.require_completed && request.wait.is_none() {
+            return Err(Error::Configuration(
+                "require_completed needs a nonzero wait budget".to_owned(),
+            ));
+        }
 
         let target = match &request.target {
             CompactionTarget::WholeStore => None,
@@ -562,6 +594,10 @@ impl Catalog {
                     merge.bytes_after = Some(bytes_of(&after, &merge.subspace));
                 }
             }
+        }
+
+        if request.require_completed {
+            verify_merges(&merges)?;
         }
 
         Ok(CompactStoreReport { merges })

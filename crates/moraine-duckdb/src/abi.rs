@@ -2297,6 +2297,12 @@ pub struct MoraineSubspaceCensus {
     pub subspace: *mut c_char,
     /// Physical bytes across its SSTs.
     pub bytes: u64,
+    /// Bloom-filter bytes across its SSTs.
+    pub filter_bytes: u64,
+    /// Index-block bytes across its SSTs.
+    pub index_bytes: u64,
+    /// Statistics-block bytes across its SSTs.
+    pub stats_bytes: u64,
     /// SSTs not yet merged into a sorted run.
     pub l0_ssts: u32,
     /// Sorted runs. A merge collapses these to one.
@@ -2376,6 +2382,34 @@ pub struct MoraineObjectStoreTally {
     pub wal_delete_nanoseconds: u64,
     /// Failed request attempts across both stores, including handled errors.
     pub errors: u64,
+}
+
+/// Process-wide cache capacity, occupancy, and eviction counters.
+#[repr(C)]
+#[derive(Default)]
+pub struct MoraineCacheStatus {
+    /// Memory reserved for decoded SlateDB metadata.
+    pub metadata_capacity_bytes: u64,
+    /// Memory currently occupied by decoded SlateDB metadata.
+    pub metadata_occupancy_bytes: u64,
+    /// Decoded SlateDB metadata entries evicted from memory.
+    pub metadata_evictions: u64,
+    /// Memory reserved for SlateDB data blocks.
+    pub block_capacity_bytes: u64,
+    /// Memory currently occupied by SlateDB data blocks.
+    pub block_occupancy_bytes: u64,
+    /// SlateDB data-block entries evicted from memory.
+    pub block_evictions: u64,
+    /// Whether a disk tier is configured.
+    pub has_block_disk: bool,
+    /// Configured disk capacity when `has_block_disk` is true.
+    pub block_disk_capacity_bytes: u64,
+    /// Memory reserved for parsed Parquet metadata.
+    pub auxiliary_metadata_capacity_bytes: u64,
+    /// Memory currently occupied by parsed Parquet metadata.
+    pub auxiliary_metadata_occupancy_bytes: u64,
+    /// Parsed Parquet metadata entries evicted from memory.
+    pub auxiliary_metadata_evictions: u64,
 }
 
 fn duration_nanoseconds(duration: Duration) -> u64 {
@@ -2478,6 +2512,9 @@ pub unsafe extern "C" fn moraine_store_census(
                     MoraineSubspaceCensus {
                         subspace: name.into_raw(),
                         bytes: subspace.bytes,
+                        filter_bytes: subspace.filter_bytes,
+                        index_bytes: subspace.index_bytes,
+                        stats_bytes: subspace.stats_bytes,
                         l0_ssts: subspace.l0_ssts,
                         sorted_runs: subspace.sorted_runs,
                         sorted_run_ssts: subspace.sorted_run_ssts,
@@ -2546,6 +2583,7 @@ pub unsafe extern "C" fn moraine_compact_store(
     handle: *mut MoraineCatalogHandle,
     subspace: *const c_char,
     wait_ms: u64,
+    require_completed: bool,
     out_items: *mut *mut MoraineSubspaceMerge,
     out_len: *mut usize,
     probe: MoraineInterruptProbe,
@@ -2565,6 +2603,7 @@ pub unsafe extern "C" fn moraine_compact_store(
             if wait_ms > 0 {
                 request.wait = Some(Duration::from_millis(wait_ms));
             }
+            request.require_completed = require_completed;
 
             // SAFETY: caller contract for `probe`/`probe_ctx`.
             let report = unsafe {
@@ -2684,6 +2723,11 @@ pub unsafe extern "C" fn moraine_cache_tally(
     out_block_hits: *mut u64,
     out_block_misses: *mut u64,
     out_errors: *mut u64,
+    out_preload_metadata_hits: *mut u64,
+    out_preload_metadata_misses: *mut u64,
+    out_preload_block_hits: *mut u64,
+    out_preload_block_misses: *mut u64,
+    out_preload_failures: *mut u64,
 ) -> i32 {
     let attempt = || {
         if out_metadata_hits.is_null()
@@ -2691,6 +2735,11 @@ pub unsafe extern "C" fn moraine_cache_tally(
             || out_block_hits.is_null()
             || out_block_misses.is_null()
             || out_errors.is_null()
+            || out_preload_metadata_hits.is_null()
+            || out_preload_metadata_misses.is_null()
+            || out_preload_block_hits.is_null()
+            || out_preload_block_misses.is_null()
+            || out_preload_failures.is_null()
         {
             return codes::INVALID_ARGUMENT;
         }
@@ -2702,6 +2751,11 @@ pub unsafe extern "C" fn moraine_cache_tally(
             *out_block_hits = tally.block_hits;
             *out_block_misses = tally.block_misses;
             *out_errors = tally.errors;
+            *out_preload_metadata_hits = tally.preload_metadata_hits;
+            *out_preload_metadata_misses = tally.preload_metadata_misses;
+            *out_preload_block_hits = tally.preload_block_hits;
+            *out_preload_block_misses = tally.preload_block_misses;
+            *out_preload_failures = tally.preload_failures;
         }
         codes::OK
     };
@@ -2730,6 +2784,11 @@ pub unsafe extern "C" fn moraine_catalog_cache_tally(
     out_block_hits: *mut u64,
     out_block_misses: *mut u64,
     out_errors: *mut u64,
+    out_preload_metadata_hits: *mut u64,
+    out_preload_metadata_misses: *mut u64,
+    out_preload_block_hits: *mut u64,
+    out_preload_block_misses: *mut u64,
+    out_preload_failures: *mut u64,
 ) -> i32 {
     let attempt = || {
         if handle.is_null()
@@ -2738,6 +2797,11 @@ pub unsafe extern "C" fn moraine_catalog_cache_tally(
             || out_block_hits.is_null()
             || out_block_misses.is_null()
             || out_errors.is_null()
+            || out_preload_metadata_hits.is_null()
+            || out_preload_metadata_misses.is_null()
+            || out_preload_block_hits.is_null()
+            || out_preload_block_misses.is_null()
+            || out_preload_failures.is_null()
         {
             return codes::INVALID_ARGUMENT;
         }
@@ -2750,6 +2814,44 @@ pub unsafe extern "C" fn moraine_catalog_cache_tally(
             *out_block_hits = tally.block_hits;
             *out_block_misses = tally.block_misses;
             *out_errors = tally.errors;
+            *out_preload_metadata_hits = tally.preload_metadata_hits;
+            *out_preload_metadata_misses = tally.preload_metadata_misses;
+            *out_preload_block_hits = tally.preload_block_hits;
+            *out_preload_block_misses = tally.preload_block_misses;
+            *out_preload_failures = tally.preload_failures;
+        }
+        codes::OK
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(codes::INTERNAL)
+}
+
+/// Returns process-wide cache capacity, occupancy, and eviction counters.
+///
+/// # Safety
+///
+/// `out_status` must be valid and writable for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_cache_status(out_status: *mut MoraineCacheStatus) -> i32 {
+    let attempt = || {
+        if out_status.is_null() {
+            return codes::INVALID_ARGUMENT;
+        }
+        let status = moraine::cache_status();
+        // SAFETY: checked non-null above; caller contract for validity.
+        unsafe {
+            *out_status = MoraineCacheStatus {
+                metadata_capacity_bytes: status.metadata_capacity_bytes,
+                metadata_occupancy_bytes: status.metadata_occupancy_bytes,
+                metadata_evictions: status.metadata_evictions,
+                block_capacity_bytes: status.block_capacity_bytes,
+                block_occupancy_bytes: status.block_occupancy_bytes,
+                block_evictions: status.block_evictions,
+                has_block_disk: status.block_disk_capacity_bytes.is_some(),
+                block_disk_capacity_bytes: status.block_disk_capacity_bytes.unwrap_or_default(),
+                auxiliary_metadata_capacity_bytes: status.auxiliary_metadata_capacity_bytes,
+                auxiliary_metadata_occupancy_bytes: status.auxiliary_metadata_occupancy_bytes,
+                auxiliary_metadata_evictions: status.auxiliary_metadata_evictions,
+            };
         }
         codes::OK
     };
@@ -4457,6 +4559,7 @@ mod tests {
                 handle,
                 ptr::null(),
                 1_000,
+                false,
                 &raw mut items,
                 &raw mut len,
                 None,
@@ -4488,6 +4591,7 @@ mod tests {
                 handle,
                 unknown.as_ptr(),
                 0,
+                false,
                 &raw mut items,
                 &raw mut len,
                 None,

@@ -125,7 +125,9 @@ impl MetadataCache {
         while self.bytes > capacity {
             let evicted = self.entries.pop_front()?;
             self.bytes = self.bytes.saturating_sub(evicted.bytes);
+            cache::auxiliary_metadata_evicted();
         }
+        cache::set_auxiliary_metadata_usage(self.bytes);
 
         let weak = Arc::downgrade(store);
         let position = self.entries.iter().position(|entry| {
@@ -180,7 +182,9 @@ impl MetadataCache {
                 break;
             };
             self.bytes = self.bytes.saturating_sub(evicted.bytes);
+            cache::auxiliary_metadata_evicted();
         }
+        cache::set_auxiliary_metadata_usage(self.bytes);
     }
 
     fn in_flight(

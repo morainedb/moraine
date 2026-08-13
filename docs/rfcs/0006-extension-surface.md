@@ -324,7 +324,9 @@ store with a deep unfolded tail.
 **`moraine_cache_tally()` — what the cache has served.** One row:
 `metadata_hits`/`metadata_misses` and `block_hits`/`block_misses` with a
 rate beside each, plus `errors` for lookups the cache itself failed and
-read through. Without arguments the numbers are the host's — a process
+read through. `preload_metadata_hits`/`misses`, `preload_block_hits`/`misses`,
+and `preload_failures` attribute the attach-time warm subset. Without
+arguments the numbers are the host's — a process
 keeps one cache and every attached store reads through it — which is the
 scope the budget is set at.
 
@@ -347,6 +349,16 @@ metadata rate says the working set exceeds the block slot, which is a
 A rate is NULL, not zero, before anything has been looked up: zero would
 read as a cold cache to a monitoring query, and "nothing asked" is not
 the same fact.
+
+**`moraine_cache_status()` — what the process-wide caches occupy.** One row
+reports capacity, current occupancy, and cumulative evictions for SlateDB
+metadata, SlateDB data-block memory, and parsed Parquet metadata. It also
+reports the configured data-block disk capacity, NULL without a disk tier.
+Disk occupancy is omitted because Foyer does not expose a reliable live
+value through the cache interface; configured capacity is not mislabeled as
+usage. `moraine_store_census` adds `filter_bytes`, `index_bytes`, and
+`stats_bytes` per subspace from the manifest, which is the store-side demand
+to compare with metadata capacity.
 
 **`moraine_object_store_tally('lake')` — what SlateDB sent to storage.**
 One cumulative row per attach reports `main_gets`, `main_puts`, and

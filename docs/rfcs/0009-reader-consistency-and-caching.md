@@ -814,8 +814,15 @@ blocks are counted apart because they are budgeted apart — a metadata
 rate short of ~1 says the meta slot cannot hold the store's filters and
 indexes, which the census measures directly, while a low block rate
 beside a healthy metadata one is a working set larger than the block
-slot. A rate is absent rather than zero before any lookup. Budgets are
-sized from these curves, not from the defaults.
+slot. The same tally attributes the subset of hits and misses caused by
+attach-time preload and counts subspaces preload failed to warm.
+`moraine_cache_status()` reports actual capacity, occupancy, and eviction
+counts for each memory cache plus the configured block disk capacity. It
+does not report disk occupancy: Foyer's typed cache API does not expose a
+reliable live figure. `moraine_store_census` reports each subspace's recorded
+SST filter, index, and stats bytes, so metadata capacity can be compared with
+the store it is expected to hold. A rate is absent rather than zero before
+any lookup. Budgets are sized from these curves, not from the defaults.
 
 Object-store traffic is measured separately per attach through
 `moraine_object_store_tally('lake')` (RFC 0006). This is the physical
