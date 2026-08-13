@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/morainedb/moraine/compare/v0.5.1...v0.5.2) - 2026-08-13
+
+### Added
+
+- expose staged commit phase diagnostics ([#126](https://github.com/morainedb/moraine/pull/126))
+- expose object-store commit diagnostics ([#124](https://github.com/morainedb/moraine/pull/124))
+
+### Other
+
+- stream and parallelize index maintenance ([#134](https://github.com/morainedb/moraine/pull/134))
+- overlap delete discovery with index upkeep ([#133](https://github.com/morainedb/moraine/pull/133))
+- reduce index upkeep copies and barriers ([#132](https://github.com/morainedb/moraine/pull/132))
+- reduce index upkeep copies and barriers ([#131](https://github.com/morainedb/moraine/pull/131))
+- stream staged index maintenance ([#130](https://github.com/morainedb/moraine/pull/130))
+- reduce staged index maintenance overhead ([#129](https://github.com/morainedb/moraine/pull/129))
+- parallelize equality index maintenance ([#127](https://github.com/morainedb/moraine/pull/127))
+
 ## [0.5.1](https://github.com/morainedb/moraine/compare/v0.4.6...v0.5.1) - 2026-08-10
 
 ### Added
