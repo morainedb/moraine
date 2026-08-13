@@ -48,7 +48,8 @@ index f5eef0f40f258d073cd4d8425faa2e2625cbbb4c..d61d9dbd97fee2caaae14ceedd72b59d
 +++ b/src/storage/ducklake_transaction.cpp
 @@ -6,0 +7 @@
 +#include "duckdb/common/multi_file/multi_file_reader.hpp"
-@@ -1240,0 +1242,18 @@ DuckLakeFileInfo DuckLakeTransaction::BuildDataFileInfo(const DuckLakeDataFile &
+@@ -1240 +1242,19 @@ DuckLakeFileInfo DuckLakeTransaction::BuildDataFileInfo(const DuckLakeDataFile &
+-	return data_file;
 +	auto row_id_field = FieldIndex(static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID));
 +	if (file.row_count > 0 && row_id_start.IsValid() &&
 +	    data_file.column_stats.find(row_id_field) == data_file.column_stats.end()) {
@@ -67,6 +68,7 @@ index f5eef0f40f258d073cd4d8425faa2e2625cbbb4c..d61d9dbd97fee2caaae14ceedd72b59d
 +			data_file.column_stats.emplace(row_id_field, std::move(row_id_stats));
 +		}
 +	}
++	return data_file;
 diff --git a/test/sql/add_files/add_files_complex_nested_stats_mre.test b/test/sql/add_files/add_files_complex_nested_stats_mre.test
 index 257a4e675b69ef1376317e2d5cf5ba7afb9ff321..0d100b8cebbb5ae925ca6e50ac44496a47805d2d 100644
 --- a/test/sql/add_files/add_files_complex_nested_stats_mre.test
