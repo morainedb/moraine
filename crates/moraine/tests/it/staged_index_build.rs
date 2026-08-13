@@ -100,18 +100,6 @@ fn captured_events() -> &'static CapturedEvents {
 async fn table_with_file(values: Vec<i64>) -> (Catalog, TableId, Arc<dyn ObjectStore>) {
     let catalog = open_memory().await;
     let rows = u64::try_from(values.len()).expect("row count fits");
-    let created = std::cell::Cell::new(None);
-    catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "orders", &[col("a")])?;
-            tx.register_data_file(table, datafile(rows), &[])?;
-            created.set(Some(table));
-            Ok(())
-        })
-        .await
-        .unwrap();
-
     let data = Arc::new(InMemory::new());
     let arrow_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(
@@ -125,12 +113,37 @@ async fn table_with_file(values: Vec<i64>) -> (Catalog, TableId, Arc<dyn ObjectS
         writer.write(&batch).unwrap();
         writer.close().unwrap();
     }
+    let footer_offset = buffer.len() - 8;
+    let footer_size = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
+    let file_size_bytes = u64::try_from(buffer.len()).unwrap();
     data.put(
         &Path::from(format!("main/orders/data-{rows}.parquet")),
         buffer.into(),
     )
     .await
     .unwrap();
+
+    let created = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
+            let table = tx.create_table(schema, "orders", &[col("a")])?;
+            tx.register_data_file(
+                table,
+                moraine::DataFile {
+                    file_size_bytes,
+                    footer_size,
+                    ..datafile(rows)
+                },
+                &[],
+            )?;
+            created.set(Some(table));
+            Ok(())
+        })
+        .await
+        .unwrap();
 
     (catalog, created.get().unwrap(), data)
 }

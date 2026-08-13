@@ -7,12 +7,13 @@
 //! mechanically, and the loser re-runs and sees the winner's entry.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Bound,
+    sync::{Arc, Mutex},
 };
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use slatedb::DbTransaction;
 use tracing::warn;
 
@@ -64,6 +65,10 @@ fn decode_row_id(bytes: &[u8]) -> Result<u64> {
 /// cost one store round-trip of latency *per entry*. This covers an ordinary
 /// several-hundred-row flush in one window while keeping a bulk load bounded.
 const UNIQUENESS_PROBE_CONCURRENCY: usize = 512;
+
+/// Additions derived while the deletion phase is still draining. Once full,
+/// backpressure pauses addition sources without holding up deletion staging.
+const ADDITION_PREFETCH: usize = 512;
 
 /// The most entries one commit may stage.
 ///
@@ -142,61 +147,44 @@ enum ProbeResolution {
     Failure(Error),
 }
 
-/// Sequential planning state. Input order assigns stable sequence numbers;
-/// completed reads may arrive in any order without changing which error is
-/// ultimately reported.
+/// Sequential planning state. Claims are recorded before probes start, so
+/// concurrent reads cannot admit duplicate values from the same commit.
 struct ProbePlanner<'a> {
     deleted_unique: &'a HashSet<Bytes>,
     claimed: HashMap<Bytes, u64>,
-    next_sequence: usize,
     entry_count: usize,
 }
 
 impl ProbePlanner<'_> {
-    fn plan(&mut self, entry: Result<StagedIndexEntry>) -> (usize, ProbePlan) {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-
+    fn plan(&mut self, entry: Result<StagedIndexEntry>) -> ProbePlan {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(error) => return (sequence, ProbePlan::Failure(error)),
+            Err(error) => return ProbePlan::Failure(error),
         };
         self.entry_count = self.entry_count.saturating_add(1);
         if self.entry_count > MAX_INDEX_ENTRIES_PER_COMMIT {
-            return (
-                sequence,
-                ProbePlan::Failure(oversized_commit(self.entry_count)),
-            );
+            return ProbePlan::Failure(oversized_commit(self.entry_count));
         }
         if entry.delete {
-            return (
-                sequence,
-                ProbePlan::Failure(Error::Corruption(
-                    "index put stream contains a deletion".to_owned(),
-                )),
-            );
+            return ProbePlan::Failure(Error::Corruption(
+                "index put stream contains a deletion".to_owned(),
+            ));
         }
         if !entry.unique {
-            return (
-                sequence,
-                ProbePlan::Put {
-                    key: entry.key,
-                    row_id: None,
-                },
-            );
+            return ProbePlan::Put {
+                key: entry.key,
+                row_id: None,
+            };
         }
 
         if let Some(&holder) = self.claimed.get(&entry.key) {
             return if holder == entry.row_id {
-                (sequence, ProbePlan::Noop)
+                ProbePlan::Noop
             } else {
-                (
-                    sequence,
-                    ProbePlan::Collision {
-                        index_id: entry.index_id,
-                        building: entry.building,
-                    },
-                )
+                ProbePlan::Collision {
+                    index_id: entry.index_id,
+                    building: entry.building,
+                }
             };
         }
         self.claimed.insert(entry.key.clone(), entry.row_id);
@@ -208,35 +196,27 @@ impl ProbePlanner<'_> {
             building: entry.building,
         };
         if self.deleted_unique.contains(&probe.key) {
-            (
-                sequence,
-                ProbePlan::Put {
-                    key: probe.key,
-                    row_id: Some(probe.row_id),
-                },
-            )
+            ProbePlan::Put {
+                key: probe.key,
+                row_id: Some(probe.row_id),
+            }
         } else {
-            (sequence, ProbePlan::Probe(probe))
+            ProbePlan::Probe(probe)
         }
     }
 }
 
 /// A collision's verdict: fail the commit, or poison the building index.
-fn collision(probe_index_id: u64, building: bool, poisoned: &mut Vec<u64>) -> Option<Error> {
+fn collision(probe_index_id: u64, building: bool) -> Result<Option<u64>> {
     if building {
-        poisoned.push(probe_index_id);
-        None
+        Ok(Some(probe_index_id))
     } else {
-        Some(unique_violation(probe_index_id))
+        Err(unique_violation(probe_index_id))
     }
 }
 
-async fn resolve_probe_plan(
-    reader: ReadHandle<'_>,
-    sequence: usize,
-    plan: ProbePlan,
-) -> (usize, ProbeResolution) {
-    let resolution = match plan {
+async fn resolve_probe_plan(reader: ReadHandle<'_>, plan: ProbePlan) -> ProbeResolution {
+    match plan {
         ProbePlan::Put { key, row_id } => ProbeResolution::Put { key, row_id },
         ProbePlan::Probe(probe) => match reader.get(probe.key.clone()).await {
             Ok(present) => ProbeResolution::Probed { probe, present },
@@ -247,16 +227,6 @@ async fn resolve_probe_plan(
             ProbeResolution::Collision { index_id, building }
         }
         ProbePlan::Failure(error) => ProbeResolution::Failure(error),
-    };
-    (sequence, resolution)
-}
-
-fn remember_earliest_error(earliest: &mut Option<(usize, Error)>, sequence: usize, error: Error) {
-    if earliest
-        .as_ref()
-        .is_none_or(|(held_sequence, _)| sequence < *held_sequence)
-    {
-        *earliest = Some((sequence, error));
     }
 }
 
@@ -322,9 +292,10 @@ pub(crate) async fn stage_index_entries(
 }
 
 /// Consumes deletion entries, then additions, as streams. Unique probes form
-/// one continuously replenished window across every derived source group;
-/// sequence numbers retain deterministic error selection even though
-/// successful reads stage in completion order.
+/// one continuously replenished window across every derived source group.
+/// Successful reads stage in completion order, and the first fatal result
+/// aborts the transaction without waiting for slower probes.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn stage_index_entry_stream<D, S>(
     db_tx: &DbTransaction,
     deletes: D,
@@ -339,7 +310,30 @@ where
     let mut deleted_unique = HashSet::new();
     let mut entry_count = prior_entry_count;
     let mut deletes = std::pin::pin!(deletes);
-    while let Some(entry) = deletes.next().await {
+    let mut entries = std::pin::pin!(entries);
+    let mut prefetched = VecDeque::with_capacity(ADDITION_PREFETCH);
+    let mut additions_done = false;
+
+    loop {
+        let deletion = if additions_done || prefetched.len() == ADDITION_PREFETCH {
+            deletes.next().await
+        } else {
+            tokio::select! {
+                biased;
+                deletion = deletes.next() => deletion,
+                addition = entries.next() => if let Some(addition) = addition {
+                        prefetched.push_back(addition?);
+                        continue;
+                } else {
+                    additions_done = true;
+                        continue;
+
+                }
+            }
+        };
+        let Some(entry) = deletion else {
+            break;
+        };
         let entry = entry?;
         entry_count = entry_count.saturating_add(1);
         if entry_count > MAX_INDEX_ENTRIES_PER_COMMIT {
@@ -357,69 +351,80 @@ where
         db_tx.delete(entry.key).map_err(Error::from)?;
     }
 
+    let entries = stream::iter(prefetched.into_iter().map(Ok)).chain(entries);
     // Read at most the remaining budget plus one entry: the extra one
     // produces the refusal without deriving an oversized stream to its end.
     let stream_budget = MAX_INDEX_ENTRIES_PER_COMMIT
         .saturating_sub(entry_count)
         .saturating_add(1);
-    let mut planner = ProbePlanner {
+    let planner = Arc::new(Mutex::new(ProbePlanner {
         deleted_unique: &deleted_unique,
         claimed: HashMap::new(),
-        next_sequence: 0,
         entry_count,
-    };
+    }));
     let reader = ReadHandle::Tx(db_tx);
-    let outcomes = entries
+
+    let (poisoned, addition_bytes): (Vec<_>, Vec<_>) = entries
         .take(stream_budget)
-        .map(move |entry| {
-            let (sequence, plan) = planner.plan(entry);
-            resolve_probe_plan(reader, sequence, plan)
-        })
-        .buffer_unordered(UNIQUENESS_PROBE_CONCURRENCY);
-    let mut outcomes = std::pin::pin!(outcomes);
-    let mut poisoned = Vec::new();
-    let mut earliest_error = None;
-    while let Some((sequence, resolution)) = outcomes.next().await {
-        match resolution {
-            ProbeResolution::Put { key, row_id } => {
-                stage_probe_put(db_tx, &mut staged, key, row_id)?;
-            }
-            ProbeResolution::Probed { probe, present } => {
-                if let Some(bytes) = present {
-                    match decode_row_id(&bytes) {
-                        Ok(holder) if holder == probe.row_id => {}
-                        Ok(_) => {
-                            if let Some(error) =
-                                collision(probe.index_id, probe.building, &mut poisoned)
-                            {
-                                remember_earliest_error(&mut earliest_error, sequence, error);
+        .map(|entry| {
+            let planner = planner.clone();
+            async move {
+                let plan = {
+                    let mut planner_guard =
+                        planner.lock().map_err(|_| Error::ConcurrentModification)?;
+                    planner_guard.plan(entry)
+                };
+
+                let mut addition_bytes = StagedBytes::default();
+                let poisoned = match resolve_probe_plan(reader, plan).await {
+                    ProbeResolution::Put { key, row_id } => {
+                        stage_probe_put(db_tx, &mut addition_bytes, key, row_id)?;
+                        None
+                    }
+                    ProbeResolution::Probed { probe, present } => {
+                        if let Some(bytes) = present {
+                            match decode_row_id(&bytes) {
+                                Ok(holder) if holder == probe.row_id => None,
+                                Ok(_) => {
+                                    return collision(probe.index_id, probe.building)
+                                        .map(|index_id| (index_id, addition_bytes));
+                                }
+                                Err(error) => return Err(error),
                             }
-                        }
-                        Err(error) => {
-                            remember_earliest_error(&mut earliest_error, sequence, error);
+                        } else {
+                            stage_probe_put(
+                                db_tx,
+                                &mut addition_bytes,
+                                probe.key,
+                                Some(probe.row_id),
+                            )?;
+                            None
                         }
                     }
-                } else {
-                    stage_probe_put(db_tx, &mut staged, probe.key, Some(probe.row_id))?;
-                }
-            }
-            ProbeResolution::Noop => {}
-            ProbeResolution::Collision { index_id, building } => {
-                if let Some(error) = collision(index_id, building, &mut poisoned) {
-                    remember_earliest_error(&mut earliest_error, sequence, error);
-                }
-            }
-            ProbeResolution::Failure(error) => {
-                remember_earliest_error(&mut earliest_error, sequence, error);
-            }
-        }
-    }
-    if let Some((_, error)) = earliest_error {
-        return Err(error);
-    }
+                    ProbeResolution::Noop => None,
+                    ProbeResolution::Collision { index_id, building } => {
+                        return collision(index_id, building)
+                            .map(|index_id| (index_id, addition_bytes));
+                    }
+                    ProbeResolution::Failure(error) => return Err(error),
+                };
 
+                Ok((poisoned, addition_bytes))
+            }
+        })
+        .buffer_unordered(UNIQUENESS_PROBE_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .unzip();
+
+    for bytes in addition_bytes {
+        staged.merge(bytes);
+    }
+    let mut poisoned = poisoned.into_iter().flatten().collect::<Vec<_>>();
     poisoned.sort_unstable();
     poisoned.dedup();
+
     Ok(StagedEntries {
         poisoned,
         deferred: Vec::new(),
@@ -771,6 +776,62 @@ mod tests {
             .unwrap();
 
         assert_eq!(staged.bytes, u64::try_from(ENTRIES * 16).unwrap());
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// Addition sources may fill the bounded prefetch while a deletion is
+    /// pending, but the transaction must still stage the delete first.
+    #[tokio::test]
+    async fn addition_prefetch_preserves_the_deletion_phase_boundary() {
+        let (db, _) = StoreBuilder::new("addition-prefetch", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let key = Bytes::from_static(b"delete-before-add");
+        let (release_deletion, deletion_released) = tokio::sync::oneshot::channel();
+        let deletion_key = key.clone();
+        let deletions = stream::once(async move {
+            deletion_released.await.unwrap();
+            Ok(StagedIndexEntry {
+                index_id: 1,
+                unique: true,
+                key: deletion_key,
+                row_id: 7,
+                delete: true,
+                building: false,
+            })
+        });
+        let (addition_polled, observed_addition) = tokio::sync::oneshot::channel();
+        let addition_key = key.clone();
+        let additions = stream::once(async move {
+            addition_polled.send(()).unwrap();
+            Ok(StagedIndexEntry {
+                index_id: 1,
+                unique: true,
+                key: addition_key,
+                row_id: 7,
+                delete: false,
+                building: false,
+            })
+        });
+
+        {
+            let staging = stage_index_entry_stream(&tx, deletions, additions, 0);
+            let mut staging = std::pin::pin!(staging);
+            tokio::select! {
+                _ = &mut staging => panic!("staging finished before deletion release"),
+                observed = observed_addition => observed.unwrap(),
+            }
+            release_deletion.send(()).unwrap();
+            staging.as_mut().await.unwrap();
+        }
+
+        assert_eq!(
+            tx.get(&key).await.unwrap(),
+            Some(Bytes::copy_from_slice(&7_u64.to_be_bytes()))
+        );
         tx.rollback();
         db.close().await.unwrap();
     }

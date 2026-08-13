@@ -33,4 +33,8 @@ impl StagedBytes {
             .saturating_add(key as u64)
             .saturating_add(value as u64);
     }
+
+    pub(crate) fn merge(&mut self, other: StagedBytes) {
+        self.0 = self.0.saturating_add(other.0);
+    }
 }

@@ -3,11 +3,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use futures::{StreamExt, TryStreamExt, stream};
+
 use super::{
     DbTransaction, EntityKey, Error, HashMap, InlineKey, InlineOperation, InlineScanKind, Key,
     ReadHandle, Result, RowOperation, TableKind, commit, decode::decode_hard_delete,
     materialize_inline_rows, proto, store_inline, value,
 };
+
+/// Independent per-table inline scans kept in flight during translation.
+const INLINE_TRANSLATION_CONCURRENCY: usize = 8;
 
 /// Allocates `inline/insert` chunk sequence numbers within one commit: the
 /// first [`RowOp::InlineInsert`] staged for a given `(table_id,
@@ -43,8 +48,10 @@ pub(crate) async fn translate_inline_flush_delete(
     flush_snapshot: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<HashSet<u64>> {
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
-    let inline_deletes = store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?;
+    let (chunks, inline_deletes) = futures::try_join!(
+        store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id),
+        store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
+    )?;
 
     let scoped: Vec<(InlineOperation, proto::InlineChunkValue)> = chunks
         .into_iter()
@@ -99,8 +106,7 @@ pub(super) async fn translate_inline_file_delete_removals(
     db_tx: &DbTransaction,
     table_id: u64,
     removals: &[(u64, u64)],
-    writes: &mut Vec<commit::StagedWrite>,
-) -> Result<()> {
+) -> Result<Vec<commit::StagedWrite>> {
     let live: HashSet<(u64, u64)> =
         store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id)
             .await?
@@ -108,7 +114,7 @@ pub(super) async fn translate_inline_file_delete_removals(
             .map(|(data_file_id, row_id, _)| (data_file_id, row_id))
             .collect();
 
-    writes.push(inline_file_delete_table_write(table_id));
+    let mut writes = vec![inline_file_delete_table_write(table_id)];
     for &(data_file_id, row_id) in removals {
         if !live.contains(&(data_file_id, row_id)) {
             return Err(Error::Corruption(format!(
@@ -125,7 +131,7 @@ pub(super) async fn translate_inline_file_delete_removals(
             None,
         ));
     }
-    Ok(())
+    Ok(writes)
 }
 
 /// The `(table_id, data_file_id)` of every data file this commit
@@ -166,28 +172,33 @@ fn gather_pruned_data_files(ops: &[RowOperation]) -> Result<BTreeSet<(u64, u64)>
 async fn translate_pruned_file_delete_cascade(
     db_tx: &DbTransaction,
     pruned: &BTreeSet<(u64, u64)>,
-    writes: &mut Vec<commit::StagedWrite>,
-) -> Result<()> {
+) -> Result<Vec<commit::StagedWrite>> {
     let tables: BTreeSet<u64> = pruned.iter().map(|(table_id, _)| *table_id).collect();
-    for table_id in tables {
+    stream::iter(tables.into_iter().map(|table_id| async move {
+        let mut writes = Vec::new();
         for (data_file_id, row_id, _) in
             store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id).await?
         {
-            if !pruned.contains(&(table_id, data_file_id)) {
-                continue;
+            if pruned.contains(&(table_id, data_file_id)) {
+                writes.push((
+                    Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
+                        table_id,
+                        data_file_id,
+                        row_id,
+                    }))
+                    .encode(),
+                    None,
+                ));
             }
-            writes.push((
-                Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
-                    table_id,
-                    data_file_id,
-                    row_id,
-                }))
-                .encode(),
-                None,
-            ));
         }
-    }
-    Ok(())
+        Ok::<_, Error>(writes)
+    }))
+    .buffer_unordered(INLINE_TRANSLATION_CONCURRENCY)
+    .try_fold(Vec::new(), |mut writes, table_writes| async move {
+        writes.extend(table_writes);
+        Ok(writes)
+    })
+    .await
 }
 
 /// Removes every `inline/*` record for `table_id`: schema, chunks, and
@@ -197,12 +208,18 @@ pub(super) async fn translate_inline_drop(
     table_id: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
-    for (op, _) in store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await? {
+    let (chunks, ranges, inline_deletes, file_deletes, schemas) = futures::try_join!(
+        store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id),
+        store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id),
+        store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
+        store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id),
+        store_inline::scan_inline_schemas(ReadHandle::Tx(db_tx), table_id),
+    )?;
+
+    for (op, _) in chunks {
         writes.push((Key::Inline(InlineKey::Live(op)).encode(), None));
     }
-    for row_id_end in
-        store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id).await?
-    {
+    for row_id_end in ranges {
         writes.push((
             Key::Inline(InlineKey::ChunkRange {
                 table_id,
@@ -212,7 +229,7 @@ pub(super) async fn translate_inline_drop(
             None,
         ));
     }
-    for (row_id, _) in store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id).await? {
+    for (row_id, _) in inline_deletes {
         writes.push((
             Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
                 table_id,
@@ -222,9 +239,7 @@ pub(super) async fn translate_inline_drop(
             None,
         ));
     }
-    for (data_file_id, row_id, _) in
-        store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id).await?
-    {
+    for (data_file_id, row_id, _) in file_deletes {
         writes.push((
             Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
                 table_id,
@@ -235,9 +250,7 @@ pub(super) async fn translate_inline_drop(
             None,
         ));
     }
-    for (schema_version, _) in
-        store_inline::scan_inline_schemas(ReadHandle::Tx(db_tx), table_id).await?
-    {
+    for (schema_version, _) in schemas {
         writes.push((
             Key::Inline(InlineKey::Schema {
                 table_id,
@@ -460,13 +473,19 @@ pub(super) async fn translate_inline(
     // this batch stages into it.
     let mut file_delete_tables: HashSet<u64> = HashSet::new();
 
-    for (table_id, removals) in gather_file_delete_removals(ops) {
-        translate_inline_file_delete_removals(db_tx, table_id, &removals, &mut writes).await?;
-    }
+    let removal_writes = stream::iter(gather_file_delete_removals(ops).into_iter().map(
+        |(table_id, removals)| async move {
+            translate_inline_file_delete_removals(db_tx, table_id, &removals).await
+        },
+    ))
+    .buffer_unordered(INLINE_TRANSLATION_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?;
+    writes.extend(removal_writes.into_iter().flatten());
 
     let pruned = gather_pruned_data_files(ops)?;
     if !pruned.is_empty() {
-        translate_pruned_file_delete_cascade(db_tx, &pruned, &mut writes).await?;
+        writes.extend(translate_pruned_file_delete_cascade(db_tx, &pruned).await?);
     }
 
     for op in ops {

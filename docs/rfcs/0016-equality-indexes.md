@@ -267,8 +267,11 @@ writer-supplied backfill entries passed to `create_index` — except through
 `moraine_create_index`, which has no writer and backfills by scoped-reading
 **every live data file** of the table, so its build cost is the table's
 indexed columns, and the one-commit bound bites hardest exactly there. The
-whole build is one commit, one batch; uniqueness is validated over the
-assembled entry set before staging, and a duplicate aborts the create. A
+reader overlaps a fixed number of immutable files and sends bounded Arrow
+batches through a bounded channel, so it retains no complete per-file result
+sets. The transaction still owns the table-wide encoded entry set: the whole
+build is one commit and one atomic batch, uniqueness is validated over that
+assembled set before staging, and a duplicate aborts the create. A
 backfill that exceeds the store's batch bound fails typed before staging
 anything, and the caller re-drives as a staged build (Staged builds).
 

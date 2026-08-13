@@ -8,6 +8,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use futures::{StreamExt, stream};
 use object_store::ObjectStore;
 use slatedb::{
     BlockCachePolicy, CacheTarget, Db, DbReader, DbReaderMode,
@@ -350,15 +351,18 @@ impl<'a> StoreBuilder<'a> {
             key::Subspace::Changelog,
         ];
 
-        let mut warmed = 0_usize;
-        let mut failed = 0_usize;
-        for subspace in metadata_only {
+        let (warmed, failed) = stream::iter(metadata_only.into_iter().map(|subspace| {
             let deep = matches!(preload, CachePreload::All) && whole.contains(&subspace);
-            match warm_subspace(handle, subspace, deep).await {
-                Ok(()) => warmed += 1,
-                Err(_) => failed += 1,
+            warm_subspace(handle, subspace, deep)
+        }))
+        .buffer_unordered(metadata_only.len())
+        .fold((0_usize, 0_usize), |(warmed, failed), result| async move {
+            match result {
+                Ok(()) => (warmed + 1, failed),
+                Err(_) => (warmed, failed + 1),
             }
-        }
+        })
+        .await;
         info!(
             warmed,
             failed,
