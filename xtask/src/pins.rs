@@ -5,7 +5,7 @@
 //! A C++-ABI extension is refused by any DuckDB whose version string
 //! differs from the one in its metadata footer, so the pin is not a
 //! preference — it decides which engine can load the artifact at all. It
-//! is also named in six places that cannot be derived from one another
+//! is also named in several places that cannot be derived from one another
 //! (two git submodules, a Rust constant, two workflow files, a README
 //! table), and a bump that misses one produces an artifact that builds,
 //! passes CI, and then fails to load. This makes that a build failure
@@ -35,6 +35,9 @@ const README: &str = "crates/moraine-duckdb/README.md";
 
 /// Prose that names the pinned DuckLake commit.
 const DUCKLAKE_PROSE: [&str; 2] = [README, "docs/rfcs/0006-extension-surface.md"];
+
+/// Version-specific DuckLake source pins used by the companion release.
+const DUCKLAKE_RELEASE_PINS: &str = "patches/ducklake/source-pins";
 
 /// How much of a commit `duckdb_extensions()` reports as
 /// `extension_version`, and so how much the pins carry.
@@ -85,6 +88,7 @@ pub fn check_pins() -> anyhow::Result<()> {
     // is required.
     for file in [
         ".github/workflows/extension.yml",
+        ".github/workflows/ducklake-extension.yml",
         ".github/workflows/release.yml",
     ] {
         let contents = read(file)?;
@@ -126,7 +130,10 @@ pub fn check_pins() -> anyhow::Result<()> {
 
     let ducklake = pinned_ducklake_commit();
     match &ducklake {
-        Ok(commit) => problems.extend(ducklake_problems(commit)?),
+        Ok(commit) => {
+            problems.extend(ducklake_problems(commit)?);
+            problems.extend(ducklake_release_problems(&supported, commit)?);
+        }
         Err(problem) => problems.push(problem.clone()),
     }
 
@@ -140,6 +147,65 @@ pub fn check_pins() -> anyhow::Result<()> {
         println!("ok: every DuckLake commit reference matches the one {pin} declares ({commit})");
     }
     Ok(())
+}
+
+fn ducklake_release_problems(
+    versions: &[String],
+    primary_commit: &str,
+) -> anyhow::Result<Vec<String>> {
+    let contents = read(DUCKLAKE_RELEASE_PINS)?;
+    let pins: Vec<(&str, &str)> = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_once(char::is_whitespace))
+        .map(|(version, commit)| (version, commit.trim()))
+        .collect();
+    let mut problems = Vec::new();
+
+    for version in versions {
+        if !pins.iter().any(|(pinned, _)| *pinned == version) {
+            problems.push(format!(
+                "{DUCKLAKE_RELEASE_PINS} has no DuckLake source pin for DuckDB `{version}`"
+            ));
+        }
+    }
+    for (version, _) in &pins {
+        if !versions.iter().any(|supported| supported == version) {
+            problems.push(format!(
+                "{DUCKLAKE_RELEASE_PINS} pins DuckDB `{version}`, which is not supported"
+            ));
+        }
+    }
+    if pins.len() != versions.len() {
+        problems.push(format!(
+            "{DUCKLAKE_RELEASE_PINS} has {} source pins for {} supported DuckDB versions",
+            pins.len(),
+            versions.len()
+        ));
+    }
+    for (version, commit) in &pins {
+        if commit.len() != 40
+            || !commit
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            problems.push(format!(
+                "{DUCKLAKE_RELEASE_PINS} gives DuckDB `{version}` a non-commit pin `{commit}`"
+            ));
+        }
+    }
+    if !pins
+        .iter()
+        .any(|(version, commit)| *version == versions[0] && *commit == primary_commit)
+    {
+        problems.push(format!(
+            "{DUCKLAKE_RELEASE_PINS} does not map primary DuckDB `{}` to DuckLake `{primary_commit}`",
+            versions[0]
+        ));
+    }
+
+    Ok(problems)
 }
 
 /// The DuckLake commit the pinned DuckDB declares, or the problem that

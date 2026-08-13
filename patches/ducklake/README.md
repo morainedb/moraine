@@ -6,11 +6,16 @@ stores file-level row-ID min/max statistics in DuckLake's existing
 list before any Parquet reader is created. Moraine can therefore return stable
 row ids without taking ownership of DuckLake scans or physical placement.
 
-The patch is pinned to the DuckLake revision selected by DuckDB v1.5.5. It is
-an evaluation build, not part of the released moraine extension.
+The patch is pinned separately to the DuckLake revisions selected by every
+DuckDB release moraine supports. It is released as an unsigned companion
+extension, not bundled into the moraine extension.
 Its zero-context diff is intentional: the exact source pin makes context
 unnecessary and keeps the patch file compatible with moraine's whitespace
 gate.
+
+The source mapping lives in `source-pins`. Each entry binds one DuckDB release
+to the upstream DuckLake commit that release selects. A DuckDB bump must add a
+validated mapping before the companion release can build.
 
 ## Build
 
@@ -102,3 +107,28 @@ The same shape works with `moraine_index_lookup`, `moraine_index_range`, and
 `moraine_index_nulls`. DuckDB turns the join key into a dynamic row-ID filter.
 The patched DuckLake maps it to the reserved internal row-ID field and applies
 its existing zone-map pruning while constructing the physical-file list.
+
+## Release
+
+Dispatch the `Patched DuckLake extension` workflow with a tag such as
+`ducklake-rowid-v0.1.0`. It calls DuckDB's extension distribution workflow for
+every version in `.github/duckdb-versions` and publishes the same four native
+platforms as moraine:
+
+```text
+ducklake.v1.5.5.linux_amd64.duckdb_extension
+ducklake.v1.5.5.linux_arm64.duckdb_extension
+ducklake.v1.5.5.osx_amd64.duckdb_extension
+ducklake.v1.5.5.osx_arm64.duckdb_extension
+```
+
+The corresponding four v1.5.4 assets are included in the same release. The
+publisher stays in draft mode until all eight assets exist and the Linux amd64
+and macOS arm64 artifacts for both DuckDB versions pass the row-ID statistics
+and one-file-pruning smoke test. A failed or cancelled run leaves no partial
+public release.
+
+Each artifact only loads into the exact DuckDB version and platform in its
+name. Start DuckDB with unsigned extensions enabled, load moraine first, then
+load the matching DuckLake artifact by path. Do not install or load stock
+DuckLake afterward in the same process.
