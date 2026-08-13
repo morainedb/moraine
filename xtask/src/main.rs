@@ -14,6 +14,10 @@
 //!   that manifest as the JSON array the release workflows build from.
 //! - `check-release-assets <directory>` verifies a release carries a build for
 //!   every supported version on every published platform (see `release.rs`).
+//! - `check-ducklake-release-assets <directory>` applies the same completeness
+//!   gate to the patched DuckLake companion release.
+//! - `validate-ducklake-release-artifact <version> <artifact>` proves one
+//!   companion artifact records row-ID statistics and prunes files.
 //! - `bump-duckdb <version>` moves the primary pin to a new DuckDB release,
 //!   writing every place `check-pins` checks (see `bump.rs`).
 //! - `ducklake-patch` builds the repository's DuckLake patch as a loadable
@@ -42,6 +46,10 @@ fn main() -> anyhow::Result<()> {
         Some("ducklake-patch") => ducklake_patch::build(&arguments),
         Some("check-pins") => pins::check_pins(),
         Some("check-release-assets") => release::check_release_assets(&arguments),
+        Some("check-ducklake-release-assets") => release::check_ducklake_release_assets(&arguments),
+        Some("validate-ducklake-release-artifact") => {
+            release::validate_ducklake_release_artifact(&arguments)
+        }
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
         Some("version-matrix") => {
             pins::print_version_matrix();
@@ -50,12 +58,16 @@ fn main() -> anyhow::Result<()> {
         Some(other) => {
             bail!(
                 "unknown task `{other}`; available: e2e, bench, commit-bench, s3, check-pins, \
-                 check-release-assets, version-matrix, bump-duckdb, ducklake-patch"
+                 check-release-assets, check-ducklake-release-assets, \
+                 validate-ducklake-release-artifact, version-matrix, bump-duckdb, \
+                 ducklake-patch"
             )
         }
         None => bail!(
             "usage: cargo xtask <task>; available: e2e, bench, commit-bench, s3, check-pins, \
-             check-release-assets, version-matrix, bump-duckdb, ducklake-patch"
+             check-release-assets, check-ducklake-release-assets, \
+             validate-ducklake-release-artifact, version-matrix, bump-duckdb, \
+             ducklake-patch"
         ),
     }
 }

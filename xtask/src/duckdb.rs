@@ -170,10 +170,8 @@ pub fn workspace_root() -> PathBuf {
 /// Keyed by version: a CLI only loads an extension built for its own
 /// version string, so a pin bump must miss the cache rather than serve
 /// the release it downloaded before.
-fn duckdb_cli_root() -> PathBuf {
-    workspace_root()
-        .join("target/duckdb-cli")
-        .join(duckdb_pin())
+fn duckdb_cli_root_for(pin: &str) -> PathBuf {
+    workspace_root().join("target/duckdb-cli").join(pin)
 }
 
 /// Cache root for `INSTALL ducklake`-style downloaded extensions,
@@ -199,14 +197,24 @@ fn cli_binary_name() -> &'static str {
 /// extension for the new version and then fail to load it into the old
 /// CLI, reported as a load error rather than a stale cache.
 pub fn ensure_duckdb_cli() -> anyhow::Result<PathBuf> {
-    let duckdb_root = duckdb_cli_root();
+    ensure_duckdb_cli_for(duckdb_pin())
+}
+
+/// Downloads or reuses a DuckDB CLI for an explicitly supported release.
+pub fn ensure_duckdb_cli_for(pin: &str) -> anyhow::Result<PathBuf> {
+    ensure!(
+        supported_duckdb_versions()
+            .iter()
+            .any(|supported| supported == pin),
+        "DuckDB {pin} is not listed in .github/duckdb-versions"
+    );
+    let duckdb_root = duckdb_cli_root_for(pin);
     let cli_dir = duckdb_root.join("cli");
     let cli_path = cli_dir.join(cli_binary_name());
     if cli_path.exists() {
         return Ok(cli_path);
     }
 
-    let pin = duckdb_pin();
     let platform = cli_download_platform(pin)?;
     let zip_name = format!("duckdb_cli-{platform}.zip");
     let zip_path = duckdb_root.join(&zip_name);
