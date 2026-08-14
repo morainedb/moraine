@@ -274,7 +274,9 @@ store by default — now for the whole process, so a multi-store host is
 strictly smaller than before, and a single-store host is unchanged. This
 is the number to weigh against DuckDB's `memory_limit` when sizing a
 host: DuckDB's budget covers its own buffers and the data-file cache, and
-this cache is the one memory consumer beside it.
+this cache is the process-wide memory consumer beside it. A handle's
+decoded catalog is not in it: that is bounded by the catalog's size rather
+than by an option, and is reported rather than budgeted.
 
 **`CACHE_PUTS` — fill the cache from the write path too.** Left alone, the
 cache fills only from reads: blocks the store just flushed are fetched back

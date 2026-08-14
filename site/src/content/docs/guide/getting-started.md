@@ -112,7 +112,11 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 
 `META_CACHE_MEMORY` is the number to weigh against DuckDB's own `memory_limit`
 when sizing a host: DuckDB's budget covers its buffers and its Parquet cache,
-and this is the one memory consumer beside it.
+and this covers moraine's **process** caches — SST metadata, data blocks, and
+the parsed Parquet metadata equality-index upkeep reads. Each attached
+catalog additionally holds its own decoded view, which no option bounds
+because its size is the catalog's; `projection_bytes` on a catalog handle
+reports it.
 
 SST filters and indexes share that budget with data blocks, and every point
 read walks them before it can reach a block. They are not given a fixed
