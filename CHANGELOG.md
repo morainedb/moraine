@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/morainedb/moraine/compare/v0.5.2...v0.6.0) - 2026-08-14
+
+### Added
+
+- backfill DuckLake row ID file statistics ([#145](https://github.com/morainedb/moraine/pull/145))
+
+### Other
+
+- expose and tune index lookup maintenance ([#137](https://github.com/morainedb/moraine/pull/137))
+- streamline index maintenance reads ([#135](https://github.com/morainedb/moraine/pull/135))
+
 ## [0.5.2](https://github.com/morainedb/moraine/compare/v0.5.1...v0.5.2) - 2026-08-13
 
 ### Added
