@@ -43,10 +43,19 @@ const METADATA_PRIORITY_POOL_RATIO: f64 = 0.9;
 
 /// At most this much of the budget is reserved for parsed metadata outside
 /// SlateDB.
-const MAX_AUXILIARY_METADATA_MEMORY: u64 = 8 * 1024 * 1024;
+///
+/// A ceiling is needed because this allowance is **deducted** from the
+/// budget whether the parsed-metadata cache fills it or not — it cannot
+/// share one eviction store with SlateDB's, whose key and value types are
+/// SlateDB's own. So the share scales with the budget up to here and then
+/// stops, rather than reserving hundreds of megabytes on a large host for a
+/// cache that may hold little.
+const MAX_AUXILIARY_METADATA_MEMORY: u64 = 64 * 1024 * 1024;
 
 /// The auxiliary allowance's divisor against the whole budget, up to its
-/// ceiling.
+/// ceiling. At the default budget this lands exactly on the 8 MiB the
+/// allowance was fixed at, so a default host is unchanged and a larger one
+/// stops being pinned to a small host's figure.
 const AUXILIARY_METADATA_SHARE_DIVISOR: u64 = 80;
 
 /// Bytes of disk the block slot's device takes when no cap is
@@ -1282,6 +1291,30 @@ mod tests {
         assert_eq!(auxiliary, 8 * 1024 * 1024);
         assert_eq!(shared, 632 * 1024 * 1024);
         assert!(metadata_ceiling(shared) > 4 * 120 * 1024 * 1024);
+    }
+
+    /// The parsed-metadata allowance follows the budget instead of standing
+    /// at a small host's figure, and stops at its ceiling rather than
+    /// reserving unboundedly — the bytes are deducted whether it fills them
+    /// or not.
+    #[test]
+    fn the_auxiliary_allowance_scales_with_the_budget() {
+        let allowance = |memory: u64| {
+            CacheConfig {
+                memory: Some(memory),
+                ..CacheConfig::default()
+            }
+            .slots()
+            .0
+        };
+
+        assert_eq!(allowance(DEFAULT_CACHE_MEMORY), 8 * 1024 * 1024);
+        // A 4 GiB budget: 51.2 MiB, where the old ceiling gave 8 MiB.
+        assert_eq!(allowance(4 * 1024 * 1024 * 1024), 53_687_091);
+        assert_eq!(
+            allowance(64 * 1024 * 1024 * 1024),
+            MAX_AUXILIARY_METADATA_MEMORY
+        );
     }
 
     /// A later store's cache options do not take effect, and the process
