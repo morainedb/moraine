@@ -55,6 +55,9 @@ use crate::{
     store::index_encoding::{Direction, IndexKeyValue, NullOrder},
 };
 
+/// DuckDB's reserved Parquet field id for `_ducklake_internal_row_id`.
+pub(crate) const ROW_ID_FIELD_ID: u64 = 2_147_483_540;
+
 /// One entry derived from a registered file: the row id and the canonical
 /// values of the indexed columns, in the index's column order.
 #[derive(Debug, Clone, PartialEq)]

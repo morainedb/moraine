@@ -5,19 +5,15 @@ use object_store::path::Path;
 use parquet::arrow::ProjectionMask;
 
 use crate::{
-    data_file::{IndexProjection, RowIdSource},
+    data_file::{IndexProjection, ROW_ID_FIELD_ID, RowIdSource},
     error::{Error, Result},
 };
-
-/// DuckDB's reserved Parquet field id tagging the embedded row-id column
-/// (`_ducklake_internal_row_id`) that rewrite and flush files carry.
-const ROW_ID_FIELD_ID: i32 = 2_147_483_540;
 
 /// The root position of the embedded row-id column, if the file has one.
 fn embedded_row_id_position(schema: &parquet::schema::types::SchemaDescriptor) -> Option<usize> {
     schema.root_schema().get_fields().iter().position(|field| {
         let info = field.get_basic_info();
-        info.has_id() && info.id() == ROW_ID_FIELD_ID
+        info.has_id() && u64::try_from(info.id()).ok() == Some(ROW_ID_FIELD_ID)
     })
 }
 

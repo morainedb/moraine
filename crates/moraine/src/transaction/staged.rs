@@ -1403,12 +1403,14 @@ fn refuse_orphaned_children(children: &ChildRows) -> Result<()> {
 }
 
 /// Translates a head-preserving maintenance commit: snapshot expiry and
-/// file cleanup arrive with no `ducklake_snapshot` insert (DuckLake mints
-/// no snapshot for them), so nothing advances head and no snapshot record
-/// is written. Only reclamation-shaped operations are legal — raw
-/// deletes, schedule inserts, and the inline drops a dead table's cleanup
-/// issues; any entity insert or lifecycle update without a snapshot row
-/// is a constraint violation (DuckLake always mints a snapshot for real
+/// file cleanup and derived-statistics repair arrive with no
+/// `ducklake_snapshot` insert (DuckLake mints no snapshot for them), so
+/// the head snapshot id is retained and no snapshot record is written. Only
+/// reclamation-shaped operations and unversioned maintenance writes are
+/// legal — raw deletes, schedule inserts, row-ID file-stat inserts, option
+/// writes, and the inline drops a dead table's cleanup issues; any
+/// versioned entity insert or lifecycle update without a snapshot row is
+/// a constraint violation (DuckLake always mints a snapshot for real
 /// catalog changes).
 fn translate_maintenance(
     base: &CatalogSnapshot,
@@ -1421,6 +1423,13 @@ fn translate_maintenance(
     let mut direct = Vec::new();
     let hard_deleted = collect_hard_deletes(ops)?;
     for op in ops {
+        let row_id_statistics_insert = match op {
+            RowOperation::Insert {
+                table: TableKind::FileColumnStats,
+                cells,
+            } => decode::decode_file_column_stats(cells)?.column_id == data_file::ROW_ID_FIELD_ID,
+            _ => false,
+        };
         let allowed = matches!(
             op,
             RowOperation::Delete { .. }
@@ -1433,12 +1442,13 @@ fn translate_maintenance(
                         | TableKind::Metadata,
                     ..
                 }
-        ) || is_inline_op(op);
+        ) || row_id_statistics_insert
+            || is_inline_op(op);
         if !allowed {
             return Err(Error::Constraint(
-                "a staged commit without a ducklake_snapshot insert may only reclaim state \
-                 or set options (maintenance deletes, deletion-schedule inserts, and \
-                 ducklake_metadata writes)"
+                "a staged commit without a ducklake_snapshot insert may only maintain \
+                 unversioned state (maintenance deletes, deletion-schedule inserts, \
+                 reserved row-ID file-stat inserts, and ducklake_metadata writes)"
                     .to_string(),
             ));
         }

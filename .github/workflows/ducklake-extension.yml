@@ -123,7 +123,7 @@ jobs:
             | paste -sd', ' -)
           gh release create "$tag" --target '${{ github.sha }}' --draft \
             --title "$tag" \
-            --notes "Unsigned DuckLake with Moraine's row-ID file-pruning patch, built for DuckDB ${versions}. Assets are named ducklake.<duckdb-version>.<platform>.duckdb_extension and only load into the exact DuckDB version they name. Load Moraine first, then load this artifact by path; do not INSTALL or LOAD stock ducklake afterward." \
+            --notes "Unsigned DuckLake with Moraine's row-ID file-statistics backfill and file-pruning patch, built for DuckDB ${versions}. Assets are named ducklake.<duckdb-version>.<platform>.duckdb_extension and only load into the exact DuckDB version they name. Load Moraine first, then load this artifact by path; do not INSTALL or LOAD stock ducklake afterward." \
             || true
           gh release upload "$tag" dist/*.duckdb_extension --clobber
           gh release edit "$tag" --draft=false

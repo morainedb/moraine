@@ -19,10 +19,10 @@ use crate::helpers::*;
 
 /// The exact DuckLake commit whose behaviour these pins describe and that
 /// the repository patch is applied to.
-const DUCKLAKE_SOURCE_COMMIT: &str = "d8a1881e";
+const DUCKLAKE_SOURCE_COMMIT: &str = "d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4";
 
-/// The source revision embedded by the local `CMake` build.
-const DUCKLAKE_EXTENSION_VERSION: &str = "d8a1881";
+/// Git's default lower bound for an abbreviated object name.
+const MINIMUM_GIT_ABBREVIATION_LENGTH: usize = 7;
 
 /// Runs `statements` in one CLI session with `QueryLog` capture on, and
 /// returns every statement DuckDB executed — DuckLake's own metadata SQL
@@ -383,19 +383,16 @@ fn moraine_serves_the_conflict_resolution_read_inside_a_transaction() {
 /// The DuckDB/DuckLake build pair the loadable is linked against, checked
 /// by running rather than assumed.
 ///
-/// moraine statically links DuckDB v1.5.5; the DuckLake extension that
-/// CLI installs is built by DuckDB's own CI against v1.5.3. Patch-level
-/// ABI friction between the two would show up as a load failure, a crash,
-/// or a wrong answer at the boundary where DuckLake hands moraine C++
-/// objects by pointer — so the pin is: both extensions load into one
-/// process, and the full chain answers correctly.
+/// moraine statically links DuckDB v1.5.5, and the patched DuckLake extension
+/// is built against the same release. ABI friction between the two would show
+/// up as a load failure, a crash, or a wrong answer at the boundary where
+/// DuckLake hands moraine C++ objects by pointer — so the pin is: both
+/// extensions load into one process, and the full chain answers correctly.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn the_pinned_duckdb_and_ducklake_builds_interoperate() {
     let dir = TempDir::new("pin-store");
     let data_dir = TempDir::new("pin-data");
-
-    assert!(DUCKLAKE_SOURCE_COMMIT.starts_with(DUCKLAKE_EXTENSION_VERSION));
 
     assert_eq!(
         csv_rows(&run_ducklake_sql(
@@ -406,15 +403,28 @@ fn the_pinned_duckdb_and_ducklake_builds_interoperate() {
         vec![vec![duckdb_pin()]],
         "the CLI is not the pinned DuckDB release"
     );
+    let extension_rows = csv_rows(&run_ducklake_sql(
+        dir.path(),
+        data_dir.path(),
+        "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake';",
+    ));
     assert_eq!(
-        csv_rows(&run_ducklake_sql(
-            dir.path(),
-            data_dir.path(),
-            "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake';",
-        )),
-        vec![vec![DUCKLAKE_EXTENSION_VERSION]],
-        "the patched DuckLake artifact has a different source revision; re-verify every pin in \
-         this file and RFC 0006's version table"
+        extension_rows.len(),
+        1,
+        "DuckLake version: {extension_rows:?}"
+    );
+    assert_eq!(
+        extension_rows[0].len(),
+        1,
+        "DuckLake version: {extension_rows:?}"
+    );
+    let extension_version = &extension_rows[0][0];
+    assert!(
+        extension_version.len() >= MINIMUM_GIT_ABBREVIATION_LENGTH
+            && DUCKLAKE_SOURCE_COMMIT.starts_with(extension_version),
+        "the patched DuckLake artifact reports source revision {extension_version}, not an \
+         abbreviation of {DUCKLAKE_SOURCE_COMMIT}; re-verify every pin in this file and RFC \
+         0006's version table"
     );
 
     // Both extensions loaded and the chain answers: the interoperation

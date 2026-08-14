@@ -97,7 +97,7 @@ pub fn check_ducklake_release_assets(arguments: &[String]) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Loads one published patched DuckLake artifact and proves that it records
+/// Loads one published patched DuckLake artifact and proves that it backfills
 /// row-ID statistics and prunes a three-file scan to one file.
 pub fn validate_ducklake_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
     let [version, artifact] = arguments else {
@@ -132,10 +132,10 @@ pub fn validate_ducklake_release_artifact(arguments: &[String]) -> anyhow::Resul
     let row_id_stat_rows = stdout.matches("2147483540").count();
     ensure!(
         row_id_stat_rows == 3 && stdout.contains("Total Files Read: 1"),
-        "patched DuckLake for DuckDB {version} exposed {row_id_stat_rows} of 3 expected row-ID \
+        "patched DuckLake for DuckDB {version} backfilled {row_id_stat_rows} of 3 expected row-ID \
          statistic rows or did not prune the scan to one file"
     );
-    println!("ok: patched DuckLake prunes row IDs under DuckDB {version}");
+    println!("ok: patched DuckLake backfills and prunes row IDs under DuckDB {version}");
     Ok(())
 }
 

@@ -10,6 +10,12 @@ INSERT INTO lake.items VALUES (0), (1), (2);
 INSERT INTO lake.items VALUES (3), (4);
 INSERT INTO lake.items VALUES (5), (6), (7), (8);
 
+DELETE FROM release_smoke.ducklake_file_column_stats
+WHERE column_id = 2147483540;
+
+SELECT schema_name, table_name, files_backfilled, files_remaining
+FROM ducklake_backfill_row_id_stats('lake', schema => 'main', table_name => 'items');
+
 SELECT stats.column_id, stats.min_value, stats.max_value
 FROM release_smoke.ducklake_data_file AS data
 JOIN release_smoke.ducklake_file_column_stats AS stats
