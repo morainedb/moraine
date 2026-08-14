@@ -1,5 +1,5 @@
-//! Builds the repository's DuckLake patch against moraine's primary DuckDB
-//! pin without compiling DuckDB core.
+//! Builds the repository's DuckLake patch series against moraine's primary
+//! DuckDB pin without compiling DuckDB core.
 
 use std::{
     fs,
@@ -16,7 +16,10 @@ const DUCKLAKE_REVISION: &str = "d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4";
 const SUPPORTED_DUCKDB_PIN: &str = "v1.5.5";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
-const PATCH_PATH: &str = "patches/ducklake/0001-perf-prune-DuckLake-files-by-row-id.patch";
+const PATCH_PATHS: [&str; 2] = [
+    "patches/ducklake/0001-perf-prune-DuckLake-files-by-row-id.patch",
+    "patches/ducklake/0002-feat-backfill-DuckLake-row-id-file-statistics.patch",
+];
 const CONFIG_PATH: &str = "patches/ducklake/extension_config.cmake";
 const ROW_ID_TEST_PATH: &str = "test/sql/rowid/ducklake_row_id_file_pruning.test";
 
@@ -74,11 +77,13 @@ pub fn build_artifact(arguments: &[String]) -> anyhow::Result<PathBuf> {
         "the DuckLake patch targets DuckDB {SUPPORTED_DUCKDB_PIN}, but moraine's primary pin is {}",
         duckdb::duckdb_pin()
     );
-    ensure!(
-        workspace.join(PATCH_PATH).exists(),
-        "the DuckLake patch is missing at {}",
-        workspace.join(PATCH_PATH).display()
-    );
+    for patch in PATCH_PATHS {
+        ensure!(
+            workspace.join(patch).exists(),
+            "the DuckLake patch is missing at {}",
+            workspace.join(patch).display()
+        );
+    }
 
     fs::create_dir_all(&paths.root)
         .with_context(|| format!("creating {}", paths.root.display()))?;
@@ -90,7 +95,7 @@ pub fn build_artifact(arguments: &[String]) -> anyhow::Result<PathBuf> {
         options.duckdb_static.display(),
     );
     prepare_checkout(&paths.source, DUCKLAKE_URL, DUCKLAKE_REVISION, "DuckLake")?;
-    apply_patch(&workspace, &paths.source)?;
+    apply_patches(&workspace, &paths.source)?;
     prepare_checkout(&paths.vcpkg, VCPKG_URL, VCPKG_REVISION, "vcpkg")?;
     bootstrap_vcpkg(&paths.vcpkg)?;
 
@@ -270,35 +275,35 @@ fn ensure_directory_is_empty(path: &Path, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn apply_patch(workspace: &Path, source: &Path) -> anyhow::Result<()> {
-    let patch = workspace.join(PATCH_PATH);
-    if checkout_matches_patch(source, &patch)? {
+fn apply_patches(workspace: &Path, source: &Path) -> anyhow::Result<()> {
+    let patches: Vec<PathBuf> = PATCH_PATHS
+        .iter()
+        .map(|patch| workspace.join(patch))
+        .collect();
+    if checkout_matches_patches(source, &patches)? {
         return Ok(());
     }
 
     ensure_clean_checkout(source, "cached DuckLake checkout")?;
 
-    duckdb::run(
-        Command::new("git")
-            .args(["apply", "--unidiff-zero", "--check"])
-            .arg(&patch)
-            .current_dir(source),
-    )?;
+    // One invocation for the whole series: git threads each patch's result
+    // into the next, so later hunks address the lines earlier ones produced.
+    // The apply is all-or-nothing; `--check` cannot stand in for it because it
+    // does not see files an earlier patch in the same run creates.
     duckdb::run(
         Command::new("git")
             .args(["apply", "--unidiff-zero"])
-            .arg(&patch)
+            .args(&patches)
             .current_dir(source),
     )?;
     ensure!(
-        checkout_matches_patch(source, &patch)?,
-        "applying {} did not produce its exact tracked diff",
-        patch.display()
+        checkout_matches_patches(source, &patches)?,
+        "applying the DuckLake patch series did not produce its exact tracked diff"
     );
     Ok(())
 }
 
-fn checkout_matches_patch(source: &Path, patch: &Path) -> anyhow::Result<bool> {
+fn checkout_matches_patches(source: &Path, patches: &[PathBuf]) -> anyhow::Result<bool> {
     let parent = source
         .parent()
         .context("the DuckLake source checkout has no parent")?;
@@ -310,7 +315,7 @@ fn checkout_matches_patch(source: &Path, patch: &Path) -> anyhow::Result<bool> {
     command_output(
         Command::new("git")
             .args(["apply", "--cached", "--unidiff-zero"])
-            .arg(patch)
+            .args(patches)
             .env("GIT_INDEX_FILE", &expected_index)
             .current_dir(source),
     )?;
@@ -745,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_patch_requires_the_exact_resulting_tree() {
+    fn cached_patch_series_requires_the_exact_resulting_tree() {
         let root = TemporaryDirectory::create(&std::env::temp_dir(), "patch-tree-test")
             .expect("temporary root");
         let source = root.path().join("source");
@@ -777,27 +782,39 @@ mod tests {
         )
         .expect("commit baseline");
 
-        let patch = root.path().join("change.patch");
+        let first = root.path().join("0001-change.patch");
         fs::write(
-            &patch,
+            &first,
             "diff --git a/source.cpp b/source.cpp\n\
              --- a/source.cpp\n\
              +++ b/source.cpp\n\
              @@ -1 +1 @@\n\
              -old\n\
+             +mid\n",
+        )
+        .expect("first patch file");
+        let second = root.path().join("0002-change.patch");
+        fs::write(
+            &second,
+            "diff --git a/source.cpp b/source.cpp\n\
+             --- a/source.cpp\n\
+             +++ b/source.cpp\n\
+             @@ -1 +1 @@\n\
+             -mid\n\
              +new\n",
         )
-        .expect("patch file");
+        .expect("second patch file");
+        let patches = [first, second];
         fs::write(source.join("source.cpp"), "new\n").expect("apply expected edit");
 
-        assert!(checkout_matches_patch(&source, &patch).expect("matching tree"));
+        assert!(checkout_matches_patches(&source, &patches).expect("matching tree"));
 
         fs::write(source.join("sibling.cpp"), "extra edit\n").expect("extra tracked edit");
-        assert!(!checkout_matches_patch(&source, &patch).expect("extra tracked edit"));
+        assert!(!checkout_matches_patches(&source, &patches).expect("extra tracked edit"));
 
         fs::write(source.join("sibling.cpp"), "unchanged\n").expect("restore sibling");
         fs::write(source.join("untracked.cpp"), "extra\n").expect("extra untracked file");
-        assert!(!checkout_matches_patch(&source, &patch).expect("extra untracked file"));
+        assert!(!checkout_matches_patches(&source, &patches).expect("extra untracked file"));
     }
 
     #[test]
