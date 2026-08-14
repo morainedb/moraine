@@ -79,6 +79,20 @@ impl<K: Ord, V> Maintained<K, V> {
         self.rows.clear();
     }
 
+    /// Roughly what the maintained rows hold, keys included.
+    fn estimated_bytes(&self) -> u64
+    where
+        V: prost::Message,
+    {
+        self.rows
+            .values()
+            .map(|value| {
+                u64::try_from(value.encoded_len()).unwrap_or(u64::MAX)
+                    + u64::try_from(std::mem::size_of::<K>()).unwrap_or(0)
+            })
+            .sum()
+    }
+
     fn advance(&mut self, new_head: HeadValue) {
         if self.head.is_some() {
             self.head = Some(new_head);
@@ -252,6 +266,36 @@ pub(crate) struct ProjectionCache {
 }
 
 impl ProjectionCache {
+    /// Roughly what this handle's decoded catalog holds, in bytes.
+    ///
+    /// Counts the shared `current` and `history` record sets, the
+    /// maintained projections, and the folded head view — each a separate
+    /// allocation, and on a writer the head view is often the only one
+    /// standing. Encoded lengths throughout, so it understates the decoded
+    /// form.
+    ///
+    /// Bounded by one catalog's decoded size rather than by a cap: nothing
+    /// evicts these, they are replaced when the head stamp moves. Reporting
+    /// them is what keeps them visible to sizing.
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        let records = |half: &Option<(HeadValue, Arc<Vec<EntityRecord>>)>| {
+            half.as_ref().map_or(0, |(_, records)| {
+                records.iter().map(EntityRecord::estimated_bytes).sum()
+            })
+        };
+
+        records(&self.current_entities)
+            .saturating_add(records(&self.history_entities))
+            .saturating_add(self.snapshots.estimated_bytes())
+            .saturating_add(self.table_stats.estimated_bytes())
+            .saturating_add(self.table_column_stats.estimated_bytes())
+            .saturating_add(
+                self.head_view
+                    .as_ref()
+                    .map_or(0, |view| view.estimated_bytes()),
+            )
+    }
+
     pub(crate) fn empty() -> Self {
         Self {
             snapshots: Maintained::empty(),

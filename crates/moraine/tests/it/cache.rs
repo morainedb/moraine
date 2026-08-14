@@ -781,3 +781,54 @@ async fn the_shared_cache_reports_metadata_apart_from_data_blocks() {
         "{status:?}"
     );
 }
+
+/// The handle's decoded catalog is reported, so a host sizing a process can
+/// see the one cache no byte budget covers. It grows with the catalog and is
+/// replaced when the head moves, never evicted under pressure.
+#[tokio::test]
+async fn a_handle_reports_what_its_decoded_catalog_holds() {
+    let object_store = Arc::new(InMemory::new());
+    let writer = Catalog::open(
+        Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // Nothing materialized yet.
+    assert_eq!(writer.projection_bytes(), 0);
+
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "t", &[col("a")])?;
+            for _ in 0..64 {
+                tx.register_data_file(table, datafile(100), &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.snapshot().await.unwrap();
+    let small = writer.projection_bytes();
+    assert!(small > 0, "a materialized catalog reports nothing");
+
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "u", &[col("b")])?;
+            for _ in 0..512 {
+                tx.register_data_file(table, datafile(100), &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.snapshot().await.unwrap();
+
+    assert!(
+        writer.projection_bytes() > small,
+        "a larger catalog must report more: {small} then {}",
+        writer.projection_bytes()
+    );
+}

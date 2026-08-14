@@ -459,6 +459,26 @@ impl ReadOnlyCatalog {
         self.cache.tally()
     }
 
+    /// Roughly what this handle's decoded catalog holds, in bytes.
+    ///
+    /// The other caches are the process's and are budgeted by
+    /// [`CatalogOptions::cache_memory`]; this one is the handle's, is
+    /// bounded by the catalog's own size rather than by a cap, and is
+    /// replaced when the head stamp moves rather than evicted under
+    /// pressure. It is reported so a host sizing a process can see it at
+    /// all.
+    ///
+    /// An estimate over the decoded record sets and maintained projections.
+    /// The head view derived from those records is a separate allocation
+    /// and is not counted, so treat this as a floor.
+    #[must_use]
+    pub fn projection_bytes(&self) -> u64 {
+        self.projections
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .estimated_bytes()
+    }
+
     /// Physical object-store requests this catalog has issued since it
     /// attached.
     ///

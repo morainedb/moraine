@@ -3,6 +3,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use prost::Message as _;
+
 use crate::{
     catalog::types::{
         ColumnId, ColumnInfo, ColumnStats, DataFileId, DataFileInfo, DeleteFileId, DeleteFileInfo,
@@ -138,7 +140,52 @@ fn remove_nested<K: Ord, V>(map: &mut BTreeMap<u64, BTreeMap<K, V>>, table_id: u
     }
 }
 
+/// Encoded bytes of one map's values, keys included.
+fn flat_bytes<K, V: prost::Message>(map: &BTreeMap<K, V>) -> u64 {
+    map.values()
+        .map(|value| u64::try_from(value.encoded_len()).unwrap_or(u64::MAX))
+        .sum::<u64>()
+        + u64::try_from(map.len() * std::mem::size_of::<K>()).unwrap_or(0)
+}
+
+/// As [`flat_bytes`], for a map of maps.
+fn nested_bytes<K1, K2, V: prost::Message>(map: &BTreeMap<K1, BTreeMap<K2, V>>) -> u64 {
+    map.values().map(flat_bytes).sum::<u64>()
+        + u64::try_from(map.len() * std::mem::size_of::<K1>()).unwrap_or(0)
+}
+
 impl CatalogSnapshot {
+    /// Roughly what this view holds, in bytes.
+    ///
+    /// Sums the encoded length of every entity it carries. The name indexes
+    /// are derived and small beside the file maps, and are not counted; an
+    /// encoded length also understates its decoded form. Read to report a
+    /// handle's footprint, never to decide an eviction.
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        [
+            flat_bytes(&self.schemas),
+            flat_bytes(&self.tables),
+            flat_bytes(&self.views),
+            flat_bytes(&self.macros),
+            flat_bytes(&self.table_stats),
+            flat_bytes(&self.tags),
+            flat_bytes(&self.gc_files),
+            flat_bytes(&self.options),
+            nested_bytes(&self.columns),
+            nested_bytes(&self.data_files),
+            nested_bytes(&self.delete_files),
+            nested_bytes(&self.partitions),
+            nested_bytes(&self.sorts),
+            nested_bytes(&self.mappings),
+            nested_bytes(&self.indexes),
+            nested_bytes(&self.table_column_stats),
+            nested_bytes(&self.file_column_stats),
+            u64::try_from(self.snapshot.encoded_len()).unwrap_or(u64::MAX),
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add)
+    }
+
     /// Builds the view. With `at: None` every `current` record is live and
     /// `history` is unused (allocation reads the table's persisted counter,
     /// not history); with `at: Some(s)` a record is included iff

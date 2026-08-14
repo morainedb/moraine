@@ -570,8 +570,8 @@ The caches a moraine-backed query crosses, top to bottom:
 | DuckDB metadata caches | Parquet footers, HTTP metadata | path | unbounded, opt-in | never / on error |
 | DuckLake catalog cache | schema/catalog entries; the per-transaction snapshot | snapshot id + `schema_version` | live-catalog-sized | `schema_version` move; transaction end |
 | shim `MetadataRows` | decoded rows per synthesized table | head stamp at first scan | per transaction | transaction end |
-| core logical caches | `CatalogSnapshot`, entity record set, maintained projections | head stamp + install epoch | one catalog's decoded size | replaced on stamp move |
-| core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep | object-store identity + path + file size + page-index policy | process-wide share of `CACHE_MEMORY`, capped at 8 MiB | byte-bounded LRU |
+| core logical caches | `CatalogSnapshot`, entity record set, maintained projections | head stamp + install epoch | one catalog's decoded size, reported by `projection_bytes` | replaced on stamp move |
+| core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep | object-store identity + path + file size + page-index policy | process-wide share of `CACHE_MEMORY`, to a ceiling | byte-bounded LRU |
 | SlateDB block + meta cache | decoded SST blocks, indexes, filters | scoped SST id + offset | process-shared memory + `CACHE_DIR` disk | LRU-ish (foyer) |
 
 Two findings drove this section. Before consolidation, one catalog byte could
@@ -591,6 +591,21 @@ The SlateDB cache and the scoped reader's parsed-Parquet cache share a
 once when the process cache is built: the auxiliary metadata allowance comes
 off the top, and SlateDB's shared cache receives the remainder. No attach may
 construct another allowance or grow either cache beyond that split.
+
+The allowance is a **share of the budget to a ceiling**, not a fixed figure.
+It cannot share one eviction store with SlateDB's — foyer's cache is
+monomorphic and both the key and the value type are SlateDB's own, neither
+constructible here — so the bytes are deducted whether the parsed-metadata
+cache fills them or not. That reservation is why it scales with the budget
+rather than standing at a small host's number, and why it stops scaling
+rather than reserving unboundedly on a large one.
+
+The logical caches take no share of the budget at all. They are per handle,
+hold one head's decoded state, and are replaced when the stamp moves rather
+than evicted under pressure, so they are bounded by the catalog's own size —
+which is a bound, but not one an operator can set.
+`ReadOnlyCatalog::projection_bytes` reports it, because a cache invisible to
+sizing is what this RFC's goals rule out.
 
 Their storage engines remain separate because their entries have different
 identity, value, and tiering contracts:

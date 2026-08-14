@@ -251,7 +251,10 @@ SET cache_httpfs_max_in_mem_cache_block_count = 256;
 
 So a host running this alongside moraine has three memory consumers to
 size, not one: DuckDB's `memory_limit`, moraine's `META_CACHE_MEMORY`,
-and cache_httpfs's block count times its block size. Only the first two
+and cache_httpfs's block count times its block size. A fourth sits outside
+every budget: each attached catalog holds its own decoded view, bounded by
+the catalog's size rather than by a cap. The core reports it as
+`projection_bytes` on a catalog handle. Only the first two
 are visible to DuckDB. Set the block counts before the first read —
 they take effect once.
 

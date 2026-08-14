@@ -2,6 +2,7 @@
 //! wire types. No interpretation — the domain layer owns meaning.
 
 use bytes::Bytes;
+use prost::Message as _;
 
 use crate::{
     error::{Error, Result},
@@ -68,6 +69,39 @@ pub(crate) enum EntityRecord {
     /// A `ducklake_files_scheduled_for_deletion` row — `current`-only
     /// bookkeeping, not a temporal entity.
     GcFile(GcFileValue),
+}
+
+impl EntityRecord {
+    /// Roughly what one record holds, as its encoded length plus the
+    /// enum's own footprint.
+    ///
+    /// An estimate, and deliberately a cheap one: it is read to report what
+    /// a handle's decoded catalog costs, never to decide an eviction. The
+    /// encoded length understates the decoded form, which is the safe
+    /// direction for a figure an operator sizes against.
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        let encoded = match self {
+            Self::Schema(value) => value.encoded_len(),
+            Self::Table(value) => value.encoded_len(),
+            Self::View(value) => value.encoded_len(),
+            Self::Column(value) => value.encoded_len(),
+            Self::File(value) => value.encoded_len(),
+            Self::DeleteFile(value) => value.encoded_len(),
+            Self::Partition(value) => value.encoded_len(),
+            Self::Sort(value) => value.encoded_len(),
+            Self::Macro(value) => value.encoded_len(),
+            Self::Mapping(value) => value.encoded_len(),
+            Self::Index(value) => value.encoded_len(),
+            Self::FileColumnStats(value) => value.encoded_len(),
+            Self::TableStats(value) => value.encoded_len(),
+            Self::TableColumnStats(value) => value.encoded_len(),
+            Self::Option { value, .. } => value.encoded_len(),
+            Self::Tag(value) => value.encoded_len(),
+            Self::GcFile(value) => value.encoded_len(),
+        };
+        u64::try_from(encoded).unwrap_or(u64::MAX)
+            + u64::try_from(std::mem::size_of::<Self>()).unwrap_or(0)
+    }
 }
 
 /// One decoded entity-record kind, used to read only the catalog table a
