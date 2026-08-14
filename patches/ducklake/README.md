@@ -1,14 +1,21 @@
 # Patched DuckLake row-ID statistics and pruning
 
-This directory carries a downstream DuckLake patch for DuckDB v1.5.5. It
-stores file-level row-ID min/max statistics in DuckLake's existing
-`ducklake_file_column_stats` table and pushes `rowid` filters into its file
-list before any Parquet reader is created. Moraine can therefore return stable
-row ids without taking ownership of DuckLake scans or physical placement. A
-metadata-only backfill repairs files written before the statistics patch was
-installed.
+This directory carries a downstream DuckLake patch series for DuckDB v1.5.5,
+applied in file-name order:
 
-The patch is pinned separately to the DuckLake revisions selected by every
+1. `0001-perf-prune-DuckLake-files-by-row-id.patch` stores file-level row-ID
+   min/max statistics in DuckLake's existing `ducklake_file_column_stats`
+   table and pushes `rowid` filters into its file list before any Parquet
+   reader is created. Moraine can therefore return stable row ids without
+   taking ownership of DuckLake scans or physical placement.
+2. `0002-feat-backfill-DuckLake-row-id-file-statistics.patch` adds the
+   metadata-only `ducklake_backfill_row_id_stats` function, which repairs
+   files written before the statistics patch was installed.
+
+Later patches address the lines earlier ones produce, so the series is applied
+in one `git apply` invocation rather than one per file.
+
+The series is pinned separately to the DuckLake revisions selected by every
 DuckDB release moraine supports. It is released as an unsigned companion
 extension, not bundled into the moraine extension.
 Most hunks use zero context to satisfy moraine's whitespace gate across both
@@ -49,12 +56,12 @@ The command:
 
 1. fetches the pinned DuckLake and vcpkg revisions under
    `target/patched-ducklake/`;
-2. rejects a dirty DuckDB submodule, then applies the tracked patch and
-   verifies the cached checkout's complete diff byte-for-byte;
+2. rejects a dirty DuckDB submodule, then applies the tracked patch series
+   and verifies the cached checkout's complete diff byte-for-byte;
 3. builds only `ducklake_loadable_extension` against moraine's exact DuckDB
    submodule and prebuilt static library; and
 4. downloads the pinned DuckDB CLI if needed and verifies that the artifact
-   loads; then runs the patch's row-ID write, backfill, and pruning
+   loads; then runs the series' row-ID write, backfill, and pruning
    sqllogictest against that artifact.
 
 The resulting extension is:
@@ -88,7 +95,7 @@ ATTACH 'ducklake:moraine:s3://bucket/catalog' AS lake (
 
 Do not `INSTALL` or `LOAD ducklake` afterward in the same process: that would
 select the stock extension instead of this artifact. The CLI, moraine, the
-DuckDB static archive, and DuckLake patch must all match DuckDB v1.5.5.
+DuckDB static archive, and DuckLake patches must all match DuckDB v1.5.5.
 
 ## Backfill existing files
 

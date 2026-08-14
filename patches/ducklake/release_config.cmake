@@ -23,6 +23,7 @@ FetchContent_Declare(moraine_patched_ducklake
     PATCH_COMMAND
         ${GIT_EXECUTABLE} apply --unidiff-zero
         ${CMAKE_CURRENT_LIST_DIR}/0001-perf-prune-DuckLake-files-by-row-id.patch
+        ${CMAKE_CURRENT_LIST_DIR}/0002-feat-backfill-DuckLake-row-id-file-statistics.patch
 )
 FetchContent_GetProperties(moraine_patched_ducklake)
 if(NOT moraine_patched_ducklake_POPULATED)
