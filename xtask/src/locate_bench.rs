@@ -27,15 +27,22 @@ const DEFAULT_ROWS_PER_FILE: usize = 2_000;
 /// Timed repetitions of each lookup.
 const REPETITIONS: usize = 5;
 
+/// Update batches applied after the disjoint measurement. Each writes one
+/// file of ids preserved from across the table, so its row-id range spans
+/// everything and statistics can no longer exclude it.
+const DEFAULT_UPDATE_BATCHES: usize = 6;
+
 struct Options {
     files: usize,
     rows_per_file: usize,
+    update_batches: usize,
 }
 
 fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
     let mut options = Options {
         files: DEFAULT_FILES,
         rows_per_file: DEFAULT_ROWS_PER_FILE,
+        update_batches: DEFAULT_UPDATE_BATCHES,
     };
     let mut index = 0;
     while index < arguments.len() {
@@ -56,9 +63,17 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
                     .parse()
                     .context("`--rows-per-file` must be a number")?;
             }
+            "--update-batches" => {
+                index += 1;
+                options.update_batches = arguments
+                    .get(index)
+                    .context("`--update-batches` requires a count")?
+                    .parse()
+                    .context("`--update-batches` must be a number")?;
+            }
             unknown => bail!(
                 "unknown argument `{unknown}`; usage: locate-bench [--files N] \
-                 [--rows-per-file N]"
+                 [--rows-per-file N] [--update-batches N]"
             ),
         }
         index += 1;
@@ -301,11 +316,16 @@ fn files_read_static(cli: &Path, preamble: &str, key: usize) -> anyhow::Result<O
 /// drawn from every source file, so its row-id range spans the table and
 /// min/max statistics can no longer exclude it. That is the shape where
 /// locating has something left to prune.
-fn introduce_overlap(cli: &Path, preamble: &str, options: &Options) -> anyhow::Result<()> {
+fn introduce_overlap(
+    cli: &Path,
+    preamble: &str,
+    options: &Options,
+    batch: usize,
+) -> anyhow::Result<()> {
     let mut script = preamble.to_owned();
     let _ = writeln!(
         script,
-        "UPDATE lake.main.t SET b = 'updated' WHERE a % {} = 1;",
+        "UPDATE lake.main.t SET b = 'u{batch}' WHERE a % {} = {batch};",
         options.rows_per_file
     );
     run_sql(cli, &script)?;
@@ -357,10 +377,16 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let (first_ms, warm_ms) = warm_lookups(&cli, &preamble, &options)?;
     let (row_id_files, located_files) = files_read(&cli, &preamble, key)?;
 
-    // Then the same measurement once the row-id ranges overlap.
-    introduce_overlap(&cli, &preamble, &options)?;
-    let (overlap_row_id_files, overlap_located_files) = files_read(&cli, &preamble, key)?;
-    let overlap_static_files = files_read_static(&cli, &preamble, key)?;
+    // Then the same measurement per update batch: the row-id path's cost
+    // grows with update history, not with file count, so one batch
+    // understates it.
+    let mut overlap = Vec::new();
+    for batch in 1..=options.update_batches {
+        introduce_overlap(&cli, &preamble, &options, batch)?;
+        let (row_id_files, located_files) = files_read(&cli, &preamble, key)?;
+        let static_files = files_read_static(&cli, &preamble, key)?;
+        overlap.push((batch, row_id_files, located_files, static_files));
+    }
 
     let report = |name: &str, value: String| println!("{name:<32}{value}");
     println!();
@@ -378,19 +404,17 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
         "files read, located",
         located_files.map_or_else(|| "none reported".to_owned(), |files| files.to_string()),
     );
-    println!("\nafter an update makes the row-id ranges overlap:");
-    report(
-        "files read, row id only",
-        overlap_row_id_files.map_or_else(|| "none reported".to_owned(), |files| files.to_string()),
-    );
-    report(
-        "files read, located",
-        overlap_located_files.map_or_else(|| "none reported".to_owned(), |files| files.to_string()),
-    );
-    report(
-        "files read, id as a constant",
-        overlap_static_files.map_or_else(|| "none reported".to_owned(), |files| files.to_string()),
-    );
+    println!("\nfiles read after each update batch:");
+    println!("batch  row id only  located  id as a constant");
+    let show = |files: Option<u64>| files.map_or_else(|| "-".to_owned(), |count| count.to_string());
+    for (batch, row_id_files, located_files, static_files) in overlap {
+        println!(
+            "{batch:<7}{:<13}{:<9}{}",
+            show(row_id_files),
+            show(located_files),
+            show(static_files)
+        );
+    }
     Ok(())
 }
 
@@ -428,6 +452,7 @@ mod tests {
         let options = parse_options(&[]).unwrap();
         assert_eq!(options.files, DEFAULT_FILES);
         assert_eq!(options.rows_per_file, DEFAULT_ROWS_PER_FILE);
+        assert_eq!(options.update_batches, DEFAULT_UPDATE_BATCHES);
     }
 
     #[test]
