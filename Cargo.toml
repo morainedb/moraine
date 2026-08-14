@@ -24,6 +24,7 @@ prost-build = "0.14"
 protox = "0.9"
 proptest = "1"
 proptest-derive = "0.8"
+roaring = "0.11"
 slatedb = "0.15.0"
 # must move in lockstep with slatedb: it is where the metrics traits live
 slatedb-common = "0.15.0"

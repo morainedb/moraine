@@ -253,14 +253,14 @@ pub use catalog::{
     ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats, CommitMember,
     CompactStoreReport, CompactStoreRequest, CompactionTarget, DataFile, DataFileId, DataFileInfo,
     DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval,
-    FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexState,
-    InlineChunk, LiveCount, MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef,
-    MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep, MappingId,
-    MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef,
-    PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow, ScheduledDeletion, SchemaId,
-    SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus, StoreObjects,
-    SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo, TableStats, TagEntry,
-    TagTarget, Timestamp, ViewId, ViewInfo,
+    FileRowCandidate, FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexMaintenance,
+    IndexState, InlineChunk, LiveCount, MacroId, MacroImplementationDef, MacroInfo,
+    MacroParameterDef, MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass,
+    MaintenanceStatusStep, MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef,
+    OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow,
+    RowSummaryWarmth, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId,
+    SortKeyDef, SortSpec, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
+    TableId, TableInfo, TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
 /// Fault injection: the crash seams a test drives a migration to and stops

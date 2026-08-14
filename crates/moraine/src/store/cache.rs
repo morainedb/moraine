@@ -110,6 +110,7 @@ pub(crate) fn metadata_shortfall(metadata_bytes: u64, capacity: u64) -> Option<u
 static AUXILIARY_METADATA_MEMORY: AtomicU64 = AtomicU64::new(MAX_AUXILIARY_METADATA_MEMORY);
 
 static AUXILIARY_METADATA_USAGE: AtomicU64 = AtomicU64::new(0);
+static ROW_SUMMARY_USAGE: AtomicU64 = AtomicU64::new(0);
 static AUXILIARY_METADATA_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static METADATA_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static BLOCK_EVICTIONS: AtomicU64 = AtomicU64::new(0);
@@ -178,10 +179,25 @@ fn subtract_metadata_occupancy(bytes: u64) {
     });
 }
 
+/// The auxiliary allowance's divisor for file row-id summaries. The
+/// summaries share the allowance with parsed metadata rather than widening
+/// it, so the whole budget stays what the first attach reserved.
+const ROW_SUMMARY_SHARE_DIVISOR: usize = 4;
+
 /// The process-wide allowance for auxiliary parsed metadata. It is reserved
 /// from the first attach's `CACHE_MEMORY` budget.
 pub(crate) fn auxiliary_metadata_memory() -> usize {
     usize::try_from(AUXILIARY_METADATA_MEMORY.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
+}
+
+/// The parsed-metadata cache's share of the auxiliary allowance.
+pub(crate) fn parsed_metadata_memory() -> usize {
+    auxiliary_metadata_memory().saturating_sub(row_summary_memory())
+}
+
+/// The file row-id summary cache's share of the auxiliary allowance.
+pub(crate) fn row_summary_memory() -> usize {
+    auxiliary_metadata_memory() / ROW_SUMMARY_SHARE_DIVISOR
 }
 
 /// Records the parsed Parquet metadata cache's current heap footprint.
@@ -189,8 +205,18 @@ pub(crate) fn set_auxiliary_metadata_usage(bytes: usize) {
     AUXILIARY_METADATA_USAGE.store(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
 }
 
+/// Records the row-summary cache's current heap footprint.
+pub(crate) fn set_row_summary_usage(bytes: usize) {
+    ROW_SUMMARY_USAGE.store(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
 /// Records one parsed Parquet metadata eviction.
 pub(crate) fn auxiliary_metadata_evicted() {
+    AUXILIARY_METADATA_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records one row-summary eviction.
+pub(crate) fn row_summary_evicted() {
     AUXILIARY_METADATA_EVICTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -788,7 +814,9 @@ pub fn cache_status() -> CacheStatus {
         block_evictions: BLOCK_EVICTIONS.load(Ordering::Relaxed),
         block_disk_capacity_bytes: observation.disk_capacity,
         auxiliary_metadata_capacity_bytes: AUXILIARY_METADATA_MEMORY.load(Ordering::Relaxed),
-        auxiliary_metadata_occupancy_bytes: AUXILIARY_METADATA_USAGE.load(Ordering::Relaxed),
+        auxiliary_metadata_occupancy_bytes: AUXILIARY_METADATA_USAGE
+            .load(Ordering::Relaxed)
+            .saturating_add(ROW_SUMMARY_USAGE.load(Ordering::Relaxed)),
         auxiliary_metadata_evictions: AUXILIARY_METADATA_EVICTIONS.load(Ordering::Relaxed),
     }
 }

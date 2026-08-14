@@ -21,16 +21,17 @@ pub(crate) use handle::BACKFILL_FILE_READ_CONCURRENCY;
 pub use handle::{
     CachePreload, Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest,
     MaintenanceStatusPass, MaintenanceStatusStep, MigrationRequest, ReadOnlyCatalog,
+    RowSummaryWarmth,
 };
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;
 pub use types::{
     BuildStep, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats,
     DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats,
-    FileIndexEntry, FileIndexRemoval, FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo,
-    IndexMaintenance, IndexState, InlineChunk, MacroId, MacroImplementationDef, MacroInfo,
-    MacroParameterDef, MappingId, MappingInfo, NameMappingDef, OptionScope, PartitionColumnDef,
-    PartitionId, PartitionSpec, RecentRow, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId,
-    SnapshotInfo, SortId, SortKeyDef, SortSpec, TableId, TableInfo, TableStats, TagEntry,
-    TagTarget, Timestamp, ViewId, ViewInfo,
+    FileIndexEntry, FileIndexRemoval, FileRowCandidate, FlushedDataFile, IndexDef, IndexEntry,
+    IndexId, IndexInfo, IndexMaintenance, IndexState, InlineChunk, MacroId, MacroImplementationDef,
+    MacroInfo, MacroParameterDef, MappingId, MappingInfo, NameMappingDef, OptionScope,
+    PartitionColumnDef, PartitionId, PartitionSpec, RecentRow, ScheduledDeletion, SchemaId,
+    SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, TableId, TableInfo,
+    TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
 };

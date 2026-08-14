@@ -328,6 +328,21 @@ pub struct DataFileInfo {
     pub partial_max: Option<SnapshotId>,
 }
 
+/// Where one stable row id may physically live at head.
+///
+/// A row id can yield more than one candidate: an update can leave an
+/// expired copy in an otherwise-current file while writing the visible copy
+/// elsewhere. Choosing between them stays DuckLake's delete and snapshot
+/// processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileRowCandidate {
+    /// The stable row id located.
+    pub row_id: u64,
+    /// The file holding it, or `None` for a live inlined row and for one
+    /// located nowhere at all.
+    pub data_file_id: Option<DataFileId>,
+}
+
 /// A live delete file, as read from a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteFileInfo {

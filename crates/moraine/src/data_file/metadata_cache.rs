@@ -121,7 +121,7 @@ impl MetadataCache {
     ) -> Option<Arc<ParquetMetaData>> {
         self.entries.retain(|entry| entry.store.strong_count() > 0);
         self.bytes = self.entries.iter().map(|entry| entry.bytes).sum();
-        let capacity = cache::auxiliary_metadata_memory();
+        let capacity = cache::parsed_metadata_memory();
         while self.bytes > capacity {
             let evicted = self.entries.pop_front()?;
             self.bytes = self.bytes.saturating_sub(evicted.bytes);
@@ -151,7 +151,7 @@ impl MetadataCache {
         metadata: Arc<ParquetMetaData>,
     ) {
         let bytes = metadata.memory_size();
-        let capacity = cache::auxiliary_metadata_memory();
+        let capacity = cache::parsed_metadata_memory();
         if capacity == 0 || bytes > capacity {
             return;
         }

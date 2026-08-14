@@ -10,7 +10,9 @@ use crate::{
 };
 
 /// The root position of the embedded row-id column, if the file has one.
-fn embedded_row_id_position(schema: &parquet::schema::types::SchemaDescriptor) -> Option<usize> {
+pub(super) fn embedded_row_id_position(
+    schema: &parquet::schema::types::SchemaDescriptor,
+) -> Option<usize> {
     schema.root_schema().get_fields().iter().position(|field| {
         let info = field.get_basic_info();
         info.has_id() && u64::try_from(info.id()).ok() == Some(ROW_ID_FIELD_ID)

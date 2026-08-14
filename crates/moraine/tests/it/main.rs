@@ -21,6 +21,7 @@ mod macros;
 mod maintenance_status;
 mod measure;
 mod partitioning;
+mod row_location;
 mod runtime;
 mod schema_evolution;
 mod sorting;

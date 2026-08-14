@@ -5,6 +5,7 @@ mod backfill;
 mod index_build;
 mod index_lookup;
 mod maintenance;
+mod row_location;
 
 use std::{
     collections::HashMap,
@@ -19,6 +20,7 @@ pub use maintenance::{
     MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep,
 };
 use object_store::ObjectStore;
+pub use row_location::RowSummaryWarmth;
 use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
 use tokio::sync::watch;
 use tracing::{info, warn};
