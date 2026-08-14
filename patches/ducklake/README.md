@@ -11,6 +11,14 @@ applied in file-name order:
 2. `0002-feat-backfill-DuckLake-row-id-file-statistics.patch` adds the
    metadata-only `ducklake_backfill_row_id_stats` function, which repairs
    files written before the statistics patch was installed.
+3. `0003-feat-expose-DuckLake-data-file-ids-to-scans.patch` exposes
+   `data_file_id` as an internal virtual `UBIGINT` column. A physical file
+   emits its persistent catalog id; inlined and transaction-local sources
+   emit NULL. Filters on it are pushed into the metadata file-list query as
+   predicates on `ducklake_data_file.data_file_id`, using no column
+   statistics, so a located index result restricts the file list as well as
+   the rows read within it. A filter shape the translation does not cover
+   adds no predicate, which keeps every file rather than guessing.
 
 Later patches address the lines earlier ones produce, so the series is applied
 in one `git apply` invocation rather than one per file.
