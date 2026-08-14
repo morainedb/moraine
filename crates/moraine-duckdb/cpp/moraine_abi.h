@@ -393,8 +393,18 @@ typedef struct MoraineLookupValue {
   size_t bytes_len;
 } MoraineLookupValue;
 
-// One stable row id returned by an index lookup.
-typedef uint64_t MoraineRowId;
+// One stable row id returned by an index lookup, and the file currently
+// holding it. A row id can appear more than once when more than one
+// current file is a candidate for it.
+typedef struct MoraineRowId {
+  // The numeric row id.
+  uint64_t value;
+  // The file holding it; meaningful only when `has_data_file_id`.
+  uint64_t data_file_id;
+  // Whether `data_file_id` names a file. False for a live inlined row
+  // and for one this lookup could not place.
+  bool has_data_file_id;
+} MoraineRowId;
 
 // One complete equality key passed to [`moraine_index_in`].
 typedef struct MoraineLookupKey {
@@ -1703,7 +1713,7 @@ int32_t moraine_index_lookup(struct MoraineCatalogHandle *handle,
                              const char *index_name,
                              const struct MoraineLookupValue *values,
                              size_t values_len,
-                             MoraineRowId **out_items,
+                             struct MoraineRowId **out_items,
                              size_t *out_len,
                              MoraineInterruptProbe probe,
                              void *probe_ctx,
@@ -1715,7 +1725,7 @@ int32_t moraine_index_lookup(struct MoraineCatalogHandle *handle,
 //
 // `items`/`len` must be exactly the pointer and length written by a
 // matching [`moraine_index_lookup`] call, not yet freed.
-void moraine_index_lookup_free(MoraineRowId *items, size_t len);
+void moraine_index_lookup_free(struct MoraineRowId *items, size_t len);
 
 // Resolves an `IN` lookup to the union of rows holding any complete key.
 // Each key is coerced to the indexed columns' canonical types. Duplicate
@@ -1733,7 +1743,7 @@ int32_t moraine_index_in(struct MoraineCatalogHandle *handle,
                          const char *index_name,
                          const struct MoraineLookupKey *keys,
                          size_t keys_len,
-                         MoraineRowId **out_items,
+                         struct MoraineRowId **out_items,
                          size_t *out_len,
                          MoraineInterruptProbe probe,
                          void *probe_ctx,
@@ -1745,7 +1755,7 @@ int32_t moraine_index_in(struct MoraineCatalogHandle *handle,
 //
 // `items`/`len` must be exactly the pointer and length written by a matching
 // [`moraine_index_in`] call, not yet freed.
-void moraine_index_in_free(MoraineRowId *items, size_t len);
+void moraine_index_in_free(struct MoraineRowId *items, size_t len);
 
 // Resolves a comparison query to the rows whose leading indexed values fall
 // between the bounds. Each bound is a run of `lower_len`/`upper_len`
@@ -1771,7 +1781,7 @@ int32_t moraine_index_range(struct MoraineCatalogHandle *handle,
                             size_t upper_len,
                             bool upper_inclusive,
                             bool reverse,
-                            MoraineRowId **out_items,
+                            struct MoraineRowId **out_items,
                             size_t *out_len,
                             MoraineInterruptProbe probe,
                             void *probe_ctx,
@@ -1783,7 +1793,7 @@ int32_t moraine_index_range(struct MoraineCatalogHandle *handle,
 //
 // `items`/`len` must be exactly the pointer and length written by a matching
 // [`moraine_index_range`] call, not yet freed.
-void moraine_index_range_free(MoraineRowId *items, size_t len);
+void moraine_index_range_free(struct MoraineRowId *items, size_t len);
 
 // Resolves an `IS NULL` query on an index to the matching rows. `prefix` is a
 // leading run of predicates over the index's columns: a `MoraineLookupValue`
@@ -1802,7 +1812,7 @@ int32_t moraine_index_nulls(struct MoraineCatalogHandle *handle,
                             const struct MoraineLookupValue *prefix,
                             size_t prefix_len,
                             bool reverse,
-                            MoraineRowId **out_items,
+                            struct MoraineRowId **out_items,
                             size_t *out_len,
                             MoraineInterruptProbe probe,
                             void *probe_ctx,
@@ -1814,7 +1824,7 @@ int32_t moraine_index_nulls(struct MoraineCatalogHandle *handle,
 //
 // `items`/`len` must be exactly the pointer and length written by a matching
 // [`moraine_index_nulls`] call, not yet freed.
-void moraine_index_nulls_free(MoraineRowId *items, size_t len);
+void moraine_index_nulls_free(struct MoraineRowId *items, size_t len);
 
 // Mints a checkpoint over `handle`'s current durable state and writes its
 // id to `*out_id` (free with `moraine_string_free`).

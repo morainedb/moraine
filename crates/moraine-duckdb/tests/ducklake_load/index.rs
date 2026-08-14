@@ -34,7 +34,7 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
         "the created unique index is listed"
     );
 
-    let lookup = csv_rows(&run("SELECT * FROM \
+    let lookup = csv_rows(&run("SELECT row_id FROM \
          moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"));
     assert_eq!(
         lookup,
@@ -43,7 +43,7 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
     );
 
     // A value that exists reads through one relational query.
-    let hit = csv_rows(&run("SELECT data.a \
+    let hit = csv_rows(&run("SELECT DISTINCT data.a \
          FROM lake.main.t data \
          JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 42) hits \
            ON hits.row_id = data.rowid;"));
@@ -53,7 +53,7 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
         "value 42 is read through its stable row id"
     );
     // A value that does not exist resolves to none.
-    let miss = csv_rows(&run("SELECT count(*) FROM \
+    let miss = csv_rows(&run("SELECT count(DISTINCT row_id) FROM \
          moraine_index_lookup('lake', 'main', 't', 'by_a', 9999);"));
     assert_eq!(miss, vec![vec!["0".to_string()]], "value 9999 is absent");
 
@@ -89,7 +89,7 @@ fn absent_index_lookup_eliminates_the_ducklake_scan() {
     // must therefore see the execution-time bind, not rely on a literal in
     // the original SQL text.
     let plan = run("PREPARE absent_lookup AS \
-         SELECT count(*) FROM lake.main.t data \
+         SELECT count(DISTINCT row_id) FROM lake.main.t data \
          JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', $1) hits \
            ON hits.row_id = data.rowid; \
          EXPLAIN ANALYZE EXECUTE absent_lookup(9999);");
@@ -138,7 +138,9 @@ fn moraine_index_lookup_resolves_a_composite_key() {
     );
     // A key present in neither column combination resolves to no rows.
     assert_eq!(
-        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_ab', 9, 'x');"),
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_ab', 9, 'x');"
+        ),
         vec![vec!["0".to_string()]],
         "(9, 'x') matches no row"
     );
@@ -177,7 +179,7 @@ fn moraine_index_in_resolves_a_list_of_keys() {
         "composite IN accepts a list of full row keys"
     );
     assert_eq!(
-        csv_rows(&run("SELECT count(*) FROM moraine_index_in(\
+        csv_rows(&run("SELECT count(DISTINCT row_id) FROM moraine_index_in(\
                 'lake', 'main', 't', 'by_a', []::BIGINT[]);")),
         vec![vec!["0".to_string()]],
         "an empty typed list returns no rows"
@@ -243,7 +245,7 @@ fn moraine_index_range_selects_a_comparison_window() {
     // BETWEEN 10 AND 20, both inclusive: values 10..=20 -> 11 rows.
     assert_eq!(
         count(
-            "SELECT count(*) FROM \
+            "SELECT count(DISTINCT row_id) FROM \
              moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, true, true);"
         ),
         vec![vec!["11".to_string()]],
@@ -252,7 +254,7 @@ fn moraine_index_range_selects_a_comparison_window() {
     // 10 < a < 20, both exclusive: values 11..=19 -> 9 rows.
     assert_eq!(
         count(
-            "SELECT count(*) FROM \
+            "SELECT count(DISTINCT row_id) FROM \
              moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, false, false);"
         ),
         vec![vec!["9".to_string()]],
@@ -261,7 +263,7 @@ fn moraine_index_range_selects_a_comparison_window() {
     // a >= 90 with an open upper side (NULL bound): values 90..=99 -> 10 rows.
     assert_eq!(
         count(
-            "SELECT count(*) FROM \
+            "SELECT count(DISTINCT row_id) FROM \
              moraine_index_range('lake', 'main', 't', 'by_a', 90, NULL::BIGINT, true, true);"
         ),
         vec![vec!["10".to_string()]],
@@ -270,7 +272,7 @@ fn moraine_index_range_selects_a_comparison_window() {
     // a < 5 with an open lower side: values 0..=4 -> 5 rows.
     assert_eq!(
         count(
-            "SELECT count(*) FROM \
+            "SELECT count(DISTINCT row_id) FROM \
              moraine_index_range('lake', 'main', 't', 'by_a', NULL::BIGINT, 5, true, false);"
         ),
         vec![vec!["5".to_string()]],
@@ -317,7 +319,7 @@ fn moraine_index_create_descending_answers_range_and_lookup() {
     // A descending index answers a closed value window: 10..=20 -> 11 rows.
     assert_eq!(
         count(
-            "SELECT count(*) FROM \
+            "SELECT count(DISTINCT row_id) FROM \
              moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, true, true);"
         ),
         vec![vec!["11".to_string()]],
@@ -325,7 +327,9 @@ fn moraine_index_create_descending_answers_range_and_lookup() {
     );
     // And an equality lookup on the same descending index.
     assert_eq!(
-        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"),
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"
+        ),
         vec![vec!["1".to_string()]],
         "the descending index answers an equality lookup"
     );
@@ -352,13 +356,15 @@ fn moraine_index_create_nulls_first_still_resolves_values() {
     );
 
     assert_eq!(
-        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"),
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"
+        ),
         vec![vec!["1".to_string()]],
         "a NULLS FIRST index still resolves an equality lookup"
     );
     assert_eq!(
         count(
-            "SELECT count(*) FROM \
+            "SELECT count(DISTINCT row_id) FROM \
              moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, true, true);"
         ),
         vec![vec!["11".to_string()]],
@@ -388,20 +394,26 @@ fn moraine_index_nulls_finds_null_rows() {
 
     // a IS NULL resolves to exactly the two NULL rows.
     assert_eq!(
-        count("SELECT count(*) FROM moraine_index_nulls('lake', 'main', 't', 'by_a', NULL);"),
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_nulls('lake', 'main', 't', 'by_a', NULL);"
+        ),
         vec![vec!["2".to_string()]],
         "IS NULL finds both NULL rows"
     );
     // A non-null value is still uniquely resolvable, unaffected.
     assert_eq!(
-        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 5);"),
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 5);"
+        ),
         vec![vec!["1".to_string()]],
         "a non-null value is still uniquely resolvable"
     );
     // An inline NULL added after the index also becomes findable.
     run("INSERT INTO lake.main.t VALUES (NULL, 'n3');");
     assert_eq!(
-        count("SELECT count(*) FROM moraine_index_nulls('lake', 'main', 't', 'by_a', NULL);"),
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_nulls('lake', 'main', 't', 'by_a', NULL);"
+        ),
         vec![vec!["3".to_string()]],
         "an inline NULL inserted after create is indexed too"
     );
@@ -424,7 +436,7 @@ fn moraine_index_maintained_on_bulk_insert() {
 
     // A bulk INSERT after create is maintained by the staged commit.
     run("INSERT INTO lake.main.t SELECT i, 'y' FROM range(100, 200) t(i);");
-    let post = csv_rows(&run("SELECT count(*) FROM \
+    let post = csv_rows(&run("SELECT count(DISTINCT row_id) FROM \
          moraine_index_lookup('lake', 'main', 't', 'by_a', 150);"));
     assert_eq!(
         post,
@@ -432,7 +444,7 @@ fn moraine_index_maintained_on_bulk_insert() {
         "value 150 from the post-create INSERT is indexed"
     );
     // The backfilled rows are still resolvable too.
-    let pre = csv_rows(&run("SELECT count(*) FROM \
+    let pre = csv_rows(&run("SELECT count(DISTINCT row_id) FROM \
          moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"));
     assert_eq!(
         pre,
@@ -443,7 +455,7 @@ fn moraine_index_maintained_on_bulk_insert() {
     // A small INSERT (one row, under the 10-row inline limit) is inlined
     // as an Arrow chunk, not a Parquet file, and is maintained too.
     run("INSERT INTO lake.main.t VALUES (500, 'z');");
-    let inline = csv_rows(&run("SELECT data.a \
+    let inline = csv_rows(&run("SELECT DISTINCT data.a \
          FROM lake.main.t data \
          JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 500) hits \
            ON hits.row_id = data.rowid;"));
@@ -500,13 +512,17 @@ fn moraine_index_entries_are_removed_by_delete() {
     // A row in the flushed Parquet file: deleting it frees its value.
     run("DELETE FROM lake.main.t WHERE a = 42;");
     assert_eq!(
-        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"),
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"
+        ),
         vec![vec!["0".to_string()]],
         "the deleted row's entry is gone"
     );
     run("INSERT INTO lake.main.t VALUES (42, 'again');");
     assert_eq!(
-        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"),
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"
+        ),
         vec![vec!["1".to_string()]],
         "the freed value is insertable again"
     );
@@ -515,13 +531,17 @@ fn moraine_index_entries_are_removed_by_delete() {
     run("INSERT INTO lake.main.t VALUES (500, 'z');");
     run("DELETE FROM lake.main.t WHERE a = 500;");
     assert_eq!(
-        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 500);"),
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 500);"
+        ),
         vec![vec!["0".to_string()]],
         "the inlined row's entry is gone"
     );
     run("INSERT INTO lake.main.t VALUES (500, 'again');");
     assert_eq!(
-        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 500);"),
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 500);"
+        ),
         vec![vec!["1".to_string()]],
         "the freed inlined value is insertable again"
     );
@@ -535,7 +555,9 @@ fn moraine_index_entries_are_removed_by_delete() {
         "the replacement row is the live one"
     );
     assert_eq!(
-        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 7);"),
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 7);"
+        ),
         vec![vec!["1".to_string()]],
         "the replaced key resolves to exactly one row"
     );
@@ -573,7 +595,7 @@ fn moraine_index_data_path_persists_across_attach() {
     let dp = |sql: &str| run_ducklake_sql(store.path(), data.path(), sql);
     dp("INSERT INTO lake.main.t SELECT i, 'y' FROM range(100, 120) t(i);");
     assert_eq!(
-        csv_rows(&dp("SELECT count(*) FROM \
+        csv_rows(&dp("SELECT count(DISTINCT row_id) FROM \
              moraine_index_lookup('lake','main','t','by_a',110);")),
         vec![vec!["1".to_string()]],
         "a bulk value indexed through a DATA_PATH-only attach is found"
@@ -667,7 +689,7 @@ fn moraine_index_uuid_across_paths_and_lookup() {
 
     // The Parquet-stored UUID is found by an equality lookup.
     let hit = csv_rows(&run(&format!(
-        "SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_id', '{KNOWN}'::UUID);"
+        "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_id', '{KNOWN}'::UUID);"
     )));
     assert_eq!(
         hit,
@@ -675,7 +697,7 @@ fn moraine_index_uuid_across_paths_and_lookup() {
         "the UUID is indexed and found"
     );
     let miss = csv_rows(&run(
-        "SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_id', \
+        "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_id', \
              '00000000-0000-0000-0000-000000000000'::UUID);",
     ));
     assert_eq!(
@@ -819,7 +841,7 @@ fn moraine_index_survives_update_and_compaction() {
     let count = |sql: &str| csv_rows(&run(sql));
     let lookup_count = |key: i64| {
         count(&format!(
-            "SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', {key});"
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', {key});"
         ))
     };
 
@@ -833,9 +855,12 @@ fn moraine_index_survives_update_and_compaction() {
     assert_eq!(lookup_count(7), vec![vec!["1".to_string()]]);
     assert_eq!(
         count(
+            // The located file id is part of the join: an UPDATE leaves an
+            // expired physical copy behind, and only the visible one matches.
             "SELECT data.b FROM lake.main.t data \
              JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 7) hits \
-               ON data.rowid = hits.row_id;"
+               ON data.rowid = hits.row_id \
+              AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;"
         ),
         vec![vec!["updated".to_string()]],
         "the row-id join follows the preserved id into the UPDATE file"
@@ -966,7 +991,7 @@ fn moraine_index_create_staged_builds_over_existing_data() {
     for value in ["0", "250", "499"] {
         assert_eq!(
             csv_rows(&run(&format!(
-                "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', {value});"
+                "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a', {value});"
             ))),
             vec![vec!["1".to_string()]],
             "backfilled value {value} is indexed"
@@ -978,7 +1003,7 @@ fn moraine_index_create_staged_builds_over_existing_data() {
     run("INSERT INTO lake.main.t SELECT i, 'y' FROM range(500, 600) t(i);");
     assert_eq!(
         csv_rows(&run(
-            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 550);"
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a', 550);"
         )),
         vec![vec!["1".to_string()]],
         "a post-build INSERT is maintained"
@@ -1049,7 +1074,7 @@ fn flushing_an_indexed_table_with_deleted_inlined_rows() {
     for survivor in ["0", "2", "4"] {
         assert_eq!(
             csv_rows(&run(&format!(
-                "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', {survivor});"
+                "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a', {survivor});"
             ))),
             vec![vec!["1".to_string()]],
             "surviving value {survivor} is indexed after the flush"
@@ -1058,7 +1083,7 @@ fn flushing_an_indexed_table_with_deleted_inlined_rows() {
     for killed in ["1", "3"] {
         assert_eq!(
             csv_rows(&run(&format!(
-                "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', {killed});"
+                "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a', {killed});"
             ))),
             vec![vec!["0".to_string()]],
             "deleted value {killed} must not survive in the index"
@@ -1070,7 +1095,7 @@ fn flushing_an_indexed_table_with_deleted_inlined_rows() {
     run("INSERT INTO lake.main.t VALUES (1, 'again');");
     assert_eq!(
         csv_rows(&run(
-            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 1);"
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a', 1);"
         )),
         vec![vec!["1".to_string()]],
         "the reinserted value resolves to exactly one row"
@@ -1100,7 +1125,7 @@ fn moraine_index_entries_survive_the_data_file_lifecycle() {
     let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
     let lookup_count = |key: i64| {
         csv_rows(&run(&format!(
-            "SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', {key});"
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', {key});"
         )))
     };
     let found = |n: &str| vec![vec![n.to_string()]];
@@ -1185,7 +1210,7 @@ fn moraine_index_create_takes_a_step_size() {
     );
     assert_eq!(
         csv_rows(&run(
-            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 399);"
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a', 399);"
         )),
         vec![vec!["1".to_string()]],
         "every step's entries landed"
@@ -1242,7 +1267,7 @@ fn moraine_index_deferred_maintenance_catches_up_after_sql_insert() {
 
     assert_eq!(
         csv_rows(&run(
-            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 1);"
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a', 1);"
         )),
         vec![vec!["2".to_string()]],
         "the post-commit pass made every inserted row visible"
@@ -1261,14 +1286,14 @@ fn moraine_index_deferred_maintenance_catches_up_after_sql_insert() {
     run("UPDATE lake.main.t SET a = 2 WHERE a = 0;");
     assert_eq!(
         csv_rows(&run(
-            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 1);"
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a', 1);"
         )),
         vec![vec!["3".to_string()]],
         "a later repair starts at the preceding source tail"
     );
     assert_eq!(
         csv_rows(&run(
-            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 2);"
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a', 2);"
         )),
         vec![vec!["5".to_string()]],
         "deferred UPDATE additions replace their synchronous removals"
