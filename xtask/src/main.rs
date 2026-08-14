@@ -31,6 +31,7 @@ mod commit_bench;
 mod duckdb;
 mod ducklake_patch;
 mod e2e;
+mod locate_bench;
 mod pins;
 mod release;
 mod s3;
@@ -42,6 +43,7 @@ fn main() -> anyhow::Result<()> {
         Some("e2e") => e2e::e2e(),
         Some("bench") => bench::bench(&arguments),
         Some("commit-bench") => commit_bench::run(&arguments),
+        Some("locate-bench") => locate_bench::run(&arguments),
         Some("s3") => s3::s3(),
         Some("ducklake-patch") => ducklake_patch::build(&arguments),
         Some("check-pins") => pins::check_pins(),
@@ -57,14 +59,14 @@ fn main() -> anyhow::Result<()> {
         }
         Some(other) => {
             bail!(
-                "unknown task `{other}`; available: e2e, bench, commit-bench, s3, check-pins, \
+                "unknown task `{other}`; available: e2e, bench, commit-bench, locate-bench, s3, check-pins, \
                  check-release-assets, check-ducklake-release-assets, \
                  validate-ducklake-release-artifact, version-matrix, bump-duckdb, \
                  ducklake-patch"
             )
         }
         None => bail!(
-            "usage: cargo xtask <task>; available: e2e, bench, commit-bench, s3, check-pins, \
+            "usage: cargo xtask <task>; available: e2e, bench, commit-bench, locate-bench, s3, check-pins, \
              check-release-assets, check-ducklake-release-assets, \
              validate-ducklake-release-artifact, version-matrix, bump-duckdb, \
              ducklake-patch"
