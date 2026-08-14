@@ -93,7 +93,7 @@ index 18778f49..22d4cbda 100644
 +  ducklake_backfill_row_id_stats.cpp
 diff --git a/src/functions/ducklake_backfill_row_id_stats.cpp b/src/functions/ducklake_backfill_row_id_stats.cpp
 new file mode 100644
-index 00000000..28c6905f
+index 00000000..fd58b0e6
 --- /dev/null
 +++ b/src/functions/ducklake_backfill_row_id_stats.cpp
 @@ -0,0 +1,339 @@
@@ -383,7 +383,7 @@ index 00000000..28c6905f
 +			continue;
 +		}
 +		auto missing = GetFilesMissingRowIdStats(transaction, snapshot, table.GetTableId());
-+		auto selected_count = MinValue(files_left, missing.size());
++		auto selected_count = MinValue<idx_t>(files_left, missing.size());
 +		if (selected_count > 0) {
 +			auto files = metadata_manager.GetExtendedFilesForTable(table, snapshot, nullptr);
 +			unordered_map<idx_t, reference<DuckLakeFileListExtendedEntry>> files_by_id;
