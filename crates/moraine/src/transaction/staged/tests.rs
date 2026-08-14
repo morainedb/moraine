@@ -80,6 +80,27 @@ fn snapshot_changes_row(id: u64, changes_made: &str) -> Vec<Cell> {
     ]
 }
 
+fn file_column_stats_row(
+    data_file_id: u64,
+    table_id: u64,
+    column_id: u64,
+    min_value: &str,
+    max_value: &str,
+) -> Vec<Cell> {
+    vec![
+        Cell::U64(data_file_id),
+        Cell::U64(table_id),
+        Cell::U64(column_id),
+        Cell::U64(0),
+        Cell::U64(10),
+        Cell::U64(0),
+        Cell::Str(min_value.to_string()),
+        Cell::Str(max_value.to_string()),
+        Cell::Bool(false),
+        Cell::Null,
+    ]
+}
+
 async fn open() -> Catalog {
     Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
@@ -4322,6 +4343,69 @@ async fn maintenance_commit_rejects_entity_inserts() {
     });
     let err = tx.commit().await.unwrap_err();
     assert!(matches!(err, Error::Constraint(_)), "{err}");
+    catalog.close().await.unwrap();
+}
+
+/// Row-ID file statistics are derived from immutable Parquet files and are
+/// unversioned. A repair can therefore land without manufacturing a DuckLake
+/// snapshot, while still sharing the head stamp used to detect concurrent
+/// catalog changes.
+#[tokio::test]
+async fn maintenance_commit_only_adds_row_id_file_stats_without_minting_a_snapshot() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 0),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: data_file_row(9, 1, 1),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+    });
+    tx.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::FileColumnStats,
+        cells: file_column_stats_row(9, 1, 2_147_483_540, "0", "9"),
+    });
+    let id = tx.commit().await.unwrap();
+
+    assert_eq!(id.get(), 1);
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(snapshot.current_snapshot().id.get(), 1);
+    let stats = snapshot
+        .file_column_stats
+        .get(&1)
+        .and_then(|columns| columns.get(&(9, 2_147_483_540)))
+        .expect("backfilled row-ID stats");
+    assert_eq!(stats.min_value.as_deref(), Some("0"));
+    assert_eq!(stats.max_value.as_deref(), Some("9"));
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::FileColumnStats,
+        cells: file_column_stats_row(9, 1, 1, "0", "9"),
+    });
+    let err = tx.commit().await.unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+
     catalog.close().await.unwrap();
 }
 

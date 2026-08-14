@@ -72,7 +72,12 @@ its own statistics to avoid opening unrelated data files.
 A pinned downstream evaluation patch, extension-only build command, and the
 one-query join live in
 [`patches/ducklake/`](../patches/ducklake/README.md). The patch remains an
-experiment until the scan contract is accepted upstream.
+experiment until the scan contract is accepted upstream. It also exposes a
+bounded, idempotent backfill for pre-patch files: dense ranges are derived
+from immutable file metadata, sparse ranges come from the embedded row-ID
+column's Parquet statistics (or a scan of only that column), and only the
+metadata statistics rows are written. Missing statistics remain conservative
+during a partial migration.
 
 Owner: [RFC 0013](rfcs/0013-partitioning-sorting-and-pruning.md).
 

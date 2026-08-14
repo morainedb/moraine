@@ -924,6 +924,27 @@ Any resolution that consults `row_id_start` first is therefore wrong by
 construction; the fallback order is fixed as column, then range, then
 refusal.
 
+**File-level row-ID statistics are derived, repairable metadata.** The
+patched DuckLake writer records min/max under the same reserved field id for
+every new non-empty file and uses those values to prune the physical-file list
+for static and dynamic `rowid` filters. A missing row is "unknown" and keeps
+the file, so installing the patch over an existing lake is safe but does not
+accelerate legacy files until they are repaired.
+
+`ducklake_backfill_row_id_stats(catalog [, schema := name] [, table_name :=
+name] [, max_files := n])` is the migration surface. It returns one row per
+selected table — schema, table, files repaired, and files still missing — and
+is idempotent. `max_files` is a positive global bound across the selected
+tables; omitting it repairs all missing non-empty active files. Dense files
+first prove the embedded field is absent and derive `[row_id_start,
+row_id_start + record_count - 1]`. Sparse rewrite and flush files use the
+embedded BIGINT field's Parquet min/max, falling back to reading only that
+column when its footer lacks statistics. The operation never rewrites a data
+file and never mints a DuckLake snapshot. Through Moraine, its reserved-stat
+inserts land as head-preserving maintenance batches; other file-stat inserts
+remain illegal without a snapshot. A bounded partial run remains correct
+because every unrepaired file is still included conservatively.
+
 **Resolution lives inside the scoped read.** The reader already fetches the
 file's footer; discovering the field-id column there costs nothing and
 keeps the precedence rule in one place instead of at every call site.

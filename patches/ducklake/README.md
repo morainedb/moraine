@@ -1,10 +1,12 @@
-# Patched DuckLake row-ID pruning
+# Patched DuckLake row-ID statistics and pruning
 
 This directory carries a downstream DuckLake patch for DuckDB v1.5.5. It
 stores file-level row-ID min/max statistics in DuckLake's existing
 `ducklake_file_column_stats` table and pushes `rowid` filters into its file
 list before any Parquet reader is created. Moraine can therefore return stable
-row ids without taking ownership of DuckLake scans or physical placement.
+row ids without taking ownership of DuckLake scans or physical placement. A
+metadata-only backfill repairs files written before the statistics patch was
+installed.
 
 The patch is pinned separately to the DuckLake revisions selected by every
 DuckDB release moraine supports. It is released as an unsigned companion
@@ -52,8 +54,8 @@ The command:
 3. builds only `ducklake_loadable_extension` against moraine's exact DuckDB
    submodule and prebuilt static library; and
 4. downloads the pinned DuckDB CLI if needed and verifies that the artifact
-   loads; then runs the patch's row-ID statistics and pruning sqllogictest
-   against that artifact.
+   loads; then runs the patch's row-ID write, backfill, and pruning
+   sqllogictest against that artifact.
 
 The resulting extension is:
 
@@ -87,6 +89,53 @@ ATTACH 'ducklake:moraine:s3://bucket/catalog' AS lake (
 Do not `INSTALL` or `LOAD ducklake` afterward in the same process: that would
 select the stock extension instead of this artifact. The CLI, moraine, the
 DuckDB static archive, and DuckLake patch must all match DuckDB v1.5.5.
+
+## Backfill existing files
+
+New files receive row-ID statistics when DuckLake registers them. Files that
+were already active when the patched extension was installed remain safe but
+unpruned: the absence of a statistics row means "unknown," so DuckLake keeps
+the file in every row-ID-filtered scan. Repair them with:
+
+```sql
+SELECT * FROM ducklake_backfill_row_id_stats('lake');
+```
+
+The result has one row per selected table:
+
+```text
+schema_name  table_name  files_backfilled  files_remaining
+```
+
+Scope a run by schema or table and bound the total files processed by one
+statement:
+
+```sql
+SELECT *
+FROM ducklake_backfill_row_id_stats(
+    'lake',
+    schema := 'main',
+    table_name := 'items',
+    max_files := 100
+);
+```
+
+Repeat bounded calls until every row reports `files_remaining = 0`.
+`max_files` is shared across the selected tables and must be greater than
+zero. Omitting it processes every missing non-empty active file.
+
+The operation changes metadata only: it neither rewrites Parquet nor mints a
+DuckLake snapshot. For an ordinary dense file it verifies that the reserved
+row-ID column is absent, then derives the range from `row_id_start` and
+`record_count`. For a rewrite or flushed file it reads the embedded row-ID
+column's Parquet min/max; if those footer statistics are absent, it scans only
+that physical column. Existing valid rows are left untouched, so the function
+is idempotent. A concurrent catalog commit can make a call fail; rerun it.
+
+With a Moraine metadata catalog, the Moraine extension must include support
+for head-preserving reserved row-ID-stat inserts. Older Moraine binaries reject
+the backfill commit even when the patched DuckLake binary exposes the
+function.
 
 ## Index-assisted read
 
@@ -124,7 +173,7 @@ ducklake.v1.5.5.osx_arm64.duckdb_extension
 
 The corresponding four v1.5.4 assets are included in the same release. The
 publisher stays in draft mode until all eight assets exist and the Linux amd64
-and macOS arm64 artifacts for both DuckDB versions pass the row-ID statistics
+and macOS arm64 artifacts for both DuckDB versions pass the row-ID backfill
 and one-file-pruning smoke test. A failed or cancelled run leaves no partial
 public release.
 

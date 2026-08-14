@@ -175,14 +175,21 @@ moraine must translate into one atomic batch:
   for the whole table. A store that lost its rows that way is repaired on
   read: the projection floors each affected table at its oldest data
   file, carrying the oldest schema version still known for it.
+- **Derived row-ID file statistics.** The patched DuckLake backfill may
+  insert an unversioned `ducklake_file_column_stats` row for DuckDB's
+  reserved row-ID field id `2147483540` without inserting a snapshot. The
+  row is derived from an immutable active Parquet file: its dense
+  `row_id_start` range, or the embedded row-ID column for a sparse rewrite.
+  This one insert shape is maintenance; ordinary file-column statistics and
+  every versioned-entity insert still require a snapshot-minting commit.
 - **No snapshot minted.** A staged transaction whose operations are all
-  maintenance operations commits without a `ducklake_snapshot` insert:
-  one `WriteBatch`, no new snapshot record, no head update. Atomicity is
-  unchanged; a racing writer is caught by the store transaction's
-  write-write conflict detection and surfaces the same `conflict`-substring
-  error every staged commit uses. A mixed set (entity mutations but no
-  snapshot row) stays a constraint error — DuckLake always mints a
-  snapshot for real catalog changes.
+  maintenance operations commits without a `ducklake_snapshot` insert: one
+  `WriteBatch`, no new snapshot record, and `sys/head` retains its snapshot
+  id while advancing its batch count. Atomicity is unchanged; a racing writer
+  is caught by the store transaction's write-write conflict detection and
+  surfaces the same `conflict`-substring error every staged commit uses. A
+  mixed set (entity mutations but no snapshot row) stays a constraint error —
+  DuckLake always mints a snapshot for real catalog changes.
 
 ### Read-your-writes projections
 

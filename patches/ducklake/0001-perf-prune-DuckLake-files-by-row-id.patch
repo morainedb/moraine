@@ -1,5 +1,461 @@
+diff --git a/src/common/parquet_file_scanner.cpp b/src/common/parquet_file_scanner.cpp
+index b2b6b280..cbb492b4 100644
+--- a/src/common/parquet_file_scanner.cpp
++++ b/src/common/parquet_file_scanner.cpp
+@@ -4,0 +5,2 @@
++#include "duckdb/common/multi_file/multi_file_list.hpp"
++#include "duckdb/common/multi_file/multi_file_reader.hpp"
+@@ -7,0 +10,40 @@ namespace duckdb {
++struct ParquetFileScannerFunctionInfo : public TableFunctionInfo {
++	DuckLakeFileData file_data;
++};
++
++class ParquetFileScannerMultiFileReader : public MultiFileReader {
++public:
++	static unique_ptr<MultiFileReader> CreateInstance(const TableFunction &table_function) {
++		auto &info = table_function.function_info->Cast<ParquetFileScannerFunctionInfo>();
++		return make_uniq<ParquetFileScannerMultiFileReader>(info.file_data);
++	}
++
++	explicit ParquetFileScannerMultiFileReader(const DuckLakeFileData &file) {
++		OpenFileInfo file_info(file.path);
++		auto extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
++		extended_info->options["file_size"] = Value::UBIGINT(file.file_size_bytes);
++		if (file.footer_size.IsValid()) {
++			extended_info->options["footer_size"] = Value::UBIGINT(file.footer_size.GetIndex());
++		}
++		if (!file.encryption_key.empty()) {
++			extended_info->options["encryption_key"] = Value::BLOB_RAW(file.encryption_key);
++		}
++		extended_info->options["validate_external_file_cache"] = Value::BOOLEAN(false);
++		extended_info->options["etag"] = Value("");
++		extended_info->options["last_modified"] = Value::TIMESTAMP(timestamp_t(0));
++		file_info.extended_info = std::move(extended_info);
++
++		vector<OpenFileInfo> files;
++		files.push_back(std::move(file_info));
++		file_list = make_shared_ptr<SimpleMultiFileList>(std::move(files));
++	}
++
++	shared_ptr<MultiFileList> CreateFileList(ClientContext &, const vector<string> &,
++	                                         const FileGlobInput &) override {
++		return file_list;
++	}
++
++private:
++	shared_ptr<MultiFileList> file_list;
++};
++
+@@ -39,0 +82,6 @@ ParquetFileScanner::ParquetFileScanner(ClientContext &context, const DuckLakeFil
++	if (!multi_file_reader_creator_p) {
++		auto function_info = make_shared_ptr<ParquetFileScannerFunctionInfo>();
++		function_info->file_data = file;
++		multi_file_reader_creator_p = ParquetFileScannerMultiFileReader::CreateInstance;
++		function_info_p = std::move(function_info);
++	}
+@@ -70,0 +119,23 @@ optional_idx ParquetFileScanner::FindColumn(const string &name) const {
++optional_idx ParquetFileScanner::FindColumnByFieldId(int32_t field_id) const {
++	auto &multi_file_data = bind_data->Cast<MultiFileBindData>();
++	if (!multi_file_data.initial_reader) {
++		return optional_idx();
++	}
++	auto &columns = multi_file_data.initial_reader->GetColumns();
++	for (idx_t i = 0; i < columns.size(); i++) {
++		auto &identifier = columns[i].identifier;
++		if (!identifier.IsNull() && identifier.type().id() == LogicalTypeId::INTEGER &&
++		    identifier.GetValue<int32_t>() == field_id) {
++			return i;
++		}
++	}
++	return optional_idx();
++}
++
++unique_ptr<BaseStatistics> ParquetFileScanner::GetStatistics(column_t column_index) {
++	if (!parquet_scan.statistics) {
++		return nullptr;
++	}
++	return parquet_scan.statistics(context, bind_data.get(), column_index);
++}
++
+diff --git a/src/ducklake_extension.cpp b/src/ducklake_extension.cpp
+index ffe9826e..02508563 100644
+--- a/src/ducklake_extension.cpp
++++ b/src/ducklake_extension.cpp
+@@ -81,0 +82,3 @@ static void LoadInternal(ExtensionLoader &loader) {
++	DuckLakeBackfillRowIdStatsFunction backfill_row_id_stats;
++	loader.RegisterFunction(backfill_row_id_stats);
++
+diff --git a/src/functions/CMakeLists.txt b/src/functions/CMakeLists.txt
+index 18778f49..22d4cbda 100644
+--- a/src/functions/CMakeLists.txt
++++ b/src/functions/CMakeLists.txt
+@@ -4,0 +5 @@ add_library(
++  ducklake_backfill_row_id_stats.cpp
+diff --git a/src/functions/ducklake_backfill_row_id_stats.cpp b/src/functions/ducklake_backfill_row_id_stats.cpp
+new file mode 100644
+index 00000000..28c6905f
+--- /dev/null
++++ b/src/functions/ducklake_backfill_row_id_stats.cpp
+@@ -0,0 +1,339 @@
++#include "functions/ducklake_table_functions.hpp"
++
++#include "common/ducklake_util.hpp"
++#include "common/parquet_file_scanner.hpp"
++#include "duckdb/common/multi_file/multi_file_reader.hpp"
++#include "duckdb/storage/statistics/numeric_stats.hpp"
++#include "storage/ducklake_catalog.hpp"
++#include "storage/ducklake_schema_entry.hpp"
++#include "storage/ducklake_stats.hpp"
++#include "storage/ducklake_table_entry.hpp"
++#include "storage/ducklake_transaction.hpp"
++
++namespace duckdb {
++
++struct DuckLakeBackfillRowIdStatsBindData : public TableFunctionData {
++	DuckLakeBackfillRowIdStatsBindData(Catalog &catalog_p, string schema_name_p, string table_name_p,
++	                                   optional_idx max_files_p)
++	    : catalog(catalog_p), schema_name(std::move(schema_name_p)), table_name(std::move(table_name_p)),
++	      max_files(max_files_p) {
++	}
++
++	Catalog &catalog;
++	string schema_name;
++	string table_name;
++	optional_idx max_files;
++};
++
++struct DuckLakeBackfillRowIdStatsState : public GlobalTableFunctionState {
++	vector<vector<Value>> rows;
++	idx_t offset = 0;
++	bool backfilled = false;
++};
++
++static unique_ptr<FunctionData> DuckLakeBackfillRowIdStatsBind(ClientContext &context,
++	                                                           TableFunctionBindInput &input,
++	                                                           vector<LogicalType> &return_types,
++	                                                           vector<string> &names) {
++	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]);
++	string schema_name;
++	string table_name;
++	optional_idx max_files;
++
++	auto schema_entry = input.named_parameters.find("schema");
++	if (schema_entry != input.named_parameters.end() && !schema_entry->second.IsNull()) {
++		schema_name = StringValue::Get(schema_entry->second);
++	}
++	auto table_entry = input.named_parameters.find("table_name");
++	if (table_entry != input.named_parameters.end() && !table_entry->second.IsNull()) {
++		table_name = StringValue::Get(table_entry->second);
++	}
++	auto max_files_entry = input.named_parameters.find("max_files");
++	if (max_files_entry != input.named_parameters.end()) {
++		if (max_files_entry->second.IsNull()) {
++			throw BinderException("The max_files option must be a non-null integer");
++		}
++		max_files = UBigIntValue::Get(max_files_entry->second);
++		if (max_files.GetIndex() == 0) {
++			throw BinderException("The max_files option must be greater than zero");
++		}
++	}
++
++	if (!table_name.empty()) {
++		catalog.GetEntry<TableCatalogEntry>(context, schema_name, table_name, OnEntryNotFound::THROW_EXCEPTION);
++	} else if (!schema_name.empty()) {
++		catalog.GetSchema(context, schema_name, OnEntryNotFound::THROW_EXCEPTION);
++	}
++
++	names.emplace_back("schema_name");
++	return_types.emplace_back(LogicalType::VARCHAR);
++	names.emplace_back("table_name");
++	return_types.emplace_back(LogicalType::VARCHAR);
++	names.emplace_back("files_backfilled");
++	return_types.emplace_back(LogicalType::UBIGINT);
++	names.emplace_back("files_remaining");
++	return_types.emplace_back(LogicalType::UBIGINT);
++	return make_uniq<DuckLakeBackfillRowIdStatsBindData>(catalog, std::move(schema_name), std::move(table_name),
++	                                                    max_files);
++}
++
++static unique_ptr<GlobalTableFunctionState> DuckLakeBackfillRowIdStatsInit(ClientContext &,
++	                                                                       TableFunctionInitInput &) {
++	return make_uniq<DuckLakeBackfillRowIdStatsState>();
++}
++
++static vector<reference<DuckLakeTableEntry>> GetBackfillTables(ClientContext &context,
++	                                                           const DuckLakeBackfillRowIdStatsBindData &data) {
++	auto &catalog = data.catalog.Cast<DuckLakeCatalog>();
++	vector<reference<DuckLakeTableEntry>> tables;
++	if (!data.table_name.empty()) {
++		auto entry = catalog.GetEntry<TableCatalogEntry>(context, data.schema_name, data.table_name,
++		                                               OnEntryNotFound::THROW_EXCEPTION);
++		tables.push_back(entry->Cast<DuckLakeTableEntry>());
++	} else {
++		vector<reference<SchemaCatalogEntry>> schemas;
++		if (data.schema_name.empty()) {
++			schemas = catalog.GetSchemas(context);
++		} else {
++			schemas.push_back(catalog.GetSchema(context, data.schema_name));
++		}
++		for (auto &schema : schemas) {
++			schema.get().Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
++				if (entry.type == CatalogType::TABLE_ENTRY) {
++					tables.push_back(entry.Cast<DuckLakeTableEntry>());
++				}
++			});
++		}
++	}
++	std::sort(tables.begin(), tables.end(), [](const reference<DuckLakeTableEntry> &left,
++	                                          const reference<DuckLakeTableEntry> &right) {
++		auto &left_table = left.get();
++		auto &right_table = right.get();
++		if (left_table.schema.name != right_table.schema.name) {
++			return left_table.schema.name < right_table.schema.name;
++		}
++		return left_table.name < right_table.name;
++	});
++	return tables;
++}
++
++static vector<DataFileIndex> GetFilesMissingRowIdStats(DuckLakeTransaction &transaction,
++	                                                   DuckLakeSnapshot snapshot, TableIndex table_id) {
++	auto row_id_field = static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID);
++	auto query = StringUtil::Format(R"(
++SELECT data.data_file_id
++FROM {METADATA_CATALOG}.ducklake_data_file AS data
++WHERE data.table_id = %d
++  AND data.record_count > 0
++  AND {SNAPSHOT_ID} >= data.begin_snapshot
++  AND ({SNAPSHOT_ID} < data.end_snapshot OR data.end_snapshot IS NULL)
++  AND NOT EXISTS (
++      SELECT 1
++      FROM {METADATA_CATALOG}.ducklake_file_column_stats AS stats
++      WHERE stats.table_id = data.table_id
++        AND stats.data_file_id = data.data_file_id
++        AND stats.column_id = %d
++        AND stats.min_value IS NOT NULL
++        AND stats.max_value IS NOT NULL
++  )
++ORDER BY data.data_file_id
++)",
++	                                table_id.index, row_id_field);
++	auto result = transaction.Query(snapshot, query);
++	if (result->HasError()) {
++		result->GetErrorObject().Throw("Failed to find DuckLake files missing row-ID statistics: ");
++	}
++
++	vector<DataFileIndex> missing;
++	for (auto &row : *result) {
++		missing.emplace_back(row.GetValue<idx_t>(0));
++	}
++	return missing;
++}
++
++static DuckLakeColumnStats DenseRowIdStats(const DuckLakeFileListExtendedEntry &file) {
++	if (!file.row_id_start.IsValid()) {
++		throw InvalidInputException("Cannot backfill row-ID statistics for dense file %s without row_id_start",
++		                            file.file.path);
++	}
++	auto max_offset = file.row_count - 1;
++	auto min_row_id = file.row_id_start.GetIndex();
++	if (min_row_id > NumericLimits<idx_t>::Maximum() - max_offset) {
++		throw InvalidInputException("Cannot backfill overflowing row-ID range for file %s", file.file.path);
++	}
++
++	DuckLakeColumnStats result(LogicalType::BIGINT);
++	result.min = to_string(min_row_id);
++	result.max = to_string(min_row_id + max_offset);
++	result.has_min = true;
++	result.has_max = true;
++	result.num_values = file.row_count;
++	result.null_count = 0;
++	result.has_num_values = true;
++	result.has_null_count = true;
++	return result;
++}
++
++static DuckLakeColumnStats ScanSparseRowIdStats(ClientContext &context, ParquetFileScanner &scanner,
++	                                             idx_t column_index,
++	                                             const DuckLakeFileListExtendedEntry &file) {
++	if (scanner.GetTypes()[column_index].id() != LogicalTypeId::BIGINT) {
++		throw InvalidInputException("Invalid row-ID column type in file %s: expected BIGINT, found %s", file.file.path,
++		                            scanner.GetTypes()[column_index].ToString());
++	}
++
++	DuckLakeColumnStats result(LogicalType::BIGINT);
++	auto footer_stats = scanner.GetStatistics(column_index);
++	if (footer_stats && !footer_stats->CanHaveNull() && NumericStats::HasMin(*footer_stats) &&
++	    NumericStats::HasMax(*footer_stats)) {
++		auto min_row_id = NumericStats::Min(*footer_stats).GetValue<int64_t>();
++		auto max_row_id = NumericStats::Max(*footer_stats).GetValue<int64_t>();
++		if (min_row_id < 0 || max_row_id < min_row_id) {
++			throw InvalidInputException("Invalid row-ID range in file %s", file.file.path);
++		}
++		result.min = to_string(min_row_id);
++		result.max = to_string(max_row_id);
++	} else {
++		scanner.SetColumnIds({column_index});
++		DataChunk chunk;
++		chunk.Initialize(context, {scanner.GetTypes()[column_index]});
++		idx_t scanned_rows = 0;
++		int64_t min_row_id = NumericLimits<int64_t>::Maximum();
++		int64_t max_row_id = NumericLimits<int64_t>::Minimum();
++		while (scanner.Scan(chunk)) {
++			UnifiedVectorFormat row_ids;
++			chunk.data[0].ToUnifiedFormat(chunk.size(), row_ids);
++			auto values = UnifiedVectorFormat::GetData<int64_t>(row_ids);
++			for (idx_t row_index = 0; row_index < chunk.size(); row_index++) {
++				auto value_index = row_ids.sel->get_index(row_index);
++				if (!row_ids.validity.RowIsValid(value_index)) {
++					throw InvalidInputException("Invalid NULL row ID in file %s", file.file.path);
++				}
++				if (values[value_index] < 0) {
++					throw InvalidInputException("Invalid negative row ID in file %s", file.file.path);
++				}
++				min_row_id = MinValue(min_row_id, values[value_index]);
++				max_row_id = MaxValue(max_row_id, values[value_index]);
++				scanned_rows++;
++			}
++		}
++		if (scanned_rows != file.row_count) {
++			throw InvalidInputException("Row count mismatch while backfilling file %s: expected %d, scanned %d",
++			                            file.file.path, file.row_count, scanned_rows);
++		}
++		result.min = to_string(min_row_id);
++		result.max = to_string(max_row_id);
++	}
++	result.has_min = true;
++	result.has_max = true;
++	result.num_values = file.row_count;
++	result.null_count = 0;
++	result.has_num_values = true;
++	result.has_null_count = true;
++	return result;
++}
++
++static DuckLakeColumnStats ReadRowIdStats(ClientContext &context, const DuckLakeFileListExtendedEntry &file) {
++	ParquetFileScanner scanner(context, file.file);
++	auto row_id_column = scanner.FindColumnByFieldId(MultiFileReader::ROW_ID_FIELD_ID);
++	if (!row_id_column.IsValid()) {
++		return DenseRowIdStats(file);
++	}
++	return ScanSparseRowIdStats(context, scanner, row_id_column.GetIndex(), file);
++}
++
++static void WriteRowIdStats(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot, TableIndex table_id,
++	                        DataFileIndex file_id, const DuckLakeColumnStats &stats) {
++	auto row_id_field = FieldIndex(static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID));
++	auto values = DuckLakeColumnStatsInfo::FromColumnStats(row_id_field, stats);
++	auto query = StringUtil::Format(R"(
++DELETE FROM {METADATA_CATALOG}.ducklake_file_column_stats
++WHERE table_id = %d AND data_file_id = %d AND column_id = %d;
++INSERT INTO {METADATA_CATALOG}.ducklake_file_column_stats
++SELECT %d, %d, %d, %s, %s, %s, %s, %s, %s, %s
++WHERE EXISTS (
++    SELECT 1
++    FROM {METADATA_CATALOG}.ducklake_data_file
++    WHERE table_id = %d
++      AND data_file_id = %d
++      AND {SNAPSHOT_ID} >= begin_snapshot
++      AND ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)
++)
++)",
++	                                table_id.index, file_id.index, row_id_field.index, file_id.index, table_id.index,
++	                                row_id_field.index, values.column_size_bytes, values.value_count, values.null_count,
++	                                values.min_val, values.max_val, values.contains_nan, values.extra_stats,
++	                                table_id.index, file_id.index);
++	auto result = transaction.Query(snapshot, query);
++	if (result->HasError()) {
++		result->GetErrorObject().Throw("Failed to write DuckLake row-ID statistics: ");
++	}
++}
++
++static void BackfillRowIdStats(ClientContext &context, const DuckLakeBackfillRowIdStatsBindData &data,
++	                           DuckLakeBackfillRowIdStatsState &state) {
++	auto &transaction = DuckLakeTransaction::Get(context, data.catalog);
++	auto snapshot = transaction.GetSnapshot();
++	auto &metadata_manager = transaction.GetMetadataManager();
++	auto tables = GetBackfillTables(context, data);
++	idx_t files_left = data.max_files.IsValid() ? data.max_files.GetIndex() : NumericLimits<idx_t>::Maximum();
++
++	for (auto &table_ref : tables) {
++		auto &table = table_ref.get();
++		if (table.GetTableId().IsTransactionLocal()) {
++			continue;
++		}
++		auto missing = GetFilesMissingRowIdStats(transaction, snapshot, table.GetTableId());
++		auto selected_count = MinValue(files_left, missing.size());
++		if (selected_count > 0) {
++			auto files = metadata_manager.GetExtendedFilesForTable(table, snapshot, nullptr);
++			unordered_map<idx_t, reference<DuckLakeFileListExtendedEntry>> files_by_id;
++			for (auto &file : files) {
++				files_by_id.emplace(file.file_id.index, file);
++			}
++			for (idx_t file_index = 0; file_index < selected_count; file_index++) {
++				auto entry = files_by_id.find(missing[file_index].index);
++				if (entry == files_by_id.end()) {
++					throw InternalException("Active DuckLake data file %d disappeared during row-ID-stat backfill",
++					                        missing[file_index].index);
++				}
++				auto stats = ReadRowIdStats(context, entry->second.get());
++				WriteRowIdStats(transaction, snapshot, table.GetTableId(), missing[file_index], stats);
++			}
++			files_left -= selected_count;
++		}
++
++		state.rows.push_back({Value(table.schema.name), Value(table.name), Value::UBIGINT(selected_count),
++		                      Value::UBIGINT(missing.size() - selected_count)});
++	}
++}
++
++static void DuckLakeBackfillRowIdStatsExecute(ClientContext &context, TableFunctionInput &input,
++	                                           DataChunk &output) {
++	auto &data = input.bind_data->Cast<DuckLakeBackfillRowIdStatsBindData>();
++	auto &state = input.global_state->Cast<DuckLakeBackfillRowIdStatsState>();
++	if (!state.backfilled) {
++		BackfillRowIdStats(context, data, state);
++		state.backfilled = true;
++	}
++
++	idx_t count = 0;
++	while (state.offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
++		auto &row = state.rows[state.offset++];
++		for (idx_t column_index = 0; column_index < row.size(); column_index++) {
++			output.SetValue(column_index, count, row[column_index]);
++		}
++		count++;
++	}
++	output.SetCardinality(count);
++}
++
++DuckLakeBackfillRowIdStatsFunction::DuckLakeBackfillRowIdStatsFunction()
++	: TableFunction("ducklake_backfill_row_id_stats", {LogicalType::VARCHAR}, DuckLakeBackfillRowIdStatsExecute,
++	                DuckLakeBackfillRowIdStatsBind, DuckLakeBackfillRowIdStatsInit) {
++	named_parameters["schema"] = LogicalType::VARCHAR;
++	named_parameters["table_name"] = LogicalType::VARCHAR;
++	named_parameters["max_files"] = LogicalType::UBIGINT;
++}
++
++} // namespace duckdb
+diff --git a/src/include/common/parquet_file_scanner.hpp b/src/include/common/parquet_file_scanner.hpp
+index e8abad2f..c9bfed83 100644
+--- a/src/include/common/parquet_file_scanner.hpp
++++ b/src/include/common/parquet_file_scanner.hpp
+@@ -32,0 +33,3 @@ public:
++	//! Find a column by Parquet field ID, returns invalid index if not found
++	optional_idx FindColumnByFieldId(int32_t field_id) const;
++	unique_ptr<BaseStatistics> GetStatistics(column_t column_index);
+diff --git a/src/include/functions/ducklake_table_functions.hpp b/src/include/functions/ducklake_table_functions.hpp
+index b09bf400..3e3814f0 100644
+--- a/src/include/functions/ducklake_table_functions.hpp
++++ b/src/include/functions/ducklake_table_functions.hpp
+@@ -102,0 +103,5 @@ public:
++class DuckLakeBackfillRowIdStatsFunction : public TableFunction {
++public:
++	DuckLakeBackfillRowIdStatsFunction();
++};
++
 diff --git a/src/storage/ducklake_insert.cpp b/src/storage/ducklake_insert.cpp
-index e15d40c9ccfad3513ac8697396bd7d7ec1cbba9e..fc51b4aa37d97e56bf6776ad6c0a6eec622217ad 100644
+index e15d40c9..fc51b4aa 100644
 --- a/src/storage/ducklake_insert.cpp
 +++ b/src/storage/ducklake_insert.cpp
 @@ -150,0 +151 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
@@ -10,7 +466,7 @@ index e15d40c9ccfad3513ac8697396bd7d7ec1cbba9e..fc51b4aa37d97e56bf6776ad6c0a6eec
 +				data_file.column_stats.emplace(
 +				    FieldIndex(static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID)), std::move(row_id_stats));
 diff --git a/src/storage/ducklake_multi_file_list.cpp b/src/storage/ducklake_multi_file_list.cpp
-index 256b036cc9e1445a968ffb7e3b896a497ae6f76a..568fda6986ebd3135cd8e36f72c7dd22e4a3d723 100644
+index 256b036c..568fda69 100644
 --- a/src/storage/ducklake_multi_file_list.cpp
 +++ b/src/storage/ducklake_multi_file_list.cpp
 @@ -44,0 +45,6 @@ void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown
@@ -21,7 +477,7 @@ index 256b036cc9e1445a968ffb7e3b896a497ae6f76a..568fda6986ebd3135cd8e36f72c7dd22
 +		return;
 +	}
 diff --git a/src/storage/ducklake_server_side_commit.cpp b/src/storage/ducklake_server_side_commit.cpp
-index 141db9e735adac918414ee74c56e5fc841283930..0fe81e8fe13ab554dc84f552479cf92fbcdbf889 100644
+index 141db9e7..0fe81e8f 100644
 --- a/src/storage/ducklake_server_side_commit.cpp
 +++ b/src/storage/ducklake_server_side_commit.cpp
 @@ -5,0 +6 @@
@@ -33,7 +489,7 @@ index 141db9e735adac918414ee74c56e5fc841283930..0fe81e8fe13ab554dc84f552479cf92f
 +		    LogicalType::BIGINT);
 +	}
 diff --git a/src/storage/ducklake_stats.cpp b/src/storage/ducklake_stats.cpp
-index 1d94d7ed8061f9611dcf61d32d3bb58ca909d4f1..aed20857cd66efb930dd43e1d1dac4e8b8bc54a0 100644
+index 1d94d7ed..aed20857 100644
 --- a/src/storage/ducklake_stats.cpp
 +++ b/src/storage/ducklake_stats.cpp
 @@ -10,0 +11 @@
@@ -43,12 +499,12 @@ index 1d94d7ed8061f9611dcf61d32d3bb58ca909d4f1..aed20857cd66efb930dd43e1d1dac4e8
 +			continue;
 +		}
 diff --git a/src/storage/ducklake_transaction.cpp b/src/storage/ducklake_transaction.cpp
-index f5eef0f40f258d073cd4d8425faa2e2625cbbb4c..d61d9dbd97fee2caaae14ceedd72b59d7d0f462d 100644
+index f5eef0f4..7a253535 100644
 --- a/src/storage/ducklake_transaction.cpp
 +++ b/src/storage/ducklake_transaction.cpp
 @@ -6,0 +7 @@
 +#include "duckdb/common/multi_file/multi_file_reader.hpp"
-@@ -1240 +1242,19 @@ DuckLakeFileInfo DuckLakeTransaction::BuildDataFileInfo(const DuckLakeDataFile &
+@@ -1247 +1247,19 @@ DuckLakeFileInfo DuckLakeTransaction::BuildDataFileInfo(const DuckLakeDataFile &
 -	return data_file;
 +	auto row_id_field = FieldIndex(static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID));
 +	if (file.row_count > 0 && row_id_start.IsValid() &&
@@ -70,7 +526,7 @@ index f5eef0f40f258d073cd4d8425faa2e2625cbbb4c..d61d9dbd97fee2caaae14ceedd72b59d
 +	}
 +	return data_file;
 diff --git a/test/sql/add_files/add_files_complex_nested_stats_mre.test b/test/sql/add_files/add_files_complex_nested_stats_mre.test
-index 257a4e675b69ef1376317e2d5cf5ba7afb9ff321..0d100b8cebbb5ae925ca6e50ac44496a47805d2d 100644
+index 257a4e67..0d100b8c 100644
 --- a/test/sql/add_files/add_files_complex_nested_stats_mre.test
 +++ b/test/sql/add_files/add_files_complex_nested_stats_mre.test
 @@ -42 +42,3 @@ query III
@@ -84,13 +540,13 @@ index 257a4e675b69ef1376317e2d5cf5ba7afb9ff321..0d100b8cebbb5ae925ca6e50ac44496a
 +WHERE column_id <> 2147483540
 +ORDER BY data_file_id, column_id
 diff --git a/test/sql/add_files/add_files_nested_list_struct_nulls.test b/test/sql/add_files/add_files_nested_list_struct_nulls.test
-index 63211beccc7cf64d0eca97fab01f9fb092a444d8..c5ce328dc2efe43505961d3daf15a5aae919f86d 100644
+index 63211bec..c5ce328d 100644
 --- a/test/sql/add_files/add_files_nested_list_struct_nulls.test
 +++ b/test/sql/add_files/add_files_nested_list_struct_nulls.test
 @@ -68,0 +69 @@ WHERE f.path LIKE '%simple_test%'
 +  AND s.column_id <> 2147483540
 diff --git a/test/sql/geo/ducklake_geometry.test b/test/sql/geo/ducklake_geometry.test
-index 438c40fb1ec6f46ab28a38b4c7ac4c84b42db15a..32cb958ff0b6dba7a2ff4bb7ccbcab9ae0356f0b 100644
+index 438c40fb..32cb958f 100644
 --- a/test/sql/geo/ducklake_geometry.test
 +++ b/test/sql/geo/ducklake_geometry.test
 @@ -31 +31 @@ query I
@@ -109,7 +565,7 @@ index 438c40fb1ec6f46ab28a38b4c7ac4c84b42db15a..32cb958ff0b6dba7a2ff4bb7ccbcab9a
 -select extra_stats from ducklake_meta.ducklake_file_column_stats order by all;
 +select extra_stats from ducklake_meta.ducklake_file_column_stats where column_id <> 2147483540 order by all;
 diff --git a/test/sql/geo/ducklake_geometry_add_files.test b/test/sql/geo/ducklake_geometry_add_files.test
-index be2fe66e9d9baed35ee6300a23be042ee11d23d6..6e982a00efcc8e1623f6a9a0bb6170b336b90883 100644
+index be2fe66e..6e982a00 100644
 --- a/test/sql/geo/ducklake_geometry_add_files.test
 +++ b/test/sql/geo/ducklake_geometry_add_files.test
 @@ -47 +47 @@ query I
@@ -120,7 +576,7 @@ index be2fe66e9d9baed35ee6300a23be042ee11d23d6..6e982a00efcc8e1623f6a9a0bb6170b3
 \ No newline at end of file
 +{"bbox": {"xmin": 5.000000, "xmax": 5.000000, "ymin": 5.000000, "ymax": 5.000000, "zmin": null, "zmax": null, "mmin": null, "mmax": null}, "types": ["point"]}
 diff --git a/test/sql/geo/ducklake_geometry_nested_list.test b/test/sql/geo/ducklake_geometry_nested_list.test
-index 20346faecfeffcbfe1204a643e234abfe8d51d56..a21cfd7859606ddccec15655ac11dd4a466cc0b8 100644
+index 20346fae..a21cfd78 100644
 --- a/test/sql/geo/ducklake_geometry_nested_list.test
 +++ b/test/sql/geo/ducklake_geometry_nested_list.test
 @@ -44 +44 @@ query I
@@ -131,7 +587,7 @@ index 20346faecfeffcbfe1204a643e234abfe8d51d56..a21cfd7859606ddccec15655ac11dd4a
 \ No newline at end of file
 +{"bbox": {"xmin": 0.000000, "xmax": 1.000000, "ymin": 0.000000, "ymax": 2.000000, "zmin": null, "zmax": null, "mmin": null, "mmax": null}, "types": ["linestring", "point"]}
 diff --git a/test/sql/geo/ducklake_geometry_nested_map.test b/test/sql/geo/ducklake_geometry_nested_map.test
-index a4eca53a407b83a575291ab297d0f7f62e152ff5..6a4f90525586c918749a7ed7dde6112b73f3db52 100644
+index a4eca53a..6a4f9052 100644
 --- a/test/sql/geo/ducklake_geometry_nested_map.test
 +++ b/test/sql/geo/ducklake_geometry_nested_map.test
 @@ -45 +45 @@ query I
@@ -140,14 +596,14 @@ index a4eca53a407b83a575291ab297d0f7f62e152ff5..6a4f90525586c918749a7ed7dde6112b
 @@ -49 +48,0 @@ NULL
 -
 diff --git a/test/sql/geo/ducklake_geometry_nested_struct.test b/test/sql/geo/ducklake_geometry_nested_struct.test
-index c2a8d5e9b500e191e411b5c0bc711598b774ae69..f472403857578af15e49852c2bb19db781baa0a8 100644
+index c2a8d5e9..f4724038 100644
 --- a/test/sql/geo/ducklake_geometry_nested_struct.test
 +++ b/test/sql/geo/ducklake_geometry_nested_struct.test
 @@ -46 +46 @@ query I
 -select extra_stats from ducklake_meta.ducklake_file_column_stats;
 +select extra_stats from ducklake_meta.ducklake_file_column_stats where column_id <> 2147483540;
 diff --git a/test/sql/metadata/appender_data_files.test b/test/sql/metadata/appender_data_files.test
-index e73d57c6b8cd185641caf16cdbac97906f7e6349..a28d7db933cd9aae998855bc3b5d16ec89487031 100644
+index e73d57c6..a28d7db9 100644
 --- a/test/sql/metadata/appender_data_files.test
 +++ b/test/sql/metadata/appender_data_files.test
 @@ -42,0 +43 @@ WHERE table_id = (SELECT table_id FROM dl.ducklake_table WHERE table_name = 'bas
@@ -163,10 +619,10 @@ index e73d57c6b8cd185641caf16cdbac97906f7e6349..a28d7db933cd9aae998855bc3b5d16ec
 +  AND column_id <> 2147483540
 diff --git a/test/sql/rowid/ducklake_row_id_file_pruning.test b/test/sql/rowid/ducklake_row_id_file_pruning.test
 new file mode 100644
-index 0000000000000000000000000000000000000000..9c87e00fa1648bfbafdff0d64fd2684a3c568bfb
+index 00000000..edee9c1c
 --- /dev/null
 +++ b/test/sql/rowid/ducklake_row_id_file_pruning.test
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,257 @@
 +# name: test/sql/rowid/ducklake_row_id_file_pruning.test
 +# description: row-id statistics prune files without excluding files whose statistics are missing
 +# group: [rowid]
@@ -206,6 +662,16 @@ index 0000000000000000000000000000000000000000..9c87e00fa1648bfbafdff0d64fd2684a
 +2	3	4
 +4	5	8
 +
++statement error
++SELECT * FROM ducklake_backfill_row_id_stats('ducklake', max_files => NULL)
++----
++The max_files option must be a non-null integer
++
++statement error
++SELECT * FROM ducklake_backfill_row_id_stats('ducklake', max_files => 0)
++----
++The max_files option must be greater than zero
++
 +query II
 +EXPLAIN ANALYZE SELECT * FROM ducklake.dense WHERE rowid = 3
 +----
@@ -228,10 +694,12 @@ index 0000000000000000000000000000000000000000..9c87e00fa1648bfbafdff0d64fd2684a
 +statement ok
 +DELETE FROM row_id_meta.ducklake_file_column_stats
 +WHERE column_id = 2147483540
-+  AND data_file_id = (
-+    SELECT min(data_file_id)
++  AND data_file_id IN (
++    SELECT data_file_id
 +    FROM row_id_meta.ducklake_data_file
 +    WHERE end_snapshot IS NULL
++    ORDER BY data_file_id
++    LIMIT 2
 +  )
 +
 +query II
@@ -242,7 +710,62 @@ index 0000000000000000000000000000000000000000..9c87e00fa1648bfbafdff0d64fd2684a
 +query II
 +EXPLAIN ANALYZE SELECT * FROM ducklake.dense WHERE rowid = 999
 +----
++analyzed_plan	<REGEX>:.*Total Files Read: 2.*
++
++statement ok
++CREATE TEMP TABLE snapshot_before_backfill AS
++SELECT id FROM ducklake_current_snapshot('ducklake')
++
++query TTII
++SELECT schema_name, table_name, files_backfilled, files_remaining
++FROM ducklake_backfill_row_id_stats(
++  'ducklake', schema => 'main', table_name => 'dense', max_files => 1
++)
++----
++main	dense	1	1
++
++query III
++SELECT data.record_count, stats.min_value, stats.max_value
++FROM row_id_meta.ducklake_data_file AS data
++JOIN row_id_meta.ducklake_file_column_stats AS stats USING (data_file_id, table_id)
++WHERE data.end_snapshot IS NULL
++  AND data.data_file_id = (
++    SELECT min(data_file_id)
++    FROM row_id_meta.ducklake_data_file
++    WHERE end_snapshot IS NULL
++  )
++  AND stats.column_id = 2147483540
++----
++3	0	2
++
++query I
++SELECT count(*) = 1
++FROM snapshot_before_backfill
++JOIN ducklake_current_snapshot('ducklake') USING (id)
++----
++true
++
++query II
++EXPLAIN ANALYZE SELECT * FROM ducklake.dense WHERE rowid = 999
++----
 +analyzed_plan	<REGEX>:.*Total Files Read: 1.*
++
++query TTII
++SELECT schema_name, table_name, files_backfilled, files_remaining
++FROM ducklake_backfill_row_id_stats('ducklake', schema => 'main', table_name => 'dense')
++----
++main	dense	1	0
++
++query II
++EXPLAIN ANALYZE SELECT * FROM ducklake.dense WHERE rowid = 999
++----
++analyzed_plan	<REGEX>:.*Total Files Read: 0.*
++
++query TTII
++SELECT schema_name, table_name, files_backfilled, files_remaining
++FROM ducklake_backfill_row_id_stats('ducklake', schema => 'main', table_name => 'dense')
++----
++main	dense	0	0
 +
 +statement ok
 +CREATE TABLE ducklake.flushed(i INTEGER)
@@ -293,6 +816,36 @@ index 0000000000000000000000000000000000000000..9c87e00fa1648bfbafdff0d64fd2684a
 +23	23
 +
 +statement ok
++DELETE FROM row_id_meta.ducklake_file_column_stats
++WHERE column_id = 2147483540
++  AND data_file_id = (
++    SELECT data.data_file_id
++    FROM row_id_meta.ducklake_data_file AS data
++    JOIN row_id_meta.ducklake_table AS tables USING (table_id)
++    WHERE tables.table_name = 'flushed'
++      AND data.end_snapshot IS NULL
++      AND data.record_count = 4
++  )
++
++query TTII
++SELECT schema_name, table_name, files_backfilled, files_remaining
++FROM ducklake_backfill_row_id_stats('ducklake', schema => 'main', table_name => 'flushed')
++----
++main	flushed	1	0
++
++query III
++SELECT data.record_count, stats.min_value, stats.max_value
++FROM row_id_meta.ducklake_data_file AS data
++JOIN row_id_meta.ducklake_table AS tables USING (table_id)
++JOIN row_id_meta.ducklake_file_column_stats AS stats USING (data_file_id, table_id)
++WHERE tables.table_name = 'flushed'
++  AND data.end_snapshot IS NULL
++  AND data.record_count = 4
++  AND stats.column_id = 2147483540
++----
++4	0	23
++
++statement ok
 +CREATE TABLE ducklake.sparse(i INTEGER)
 +
 +statement ok
@@ -328,7 +881,7 @@ index 0000000000000000000000000000000000000000..9c87e00fa1648bfbafdff0d64fd2684a
 +----
 +8	8
 diff --git a/test/sql/stats/variant_shredded_stats.test b/test/sql/stats/variant_shredded_stats.test
-index b85b641342dd46a09be5f3b7b956f737222d90e4..a66f07b89ec260d12c5b4577801dd0bf35a5521d 100644
+index b85b6413..a66f07b8 100644
 --- a/test/sql/stats/variant_shredded_stats.test
 +++ b/test/sql/stats/variant_shredded_stats.test
 @@ -36 +36 @@ query II

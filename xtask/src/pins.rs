@@ -247,19 +247,29 @@ fn string_constant<'a>(contents: &'a str, name: &str) -> Option<&'a str> {
     rest.find('"').and_then(|end| rest.get(..end))
 }
 
+fn ducklake_commit_matches(commit: &str, pinned: &str) -> bool {
+    pinned.len() >= SHORT_COMMIT
+        && pinned.len() <= commit.len()
+        && pinned
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+        && commit.starts_with(pinned)
+}
+
 /// Every place naming a DuckLake commit that disagrees with `commit`.
 ///
-/// The suite's constant must match exactly; prose only has to carry it,
-/// since the same file quotes the commit in more than one form.
+/// The suite's constant may use the full commit or an unambiguous prefix;
+/// prose only has to carry the conventional short form, since the same file
+/// can quote the commit in more than one form.
 fn ducklake_problems(commit: &str) -> anyhow::Result<Vec<String>> {
     let short = commit.get(..SHORT_COMMIT).unwrap_or(commit);
     let mut problems = Vec::new();
 
     match string_constant(&read(WIRE_CONTRACT)?, "DUCKLAKE_SOURCE_COMMIT") {
-        Some(pinned) if pinned == short => {}
+        Some(pinned) if ducklake_commit_matches(commit, pinned) => {}
         Some(pinned) => problems.push(format!(
             "{WIRE_CONTRACT} pins DuckLake `{pinned}`, but {DUCKLAKE_CONFIG} declares \
-             `{short}` — re-verify every pin in that file against the new DuckLake"
+             `{commit}` — re-verify every pin in that file against the new DuckLake"
         )),
         None => problems.push(format!(
             "{WIRE_CONTRACT} declares no `DUCKLAKE_SOURCE_COMMIT`"
@@ -411,6 +421,17 @@ mod tests {
         let source = "const OTHER: &str = \"no\";\nconst WANTED: &str = \"yes\";\n";
         assert_eq!(string_constant(source, "WANTED"), Some("yes"));
         assert_eq!(string_constant(source, "MISSING"), None);
+    }
+
+    #[test]
+    fn a_ducklake_pin_may_be_the_full_commit_or_an_unambiguous_prefix() {
+        let commit = "d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4";
+
+        assert!(ducklake_commit_matches(commit, commit));
+        assert!(ducklake_commit_matches(commit, "d8a1881e"));
+        assert!(!ducklake_commit_matches(commit, "d8a1881"));
+        assert!(!ducklake_commit_matches(commit, "d8a1881f"));
+        assert!(!ducklake_commit_matches(commit, "not-a-commit"));
     }
 
     /// The checked-in tree agrees with the submodule it is pinned to —
