@@ -732,3 +732,52 @@ async fn a_preload_warms_before_the_first_read() {
     assert!(view.schema_by_name("main").is_some());
     reader.close().await.unwrap();
 }
+
+/// One shared cache still reports SST metadata apart from data blocks.
+///
+/// Nothing outside SlateDB can classify a cached entry, so the split comes
+/// from what each typed admission recorded. If that broke, metadata occupancy
+/// would read zero however full the cache was, and the attach-time sizing
+/// warning would never fire.
+#[tokio::test]
+async fn the_shared_cache_reports_metadata_apart_from_data_blocks() {
+    let object_store = Arc::new(InMemory::new());
+    let writer = Catalog::open(
+        Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "t", &[col("a")])?;
+            for _ in 0..256 {
+                tx.register_data_file(table, datafile(100), &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    // A cold reader walks every SST's filter and index out of object storage.
+    let reader = Catalog::open_read_only(
+        object_store as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    reader.snapshot().await.unwrap();
+
+    let status = moraine::cache_status();
+    assert!(status.metadata_occupancy_bytes > 0, "{status:?}");
+
+    // Metadata is protected up to a share of the one capacity rather than
+    // partitioned into its own, so its ceiling is under the whole.
+    assert!(status.metadata_capacity_bytes > 0, "{status:?}");
+    assert!(
+        status.metadata_capacity_bytes < status.block_capacity_bytes,
+        "{status:?}"
+    );
+}

@@ -40,7 +40,11 @@ this file is the operational summary.
   Comments carry content, not typography; if a file needs section markers,
   split the module instead.
 - Comments are direct and succinct: state what the item does and any hard
-  constraint, no rationale essays.
+  constraint, no rationale essays. One or two sentences is the norm; a third
+  needs a caller who would otherwise get it wrong. Never restate the design
+  above a function — that is the RFC's job — and never argue for the code in
+  its own doc comment. Test docs name the property, not the case for it. A
+  doc comment longer than the item it documents is the signal to cut.
 - Use blank lines to group code into readable stanzas.
 - Names prefer full words, for every symbol; abbreviate only when the word
   is long and the abbreviation is conventional (`tx`, not `tbl`).

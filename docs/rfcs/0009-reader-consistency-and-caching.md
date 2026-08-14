@@ -589,7 +589,7 @@ with, not consolidated), the byte tier (consolidated), and the data tier
 The SlateDB cache and the scoped reader's parsed-Parquet cache share a
 **budget and process lifetime, not an entry store**. `CACHE_MEMORY` is split
 once when the process cache is built: the auxiliary metadata allowance comes
-out of the metadata fifth, and SlateDB receives the remainder. No attach may
+off the top, and SlateDB's shared cache receives the remainder. No attach may
 construct another allowance or grow either cache beyond that split.
 
 Their storage engines remain separate because their entries have different
@@ -706,24 +706,81 @@ what DuckLake cannot see is what the batch count exists for, one tier
 down. DuckLake's own catalog-cache race (`SET threads=1`) is upstream's
 bug in upstream's tier, tracked by the presence test and nothing more.
 
-### One block cache: two slots, one budget
+### One block cache: two priorities, one budget
 
 The physical tier is one shared cache instance per process, passed to
 every `Db` and `DbReader` the extension opens (SlateDB supports sharing;
 the sharer owns shutdown). SlateDB's split structure is kept, because the
 split is the tuning:
 
-- **The meta slot — SST indexes, filters, stats — is memory-only and
-  sized to fit.** Every probe walks a filter and an index before it can
-  touch a data block, and metadata is a small fraction of store bytes
-  even where one `index` run is multi-GiB. Data blocks cannot compete for
-  the slot, so a scan cannot push filters out and leave every later probe
-  fetching to learn "not here". The slot takes a fixed fifth of the
-  budget — SlateDB's own metadata-to-block ratio, which holds all of it
-  on any ordinary store; `moraine_store_census` reports a store's index
-  and filter bytes for sizing against one that disagrees.
-- **The block slot — data blocks — is the foyer hybrid**: a memory tier
-  spilling at block grain to the `CACHE_DIR` device.
+- **SST indexes, filters, and stats are protected by eviction priority,
+  not by a slot.** Every probe walks a filter and an index before it can
+  touch a data block. Both kinds live in one cache: metadata is admitted at
+  normal priority, data blocks at low, and foyer's LRU drains the
+  low-priority list entirely before it touches the high-priority one. So a
+  scan cannot push filters out and leave every later probe fetching to learn
+  "not here" — metadata is evicted only once no data block is left to evict
+  — while metadata a store does not need is space blocks may use.
+
+  A fixed fifth of the budget is what this replaces. That slot was a ceiling
+  as much as a floor: metadata could not exceed 20% however idle the block
+  cache was, so the only way to hold a large store's filters was to inflate
+  the whole budget fivefold and take the block cache that came with it.
+
+  The share that replaces it is `METADATA_PRIORITY_POOL_RATIO`, and it is
+  **not a reservation**. A data block is admitted whatever the share says,
+  so metadata a store does not need is space blocks simply take, and an
+  unused protected share costs nothing. It binds in one case only: metadata
+  larger than the share, where the surplus is demoted to compete with blocks
+  on recency rather than being protected.
+
+  That is also why the share is not measured from the store. A census-seeded
+  share was tried and removed: for any store whose metadata fits under the
+  share it changes nothing, because nothing was being held back; for a store
+  that grew past its census it demotes metadata that would have fit; and for
+  a store larger than the cache it lands on the same clamp. The census is
+  what the sizing check below is for, not what the share is for.
+
+  What the cache is sized against is **residency, not a hit rate**. A probe
+  for an absent key clears a filter for every SST on its path — all of L0,
+  which is unpartitioned, plus one per sorted run — so holding all but a
+  little of the metadata still leaves most such probes fetching: at
+  per-entry residency `h` over `N` SSTs the probe is served whole with
+  probability about `h^N`. 95% resident is not 95% as good as fitting.
+  Absent-key probes are also the read no data-block cache can help with —
+  they reach no block at all — so they are what this protection exists for.
+
+  A store can still outgrow the protected share, and does so silently. Every
+  attach reads the manifest once and compares the store's filter, index, and
+  statistics bytes against the share actually in force, warning when it
+  cannot hold them; `moraine_store_census` reports the same figures per
+  subspace. The capacity is read after the open, so it is the one the
+  process built rather than the one this attach asked for. The census
+  figures are encoded lengths and the cache holds decoded entries, so the
+  check understates the requirement and never overstates it.
+
+  Three properties follow from the mechanism rather than from choice.
+  Metadata past the protected share is **demoted, not refused** — it
+  competes with blocks instead of being rejected — so occupancy may exceed
+  the reported capacity, which bounds protection rather than residency. The
+  pool is a share of a **shard**, and foyer divides the cache across eight
+  by default, so the protection holds for metadata spread across shards as
+  real SST keys are and degenerates only for a cache too small to shard.
+  And **LRU is required, not preferred**: the priority hint is the only
+  thing separating the two kinds, and foyer's LFU, S3-FIFO, and Sieve
+  ignore it.
+
+  Neither `CachedKey` nor `CachedEntry` exposes an entry's kind outside
+  SlateDB, and `DbCache::insert` carries both — data blocks as a scan reads
+  them, metadata under write-through admission. The kind is therefore known
+  only on the typed `fetch_index` / `fetch_filter` / `fetch_stats` calls,
+  which is where it is recorded so the two can be reported apart, and an
+  untyped insert is treated as a block: admitting scan traffic into the
+  protected share is the failure this design exists to prevent, and metadata
+  that arrives untyped is protected again from its next typed fetch.
+- **The cache is the foyer hybrid** when `CACHE_DIR` is set: a memory tier
+  spilling at block grain to that device. Metadata shares it, so a
+  metadata miss can be served from local disk rather than object storage.
 
 `CachedObjectStore` is no longer configured — coexisting it with a hybrid
 cache double-writes disk (SlateDB's own warning). Against it, this buys
@@ -782,8 +839,9 @@ adding speculative options.
 The attach options keep their surface (RFC 0006) and change machinery:
 
 - `CACHE_DIR` / `CACHE_SIZE` — the block slot's disk device and cap.
-- `CACHE_MEMORY` (new) — one memory budget across both slots: meta takes
-  what the census says the metadata needs, blocks the remainder. Unset:
+- `CACHE_MEMORY` (new) — one memory budget across both kinds, which share
+  one cache and are separated by eviction priority; an attach whose store
+  outgrows the protected share says so. Unset:
   what SlateDB gave a single store, now for the whole process. Never
   inert — the memory tiers exist without a `CACHE_DIR`.
 - `CACHE_PUTS` — the flush/compaction insertion policy: written SSTs'
@@ -811,7 +869,7 @@ process-wide through `moraine_cache_tally()` and per attach through
 `moraine_cache_tally('lake')` (RFC 0006) — the budget is set at the first
 scope and attributed at the second. Metadata and
 blocks are counted apart because they are budgeted apart — a metadata
-rate short of ~1 says the meta slot cannot hold the store's filters and
+rate short of ~1 says the cache cannot hold the store's filters and
 indexes, which the census measures directly, while a low block rate
 beside a healthy metadata one is a working set larger than the block
 slot. The same tally attributes the subset of hits and misses caused by
@@ -844,7 +902,7 @@ at all.
 
 A cache per attach is rejected. It would make each attach's options
 independent and isolate eviction, but it would also multiply `CACHE_MEMORY` by
-an unnamed attach count and reserve the metadata fifth in every copy. Each
+an unnamed attach count and reserve a protected metadata share in every copy. Each
 copy would require a different directory because Foyer devices do not lock or
 namespace their partition files, while the executor would still have to stay
 process-wide to avoid two threads and the detached-runtime failure per attach.

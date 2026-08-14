@@ -1,18 +1,18 @@
-//! The caches every store in the process shares: one budget split between
-//! SlateDB metadata, SlateDB blocks, and auxiliary parsed metadata.
+//! The caches every store in the process shares: one budget across SlateDB
+//! metadata, SlateDB blocks, and auxiliary parsed metadata.
 //!
-//! The meta slot holds SST indexes, filters, and stats in memory and
-//! nothing evicts them but their own size — every point probe walks a
-//! filter and an index before it can reach a data block, and letting data
-//! blocks compete for that space is how a scan makes every later probe
-//! pay a fetch to learn "not here". The block slot holds data blocks,
-//! tiered to disk when a cache directory is configured.
+//! Metadata and blocks share one cache and are separated by eviction
+//! priority rather than by capacity. A scan cannot push out the filters and
+//! indexes every probe walks, and metadata a store does not need is left to
+//! blocks — so neither is bounded at a size the operator has to predict.
+//! Blocks tier to disk when a cache directory is configured.
 //!
 //! Sharing is what makes the budget mean anything: a per-store cache is
 //! bounded per store, so a host attaching several catalogs is
 //! over-committed by however many it attached.
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -23,12 +23,11 @@ use std::{
 
 use async_trait::async_trait;
 use foyer::{
-    BlockEngineConfig, DeviceBuilder, Event, EventListener, FsDeviceBuilder, HybridCacheBuilder,
-    PsyncIoEngineConfig, RecoverMode, Spawner,
+    BlockEngineConfig, CacheProperties, DeviceBuilder, Event, EventListener, FsDeviceBuilder, Hint,
+    HybridCacheBuilder, HybridCacheProperties, LruConfig, PsyncIoEngineConfig, RecoverMode,
+    Spawner,
 };
-use slatedb::db_cache::{
-    CacheLoader, CachedEntry, CachedKey, DbCache, SplitCache, foyer_hybrid::FoyerHybridCache, stats,
-};
+use slatedb::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache, stats};
 use slatedb_common::metrics::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn};
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
@@ -39,21 +38,16 @@ use tracing::{info, warn};
 /// unchanged and a multi-store one is strictly smaller than before.
 const DEFAULT_CACHE_MEMORY: u64 = 640 * 1024 * 1024;
 
-/// The share of the memory budget the meta slot takes, as a divisor —
-/// one fifth, which is SlateDB's own 128:512 split between metadata and
-/// blocks. Metadata is a small fraction of any real store, so this is
-/// meant to hold all of it; `moraine_store_census` reports the store's
-/// index and filter bytes for sizing the budget against a store that
-/// disagrees.
-const META_SHARE_DIVISOR: u64 = 5;
+/// The most of the cache SST metadata may hold under eviction protection.
+const METADATA_PRIORITY_POOL_RATIO: f64 = 0.9;
 
-/// At most this much of the metadata share is reserved for parsed metadata
-/// outside SlateDB.
+/// At most this much of the budget is reserved for parsed metadata outside
+/// SlateDB.
 const MAX_AUXILIARY_METADATA_MEMORY: u64 = 8 * 1024 * 1024;
 
-/// One sixteenth of the metadata share goes to auxiliary parsed metadata,
-/// up to its fixed ceiling. The remainder continues to hold SlateDB metadata.
-const AUXILIARY_METADATA_SHARE_DIVISOR: u64 = 16;
+/// The auxiliary allowance's divisor against the whole budget, up to its
+/// ceiling.
+const AUXILIARY_METADATA_SHARE_DIVISOR: u64 = 80;
 
 /// Bytes of disk the block slot's device takes when no cap is
 /// configured — SlateDB's own default for a store's cache.
@@ -72,17 +66,36 @@ pub(crate) struct CacheConfig {
 }
 
 impl CacheConfig {
-    /// Bytes for SlateDB metadata, scoped Parquet metadata, and the block
-    /// slot's memory tier.
-    fn slots(&self) -> (u64, u64, u64) {
+    /// Bytes for scoped Parquet metadata and for the one cache SlateDB
+    /// metadata and data blocks share.
+    fn slots(&self) -> (u64, u64) {
         let budget = self.memory.unwrap_or(DEFAULT_CACHE_MEMORY).max(2);
-        let metadata = (budget / META_SHARE_DIVISOR).max(1);
         let auxiliary_metadata =
-            (metadata / AUXILIARY_METADATA_SHARE_DIVISOR).min(MAX_AUXILIARY_METADATA_MEMORY);
-        let slatedb_metadata = metadata.saturating_sub(auxiliary_metadata).max(1);
-        let blocks = budget.saturating_sub(metadata).max(1);
-        (slatedb_metadata, auxiliary_metadata, blocks)
+            (budget / AUXILIARY_METADATA_SHARE_DIVISOR).min(MAX_AUXILIARY_METADATA_MEMORY);
+        let shared = budget.saturating_sub(auxiliary_metadata).max(1);
+
+        (auxiliary_metadata, shared)
     }
+}
+
+/// Bytes of `capacity` metadata holds before it is demoted to compete with
+/// data blocks.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a share of a byte count; the ratio is a fixed fraction under 1"
+)]
+fn metadata_ceiling(capacity: u64) -> u64 {
+    (capacity as f64 * METADATA_PRIORITY_POOL_RATIO) as u64
+}
+
+/// Bytes of a store's SST metadata a meta slot of `capacity` cannot hold,
+/// or `None` when it holds all of it.
+pub(crate) fn metadata_shortfall(metadata_bytes: u64, capacity: u64) -> Option<u64> {
+    metadata_bytes
+        .checked_sub(capacity)
+        .filter(|shortfall| *shortfall > 0)
 }
 
 static AUXILIARY_METADATA_MEMORY: AtomicU64 = AtomicU64::new(MAX_AUXILIARY_METADATA_MEMORY);
@@ -91,6 +104,70 @@ static AUXILIARY_METADATA_USAGE: AtomicU64 = AtomicU64::new(0);
 static AUXILIARY_METADATA_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static METADATA_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static BLOCK_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Which cached keys hold SST metadata, and what each weighs.
+///
+/// SlateDB names an entry's kind on the call that admits it and nowhere
+/// else — neither `CachedKey` nor `CachedEntry` exposes it — so one shared
+/// cache can only tell metadata from a data block by what was recorded at
+/// admission. Without this the two could not be reported apart.
+static METADATA_ENTRIES: std::sync::LazyLock<std::sync::RwLock<HashMap<CachedKey, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+static METADATA_OCCUPANCY: AtomicU64 = AtomicU64::new(0);
+
+/// Records an admitted metadata entry. A hit on one already recorded at the
+/// same weight takes a read lock and returns, so metadata reads do not
+/// serialize on the write lock.
+fn metadata_admitted(key: &CachedKey, bytes: u64) {
+    if METADATA_ENTRIES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        == Some(&bytes)
+    {
+        return;
+    }
+
+    let mut entries = METADATA_ENTRIES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(previous) = entries.insert(key.clone(), bytes) {
+        subtract_metadata_occupancy(previous);
+    }
+
+    METADATA_OCCUPANCY.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Drops a leaving entry's accounting, reporting whether it was metadata.
+/// A data block is the common case and costs one read lock.
+fn metadata_left(key: &CachedKey) -> bool {
+    if !METADATA_ENTRIES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(key)
+    {
+        return false;
+    }
+
+    let removed = METADATA_ENTRIES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
+    match removed {
+        Some(bytes) => {
+            subtract_metadata_occupancy(bytes);
+            true
+        }
+        None => false,
+    }
+}
+
+fn subtract_metadata_occupancy(bytes: u64) {
+    let _ = METADATA_OCCUPANCY.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(bytes))
+    });
+}
 
 /// The process-wide allowance for auxiliary parsed metadata. It is reserved
 /// from the first attach's `CACHE_MEMORY` budget.
@@ -640,36 +717,65 @@ pub fn cache_tally() -> CacheTally {
 type MemoryCache = foyer::Cache<CachedKey, CachedEntry>;
 type HybridCache = foyer::HybridCache<CachedKey, CachedEntry>;
 
-enum BlockObservation {
+/// The one cache SlateDB metadata and data blocks share, in whichever
+/// tiering the first attach configured.
+#[derive(Clone)]
+enum Tier {
     Memory(MemoryCache),
     Hybrid(HybridCache),
 }
 
+impl Tier {
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Memory(cache) => cache.capacity(),
+            Self::Hybrid(cache) => cache.memory().capacity(),
+        }
+    }
+
+    fn usage(&self) -> usize {
+        match self {
+            Self::Memory(cache) => cache.usage(),
+            Self::Hybrid(cache) => cache.memory().usage(),
+        }
+    }
+
+    fn entries(&self) -> usize {
+        match self {
+            Self::Memory(cache) => cache.entries(),
+            Self::Hybrid(cache) => cache.memory().entries(),
+        }
+    }
+}
+
 struct CacheObservation {
-    metadata: MemoryCache,
-    block: BlockObservation,
+    tier: Tier,
+    metadata_ceiling: u64,
     disk_capacity: Option<u64>,
 }
 
 static OBSERVATION: OnceCell<CacheObservation> = OnceCell::const_new();
 
 /// Current process-wide cache sizing and occupancy.
+///
+/// Both kinds share one capacity, so the metadata figure is the ceiling past
+/// which metadata stops being protected rather than a partition, and the
+/// block figure is what the whole cache holds.
 #[must_use]
 pub fn cache_status() -> CacheStatus {
     let Some(observation) = OBSERVATION.get() else {
         return CacheStatus::default();
     };
-    let (block_capacity, block_occupancy) = match &observation.block {
-        BlockObservation::Memory(cache) => (cache.capacity(), cache.usage()),
-        BlockObservation::Hybrid(cache) => (cache.memory().capacity(), cache.memory().usage()),
-    };
+    let capacity = u64::try_from(observation.tier.capacity()).unwrap_or(u64::MAX);
+    let usage = u64::try_from(observation.tier.usage()).unwrap_or(u64::MAX);
+    let metadata_occupancy = METADATA_OCCUPANCY.load(Ordering::Relaxed);
 
     CacheStatus {
-        metadata_capacity_bytes: u64::try_from(observation.metadata.capacity()).unwrap_or(u64::MAX),
-        metadata_occupancy_bytes: u64::try_from(observation.metadata.usage()).unwrap_or(u64::MAX),
+        metadata_capacity_bytes: observation.metadata_ceiling,
+        metadata_occupancy_bytes: metadata_occupancy,
         metadata_evictions: METADATA_EVICTIONS.load(Ordering::Relaxed),
-        block_capacity_bytes: u64::try_from(block_capacity).unwrap_or(u64::MAX),
-        block_occupancy_bytes: u64::try_from(block_occupancy).unwrap_or(u64::MAX),
+        block_capacity_bytes: capacity,
+        block_occupancy_bytes: usage.saturating_sub(metadata_occupancy),
         block_evictions: BLOCK_EVICTIONS.load(Ordering::Relaxed),
         block_disk_capacity_bytes: observation.disk_capacity,
         auxiliary_metadata_capacity_bytes: AUXILIARY_METADATA_MEMORY.load(Ordering::Relaxed),
@@ -678,79 +784,149 @@ pub fn cache_status() -> CacheStatus {
     }
 }
 
-#[derive(Clone, Copy)]
-enum CacheSlot {
-    Metadata,
-    Block,
-}
-
-struct EvictionCounter(CacheSlot);
+struct EvictionCounter;
 
 impl EventListener for EvictionCounter {
     type Key = CachedKey;
     type Value = CachedEntry;
 
-    fn on_leave(&self, reason: Event, _: &CachedKey, _: &CachedEntry) {
+    fn on_leave(&self, reason: Event, key: &CachedKey, _: &CachedEntry) {
+        let metadata = metadata_left(key);
         if reason != Event::Evict {
             return;
         }
-        match self.0 {
-            CacheSlot::Metadata => &METADATA_EVICTIONS,
-            CacheSlot::Block => &BLOCK_EVICTIONS,
+        if metadata {
+            &METADATA_EVICTIONS
+        } else {
+            &BLOCK_EVICTIONS
         }
         .fetch_add(1, Ordering::Relaxed);
     }
 }
 
-struct MemoryDbCache {
-    inner: MemoryCache,
+/// One cache for both kinds, with SST metadata evicted only once every data
+/// block is gone.
+///
+/// Metadata enters hinted `Normal` and data blocks `Low`; foyer's LRU drains
+/// the low-priority list first and only falls back to the high-priority one
+/// when nothing else is left. That replaces a fixed metadata slot with a
+/// ceiling: metadata takes what the store needs up to
+/// [`METADATA_PRIORITY_POOL_RATIO`], blocks take the rest, and neither
+/// starves the other at a size the operator has to predict.
+struct PriorityDbCache {
+    tier: Tier,
 }
 
-impl MemoryDbCache {
+fn as_bytes(size: usize) -> u64 {
+    u64::try_from(size).unwrap_or(u64::MAX)
+}
+
+fn fill_failed(error: impl std::error::Error + Send + Sync + 'static) -> slatedb::Error {
+    slatedb::Error::unavailable("cache fill failed".to_owned()).with_source(Box::new(error))
+}
+
+impl PriorityDbCache {
     async fn fetch(
         &self,
         key: CachedKey,
         loader: CacheLoader,
+        metadata: bool,
     ) -> Result<CachedEntry, slatedb::Error> {
-        self.inner
-            .get_or_fetch(&key, move || async move { loader().await })
-            .await
-            .map(|entry| entry.value().clone())
-            .map_err(|error| {
-                slatedb::Error::unavailable("cache fill failed".to_owned())
-                    .with_source(Box::new(error))
-            })
+        let hint = if metadata { Hint::Normal } else { Hint::Low };
+        let entry = match &self.tier {
+            Tier::Memory(cache) => cache
+                .get_or_fetch(&key, move || async move {
+                    loader()
+                        .await
+                        .map(|entry| (entry, CacheProperties::default().with_hint(hint)))
+                })
+                .await
+                .map(|entry| entry.value().clone())
+                .map_err(fill_failed)?,
+            Tier::Hybrid(cache) => cache
+                .get_or_fetch(&key, move || async move {
+                    loader()
+                        .await
+                        .map(|entry| (entry, HybridCacheProperties::default().with_hint(hint)))
+                })
+                .await
+                .map(|entry| entry.value().clone())
+                .map_err(fill_failed)?,
+        };
+
+        if metadata {
+            metadata_admitted(&key, as_bytes(entry.size()));
+        }
+        Ok(entry)
+    }
+
+    async fn read(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+        match &self.tier {
+            Tier::Memory(cache) => Ok(cache.get(key).map(|entry| entry.value().clone())),
+            Tier::Hybrid(cache) => cache
+                .get(key)
+                .await
+                .map(|entry| entry.map(|entry| entry.value().clone()))
+                .map_err(fill_failed),
+        }
     }
 }
 
 #[async_trait]
-impl DbCache for MemoryDbCache {
+impl DbCache for PriorityDbCache {
     async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
-        Ok(self.inner.get(key).map(|entry| entry.value().clone()))
+        self.read(key).await
     }
 
     async fn get_index(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
-        self.get_block(key).await
+        self.read(key).await
     }
 
     async fn get_filter(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
-        self.get_block(key).await
+        self.read(key).await
     }
 
     async fn get_stats(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
-        self.get_block(key).await
+        self.read(key).await
     }
 
+    /// The one admission that does not say what it is caching: SlateDB
+    /// calls it both for blocks a scan just read and, under write-through
+    /// admission, for a fresh SST's metadata. Everything arriving here is
+    /// treated as a block — guessing "metadata" would let a scan fill the
+    /// protected segment, which is what this whole design prevents.
+    /// Metadata guessed wrong is protected again the next time a
+    /// `fetch_index`, `fetch_filter`, or `fetch_stats` reads it.
     async fn insert(&self, key: CachedKey, value: CachedEntry) {
-        self.inner.insert(key, value);
+        match &self.tier {
+            Tier::Memory(cache) => {
+                cache.insert_with_properties(
+                    key,
+                    value,
+                    CacheProperties::default().with_hint(Hint::Low),
+                );
+            }
+            Tier::Hybrid(cache) => {
+                cache.insert_with_properties(
+                    key,
+                    value,
+                    HybridCacheProperties::default().with_hint(Hint::Low),
+                );
+            }
+        }
     }
 
     async fn remove(&self, key: &CachedKey) {
-        self.inner.remove(key);
+        match &self.tier {
+            Tier::Memory(cache) => {
+                cache.remove(key);
+            }
+            Tier::Hybrid(cache) => cache.remove(key),
+        }
     }
 
     fn entry_count(&self) -> u64 {
-        u64::try_from(self.inner.entries()).unwrap_or(u64::MAX)
+        as_bytes(self.tier.entries())
     }
 
     async fn fetch_block(
@@ -758,7 +934,7 @@ impl DbCache for MemoryDbCache {
         key: CachedKey,
         loader: CacheLoader,
     ) -> Result<CachedEntry, slatedb::Error> {
-        self.fetch(key, loader).await
+        self.fetch(key, loader, false).await
     }
 
     async fn fetch_index(
@@ -766,7 +942,7 @@ impl DbCache for MemoryDbCache {
         key: CachedKey,
         loader: CacheLoader,
     ) -> Result<CachedEntry, slatedb::Error> {
-        self.fetch(key, loader).await
+        self.fetch(key, loader, true).await
     }
 
     async fn fetch_filter(
@@ -774,7 +950,7 @@ impl DbCache for MemoryDbCache {
         key: CachedKey,
         loader: CacheLoader,
     ) -> Result<CachedEntry, slatedb::Error> {
-        self.fetch(key, loader).await
+        self.fetch(key, loader, true).await
     }
 
     async fn fetch_stats(
@@ -782,21 +958,25 @@ impl DbCache for MemoryDbCache {
         key: CachedKey,
         loader: CacheLoader,
     ) -> Result<CachedEntry, slatedb::Error> {
-        self.fetch(key, loader).await
+        self.fetch(key, loader, true).await
     }
 }
 
-fn memory_cache(capacity: u64, slot: CacheSlot) -> (Arc<dyn DbCache>, MemoryCache) {
-    let inner = foyer::CacheBuilder::new(usize::try_from(capacity).unwrap_or(usize::MAX))
+/// The eviction config both tiers take. LRU is not a preference: `Hint` is
+/// the only thing that separates metadata from blocks here, and LFU, S3-FIFO,
+/// and Sieve all ignore it.
+fn eviction_config() -> LruConfig {
+    LruConfig {
+        high_priority_pool_ratio: METADATA_PRIORITY_POOL_RATIO,
+    }
+}
+
+fn memory_cache(capacity: u64) -> MemoryCache {
+    foyer::CacheBuilder::new(usize::try_from(capacity).unwrap_or(usize::MAX))
+        .with_eviction_config(eviction_config())
         .with_weighter(|_: &CachedKey, value: &CachedEntry| value.size())
-        .with_event_listener(Arc::new(EvictionCounter(slot)))
-        .build();
-    (
-        Arc::new(MemoryDbCache {
-            inner: inner.clone(),
-        }),
-        inner,
-    )
+        .with_event_listener(Arc::new(EvictionCounter))
+        .build()
 }
 
 /// The cache every store in this process shares, built to `config` if
@@ -847,47 +1027,37 @@ pub(crate) async fn shared(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
 static BUILT_WITH: std::sync::Mutex<Option<CacheConfig>> = std::sync::Mutex::new(None);
 
 async fn build(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
-    let (meta_bytes, auxiliary_metadata_bytes, block_bytes) = config.slots();
+    let (auxiliary_metadata_bytes, shared_bytes) = config.slots();
     AUXILIARY_METADATA_MEMORY.store(auxiliary_metadata_bytes, Ordering::Relaxed);
 
-    let (meta, metadata_observation) = memory_cache(meta_bytes, CacheSlot::Metadata);
-
-    let (block, block_observation) = if let Some(dir) = &config.dir {
-        if let Some(cache) = hybrid(dir, block_bytes, config.disk_size).await {
-            cache
-        } else {
-            // The device is the only part that can fail, and a memory
-            // tier alone is strictly better than no cache at all.
-            let (cache, observation) = memory_cache(block_bytes, CacheSlot::Block);
-            (cache, BlockObservation::Memory(observation))
-        }
-    } else {
-        let (cache, observation) = memory_cache(block_bytes, CacheSlot::Block);
-        (cache, BlockObservation::Memory(observation))
+    // The device is the only part that can fail, and a memory tier alone is
+    // strictly better than no cache at all.
+    let tier = match &config.dir {
+        Some(dir) => match hybrid(dir, shared_bytes, config.disk_size).await {
+            Some(cache) => Tier::Hybrid(cache),
+            None => Tier::Memory(memory_cache(shared_bytes)),
+        },
+        None => Tier::Memory(memory_cache(shared_bytes)),
     };
 
-    let disk_capacity = matches!(&block_observation, BlockObservation::Hybrid(_))
-        .then(|| config.disk_size.unwrap_or(DEFAULT_CACHE_DISK));
+    let disk_capacity =
+        matches!(tier, Tier::Hybrid(_)).then(|| config.disk_size.unwrap_or(DEFAULT_CACHE_DISK));
+    let ceiling = metadata_ceiling(shared_bytes);
     let _ = OBSERVATION.set(CacheObservation {
-        metadata: metadata_observation,
-        block: block_observation,
+        tier: tier.clone(),
+        metadata_ceiling: ceiling,
         disk_capacity,
     });
 
     info!(
-        meta_bytes,
+        shared_bytes,
+        metadata_ceiling = ceiling,
         auxiliary_metadata_bytes,
-        block_bytes,
         disk = config.dir.is_some(),
         "built the shared block cache"
     );
 
-    Some(Arc::new(
-        SplitCache::new()
-            .with_meta_cache(Some(meta))
-            .with_block_cache(Some(block))
-            .build(),
-    ) as Arc<dyn DbCache>)
+    Some(Arc::new(PriorityDbCache { tier }) as Arc<dyn DbCache>)
 }
 
 /// The runtime the hybrid cache spawns its fetch and flush tasks on.
@@ -921,11 +1091,7 @@ fn cache_runtime() -> Option<tokio::runtime::Runtime> {
 /// The block slot backed by memory over a disk device at `dir`. `None`
 /// if the device or its runtime will not open, which the caller degrades
 /// from rather than failing.
-async fn hybrid(
-    dir: &PathBuf,
-    memory: u64,
-    disk: Option<u64>,
-) -> Option<(Arc<dyn DbCache>, BlockObservation)> {
+async fn hybrid(dir: &PathBuf, memory: u64, disk: Option<u64>) -> Option<HybridCache> {
     if let Err(error) = std::fs::create_dir_all(dir) {
         warn!(
             directory = %dir.display(),
@@ -949,8 +1115,9 @@ async fn hybrid(
     };
 
     let built = HybridCacheBuilder::new()
-        .with_event_listener(Arc::new(EvictionCounter(CacheSlot::Block)))
+        .with_event_listener(Arc::new(EvictionCounter))
         .memory(usize::try_from(memory).unwrap_or(usize::MAX))
+        .with_eviction_config(eviction_config())
         .with_weighter(|_: &CachedKey, value: &CachedEntry| value.size())
         .storage()
         // SlateDB scopes shared-cache keys with an attach-order counter.
@@ -966,10 +1133,7 @@ async fn hybrid(
         .await;
 
     match built {
-        Ok(cache) => Some((
-            Arc::new(FoyerHybridCache::new_with_cache(cache.clone())),
-            BlockObservation::Hybrid(cache),
-        )),
+        Ok(cache) => Some(cache),
         Err(error) => {
             warn!(
                 directory = %dir.display(),
@@ -1032,9 +1196,12 @@ mod tests {
             std::process::exit(0);
         }
 
-        let (cache, _) = hybrid(&cache_root, 4 * 1024 * 1024, Some(64 * 1024 * 1024))
-            .await
-            .unwrap();
+        let tier = Tier::Hybrid(
+            hybrid(&cache_root, 4 * 1024 * 1024, Some(64 * 1024 * 1024))
+                .await
+                .unwrap(),
+        );
+        let cache: Arc<dyn DbCache> = Arc::new(PriorityDbCache { tier: tier.clone() });
         let order = if phase == "warm" {
             [("a", b"catalog-a"), ("b", b"catalog-b")]
         } else {
@@ -1051,7 +1218,10 @@ mod tests {
             assert_eq!(found.as_ref(), expected, "cache scope crossed into {path}");
             reader.close().await.unwrap();
         }
-        cache.close().await.unwrap();
+        let Tier::Hybrid(hybrid) = tier else {
+            unreachable!("built as a hybrid tier")
+        };
+        hybrid.close().await.unwrap();
     }
 
     /// Recovered keys must not follow attach-order scope ids into another
@@ -1098,20 +1268,20 @@ mod tests {
             memory: Some(1_000),
             ..CacheConfig::default()
         };
-        let (meta, auxiliary, block) = config.slots();
-        assert_eq!(meta + auxiliary + block, 1_000);
-        assert!(meta + auxiliary < block);
+        let (auxiliary, shared) = config.slots();
+        assert_eq!(auxiliary + shared, 1_000);
+        assert!(auxiliary < shared);
     }
 
-    /// An unset budget is what SlateDB gives one store, so a single-store
-    /// host is unchanged by the move to a shared cache.
+    /// An unset budget still totals what SlateDB gives one store, but
+    /// metadata may now grow into most of it rather than a fixed fifth.
     #[test]
     fn an_unset_budget_matches_one_stores_defaults() {
-        let (meta, auxiliary, block) = CacheConfig::default().slots();
-        assert_eq!(meta + auxiliary + block, DEFAULT_CACHE_MEMORY);
-        assert_eq!(meta, 120 * 1024 * 1024);
+        let (auxiliary, shared) = CacheConfig::default().slots();
+        assert_eq!(auxiliary + shared, DEFAULT_CACHE_MEMORY);
         assert_eq!(auxiliary, 8 * 1024 * 1024);
-        assert_eq!(block, 512 * 1024 * 1024);
+        assert_eq!(shared, 632 * 1024 * 1024);
+        assert!(metadata_ceiling(shared) > 4 * 120 * 1024 * 1024);
     }
 
     /// A later store's cache options do not take effect, and the process
@@ -1259,6 +1429,53 @@ mod tests {
         assert!((tally.block_hit_rate().unwrap() - 0.25).abs() < f64::EPSILON);
     }
 
+    /// A meta slot smaller than the store's SST metadata reports what it
+    /// cannot hold; equal is not a shortfall.
+    #[test]
+    fn a_meta_slot_smaller_than_the_store_reports_its_shortfall() {
+        assert_eq!(metadata_shortfall(0, 0), None);
+        assert_eq!(metadata_shortfall(625_189_215, 625_189_215), None);
+        assert_eq!(metadata_shortfall(625_189_215, 850_604_851), None);
+
+        // Priority lifts the default ceiling from 120 MiB to 568 MiB, which
+        // still leaves the store that prompted the check short.
+        let (_, shared) = CacheConfig::default().slots();
+        assert_eq!(
+            metadata_shortfall(625_189_215, metadata_ceiling(shared)),
+            Some(28_759_187)
+        );
+    }
+
+    /// Metadata outlives every data block, which is the whole of the
+    /// protection: foyer drains the low-priority list first and reaches the
+    /// high-priority one only once nothing else is left. The hint is honoured
+    /// by LRU alone, so this also pins the eviction algorithm.
+    #[test]
+    fn blocks_are_evicted_before_metadata() {
+        // One shard: foyer divides the capacity across eight by default, and
+        // a protected pool is a share of a *shard*, so a cache this small
+        // would otherwise be measuring the sharding rather than the policy.
+        let cache: foyer::Cache<u64, u64> = foyer::CacheBuilder::new(64)
+            .with_shards(1)
+            .with_eviction_config(eviction_config())
+            .with_weighter(|_: &u64, _: &u64| 1)
+            .build();
+
+        cache.insert_with_properties(0, 0, CacheProperties::default().with_hint(Hint::Normal));
+        for block in 1..512 {
+            cache.insert_with_properties(
+                block,
+                block,
+                CacheProperties::default().with_hint(Hint::Low),
+            );
+        }
+
+        assert!(
+            cache.get(&0).is_some(),
+            "metadata evicted before the blocks"
+        );
+    }
+
     /// A budget too small to split still yields usable slots rather than
     /// a zero-capacity cache.
     #[test]
@@ -1267,9 +1484,9 @@ mod tests {
             memory: Some(1),
             ..CacheConfig::default()
         };
-        let (meta, auxiliary, block) = config.slots();
-        assert!(meta >= 1 && block >= 1);
+        let (auxiliary, shared) = config.slots();
         assert_eq!(auxiliary, 0);
+        assert!(shared >= 1);
     }
 
     /// The public status reports the actual live memory-cache dimensions,
@@ -1280,7 +1497,10 @@ mod tests {
         let status = cache_status();
         assert!(status.metadata_capacity_bytes > 0);
         assert!(status.block_capacity_bytes > 0);
-        assert!(status.metadata_occupancy_bytes <= status.metadata_capacity_bytes);
+        // Metadata past the ceiling is demoted rather than refused, so it is
+        // bounded by the whole cache and not by its own protected share.
+        assert!(status.metadata_capacity_bytes < status.block_capacity_bytes);
+        assert!(status.metadata_occupancy_bytes <= status.block_capacity_bytes);
         assert!(status.block_occupancy_bytes <= status.block_capacity_bytes);
         assert!(
             status.auxiliary_metadata_occupancy_bytes <= status.auxiliary_metadata_capacity_bytes
