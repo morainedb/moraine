@@ -34,7 +34,7 @@ use crate::{
     },
     error::{Error, Result},
     store::{
-        cache::{CacheCounters, CacheTally, ObjectStoreTally},
+        cache::{CacheCounters, CacheTally, ObjectStoreTally, cache_status, metadata_shortfall},
         census,
         handle::{ReadHandle, ReadSession},
         inline as store_inline,
@@ -263,6 +263,7 @@ async fn warn_if_preload_cannot_fit(options: &CatalogOptions, object_store: Arc<
     if options.cache_preload != Some(CachePreload::All) || options.cache_dir.is_none() {
         return;
     }
+
     let Ok(store_bytes) = census::manifest_bytes(&options.path, object_store).await else {
         return;
     };
@@ -274,6 +275,30 @@ async fn warn_if_preload_cannot_fit(options: &CatalogOptions, object_store: Arc<
             shortfall,
             "preload cannot hold this store: the load stops once the cache is full, leaving \
              the rest to be fetched on demand"
+        );
+    }
+}
+
+/// Warns when the process's metadata cache is smaller than the store's SST
+/// filters, indexes, and statistics.
+///
+/// Reads the capacity after the open: the cache is process-wide, so only
+/// then is it the one in force rather than the one this attach asked for.
+/// Diagnostics only.
+fn warn_if_metadata_cache_cannot_hold(path: &str, metadata_bytes: Option<u64>) {
+    let Some(metadata_bytes) = metadata_bytes else {
+        return;
+    };
+    let capacity = cache_status().metadata_capacity_bytes;
+    if let Some(shortfall) = metadata_shortfall(metadata_bytes, capacity) {
+        warn!(
+            path,
+            metadata_bytes,
+            metadata_capacity_bytes = capacity,
+            shortfall,
+            "the metadata cache cannot hold this store's SST filters and indexes, so probes \
+             will fetch them from object storage. Raise the cache memory budget on the first \
+             attach in the process."
         );
     }
 }
@@ -937,6 +962,11 @@ impl Catalog {
         }
         warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
         let located = Arc::clone(&object_store);
+        // Measured before the open so the warning after it costs no second
+        // manifest read.
+        let metadata_bytes = census::manifest_metadata_bytes(&options.path, Arc::clone(&located))
+            .await
+            .ok();
         let store = StoreBuilder::new(&options.path, object_store)
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
@@ -947,6 +977,7 @@ impl Catalog {
         let (db, cache) =
             commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
                 .await?;
+        warn_if_metadata_cache_cannot_hold(&options.path, metadata_bytes);
         info!(
             path = options.path,
             flush_interval_ms = options.flush_interval.as_millis(),
@@ -1023,6 +1054,11 @@ impl Catalog {
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
         warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
         let located = Arc::clone(&object_store);
+        // Measured before the open so the warning after it costs no second
+        // manifest read.
+        let metadata_bytes = census::manifest_metadata_bytes(&options.path, Arc::clone(&located))
+            .await
+            .ok();
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
@@ -1033,6 +1069,7 @@ impl Catalog {
             .checkpoint(checkpoint);
 
         let (reader, cache) = commit::open_reader_initialized(store).await?;
+        warn_if_metadata_cache_cannot_hold(&options.path, metadata_bytes);
         info!(
             path = options.path,
             checkpoint = options.checkpoint,

@@ -67,3 +67,34 @@ the export would permit precise per-SST warming and eviction when an operator
 needs them.
 
 Owner: [RFC 0009](rfcs/0009-reader-consistency-and-caching.md).
+
+### Name a cached entry's kind, and the level it came from
+
+`CachedKey` and `CachedEntry` both keep their fields and accessors
+`pub(crate)`, so a `DbCache` implementation cannot ask what it is holding. The
+kind is knowable only from which trait method was called, and one method does
+not say: `insert` carries data blocks a scan just read and, under
+write-through admission, a fresh SST's index and filters.
+
+Two consequences for a cache that holds both kinds in one store, as moraine's
+does so that neither is bounded at a size an operator has to predict. Untyped
+inserts must be guessed, and moraine guesses "data block" because admitting
+scan traffic to the protected share would defeat the design; metadata that
+arrives that way goes unprotected until its next typed fetch. And per-kind
+occupancy and eviction figures — which is what says whether a store's filters
+actually fit — have to be reconstructed by recording every typed admission in
+a parallel index of keys.
+
+Expose the kind. Either accessors on `CachedKey`/`CachedEntry`, or an
+`insert_block` / `insert_index` / `insert_filter` / `insert_stats` family
+matching the existing `fetch_*` methods, would remove both the guess and the
+parallel index.
+
+Separately, expose the SST's level. All of L0 is on the path of every point
+read, because L0 is unpartitioned, while a sorted run contributes one SST per
+probe — so L0 metadata is the highest-value content in the cache per byte and
+is the one class worth pinning above all others. Nothing reaches moraine that
+distinguishes them. (Acting on it would also need a third priority level from
+foyer, whose `Hint` is `Normal` or `Low` and nothing else.)
+
+Owner: [RFC 0009](rfcs/0009-reader-consistency-and-caching.md).

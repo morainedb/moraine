@@ -243,11 +243,11 @@ stores.
 There is one cache, in two slots, shared by every store the process
 attaches (RFC 0009). The first attach to open sizes it and later ones
 share what it built, so these options are the process's rather than the
-attach's. The meta slot pins SST indexes and filters in
-memory, sized to what the store's metadata actually needs; the block slot
-holds data blocks in memory and spills them at block grain to the disk
-device `CACHE_DIR` names, capped by `CACHE_SIZE`, with `CACHE_MEMORY`
-budgeting both slots' memory together. There is no separate per-store
+attach's. SST indexes and filters are held at a higher eviction priority
+than data blocks, so a scan cannot push them out, while metadata a store
+does not need is space blocks take; data blocks spill at block grain to the
+disk device `CACHE_DIR` names, capped by `CACHE_SIZE`, with `CACHE_MEMORY`
+budgeting the memory both kinds share. There is no separate per-store
 block cache and no separate object-part cache beneath it — a byte is
 cached decoded, once.
 
@@ -265,11 +265,11 @@ disk tier to bound. It threads through the shim (`moraine_attach`'s
 **`CACHE_MEMORY` — how much memory the cache may take.** The same shape for
 the memory side — `META_CACHE_MEMORY` through the DuckLake attach,
 `CACHE_MEMORY` standalone — and the one cache option that is never inert,
-because the memory slots exist with or without a disk device. It is one
-budget across both slots: the meta slot takes a fixed fifth —
-`moraine_store_census` reports a store's index and filter bytes for
-sizing the budget against a store that needs more — and the block slot
-takes the remainder. Unset, the budget is what SlateDB would give a *single*
+because the memory tiers exist with or without a disk device. It is one
+budget across both kinds, which share one cache and are separated by
+eviction priority rather than by capacity; `moraine_store_census` reports a
+store's index and filter bytes, and the attach warns when the budget cannot
+hold them. Unset, the budget is what SlateDB would give a *single*
 store by default — now for the whole process, so a multi-store host is
 strictly smaller than before, and a single-store host is unchanged. This
 is the number to weigh against DuckDB's `memory_limit` when sizing a
@@ -345,6 +345,12 @@ wherever the working set does. A metadata rate that is not near 1 says
 `moraine_store_census` measures directly; a low block rate with a healthy
 metadata rate says the working set exceeds the block slot, which is a
 `CACHE_MEMORY` or `CACHE_DIR` decision rather than a correctness one.
+
+The metadata case does not wait to be noticed: the attach itself compares
+the store's filter and index bytes against the share of the cache metadata
+holds under eviction protection, and warns when that share cannot hold
+them, so a rate read later confirms a sizing problem rather than
+discovering one.
 
 A rate is NULL, not zero, before anything has been looked up: zero would
 read as a cold cache to a monitoring query, and "nothing asked" is not

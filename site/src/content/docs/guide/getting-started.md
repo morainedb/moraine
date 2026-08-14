@@ -114,6 +114,28 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 when sizing a host: DuckDB's budget covers its buffers and its Parquet cache,
 and this is the one memory consumer beside it.
 
+SST filters and indexes share that budget with data blocks, and every point
+read walks them before it can reach a block. They are not given a fixed
+slice: metadata is evicted only once no data block is left to evict, so a
+scan cannot push it out, and metadata a store does not need is space blocks
+may use. What is capped is how much stays protected — most of the budget.
+
+A store whose metadata outgrows that turns each probe into an S3 fetch,
+worst for keys that are absent, which consult every filter on the path and
+touch no data block at all. The attach warns when it happens, naming the
+shortfall:
+
+```text
+WARN the metadata cache cannot hold this store's SST filters and indexes,
+     so probes will fetch them from object storage
+     metadata_bytes=625189215 metadata_capacity_bytes=125829120
+```
+
+Raise `META_CACHE_MEMORY` on the **first** attach in the process — the cache
+is process-wide and the first attach builds it. `moraine_store_census`
+reports the same filter and index bytes per subspace if you want to see
+where the weight sits before setting a number.
+
 By default the cache fills only as queries read, so the indexes and filters
 of an SST the writer just flushed are fetched back from S3 the first time
 something reads them. `META_CACHE_PUTS true` admits them as they are written

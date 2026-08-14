@@ -141,6 +141,30 @@ pub(crate) async fn manifest_bytes(path: &str, object_store: Arc<dyn ObjectStore
         .fold(0, |total, segment| total.saturating_add(segment.bytes)))
 }
 
+/// Encoded bytes of SST metadata the manifest accounts for — filters,
+/// indexes, and statistics across every segment. One manifest read, like
+/// [`manifest_bytes`].
+pub(crate) async fn manifest_metadata_bytes(
+    path: &str,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<u64> {
+    let view = AdminBuilder::new(path, object_store)
+        .build()
+        .read_compactor_state_view()
+        .await
+        .map_err(Error::from)?;
+
+    Ok(census_of_manifest(view.manifest())
+        .segments
+        .iter()
+        .fold(0, |total, segment| {
+            total
+                .saturating_add(segment.filter_bytes)
+                .saturating_add(segment.index_bytes)
+                .saturating_add(segment.stats_bytes)
+        }))
+}
+
 /// Totals every object under the store's prefix, by kind.
 ///
 /// One listing, paginated by the object store — the only part of a census
@@ -386,6 +410,45 @@ mod tests {
         // The root tree stays empty under an extractor-configured store, so
         // it is reported not at all rather than as a zero row.
         assert!(census.segment(&[]).is_none(), "{census:?}");
+    }
+
+    /// The shorthand agrees with the full census, across every segment and
+    /// every metadata kind.
+    #[tokio::test]
+    async fn manifest_metadata_bytes_sums_every_segments_metadata() {
+        let store = memory_store();
+        let (db, _) = StoreBuilder::new("census/metadata", Arc::clone(&store))
+            .open_writer()
+            .await
+            .unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(
+            Key::current(EntityKey::Schema { schema_id: 1 }).encode(),
+            b"schema".as_slice(),
+        );
+        batch.put(
+            Key::Snapshot { snapshot_id: 1 }.encode(),
+            b"snap".as_slice(),
+        );
+        db.write(batch).await.unwrap();
+        flush_to_l0(&db).await;
+
+        let census = read_manifest_census("census/metadata", Arc::clone(&store))
+            .await
+            .unwrap();
+        let expected = census.segments.iter().fold(0, |total, segment| {
+            total + segment.filter_bytes + segment.index_bytes + segment.stats_bytes
+        });
+
+        let counted = manifest_metadata_bytes("census/metadata", store)
+            .await
+            .unwrap();
+        assert_eq!(counted, expected);
+
+        // Not compared against segment bytes: at two keys the metadata
+        // outweighs the data it describes.
+        assert!(counted > 0, "{census:?}");
     }
 
     /// The census reads the manifest, so a write still in the write-ahead
