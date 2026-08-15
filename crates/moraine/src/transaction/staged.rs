@@ -1047,7 +1047,7 @@ impl StagedTransaction {
 
         let phase_started = Instant::now();
         match translate_batch(base_ref, &ops, &poisoned, &deferred, mints_snapshot) {
-            Ok((result_id, mut writes)) => {
+            Ok((result_id, mut writes, translated_head_view)) => {
                 phases.translate = phase_started.elapsed();
                 let phase_started = Instant::now();
                 let staged_bytes = match stage_batch(
@@ -1078,6 +1078,10 @@ impl StagedTransaction {
                 // interrupt races the wait for it rather than the write
                 // itself.
                 let head_before = base_ref.snapshot.snapshot_id;
+                let head_view_update = translated_head_view.map_or_else(
+                    || commit::HeadViewUpdate::Rebuild(Arc::clone(&base)),
+                    |view| commit::HeadViewUpdate::Prepared(Arc::new(view)),
+                );
                 let phase_started = Instant::now();
                 let landed = commit::commit_batch_off_task(
                     db_tx,
@@ -1085,7 +1089,7 @@ impl StagedTransaction {
                     result_id,
                     writes,
                     staged_bytes,
-                    Arc::clone(&base),
+                    head_view_update,
                     projections,
                 )
                 .await?;
@@ -1123,12 +1127,14 @@ fn translate_batch(
     poisoned: &[u64],
     deferred: &[u64],
     mints_snapshot: bool,
-) -> Result<(u64, Vec<commit::StagedWrite>)> {
+) -> Result<(u64, Vec<commit::StagedWrite>, Option<CatalogSnapshot>)> {
     if !mints_snapshot {
-        return translate_maintenance(base, ops).map(|writes| (base.snapshot.snapshot_id, writes));
+        return translate_maintenance(base, ops)
+            .map(|writes| (base.snapshot.snapshot_id, writes, None));
     }
 
-    let (new_id, mut writes, snap) = translate(base, ops, poisoned, deferred)?;
+    let (new_id, mut writes, snap, translated_head_view) =
+        translate(base, ops, poisoned, deferred)?;
     // Derived before the snapshot record joins the batch: the changelog
     // names `current` keys, and that record is not.
     let changelog = commit::changelog_writes(new_id, &writes);
@@ -1140,7 +1146,11 @@ fn translate_batch(
         Some(value::encode_value(&snap)),
     ));
     writes.extend(changelog);
-    Ok((new_id, writes))
+    let translated_head_view = translated_head_view.map(|mut view| {
+        view.batch_seq = base.batch_seq.saturating_add(1);
+        view
+    });
+    Ok((new_id, writes, translated_head_view))
 }
 
 /// Stamps the head, folds in the inline writes, and stages the whole batch
@@ -1245,7 +1255,12 @@ fn translate(
     ops: &[RowOperation],
     poisoned: &[u64],
     deferred: &[u64],
-) -> Result<(u64, Vec<commit::StagedWrite>, proto::SnapshotValue)> {
+) -> Result<(
+    u64,
+    Vec<commit::StagedWrite>,
+    proto::SnapshotValue,
+    Option<CatalogSnapshot>,
+)> {
     let snapshot = build_snapshot_value(ops)?;
     let new_id = snapshot.snapshot_id;
 
@@ -1340,8 +1355,16 @@ fn translate(
 
     apply_poison(&mut state, poisoned);
     apply_deferred_maintenance(base, &mut state, deferred, new_id);
+    state.snapshot = snapshot.clone();
 
     let mut writes = commit::diff_writes(base, &state, new_id);
+    let translated_head_view = match commit::finish_translated_head_view(&mut state, &direct) {
+        Ok(()) => Some(state),
+        Err(err) => {
+            debug!(error = %err, "translated head view could not be completed; rebuilding after commit");
+            None
+        }
+    };
     writes.extend(direct);
     // The `ducklake_schema_versions` rows this commit staged, as records of
     // their own: `snapshot` carries them too, but only until expiry deletes
@@ -1354,7 +1377,7 @@ fn translate(
         ));
     }
 
-    Ok((new_id, writes, snapshot))
+    Ok((new_id, writes, snapshot, translated_head_view))
 }
 
 /// Refuses child rows left over after every parent was applied. An
