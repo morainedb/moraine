@@ -950,6 +950,33 @@ pub(crate) fn refresh_head_view(
     }
 }
 
+/// Applies direct writes not represented by staged-row translation.
+pub(crate) fn finish_translated_head_view(
+    view: &mut CatalogSnapshot,
+    writes: &[StagedWrite],
+) -> Result<()> {
+    fold::fold_batch(view, writes)
+}
+
+/// How a successful head-advancing commit obtains its cached head view.
+pub(crate) enum HeadViewUpdate {
+    /// Derive the view from the commit's base and writes.
+    Rebuild(Arc<CatalogSnapshot>),
+    /// Install the view staged-row translation already produced.
+    Prepared(Arc<CatalogSnapshot>),
+}
+
+fn install_committed_head_view(
+    projections: &std::sync::RwLock<ProjectionCache>,
+    update: HeadViewUpdate,
+    writes: &[StagedWrite],
+) {
+    match update {
+        HeadViewUpdate::Rebuild(base) => refresh_head_view(projections, &base, writes),
+        HeadViewUpdate::Prepared(view) => install_head_view(projections, view),
+    }
+}
+
 /// What one attempt staged onto its transaction.
 enum Prepared {
     /// The closure changed nothing; the head is unchanged.
@@ -1216,7 +1243,7 @@ pub(crate) async fn commit_batch(
     head: u64,
     writes: &[StagedWrite],
     staged_bytes: StagedBytes,
-    base: &CatalogSnapshot,
+    head_view_update: HeadViewUpdate,
     projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Result<Landed> {
     // A head-preserving commit reuses the head id with new content; drop the
@@ -1233,7 +1260,7 @@ pub(crate) async fn commit_batch(
             let projection_started = Instant::now();
             fold_committed_batch(projections, writes, head);
             if head_advanced {
-                refresh_head_view(projections, base, writes);
+                install_committed_head_view(projections, head_view_update, writes);
             }
             let projection = projection_started.elapsed();
             debug!(
@@ -1282,7 +1309,7 @@ pub(crate) async fn commit_batch_off_task(
     head: u64,
     writes: Vec<StagedWrite>,
     staged_bytes: StagedBytes,
-    base: Arc<CatalogSnapshot>,
+    head_view_update: HeadViewUpdate,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
 ) -> Result<Landed> {
     let task = {
@@ -1294,7 +1321,7 @@ pub(crate) async fn commit_batch_off_task(
                 head,
                 &writes,
                 staged_bytes,
-                &base,
+                head_view_update,
                 &projections,
             )
             .await

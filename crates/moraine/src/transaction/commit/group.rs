@@ -19,7 +19,10 @@ use std::sync::{
 use slatedb::{Db, DbTransaction, IsolationLevel};
 use tokio::sync::{Mutex, MutexGuard, watch};
 
-use super::{Landed, Prepared, StagedWrite, commit_batch, fold, head_view_for, prepare_and_stage};
+use super::{
+    HeadViewUpdate, Landed, Prepared, StagedWrite, commit_batch, fold, head_view_for,
+    prepare_and_stage,
+};
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
     error::{Error, Result},
@@ -323,7 +326,7 @@ impl Coalescer {
             head,
             &writes,
             staged_bytes,
-            &base,
+            HeadViewUpdate::Rebuild(base),
             &self.projections,
         )
         .await
