@@ -911,6 +911,98 @@ fn moraine_index_survives_update_and_compaction() {
     );
 }
 
+/// The `Total Files Read` an analyzed plan reported. The count follows the
+/// label rather than ending the line: the profile renders side-by-side boxes,
+/// so one line can carry another operator's timing after it.
+fn total_files_read(plan: &str) -> u64 {
+    plan.lines()
+        .find_map(|line| {
+            let tail = line.split_once("Total Files Read:")?.1;
+            tail.trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no `Total Files Read` in the analyzed plan:\n{plan}"))
+}
+
+/// A join against an index read restricts the scan to the rows the lookup
+/// already resolved. The condition alone does not: a hash join's runtime
+/// filters arrive after DuckLake has built its file list, and null-safe
+/// equality generates none at all.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn a_located_join_reads_only_the_file_holding_the_row() {
+    let store = TempDir::new("index-locate-prune-store");
+    let data = TempDir::new("index-locate-prune-data");
+    // Inlining off: an UPDATE small enough to inline writes no file, and the
+    // file list is what this measures.
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    for start in [0, 100, 200] {
+        run(&format!(
+            "INSERT INTO lake.main.t SELECT i, 'x' FROM range({start}, {}) t(i);",
+            start + 100
+        ));
+    }
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+
+    // Each UPDATE writes a file under preserved row ids drawn from across the
+    // table, so its row-id range spans everything and statistics can no
+    // longer exclude it.
+    for key in [10, 11, 12] {
+        run(&format!(
+            "UPDATE lake.main.t SET b = 'updated' WHERE a IN ({key}, {}, {});",
+            key + 100,
+            key + 200
+        ));
+    }
+
+    let located_join = "SELECT data.b FROM lake.main.t data \
+         JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
+           ON data.rowid = hits.row_id \
+          AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
+    let row_id_join = "SELECT data.b FROM lake.main.t data \
+         JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
+           ON data.rowid = hits.row_id";
+
+    assert_eq!(
+        csv_rows(&run(&format!("{located_join};"))),
+        vec![vec!["x".to_string()]],
+        "the located join still returns the row it pruned to"
+    );
+
+    let located = total_files_read(&run(&format!("EXPLAIN ANALYZE {located_join};")));
+    let row_id_only = total_files_read(&run(&format!("EXPLAIN ANALYZE {row_id_join};")));
+    assert_eq!(
+        located, 1,
+        "the located join read more than the holding file"
+    );
+    assert!(
+        row_id_only > located,
+        "the row-id join read {row_id_only} files and the located join {located}; \
+         the update files no longer overlap, so this proves nothing"
+    );
+
+    // An outer join keeps rows meeting no condition, so the same restriction
+    // would drop them.
+    let outer = "SELECT count(*) FROM lake.main.t data \
+         LEFT JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
+           ON data.rowid = hits.row_id";
+    assert_eq!(
+        csv_rows(&run(&format!("{outer};"))),
+        vec![vec!["300".to_string()]],
+        "the outer join lost rows the lookup did not resolve"
+    );
+}
+
 /// The index functions resolve a lake whose metadata catalog was named
 /// by `METADATA_CATALOG` rather than DuckLake's default
 /// `__ducklake_metadata_<lake>`. Name derivation cannot find such a

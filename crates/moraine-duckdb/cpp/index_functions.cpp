@@ -7,6 +7,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "catalog.hpp"
+#include "index_functions.hpp"
 #include "moraine_abi.h"
 #include "owned_array.hpp"
 
@@ -806,6 +807,28 @@ void NullsImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 }
 
 } // namespace
+
+bool IsIndexRead(const std::string &name) {
+	return name == "moraine_index_lookup" || name == "moraine_index_in" || name == "moraine_index_range" ||
+	       name == "moraine_index_nulls";
+}
+
+const std::vector<MoraineRowId> *IndexReadRows(const duckdb::TableFunction &function,
+                                               const duckdb::FunctionData *bind_data) {
+	if (!bind_data) {
+		return nullptr;
+	}
+	if (function.name == "moraine_index_lookup" || function.name == "moraine_index_in") {
+		return &bind_data->Cast<LookupBindData>().rows;
+	}
+	if (function.name == "moraine_index_range") {
+		return &bind_data->Cast<RangeBindData>().rows;
+	}
+	if (function.name == "moraine_index_nulls") {
+		return &bind_data->Cast<NullsBindData>().rows;
+	}
+	return nullptr;
+}
 
 void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	using duckdb::LogicalType;

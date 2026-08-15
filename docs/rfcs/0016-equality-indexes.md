@@ -665,8 +665,27 @@ constant; inlined and transaction-local sources emit NULL.
 Static and dynamic filters on that column are pushed into DuckLake's
 metadata file-list query as predicates on `ducklake_data_file.data_file_id`,
 using no column statistics; row-id filters continue through the existing
-reserved-field statistics path. Joining a located result therefore restricts
-both the file list and the rows read within the files that survive.
+reserved-field statistics path. A predicate naming both columns therefore
+restricts the file list and the rows read within the files that survive.
+
+A join condition does not reach that far by itself. A hash join's runtime
+filters are generated after DuckLake has built its file list, and DuckDB
+generates none at all for the null-safe equality the file-id column requires.
+Left alone, a located join reads every file whose row-id statistics admit the
+key — which, because each update writes a file spanning the ids it preserved,
+is every update the table has taken.
+
+An extension optimizer rule closes that gap. An index read resolves its rows
+while binding, so a join against one is a join against a list of constants
+already visible to the planner; the rule restates that list as an `IN` filter
+on the other side of an inner join, where the ordinary pushdown carries it
+into the scan. The filter only repeats what the join enforces, so it is added
+beside the join rather than replacing it: whatever the query projects from
+either side is unaffected, and an outer join — which keeps rows meeting no
+condition — is left alone. A file id resolved as NULL contributes an
+`IS NULL` disjunct under null-safe equality and nothing under plain equality,
+matching what each comparison would have accepted. Past a bounded list length
+the rule declines, a lookup that wide being a scan in disguise.
 
 The current DuckLake catalog view stays authoritative for file lifetime.
 Ended compaction inputs are simply absent, new outputs are cache misses, and
@@ -996,11 +1015,13 @@ and the permanent `Constraint` surfaces then. On a bulk violation the Parquet
 DuckLake already wrote is left orphaned for ordinary cleanup — space, not
 correctness.
 
-**Reads are explicit.** DuckLake owns the planner, so no optimizer routing.
-The extension path reads through `moraine_index_lookup`; the caller joins
-back to the table, whose scan DuckLake adjudicates against delete files. v1
-scope: creation, uniqueness enforcement, and explicit equality, range, and
-NULL reads.
+**Reads are explicit.** DuckLake owns the planner, so nothing routes a
+predicate to an index. The extension path reads through
+`moraine_index_lookup`; the caller joins back to the table, whose scan
+DuckLake adjudicates against delete files. The optimizer rule above does not
+change that: it restates a join the caller already wrote, and never chooses
+an index. v1 scope: creation, uniqueness enforcement, and explicit equality,
+range, and NULL reads.
 
 **The upstream boundary is explicit.** Moraine does not carry a downstream
 DuckLake binder or optimizer patch. If DuckLake defines native index metadata,
