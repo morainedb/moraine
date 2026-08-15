@@ -1003,6 +1003,122 @@ fn a_located_join_reads_only_the_file_holding_the_row() {
     );
 }
 
+/// An UPDATE out of a file into inline data leaves the row two candidates:
+/// the expired copy the file still carries, and the live inlined one. The
+/// restriction must admit both, or the scan reads only the copy DuckLake
+/// then adjudicates away and the join returns nothing.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn a_located_join_follows_a_row_updated_out_of_its_file() {
+    let store = TempDir::new("index-locate-inline-store");
+    let data = TempDir::new("index-locate-inline-data");
+    // Inlining left at its default: the UPDATE below has to land inline for
+    // the row to hold a file copy and an inlined copy at once.
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t SELECT i, 'from-file' FROM range(100) t(i);");
+    run("CALL ducklake_flush_inlined_data('lake');");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("UPDATE lake.main.t SET b = 'now-inlined' WHERE a = 42;");
+
+    assert_eq!(
+        csv_rows(&run(
+            // Rendered rather than compared as NULL, so the ordering and the
+            // absent file id are both unambiguous.
+            "SELECT row_id, coalesce(data_file_id::VARCHAR, 'inlined') \
+             FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42) ORDER BY 2;"
+        )),
+        vec![
+            vec!["42".to_string(), "0".to_string()],
+            vec!["42".to_string(), "inlined".to_string()],
+        ],
+        "the lookup stopped offering both the file copy and the inlined one"
+    );
+
+    assert_eq!(
+        csv_rows(&run("SELECT data.b FROM lake.main.t data \
+             JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 42) hits \
+               ON data.rowid = hits.row_id \
+              AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;")),
+        vec![vec!["now-inlined".to_string()]],
+        "the located join lost the live inlined copy of an updated row"
+    );
+}
+
+/// A prepared located join carries no resolved row into its next execution:
+/// each key is looked up when its own execution binds. The rows are constants
+/// in the plan, so a reused plan would answer with another key's row rather
+/// than fail.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn a_prepared_located_join_resolves_each_key_it_is_executed_with() {
+    let store = TempDir::new("index-locate-prepared-store");
+    let data = TempDir::new("index-locate-prepared-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    for start in [0, 100, 200] {
+        run(&format!(
+            "INSERT INTO lake.main.t SELECT i, 'file{}-' || i FROM range({start}, {}) t(i);",
+            start / 100,
+            start + 100
+        ));
+    }
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    // Update files spanning the whole id range, so a plan that resolved
+    // nothing would have every file to read.
+    for key in [10, 11, 12] {
+        run(&format!(
+            "UPDATE lake.main.t SET b = 'updated' WHERE a IN ({key}, {}, {});",
+            key + 100,
+            key + 200
+        ));
+    }
+
+    let prepare = "PREPARE located AS SELECT data.b AS value FROM lake.main.t data \
+         JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', $1) hits \
+           ON data.rowid = hits.row_id \
+          AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;";
+
+    // One header per result set, and these executions produce four.
+    let executed: Vec<Vec<String>> = csv_rows(&run(&format!(
+        "{prepare} EXECUTE located(50); EXECUTE located(150); \
+         EXECUTE located(250); EXECUTE located(50);"
+    )))
+    .into_iter()
+    .filter(|row| row != &["value".to_string()])
+    .collect();
+
+    assert_eq!(
+        executed,
+        vec![
+            vec!["file0-50".to_string()],
+            vec!["file1-150".to_string()],
+            vec!["file2-250".to_string()],
+            vec!["file0-50".to_string()],
+        ],
+        "a prepared execution answered with a key other than its own"
+    );
+
+    // Executed, not just bound: the restriction reaches the file list of a
+    // plan built behind EXECUTE. The key sits inside every update file's
+    // id range, so row-id statistics alone exclude none of them.
+    let plan = run(&format!(
+        "{prepare} EXECUTE located(50); EXPLAIN ANALYZE EXECUTE located(150);"
+    ));
+    assert_eq!(
+        total_files_read(&plan),
+        1,
+        "a prepared located join read more than the holding file"
+    );
+}
+
 /// The index functions resolve a lake whose metadata catalog was named
 /// by `METADATA_CATALOG` rather than DuckLake's default
 /// `__ducklake_metadata_<lake>`. Name derivation cannot find such a
