@@ -52,28 +52,29 @@ pub(crate) async fn file_summary(
         return Ok(FileSummary { rows, built: false });
     }
 
+    // Dense range
     if let Some(start) = row_id_start
         && !carries_embedded_row_ids(file.clone()).await?
     {
-        return Ok(FileSummary {
+        Ok(FileSummary {
             rows: Arc::new(FileRowSet::range(start, record_count)?),
             built: false,
-        });
+        })
+    } else {
+        let entries = scoped_read_recorded_entries(
+            file,
+            &[],
+            ScopedRows::All,
+            RowIdSource::Resolve { row_id_start },
+        )
+        .await?;
+        let mut row_ids: Vec<u64> = entries.into_iter().map(|entry| entry.row_id).collect();
+        row_ids.sort_unstable();
+        row_ids.dedup();
+
+        let rows = Arc::new(FileRowSet::from_sorted(row_ids)?);
+        row_set_cache::store(&store, &key, &rows);
+
+        Ok(FileSummary { rows, built: true })
     }
-
-    let entries = scoped_read_recorded_entries(
-        file,
-        &[],
-        ScopedRows::All,
-        RowIdSource::Resolve { row_id_start },
-    )
-    .await?;
-    let mut row_ids: Vec<u64> = entries.into_iter().map(|entry| entry.row_id).collect();
-    row_ids.sort_unstable();
-    row_ids.dedup();
-
-    let rows = Arc::new(FileRowSet::from_sorted(row_ids)?);
-    row_set_cache::store(&store, &key, &rows);
-
-    Ok(FileSummary { rows, built: true })
 }

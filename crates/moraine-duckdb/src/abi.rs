@@ -3107,7 +3107,7 @@ unsafe fn abi_located_row_ids(
                 handle_ref.data_store.clone(),
                 &handle_ref.data_prefix,
                 table_id,
-                row_ids,
+                row_ids.to_vec(),
             ),
         )
     }?;

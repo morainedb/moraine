@@ -115,7 +115,7 @@ async fn a_dense_file_answers_from_its_recorded_range() {
     .await;
 
     let located = catalog
-        .locate_row_ids(Some(data), "", table, &[0, 2, 7])
+        .locate_row_ids(Some(data), "", table, vec![0, 2, 7])
         .await
         .unwrap();
 
@@ -152,7 +152,7 @@ async fn a_file_whose_embedded_ids_hold_gaps_is_read_exactly() {
     .await;
 
     let located = catalog
-        .locate_row_ids(Some(data), "", table, &[1, 5, 12])
+        .locate_row_ids(Some(data), "", table, vec![1, 5, 12])
         .await
         .unwrap();
 
@@ -199,7 +199,7 @@ async fn one_row_id_in_two_current_files_returns_both() {
     .await;
 
     let located = catalog
-        .locate_row_ids(Some(data), "", table, &[8])
+        .locate_row_ids(Some(data), "", table, vec![8])
         .await
         .unwrap();
 
@@ -223,7 +223,7 @@ async fn an_unreadable_file_leaves_every_requested_row_a_candidate() {
     let table = table_with(&catalog, vec![datafile(3)]).await;
 
     let located = catalog
-        .locate_row_ids(Some(data), "", table, &[100, 200])
+        .locate_row_ids(Some(data), "", table, vec![100, 200])
         .await
         .unwrap();
 
@@ -265,7 +265,7 @@ async fn an_inlined_row_locates_with_no_file() {
     // Row 1 is inlined and row 9 is nowhere. Both come back unlocated, and
     // neither is dropped.
     let located = catalog
-        .locate_row_ids(None, "", table, &[1, 9])
+        .locate_row_ids(None, "", table, vec![1, 9])
         .await
         .unwrap();
 
@@ -279,7 +279,10 @@ async fn no_requested_rows_locate_nothing() {
     let catalog = open_memory().await;
     let table = table_with(&catalog, vec![]).await;
 
-    let located = catalog.locate_row_ids(None, "", table, &[]).await.unwrap();
+    let located = catalog
+        .locate_row_ids(None, "", table, vec![])
+        .await
+        .unwrap();
 
     assert!(located.is_empty());
     catalog.close().await.unwrap();
@@ -325,7 +328,7 @@ async fn warming_builds_the_summaries_a_cold_lookup_would_pay_for() {
 
     // And the warmed summary answers the same as a cold lookup would.
     let located = catalog
-        .locate_row_ids(Some(data), "", table, &[9, 11])
+        .locate_row_ids(Some(data), "", table, vec![9, 11])
         .await
         .unwrap();
     let file = catalog.snapshot().await.unwrap().data_files_of(table)[0]
@@ -402,7 +405,7 @@ async fn located_rows_keep_the_order_they_were_requested_in() {
     // A range or NULL scan hands its ids over already ordered; locating them
     // must not reorder them.
     let located = catalog
-        .locate_row_ids(Some(data), "", table, &[12, 5, 9])
+        .locate_row_ids(Some(data), "", table, vec![12, 5, 9])
         .await
         .unwrap();
 

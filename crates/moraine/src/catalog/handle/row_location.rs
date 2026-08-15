@@ -39,18 +39,15 @@ impl ReadOnlyCatalog {
         table: TableId,
         files: Vec<DataFileInfo>,
     ) -> Vec<(DataFileId, Result<FileSummary>)> {
-        let resolve = |path: &str, is_relative: bool| {
-            let relative = match (is_relative, data_prefix.is_empty()) {
-                (false, _) => path.to_owned(),
-                (true, true) => format!("{table_prefix}{path}"),
-                (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
-            };
-            Path::from(relative.as_str())
-        };
-
         stream::iter(files.into_iter().map(|file| {
-            let path = resolve(&file.path, file.path_is_relative);
+            let relative = match (file.path_is_relative, data_prefix.is_empty()) {
+                (false, _) => file.path,
+                (true, true) => format!("{table_prefix}{}", file.path),
+                (true, false) => format!("{data_prefix}/{table_prefix}{}", file.path),
+            };
+            let path = Path::from(relative.as_str());
             let store = Arc::clone(store);
+
             async move {
                 let summary = data_file::file_summary(
                     data_file::ParquetFile::new(
@@ -95,26 +92,24 @@ impl ReadOnlyCatalog {
         data_store: Option<Arc<dyn ObjectStore>>,
         data_prefix: &str,
         table: TableId,
-        row_ids: &[u64],
+        mut row_ids: Vec<u64>,
     ) -> Result<Vec<FileRowCandidate>> {
-        let mut requested = row_ids.to_vec();
-        requested.sort_unstable();
-        requested.dedup();
-        if requested.is_empty() {
+        if row_ids.is_empty() {
             return Ok(Vec::new());
         }
 
+        row_ids.dedup();
         let snapshot = self.snapshot().await?;
-        let mut candidates = Vec::new();
 
-        if let Some(store) = &data_store {
+        let mut placements = if let Some(store) = &data_store {
             let table_prefix = snapshot.table_data_prefix(table)?;
             let files = snapshot.data_files_of(table);
-            for (data_file_id, summary) in
-                Self::file_summaries(store, data_prefix, &table_prefix, table, files).await
-            {
-                let rows = match summary {
-                    Ok(summary) => summary.matching(&requested),
+
+            Self::file_summaries(store, data_prefix, &table_prefix, table, files)
+                .await
+                .into_iter()
+                .map(|(data_file_id, summary)| match summary {
+                    Ok(summary) => (data_file_id, summary.matching(&row_ids.clone())),
                     Err(error) => {
                         warn!(
                             table_id = table.get(),
@@ -122,64 +117,88 @@ impl ReadOnlyCatalog {
                             %error,
                             "row location fell back to every requested row for this file"
                         );
-                        requested.clone()
+                        (data_file_id, row_ids.clone())
                     }
-                };
-                candidates.extend(rows.into_iter().map(|row_id| FileRowCandidate {
-                    row_id,
-                    data_file_id: Some(data_file_id),
-                }));
-            }
-        }
+                })
+                .flat_map(|(data_file_id, row_ids)| {
+                    row_ids
+                        .into_iter()
+                        .map(|row_id| FileRowCandidate {
+                            row_id,
+                            data_file_id: Some(data_file_id),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .fold(
+                    HashMap::<u64, Vec<DataFileId>>::new(),
+                    |mut acc, candidate| {
+                        if let Some(data_file_id) = candidate.data_file_id {
+                            acc.entry(candidate.row_id).or_default().push(data_file_id);
+                        }
 
-        let mut placements: HashMap<u64, Vec<DataFileId>> = HashMap::new();
-        for candidate in candidates {
-            if let Some(data_file_id) = candidate.data_file_id {
-                placements
-                    .entry(candidate.row_id)
-                    .or_default()
-                    .push(data_file_id);
-            }
-        }
+                        acc
+                    },
+                )
+        } else {
+            HashMap::new()
+        };
+
         // A row can be inlined and still hold an expired physical copy in a
         // current file, so the live inlined copy is its own candidate rather
         // than an alternative to the file ones.
-        let mut inlined: HashSet<u64> = HashSet::new();
-        for row in self.recent_rows(table).await? {
-            if requested.binary_search(&row.row_id).is_ok() {
-                inlined.insert(row.row_id);
-            }
-        }
+        let inlined: HashSet<u64> = self
+            .recent_rows(table)
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                if let Ok(idx) = row_ids.binary_search(&row.row_id) {
+                    Some(row_ids[idx])
+                } else {
+                    None
+                }
+            })
+            .collect::<HashSet<_>>();
 
         // Emit in the caller's order: a range or NULL scan hands its row ids
         // over already ordered, and locating them must not reorder them.
         let mut seen = HashSet::new();
-        let mut located = Vec::new();
-        for row_id in row_ids
+
+        let located = row_ids
             .iter()
             .copied()
             .filter(|row_id| seen.insert(*row_id))
-        {
-            if let Some(files) = placements.get_mut(&row_id) {
-                files.sort_unstable();
-                files.dedup();
-                located.extend(files.iter().map(|data_file_id| FileRowCandidate {
-                    row_id,
-                    data_file_id: Some(*data_file_id),
-                }));
-            }
-            // A live inlined row, and a row located nowhere at all, are both
-            // reported without a file rather than dropped.
-            if inlined.contains(&row_id) || !placements.contains_key(&row_id) {
-                located.push(FileRowCandidate {
-                    row_id,
-                    data_file_id: None,
-                });
-            }
-        }
-        let candidates = located;
+            .flat_map(|row_id| {
+                // A live inlined row, and a row located nowhere at all, are both
+                // reported without a file rather than dropped.
+                let inline_placements =
+                    if inlined.contains(&row_id) || !placements.contains_key(&row_id) {
+                        Some(FileRowCandidate {
+                            row_id,
+                            data_file_id: None,
+                        })
+                    } else {
+                        None
+                    };
 
-        Ok(candidates)
+                let file_placements = if let Some(files) = placements.get_mut(&row_id) {
+                    files.sort_unstable();
+                    files.dedup();
+                    files
+                        .iter()
+                        .map(|data_file_id| FileRowCandidate {
+                            row_id,
+                            data_file_id: Some(*data_file_id),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                file_placements.into_iter().chain(inline_placements)
+            })
+            .collect();
+
+        Ok(located)
     }
 
     /// Builds and caches the summaries a lookup would otherwise build cold.
@@ -188,11 +207,6 @@ impl ReadOnlyCatalog {
     /// from its dense range, costs nothing, and a file that cannot be read
     /// is counted rather than raised. Nothing here is durable, so a pass
     /// that never runs changes only latency.
-    ///
-    /// Intended to be spawned after a commit that lands compaction outputs
-    /// — the files carrying embedded row ids, which are exactly the ones a
-    /// lookup pays to read. It warms this process only; a separate reader
-    /// builds its own.
     ///
     /// # Errors
     ///

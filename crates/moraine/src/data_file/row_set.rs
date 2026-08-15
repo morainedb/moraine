@@ -59,6 +59,7 @@ impl FileRowSet {
             ));
         }
 
+        // Check if the row ids form a dense range
         if let (Some(&start), Some(&last)) = (row_ids.first(), row_ids.last()) {
             let count = usize_as_u64(row_ids.len());
             if start
@@ -80,6 +81,7 @@ impl FileRowSet {
                 optimized.optimize();
                 (partition, optimized)
             }));
+
         if roaring_estimated_bytes(&roaring) < raw_bytes {
             Ok(Self::Roaring(roaring))
         } else {
@@ -94,6 +96,7 @@ impl FileRowSet {
                 "file row-id range {start} + {count} exceeds the u64 domain"
             ))
         })?;
+
         Ok(Self::Range { start, end })
     }
 
@@ -143,6 +146,7 @@ fn roaring_estimated_bytes(rows: &RoaringTreemap) -> u64 {
         let payload = (stats.n_bytes_array_containers / ROARING_ARRAY_STATISTIC_PER_BYTE)
             .saturating_add(stats.n_bytes_run_containers)
             .saturating_add(stats.n_bytes_bitset_containers / ROARING_BITSET_STATISTIC_PER_BYTE);
+
         total
             .saturating_add(payload)
             .saturating_add(
