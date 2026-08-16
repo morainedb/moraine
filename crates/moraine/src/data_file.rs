@@ -9,18 +9,20 @@
 //! catalog's own keyspace out of SlateDB, and [`crate::catalog`] interprets
 //! what either returns.
 
+mod auxiliary_cache;
 mod columns;
 mod delete_file;
 mod entries;
 mod inline_batch;
-mod metadata_cache;
 mod metrics;
+mod reader;
 mod row_location;
 mod row_set;
-mod row_set_cache;
 mod selection;
 mod values;
 
+#[cfg(test)]
+mod auxiliary_cache_tests;
 #[cfg(test)]
 mod row_set_tests;
 #[cfg(test)]
@@ -44,6 +46,7 @@ pub(crate) use crate::data_file::inline_batch::{
     inline_batch_decode_count, inline_schema_decode_count,
 };
 pub(crate) use crate::data_file::{
+    auxiliary_cache::{occupancy as auxiliary_occupancy, resize as resize_auxiliary},
     delete_file::delete_file_positions,
     inline_batch::{decode_inline_schema, inline_batch_entries, inline_batch_index_entries},
     metrics::{ScopedReadMetrics, ScopedReadTally, run_bounded_index_encoding},
@@ -57,8 +60,8 @@ use crate::{
             resolve_row_id_source,
         },
         entries::{record_batch_entries, record_batch_index_entries},
-        metadata_cache::ObjectStoreReader,
         metrics::INDEX_ENCODING_CONCURRENCY,
+        reader::ObjectStoreReader,
         selection::{scoped_selection, total_rows},
     },
     error::{Error, Result},

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::{
     data_file::{
-        ParquetFile, RowIdSource, ScopedRows, carries_embedded_row_ids, row_set::FileRowSet,
-        row_set_cache, scoped_read_recorded_entries,
+        ParquetFile, RowIdSource, ScopedRows, auxiliary_cache, carries_embedded_row_ids,
+        row_set::FileRowSet, scoped_read_recorded_entries,
     },
     error::Result,
 };
@@ -41,14 +41,14 @@ pub(crate) async fn file_summary(
     let path = file.path.clone();
     let file_size = file.file_size;
     let store = Arc::clone(&file.object_store);
-    let key = row_set_cache::SummaryKey {
+    let key = auxiliary_cache::FileSummaryKey {
         table_id,
         data_file_id,
         path: &path,
         file_size,
     };
 
-    if let Some(rows) = row_set_cache::cached(&store, &key) {
+    if let Some(rows) = auxiliary_cache::shared().summary(&store, &key) {
         return Ok(FileSummary { rows, built: false });
     }
 
@@ -73,7 +73,7 @@ pub(crate) async fn file_summary(
         row_ids.dedup();
 
         let rows = Arc::new(FileRowSet::from_sorted(row_ids)?);
-        row_set_cache::store(&store, &key, &rows);
+        auxiliary_cache::shared().insert_summary(&store, &key, &rows);
 
         Ok(FileSummary { rows, built: true })
     }
