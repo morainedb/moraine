@@ -2,13 +2,14 @@
 //! the `inline` subspace, and its translation into store writes. Inline
 //! records live outside the entity model and are never diffed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use futures::{StreamExt, TryStreamExt, stream};
 use slatedb::DbTransaction;
 
 use crate::{
     error::{Error, Result},
-    store::{handle::ReadHandle, inline as store_inline},
+    store::{handle::ReadHandle, inline as store_inline, proto},
     transaction::{
         commit::StagedWrite,
         staged::inline::{
@@ -52,15 +53,51 @@ pub(crate) enum InlineStage {
     },
 }
 
+/// Point reads one batch keeps in flight against the store.
+const SCHEMA_READ_CONCURRENCY: usize = 16;
+
+/// The recorded schema of every distinct version `ops` writes a schema
+/// for, keyed by `(table_id, schema_version)`; read concurrently since the
+/// key set is known up front.
+async fn recorded_schemas(
+    db_tx: &DbTransaction,
+    ops: &[InlineStage],
+) -> Result<HashMap<(u64, u64), Option<proto::InlineSchemaValue>>> {
+    let mut versions = Vec::new();
+    let mut seen = HashSet::new();
+    for op in ops {
+        if let InlineStage::Schema {
+            table_id,
+            schema_version,
+            ..
+        } = op
+            && seen.insert((*table_id, *schema_version))
+        {
+            versions.push((*table_id, *schema_version));
+        }
+    }
+
+    stream::iter(versions)
+        .map(|(table_id, schema_version)| async move {
+            let recorded =
+                store_inline::read_inline_schema(ReadHandle::Tx(db_tx), table_id, schema_version)
+                    .await?;
+            Ok::<_, Error>(((table_id, schema_version), recorded))
+        })
+        .buffered(SCHEMA_READ_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
 /// The schema record a version owes, or nothing when it already has one.
 /// A version's schema is fixed once written; a differing one is refused.
-async fn schema_write_if_new(
-    db_tx: &DbTransaction,
+fn schema_write_if_new(
+    recorded: Option<&proto::InlineSchemaValue>,
     table_id: u64,
     schema_version: u64,
     arrow_schema: &[u8],
 ) -> Result<Option<StagedWrite>> {
-    match store_inline::read_inline_schema(ReadHandle::Tx(db_tx), table_id, schema_version).await? {
+    match recorded {
         Some(recorded) if recorded.arrow_schema == arrow_schema => Ok(None),
         Some(_) => Err(Error::Constraint(format!(
             "table {table_id} already records a different schema for version {schema_version}; \
@@ -112,6 +149,7 @@ pub(crate) async fn stage_inline_writes(
             _ => None,
         })
         .collect();
+    let recorded = recorded_schemas(db_tx, ops).await?;
     // Versions whose schema record this batch has already settled.
     let mut settled: HashSet<(u64, u64)> = HashSet::new();
     for op in ops {
@@ -122,10 +160,15 @@ pub(crate) async fn stage_inline_writes(
                 arrow_schema,
             } => {
                 if settled.insert((*table_id, *schema_version)) {
-                    writes.extend(
-                        schema_write_if_new(db_tx, *table_id, *schema_version, arrow_schema)
-                            .await?,
-                    );
+                    let recorded = recorded
+                        .get(&(*table_id, *schema_version))
+                        .and_then(Option::as_ref);
+                    writes.extend(schema_write_if_new(
+                        recorded,
+                        *table_id,
+                        *schema_version,
+                        arrow_schema,
+                    )?);
                 }
             }
             InlineStage::Insert {

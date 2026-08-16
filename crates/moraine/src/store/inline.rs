@@ -32,6 +32,15 @@ pub(crate) struct InlineChunkLocator {
 }
 
 impl InlineChunkLocator {
+    /// The schema version this chunk decodes against; `None` for a
+    /// locator naming a non-insert operation.
+    pub(crate) fn schema_version(self) -> Option<u64> {
+        match self.operation {
+            InlineOperation::Insert { schema_version, .. } => Some(schema_version),
+            InlineOperation::InlineDelete { .. } | InlineOperation::FileDelete { .. } => None,
+        }
+    }
+
     /// Whether this chunk owns `row_id`.
     pub(crate) fn holds(self, row_id: u64) -> bool {
         row_id >= self.row_id_start && row_id <= self.row_id_end

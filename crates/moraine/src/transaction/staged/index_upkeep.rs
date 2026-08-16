@@ -28,6 +28,10 @@ const FILE_READ_CONCURRENCY: usize = 64;
 /// Per-commit fan-out into the process-wide Arrow encoding worker pool.
 const INLINE_DECODE_CONCURRENCY: usize = 8;
 
+/// Inline schema point reads one prefetch keeps in flight, sized for a
+/// remote object store.
+const INLINE_READ_CONCURRENCY: usize = 16;
+
 /// Decoded inline schemas shared by every chunk in one commit, one cell
 /// per table version.
 struct InlineSchemaCache<'a> {
@@ -43,6 +47,25 @@ impl<'a> InlineSchemaCache<'a> {
             pending,
             decoded: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Fills the cells for `versions` concurrently so each chunk's `get` is a
+    /// hit. Failures are left for that `get` to surface, since a version no
+    /// chunk ends up decoding must not fail the commit.
+    async fn prefetch(
+        &self,
+        db_tx: &DbTransaction,
+        versions: impl IntoIterator<Item = (u64, u64)>,
+    ) {
+        let distinct: HashSet<(u64, u64)> = versions.into_iter().collect();
+        stream::iter(distinct)
+            .for_each_concurrent(
+                INLINE_READ_CONCURRENCY,
+                |(table_id, schema_version)| async move {
+                    let _ = self.get(db_tx, table_id, schema_version).await;
+                },
+            )
+            .await;
     }
 
     async fn get(
@@ -313,6 +336,18 @@ pub(super) async fn stage_index_maintenance(
     let locator_writes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let locator_writes_for_removals = Arc::clone(&locator_writes);
     let mut staged_chunks = staged_inline_chunks(ops);
+    let mut staged_versions = Vec::new();
+    for (table_id, chunks) in &staged_chunks {
+        if !context
+            .indexing(base, TableId::new(*table_id))?
+            .all
+            .indexes
+            .is_empty()
+        {
+            staged_versions.extend(chunks.iter().map(|chunk| (*table_id, chunk.schema_version)));
+        }
+    }
+    inline_schemas.prefetch(db_tx, staged_versions).await;
     let inline_schemas_ref = &inline_schemas;
     let context_ref = &context;
     let inline_deletions = stream::iter(inline_deletes)
@@ -886,6 +921,14 @@ async fn stage_inline_delete_entries(
         )
         .await?;
         if let Some(locators) = locators {
+            inline_schemas
+                .prefetch(
+                    db_tx,
+                    locators
+                        .iter()
+                        .filter_map(|locator| Some((table_id, locator.schema_version()?))),
+                )
+                .await;
             let (entries, covered) = derive_located_inline_removals(
                 db_tx,
                 base,
@@ -914,6 +957,12 @@ async fn stage_inline_delete_entries(
                 _ => None,
             })
             .collect();
+        inline_schemas
+            .prefetch(
+                db_tx,
+                chunks.iter().map(|chunk| (table_id, chunk.schema_version)),
+            )
+            .await;
         let (entries, covered) = derive_inline_chunk_removals(
             db_tx,
             base,
@@ -1203,5 +1252,59 @@ mod tests {
         let bytes = InlineBody::Owned(Bytes::from(body)).into_bytes();
 
         assert_eq!(bytes.as_ptr(), pointer);
+    }
+
+    /// A prefetch that names a version with no schema record does not fail;
+    /// only the chunk that decodes against it does, while the recorded
+    /// versions it fetched are served without another store read.
+    #[tokio::test]
+    async fn prefetch_leaves_missing_schema_errors_to_the_chunk_that_needs_them() {
+        use object_store::memory::InMemory;
+        use slatedb::IsolationLevel;
+
+        use crate::store::{
+            key::{InlineKey, Key},
+            open::StoreBuilder,
+            value,
+        };
+
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]);
+        let schema_ipc = super::super::tests::inline_schema_ipc(&schema);
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(
+            Key::Inline(InlineKey::Schema {
+                table_id: 7,
+                schema_version: 1,
+            })
+            .encode(),
+            value::encode_value(&proto::InlineSchemaValue {
+                arrow_schema: schema_ipc.into(),
+            }),
+        )
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let pending = HashMap::new();
+        let cache = InlineSchemaCache::new(&pending);
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        cache.prefetch(&tx, [(7, 1), (7, 2)]).await;
+
+        let decoded = cache.get(&tx, 7, 1).await.unwrap();
+        assert_eq!(decoded.fields().len(), 1);
+        assert!(matches!(
+            cache.get(&tx, 7, 2).await,
+            Err(Error::Corruption(_))
+        ));
+
+        tx.rollback();
+        db.close().await.unwrap();
     }
 }

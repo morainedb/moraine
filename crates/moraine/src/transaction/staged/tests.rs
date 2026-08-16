@@ -826,7 +826,7 @@ async fn stages_inline_idel_and_row_disappears_from_table_scan_after_it() {
 
 /// The schema-only Arrow IPC stream stored once per inline schema
 /// version, matching what the extension's encoder produces.
-fn inline_schema_ipc(schema: &arrow::datatypes::Schema) -> Vec<u8> {
+pub(super) fn inline_schema_ipc(schema: &arrow::datatypes::Schema) -> Vec<u8> {
     let mut buffer = Vec::new();
     {
         let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, schema).unwrap();
