@@ -1,6 +1,7 @@
 //! Which of a file's rows a read decodes, and where each emitted row sits
-//! in the file. Positions arrive sorted and duplicate-free, so building a
-//! row selection never repeats a sort.
+//! in the file.
+
+use std::sync::Arc;
 
 use object_store::path::Path;
 use parquet::{
@@ -14,18 +15,12 @@ use crate::{
 };
 
 /// Which of a file's rows a scoped read decodes.
-///
-/// [`At`](Self::At) becomes a Parquet row selection, so deriving the entries
-/// of a few rows out of a large file costs those rows rather than the file —
-/// the difference between a delete that pays for what it deletes and one
-/// that pays for the table.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ScopedRows<'a> {
     /// Every row, in file order.
     All,
-    /// Only the rows at these physical positions. Entries come back in
-    /// position order, and the set's ordering is what lets the selection be
-    /// built without sorting.
+    /// Only the rows at these physical positions; entries come back in
+    /// position order.
     At(&'a RowPositions),
     /// Every row from this physical position through the end of the file.
     From(u64),
@@ -37,8 +32,7 @@ impl ScopedRows<'_> {
         matches!(self, Self::At(wanted) if wanted.is_empty())
     }
 
-    /// A selection reads the page index so it can skip whole pages; a full
-    /// read has nothing to skip and does not pay for it.
+    /// A selection reads the page index so it can skip whole pages.
     pub(super) fn page_index_policy(self) -> PageIndexPolicy {
         match self {
             Self::All => PageIndexPolicy::Skip,
@@ -47,23 +41,19 @@ impl ScopedRows<'_> {
     }
 }
 
-/// Physical Parquet row positions, sorted and duplicate-free. Every selected
-/// read shares this representation, so constructing a row selection never
-/// repeats a tree-to-vector copy.
+/// Physical Parquet row positions, sorted and duplicate-free.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct RowPositions(Vec<u64>);
+pub(crate) struct RowPositions(Arc<[u64]>);
 
 impl RowPositions {
-    /// Establishes the sorted/unique invariant for positions collected from
-    /// one or more delete sources.
+    /// Sorts and deduplicates `positions`.
     pub(crate) fn from_unsorted(mut positions: Vec<u64>) -> Self {
         positions.sort_unstable();
         positions.dedup();
-        Self(positions)
+        Self(positions.into())
     }
 
-    /// The ordered positions used by Parquet row selection and ordinal
-    /// resolution.
+    /// The ordered positions.
     pub(crate) fn as_slice(&self) -> &[u64] {
         &self.0
     }
@@ -115,7 +105,7 @@ impl Ordinals<'_> {
 pub(super) enum OwnedOrdinals {
     Dense,
     Offset(u64),
-    Selected(Vec<u64>),
+    Selected(RowPositions),
 }
 
 impl OwnedOrdinals {
@@ -123,7 +113,7 @@ impl OwnedOrdinals {
         match self {
             Self::Dense => Ordinals::Dense,
             Self::Offset(start) => Ordinals::Offset(*start),
-            Self::Selected(positions) => Ordinals::Selected(positions),
+            Self::Selected(positions) => Ordinals::Selected(positions.as_slice()),
         }
     }
 }
@@ -136,7 +126,7 @@ pub(super) fn scoped_selection(
         ScopedRows::All => Ok((None, OwnedOrdinals::Dense)),
         ScopedRows::At(positions) => Ok((
             Some(row_selection(positions.as_slice(), total)?),
-            OwnedOrdinals::Selected(positions.as_slice().to_vec()),
+            OwnedOrdinals::Selected(positions.clone()),
         )),
         ScopedRows::From(start_ordinal) => {
             let start = usize::try_from(start_ordinal)
@@ -159,23 +149,22 @@ pub(super) fn scoped_selection(
 }
 
 /// The row selection naming `positions` in a file of `total_rows`.
-///
-/// Positions arrive ascending and unique (they come from [`RowPositions`]) and
-/// are bounds-checked here, so the consecutive ranges handed over are
-/// ordered and in range — the two things the builder requires of them.
+/// Positions must be ascending and unique.
 fn row_selection(positions: &[u64], total_rows: usize) -> Result<RowSelection> {
-    let mut ranges = Vec::with_capacity(positions.len());
-    for &position in positions {
-        let start = usize::try_from(position)
-            .ok()
-            .filter(|start| *start < total_rows)
-            .ok_or_else(|| {
-                Error::Corruption(format!(
-                    "scoped read: selected row {position} is past the file's {total_rows} rows"
-                ))
-            })?;
-        ranges.push(start..start.saturating_add(1));
-    }
+    let ranges = positions
+        .iter()
+        .map(|&position| {
+            usize::try_from(position)
+                .ok()
+                .filter(|start| *start < total_rows)
+                .map(|start| start..start.saturating_add(1))
+                .ok_or_else(|| {
+                    Error::Corruption(format!(
+                        "scoped read: selected row {position} is past the file's {total_rows} rows"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(RowSelection::from_consecutive_ranges(
         ranges.into_iter(),
         total_rows,

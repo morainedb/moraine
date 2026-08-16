@@ -1,8 +1,6 @@
-//! The typed mutation log and conflict classification.
-//!
-//! Ops are recorded at classification grain — which schema-list entries
-//! and which tables a commit touched — not at entity-payload grain; the
-//! staged entity state lives in the transaction's working snapshot.
+//! The typed mutation log and conflict classification. Ops are recorded
+//! at classification grain: which schema-list entries and which tables a
+//! commit touched.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,8 +11,7 @@ pub(crate) enum Operation {
     CreateSchema {
         /// The new schema's id.
         schema_id: u64,
-        /// The new schema's name (the `changes_made` grammar carries
-        /// names for created entries).
+        /// The new schema's name.
         name: String,
     },
     /// A schema was dropped.
@@ -23,9 +20,7 @@ pub(crate) enum Operation {
         schema_id: u64,
     },
     /// An existing schema's tags changed. Mints a snapshot and bumps the
-    /// schema version, but feeds no change-set entry: DuckLake's
-    /// `changes_made` grammar has no schema-alter kind, and a concurrent
-    /// drop of the schema is caught by the closure re-run instead.
+    /// schema version, but feeds no change-set entry.
     AlterSchema {
         /// The mutated schema's id.
         schema_id: u64,
@@ -47,24 +42,19 @@ pub(crate) enum Operation {
         table_id: u64,
     },
     /// A table's sort spec was set, changed, or cleared. Classifies as an
-    /// alter — it races a concurrent drop or another spec change — but is
-    /// not schema-changing: DuckLake marks the table altered without
-    /// bumping the schema version, a sort spec never invalidating a
-    /// cross-file compaction.
+    /// alter but is not schema-changing.
     AlterTableSorting {
         /// The re-sorted table's id.
         table_id: u64,
     },
     /// An intermediate staged index-build cursor advance. Classifies as an
-    /// insert so concurrent appends can land, while deletes, alters, and
-    /// drops retain the build protocol's conflict fence.
+    /// insert.
     AdvanceIndexBuild {
         /// The table whose index build advanced.
         table_id: u64,
     },
-    /// A deferred repair published complete coverage. Classifies as an alter
-    /// so a racing writer cannot leave the index ready without its additions,
-    /// but does not change the table schema.
+    /// A deferred repair published complete coverage. Classifies as an
+    /// alter but is not schema-changing.
     FinishIndexMaintenance {
         /// The table whose repaired index became ready.
         table_id: u64,
@@ -83,9 +73,7 @@ pub(crate) enum Operation {
     RegisterDeleteFile {
         /// The table delete markers were appended to.
         table_id: u64,
-        /// The data file whose rows they remove. Carried so two concurrent
-        /// deletes of one table conflict only when they touch the same
-        /// file, which is the grain DuckLake checks deletes at.
+        /// The data file whose rows they remove.
         data_file_id: u64,
     },
     /// Data file(s) became eligible for garbage collection via merge.
@@ -100,9 +88,7 @@ pub(crate) enum Operation {
     },
     /// Table statistics were updated.
     UpdateStats {
-        /// The table whose statistics changed. Exists so a stats-only
-        /// commit mints a snapshot; feeds no change-set entry and no
-        /// conflict detection.
+        /// The table whose statistics changed.
         table_id: u64,
     },
     /// A view was created.
@@ -146,22 +132,17 @@ pub(crate) enum Operation {
         /// `"scalar"` or `"table"` — selects the change-set entry kind.
         macro_type: String,
     },
-    /// Rows were inlined into a table. Classifies as an append, exactly as
-    /// a data-file registration does — DuckLake's inlined inserts carry
-    /// `inserted_into_table` too.
+    /// Rows were inlined into a table. Classifies as an append.
     InlineInsert {
         /// The table rows were inlined into.
         table_id: u64,
     },
-    /// Inlined rows were tombstoned. Classifies as a delete, like a delete
-    /// file.
+    /// Inlined rows were tombstoned. Classifies as a delete.
     InlineDelete {
         /// The table rows were tombstoned in.
         table_id: u64,
     },
-    /// Inlined rows were drained to a data file. Classifies as compaction:
-    /// it rewrites rows that already exist rather than adding any, so it
-    /// races a concurrent delete or drop but not a concurrent append.
+    /// Inlined rows were drained to a data file. Classifies as compaction.
     FlushInlinedData {
         /// The table whose inlined rows were drained.
         table_id: u64,
@@ -169,8 +150,8 @@ pub(crate) enum Operation {
 }
 
 impl Operation {
-    /// Whether this op changes the catalog's shape (and bumps the schema
-    /// version). Explicit per op — never inferred from the write set.
+    /// Whether this op changes the catalog's shape and bumps the schema
+    /// version.
     pub(crate) fn is_schema_changing(&self) -> bool {
         match self {
             Operation::CreateSchema { .. }
@@ -198,9 +179,8 @@ impl Operation {
         }
     }
 
-    /// The table or view whose shape this op changes, if any — the ids a
-    /// snapshot records as its `ducklake_schema_versions` rows. Tables and
-    /// views share the catalog id space; drops mint no new shape.
+    /// The table or view whose shape this op changes, if any: the ids a
+    /// snapshot records as its `ducklake_schema_versions` rows.
     pub(crate) fn schema_changed_table_id(&self) -> Option<u64> {
         match self {
             Operation::CreateTable { table_id, .. } | Operation::AlterTable { table_id } => {
@@ -209,8 +189,6 @@ impl Operation {
             Operation::CreateView { view_id, .. } | Operation::AlterView { view_id } => {
                 Some(*view_id)
             }
-            // Macros carry no per-table schema version: DuckLake writes no
-            // `ducklake_schema_versions` row for macro DDL.
             Operation::CreateSchema { .. }
             | Operation::DropSchema { .. }
             | Operation::AlterSchema { .. }
@@ -233,8 +211,7 @@ impl Operation {
     }
 }
 
-/// Wraps `s` in double quotes, doubling any embedded quote — the SQL
-/// identifier quoting rule for names in `changes_made`.
+/// Wraps `s` in double quotes, doubling any embedded quote.
 fn quote_ident(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -312,40 +289,34 @@ fn split_entries(changes_made: &str) -> Vec<&str> {
 
 /// What one commit touched, comparable against another commit's set.
 /// Serialized into the snapshot record's `changes_made` field in
-/// DuckLake's own wire grammar: comma-joined `kind:payload` entries,
-/// created entries carrying SQL-quoted names and all other entries
-/// carrying numeric ids, e.g.
-/// `dropped_schema:5,dropped_table:4,created_schema:"s1",created_table:"s1"."
-/// orders",altered_table:3`.
+/// DuckLake's wire grammar: comma-joined `kind:payload` entries, created
+/// entries carrying SQL-quoted names and all others numeric ids, e.g.
+/// `dropped_schema:5,created_schema:"s1",created_table:"s1"."orders",
+/// altered_table:3`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ChangeSet {
     /// Names of schemas created by this commit, unquoted.
     pub(crate) created_schemas: BTreeSet<String>,
     pub(crate) dropped_schemas: BTreeSet<u64>,
-    /// `(schema name, table name)` pairs, unquoted — the grammar carries
-    /// names, not ids, for created entries.
+    /// `(schema name, table name)` pairs, unquoted.
     pub(crate) created_tables: BTreeSet<(String, String)>,
     /// Schema ids a table was created in. Populated only by
-    /// [`Self::from_ops`] (the wire grammar has no ids for created
-    /// entries); feeds the create-inside-dropped-schema check for our own
-    /// side only — the other direction re-validates on retry.
+    /// [`Self::from_operations`]; the wire grammar carries no ids for
+    /// created entries.
     pub(crate) created_table_schema_ids: BTreeSet<u64>,
     pub(crate) altered_tables: BTreeSet<u64>,
     pub(crate) dropped_tables: BTreeSet<u64>,
-    /// `(schema name, view name)` pairs, unquoted — the view twin of
-    /// [`Self::created_tables`].
+    /// `(schema name, view name)` pairs, unquoted.
     pub(crate) created_views: BTreeSet<(String, String)>,
-    /// Schema ids a view was created in — the view twin of
+    /// Schema ids a view was created in; as
     /// [`Self::created_table_schema_ids`].
     pub(crate) created_view_schema_ids: BTreeSet<u64>,
     pub(crate) altered_views: BTreeSet<u64>,
     pub(crate) dropped_views: BTreeSet<u64>,
-    /// `(schema name, macro name)` pairs, unquoted — one set per macro
-    /// type because the wire grammar distinguishes them.
+    /// `(schema name, macro name)` pairs, unquoted.
     pub(crate) created_scalar_macros: BTreeSet<(String, String)>,
-    /// The table-macro twin of [`Self::created_scalar_macros`].
     pub(crate) created_table_macros: BTreeSet<(String, String)>,
-    /// Schema ids a macro was created in — the macro twin of
+    /// Schema ids a macro was created in; as
     /// [`Self::created_table_schema_ids`].
     pub(crate) created_macro_schema_ids: BTreeSet<u64>,
     pub(crate) dropped_scalar_macros: BTreeSet<u64>,
@@ -354,27 +325,22 @@ pub(crate) struct ChangeSet {
     pub(crate) inserted_tables: BTreeSet<u64>,
     /// Tables delete markers were appended to.
     pub(crate) deleted_from_tables: BTreeSet<u64>,
-    /// The data files those delete markers target. Ids are global, so a
-    /// shared id *is* a shared file and no table key is needed to compare
-    /// two commits.
+    /// The data files those delete markers target; ids are global.
     pub(crate) deleted_data_file_ids: BTreeSet<u64>,
     /// Set when this commit deletes without naming the file it deletes
-    /// from: an inlined delete names a row, and a change set parsed from
-    /// DuckLake's grammar carries table ids only. Either way the file set
-    /// above is incomplete, so delete-delete falls back to table grain.
+    /// from (an inlined delete, or a set parsed from the wire grammar), so
+    /// delete-delete falls back to table grain.
     pub(crate) deletes_untargeted_files: bool,
     /// Tables whose data files were merged away.
     pub(crate) merge_adjacent_tables: BTreeSet<u64>,
     /// Tables whose delete files were rewritten away.
     pub(crate) rewrite_delete_tables: BTreeSet<u64>,
-    /// Parse-only legacy `compacted_table` kind; never emitted,
-    /// classifies as compaction.
+    /// Parse-only legacy `compacted_table` kind; classifies as compaction.
     pub(crate) compacted_tables: BTreeSet<u64>,
-    /// Parse-only DuckLake inline-flush kind. Moving inline rows and their
-    /// tombstones into files preserves every row id and indexed value.
+    /// Parse-only DuckLake inline-flush kind.
     pub(crate) inline_flush_tables: BTreeSet<u64>,
-    /// Set when parsing met a kind or payload this binary does not
-    /// model. Unknown changes classify as conflicting, never benign.
+    /// Set when parsing met a kind or payload this binary does not model;
+    /// classifies as conflicting.
     pub(crate) has_unknown: bool,
 }
 
@@ -407,10 +373,6 @@ impl ChangeSet {
                 Operation::DropTable { table_id } => {
                     set.dropped_tables.insert(*table_id);
                 }
-                // An inlined insert and an intermediate index step both
-                // classify as appends. A concurrent append cannot invalidate
-                // the step's already-derived entries, while a delete still
-                // conflicts through the ordinary table matrix.
                 Operation::RegisterDataFile { table_id }
                 | Operation::InlineInsert { table_id }
                 | Operation::AdvanceIndexBuild { table_id } => {
@@ -423,8 +385,7 @@ impl ChangeSet {
                     set.deleted_from_tables.insert(*table_id);
                     set.deleted_data_file_ids.insert(*data_file_id);
                 }
-                // An inlined delete names a row, not a file, so it has no
-                // file grain to be refined at.
+                // An inlined delete names a row, not a file.
                 Operation::InlineDelete { table_id } => {
                     set.deleted_from_tables.insert(*table_id);
                     set.deletes_untargeted_files = true;
@@ -436,9 +397,8 @@ impl ChangeSet {
                 Operation::ExpireDeleteFile { table_id } => {
                     set.rewrite_delete_tables.insert(*table_id);
                 }
-                // Neither populates a set: each exists so its commit is
-                // non-empty and mints a snapshot. A schema alteration has no
-                // kind in the wire grammar at all.
+                // Neither has a change-set kind; each exists so its commit
+                // mints a snapshot.
                 Operation::UpdateStats { .. } | Operation::AlterSchema { .. } => {}
                 Operation::CreateView {
                     schema_id,
@@ -486,12 +446,7 @@ impl ChangeSet {
         set
     }
 
-    /// Emits entries in DuckLake's writer order (the subset moraine
-    /// emits): dropped schemas, dropped tables, dropped views, created
-    /// schemas, created tables, created views, created scalar/table
-    /// macros, dropped scalar/table macros, `inserted_into_table`,
-    /// `deleted_from_table`, altered tables, altered views,
-    /// `merge_adjacent`, `rewrite_delete`.
+    /// Emits entries in DuckLake's writer order.
     pub(crate) fn to_changes_made(&self) -> String {
         fn ids(entries: &mut Vec<String>, kind: &str, set: &BTreeSet<u64>) {
             entries.extend(set.iter().map(|id| format!("{kind}:{id}")));
@@ -577,10 +532,8 @@ impl ChangeSet {
                 "dropped_scalar_macro" => id(&mut set.dropped_scalar_macros),
                 "dropped_table_macro" => id(&mut set.dropped_table_macros),
                 "inserted_into_table" => id(&mut set.inserted_tables),
-                // The grammar names the table, never the files, so a
-                // parsed delete is untargeted by construction. A caller
-                // that has the file ids elsewhere — the committer, from
-                // the snapshot record — supplies them after parsing.
+                // The grammar names the table, never the files; the caller
+                // may supply file ids after parsing.
                 "deleted_from_table" => {
                     set.deletes_untargeted_files = true;
                     id(&mut set.deleted_from_tables)
@@ -605,19 +558,11 @@ impl ChangeSet {
         *self == Self::default()
     }
 
-    /// The tables this commit compacts, when compaction is *all* it does.
-    /// DuckLake refuses to mix compaction with any other change in one
-    /// transaction, so such a commit only re-homes rows: every row it
-    /// re-registers keeps the id and the values it already had.
-    ///
-    /// Empty when the set carries anything else, including a kind this
-    /// binary does not model. The caller's fallback is to do the work it
-    /// would otherwise skip, so an unrecognized change must never widen
-    /// this set.
+    /// The tables this commit compacts, when compaction is all it does:
+    /// such a commit only re-homes rows. Empty when the set carries
+    /// anything else, including a kind this binary does not model.
     pub(crate) fn compaction_only_tables(&self) -> BTreeSet<u64> {
-        // Taken out of a clone rather than read in place: whatever remains
-        // must equal the default, so a change kind added later is counted
-        // by construction instead of by remembering to list it here.
+        // Taken out of a clone so whatever remains must equal the default.
         let mut rest = self.clone();
         let compacted: BTreeSet<u64> = std::mem::take(&mut rest.merge_adjacent_tables)
             .into_iter()
@@ -634,8 +579,6 @@ impl ChangeSet {
             rest.deletes_untargeted_files = false;
             compacted.into_iter().chain(inline_flushed).collect()
         } else {
-            // Keep the flush visible in `rest`: a flush mixed with an
-            // unrelated delete is not safe to classify as re-homing only.
             rest.inline_flush_tables = inline_flushed;
             compacted
         };
@@ -671,15 +614,13 @@ impl ChangeSet {
         for &table_id in self.dropped_tables.iter().chain(self.dropped_views.iter()) {
             kinds.entry(table_id).or_default().dropped = true;
         }
-        let compacted: BTreeSet<u64> = self
+        for &table_id in self
             .merge_adjacent_tables
             .iter()
             .chain(self.rewrite_delete_tables.iter())
             .chain(self.compacted_tables.iter())
             .chain(self.inline_flush_tables.iter())
-            .copied()
-            .collect();
-        for &table_id in &compacted {
+        {
             kinds.entry(table_id).or_default().compacted = true;
         }
 
@@ -698,9 +639,7 @@ struct TableKinds {
 }
 
 /// DuckLake's per-table conflict matrix, symmetric closure.
-///
-/// Delete-versus-delete is deliberately absent: it is the one pair DuckLake
-/// checks below table grain, and [`delete_delete_conflicts`] decides it.
+/// Delete-versus-delete is decided by [`delete_delete_conflicts`].
 fn kinds_conflict(a: TableKinds, b: TableKinds) -> bool {
     let one_way = |x: TableKinds, y: TableKinds| {
         (x.inserted && (y.altered || y.deleted || y.dropped))
@@ -712,19 +651,8 @@ fn kinds_conflict(a: TableKinds, b: TableKinds) -> bool {
     one_way(a, b) || one_way(b, a)
 }
 
-/// Whether two concurrent deletes of one table conflict.
-///
-/// DuckLake checks this pair at `data_file_id` grain rather than table
-/// grain — two transactions deleting from the same table clash only if they
-/// deleted from the same **file** — and moraine matches it: one live delete
-/// file per data file, so two commits targeting disjoint files write
-/// disjoint records and neither invalidates the other's premise.
-///
-/// A side that deleted without naming a file falls back to table grain,
-/// which is where every DuckLake-authored commit lands: its grammar carries
-/// the table and not the file, so it is treated as deleting from all of
-/// them. Stricter is always safe here; looser would let two rewrites of one
-/// file both land.
+/// Whether two concurrent deletes of one table conflict: at data-file
+/// grain when both sides name their files, else at table grain.
 fn delete_delete_conflicts(ours: &ChangeSet, theirs: &ChangeSet) -> bool {
     ours.deletes_untargeted_files
         || theirs.deletes_untargeted_files
@@ -733,13 +661,10 @@ fn delete_delete_conflicts(ours: &ChangeSet, theirs: &ChangeSet) -> bool {
             .is_disjoint(&theirs.deleted_data_file_ids)
 }
 
-/// Whether two concurrent commits are a true conflict. Symmetric.
-///
-/// Benign unless: either side has unknown changes; both touch the schema
-/// list (coarse by design); a common table has incompatible kinds, or has
-/// deletes on both sides that meet on a file; or one created a table inside
-/// a schema the other dropped. Name uniqueness is re-validated by the
-/// closure re-run, not by set comparison.
+/// Whether two concurrent commits are a true conflict. Symmetric. Benign
+/// unless: either side has unknown changes; both touch the schema list; a
+/// common table has incompatible kinds, or deletes on both sides that meet
+/// on a file; or one created a relation inside a schema the other dropped.
 pub(crate) fn conflicts(ours: &ChangeSet, theirs: &ChangeSet) -> bool {
     if ours.has_unknown || theirs.has_unknown {
         return true;

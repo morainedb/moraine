@@ -41,9 +41,11 @@ pub(crate) async fn record(catalog: &Catalog, pass: MaintenanceStatusPass) -> Re
         }
 
         let tx = catalog.begin_write_tx().await?;
-        let mut status = read::read_maintenance_status(ReadHandle::Tx(&tx))
-            .await?
-            .unwrap_or_default();
+        let (status, stamp) = futures::try_join!(
+            read::read_maintenance_status(ReadHandle::Tx(&tx)),
+            commit::format_stamp_to(&tx, FORMAT_WITH_MAINTENANCE_STATUS),
+        )?;
+        let mut status = status.unwrap_or_default();
         status.passes.push(encoded.clone());
         if status.passes.len() > RETAINED_PASSES {
             let remove = status.passes.len() - RETAINED_PASSES;
@@ -54,9 +56,7 @@ pub(crate) async fn record(catalog: &Catalog, pass: MaintenanceStatusPass) -> Re
             Key::Sys(SysKey::MaintenanceStatus).encode(),
             Some(value::encode_value(&status)),
         )];
-        if let Some(stamp) = commit::format_stamp_to(&tx, FORMAT_WITH_MAINTENANCE_STATUS).await? {
-            writes.push(stamp);
-        }
+        writes.extend(stamp);
         let staged = commit::stage_writes(&tx, &writes)?;
 
         match commit::commit_durable(tx, "maintenance status", staged).await {

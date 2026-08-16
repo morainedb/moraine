@@ -1,10 +1,7 @@
 //! Index entry maintenance: turning writer-supplied entries into staged
-//! `index` writes, with commit-time uniqueness enforcement.
-//!
-//! Entries ride the same batch as the commit that owns them. A unique
-//! entry's store key *is* the value, so staging its put arms SlateDB's
-//! write-write detection: two commits inserting the same value collide
-//! mechanically, and the loser re-runs and sees the winner's entry.
+//! `index` writes, with commit-time uniqueness enforcement. A unique
+//! entry's store key is the value, so two commits inserting the same value
+//! collide on write-write detection.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -37,16 +34,16 @@ use crate::{
 pub(crate) struct StagedIndexEntry {
     /// The index this entry belongs to.
     pub(crate) index_id: u64,
-    /// Whether the index is unique — selects the key shape and enforcement.
+    /// Whether the index is unique.
     pub(crate) unique: bool,
     /// The final encoded SlateDB entry key.
     pub(crate) key: Bytes,
     /// The row the entry points at.
     pub(crate) row_id: u64,
-    /// Whether this removes the entry (`true`) or adds it (`false`).
+    /// Whether this removes the entry rather than adds it.
     pub(crate) delete: bool,
-    /// Whether the index is still building, so a collision poisons it
-    /// instead of failing this commit.
+    /// Whether the index is still building; a collision then poisons it
+    /// instead of failing the commit.
     pub(crate) building: bool,
 }
 
@@ -61,32 +58,16 @@ fn decode_row_id(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(array))
 }
 
-/// How many uniqueness probes are in flight at once. Each probe is an
-/// independent point read, so running them one after another makes a batch
-/// cost one store round-trip of latency *per entry*. This covers an ordinary
-/// several-hundred-row flush in one window while keeping a bulk load bounded.
-const UNIQUENESS_PROBE_CONCURRENCY: usize = 512;
+/// Uniqueness probes in flight at once; sized for a remote object store.
+const UNIQUENESS_PROBE_CONCURRENCY: usize = 1024;
 
 /// Additions derived while the deletion phase is still draining. Once full,
 /// backpressure pauses addition sources without holding up deletion staging.
 const ADDITION_PREFETCH: usize = 512;
 
-/// The most entries one commit may stage.
-///
-/// Every staged key costs roughly a kilobyte of memory in the store's write
-/// path — measured, and almost none of it moraine's: the write batch, the
-/// WAL buffer's copy, the memtable's skiplist node, and the transaction's
-/// write-key set each hold their own. That is inherent to putting a key in a
-/// batch, so a commit's footprint is set by how many entries it stages and
-/// cannot be optimized away here.
-///
-/// A bulk load stages one entry per indexed row per index, so an unbounded
-/// load asks for memory proportional to the whole table — tens of gigabytes
-/// at tens of millions of rows. Past that the process does not fail, it
-/// thrashes: swapping, no progress, no error. Refusing up front turns that
-/// into an immediate, actionable message.
-///
-/// At roughly a kilobyte apiece this admits commits needing about 8 GiB.
+/// The most entries one commit may stage. Each staged key costs roughly a
+/// kilobyte in the store's write path, so this admits commits needing
+/// about 8 GiB.
 const MAX_INDEX_ENTRIES_PER_COMMIT: usize = 8_000_000;
 
 /// What staging a batch's entries produced: the indexes a collision
@@ -100,12 +81,10 @@ pub(crate) struct StagedEntries {
     pub(crate) bytes: u64,
     /// Whether this batch wrote the inline chunk row-range directory.
     pub(crate) uses_inline_chunk_directory: bool,
-    /// Work inside index upkeep. Its wall-clock fields overlap by design.
     pub(crate) metrics: IndexMaintenanceMetrics,
 }
 
-/// Per-commit equality-index work. Derivation and probe windows overlap, so
-/// these durations describe phases rather than an additive decomposition.
+/// Per-commit equality-index work. Derivation and probe windows overlap.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct IndexMaintenanceMetrics {
     pub(crate) deletion_derivation: Duration,
@@ -131,8 +110,7 @@ struct PendingProbe {
     row_id: u64,
     /// The index the claim belongs to.
     index_id: u64,
-    /// Whether that index is still building, so a collision poisons it
-    /// rather than failing this commit.
+    /// Whether that index is still building.
     building: bool,
 }
 
@@ -276,20 +254,16 @@ fn stage_probe_put(
 }
 
 /// Resolves accumulated entries onto `db_tx`, enforcing uniqueness at
-/// commit. Deletes are staged first so a delete-then-reinsert of one unique
-/// value within a commit sees the value as absent. For each unique put:
-/// present with a **different** row id → [`Error::Constraint`]; present with
-/// the **same** row id → no-op (a re-derived entry); absent → staged.
-/// Duplicates within the commit are caught in memory.
+/// commit. Deletes are staged first. For each unique put: present with a
+/// different row id → [`Error::Constraint`]; present with the same row id
+/// → no-op; absent → staged. Duplicates within the commit are caught in
+/// memory.
 pub(crate) async fn stage_index_entries(
     db_tx: &DbTransaction,
     entries: Vec<StagedIndexEntry>,
 ) -> Result<StagedEntries> {
     let entry_count = entries.len();
     if entry_count > MAX_INDEX_ENTRIES_PER_COMMIT {
-        // Logged as well as returned: the refusal is the guardrail firing,
-        // and an operator reading logs after a failed bulk load should see
-        // it without having to recover the SQL error text.
         warn!(
             staged = entry_count,
             limit = MAX_INDEX_ENTRIES_PER_COMMIT,
@@ -305,9 +279,8 @@ pub(crate) async fn stage_index_entries(
 }
 
 /// Consumes deletion entries, then additions, as streams. Unique probes form
-/// one continuously replenished window across every derived source group.
-/// Successful reads stage in completion order, and the first fatal result
-/// aborts the transaction without waiting for slower probes.
+/// one continuously replenished window; successful reads stage in
+/// completion order, and the first fatal result aborts.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn stage_index_entry_stream<D, S>(
     db_tx: &DbTransaction,
@@ -492,21 +465,22 @@ where
 }
 
 /// Records `poisoned` on the working state's definitions, so the commit's
-/// ordinary entity diff stages the flag. It is terminal: a poisoned build
-/// never flips ready, and its driver ends the definition.
+/// ordinary entity diff stages the flag. Poisoning is terminal.
 pub(crate) fn apply_poison(state: &mut crate::catalog::CatalogSnapshot, poisoned: &[u64]) {
-    for index_id in poisoned {
-        for per_table in state.indexes.values_mut() {
-            if let Some(value) = per_table.get_mut(index_id) {
-                value.poisoned = Some(true);
-            }
+    let poisoned: HashSet<&u64> = poisoned.iter().collect();
+    for value in state
+        .indexes
+        .values_mut()
+        .flat_map(|per_table| per_table.values_mut())
+    {
+        if poisoned.contains(&value.index_id) {
+            value.poisoned = Some(true);
         }
     }
 }
 
 /// Marks ready deferred definitions as awaiting repair. A definition already
-/// being repaired keeps its cursor: newly registered files have greater ids,
-/// so the existing source watermark will still reach them.
+/// being repaired keeps its cursor.
 pub(crate) fn apply_deferred_maintenance(
     base: &crate::catalog::CatalogSnapshot,
     state: &mut crate::catalog::CatalogSnapshot,
@@ -530,9 +504,8 @@ pub(crate) fn apply_deferred_maintenance(
                     .data_files
                     .get(table_id)
                     .and_then(|files| files.values().max_by_key(|file| file.data_file_id));
-                // File ids begin above zero. The zero sentinel means the
-                // old snapshot held no files, while still selecting the
-                // physical source-cursor resume path.
+                // File ids begin above zero: zero means the old snapshot held
+                // no files.
                 value.build_cursor_file = Some(tail.map_or(0, |file| file.data_file_id));
                 value.build_cursor_position =
                     Some(tail.map_or(0, |file| file.record_count.saturating_sub(1)));
@@ -542,15 +515,10 @@ pub(crate) fn apply_deferred_maintenance(
 }
 
 /// The refusal for a commit staging more entries than
-/// [`MAX_INDEX_ENTRIES_PER_COMMIT`]. Names the count, the limit, and the
-/// remedy, because the caller's only fix is to commit less at a time.
-///
-/// Like the uniqueness rejection, the text avoids DuckLake's four retry
-/// substrings: this is terminal, and re-running it would only spend the
-/// caller's retry budget arriving at the same answer more slowly.
+/// [`MAX_INDEX_ENTRIES_PER_COMMIT`]. The text must avoid DuckLake's retry
+/// substrings (`conflict`, `concurrent`, `unique`, `primary key`).
 fn oversized_commit(staged: usize) -> Error {
-    // A kilobyte apiece, rounded to the nearest GiB — an order-of-magnitude
-    // figure for the reader, so integer arithmetic is precise enough.
+    // A kilobyte apiece, rounded to the nearest GiB.
     let gib = (staged + 512 * 1024) / (1024 * 1024);
     Error::Constraint(format!(
         "commit stages {staged} equality-index entries, above the \
@@ -560,9 +528,8 @@ fn oversized_commit(staged: usize) -> Error {
     ))
 }
 
-/// A uniqueness error. The text is free of DuckLake's four retry substrings
-/// (`conflict`, `concurrent`, `unique`, `primary key`) so a rejected bulk
-/// INSERT surfaces at once instead of spinning DuckLake's commit loop.
+/// A uniqueness error. The text must avoid DuckLake's retry substrings
+/// (`conflict`, `concurrent`, `unique`, `primary key`).
 fn unique_violation(index_id: u64) -> Error {
     Error::Constraint(format!(
         "duplicate value violates equality index {index_id}"
@@ -570,9 +537,7 @@ fn unique_violation(index_id: u64) -> Error {
 }
 
 /// Deletes up to `limit` orphaned entries of one dropped index inside an
-/// open transaction, returning how many deletes were staged. An index is
-/// exclusively one kind, so only one prefix holds entries; scanning both
-/// is harmless.
+/// open transaction, returning how many deletes were staged.
 pub(crate) async fn reclaim_entries(
     tx: &slatedb::DbTransaction,
     index_id: u64,
@@ -614,26 +579,42 @@ pub(crate) async fn reclaim_entries_from(
         .scan_prefix(prefix, suffix.., ScanShape::Bulk)
         .await?;
     let mut deleted = 0;
-    let mut last = None;
+    let mut last: Option<Bytes> = None;
     while deleted < limit {
         match iter.next().await? {
             Some(entry) => {
-                let key = entry.key.to_vec();
-                staged.add(key.len(), 0);
+                staged.add(entry.key.len(), 0);
+                last = Some(entry.key.clone());
                 tx.delete(entry.key)?;
                 deleted += 1;
-                last = Some(key);
             }
             None => break,
         }
     }
 
-    Ok((deleted, last))
+    Ok((deleted, last.map(|key| key.to_vec())))
+}
+
+/// Drains a scan over `multi` entries into their row ids, which live in
+/// the key. `context` names the scan in a corruption error.
+async fn collect_multi_row_ids(iter: &mut slatedb::DbIterator, context: &str) -> Result<Vec<u64>> {
+    let mut row_ids = Vec::new();
+    while let Some(entry) = iter.next().await.map_err(Error::from)? {
+        match Key::decode(&entry.key)? {
+            Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
+            other => {
+                return Err(Error::Corruption(format!(
+                    "non-multi key in {context}: {other:?}"
+                )));
+            }
+        }
+    }
+
+    Ok(row_ids)
 }
 
 /// The row ids holding one indexed value: a point-get for a unique index,
-/// an ascending prefix scan for a non-unique one. The non-unique row id
-/// lives in the entry key, so each scanned key is decoded to recover it.
+/// an ascending prefix scan for a non-unique one.
 pub(crate) async fn lookup_row_ids(
     reader: ReadHandle<'_>,
     index_id: u64,
@@ -654,27 +635,12 @@ pub(crate) async fn lookup_row_ids(
         .await
         .map_err(Error::from)?;
 
-    let mut row_ids = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
-            Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-multi key in index scan: {other:?}"
-                )));
-            }
-        }
-    }
-
-    Ok(row_ids)
+    collect_multi_row_ids(&mut iter, "index scan").await
 }
 
 /// The row ids whose indexed value falls between `lower` and `upper`, in the
-/// requested scan order. Ordered encoding makes byte order equal the index's
-/// declared value order, so the query is a bounded sub-scan of its contiguous
-/// range; descending iteration serves the exact opposite. The bounds are the
-/// canonical values, already encoded in the columns' declared directions. A
-/// unique entry carries its row id in the value, a non-unique one in the key.
+/// requested scan order. The bounds are canonical values, already encoded
+/// in the columns' declared directions.
 pub(crate) async fn range_row_ids(
     reader: ReadHandle<'_>,
     index_id: u64,
@@ -694,10 +660,8 @@ pub(crate) async fn range_row_ids(
     let suffix = |canon: &CanonicalKey| index_value_suffix(kind, index_id, canon);
     let above = |canon: &CanonicalKey| index_value_above(kind, index_id, canon);
 
-    // A comparison never matches a NULL, and a non-unique index stores
-    // NULL-bearing entries beside valued ones. An open side stops at the
-    // leading column's non-null region; a bound value is non-null, so a
-    // closed side is already inside it.
+    // A comparison never matches a NULL, so an open side stops at the
+    // leading column's non-null region.
     let non_null = non_null_flag_key(leading_nulls);
     let past_non_null = above(&non_null).map_or(Bound::Unbounded, Bound::Excluded);
 
@@ -724,31 +688,21 @@ pub(crate) async fn range_row_ids(
         .scan_prefix_ordered(prefix, (start, end), ScanShape::Probe, order)
         .await
         .map_err(Error::from)?;
+    if !unique {
+        return collect_multi_row_ids(&mut iter, "index range scan").await;
+    }
     let mut row_ids = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        if unique {
-            row_ids.push(decode_row_id(entry.value.as_ref())?);
-        } else {
-            match Key::decode(&entry.key)? {
-                Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
-                other => {
-                    return Err(Error::Corruption(format!(
-                        "non-multi key in index range scan: {other:?}"
-                    )));
-                }
-            }
-        }
+        row_ids.push(decode_row_id(entry.value.as_ref())?);
     }
 
     Ok(row_ids)
 }
 
-/// The row ids of live rows whose leading indexed columns match `prefix` — a
-/// canonical key over a leading run of `= value` and `IS NULL` predicates.
-/// A row with any NULL indexed column is stored multi-shaped, so `IS NULL`
-/// queries scan the `multi` subrange; the value framing's terminator is
-/// dropped from the scan prefix so it matches every key that extends the run.
-/// The iterator emits the stored or exact-opposite order directly.
+/// The row ids whose leading indexed columns match `prefix`, a canonical
+/// key over a leading run of `= value` and `IS NULL` predicates. A row with
+/// any NULL indexed column is stored multi-shaped, so the `multi` subrange
+/// is scanned.
 pub(crate) async fn null_prefix_row_ids(
     reader: ReadHandle<'_>,
     index_id: u64,
@@ -756,27 +710,16 @@ pub(crate) async fn null_prefix_row_ids(
     order: ScanOrder,
 ) -> Result<Vec<u64>> {
     let mut scan_prefix = index_multi_value_prefix(index_id, prefix);
-    // `index_multi_value_prefix` frames the value and appends a terminator for an
-    // exact-value scan; dropping it turns the bytes into a true leading prefix.
+    // Dropping the exact-value terminator turns the bytes into a true
+    // leading prefix.
     scan_prefix.pop();
 
     let mut iter = reader
         .scan_prefix_ordered(scan_prefix, .., ScanShape::Probe, order)
         .await
         .map_err(Error::from)?;
-    let mut row_ids = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
-            Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-multi key in null-prefix scan: {other:?}"
-                )));
-            }
-        }
-    }
 
-    Ok(row_ids)
+    collect_multi_row_ids(&mut iter, "null-prefix scan").await
 }
 
 #[cfg(test)]

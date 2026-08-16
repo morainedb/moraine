@@ -844,12 +844,32 @@ block-grained), with every read path naming one. Foyer's admission picker
 repeats the rule at the disk device, so scan and compaction churn cannot
 wear it or evict the probe set.
 
-Bulk and probe scans use fixed 4 MiB read-ahead with eight fetches in flight.
+Bulk and probe scans use fixed 8 MiB read-ahead with 32 fetches in flight,
+sized for a remote object store.
 These are implementation constants, not attach policy: they remove the
 measured sequential-round-trip failure, while no local/S3 ladder demonstrates
 that per-attach tuning improves a supported workload. A different value needs
 that measurement and changes the implementation choice directly rather than
 adding speculative options.
+
+A SlateDB iterator is one sequential cursor however much it prefetches, so
+the whole-subspace scans that materialize a view (`current`, and `history`
+for time travel), the per-kind scans a staged transaction's metadata reads
+issue, and a preload's deep walks split a large kind into concurrent
+sub-ranges, eight in flight (`SCAN_SPLIT`, sized like the read-ahead for a
+remote store). Only the kinds whose record counts scale with the data can
+split — columns, data files, delete files, file column stats, table column
+stats; schema-scaled kinds and the `sys`/`snapshot`/changelog subspaces
+stay one iterator. The split is adaptive: the scan walks as one iterator
+until a split kind has streamed one read-ahead's worth of bytes (the span
+one round trip covers), then seeks that kind's highest key, divides the id
+bytes between the last key seen and it evenly — so ids clustered near zero
+still split where the records are — reads the remainder as concurrent
+sub-ranges, and resumes the walk past the kind. A catalog that fits one
+read-ahead therefore costs exactly one iterator, as before. A split scan
+yields the same records in the same key order as one iterator would
+(sub-ranges are concatenated in range order, never in completion order)
+and counts as one scan in the handle's tallies.
 
 The attach options keep their surface (RFC 0006) and change machinery:
 
@@ -878,6 +898,21 @@ The attach options keep their surface (RFC 0006) and change machinery:
   it stays one fetch per probed block behind the filters just warmed. The
   attach contract holds: warm inside the open, caps govern, a shortfall
   is warned with both numbers, a failure is skipped rather than fatal.
+- **Per-table warm on first touch.** The `index` and `inline` subspaces
+  scale with the data, so their warm is per table and lazy: the first
+  index lookup, range, NULL probe, or inline-row read a handle serves for
+  a table runs a warm joined with that read, so the burst overlaps it and
+  no task outlives the call: it reads, in probe shape, the first entry of
+  each of that table's index ranges (`index/<kind>/<index id>`) and inline
+  ranges (`inline/<table id>` per operation kind, its schemas and
+  chunk-range locators), admitting the SST metadata and first block a
+  probe there would fetch — one burst rather than a round trip per probe.
+  A handle warms each table once (`warmed_tables`, which an explicit
+  `warm_tables` also marks); a warm that fails is logged at trace level and
+  never surfaces. `ReadOnlyCatalog::warm_tables`
+  is the same pass on demand, and the extension runs it after a commit for
+  the tables the commit wrote data files against, alongside the row-summary
+  warm.
 
 **Hit rates before tuning.** The tiers report: hits and misses per slot,
 process-wide through `moraine_cache_tally()` and per attach through

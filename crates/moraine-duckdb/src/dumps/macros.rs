@@ -33,12 +33,10 @@ pub struct MoraineMacroRow {
 pub(crate) fn macro_rows(
     rows: Vec<moraine::ffi_support::MacroRecord>,
 ) -> Result<Vec<MoraineMacroRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|m| {
-            let macro_name = to_c_string(&m.macro_name)?;
+        .map(|mut m| {
+            let macro_name = to_c_string(std::mem::take(&mut m.macro_name))?;
             Ok((m, macro_name))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -87,7 +85,7 @@ pub unsafe extern "C" fn moraine_dump_macros(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_macros(catalog)),
+            moraine::ffi_support::dump_macros,
             macro_rows,
         )
     }
@@ -131,14 +129,12 @@ pub struct MoraineMacroImplRow {
 pub(crate) fn macro_impl_rows(
     rows: Vec<moraine::ffi_support::MacroImplRow>,
 ) -> Result<Vec<MoraineMacroImplRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|row| {
-            let dialect = to_c_string(&row.dialect)?;
-            let sql = to_c_string(&row.sql)?;
-            let macro_type = to_c_string(&row.macro_type)?;
+        .map(|mut row| {
+            let dialect = to_c_string(std::mem::take(&mut row.dialect))?;
+            let sql = to_c_string(std::mem::take(&mut row.sql))?;
+            let macro_type = to_c_string(std::mem::take(&mut row.macro_type))?;
             Ok((row, dialect, sql, macro_type))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -185,7 +181,7 @@ pub unsafe extern "C" fn moraine_dump_macro_impls(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_macro_impl_rows(catalog)),
+            moraine::ffi_support::dump_macro_impl_rows,
             macro_impl_rows,
         )
     }
@@ -238,15 +234,13 @@ pub struct MoraineMacroParameterRow {
 pub(crate) fn macro_parameter_rows(
     rows: Vec<moraine::ffi_support::MacroParameterRow>,
 ) -> Result<Vec<MoraineMacroParameterRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|row| {
-            let parameter_name = to_c_string(&row.parameter_name)?;
-            let parameter_type = to_c_string(&row.parameter_type)?;
+        .map(|mut row| {
+            let parameter_name = to_c_string(std::mem::take(&mut row.parameter_name))?;
+            let parameter_type = to_c_string(std::mem::take(&mut row.parameter_type))?;
             let default_value = opt_c_string(row.default_value.as_deref())?;
-            let default_value_type = to_c_string(&row.default_value_type)?;
+            let default_value_type = to_c_string(std::mem::take(&mut row.default_value_type))?;
             Ok((
                 row,
                 parameter_name,
@@ -305,7 +299,7 @@ pub unsafe extern "C" fn moraine_dump_macro_parameters(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_macro_parameter_rows(catalog)),
+            moraine::ffi_support::dump_macro_parameter_rows,
             macro_parameter_rows,
         )
     }

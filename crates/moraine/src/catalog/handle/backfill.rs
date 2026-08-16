@@ -15,8 +15,9 @@ use crate::{
     },
     data_file,
     error::{Error, Result},
-    store::{handle::ReadHandle, inline as store_inline, key::InlineOperation},
-    transaction::commit,
+    store::{
+        handle::ReadHandle, inline as store_inline, key::InlineOperation, proto::InlineSchemaValue,
+    },
 };
 
 async fn collect_immediate_backfill<'a>(
@@ -31,8 +32,8 @@ async fn collect_immediate_backfill<'a>(
         .map(move |file| {
             let object_store = Arc::clone(&object_store);
             let path = resolve(&file.path, file.path_is_relative);
-            let dead_positions = killed_positions.get(&file.id.get()).cloned();
-            let dead_row_ids = killed_row_ids.get(&file.id.get()).cloned();
+            let dead_positions = killed_positions.get(&file.id.get());
+            let dead_row_ids = killed_row_ids.get(&file.id.get());
             async move {
                 let batches = data_file::scoped_read_entry_batches(
                     data_file::ParquetFile::new(
@@ -56,10 +57,8 @@ async fn collect_immediate_backfill<'a>(
                             .into_iter()
                             .map(|entry| {
                                 let dead = dead_positions
-                                    .as_ref()
                                     .is_some_and(|positions| positions.contains(&entry.ordinal))
                                     || dead_row_ids
-                                        .as_ref()
                                         .is_some_and(|rows| rows.contains(&entry.row_id));
                                 Ok((!dead).then_some(IndexEntry {
                                     row_id: entry.row_id,
@@ -101,6 +100,35 @@ pub(super) async fn collect_inline_delete_positions(
     Ok(killed)
 }
 
+/// The recorded inline schema of each distinct version in `schema_versions`,
+/// fetched concurrently.
+pub(super) async fn read_inline_schemas(
+    session_handle: ReadHandle<'_>,
+    table: TableId,
+    schema_versions: impl IntoIterator<Item = u64>,
+) -> Result<HashMap<u64, InlineSchemaValue>> {
+    let schema_versions: BTreeSet<u64> = schema_versions.into_iter().collect();
+
+    stream::iter(
+        schema_versions
+            .into_iter()
+            .map(|schema_version| async move {
+                let record =
+                    store_inline::read_inline_schema(session_handle, table.get(), schema_version)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Corruption(format!(
+                                "no inline schema for table {table} version {schema_version}"
+                            ))
+                        })?;
+                Ok::<_, Error>((schema_version, record))
+            }),
+    )
+    .buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
+    .try_collect()
+    .await
+}
+
 pub(super) async fn collect_delete_positions<'a>(
     files: impl Iterator<Item = DeleteFileInfo> + 'a,
     object_store: Arc<dyn ObjectStore>,
@@ -133,18 +161,14 @@ pub(super) async fn collect_delete_positions<'a>(
 
 impl ReadOnlyCatalog {
     /// Derives the index entries for a file the extension path registers, by
-    /// scoped-reading it — DuckLake supplies none, so moraine reads them.
-    /// The caller resolves each of the index's columns to its physical
-    /// position in the file (through the column-mapping rules) and passes
-    /// them in the index's column order. `file_size` and `footer_size` are
-    /// DuckLake's recorded values; carrying both avoids discovery requests
-    /// before the projected read. The returned entries feed
-    /// [`crate::Transaction::register_data_file`] so registration stays
-    /// covered.
+    /// scoped-reading it. The caller resolves each of the index's columns to
+    /// its physical position in the file and passes them in the index's
+    /// column order. `file_size` and `footer_size` are DuckLake's recorded
+    /// values. The returned entries feed
+    /// [`crate::Transaction::register_data_file`].
     ///
-    /// The file must not carry an embedded row-id column — its rows already
-    /// have ids, and re-registering them under a fresh dense range would
-    /// fork their identity — so such a file is refused.
+    /// A file carrying an embedded row-id column is refused: its rows
+    /// already have ids.
     ///
     /// # Errors
     ///
@@ -206,22 +230,8 @@ impl ReadOnlyCatalog {
     ) -> Result<Vec<IndexEntry>> {
         let session = self.begin_read().await?;
 
-        let snapshot = commit::materialize(session.handle(), None).await?;
-        // `columns_of` is ordered by the column's ordinal, so a column's
-        // 0-based index here is its physical position in a file written
-        // under this schema — the mapping the scoped read needs. (Ordinals
-        // are 1-based in the stored value, so the stored order can't be
-        // used directly.)
-        let live_columns = snapshot.columns_of(table);
-        let positions = columns
-            .iter()
-            .map(|column| {
-                live_columns
-                    .iter()
-                    .position(|c| c.id == *column)
-                    .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let snapshot = self.head_view(session.handle()).await?;
+        let positions = snapshot.column_positions(table, columns)?;
 
         let table_prefix = snapshot.table_data_prefix(table)?;
         let resolve = |path: &str, is_relative: bool| {
@@ -233,20 +243,9 @@ impl ReadOnlyCatalog {
             object_store::path::Path::from(relative.as_str())
         };
 
-        // Rows already dead when the index is built must not be backfilled
-        // (entries are live-only): delete files name positions within their
+        // Entries are live-only: delete files name positions within their
         // target, inline file-deletes name row ids.
-        let inline_deletes = async {
-            let deleted =
-                store_inline::scan_inline_file_deletes(session.handle(), table.get()).await?;
-            Ok::<_, Error>(deleted.into_iter().fold(
-                HashMap::<u64, HashSet<u64>>::new(),
-                |mut killed, (data_file_id, row_id, _)| {
-                    killed.entry(data_file_id).or_default().insert(row_id);
-                    killed
-                },
-            ))
-        };
+        let inline_deletes = collect_inline_delete_positions(session.handle(), table.get());
         let delete_files = collect_delete_positions(
             snapshot.delete_files_of(table).into_iter(),
             Arc::clone(&object_store),
@@ -286,17 +285,8 @@ impl ReadOnlyCatalog {
     ) -> Result<Vec<IndexEntry>> {
         let session = self.begin_read().await?;
 
-        let snapshot = commit::materialize(session.handle(), None).await?;
-        let live_columns = snapshot.columns_of(table);
-        let positions = columns
-            .iter()
-            .map(|column| {
-                live_columns
-                    .iter()
-                    .position(|c| c.id == *column)
-                    .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let snapshot = self.head_view(session.handle()).await?;
+        let positions = snapshot.column_positions(table, columns)?;
 
         // A tombstone ends only versions begun before it. UPDATE can
         // reinsert the same row id in the tombstone's snapshot, and that
@@ -313,74 +303,54 @@ impl ReadOnlyCatalog {
             },
             store_inline::scan_inline_chunks(session.handle(), table.get()),
         )?;
-        let schema_versions: BTreeSet<u64> = chunks
-            .iter()
-            .filter_map(|(operation, _)| match operation {
-                InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
-                _ => None,
-            })
-            .collect();
-        let handle = session.handle();
-        let schemas = stream::iter(
-            schema_versions
-                .into_iter()
-                .map(|schema_version| async move {
-                    let record =
-                        store_inline::read_inline_schema(handle, table.get(), schema_version)
-                            .await?
-                            .ok_or_else(|| {
-                                Error::Corruption(format!(
-                                    "no inline schema for table {table} version {schema_version}"
-                                ))
-                            })?;
-                    let schema = data_file::decode_inline_schema(record.arrow_schema)?;
-                    Ok::<_, Error>((schema_version, schema))
-                }),
-        )
-        .buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
-        .try_collect::<HashMap<_, _>>()
-        .await?;
-
-        let entries = chunks
+        let schema_versions = chunks.iter().filter_map(|(operation, _)| match operation {
+            InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
+            _ => None,
+        });
+        let schemas = read_inline_schemas(session.handle(), table, schema_versions)
+            .await?
             .into_iter()
-            .map(|(op, chunk)| {
-                let InlineOperation::Insert {
-                    schema_version,
-                    begin_snapshot,
-                    ..
-                } = op
-                else {
-                    return Ok(vec![]);
-                };
-                let schema = schemas.get(&schema_version).cloned().ok_or_else(|| {
-                    Error::Corruption(format!(
-                        "no inline schema for table {table} version {schema_version}"
-                    ))
-                })?;
-
-                let scoped = data_file::inline_batch_entries(
-                    schema,
-                    &chunk.body,
-                    &positions,
-                    chunk.row_id_start,
-                )?
-                .into_iter()
-                .filter(|entry| {
-                    dead.get(&entry.row_id)
-                        .is_none_or(|end_snapshot| begin_snapshot >= *end_snapshot)
-                })
-                .map(|entry| IndexEntry {
-                    row_id: entry.row_id,
-                    values: entry.values,
-                })
-                .collect::<Vec<_>>();
-
-                Ok(scoped)
+            .map(|(schema_version, record)| {
+                let schema = data_file::decode_inline_schema(record.arrow_schema)?;
+                Ok::<_, Error>((schema_version, schema))
             })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        let mut entries = Vec::new();
+        for (op, chunk) in chunks {
+            let InlineOperation::Insert {
+                schema_version,
+                begin_snapshot,
+                ..
+            } = op
+            else {
+                continue;
+            };
+            let schema = schemas.get(&schema_version).cloned().ok_or_else(|| {
+                Error::Corruption(format!(
+                    "no inline schema for table {table} version {schema_version}"
+                ))
+            })?;
+
+            let scoped = data_file::inline_batch_entries(
+                schema,
+                &chunk.body,
+                &positions,
+                chunk.row_id_start,
+            )?;
+            entries.extend(
+                scoped
+                    .into_iter()
+                    .filter(|entry| {
+                        dead.get(&entry.row_id)
+                            .is_none_or(|end_snapshot| begin_snapshot >= *end_snapshot)
+                    })
+                    .map(|entry| IndexEntry {
+                        row_id: entry.row_id,
+                        values: entry.values,
+                    }),
+            );
+        }
         session.finish();
 
         Ok(entries)

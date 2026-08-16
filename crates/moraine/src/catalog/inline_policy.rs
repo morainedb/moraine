@@ -1,14 +1,9 @@
-//! DuckLake column-type policy for inlining. Lives in the catalog so both
-//! commit front doors enforce one rule at the boundary where a column
-//! enters the catalog, rather than each caller — or the shim — carrying
-//! its own.
+//! DuckLake column-type policy for inlining.
 
 use crate::{catalog::index_policy::ducklake_base_type, error::Error};
 
-/// Refuses a column moraine cannot inline. Inlined rows are Arrow IPC, and
-/// DuckDB's Arrow encoding has no `VARIANT` representation, so a `VARIANT`
-/// column is refused when it enters the catalog rather than at its first
-/// insert — the table would otherwise appear to work until then.
+/// Refuses a column moraine cannot inline: inlined rows are Arrow IPC, which
+/// has no `VARIANT` representation.
 pub(crate) fn ensure_inlinable(column_name: &str, column_type: &str) -> Result<(), Error> {
     if ducklake_base_type(column_type) == "VARIANT" {
         return Err(Error::Unsupported(format!(

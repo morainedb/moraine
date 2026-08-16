@@ -19,15 +19,12 @@ use crate::{
 
 /// One inlined row selected by [`scan_inline`], referencing its chunk's
 /// body by index into the scan's deduplicated
-/// [`chunk_bodies`](InlineScanRecord::chunk_bodies) — a chunk's body
-/// crosses the ABI once however many rows it holds, and the reader
-/// decodes it once.
+/// [`chunk_bodies`](InlineScanRecord::chunk_bodies).
 #[doc(hidden)]
 pub struct InlineRowRecord {
     /// The row's dense id.
     pub row_id: u64,
-    /// The schema version the owning chunk was written under — selects the
-    /// `inline/schema` record its body decodes against.
+    /// The schema version the owning chunk was written under.
     pub schema_version: u64,
     /// The commit snapshot that inserted this row.
     pub begin_snapshot: u64,
@@ -66,8 +63,10 @@ pub async fn scan_inline(
     start: u64,
 ) -> Result<InlineScanRecord> {
     let session = catalog.begin_read().await?;
-    let chunks = store_inline::scan_inline_chunks(session.handle(), table_id).await;
-    let inline_deletes = store_inline::scan_inline_deletes(session.handle(), table_id).await;
+    let (chunks, inline_deletes) = futures::join!(
+        store_inline::scan_inline_chunks(session.handle(), table_id),
+        store_inline::scan_inline_deletes(session.handle(), table_id),
+    );
     session.finish();
     let chunks = chunks?;
     let inline_deletes = inline_deletes?;
@@ -82,8 +81,6 @@ pub async fn scan_inline(
         .into_iter()
         .map(|row| {
             let (operation, chunk) = &chunks[row.chunk];
-            // Every chunk a row references is an insert — the row was
-            // materialized from it.
             let InlineOperation::Insert { schema_version, .. } = operation else {
                 return Err(Error::Corruption(format!(
                     "inline row {} references a non-insert chunk key: {operation:?}",
@@ -149,18 +146,10 @@ pub async fn inline_registered_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<(
         .collect())
 }
 
-/// Whether `table_id`'s `ducklake_inlined_delete_<table_id>` exists.
-/// DuckLake probes it via a catalog bind that must error until the first
-/// `inline/file_delete` is staged, so this reports the table missing (not
-/// merely unreferenced) until then.
-///
-/// Existing once it has existed is the other half, and the reason this
-/// consults a marker rather than only the records: a flush materializes
-/// the table's deletions into a real delete file and clears them, and an
-/// emptied SQL table still exists — which is what DuckLake, having cached
-/// the table's existence for the life of the catalog, goes on assuming.
-/// The record fallback covers stores written before the marker did, whose
-/// first write of either kind heals them.
+/// Whether `table_id`'s `ducklake_inlined_delete_<table_id>` exists: it
+/// does not until the first `inline/file_delete` is staged, and stays
+/// existing after a flush clears the records. The record fallback covers
+/// stores written before the marker.
 ///
 /// # Errors
 ///

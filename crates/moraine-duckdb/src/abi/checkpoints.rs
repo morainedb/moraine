@@ -2,12 +2,9 @@
 //! release the checkpoints a zero-write read-only attach
 //! (`moraine_attach`'s `checkpoint`) pins itself to.
 //!
-//! Minting takes an attached handle, because the core mints through the
-//! writer that attach already opened — a second read-write open would
-//! fence it. Listing and releasing take a store path instead, for the
-//! same reason [`moraine_migrate`](super::moraine_migrate) does: they
-//! touch only the manifest, and the processes that attach against the id
-//! hold no write credentials, so those calls happen elsewhere.
+//! Minting takes an attached handle (the core mints through the writer
+//! that attach opened). Listing and releasing take a store path: they
+//! touch only the manifest.
 
 use std::{ffi::c_char, ptr};
 
@@ -30,9 +27,8 @@ pub struct MoraineCheckpoint {
     pub id: *mut c_char,
 }
 
-/// The object store and catalog options a path resolves to. The path-taking
-/// entry points here touch the manifest only, so neither the flush cadence
-/// nor the on-disk object cache applies.
+/// The object store and catalog options a path resolves to, for the
+/// manifest-only entry points.
 fn resolve(
     path: &str,
     s3: *const MoraineS3Config,
@@ -48,8 +44,6 @@ fn resolve(
     // entry point that took it.
     let s3_creds = unsafe { borrow_s3_creds(s3) };
     let object_store = store_kind.open(path, s3_creds.as_ref())?;
-    // `CatalogOptions` is `#[non_exhaustive]`, so it is built through
-    // `default()` and field assignment rather than a struct literal.
     let mut options = CatalogOptions::default();
     options.path = prefix;
     Ok((object_store, options))
@@ -58,9 +52,7 @@ fn resolve(
 /// Mints a checkpoint over `handle`'s current durable state and writes its
 /// id to `*out_id` (free with `moraine_string_free`).
 ///
-/// Takes the attached handle rather than a path: the core mints through
-/// the writer, and opening a second one to do it would fence the first.
-/// The handle must therefore be a read-write attach.
+/// The handle must be a read-write attach.
 ///
 /// `lifetime_ms` bounds how long the checkpoint holds its objects against
 /// garbage collection; `0` means no expiry, which pins them until
@@ -97,7 +89,7 @@ pub unsafe extern "C" fn moraine_create_checkpoint(
             .block_on(handle_ref.catalog.writer()?.create_checkpoint(lifetime))
             .map_err(AbiError::from)?;
 
-        let id = to_c_string(&checkpoint)?.into_raw();
+        let id = to_c_string(checkpoint)?.into_raw();
         // SAFETY: `out_id` is non-null and writable per the caller
         // contract, checked above.
         unsafe { *out_id = id };
@@ -136,8 +128,7 @@ pub unsafe extern "C" fn moraine_checkpoints(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<(), AbiError> {
-        // Before anything that could emit an event, so a failure here is
-        // itself drainable.
+        // Before anything that could emit an event.
         crate::logging::install();
         if out_items.is_null() || out_len.is_null() {
             return Err(AbiError::invalid_argument("an out-parameter is null"));
@@ -148,8 +139,6 @@ pub unsafe extern "C" fn moraine_checkpoints(
 
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
-        // A one-shot runtime for one operation, with no host thread
-        // setting to take after: the floor is all it needs.
         let runtime = new_runtime(log_id, 0).map_err(|e| {
             AbiError::new(
                 codes::INTERNAL,
@@ -161,16 +150,14 @@ pub unsafe extern "C" fn moraine_checkpoints(
             .block_on(moraine::Catalog::checkpoints(object_store, options))
             .map_err(AbiError::from)?;
 
-        // Built owned-first: a mid-way allocation failure must not leave a
-        // half-populated array for the shim to free.
-        let items = checkpoints
-            .iter()
-            .map(|id| {
-                Ok(MoraineCheckpoint {
-                    id: to_c_string(id)?.into_raw(),
-                })
-            })
+        let ids = checkpoints
+            .into_iter()
+            .map(to_c_string)
             .collect::<Result<Vec<_>, AbiError>>()?;
+        let items = ids
+            .into_iter()
+            .map(|id| MoraineCheckpoint { id: id.into_raw() })
+            .collect::<Vec<_>>();
 
         // SAFETY: both out-parameters are non-null and writable per the
         // caller contract, checked above.
@@ -203,11 +190,8 @@ pub unsafe extern "C" fn moraine_checkpoints_free(items: *mut MoraineCheckpoint,
 }
 
 /// Releases the checkpoint named by `id`, unpinning whatever it held
-/// against garbage collection.
-///
-/// Takes a path rather than a handle: it CASes the manifest without
-/// opening the writer, so it runs against a live catalog without fencing
-/// it.
+/// against garbage collection. Runs against a live catalog without
+/// fencing it.
 ///
 /// Returns [`codes::OK`] on success. On failure, if `err` is non-null,
 /// `*err` carries the code and a message.
@@ -236,8 +220,6 @@ pub unsafe extern "C" fn moraine_delete_checkpoint(
 
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
-        // A one-shot runtime for one operation, with no host thread
-        // setting to take after: the floor is all it needs.
         let runtime = new_runtime(log_id, 0).map_err(|e| {
             AbiError::new(
                 codes::INTERNAL,

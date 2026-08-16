@@ -4,6 +4,7 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         Arc, LazyLock, Mutex, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -20,6 +21,7 @@ use tracing::warn;
 
 use crate::{
     data_file::{reader::ObjectStoreReader, row_set::FileRowSet, usize_as_u64},
+    error::{Error, Result},
     store::cache,
 };
 
@@ -42,11 +44,8 @@ impl From<PageIndexPolicy> for PageIndex {
     }
 }
 
-/// One file's identity within its store.
-///
-/// Catalog file ids are never reused, so the path and recorded size only
-/// guard an imported catalog that violates that: a mismatch misses rather
-/// than serving another file's rows.
+/// One file's identity within its store. The path and recorded size guard
+/// against a reused catalog file id: a mismatch misses.
 pub(super) struct FileSummaryKey<'a> {
     pub(super) table_id: u64,
     pub(super) data_file_id: u64,
@@ -77,23 +76,31 @@ enum AuxiliaryValue {
     Summary(Arc<FileRowSet>),
 }
 
-impl AuxiliaryValue {
-    fn bytes(&self) -> usize {
-        match self {
-            Self::Metadata(metadata) => metadata.memory_size(),
-            Self::Summary(rows) => usize::try_from(rows.estimated_bytes()).unwrap_or(usize::MAX),
-        }
+/// A value with its charge measured once, at insertion.
+#[derive(Debug, Clone)]
+struct Weighed {
+    value: AuxiliaryValue,
+    bytes: usize,
+}
+
+impl From<AuxiliaryValue> for Weighed {
+    fn from(value: AuxiliaryValue) -> Self {
+        let bytes = match &value {
+            AuxiliaryValue::Metadata(metadata) => metadata.memory_size(),
+            AuxiliaryValue::Summary(rows) => {
+                usize::try_from(rows.estimated_bytes()).unwrap_or(usize::MAX)
+            }
+        };
+
+        Self { value, bytes }
     }
 }
 
 type StoreIdentities = HashMap<usize, (Weak<dyn ObjectStore>, u64)>;
 
-/// Identities handed to stores, keyed by the address each occupies.
-///
-/// The weak reference is what makes an address trustworthy: it keeps the
-/// allocation alive, so no later store can take the address of one still
-/// registered here. An entry whose store is gone is replaced rather than
-/// reused, which is where the address becomes available again.
+/// Identities handed to stores, keyed by the address each occupies. The
+/// weak reference keeps the allocation alive, so a registered address
+/// cannot be taken by a later store; a dead entry is replaced, not reused.
 static STORE_IDENTITIES: LazyLock<Mutex<StoreIdentities>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -118,12 +125,10 @@ pub(super) fn store_id(store: &Arc<dyn ObjectStore>) -> u64 {
     id
 }
 
-/// One weighted cache over both kinds, so footers and summaries take the
-/// allowance in proportion to what is actually asked for.
+/// One weighted cache over both footers and summaries.
 pub(super) struct AuxiliaryCache {
-    cache: Cache<AuxiliaryKey, AuxiliaryValue>,
-    /// What the cache was last built or resized to. Read by the admission
-    /// filter, which cannot borrow the cache it belongs to.
+    cache: Cache<AuxiliaryKey, Weighed>,
+    /// What the cache was last built or resized to.
     capacity: Arc<AtomicUsize>,
 }
 
@@ -132,15 +137,14 @@ impl AuxiliaryCache {
         let admitted = Arc::new(AtomicUsize::new(capacity));
         let limit = Arc::clone(&admitted);
 
-        // One shard: the allowance is small next to a single parsed footer,
-        // and foyer divides capacity evenly across eight by default — which
-        // would reject any footer larger than an eighth of it.
+        // One shard: foyer splits capacity across shards, and a footer must
+        // fit within one.
         let cache = foyer::CacheBuilder::new(capacity)
             .with_shards(1)
-            .with_weighter(|_: &AuxiliaryKey, value: &AuxiliaryValue| value.bytes())
-            .with_filter(move |_: &AuxiliaryKey, value: &AuxiliaryValue| {
+            .with_weighter(|_: &AuxiliaryKey, value: &Weighed| value.bytes)
+            .with_filter(move |_: &AuxiliaryKey, value: &Weighed| {
                 let limit = limit.load(Ordering::Relaxed);
-                limit > 0 && value.bytes() <= limit
+                limit > 0 && value.bytes <= limit
             })
             .with_event_listener(Arc::new(EvictionCounter))
             .build();
@@ -167,7 +171,7 @@ impl AuxiliaryCache {
 
         if let Some(entry) = self.cache.get(&key) {
             reader.metrics.metadata_hit();
-            return metadata_of(entry.value());
+            return metadata_of(&entry.value().value);
         }
         reader.metrics.metadata_miss();
 
@@ -180,21 +184,18 @@ impl AuxiliaryCache {
                 .with_prefetch_hint(prefetch)
                 .load_and_finish(&mut loader, file_size)
                 .await
-                .map(|metadata| AuxiliaryValue::Metadata(Arc::new(metadata)))
+                .map(|metadata| Weighed::from(AuxiliaryValue::Metadata(Arc::new(metadata))))
         };
 
-        // Deliberately the calling runtime: a fill is keyed to one store,
-        // so the only readers a cancelled fill can strand belong to the
-        // attach that is tearing that store down anyway. Moving fills to a
-        // long-lived runtime instead costs the lockstep start that lets a
-        // commit's file reads overlap.
-        let fetch = self.cache.get_or_fetch(&key, fill);
-
-        let entry = fetch
+        // Runs on the calling runtime: a fill is keyed to one store, so a
+        // cancelled fill can only strand readers of a store being torn down.
+        let entry = self
+            .cache
+            .get_or_fetch(&key, fill)
             .await
             .map_err(|error| ParquetError::General(error.to_string()))?;
 
-        metadata_of(entry.value())
+        metadata_of(&entry.value().value)
     }
 
     pub(super) fn summary(
@@ -202,12 +203,49 @@ impl AuxiliaryCache {
         store: &Arc<dyn ObjectStore>,
         key: &FileSummaryKey<'_>,
     ) -> Option<Arc<FileRowSet>> {
-        match self.cache.get(&Self::file_summary_key(store, key))?.value() {
-            AuxiliaryValue::Summary(rows) => Some(Arc::clone(rows)),
-            AuxiliaryValue::Metadata(_) => None,
-        }
+        summary_of(
+            &self
+                .cache
+                .get(&Self::file_summary_key(store, key))?
+                .value()
+                .value,
+        )
     }
 
+    /// This file's row-id summary, building it through `fill` on a miss.
+    /// Concurrent misses on one key share the single fill.
+    pub(super) async fn fetch_summary<F, Fut>(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        key: &FileSummaryKey<'_>,
+        fill: F,
+    ) -> Result<Arc<FileRowSet>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Arc<FileRowSet>>> + Send + 'static,
+    {
+        let fill = fill();
+        let fill = || async move {
+            fill.await
+                .map(|rows| Weighed::from(AuxiliaryValue::Summary(rows)))
+        };
+
+        let entry = self
+            .cache
+            .get_or_fetch(&Self::file_summary_key(store, key), fill)
+            .await
+            .map_err(|error| {
+                let cause = std::error::Error::source(&error)
+                    .map_or_else(|| error.to_string(), ToString::to_string);
+                Error::Corruption(format!("row summary: {cause}"))
+            })?;
+
+        summary_of(&entry.value().value).ok_or_else(|| {
+            Error::Corruption("a footer was cached under a row summary key".to_owned())
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn insert_summary(
         &self,
         store: &Arc<dyn ObjectStore>,
@@ -216,7 +254,7 @@ impl AuxiliaryCache {
     ) {
         self.cache.insert(
             Self::file_summary_key(store, key),
-            AuxiliaryValue::Summary(Arc::clone(rows)),
+            Weighed::from(AuxiliaryValue::Summary(Arc::clone(rows))),
         );
     }
 
@@ -231,8 +269,7 @@ impl AuxiliaryCache {
     }
 
     /// Settles the allowance, evicting whatever no longer fits. A refusal
-    /// leaves the previous capacity in force: a cache that would not resize
-    /// is still a working cache.
+    /// leaves the previous capacity in force.
     pub(super) fn resize(&self, capacity: usize) {
         match self.cache.resize(capacity) {
             Ok(()) => {
@@ -246,15 +283,21 @@ impl AuxiliaryCache {
         }
     }
 
-    /// Tracked rather than read back: foyer's `resize` moves each shard's
-    /// capacity and evicts against it, but leaves `Cache::capacity` at
-    /// whatever the cache was built with.
+    /// Tracked here because foyer's `Cache::capacity` does not follow
+    /// `resize`.
     pub(super) fn capacity(&self) -> usize {
         self.capacity.load(Ordering::Relaxed)
     }
 
     pub(super) fn usage(&self) -> usize {
         self.cache.usage()
+    }
+}
+
+fn summary_of(value: &AuxiliaryValue) -> Option<Arc<FileRowSet>> {
+    match value {
+        AuxiliaryValue::Summary(rows) => Some(Arc::clone(rows)),
+        AuxiliaryValue::Metadata(_) => None,
     }
 }
 
@@ -271,9 +314,9 @@ struct EvictionCounter;
 
 impl foyer::EventListener for EvictionCounter {
     type Key = AuxiliaryKey;
-    type Value = AuxiliaryValue;
+    type Value = Weighed;
 
-    fn on_leave(&self, reason: foyer::Event, _: &AuxiliaryKey, _: &AuxiliaryValue) {
+    fn on_leave(&self, reason: foyer::Event, _: &AuxiliaryKey, _: &Weighed) {
         if reason == foyer::Event::Evict {
             cache::auxiliary_evicted();
         }
@@ -296,8 +339,7 @@ pub(crate) fn occupancy() -> (u64, u64) {
     )
 }
 
-/// Sizes the cache to the allowance the first attach reserved. The cache
-/// is built on first use, which can precede that attach.
+/// Sizes the cache to the allowance the first attach reserved.
 pub(crate) fn resize(capacity: usize) {
     SHARED.resize(capacity);
 }

@@ -1889,6 +1889,7 @@ dependencies = [
  "arrow",
  "bytes",
  "cbindgen",
+ "futures",
  "moraine",
  "object_store",
  "tokio",

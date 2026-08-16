@@ -28,12 +28,10 @@ pub struct MoraineColumnMappingRow {
 pub(crate) fn mapping_rows(
     rows: Vec<moraine::ffi_support::MappingRecord>,
 ) -> Result<Vec<MoraineColumnMappingRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|m| {
-            let map_type = to_c_string(&m.map_type)?;
+        .map(|mut m| {
+            let map_type = to_c_string(std::mem::take(&mut m.map_type))?;
             Ok((m, map_type))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -77,7 +75,7 @@ pub unsafe extern "C" fn moraine_dump_column_mappings(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_mappings(catalog)),
+            moraine::ffi_support::dump_mappings,
             mapping_rows,
         )
     }
@@ -128,12 +126,10 @@ pub struct MoraineNameMappingRow {
 pub(crate) fn name_mapping_rows(
     rows: Vec<moraine::ffi_support::NameMappingRow>,
 ) -> Result<Vec<MoraineNameMappingRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|row| {
-            let source_name = to_c_string(&row.source_name)?;
+        .map(|mut row| {
+            let source_name = to_c_string(std::mem::take(&mut row.source_name))?;
             Ok((row, source_name))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -184,7 +180,7 @@ pub unsafe extern "C" fn moraine_dump_name_mappings(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_name_mapping_rows(catalog)),
+            moraine::ffi_support::dump_name_mapping_rows,
             name_mapping_rows,
         )
     }

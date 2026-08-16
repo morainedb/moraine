@@ -35,9 +35,7 @@ use crate::{
 pub struct CatalogSnapshot {
     pub(crate) snapshot: SnapshotValue,
     /// The head record's batch count when this view was built, zero for a
-    /// time-travel view. A maintenance batch changes committed state
-    /// without minting a snapshot, so the snapshot id alone does not say
-    /// which store state a head view stands at; this does.
+    /// time-travel view.
     pub(crate) batch_seq: u64,
     pub(crate) schemas: BTreeMap<u64, SchemaValue>,
     pub(crate) tables: BTreeMap<u64, TableValue>,
@@ -155,12 +153,8 @@ fn nested_bytes<K1, K2, V: prost::Message>(map: &BTreeMap<K1, BTreeMap<K2, V>>) 
 }
 
 impl CatalogSnapshot {
-    /// Roughly what this view holds, in bytes.
-    ///
-    /// Sums the encoded length of every entity it carries. The name indexes
-    /// are derived and small beside the file maps, and are not counted; an
-    /// encoded length also understates its decoded form. Read to report a
-    /// handle's footprint, never to decide an eviction.
+    /// Roughly what this view holds, in bytes: the encoded length of every
+    /// entity it carries, name indexes excluded.
     pub(crate) fn estimated_bytes(&self) -> u64 {
         [
             flat_bytes(&self.schemas),
@@ -206,7 +200,7 @@ impl CatalogSnapshot {
             None => end.is_none(),
             Some(s) => begin <= s && end.is_none_or(|e| e > s),
         };
-        for record in current.iter().chain(history).cloned() {
+        for record in current.iter().chain(history) {
             // Unversioned kinds (no lifecycle) are live at any time-travel
             // target: mappings are immutable, tag entries filter at read,
             // stats/options/gc rows are current-state bookkeeping.
@@ -216,14 +210,12 @@ impl CatalogSnapshot {
             {
                 continue;
             }
-            view.put_record(record);
+            view.put_record(record.clone());
         }
         view
     }
 
-    /// How many `current` records this view holds — the size a full
-    /// rematerialization would have to read and decode, and so the scale an
-    /// incremental refresh's churn is weighed against.
+    /// How many `current` records this view holds.
     pub(crate) fn live_entity_count(&self) -> usize {
         fn nested<K, V>(map: &BTreeMap<u64, BTreeMap<K, V>>) -> usize {
             map.values().map(BTreeMap::len).sum()
@@ -249,8 +241,7 @@ impl CatalogSnapshot {
     }
 
     /// Inserts one decoded record into the maps it belongs to, keeping the
-    /// name indexes coherent. Shared by [`build`](Self::build) and the
-    /// commit-time fold that folds a batch forward without rescanning.
+    /// name indexes coherent.
     pub(crate) fn put_record(&mut self, record: EntityRecord) {
         match record {
             EntityRecord::Schema(s) => self.put_schema(s),
@@ -356,6 +347,29 @@ impl CatalogSnapshot {
         infos
     }
 
+    /// The physical position of each of `columns` in a file written under
+    /// `table`'s current column order.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if a column is not live.
+    pub(crate) fn column_positions(
+        &self,
+        table: TableId,
+        columns: &[ColumnId],
+    ) -> Result<Vec<usize>> {
+        let live_columns = self.columns_of(table);
+        columns
+            .iter()
+            .map(|column| {
+                live_columns
+                    .iter()
+                    .position(|candidate| candidate.id == *column)
+                    .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
+            })
+            .collect()
+    }
+
     /// The schema's live views, ordered by id.
     #[must_use]
     pub fn views_in(&self, schema: SchemaId) -> Vec<ViewInfo> {
@@ -416,10 +430,8 @@ impl CatalogSnapshot {
     }
 
     /// The table's partition spec live at this view's snapshot, or `None`
-    /// when the table is unpartitioned. A table has at most one live spec;
-    /// a store carrying more (only reachable through the staged path, which
-    /// stores DuckLake's rows verbatim) yields the lowest-numbered, the one
-    /// a scan in key order meets first.
+    /// when the table is unpartitioned. A store carrying more than one
+    /// yields the lowest-numbered.
     #[must_use]
     pub fn partitioning_of(&self, table: TableId) -> Option<PartitionSpec> {
         self.partitions
@@ -429,10 +441,8 @@ impl CatalogSnapshot {
     }
 
     /// The table's sort spec live at this view's snapshot, or `None` when
-    /// the table is unsorted. A table has at most one live spec; a store
-    /// carrying more (only reachable through the staged path, which stores
-    /// DuckLake's rows verbatim) yields the lowest-numbered, the one a scan
-    /// in key order meets first.
+    /// the table is unsorted. A store carrying more than one yields the
+    /// lowest-numbered.
     #[must_use]
     pub fn sorting_of(&self, table: TableId) -> Option<SortSpec> {
         self.sorts
@@ -483,16 +493,7 @@ impl CatalogSnapshot {
 
     pub(crate) fn put_index(&mut self, value: IndexValue) {
         let per_table = self.indexes.entry(value.table_id).or_default();
-        if let Some(old) = per_table.get(&value.index_id) {
-            let (_, old_scope, old_name) = index_identity(old);
-            let (old_scope, old_name) = (old_scope, old_name.to_owned());
-            remove_scoped_name(&mut self.index_names, old_scope, &old_name);
-        }
-        self.index_names
-            .entry(value.table_id)
-            .or_default()
-            .insert(value.index_name.clone(), value.index_id);
-        per_table.insert(value.index_id, value);
+        put_named(per_table, &mut self.index_names, value, index_identity);
     }
 
     pub(crate) fn delete_index(&mut self, table_id: u64, index_id: u64) {
@@ -623,10 +624,8 @@ impl CatalogSnapshot {
         self.table_stats.remove(&table_id);
         self.table_column_stats.remove(&table_id);
         self.remove_option_record(OptionScope::Table(TableId::new(table_id)).key_components());
-        // file_column_stats is kept: per-file stats outlive the file's
-        // live version until its history is garbage-collected. mappings
-        // are kept for the same reason: historical file reads still
-        // resolve through them.
+        // file_column_stats and mappings are kept: historical file reads
+        // still resolve through them.
     }
 
     pub(crate) fn put_view(&mut self, value: ViewValue) {
@@ -791,9 +790,7 @@ impl CatalogSnapshot {
     }
 
     /// Removes a schema and its name entry, without the option-scope
-    /// cascade [`delete_schema`](Self::delete_schema) applies. The
-    /// commit-time fold mirrors the store key by key, so a cascade would
-    /// drop rows the batch keeps.
+    /// cascade [`delete_schema`](Self::delete_schema) applies.
     pub(crate) fn remove_schema_only(&mut self, schema_id: u64) {
         if let Some(old) = self.schemas.remove(&schema_id) {
             self.schema_names.remove(&old.schema_name);
@@ -944,8 +941,7 @@ pub(crate) fn index_info(value: &IndexValue) -> IndexInfo {
         .copied()
         .map(ColumnId::new)
         .collect();
-    // Absent per-column orders default to ascending / NULLS LAST, so an
-    // ascending index reads the same whether or not it recorded them.
+    // Absent per-column orders default to ascending / NULLS LAST.
     let directions = (0..columns.len())
         .map(|i| {
             if value.column_descending.get(i).copied().unwrap_or(false) {

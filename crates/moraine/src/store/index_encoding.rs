@@ -12,12 +12,13 @@ use std::mem::size_of;
 use bytes::Bytes;
 use storekey::{Decode, Encode};
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    store::key::{INDEX_ENTRY_PREFIX_LEN, INDEX_SUBSPACE_TAG, index_kind_tag},
+};
 
 /// Maximum size of a composite index key, summed over its component
-/// canonical encodings. Values past this are refused: huge keys degrade
-/// the whole segment, and equality over megabyte values is not this
-/// feature's job.
+/// canonical encodings; larger values are refused.
 pub(crate) const MAX_INDEX_KEY_BYTES: usize = 1024;
 
 /// Byte width of a fixed-width integer column.
@@ -32,9 +33,7 @@ pub enum IntWidth {
     /// Eight bytes (`BIGINT`, `UBIGINT`, and temporal types by their
     /// underlying representation).
     I64,
-    /// Sixteen bytes. Reserved: no column type currently derives this width
-    /// — `HUGEINT`/`UHUGEINT` are not indexable, since DuckDB writes them to
-    /// Parquet as a lossy double. Kept encodable for if that changes.
+    /// Sixteen bytes. Reserved: no indexable column type derives this width.
     I128,
 }
 
@@ -208,13 +207,8 @@ impl IndexKeyValue {
     }
 }
 
-/// What [`encode_ordered_values`] would produce for `values`, assuming no byte
-/// needs escaping: a flag byte per column, plus each non-null value's
-/// canonical bytes and their terminator.
-///
-/// A lower bound, not the exact length — framing escapes `0x00` and `0x01`,
-/// which at worst doubles a value. Callers sizing a batch against it get a
-/// bound they may exceed by up to that factor.
+/// What [`encode_ordered_values`] would produce for `values`, assuming no
+/// byte needs escaping. A lower bound: escaping can at worst double a value.
 pub(crate) fn nominal_key_bytes(values: &[Option<IndexKeyValue>]) -> usize {
     values
         .iter()
@@ -231,8 +225,7 @@ pub enum Direction {
     /// Ascending — smaller values first.
     Ascending,
     /// Descending — larger values first, realized by complementing the
-    /// column's framed bytes so that one forward scan yields reverse value
-    /// order without a reverse iterator.
+    /// column's framed bytes.
     Descending,
 }
 
@@ -261,11 +254,7 @@ pub struct OrderedColumn {
 
 /// The canonical encoding of an index's ordered column values: the
 /// storekey-framed concatenation of the per-column component encodings,
-/// held as one opaque byte string. Framing at construction keeps distinct
-/// component splits distinct (`("ab","c") ≠ ("a","bc")`); holding the
-/// result as a single byte string lets the enclosing entry key embed it —
-/// and append a trailing row id — with an unambiguous, self-delimiting
-/// storekey encoding.
+/// held as one opaque byte string.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CanonicalKey(Bytes);
 
@@ -294,9 +283,7 @@ impl<F> Decode<F> for CanonicalKey {
 }
 
 impl CanonicalKey {
-    /// A key with no framed content, for subspace-prefix derivation only —
-    /// the derived prefix keeps just the leading discriminant byte, so the
-    /// content is never inspected.
+    /// A key with no framed content, for prefix derivation only.
     pub(crate) const fn empty() -> Self {
         Self(Bytes::new())
     }
@@ -308,11 +295,8 @@ impl CanonicalKey {
     }
 }
 
-/// Builds a canonical composite key directly from borrowed scalar values.
-///
-/// The builder writes each component's flag, escaping, terminator, and
-/// direction transform into the final key allocation. It also tracks NULLs
-/// for unique-index shaping, so callers need no second pass over a row.
+/// Builds a canonical composite key directly from borrowed scalar values,
+/// tracking whether any component was NULL.
 pub(crate) struct CanonicalKeyBuilder {
     bytes: Vec<u8>,
     raw_bytes: usize,
@@ -400,22 +384,18 @@ impl CanonicalKeyBuilder {
         (CanonicalKey(Bytes::from(self.bytes)), self.has_null)
     }
 
-    /// Finishes directly as a physical SlateDB index-entry key. The
-    /// canonical bytes are outer-framed in place from back to front, leaving
-    /// room for the entry prefix and optional row id without allocating a
-    /// second payload buffer.
+    /// Finishes directly as a physical index-entry key, outer-framing the
+    /// canonical bytes in place from back to front.
     pub(crate) fn finish_index_entry(
         mut self,
         index_id: u64,
         requested_unique: bool,
         row_id: u64,
     ) -> (Bytes, bool) {
-        const ENTRY_PREFIX_BYTES: usize = 2 + size_of::<u64>();
-
         let unique = requested_unique && !self.has_null;
         let canonical_len = self.bytes.len();
         let escapes = self.bytes.iter().filter(|byte| **byte <= 1).count();
-        let framed_end = ENTRY_PREFIX_BYTES
+        let framed_end = INDEX_ENTRY_PREFIX_LEN
             .saturating_add(canonical_len)
             .saturating_add(escapes);
         let suffix = 1 + if unique { 0 } else { size_of::<u64>() };
@@ -431,9 +411,9 @@ impl CanonicalKeyBuilder {
                 self.bytes[write] = 1;
             }
         }
-        self.bytes[0] = 7;
-        self.bytes[1] = if unique { 2 } else { 3 };
-        self.bytes[2..ENTRY_PREFIX_BYTES].copy_from_slice(&index_id.to_be_bytes());
+        self.bytes[0] = INDEX_SUBSPACE_TAG;
+        self.bytes[1] = index_kind_tag(unique);
+        self.bytes[2..INDEX_ENTRY_PREFIX_LEN].copy_from_slice(&index_id.to_be_bytes());
         self.bytes[framed_end] = 0;
         if !unique {
             self.bytes[framed_end + 1..].copy_from_slice(&row_id.to_be_bytes());
@@ -461,6 +441,19 @@ impl CanonicalKeyBuilder {
 }
 
 impl BorrowedIndexKeyValue<'_> {
+    /// This value with its text or bytes copied out of their source.
+    pub(crate) fn into_owned(self) -> IndexKeyValue {
+        match self {
+            Self::Int { value, width } => IndexKeyValue::Int { value, width },
+            Self::UInt { value, width } => IndexKeyValue::UInt { value, width },
+            Self::F32(value) => IndexKeyValue::F32(value),
+            Self::F64(value) => IndexKeyValue::F64(value),
+            Self::Bool(value) => IndexKeyValue::Bool(value),
+            Self::Str(value) => IndexKeyValue::Str(value.to_owned()),
+            Self::Bytes(value) => IndexKeyValue::Bytes(value.to_vec()),
+        }
+    }
+
     const fn encoded_len(self) -> usize {
         match self {
             Self::Int { width, .. } | Self::UInt { width, .. } => width.bytes(),
@@ -551,15 +544,14 @@ pub(crate) fn encode_ordered_key(columns: &[OrderedColumn]) -> Result<CanonicalK
     Ok(builder.finish().0)
 }
 
-/// Encode index values in their columns' declared orders. `directions` and
-/// `nulls` run parallel to `values`; where either is shorter (or empty) the
-/// column defaults to ascending / NULLS LAST, so an empty slice means the
-/// all-ascending equality shape. A `None` value is SQL NULL.
-pub(crate) fn encode_ordered_values(
+/// Appends every value in its column's declared order; `directions` and
+/// `nulls` run parallel to `values`, defaulting to ascending / NULLS LAST
+/// where shorter.
+fn build(
     values: &[Option<IndexKeyValue>],
     directions: &[Direction],
     nulls: &[NullOrder],
-) -> Result<CanonicalKey> {
+) -> Result<CanonicalKeyBuilder> {
     let mut builder = CanonicalKeyBuilder::new();
     for (index, value) in values.iter().enumerate() {
         builder.append(
@@ -571,7 +563,18 @@ pub(crate) fn encode_ordered_values(
             nulls.get(index).copied().unwrap_or(NullOrder::Last),
         )?;
     }
-    Ok(builder.finish().0)
+    Ok(builder)
+}
+
+/// Encode index values in their columns' declared orders. `directions` and
+/// `nulls` run parallel to `values`, defaulting to ascending / NULLS LAST
+/// where shorter. A `None` value is SQL NULL.
+pub(crate) fn encode_ordered_values(
+    values: &[Option<IndexKeyValue>],
+    directions: &[Direction],
+    nulls: &[NullOrder],
+) -> Result<CanonicalKey> {
+    Ok(build(values, directions, nulls)?.finish().0)
 }
 
 /// Encodes ordered values straight into their physical SlateDB entry key.
@@ -585,18 +588,7 @@ pub(crate) fn encode_ordered_index_entry(
     requested_unique: bool,
     row_id: u64,
 ) -> Result<(Bytes, bool)> {
-    let mut builder = CanonicalKeyBuilder::new();
-    for (index, value) in values.iter().enumerate() {
-        builder.append(
-            value.as_ref().map(BorrowedIndexKeyValue::from),
-            directions
-                .get(index)
-                .copied()
-                .unwrap_or(Direction::Ascending),
-            nulls.get(index).copied().unwrap_or(NullOrder::Last),
-        )?;
-    }
-    Ok(builder.finish_index_entry(index_id, requested_unique, row_id))
+    Ok(build(values, directions, nulls)?.finish_index_entry(index_id, requested_unique, row_id))
 }
 
 /// A single slice framed as a storekey byte string: low bytes escaped behind

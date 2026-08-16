@@ -34,13 +34,11 @@ pub struct MoraineTagRow {
 pub(crate) fn tag_rows(
     rows: Vec<moraine::ffi_support::TagRow>,
 ) -> Result<Vec<MoraineTagRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|row| {
-            let key = to_c_string(&row.key)?;
-            let value = to_c_string(&row.value)?;
+        .map(|mut row| {
+            let key = to_c_string(std::mem::take(&mut row.key))?;
+            let value = to_c_string(std::mem::take(&mut row.value))?;
             Ok((row, key, value))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -88,7 +86,7 @@ pub unsafe extern "C" fn moraine_dump_tags(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_tags(catalog)),
+            moraine::ffi_support::dump_tags,
             tag_rows,
         )
     }
@@ -139,13 +137,11 @@ pub struct MoraineColumnTagRow {
 pub(crate) fn column_tag_rows(
     rows: Vec<moraine::ffi_support::ColumnTagRow>,
 ) -> Result<Vec<MoraineColumnTagRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|row| {
-            let key = to_c_string(&row.key)?;
-            let value = to_c_string(&row.value)?;
+        .map(|mut row| {
+            let key = to_c_string(std::mem::take(&mut row.key))?;
+            let value = to_c_string(std::mem::take(&mut row.value))?;
             Ok((row, key, value))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -194,7 +190,7 @@ pub unsafe extern "C" fn moraine_dump_column_tags(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_column_tags(catalog)),
+            moraine::ffi_support::dump_column_tags,
             column_tag_rows,
         )
     }

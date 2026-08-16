@@ -42,34 +42,22 @@ fn measure(subspace: SubspaceName, segment: Option<&SegmentSize>) -> SubspaceCen
     }
 }
 
-/// Counts the live entries of each measured subspace under one read
-/// session.
-async fn count_live_entries(
-    handle: ReadHandle<'_>,
-    subspaces: &mut [SubspaceCensus],
-) -> Result<()> {
-    if subspaces.is_empty() {
-        return Ok(());
-    }
+/// Counts the live entries of every known subspace under one read session.
+/// An unknown segment addresses no keys this build can decode, so it has
+/// no count.
+async fn count_live_entries(handle: ReadHandle<'_>) -> Result<Vec<(Subspace, LiveCount)>> {
+    stream::iter(Subspace::ALL.into_iter().map(|subspace| async move {
+        let tally = store_census::scan_live(handle, subspace).await?;
+        let live = LiveCount {
+            keys: tally.keys,
+            key_bytes: tally.key_bytes,
+            value_bytes: tally.value_bytes,
+            scheduled_files: tally.scheduled_files,
+        };
 
-    let concurrency = subspaces.len();
-    stream::iter(subspaces.iter_mut().filter_map(|measured| {
-        // An unknown segment addresses no keys this build can decode, so
-        // there is nothing to scan and no count to report.
-        let subspace = measured.subspace.subspace()?;
-        Some(async move {
-            let tally = store_census::scan_live(handle, subspace).await?;
-            measured.live = Some(LiveCount {
-                keys: tally.keys,
-                key_bytes: tally.key_bytes,
-                value_bytes: tally.value_bytes,
-                scheduled_files: tally.scheduled_files,
-            });
-
-            Ok(())
-        })
+        Ok((subspace, live))
     }))
-    .buffer_unordered(concurrency)
+    .buffer_unordered(Subspace::ALL.len())
     .try_collect()
     .await
 }
@@ -112,9 +100,7 @@ pub struct MaintenanceRequest {
     /// orphaned by `drop_index`, or by a `drop_table` that ended the
     /// table's indexes with it.
     pub sweep_orphaned_index_entries: bool,
-    /// Maximum entries deleted per commit. Each batch is one atomic
-    /// write; the pass yields between them so a large reclamation never
-    /// holds the writer. Must be nonzero.
+    /// Maximum entries deleted per commit. Must be nonzero.
     pub batch_size: usize,
 }
 
@@ -208,11 +194,10 @@ impl ReadOnlyCatalog {
 
     /// What the store weighs, subspace by subspace.
     ///
-    /// The default request reads the store's manifest and nothing else —
-    /// two object reads, a cost independent of how large the store is — and
+    /// The default request reads the store's manifest and nothing else, and
     /// reports physical bytes, SST counts, and sorted-run counts per
-    /// subspace. Those figures include superseded versions and tombstones,
-    /// which is the point: the gap between them and the live count is what
+    /// subspace. Those figures include superseded versions and tombstones;
+    /// the gap between them and the live count is what
     /// [`compact_store`](Catalog::compact_store) reclaims.
     ///
     /// Setting [`CensusRequest::count_live_entries`] adds a scan of every
@@ -245,19 +230,31 @@ impl ReadOnlyCatalog {
         let physical = store_census::read_manifest_census(
             &self.location.path,
             Arc::clone(&self.location.object_store),
-        )
-        .await?;
+        );
+        let live = async {
+            if !request.count_live_entries {
+                return Ok(Vec::new());
+            }
+            // One session for every subspace: one consistent cut.
+            let session = self.begin_read().await?;
+            let counted = count_live_entries(session.handle()).await;
+            session.finish();
+            counted
+        };
+        let (physical, live) = futures::try_join!(physical, live)?;
 
         // Every subspace is reported, whether or not the manifest carries a
-        // segment for it: a subspace absent from the manifest is one whose
-        // writes have not been written out, which is a measurement rather
-        // than a reason to omit the row. Two censuses of one store are then
-        // always comparable row by row.
+        // segment for it, so two censuses stay comparable row by row.
         let mut subspaces: Vec<SubspaceCensus> = Subspace::ALL
             .into_iter()
             .map(|subspace| {
                 let prefix = subspace_prefix(subspace);
-                measure(SubspaceName::from(subspace), physical.segment(&prefix))
+                let mut measured = measure(SubspaceName::from(subspace), physical.segment(&prefix));
+                measured.live = live
+                    .iter()
+                    .find(|(counted, _)| *counted == subspace)
+                    .map(|(_, live)| *live);
+                measured
             })
             .collect();
         subspaces.extend(
@@ -272,15 +269,6 @@ impl ReadOnlyCatalog {
                 })
                 .map(|segment| measure(SubspaceName::of_prefix(&segment.prefix), Some(segment))),
         );
-
-        if request.count_live_entries {
-            // One session for every subspace, so the counts are one
-            // consistent cut rather than a sequence of unrelated ones.
-            let session = self.begin_read().await?;
-            let counted = count_live_entries(session.handle(), &mut subspaces).await;
-            session.finish();
-            counted?;
-        }
 
         Ok(StoreCensus {
             manifest_id: physical.manifest_id,
@@ -352,15 +340,13 @@ impl Catalog {
     }
 
     /// Deletes up to `limit` orphaned entries of a dropped index, in one
-    /// bounded batch outside the commit protocol (entries are not catalog
-    /// entities, and the dropping commit's batch must stay bounded). Returns
-    /// the number deleted; a host loops until it returns 0. Index ids are
-    /// never reused, so a concurrent create cannot collide with a sweep.
+    /// bounded batch outside the commit protocol. Returns the number
+    /// deleted; a host loops until it returns 0.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Constraint`] if the index is still live (reclaiming
-    /// a live index's entries would corrupt it), or a store error.
+    /// Returns [`Error::Constraint`] if the index is still live, or a store
+    /// error.
     pub async fn reclaim_index_entries(&self, index: IndexId, limit: usize) -> Result<usize> {
         let head = self.snapshot().await?;
         if head
@@ -406,10 +392,7 @@ impl Catalog {
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn maintain(&self, request: MaintenanceRequest) -> Result<MaintenanceReport> {
-        // Refuse before doing anything, including before the
-        // nothing-to-do shortcut: a pass that reclaims nothing is still a
-        // pass, and answering it differently on a read-only catalog would
-        // make the outcome depend on the request rather than the handle.
+        // Refused before the nothing-to-do shortcut too.
         self.writer()?;
         if request.batch_size == 0 {
             return Err(Error::Configuration(
@@ -423,10 +406,8 @@ impl Catalog {
             return Ok(report);
         }
 
-        // Index ids come from the monotonic catalog-id counter and are
-        // never reused, so an id absent from this view can never become
-        // live again: deciding liveness once, here, is sound for the
-        // whole pass however long it runs.
+        // Index ids are never reused, so liveness decided once holds for
+        // the whole pass.
         let live: HashSet<u64> = self
             .snapshot()
             .await?
@@ -461,11 +442,8 @@ impl Catalog {
     /// Merges each targeted subspace's sorted runs into one, reclaiming the
     /// superseded versions and tombstones they hold.
     ///
-    /// moraine plans nothing: SlateDB decides which runs merge into which,
-    /// and the plan it makes for a whole tree destines that tree's bottom
-    /// run — which is what permits dropping a tombstone rather than carrying
-    /// it forward. A subspace with no sorted runs is skipped, as is one
-    /// already being merged.
+    /// A subspace with no sorted runs is skipped, as is one already being
+    /// merged.
     ///
     /// With [`CompactStoreRequest::wait`] set, the call returns once every
     /// submitted merge has committed or failed. A merge that outlives the
@@ -474,10 +452,8 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Constraint`] if the catalog was opened read-only —
-    /// the compactor that executes a submitted merge runs inside the writer,
-    /// so a reader would queue work nothing would run — or a store error if
-    /// the merge cannot be submitted.
+    /// Returns [`Error::Constraint`] if the catalog was opened read-only, or
+    /// a store error if the merge cannot be submitted.
     #[allow(
         clippy::too_many_lines,
         reason = "the method keeps one ordered submit, await, classify, and measure protocol"
@@ -494,8 +470,6 @@ impl Catalog {
             CompactionTarget::WholeStore => None,
             CompactionTarget::Subspace(name) => match name.subspace() {
                 Some(subspace) => Some(subspace_prefix(subspace)),
-                // An unknown subspace addresses no keys, so there is no
-                // tree to name in a request.
                 None => {
                     return Err(Error::Configuration(format!(
                         "{name} is not a subspace this build can merge"
@@ -541,27 +515,26 @@ impl Catalog {
             vec![None; submitted.len()]
         };
 
-        let mut merges = Vec::new();
-        for (merge, outcome) in submitted.iter().zip(outcomes) {
-            let subspace = SubspaceName::of_prefix(&merge.segment);
-            let outcome = match outcome {
-                None => MergeOutcome::Pending,
-                Some(outcome) => match outcome {
-                    MergeEnd::Completed => MergeOutcome::Completed,
-                    MergeEnd::Failed => {
+        let mut merges: Vec<SubspaceMerge> = submitted
+            .iter()
+            .zip(outcomes)
+            .map(|(merge, outcome)| {
+                let subspace = SubspaceName::of_prefix(&merge.segment);
+                let outcome = match outcome {
+                    None | Some(MergeEnd::Pending) => MergeOutcome::Pending,
+                    Some(MergeEnd::Completed) => MergeOutcome::Completed,
+                    Some(MergeEnd::Failed) => {
                         MergeOutcome::Failed("the merge ended without committing".to_string())
                     }
-                    MergeEnd::Pending => MergeOutcome::Pending,
-                },
-            };
-
-            merges.push(SubspaceMerge {
-                subspace: subspace.clone(),
-                outcome,
-                bytes_before: bytes_of(&before, &subspace),
-                bytes_after: None,
-            });
-        }
+                };
+                SubspaceMerge {
+                    bytes_before: bytes_of(&before, &subspace),
+                    subspace,
+                    outcome,
+                    bytes_after: None,
+                }
+            })
+            .collect();
 
         // Every subspace the request covered but nothing was submitted for
         // is reported rather than dropped, so two calls stay comparable.
@@ -572,10 +545,8 @@ impl Catalog {
             if !covered || merges.iter().any(|m| m.subspace == measured.subspace) {
                 continue;
             }
-            // The only reason a plan omits a tree: L0 SSTs are not
-            // eligible sources, so a tree without sorted runs has nothing
-            // to merge. A tree already being merged is adopted rather than
-            // omitted, so it never reaches here.
+            // A plan omits a tree only when it has no sorted runs; one
+            // already being merged is adopted, not omitted.
             merges.push(SubspaceMerge {
                 subspace: measured.subspace.clone(),
                 outcome: MergeOutcome::Skipped("no sorted runs to merge"),
@@ -613,10 +584,7 @@ impl Catalog {
         batch_size: usize,
     ) -> Result<u64> {
         let mut total = 0u64;
-        // Each batch resumes where the last one stopped. Restarting at
-        // the range's beginning would make every batch step over the
-        // tombstones its predecessors left, which is quadratic in the
-        // size of the range.
+        // Each batch resumes past the tombstones the last one left.
         let mut cursor: Option<Vec<u8>> = None;
         loop {
             let tx = self.begin_write_tx().await?;
@@ -635,11 +603,8 @@ impl Catalog {
                 tx.rollback();
                 return Ok(total);
             }
-            // Batches commit non-durably: awaiting a flush tick per batch
-            // makes the whole sweep flush-bound, and durability buys nothing
-            // here. A dead index id is never reused and the deletes are
-            // idempotent, so a batch lost to a crash simply leaves entries a
-            // later pass rediscovers.
+            // Non-durable: the deletes are idempotent, so a batch lost to a
+            // crash leaves entries a later pass rediscovers.
             tx.commit_with_options(&commit::non_durable())
                 .await
                 .map_err(Error::from)?;

@@ -832,3 +832,76 @@ async fn a_handle_reports_what_its_decoded_catalog_holds() {
         writer.projection_bytes()
     );
 }
+
+/// Warming a table reads its index and inline probe ranges, and an index
+/// lookup on the warmed handle still answers. Whether those blocks stay
+/// resident is a property of the shared cache under load, measured by the
+/// object-storage benchmark rather than pinned here.
+#[tokio::test]
+async fn warming_a_table_reads_its_probe_ranges() {
+    use moraine::{IndexDef, IndexEntry, IndexKeyValue, IntWidth};
+
+    let key = |value: i128| IndexKeyValue::Int {
+        value,
+        width: IntWidth::I64,
+    };
+    let seed = || async {
+        let object_store = Arc::new(InMemory::new());
+        let writer = Catalog::open(
+            Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+            CatalogOptions::default(),
+        )
+        .await
+        .unwrap();
+        let created = std::cell::Cell::new(None);
+        writer
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                let table = tx.create_table(schema, "items", &[col("value")])?;
+                let entries = (0..2_000_u64)
+                    .map(|row_id| IndexEntry {
+                        row_id,
+                        values: vec![Some(key(i128::from(row_id)))],
+                    })
+                    .collect::<Vec<_>>();
+                let index = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_value".to_owned(),
+                        columns: vec![moraine::ColumnId::new(1)],
+                        unique: false,
+                    },
+                    &entries,
+                )?;
+                created.set(Some((table, index)));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let (table, index) = created.get().unwrap();
+        (object_store, table, index)
+    };
+
+    let (object_store, table, index) = seed().await;
+    let counting = Arc::new(CountingStore::new(object_store));
+    let reader = Catalog::open_read_only(
+        Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    reader.snapshot().await.unwrap();
+    counting.take_reads();
+
+    reader.warm_tables(&[table]).await.unwrap();
+    let warm_reads = counting.take_reads();
+    assert!(warm_reads > 0, "warming a cold table read nothing");
+
+    let found = reader
+        .index_lookup(table, index, &[key(1_500)])
+        .await
+        .unwrap();
+    assert_eq!(found, vec![1_500]);
+    reader.close().await.unwrap();
+}

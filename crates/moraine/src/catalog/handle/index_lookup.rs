@@ -10,7 +10,7 @@ use tracing::debug;
 
 use super::ReadOnlyCatalog;
 use crate::{
-    catalog::{IndexId, IndexInfo, IndexState, TableId},
+    catalog::{CatalogSnapshot, IndexId, IndexInfo, IndexState, TableId},
     error::{Error, Result},
     store::{
         cache::{CacheTally, ObjectStoreTally},
@@ -180,69 +180,59 @@ impl ReadOnlyCatalog {
         let started = Instant::now();
         let cache_before = self.cache_tally();
         let store_before = self.object_store_tally();
-        let session = self.begin_read().await?;
-        let handle = session.handle();
+        let read = async {
+            let session = self.begin_read().await?;
+            let handle = session.handle();
 
-        let index_row_ids = read::consistent(handle, || async {
-            let head_started = Instant::now();
-            let view = self.head_view(handle).await?;
-            let head = head_started.elapsed();
-            let info = view
-                .index_by_id(table, index)
-                .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
+            let index_row_ids = read::consistent(handle, || async {
+                let head_started = Instant::now();
+                let view = self.head_view(handle).await?;
+                let head = head_started.elapsed();
+                let info = ready_index(&view, table, index)?;
 
-            match info.state {
-                IndexState::Ready => {}
-                IndexState::Building | IndexState::Maintaining => {
-                    return Err(Error::IndexBuilding(format!(
-                        "index {index} is still building"
-                    )));
+                let mut encoded = keys.iter().map(|key| {
+                    if key.len() != info.columns.len() {
+                        return Err(Error::Constraint(format!(
+                            "index lookup: {} values do not address the {}-column index {index}; an \
+                             equality lookup names every column",
+                            key.len(),
+                            info.columns.len()
+                        )));
+                    }
+                    encode_ordered_values(
+                        &key.iter().cloned().map(Some).collect::<Vec<_>>(),
+                        &info.directions,
+                        &info.nulls,
+                    )
+                }).collect::<Result<Vec<_>>>()?;
+                encoded.sort_unstable();
+                encoded.dedup();
+
+                let mut resolution = resolve_encoded(handle, index.get(), info.unique, encoded).await?;
+                resolution.metrics.head = head;
+                Ok(resolution)
+            })
+            .await;
+            session.finish();
+
+            match index_row_ids {
+                Ok(resolution) => {
+                    log_lookup(
+                        table,
+                        index,
+                        keys.len(),
+                        started.elapsed(),
+                        &resolution.metrics,
+                        self.cache_tally().since(cache_before),
+                        self.object_store_tally().since(store_before),
+                    );
+                    Ok(resolution.row_ids)
                 }
-                IndexState::Poisoned => {
-                    return Err(Error::NotFound(format!("index {index} was poisoned")));
-                }
+                Err(error) => Err(error),
             }
-
-            let mut encoded = keys.iter().map(|key| {
-                if key.len() != info.columns.len() {
-                    return Err(Error::Constraint(format!(
-                        "index lookup: {} values do not address the {}-column index {index}; an \
-                         equality lookup names every column",
-                        key.len(),
-                        info.columns.len()
-                    )));
-                }
-                encode_ordered_values(
-                    &key.iter().cloned().map(Some).collect::<Vec<_>>(),
-                    &info.directions,
-                    &info.nulls,
-                )
-            }).collect::<Result<Vec<_>>>()?;
-            encoded.sort_unstable();
-            encoded.dedup();
-
-            let mut resolution = resolve_encoded(handle, index.get(), info.unique, encoded).await?;
-            resolution.metrics.head = head;
-            Ok(resolution)
-        })
-        .await;
-        session.finish();
-
-        match index_row_ids {
-            Ok(resolution) => {
-                log_lookup(
-                    table,
-                    index,
-                    keys.len(),
-                    started.elapsed(),
-                    &resolution.metrics,
-                    self.cache_tally().since(cache_before),
-                    self.object_store_tally().since(store_before),
-                );
-                Ok(resolution.row_ids)
-            }
-            Err(error) => Err(error),
-        }
+        };
+        let (result, ()) = futures::join!(read, self.warm_on_first_touch(table));
+        result
     }
 
     /// Resolves a comparison query to the rows whose indexed value falls
@@ -251,11 +241,8 @@ impl ReadOnlyCatalog {
     /// columns' values; equality is the degenerate closed `[v, v]` range.
     ///
     /// Head-only and candidate-returning, exactly like
-    /// [`index_lookup`](Self::index_lookup): the scan and the catalog it
-    /// resolves against are one consistent cut, and the caller applies delete
-    /// files. Results are in the index's stored order, or its exact opposite
-    /// when `reverse` is set. Both directions stream from the store in the
-    /// requested order.
+    /// [`index_lookup`](Self::index_lookup). Results are in the index's
+    /// stored order, or its exact opposite when `reverse` is set.
     ///
     /// # Errors
     ///
@@ -271,42 +258,33 @@ impl ReadOnlyCatalog {
         upper: Bound<Vec<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
-        let session = self.begin_read().await?;
-        let handle = session.handle();
+        let read = async {
+            let session = self.begin_read().await?;
+            let handle = session.handle();
 
-        let view = self.head_view(handle).await?;
-        let info = view
-            .index_by_id(table, index)
-            .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
+            let view = self.head_view(handle).await?;
+            let info = ready_index(&view, table, index)?;
 
-        match info.state {
-            IndexState::Ready => {}
-            IndexState::Building | IndexState::Maintaining => {
-                return Err(Error::IndexBuilding(format!(
-                    "index {index} is still building"
-                )));
-            }
-            IndexState::Poisoned => {
-                return Err(Error::NotFound(format!("index {index} was poisoned")));
-            }
-        }
+            let (byte_lower, byte_upper) = encode_range_bounds(&info, index, lower, upper)?;
+            let leading_nulls = info.nulls.first().copied().unwrap_or(NullOrder::Last);
 
-        let (byte_lower, byte_upper) = encode_range_bounds(&info, index, lower, upper)?;
-        let leading_nulls = info.nulls.first().copied().unwrap_or(NullOrder::Last);
+            let range_row_ids = index_maintenance::range_row_ids(
+                handle,
+                index.get(),
+                info.unique,
+                leading_nulls,
+                byte_lower,
+                byte_upper,
+                ScanOrder::from_reverse(reverse),
+            )
+            .await;
+            session.finish();
 
-        let range_row_ids = index_maintenance::range_row_ids(
-            handle,
-            index.get(),
-            info.unique,
-            leading_nulls,
-            byte_lower,
-            byte_upper,
-            ScanOrder::from_reverse(reverse),
-        )
-        .await;
-        session.finish();
+            range_row_ids
+        };
+        let (result, ()) = futures::join!(read, self.warm_on_first_touch(table));
 
-        range_row_ids
+        result
     }
 
     /// Resolves an `IS NULL` query to the rows whose leading indexed columns
@@ -330,54 +308,59 @@ impl ReadOnlyCatalog {
         prefix: Vec<Option<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
-        let session = self.begin_read().await?;
-        let handle = session.handle();
+        let read = async {
+            let session = self.begin_read().await?;
+            let handle = session.handle();
 
-        let view = self.head_view(handle).await?;
-        let info = view
-            .index_by_id(table, index)
-            .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
+            let view = self.head_view(handle).await?;
+            let info = ready_index(&view, table, index)?;
 
-        match info.state {
-            IndexState::Ready => {}
-            IndexState::Building | IndexState::Maintaining => {
-                return Err(Error::IndexBuilding(format!(
-                    "index {index} is still building"
+            if prefix.is_empty() || prefix.len() > info.columns.len() {
+                return Err(Error::Constraint(format!(
+                    "index_nulls: a prefix of {} predicates does not fit the {}-column index \
+                         {index}",
+                    prefix.len(),
+                    info.columns.len()
                 )));
             }
-            IndexState::Poisoned => {
-                return Err(Error::NotFound(format!("index {index} was poisoned")));
+            if prefix.iter().all(Option::is_some) {
+                return Err(Error::Constraint(
+                    "index_nulls: the prefix names no IS NULL; use index_lookup for pure equality"
+                        .to_owned(),
+                ));
             }
-        }
 
-        if prefix.is_empty() || prefix.len() > info.columns.len() {
-            return Err(Error::Constraint(format!(
-                "index_nulls: a prefix of {} predicates does not fit the {}-column index \
-                     {index}",
-                prefix.len(),
-                info.columns.len()
-            )));
-        }
-        if prefix.iter().all(Option::is_some) {
-            return Err(Error::Constraint(
-                "index_nulls: the prefix names no IS NULL; use index_lookup for pure equality"
-                    .to_owned(),
-            ));
-        }
+            let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
 
-        let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
+            let null_prefix_row_ids = index_maintenance::null_prefix_row_ids(
+                handle,
+                index.get(),
+                &key,
+                ScanOrder::from_reverse(reverse),
+            )
+            .await;
 
-        let null_prefix_row_ids = index_maintenance::null_prefix_row_ids(
-            handle,
-            index.get(),
-            &key,
-            ScanOrder::from_reverse(reverse),
-        )
-        .await;
+            session.finish();
 
-        session.finish();
+            null_prefix_row_ids
+        };
+        let (result, ()) = futures::join!(read, self.warm_on_first_touch(table));
+        result
+    }
+}
 
-        null_prefix_row_ids
+/// The index `index` of `table` in `view`, once it is ready to serve.
+fn ready_index(view: &CatalogSnapshot, table: TableId, index: IndexId) -> Result<IndexInfo> {
+    let info = view
+        .index_by_id(table, index)
+        .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
+
+    match info.state {
+        IndexState::Ready => Ok(info),
+        IndexState::Building | IndexState::Maintaining => Err(Error::IndexBuilding(format!(
+            "index {index} is still building"
+        ))),
+        IndexState::Poisoned => Err(Error::NotFound(format!("index {index} was poisoned"))),
     }
 }
 

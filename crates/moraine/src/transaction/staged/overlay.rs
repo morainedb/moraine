@@ -1,24 +1,17 @@
 //! Read-your-writes for the `dump_*` projections: the committed records a
 //! staged transaction can see, with its own uncommitted rows applied over
-//! them.
+//! them in stage order, decoded by the same decoders translation uses.
 //!
-//! A staged row is stored untranslated — DuckLake's own cells, carrying the
-//! snapshot ids DuckLake itself authored — so what the transaction will
-//! *see* is fully determined the moment the row is staged, without waiting
-//! for commit-time translation. That is what makes an overlay possible at
-//! all: it decodes each staged row with the same decoders translation uses
-//! and applies it to the scanned records, in stage order.
-//!
-//! The overlay is deliberately not translation. It never validates, never
-//! diffs, and never touches the store: a row translation would refuse still
-//! shows up here, and fails loudly at commit where it belongs.
+//! The overlay is not translation: it never validates, never diffs, and
+//! never touches the store. A row translation would refuse still shows up
+//! here and fails at commit.
 
 use super::{
     Cell, EntityKey, Error, Result, RowOperation, TableKind,
     decode::{
         Cursor, StatsKey, decode_column, decode_column_mapping, decode_data_file,
         decode_delete_file, decode_delete_key, decode_end, decode_file_column_stats,
-        decode_gc_file_row, decode_hard_delete, decode_macro, decode_metadata,
+        decode_gc_file_row, decode_hard_delete, decode_macro, decode_metadata, decode_metadata_key,
         decode_partition_info, decode_schema, decode_sort_info, decode_table,
         decode_table_column_stats, decode_table_stats, decode_tag_row, decode_view,
     },
@@ -39,10 +32,8 @@ pub(super) trait Versioned: Sized {
 
     fn set_end_snapshot(&mut self, end: u64);
 
-    /// Rebases the live version's `begin_snapshot`. Defaulted to a no-op:
-    /// an `UPDATE ... SET begin_snapshot` is refused at decode for every
-    /// kind but `ducklake_data_file`, so no other implementation is ever
-    /// reached.
+    /// Rebases the live version's `begin_snapshot`. Defaulted to a no-op;
+    /// only `ducklake_data_file` reaches it.
     fn set_begin_snapshot(&mut self, begin: u64) {
         let _ = begin;
     }
@@ -53,14 +44,9 @@ pub(super) trait Versioned: Sized {
 }
 
 /// `rows` with the transaction's staged rows for `T::KIND` applied, in
-/// stage order.
-///
-/// Inserts append; a hard delete drops exactly the version it names
-/// (`end_snapshot` `NULL` for the live one, a value for that history one);
-/// an `UPDATE ... SET end_snapshot` ends the live version; an
-/// `UPDATE ... SET begin_snapshot` rebases it. Stage order is load-bearing:
-/// a transaction that inserts a row and then ends it must see both, in that
-/// order.
+/// stage order: inserts append, a hard delete drops exactly the version it
+/// names, an `UPDATE ... SET end_snapshot` ends the live version, and an
+/// `UPDATE ... SET begin_snapshot` rebases it.
 pub(super) fn overlay_versioned<T: Versioned>(
     ops: &[RowOperation],
     mut rows: Vec<T>,
@@ -253,11 +239,8 @@ impl Versioned for proto::TableValue {
         self.end_snapshot = Some(end);
     }
 
-    /// `next_column_id` is moraine's own counter, not a DuckLake column, so
-    /// a staged row carries no value for it: it is inherited from whatever
-    /// the table already had, and starts at 1 for a table this transaction
-    /// is creating. It reaches no projection either way — translation
-    /// recomputes it at commit.
+    /// `next_column_id` is not a DuckLake column: it is inherited from the
+    /// table's committed row, or 1 for a table this transaction creates.
     fn decode_row(cells: &[Cell], committed: &[Self]) -> Result<Self> {
         let cells = decode_table(cells)?;
         let next_column_id = committed
@@ -497,8 +480,7 @@ impl Unversioned for proto::MappingValue {
         decode_column_mapping(cells)
     }
 
-    /// Mappings are unversioned but their delete is a hard one, keyed like
-    /// the versioned kinds' rather than like the statistics kinds'.
+    /// A mapping delete is keyed like the versioned kinds'.
     fn decode_key(cells: &[Cell]) -> Result<Self::Key> {
         match decode_hard_delete(Self::KIND, cells)?.0 {
             EntityKey::Mapping { mapping_id, .. } => Ok(mapping_id),
@@ -509,24 +491,16 @@ impl Unversioned for proto::MappingValue {
     }
 }
 
-/// A statistics delete that decoded as another kind's key — unreachable
-/// while [`decode_delete_key`] switches on the same kind the caller asked
-/// for, and a loud error rather than a silent mismatch if that changes.
+/// A statistics delete that decoded as another kind's key.
 fn stats_key_mismatch(kind: TableKind) -> Error {
     Error::Constraint(format!("{kind:?} delete decoded as another statistics key"))
 }
 
-/// `containers` with the transaction's staged `ducklake_tag` rows applied.
-///
-/// A tag row is an *entry* inside its object's container record, not a
-/// record of its own, so this folds rather than appends: an insert adds an
-/// entry (minting the container if the object has none yet), an
+/// `containers` with the transaction's staged `ducklake_tag` rows folded
+/// in: an insert adds an entry (minting the container if needed), an
 /// `UPDATE ... SET end_snapshot` ends the live entry with that key, and a
 /// delete removes the entry it names, taking an emptied container with it.
-///
-/// Naming an entry that is not there is a shape error translation refuses
-/// at commit; the overlay leaves the view unchanged rather than deciding
-/// that here.
+/// Naming an absent entry leaves the view unchanged.
 pub(super) fn overlay_tag_containers(
     ops: &[RowOperation],
     mut containers: Vec<proto::TagValue>,
@@ -578,13 +552,10 @@ pub(super) fn overlay_tag_containers(
     Ok(containers)
 }
 
-/// `scopes` with the transaction's staged `ducklake_metadata` rows applied.
-///
-/// Options live outside the snapshot protocol — last write wins, no
-/// lifecycle — so an insert sets its key in the scope's record (minting the
-/// scope if it is new) and a delete removes it, taking an emptied scope with
-/// it. A delete of a key already gone is a no-op, matching translation: two
-/// writers agreeing a key is absent is not a disagreement about state.
+/// `scopes` with the transaction's staged `ducklake_metadata` rows applied:
+/// an insert sets its key in the scope's record (minting the scope if
+/// needed) and a delete removes it, taking an emptied scope with it. A
+/// delete of an absent key is a no-op.
 pub(super) fn overlay_option_scopes(
     ops: &[RowOperation],
     mut scopes: Vec<(u64, u64, proto::OptionScopeValue)>,
@@ -596,7 +567,7 @@ pub(super) fn overlay_option_scopes(
                 (components, key, Some(value))
             }
             RowOperation::Delete { table, cells } if *table == TableKind::Metadata => {
-                let (components, key, _) = decode_metadata(cells)?;
+                let (components, key) = decode_metadata_key(cells)?;
                 (components, key, None)
             }
             _ => continue,

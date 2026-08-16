@@ -168,6 +168,41 @@ this deployment: lowering the cadence from 25 ms to 1 ms buys nothing, while
 the 100 ms cadence still binds. This is the real-endpoint row the injected-RTT
 model predicted, not a new term in the composition.
 
+### Index lookup latency against a real endpoint
+
+The in-memory probe measurement further down prices what an index probe
+*fetches*; this prices what it *waits*. `object_storage.rs`'s
+`measure_index_lookup_latency_against_the_endpoint` seeds one table with a
+unique and a non-unique index and 64 files x 2 000 rows (128 000 entries per
+index, spread over several SSTs by closing the seed writer every 8 files;
+no Parquet is written, since a lookup reads only the store), then times the
+current read path — per-table warm on first touch, `warm_tables`, batched
+probes, remote-sized read-ahead — from fresh read-only attaches, five
+repetitions each, reporting median/min/max and the median main-store GET
+count per phase:
+
+| phase | what it times |
+|---|---|
+| `attach_read_only` | `Catalog::open_read_only` |
+| `cold_first_lookup` | first `index_lookup` on a fresh attach (the first-touch warm starts here) |
+| `warm_second_lookup` | a second, different key on the same attach |
+| `steady_lookup` | 20 distinct keys on the warm attach, pooled per lookup |
+| `non_unique_lookup` | one key of the non-unique index (8 rows) |
+| `in_list_lookup_many` | one `index_lookup_many` of 50 keys |
+| `range` | one `index_range` over 100 entries |
+| `locate_row_ids` | 50 row ids with no data store (catalog side only) |
+| `warm_tables` | explicit `warm_tables` on a fresh attach |
+| `lookup_after_warm` | the first `index_lookup` behind that warm |
+
+Locally, `cargo xtask s3` runs it in release against the pinned MinIO; the
+main-only [`Real S3 benchmark`](docs/real-s3-benchmark.md) workflow runs it
+against AWS S3 and keeps the printed table in the run artifact. Results are
+recorded here after a run:
+
+| phase | median | min | max | gets |
+|---|---:|---:|---:|---:|
+| _(after a run)_ | | | | |
+
 ### Commit throughput vs. concurrency
 
 The sequential number above is one commit per flush by construction. This is

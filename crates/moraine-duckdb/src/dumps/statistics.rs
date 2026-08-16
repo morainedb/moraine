@@ -73,7 +73,7 @@ pub unsafe extern "C" fn moraine_dump_table_stats(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_table_stats(catalog)),
+            moraine::ffi_support::dump_table_stats,
             table_stats_rows,
         )
     }
@@ -126,8 +126,6 @@ pub struct MoraineTableColumnStatsRow {
 pub(crate) fn table_column_stats_rows(
     rows: Vec<moraine::ffi_support::TableColumnStatsRecord>,
 ) -> Result<Vec<MoraineTableColumnStatsRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
         .map(|v| {
@@ -185,7 +183,7 @@ pub unsafe extern "C" fn moraine_dump_table_column_stats(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_table_column_stats(catalog)),
+            moraine::ffi_support::dump_table_column_stats,
             table_column_stats_rows,
         )
     }
@@ -248,8 +246,6 @@ pub struct MoraineFileColumnStatsRow {
 pub(crate) fn file_column_stats_rows(
     rows: Vec<moraine::ffi_support::FileColumnStatsRecord>,
 ) -> Result<Vec<MoraineFileColumnStatsRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
         .map(|v| {
@@ -308,7 +304,7 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_file_column_stats(catalog)),
+            moraine::ffi_support::dump_file_column_stats,
             file_column_stats_rows,
         )
     }

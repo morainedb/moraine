@@ -15,7 +15,6 @@ use crate::{
     data_file,
     error::{Error, Result},
     store::index_encoding::{Direction, NullOrder},
-    transaction::commit,
 };
 
 /// How many times a staged build re-derives after losing a race before
@@ -386,9 +385,8 @@ impl Catalog {
                 .then_some(info.build_cursor)
                 .flatten();
             // Deferred UPDATE may reinsert an inline row under its preserved
-            // id, so row-id watermarks cannot distinguish its new value.
-            // Inline data is policy-bounded; re-derive its live set during
-            // repair. Initial builds still resume by their durable row id.
+            // id, so a repair re-derives the inline live set rather than
+            // resuming by row-id watermark.
             let inline_row_cursor = (info.state != IndexState::Maintaining)
                 .then_some(info.build_cursor)
                 .flatten();
@@ -487,17 +485,8 @@ impl Catalog {
         buffer: &mut BuildStepBuffer<'_>,
     ) -> Result<()> {
         let session = self.begin_read().await?;
-        let snapshot = commit::materialize(session.handle(), None).await?;
-        let live_columns = snapshot.columns_of(table);
-        let positions = columns
-            .iter()
-            .map(|column| {
-                live_columns
-                    .iter()
-                    .position(|candidate| candidate.id == *column)
-                    .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let snapshot = self.head_view(session.handle()).await?;
+        let positions = snapshot.column_positions(table, columns)?;
 
         let table_prefix = snapshot.table_data_prefix(table)?;
         let resolve = |path: &str, is_relative: bool| {

@@ -1,17 +1,13 @@
 //! Measuring a store: physical bytes per segment from the manifest, and
 //! live keys per subspace from a scan.
-//!
-//! The manifest half is size-independent — two object reads — and needs no
-//! open handle, so it serves a store nobody has attached. The scan half
-//! reads every key in the subspace and decodes none of the values.
 
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use futures::StreamExt;
 use object_store::{ObjectStore, path::Path};
 use slatedb::{
     admin::AdminBuilder,
-    manifest::{Segment, SortedRun, SsTableView, VersionedManifest},
+    manifest::{SortedRun, SsTableView, VersionedManifest},
 };
 use tracing::warn;
 
@@ -45,11 +41,6 @@ impl SegmentSize {
 }
 
 /// What the object store holds, by the kind of object holding it.
-///
-/// The manifest accounts for SST bytes only, so a store whose weight is in
-/// its write-ahead log reads as nearly empty by segment while costing every
-/// reader dearly — a reader replays the log at open. Counting the objects
-/// is the only way to tell those apart.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ObjectTotals {
     pub(crate) total_objects: u64,
@@ -60,9 +51,8 @@ pub(crate) struct ObjectTotals {
     pub(crate) manifest_bytes: u64,
     pub(crate) sst_objects: u64,
     pub(crate) sst_bytes: u64,
-    /// Everything else the store's layout carries — the compactions file
-    /// and any object a newer layout adds. Counted rather than dropped, so
-    /// the parts always sum to the total.
+    /// Every object that is not WAL, manifest, or SST; the parts always sum
+    /// to the total.
     pub(crate) other_objects: u64,
     pub(crate) other_bytes: u64,
 }
@@ -72,10 +62,7 @@ pub(crate) struct ObjectTotals {
 pub(crate) struct ManifestCensus {
     pub(crate) manifest_id: u64,
     pub(crate) segments: Vec<SegmentSize>,
-    /// `None` when the store could not be listed — read-only credentials
-    /// often grant `GetObject` without `ListBucket`, and a census that
-    /// failed wholesale for that would be useless to the operator most
-    /// likely to be holding them.
+    /// `None` when the store could not be listed.
     pub(crate) objects: Option<ObjectTotals>,
 }
 
@@ -100,21 +87,19 @@ pub(crate) struct LiveTally {
 }
 
 /// Reads the latest manifest and reports each segment's physical size.
-///
-/// Opens no `Db`, so it fences no writer and costs the same on a 3 GB store
-/// as on an empty one.
+/// Opens no `Db`, so it fences no writer.
 pub(crate) async fn read_manifest_census(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<ManifestCensus> {
-    let view = AdminBuilder::new(path, Arc::clone(&object_store))
-        .build()
-        .read_compactor_state_view()
-        .await
-        .map_err(Error::from)?;
+    let admin = AdminBuilder::new(path, Arc::clone(&object_store)).build();
+    let (view, objects) = futures::join!(
+        admin.read_compactor_state_view(),
+        count_objects(path, object_store)
+    );
 
-    let mut census = census_of_manifest(view.manifest());
-    census.objects = match count_objects(path, object_store).await {
+    let mut census = census_of_manifest(view.map_err(Error::from)?.manifest());
+    census.objects = match objects {
         Ok(totals) => Some(totals),
         Err(err) => {
             warn!(path, error = %err, "store listing failed; census reports segments only");
@@ -125,51 +110,42 @@ pub(crate) async fn read_manifest_census(
     Ok(census)
 }
 
-/// Bytes the manifest accounts for, without the store listing a full
-/// census pays for. One manifest read, so it costs the same on a large
-/// store as on a small one.
-pub(crate) async fn manifest_bytes(path: &str, object_store: Arc<dyn ObjectStore>) -> Result<u64> {
-    let view = AdminBuilder::new(path, object_store)
-        .build()
-        .read_compactor_state_view()
-        .await
-        .map_err(Error::from)?;
-
-    Ok(census_of_manifest(view.manifest())
-        .segments
-        .iter()
-        .fold(0, |total, segment| total.saturating_add(segment.bytes)))
+/// Bytes the manifest accounts for: SST bytes, and the SST metadata
+/// (filters, indexes, statistics) among them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManifestBytes {
+    pub(crate) store_bytes: u64,
+    pub(crate) metadata_bytes: u64,
 }
 
-/// Encoded bytes of SST metadata the manifest accounts for — filters,
-/// indexes, and statistics across every segment. One manifest read, like
-/// [`manifest_bytes`].
-pub(crate) async fn manifest_metadata_bytes(
+/// The manifest's byte totals, from one manifest read.
+pub(crate) async fn manifest_bytes(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
-) -> Result<u64> {
+) -> Result<ManifestBytes> {
     let view = AdminBuilder::new(path, object_store)
         .build()
         .read_compactor_state_view()
         .await
         .map_err(Error::from)?;
 
-    Ok(census_of_manifest(view.manifest())
-        .segments
-        .iter()
-        .fold(0, |total, segment| {
-            total
+    Ok(census_of_manifest(view.manifest()).segments.iter().fold(
+        ManifestBytes {
+            store_bytes: 0,
+            metadata_bytes: 0,
+        },
+        |total, segment| ManifestBytes {
+            store_bytes: total.store_bytes.saturating_add(segment.bytes),
+            metadata_bytes: total
+                .metadata_bytes
                 .saturating_add(segment.filter_bytes)
                 .saturating_add(segment.index_bytes)
-                .saturating_add(segment.stats_bytes)
-        }))
+                .saturating_add(segment.stats_bytes),
+        },
+    ))
 }
 
-/// Totals every object under the store's prefix, by kind.
-///
-/// One listing, paginated by the object store — the only part of a census
-/// whose cost grows with the store, and the only part that sees bytes the
-/// manifest does not account for.
+/// Totals every object under the store's prefix, by kind, in one listing.
 async fn count_objects(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
@@ -199,8 +175,6 @@ async fn count_objects(
                 totals.sst_objects += 1;
                 totals.sst_bytes = totals.sst_bytes.saturating_add(size);
             }
-            // The compactions file, and whatever a layout this build
-            // predates adds beside it.
             _ => {
                 totals.other_objects += 1;
                 totals.other_bytes = totals.other_bytes.saturating_add(size);
@@ -217,43 +191,16 @@ fn kind_of(location: &Path, prefix: &Path) -> Option<String> {
     remainder.next().map(|part| part.as_ref().to_string())
 }
 
-/// The per-segment sizes a manifest records, root tree included.
+/// The per-segment sizes a manifest records, plus the root tree when a
+/// store written without the segment extractor left it non-empty.
 fn census_of_manifest(manifest: &VersionedManifest) -> ManifestCensus {
-    let mut segments: Vec<SegmentSize> = manifest.segments().iter().map(size_of_segment).collect();
+    let mut segments: Vec<SegmentSize> = manifest
+        .segments()
+        .iter()
+        .map(|segment| tree_size(segment.prefix().to_vec(), segment.l0(), segment.compacted()))
+        .collect();
 
-    // A store created with the segment extractor keeps the root tree empty
-    // by construction. Reporting it when it is not lets a census describe a
-    // store written without one rather than hiding its bytes.
-    let root_views = || {
-        manifest.l0().iter().chain(
-            manifest
-                .compacted()
-                .iter()
-                .flat_map(|run| run.sst_views.iter()),
-        )
-    };
-    let root = SegmentSize {
-        prefix: Vec::new(),
-        bytes: total_bytes(
-            manifest
-                .l0()
-                .iter()
-                .map(SsTableView::estimate_size)
-                .chain(manifest.compacted().iter().map(SortedRun::estimate_size)),
-        ),
-        filter_bytes: total_bytes(root_views().map(|view| view.sst.info.filter_len)),
-        index_bytes: total_bytes(root_views().map(|view| view.sst.info.index_len)),
-        stats_bytes: total_bytes(root_views().map(|view| view.sst.info.stats_len)),
-        l0_ssts: count(manifest.l0().len()),
-        sorted_runs: count(manifest.compacted().len()),
-        sorted_run_ssts: count(
-            manifest
-                .compacted()
-                .iter()
-                .map(|sr| sr.sst_views.len())
-                .sum(),
-        ),
-    };
+    let root = tree_size(Vec::new(), manifest.l0(), manifest.compacted());
     if !root.is_empty() {
         segments.push(root);
     }
@@ -265,37 +212,25 @@ fn census_of_manifest(manifest: &VersionedManifest) -> ManifestCensus {
     }
 }
 
-fn size_of_segment(segment: &Segment) -> SegmentSize {
+fn tree_size(prefix: Vec<u8>, l0: &VecDeque<SsTableView>, compacted: &[SortedRun]) -> SegmentSize {
     let views = || {
-        segment.l0().iter().chain(
-            segment
-                .compacted()
-                .iter()
-                .flat_map(|run| run.sst_views.iter()),
-        )
+        l0.iter()
+            .chain(compacted.iter().flat_map(|run| run.sst_views.iter()))
     };
 
     SegmentSize {
-        prefix: segment.prefix().to_vec(),
+        prefix,
         bytes: total_bytes(
-            segment
-                .l0()
-                .iter()
+            l0.iter()
                 .map(SsTableView::estimate_size)
-                .chain(segment.compacted().iter().map(SortedRun::estimate_size)),
+                .chain(compacted.iter().map(SortedRun::estimate_size)),
         ),
         filter_bytes: total_bytes(views().map(|view| view.sst.info.filter_len)),
         index_bytes: total_bytes(views().map(|view| view.sst.info.index_len)),
         stats_bytes: total_bytes(views().map(|view| view.sst.info.stats_len)),
-        l0_ssts: count(segment.l0().len()),
-        sorted_runs: count(segment.compacted().len()),
-        sorted_run_ssts: count(
-            segment
-                .compacted()
-                .iter()
-                .map(|run| run.sst_views.len())
-                .sum(),
-        ),
+        l0_ssts: count(l0.len()),
+        sorted_runs: count(compacted.len()),
+        sorted_run_ssts: count(compacted.iter().map(|run| run.sst_views.len()).sum()),
     }
 }
 
@@ -303,16 +238,13 @@ fn total_bytes(sizes: impl Iterator<Item = u64>) -> u64 {
     sizes.fold(0, u64::saturating_add)
 }
 
-/// Counts are per-tree SST and run tallies, which no store approaches
-/// `u32::MAX` of; saturating keeps the census describing a store that did.
+/// Saturating conversion of a per-tree SST or run tally.
 fn count(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Counts the live keys of `subspace` and the bytes they and their values
-/// occupy, decoding keys only where the tally distinguishes kinds.
-///
-/// Costs a full read of the subspace.
+/// occupy, in one full read of the subspace.
 pub(crate) async fn scan_live(handle: ReadHandle<'_>, subspace: Subspace) -> Result<LiveTally> {
     let mut iterator = handle
         .scan_prefix(subspace_prefix(subspace), .., ScanShape::Bulk)
@@ -324,9 +256,6 @@ pub(crate) async fn scan_live(handle: ReadHandle<'_>, subspace: Subspace) -> Res
         tally.key_bytes += entry.key.len() as u64;
         tally.value_bytes += entry.value.len() as u64;
 
-        // The deletion schedule shares `current` with the entity records,
-        // and only their split says whether a bloated `current` is dead
-        // weight a merge reclaims or a schedule cleanup drains.
         if subspace == Subspace::Current
             && matches!(
                 Key::decode(&entry.key)?,
@@ -356,8 +285,7 @@ mod tests {
     }
 
     /// Freezes the memtable and writes it out, so the manifest carries what
-    /// was written. The census reads the manifest, so unflushed writes are
-    /// not in it — a property, not an omission.
+    /// was written.
     async fn flush_to_l0(db: &Db) {
         db.flush_with_options(FlushOptions {
             flush_type: FlushType::MemTable,
@@ -441,9 +369,10 @@ mod tests {
             total + segment.filter_bytes + segment.index_bytes + segment.stats_bytes
         });
 
-        let counted = manifest_metadata_bytes("census/metadata", store)
+        let counted = manifest_bytes("census/metadata", store)
             .await
-            .unwrap();
+            .unwrap()
+            .metadata_bytes;
         assert_eq!(counted, expected);
 
         // Not compared against segment bytes: at two keys the metadata
@@ -451,9 +380,7 @@ mod tests {
         assert!(counted > 0, "{census:?}");
     }
 
-    /// The census reads the manifest, so a write still in the write-ahead
-    /// log is not in it. Anyone reading a census against a busy writer is
-    /// reading what has been written out, not what has been accepted.
+    /// A write still in the write-ahead log is not in the manifest census.
     #[tokio::test]
     async fn manifest_census_omits_unflushed_writes() {
         let store = memory_store();
@@ -477,8 +404,7 @@ mod tests {
     }
 
     /// The listing leg counts every object under the prefix, including the
-    /// write-ahead log and the manifest — bytes the per-segment figures do
-    /// not account for and no merge reclaims.
+    /// write-ahead log and the manifest.
     #[tokio::test]
     async fn the_listing_counts_objects_the_manifest_does_not() {
         let store = memory_store();
@@ -498,9 +424,8 @@ mod tests {
         let census = read_manifest_census("census/objects", store).await.unwrap();
         let objects = census.objects.expect("an in-memory store lists");
 
-        // Every store carries a manifest, and this one's write is still in
-        // the log — so the manifest accounts for no SST bytes at all while
-        // the object store plainly holds some.
+        // The write is still in the log, so the manifest accounts for no SST
+        // bytes while the object store holds some.
         assert!(objects.manifest_objects > 0, "{objects:?}");
         assert!(objects.total_bytes > 0, "{objects:?}");
         assert_eq!(
@@ -554,8 +479,7 @@ mod tests {
         assert!(tally.key_bytes > 0);
     }
 
-    /// A deleted key is not live: the tally counts what a reader would see,
-    /// not what the substrate still holds.
+    /// A deleted key is not live.
     #[tokio::test]
     async fn scan_live_ignores_deleted_keys() {
         let store = memory_store();

@@ -13,22 +13,18 @@ use parquet::{
 
 use crate::data_file::{auxiliary_cache, metrics::ScopedReadMetrics, usize_as_u64};
 
-/// An [`AsyncFileReader`] over moraine's own object store: the Parquet
-/// footer and the projected column chunks arrive as byte-range reads, so a
-/// scoped read never downloads the whole data file. Deliberately not
-/// `parquet`'s built-in `object_store` integration, which pins a different
-/// `object_store` major than the workspace.
+/// An [`AsyncFileReader`] over moraine's own object store: the footer and
+/// the projected column chunks arrive as byte-range reads. Not `parquet`'s
+/// built-in integration, which pins a different `object_store` major.
 #[derive(Clone)]
 pub(super) struct ObjectStoreReader {
     pub(super) store: Arc<dyn ObjectStore>,
     pub(super) path: Path,
     /// The object's total length, required to locate the footer.
     pub(super) file_size: u64,
-    /// The serialized Parquet metadata length recorded by DuckLake. The
-    /// trailing length and magic occupy another eight bytes.
+    /// The serialized Parquet metadata length recorded by DuckLake,
+    /// excluding the trailing eight bytes of length and magic.
     pub(super) footer_size: u64,
-    /// Whether to load the page index with the footer. A row selection
-    /// needs it to skip pages; without one it is footer bytes for nothing.
     pub(super) page_index: PageIndexPolicy,
     pub(super) metrics: Arc<ScopedReadMetrics>,
 }

@@ -193,10 +193,9 @@
 //! A bump that *moves* existing keys does need a rewrite, and
 //! [`Catalog::migrate`] performs it: a one-way, crash-resumable pass that
 //! takes the single writer, walks the keyspace under a durable cursor, and
-//! flips the version stamp in one final atomic batch. It is deliberately a
-//! separate verb rather than part of opening a catalog — the cost and timing
-//! are the operator's to choose. While it runs, every reader refuses the
-//! store rather than serving a view of a keyspace in motion.
+//! flips the version stamp in one final atomic batch. It is a separate verb
+//! from opening a catalog, so the operator chooses when to pay for it. While
+//! it runs, every reader refuses the store.
 //!
 //! No such rewrite exists yet, so `migrate` reports a no-op against every
 //! store this release can open.
@@ -204,14 +203,10 @@
 //! # Features
 //!
 //! - `fault-injection` — compiles the crash-injection seams the migration
-//!   driver consults between its durable batches, and exposes `CrashPoint` and
-//!   `inject_crash` so a test can arm one and stop a migration at a named
-//!   durable boundary. It also exposes `SyntheticMigration` and
-//!   `install_migration`, which put a unit into the driver's registry — every
-//!   shipped format is additive, so without one there is no migration to crash
-//!   — and `CrashCase`, the enumeration of crash cases the suites drive. Off by
-//!   default; a build without it carries an empty function at each seam, an
-//!   empty installed registry, and no fault surface.
+//!   driver consults between its durable batches, and exposes `CrashPoint`,
+//!   `inject_crash`, `SyntheticMigration`, `install_migration`, and `CrashCase`
+//!   so a test can install a migration unit and stop it at a named durable
+//!   boundary. Off by default; a build without it carries no fault surface.
 //! - `fuzzing` — exposes the codec and read-path decode entry points the
 //!   `fuzz/` targets drive. They live in their own crate and so cannot reach
 //!   the crate-private codecs; nothing else needs this. Off by default.
@@ -263,9 +258,7 @@ pub use catalog::{
     TableId, TableInfo, TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
-/// Fault injection: the crash seams a test drives a migration to and stops
-/// it at, the synthetic units that give the migration driver something to
-/// run, and the enumeration of crash cases. Unstable and not part of the
+/// Fault injection for the migration driver. Unstable and not part of the
 /// semver contract.
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]

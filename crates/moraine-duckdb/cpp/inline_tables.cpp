@@ -213,13 +213,24 @@ MoraineArrowBytes EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::
 	return bytes;
 }
 
+DecodedInlineSchema::DecodedInlineSchema(const uint8_t *schema_ipc, size_t schema_ipc_len) : handle_(nullptr) {
+	MoraineError err {};
+	if (moraine_arrow_schema_decode(schema_ipc, schema_ipc_len, &handle_, &err) != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+}
+
+DecodedInlineSchema::~DecodedInlineSchema() {
+	moraine_arrow_schema_free(handle_);
+}
+
 std::vector<duckdb::unique_ptr<duckdb::DataChunk>>
-DecodeInlineChunkPieces(duckdb::ClientContext &context, const uint8_t *schema_ipc, size_t schema_ipc_len,
-                        MoraineInlineChunk &chunk, const std::vector<duckdb::LogicalType> &user_types) {
+DecodeInlineChunkPieces(duckdb::ClientContext &context, const DecodedInlineSchema &schema, MoraineInlineChunk &chunk,
+                        const std::vector<duckdb::LogicalType> &user_types) {
 	ArrowSchema c_schema;
 	ArrowArray c_array;
 	MoraineError err {};
-	if (moraine_arrow_decode_inline_chunk(schema_ipc, schema_ipc_len, &chunk, &c_schema, &c_array, &err) != 0) {
+	if (moraine_arrow_decode_inline_chunk_with_schema(schema.Get(), &chunk, &c_schema, &c_array, &err) != 0) {
 		ThrowMoraineError(err);
 	}
 
@@ -360,6 +371,8 @@ InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHand
 		                                static_cast<unsigned long long>(table_id),
 		                                static_cast<unsigned long long>(schema_version));
 	}
+	// Parsed once here; every chunk of this version decodes against it.
+	DecodedInlineSchema decoded_schema(schema_ipc, schema_ipc_len);
 
 	// The scan returns rows plus the deduplicated chunk bodies they
 	// reference; both arrays are owned together and freed by the one
@@ -405,7 +418,7 @@ InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHand
 		if (with_values) {
 			if (first_piece[r.chunk_index] == std::numeric_limits<size_t>::max()) {
 				auto &chunk = scan.chunks[r.chunk_index];
-				auto decoded = DecodeInlineChunkPieces(context, schema_ipc, schema_ipc_len, chunk, user_types);
+				auto decoded = DecodeInlineChunkPieces(context, decoded_schema, chunk, user_types);
 				first_piece[r.chunk_index] = result.pieces.size();
 				chunk_rows[r.chunk_index] = 0;
 				for (auto &p : decoded) {

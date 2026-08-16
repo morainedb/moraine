@@ -1,6 +1,6 @@
 //! Inline-insert chunks: the Arrow IPC decode and the entries derived from
-//! it. Inline chunks carry no row-id column, so their ids are dense from the
-//! chunk's recorded start.
+//! it. Inline chunks carry no row-id column; ids are dense from the chunk's
+//! recorded start.
 
 use std::collections::HashSet;
 
@@ -24,9 +24,7 @@ use crate::{
     error::{Error, Result},
 };
 
-/// Decodes one schema-only inline IPC stream. Callers cache the resulting
-/// Arrow schema per table version so chunks sharing it do not repeat the
-/// `FlatBuffer` work.
+/// Decodes one schema-only inline IPC stream.
 pub(crate) fn decode_inline_schema(schema_ipc: Bytes) -> Result<SchemaRef> {
     #[cfg(test)]
     record_inline_schema_decode(&schema_ipc);
@@ -40,8 +38,7 @@ pub(crate) fn decode_inline_schema(schema_ipc: Bytes) -> Result<SchemaRef> {
 
 /// Decodes an inline-insert Arrow body — `[u32-le message length][record-
 /// batch message][arrow data buffers]` — against its already-decoded table
-/// schema. The body becomes Arrow's immutable buffer by slicing the owning
-/// `Bytes`, so decoding does not copy its potentially large data region.
+/// schema without copying the data region.
 fn decode_inline_batch(schema: SchemaRef, body: &Bytes) -> Result<RecordBatch> {
     if body.len() < 4 {
         return Err(Error::Corruption("inline body truncated".to_owned()));
@@ -72,9 +69,8 @@ fn decode_inline_batch(schema: SchemaRef, body: &Bytes) -> Result<RecordBatch> {
     .map_err(corrupt("inline batch"))
 }
 
-/// Derives entries from an inline-insert chunk: decodes its body against the
-/// schema, then reads the columns at `positions` per row with dense
-/// `row_id_start + ordinal` ids (inline chunks carry no row-id column).
+/// Derives entries from an inline-insert chunk: the columns at `positions`
+/// per row, with dense `row_id_start + ordinal` ids.
 pub(crate) fn inline_batch_entries(
     schema: SchemaRef,
     body: &Bytes,
@@ -88,9 +84,8 @@ pub(crate) fn inline_batch_entries(
     record_batch_entries(&batch, positions, None, row_id_start, Ordinals::Dense, 0)
 }
 
-/// Decodes one inline Arrow chunk and constructs every requested index key
-/// directly from its arrays. Each chunk is decoded once regardless of how
-/// many indexes overlap its columns.
+/// Decodes one inline Arrow chunk once and constructs every requested index
+/// key directly from its arrays.
 pub(crate) fn inline_batch_index_entries(
     schema: SchemaRef,
     body: &Bytes,
