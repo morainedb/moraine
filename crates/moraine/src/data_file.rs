@@ -114,32 +114,26 @@ pub(crate) struct ScopedIndexEntry {
 /// How a scoped read resolves each row's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowIdSource {
-    /// The embedded row-id column when the file carries one — preferred
-    /// even over a recorded dense start, since flushed files carry both
-    /// and their embedded ids may hold gaps — else `start + ordinal`,
-    /// else refusal.
+    /// The embedded row-id column when the file carries one (even if a dense
+    /// start is recorded), else `start + ordinal`, else refusal.
     Resolve {
         /// The catalog row's dense start, if it records one.
         row_id_start: Option<u64>,
     },
-    /// Row ids are file ordinals from 0. A file carrying the embedded
-    /// column is refused: its rows already have ids, and renumbering
-    /// them would fork the file's identity.
+    /// Row ids are file ordinals from 0; a file carrying the embedded
+    /// column is refused.
     Ordinal,
 }
 
-/// A `map_err` builder for corruption context `what`: turns any displayable
-/// reader error into `Error::Corruption("{what}: {err}")`. One place for the
-/// shape every scoped/delete/inline read shares.
+/// A `map_err` builder turning any displayable reader error into
+/// `Error::Corruption("{what}: {err}")`.
 fn corrupt<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> Error {
     move |err| Error::Corruption(format!("{what}: {err}"))
 }
 
-/// A `usize` row count or offset as a `u64`. Infallible on every target
-/// moraine supports (`usize` is at most 64 bits), so the conversion cannot
-/// fail — a failure would mean a wider-than-64-bit platform, which would
-/// otherwise silently mint a wrong row id.
+/// A `usize` row count or offset as a `u64`.
 fn usize_as_u64(value: usize) -> u64 {
+    // `usize` is at most 64 bits on every supported target.
     #[allow(clippy::expect_used)]
     u64::try_from(value).expect("usize fits in u64 on supported targets")
 }
@@ -160,9 +154,7 @@ pub(crate) async fn scoped_read_recorded_entries(
         .await
 }
 
-/// One immutable Parquet object's location and recorded metadata. Keeping
-/// both sizes beside the path prevents a read path from silently dropping
-/// the footer size and reintroducing metadata round trips.
+/// One immutable Parquet object's location and recorded sizes.
 #[derive(Clone)]
 pub(crate) struct ParquetFile {
     object_store: Arc<dyn ObjectStore>,
@@ -196,16 +188,14 @@ impl ParquetFile {
     }
 }
 
-/// Whether `file` carries the reserved embedded row-id column. A recorded
-/// dense start does not imply contiguous ids: a flushed file carries both,
-/// and its embedded ids may hold gaps.
+/// Whether `file` carries the reserved embedded row-id column.
 pub(crate) async fn carries_embedded_row_ids(file: ParquetFile) -> Result<bool> {
     let reader = ObjectStoreReader {
         store: file.object_store,
         path: file.path,
         file_size: file.file_size,
         footer_size: file.footer_size,
-        page_index: ScopedRows::All.page_index_policy(),
+        page_index: PageIndexPolicy::Skip,
         metrics: file.metrics,
     };
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
@@ -221,9 +211,7 @@ pub(crate) async fn carries_embedded_row_ids(file: ParquetFile) -> Result<bool> 
 const BUILD_READ_BATCH_ROWS: usize = 8_192;
 
 /// Streams a file's fused index entries in bounded Arrow batches. Shared
-/// columns are projected once and borrowed directly into their final keys
-/// without retaining the whole file's encoded entries.
-#[allow(clippy::too_many_lines)]
+/// columns are projected once and borrowed directly into their final keys.
 pub(crate) async fn scoped_read_index_entry_batches(
     file: ParquetFile,
     projections: Vec<IndexProjection>,
@@ -273,7 +261,6 @@ pub(crate) async fn scoped_read_index_entry_batches(
     let arrow_reader = builder.build().map_err(corrupt("scoped read"))?;
     let mut emitted = 0usize;
 
-    let excluded_ordinals = excluded_ordinals.map(Arc::new);
     let metrics = Arc::clone(&file.metrics);
     Ok(arrow_reader
         .map(move |batch| {
@@ -299,7 +286,7 @@ pub(crate) async fn scoped_read_index_entry_batches(
                         row_id_start,
                         ordinals.borrowed(),
                         batch_start,
-                        excluded_ordinals.as_deref(),
+                        excluded_ordinals.as_ref(),
                         None,
                     );
                     metrics.encoded(started.elapsed());
@@ -313,8 +300,6 @@ pub(crate) async fn scoped_read_index_entry_batches(
 }
 
 /// Streams a file's projected index entries in bounded Arrow batches.
-/// DuckLake's recorded footer size is available to the metadata reader.
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn scoped_read_entry_batches(
     file: ParquetFile,
     indexed_positions: &[usize],

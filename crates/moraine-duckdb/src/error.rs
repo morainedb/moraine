@@ -39,49 +39,37 @@ pub mod codes {
     pub const CONSTRAINT: i32 = 3;
     /// [`moraine::Error::CommitConflict`].
     pub const COMMIT_CONFLICT: i32 = 4;
-    /// [`moraine::Error::Corruption`], and ABI-level string encoding
-    /// failures (an embedded NUL byte cannot be represented as a C
-    /// string).
+    /// [`moraine::Error::Corruption`], and a catalog string with an
+    /// embedded NUL byte.
     pub const CORRUPTION: i32 = 5;
     /// [`moraine::Error::Store`].
     pub const STORE: i32 = 6;
-    /// A null pointer, invalid UTF-8, or unsupported argument value
-    /// (e.g. an unrecognized `object_store_uri` scheme). Never produced
-    /// by the `moraine` core — an ABI-layer validation failure.
+    /// A null pointer, invalid UTF-8, or unsupported argument value.
+    /// ABI-layer only.
     pub const INVALID_ARGUMENT: i32 = 7;
-    /// A panic was caught at the FFI boundary and converted to an error
-    /// instead of unwinding into C++.
+    /// A panic was caught at the FFI boundary.
     pub const INTERNAL: i32 = 8;
-    /// Cancellation — the call's interrupt probe cancelled the read in
-    /// flight (or about to start) on this handle. Never produced by the
-    /// `moraine` core — an ABI-layer cancellation signal.
+    /// The call's interrupt probe cancelled it. ABI-layer only.
     pub const INTERRUPTED: i32 = 9;
-    /// [`moraine::Error::RetryBudgetExhausted`]. Terminal: unlike
-    /// [`COMMIT_CONFLICT`], the message deliberately carries none of the
-    /// substrings DuckLake's commit loop retries on.
+    /// [`moraine::Error::RetryBudgetExhausted`]. Terminal: the message
+    /// must carry none of the substrings DuckLake's commit loop retries on.
     pub const RETRY_EXHAUSTED: i32 = 10;
-    /// [`moraine::Error::Fenced`] — another process took over as the
-    /// writer; this handle can no longer commit. Terminal for the handle,
-    /// and the message likewise avoids DuckLake's retry substrings.
+    /// [`moraine::Error::Fenced`]: another process took over as the
+    /// writer; this handle can no longer commit. Terminal, and the message
+    /// must avoid DuckLake's retry substrings.
     pub const FENCED: i32 = 11;
-    /// [`moraine::Error::Migration`] — the store needs, is undergoing, or
-    /// is newer than a structural format this binary supports. The C++
-    /// shim raises it as an `IOException`: fatal at attach, never retried.
+    /// [`moraine::Error::Migration`]: the store needs, is undergoing, or
+    /// is newer than a structural format this binary supports.
     pub const MIGRATION: i32 = 12;
-    /// [`moraine::Error::SnapshotExpired`] — a time-travel target fell
-    /// below the retention horizon. Raised as a `CatalogException`, like a
-    /// missing entity: the caller re-resolves rather than retries.
+    /// [`moraine::Error::SnapshotExpired`]: a time-travel target fell
+    /// below the retention horizon.
     pub const SNAPSHOT_EXPIRED: i32 = 13;
-    /// [`moraine::Error::Unsupported`] — a DuckLake feature moraine does
-    /// not implement. Raised as a `NotImplementedException`; terminal.
+    /// [`moraine::Error::Unsupported`]: a DuckLake feature moraine does
+    /// not implement.
     pub const UNSUPPORTED: i32 = 14;
-    /// [`moraine::Error::OpenRaced`] — another process created this store
-    /// while the attach was creating it. Nothing was written, and attaching
-    /// again adopts the store that won, so this is the one code here whose
-    /// remedy is to repeat the attach. Raised as an `IOException` like the
-    /// other attach-time failures, and deliberately **not** a
-    /// `TransactionException`: re-driving a commit is the wrong response to
-    /// a race that happened before any transaction existed.
+    /// [`moraine::Error::OpenRaced`]: another process created this store
+    /// while the attach was creating it. Nothing was written; attaching
+    /// again adopts the store that won.
     pub const OPEN_RACED: i32 = 15;
 }
 
@@ -113,11 +101,8 @@ impl AbiError {
 
     /// Appends read-only-attach guidance when the code signals a missing or
     /// unreadable catalog ([`STORE`](codes::STORE) or
-    /// [`CORRUPTION`](codes::CORRUPTION)) — the shape a read-only open of an
-    /// uninitialized store takes. A read-only attach cannot bootstrap, and
-    /// DuckDB opens remote (e.g. `s3://`) paths read-only by default, so the
-    /// usual fix for a fresh remote lake is to add `READ_WRITE` to the
-    /// ATTACH. Other codes pass through unchanged.
+    /// [`CORRUPTION`](codes::CORRUPTION)), the shape a read-only open of an
+    /// uninitialized store takes. Other codes pass through unchanged.
     pub(crate) fn with_read_only_attach_hint(mut self) -> Self {
         if self.code == codes::STORE || self.code == codes::CORRUPTION {
             self.message.push_str(
@@ -150,11 +135,12 @@ impl AbiError {
         if err.is_null() {
             return;
         }
-        // Embedded NULs are stripped: diagnostic text, not protocol data.
-        let sanitized = self.message.replace('\0', "");
-        // Always succeeds after sanitization above; falls back to an
-        // empty message otherwise.
-        let c_message = CString::new(sanitized).unwrap_or_default();
+        // The retry cannot fail after stripping; its fallback is unreachable.
+        let c_message = CString::new(self.message).unwrap_or_else(|failed| {
+            let mut bytes = failed.into_vec();
+            bytes.retain(|byte| *byte != 0);
+            CString::new(bytes).unwrap_or_default()
+        });
         // SAFETY: caller contract above; checked non-null just above.
         unsafe {
             (*err).code = self.code;
@@ -169,16 +155,12 @@ impl From<moraine::Error> for AbiError {
             moraine::Error::NotFound(_) => codes::NOT_FOUND,
             moraine::Error::AlreadyExists(_) => codes::ALREADY_EXISTS,
             moraine::Error::Constraint(_) => codes::CONSTRAINT,
-            // The shim's retry loop matches the literal substring
-            // "conflict" in the message; core's `Display` already includes
-            // it.
+            // The shim's retry loop matches the literal substring "conflict"
+            // in the message; core's `Display` includes it.
             moraine::Error::CommitConflict(_) => codes::COMMIT_CONFLICT,
             moraine::Error::RetryBudgetExhausted(_) => codes::RETRY_EXHAUSTED,
             moraine::Error::Fenced(_) => codes::FENCED,
             moraine::Error::Corruption(_) => codes::CORRUPTION,
-            // The four below carry none of the shim's retry substrings, so
-            // none is re-driven; their codes map to non-`TransactionException`
-            // DuckDB errors in the C++ shim (catalog.cpp) for the same reason.
             moraine::Error::Unsupported(_) => codes::UNSUPPORTED,
             moraine::Error::SnapshotExpired(_) => codes::SNAPSHOT_EXPIRED,
             moraine::Error::Interrupted(_) => codes::INTERRUPTED,
@@ -192,11 +174,7 @@ impl From<moraine::Error> for AbiError {
     }
 }
 
-/// Formats an error with its full `source()` chain. A terse top-level
-/// message — `moraine::Error::Store` renders only "store error" — would
-/// otherwise drop the underlying object-store cause (`AccessDenied`, a
-/// region redirect, a missing bucket), which is exactly what a caller
-/// needs to fix a misconfigured attach.
+/// Formats an error with its full `source()` chain.
 fn error_chain(err: &dyn std::error::Error) -> String {
     let mut message = err.to_string();
     let mut source = err.source();
@@ -213,9 +191,8 @@ fn error_chain(err: &dyn std::error::Error) -> String {
 /// Caller-allocated and passed by pointer to every fallible `moraine_*`
 /// entry point; on failure the callee fills in both fields. `message` is
 /// null when there is nothing to free, and must be passed to
-/// [`moraine_error_free`](crate::abi::moraine_error_free) exactly once —
-/// the entry point never frees a previous message, so reuse without
-/// freeing in between leaks.
+/// [`moraine_error_free`](crate::abi::moraine_error_free) exactly once;
+/// the entry point never frees a previous message.
 #[repr(C)]
 #[derive(Debug)]
 pub struct MoraineError {
@@ -263,16 +240,8 @@ mod tests {
         assert!(!err.message.contains("READ_WRITE"), "{}", err.message);
     }
 
-    /// The C++ shim switches on `MORAINE_*`, and those are hand-written in
-    /// `cbindgen.toml` rather than generated from the consts here — cbindgen
-    /// would emit them as unprefixed `#define OK 0` macros. Two hand-kept
-    /// copies of a wire contract drift, and silently: a code added here but
-    /// not there still compiles, and the shim falls through to
-    /// `InternalException` for it at runtime.
-    ///
-    /// So this reads the generated header back and pins the pair. The count
-    /// check is what catches an addition, since a code missing from the
-    /// table below would otherwise go unnoticed by the value checks.
+    /// The `MORAINE_*` values hand-written in `cbindgen.toml` match the
+    /// consts here, in value and in count.
     #[test]
     fn every_code_matches_the_c_enum_the_shim_switches_on() {
         let header = std::fs::read_to_string(
@@ -326,9 +295,8 @@ mod tests {
         }
     }
 
-    /// Every variant the core can raise carries its own code. The catch-all
-    /// exists for the store-shaped rest, so a variant landing there by
-    /// omission is invisible until a caller sees the wrong DuckDB exception.
+    /// Every distinctly handled core variant carries its own code rather
+    /// than the store catch-all.
     #[test]
     fn distinctly_handled_errors_do_not_fall_into_the_store_catch_all() {
         let sample = || "x".to_string();
@@ -363,18 +331,9 @@ mod tests {
         }
     }
 
-    /// The first of the two conflict-propagation wire obligations: the
-    /// message a lost commit carries must still contain `conflict` once it
-    /// has crossed this boundary. DuckLake's `RetryOnError` decides
-    /// retryability by substring on the lowercased text, so a conversion
-    /// that summarized or replaced the message would turn every benign
-    /// race into an aborted transaction — silently, and only under
-    /// concurrency.
-    ///
-    /// The counterpart is pinned alongside it: no other error the shim
-    /// raises from a commit may carry any of the four substrings, or an
-    /// unretryable failure is re-driven until DuckLake's own budget runs
-    /// out.
+    /// A lost commit's message still contains `conflict` after crossing
+    /// this boundary (DuckLake retries by substring), and no other error a
+    /// commit raises carries any of DuckLake's retry substrings.
     #[test]
     fn the_commit_conflict_message_keeps_its_retry_substring() {
         let conflict = AbiError::from(moraine::Error::CommitConflict(

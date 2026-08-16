@@ -7,11 +7,7 @@
 //! production build carries an empty function and no fault surface.
 
 /// A named seam the migration driver consults between durable batches.
-/// These are that driver's own batch boundaries; [`CrashCase`] enumerates
-/// the crash cases the suites drive, of which one reaches these seams.
-///
-/// Reachable outside the crate only under the `fault-injection` feature,
-/// which re-exports it alongside [`inject_crash`].
+/// Reachable outside the crate only under the `fault-injection` feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashPoint {
     /// After the start batch (marker + initial cursor) is durable.
@@ -25,18 +21,9 @@ pub enum CrashPoint {
 }
 
 /// Where a crash can interrupt a state-changing operation. Each variant
-/// names what the process was doing when it died.
-///
-/// It lives here, beside the seams, because one case is driven from *inside*
-/// a library call: a migration's batch boundaries are internal to
-/// `Catalog::migrate`, so [`CrashPoint`] is the only way in and the case and
-/// its seams have to be able to name each other. Every other case is crashed
-/// from outside — the suite drops a handle, races two writers, or freezes the
-/// object store — and needs nothing from the library.
-///
-/// Which guarantee makes a case survivable, and whether it is driven yet, is
-/// the suite's own table; this enumeration is the shared vocabulary both
-/// halves index by.
+/// names what the process was doing when it died; only
+/// [`MigrationInterrupted`](Self::MigrationInterrupted) is driven from
+/// inside the library, through [`CrashPoint`].
 #[cfg(any(test, feature = "fault-injection"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashCase {
@@ -98,28 +85,20 @@ impl CrashCase {
 }
 
 /// Which synthetic migration units a fault-injection build installs into the
-/// driver's registry, on top of the formats this binary really ships.
-///
-/// Every shipped format is additive, so the shipped registry is empty:
-/// `Catalog::migrate` is a no-op against every store in the world, and no
-/// public path can put one mid-migration. Installing a unit gives the real
-/// planner something to run, so a test drives the shipped driver rather than
-/// a parallel copy of it.
+/// driver's registry. The shipped registry is empty (every shipped format is
+/// additive), so a unit is what gives the driver something to run.
 #[cfg(any(test, feature = "fault-injection"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyntheticMigration {
     /// Nothing installed: the registry is exactly what ships.
     #[default]
     None,
-    /// One rewriting unit that walks the catalog's option records and moves
-    /// each from schema scope to table scope — one record per batch, new key
-    /// before old, resumable from its cursor. It lands the store on the
-    /// newest format this binary reads, so a store it migrates still
-    /// attaches.
+    /// One rewriting unit that moves the catalog's option records from
+    /// schema scope to table scope, one record per batch, resumable from its
+    /// cursor. It lands the store on the newest format this binary reads.
     MoveOptionScope,
-    /// The rewriting unit followed by a second link that walks nothing, so a
-    /// multi-version jump has a chain to compose. The second link's target is
-    /// past the newest format this binary reads.
+    /// The rewriting unit followed by a second link that walks nothing and
+    /// targets a format past the newest this binary reads.
     MoveOptionScopeThenLink,
 }
 
@@ -144,13 +123,9 @@ mod armed {
         ARMED.with(|armed| armed.set(point));
     }
 
-    /// Installs the synthetic units the migration driver's registry carries
-    /// on top of the ones this binary ships.
-    ///
-    /// Thread-local, like [`inject_crash`], so tests installing different
-    /// registries do not collide — which means the migration has to be driven
-    /// from the thread that installed it, on a current-thread runtime rather
-    /// than a work-stealing one.
+    /// Installs the synthetic units the migration driver's registry carries.
+    /// Thread-local: the migration must be driven from the installing thread,
+    /// on a current-thread runtime.
     pub fn install_migration(units: SyntheticMigration) {
         INSTALLED.with(|installed| installed.set(units));
     }
@@ -165,8 +140,6 @@ mod armed {
     }
 
     /// Errors the first time it is called at the armed point, then disarms.
-    /// The driver treats the error as a simulated crash: it stops, leaving
-    /// the last durable state intact.
     pub(crate) fn crash_seam(point: CrashPoint) -> Result<()> {
         let tripped = ARMED.with(|armed| {
             if armed.get() == Some(point) {
@@ -190,11 +163,8 @@ pub(crate) use armed::{crash_seam, installed_migrations};
 #[cfg(any(test, feature = "fault-injection"))]
 pub use armed::{inject_crash, install_migration};
 
-/// The seam with fault injection compiled out: an empty function, so the
-/// driver's call sites cost a production build nothing.
-///
-/// The `Result` it can never fail with is what keeps those call sites
-/// identical to the armed build's, which is the point of the pair.
+/// The seam with fault injection compiled out; the `Result` keeps call
+/// sites identical to the armed build's.
 #[cfg(not(any(test, feature = "fault-injection")))]
 #[inline]
 #[allow(clippy::unnecessary_wraps)]
@@ -202,8 +172,7 @@ pub(crate) fn crash_seam(_point: CrashPoint) -> crate::error::Result<()> {
     Ok(())
 }
 
-/// The installed-unit list with fault injection compiled out: always empty,
-/// so a production build's registry is exactly what it ships.
+/// The installed-unit list with fault injection compiled out: always empty.
 #[cfg(not(any(test, feature = "fault-injection")))]
 #[inline]
 pub(crate) fn installed_migrations()
@@ -236,9 +205,7 @@ mod tests {
     }
 
     /// Exactly one case is crashed from inside the library, and it names
-    /// every seam the driver has. A seam nothing claims, or a case claiming
-    /// one the driver never reaches, is a table that has drifted from the
-    /// driver it describes.
+    /// every seam the driver has.
     #[test]
     fn one_case_owns_the_driver_seams_and_the_rest_own_none() {
         let seam_driven: Vec<CrashCase> = CrashCase::ALL
@@ -257,8 +224,7 @@ mod tests {
         );
     }
 
-    /// Installing a registry is thread-local and reversible, exactly as
-    /// arming a seam is.
+    /// Installing a registry is reversible.
     #[test]
     fn installed_units_replace_and_clear() {
         assert!(installed_migrations().is_empty());

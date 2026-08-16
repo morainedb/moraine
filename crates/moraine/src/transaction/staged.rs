@@ -133,15 +133,10 @@ pub enum TableKind {
     TableColumnStats,
     /// `ducklake_file_column_stats`.
     FileColumnStats,
-    /// `ducklake_schema_versions`: per-table schema-change history, one
-    /// `(begin_snapshot, schema_version, table_id)` row per
-    /// created-or-schema-altered table per commit. The first two values
-    /// are always the committing snapshot's own id and `schema_version`,
-    /// validated against the `ducklake_snapshot` row in the same batch
-    /// rather than trusted. Each row lands as a `schema_version` record of
-    /// its own — the snapshot record names the same tables, but expiry
-    /// deletes it and a data file older than every surviving snapshot
-    /// still has to resolve the version it was written under.
+    /// `ducklake_schema_versions`: one `(begin_snapshot, schema_version,
+    /// table_id)` row per created-or-schema-altered table per commit. The
+    /// first two must equal the batch's `ducklake_snapshot` values; each
+    /// row lands as a `schema_version` record of its own.
     SchemaVersions,
     /// `ducklake_partition_info`.
     PartitionInfo,
@@ -171,17 +166,13 @@ pub enum TableKind {
     /// `ducklake_name_mapping` — folded into its mapping's record.
     NameMapping,
     /// `ducklake_metadata`: catalog options, keyed by `(key, scope,
-    /// scope_id)`. Outside the snapshot protocol — DuckLake writes it
-    /// within its metadata connection, minting no snapshot and bumping no
-    /// schema version — so its rows overwrite the scope's option record in
-    /// place, last write wins.
+    /// scope_id)`. Outside the snapshot protocol: rows overwrite the
+    /// scope's option record in place, last write wins.
     Metadata,
 }
 
 impl TableKind {
-    /// Every kind, in wire-discriminant order — the decode table for the
-    /// ABI's `table_kind` values. A new variant added anywhere but the
-    /// end fails the order test pinning `ALL[i] as i32 == i`.
+    /// Every kind, in wire-discriminant order (`ALL[i] as i32 == i`).
     pub const ALL: [Self; 26] = [
         Self::Snapshot,
         Self::SnapshotChanges,
@@ -340,15 +331,8 @@ pub enum RowOperation {
         /// The commit snapshot the delete takes effect at.
         begin_snapshot: u64,
     },
-    /// Removes one live `inline/file_delete` record — the row-grain
-    /// counterpart of [`Self::InlineFileDelete`], issued when a flush has
-    /// materialized that inlined deletion into a real delete file and the
-    /// inlined form must go, or the row would be counted deleted twice.
-    ///
-    /// Row-grain rather than table-wide on purpose: DuckLake's flush
-    /// happens to clear the whole table, but the operation it issues is an
-    /// ordinary SQL `DELETE`, and translating it per row means a filtered
-    /// one removes exactly what it matched instead of everything.
+    /// Removes one live `inline/file_delete` record, issued once a flush
+    /// has materialized that inlined deletion into a real delete file.
     InlineFileDeleteRemove {
         /// Owning table.
         table_id: u64,
@@ -359,9 +343,7 @@ pub enum RowOperation {
     },
     /// Removes every `inline/insert` chunk begun at or before
     /// `flush_snapshot` for `(table_id, schema_version)`, plus the
-    /// `inline/inline_delete` tombstones those chunks' rows consumed — the
-    /// flushed data survives only as the backdated `ducklake_data_file`
-    /// DuckLake registers through the ordinary file path.
+    /// `inline/inline_delete` tombstones on those chunks' rows.
     InlineFlushDelete {
         /// Owning table.
         table_id: u64,
@@ -377,11 +359,8 @@ pub enum RowOperation {
         table_id: u64,
     },
     /// Removes only the `inline/schema` record for one `(table_id,
-    /// schema_version)` — the superseded-schema-version cleanup a flush
-    /// issues once its chunks are gone, leaving any other schema
-    /// version's `inline/*` records (a newer version accumulating
-    /// concurrently) untouched. Distinct from [`Self::InlineDrop`], which
-    /// is table-wide (the whole-table `DROP TABLE` cascade).
+    /// schema_version)`, leaving other schema versions' `inline/*` records
+    /// untouched.
     InlineSchemaDrop {
         /// Owning table.
         table_id: u64,
@@ -396,8 +375,7 @@ type CommittedRecordCache = tokio::sync::Mutex<
 >;
 
 /// A malformed staged row: wrong cell count or a cell of the wrong kind
-/// for its column. Never produced by a correct shim translation; this
-/// path fails loudly rather than guessing.
+/// for its column.
 fn corrupt_row(table: TableKind, detail: impl std::fmt::Display) -> Error {
     Error::Corruption(format!("staged row for {table:?}: {detail}"))
 }
@@ -460,9 +438,7 @@ impl StagedTransaction {
 
     /// As [`begin_detached`](Self::begin_detached), but sharing `catalog`'s
     /// projections — for tests that commit here and then read back through
-    /// the handle. A throwaway state would leave that handle holding a view
-    /// the store has moved past, which a staged commit through a `Catalog`
-    /// never does.
+    /// the handle.
     #[cfg(test)]
     pub(crate) fn begin_detached_on(catalog: &crate::Catalog, db_tx: DbTransaction) -> Self {
         Self::begin(
@@ -524,9 +500,6 @@ impl StagedTransaction {
 
     /// Snapshot records as this transaction sees them: the committed
     /// rows at its read point, minus the snapshot deletes staged so far.
-    /// The expiry cascade re-reads `ducklake_snapshot` after staging its
-    /// deletes (its dead-row rule is `NOT EXISTS` over the survivors), so
-    /// the projection must observe the transaction's own writes.
     ///
     /// # Errors
     ///
@@ -803,11 +776,8 @@ impl StagedTransaction {
         overlay::overlay_unversioned(&self.ops, committed)
     }
 
-    /// The `ducklake_tag` container records as this transaction sees them.
-    ///
-    /// A tag row is an entry inside its object's container, so the
-    /// transaction's staged tag rows are folded into those containers
-    /// rather than overlaid as records of their own.
+    /// The `ducklake_tag` container records as this transaction sees them,
+    /// with its staged tag rows folded into the containers.
     ///
     /// # Errors
     ///
@@ -844,14 +814,9 @@ impl StagedTransaction {
     }
 
     /// The rows this transaction staged for one embedded child kind,
-    /// decoded and paired with the parent each names.
-    ///
-    /// An embedded row rides its parent's record, and a staged child always
-    /// names a parent the same batch inserts — translation refuses one that
-    /// does not — so a child projection is its parents' rows plus these.
-    /// Deletes need no counterpart: an embedded row is only ever removed
-    /// alongside the parent that carries it, which the parent's own overlay
-    /// already drops.
+    /// decoded and paired with the parent each names. Deletes need no
+    /// counterpart: an embedded row is only removed alongside its parent,
+    /// which the parent's overlay already drops.
     fn staged_children<T>(
         &self,
         kind: TableKind,
@@ -950,18 +915,26 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_schema_version_records(&self) -> Result<Vec<(u64, u64, u64)>> {
         let mut records = read::scan_schema_versions(ReadHandle::Tx(&self.db_tx)).await?;
+
+        // A staged delete removes committed records and any staged insert
+        // before it; a staged insert after the delete survives.
+        let mut deleted = HashSet::new();
+        let mut inserted = Vec::new();
         for op in &self.ops {
             match op {
                 RowOperation::Insert { table, cells } if *table == TableKind::SchemaVersions => {
-                    records.push(decode::decode_schema_version_row(cells)?);
+                    inserted.push(decode::decode_schema_version_row(cells)?);
                 }
                 RowOperation::Delete { table, cells } if *table == TableKind::SchemaVersions => {
                     let (table_id, begin_snapshot, _) = decode::decode_schema_version_row(cells)?;
-                    records.retain(|(t, b, _)| !(*t == table_id && *b == begin_snapshot));
+                    deleted.insert((table_id, begin_snapshot));
+                    inserted.retain(|(t, b, _)| !(*t == table_id && *b == begin_snapshot));
                 }
                 _ => {}
             }
         }
+        records.retain(|(t, b, _)| !deleted.contains(&(*t, *b)));
+        records.extend(inserted);
 
         Ok(records)
     }
@@ -985,10 +958,8 @@ impl StagedTransaction {
     /// Translates every staged row and lands them in one atomic batch.
     ///
     /// A commit with a `ducklake_snapshot` insert mints that snapshot and
-    /// advances head. A commit **without** one is a maintenance commit —
-    /// snapshot expiry / file cleanup, which DuckLake runs without
-    /// minting a snapshot — and lands head-preserving: reclamation
-    /// deletes only, no new snapshot record, `sys/head` untouched.
+    /// advances head. A commit without one is a maintenance commit and
+    /// lands head-preserving: no new snapshot record, `sys/head` untouched.
     ///
     /// # Errors
     ///
@@ -1016,37 +987,35 @@ impl StagedTransaction {
             .any(|operation| matches!(operation, RowOperation::InlineInsert { .. }));
         let mut phases = CommitPhases::default();
 
-        let phase_started = Instant::now();
-        let base = match commit::head_view_for(&db_tx, &projections).await {
-            Ok(base) => base,
+        // Both read `db_tx`'s current state before any write in this commit
+        // is staged: `InlineFlushDelete`/`InlineDrop` name a table, not keys,
+        // and resolve against the same cut as `base`.
+        let head_view = async {
+            let phase_started = Instant::now();
+            let base = commit::head_view_for(&db_tx, &projections).await?;
+            Ok::<_, Error>((base, phase_started.elapsed()))
+        };
+        let inline = async {
+            let phase_started = Instant::now();
+            let writes = translate_inline(&db_tx, &ops).await?;
+            Ok::<_, Error>((writes, phase_started.elapsed()))
+        };
+        let (base, inline_writes) = match futures::try_join!(head_view, inline) {
+            Ok(((base, head_view_elapsed), (inline_writes, inline_elapsed))) => {
+                phases.head_view = head_view_elapsed;
+                phases.inline = inline_elapsed;
+                (base, inline_writes)
+            }
             Err(err) => {
                 db_tx.rollback();
                 return Err(err);
             }
         };
-        phases.head_view = phase_started.elapsed();
         let base_ref: &CatalogSnapshot = &base;
-        // Read before any write in this commit is staged: `InlineFlushDelete`
-        // /`InlineDrop` name a table, not keys, and resolve against
-        // `db_tx`'s current state exactly like `base` above.
-        let phase_started = Instant::now();
-        let inline_writes = match translate_inline(&db_tx, &ops).await {
-            Ok(writes) => writes,
-            Err(err) => {
-                db_tx.rollback();
-                return Err(err);
-            }
-        };
-        phases.inline = phase_started.elapsed();
 
         let mints_snapshot = mints_snapshot(&ops);
-        // Maintain equality-index entries for any data file this commit
-        // registered on an indexed table, by scoped-reading it from
-        // `DATA_PATH`. Gated: a no-op unless a live index covers the file's
-        // table, so non-indexed writes are untouched. A Parquet file on an
-        // indexed table with no store to read it aborts the commit rather
-        // than under-covering the index. Staged before the translation so a
-        // poisoned definition rides the writes it produces.
+        // Staged before translation so a poisoned index definition rides
+        // the writes it produces.
         let store = data_store.as_ref();
         let phase_started = Instant::now();
         let entries =
@@ -1078,6 +1047,7 @@ impl StagedTransaction {
                     &mut writes,
                     inline_writes,
                     result_id,
+                    base_ref.batch_seq,
                     entry_bytes,
                     uses_inline_chunk_directory,
                 )
@@ -1090,16 +1060,8 @@ impl StagedTransaction {
                     }
                 };
                 phases.stage = phase_started.elapsed();
-                // The same landing the verb path takes: one durable write,
-                // one head-race classification, one projection refresh.
-                // This path never retries the loss — DuckLake authored the
-                // rows, so re-driving them is DuckLake's call.
-                //
-                // Spawned, not awaited inline: everything above is staged
-                // in memory and a dropped future discards it, but the write
-                // below cannot be retracted once issued, so a host
-                // interrupt races the wait for it rather than the write
-                // itself.
+                // Landed off-task: the write cannot be retracted once
+                // issued, so a host interrupt races the wait, not the write.
                 let head_before = base_ref.snapshot.snapshot_id;
                 let head_view_update = translated_head_view.map_or_else(
                     || commit::HeadViewUpdate::Rebuild(Arc::clone(&base)),
@@ -1177,22 +1139,19 @@ fn translate_batch(
 }
 
 /// Stamps the head, folds in the inline writes, and stages the whole batch
-/// onto `db_tx`, returning what the batch weighs — `entry_bytes` included,
-/// since index entries stage directly and never join `writes`.
-///
-/// Every batch stamps the head, a maintenance one included, where it reuses
-/// the standing snapshot id and only the batch count moves. That makes
-/// `sys/head` the one conflict anchor every batch shares, and the stamp a
-/// reader validates its cut against.
+/// onto `db_tx`, returning what the batch weighs (`entry_bytes` included,
+/// since index entries stage directly and never join `writes`). A
+/// maintenance batch stamps the head too, reusing the standing snapshot id.
 async fn stage_batch(
     db_tx: &DbTransaction,
     writes: &mut Vec<commit::StagedWrite>,
     inline_writes: Vec<commit::StagedWrite>,
     result_id: u64,
+    standing_batch_seq: u64,
     entry_bytes: u64,
     uses_inline_chunk_directory: bool,
 ) -> Result<StagedBytes> {
-    writes.push(commit::head_write(db_tx, result_id).await?);
+    writes.push(commit::head_stamp(result_id, standing_batch_seq));
     writes.extend(inline_writes);
     if uses_inline_chunk_directory
         && let Some(stamp) =
@@ -1256,9 +1215,8 @@ fn staged_landed(
     );
 }
 
-/// The lost-race error for a staged commit, logged as it is built:
-/// DuckLake's own loop re-drives the loser, so the log line is the only
-/// visible trace of the race.
+/// The lost-race error for a staged commit, logged as it is built. Its
+/// text must contain `conflict`: DuckLake's retry loop scans for it.
 fn staged_lost_race(result_id: u64, staged_rows: usize) -> Error {
     debug!(
         attempted_snapshot = result_id,
@@ -1287,67 +1245,34 @@ fn translate(
     let snapshot = build_snapshot_value(ops)?;
     let new_id = snapshot.snapshot_id;
 
-    // DuckLake mints the id from the head it read, so an id at or below the
-    // head this commit lands on means another commit landed in between.
-    // Landing it would overwrite a snapshot record and move the head
-    // backwards, and every write below stamps `new_id` as the version it
-    // begins at — so refuse it, as the lost race it is. Reporting anything
-    // else would be a wire-contract bug rather than a wording one: DuckLake
-    // re-drives on the text of the error, and a loser it does not recognize
-    // is a transaction it abandons instead of re-running against the head
-    // that won.
+    // DuckLake mints the id from the head it read; an id at or below the
+    // head means another commit landed in between, a lost race.
     if new_id <= base.snapshot.snapshot_id {
         return Err(staged_lost_race(new_id, ops.len()));
     }
 
-    // Ends and deletes apply before inserts, independent of DuckLake's
-    // emit order: a rename ends the old version and inserts a new one
-    // under the same id, and the insert must win their shared `current` key —
-    // an end applied afterward would delete the id and erase the new row.
-    // Begin-rebases apply last: their target is the row an insert in this
-    // same commit created. Inline ops are skipped here entirely —
-    // `commit` translates them separately via `translate_inline`, since
-    // `CatalogSnapshot` has no notion of inlined rows to diff.
+    // Ends and deletes apply before inserts regardless of emit order (a
+    // rename ends and re-inserts under one id, and the insert must win the
+    // shared `current` key); begin-rebases apply last, targeting rows this
+    // commit inserted. Inline ops are translated by `translate_inline`.
     let mut state = base.clone();
     let mut children = collect_child_rows(ops)?;
     let mut direct = Vec::new();
     let hard_deleted = collect_hard_deletes(ops)?;
 
-    for op in ops {
-        if !is_inline_op(op)
-            && !matches!(
-                op,
-                RowOperation::Insert { .. } | RowOperation::UpdateSetBegin { .. }
-            )
-        {
-            apply_op(
-                base,
-                &mut state,
-                op,
-                new_id,
-                &mut children,
-                &mut direct,
-                &hard_deleted,
-            )?;
-        }
-    }
-
-    for op in ops {
-        if matches!(op, RowOperation::Insert { .. }) {
-            apply_op(
-                base,
-                &mut state,
-                op,
-                new_id,
-                &mut children,
-                &mut direct,
-                &hard_deleted,
-            )?;
-        }
-    }
-
-    for op in ops {
-        if matches!(op, RowOperation::UpdateSetBegin { .. }) {
+    let phases: [fn(&RowOperation) -> bool; 3] = [
+        |op| {
+            !is_inline_op(op)
+                && !matches!(
+                    op,
+                    RowOperation::Insert { .. } | RowOperation::UpdateSetBegin { .. }
+                )
+        },
+        |op| matches!(op, RowOperation::Insert { .. }),
+        |op| matches!(op, RowOperation::UpdateSetBegin { .. }),
+    ];
+    for phase in phases {
+        for op in ops.iter().filter(|op| phase(op)) {
             apply_op(
                 base,
                 &mut state,
@@ -1362,9 +1287,9 @@ fn translate(
 
     refuse_orphaned_children(&children)?;
 
-    // DuckLake authors column ids itself, so its inserts advance no
-    // counter; float each table's field-id counter above every live id so
-    // a later verb-path `add_column` can never re-allocate one.
+    // DuckLake authors column ids itself; float each table's field-id
+    // counter above every live id so a later verb-path `add_column` cannot
+    // re-allocate one.
     for (table_id, columns) in &state.columns {
         let Some(max_id) = columns.keys().max() else {
             continue;
@@ -1389,9 +1314,8 @@ fn translate(
         }
     };
     writes.extend(direct);
-    // The `ducklake_schema_versions` rows this commit staged, as records of
-    // their own: `snapshot` carries them too, but only until expiry deletes
-    // it, and the files they describe outlive that.
+    // The `ducklake_schema_versions` rows this commit staged, as records
+    // of their own.
     for table_id in &snapshot.schema_changed_table_ids {
         writes.push(commit::schema_version_write(
             *table_id,
@@ -1403,10 +1327,9 @@ fn translate(
     Ok((new_id, writes, snapshot, translated_head_view))
 }
 
-/// Refuses child rows left over after every parent was applied. An
+/// Refuses child rows left over after every parent was applied: an
 /// embedded child whose parent is not in the same commit has nowhere to
-/// live, and dropping it silently would lose a partition column or a macro
-/// parameter DuckLake believes it wrote.
+/// live.
 fn refuse_orphaned_children(children: &ChildRows) -> Result<()> {
     let orphans = [
         (
@@ -1448,16 +1371,11 @@ fn refuse_orphaned_children(children: &ChildRows) -> Result<()> {
     Ok(())
 }
 
-/// Translates a head-preserving maintenance commit: snapshot expiry and
-/// file cleanup and derived-statistics repair arrive with no
-/// `ducklake_snapshot` insert (DuckLake mints no snapshot for them), so
-/// the head snapshot id is retained and no snapshot record is written. Only
-/// reclamation-shaped operations and unversioned maintenance writes are
-/// legal — raw deletes, schedule inserts, row-ID file-stat inserts, option
-/// writes, and the inline drops a dead table's cleanup issues; any
-/// versioned entity insert or lifecycle update without a snapshot row is
-/// a constraint violation (DuckLake always mints a snapshot for real
-/// catalog changes).
+/// Translates a head-preserving maintenance commit (no `ducklake_snapshot`
+/// insert): the head snapshot id is retained and no snapshot record is
+/// written. Only raw deletes, schedule inserts, row-ID file-stat inserts,
+/// option writes, and inline ops are legal; anything versioned is a
+/// constraint violation.
 fn translate_maintenance(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
@@ -1480,12 +1398,7 @@ fn translate_maintenance(
             op,
             RowOperation::Delete { .. }
                 | RowOperation::Insert {
-                    table: TableKind::FilesScheduledForDeletion
-                        // An option write mints no snapshot by design —
-                        // DuckLake writes `ducklake_metadata` within its
-                        // metadata connection, outside the protocol — so it
-                        // arrives here exactly as reclamation does.
-                        | TableKind::Metadata,
+                    table: TableKind::FilesScheduledForDeletion | TableKind::Metadata,
                     ..
                 }
         ) || row_id_statistics_insert

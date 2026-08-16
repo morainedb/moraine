@@ -92,24 +92,27 @@ impl ReadOnlyCatalog {
         data_store: Option<Arc<dyn ObjectStore>>,
         data_prefix: &str,
         table: TableId,
-        mut row_ids: Vec<u64>,
+        row_ids: Vec<u64>,
     ) -> Result<Vec<FileRowCandidate>> {
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        row_ids.dedup();
         let snapshot = self.snapshot().await?;
 
-        let mut placements = if let Some(store) = &data_store {
+        let file_placements = async {
+            let Some(store) = &data_store else {
+                return Ok(HashMap::<u64, Vec<DataFileId>>::new());
+            };
             let table_prefix = snapshot.table_data_prefix(table)?;
             let files = snapshot.data_files_of(table);
 
-            Self::file_summaries(store, data_prefix, &table_prefix, table, files)
-                .await
-                .into_iter()
-                .map(|(data_file_id, summary)| match summary {
-                    Ok(summary) => (data_file_id, summary.matching(&row_ids.clone())),
+            let mut placements = HashMap::<u64, Vec<DataFileId>>::new();
+            for (data_file_id, summary) in
+                Self::file_summaries(store, data_prefix, &table_prefix, table, files).await
+            {
+                let matched = match summary {
+                    Ok(summary) => summary.matching(&row_ids),
                     Err(error) => {
                         warn!(
                             table_id = table.get(),
@@ -117,52 +120,34 @@ impl ReadOnlyCatalog {
                             %error,
                             "row location fell back to every requested row for this file"
                         );
-                        (data_file_id, row_ids.clone())
+                        row_ids.clone()
                     }
-                })
-                .flat_map(|(data_file_id, row_ids)| {
-                    row_ids
-                        .into_iter()
-                        .map(|row_id| FileRowCandidate {
-                            row_id,
-                            data_file_id: Some(data_file_id),
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .fold(
-                    HashMap::<u64, Vec<DataFileId>>::new(),
-                    |mut acc, candidate| {
-                        if let Some(data_file_id) = candidate.data_file_id {
-                            acc.entry(candidate.row_id).or_default().push(data_file_id);
-                        }
+                };
+                for row_id in matched {
+                    placements.entry(row_id).or_default().push(data_file_id);
+                }
+            }
 
-                        acc
-                    },
-                )
-        } else {
-            HashMap::new()
+            Ok(placements)
         };
 
         // A row can be inlined and still hold an expired physical copy in a
-        // current file, so the live inlined copy is its own candidate rather
-        // than an alternative to the file ones.
-        let inlined: HashSet<u64> = self
-            .recent_rows(table)
-            .await?
-            .into_iter()
-            .filter_map(|row| {
-                if let Ok(idx) = row_ids.binary_search(&row.row_id) {
-                    Some(row_ids[idx])
-                } else {
-                    None
-                }
-            })
-            .collect::<HashSet<_>>();
+        // current file, so the inlined copy is its own candidate.
+        let requested: HashSet<u64> = row_ids.iter().copied().collect();
+        let inlined = async {
+            Ok::<_, crate::Error>(
+                self.recent_rows(table)
+                    .await?
+                    .into_iter()
+                    .map(|row| row.row_id)
+                    .filter(|row_id| requested.contains(row_id))
+                    .collect::<HashSet<u64>>(),
+            )
+        };
+        let (mut placements, inlined) = futures::try_join!(file_placements, inlined)?;
 
-        // Emit in the caller's order: a range or NULL scan hands its row ids
-        // over already ordered, and locating them must not reorder them.
+        // Emit in the caller's order; locating must not reorder.
         let mut seen = HashSet::new();
-
         let located = row_ids
             .iter()
             .copied()
@@ -207,8 +192,7 @@ impl ReadOnlyCatalog {
     ///
     /// Best-effort and idempotent: a file already resident, or answering
     /// from its dense range, costs nothing, and a file that cannot be read
-    /// is counted rather than raised. Nothing here is durable, so a pass
-    /// that never runs changes only latency.
+    /// is counted rather than raised.
     ///
     /// # Errors
     ///

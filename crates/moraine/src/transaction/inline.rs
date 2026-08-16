@@ -1,10 +1,6 @@
 //! The verb path's inline staging: what a commit closure accumulates in
-//! the `inline` subspace, and its translation into store writes.
-//!
-//! Inline records live outside
-//! [`CatalogSnapshot`](crate::catalog::CatalogSnapshot)'s entity model and are
-//! never diffed, so they are staged as intents and translated here — the same
-//! split the staged-row path makes, sharing its write builders.
+//! the `inline` subspace, and its translation into store writes. Inline
+//! records live outside the entity model and are never diffed.
 
 use std::collections::HashSet;
 
@@ -57,12 +53,7 @@ pub(crate) enum InlineStage {
 }
 
 /// The schema record a version owes, or nothing when it already has one.
-///
-/// A version's schema is written once and never rewritten, so a hot inline
-/// path pays a point read rather than re-serializing the schema into every
-/// commit's batch. A second, differing schema for a version is refused: the
-/// chunks already written decode against the recorded one, so accepting it
-/// would silently misread them.
+/// A version's schema is fixed once written; a differing one is refused.
 async fn schema_write_if_new(
     db_tx: &DbTransaction,
     table_id: u64,
@@ -83,31 +74,16 @@ async fn schema_write_if_new(
     }
 }
 
-/// Refuses a commit that tombstones a row its own flush drains.
-///
-/// The flushed file was written before the commit, so it carries that row
-/// as live, and the tombstone's chunk is removed out from under it — the
-/// delete would simply vanish. The way to delete a flushed row in the
-/// commit that flushes it is a delete file against the id
-/// `flush_inlined_data` returns.
-///
-/// Only the verb path enforces this. The staged path carries DuckLake's
-/// own statements, which express a flush as the hard deletes it issues
-/// rather than as this pair.
+/// Refuses a commit that tombstones a row its own flush drains: the
+/// flushed file carries that row as live, so the tombstone would vanish.
+/// Such a row is deleted with a delete file against the flushed file.
 fn refuse_tombstones_of_drained_rows(
     table_id: u64,
     drained: &HashSet<u64>,
-    ops: &[InlineStage],
+    tombstoned: &[(u64, u64)],
 ) -> Result<()> {
-    for op in ops {
-        if let InlineStage::Tombstone {
-            table_id: tombstoned_table,
-            row_id,
-            ..
-        } = op
-            && *tombstoned_table == table_id
-            && drained.contains(row_id)
-        {
+    for &(tombstoned_table, row_id) in tombstoned {
+        if tombstoned_table == table_id && drained.contains(&row_id) {
             return Err(Error::Constraint(format!(
                 "inline_delete of row {row_id} on table {table_id} in the commit that flushes \
                  it; the row is live in the flushed file, so delete it with a delete file \
@@ -119,18 +95,24 @@ fn refuse_tombstones_of_drained_rows(
     Ok(())
 }
 
-/// Translates staged inline mutations into `inline/*` writes.
-///
-/// `db_tx` is read at its pre-commit state, so a drain sees the store as it
-/// stood before this commit — which is why a transaction may not both inline
-/// into a table and flush it.
+/// Translates staged inline mutations into `inline/*` writes. `db_tx` is
+/// read at its pre-commit state, so a drain sees the store as it stood
+/// before this commit.
 pub(crate) async fn stage_inline_writes(
     db_tx: &DbTransaction,
     ops: &[InlineStage],
 ) -> Result<Vec<StagedWrite>> {
     let mut writes = Vec::new();
-    // Versions this batch has already settled the schema record for, so a
-    // commit inlining several chunks of one version resolves it once.
+    let tombstoned: Vec<(u64, u64)> = ops
+        .iter()
+        .filter_map(|op| match op {
+            InlineStage::Tombstone {
+                table_id, row_id, ..
+            } => Some((*table_id, *row_id)),
+            _ => None,
+        })
+        .collect();
+    // Versions whose schema record this batch has already settled.
     let mut settled: HashSet<(u64, u64)> = HashSet::new();
     for op in ops {
         match op {
@@ -195,7 +177,7 @@ pub(crate) async fn stage_inline_writes(
                     &mut writes,
                 )
                 .await?;
-                refuse_tombstones_of_drained_rows(*table_id, &drained, ops)?;
+                refuse_tombstones_of_drained_rows(*table_id, &drained, &tombstoned)?;
             }
         }
     }

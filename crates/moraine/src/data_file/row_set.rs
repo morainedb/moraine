@@ -2,27 +2,21 @@
 
 use std::mem::size_of;
 
-use roaring::RoaringTreemap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 
 use super::usize_as_u64;
 use crate::error::{Error, Result};
 
 /// Approximate allocator and container metadata retained per Roaring
-/// container. The representation decision only needs a conservative ordering;
-/// the cache accounts the same estimate when enforcing its byte budget.
+/// container.
 const ROARING_CONTAINER_OVERHEAD_BYTES: u64 = 64;
 
 /// Approximate tree-node overhead for one high-32-bit partition.
 const ROARING_PARTITION_OVERHEAD_BYTES: u64 = 64;
 
-/// Divisors correcting the container statistics to the heap they describe.
-///
-/// `n_bytes_bitset_containers` reports a container's *bit* capacity
-/// (`1024 * 64`) where the container is a `Box<[u64; 1024]>` — 8 KiB, not
-/// 64 KiB. `n_bytes_array_containers` charges `size_of::<u32>()` against a
-/// vector of `u16`. Taken at face value both inflate a Roaring set past the
-/// raw ids it replaces, which picks the sorted form for exactly the
-/// moderately sparse files Roaring is smallest on.
+/// Divisors correcting the container statistics to the heap they describe:
+/// `n_bytes_bitset_containers` reports bit capacity (8x the bytes) and
+/// `n_bytes_array_containers` charges `u32` for a `u16` vector.
 const ROARING_BITSET_STATISTIC_PER_BYTE: u64 = 8;
 const ROARING_ARRAY_STATISTIC_PER_BYTE: u64 = 2;
 
@@ -34,7 +28,7 @@ pub(super) enum FileRowSetKind {
     Range,
     /// A run-optimized 64-bit Roaring set.
     Roaring,
-    /// Sorted raw row ids, selected when Roaring fragments.
+    /// Sorted raw row ids.
     Sorted,
 }
 
@@ -45,7 +39,7 @@ pub(super) enum FileRowSet {
     Range { start: u64, end: u64 },
     /// A compressed sparse set.
     Roaring(RoaringTreemap),
-    /// Predictable storage for highly fragmented ids.
+    /// Sorted raw row ids.
     Sorted(Vec<u64>),
 }
 
@@ -59,7 +53,6 @@ impl FileRowSet {
             ));
         }
 
-        // Check if the row ids form a dense range
         if let (Some(&start), Some(&last)) = (row_ids.first(), row_ids.last()) {
             let count = usize_as_u64(row_ids.len());
             if start
@@ -74,13 +67,20 @@ impl FileRowSet {
         }
 
         let raw_bytes = usize_as_u64(row_ids.len()).saturating_mul(size_of::<u64>() as u64);
-        let unoptimized = row_ids.iter().copied().collect::<RoaringTreemap>();
-        let roaring =
-            RoaringTreemap::from_bitmaps(unoptimized.bitmaps().map(|(partition, bitmap)| {
-                let mut optimized = bitmap.clone();
-                optimized.optimize();
-                (partition, optimized)
-            }));
+        let bitmaps = row_ids
+            .chunk_by(|left, right| high_word(*left) == high_word(*right))
+            .map(|partition| {
+                let mut bitmap = RoaringBitmap::from_sorted_iter(
+                    partition.iter().map(|row_id| low_word(*row_id)),
+                )
+                .map_err(|_| {
+                    Error::Constraint("file row ids must be strictly ascending".to_owned())
+                })?;
+                bitmap.optimize();
+                Ok((high_word(partition[0]), bitmap))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let roaring = RoaringTreemap::from_bitmaps(bitmaps);
 
         if roaring_estimated_bytes(&roaring) < raw_bytes {
             Ok(Self::Roaring(roaring))
@@ -136,6 +136,16 @@ impl FileRowSet {
             Self::Sorted(_) => FileRowSetKind::Sorted,
         }
     }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+const fn high_word(row_id: u64) -> u32 {
+    (row_id >> 32) as u32
+}
+
+#[allow(clippy::cast_possible_truncation)]
+const fn low_word(row_id: u64) -> u32 {
+    row_id as u32
 }
 
 /// Approximates the heap retained by the Rust Roaring implementation from its

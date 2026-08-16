@@ -34,13 +34,11 @@ pub struct MoraineOptionRow {
 pub(crate) fn option_rows(
     rows: Vec<moraine::ffi_support::OptionRow>,
 ) -> Result<Vec<MoraineOptionRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in
-    // the whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|row| {
-            let key = to_c_string(&row.key)?;
-            let value = to_c_string(&row.value)?;
+        .map(|mut row| {
+            let key = to_c_string(std::mem::take(&mut row.key))?;
+            let value = to_c_string(std::mem::take(&mut row.value))?;
             let scope = opt_c_string(row.scope.as_deref())?;
             Ok((row, key, value, scope))
         })
@@ -89,7 +87,7 @@ pub unsafe extern "C" fn moraine_dump_options(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_options(catalog)),
+            moraine::ffi_support::dump_options,
             option_rows,
         )
     }

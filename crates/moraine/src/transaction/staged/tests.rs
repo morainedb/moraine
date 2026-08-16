@@ -6082,9 +6082,14 @@ async fn visible_option_scopes_overlay_last_write_wins() {
         Some("second")
     );
 
+    // The delete carries the key cells alone, as the shim sends them.
     tx.stage(RowOperation::Delete {
         table: TableKind::Metadata,
-        cells: option(2, 9, "k", "second"),
+        cells: vec![
+            Cell::Str("k".to_string()),
+            Cell::Str("table".to_string()),
+            Cell::U64(9),
+        ],
     });
     let scopes = tx.visible_option_scopes().await.unwrap();
     assert!(

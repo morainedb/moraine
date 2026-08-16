@@ -1,14 +1,7 @@
-//! Folding a committed batch forward into a materialized view.
-//!
-//! The store after a commit is the store before it plus the batch's writes,
-//! so applying those same writes to the pre-commit [`CatalogSnapshot`] — put
-//! the decoded value at each `current` key, remove it on a delete — yields
-//! exactly what a fresh scan of the new head would build. That lets a writer
-//! reuse the view it already holds instead of rescanning on every commit.
-//!
-//! Deletes mirror the store key by key with no cascade: a fresh scan simply
-//! omits a deleted key, so dropping a table here must not also drop its
-//! columns — the batch carries their own deletes when they end.
+//! Folding a committed batch forward into a materialized view: put the
+//! decoded value at each `current` key, remove it on a delete. Deletes
+//! mirror the store key by key with no cascade; the batch carries each
+//! ended entity's own delete.
 
 use super::StagedWrite;
 use crate::{
@@ -24,8 +17,7 @@ use crate::{
 
 /// Folds one committed batch into `view`, advancing it to the batch's head.
 /// A write whose key cannot be decoded, or a deletion of an immutable kind,
-/// is refused so the caller drops the cached view rather than serve a view
-/// that has silently diverged from the store.
+/// is refused; the caller must drop the cached view.
 pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> Result<()> {
     let mut new_head: Option<u64> = None;
     let mut minted: Option<SnapshotValue> = None;
@@ -41,8 +33,6 @@ pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> 
                 Some(bytes) => view.put_gc_file(value::decode_value(bytes)?),
                 None => view.remove_gc_file(data_file_id),
             },
-            // The minted snapshot record; an expiry deletes older ones,
-            // which leave the head view's entities untouched.
             Key::Snapshot { .. } => {
                 if let Some(bytes) = bytes {
                     minted = Some(value::decode_value(bytes)?);
@@ -61,8 +51,7 @@ pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> 
         }
     }
 
-    // Adopt the minted snapshot's metadata only when it is the new head;
-    // a head-preserving (maintenance) batch keeps the current metadata.
+    // A head-preserving batch keeps the current snapshot metadata.
     if let (Some(head), Some(snapshot)) = (new_head, minted)
         && snapshot.snapshot_id == head
     {
@@ -72,9 +61,8 @@ pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> 
     Ok(())
 }
 
-/// Removes exactly the entity at one `current` key, keeping the name indexes
-/// coherent but cascading to nothing — the store deletes each ended entity
-/// under its own key.
+/// Removes exactly the entity at one `current` key, keeping the name
+/// indexes coherent and cascading to nothing.
 fn remove_entity(view: &mut CatalogSnapshot, entity: EntityKey) -> Result<()> {
     match entity {
         EntityKey::Schema { schema_id } => view.remove_schema_only(schema_id),

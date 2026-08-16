@@ -511,3 +511,60 @@ async fn located_rows_keep_the_order_they_were_requested_in() {
     );
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn an_inlined_row_with_a_file_copy_keeps_both_candidates_in_any_request_order() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let (file_size_bytes, footer_size) = write(
+        &data,
+        "main/orders/data-3.parquet",
+        &batch_with_row_ids(&[10, 20, 30], &[0, 1, 2]),
+    )
+    .await;
+    let created = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
+            let table = tx.create_table(schema, "orders", &[col("a")])?;
+            tx.inline_insert(
+                table,
+                &InlineChunk {
+                    schema_version: 0,
+                    arrow_schema: b"schema-v0".to_vec(),
+                    arrow_body: b"rows".to_vec(),
+                    row_count: 3,
+                },
+                &[],
+            )?;
+            tx.register_data_file(
+                table,
+                DataFile {
+                    file_size_bytes,
+                    footer_size,
+                    ..datafile(3)
+                },
+                &[],
+            )?;
+            created.set(Some(table));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let table = created.get().unwrap();
+    let file = catalog.snapshot().await.unwrap().data_files_of(table)[0]
+        .id
+        .get();
+
+    // Rows 0..3 are inlined and also held by the file; requested out of
+    // order, every one keeps its inlined candidate beside the file one.
+    let located = catalog
+        .locate_row_ids(Some(data), "", table, vec![2, 0, 1])
+        .await
+        .unwrap();
+
+    for row_id in [0, 1, 2] {
+        assert_eq!(files_for(&located, row_id), vec![None, Some(file)]);
+    }
+    catalog.close().await.unwrap();
+}

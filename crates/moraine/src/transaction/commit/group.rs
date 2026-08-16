@@ -3,13 +3,7 @@
 //! A store admits one batch at a time. A commit that finds the store free
 //! opens a batch and stages onto it; a commit that finds one forming joins
 //! it; a commit that finds one in flight waits for the next. A batch seals
-//! the moment no caller is on its way into it, so an uncontended commit
-//! waits for nobody and takes the path it always took, while a contended
-//! one rides a batch that grew while the previous flush was in the air.
-//!
-//! That is the whole of the batching policy: nothing here waits on a timer
-//! or guesses at arrivals. The flush already in flight is the window, and
-//! the arrival count says when it has closed.
+//! the moment no caller is on its way into it; nothing waits on a timer.
 
 use std::sync::{
     Arc,
@@ -30,23 +24,12 @@ use crate::{
     transaction::{operations::ChangeSet, verbs::Transaction},
 };
 
-/// The most commits one batch carries.
-///
-/// A batch otherwise seals when nobody is on their way into it, which under
-/// saturation is never: callers arriving faster than they can be staged
-/// would keep the count above zero and the batch would grow without ever
-/// flushing. This bounds that. It also bounds what one batch holds in
-/// memory, though only loosely — each member's own limits still apply, and
-/// a batch multiplies them by at most this. Sixty-four commits per flush is
-/// already far past where the marginal member buys anything.
+/// The most commits one batch carries; a full batch seals even while
+/// callers are still arriving.
 const MAX_BATCH_MEMBERS: usize = 64;
 
-/// What a sealed batch did, told to every member that rode it.
-///
-/// A batch's write failure does not appear here as itself. The answer goes
-/// to members that never saw the store and cannot be handed an error one
-/// of them owns, so it arrives as [`Outcome::Nothing`] and is surfaced
-/// typed by whichever member meets the same failure on its own.
+/// What a sealed batch did, told to every member that rode it. A write
+/// failure arrives as [`Outcome::Nothing`], not as the error itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// Committed. Every member's allocated ids stand.
@@ -68,8 +51,7 @@ pub(crate) struct Staged {
     pub(crate) ours: Vec<ChangeSet>,
     /// The head the batch's premise was read at.
     pub(crate) head_before: u64,
-    /// Whether this caller put anything in the batch. A caller that did
-    /// not is unaffected by the batch's fate.
+    /// Whether this caller put anything in the batch.
     pub(crate) contributed: bool,
     /// The batch's outcome, once it lands.
     pub(crate) outcome: watch::Receiver<Option<Outcome>>,
@@ -79,12 +61,10 @@ pub(crate) struct Staged {
 /// writes, and the premise the next member stages against.
 struct Batch {
     db_tx: DbTransaction,
-    /// The head view the batch opened at, and the base of the projection
-    /// refresh once it lands.
+    /// The head view the batch opened at.
     base: Arc<CatalogSnapshot>,
-    /// `base` folded forward through the members staged so far. Left
-    /// `None` until a second member needs it, so a batch nobody joins
-    /// never clones the view.
+    /// `base` folded forward through the members staged so far; `None`
+    /// until a second member needs it.
     premise: Option<CatalogSnapshot>,
     /// How much of `writes` the premise already reflects.
     folded: usize,
@@ -130,8 +110,7 @@ impl Batch {
     }
 
     /// Brings the premise up to date with everything staged since it was
-    /// last folded, so the next member stages against what its
-    /// predecessors left rather than against the head the batch opened at.
+    /// last folded.
     fn refold(&mut self) -> Result<()> {
         if self.folded == self.writes.len() {
             return Ok(());
@@ -144,9 +123,7 @@ impl Batch {
     }
 
     /// Runs every member's closure in turn and stages the result. An error
-    /// leaves the batch poisoned: some of the failing member's writes may
-    /// already be on the transaction, so the caller discards the batch
-    /// rather than commit a member that reported failure.
+    /// leaves the batch poisoned: the caller must discard it.
     async fn stage<F>(&mut self, members: &[F]) -> Result<(Vec<SnapshotId>, Vec<ChangeSet>)>
     where
         F: Fn(&mut Transaction) -> Result<()>,
@@ -180,10 +157,8 @@ impl Batch {
     }
 }
 
-/// The forming batch and whether one is in flight. Both move together, so
-/// they share one lock: a batch is taken out of `forming` and marked in
-/// flight in the same breath, and no second batch can open against a head
-/// the one in flight is about to move.
+/// The forming batch and whether one is in flight, under one lock so a
+/// batch leaves `forming` and enters flight atomically.
 struct Shared {
     forming: Option<Batch>,
     in_flight: bool,
@@ -193,12 +168,10 @@ struct Shared {
 /// clone of the catalog.
 pub(crate) struct Coalescer {
     shared: Mutex<Shared>,
-    /// Callers that have arrived and not yet staged. A batch seals when
-    /// this reaches zero, which is what makes the batch exactly as large
-    /// as the contention and no larger.
+    /// Callers that have arrived and not yet staged; a batch seals when
+    /// this reaches zero.
     arriving: AtomicUsize,
-    /// Bumped under `shared` whenever a batch leaves flight, waking the
-    /// callers waiting for the store.
+    /// Bumped under `shared` whenever a batch leaves flight.
     flights: watch::Sender<u64>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
 }
@@ -226,17 +199,15 @@ impl Coalescer {
     }
 
     /// Waits until no batch is in flight and returns the lock on the
-    /// forming one. Callers are admitted one at a time, which is what lets
-    /// each stage against the state its predecessors left.
+    /// forming one. Callers are admitted one at a time.
     async fn admit(&self) -> MutexGuard<'_, Shared> {
         loop {
             let shared = self.shared.lock().await;
             if !shared.in_flight {
                 return shared;
             }
-            // Subscribing under the lock is what makes this wait safe: the
-            // generation only moves under this same lock, so the flight
-            // being waited on cannot end unnoticed in between.
+            // Subscribed under the lock: the generation only moves under it,
+            // so the flight cannot end unnoticed in between.
             let mut flights = self.flights.subscribe();
             drop(shared);
             let _ = flights.changed().await;
@@ -261,9 +232,8 @@ impl Coalescer {
         let staged = match batch.stage(members).await {
             Ok(staged) => staged,
             Err(err) => {
-                // The batch is poisoned; discard it. Its members learn
-                // that nothing landed when the outcome sender drops, and
-                // re-run — theirs is work redone, never work lost.
+                // The batch is poisoned; its members learn that nothing
+                // landed when the outcome sender drops.
                 batch.db_tx.rollback();
                 return Err(err);
             }
@@ -274,8 +244,6 @@ impl Coalescer {
         let head_before = batch.head_before;
         let contributed = batch.writes.len() > staged_before;
 
-        // Nobody else on their way in means nobody else to wait for; a
-        // full batch stops waiting whether or not anyone is.
         let alone = arrival.settle() == 0;
         let full = batch.members >= MAX_BATCH_MEMBERS;
         if (alone || full) && !batch.writes.is_empty() {
@@ -283,8 +251,6 @@ impl Coalescer {
             drop(shared);
             self.launch(batch);
         } else if batch.writes.is_empty() {
-            // An empty batch is nothing to commit and nothing to hold
-            // open; the next caller opens a fresh one.
             batch.db_tx.rollback();
         } else {
             shared.forming = Some(batch);
@@ -300,8 +266,7 @@ impl Coalescer {
     }
 
     /// Commits `batch` on a task of its own, so the caller that sealed it
-    /// cannot take the batch down with it: a host interrupt drops that
-    /// caller's future, and every other member is owed an answer.
+    /// cannot take the batch down with it.
     fn launch(self: &Arc<Self>, batch: Batch) {
         let coalescer = Arc::clone(self);
         drop(tokio::spawn(async move { coalescer.land(batch).await }));
@@ -334,8 +299,6 @@ impl Coalescer {
             Ok(Landed::Committed(_)) => Outcome::Committed,
             Ok(Landed::LostRace) => Outcome::LostRace,
             Err(err) => {
-                // The only record of this error. Its members re-attempt,
-                // and the one that meets it alone returns it typed.
                 tracing::warn!(error = %err, "commit batch failed to write; its members retry");
                 Outcome::Nothing
             }
@@ -349,10 +312,8 @@ impl Coalescer {
             .send_modify(|flight| *flight = flight.wrapping_add(1));
     }
 
-    /// Seals whatever batch is forming, if nothing else will. The path a
-    /// caller that vanished before staging leaves behind: its batch is
-    /// holding members who are waiting for an arrival that will never
-    /// come.
+    /// Seals whatever batch is forming, if nothing else will: the path a
+    /// caller that vanished before staging leaves behind.
     async fn seal_abandoned(self: Arc<Self>) {
         let mut shared = self.shared.lock().await;
         if shared.in_flight || self.arriving.load(Ordering::Acquire) > 0 {
@@ -371,29 +332,23 @@ impl Coalescer {
     }
 }
 
-/// Waits for the batch a caller staged onto to land.
-///
-/// A sender dropped with nothing published means the batch was abandoned
-/// before it sealed — nothing was written, so the member re-runs.
+/// Waits for the batch a caller staged onto to land. A sender dropped with
+/// nothing published means the batch was abandoned before it sealed.
 pub(crate) async fn await_outcome(mut outcome: watch::Receiver<Option<Outcome>>) -> Outcome {
     loop {
         if let Some(landed) = *outcome.borrow_and_update() {
             return landed;
         }
         if outcome.changed().await.is_err() {
-            // Re-read rather than assume: the sender may have published
-            // and dropped between the borrow above and this wait.
+            // The sender may have published and dropped since the borrow.
             return outcome.borrow().unwrap_or(Outcome::Nothing);
         }
     }
 }
 
 /// Counts one caller from the moment it arrives until it has staged.
-///
-/// A batch seals when the count reaches zero, so a caller that goes away
-/// in between — its future dropped by a host interrupt — must not leave
-/// the batch waiting for a member that will never arrive. Dropping this
-/// guard without settling both drops the count and seals what is left.
+/// Dropping it without settling both drops the count and seals what is
+/// left, so a vanished caller cannot leave the batch waiting.
 struct Arrival {
     coalescer: Arc<Coalescer>,
     settled: bool,
@@ -416,8 +371,7 @@ impl Drop for Arrival {
         if self.coalescer.arriving.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
-        // Outside a runtime there is nothing to spawn onto, and nothing to
-        // rescue either: the next commit finds the batch and seals it.
+        // Outside a runtime, the next commit finds the batch and seals it.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let coalescer = Arc::clone(&self.coalescer);
             drop(runtime.spawn(async move { coalescer.seal_abandoned().await }));

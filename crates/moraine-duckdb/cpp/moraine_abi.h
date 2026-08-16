@@ -41,14 +41,12 @@ enum {
 
 
 // An attached catalog: owns the tokio runtime created at `ATTACH` and
-// the [`Catalog`] handle opened on it.
+// the [`Catalog`] handle opened on it. Every FFI entry point `block_on`s
+// through `runtime`.
 //
 // Opaque to C — only ever seen as a `MoraineCatalogHandle*` obtained
 // from [`moraine_attach`](crate::abi::moraine_attach) and released via
 // [`moraine_detach`](crate::abi::moraine_detach).
-//
-// Every FFI entry point `block_on`s through `runtime`; nothing in
-// `moraine` core ever blocks on itself.
 typedef struct MoraineCatalogHandle MoraineCatalogHandle;
 
 // A materialized snapshot view, held across the FFI boundary so
@@ -60,9 +58,7 @@ typedef struct MoraineCatalogHandle MoraineCatalogHandle;
 typedef struct MoraineSnapshotHandle MoraineSnapshotHandle;
 
 // A staged-row transaction, opaque to C. Owns one [`StagedTransaction`]
-// plus a borrowed pointer to the catalog handle it was opened on, used to
-// `block_on` the async core calls in [`moraine_tx_begin`] and
-// [`moraine_tx_commit`].
+// plus a borrowed pointer to the catalog handle it was opened on.
 typedef struct MoraineTxHandle MoraineTxHandle;
 
 // Mirrors the C `MoraineS3Config`: S3 credentials for an `s3://` store,
@@ -96,9 +92,8 @@ typedef bool (*MoraineInterruptProbe)(void *probe_ctx);
 // Caller-allocated and passed by pointer to every fallible `moraine_*`
 // entry point; on failure the callee fills in both fields. `message` is
 // null when there is nothing to free, and must be passed to
-// [`moraine_error_free`](crate::abi::moraine_error_free) exactly once —
-// the entry point never frees a previous message, so reuse without
-// freeing in between leaks.
+// [`moraine_error_free`](crate::abi::moraine_error_free) exactly once;
+// the entry point never frees a previous message.
 typedef struct MoraineError {
   // One of the [`codes`] constants.
   int32_t code;
@@ -258,9 +253,8 @@ typedef struct MoraineSubspaceCensus {
 
 // Store-wide object totals, as returned by [`moraine_store_census`].
 typedef struct MoraineStoreObjects {
-  // Whether the store could be listed at all. False leaves every other
-  // field zero — read-only credentials often grant `GetObject` without
-  // `ListBucket`.
+  // Whether the store could be listed at all; false leaves every other
+  // field zero.
   bool listed;
   // Every object under the store's prefix.
   uint64_t total_objects;
@@ -431,7 +425,7 @@ typedef struct MoraineArrowBytes {
   size_t cap;
 } MoraineArrowBytes;
 
-// One referenced chunk's full Arrow IPC record-batch body, owned —
+// One referenced chunk's full Arrow IPC record-batch body, owned;
 // returned once per chunk however many rows reference it.
 typedef struct MoraineInlineChunk {
   // The chunk's Arrow IPC record-batch body, owned.
@@ -968,8 +962,7 @@ typedef struct MoraineColumnTagRow {
 
 // One inlined row, as returned by [`moraine_inline_scan`]: `chunk_index`
 // names the owning chunk in the scan's parallel [`MoraineInlineChunk`]
-// array, so the shim decodes each chunk once and reads the row at
-// `offset_in_chunk`.
+// array.
 typedef struct MoraineInlineRow {
   // The row's dense id.
   uint64_t row_id;
@@ -994,10 +987,12 @@ typedef struct MoraineInlineRow {
 typedef struct MoraineInlineSchemaRow {
   // The schema's version.
   uint64_t schema_version;
-  // The Arrow IPC schema message, owned, verbatim.
+  // The Arrow IPC schema message, verbatim; borrowed from `owner`.
   uint8_t *arrow_schema;
   // `arrow_schema`'s length in bytes.
   size_t arrow_schema_len;
+  // Opaque owner of `arrow_schema`, released by the array's `_free`.
+  void *owner;
 } MoraineInlineSchemaRow;
 
 // One `(table_id, schema_version)` pair, as returned by
@@ -1054,69 +1049,38 @@ extern "C" {
 // credentials (any field unset falls back to the AWS_* environment); it
 // may be null to use the environment alone and is ignored otherwise.
 //
-// `encrypted` requests DuckLake data-file encryption. Creation-time
-// only: it is recorded when a fresh store bootstraps and ignored on an
-// already-initialized store, whose stored flag
-// ([`moraine_catalog_encrypted`]) is authoritative.
+// `encrypted` requests DuckLake data-file encryption. Recorded when a
+// fresh store bootstraps; ignored on an already-initialized store, whose
+// stored flag ([`moraine_catalog_encrypted`]) is authoritative.
 //
 // `cache_dir`, `cache_size_bytes`, and `cache_memory_bytes` configure the
-// block cache, which is the process's rather than the attach's: one
-// instance, shared by every store the process opens. The first attach to
-// reach it builds it and these three are what it is built from; a later
-// attach naming different ones is served what stands and its own are
-// logged as ignored, never an error. On a host that attaches several
-// catalogs, set them on the first.
+// process-wide block cache. The first attach builds it from these; a
+// later attach naming different values logs them as ignored. `cache_dir`
+// is the disk tier's directory (null keeps the cache in memory);
+// `cache_size_bytes` bounds that directory and `cache_memory_bytes`
+// bounds memory across the metadata and data-block slots. `0` means "not
+// given" for either.
 //
-// `cache_dir` is a local directory for the cache's disk tier, which holds
-// data blocks evicted from memory; null leaves the cache in memory.
-// `cache_size_bytes` bounds that directory and `cache_memory_bytes` bounds
-// memory across both of the cache's slots — the metadata slot that holds
-// SST indexes and filters, and the data-block slot. `0` means "not given"
-// for either, taking what SlateDB gives a single store's cache.
+// `cache_preload` warms this store into that cache before the attach
+// returns: `0` loads nothing, `1` each subspace's SST metadata, `2` the
+// scan-shaped subspaces whole. Any other value is
+// [`codes::INVALID_ARGUMENT`]. `cache_puts` admits SST metadata (including
+// compaction output) into the cache as it is written; `false` leaves the
+// cache filled by reads alone.
 //
-// `cache_preload` warms this store's bytes into that cache as the attach
-// opens, so the first query pays no first touch: `0` loads nothing, `1`
-// each subspace's SST metadata, `2` the scan-shaped subspaces whole. Per
-// attach rather than process-wide, and the attach waits for it. Any other
-// value is [`codes::INVALID_ARGUMENT`].
+// `checkpoint` pins a read-only attach to an existing SlateDB checkpoint
+// (see [`moraine_create_checkpoint`]); the open writes nothing and serves
+// a fixed cut. Null or empty follows the latest manifest; a non-null value
+// with `read_only` false is [`codes::INVALID_ARGUMENT`].
 //
-// `cache_puts` admits the SST metadata this store writes as it is written,
-// rather than only when a read pulls it back. Compaction output is
-// admitted too, so a merge can evict what reads had warmed; `false` leaves
-// the cache filled by reads alone. Per attach, like `cache_preload`.
-//
-// `checkpoint` pins a **read-only** attach to an existing SlateDB
-// checkpoint (see [`moraine_create_checkpoint`]), so the open writes
-// nothing at all — no manifest record of the reader, no refresh, no
-// delete on close — and serves a fixed cut that never advances. Null or
-// empty follows the latest manifest; a non-null value with `read_only`
-// false is [`codes::INVALID_ARGUMENT`].
-//
-// `host_threads` is how many execution threads the calling host runs, and
-// sizes this handle's worker pool: the host's setting is the only number
-// in the process that says how much parallelism the operator asked for,
-// so a session pinned to one thread does not get a pool sized to the
-// machine. It is clamped to a floor of two (a CPU-bound poll must not be
-// able to stall SlateDB's flush) and a ceiling of eight (the pool waits
-// on object storage, which yields its worker at every await, so further
-// workers only park — on cores the host already sized itself to). `0`
-// means the host does not say and takes the floor. The size is fixed for
-// the handle's life; a host that changes its own thread count afterwards
-// keeps the pool it attached with.
+// `host_threads` is how many execution threads the calling host runs;
+// the handle's worker pool is that count clamped to `[2, 8]`, with `0`
+// taking the floor. The size is fixed for the handle's life.
 //
 // Cancellable via `probe`/`probe_ctx`, exactly as the read entry points
-// are: the store open is the one long blocking call an attach makes, and
-// against an unreachable endpoint it is the one worth escaping. A
-// cancelled attach returns [`codes::INTERRUPTED`], writes no handle, and
-// leaves nothing attached. It may still have fenced a writer that was
-// attached before it — an attach takes the writer epoch before it can
-// know whether it will finish — so the previously attached process must
-// re-attach either way, exactly as after any failed attach.
-//
-// [`moraine_detach`] takes no probe and never will: it is teardown, and
-// an interrupt part-way through would either leak the handle or leave
-// the store half-closed. Cancellation exists to escape a wait, and
-// detach's wait is the flush that makes committed data durable.
+// are. A cancelled attach returns [`codes::INTERRUPTED`], writes no
+// handle, and leaves nothing attached; it may still have fenced a writer
+// attached before it, which must re-attach as after any failed attach.
 //
 // Returns [`codes::OK`] on success. On failure, `*out` is left
 // unwritten and, if `err` is non-null, `*err` carries the code and a
@@ -1152,11 +1116,9 @@ int32_t moraine_attach(const char *path,
                        struct MoraineCatalogHandle **out,
                        struct MoraineError *err);
 
-// Writes the lake's recorded data root — the stored global `data_path`
-// option, set when the store was created — to `*out` as an owned C string,
-// or null when none was recorded. Free a non-null result exactly once with
-// [`moraine_string_free`]. The shim serves this back as DuckLake's
-// `ducklake_metadata` `data_path` row, so a re-attach need not repeat it.
+// Writes the lake's recorded data root (the stored global `data_path`
+// option) to `*out` as an owned C string, or null when none was recorded.
+// Free a non-null result exactly once with [`moraine_string_free`].
 //
 // Cancellable via `probe`/`probe_ctx`, exactly as
 // [`moraine_snapshot`].
@@ -1174,13 +1136,8 @@ int32_t moraine_data_path(struct MoraineCatalogHandle *handle,
                           struct MoraineError *err);
 
 // Applies every structural format migration this binary carries that the
-// store at `path` still needs.
-//
-// Deliberately not part of [`moraine_attach`]: a rewrite takes the single
-// writer for its duration, so it is the operator's explicit choice. It
-// also opens the store itself, because the stores it exists to repair —
-// those carrying a migration marker — are exactly the ones an attach
-// refuses.
+// store at `path` still needs. Opens the store itself; a store carrying a
+// migration marker is one an attach refuses.
 //
 // `checkpoint` takes a whole-store checkpoint before the first rewrite and
 // releases it once the run is durable, leaving a manual recovery point if
@@ -1211,12 +1168,12 @@ int32_t moraine_migrate(const char *path,
                         struct MoraineMigrationReport *out,
                         struct MoraineError *err);
 
-// Frees a string previously written through [`moraine_data_path`]'s `out`.
-// A null pointer is ignored.
+// Frees an owned string a `moraine_*` call returned (such as
+// [`moraine_data_path`]'s `out`). A null pointer is ignored.
 //
 // # Safety
 //
-// `ptr` must be a value written by [`moraine_data_path`] and not yet
+// `ptr` must be an owned string a `moraine_*` call returned and not yet
 // freed, or null.
 void moraine_string_free(char *ptr);
 
@@ -1241,11 +1198,9 @@ int32_t moraine_catalog_encrypted(struct MoraineCatalogHandle *handle,
                                   struct MoraineError *err);
 
 // Closes the catalog (flushing background work) and drops the runtime,
-// consuming `handle`.
-//
-// Best-effort: a failure while closing the store is swallowed, since
-// this `void` entry point has no error channel. A null `handle` is a
-// no-op.
+// consuming `handle`. A close failure is logged, not returned; a null
+// `handle` is a no-op. Takes no probe: an interrupted teardown would leak
+// the handle or leave the store half-closed.
 //
 // # Safety
 //
@@ -1402,11 +1357,9 @@ void moraine_snapshot_data_files_of_free(struct MoraineDataFileDesc *items, size
 // one commit may stage — and returns once the index is ready; interrupting
 // it leaves the build resumable by the same call.
 //
-// `step_entries` and `step_bytes` bound one step of that build, each `0`
-// for the default. They matter on a slow link: a step becomes a single
-// object-store request, and one too large to transfer inside the store
-// client's timeout is retried forever rather than failing. Both are
-// ignored without `staged`.
+// `step_entries` and `step_bytes` bound one step of that build (a single
+// object-store request), each `0` for the default; both are ignored
+// without `staged`.
 //
 // # Safety
 //
@@ -1445,11 +1398,9 @@ int32_t moraine_index_drop(struct MoraineCatalogHandle *handle,
 
 // Runs one moraine-owned maintenance pass, reclaiming the entry ranges
 // of indexes no longer live, and writes what it reclaimed to
-// `*indexes_swept` and `*entries_reclaimed`.
-//
-// The pass mints no snapshot and leaves head unchanged. `batch_size` of
-// 0 means "not given" and takes the core default; the pass commits at
-// most that many deletes per batch.
+// `*indexes_swept` and `*entries_reclaimed`. The pass mints no snapshot
+// and leaves head unchanged. `batch_size` bounds the deletes per commit;
+// 0 takes the core default.
 //
 // # Safety
 //
@@ -1557,30 +1508,18 @@ int32_t moraine_compact_store(struct MoraineCatalogHandle *handle,
 // matching [`moraine_compact_store`] call, not yet freed.
 void moraine_compact_store_free(struct MoraineSubspaceMerge *items, size_t len);
 
-// Whether `name` is a subspace a merge can target.
-//
-// Exposed separately from [`moraine_compact_store`] because an attach
-// validates its options before any catalog is open: a name checked only
-// when a pass runs would let a typo attach cleanly and then fail every
-// scheduled pass, unattended, for as long as it stood.
+// Whether `name` is a subspace a merge can target, so an attach can
+// validate its options before any catalog is open.
 //
 // # Safety
 //
 // `name`, if non-null, must be a valid C string.
 bool moraine_subspace_is_known(const char *name);
 
-// What the process's block cache has served since it was built.
-//
-// One cache serves every store a process opens, so these are the host's
-// numbers — the ones its budget is set from — and they outlive the
-// attaches that produced them. Needs no handle for the same reason, and
-// reports zeros before anything has read.
-// [`moraine_catalog_cache_tally`] reports the same counts for one attach.
-//
-// Metadata (SST indexes, filters, stats) and data blocks are counted
-// apart because they are budgeted apart — a healthy stack keeps
-// metadata near fully served, while blocks land wherever the working
-// set does.
+// What the process-wide block cache has served since it was built;
+// zeros before anything has read. Metadata (SST indexes, filters, stats)
+// and data blocks are counted apart. [`moraine_catalog_cache_tally`]
+// reports the same counts for one attach.
 //
 // # Safety
 //
@@ -1597,15 +1536,8 @@ int32_t moraine_cache_tally(uint64_t *out_metadata_hits,
                             uint64_t *out_preload_block_misses,
                             uint64_t *out_preload_failures);
 
-// What the process's block cache has served **for one attach** since it
-// attached.
-//
-// The same counts [`moraine_cache_tally`] reports, narrowed to the
-// catalog `handle` names. The cache and its budget are still the
-// process's — what this adds is which attach is spending them, which is
-// the question a host with several catalogs on one cache has and the
-// process-wide numbers cannot answer. A detached catalog's counts leave
-// with it; the process's keep them.
+// The counts [`moraine_cache_tally`] reports, narrowed to what the
+// catalog `handle` names has spent since it attached.
 //
 // # Safety
 //
@@ -1644,14 +1576,9 @@ int32_t moraine_catalog_object_store_tally(struct MoraineCatalogHandle *handle,
                                            struct MoraineObjectStoreTally *out_tally);
 
 // The store state the catalog's dumps currently serve: the head
-// snapshot id and batch count. `out_present` is false on a store with no
-// head yet (mid-bootstrap), where the other outputs are left unwritten.
-//
-// One point read, so a caller holding rows it dumped earlier can ask
-// whether anything moved before paying to re-dump them. Both halves are
-// reported because a maintenance batch reuses the snapshot id while
-// changing what a scan finds, so the id alone would let a stale row set
-// keep serving.
+// snapshot id and batch count (a maintenance batch changes the count
+// without minting a snapshot). `out_present` is false on a store with no
+// head yet, where the other outputs are left unwritten.
 //
 // # Safety
 //
@@ -1669,7 +1596,7 @@ int32_t moraine_head_stamp(struct MoraineCatalogHandle *handle,
                            struct MoraineError *err);
 
 // The subspaces a merge can target, comma-separated, for an error
-// message. Owned — free via `moraine_error_free`; null if allocation
+// message. Owned — free via [`moraine_string_free`]; null if allocation
 // fails.
 char *moraine_subspace_names(void);
 
@@ -1829,9 +1756,7 @@ void moraine_index_nulls_free(struct MoraineRowId *items, size_t len);
 // Mints a checkpoint over `handle`'s current durable state and writes its
 // id to `*out_id` (free with `moraine_string_free`).
 //
-// Takes the attached handle rather than a path: the core mints through
-// the writer, and opening a second one to do it would fence the first.
-// The handle must therefore be a read-write attach.
+// The handle must be a read-write attach.
 //
 // `lifetime_ms` bounds how long the checkpoint holds its objects against
 // garbage collection; `0` means no expiry, which pins them until
@@ -1884,11 +1809,8 @@ int32_t moraine_checkpoints(const char *path,
 void moraine_checkpoints_free(struct MoraineCheckpoint *items, size_t len);
 
 // Releases the checkpoint named by `id`, unpinning whatever it held
-// against garbage collection.
-//
-// Takes a path rather than a handle: it CASes the manifest without
-// opening the writer, so it runs against a live catalog without fencing
-// it.
+// against garbage collection. Runs against a live catalog without
+// fencing it.
 //
 // Returns [`codes::OK`] on success. On failure, if `err` is non-null,
 // `*err` carries the code and a message.
@@ -1912,8 +1834,7 @@ int32_t moraine_delete_checkpoint(const char *path,
 void moraine_arrow_bytes_free(struct MoraineArrowBytes bytes);
 
 // Serializes just the Arrow schema (an IPC stream with the schema and no
-// batches), stored once per inline schema version so an empty scan can
-// reconstruct the column layout.
+// batches), stored once per inline schema version.
 //
 // # Safety
 // `schema` is an exported `ArrowSchema` consumed by this call; `out`/`err`
@@ -1922,16 +1843,14 @@ int32_t moraine_arrow_encode_schema(ArrowSchema *schema,
                                     struct MoraineArrowBytes *out,
                                     struct MoraineError *err);
 
-// Serializes one inlined chunk to a record-batch **body** only — the IPC
-// record-batch message and its buffers, without a schema message. The
-// schema is stored once per version by [`moraine_arrow_encode_schema`] and
-// supplied back at decode by [`moraine_arrow_decode_body`], so the WAL
-// append for a tiny commit never re-serializes the schema. The layout is a
-// little-endian `u32` message length, the record-batch flatbuffer message,
-// then the arrow data buffers.
+// Serializes one inlined chunk to a record-batch body only: a
+// little-endian `u32` message length, the record-batch flatbuffer
+// message, then the arrow data buffers, without a schema message (stored
+// once per version by [`moraine_arrow_encode_schema`] and supplied back
+// at decode by [`moraine_arrow_decode_body`]).
 //
 // Dictionary-encoded columns are rejected: the body carries no dictionary
-// messages. Inlined user columns are not dictionary-encoded in practice.
+// messages.
 //
 // # Safety
 // `schema`/`array` are exported structs consumed by this call; `out`/`err`
@@ -1960,8 +1879,8 @@ int32_t moraine_arrow_decode_body(const uint8_t *schema_ipc,
                                   struct MoraineError *err);
 
 // Decodes and consumes one chunk returned by
-// [`crate::inline::moraine_inline_scan`]. Its store-backed allocation becomes
-// Arrow's data buffer instead of being copied across the ABI first.
+// [`crate::inline::moraine_inline_scan`]; its store-backed allocation
+// becomes Arrow's data buffer without a copy.
 //
 // # Safety
 //
@@ -2689,7 +2608,7 @@ int32_t moraine_inline_schemas(struct MoraineCatalogHandle *handle,
 void moraine_inline_schemas_free(struct MoraineInlineSchemaRow *items, size_t len);
 
 // Dumps every `(table_id, schema_version)` with a recorded inline
-// schema, across every table — feeds the `ducklake_inlined_data_tables`
+// schema, across every table: the `ducklake_inlined_data_tables`
 // projection.
 //
 // # Safety
@@ -2712,10 +2631,8 @@ int32_t moraine_inline_registered_tables(struct MoraineCatalogHandle *handle,
 void moraine_inline_registered_tables_free(struct MoraineInlineTableRow *items, size_t len);
 
 // Reports whether `table_id` has at least one recorded `inline/file_delete`
-// record, via `*out_exists`. The shim's catalog lookup for
-// `ducklake_inlined_delete_<table_id>` uses this to decide whether the
-// table exists at all, so a probe against a table that never had one must
-// surface a bind-time catalog error.
+// record, via `*out_exists`; decides whether
+// `ducklake_inlined_delete_<table_id>` exists at all.
 //
 // # Safety
 //
@@ -2729,8 +2646,7 @@ int32_t moraine_inline_file_delete_table_exists(struct MoraineCatalogHandle *han
                                                 struct MoraineError *err);
 
 // Dumps every `inline/file_delete` record for `table_id` in
-// `(file_id, row_id)` order — the rows behind the
-// `ducklake_inlined_delete_<t>` projection.
+// `(file_id, row_id)` order: the `ducklake_inlined_delete_<t>` projection.
 //
 // # Safety
 //
@@ -2752,12 +2668,8 @@ int32_t moraine_inline_file_deletes(struct MoraineCatalogHandle *handle,
 // matching [`moraine_inline_file_deletes`] call, not yet freed.
 void moraine_inline_file_deletes_free(struct MoraineInlineFileDeleteRow *items, size_t len);
 
-// Drains every buffered log record into `sink`, oldest first.
-//
-// Called by the shim on a thread that holds a DuckDB `ClientContext`, so
-// the records can be written through DuckDB's own logger. Never fails and
-// never allocates on the caller's behalf: each message is borrowed for the
-// duration of its `sink` call and freed after it returns.
+// Drains every buffered log record into `sink`, oldest first. Never
+// fails; each message is borrowed for the duration of its `sink` call.
 //
 // # Safety
 //
@@ -2766,14 +2678,10 @@ void moraine_inline_file_deletes_free(struct MoraineInlineFileDeleteRow *items, 
 void moraine_drain_logs(MoraineLogSink sink, void *sink_ctx);
 
 // Registers `sink` as the delivery target for `handle`'s events, first
-// handing it whatever the buffer already holds from that handle so
-// nothing captured before registration is lost.
-//
-// While registered, the handle's events bypass the buffer and the
-// boundary drains — records surface as they happen, which for a long
-// commit is while the commit still runs. Other handles' events are
-// untouched: each routes to its own sink or, without one, to the buffer.
-// Registering again for the same handle replaces its sink.
+// handing it whatever the buffer already holds from that handle. While
+// registered, the handle's events bypass the buffer; other handles'
+// events are untouched. Registering again for the same handle replaces
+// its sink.
 //
 // # Safety
 //
@@ -2849,12 +2757,9 @@ int32_t moraine_tx_stage(struct MoraineTxHandle *tx,
                          size_t cells_len,
                          struct MoraineError *err);
 
-// Dumps every `ducklake_snapshot` row **as this transaction sees it**:
+// Dumps every `ducklake_snapshot` row as this transaction sees it:
 // committed rows at the transaction's read point minus the snapshot
-// deletes staged so far. The expiry cascade's own `NOT EXISTS`
-// subqueries re-read `ducklake_snapshot` after staging deletes and must
-// observe them — a committed-state dump would silently under-reclaim.
-// Freed with `moraine_dump_snapshots_free`.
+// deletes staged so far. Freed with `moraine_dump_snapshots_free`.
 //
 // # Safety
 //
@@ -2868,11 +2773,9 @@ int32_t moraine_tx_dump_snapshots(struct MoraineTxHandle *tx,
                                   size_t *out_len,
                                   struct MoraineError *err);
 
-// Dumps every `ducklake_data_file` row **as this transaction sees it**:
+// Dumps every `ducklake_data_file` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
-// them. A cascade that re-reads this table after staging its deletes must
-// observe them, or it re-plans work it has already done.
-// Freed with `moraine_dump_data_files_free`.
+// them. Freed with `moraine_dump_data_files_free`.
 //
 // # Safety
 //
@@ -2886,11 +2789,9 @@ int32_t moraine_tx_dump_data_files(struct MoraineTxHandle *tx,
                                    size_t *out_len,
                                    struct MoraineError *err);
 
-// Dumps every `ducklake_delete_file` row **as this transaction sees it**:
+// Dumps every `ducklake_delete_file` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
-// them. A cascade that re-reads this table after staging its deletes must
-// observe them, or it re-plans work it has already done.
-// Freed with `moraine_dump_delete_files_free`.
+// them. Freed with `moraine_dump_delete_files_free`.
 //
 // # Safety
 //
@@ -2904,11 +2805,9 @@ int32_t moraine_tx_dump_delete_files(struct MoraineTxHandle *tx,
                                      size_t *out_len,
                                      struct MoraineError *err);
 
-// Dumps every `ducklake_file_column_stats` row **as this transaction sees
-// it**: committed rows at the transaction's read point with its own staged
-// rows over them. A cascade that re-reads this table after staging its deletes
-// must observe them, or it re-plans work it has already done.
-// Freed with `moraine_dump_file_column_stats_free`.
+// Dumps every `ducklake_file_column_stats` row as this transaction sees
+// it: committed rows at the transaction's read point with its own staged
+// rows over them. Freed with `moraine_dump_file_column_stats_free`.
 //
 // # Safety
 //
@@ -2922,11 +2821,10 @@ int32_t moraine_tx_dump_file_column_stats(struct MoraineTxHandle *tx,
                                           size_t *out_len,
                                           struct MoraineError *err);
 
-// Dumps every `ducklake_files_scheduled_for_deletion` row **as this
-// transaction sees it**: committed rows at the transaction's read point with
-// its own staged rows over them. A cascade that re-reads this table after
-// staging its deletes must observe them, or it re-plans work it has already
-// done. Freed with `moraine_dump_scheduled_deletions_free`.
+// Dumps every `ducklake_files_scheduled_for_deletion` row as this
+// transaction sees it: committed rows at the transaction's read point with
+// its own staged rows over them. Freed with
+// `moraine_dump_scheduled_deletions_free`.
 //
 // # Safety
 //
@@ -2940,10 +2838,8 @@ int32_t moraine_tx_dump_scheduled_deletions(struct MoraineTxHandle *tx,
                                             size_t *out_len,
                                             struct MoraineError *err);
 
-// Dumps every `ducklake_column` row **as this transaction sees it**: committed
+// Dumps every `ducklake_column` row as this transaction sees it: committed
 // rows at the transaction's read point with its own staged rows over them.
-// A cascade that re-reads this table after staging its deletes must
-// observe them, or it re-plans work it has already done.
 // Freed with `moraine_dump_columns_free`.
 //
 // # Safety
@@ -2958,10 +2854,8 @@ int32_t moraine_tx_dump_columns(struct MoraineTxHandle *tx,
                                 size_t *out_len,
                                 struct MoraineError *err);
 
-// Dumps every `ducklake_table` row **as this transaction sees it**: committed
+// Dumps every `ducklake_table` row as this transaction sees it: committed
 // rows at the transaction's read point with its own staged rows over them.
-// A cascade that re-reads this table after staging its deletes must
-// observe them, or it re-plans work it has already done.
 // Freed with `moraine_dump_tables_free`.
 //
 // # Safety
@@ -2976,7 +2870,7 @@ int32_t moraine_tx_dump_tables(struct MoraineTxHandle *tx,
                                size_t *out_len,
                                struct MoraineError *err);
 
-// Dumps every `ducklake_schema` row **as this transaction sees it**: committed
+// Dumps every `ducklake_schema` row as this transaction sees it: committed
 // rows at the transaction's read point with its own staged rows over them.
 // Freed with `moraine_dump_schemas_free`.
 //
@@ -2992,7 +2886,7 @@ int32_t moraine_tx_dump_schemas(struct MoraineTxHandle *tx,
                                 size_t *out_len,
                                 struct MoraineError *err);
 
-// Dumps every `ducklake_view` row **as this transaction sees it**: committed
+// Dumps every `ducklake_view` row as this transaction sees it: committed
 // rows at the transaction's read point with its own staged rows over them.
 // Freed with `moraine_dump_views_free`.
 //
@@ -3008,7 +2902,7 @@ int32_t moraine_tx_dump_views(struct MoraineTxHandle *tx,
                               size_t *out_len,
                               struct MoraineError *err);
 
-// Dumps every `ducklake_table_stats` row **as this transaction sees it**:
+// Dumps every `ducklake_table_stats` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_table_stats_free`.
 //
@@ -3024,8 +2918,8 @@ int32_t moraine_tx_dump_table_stats(struct MoraineTxHandle *tx,
                                     size_t *out_len,
                                     struct MoraineError *err);
 
-// Dumps every `ducklake_table_column_stats` row **as this transaction sees
-// it**: committed rows at the transaction's read point with its own staged
+// Dumps every `ducklake_table_column_stats` row as this transaction sees
+// it: committed rows at the transaction's read point with its own staged
 // rows over them. Freed with `moraine_dump_table_column_stats_free`.
 //
 // # Safety
@@ -3040,7 +2934,7 @@ int32_t moraine_tx_dump_table_column_stats(struct MoraineTxHandle *tx,
                                            size_t *out_len,
                                            struct MoraineError *err);
 
-// Dumps every `ducklake_partition_info` row **as this transaction sees it**:
+// Dumps every `ducklake_partition_info` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_partition_info_free`.
 //
@@ -3056,7 +2950,7 @@ int32_t moraine_tx_dump_partition_info(struct MoraineTxHandle *tx,
                                        size_t *out_len,
                                        struct MoraineError *err);
 
-// Dumps every `ducklake_sort_info` row **as this transaction sees it**:
+// Dumps every `ducklake_sort_info` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_sort_info_free`.
 //
@@ -3072,7 +2966,7 @@ int32_t moraine_tx_dump_sort_info(struct MoraineTxHandle *tx,
                                   size_t *out_len,
                                   struct MoraineError *err);
 
-// Dumps every `ducklake_macro` row **as this transaction sees it**: committed
+// Dumps every `ducklake_macro` row as this transaction sees it: committed
 // rows at the transaction's read point with its own staged rows over them.
 // Freed with `moraine_dump_macros_free`.
 //
@@ -3088,7 +2982,7 @@ int32_t moraine_tx_dump_macros(struct MoraineTxHandle *tx,
                                size_t *out_len,
                                struct MoraineError *err);
 
-// Dumps every `ducklake_column_mapping` row **as this transaction sees it**:
+// Dumps every `ducklake_column_mapping` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_column_mappings_free`.
 //
@@ -3104,7 +2998,7 @@ int32_t moraine_tx_dump_column_mappings(struct MoraineTxHandle *tx,
                                         size_t *out_len,
                                         struct MoraineError *err);
 
-// Dumps every `ducklake_partition_column` row **as this transaction sees it**:
+// Dumps every `ducklake_partition_column` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_partition_columns_free`.
 //
@@ -3120,8 +3014,8 @@ int32_t moraine_tx_dump_partition_columns(struct MoraineTxHandle *tx,
                                           size_t *out_len,
                                           struct MoraineError *err);
 
-// Dumps every `ducklake_file_partition_value` row **as this transaction sees
-// it**: committed rows at the transaction's read point with its own staged
+// Dumps every `ducklake_file_partition_value` row as this transaction sees
+// it: committed rows at the transaction's read point with its own staged
 // rows over them. Freed with `moraine_dump_file_partition_values_free`.
 //
 // # Safety
@@ -3136,7 +3030,7 @@ int32_t moraine_tx_dump_file_partition_values(struct MoraineTxHandle *tx,
                                               size_t *out_len,
                                               struct MoraineError *err);
 
-// Dumps every `ducklake_sort_expression` row **as this transaction sees it**:
+// Dumps every `ducklake_sort_expression` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_sort_expressions_free`.
 //
@@ -3152,7 +3046,7 @@ int32_t moraine_tx_dump_sort_expressions(struct MoraineTxHandle *tx,
                                          size_t *out_len,
                                          struct MoraineError *err);
 
-// Dumps every `ducklake_column_tag` row **as this transaction sees it**:
+// Dumps every `ducklake_column_tag` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_column_tags_free`.
 //
@@ -3168,7 +3062,7 @@ int32_t moraine_tx_dump_column_tags(struct MoraineTxHandle *tx,
                                     size_t *out_len,
                                     struct MoraineError *err);
 
-// Dumps every `ducklake_macro_impl` row **as this transaction sees it**:
+// Dumps every `ducklake_macro_impl` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_macro_impls_free`.
 //
@@ -3184,7 +3078,7 @@ int32_t moraine_tx_dump_macro_impls(struct MoraineTxHandle *tx,
                                     size_t *out_len,
                                     struct MoraineError *err);
 
-// Dumps every `ducklake_macro_parameters` row **as this transaction sees it**:
+// Dumps every `ducklake_macro_parameters` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_macro_parameters_free`.
 //
@@ -3200,7 +3094,7 @@ int32_t moraine_tx_dump_macro_parameters(struct MoraineTxHandle *tx,
                                          size_t *out_len,
                                          struct MoraineError *err);
 
-// Dumps every `ducklake_name_mapping` row **as this transaction sees it**:
+// Dumps every `ducklake_name_mapping` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_name_mappings_free`.
 //
@@ -3216,7 +3110,7 @@ int32_t moraine_tx_dump_name_mappings(struct MoraineTxHandle *tx,
                                       size_t *out_len,
                                       struct MoraineError *err);
 
-// Dumps every `ducklake_tag` row **as this transaction sees it**: committed
+// Dumps every `ducklake_tag` row as this transaction sees it: committed
 // rows at the transaction's read point with its own staged rows over them.
 // Freed with `moraine_dump_tags_free`.
 //
@@ -3232,7 +3126,7 @@ int32_t moraine_tx_dump_tags(struct MoraineTxHandle *tx,
                              size_t *out_len,
                              struct MoraineError *err);
 
-// Dumps every `ducklake_metadata` row **as this transaction sees it**:
+// Dumps every `ducklake_metadata` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_options_free`.
 //
@@ -3248,7 +3142,7 @@ int32_t moraine_tx_dump_options(struct MoraineTxHandle *tx,
                                 size_t *out_len,
                                 struct MoraineError *err);
 
-// Dumps every `ducklake_schema_versions` row **as this transaction sees it**:
+// Dumps every `ducklake_schema_versions` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_schema_versions_free`.
 //
@@ -3276,28 +3170,16 @@ int32_t moraine_tx_dump_schema_versions(struct MoraineTxHandle *tx,
 //
 // Cancellable: races the commit against `probe` (polled immediately, then
 // ~100 ms; a null `probe` disables polling). Where the cancellation lands
-// decides what it means, and one of the three outcomes is ambiguous:
+// decides what it means:
 //
-// - **Before the durable write is issued** — translation, index maintenance,
-//   and staging are in-memory only, so cancelling discards them.
-//   [`codes::INTERRUPTED`], catalog unchanged, head where it was.
-// - **While the durable write is in flight** — the write is spawned past the
-//   point of no return and is never dropped mid-batch, so it runs to
-//   completion in the background while this call returns
-//   [`codes::INTERRUPTED`] promptly. **The commit may still land.** The
-//   outcome is therefore ambiguous in exactly the way an unacknowledged
-//   durable write is: the batch is atomic, so head ends at either the old id
-//   or the new one and never in between, but this return does not say which. A
-//   caller that needs to know re-resolves head and reads it — it must not
-//   treat [`codes::INTERRUPTED`] as "nothing landed", and must not re-drive
-//   the rows blind.
-// - **After the write completed** — there is nothing left to cancel, so the
-//   committed snapshot id is reported normally.
-//
-// The interrupt is honored rather than ridden out because the wait it
-// escapes is unbounded: a durable write against an unreachable endpoint
-// is retried beneath moraine indefinitely, and a session with no way out
-// of it is the worse failure.
+// - Before the durable write is issued: [`codes::INTERRUPTED`], catalog
+//   unchanged, head where it was.
+// - While the durable write is in flight: the write runs to completion in the
+//   background and this call returns [`codes::INTERRUPTED`] promptly, so the
+//   commit may still land. Head ends at either the old id or the new one; a
+//   caller that needs to know re-resolves head, and must not treat
+//   [`codes::INTERRUPTED`] as "nothing landed".
+// - After the write completed: the committed snapshot id is reported normally.
 //
 // # Safety
 //
@@ -3412,16 +3294,10 @@ int32_t moraine_tx_stage_inline_file_delete(struct MoraineTxHandle *tx,
                                             uint64_t begin_snapshot,
                                             struct MoraineError *err);
 
-// Stages the removal of one live `inline/file_delete` record — the
-// row-grain counterpart of [`moraine_tx_stage_inline_file_delete`],
-// which a `DELETE` against `ducklake_inlined_delete_<table_id>`
-// translates to.
-//
-// DuckLake issues that `DELETE` at the end of
-// `ducklake_flush_inlined_data`, once it has materialized the table's
-// inlined deletions into a real delete file: leaving the inlined form
-// behind would count those rows deleted twice. Naming a record the table
-// does not carry is [`codes::CORRUPTION`], not a no-op.
+// Stages the removal of one live `inline/file_delete` record, which a
+// `DELETE` against `ducklake_inlined_delete_<table_id>` translates to.
+// Naming a record the table does not carry is [`codes::CORRUPTION`], not
+// a no-op.
 //
 // # Safety
 //

@@ -21,24 +21,27 @@ use uuid::Uuid;
 use crate::{
     catalog::CachePreload,
     error::{Error, Result},
-    store::{cache, handle::ScanShape, key, segment::TagSegmentExtractor},
+    store::{
+        cache,
+        handle::{ReadHandle, ScanShape},
+        key,
+        segment::TagSegmentExtractor,
+    },
 };
 
 /// The default WAL flush cadence when none is configured.
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How often a read-only handle polls for new state when none is
-/// configured — SlateDB's own default, kept so an unconfigured reader
-/// costs exactly what it always has.
+/// configured (SlateDB's own default).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The stored block grain for every writer and reader.
 const SST_BLOCK_SIZE: SstBlockSize = SstBlockSize::Block4Kib;
 
-/// Creates a checkpoint of everything `db` has committed, expiring after
-/// `lifetime` (never, if `None`), and reports its id. The scope is every
-/// write the handle has taken, not only the already-durable ones, so a
-/// commit that has returned is inside the checkpoint it precedes.
+/// Creates a checkpoint of every write `db` has taken (not only the
+/// already-durable ones), expiring after `lifetime` (never, if `None`),
+/// and reports its id.
 pub(crate) async fn create_checkpoint(db: &Db, lifetime: Option<Duration>) -> Result<Uuid> {
     let created = db
         .create_checkpoint(
@@ -53,14 +56,9 @@ pub(crate) async fn create_checkpoint(db: &Db, lifetime: Option<Duration>) -> Re
     Ok(created.id)
 }
 
-/// How many bytes of a store a preload bounded by `cache_size` will not
-/// hold, or `None` when all of it fits. An unset `cache_size` is not an
-/// unbounded one — the store's own cap still governs — so the comparison
-/// is against whichever cap will actually apply.
-///
-/// The load stops at the first object that would exceed the cap rather
-/// than skipping it, so a shortfall means the tail of the store goes
-/// unloaded, not that the largest objects do.
+/// How many bytes of a store a preload bounded by `cache_size` (or the
+/// default disk cap when unset) will not hold, or `None` when all of it
+/// fits.
 pub(crate) fn preload_shortfall(store_bytes: u64, cache_size: Option<u64>) -> Option<u64> {
     let cap = cache_size.unwrap_or(cache::DEFAULT_CACHE_DISK);
     store_bytes
@@ -111,87 +109,64 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// Sets the WAL flush cadence. Durable commits wait for the next flush,
-    /// so this bounds per-commit latency; smaller values mean more frequent
-    /// (on S3, costlier) object-store PUTs. Zero flushes continuously (no
-    /// timer), so a durable commit waits only on the object-store PUT — the
-    /// lowest latency, at the cost of a busy flush loop. Writer only — a
-    /// reader never flushes.
+    /// Sets the WAL flush cadence, which bounds durable-commit latency;
+    /// zero flushes continuously with no timer. Writer only — a reader
+    /// never flushes.
     pub(crate) fn flush_interval(mut self, flush_interval: Duration) -> Self {
         self.flush_interval = flush_interval;
         self
     }
 
-    /// Sets the local directory backing the block cache's disk tier, which
-    /// holds data blocks evicted from memory. When set, warm reads skip
-    /// repeat object-store GETs — worthwhile for remote (`s3://`) stores,
-    /// redundant for local ones. Process-wide, not per store: the first
-    /// store to open decides whether there is a disk tier at all, and
-    /// where. `None` (the default) keeps the cache in memory.
+    /// Sets the local directory backing the block cache's disk tier.
+    /// Process-wide: the first store to open decides whether there is a
+    /// disk tier, and where. `None` (the default) keeps the cache in memory.
     pub(crate) fn cache_dir(mut self, cache_dir: Option<PathBuf>) -> Self {
         self.cache_dir = cache_dir;
         self
     }
 
     /// Sets how many bytes of disk the block cache's device may hold.
-    /// Process-wide, not per store: the first store to open sizes the
-    /// device and later ones share it. `None` (the default) takes what
-    /// SlateDB gives one store's cache, and without a
-    /// [`cache_dir`](Self::cache_dir) there is no device to bound. The
-    /// memory budget is [`cache_memory`](Self::cache_memory).
+    /// Process-wide: the first store to open sizes the device. `None` (the
+    /// default) takes SlateDB's default; without a
+    /// [`cache_dir`](Self::cache_dir) there is no device to bound.
     pub(crate) fn cache_size(mut self, cache_size: Option<u64>) -> Self {
         self.cache_size = cache_size;
         self
     }
 
     /// Sets how much memory the process-shared cache may hold across both
-    /// slots. Process-wide, not per store: the first store to open sizes
-    /// it and later ones share what it built. `None` (the default) takes
-    /// what SlateDB gives a single store, now for the whole process.
-    /// Never inert — the memory slots exist with or without a
-    /// [`cache_dir`](Self::cache_dir).
+    /// slots. Process-wide: the first store to open sizes it. `None` (the
+    /// default) takes SlateDB's single-store default for the whole process.
     pub(crate) fn cache_memory(mut self, cache_memory: Option<u64>) -> Self {
         self.cache_memory = cache_memory;
         self
     }
 
-    /// Sets what to load into the cache while the store opens. Per store,
-    /// unlike the budget: each store warms its own bytes into the shared
-    /// cache. The load skips what it cannot fetch, but it runs as part of
-    /// the open, so an open that preloads returns only once it has. `None`
-    /// (the default) loads nothing. Never inert — the memory slots exist
-    /// with or without a [`cache_dir`](Self::cache_dir).
+    /// Sets what to load into the cache while the store opens. Per store;
+    /// the load is best-effort and completes before the open returns.
+    /// `None` (the default) loads nothing.
     pub(crate) fn cache_preload(mut self, cache_preload: Option<CachePreload>) -> Self {
         self.cache_preload = cache_preload;
         self
     }
 
-    /// Sets whether the SST metadata this store writes enters the cache as
-    /// it is written, rather than only when something reads it back. A
-    /// flushed or compacted SST's index and filters are then resident
-    /// without a later fetch. Compaction output is admitted too, so a merge
-    /// can evict what reads had warmed — which is why this is off by
-    /// default. Data blocks are never admitted on the write path, at either
-    /// setting. Per store, and never inert: the metadata it admits lands in
-    /// the memory slot, with or without a [`cache_dir`](Self::cache_dir).
+    /// Sets whether the SST index and filters this store flushes or
+    /// compacts enter the cache as they are written (default: off). Data
+    /// blocks are never admitted on the write path.
     pub(crate) fn cache_puts(mut self, cache_puts: bool) -> Self {
         self.cache_puts = cache_puts;
         self
     }
 
     /// Pins the reader to an existing checkpoint instead of the latest
-    /// manifest. Reader only, and the only truly zero-write open: a
-    /// latest-mode reader creates and refreshes a checkpoint of its own,
-    /// which is a manifest write.
+    /// manifest. Reader only, and the only zero-write open.
     pub(crate) fn checkpoint(mut self, checkpoint: Option<Uuid>) -> Self {
         self.checkpoint = checkpoint;
         self
     }
 
     /// Opens (or creates) the store as a read-write [`Db`], with the
-    /// counters its reads tally into. The cache is the process's; the
-    /// counters are this store's, so a host attaching several can tell
-    /// which catalog's reads the one cache is serving.
+    /// per-store counters its reads tally into.
     pub(crate) async fn open_writer(&self) -> Result<(Db, Arc<cache::CacheCounters>)> {
         let settings = self.settings();
         let counters = cache::store_counters();
@@ -207,27 +182,22 @@ impl<'a> StoreBuilder<'a> {
         }
 
         let db = builder.build().await.map_err(Error::from)?;
-        if self.cache_preload.is_some() {
+        if let Some(preload) = self.cache_preload {
             let tx = db
                 .begin(slatedb::IsolationLevel::Snapshot)
                 .await
                 .map_err(Error::from)?;
-            self.warm(crate::store::handle::ReadHandle::Tx(&tx), &counters)
-                .await;
+            warm(preload, ReadHandle::Tx(&tx), &counters).await;
             tx.rollback();
         }
 
         Ok((db, counters))
     }
 
-    /// Opens the store read-only as a [`DbReader`]. A `DbReader` never opens
-    /// the writer `Db`, so it never fences a live writer. The flush cadence,
-    /// if set, is ignored.
-    ///
-    /// Without a checkpoint the reader follows the latest manifest, which
-    /// costs a manifest write on open and a refresh for the reader's
-    /// lifetime. Pinned to a [`checkpoint`](Self::checkpoint) it writes
-    /// nothing at all, and reads the fixed cut that checkpoint names.
+    /// Opens the store read-only as a [`DbReader`], which never fences a
+    /// live writer; the flush cadence is ignored. Without a
+    /// [`checkpoint`](Self::checkpoint) the reader follows the latest
+    /// manifest, which costs a manifest write on open.
     pub(crate) async fn open_reader(&self) -> Result<(DbReader, Arc<cache::CacheCounters>)> {
         let options = DbReaderOptions {
             manifest_poll_interval: self.poll_interval,
@@ -247,17 +217,15 @@ impl<'a> StoreBuilder<'a> {
         }
 
         let reader = builder.build().await.map_err(Error::from)?;
-        if self.cache_preload.is_some() {
-            self.warm(crate::store::handle::ReadHandle::Reader(&reader), &counters)
-                .await;
+        if let Some(preload) = self.cache_preload {
+            warm(preload, ReadHandle::Reader(&reader), &counters).await;
         }
 
         Ok((reader, counters))
     }
 
     /// Deletes the checkpoint `checkpoint`, unpinning whatever it held
-    /// against SlateDB's garbage collection. Readers still open against it
-    /// keep serving from the objects they have already resolved.
+    /// against garbage collection.
     pub(crate) async fn delete_checkpoint(&self, checkpoint: Uuid) -> Result<()> {
         AdminBuilder::new(self.path, Arc::clone(&self.object_store))
             .build()
@@ -278,9 +246,7 @@ impl<'a> StoreBuilder<'a> {
         Ok(checkpoints.into_iter().map(|c| c.id).collect())
     }
 
-    /// SlateDB settings for a writer. A zero flush interval flushes
-    /// continuously rather than on a timer: durable commits then wait only
-    /// on the object-store PUT, at the cost of a busy flush loop.
+    /// SlateDB settings for a writer.
     fn settings(&self) -> Settings {
         Settings {
             flush_interval: Some(self.flush_interval),
@@ -288,9 +254,7 @@ impl<'a> StoreBuilder<'a> {
         }
     }
 
-    /// How this store asks for the process-shared cache. The first store
-    /// to open builds it; a later one with different numbers shares what
-    /// was built, since the budget is the process's and not the store's.
+    /// How this store asks for the process-shared cache.
     fn cache_config(&self) -> cache::CacheConfig {
         cache::CacheConfig {
             memory: self.cache_memory,
@@ -299,10 +263,8 @@ impl<'a> StoreBuilder<'a> {
         }
     }
 
-    /// Whether the blocks of flushed and compacted SSTs enter the cache
-    /// as they are written. Off by default: compaction output goes through
-    /// the same policy, and a merge admitting everything evicts what reads
-    /// had warmed.
+    /// Which blocks of flushed and compacted SSTs enter the cache as they
+    /// are written.
     fn block_cache_policy(&self) -> BlockCachePolicy {
         let targets: &[CacheTarget] = if self.cache_puts {
             &[CacheTarget::Index, CacheTarget::Filters, CacheTarget::Stats]
@@ -313,89 +275,58 @@ impl<'a> StoreBuilder<'a> {
             .with_flush_targets(targets)
             .with_compaction_output_targets(targets)
     }
-
-    /// Warms the cache before the first query, per `cache_preload`.
-    ///
-    /// Warming is reading: a scan admits the blocks it touches (probe
-    /// shape) and SlateDB caches every SST index and filter it walks
-    /// regardless, so a bounded read over the right subspaces populates
-    /// both slots without naming a single SST. That matters beyond
-    /// convenience — SlateDB's per-SST warm call takes an id type its
-    /// crate does not export, so no caller outside it can name one.
-    ///
-    /// Which subspaces is the whole difference between the levels.
-    /// `'l0'` touches each one just far enough to pull its SST metadata,
-    /// which is what makes a cold probe tolerable; `'all'` additionally
-    /// walks the scan-shaped subspaces whole, so an attach's first
-    /// materialization reads no object storage at all. Neither walks the
-    /// `index` subspace's data blocks: that is the multi-GiB bulk a
-    /// preload must not pull, and it stays reachable at one fetch per
-    /// probed block behind the filters just warmed.
-    ///
-    /// Best-effort throughout: a preload is an optimization, and no open
-    /// should fail because one subspace could not be read.
-    async fn warm(
-        &self,
-        handle: crate::store::handle::ReadHandle<'_>,
-        counters: &cache::CacheCounters,
-    ) {
-        let Some(preload) = self.cache_preload else {
-            return;
-        };
-
-        // Every subspace, so each one's SST metadata is resident.
-        let metadata_only = [
-            key::Subspace::System,
-            key::Subspace::Current,
-            key::Subspace::History,
-            key::Subspace::Snapshot,
-            key::Subspace::Changelog,
-            key::Subspace::Index,
-            key::Subspace::Inline,
-        ];
-        // The scan-shaped ones, whose data a materialization walks whole.
-        let whole = [
-            key::Subspace::System,
-            key::Subspace::Current,
-            key::Subspace::History,
-            key::Subspace::Snapshot,
-            key::Subspace::Changelog,
-        ];
-
-        let before = counters.tally();
-        let (warmed, failed) = stream::iter(metadata_only.into_iter().map(|subspace| {
-            let deep = matches!(preload, CachePreload::All) && whole.contains(&subspace);
-            warm_subspace(handle, subspace, deep)
-        }))
-        .buffer_unordered(metadata_only.len())
-        .fold((0_usize, 0_usize), |(warmed, failed), result| async move {
-            match result {
-                Ok(()) => (warmed + 1, failed),
-                Err(_) => (warmed, failed + 1),
-            }
-        })
-        .await;
-        counters.record_preload(before, counters.tally(), failed);
-        info!(
-            warmed,
-            failed,
-            level = match preload {
-                CachePreload::L0 => "l0",
-                CachePreload::All => "all",
-            },
-            "warmed the cache"
-        );
-    }
 }
 
-/// Reads `subspace` far enough to warm it: one entry for its SST
-/// metadata, or the whole range when `deep`. Blocks are admitted (probe
-/// shape) so what this touches stays resident.
-async fn warm_subspace(
-    handle: crate::store::handle::ReadHandle<'_>,
-    subspace: key::Subspace,
-    deep: bool,
-) -> Result<()> {
+/// Warms the cache by reading, best-effort. `L0` reads one entry of every
+/// subspace so its SST metadata is resident; `All` additionally walks the
+/// scan-shaped subspaces whole. Neither reads the `index` subspace's data
+/// blocks.
+async fn warm(preload: CachePreload, handle: ReadHandle<'_>, counters: &cache::CacheCounters) {
+    let metadata_only = [
+        key::Subspace::System,
+        key::Subspace::Current,
+        key::Subspace::History,
+        key::Subspace::Snapshot,
+        key::Subspace::Changelog,
+        key::Subspace::Index,
+        key::Subspace::Inline,
+    ];
+    let whole = [
+        key::Subspace::System,
+        key::Subspace::Current,
+        key::Subspace::History,
+        key::Subspace::Snapshot,
+        key::Subspace::Changelog,
+    ];
+
+    let before = counters.tally();
+    let (warmed, failed) = stream::iter(metadata_only.into_iter().map(|subspace| {
+        let deep = matches!(preload, CachePreload::All) && whole.contains(&subspace);
+        warm_subspace(handle, subspace, deep)
+    }))
+    .buffer_unordered(metadata_only.len())
+    .fold((0_usize, 0_usize), |(warmed, failed), result| async move {
+        match result {
+            Ok(()) => (warmed + 1, failed),
+            Err(_) => (warmed, failed + 1),
+        }
+    })
+    .await;
+    counters.record_preload(before, counters.tally(), failed);
+    info!(
+        warmed,
+        failed,
+        level = match preload {
+            CachePreload::L0 => "l0",
+            CachePreload::All => "all",
+        },
+        "warmed the cache"
+    );
+}
+
+/// Reads one entry of `subspace`, or the whole range when `deep`, in probe
+/// shape so the touched blocks are admitted.
+async fn warm_subspace(handle: ReadHandle<'_>, subspace: key::Subspace, deep: bool) -> Result<()> {
     let mut iterator = handle
         .scan_prefix(key::subspace_prefix(subspace), .., ScanShape::Probe)
         .await?;

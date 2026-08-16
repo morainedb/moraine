@@ -21,22 +21,14 @@ use crate::{
 /// id they are valid at. `head: None` means not installed — serves refuse
 /// and folds skip until a fresh scan installs it.
 struct Maintained<K: Ord, V> {
-    // The whole head stamp, not the snapshot id alone. A writer folds every
-    // batch forward so an id would serve it correctly, but a reader folds
-    // nothing and can only compare what the store told it — and a
-    // maintenance batch reuses the id while changing what a scan finds.
+    // The whole head stamp: a maintenance batch reuses the snapshot id.
     head: Option<HeadValue>,
     rows: BTreeMap<K, V>,
 }
 
-/// The head record a batch leaves behind. Every catalog batch writes one.
-///
-/// Searched from the end: a group commit stages each member's own head
-/// write onto the one batch, each read through the transaction and so
-/// numbered above the last, and the store keeps the final write of a key.
-/// Taking the first would stamp the projections with a state the store
-/// never settled at — a reader matching it would be served rows from a
-/// partial batch.
+/// The head record a batch leaves behind: the last head write in the
+/// batch, since a group commit stages one per member and the store keeps
+/// the final write of a key.
 fn head_stamp(writes: &[StagedWrite]) -> Option<HeadValue> {
     let head_key = Key::Sys(SysKey::Head).encode();
     writes.iter().rev().find_map(|(key, bytes)| {
@@ -133,9 +125,7 @@ impl<K: Ord, V> Maintained<K, V> {
 }
 
 /// Folds a just-committed batch into the shared cache. A poisoned lock is
-/// recovered rather than propagated: panics cannot originate inside the
-/// fold (non-panicking map operations end to end), so the state under a
-/// poisoned lock is never half-applied.
+/// recovered: the fold cannot panic, so its state is never half-applied.
 pub(crate) fn fold_committed_batch(
     cache: &std::sync::RwLock<ProjectionCache>,
     writes: &[StagedWrite],
@@ -190,9 +180,7 @@ pub(crate) fn cache_epoch(cache: &std::sync::RwLock<ProjectionCache>) -> u64 {
 }
 
 /// Installs `view` only if no invalidation has intervened since `epoch` was
-/// captured. A reader pins its handle and then reads, so without this an
-/// install could land after a head-preserving commit's invalidation and
-/// resurrect the very content that invalidation discarded.
+/// captured.
 pub(crate) fn install_head_view_at(
     cache: &std::sync::RwLock<ProjectionCache>,
     epoch: u64,
@@ -223,8 +211,7 @@ pub(crate) fn shared_current_entities(
 }
 
 /// Installs the shared `current` half. Unconditional: the stamp keying
-/// makes a stale install self-invalidating, unlike the head view whose
-/// install races the invalidation epoch.
+/// makes a stale install self-invalidating.
 pub(crate) fn install_shared_current_entities(
     cache: &std::sync::RwLock<ProjectionCache>,
     head: HeadValue,
@@ -242,38 +229,23 @@ pub(crate) struct ProjectionCache {
     snapshots: Maintained<u64, SnapshotValue>,
     table_stats: Maintained<u64, TableStatsValue>,
     table_column_stats: Maintained<(u64, u64), TableColumnStatsValue>,
-    /// The shared decoded record set: at one head stamp each half is
-    /// scanned at most once, and the head view, the entity dumps, and the
-    /// unversioned projections all derive from it. The halves install
-    /// independently — a head view needs `current` only, and the dumps add
-    /// `history` when first to want it. Not folded forward — entity writes
-    /// are too varied — so any committed batch drops both halves and the
-    /// next read re-installs at the new head.
+    /// The `current` half of the shared decoded record set, stamped with
+    /// the head it was scanned at. Not folded forward: any committed batch
+    /// drops both halves.
     current_entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
     /// The `history` half of the shared record set, stamped the same way.
     history_entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
-    /// The materialized head view, folded forward on every commit and
-    /// served to the commit path so it stages against known state without
-    /// rescanning. Carries its own head (`snapshot.snapshot_id`); a fold
-    /// that cannot be applied faithfully clears it, degrading to a scan.
+    /// The materialized head view, folded forward on every commit; a fold
+    /// that cannot be applied faithfully clears it.
     head_view: Option<Arc<CatalogSnapshot>>,
-    /// Bumped by every invalidation, so an installer that captured it
-    /// before reading can tell whether its view is still admissible.
+    /// Bumped by every invalidation.
     epoch: u64,
 }
 
 impl ProjectionCache {
-    /// Roughly what this handle's decoded catalog holds, in bytes.
-    ///
-    /// Counts the shared `current` and `history` record sets, the
-    /// maintained projections, and the folded head view — each a separate
-    /// allocation, and on a writer the head view is often the only one
-    /// standing. Encoded lengths throughout, so it understates the decoded
-    /// form.
-    ///
-    /// Bounded by one catalog's decoded size rather than by a cap: nothing
-    /// evicts these, they are replaced when the head stamp moves. Reporting
-    /// them is what keeps them visible to sizing.
+    /// Roughly what this handle's decoded catalog holds, in bytes: the
+    /// shared record sets, the maintained projections, and the folded head
+    /// view. Encoded lengths throughout, so it understates the decoded form.
     pub(crate) fn estimated_bytes(&self) -> u64 {
         let records = |half: &Option<(HeadValue, Arc<Vec<EntityRecord>>)>| {
             half.as_ref().map_or(0, |(_, records)| {
@@ -305,10 +277,8 @@ impl ProjectionCache {
         }
     }
 
-    /// The head view iff it stands at exactly the state `expected` names.
-    /// Both halves of the stamp are checked: a maintenance batch reuses the
-    /// snapshot id, so the id alone would let a view of the state it
-    /// reclaimed keep serving.
+    /// The head view iff it stands at exactly the state `expected` names,
+    /// both halves of the stamp checked.
     pub(crate) fn head_view(&self, expected: &HeadValue) -> Option<Arc<CatalogSnapshot>> {
         self.head_view
             .as_ref()
@@ -323,11 +293,8 @@ impl ProjectionCache {
         self.epoch
     }
 
-    /// Installs unconditionally, and moves the epoch with it. A read-write
-    /// handle serves this view as head without re-reading `sys/head`, so an
-    /// installer holding an older view must not be able to land on top of a
-    /// commit's folded one; bumping here is what makes
-    /// [`set_head_view_at`](Self::set_head_view_at) refuse it.
+    /// Installs unconditionally, and moves the epoch so a pending
+    /// [`set_head_view_at`](Self::set_head_view_at) is refused.
     pub(crate) fn set_head_view(&mut self, view: Arc<CatalogSnapshot>) {
         self.head_view = Some(view);
         self.epoch = self.epoch.wrapping_add(1);
@@ -362,8 +329,7 @@ impl ProjectionCache {
     }
 
     /// Serves the `current` half of the shared record set if it stands at
-    /// exactly `expected` — both halves of the stamp, so a maintenance
-    /// batch that reused the snapshot id invalidates it like any other.
+    /// exactly `expected`, both halves of the stamp checked.
     pub(crate) fn current_entities_at(
         &self,
         expected: &HeadValue,
@@ -424,13 +390,8 @@ impl ProjectionCache {
     }
 
     /// Folds one committed batch, stamping every installed projection with
-    /// the head record the batch itself wrote. Every batch writes
-    /// `sys/head` — a maintenance one reuses the snapshot id and still
-    /// moves the batch count — so the stamp is read out of `writes` rather
-    /// than passed alongside them, which keeps it impossible for the two to
-    /// disagree. An undecodable key, or a batch with no head write, clears
-    /// everything: the batch cannot be attributed, so no projection may
-    /// claim the state it left.
+    /// the head record the batch itself wrote. An undecodable key, or a
+    /// batch with no head write matching `new_head`, clears everything.
     pub(crate) fn apply_batch(&mut self, writes: &[StagedWrite], new_head: u64) {
         self.current_entities = None;
         self.history_entities = None;
@@ -454,11 +415,8 @@ impl ProjectionCache {
                 }
             }
         }
-        // A batch with no head write, or one naming a state the caller does
-        // not agree with, cannot be attributed — so nothing may keep
-        // claiming a state. Cleared rather than asserted: this runs under
-        // the projection write lock inside a spawned commit, where a panic
-        // strands the joiner instead of failing the commit.
+        // Cleared rather than asserted: this runs under the projection write
+        // lock inside a spawned commit, where a panic strands the joiner.
         let Some(stamp) = head_stamp(writes).filter(|stamp| stamp.snapshot_id == new_head) else {
             self.snapshots.clear();
             self.table_stats.clear();

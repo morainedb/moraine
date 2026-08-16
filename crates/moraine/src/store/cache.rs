@@ -2,14 +2,8 @@
 //! metadata, SlateDB blocks, and auxiliary parsed metadata.
 //!
 //! Metadata and blocks share one cache and are separated by eviction
-//! priority rather than by capacity. A scan cannot push out the filters and
-//! indexes every probe walks, and metadata a store does not need is left to
-//! blocks — so neither is bounded at a size the operator has to predict.
-//! Blocks tier to disk when a cache directory is configured.
-//!
-//! Sharing is what makes the budget mean anything: a per-store cache is
-//! bounded per store, so a host attaching several catalogs is
-//! over-committed by however many it attached.
+//! priority rather than by capacity. Blocks tier to disk when a cache
+//! directory is configured.
 
 use std::{
     collections::HashMap,
@@ -34,10 +28,8 @@ use tracing::{info, warn};
 
 use crate::data_file;
 
-/// Memory the cache takes when no budget is configured: what SlateDB
-/// gives a *single* store by default (512 MiB of blocks, 128 MiB of
-/// metadata), now for the whole process. A single-store host is therefore
-/// unchanged and a multi-store one is strictly smaller than before.
+/// Memory the cache takes when no budget is configured: SlateDB's
+/// single-store default (512 MiB of blocks, 128 MiB of metadata).
 const DEFAULT_CACHE_MEMORY: u64 = 640 * 1024 * 1024;
 
 /// The most of the cache SST metadata may hold under eviction protection.
@@ -47,14 +39,12 @@ const METADATA_PRIORITY_POOL_RATIO: f64 = 0.9;
 /// SlateDB.
 const MAX_AUXILIARY_METADATA_MEMORY: u64 = 64 * 1024 * 1024;
 
-/// The auxiliary allowance's divisor against the whole budget, up to its
-/// ceiling. At the default budget this lands exactly on the 8 MiB the
-/// allowance was fixed at, so a default host is unchanged and a larger one
-/// stops being pinned to a small host's figure.
+/// The auxiliary allowance's divisor against the whole budget, up to
+/// [`MAX_AUXILIARY_METADATA_MEMORY`].
 const AUXILIARY_METADATA_SHARE_DIVISOR: u64 = 80;
 
-/// Bytes of disk the block slot's device takes when no cap is
-/// configured — SlateDB's own default for a store's cache.
+/// Bytes of disk the block slot's device takes when no cap is configured
+/// (SlateDB's own default).
 pub(crate) const DEFAULT_CACHE_DISK: u64 = 16 * 1024 * 1024 * 1024;
 
 /// How the process's cache is built. The first store to open decides it;
@@ -109,20 +99,15 @@ static AUXILIARY_METADATA_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static METADATA_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static BLOCK_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
-/// Which cached keys hold SST metadata, and what each weighs.
-///
-/// SlateDB names an entry's kind on the call that admits it and nowhere
-/// else — neither `CachedKey` nor `CachedEntry` exposes it — so one shared
-/// cache can only tell metadata from a data block by what was recorded at
-/// admission. Without this the two could not be reported apart.
+/// Which cached keys hold SST metadata, and what each weighs. SlateDB
+/// names an entry's kind only on the call that admits it.
 static METADATA_ENTRIES: std::sync::LazyLock<std::sync::RwLock<HashMap<CachedKey, u64>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
 
 static METADATA_OCCUPANCY: AtomicU64 = AtomicU64::new(0);
 
-/// Records an admitted metadata entry. A hit on one already recorded at the
-/// same weight takes a read lock and returns, so metadata reads do not
-/// serialize on the write lock.
+/// Records an admitted metadata entry; one already recorded at the same
+/// weight costs only a read lock.
 fn metadata_admitted(key: &CachedKey, bytes: u64) {
     if METADATA_ENTRIES
         .read()
@@ -144,7 +129,6 @@ fn metadata_admitted(key: &CachedKey, bytes: u64) {
 }
 
 /// Drops a leaving entry's accounting, reporting whether it was metadata.
-/// A data block is the common case and costs one read lock.
 fn metadata_left(key: &CachedKey) -> bool {
     if !METADATA_ENTRIES
         .read()
@@ -174,8 +158,7 @@ fn subtract_metadata_occupancy(bytes: u64) {
 }
 
 /// The process-wide allowance for parsed Parquet metadata and file row-id
-/// summaries. It is reserved from the first attach's `CACHE_MEMORY` budget,
-/// and is what the auxiliary cache is built to.
+/// summaries, reserved from the first attach's memory budget.
 pub(crate) fn auxiliary_metadata_memory() -> usize {
     usize::try_from(AUXILIARY_METADATA_MEMORY.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
 }
@@ -185,29 +168,21 @@ pub(crate) fn auxiliary_evicted() {
     AUXILIARY_METADATA_EVICTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The process's cache, built on first use. A `OnceCell` rather than a
-/// per-store build: two catalogs attached in one process share one
-/// budget, which is the whole point, and a cache that failed to build
-/// once is not retried — the store simply runs uncached rather than
-/// failing an attach over a cache.
+/// The process's cache, built on first use. A build that failed is not
+/// retried; stores then run uncached.
 static SHARED: OnceCell<Option<Arc<dyn DbCache>>> = OnceCell::const_new();
 
-/// What the cache has served, by tier. Every sizing claim about the
-/// budget is checkable only if the tiers report, so they do.
-///
-/// Read at two scopes over the one cache: [`cache_tally`] is the
-/// process's, which is what the budget is set from, and
+/// What the cache has served, by tier. [`cache_tally`] reports the
+/// process's;
 /// [`ReadOnlyCatalog::cache_tally`](crate::ReadOnlyCatalog::cache_tally)
-/// is one attach's,
-/// which is what says whose reads the budget is spent on.
+/// one attach's.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CacheTally {
     /// Filter, index, and stats lookups the meta slot served.
     pub metadata_hits: u64,
     /// Those it did not, each one a fetch and a decode.
     pub metadata_misses: u64,
-    /// Data-block lookups the block slot served, from either of its
-    /// tiers — foyer reports a hybrid hit without saying which.
+    /// Data-block lookups the block slot served, from either tier.
     pub block_hits: u64,
     /// Those it did not, each one an object-store read.
     pub block_misses: u64,
@@ -226,12 +201,8 @@ pub struct CacheTally {
     pub preload_failures: u64,
 }
 
-/// Current size and pressure of the process-shared caches.
-///
-/// SlateDB metadata, SlateDB data blocks, and parsed Parquet metadata have
-/// separate admission policies, so each reports its own memory figures.
-/// The disk figure is a configured capacity: Foyer does not expose reliable
-/// live disk occupancy through its typed cache API.
+/// Current size and pressure of the process-shared caches. The disk figure
+/// is a configured capacity, not live occupancy.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CacheStatus {
     /// Memory reserved for decoded SlateDB filters, indexes, and stats.
@@ -256,14 +227,10 @@ pub struct CacheStatus {
     pub auxiliary_metadata_evictions: u64,
 }
 
-/// Physical object-store requests SlateDB has issued for one catalog.
-///
-/// Counts include retries and every SlateDB component using the catalog.
-/// Moraine currently gives SlateDB one physical store, so its WAL objects
-/// are included in the `main_*` fields; `wal_*` remains available for a
-/// future separately configured WAL store. Durations are the sum of
-/// completed request latency, so concurrent requests can add up to more
-/// than wall-clock time.
+/// Physical object-store requests SlateDB has issued for one catalog,
+/// retries included. WAL objects land in the `main_*` fields while the WAL
+/// shares the main store. Durations sum completed request latency, so
+/// concurrent requests can exceed wall-clock time.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectStoreTally {
     /// Reads from the main store.
@@ -321,10 +288,8 @@ impl CacheTally {
         }
     }
 
-    /// The share of lookups the cache served, `None` before it has served
-    /// any. Metadata and blocks are counted apart because they are sized
-    /// apart: a healthy stack has metadata near 1.0 and blocks wherever
-    /// the working set puts them.
+    /// The share of metadata lookups the cache served, `None` before it
+    /// has served any.
     #[must_use]
     pub fn metadata_hit_rate(&self) -> Option<f64> {
         rate(self.metadata_hits, self.metadata_misses)
@@ -378,10 +343,8 @@ fn rate(hits: u64, misses: u64) -> Option<f64> {
     Some(hits as f64 / total as f64)
 }
 
-/// The counters SlateDB increments as the cache serves. One set per store
-/// and one for the process: the cache is shared, so the process's numbers
-/// are what size it, but only a per-store set can say whose reads it is
-/// serving.
+/// The counters SlateDB increments as the cache serves; one set per store
+/// and one for the process.
 #[derive(Debug, Default)]
 pub(crate) struct CacheCounters {
     metadata_hits: AtomicU64,
@@ -498,8 +461,7 @@ impl CacheCounters {
 }
 
 /// One counter's home in the opening store's [`CacheCounters`] and in the
-/// process's, or nowhere: SlateDB registers far more than the cache's, and
-/// everything else increments a sink.
+/// process's, or nowhere.
 struct Slot {
     store: Arc<CacheCounters>,
     process: Arc<CacheCounters>,
@@ -585,12 +547,8 @@ fn object_store_metric(labels: &[(&str, &str)], duration: bool) -> Option<Which>
 }
 
 /// Routes SlateDB's cache and object-store counters into
-/// [`CacheCounters`] and drops everything else on the floor.
-///
-/// The cache reports one counter per `(entry_kind, result)` pair —
-/// `filter`, `index`, and `stats` are the meta slot's, `data_block` the
-/// block slot's — so the routing is by label, and a kind SlateDB adds
-/// later lands in neither rather than being miscounted as one.
+/// [`CacheCounters`], by label, and drops everything else. An entry kind
+/// SlateDB adds later lands in neither slot.
 #[derive(Debug)]
 struct CacheRecorder {
     store: Arc<CacheCounters>,
@@ -690,15 +648,11 @@ pub(crate) fn recorder(store: Arc<CacheCounters>) -> Arc<dyn MetricsRecorder> {
     Arc::new(CacheRecorder { store })
 }
 
-/// What the process's block cache has served since it was built —
-/// metadata and data blocks counted apart, because they are sized apart.
-///
-/// Process-wide, like the cache itself: every catalog a process attaches
-/// reads through the one instance, so these are the host's numbers, and
-/// they outlive the catalogs that produced them. Use them to size
+/// What the process's block cache has served since it was built, metadata
+/// and data blocks counted apart. Process-wide, outliving the catalogs
+/// that produced it; use it to size
 /// [`CatalogOptions::cache_memory`](crate::CatalogOptions::cache_memory)
-/// and [`cache_size`](crate::CatalogOptions::cache_size) from measured
-/// curves rather than from the defaults, and
+/// and [`cache_size`](crate::CatalogOptions::cache_size), and
 /// [`ReadOnlyCatalog::cache_tally`](crate::ReadOnlyCatalog::cache_tally)
 /// to see which attach is spending them.
 ///
@@ -757,11 +711,9 @@ struct CacheObservation {
 
 static OBSERVATION: OnceCell<CacheObservation> = OnceCell::const_new();
 
-/// Current process-wide cache sizing and occupancy.
-///
-/// Both kinds share one capacity, so the metadata figure is the ceiling past
-/// which metadata stops being protected rather than a partition, and the
-/// block figure is what the whole cache holds.
+/// Current process-wide cache sizing and occupancy. The metadata figure is
+/// the ceiling past which metadata stops being protected, not a partition;
+/// the block figure is the whole cache.
 #[must_use]
 pub fn cache_status() -> CacheStatus {
     let Some(observation) = OBSERVATION.get() else {
@@ -770,8 +722,6 @@ pub fn cache_status() -> CacheStatus {
     let capacity = u64::try_from(observation.tier.capacity()).unwrap_or(u64::MAX);
     let usage = u64::try_from(observation.tier.usage()).unwrap_or(u64::MAX);
     let metadata_occupancy = METADATA_OCCUPANCY.load(Ordering::Relaxed);
-    // Read live rather than remembered, so a resize cannot leave the
-    // reported allowance describing a split that no longer holds.
     let (auxiliary_capacity, auxiliary_usage) = data_file::auxiliary_occupancy();
 
     CacheStatus {
@@ -808,15 +758,9 @@ impl EventListener for EvictionCounter {
     }
 }
 
-/// One cache for both kinds, with SST metadata evicted only once every data
-/// block is gone.
-///
-/// Metadata enters hinted `Normal` and data blocks `Low`; foyer's LRU drains
-/// the low-priority list first and only falls back to the high-priority one
-/// when nothing else is left. That replaces a fixed metadata slot with a
-/// ceiling: metadata takes what the store needs up to
-/// [`METADATA_PRIORITY_POOL_RATIO`], blocks take the rest, and neither
-/// starves the other at a size the operator has to predict.
+/// One cache for both kinds. Metadata enters hinted `Normal` and data
+/// blocks `Low`, so metadata is evicted only once every data block is
+/// gone, up to [`METADATA_PRIORITY_POOL_RATIO`] of the capacity.
 struct CatalogCache {
     tier: Tier,
 }
@@ -839,9 +783,8 @@ impl CatalogCache {
         let hint = if metadata { Hint::Normal } else { Hint::Low };
         let entry = match &self.tier {
             Tier::Memory(cache) => {
-                // The memory tier reads its spawner from the ambient
-                // runtime inside the call, not on the returned future, so
-                // the guard has to be held across the call alone.
+                // The memory tier reads its spawner from the ambient runtime
+                // inside the call, so the guard must be held across the call.
                 let fetch = {
                     let _guard = CACHE_RUNTIME.as_ref().map(|runtime| runtime.enter());
                     cache.get_or_fetch(&key, move || async move {
@@ -903,13 +846,9 @@ impl DbCache for CatalogCache {
         self.read(key).await
     }
 
-    /// The one admission that does not say what it is caching: SlateDB
-    /// calls it both for blocks a scan just read and, under write-through
-    /// admission, for a fresh SST's metadata. Everything arriving here is
-    /// treated as a block — guessing "metadata" would let a scan fill the
-    /// protected segment, which is what this whole design prevents.
-    /// Metadata guessed wrong is protected again the next time a
-    /// `fetch_index`, `fetch_filter`, or `fetch_stats` reads it.
+    /// SlateDB does not say what this admits, so everything arriving here
+    /// is treated as a block; metadata is protected again on its next
+    /// `fetch_*` read.
     async fn insert(&self, key: CachedKey, value: CachedEntry) {
         match &self.tier {
             Tier::Memory(cache) => {
@@ -975,9 +914,8 @@ impl DbCache for CatalogCache {
     }
 }
 
-/// The eviction config both tiers take. LRU is not a preference: `Hint` is
-/// the only thing that separates metadata from blocks here, and LFU, S3-FIFO,
-/// and Sieve all ignore it.
+/// The eviction config both tiers take. Must be LRU: it is the only policy
+/// that honours the `Hint` separating metadata from blocks.
 fn eviction_config() -> LruConfig {
     LruConfig {
         high_priority_pool_ratio: METADATA_PRIORITY_POOL_RATIO,
@@ -993,10 +931,8 @@ fn memory_cache(capacity: u64) -> MemoryCache {
 }
 
 /// The cache every store in this process shares, built to `config` if
-/// nothing has built it yet. `None` when the disk tier could not be
-/// opened *and* nothing else was configured — never an error: a cache is
-/// an optimization, and no attach should fail because a device would not
-/// open.
+/// nothing has built it yet. `None` when the disk tier could not be opened
+/// and nothing else was configured; never an error.
 pub(crate) async fn shared(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
     let cache = SHARED
         .get_or_init(|| async {
@@ -1010,11 +946,6 @@ pub(crate) async fn shared(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
         .await
         .clone();
 
-    // A later store asking for something else gets what was built. That
-    // is the budget being the process's rather than the store's, and
-    // refusing would fail an attach over a cache — but a mismatch nobody
-    // can see is a host sized from options that never took effect, so it
-    // is said out loud once per attach that disagrees.
     let settled = BUILT_WITH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1028,27 +959,22 @@ pub(crate) async fn shared(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
             in_force_memory = settled.memory,
             in_force_disk_size = settled.disk_size,
             in_force_dir = ?settled.dir,
-            "the block cache is process-wide and already built; this attach's cache options              are ignored. Set them on the first attach in the process."
+            "the block cache is process-wide and already built; this attach's cache options are ignored. Set them on the first attach in the process."
         );
     }
 
     cache
 }
 
-/// What the process's cache was built with, for telling a later attach
-/// that its own numbers did not take effect.
+/// What the process's cache was built with.
 static BUILT_WITH: std::sync::Mutex<Option<CacheConfig>> = std::sync::Mutex::new(None);
 
 async fn build(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
     let (auxiliary_metadata_bytes, shared_bytes) = config.slots();
     AUXILIARY_METADATA_MEMORY.store(auxiliary_metadata_bytes, Ordering::Relaxed);
-    // The block slot is built to its share below, but the auxiliary cache
-    // is built on first use — which a read arriving before any attach would
-    // do at the default allowance. Sizing it here settles it either way.
+    // The auxiliary cache is built on first use, possibly before any attach.
     data_file::resize_auxiliary(usize::try_from(auxiliary_metadata_bytes).unwrap_or(usize::MAX));
 
-    // The device is the only part that can fail, and a memory tier alone is
-    // strictly better than no cache at all.
     let tier = match &config.dir {
         Some(dir) => match hybrid(dir, shared_bytes, config.disk_size).await {
             Some(cache) => Tier::Hybrid(cache),
@@ -1077,16 +1003,9 @@ async fn build(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
     Some(Arc::new(CatalogCache { tier }) as Arc<dyn DbCache>)
 }
 
-/// The runtime the cache spawns its fetch and flush tasks on.
-///
-/// It must not be an attach's runtime. The cache outlives every attach, so
-/// the first store to open would otherwise lend it a runtime that dies at
-/// that store's detach — after which tokio cancels the tasks that runtime
-/// owned. The hybrid tier takes this at build time, where the tasks it
-/// strands include the disk engine's and the next attach to touch the cache
-/// blocks forever. The memory tier resolves its spawner per call, where a
-/// stranded fill instead fails the readers waiting on it. Two workers is
-/// plenty; these tasks fetch and flush, they do not compute.
+/// The runtime the cache spawns its fetch and flush tasks on. Must not be
+/// an attach's runtime: the cache outlives every attach, and tokio cancels
+/// a dead runtime's tasks.
 static CACHE_RUNTIME: std::sync::LazyLock<Option<Arc<tokio::runtime::Runtime>>> =
     std::sync::LazyLock::new(|| build_cache_runtime().map(Arc::new));
 
@@ -1293,8 +1212,8 @@ mod tests {
         assert!(auxiliary < shared);
     }
 
-    /// An unset budget still totals what SlateDB gives one store, but
-    /// metadata may now grow into most of it rather than a fixed fifth.
+    /// An unset budget totals SlateDB's single-store default, with metadata
+    /// free to grow into most of it.
     #[test]
     fn an_unset_budget_matches_one_stores_defaults() {
         let (auxiliary, shared) = CacheConfig::default().slots();
@@ -1304,10 +1223,8 @@ mod tests {
         assert!(metadata_ceiling(shared) > 4 * 120 * 1024 * 1024);
     }
 
-    /// The parsed-metadata allowance follows the budget instead of standing
-    /// at a small host's figure, and stops at its ceiling rather than
-    /// reserving unboundedly — the bytes are deducted whether it fills them
-    /// or not.
+    /// The parsed-metadata allowance scales with the budget up to its
+    /// ceiling, and is deducted from the shared slot.
     #[test]
     fn the_auxiliary_allowance_scales_with_the_budget() {
         let allowance = |memory: u64| {
@@ -1320,7 +1237,7 @@ mod tests {
         };
 
         assert_eq!(allowance(DEFAULT_CACHE_MEMORY), 8 * 1024 * 1024);
-        // A 4 GiB budget: 51.2 MiB, where the old ceiling gave 8 MiB.
+        // A 4 GiB budget: 51.2 MiB.
         assert_eq!(allowance(4 * 1024 * 1024 * 1024), 53_687_091);
         assert_eq!(
             allowance(64 * 1024 * 1024 * 1024),
@@ -1328,9 +1245,8 @@ mod tests {
         );
     }
 
-    /// A later store's cache options do not take effect, and the process
-    /// says so rather than leaving a host sized from numbers that never
-    /// applied. The first config to arrive is what stands.
+    /// The first store's cache config stands; a later store is served the
+    /// same cache whatever it asks for.
     #[tokio::test]
     async fn a_later_attachs_cache_options_are_reported_as_ignored() {
         let first = CacheConfig {
@@ -1358,9 +1274,8 @@ mod tests {
     }
 
     /// The recorder routes SlateDB's cache counters by label: the meta
-    /// slot's three entry kinds tally together, data blocks apart, and a
-    /// kind nobody here models lands in neither rather than being
-    /// miscounted as one.
+    /// slot's three entry kinds tally together, data blocks apart, and an
+    /// unmodelled kind lands in neither.
     #[test]
     fn the_recorder_routes_counters_by_entry_kind() {
         let counters = Arc::new(CacheCounters::default());
@@ -1427,10 +1342,8 @@ mod tests {
         assert_eq!(tally.wal_puts, 0);
     }
 
-    /// Two stores share the cache but not the counters: what one store's
-    /// reads tally stays out of the other's, while the process's set takes
-    /// both. Without this the per-attach tally is the process's under
-    /// another name.
+    /// Two stores share the cache but not the counters; the process's set
+    /// takes both.
     #[test]
     fn a_stores_counters_are_its_own() {
         let first = store_counters();
@@ -1490,10 +1403,8 @@ mod tests {
         );
     }
 
-    /// Metadata outlives every data block, which is the whole of the
-    /// protection: foyer drains the low-priority list first and reaches the
-    /// high-priority one only once nothing else is left. The hint is honoured
-    /// by LRU alone, so this also pins the eviction algorithm.
+    /// Metadata outlives every data block under pressure; this also pins
+    /// the eviction algorithm to LRU, the only one honouring the hint.
     #[test]
     fn blocks_are_evicted_before_metadata() {
         // One shard: foyer divides the capacity across eight by default, and

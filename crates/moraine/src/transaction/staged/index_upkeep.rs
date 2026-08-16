@@ -10,6 +10,7 @@ use futures::{
     StreamExt, TryStreamExt,
     stream::{self, BoxStream},
 };
+use tokio::sync::OnceCell;
 
 use super::{
     Arc, CatalogSnapshot, Cell, ColumnInfo, DbTransaction, Error, HashMap, HashSet, IndexInfo,
@@ -21,24 +22,20 @@ use super::{
 };
 use crate::transaction::operations::ChangeSet;
 
-/// How many files one upkeep phase reads at once. Each read is an
-/// independent fetch of an independent file, so reading them one after
-/// another costs a commit one round trip of store latency per file — the
-/// term that dominates a commit touching many. Bounding the fan-out
-/// instead keeps a single commit from monopolizing the store's request
-/// budget.
+/// How many files one upkeep phase reads at once.
 const FILE_READ_CONCURRENCY: usize = 64;
 
 /// Per-commit fan-out into the process-wide Arrow encoding worker pool.
 const INLINE_DECODE_CONCURRENCY: usize = 8;
 
-/// Decoded inline schemas shared by every chunk in one commit. Holding the
-/// mutex through the first catalog read guarantees concurrent chunks of one
-/// table version still decode its IPC exactly once.
+/// Decoded inline schemas shared by every chunk in one commit, one cell
+/// per table version.
 struct InlineSchemaCache<'a> {
     pending: &'a HashMap<(u64, u64), &'a [u8]>,
-    decoded: tokio::sync::Mutex<HashMap<(u64, u64), SchemaRef>>,
+    decoded: tokio::sync::Mutex<HashMap<(u64, u64), Arc<SchemaCell>>>,
 }
+
+type SchemaCell = OnceCell<SchemaRef>;
 
 impl<'a> InlineSchemaCache<'a> {
     fn new(pending: &'a HashMap<(u64, u64), &'a [u8]>) -> Self {
@@ -55,44 +52,111 @@ impl<'a> InlineSchemaCache<'a> {
         schema_version: u64,
     ) -> Result<SchemaRef> {
         let key = (table_id, schema_version);
-        let mut decoded = self.decoded.lock().await;
-        if let Some(schema) = decoded.get(&key) {
-            return Ok(Arc::clone(schema));
-        }
+        let cell = {
+            let mut decoded = self.decoded.lock().await;
+            Arc::clone(decoded.entry(key).or_default())
+        };
 
-        let schema_ipc = if let Some(bytes) = self.pending.get(&key) {
-            Bytes::copy_from_slice(bytes)
-        } else {
-            let stored =
-                store_inline::read_inline_schema(ReadHandle::Tx(db_tx), table_id, schema_version)
+        let schema = cell
+            .get_or_try_init(|| async {
+                let schema_ipc = if let Some(bytes) = self.pending.get(&key) {
+                    Bytes::copy_from_slice(bytes)
+                } else {
+                    store_inline::read_inline_schema(
+                        ReadHandle::Tx(db_tx),
+                        table_id,
+                        schema_version,
+                    )
                     .await?
                     .ok_or_else(|| {
                         Error::Corruption(format!(
                             "no inline schema for table {table_id} version {schema_version}"
                         ))
-                    })?;
-            stored.arrow_schema
-        };
-        let schema = data_file::decode_inline_schema(schema_ipc)?;
-        decoded.insert(key, Arc::clone(&schema));
-        Ok(schema)
+                    })?
+                    .arrow_schema
+                };
+                data_file::decode_inline_schema(schema_ipc)
+            })
+            .await?;
+        Ok(Arc::clone(schema))
     }
 }
 
 /// What a commit's registered and targeted files need before their entries
-/// can be derived: where the bytes live, and which tables the commit merely
-/// re-homes rows in.
+/// can be derived.
 pub(super) struct FileContext<'a> {
     /// The `DATA_PATH` store, absent when the caller supplied none.
     store: Option<&'a Arc<dyn ObjectStore>>,
     /// The store-relative prefix data files resolve against.
     prefix: &'a str,
-    /// Tables this commit compacts and does nothing else to, whose
-    /// registrations derive no entries at all.
+    /// Tables this commit compacts and does nothing else to.
     compacted: BTreeSet<u64>,
-    /// One commit-wide bound shared by delete-file position reads.
     delete_file_permits: Arc<tokio::sync::Semaphore>,
     metrics: Arc<data_file::ScopedReadMetrics>,
+    /// Per-table index metadata and compiled projections, built on first use.
+    indexing: std::sync::Mutex<HashMap<u64, Arc<TableIndexing>>>,
+}
+
+impl FileContext<'_> {
+    fn indexing(&self, base: &CatalogSnapshot, table: TableId) -> Result<Arc<TableIndexing>> {
+        let mut cache = self.indexing.lock().map_err(|_| {
+            Error::Interrupted("index metadata cache poisoned by a failed upkeep task".to_owned())
+        })?;
+        if let Some(indexing) = cache.get(&table.get()) {
+            return Ok(Arc::clone(indexing));
+        }
+
+        let indexing = Arc::new(TableIndexing::build(base, table)?);
+        cache.insert(table.get(), Arc::clone(&indexing));
+        Ok(indexing)
+    }
+}
+
+/// One table's indexes with their projections compiled once: every index
+/// (removals) and the subset maintained on write (additions).
+struct TableIndexing {
+    all: Arc<IndexSet>,
+    maintained: Arc<IndexSet>,
+    deferred: Vec<u64>,
+}
+
+/// Indexes with the projection compiled for each, in parallel order.
+struct IndexSet {
+    indexes: Vec<IndexInfo>,
+    projections: Vec<data_file::IndexProjection>,
+}
+
+impl IndexSet {
+    fn build(live_columns: &[ColumnInfo], indexes: Vec<IndexInfo>, table: TableId) -> Result<Self> {
+        let projections = index_projections(live_columns, &indexes, table)?;
+        Ok(Self {
+            indexes,
+            projections,
+        })
+    }
+}
+
+impl TableIndexing {
+    fn build(base: &CatalogSnapshot, table: TableId) -> Result<Self> {
+        let all = base.indexes_of(table);
+        let live_columns = base.columns_of(table);
+        let maintained: Vec<_> = all
+            .iter()
+            .filter(|index| index.maintenance != crate::catalog::IndexMaintenance::Deferred)
+            .cloned()
+            .collect();
+        let deferred = all
+            .iter()
+            .filter(|index| index.maintenance == crate::catalog::IndexMaintenance::Deferred)
+            .map(|index| index.id.get())
+            .collect();
+
+        Ok(Self {
+            all: Arc::new(IndexSet::build(&live_columns, all, table)?),
+            maintained: Arc::new(IndexSet::build(&live_columns, maintained, table)?),
+            deferred,
+        })
+    }
 }
 
 type IndexEntryStream<'a> = BoxStream<'a, Result<StagedIndexEntry>>;
@@ -101,9 +165,8 @@ fn staged_entry_stream(entries: Vec<StagedIndexEntry>) -> IndexEntryStream<'stat
     stream::iter(entries.into_iter().map(Ok)).boxed()
 }
 
-/// Streams equality-index entries for one registered data file. Fused Arrow
-/// encoding yields each bounded read batch before the reader advances, while
-/// the caller overlaps independent file streams in completion order.
+/// Streams equality-index entries for one registered data file, one
+/// bounded read batch at a time.
 async fn stream_data_file_index_entries(
     base: &CatalogSnapshot,
     cells: &[Cell],
@@ -112,17 +175,11 @@ async fn stream_data_file_index_entries(
 ) -> Result<IndexEntryStream<'static>> {
     let file = decode_data_file(cells)?;
     let table = TableId::new(file.table_id);
-    let indexes: Vec<_> = base
-        .indexes_of(table)
-        .into_iter()
-        .filter(|index| index.maintenance != crate::catalog::IndexMaintenance::Deferred)
-        .collect();
-    if indexes.is_empty() {
+    let indexes = Arc::clone(&context.indexing(base, table)?.maintained);
+    if indexes.indexes.is_empty() {
         return Ok(stream::empty().boxed());
     }
 
-    // The file must be read to maintain the index; no store to read it means
-    // the index would silently miss these rows.
     let data_store = context.store.ok_or_else(|| {
         Error::Constraint(format!(
             "data file {} on indexed table {} cannot be read to maintain its equality index: no \
@@ -141,12 +198,8 @@ async fn stream_data_file_index_entries(
     };
     let path = data_file_object_path(base, &file, context.prefix)?;
     // A row this same commit deletes out of the file it also registers is
-    // never indexed, rather than indexed and then removed. The two are not
-    // interchangeable: an entry's key carries no file, so a removal beside
-    // an add would be indistinguishable from an UPDATE's — which rewrites
-    // a row into a new file under its preserved id and must keep its entry.
-    let live_columns = base.columns_of(table);
-    let projections = index_projections(&live_columns, &indexes, table)?;
+    // never indexed: an entry's key carries no file, so a removal beside an
+    // add would be indistinguishable from an UPDATE's.
     let entries = data_file::scoped_read_index_entry_batches(
         data_file::ParquetFile::new(
             Arc::clone(data_store),
@@ -155,7 +208,7 @@ async fn stream_data_file_index_entries(
             file.footer_size,
         )
         .with_metrics(Arc::clone(&context.metrics)),
-        projections,
+        indexes.projections.clone(),
         data_file::ScopedRows::All,
         data_file::RowIdSource::Resolve {
             row_id_start: file.row_id_start,
@@ -164,14 +217,15 @@ async fn stream_data_file_index_entries(
     )
     .await?;
     Ok(entries
-        .map(move |batch| batch.and_then(|batch| staged_scoped_entries(&indexes, batch, false)))
+        .map(move |batch| {
+            batch.and_then(|batch| staged_scoped_entries(&indexes.indexes, batch, false))
+        })
         .map_ok(|batch| stream::iter(batch.into_iter().map(Ok)))
         .try_flatten()
         .boxed())
 }
 
-/// Compiles one Arrow projection per index. Shared source positions are
-/// deduplicated by the scoped reader before Parquet columns are fetched.
+/// Compiles one Arrow projection per index.
 fn index_projections(
     live_columns: &[ColumnInfo],
     indexes: &[IndexInfo],
@@ -222,9 +276,9 @@ fn staged_scoped_entry(
     })
 }
 
-/// Returns the ids of any building indexes a duplicate poisoned — the
-/// caller records the flag on their definitions — with the bytes the
-/// entries put on the batch.
+/// Stages the commit's index entry adds and removals, returning the ids of
+/// any building indexes a duplicate poisoned with the bytes the entries
+/// put on the batch.
 #[allow(clippy::too_many_lines)]
 pub(super) async fn stage_index_maintenance(
     db_tx: &DbTransaction,
@@ -242,10 +296,9 @@ pub(super) async fn stage_index_maintenance(
         compacted: compaction_only_tables(ops)?,
         delete_file_permits: Arc::new(tokio::sync::Semaphore::new(FILE_READ_CONCURRENCY)),
         metrics: Arc::clone(&metrics),
+        indexing: std::sync::Mutex::new(HashMap::new()),
     };
 
-    // Classifying delete sources reads only the staged metadata. Each file
-    // target resolves its own position files later, beside independent adds.
     let DeletePlan {
         inline: inline_deletes,
         files: file_deletes,
@@ -253,27 +306,28 @@ pub(super) async fn stage_index_maintenance(
 
     let AddPlan {
         registered,
-        mut deferred,
+        deferred,
         adds,
     } = plan_adds(base, ops, &file_deletes, &context)?;
 
     let locator_writes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let locator_writes_for_removals = Arc::clone(&locator_writes);
-    let metrics_for_inline_deletions = Arc::clone(&metrics);
+    let mut staged_chunks = staged_inline_chunks(ops);
     let inline_schemas_ref = &inline_schemas;
+    let context_ref = &context;
     let inline_deletions = stream::iter(inline_deletes)
         .map(move |(table_id, row_ids)| {
             let locator_writes = Arc::clone(&locator_writes_for_removals);
-            let metrics = Arc::clone(&metrics_for_inline_deletions);
+            let staged_chunks = staged_chunks.remove(&table_id).unwrap_or_default();
             async move {
                 let (entries, writes) = stage_inline_delete_entries(
                     db_tx,
                     base,
-                    ops,
                     inline_schemas_ref,
+                    context_ref,
                     table_id,
                     &row_ids,
-                    metrics,
+                    staged_chunks,
                 )
                 .await?;
                 locator_writes.lock().await.extend(writes);
@@ -313,9 +367,7 @@ pub(super) async fn stage_index_maintenance(
         staged.bytes = staged.bytes.saturating_add(locator_bytes.0);
         staged.uses_inline_chunk_directory = !locator_writes.is_empty();
     }
-    deferred.sort_unstable();
-    deferred.dedup();
-    staged.deferred = deferred;
+    staged.deferred = deferred.into_iter().collect();
 
     Ok(staged)
 }
@@ -336,10 +388,10 @@ async fn produce_addition(
                 db_tx,
                 base,
                 inline_schemas,
+                context,
                 table_id,
                 chunk,
                 None,
-                Arc::clone(&context.metrics),
             )
             .await?;
             Ok(staged_entry_stream(entries))
@@ -347,9 +399,9 @@ async fn produce_addition(
     }
 }
 
-/// Classifies every staged delete without reading a data-store object.
-/// Inline positions are known immediately; each Parquet delete file remains
-/// attached to its target until that target's producer resolves it.
+/// Classifies every staged delete without reading a data-store object;
+/// each Parquet delete file stays attached to its target until that
+/// target's producer resolves it.
 fn plan_deletes(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
@@ -365,7 +417,7 @@ fn plan_deletes(
                 let delete_file = decode_delete_file(cells)?;
                 let table = TableId::new(delete_file.table_id);
                 if !context.compacted.contains(&delete_file.table_id)
-                    && !base.indexes_of(table).is_empty()
+                    && !context.indexing(base, table)?.all.indexes.is_empty()
                 {
                     plan.files
                         .entry((delete_file.table_id, delete_file.data_file_id))
@@ -380,8 +432,8 @@ fn plan_deletes(
                 row_id: position,
                 ..
             } if !context.compacted.contains(table_id) => {
-                // An inlined file-delete names a physical position in the
-                // file, exactly as a delete file's `pos` does.
+                // An inlined file-delete names a physical position, as a
+                // delete file's `pos` does.
                 plan.files
                     .entry((*table_id, *data_file_id))
                     .or_default()
@@ -400,9 +452,7 @@ fn plan_deletes(
     Ok(plan)
 }
 
-/// Plans entry additions without reading their bytes. The registered set is
-/// available immediately, so old-file removals can start beside the reads
-/// that derive additions.
+/// Plans entry additions without reading their bytes.
 fn plan_adds<'a>(
     base: &CatalogSnapshot,
     ops: &'a [RowOperation],
@@ -410,7 +460,7 @@ fn plan_adds<'a>(
     context: &FileContext<'_>,
 ) -> Result<AddPlan<'a>> {
     let mut registered: HashSet<(u64, u64)> = HashSet::new();
-    let mut deferred = Vec::new();
+    let mut deferred = BTreeSet::new();
     let mut adds: Vec<Add<'_>> = Vec::new();
 
     for op in ops {
@@ -420,26 +470,19 @@ fn plan_adds<'a>(
                 cells,
             } => {
                 let file = decode_data_file(cells)?;
-                // Compaction re-homes rows it neither renumbers nor
-                // rewrites, so every entry this file would derive is
-                // already stored under the same key. Skipped rather than
-                // re-derived: a merge of a whole table would read every
-                // merged file and stage one entry per row per index, which
-                // past a few million rows exceeds what one commit may stage
-                // at all. Left out of `registered` too — the commit stages
-                // no delete against a file it compacts, and a claim that it
-                // resolved one here would be false.
+                // A compacted file's entries are already stored under the
+                // same keys; it is left out of `registered` too, since the
+                // commit stages no delete against it.
                 if context.compacted.contains(&file.table_id) {
                     continue;
                 }
 
                 deferred.extend(
-                    base.indexes_of(TableId::new(file.table_id))
-                        .into_iter()
-                        .filter(|index| {
-                            index.maintenance == crate::catalog::IndexMaintenance::Deferred
-                        })
-                        .map(|index| index.id.get()),
+                    context
+                        .indexing(base, TableId::new(file.table_id))?
+                        .deferred
+                        .iter()
+                        .copied(),
                 );
 
                 let key = (file.table_id, file.data_file_id);
@@ -458,12 +501,11 @@ fn plan_adds<'a>(
                 ..
             } => {
                 deferred.extend(
-                    base.indexes_of(TableId::new(*table_id))
-                        .into_iter()
-                        .filter(|index| {
-                            index.maintenance == crate::catalog::IndexMaintenance::Deferred
-                        })
-                        .map(|index| index.id.get()),
+                    context
+                        .indexing(base, TableId::new(*table_id))?
+                        .deferred
+                        .iter()
+                        .copied(),
                 );
                 adds.push(Add::Inline {
                     table_id: *table_id,
@@ -492,9 +534,8 @@ struct DeletePlan {
     files: HashMap<(u64, u64), TargetDeletes>,
 }
 
-/// Every source of killed positions for one physical data file. The source
-/// metadata is cheap to group; its Parquet bodies stay unread until the
-/// target's add or removal producer starts.
+/// Every source of killed positions for one physical data file; delete
+/// files stay unread until the target's producer starts.
 #[derive(Default)]
 struct TargetDeletes {
     positions: Vec<u64>,
@@ -505,20 +546,18 @@ struct TargetDeletes {
 /// from the removal branch.
 struct AddPlan<'a> {
     registered: HashSet<(u64, u64)>,
-    deferred: Vec<u64>,
+    deferred: BTreeSet<u64>,
     adds: Vec<Add<'a>>,
 }
 
-/// One add a commit derives entries from, held in stage order until every
-/// add's bytes have been read.
+/// One add a commit derives entries from.
 enum Add<'a> {
     /// A registered data file, read from the data store.
     File {
         cells: &'a [Cell],
         killed: Option<&'a TargetDeletes>,
     },
-    /// An inlined chunk, whose rows the commit already carries and whose
-    /// schema comes from the catalog.
+    /// An inlined chunk the commit itself carries.
     Inline {
         table_id: u64,
         chunk: InlineChunk<'a>,
@@ -526,8 +565,7 @@ enum Add<'a> {
 }
 
 /// The tables this commit compacts and otherwise leaves alone, read from
-/// the `ducklake_snapshot_changes` row it stages. Empty for a commit that
-/// mints no snapshot, which therefore claims no compaction.
+/// the `ducklake_snapshot_changes` row it stages; empty without one.
 fn compaction_only_tables(ops: &[RowOperation]) -> Result<BTreeSet<u64>> {
     let Some(cells) = ops.iter().find_map(|op| match op {
         RowOperation::Insert {
@@ -539,11 +577,34 @@ fn compaction_only_tables(ops: &[RowOperation]) -> Result<BTreeSet<u64>> {
         return Ok(BTreeSet::new());
     };
 
-    // The row's own shape is validated in full when the snapshot record is
-    // built; here only the leading id and the changes need decoding.
+    // The row's full shape is validated when the snapshot record is built.
     let mut cursor = Cursor::new(TableKind::SnapshotChanges, cells);
     cursor.u64()?;
     Ok(ChangeSet::parse(&cursor.string()?).compaction_only_tables())
+}
+
+/// The inline chunks this commit stages, grouped by table.
+fn staged_inline_chunks(ops: &[RowOperation]) -> HashMap<u64, Vec<InlineChunk<'_>>> {
+    let mut chunks: HashMap<u64, Vec<InlineChunk<'_>>> = HashMap::new();
+    for op in ops {
+        if let RowOperation::InlineInsert {
+            table_id,
+            schema_version,
+            row_id_start,
+            row_count,
+            arrow_body,
+            ..
+        } = op
+        {
+            chunks.entry(*table_id).or_default().push(InlineChunk {
+                schema_version: *schema_version,
+                row_id_start: *row_id_start,
+                row_count: *row_count,
+                body: InlineBody::Borrowed(arrow_body),
+            });
+        }
+    }
+    chunks
 }
 
 /// The inline schemas this commit registers, for a chunk whose
@@ -561,57 +622,24 @@ pub(super) fn pending_inline_schemas(ops: &[RowOperation]) -> HashMap<(u64, u64)
         .collect()
 }
 
-#[cfg(test)]
-mod concurrency_tests {
-    use super::*;
-
-    /// A ready source must not wait behind an earlier source that has not
-    /// produced anything yet.
-    #[tokio::test]
-    async fn ready_source_bypasses_a_stalled_earlier_source() {
-        let first = stream::pending::<usize>();
-        let second = stream::once(async { 2 });
-        let merged = stream::select(first, second);
-        let mut merged = std::pin::pin!(merged);
-        let next = tokio::time::timeout(std::time::Duration::from_millis(20), merged.next())
-            .await
-            .unwrap();
-
-        assert_eq!(next, Some(2));
-    }
-
-    #[test]
-    fn owned_inline_body_keeps_its_allocation() {
-        let body = vec![1, 2, 3, 4];
-        let pointer = body.as_ptr();
-
-        let bytes = InlineBody::Owned(Bytes::from(body)).into_bytes();
-
-        assert_eq!(bytes.as_ptr(), pointer);
-    }
-}
-
 /// The index entries for one inline chunk's rows: every row when `held` is
-/// `None` (the chunk is being inserted), or just those rows when it is
-/// `Some` (they are being deleted, so their entries are removals).
+/// `None` (an insert), or removals for just those rows when it is `Some`.
 async fn inline_chunk_index_entries(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
     inline_schemas: &InlineSchemaCache<'_>,
+    context: &FileContext<'_>,
     table_id: u64,
     chunk: InlineChunk<'_>,
     held: Option<&HashSet<u64>>,
-    metrics: Arc<data_file::ScopedReadMetrics>,
 ) -> Result<Vec<StagedIndexEntry>> {
-    let table = TableId::new(table_id);
-    let indexes: Vec<_> = base
-        .indexes_of(table)
-        .into_iter()
-        .filter(|index| {
-            held.is_some() || index.maintenance != crate::catalog::IndexMaintenance::Deferred
-        })
-        .collect();
-    if indexes.is_empty() {
+    let indexing = context.indexing(base, TableId::new(table_id))?;
+    let indexes = if held.is_some() {
+        Arc::clone(&indexing.all)
+    } else {
+        Arc::clone(&indexing.maintained)
+    };
+    if indexes.indexes.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -621,12 +649,12 @@ async fn inline_chunk_index_entries(
     let plan = InlineDecodePlan {
         schema,
         body: chunk.body.into_bytes(),
-        live_columns: base.columns_of(table),
         indexes,
         row_id_start: chunk.row_id_start,
         held: held.cloned(),
     };
 
+    let metrics = Arc::clone(&context.metrics);
     data_file::run_bounded_index_encoding(move || {
         let started = Instant::now();
         metrics.inline_chunk();
@@ -637,36 +665,27 @@ async fn inline_chunk_index_entries(
     .await
 }
 
-/// Owned input for one blocking Arrow decode. Ownership lets the work leave
-/// the async executor without tying a worker to the transaction's borrows.
+/// Owned input for one blocking Arrow decode.
 struct InlineDecodePlan {
     schema: SchemaRef,
     body: Bytes,
-    live_columns: Vec<ColumnInfo>,
-    indexes: Vec<IndexInfo>,
+    indexes: Arc<IndexSet>,
     row_id_start: u64,
     held: Option<HashSet<u64>>,
 }
 
 impl InlineDecodePlan {
-    /// Decodes the chunk once and writes each borrowed Arrow scalar directly
-    /// into its index's final canonical key.
+    /// Decodes the chunk and encodes each row's index keys.
     fn derive(self) -> Result<Vec<StagedIndexEntry>> {
-        let table = self
-            .indexes
-            .first()
-            .map(|index| index.table_id)
-            .ok_or_else(|| Error::Corruption("inline index plan has no index".to_owned()))?;
-        let projections = index_projections(&self.live_columns, &self.indexes, table)?;
         let scoped = data_file::inline_batch_index_entries(
             self.schema,
             &self.body,
-            &projections,
+            &self.indexes.projections,
             self.row_id_start,
             self.held.as_ref(),
         )?;
         let delete = self.held.is_some();
-        staged_scoped_entries(&self.indexes, scoped, delete)
+        staged_scoped_entries(&self.indexes.indexes, scoped, delete)
     }
 }
 
@@ -680,8 +699,13 @@ pub(super) struct InlineChunk<'a> {
 }
 
 impl InlineChunk<'_> {
-    fn holds(&self, row_id: u64) -> bool {
-        row_id >= self.row_id_start && row_id < self.row_id_start.saturating_add(self.row_count)
+    /// The ids of `sorted_row_ids` this chunk holds; the input is sorted
+    /// ascending, so they form one contiguous run.
+    fn held<'r>(&self, sorted_row_ids: &'r [u64]) -> &'r [u64] {
+        let row_id_end = self.row_id_start.saturating_add(self.row_count);
+        let start = sorted_row_ids.partition_point(|&row_id| row_id < self.row_id_start);
+        let end = sorted_row_ids.partition_point(|&row_id| row_id < row_id_end);
+        &sorted_row_ids[start..end.max(start)]
     }
 }
 
@@ -699,23 +723,26 @@ impl InlineBody<'_> {
     }
 }
 
+/// Derives removals for `sorted_row_ids` (sorted, unique) from the chunks
+/// `locators` name; the locators arrive in ascending, non-overlapping row
+/// order, so one forward walk assigns each its held run.
 async fn derive_located_inline_removals(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
     inline_schemas: &InlineSchemaCache<'_>,
+    context: &FileContext<'_>,
     table_id: u64,
-    row_ids: &[u64],
+    sorted_row_ids: &[u64],
     locators: Vec<store_inline::InlineChunkLocator>,
-    metrics: Arc<data_file::ScopedReadMetrics>,
 ) -> Result<(Vec<StagedIndexEntry>, HashSet<u64>)> {
+    let mut next = 0usize;
     let resolved = stream::iter(locators)
         .map(|locator| {
-            let metrics = Arc::clone(&metrics);
-            let held: HashSet<u64> = row_ids
-                .iter()
-                .copied()
-                .filter(|&row_id| locator.holds(row_id))
-                .collect();
+            let start = next;
+            while next < sorted_row_ids.len() && locator.holds(sorted_row_ids[next]) {
+                next += 1;
+            }
+            let held: HashSet<u64> = sorted_row_ids[start..next].iter().copied().collect();
 
             async move {
                 let (operation, value) = store_inline::read_inline_chunk_locator(
@@ -739,10 +766,10 @@ async fn derive_located_inline_removals(
                     db_tx,
                     base,
                     inline_schemas,
+                    context,
                     table_id,
                     chunk,
                     Some(&held),
-                    metrics,
                 )
                 .await?;
 
@@ -763,37 +790,30 @@ async fn derive_inline_chunk_removals(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
     inline_schemas: &InlineSchemaCache<'_>,
+    context: &FileContext<'_>,
     table_id: u64,
-    row_ids: &[u64],
+    sorted_row_ids: &[u64],
     chunks: Vec<InlineChunk<'_>>,
-    metrics: Arc<data_file::ScopedReadMetrics>,
 ) -> Result<(Vec<StagedIndexEntry>, HashSet<u64>)> {
     let resolved = stream::iter(chunks)
         .filter_map(|chunk| {
-            let held: HashSet<u64> = row_ids
-                .iter()
-                .copied()
-                .filter(|&row_id| chunk.holds(row_id))
-                .collect();
+            let held: HashSet<u64> = chunk.held(sorted_row_ids).iter().copied().collect();
 
             async move { (!held.is_empty()).then_some((chunk, held)) }
         })
-        .map(|(chunk, held)| {
-            let metrics = Arc::clone(&metrics);
-            async move {
-                let entries = inline_chunk_index_entries(
-                    db_tx,
-                    base,
-                    inline_schemas,
-                    table_id,
-                    chunk,
-                    Some(&held),
-                    metrics,
-                )
-                .await?;
+        .map(|(chunk, held)| async move {
+            let entries = inline_chunk_index_entries(
+                db_tx,
+                base,
+                inline_schemas,
+                context,
+                table_id,
+                chunk,
+                Some(&held),
+            )
+            .await?;
 
-                Ok::<_, Error>((entries, held))
-            }
+            Ok::<_, Error>((entries, held))
         })
         .buffer_unordered(INLINE_DECODE_CONCURRENCY)
         .try_collect::<Vec<_>>()
@@ -834,39 +854,52 @@ fn legacy_inline_locator_writes(
         .collect()
 }
 
-/// Derives the entry removals for rows tombstoned out of inline chunks. A
-/// tombstoned row's indexed values come from the chunk holding it, so the
-/// removal rides the same batch that kills the row.
+/// Derives the entry removals for rows tombstoned out of inline chunks,
+/// reading each row's indexed values from the chunk holding it.
 async fn stage_inline_delete_entries(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
-    ops: &[RowOperation],
     inline_schemas: &InlineSchemaCache<'_>,
+    context: &FileContext<'_>,
     table_id: u64,
     row_ids: &[u64],
-    metrics: Arc<data_file::ScopedReadMetrics>,
+    staged_chunks: Vec<InlineChunk<'_>>,
 ) -> Result<(Vec<StagedIndexEntry>, Vec<commit::StagedWrite>)> {
-    if base.indexes_of(TableId::new(table_id)).is_empty() {
+    if context
+        .indexing(base, TableId::new(table_id))?
+        .all
+        .indexes
+        .is_empty()
+    {
         return Ok((Vec::new(), Vec::new()));
     }
 
-    let locators =
-        store_inline::find_inline_chunk_locators_for_rows(ReadHandle::Tx(db_tx), table_id, row_ids)
-            .await?;
-    let (mut entries, mut covered, locator_writes) = if let Some(locators) = locators {
-        let (entries, covered) = derive_located_inline_removals(
-            db_tx,
-            base,
-            inline_schemas,
+    let mut sorted_row_ids = row_ids.to_vec();
+    sorted_row_ids.sort_unstable();
+    sorted_row_ids.dedup();
+
+    let committed = async {
+        let locators = store_inline::find_inline_chunk_locators_for_rows(
+            ReadHandle::Tx(db_tx),
             table_id,
             row_ids,
-            locators,
-            Arc::clone(&metrics),
         )
         .await?;
+        if let Some(locators) = locators {
+            let (entries, covered) = derive_located_inline_removals(
+                db_tx,
+                base,
+                inline_schemas,
+                context,
+                table_id,
+                &sorted_row_ids,
+                locators,
+            )
+            .await?;
 
-        (entries, covered, Vec::new())
-    } else {
+            return Ok((entries, covered, Vec::new()));
+        }
+
         let committed = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
         let locator_writes = legacy_inline_locator_writes(table_id, &committed)?;
         let chunks: Vec<_> = committed
@@ -885,52 +918,33 @@ async fn stage_inline_delete_entries(
             db_tx,
             base,
             inline_schemas,
+            context,
             table_id,
-            row_ids,
+            &sorted_row_ids,
             chunks,
-            Arc::clone(&metrics),
         )
         .await?;
 
-        (entries, covered, locator_writes)
+        Ok::<_, Error>((entries, covered, locator_writes))
     };
 
     // A row inserted and deleted inside one commit lives in a chunk that is
     // still only staged.
-    let staged_chunks: Vec<_> = ops
-        .iter()
-        .filter_map(|op| match op {
-            RowOperation::InlineInsert {
-                table_id: owner,
-                schema_version,
-                row_id_start,
-                row_count,
-                arrow_body,
-                ..
-            } if *owner == table_id => Some(InlineChunk {
-                schema_version: *schema_version,
-                row_id_start: *row_id_start,
-                row_count: *row_count,
-                body: InlineBody::Borrowed(arrow_body),
-            }),
-            _ => None,
-        })
-        .collect();
-    let (staged_entries, staged_covered) = derive_inline_chunk_removals(
+    let staged = derive_inline_chunk_removals(
         db_tx,
         base,
         inline_schemas,
+        context,
         table_id,
-        row_ids,
+        &sorted_row_ids,
         staged_chunks,
-        metrics,
-    )
-    .await?;
+    );
+    let ((mut entries, mut covered, locator_writes), (staged_entries, staged_covered)) =
+        futures::try_join!(committed, staged)?;
     entries.extend(staged_entries);
     covered.extend(staged_covered);
 
-    // A tombstone naming no live chunk would leave its entries behind, which
-    // is the leak this derivation exists to prevent.
+    // A tombstone naming no live chunk would leave its entries behind.
     if let Some(missing) = row_ids.iter().find(|row_id| !covered.contains(row_id)) {
         return Err(Error::Corruption(format!(
             "inline delete of row {missing} on indexed table {table_id} names no inline chunk, so \
@@ -940,19 +954,14 @@ async fn stage_inline_delete_entries(
     Ok((entries, locator_writes))
 }
 
-/// The physical row positions a commit kills inside one data file. Both a
-/// delete file's `pos` column and an inlined file-delete name positions,
-/// not row ids; the target's scoped read resolves each position to the row
-/// it holds. Ordered, because the read selects on these positions and a
-/// selection is built in file order.
+/// The physical row positions (not row ids) a commit kills inside one data
+/// file, sorted and unique.
 #[derive(Debug)]
 pub(super) struct KilledRows {
     positions: data_file::RowPositions,
 }
 
 impl KilledRows {
-    /// Establishes the one sorted/unique representation after every delete
-    /// source for a target has been collected.
     fn from_unsorted(positions: Vec<u64>) -> Self {
         Self {
             positions: data_file::RowPositions::from_unsorted(positions),
@@ -960,9 +969,8 @@ impl KilledRows {
     }
 }
 
-/// Resolves every delete source for one data file. Delete files overlap, and
-/// the physical positions become sorted and unique only after all sources
-/// have contributed.
+/// Resolves every delete source for one data file into one sorted, unique
+/// position set.
 async fn resolve_target_deletes(
     base: &CatalogSnapshot,
     context: &FileContext<'_>,
@@ -1024,14 +1032,10 @@ async fn read_delete_file_positions(
     Ok(positions)
 }
 
-/// Derives the entry removals for rows killed inside one data file the
-/// committed head already holds, by scoped-reading the file and keeping
-/// the rows this commit marks dead. A delete against a file this same
-/// commit registers never reaches here — those rows are left unindexed at
-/// the add instead.
-///
-/// Each bounded Arrow batch is yielded before the reader advances. Target
-/// readers overlap and feed staging as their batches become ready.
+/// Streams the entry removals for rows killed inside one committed data
+/// file, by scoped-reading the killed positions. A delete against a file
+/// this same commit registers never reaches here; those rows are left
+/// unindexed at the add.
 pub(super) async fn stream_file_delete_index_entries(
     base: &CatalogSnapshot,
     table_id: u64,
@@ -1040,8 +1044,8 @@ pub(super) async fn stream_file_delete_index_entries(
     context: &FileContext<'_>,
 ) -> Result<IndexEntryStream<'static>> {
     let table = TableId::new(table_id);
-    let indexes = base.indexes_of(table);
-    if indexes.is_empty() {
+    let indexes = Arc::clone(&context.indexing(base, table)?.all);
+    if indexes.indexes.is_empty() {
         return Ok(stream::empty().boxed());
     }
 
@@ -1056,12 +1060,6 @@ pub(super) async fn stream_file_delete_index_entries(
     refuse_out_of_range(killed, &file)?;
 
     let path = data_file_object_path(base, &file, context.prefix)?;
-    // An entry dies when a delete names its physical position, so only those
-    // positions are read: a delete costs the rows it removes rather than the
-    // file holding them. The scoped read resolves each position to the row it
-    // holds — one rule for dense and per-row-id targets alike.
-    let live_columns = base.columns_of(table);
-    let projections = index_projections(&live_columns, &indexes, table)?;
     let entries = data_file::scoped_read_index_entry_batches(
         data_file::ParquetFile::new(
             Arc::clone(data_store),
@@ -1070,7 +1068,7 @@ pub(super) async fn stream_file_delete_index_entries(
             file.footer_size,
         )
         .with_metrics(Arc::clone(&context.metrics)),
-        projections,
+        indexes.projections.clone(),
         data_file::ScopedRows::At(&killed.positions),
         data_file::RowIdSource::Resolve {
             row_id_start: file.row_id_start,
@@ -1080,7 +1078,9 @@ pub(super) async fn stream_file_delete_index_entries(
     .await?;
 
     Ok(entries
-        .map(move |batch| batch.and_then(|batch| staged_scoped_entries(&indexes, batch, true)))
+        .map(move |batch| {
+            batch.and_then(|batch| staged_scoped_entries(&indexes.indexes, batch, true))
+        })
         .map_ok(|batch| stream::iter(batch.into_iter().map(Ok)))
         .try_flatten()
         .boxed())
@@ -1099,18 +1099,17 @@ fn live_data_file(
         .ok_or_else(|| Error::NotFound(format!("data file {data_file_id} of table {table_id}")))
 }
 
-/// Positions are physical row ordinals read out of the delete file; one
-/// naming a row the target does not hold could never match a scoped entry
-/// and would silently orphan index rows, so refuse it.
+/// Refuses a killed position the target file does not hold; it could never
+/// match a scoped entry and would silently orphan index rows.
 fn refuse_out_of_range(killed: &KilledRows, file: &proto::DataFileValue) -> Result<()> {
-    for &position in killed.positions.as_slice() {
-        if position >= file.record_count {
-            return Err(Error::Constraint(format!(
-                "delete file for data file {} on table {} names position {position} outside the \
-                 file's record count {}",
-                file.data_file_id, file.table_id, file.record_count
-            )));
-        }
+    if let Some(&position) = killed.positions.as_slice().last()
+        && position >= file.record_count
+    {
+        return Err(Error::Constraint(format!(
+            "delete file for data file {} on table {} names position {position} outside the \
+             file's record count {}",
+            file.data_file_id, file.table_id, file.record_count
+        )));
     }
     Ok(())
 }
@@ -1155,8 +1154,6 @@ pub(super) fn table_object_path(
     path_is_relative: bool,
     data_prefix: &str,
 ) -> Result<object_store::path::Path> {
-    // A missing table here is corruption, not a caller mistake: the file
-    // row itself named it.
     let table_prefix = base
         .table_data_prefix(TableId::new(table_id))
         .map_err(|err| match err {
@@ -1192,4 +1189,19 @@ pub(super) fn index_positions(
                 .ok_or_else(|| Error::NotFound(format!("indexed column {column} of table {table}")))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_inline_body_keeps_its_allocation() {
+        let body = vec![1, 2, 3, 4];
+        let pointer = body.as_ptr();
+
+        let bytes = InlineBody::Owned(Bytes::from(body)).into_bytes();
+
+        assert_eq!(bytes.as_ptr(), pointer);
+    }
 }

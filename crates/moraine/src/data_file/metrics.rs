@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::{
+    data_file::usize_as_u64,
     error::{Error, Result},
     telemetry::nanoseconds,
 };
@@ -63,7 +64,7 @@ impl ScopedReadMetrics {
     pub(super) fn range_read(&self, ranges: usize, bytes: u64, duration: Duration) {
         self.range_fetches.fetch_add(1, Ordering::Relaxed);
         self.ranges
-            .fetch_add(u64::try_from(ranges).unwrap_or(u64::MAX), Ordering::Relaxed);
+            .fetch_add(usize_as_u64(ranges), Ordering::Relaxed);
         self.range_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.range_nanoseconds
             .fetch_add(nanoseconds(duration), Ordering::Relaxed);

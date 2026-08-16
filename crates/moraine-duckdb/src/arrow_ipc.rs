@@ -167,8 +167,7 @@ unsafe fn write_bytes_result(
 }
 
 /// Serializes just the Arrow schema (an IPC stream with the schema and no
-/// batches), stored once per inline schema version so an empty scan can
-/// reconstruct the column layout.
+/// batches), stored once per inline schema version.
 ///
 /// # Safety
 /// `schema` is an exported `ArrowSchema` consumed by this call; `out`/`err`
@@ -196,16 +195,14 @@ pub unsafe extern "C" fn moraine_arrow_encode_schema(
     unsafe { write_bytes_result(out, err, attempt) }
 }
 
-/// Serializes one inlined chunk to a record-batch **body** only — the IPC
-/// record-batch message and its buffers, without a schema message. The
-/// schema is stored once per version by [`moraine_arrow_encode_schema`] and
-/// supplied back at decode by [`moraine_arrow_decode_body`], so the WAL
-/// append for a tiny commit never re-serializes the schema. The layout is a
-/// little-endian `u32` message length, the record-batch flatbuffer message,
-/// then the arrow data buffers.
+/// Serializes one inlined chunk to a record-batch body only: a
+/// little-endian `u32` message length, the record-batch flatbuffer
+/// message, then the arrow data buffers, without a schema message (stored
+/// once per version by [`moraine_arrow_encode_schema`] and supplied back
+/// at decode by [`moraine_arrow_decode_body`]).
 ///
 /// Dictionary-encoded columns are rejected: the body carries no dictionary
-/// messages. Inlined user columns are not dictionary-encoded in practice.
+/// messages.
 ///
 /// # Safety
 /// `schema`/`array` are exported structs consumed by this call; `out`/`err`
@@ -331,8 +328,8 @@ fn decode_inline_body(
 }
 
 /// Decodes and consumes one chunk returned by
-/// [`crate::inline::moraine_inline_scan`]. Its store-backed allocation becomes
-/// Arrow's data buffer instead of being copied across the ABI first.
+/// [`crate::inline::moraine_inline_scan`]; its store-backed allocation
+/// becomes Arrow's data buffer without a copy.
 ///
 /// # Safety
 ///
@@ -438,9 +435,8 @@ mod tests {
     }
 
     /// Encodes a struct array's schema and body separately, then decodes the
-    /// body against that stored schema — the exact FFI round trip the C++ shim
-    /// drives (schema once per version, body per chunk). The returned structs
-    /// are Rust-owned and release on drop.
+    /// body against that stored schema. The returned structs are Rust-owned
+    /// and release on drop.
     fn encode_then_decode(source: &StructArray) -> (FFI_ArrowArray, FFI_ArrowSchema) {
         let mut err = MoraineError::default();
 

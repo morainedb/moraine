@@ -43,9 +43,8 @@ pub(crate) enum Key {
     Index(IndexKey),
     /// `ducklake_schema_versions`: one record per snapshot at which a
     /// table's shape changed, holding the catalog schema version that
-    /// snapshot minted. Retained across snapshot expiry — a data file
-    /// resolves its schema version through these long after the snapshot
-    /// that wrote it is gone — and removed only with the table.
+    /// snapshot minted. Retained across snapshot expiry; removed only with
+    /// the table.
     SchemaVersion {
         /// The created-or-altered table (or view).
         table_id: u64,
@@ -53,24 +52,18 @@ pub(crate) enum Key {
         begin_snapshot: u64,
     },
     /// The `current` keys one commit's batch wrote — the changelog a reader
-    /// replays to advance a held view across that commit. Its own subspace
-    /// rather than a field of the snapshot record: snapshot records are
-    /// scanned in full on a read path DuckLake takes every transaction, and
-    /// the changelog is several times their size. Only a refresh reads
-    /// these, one point read per snapshot in the gap. A sliding window of
-    /// the most recent commits' records is retained; older ones are deleted
-    /// by later commits, so nothing else has to reclaim them.
+    /// replays to advance a held view across that commit. Only a sliding
+    /// window of the most recent commits' records is retained; later
+    /// commits delete the rest.
     Changelog {
         /// The snapshot whose batch wrote these keys.
         snapshot_id: u64,
     },
 }
 
-/// An equality-index entry key. The unique kind keys on the value alone —
-/// the store key *is* the uniqueness claim, so two commits inserting the
-/// same value collide in the store's write-write detection. The non-unique
-/// kind appends the row id, so rows sharing a value occupy distinct keys
-/// and concurrent appends stay benign.
+/// An equality-index entry key. The unique kind keys on the value alone,
+/// so two commits inserting the same value collide in write-write
+/// detection; the non-unique kind appends the row id.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum IndexKey {
     /// A unique-index entry; value is the holding row id.
@@ -110,10 +103,8 @@ pub(crate) enum SysKey {
 pub(crate) enum CurrentKey {
     /// A live entity version.
     Entity(EntityKey),
-    /// `ducklake_files_scheduled_for_deletion`. Keyed by the scheduled
-    /// file's id — the row's identity in DuckLake's own schema (inserts
-    /// carry it, cleanup deletes by it), unique because a file's catalog
-    /// rows are removed in the same transaction that schedules it.
+    /// `ducklake_files_scheduled_for_deletion`, keyed by the scheduled
+    /// file's id.
     GcFile {
         /// The scheduled data or delete file's id.
         data_file_id: u64,
@@ -371,20 +362,13 @@ pub(crate) enum InlineKey {
     /// The archived form of an inlined-data record.
     Arch(InlineOperation),
     /// Marks that a table's `ducklake_inlined_delete_<table_id>` exists,
-    /// once per table. Appended last so the variants above keep their
-    /// discriminants.
-    ///
-    /// Existence has to be recorded rather than derived from whether any
-    /// `FileDelete` record is currently live: a flush materializes those
-    /// into a real delete file and clears them, and an emptied SQL table
-    /// still exists — which is what DuckLake, having cached the table's
-    /// existence for the life of the catalog, goes on assuming.
+    /// once per table; the table outlives its `FileDelete` records, which
+    /// a flush clears.
     FileDeleteTable {
         /// Owning table.
         table_id: u64,
     },
-    /// One live inline chunk's inclusive row-id end. Appended last so every
-    /// previously shipped variant keeps its discriminant.
+    /// One live inline chunk's inclusive row-id end.
     ChunkRange {
         /// Owning table.
         table_id: u64,
@@ -455,9 +439,8 @@ impl Key {
     }
 }
 
-/// Encodes one equality-index entry from a borrowed canonical value. This is
-/// byte-identical to [`Key::Index`] but avoids constructing an owned key and
-/// cloning its potentially large canonical payload before serialization.
+/// Encodes one equality-index entry from a borrowed canonical value,
+/// byte-identical to [`Key::Index`] without cloning the payload.
 pub(crate) fn encode_index_entry(
     index_id: u64,
     unique: bool,
@@ -467,11 +450,10 @@ pub(crate) fn encode_index_entry(
     let mut bytes = Vec::new();
     let mut writer = storekey::Writer::new(&mut bytes);
     // Infallible by construction: a `Vec` sink raises no I/O error and these
-    // primitive/canonical encoders raise no custom error. The discriminants
-    // are the pinned `Key::Index` and `IndexKey::{Unique,Multi}` variants.
+    // primitive/canonical encoders raise no custom error.
     let result = (|| -> std::result::Result<(), storekey::EncodeError> {
-        writer.write_u8(7)?;
-        writer.write_u8(if unique { 2 } else { 3 })?;
+        writer.write_u8(INDEX_SUBSPACE_TAG)?;
+        writer.write_u8(index_kind_tag(unique))?;
         writer.write_u64(index_id)?;
         <CanonicalKey as Encode<()>>::encode(key, &mut writer)?;
         if !unique {
@@ -547,8 +529,6 @@ impl Subspace {
 
 /// The kinds whose live keys are scoped `table_id`-first — the only kinds
 /// [`current_table_prefix`] accepts.
-// No caller needs "everything about table T" yet (cascading table drop and
-// per-table GC land in later slices); the prefix math is pinned by tests.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TableScopedKind {
@@ -624,8 +604,6 @@ impl TableScopedKind {
 
 /// Discriminant bytes preceding an entity's components in a live key:
 /// subspace, `CurrentKey::Entity`, entity kind.
-// Only `current_table_prefix` consumes this, and it has no caller yet.
-#[allow(dead_code)]
 const CUR_KIND_PREFIX_LEN: usize = 3;
 
 /// Discriminant bytes preceding an entity's components in a history key:
@@ -733,29 +711,39 @@ pub(crate) fn inline_chunk_range_table_prefix(table_id: u64) -> Vec<u8> {
 /// The range suffix that seeks to the first chunk ending at or after
 /// `row_id` within [`inline_chunk_range_table_prefix`].
 pub(crate) fn inline_chunk_range_suffix(table_id: u64, row_id: u64) -> Vec<u8> {
-    let prefix = inline_chunk_range_table_prefix(table_id);
-    let encoded = Key::Inline(InlineKey::ChunkRange {
+    Key::Inline(InlineKey::ChunkRange {
         table_id,
         row_id_end: row_id,
     })
-    .encode();
-    encoded[prefix.len()..].to_vec()
+    .encode()
+    .split_off(INLINE_CHUNK_RANGE_PREFIX_LEN + size_of::<u64>())
 }
 
+/// The `index` subspace discriminant byte, as [`Key::Index`] encodes it.
+pub(crate) const INDEX_SUBSPACE_TAG: u8 = 7;
+/// The [`IndexKey::Unique`] discriminant byte.
+pub(crate) const INDEX_UNIQUE_TAG: u8 = 2;
+/// The [`IndexKey::Multi`] discriminant byte.
+pub(crate) const INDEX_MULTI_TAG: u8 = 3;
 /// Discriminant bytes preceding an index entry's components: the `index`
 /// subspace byte and the [`IndexKey`] kind byte.
 const INDEX_KIND_PREFIX_LEN: usize = 2;
 /// Bytes preceding an index entry's value: the kind discriminants and the
 /// eight-byte index id.
-const INDEX_ENTRY_PREFIX_LEN: usize = INDEX_KIND_PREFIX_LEN + size_of::<u64>();
+pub(crate) const INDEX_ENTRY_PREFIX_LEN: usize = INDEX_KIND_PREFIX_LEN + size_of::<u64>();
 
-/// The bytes one index entry stages, key and value together. Both kinds
-/// cost the same: the entry prefix and the framed value, plus a row id
-/// carried in the key (non-unique, where it is the final component) or as
-/// the whole value (unique).
-///
-/// Nominal, in the sense [`nominal_key_bytes`] is: escaping can make the
-/// real entry larger, never smaller.
+/// The [`IndexKey`] discriminant byte for a unique or non-unique entry.
+pub(crate) const fn index_kind_tag(unique: bool) -> u8 {
+    if unique {
+        INDEX_UNIQUE_TAG
+    } else {
+        INDEX_MULTI_TAG
+    }
+}
+
+/// The nominal bytes one index entry stages, key and value together: the
+/// entry prefix, the framed value, and one row id (in the key or as the
+/// value). Escaping can make the real entry larger, never smaller.
 pub(crate) fn index_entry_bytes(values: &[Option<IndexKeyValue>]) -> u64 {
     let bytes = INDEX_ENTRY_PREFIX_LEN + nominal_key_bytes(values) + size_of::<u64>();
     bytes as u64
@@ -763,9 +751,6 @@ pub(crate) fn index_entry_bytes(values: &[Option<IndexKeyValue>]) -> u64 {
 
 /// The two entry kinds inside the `index` subspace. An index is exclusively
 /// one kind, so its entries form one contiguous `(kind, index_id)` range.
-// The prefix builders below have no caller until index lookups and
-// reclamation land; the ranges are pinned by tests.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexKind {
     /// `index/unique`.
@@ -774,8 +759,7 @@ pub(crate) enum IndexKind {
     Multi,
 }
 
-/// Byte prefix of every entry of one kind, across all indexes — the range
-/// the orphan sweep walks, seeking by index id.
+/// Byte prefix of every entry of one kind, across all indexes.
 pub(crate) fn index_kind_prefix(kind: IndexKind) -> Vec<u8> {
     let key = match kind {
         IndexKind::Unique => Key::Index(IndexKey::Unique {
@@ -792,8 +776,7 @@ pub(crate) fn index_kind_prefix(kind: IndexKind) -> Vec<u8> {
     prefix_of(&key, INDEX_KIND_PREFIX_LEN)
 }
 
-/// Byte prefix of every entry of one index — the range reclamation sweeps
-/// after a drop.
+/// Byte prefix of every entry of one index.
 pub(crate) fn index_index_prefix(kind: IndexKind, index_id: u64) -> Vec<u8> {
     let key = match kind {
         IndexKind::Unique => Key::Index(IndexKey::Unique {
@@ -809,10 +792,8 @@ pub(crate) fn index_index_prefix(kind: IndexKind, index_id: u64) -> Vec<u8> {
     prefix_of(&key, INDEX_ENTRY_PREFIX_LEN)
 }
 
-/// Byte prefix of every non-unique entry sharing one `(index_id, value)` —
-/// the ascending scan a non-unique lookup runs. The row id is the fixed
-/// eight-byte final component, so dropping it yields the value prefix.
-#[allow(dead_code)]
+/// Byte prefix of every non-unique entry sharing one `(index_id, value)`:
+/// the entry key without its fixed eight-byte row id.
 pub(crate) fn index_multi_value_prefix(index_id: u64, value: &CanonicalKey) -> Vec<u8> {
     let mut bytes = Key::Index(IndexKey::Multi {
         index_id,
@@ -881,7 +862,6 @@ pub(crate) fn subspace_prefix(subspace: Subspace) -> Vec<u8> {
 }
 
 /// Byte prefix of every live key of `kind` scoped to `table_id`.
-// No caller yet; pinned by the prefix tests below.
 #[allow(dead_code)]
 pub(crate) fn current_table_prefix(kind: TableScopedKind, table_id: u64) -> Vec<u8> {
     prefix_of(
@@ -1250,6 +1230,30 @@ mod tests {
             ]),
         });
         assert_ne!(ab_c.encode(), a_bc.encode());
+    }
+
+    /// The hand-written index tags match what the derive encodes.
+    #[test]
+    fn index_tags_match_the_encoded_discriminants() {
+        let unique = Key::Index(IndexKey::Unique {
+            index_id: 9,
+            key: CanonicalKey::empty(),
+        })
+        .encode();
+        let multi = Key::Index(IndexKey::Multi {
+            index_id: 9,
+            key: CanonicalKey::empty(),
+            row_id: 0,
+        })
+        .encode();
+
+        assert_eq!(unique[0], INDEX_SUBSPACE_TAG);
+        assert_eq!(multi[0], INDEX_SUBSPACE_TAG);
+        assert_eq!(unique[1], INDEX_UNIQUE_TAG);
+        assert_eq!(multi[1], INDEX_MULTI_TAG);
+        assert_eq!(index_kind_tag(true), INDEX_UNIQUE_TAG);
+        assert_eq!(index_kind_tag(false), INDEX_MULTI_TAG);
+        assert_eq!(&unique[2..INDEX_ENTRY_PREFIX_LEN], &9_u64.to_be_bytes());
     }
 
     #[test]

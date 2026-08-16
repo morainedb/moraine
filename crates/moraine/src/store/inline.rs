@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// One directory entry identifying an immutable inline chunk and its row
-/// range. Callers can begin work on each chunk as its point read completes.
+/// range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InlineChunkLocator {
     operation: InlineOperation,
@@ -105,12 +105,7 @@ pub(crate) async fn find_inline_chunk_locators_for_rows(
             row_id_start: locator.row_id_start,
             row_id_end,
         });
-        while target_index < targets.len() && targets[target_index] <= row_id_end {
-            if targets[target_index] < locator.row_id_start {
-                return Ok(None);
-            }
-            target_index += 1;
-        }
+        target_index += targets[target_index..].partition_point(|&target| target <= row_id_end);
     }
 
     Ok(Some(locators))
@@ -311,10 +306,8 @@ mod tests {
     use super::*;
     use crate::store::open::StoreBuilder;
 
-    /// The range directory seeks to the chunk whose inclusive end covers a
-    /// row and returns only that immutable chunk body. A legacy table with
-    /// no directory reports `None`, allowing the caller to fall back to the
-    /// old full chunk scan during rolling adoption.
+    /// The range directory resolves a row to exactly its chunk; a table
+    /// with no directory reports `None`.
     #[tokio::test]
     async fn chunk_range_directory_selects_owners_and_detects_legacy_chunks() {
         let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))

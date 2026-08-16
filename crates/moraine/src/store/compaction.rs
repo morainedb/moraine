@@ -1,16 +1,9 @@
 //! Submitting a full merge of a segment's tree, and waiting for it.
 //!
-//! Nothing here plans a merge. SlateDB's own scheduler turns "all of this
-//! tree" into a spec — every sorted run a source, the lowest run id the
-//! destination — and that shape is what lets the merge drop superseded
-//! versions and tombstones instead of carrying them forward.
-//!
-//! Submitting only queues: the compactor running inside the writer promotes
-//! the entry on its own poll tick. A store nobody has attached read-write
-//! executes nothing, which is why the catalog verb above this refuses a
-//! read-only handle.
+//! SlateDB's own scheduler plans the merge; submitting only queues it, and
+//! only a writer's compactor executes it.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use object_store::ObjectStore;
@@ -26,9 +19,8 @@ use slatedb::{
 
 use crate::error::{Error, Result};
 
-/// How often a wait re-reads the compactions file. Derived from SlateDB's
-/// own compactor poll cadence, so a wait costs about one read per tick the
-/// compactor takes rather than a cadence of moraine's choosing.
+/// How often a wait re-reads the compactions file (SlateDB's compactor
+/// poll cadence).
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// One merge a caller is waiting on: the segment it targets and the record
@@ -51,20 +43,10 @@ pub(crate) enum MergeEnd {
 }
 
 /// Plans and submits a full merge of `segment` (of every segment, when
-/// `None`).
-///
-/// Returns one entry per merge the caller can wait on. A tree yields none
-/// only when it holds no compacted sorted runs — what SlateDB's whole-store
-/// request does silently, and what a store whose bulk is still in L0 will
-/// report.
-///
-/// A tree already being merged is **adopted rather than skipped**: its
-/// in-flight compaction is returned to be waited on. Submitting a second
-/// plan for it would claim a destination the executor refuses, but the
-/// caller asked for a merged tree and one is on its way — and a writer's
-/// own compactor starts proposing the moment it opens, so skipping would
-/// make an on-demand merge reclaim nothing precisely when it is asked for
-/// straight after an attach.
+/// `None`), returning one entry per merge to wait on. A tree with no
+/// compacted sorted runs yields none. A tree already being merged is
+/// adopted: its in-flight compaction is returned instead of a second
+/// submission, which the executor would refuse.
 pub(crate) async fn submit_full_merge(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
@@ -83,34 +65,22 @@ pub(crate) async fn submit_full_merge(
         None => CompactionRequest::Full,
     };
 
-    // The scheduler is asked only to *plan*; it never runs here. Going
-    // through it rather than assembling a spec keeps the choice of sources
-    // and destination upstream's.
     let scheduler =
         SizeTieredCompactionSchedulerSupplier.compaction_scheduler(&CompactorOptions::default());
     let specs = match scheduler.generate(&state, &request) {
         Ok(specs) => specs,
-        // A named tree with nothing to merge is an upstream error and a
-        // skip here, so both request shapes report the same way.
+        // A named tree with nothing to merge is an upstream error; report
+        // it as the whole-store request does, with no merges.
         Err(_) if segment.is_some() => return Ok(Vec::new()),
         Err(err) => return Err(Error::from(err)),
     };
 
-    let busy = merges_in_flight(&state);
+    let mut busy = merges_in_flight(&state);
 
     let mut submitted = Vec::with_capacity(specs.len());
     for spec in specs {
         let target = spec.segment().to_vec();
-        // A full-tree plan destines the tree's lowest sorted-run id, which
-        // is what the background scheduler destines when it merges the same
-        // runs, and two jobs claiming one destination is a state the
-        // executor refuses. So the in-flight one is adopted: the caller
-        // waits on it instead of on a submission that cannot be made.
-        if let Some(in_flight) = busy
-            .iter()
-            .find(|(segment, _)| segment == &target)
-            .map(|(_, compaction)| compaction.clone())
-        {
+        if let Some(in_flight) = busy.remove(&target) {
             submitted.push(SubmittedMerge {
                 segment: target,
                 compaction: in_flight,
@@ -128,10 +98,8 @@ pub(crate) async fn submit_full_merge(
     Ok(submitted)
 }
 
-/// Polls `compaction` until it commits, fails, or `budget` runs out.
-///
-/// A merge that outlives the budget keeps running: nothing is cancelled,
-/// and a later census shows the result.
+/// Polls `compaction` until it commits, fails, or `budget` runs out; a
+/// merge that outlives the budget keeps running.
 pub(crate) async fn await_merge(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
@@ -148,8 +116,7 @@ pub(crate) async fn await_merge(
             .map_err(Error::from)?
             .map(|found| found.status())
         {
-            // A compaction the compactions file no longer carries has been
-            // retired from it; the manifest holds its result either way.
+            // A compaction retired from the compactions file has completed.
             Some(CompactionStatus::Completed) | None => return Ok(MergeEnd::Completed),
             Some(CompactionStatus::Failed) => return Ok(MergeEnd::Failed),
             Some(_) => {}
@@ -165,7 +132,7 @@ pub(crate) async fn await_merge(
 
 /// Every compaction that has not reached a terminal status, by the segment
 /// it targets.
-fn merges_in_flight(state: &CompactorStateView) -> Vec<(Vec<u8>, Compaction)> {
+fn merges_in_flight(state: &CompactorStateView) -> HashMap<Vec<u8>, Compaction> {
     state
         .compactions()
         .into_iter()
@@ -182,8 +149,6 @@ fn merges_in_flight(state: &CompactorStateView) -> Vec<(Vec<u8>, Compaction)> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use object_store::memory::InMemory;
     use slatedb::{
         Db, IsolationLevel, WriteBatch,
@@ -260,8 +225,7 @@ mod tests {
     }
 
     /// A merge drops the tombstone of a deleted key, not only its superseded
-    /// values: a full-tree plan destines the bottom run, which is what
-    /// permits the drop rather than carrying the marker forward forever.
+    /// values.
     #[tokio::test]
     async fn a_full_merge_drops_tombstones() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -324,13 +288,8 @@ mod tests {
         assert_eq!(after.segment(&snapshots), Some(&before));
     }
 
-    /// A tree already being merged is adopted rather than skipped: the
-    /// second caller waits on the first caller's merge instead of being
-    /// told there was nothing to do.
-    ///
-    /// Skipping instead would make an on-demand merge reclaim nothing in
-    /// the case it is most often asked for — straight after an attach,
-    /// whose writer starts a compactor that proposes immediately.
+    /// A tree already being merged is adopted: the second caller waits on
+    /// the first caller's merge.
     #[tokio::test]
     async fn a_tree_already_merging_is_adopted() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

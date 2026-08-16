@@ -29,10 +29,10 @@ use crate::{
     error::Result,
     store::{
         proto::{
-            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
-            HeadValue, MacroValue, MappingValue, OptionScopeValue, PartitionValue, SchemaValue,
-            SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
-            ViewValue,
+            ColumnTag, ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue,
+            GcFileValue, HeadValue, MacroValue, MappingValue, OptionScopeValue, PartitionValue,
+            SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue,
+            TableValue, TagValue, ViewValue,
         },
         read::{
             EntityRecord, read_head, scan_current_entities, scan_history_entities,
@@ -51,14 +51,10 @@ async fn session_head(
     read_head(session.handle()).await
 }
 
-/// The head a dump may key its projection lookup on without reading it:
-/// the stamp of the view a read-write handle already holds. `None` on a
-/// read-only handle, or on a writer whose view is not held — both then
-/// resolve the head through the open session, as they always have.
-///
-/// Only ever a lookup key. A miss falls through to the session path, so
-/// rows installed under a stamp are installed under one the store told
-/// this handle, never under one inferred here.
+/// The stamp of the view a read-write handle already holds, usable as a
+/// projection lookup key without a head read. `None` on a read-only handle
+/// or a writer whose view is not held. Only a lookup key: a miss falls
+/// through to the session path.
 fn writer_head(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> {
     let Some(view) = catalog.writer_head_view() else {
         return Ok(None);
@@ -69,7 +65,7 @@ fn writer_head(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> {
 }
 
 /// Locks the shared projection state for reading, recovering a poisoned
-/// lock (folds never panic mid-flight, so the state is whole).
+/// lock.
 fn projections_read(catalog: &ReadOnlyCatalog) -> std::sync::RwLockReadGuard<'_, ProjectionCache> {
     catalog
         .projections()
@@ -95,8 +91,7 @@ pub mod inline;
 pub mod staged;
 
 // Re-exported so the ABI crate can name the record types its dumps convert
-// from, instead of mirroring them as anonymous tuples. The transaction-aware
-// dumps convert from the same types, so both share one conversion.
+// from.
 #[doc(hidden)]
 pub use crate::store::proto::{
     ColumnValue as ColumnRecord, DataFileValue as DataFileRecord,
@@ -109,15 +104,10 @@ pub use crate::store::proto::{
 };
 
 /// The store state every dump's rows stand at: the head snapshot id and
-/// batch count, or `None` on a store that has no head yet.
-///
-/// At most one point read — none at all on a read-write handle, whose
-/// held view is at head by construction. A caller holding rows it took
-/// earlier compares this against the stamp they were served at and
-/// re-dumps only on a move, which is what makes a quiet catalog cost one
-/// read per table per commit rather than per transaction. Both halves
-/// matter: a maintenance batch reuses the snapshot id while changing what
-/// a scan finds.
+/// batch count, or `None` on a store that has no head yet. A caller holding
+/// rows compares this against the stamp they were served at and re-dumps
+/// only on a move; both halves matter, since a maintenance batch reuses the
+/// snapshot id.
 #[doc(hidden)]
 pub async fn head_stamp(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> {
     if let Some(head) = writer_head(catalog)? {
@@ -132,10 +122,7 @@ pub async fn head_stamp(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> 
 
 /// The shared record set's two halves at the session head, each served
 /// from the projection cache when its stamp matches and scanned at most
-/// once otherwise — the whole point: populating DuckLake's metadata
-/// tables issues ~two dozen `dump_*` calls, and the head view derives
-/// from the same `current` half, so one head costs one scan pair however
-/// many consumers read at it.
+/// once otherwise.
 async fn entity_halves(
     catalog: &ReadOnlyCatalog,
     want_history: bool,
@@ -144,10 +131,8 @@ async fn entity_halves(
     Arc<Vec<EntityRecord>>,
     Arc<Vec<EntityRecord>>,
 )> {
-    // A read-write handle's held view is at head by construction, so a
-    // fully-served read needs neither a session nor a head read. Both
-    // halves must be held for that: a miss on either falls through, where
-    // the session resolves the head as it always has.
+    // A read-write handle's held view is at head, so a read served wholly
+    // from the cache needs neither a session nor a head read.
     if let Some(head) = writer_head(catalog)? {
         let projections = projections_read(catalog);
         if let Some(current) = projections.current_entities_at(&head) {
@@ -226,15 +211,9 @@ async fn entity_halves(
     Ok((head, current, history))
 }
 
-/// Scans `current` then `history` (through the shared record set),
-/// keeping only the records `extract` maps to `Some` — the shared engine
-/// every *versioned* entity-kind `dump_*` function below is a thin,
-/// concretely typed wrapper over.
-///
-/// `extract` borrows and clones what it keeps, so a dump copies only the
-/// rows it returns. Taking it by value would clone the whole shared record
-/// set per call, and one population of DuckLake's metadata tables issues
-/// two dozen of them.
+/// Scans `current` then `history` through the shared record set, keeping
+/// only the records `extract` maps to `Some`. `extract` borrows and clones
+/// what it keeps, so a dump copies only the rows it returns.
 async fn dump_entities<T>(
     catalog: &ReadOnlyCatalog,
     extract: impl Fn(&EntityRecord) -> Option<T>,
@@ -248,10 +227,7 @@ async fn dump_entities<T>(
 }
 
 /// As [`dump_entities`], for the unversioned kinds (statistics, tags,
-/// mappings, scheduled deletions). They are overwritten in place and
-/// never mirrored to `history` — a history record of one is refused as
-/// corruption at scan — so the `current` half holds exactly their live
-/// rows and no dump of one ever grows a `history` scan.
+/// mappings, scheduled deletions), which are never mirrored to `history`.
 async fn dump_current_entities<T>(
     catalog: &ReadOnlyCatalog,
     extract: impl Fn(&EntityRecord) -> Option<T>,
@@ -302,9 +278,8 @@ pub async fn dump_macros(catalog: &ReadOnlyCatalog) -> Result<Vec<MacroValue>> {
 }
 
 /// Every `ducklake_column_mapping` row with its embedded
-/// `ducklake_name_mapping` rows in `column_id` order. Unversioned
-/// (create-only, never mirrored), so this is always exactly the live
-/// rows.
+/// `ducklake_name_mapping` rows in `column_id` order. Unversioned, so
+/// always exactly the live rows.
 #[doc(hidden)]
 pub async fn dump_mappings(catalog: &ReadOnlyCatalog) -> Result<Vec<MappingValue>> {
     dump_current_entities(catalog, |r| match r {
@@ -367,8 +342,8 @@ pub async fn dump_sort_info(catalog: &ReadOnlyCatalog) -> Result<Vec<SortValue>>
 }
 
 /// Serves one unversioned kind from its maintained projection when the
-/// head matches; a miss derives the rows from the shared `current` half —
-/// never a scan of its own — and installs them for the next call.
+/// head matches; a miss derives the rows from the shared `current` half
+/// and installs them for the next call.
 async fn dump_projected_current<T: Clone>(
     catalog: &ReadOnlyCatalog,
     read: impl Fn(&ProjectionCache, &HeadValue) -> Option<Vec<T>>,
@@ -391,11 +366,8 @@ async fn dump_projected_current<T: Clone>(
     }
     session.finish();
 
-    // Readers serve from this too: each of these dumps covers the whole of
-    // `current`, so deriving from the shared half costs a reader exactly
-    // what the entity projection costs it. The rows are installed at the
-    // stamp the halves were served at, which may be newer than the head
-    // read above — never older, and never mismatched with the rows.
+    // Installed at the stamp the halves were served at, which may be newer
+    // than the head read above but never mismatched with the rows.
     let (served_at, current, _) = entity_halves(catalog, false).await?;
     let rows: Vec<T> = current.iter().filter_map(extract).collect();
     if let Some(head) = served_at {
@@ -404,10 +376,8 @@ async fn dump_projected_current<T: Clone>(
     Ok(rows)
 }
 
-/// Every `ducklake_table_stats` row. Unversioned (overwritten in place,
-/// never mirrored to history), so this is always exactly the live rows.
-/// Served from the maintained projection when its head matches; a fresh
-/// scan installs it otherwise.
+/// Every `ducklake_table_stats` row. Unversioned, so always exactly the
+/// live rows.
 #[doc(hidden)]
 pub async fn dump_table_stats(catalog: &ReadOnlyCatalog) -> Result<Vec<TableStatsValue>> {
     dump_projected_current(
@@ -423,8 +393,7 @@ pub async fn dump_table_stats(catalog: &ReadOnlyCatalog) -> Result<Vec<TableStat
 }
 
 /// Every `ducklake_table_column_stats` row. Unversioned, as
-/// [`dump_table_stats`], and served from the maintained projection the
-/// same way.
+/// [`dump_table_stats`].
 #[doc(hidden)]
 pub async fn dump_table_column_stats(
     catalog: &ReadOnlyCatalog,
@@ -455,10 +424,7 @@ pub async fn dump_file_column_stats(
 }
 
 /// Every `ducklake_snapshot`/`ducklake_snapshot_changes` row (merged).
-/// Snapshots are append-only and carry no begin/end lifecycle of their
-/// own — this is the full history, not a current/history split. Served
-/// from the maintained projection when its head matches; a fresh scan
-/// installs it otherwise.
+/// Snapshots are append-only, so this is the full history.
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &ReadOnlyCatalog) -> Result<Vec<SnapshotValue>> {
     if let Some(head) = writer_head(catalog)?
@@ -501,45 +467,42 @@ pub struct SchemaVersionRow {
 
 /// Every `ducklake_schema_versions` row, in `(table_id, begin_snapshot)`
 /// order: the `schema_version` records, plus the same rows still folded
-/// into snapshot records written before those records existed, plus a
-/// floor row for any table whose oldest data file predates every row it
-/// has left.
-///
-/// The last two are what a store carries out of the era when this
-/// projection was derived from snapshot records alone. Expiry deletes
-/// snapshots; DuckLake's own catalogs never delete a schema-version row
-/// for a live table, and its compaction planner reads a data file's
-/// schema version by joining `begin_snapshot` against these rows — an
-/// uncovered file makes that join yield NULL and aborts the planner
-/// before it does any work. The floor row is the repair a store whose
-/// rows are already gone needs: it carries the oldest schema version
-/// still known for the table (the current one when none is), which is
-/// also what stock DuckLake resolves for a file that old once the
-/// columns of its era have themselves expired.
+/// into older snapshot records, plus a floor row for any table whose oldest
+/// data file predates every row it has left. Every live data file must be
+/// covered: DuckLake's compaction planner joins `begin_snapshot` against
+/// these rows and aborts on a NULL.
 #[doc(hidden)]
 pub async fn dump_schema_versions(catalog: &ReadOnlyCatalog) -> Result<Vec<SchemaVersionRow>> {
-    let session = catalog.begin_read().await?;
-    let records = scan_schema_versions(session.handle()).await;
-    session.finish();
+    let records = async {
+        let session = catalog.begin_read().await?;
+        let records = scan_schema_versions(session.handle()).await;
+        session.finish();
+        records
+    };
+    let file_snapshots = dump_entities(catalog, |r| match r {
+        EntityRecord::File(v) => Some((v.table_id, v.begin_snapshot)),
+        _ => None,
+    });
+    let (records, snapshots, file_snapshots) =
+        futures::try_join!(records, dump_snapshots(catalog), file_snapshots)?;
 
     Ok(schema_version_rows_from(
-        records?,
-        &dump_snapshots(catalog).await?,
-        &dump_data_files(catalog).await?,
+        records,
+        &snapshots,
+        &file_snapshots,
     ))
 }
 
 /// The `ducklake_schema_versions` projection assembled from its three
 /// inputs: the `schema_version` records, the snapshot records that still
-/// fold the same rows in, and the data files the floor rows repair. Shared
-/// by the committed dump and the transaction-aware one, which differ only
-/// in whether those three are overlaid.
+/// fold the same rows in, and each data file's `(table_id, begin_snapshot)`
+/// for the floor rows.
 #[doc(hidden)]
 #[must_use]
 pub fn schema_version_rows_from(
     records: Vec<(u64, u64, u64)>,
     snapshots: &[SnapshotValue],
-    data_files: &[DataFileValue],
+    file_snapshots: &[(u64, u64)],
 ) -> Vec<SchemaVersionRow> {
     let mut rows: BTreeMap<(u64, u64), u64> = records
         .into_iter()
@@ -553,7 +516,7 @@ pub fn schema_version_rows_from(
                 .or_insert(snapshot.schema_version);
         }
     }
-    rows.extend(schema_version_floors(&rows, snapshots, data_files));
+    rows.extend(schema_version_floors(&rows, snapshots, file_snapshots));
 
     rows.into_iter()
         .map(
@@ -566,23 +529,21 @@ pub fn schema_version_rows_from(
         .collect()
 }
 
-/// The floor rows [`dump_schema_versions`] adds for tables whose oldest
-/// live data file sits below every row they have left: one row at that
-/// file's `begin_snapshot`, carrying the table's oldest surviving schema
-/// version, or the catalog's current one when the table has no row at
-/// all. A table whose rows are intact — every store this binary has
-/// written from the start — produces nothing here.
+/// The floor rows for tables whose oldest live data file sits below every
+/// row they have left: one row at that file's `begin_snapshot`, carrying
+/// the table's oldest surviving schema version, or the catalog's current
+/// one when the table has no row at all.
 fn schema_version_floors(
     rows: &BTreeMap<(u64, u64), u64>,
     snapshots: &[SnapshotValue],
-    data_files: &[DataFileValue],
+    file_snapshots: &[(u64, u64)],
 ) -> BTreeMap<(u64, u64), u64> {
     let mut oldest_file: BTreeMap<u64, u64> = BTreeMap::new();
-    for file in data_files {
+    for &(table_id, begin_snapshot) in file_snapshots {
         oldest_file
-            .entry(file.table_id)
-            .and_modify(|oldest| *oldest = (*oldest).min(file.begin_snapshot))
-            .or_insert(file.begin_snapshot);
+            .entry(table_id)
+            .and_modify(|oldest| *oldest = (*oldest).min(begin_snapshot))
+            .or_insert(begin_snapshot);
     }
 
     let uncovered: Vec<(u64, u64)> = oldest_file
@@ -612,9 +573,8 @@ fn schema_version_floors(
         .collect()
 }
 
-/// Every `ducklake_files_scheduled_for_deletion` row. Live bookkeeping
-/// with no temporal lifecycle: always exactly the rows awaiting physical
-/// deletion.
+/// Every `ducklake_files_scheduled_for_deletion` row: exactly the rows
+/// awaiting physical deletion.
 #[doc(hidden)]
 pub async fn dump_scheduled_deletions(catalog: &ReadOnlyCatalog) -> Result<Vec<GcFileValue>> {
     dump_current_entities(catalog, |r| match r {
@@ -641,8 +601,7 @@ pub struct TagRow {
 }
 
 /// Every `ducklake_tag` row: one per embedded entry, ended entries
-/// included — each row carries its lifecycle verbatim and DuckLake
-/// filters in SQL.
+/// included.
 #[doc(hidden)]
 pub async fn dump_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<TagRow>> {
     Ok(tag_rows_from(
@@ -654,8 +613,7 @@ pub async fn dump_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<TagRow>> {
     ))
 }
 
-/// The `ducklake_tag` rows carried by `containers`, flattened. Shared by
-/// the committed dump and the transaction-aware one.
+/// The `ducklake_tag` rows carried by `containers`, flattened.
 #[doc(hidden)]
 #[must_use]
 pub fn tag_rows_from(containers: Vec<TagValue>) -> Vec<TagRow> {
@@ -683,16 +641,14 @@ pub struct OptionRow {
     pub key: String,
     /// Option value.
     pub value: String,
-    /// The scope's name — `None` for a global option, else `"schema"` or
-    /// `"table"`, matching the vocabulary DuckLake writes and reads.
+    /// `None` for a global option, else `"schema"` or `"table"`.
     pub scope: Option<String>,
     /// The scoped object's id; `None` alongside a `None` scope.
     pub scope_id: Option<u64>,
 }
 
-/// Every stored `ducklake_metadata` row. Options carry no lifecycle —
-/// they live outside the snapshot protocol, last write wins — so this is
-/// simply what is set now.
+/// Every stored `ducklake_metadata` row: options carry no lifecycle, so
+/// this is what is set now.
 #[doc(hidden)]
 pub async fn dump_options(catalog: &ReadOnlyCatalog) -> Result<Vec<OptionRow>> {
     Ok(option_rows_from(
@@ -709,7 +665,6 @@ pub async fn dump_options(catalog: &ReadOnlyCatalog) -> Result<Vec<OptionRow>> {
 }
 
 /// The `ducklake_metadata` rows carried by `scopes`, flattened and ordered.
-/// Shared by the committed dump and the transaction-aware one.
 #[doc(hidden)]
 #[must_use]
 pub fn option_rows_from(scopes: Vec<(u64, u64, OptionScopeValue)>) -> Vec<OptionRow> {
@@ -733,8 +688,6 @@ pub fn option_rows_from(scopes: Vec<(u64, u64, OptionScopeValue)>) -> Vec<Option
                 })
         })
         .collect();
-    // A stable order: the store's map iteration is not one callers should
-    // depend on, and DuckLake reads these back by key.
     rows.sort_by(|a, b| (&a.scope, a.scope_id, &a.key).cmp(&(&b.scope, b.scope_id, &b.key)));
     rows
 }
@@ -757,51 +710,83 @@ pub struct ColumnTagRow {
     pub value: String,
 }
 
-/// The `ducklake_column_tag` rows carried by `columns`, flattened. Shared by
-/// the committed dump and the transaction-aware one.
+/// The tags one column record carries, with what places the record among
+/// its column's versions.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnTags {
+    /// The owning table.
+    pub table_id: u64,
+    /// The tagged column.
+    pub column_id: u64,
+    /// Snapshot at which this column record was superseded, if it has been.
+    pub end_snapshot: Option<u64>,
+    /// The record's tags.
+    pub tags: Vec<ColumnTag>,
+}
+
+impl From<&ColumnValue> for ColumnTags {
+    fn from(column: &ColumnValue) -> Self {
+        Self {
+            table_id: column.table_id,
+            column_id: column.column_id,
+            end_snapshot: column.end_snapshot,
+            tags: column.tags.clone(),
+        }
+    }
+}
+
+/// The `ducklake_column_tag` rows carried by `columns`, flattened.
 #[doc(hidden)]
 #[must_use]
-pub fn column_tag_rows_from(columns: &[ColumnValue]) -> Vec<ColumnTagRow> {
-    let mut latest: std::collections::BTreeMap<(u64, u64), &ColumnValue> =
-        std::collections::BTreeMap::new();
+pub fn column_tag_rows_from(columns: impl IntoIterator<Item = ColumnTags>) -> Vec<ColumnTagRow> {
+    let mut latest: BTreeMap<(u64, u64), ColumnTags> = BTreeMap::new();
     for column in columns {
-        let entry = latest
-            .entry((column.table_id, column.column_id))
-            .or_insert(column);
-        // Later than the incumbent: live beats ended, higher end beats
-        // lower.
-        let newer = match (column.end_snapshot, entry.end_snapshot) {
-            (None, _) => true,
-            (Some(_), None) => false,
-            (Some(a), Some(b)) => a > b,
-        };
-        if newer {
-            *entry = column;
+        match latest.entry((column.table_id, column.column_id)) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(column);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                // Later than the incumbent: live beats ended, higher end
+                // beats lower.
+                let newer = match (column.end_snapshot, entry.get().end_snapshot) {
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                    (Some(a), Some(b)) => a > b,
+                };
+                if newer {
+                    entry.insert(column);
+                }
+            }
         }
     }
 
     latest
         .into_values()
         .flat_map(|column| {
-            column.tags.iter().map(|t| ColumnTagRow {
+            column.tags.into_iter().map(move |t| ColumnTagRow {
                 table_id: column.table_id,
                 column_id: column.column_id,
                 begin_snapshot: t.begin_snapshot,
                 end_snapshot: t.end_snapshot,
-                key: t.key.clone(),
-                value: t.value.clone(),
+                key: t.key,
+                value: t.value,
             })
         })
         .collect()
 }
 
-/// Every `ducklake_column_tag` row. Entries are authoritative on each
-/// column's latest record (a version transition carries them forward),
-/// so rows are emitted from that record only — emitting from every
-/// version would duplicate them.
+/// Every `ducklake_column_tag` row, emitted from each column's latest
+/// record only, which carries the authoritative entries.
 #[doc(hidden)]
 pub async fn dump_column_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<ColumnTagRow>> {
-    Ok(column_tag_rows_from(&dump_columns(catalog).await?))
+    let columns = dump_entities(catalog, |r| match r {
+        EntityRecord::Column(v) => Some(ColumnTags::from(v)),
+        _ => None,
+    })
+    .await?;
+
+    Ok(column_tag_rows_from(columns))
 }
 
 /// One `ducklake_macro_impl` row, flattened from its macro's record.
@@ -820,9 +805,7 @@ pub struct MacroImplRow {
     pub macro_type: String,
 }
 
-/// The `MacroImpl` rows carried by `parents`, flattened. Shared by the
-/// committed dump and the transaction-aware one, so a staged parent's rows
-/// and a committed one's are shaped by the same code.
+/// The `MacroImpl` rows carried by `parents`, flattened.
 #[doc(hidden)]
 #[must_use]
 pub fn macro_impl_rows_from(parents: Vec<MacroValue>) -> Vec<MacroImplRow> {
@@ -871,9 +854,7 @@ pub struct MacroParameterRow {
     pub default_value_type: String,
 }
 
-/// The `MacroParameter` rows carried by `parents`, flattened. Shared by the
-/// committed dump and the transaction-aware one, so a staged parent's rows
-/// and a committed one's are shaped by the same code.
+/// The `MacroParameter` rows carried by `parents`, flattened.
 #[doc(hidden)]
 #[must_use]
 pub fn macro_parameter_rows_from(parents: Vec<MacroValue>) -> Vec<MacroParameterRow> {
@@ -923,9 +904,7 @@ pub struct NameMappingRow {
     pub is_partition: bool,
 }
 
-/// The `NameMapping` rows carried by `parents`, flattened. Shared by the
-/// committed dump and the transaction-aware one, so a staged parent's rows
-/// and a committed one's are shaped by the same code.
+/// The `NameMapping` rows carried by `parents`, flattened.
 #[doc(hidden)]
 #[must_use]
 pub fn name_mapping_rows_from(parents: Vec<MappingValue>) -> Vec<NameMappingRow> {
@@ -970,9 +949,7 @@ pub struct PartitionColumnRow {
     pub transform: String,
 }
 
-/// The `PartitionColumn` rows carried by `parents`, flattened. Shared by the
-/// committed dump and the transaction-aware one, so a staged parent's rows
-/// and a committed one's are shaped by the same code.
+/// The `PartitionColumn` rows carried by `parents`, flattened.
 #[doc(hidden)]
 #[must_use]
 pub fn partition_column_rows_from(parents: Vec<PartitionValue>) -> Vec<PartitionColumnRow> {
@@ -1018,9 +995,7 @@ pub struct FilePartitionValueRow {
     pub partition_value: String,
 }
 
-/// The `FilePartitionValue` rows carried by `parents`, flattened. Shared by the
-/// committed dump and the transaction-aware one, so a staged parent's rows
-/// and a committed one's are shaped by the same code.
+/// The `FilePartitionValue` rows carried by `parents`, flattened.
 #[doc(hidden)]
 #[must_use]
 pub fn file_partition_value_rows_from(parents: Vec<DataFileValue>) -> Vec<FilePartitionValueRow> {
@@ -1070,9 +1045,7 @@ pub struct SortExpressionRow {
     pub null_order: String,
 }
 
-/// The `SortExpression` rows carried by `parents`, flattened. Shared by the
-/// committed dump and the transaction-aware one, so a staged parent's rows
-/// and a committed one's are shaped by the same code.
+/// The `SortExpression` rows carried by `parents`, flattened.
 #[doc(hidden)]
 #[must_use]
 pub fn sort_expression_rows_from(parents: Vec<SortValue>) -> Vec<SortExpressionRow> {
@@ -1219,10 +1192,8 @@ mod tests {
         catalog
     }
 
-    /// The stamp a holder of dumped rows compares against: it stands still
-    /// while nothing commits, and moves for every batch — a snapshot-
-    /// minting one and an option write that reuses the id alike, which is
-    /// why both halves cross the ABI.
+    /// The head stamp stands still while nothing commits and moves for
+    /// every batch, snapshot-minting or not.
     #[tokio::test]
     async fn the_head_stamp_moves_for_every_batch() {
         use crate::catalog::OptionScope;
@@ -1353,11 +1324,7 @@ mod tests {
         matches!(outcome, Err(crate::error::Error::Migration(_)))
     }
 
-    /// A migration is moving keys as these functions scan, so each must be
-    /// unavailable rather than serve a catalog with a hole in it. The
-    /// `dump_*` and inline seams scan the store directly instead of
-    /// through a materialization, so the read-session gate is the only
-    /// thing standing between them and a silently shrinking view.
+    /// Every dump refuses a store undergoing a migration.
     #[tokio::test]
     async fn a_planted_marker_refuses_every_read_seam() {
         let store: Arc<InMemory> = Arc::new(InMemory::new());
@@ -1414,10 +1381,7 @@ mod tests {
     }
 
     /// Expires every snapshot below the head and, when `records`, the
-    /// schema-version records too — the two DELETE streams DuckLake's
-    /// expiry and dead-table cleanup issue, staged the way DuckLake stages
-    /// them. Dropping the records models a store written before they
-    /// existed.
+    /// schema-version records too, staged the way DuckLake stages them.
     async fn expire_snapshots_below_head(catalog: &Catalog, records: bool) {
         use crate::transaction::staged::{Cell, RowOperation, TableKind};
 

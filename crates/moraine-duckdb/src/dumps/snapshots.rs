@@ -36,16 +36,14 @@ pub struct MoraineSnapshotRow {
     pub commit_extra_info: *mut c_char,
 }
 
-/// Converts snapshot records to C rows, owned-first (see
-/// `moraine_dump_schemas`): every string in the whole batch converts
-/// before any raw pointer is minted.
+/// Converts snapshot records to C rows.
 pub(crate) fn snapshot_rows(
     rows: Vec<moraine::ffi_support::SnapshotRecord>,
 ) -> Result<Vec<MoraineSnapshotRow>, AbiError> {
     let owned = rows
         .into_iter()
-        .map(|v| {
-            let changes_made = to_c_string(&v.changes_made)?;
+        .map(|mut v| {
+            let changes_made = to_c_string(std::mem::take(&mut v.changes_made))?;
             let author = opt_c_string(v.author.as_deref())?;
             let commit_message = opt_c_string(v.commit_message.as_deref())?;
             let commit_extra_info = opt_c_string(v.commit_extra_info.as_deref())?;
@@ -99,7 +97,7 @@ pub unsafe extern "C" fn moraine_dump_snapshots(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_snapshots(catalog)),
+            moraine::ffi_support::dump_snapshots,
             snapshot_rows,
         )
     }
@@ -186,7 +184,7 @@ pub unsafe extern "C" fn moraine_dump_schema_versions(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_schema_versions(catalog)),
+            moraine::ffi_support::dump_schema_versions,
             schema_version_rows,
         )
     }

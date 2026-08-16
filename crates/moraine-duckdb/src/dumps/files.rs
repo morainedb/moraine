@@ -70,13 +70,11 @@ pub struct MoraineDataFileRow {
 pub(crate) fn data_file_rows(
     rows: Vec<moraine::ffi_support::DataFileRecord>,
 ) -> Result<Vec<MoraineDataFileRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|v| {
-            let path = to_c_string(&v.path)?;
-            let file_format = to_c_string(&v.file_format)?;
+        .map(|mut v| {
+            let path = to_c_string(std::mem::take(&mut v.path))?;
+            let file_format = to_c_string(std::mem::take(&mut v.file_format))?;
             let encryption_key = opt_c_string(v.encryption_key.as_deref())?;
             Ok((v, path, file_format, encryption_key))
         })
@@ -148,7 +146,7 @@ pub unsafe extern "C" fn moraine_dump_data_files(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_data_files(catalog)),
+            moraine::ffi_support::dump_data_files,
             data_file_rows,
         )
     }
@@ -214,13 +212,11 @@ pub struct MoraineDeleteFileRow {
 pub(crate) fn delete_file_rows(
     rows: Vec<moraine::ffi_support::DeleteFileRecord>,
 ) -> Result<Vec<MoraineDeleteFileRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|v| {
-            let path = to_c_string(&v.path)?;
-            let format = to_c_string(&v.format)?;
+        .map(|mut v| {
+            let path = to_c_string(std::mem::take(&mut v.path))?;
+            let format = to_c_string(std::mem::take(&mut v.format))?;
             let encryption_key = opt_c_string(v.encryption_key.as_deref())?;
             Ok((v, path, format, encryption_key))
         })
@@ -279,7 +275,7 @@ pub unsafe extern "C" fn moraine_dump_delete_files(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_delete_files(catalog)),
+            moraine::ffi_support::dump_delete_files,
             delete_file_rows,
         )
     }
@@ -327,12 +323,10 @@ pub struct MoraineFilePartitionValueRow {
 pub(crate) fn file_partition_value_rows(
     rows: Vec<moraine::ffi_support::FilePartitionValueRow>,
 ) -> Result<Vec<MoraineFilePartitionValueRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|row| {
-            let partition_value = to_c_string(&row.partition_value)?;
+        .map(|mut row| {
+            let partition_value = to_c_string(std::mem::take(&mut row.partition_value))?;
             Ok((row, partition_value))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -377,11 +371,7 @@ pub unsafe extern "C" fn moraine_dump_file_partition_values(
             probe,
             probe_ctx,
             err,
-            |catalog| {
-                Box::pin(moraine::ffi_support::dump_file_partition_value_rows(
-                    catalog,
-                ))
-            },
+            moraine::ffi_support::dump_file_partition_value_rows,
             file_partition_value_rows,
         )
     }
@@ -426,12 +416,10 @@ pub struct MoraineScheduledDeletionRow {
 pub(crate) fn scheduled_deletion_rows(
     rows: Vec<moraine::ffi_support::GcFileRecord>,
 ) -> Result<Vec<MoraineScheduledDeletionRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|row| {
-            let path = to_c_string(&row.path)?;
+        .map(|mut row| {
+            let path = to_c_string(std::mem::take(&mut row.path))?;
             Ok((row, path))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -475,7 +463,7 @@ pub unsafe extern "C" fn moraine_dump_scheduled_deletions(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_scheduled_deletions(catalog)),
+            moraine::ffi_support::dump_scheduled_deletions,
             scheduled_deletion_rows,
         )
     }

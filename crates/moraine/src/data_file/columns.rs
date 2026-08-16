@@ -77,8 +77,7 @@ pub(super) fn projection(
     Ok((mask, indexed_output, row_id_output))
 }
 
-/// Unique Arrow positions needed by every index plan, sorted for stable
-/// Parquet projection and cheap remapping.
+/// Unique Arrow positions needed by every index plan, sorted.
 pub(super) fn index_positions(projections: &[IndexProjection]) -> Vec<usize> {
     let mut positions: Vec<_> = projections
         .iter()
@@ -90,7 +89,8 @@ pub(super) fn index_positions(projections: &[IndexProjection]) -> Vec<usize> {
 }
 
 /// Remaps plans from source-schema positions to columns in a projected
-/// `RecordBatch`. This runs once per reader, never once per row.
+/// `RecordBatch`, refusing a plan whose directions or null orders do not
+/// pair one-to-one with its positions.
 pub(super) fn remap_index_projections(
     projections: Vec<IndexProjection>,
     source_positions: &[usize],
@@ -98,38 +98,31 @@ pub(super) fn remap_index_projections(
 ) -> Result<Vec<IndexProjection>> {
     projections
         .into_iter()
-        .map(|projection| {
-            let IndexProjection {
-                index_id,
-                unique,
-                positions,
-                directions,
-                nulls,
-                ..
-            } = projection;
-            let positions = positions
-                .iter()
-                .map(|position| {
-                    let source = source_positions.binary_search(position).map_err(|_| {
-                        Error::Corruption(
-                            "scoped read: index column vanished from projection".to_owned(),
-                        )
-                    })?;
-                    output_positions.get(source).copied().ok_or_else(|| {
-                        Error::Corruption(
-                            "scoped read: projected index column has no output".to_owned(),
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+        .map(|mut projection| {
+            let columns = projection.positions.len();
+            if projection.directions.len() != columns || projection.nulls.len() != columns {
+                return Err(Error::Corruption(format!(
+                    "scoped read: index {} names {columns} columns but {} directions and {} \
+                     null orders",
+                    projection.index_id,
+                    projection.directions.len(),
+                    projection.nulls.len()
+                )));
+            }
+            for position in &mut projection.positions {
+                let source = source_positions.binary_search(position).map_err(|_| {
+                    Error::Corruption(
+                        "scoped read: index column vanished from projection".to_owned(),
+                    )
+                })?;
+                *position = output_positions.get(source).copied().ok_or_else(|| {
+                    Error::Corruption(
+                        "scoped read: projected index column has no output".to_owned(),
+                    )
+                })?;
+            }
 
-            Ok(IndexProjection {
-                index_id,
-                unique,
-                positions,
-                directions,
-                nulls,
-            })
+            Ok(projection)
         })
         .collect()
 }

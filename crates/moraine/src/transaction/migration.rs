@@ -2,16 +2,11 @@
 //! carries a store from one `sys/format` version to the next.
 //!
 //! A migration runs as start, steps, finish. The start batch writes the
-//! `sys/migration` marker, which makes every reader refuse the store while
-//! its keyspace is in motion. Each step batch stages one bounded piece of
-//! the rewrite together with the cursor that records it, so a crash resumes
-//! from exactly what is durable and never from more. The finish batch flips
-//! `sys/format` and clears the marker together, so no reopen can see the new
-//! format with the marker still present.
-//!
-//! Migrations are named `v_n → v_{n+1}` units. A multi-version jump is their
-//! composition, each link running its own start, steps, and finish, so there
-//! is no bespoke multi-version path to write or test.
+//! `sys/migration` marker, which makes every reader refuse the store. Each
+//! step batch stages one bounded piece of the rewrite together with the
+//! cursor that records it. The finish batch flips `sys/format` and clears
+//! the marker together. A multi-version jump composes `v_n → v_{n+1}`
+//! units, each running its own start, steps, and finish.
 
 use futures::future::BoxFuture;
 use slatedb::{Db, DbTransaction, IsolationLevel};
@@ -43,19 +38,14 @@ pub(crate) struct StepProgress {
 }
 
 /// A unit's step: stages one bounded batch of its rewrite into `tx`,
-/// resuming at `cursor` (empty at the start of the walk).
-///
-/// A step must write the new-format keys it produces **before** deleting the
-/// old-format keys they supersede, and must be idempotent — re-running it at
-/// or before the cursor converges rather than duplicating. The driver commits
-/// the batch and advances the durable cursor; the step commits nothing
-/// itself.
+/// resuming at `cursor` (empty at the start of the walk). A step must be
+/// idempotent, must write new-format keys before deleting the old-format
+/// keys they supersede, and commits nothing itself.
 type StepFn = for<'a> fn(&'a DbTransaction, &'a [u8]) -> BoxFuture<'a, Result<StepOutcome>>;
 
-/// One `v_n → v_{n+1}` structural rewrite: a named unit with its own step
-/// logic and its own tests, composed with its neighbours for a longer jump.
+/// One `v_n → v_{n+1}` structural rewrite.
 pub(crate) struct MigrationUnit {
-    /// Stable name, carried into logs and into the report.
+    /// Stable name, carried into logs and the report.
     pub(crate) name: &'static str,
     /// The format this unit reads.
     pub(crate) from_format: u64,
@@ -66,21 +56,11 @@ pub(crate) struct MigrationUnit {
 }
 
 /// Every structural migration this binary ships, in ascending order.
-///
-/// Empty, and correctly so: every format to date is additive — it adds a
-/// subspace without moving a key that already exists — so the lazy stamp
-/// carries it and there is no keyspace to rewrite. The first format that
-/// moves an existing key adds the first entry here, and inherits the
-/// start/step/finish protocol below already built and tested.
+/// Empty: every format to date is additive, so no keyspace is rewritten.
 pub(crate) const MIGRATIONS: &[MigrationUnit] = &[];
 
 /// The units a call plans over: everything this binary ships, plus whatever
 /// a fault-injection build installed.
-///
-/// One seam, consulted by the planner itself, so a test with a unit to drive
-/// exercises the shipped planner rather than a parallel copy of it. A
-/// production build's `installed_migrations` is the empty slice, so this is
-/// [`MIGRATIONS`] and nothing else.
 fn registry() -> Vec<&'static MigrationUnit> {
     MIGRATIONS
         .iter()
@@ -100,7 +80,7 @@ pub struct MigrationReport {
     /// The units run, in the order they ran.
     pub units_run: Vec<String>,
     /// Whether the call resumed a migration a previous run left partly
-    /// applied, rather than starting from a clean store.
+    /// applied.
     pub resumed: bool,
 }
 
@@ -111,21 +91,13 @@ struct Plan {
     resume: Option<Vec<u8>>,
 }
 
-/// The unit that reads `format`, if this binary carries one.
-fn unit_from(format: u64) -> Option<&'static MigrationUnit> {
-    registry()
-        .into_iter()
-        .find(|unit| unit.from_format == format)
-}
-
 /// The chain of units carrying `format` as far as this binary can take it.
-/// Stops at the first version no unit reads, which is the newest this binary
-/// migrates to.
 fn chain_from(format: u64) -> Vec<&'static MigrationUnit> {
+    let registry = registry();
     let mut units = Vec::new();
     let mut format = format;
-    while let Some(unit) = unit_from(format) {
-        units.push(unit);
+    while let Some(unit) = registry.iter().find(|unit| unit.from_format == format) {
+        units.push(*unit);
         format = unit.to_format;
     }
     units
@@ -141,9 +113,8 @@ fn plan(format: u64, marker: Option<&proto::MigrationValue>) -> Result<Plan> {
         });
     };
 
-    // The finish batch flips the format and clears the marker together, so a
-    // marker naming any other source format is torn state no step of the
-    // protocol can produce.
+    // The finish batch flips the format and clears the marker together, so
+    // no protocol step can produce a marker naming another source format.
     if marker.from_format != format {
         return Err(Error::Corruption(format!(
             "store is stamped format {format} but carries a migration marker from format {} \
@@ -205,8 +176,7 @@ async fn start(db: &Db, unit: &MigrationUnit) -> Result<()> {
     Ok(())
 }
 
-/// The finish batch: the format flip and the marker clear, together. Until
-/// it lands the store is coherently old; after it lands, coherently new.
+/// The finish batch: the format flip and the marker clear, together.
 async fn finish(db: &Db, unit: &MigrationUnit) -> Result<()> {
     let tx = db
         .begin(IsolationLevel::Snapshot)
@@ -267,8 +237,7 @@ async fn run_unit(db: &Db, unit: &MigrationUnit, resume: Option<Vec<u8>>) -> Res
             break;
         };
 
-        // The cursor advances in the same batch as the rewrite it records,
-        // so it never claims more progress than is durable.
+        // The cursor advances in the same batch as the rewrite it records.
         let mut staged = match stage_marker(&tx, unit, &next) {
             Ok(staged) => staged,
             Err(error) => {
@@ -294,11 +263,8 @@ async fn run_unit(db: &Db, unit: &MigrationUnit, resume: Option<Vec<u8>>) -> Res
 
 /// Migrates `db` as far as this binary can carry it, resuming an interrupted
 /// migration if the marker says one is in flight. A store already at the
-/// newest format this binary knows is left untouched and reported as such.
-///
-/// The caller owns the writer: SlateDB's epoch fencing means exactly one
-/// migrator runs, by the same guarantee that makes a second catalog writer
-/// safe.
+/// newest format is left untouched and reported as such. Epoch fencing on
+/// the writer means exactly one migrator runs.
 pub(crate) async fn run(db: &Db) -> Result<MigrationReport> {
     let tx = db
         .begin(IsolationLevel::Snapshot)

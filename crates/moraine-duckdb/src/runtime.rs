@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use futures::future::join_all;
 use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog, TableId};
 use object_store::ObjectStore;
 use tokio::{
@@ -33,40 +34,31 @@ pub type MoraineInterruptProbe = Option<unsafe extern "C" fn(probe_ctx: *mut c_v
 const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// An attached catalog: owns the tokio runtime created at `ATTACH` and
-/// the [`Catalog`] handle opened on it.
+/// the [`Catalog`] handle opened on it. Every FFI entry point `block_on`s
+/// through `runtime`.
 ///
 /// Opaque to C — only ever seen as a `MoraineCatalogHandle*` obtained
 /// from [`moraine_attach`](crate::abi::moraine_attach) and released via
 /// [`moraine_detach`](crate::abi::moraine_detach).
-///
-/// Every FFI entry point `block_on`s through `runtime`; nothing in
-/// `moraine` core ever blocks on itself.
 pub struct MoraineCatalogHandle {
     pub(crate) runtime: Runtime,
     pub(crate) catalog: AttachedCatalog,
-    /// Routes this handle's `tracing` events to its registered log sink:
-    /// the runtime's worker threads carry it for life, and the `block_on`
-    /// wrappers below tag the calling thread with it per call.
+    /// Routes this handle's `tracing` events to its registered log sink.
     pub(crate) log_id: HandleId,
-    /// The `DATA_PATH` object store, resolved at attach from `META_DATA_PATH`.
-    /// Present only when that option was given; index maintenance and
-    /// scoped-read backfill need it, and are skipped when it is absent.
+    /// The `DATA_PATH` object store, present only when `META_DATA_PATH`
+    /// was given; index maintenance and scoped reads are skipped without it.
     pub(crate) data_store: Option<Arc<dyn ObjectStore>>,
     /// The bucket-relative key prefix of `DATA_PATH` (empty for a local or
     /// bare-bucket store), prepended to a data file's stored path.
     pub(crate) data_prefix: String,
-    /// Row-summary warming spawned by the attach and by each commit that
-    /// registers data files. Ended by [`finish_warming`](
-    /// MoraineCatalogHandle::finish_warming) before the catalog closes, so
-    /// a close never races an in-flight scoped read.
+    /// In-flight row-summary warming passes; ended by
+    /// [`finish_warming`](MoraineCatalogHandle::finish_warming) before the
+    /// catalog closes.
     warming: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// Which mode the attach opened in. The core types the two apart, so a
-/// mutator is unavailable on the read-only one at compile time; this is
-/// where that meets a C ABI with one handle type and no types of its own,
-/// and a write on a read-only attach becomes a runtime refusal again —
-/// [`AttachedCatalog::writer`] is the single place that happens.
+/// Which mode the attach opened in. A write on a read-only attach is
+/// refused at runtime by [`AttachedCatalog::writer`].
 pub(crate) enum AttachedCatalog {
     Writer(Catalog),
     Reader(ReadOnlyCatalog),
@@ -143,13 +135,13 @@ impl MoraineCatalogHandle {
                 .warm_selected_row_summaries(data_store, &data_prefix, tables)
                 .await
             {
-                warn!(%error, "row summary warming skipped this attach");
+                warn!(%error, "row summary warming skipped this commit");
             }
         }));
     }
 
-    /// Retains `task` so a detach can end it, dropping the passes that have
-    /// already finished — a long insert session spawns one per commit.
+    /// Retains `task` so a detach can end it, dropping already-finished
+    /// passes.
     fn track(&self, task: JoinHandle<()>) {
         let Ok(mut warming) = self.warming.lock() else {
             return;
@@ -159,11 +151,8 @@ impl MoraineCatalogHandle {
     }
 
     /// Cancels the warming passes still in flight and waits for them to
-    /// end, reporting how many were outstanding.
-    ///
-    /// Warming holds a catalog handle of its own, so this must precede the
-    /// close: a cancelled pass loses only cache, where one still reading
-    /// when the store shuts under it would not.
+    /// end, reporting how many were outstanding. Must precede the close:
+    /// warming holds a catalog handle of its own.
     pub(crate) fn finish_warming(&self) -> usize {
         let tasks = match self.warming.lock() {
             Ok(mut warming) => std::mem::take(&mut *warming),
@@ -174,10 +163,8 @@ impl MoraineCatalogHandle {
             task.abort();
         }
         let outstanding = tasks.len();
-        for task in tasks {
-            // A cancelled pass reports `JoinError`, which is the ask here.
-            let _ = self.runtime.block_on(task);
-        }
+        // A cancelled pass reports `JoinError`, which is the ask here.
+        let _ = self.runtime.block_on(join_all(tasks));
 
         outstanding
     }
@@ -213,13 +200,9 @@ impl MoraineCatalogHandle {
     }
 }
 
-/// Runs `future` on `runtime` unless `probe` cancels it first — the whole
-/// of the cancellation seam, shared by every cancellable entry point.
-///
-/// Cancellation is per **call**, not per handle: the probe and its context
-/// come from the caller, and each in-flight call selects over its own. Two
-/// concurrent reads on one handle therefore cancel independently, and
-/// neither can consume the other's signal.
+/// Runs `future` on `runtime` unless `probe` cancels it first. Cancellation
+/// is per call, not per handle: concurrent calls on one handle cancel
+/// independently.
 ///
 /// # Safety
 ///
@@ -234,10 +217,8 @@ pub(crate) unsafe fn block_on_cancellable_in<T, E>(
 where
     AbiError: From<E>,
 {
-    // Checked before the future is first polled, not left to the interval
-    // below: a timer's first tick is pending at the poll level even when
-    // already elapsed, and a future that completes on its first poll would
-    // otherwise win over a pending interrupt.
+    // Checked before the first poll: a future that completes immediately
+    // must not win over an already-pending interrupt.
     if let Some(probe) = probe {
         // SAFETY: caller contract — `probe` is callable with `probe_ctx`
         // for the duration of this call.
@@ -273,10 +254,8 @@ where
 }
 
 /// How long a cancelled attach waits for its abandoned runtime to wind
-/// down before abandoning it in turn. An interrupted open drops a
-/// half-built store whose background tasks may still be mid-request, and
-/// a plain runtime drop blocks until every one of them finishes — turning
-/// a cancellation into exactly the hang it was meant to escape.
+/// down before abandoning it in turn; a plain runtime drop would block on
+/// the half-built store's background tasks.
 pub(crate) const CANCELLED_ATTACH_SHUTDOWN: Duration = Duration::from_secs(5);
 
 /// A materialized snapshot view, held across the FFI boundary so
@@ -295,45 +274,25 @@ impl MoraineSnapshotHandle {
     }
 }
 
-/// The fewest workers an attached catalog's runtime may have.
-///
-/// Two, not one: a CPU-bound poll (an SST decode on a large catalog) holds
-/// its worker to completion, and SlateDB's flush and compaction must
-/// progress while it does or durability stalls behind a scan. That is the
-/// same reason the runtime is multi-threaded at all, so it is the floor
-/// rather than a tuning knob.
+/// The fewest workers an attached catalog's runtime may have. Must stay
+/// at least two: a CPU-bound poll must not stall SlateDB's flush and
+/// compaction.
 const MIN_WORKER_THREADS: usize = 2;
 
 /// The most workers an attached catalog's runtime may have, however many
 /// threads the host asks for.
-///
-/// The pool's work is object-store round trips, which yield their worker
-/// at every await: a four-worker runtime absorbs thirty-two concurrent
-/// materializations with a flat batch time (`BENCHMARK.md` → Core
-/// measurements). Past a handful, further workers only park — and they
-/// park in addition to the host's own threads, on cores the host already
-/// sized itself to.
 const MAX_WORKER_THREADS: usize = 8;
 
 /// The worker count for a host that asks for `requested` threads of its
 /// own, or the [floor](MIN_WORKER_THREADS) if it asks for nothing.
-///
-/// The host's thread setting is the only number in the process that says
-/// how much parallelism the operator wanted, so a session pinned to one
-/// thread does not get a catalog pool sized to the machine.
 pub(crate) fn worker_threads(requested: usize) -> usize {
     requested.clamp(MIN_WORKER_THREADS, MAX_WORKER_THREADS)
 }
 
-/// Builds the one multi-threaded tokio runtime an attached catalog owns
-/// for the lifetime of its handle, sized for a host running `requested`
-/// threads of its own (`0` when the host does not say). Worker threads
-/// exist only to run that handle's work, so each is tagged with `log_id`
-/// at spawn — every event they emit routes to the handle's log sink.
-///
-/// The size is fixed at attach. A host that changes its own thread count
-/// later keeps the pool it attached with, which is the trade for never
-/// rebuilding a runtime that owns live background tasks.
+/// Builds the multi-threaded tokio runtime an attached catalog owns for
+/// the lifetime of its handle, sized for a host running `requested`
+/// threads of its own (`0` when the host does not say). Each worker is
+/// tagged with `log_id` at spawn. The size is fixed at attach.
 pub(crate) fn new_runtime(log_id: HandleId, requested: usize) -> std::io::Result<Runtime> {
     Builder::new_multi_thread()
         .worker_threads(worker_threads(requested))
@@ -350,8 +309,7 @@ mod tests {
         test_support::{TempDir, attach_ok, attach_with_data_path},
     };
 
-    /// A scoped read needs the `DATA_PATH` store, so an attach without one
-    /// spawns no warming rather than a pass that could read nothing.
+    /// An attach without a `DATA_PATH` store spawns no warming.
     #[test]
     fn an_attach_without_a_data_path_store_spawns_no_warming() {
         let lake = TempDir::new("warm-no-store");
@@ -377,8 +335,7 @@ mod tests {
         unsafe { moraine_detach(handle) };
     }
 
-    /// Detach ends the warming it spawned before closing the store, so a
-    /// close never races an in-flight scoped read — and never hangs on one.
+    /// Detach ends the warming it spawned before closing the store.
     #[test]
     fn detaching_ends_the_warming_the_attach_spawned() {
         let lake = TempDir::new("warm-detach");
@@ -390,9 +347,7 @@ mod tests {
     }
 
     /// The pool tracks the host between the floor and the ceiling, and is
-    /// never single-threaded — a one-worker runtime would let a CPU-bound
-    /// poll stall SlateDB's flush, which is the whole reason the runtime
-    /// is multi-threaded.
+    /// never single-threaded.
     #[test]
     fn the_worker_pool_tracks_the_host_between_its_floor_and_ceiling() {
         assert_eq!(

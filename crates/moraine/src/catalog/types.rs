@@ -642,31 +642,17 @@ pub struct IndexEntry {
 
 impl IndexEntry {
     /// What this entry will weigh on a batch, key and value together,
-    /// assuming no byte needs escaping.
-    ///
-    /// Nominal because it is wanted *before* the key is encoded, to decide
-    /// how many entries a step may carry. Escaping can make the staged
-    /// entry up to twice this; nothing can make it smaller.
+    /// before escaping; escaping can make the staged entry up to twice
+    /// this, never smaller.
     pub(crate) fn nominal_bytes(&self) -> u64 {
         crate::store::key::index_entry_bytes(&self.values)
     }
 }
 
 /// How much one step of a staged index build may commit. A step ends at
-/// whichever bound it reaches first, and always carries at least one entry
-/// so a bound below a single entry's size still makes progress.
-///
-/// The two bounds answer to different limits. `entries` is memory: the
-/// store's write path holds roughly a kilobyte per staged entry, so a step
-/// of a million peaks near a gigabyte. `bytes` is transfer: the batch
-/// reaches object storage as a single request, which has to complete
-/// inside the store client's timeout, and a batch too large to push in
-/// that window is retried forever rather than failing.
-///
-/// At the defaults the byte bound always wins — an entry costs at least 19
-/// bytes, so 8 MiB admits at most ~440,000 of them. `entries` earns its
-/// place under a *raised* `bytes`, where it is what keeps a step sized for
-/// a fast link from becoming a memory bomb.
+/// whichever bound it reaches first, and always carries at least one
+/// entry. `entries` bounds memory; `bytes` bounds the single object-store
+/// request a batch becomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildStep {
     /// Entries per step.
@@ -697,13 +683,10 @@ impl Default for BuildStep {
 
 /// A column definition: the input to table creation and column addition.
 ///
-/// A nested type is a *tree*, not a type string to parse: the parent carries
+/// A nested type is a tree, not a type string to parse: the parent carries
 /// DuckLake's marker (`"STRUCT"`, `"LIST"`, `"MAP"`) as its
 /// [`column_type`](Self::column_type) and its fields as
-/// [`children`](Self::children). That is exactly the shape DuckLake itself
-/// authors over the staged-row path — a parent row plus one row per field —
-/// so both paths write the same records, and moraine never has to parse a
-/// SQL type string to find out what a column contains.
+/// [`children`](Self::children).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ColumnDef {
     /// Column name, unique among its **siblings**: DuckLake scopes a nested
@@ -805,9 +788,7 @@ pub struct ScheduledDeletion {
 /// data-file registration performs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineChunk {
-    /// The catalog schema version the body's columns match. Chunks are
-    /// decoded against their own version's schema, so evolving the table
-    /// never rewrites an existing chunk.
+    /// The catalog schema version the body's columns match.
     pub schema_version: u64,
     /// The Arrow IPC schema-only stream for `schema_version`. Written once
     /// per version; a chunk for a version already recorded may repeat it
@@ -826,9 +807,8 @@ pub struct InlineChunk {
 /// read finds them in the file rather than in the drained chunks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushedDataFile {
-    /// The written file. Its rows are already counted in the table's
-    /// statistics from when they were inlined, so registering it adds only
-    /// its bytes.
+    /// The written file. Registering it adds only its bytes to the table's
+    /// statistics; its rows were counted when inlined.
     pub file: DataFile,
     /// The first row id the file carries — preserved from the inlined
     /// rows, never reallocated.
@@ -847,8 +827,7 @@ pub struct FlushedDataFile {
 
 /// One inlined row, with the Arrow IPC bytes a caller needs to decode it.
 /// Rows of one chunk share one `chunk_body`, and rows of one schema
-/// version share one `arrow_schema`, so a scan carries each set of bytes
-/// once however many rows reference it.
+/// version share one `arrow_schema`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentRow {
     /// The row's dense id.
@@ -894,16 +873,14 @@ mod tests {
     use super::*;
 
     proptest! {
-        /// The catalog persists a timestamp as its microsecond count and the
-        /// ABI carries the same count, so the conversion has to be total in
-        /// both directions — no clamping, no error path, pre-epoch included.
+        /// The micros conversion is total in both directions, pre-epoch
+        /// included.
         #[test]
         fn timestamps_round_trip_through_their_micros(micros in any::<i64>()) {
             prop_assert_eq!(Timestamp::from_micros(micros).as_micros(), micros);
         }
 
-        /// Ordering timestamps is ordering their counts, which is what
-        /// sorting a status history newest-first relies on.
+        /// Timestamps order by their micros.
         #[test]
         fn timestamps_order_by_their_micros(left in any::<i64>(), right in any::<i64>()) {
             prop_assert_eq!(

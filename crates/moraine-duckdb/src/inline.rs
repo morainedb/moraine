@@ -8,9 +8,7 @@
 //! array. Write-side staging lives in [`crate::staged`].
 //!
 //! A scan returns two parallel arrays: the [`MoraineInlineRow`]s and the
-//! deduplicated [`MoraineInlineChunk`]s their `chunk_index` points into, so
-//! each chunk's Arrow IPC body is materialized once however many rows
-//! reference it and the shim decodes it once.
+//! deduplicated [`MoraineInlineChunk`]s their `chunk_index` points into.
 
 use std::{
     ffi::c_void,
@@ -39,32 +37,32 @@ fn decode_scan_kind(v: i32) -> Result<InlineScanKind, AbiError> {
     }
 }
 
-/// Hands a `Vec<u8>` to C as an owned heap buffer: `(ptr, len)`, freed via
-/// [`free_owned_bytes`].
-fn into_owned_bytes(bytes: Vec<u8>) -> (*mut u8, usize) {
-    let boxed = bytes.into_boxed_slice();
-    let len = boxed.len();
-    (Box::into_raw(boxed).cast::<u8>(), len)
+/// Hands a shared `Bytes` to C as `(ptr, len, owner)` without copying;
+/// `owner` is the boxed `Bytes`, released via [`release_shared_bytes`].
+fn share_bytes(bytes: Bytes) -> (*mut u8, usize, *mut c_void) {
+    let data = bytes.as_ptr().cast_mut();
+    let len = bytes.len();
+    let owner = Box::into_raw(Box::new(bytes)).cast::<c_void>();
+    (data, len, owner)
 }
 
-/// Frees a buffer minted by [`into_owned_bytes`], if non-null.
+/// Releases an `owner` minted by [`share_bytes`], if non-null.
 ///
 /// # Safety
 ///
-/// `ptr`/`len`, if `ptr` is non-null, must be exactly the pair
-/// [`into_owned_bytes`] returned, not yet freed.
-unsafe fn free_owned_bytes(ptr: *mut u8, len: usize) {
-    if ptr.is_null() {
+/// `owner`, if non-null, must be an `owner` [`share_bytes`] returned, not
+/// yet released.
+unsafe fn release_shared_bytes(owner: *mut c_void) {
+    if owner.is_null() {
         return;
     }
     // SAFETY: caller contract above.
-    drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) });
+    drop(unsafe { Box::from_raw(owner.cast::<Bytes>()) });
 }
 
 /// One inlined row, as returned by [`moraine_inline_scan`]: `chunk_index`
 /// names the owning chunk in the scan's parallel [`MoraineInlineChunk`]
-/// array, so the shim decodes each chunk once and reads the row at
-/// `offset_in_chunk`.
+/// array.
 #[repr(C)]
 pub struct MoraineInlineRow {
     /// The row's dense id.
@@ -85,7 +83,7 @@ pub struct MoraineInlineRow {
     pub offset_in_chunk: u64,
 }
 
-/// One referenced chunk's full Arrow IPC record-batch body, owned —
+/// One referenced chunk's full Arrow IPC record-batch body, owned;
 /// returned once per chunk however many rows reference it.
 #[repr(C)]
 pub struct MoraineInlineChunk {
@@ -99,11 +97,9 @@ pub struct MoraineInlineChunk {
 
 impl MoraineInlineChunk {
     pub(crate) fn from_bytes(body: Bytes) -> Self {
-        let data = body.as_ptr().cast_mut();
-        let body_len = body.len();
-        let owner = Box::into_raw(Box::new(body)).cast::<c_void>();
+        let (body, body_len, owner) = share_bytes(body);
         Self {
-            body: data,
+            body,
             body_len,
             owner,
         }
@@ -134,11 +130,9 @@ impl MoraineInlineChunk {
     ///
     /// `self` must have been minted by [`Self::from_bytes`].
     unsafe fn release(&mut self) {
-        if !self.owner.is_null() {
-            let owner = std::mem::replace(&mut self.owner, std::ptr::null_mut());
-            // SAFETY: caller contract guarantees the owner is live.
-            drop(unsafe { Box::from_raw(owner.cast::<Bytes>()) });
-        }
+        let owner = std::mem::replace(&mut self.owner, std::ptr::null_mut());
+        // SAFETY: caller contract guarantees the owner is live.
+        unsafe { release_shared_bytes(owner) };
         self.body = std::ptr::null_mut();
         self.body_len = 0;
     }
@@ -280,10 +274,12 @@ pub unsafe extern "C" fn moraine_inline_scan_free(
 pub struct MoraineInlineSchemaRow {
     /// The schema's version.
     pub schema_version: u64,
-    /// The Arrow IPC schema message, owned, verbatim.
+    /// The Arrow IPC schema message, verbatim; borrowed from `owner`.
     pub arrow_schema: *mut u8,
     /// `arrow_schema`'s length in bytes.
     pub arrow_schema_len: usize,
+    /// Opaque owner of `arrow_schema`, released by the array's `_free`.
+    pub owner: *mut c_void,
 }
 
 /// Dumps every `(schema_version, arrow_schema)` recorded for `table_id`.
@@ -322,11 +318,12 @@ pub unsafe extern "C" fn moraine_inline_schemas(
         Ok(schemas
             .into_iter()
             .map(|(schema_version, bytes)| {
-                let (arrow_schema, arrow_schema_len) = into_owned_bytes(bytes.to_vec());
+                let (arrow_schema, arrow_schema_len, owner) = share_bytes(bytes);
                 MoraineInlineSchemaRow {
                     schema_version,
                     arrow_schema,
                     arrow_schema_len,
+                    owner,
                 }
             })
             .collect())
@@ -357,9 +354,7 @@ pub unsafe extern "C" fn moraine_inline_schemas_free(
     let attempt = || {
         // SAFETY: caller contract above.
         unsafe {
-            free_array(items, len, |d| {
-                free_owned_bytes(d.arrow_schema, d.arrow_schema_len);
-            });
+            free_array(items, len, |d| release_shared_bytes(d.owner));
         }
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
@@ -376,7 +371,7 @@ pub struct MoraineInlineTableRow {
 }
 
 /// Dumps every `(table_id, schema_version)` with a recorded inline
-/// schema, across every table — feeds the `ducklake_inlined_data_tables`
+/// schema, across every table: the `ducklake_inlined_data_tables`
 /// projection.
 ///
 /// # Safety
@@ -451,10 +446,8 @@ pub unsafe extern "C" fn moraine_inline_registered_tables_free(
 }
 
 /// Reports whether `table_id` has at least one recorded `inline/file_delete`
-/// record, via `*out_exists`. The shim's catalog lookup for
-/// `ducklake_inlined_delete_<table_id>` uses this to decide whether the
-/// table exists at all, so a probe against a table that never had one must
-/// surface a bind-time catalog error.
+/// record, via `*out_exists`; decides whether
+/// `ducklake_inlined_delete_<table_id>` exists at all.
 ///
 /// # Safety
 ///
@@ -516,8 +509,7 @@ pub struct MoraineInlineFileDeleteRow {
 }
 
 /// Dumps every `inline/file_delete` record for `table_id` in
-/// `(file_id, row_id)` order — the rows behind the
-/// `ducklake_inlined_delete_<t>` projection.
+/// `(file_id, row_id)` order: the `ducklake_inlined_delete_<t>` projection.
 ///
 /// # Safety
 ///

@@ -72,13 +72,8 @@ pub(crate) enum EntityRecord {
 }
 
 impl EntityRecord {
-    /// Roughly what one record holds, as its encoded length plus the
-    /// enum's own footprint.
-    ///
-    /// An estimate, and deliberately a cheap one: it is read to report what
-    /// a handle's decoded catalog costs, never to decide an eviction. The
-    /// encoded length understates the decoded form, which is the safe
-    /// direction for a figure an operator sizes against.
+    /// A cheap estimate of the record's footprint: its encoded length plus
+    /// the enum's own size. Understates the decoded form.
     pub(crate) fn estimated_bytes(&self) -> u64 {
         let encoded = match self {
             Self::Schema(value) => value.encoded_len(),
@@ -228,21 +223,13 @@ pub(crate) async fn read_head(handle: ReadHandle<'_>) -> Result<Option<HeadValue
 }
 
 /// How many times a read-only pass is re-run before its instability is
-/// reported. A reader's state advances only when its manifest poller runs,
-/// not on every commit, so a pass that straddles one refresh is very
-/// unlikely to straddle the next.
+/// reported.
 const STABLE_READ_ATTEMPTS: usize = 8;
 
 /// Runs `read` so that everything it observes belongs to one store state.
-///
-/// A transaction handle reads at its own start sequence, so it already
-/// does and `read` runs once. A read-only reader follows the manifest:
-/// its state advances between calls, and a pass of several reads can
-/// straddle a commit and return a mix of before and after. Every batch
-/// writes the head record and moves its batch count — a maintenance batch
-/// that reuses the snapshot id included — so reading that record before
-/// and after the pass detects any state the pass could have straddled.
-/// A pass that saw it move is discarded and re-run, never returned.
+/// A transaction handle runs it once; a manifest-following reader compares
+/// the head record before and after the pass (every batch moves it) and
+/// re-runs a pass that straddled a commit.
 ///
 /// # Errors
 ///
@@ -339,8 +326,7 @@ pub(crate) fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRec
 
 /// Every `ducklake_schema_versions` record as `(table_id,
 /// begin_snapshot, schema_version)`, in key order. Retained across
-/// snapshot expiry, so this is the projection's durable source — the
-/// snapshot records only carry the same rows for as long as they live.
+/// snapshot expiry.
 pub(crate) async fn scan_schema_versions(handle: ReadHandle<'_>) -> Result<Vec<(u64, u64, u64)>> {
     scan_decode(
         handle,
@@ -382,10 +368,8 @@ pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<
 }
 
 /// Every ended entity-version record. Unversioned kinds
-/// ([`EntityKey::is_versioned`]) are overwritten in place and never
-/// mirrored to history; finding one there is store damage, refused here —
-/// before any consumer, snapshot build or raw dump, could replay it over
-/// the live record.
+/// ([`EntityKey::is_versioned`]) are never mirrored to history; finding one
+/// there is store damage and is refused.
 pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
     scan_decode(
         handle,
@@ -428,7 +412,7 @@ pub(crate) async fn scan_entity_kind(
         .await;
     };
 
-    let mut records = scan_decode(
+    let current = scan_decode(
         handle,
         current_entity_kind_prefix(entity_kind),
         ScanShape::Bulk,
@@ -438,23 +422,24 @@ pub(crate) async fn scan_entity_kind(
                 "non-entity key in {kind:?} current scan: {other:?}"
             ))),
         },
-    )
-    .await?;
-    if entity_kind.is_versioned() {
-        let history = scan_decode(
-            handle,
-            history_entity_kind_prefix(entity_kind),
-            ScanShape::Bulk,
-            |key, bytes| match key {
-                Key::History(history) => decode_entity(history.entity, &bytes),
-                other => Err(Error::Corruption(format!(
-                    "non-history key in {kind:?} history scan: {other:?}"
-                ))),
-            },
-        )
-        .await?;
-        records.extend(history);
+    );
+    if !entity_kind.is_versioned() {
+        return current.await;
     }
+
+    let history = scan_decode(
+        handle,
+        history_entity_kind_prefix(entity_kind),
+        ScanShape::Bulk,
+        |key, bytes| match key {
+            Key::History(history) => decode_entity(history.entity, &bytes),
+            other => Err(Error::Corruption(format!(
+                "non-history key in {kind:?} history scan: {other:?}"
+            ))),
+        },
+    );
+    let (mut records, history) = futures::try_join!(current, history)?;
+    records.extend(history);
 
     Ok(records)
 }
@@ -628,9 +613,7 @@ mod tests {
         db.close().await.unwrap();
     }
 
-    /// Unversioned kinds are never written to history; one found there is
-    /// store damage. Refusing it keeps the later current-then-history
-    /// replay from silently overwriting the live record.
+    /// An unversioned kind found in history is refused as store damage.
     #[tokio::test]
     async fn unversioned_kind_in_history_is_refused() {
         let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
@@ -666,8 +649,7 @@ mod tests {
         db.close().await.unwrap();
     }
 
-    /// Mappings are write-once and never mirrored to history; one found
-    /// there is refused like every other unversioned kind.
+    /// A mapping found in history is refused like every unversioned kind.
     #[tokio::test]
     async fn mapping_in_history_is_refused() {
         let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))

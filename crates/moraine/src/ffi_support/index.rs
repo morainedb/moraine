@@ -1,8 +1,6 @@
-//! How a lookup value coerces to a column's canonical stored form. Lives in
-//! the core so the type vocabulary cannot drift from index maintenance, which
-//! derives stored keys from the same types. The indexability rule and
-//! base-type extraction live in the catalog's `index_policy`, enforced at
-//! index creation.
+//! How a lookup value coerces to a column's canonical stored form. The
+//! indexability rule and base-type extraction live in the catalog's
+//! `index_policy`.
 
 use crate::{
     catalog::index_policy::ducklake_base_type,
@@ -28,15 +26,11 @@ pub enum LookupInput {
 }
 
 /// Coerces a lookup value to the canonical [`IndexKeyValue`] for a column
-/// of DuckLake type `ducklake_type`, matching how index maintenance
-/// derives the stored key from that column's Parquet/Arrow values. Errors
-/// (as plain message text — the ABI owns the error-code mapping) on a
-/// column type equality indexes do not cover, or a value kind that cannot
-/// represent it.
-// Distinct type names with a coincidentally identical body (e.g. `INTEGER`
-// and `DATE` both index as an `i32`) are kept as separate arms for clarity.
-// The `f64 as f32` narrowing for a `FLOAT` column is intended: the value came
-// from a single-precision column.
+/// of DuckLake type `ducklake_type`, matching how index maintenance derives
+/// the stored key. Errors, as plain message text, on a column type equality
+/// indexes do not cover or a value kind that cannot represent it.
+// Same-bodied arms stay separate per type name; the `f64 as f32` narrowing
+// for a `FLOAT` column is intended.
 #[allow(clippy::match_same_arms, clippy::cast_possible_truncation)]
 pub fn coerce_lookup_value(
     input: &LookupInput,
@@ -73,11 +67,10 @@ pub fn coerce_lookup_value(
         "USMALLINT" | "UINT16" => unsigned(unsigned_input()?, IntWidth::I16),
         "UINTEGER" | "UINT32" => unsigned(unsigned_input()?, IntWidth::I32),
         "UBIGINT" | "UINT64" => unsigned(unsigned_input()?, IntWidth::I64),
-        // 128-bit integers are intentionally absent: [`ensure_indexable`]
-        // refuses them at creation, so no index covers such a column and
-        // this coercion falls through to the unsupported-type error.
-        // Temporal types index by their underlying integer, as the scoped
-        // read derives them: `DATE` as an `i32` day count, the rest as `i64`.
+        // 128-bit integers are refused at index creation, so they fall
+        // through to the unsupported-type error. Temporal types index by
+        // their underlying integer: `DATE` as an `i32` day count, the rest
+        // as `i64`.
         "DATE" => signed(signed_input()?, IntWidth::I32),
         "TIME"
         | "TIME_NS"

@@ -1,7 +1,7 @@
 //! The mutation handle passed to a commit closure.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     ops::Deref,
 };
 
@@ -17,7 +17,7 @@ use crate::{
     },
     error::{Error, Result},
     store::{
-        index_encoding::{Direction, NullOrder, encode_ordered_index_entry},
+        index_encoding::{Direction, IndexKeyValue, NullOrder, encode_ordered_index_entry},
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FilePartitionValue,
             IndexValue, MacroImplementation, MacroParameter, MacroValue, PartitionColumn,
@@ -30,17 +30,63 @@ use crate::{
     },
 };
 
-/// What staging an entry against a live index needs to know about it.
+/// What staging an entry against an index needs to know about it.
 struct IndexShape {
     /// Whether the index enforces uniqueness.
     unique: bool,
     /// How many values an entry must carry.
     column_count: usize,
-    /// The declared per-column sort orders.
-    orders: Vec<ColumnOrder>,
-    /// Whether a staged build is still running, so a duplicate poisons
-    /// the index instead of failing the commit.
+    /// The declared per-column sort directions; empty means all ascending.
+    directions: Vec<Direction>,
+    /// The declared per-column null orders; empty means all NULLS LAST.
+    nulls: Vec<NullOrder>,
+    /// Whether a staged build is still running.
     building: bool,
+}
+
+impl IndexShape {
+    /// The shape of a stored index definition. Orders the record omits are
+    /// ascending / NULLS LAST.
+    fn of_value(value: &IndexValue) -> Self {
+        Self {
+            unique: value.unique,
+            column_count: value.column_ids.len(),
+            directions: value
+                .column_descending
+                .iter()
+                .map(|&descending| {
+                    if descending {
+                        Direction::Descending
+                    } else {
+                        Direction::Ascending
+                    }
+                })
+                .collect(),
+            nulls: value
+                .column_nulls_first
+                .iter()
+                .map(|&first| {
+                    if first {
+                        NullOrder::First
+                    } else {
+                        NullOrder::Last
+                    }
+                })
+                .collect(),
+            building: value.build_state.is_some(),
+        }
+    }
+
+    /// The shape of an index being created from its definition and orders.
+    fn of_definition(def: &IndexDef, orders: &[ColumnOrder]) -> Self {
+        Self {
+            unique: def.unique,
+            column_count: def.columns.len(),
+            directions: orders.iter().map(|order| order.direction).collect(),
+            nulls: orders.iter().map(|order| order.nulls).collect(),
+            building: false,
+        }
+    }
 }
 
 /// The mutation handle a commit closure receives.
@@ -53,11 +99,10 @@ pub struct Transaction {
     ops: Vec<Operation>,
     index_entries: Vec<StagedIndexEntry>,
     inline_ops: Vec<InlineStage>,
-    /// Next `chunk_seq` per `(table_id, schema_version)`, disambiguating
-    /// several chunks this commit inlines under one key prefix.
+    /// Next `chunk_seq` per `(table_id, schema_version)`.
     chunk_seqs: HashMap<(u64, u64), u64>,
-    /// The row ids a table had allocated before this commit started
-    /// allocating its own, recorded per table the first time it does.
+    /// Per table, the row-id counter as it stood before this commit first
+    /// allocated from it.
     inherited_row_ids: HashMap<u64, u64>,
     next_catalog_id: u64,
     next_file_id: u64,
@@ -159,12 +204,9 @@ impl Transaction {
     ///
     /// Returns [`Error::NotFound`] if the schema does not exist.
     /// Returns [`Error::Constraint`] if the schema still contains live
-    /// tables, or is the bootstrap `main` schema (the default DuckDB
-    /// resolves unqualified names against).
+    /// tables, views or macros, or is the bootstrap `main` schema.
     pub fn drop_schema(&mut self, schema: SchemaId) -> Result<()> {
-        // Schema id 0 is the bootstrap `main` schema — the default DuckDB
-        // resolves unqualified names against; a catalog without it is a
-        // shape DuckLake never produces or attaches.
+        // Schema id 0 is the bootstrap `main` schema.
         if schema.get() == 0 {
             return Err(Error::Constraint(
                 "the bootstrap `main` schema cannot be dropped".to_string(),
@@ -250,9 +292,7 @@ impl Transaction {
             path_is_relative: true,
             next_column_id: column_node_count(columns) + 1,
         });
-        // Field ids and positions are both assigned from 1 in pre-order, as
-        // DuckLake assigns them: a nested field takes the next id after its
-        // parent, before the parent's next sibling.
+        // Field ids and positions are both assigned from 1 in pre-order.
         let mut next_id = 1;
         let mut next_order = 1;
         for def in columns {
@@ -361,8 +401,7 @@ impl Transaction {
         Ok(())
     }
 
-    /// Adds a column. Its field id comes from the table's persisted
-    /// counter, floored above every live id, and is never reused.
+    /// Adds a column. Field ids and positions are never reused.
     ///
     /// # Errors
     ///
@@ -381,10 +420,7 @@ impl Transaction {
             .copied()
             .unwrap_or(0);
         let mut next_id = value.next_column_id.max(live_max_id + 1);
-        // Positions continue past the highest live one, never renumbering, so
-        // a dropped column leaves a gap the survivors keep — DuckLake's
-        // behaviour. Positions start at 1, so an all-columns-dropped table
-        // restarts there rather than at 0.
+        // Positions start at 1 and continue past the highest live one.
         let mut next_order = live_columns
             .and_then(|cols| cols.values().map(|c| c.column_order).max())
             .map_or(1, |max| max + 1);
@@ -400,11 +436,8 @@ impl Transaction {
         Ok(ColumnId::new(column_id))
     }
 
-    /// Stages one column and, depth first, every field beneath it, taking
-    /// the next field id and the next position from the same two counters —
-    /// DuckLake's pre-order allocation, where a nested field's id falls
-    /// between its parent's and its parent's next sibling's. Returns the
-    /// root's field id.
+    /// Stages one column and, in pre-order, every field beneath it,
+    /// advancing both counters. Returns the root's field id.
     fn stage_column_tree(
         &mut self,
         table_id: u64,
@@ -454,9 +487,7 @@ impl Transaction {
     }
 
     /// Refuses a name already taken among `parent`'s fields — the table's
-    /// top-level columns when `parent` is `None`. Sibling scope, not
-    /// table scope: DuckLake nests a field's name inside its parent, so two
-    /// structs may each hold an `x`.
+    /// top-level columns when `parent` is `None`.
     fn sibling_name_free(&self, table: TableId, parent: Option<u64>, name: &str) -> Result<()> {
         let taken = self.state.columns.get(&table.get()).is_some_and(|cols| {
             cols.values()
@@ -519,9 +550,8 @@ impl Transaction {
         if let Some(new_type) = &column_type {
             ensure_inlinable(&value.column_name, new_type)?;
         }
-        // The canonical index encoding is type-bound: a type change on an
-        // indexed column would silently invalidate its entries. Drop the
-        // index first. Nullability and default changes are unaffected.
+        // The index encoding is type-bound, so a type change on an indexed
+        // column would invalidate its entries.
         if column_type.is_some() && self.column_is_indexed(table, column) {
             return Err(Error::Constraint(format!(
                 "column {column} of table {table} is indexed; drop the index before changing its type"
@@ -548,9 +578,7 @@ impl Transaction {
     /// column of the table, or if the column or any field beneath it is
     /// indexed.
     ///
-    /// Dropping a nested column drops every field beneath it, as DuckLake
-    /// does: a parent and its whole subtree end in the same snapshot, since
-    /// a field with no parent left is not a column anyone can name.
+    /// Dropping a nested column drops every field beneath it.
     pub fn drop_column(&mut self, table: TableId, column: ColumnId) -> Result<()> {
         let value = self.live_column(table, column)?;
         let doomed = self.column_subtree(table, column);
@@ -562,10 +590,8 @@ impl Transaction {
                 "column {indexed} of table {table} is indexed; drop the index first"
             )));
         }
-        // Counted over top-level columns only, and checked only for one:
-        // a table needs a column someone can select, and a nested field is
-        // never that column — dropping the last field of a struct leaves the
-        // struct, which is still selectable.
+        // Only top-level columns count: dropping the last field of a struct
+        // leaves the struct.
         let live_top_level = self.state.columns.get(&table.get()).map_or(0, |cols| {
             cols.values().filter(|c| c.parent_column.is_none()).count()
         });
@@ -583,8 +609,6 @@ impl Transaction {
     }
 
     /// `column` and every field beneath it, parents before their children.
-    /// Depth is unbounded — a struct of structs — so this walks rather than
-    /// looking one level down.
     fn column_subtree(&self, table: TableId, column: ColumnId) -> Vec<u64> {
         let Some(columns) = self.state.columns.get(&table.get()) else {
             return Vec::new();
@@ -613,12 +637,9 @@ impl Transaction {
             .and_then(|per_table| per_table.keys().next().copied())
     }
 
-    /// Sets a table's partition spec, replacing any spec already live. The
-    /// old spec ends into history and the data files written under it keep
-    /// referencing it, so files under different specs coexist.
-    ///
-    /// Transforms are stored verbatim and never parsed; a bare partition
-    /// column is written with the transform `identity`.
+    /// Sets a table's partition spec, replacing any spec already live; the
+    /// old spec ends into history and files written under it keep
+    /// referencing it. Transforms are stored verbatim and never parsed.
     ///
     /// # Errors
     ///
@@ -672,8 +693,7 @@ impl Transaction {
         Ok(PartitionId::new(partition_id))
     }
 
-    /// Unpartitions a table: its live spec ends into history. Files written
-    /// under the ended spec keep referencing it.
+    /// Unpartitions a table: its live spec ends into history.
     ///
     /// # Errors
     ///
@@ -698,20 +718,10 @@ impl Transaction {
             .and_then(|per_table| per_table.keys().next().copied())
     }
 
-    /// Sets a table's sort spec, replacing any spec already live. The old
-    /// spec ends into history, so a snapshot taken before the change still
-    /// reconstructs the spec in force then.
-    ///
-    /// Expressions, dialects, directions and null orders are stored
-    /// verbatim and never parsed. A sort key names its column inside its
-    /// expression rather than by field id, so — unlike a partition key —
-    /// there is no column for the verb to resolve or to keep valid across
-    /// a rename.
-    ///
-    /// Setting a sort spec is not a schema change: it marks the table
-    /// altered without bumping the catalog's schema version, matching
-    /// DuckLake, for which a sort spec never invalidates a cross-file
-    /// compaction.
+    /// Sets a table's sort spec, replacing any spec already live; the old
+    /// spec ends into history. Expressions, dialects, directions and null
+    /// orders are stored verbatim and never parsed. Not a schema change:
+    /// the catalog's schema version does not advance.
     ///
     /// # Errors
     ///
@@ -755,9 +765,7 @@ impl Transaction {
         Ok(SortId::new(sort_id))
     }
 
-    /// Unsorts a table: its live spec ends into history and nothing takes
-    /// its place, which is what DuckLake's `RESET SORTED BY` does — unlike
-    /// the partition reset, which lands a live spec with no columns.
+    /// Unsorts a table: its live spec ends into history.
     ///
     /// # Errors
     ///
@@ -789,74 +797,44 @@ impl Transaction {
     }
 
     /// Encodes one writer-supplied entry and stages it. A row with any NULL
-    /// indexed column is stored multi-shaped and exempt from the value
-    /// collision, so `IS NULL` finds it and a unique index still admits any
-    /// number of NULL rows.
-    #[allow(clippy::too_many_arguments)]
+    /// indexed column is exempt from the unique-value collision.
     fn stage_index_entry(
         &mut self,
         index_id: u64,
-        unique: bool,
-        column_count: usize,
-        orders: &[ColumnOrder],
-        entry: &IndexEntry,
+        shape: &IndexShape,
+        row_id: u64,
+        values: &[Option<IndexKeyValue>],
         delete: bool,
-        building: bool,
     ) -> Result<()> {
-        if entry.values.len() != column_count {
+        if values.len() != shape.column_count {
             return Err(Error::Constraint(format!(
-                "index entry has {} values, expected {column_count}",
-                entry.values.len()
+                "index entry has {} values, expected {}",
+                values.len(),
+                shape.column_count
             )));
         }
-        // A row with any NULL indexed column is stored, so `IS NULL` can find
-        // it, but always multi-shaped (row id in the key) and exempt from the
-        // value collision — SQL treats NULLs as distinct, so a unique index
-        // still admits any number of such rows.
-        let directions: Vec<_> = orders.iter().map(|order| order.direction).collect();
-        let nulls: Vec<_> = orders.iter().map(|order| order.nulls).collect();
         let (key, unique) = encode_ordered_index_entry(
-            &entry.values,
-            &directions,
-            &nulls,
+            values,
+            &shape.directions,
+            &shape.nulls,
             index_id,
-            unique,
-            entry.row_id,
+            shape.unique,
+            row_id,
         )?;
         self.index_entries.push(StagedIndexEntry {
             index_id,
             unique,
             key,
-            row_id: entry.row_id,
+            row_id,
             delete,
-            building,
+            building: shape.building,
         });
         Ok(())
     }
 
-    /// The declared per-column orders of a stored index definition —
-    /// ascending / NULLS LAST wherever the record omits them.
-    fn column_orders(value: &IndexValue) -> Vec<ColumnOrder> {
-        (0..value.column_ids.len())
-            .map(|i| ColumnOrder {
-                direction: if value.column_descending.get(i).copied().unwrap_or(false) {
-                    Direction::Descending
-                } else {
-                    Direction::Ascending
-                },
-                nulls: if value.column_nulls_first.get(i).copied().unwrap_or(false) {
-                    NullOrder::First
-                } else {
-                    NullOrder::Last
-                },
-            })
-            .collect()
-    }
-
     /// Creates an equality index over a table, staging entries for the
-    /// writer-supplied backfill in the same commit. The first index on any
-    /// store stamps the format at 2, so older binaries — which maintain no
-    /// entries — refuse it.
+    /// writer-supplied backfill in the same commit. The first index on a
+    /// store stamps its format at 2.
     ///
     /// # Errors
     ///
@@ -872,21 +850,13 @@ impl Transaction {
         def: &IndexDef,
         backfill: &[IndexEntry],
     ) -> Result<IndexId> {
-        let index_id =
-            self.insert_index_definition(table, def, IndexMaintenance::Synchronous, None, &[])?;
-        for entry in backfill {
-            self.stage_index_entry(
-                index_id,
-                def.unique,
-                def.columns.len(),
-                &[],
-                entry,
-                false,
-                false,
-            )?;
-        }
-        self.mark_altered(table.get());
-        Ok(IndexId::new(index_id))
+        self.create_index_ordered_with_maintenance(
+            table,
+            def,
+            &[],
+            IndexMaintenance::Synchronous,
+            backfill,
+        )
     }
 
     /// Creates an index with explicit per-column sort orders — ascending or
@@ -930,16 +900,9 @@ impl Transaction {
         backfill: &[IndexEntry],
     ) -> Result<IndexId> {
         let index_id = self.insert_index_definition(table, def, maintenance, None, orders)?;
+        let shape = IndexShape::of_definition(def, orders);
         for entry in backfill {
-            self.stage_index_entry(
-                index_id,
-                def.unique,
-                def.columns.len(),
-                orders,
-                entry,
-                false,
-                false,
-            )?;
+            self.stage_index_entry(index_id, &shape, entry.row_id, &entry.values, false)?;
         }
         self.mark_altered(table.get());
         Ok(IndexId::new(index_id))
@@ -985,8 +948,8 @@ impl Transaction {
                 orders.len()
             )));
         }
-        // Record per-column orders only when they diverge from the default,
-        // so an ascending / NULLS-LAST index stays byte-identical on disk.
+        // Per-column orders are recorded only when they diverge from the
+        // default.
         let column_descending = if orders.iter().all(|o| o.direction == Direction::Ascending) {
             Vec::new()
         } else {
@@ -1051,11 +1014,10 @@ impl Transaction {
     }
 
     /// Begins a staged (multi-commit) index build. The definition lands in
-    /// `building` state — serving no lookups and stamping the store format
-    /// at 3 — and the host streams backfill batches through
-    /// [`Self::build_index_step`] until a final step flips it ready. Writers
-    /// maintain entries from this commit forward via the ordinary coverage
-    /// path.
+    /// `building` state, serving no lookups and stamping the store format
+    /// at 3; the host streams backfill batches through
+    /// [`Self::build_index_step`] until a final step flips it ready.
+    /// Writers maintain entries from this commit forward.
     ///
     /// # Errors
     ///
@@ -1066,10 +1028,8 @@ impl Transaction {
         self.create_index_staged_ordered(table, def, &[])
     }
 
-    /// Begins a staged build with explicit per-column sort orders — the
-    /// staged counterpart to [`Self::create_index_ordered`]. The definition
-    /// records the orders, and every subsequent [`Self::build_index_step`]
-    /// encodes with them.
+    /// Begins a staged build with explicit per-column sort orders, the
+    /// staged counterpart to [`Self::create_index_ordered`].
     ///
     /// # Errors
     ///
@@ -1114,12 +1074,10 @@ impl Transaction {
         Ok(IndexId::new(index_id))
     }
 
-    /// Advances a staged build by one bounded batch of writer-supplied
-    /// entries, persisting a row-id cursor so a crashed build resumes. With
-    /// `is_final`, flips the index ready in this same commit; from the flip
-    /// forward it is indistinguishable from a single-commit build. A
-    /// non-final step preserves the catalog schema version; the final flip
-    /// advances it. Returns the resulting state.
+    /// Advances a staged build by one batch of writer-supplied entries,
+    /// persisting a row-id cursor. With `is_final`, flips the index ready
+    /// in this same commit and advances the catalog schema version; a
+    /// non-final step preserves it. Returns the resulting state.
     ///
     /// # Errors
     ///
@@ -1136,9 +1094,8 @@ impl Transaction {
         self.build_index_step_at(index, batch, is_final, None)
     }
 
-    /// Advances a staged build and persists the physical source position
-    /// covered by this step. The file-position cursor, rather than row-id
-    /// ordering, lets the driver stream files without a table-wide sort.
+    /// Advances a staged build and persists the file position covered by
+    /// this step.
     pub(crate) fn build_index_source_step(
         &mut self,
         index: IndexId,
@@ -1164,24 +1121,12 @@ impl Transaction {
             return Err(Error::Constraint(format!("index {index} is not building")));
         }
 
-        let unique = value.unique;
         let maintenance_repair = value.build_state.as_deref() == Some("maintaining");
-        let column_count = value.column_ids.len();
-        let orders = Self::column_orders(&value);
+        let shape = IndexShape::of_value(&value);
         let mut cursor = value.build_cursor_row_id.unwrap_or(0);
         for entry in batch {
             cursor = cursor.max(entry.row_id);
-            // A duplicate the backfill discovers poisons the build, as a
-            // writer's would.
-            self.stage_index_entry(
-                index.get(),
-                unique,
-                column_count,
-                &orders,
-                entry,
-                false,
-                true,
-            )?;
+            self.stage_index_entry(index.get(), &shape, entry.row_id, &entry.values, false)?;
         }
 
         value.begin_snapshot = self.new_snapshot_id;
@@ -1198,7 +1143,7 @@ impl Transaction {
         let resulting_state = if is_final {
             value.build_state = None;
             IndexState::Ready
-        } else if value.build_state.as_deref() == Some("maintaining") {
+        } else if maintenance_repair {
             IndexState::Maintaining
         } else {
             IndexState::Building
@@ -1225,11 +1170,9 @@ impl Transaction {
             .ok_or_else(|| Error::Corruption(format!("table {table} has no statistics record")))
     }
 
-    /// The first row id `table` has left to mint, recording the mark its
-    /// counter stood at before this commit touched it. The caller advances
-    /// the counter as part of the statistics it writes; every verb that
-    /// mints row ids takes its start from here, so the mark is the whole
-    /// commit's rather than one verb's.
+    /// The first row id `table` has left to mint, recording the counter's
+    /// pre-commit mark on first use. The caller advances the counter in
+    /// the statistics it writes.
     fn allocate_row_ids(&mut self, table: TableId, tstat: &TableStatsValue) -> u64 {
         self.inherited_row_ids
             .entry(table.get())
@@ -1238,10 +1181,8 @@ impl Transaction {
         tstat.next_row_id
     }
 
-    /// The row ids `table` had allocated before this commit ran — the
-    /// ceiling a flushed file's rows must stay under. A file the caller
-    /// wrote before calling `commit` cannot carry a row this commit mints,
-    /// so claiming one would count that row twice.
+    /// The row-id counter as it stood before this commit ran: the ceiling
+    /// a flushed file's rows must stay under.
     fn inherited_row_ids(&self, table: TableId, tstat: &TableStatsValue) -> u64 {
         self.inherited_row_ids
             .get(&table.get())
@@ -1250,8 +1191,7 @@ impl Transaction {
     }
 
     /// The live partition spec a file registered now falls under, after
-    /// checking it carries one value per key. An unpartitioned table takes
-    /// no values and names no spec.
+    /// checking it carries one value per key.
     fn resolve_file_partition(&self, table: TableId, values: &[String]) -> Result<Option<u64>> {
         let live = self
             .state
@@ -1286,10 +1226,6 @@ impl Transaction {
     ///
     /// A partitioned table's file carries `file.partition_values`, one per
     /// key of the live spec in key order, and the record names that spec.
-    /// The spec is resolved rather than passed: a file is written under
-    /// the one in force, and a commit that raced a repartition conflicts
-    /// as append-versus-alter rather than landing values against a spec
-    /// that has moved.
     ///
     /// # Errors
     ///
@@ -1298,14 +1234,11 @@ impl Transaction {
     /// table, or if an `index_entries` entry names an index not live on the
     /// table.
     /// Returns [`Error::Constraint`] if the table has live indexes and a
-    /// non-empty file supplies no `index_entries` (a silently under-covered
-    /// index is a lie), an entry's `ordinal` is outside the file's rows, a
-    /// supplied indexed value exceeds the size cap, the entries duplicate
-    /// a unique value, or the file's partition values do not match the
-    /// live spec's keys one for one.
-    /// Returns [`Error::Corruption`] if the table has no statistics
-    /// record (impossible for a table created by [`Self::create_table`],
-    /// which always mints one).
+    /// non-empty file supplies no `index_entries`, an entry's `ordinal` is
+    /// outside the file's rows, a supplied indexed value exceeds the size
+    /// cap, the entries duplicate a unique value, or the file's partition
+    /// values do not match the live spec's keys one for one.
+    /// Returns [`Error::Corruption`] if the table has no statistics record.
     pub fn register_data_file(
         &mut self,
         table: TableId,
@@ -1326,9 +1259,7 @@ impl Transaction {
                 "register_data_file on indexed table {table} must supply index entries"
             )));
         }
-        // An entry's row is `row_id_start + ordinal`; an ordinal past the
-        // file's rows would index a row id outside the file's range and break
-        // lookup→holder resolution.
+        // An entry's row is `row_id_start + ordinal`.
         for entry in index_entries {
             if entry.ordinal >= file.record_count {
                 return Err(Error::Constraint(format!(
@@ -1383,45 +1314,41 @@ impl Transaction {
                 variant_stats: vec![],
             });
         }
-        for file_entry in index_entries {
-            self.stage_file_index_entry(table, row_id_start, file_entry)?;
-        }
+        self.stage_file_index_entries(table, row_id_start, index_entries)?;
         self.ops.push(Operation::RegisterDataFile {
             table_id: table.get(),
         });
         Ok(DataFileId::new(data_file_id))
     }
 
-    /// Stages one file-supplied index entry for the row at
-    /// `row_id_start + ordinal`. Overflow is refused: a clamped row id
-    /// would alias another row's entry.
-    fn stage_file_index_entry(
+    /// Stages file-supplied index entries, each for the row at
+    /// `row_id_start + ordinal`; overflow is refused.
+    fn stage_file_index_entries(
         &mut self,
         table: TableId,
         row_id_start: u64,
-        file_entry: &FileIndexEntry,
+        index_entries: &[FileIndexEntry],
     ) -> Result<()> {
-        let shape = self.live_index_shape(table, file_entry.index)?;
-        let row_id = row_id_start
-            .checked_add(file_entry.ordinal)
-            .ok_or_else(|| {
-                Error::Constraint(format!(
-                    "index entry ordinal {} overflows the row-id range on table {table}",
-                    file_entry.ordinal
-                ))
-            })?;
-        self.stage_index_entry(
-            file_entry.index.get(),
-            shape.unique,
-            shape.column_count,
-            &shape.orders,
-            &IndexEntry {
+        let mut shapes = HashMap::new();
+        for file_entry in index_entries {
+            let shape = self.cached_index_shape(&mut shapes, table, file_entry.index)?;
+            let row_id = row_id_start
+                .checked_add(file_entry.ordinal)
+                .ok_or_else(|| {
+                    Error::Constraint(format!(
+                        "index entry ordinal {} overflows the row-id range on table {table}",
+                        file_entry.ordinal
+                    ))
+                })?;
+            self.stage_index_entry(
+                file_entry.index.get(),
+                shape,
                 row_id,
-                values: file_entry.values.clone(),
-            },
-            false,
-            shape.building,
-        )
+                &file_entry.values,
+                false,
+            )?;
+        }
+        Ok(())
     }
 
     /// Expires a data file, removing it and subtracting its contribution
@@ -1471,13 +1398,9 @@ impl Transaction {
 
     /// Registers a delete file targeting a live data file's rows, removing
     /// the equality-index entries of the rows it kills. Each removal names
-    /// the killed row **by its id** — inside a dense target's row-id range,
-    /// or a per-row-id target's embedded id supplied verbatim — with the
-    /// values the dead row was indexed under: entries are keyed by value,
-    /// so a removal cannot be derived from a row id alone.
-    ///
-    /// Delete files do not change table statistics — `record_count`
-    /// counts data-file rows, not delete markers.
+    /// the killed row by id — inside a dense target's row-id range, or a
+    /// per-row-id target's embedded id — with the values the dead row was
+    /// indexed under. Table statistics are unchanged.
     ///
     /// # Errors
     ///
@@ -1485,10 +1408,10 @@ impl Transaction {
     /// `file.data_file_id` is not live on the table, or if an
     /// `index_entries` entry names an index not live on the table.
     /// Returns [`Error::Constraint`] if the table has live indexes and a
-    /// non-empty delete file supplies no `index_entries` (a silently
-    /// over-covered index is as much a lie as an under-covered one), an
-    /// entry's row id is outside a dense target's row-id range, or an
-    /// entry's value count does not match its index's column count.
+    /// non-empty delete file supplies no `index_entries`, an empty delete
+    /// file supplies any, an entry's row id is outside a dense target's
+    /// row-id range, or an entry's value count does not match its index's
+    /// column count.
     pub fn register_delete_file(
         &mut self,
         table: TableId,
@@ -1506,8 +1429,7 @@ impl Transaction {
                 Error::NotFound(format!("data file {} of table {table}", file.data_file_id))
             })?;
 
-        // One live delete file per data file: a new one carries all deletes
-        // and must supersede its predecessor, never sit beside it.
+        // One live delete file per data file.
         let already_targeted = self
             .state
             .delete_files
@@ -1534,8 +1456,6 @@ impl Transaction {
                 "register_delete_file on indexed table {table} must supply index entries"
             )));
         }
-        // Entries without deletes would strip index entries for rows the
-        // catalog still counts as live.
         if file.delete_count == 0 && !index_entries.is_empty() {
             return Err(Error::Constraint(format!(
                 "register_delete_file on table {table} supplies index entries but deletes no rows"
@@ -1543,13 +1463,8 @@ impl Transaction {
         }
 
         // A dense target's ids are `row_id_start..row_id_start +
-        // record_count`; an id outside that range names a row the file does
-        // not hold. A per-row-id target's ids are the writer's to supply —
-        // it read them from the file's embedded row-id column.
+        // record_count`; a per-row-id target's are the writer's to supply.
         if let Some(start) = data_file.row_id_start {
-            // A range whose end overflows names more rows than a u64 can
-            // hold: catalog corruption, refused rather than saturated (which
-            // would admit out-of-range ids).
             let end = start.checked_add(data_file.record_count).ok_or_else(|| {
                 Error::Constraint(format!(
                     "register_delete_file: target data file {}'s row-id range overflows u64 \
@@ -1569,11 +1484,6 @@ impl Transaction {
         }
 
         let delete_file_id = self.alloc_file_id();
-        // Kept before `file` is consumed below: the change set names it, so
-        // a concurrent delete of this table classifies against this commit
-        // at file grain rather than table grain.
-        let targeted = file.data_file_id.get();
-
         self.state.put_delete_file(DeleteFileValue {
             delete_file_id,
             table_id: table.get(),
@@ -1594,7 +1504,7 @@ impl Transaction {
 
         self.ops.push(Operation::RegisterDeleteFile {
             table_id: table.get(),
-            data_file_id: targeted,
+            data_file_id: file.data_file_id.get(),
         });
 
         Ok(DeleteFileId::new(delete_file_id))
@@ -1607,25 +1517,28 @@ impl Transaction {
         table: TableId,
         index_entries: &[FileIndexRemoval],
     ) -> Result<()> {
+        let mut shapes = HashMap::new();
         for entry in index_entries {
-            let shape = self.live_index_shape(table, entry.index)?;
-            self.stage_index_entry(
-                entry.index.get(),
-                shape.unique,
-                shape.column_count,
-                &shape.orders,
-                &IndexEntry {
-                    row_id: entry.row_id,
-                    values: entry.values.clone(),
-                },
-                true,
-                shape.building,
-            )?;
+            let shape = self.cached_index_shape(&mut shapes, table, entry.index)?;
+            self.stage_index_entry(entry.index.get(), shape, entry.row_id, &entry.values, true)?;
         }
         Ok(())
     }
 
-    /// A live index's uniqueness flag, column count, and per-column orders.
+    /// A live index's shape, resolved once per `shapes`.
+    fn cached_index_shape<'a>(
+        &self,
+        shapes: &'a mut HashMap<IndexId, IndexShape>,
+        table: TableId,
+        index: IndexId,
+    ) -> Result<&'a IndexShape> {
+        match shapes.entry(index) {
+            Entry::Occupied(occupied) => Ok(occupied.into_mut()),
+            Entry::Vacant(vacant) => Ok(vacant.insert(self.live_index_shape(table, index)?)),
+        }
+    }
+
+    /// The shape of a live index on the table.
     fn live_index_shape(&self, table: TableId, index: IndexId) -> Result<IndexShape> {
         let value = self
             .state
@@ -1633,12 +1546,7 @@ impl Transaction {
             .get(&table.get())
             .and_then(|per_table| per_table.get(&index.get()))
             .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
-        Ok(IndexShape {
-            unique: value.unique,
-            column_count: value.column_ids.len(),
-            orders: Self::column_orders(value),
-            building: value.build_state.is_some(),
-        })
+        Ok(IndexShape::of_value(value))
     }
 
     /// Expires a delete file, removing it.
@@ -1665,9 +1573,8 @@ impl Transaction {
         Ok(())
     }
 
-    /// Overrides a table's row-count and size statistics. `next_row_id`
-    /// is preserved and never regresses; only
-    /// [`Self::register_data_file`] advances it.
+    /// Overrides a table's row-count and size statistics; `next_row_id` is
+    /// preserved.
     ///
     /// # Errors
     ///
@@ -1805,12 +1712,8 @@ impl Transaction {
         Ok(())
     }
 
-    /// Creates a macro with its implementations.
-    ///
-    /// Macro names are namespaced per `macro_type`: scalar and table
-    /// macros are distinct catalog sets, so the name must be free only
-    /// among the schema's live macros of the same type. Every
-    /// implementation must carry the same `macro_type`.
+    /// Creates a macro with its implementations. Names are namespaced per
+    /// `macro_type`; every implementation must carry the same one.
     ///
     /// # Errors
     ///
@@ -1903,8 +1806,7 @@ impl Transaction {
         let Some(record) = self.state.macros.get(&macro_id.get()) else {
             return Err(Error::NotFound(format!("macro {macro_id}")));
         };
-        // Implementations are never empty: creation requires at least
-        // one, on the verb path above and the staged path alike.
+        // Creation requires at least one implementation.
         let macro_type = record
             .implementations
             .first()
@@ -1967,10 +1869,9 @@ impl Transaction {
         Ok(())
     }
 
-    /// Records the mutation of a live tag target, and errors if it is not
-    /// live. Schemas carry no change-set entry (the wire grammar has no
-    /// schema-alter kind); tables and views classify as alterations, so a
-    /// tag change races a concurrent alter or drop of the same object.
+    /// Records the mutation of a tag target, erroring if it is not live.
+    /// Tables and views classify as alterations; schemas carry no
+    /// change-set entry.
     fn mark_tagged(&mut self, target: TagTarget) -> Result<()> {
         let op = match target {
             TagTarget::Schema(schema) => {
@@ -2022,11 +1923,7 @@ impl Transaction {
 
     /// Sets a tag on a schema, table, or view. An existing value for the
     /// key ends into the object's tag history and the new value begins at
-    /// this commit's snapshot, so time travel reads the value in force at
-    /// any past snapshot.
-    ///
-    /// Column tags are not reachable here: DuckLake carries them on the
-    /// column record itself, and no verb authors them yet.
+    /// this commit's snapshot. Column tags are not reachable here.
     ///
     /// # Errors
     ///
@@ -2058,8 +1955,7 @@ impl Transaction {
     }
 
     /// Removes a tag from a schema, table, or view: its live entry ends at
-    /// this commit's snapshot and stays readable by time travel until
-    /// garbage collection reclaims it.
+    /// this commit's snapshot.
     ///
     /// # Errors
     ///
@@ -2097,19 +1993,14 @@ impl Transaction {
         }
     }
 
-    /// Inlines a chunk of rows: they live in the catalog's `inline`
-    /// subspace instead of a data file, and this commit's batch carries
-    /// them, so a small insert costs no Parquet file.
-    ///
-    /// Row ids come from the table's row-id counter exactly as a data-file
-    /// registration allocates them — the returned id is the chunk's first,
-    /// and its rows run densely from there. The rows count toward the
-    /// table's `record_count` from here on; a later
-    /// [`flush`](Self::flush_inlined_data) moves them to a file without
-    /// recounting them.
+    /// Inlines a chunk of rows into the catalog's `inline` subspace instead
+    /// of a data file. Row ids are allocated as for a data file: the
+    /// returned id is the chunk's first and its rows run densely from
+    /// there. The rows count toward `record_count` from here on; a later
+    /// [`flush`](Self::flush_inlined_data) does not recount them.
     ///
     /// `index_entries` covers the chunk's rows for every live equality
-    /// index, positioned by ordinal within the chunk, exactly as
+    /// index, positioned by ordinal within the chunk, as
     /// [`Self::register_data_file`] covers a file's.
     ///
     /// # Errors
@@ -2182,9 +2073,7 @@ impl Transaction {
             row_count: chunk.row_count,
             arrow_body: chunk.arrow_body.clone(),
         });
-        for file_entry in index_entries {
-            self.stage_file_index_entry(table, row_id_start, file_entry)?;
-        }
+        self.stage_file_index_entries(table, row_id_start, index_entries)?;
         self.ops.push(Operation::InlineInsert {
             table_id: table.get(),
         });
@@ -2192,16 +2081,12 @@ impl Transaction {
         Ok(row_id_start)
     }
 
-    /// Tombstones one inlined row. The chunk holding it is never rewritten:
-    /// the tombstone is its own record, so the row stays visible to reads
-    /// below this commit's snapshot and disappears from here on.
-    ///
-    /// Statistics are untouched — as with a delete file, `record_count`
-    /// counts rows, not delete markers.
+    /// Tombstones one inlined row: the row stays visible to reads below
+    /// this commit's snapshot and disappears from here on. Table
+    /// statistics are unchanged.
     ///
     /// `index_entries` names the values the dead row was indexed under, for
-    /// every live equality index; each entry's row id must be the row being
-    /// tombstoned.
+    /// every live equality index; each entry's row id must be `row_id`.
     ///
     /// # Errors
     ///
@@ -2255,23 +2140,14 @@ impl Transaction {
     /// chunk of `schema_version` committed before this commit, plus the
     /// tombstones those chunks' rows consumed.
     ///
-    /// A flushed file is not an ordinary registration: its rows keep the
-    /// ids they were inlined under and its record is backdated to the
-    /// earliest snapshot among them, so a pre-flush time-travel read finds
-    /// them in the file rather than in the drained chunks. Its rows are
-    /// already counted in the table's statistics, so registering it adds
-    /// only its bytes.
+    /// A flushed file keeps the row ids its rows were inlined under and is
+    /// backdated to the earliest snapshot among them; its rows are already
+    /// counted in the table's statistics, so registering it adds only its
+    /// bytes. Passing no files drains the chunks alone.
     ///
-    /// Passing no files drains the chunks alone — the shape a flush of
-    /// wholly tombstoned rows takes.
-    ///
-    /// A commit may inline into the same table it flushes. The drain reads
-    /// the store as it stood before this commit, so the chunk this commit
-    /// stages is not one of the chunks it drains: those rows stay inlined
-    /// for the next flush to take. They are also outside what a flushed
-    /// file may claim — the caller wrote its Parquet before the commit, so
-    /// a file naming a row id this commit minted is refused rather than
-    /// counted in both places.
+    /// A commit may inline into the same table it flushes: the chunk it
+    /// stages is not drained, and a flushed file may not claim a row id
+    /// this commit minted.
     ///
     /// # Errors
     ///
@@ -2290,10 +2166,10 @@ impl Transaction {
 
         let tstat = self.live_table_stats(table)?;
         let ceiling = self.inherited_row_ids(table, &tstat);
-        let mut ids = Vec::with_capacity(flushed.len());
-        for flush in flushed {
-            ids.push(self.register_flushed_file(table, flush, ceiling)?);
-        }
+        let ids = flushed
+            .iter()
+            .map(|flush| self.register_flushed_file(table, flush, ceiling))
+            .collect::<Result<Vec<_>>>()?;
 
         self.inline_ops.push(InlineStage::Flush {
             table_id: table.get(),
@@ -2405,9 +2281,7 @@ impl Transaction {
     }
 }
 
-/// Refuses the global `encrypted` key: whether data files are encrypted is
-/// fixed when the catalog is created and recorded at bootstrap, never
-/// mutated afterward.
+/// Refuses the global `encrypted` key, which is fixed at catalog creation.
 fn reserved_option(scope: OptionScope, key: &str) -> Result<()> {
     if scope == OptionScope::Global && key == "encrypted" {
         return Err(Error::Constraint(
@@ -2426,8 +2300,7 @@ fn nonempty_name(what: &str, name: &str) -> Result<()> {
 }
 
 /// Refuses a relation name unsafe in the storage path derived from it: a
-/// separator nests or collides prefixes, and a dot segment escapes the
-/// catalog root.
+/// path separator or a dot segment.
 fn path_safe_name(what: &str, name: &str) -> Result<()> {
     nonempty_name(what, name)?;
     if name.contains(['/', '\\']) || name == "." || name == ".." {
@@ -2476,10 +2349,8 @@ fn new_column(
     }
 }
 
-/// Every node of `defs` in pre-order, validated: names non-empty and unique
-/// among siblings, types storable. Sibling scope is DuckLake's rule — a
-/// nested field's name lives inside its parent, so two structs may each
-/// hold an `x`.
+/// Validates every node of `defs`: names non-empty and unique among
+/// siblings, types storable.
 fn validate_column_defs(defs: &[ColumnDef]) -> Result<()> {
     let mut seen = HashSet::with_capacity(defs.len());
     for def in defs {
