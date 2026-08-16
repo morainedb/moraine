@@ -879,6 +879,9 @@ pub unsafe extern "C" fn moraine_attach(
         let mut handle = MoraineCatalogHandle::new(runtime, catalog, log_id);
         handle.data_store = data_store;
         handle.data_prefix = data_prefix;
+        // Spawned, not awaited: the first located lookup would otherwise
+        // build every summary itself, and an attach must not pay for it.
+        handle.spawn_warm_all();
         Ok(Box::new(handle))
     };
 
@@ -1167,6 +1170,7 @@ pub unsafe extern "C" fn moraine_detach(handle: *mut MoraineCatalogHandle) {
     let attempt = || {
         // SAFETY: caller contract above; dropped exactly once.
         let boxed = unsafe { Box::from_raw(handle) };
+        boxed.finish_warming();
         if let Err(err) = boxed.block_on(boxed.catalog.reads().close()) {
             // Detach has no error channel, so the failed close (a final
             // flush that did not land) is logged rather than lost. The
@@ -3068,18 +3072,58 @@ pub unsafe extern "C" fn moraine_indexes_free(items: *mut MoraineIndexDesc, len:
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
-/// One stable row id returned by an index lookup.
-#[repr(transparent)]
+/// One stable row id returned by an index lookup, and the file currently
+/// holding it. A row id can appear more than once when more than one
+/// current file is a candidate for it.
+#[repr(C)]
 pub struct MoraineRowId {
     /// The numeric row id.
     pub value: u64,
+    /// The file holding it; meaningful only when `has_data_file_id`.
+    pub data_file_id: u64,
+    /// Whether `data_file_id` names a file. False for a live inlined row
+    /// and for one this lookup could not place.
+    pub has_data_file_id: bool,
 }
 
-fn abi_row_ids(row_ids: Vec<u64>) -> Vec<MoraineRowId> {
-    row_ids
+/// Places `row_ids` in the table's current files, falling back to the
+/// unplaced form when no `DATA_PATH` store was given at attach.
+///
+/// # Safety
+///
+/// `probe`/`probe_ctx` must satisfy the interrupt-probe contract.
+unsafe fn abi_located_row_ids(
+    handle_ref: &MoraineCatalogHandle,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    table_id: moraine::TableId,
+    row_ids: &[u64],
+) -> Result<Vec<MoraineRowId>, AbiError> {
+    if row_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // SAFETY: caller contract for `probe`/`probe_ctx`.
+    let located = unsafe {
+        handle_ref.block_on_cancellable(
+            probe,
+            probe_ctx,
+            handle_ref.catalog.reads().locate_row_ids(
+                handle_ref.data_store.clone(),
+                &handle_ref.data_prefix,
+                table_id,
+                row_ids.to_vec(),
+            ),
+        )
+    }?;
+
+    Ok(located
         .into_iter()
-        .map(|value| MoraineRowId { value })
-        .collect()
+        .map(|candidate| MoraineRowId {
+            value: candidate.row_id,
+            data_file_id: candidate.data_file_id.map_or(0, moraine::DataFileId::get),
+            has_data_file_id: candidate.data_file_id.is_some(),
+        })
+        .collect())
 }
 
 /// A value passed to [`moraine_index_lookup`], tagged by kind. The shim
@@ -3281,7 +3325,8 @@ pub unsafe extern "C" fn moraine_index_lookup(
                     .index_lookup(table_id, index.id, &key),
             )
         }?;
-        Ok(abi_row_ids(row_ids))
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        unsafe { abi_located_row_ids(handle_ref, probe, probe_ctx, table_id, &row_ids) }
     };
 
     // SAFETY: caller contract for the pointers.
@@ -3396,7 +3441,8 @@ pub unsafe extern "C" fn moraine_index_in(
                     .index_lookup_many(table_id, index.id, &coerced_keys),
             )
         }?;
-        Ok(abi_row_ids(row_ids))
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        unsafe { abi_located_row_ids(handle_ref, probe, probe_ctx, table_id, &row_ids) }
     };
 
     // SAFETY: caller contract for the pointers.
@@ -3521,7 +3567,8 @@ pub unsafe extern "C" fn moraine_index_range(
                     .index_range(table_id, index.id, lower, upper, reverse),
             )
         }?;
-        Ok(abi_row_ids(row_ids))
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        unsafe { abi_located_row_ids(handle_ref, probe, probe_ctx, table_id, &row_ids) }
     };
 
     // SAFETY: caller contract for the pointers.
@@ -3618,7 +3665,8 @@ pub unsafe extern "C" fn moraine_index_nulls(
                     .index_nulls(table_id, index.id, values, reverse),
             )
         }?;
-        Ok(abi_row_ids(row_ids))
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        unsafe { abi_located_row_ids(handle_ref, probe, probe_ctx, table_id, &row_ids) }
     };
 
     // SAFETY: caller contract for the pointers.

@@ -1,10 +1,6 @@
 //! Resumable, bounded staged index construction.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 use futures::TryStreamExt;
 use object_store::{ObjectStore, path::Path};
@@ -18,10 +14,7 @@ use crate::{
     },
     data_file,
     error::{Error, Result},
-    store::{
-        index_encoding::{Direction, NullOrder},
-        inline as store_inline,
-    },
+    store::index_encoding::{Direction, NullOrder},
     transaction::commit,
 };
 
@@ -273,6 +266,7 @@ impl Catalog {
             .map(snapshot::index_info)
             .filter(|index| index.state == IndexState::Maintaining)
             .collect();
+
         let mut repaired = 0u64;
         for index in pending {
             if data_store.is_none() && !snapshot.data_files_of(index.table_id).is_empty() {
@@ -413,34 +407,31 @@ impl Catalog {
                 peak_buffered_entries: 0,
             };
 
-            let pass = async {
-                // Inline rows precede file sources. Older builds that carry
-                // only a row-id cursor resume this leg by that watermark.
-                let mut inline = self.inline_backfill_entries(table, &def.columns).await?;
-                inline.sort_unstable_by_key(|entry| entry.row_id);
-                for entry in inline
-                    .into_iter()
-                    .filter(|entry| inline_row_cursor.is_none_or(|row| entry.row_id > row))
-                {
-                    buffer.push(entry, None).await?;
-                }
-
-                if let Some(store) = &data_store {
-                    self.stream_backfill_files(
-                        Arc::clone(store),
-                        data_prefix,
-                        table,
-                        &def.columns,
-                        initial_file_cursor,
-                        initial_position_cursor,
-                        legacy_row_cursor,
-                        &mut buffer,
-                    )
-                    .await?;
-                }
-                buffer.flush(true).await
+            // Inline rows precede file sources. Older builds that carry
+            // only a row-id cursor resume this leg by that watermark.
+            let mut inline = self.inline_backfill_entries(table, &def.columns).await?;
+            inline.sort_unstable_by_key(|entry| entry.row_id);
+            for entry in inline
+                .into_iter()
+                .filter(|entry| inline_row_cursor.is_none_or(|row| entry.row_id > row))
+            {
+                buffer.push(entry, None).await?;
             }
-            .await;
+
+            if let Some(store) = &data_store {
+                self.stream_backfill_files(
+                    Arc::clone(store),
+                    data_prefix,
+                    table,
+                    &def.columns,
+                    initial_file_cursor,
+                    initial_position_cursor,
+                    legacy_row_cursor,
+                    &mut buffer,
+                )
+                .await?;
+            }
+            let pass = buffer.flush(true).await;
 
             match pass {
                 Ok(()) => {
@@ -496,105 +487,92 @@ impl Catalog {
         buffer: &mut BuildStepBuffer<'_>,
     ) -> Result<()> {
         let session = self.begin_read().await?;
-        let outcome = async {
-            let snapshot = commit::materialize(session.handle(), None).await?;
-            let live_columns = snapshot.columns_of(table);
-            let positions = columns
-                .iter()
-                .map(|column| {
-                    live_columns
-                        .iter()
-                        .position(|candidate| candidate.id == *column)
-                        .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let table_prefix = snapshot.table_data_prefix(table)?;
-            let resolve = |path: &str, is_relative: bool| {
-                let relative = match (is_relative, data_prefix.is_empty()) {
-                    (false, _) => path.to_owned(),
-                    (true, true) => format!("{table_prefix}{path}"),
-                    (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
-                };
-                Path::from(relative.as_str())
-            };
+        let snapshot = commit::materialize(session.handle(), None).await?;
+        let live_columns = snapshot.columns_of(table);
+        let positions = columns
+            .iter()
+            .map(|column| {
+                live_columns
+                    .iter()
+                    .position(|candidate| candidate.id == *column)
+                    .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-            let inline_deletes = async {
-                let mut killed = HashMap::<u64, HashSet<u64>>::new();
-                for (data_file_id, row_id, _) in
-                    store_inline::scan_inline_file_deletes(session.handle(), table.get()).await?
-                {
-                    killed.entry(data_file_id).or_default().insert(row_id);
-                }
-                Ok::<_, Error>(killed)
+        let table_prefix = snapshot.table_data_prefix(table)?;
+        let resolve = |path: &str, is_relative: bool| {
+            let relative = match (is_relative, data_prefix.is_empty()) {
+                (false, _) => path.to_owned(),
+                (true, true) => format!("{table_prefix}{path}"),
+                (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
             };
-            let delete_files = backfill::collect_delete_positions(
-                snapshot.delete_files_of(table).into_iter(),
-                Arc::clone(&object_store),
-                &resolve,
-            );
-            let (killed_row_ids, killed_positions) =
-                futures::try_join!(inline_deletes, delete_files)?;
+            Path::from(relative.as_str())
+        };
 
-            for file in snapshot.data_files_of(table) {
-                if file_cursor.is_some_and(|cursor| file.id.get() < cursor) {
-                    continue;
-                }
-                let start = if file_cursor == Some(file.id.get()) {
-                    position_cursor.map_or(0, |position| position.saturating_add(1))
-                } else {
-                    0
-                };
-                if start >= file.record_count {
-                    continue;
-                }
-                let path = resolve(&file.path, file.path_is_relative);
-                let file_id = file.id.get();
-                let dead_positions = killed_positions.get(&file_id);
-                let dead_row_ids = killed_row_ids.get(&file_id);
-                let mut batches = data_file::scoped_read_entry_batches(
-                    data_file::ParquetFile::new(
-                        Arc::clone(&object_store),
-                        path,
-                        file.file_size_bytes,
-                        file.footer_size,
-                    ),
-                    &positions,
-                    data_file::ScopedRows::From(start),
-                    data_file::RowIdSource::Resolve {
-                        row_id_start: file.row_id_start,
-                    },
-                )
-                .await?;
-                while let Some(batch) = batches.try_next().await? {
-                    for entry in batch {
-                        let ordinal = entry.ordinal;
-                        let dead = dead_positions
-                            .is_some_and(|positions| positions.contains(&ordinal))
-                            || dead_row_ids.is_some_and(|rows| rows.contains(&entry.row_id));
-                        let covered =
-                            legacy_row_cursor.is_some_and(|cursor| entry.row_id <= cursor);
-                        if !dead && !covered {
-                            buffer
-                                .push(
-                                    IndexEntry {
-                                        row_id: entry.row_id,
-                                        values: entry.values,
-                                    },
-                                    Some((file_id, ordinal)),
-                                )
-                                .await?;
-                        } else {
-                            buffer.cover_source(file_id, ordinal);
-                        }
+        let inline_deletes =
+            backfill::collect_inline_delete_positions(session.handle(), table.get());
+        let delete_files = backfill::collect_delete_positions(
+            snapshot.delete_files_of(table).into_iter(),
+            Arc::clone(&object_store),
+            &resolve,
+        );
+        let (killed_row_ids, killed_positions) = futures::try_join!(inline_deletes, delete_files)?;
+
+        for file in snapshot.data_files_of(table) {
+            if file_cursor.is_some_and(|cursor| file.id.get() < cursor) {
+                continue;
+            }
+            let start = if file_cursor == Some(file.id.get()) {
+                position_cursor.map_or(0, |position| position.saturating_add(1))
+            } else {
+                0
+            };
+            if start >= file.record_count {
+                continue;
+            }
+            let path = resolve(&file.path, file.path_is_relative);
+            let file_id = file.id.get();
+            let dead_positions = killed_positions.get(&file_id);
+            let dead_row_ids = killed_row_ids.get(&file_id);
+            let mut batches = data_file::scoped_read_entry_batches(
+                data_file::ParquetFile::new(
+                    Arc::clone(&object_store),
+                    path,
+                    file.file_size_bytes,
+                    file.footer_size,
+                ),
+                &positions,
+                data_file::ScopedRows::From(start),
+                data_file::RowIdSource::Resolve {
+                    row_id_start: file.row_id_start,
+                },
+            )
+            .await?;
+            while let Some(batch) = batches.try_next().await? {
+                for entry in batch {
+                    let ordinal = entry.ordinal;
+                    let dead = dead_positions.is_some_and(|positions| positions.contains(&ordinal))
+                        || dead_row_ids.is_some_and(|rows| rows.contains(&entry.row_id));
+                    let covered = legacy_row_cursor.is_some_and(|cursor| entry.row_id <= cursor);
+                    if !dead && !covered {
+                        buffer
+                            .push(
+                                IndexEntry {
+                                    row_id: entry.row_id,
+                                    values: entry.values,
+                                },
+                                Some((file_id, ordinal)),
+                            )
+                            .await?;
+                    } else {
+                        buffer.cover_source(file_id, ordinal);
                     }
                 }
             }
-
-            Ok(())
         }
-        .await;
+
         session.finish();
 
-        outcome
+        Ok(())
     }
 }

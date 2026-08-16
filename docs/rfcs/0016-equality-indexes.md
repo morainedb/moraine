@@ -557,6 +557,140 @@ Lookups, ranges, and null queries are **head-only**: entries are live-only, so
 it always was — a scan problem. The hot path (current head) gets the index;
 the rare path pays nothing to keep it honest.
 
+### File-located lookups
+
+A lookup resolves an indexed value to stable row ids as above. It may then
+locate those rows in the current physical data files, so a DuckLake scan
+prunes by file id as well as row id.
+
+Physical location is **derived cache state**. It is not stored in the
+equality entry, takes no part in the commit protocol, and adds no `index`
+subspace keys — compaction and file rewrites leave every entry untouched.
+That is the same property as [What data movement costs the index:
+nothing](#what-data-movement-costs-the-index-nothing), extended to
+location: the index knows row ids, and where a row id currently lives is
+recomputable from the head view at any time.
+
+The core returns a located row:
+
+```text
+FileRowCandidate {
+    row_id: u64,
+    data_file_id: Option<DataFileId>,
+}
+```
+
+`ReadOnlyCatalog::locate_row_ids` takes a `DATA_PATH` object store, its path
+prefix, a table id, and stable row ids, resolving every row against the same
+head view that enumerates current data files. More than one file may be a
+candidate for one row id: an update can leave an expired physical copy in an
+otherwise-current source file while the visible copy is written elsewhere.
+
+`None` names a live inlined row. A row id in neither a current data file nor
+current inline data is also returned with `None` — a conservative fallback,
+so incomplete cache construction or catalog state cannot hide a row.
+
+The extension surfaces two columns, `row_id BIGINT` and
+`data_file_id UBIGINT`, the latter nullable for inlined or unlocated rows.
+A consumer joins with null-safe equality on file id and ordinary equality on
+row id; a caller selecting only `row_id` is unaffected.
+
+### File-row sets
+
+One immutable summary describes the physical row ids of one immutable data
+file, in whichever representation is smallest for that file:
+
+- a half-open dense range, for a file carrying `row_id_start` and no
+  reserved row-id column;
+- a run-optimized 64-bit Roaring set, when it beats the raw ids;
+- a sorted `u64` vector, when fragmentation makes Roaring larger.
+
+A recorded `row_id_start` does not by itself imply the range: a flushed file
+carries both a dense start and the reserved column, and that column's ids may
+hold gaps a range would invent rows across and, worse, end before — excluding
+a row the file holds. Which representation applies is therefore a question
+about the file's schema, settled by its footer, and only then does a dense
+file skip reading any column. A miss on any other file reads only the
+reserved internal-row-id column, and reads of separate immutable files
+overlap under the bounded concurrency index backfill already uses.
+
+Summaries are built lazily, by the lookup that first needs one. Nothing
+constructs them at write time, and nothing could cheaply: for a file the
+catalog numbers itself the summary *is* the catalog record, and for one
+carrying embedded ids — a compaction output or a rewrite — moraine holds only
+the file's metadata, never its rows, so building at registration would mean
+reading back the Parquet it was just told about, inside the commit path. A
+summary is also process-local, and the writer is not the process that reads.
+
+`ReadOnlyCatalog::warm_row_summaries` therefore exists to move that cost off
+the first lookup rather than into the commit: a caller spawns it after a
+commit that lands compaction outputs, and it builds exactly the summaries a
+cold lookup would. It is best-effort and idempotent — a resident or dense
+file costs nothing, an unreadable one is counted rather than raised — and
+warms one process, so a separate reader still builds its own. A pass that
+never runs changes latency and nothing else.
+
+The summary cache is keyed by store identity, table id, data file id, path,
+and recorded file size. The store is held weakly, which both keeps the
+process-wide cache from pinning a catalog alive and separates two catalogs
+whose table and file ids coincide. Catalog ids are never reused; path and
+size make stale reuse fail
+closed even against an imported catalog that violates that. Decoded sparse
+summaries are byte-budgeted (RFC 0009); range summaries are cheap enough to
+rederive and take none of the budget.
+
+A batch lookup sorts and deduplicates its row ids once, then intersects each
+file summary against that set — file-grouped candidates without a per-row
+location map.
+
+### Locating cannot lose a row
+
+Equality entries remain the sole source of indexed values and uniqueness, so
+the location cache can neither create nor remove a result. Every degraded
+path *broadens* the candidate file set: a missing, evicted, unsupported, or
+failed summary leaves every requested row id a candidate for that file. The
+optimization may read files it did not have to; it cannot exclude a matching
+row. Choosing the visible physical copy of a stable row id remains DuckLake's
+delete and snapshot processing.
+
+Locating is head-only, exactly as equality lookup is: a time-travel scan
+consumes neither live-only entries nor this cache.
+
+### Locating across the DuckLake file list
+
+The companion DuckLake patch exposes `data_file_id` as an internal virtual
+`UBIGINT` column. A physical file emits its persistent catalog id as a
+constant; inlined and transaction-local sources emit NULL.
+
+Static and dynamic filters on that column are pushed into DuckLake's
+metadata file-list query as predicates on `ducklake_data_file.data_file_id`,
+using no column statistics; row-id filters continue through the existing
+reserved-field statistics path. A predicate naming both columns therefore
+restricts the file list and the rows read within the files that survive.
+
+A join condition does not reach that far by itself. A hash join's runtime
+filters are generated after DuckLake has built its file list, and DuckDB
+generates none at all for the null-safe equality the file-id column requires.
+Left alone, a located join reads every file whose row-id statistics admit the
+key — which, because each update writes a file spanning the ids it preserved,
+is every update the table has taken.
+
+An extension optimizer rule closes that gap. An index read resolves its rows
+while binding, so a join against one is a join against a list of constants
+already visible to the planner; the rule restates that list as an `IN` filter
+on the other side of an inner join, where the ordinary pushdown carries it
+into the scan. The filter only repeats what the join enforces, so it is added
+beside the join rather than replacing it: whatever the query projects from
+either side is unaffected, and an outer join — which keeps rows meeting no
+condition — is left alone. A file id resolved as NULL contributes an
+`IS NULL` disjunct under null-safe equality and nothing under plain equality,
+matching what each comparison would have accepted. Past a bounded list length
+the rule declines, a lookup that wide being a scan in disguise.
+
+The current DuckLake catalog view stays authoritative for file lifetime.
+Ended compaction inputs are simply absent, new outputs are cache misses, and
+nothing pairs sources with outputs or hooks catalog changes.
+
 ### Range and comparison queries
 
 Because the canonical encoding is order-preserving (Canonical value
@@ -881,11 +1015,13 @@ and the permanent `Constraint` surfaces then. On a bulk violation the Parquet
 DuckLake already wrote is left orphaned for ordinary cleanup — space, not
 correctness.
 
-**Reads are explicit.** DuckLake owns the planner, so no optimizer routing.
-The extension path reads through `moraine_index_lookup`; the caller joins
-back to the table, whose scan DuckLake adjudicates against delete files. v1
-scope: creation, uniqueness enforcement, and explicit equality, range, and
-NULL reads.
+**Reads are explicit.** DuckLake owns the planner, so nothing routes a
+predicate to an index. The extension path reads through
+`moraine_index_lookup`; the caller joins back to the table, whose scan
+DuckLake adjudicates against delete files. The optimizer rule above does not
+change that: it restates a join the caller already wrote, and never chooses
+an index. v1 scope: creation, uniqueness enforcement, and explicit equality,
+range, and NULL reads.
 
 **The upstream boundary is explicit.** Moraine does not carry a downstream
 DuckLake binder or optimizer patch. If DuckLake defines native index metadata,
@@ -1169,6 +1305,17 @@ tests against real SlateDB on in-memory `object_store`:
   correct after each; a `DELETE` against the rewritten file removes its
   entries; `moraine_create_index` on a table already holding rewrite
   files backfills them.
+- **File-located lookups.** Each summary representation is chosen and
+  intersected correctly — dense range, Roaring, and sorted vector — and the
+  intersections are exact for both dense and sparse files. A duplicate
+  physical row id across two current files returns both as candidates; an
+  inlined row returns a NULL file id. An unreadable sparse file falls back
+  to every requested row id remaining a candidate for it, proving the
+  degradation is conservative rather than lossy. Over DuckLake:
+  `data_file_id` projects, prunes statically and dynamically, and an
+  indexed sparse-file lookup opens only the candidate Parquet files.
+  Benchmarks report cache bytes, sparse-summary build time, located-lookup
+  time, and `Total Files Read` warm and cold.
 
 ## Alternatives considered
 

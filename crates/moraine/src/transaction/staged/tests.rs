@@ -6335,3 +6335,57 @@ async fn a_staged_mapping_delete_is_invisible_to_its_own_transaction() {
     );
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn staged_data_file_inserts_name_each_table_once() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: data_file_row(1, 7, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: data_file_row(2, 7, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: data_file_row(3, 9, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 4),
+    });
+
+    let tables = tx.tables_with_staged_data_files();
+
+    assert_eq!(
+        tables.iter().map(|table| table.get()).collect::<Vec<_>>(),
+        vec![7, 9]
+    );
+    tx.rollback();
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_commit_registering_no_data_files_names_no_tables() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 1, "t", 2, None),
+    });
+    // An ended data file is not a new one: only inserts register files.
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(2)],
+    });
+
+    assert!(tx.tables_with_staged_data_files().is_empty());
+    tx.rollback();
+    catalog.close().await.unwrap();
+}

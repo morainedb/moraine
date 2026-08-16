@@ -77,6 +77,43 @@ pub(crate) fn attach_ok(dir: &Path) -> *mut MoraineCatalogHandle {
     handle
 }
 
+/// Attaches read-write to `dir` with `data_dir` as `META_DATA_PATH`, so
+/// the handle carries the store a scoped read needs, and asserts success.
+pub(crate) fn attach_with_data_path(dir: &Path, data_dir: &Path) -> *mut MoraineCatalogHandle {
+    let c_path = CString::new(dir.to_str().expect("test path is UTF-8")).expect("no NUL in path");
+    let c_data =
+        CString::new(data_dir.to_str().expect("test path is UTF-8")).expect("no NUL in path");
+    let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+    let mut err = MoraineError::default();
+    // SAFETY: both C strings are valid; outputs are valid local slots.
+    let code = unsafe {
+        moraine_attach(
+            c_path.as_ptr(),
+            ptr::null(),
+            false,
+            false,
+            0,
+            ptr::null(),
+            0,
+            0,
+            0,
+            false,
+            c_data.as_ptr(),
+            ptr::null(),
+            0,
+            None,
+            ptr::null_mut(),
+            &raw mut handle,
+            &raw mut err,
+        )
+    };
+    // SAFETY: `err.message` is null or was just written by the call above.
+    let err_message = unsafe { err.message.as_ref() };
+    assert_eq!(code, codes::OK, "attach failed: {err_message:?}");
+    assert!(!handle.is_null());
+    handle
+}
+
 /// Opens a staged-row transaction and asserts success.
 pub(crate) fn begin(handle: *mut MoraineCatalogHandle) -> *mut MoraineTxHandle {
     let mut tx: *mut MoraineTxHandle = ptr::null_mut();

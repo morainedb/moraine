@@ -1123,9 +1123,14 @@ pub unsafe extern "C" fn moraine_tx_commit(
         }
         // SAFETY: `catalog` outlives `tx` per `moraine_tx_begin`'s contract.
         let catalog_ref = unsafe { &*catalog };
+        // Read before the commit consumes `tx`, spawned after it lands: a
+        // compaction output carries its own row ids, so its summary is the
+        // one a later lookup would otherwise build cold.
+        let warm_tables = tx.tables_with_staged_data_files();
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let id = unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, tx.commit()) }?;
+        catalog_ref.spawn_warm_tables(warm_tables);
 
         // Repair begins only after the data snapshot is known durable. Its
         // failure, including cancellation, cannot turn that success into a
@@ -1581,9 +1586,96 @@ mod tests {
     use crate::{
         abi::moraine_detach,
         test_support::{
-            StrArena, TempDir, attach_ok, begin, bool_cell, i64_cell, null_cell, stage, u64_cell,
+            StrArena, TempDir, attach_ok, attach_with_data_path, begin, bool_cell, commit,
+            i64_cell, null_cell, stage, u64_cell,
         },
     };
+
+    /// Stages a full `ducklake_data_file` row (`table_kind` 6,
+    /// `operation_kind` 0) against `table_id`.
+    fn stage_data_file_row(
+        tx: *mut MoraineTxHandle,
+        arena: &mut StrArena,
+        data_file_id: u64,
+        table_id: u64,
+        begin_snapshot: u64,
+    ) {
+        stage(
+            tx,
+            6,
+            0,
+            &[
+                u64_cell(data_file_id),
+                u64_cell(table_id),
+                u64_cell(begin_snapshot),
+                null_cell(),
+                null_cell(),
+                arena.cell("data-1.parquet"),
+                bool_cell(true),
+                arena.cell("parquet"),
+                u64_cell(10),
+                u64_cell(1024),
+                u64_cell(64),
+                u64_cell(0),
+                null_cell(),
+                null_cell(),
+                null_cell(),
+                null_cell(),
+            ],
+        );
+    }
+
+    /// A commit that registers data files warms the tables it touched, so
+    /// the files it just created are not left cold for the first lookup.
+    #[test]
+    fn a_commit_registering_data_files_warms_those_tables() {
+        let lake = TempDir::new("commit-warm");
+        let data = TempDir::new("commit-warm-data");
+        let handle = attach_with_data_path(lake.path(), data.path());
+        // Drained first, so what remains at the end is the commit's own.
+        // SAFETY: attached above and not yet detached.
+        unsafe { &*handle }.finish_warming();
+
+        let tx = begin(handle);
+        let mut arena = StrArena::new();
+        stage_table_row(tx, &mut arena, 1, (1, None), 0, "t", "t/");
+        stage_data_file_row(tx, &mut arena, 1, 1, 1);
+        stage_snapshot_and_changes(tx, &mut arena, 1, 1, 2, "inserted_into_table:1");
+        stage(tx, 11, 0, &[u64_cell(1), u64_cell(1), u64_cell(1)]);
+        commit(tx);
+
+        // SAFETY: still attached.
+        let warming = unsafe { &*handle }.finish_warming();
+
+        assert_eq!(warming, 1, "the commit spawned no warming pass");
+        // SAFETY: attached above, detached exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// A commit that registers no data files spawns no warming: there is
+    /// nothing new to summarize.
+    #[test]
+    fn a_commit_registering_no_data_files_warms_nothing() {
+        let lake = TempDir::new("commit-warm-none");
+        let data = TempDir::new("commit-warm-none-data");
+        let handle = attach_with_data_path(lake.path(), data.path());
+        // SAFETY: attached above and not yet detached.
+        unsafe { &*handle }.finish_warming();
+
+        let tx = begin(handle);
+        let mut arena = StrArena::new();
+        stage_table_row(tx, &mut arena, 1, (1, None), 0, "t", "t/");
+        stage_snapshot_and_changes(tx, &mut arena, 1, 1, 2, r#"created_table:"main"."t""#);
+        stage(tx, 11, 0, &[u64_cell(1), u64_cell(1), u64_cell(1)]);
+        commit(tx);
+
+        // SAFETY: still attached.
+        let warming = unsafe { &*handle }.finish_warming();
+
+        assert_eq!(warming, 0);
+        // SAFETY: attached above, detached exactly once.
+        unsafe { moraine_detach(handle) };
+    }
 
     /// Stages a full `ducklake_table` row (`table_kind` 3, `operation_kind` 0):
     /// id, a synthetic uuid, begin/end snapshot (`lifecycle`), schema id,

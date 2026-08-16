@@ -15,18 +15,11 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStoreExt,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
 };
-use parquet::{
-    arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder},
-    file::metadata::PageIndexPolicy,
-};
+use parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
 
 use super::*;
 use crate::{
-    data_file::{
-        metadata_cache::{METADATA_CACHE, MetadataLookup, metadata_lookup},
-        selection::Ordinals,
-        values::array_value,
-    },
+    data_file::{selection::Ordinals, values::array_value},
     store::index_encoding::IntWidth,
 };
 
@@ -418,35 +411,6 @@ async fn failed_metadata_in_flight_fill_is_retryable() {
     .await
     .unwrap();
     assert_eq!(retried.len(), 1);
-}
-
-#[test]
-fn abandoned_metadata_in_flight_entry_is_removed() {
-    let store: Arc<dyn ObjectStore> = Arc::new(CountingStore::new());
-    let path = Path::from("abandoned-in-flight.parquet");
-    let lookup = metadata_lookup(&store, &path, 100, PageIndexPolicy::Skip);
-    let MetadataLookup::InFlight(in_flight) = lookup else {
-        panic!("a unique store and path must start cold");
-    };
-    assert!(
-        METADATA_CACHE
-            .lock()
-            .unwrap()
-            .in_flight
-            .iter()
-            .any(|entry| Arc::ptr_eq(&entry.result, &in_flight.result))
-    );
-
-    drop(in_flight);
-
-    assert!(
-        !METADATA_CACHE
-            .lock()
-            .unwrap()
-            .in_flight
-            .iter()
-            .any(|entry| entry.path == path)
-    );
 }
 
 /// The read fetches only the footer and projected column chunks, and

@@ -9,15 +9,22 @@
 //! catalog's own keyspace out of SlateDB, and [`crate::catalog`] interprets
 //! what either returns.
 
+mod auxiliary_cache;
 mod columns;
 mod delete_file;
 mod entries;
 mod inline_batch;
-mod metadata_cache;
 mod metrics;
+mod reader;
+mod row_location;
+mod row_set;
 mod selection;
 mod values;
 
+#[cfg(test)]
+mod auxiliary_cache_tests;
+#[cfg(test)]
+mod row_set_tests;
 #[cfg(test)]
 mod tests;
 
@@ -29,8 +36,9 @@ use futures::{
     stream::{self, BoxStream},
 };
 use object_store::{ObjectStore, path::Path};
-use parquet::arrow::{
-    arrow_reader::ArrowReaderOptions, async_reader::ParquetRecordBatchStreamBuilder,
+use parquet::{
+    arrow::{arrow_reader::ArrowReaderOptions, async_reader::ParquetRecordBatchStreamBuilder},
+    file::metadata::PageIndexPolicy,
 };
 
 #[cfg(test)]
@@ -38,17 +46,22 @@ pub(crate) use crate::data_file::inline_batch::{
     inline_batch_decode_count, inline_schema_decode_count,
 };
 pub(crate) use crate::data_file::{
+    auxiliary_cache::{occupancy as auxiliary_occupancy, resize as resize_auxiliary},
     delete_file::delete_file_positions,
     inline_batch::{decode_inline_schema, inline_batch_entries, inline_batch_index_entries},
     metrics::{ScopedReadMetrics, ScopedReadTally, run_bounded_index_encoding},
+    row_location::{FileSummary, file_summary},
     selection::{RowPositions, ScopedRows},
 };
 use crate::{
     data_file::{
-        columns::{index_positions, projection, remap_index_projections, resolve_row_id_source},
+        columns::{
+            embedded_row_id_position, index_positions, projection, remap_index_projections,
+            resolve_row_id_source,
+        },
         entries::{record_batch_entries, record_batch_index_entries},
-        metadata_cache::ObjectStoreReader,
         metrics::INDEX_ENCODING_CONCURRENCY,
+        reader::ObjectStoreReader,
         selection::{scoped_selection, total_rows},
     },
     error::{Error, Result},
@@ -150,6 +163,7 @@ pub(crate) async fn scoped_read_recorded_entries(
 /// One immutable Parquet object's location and recorded metadata. Keeping
 /// both sizes beside the path prevents a read path from silently dropping
 /// the footer size and reintroducing metadata round trips.
+#[derive(Clone)]
 pub(crate) struct ParquetFile {
     object_store: Arc<dyn ObjectStore>,
     path: Path,
@@ -180,6 +194,26 @@ impl ParquetFile {
         self.metrics = metrics;
         self
     }
+}
+
+/// Whether `file` carries the reserved embedded row-id column. A recorded
+/// dense start does not imply contiguous ids: a flushed file carries both,
+/// and its embedded ids may hold gaps.
+pub(crate) async fn carries_embedded_row_ids(file: ParquetFile) -> Result<bool> {
+    let reader = ObjectStoreReader {
+        store: file.object_store,
+        path: file.path,
+        file_size: file.file_size,
+        footer_size: file.footer_size,
+        page_index: ScopedRows::All.page_index_policy(),
+        metrics: file.metrics,
+    };
+    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+        .await
+        .map_err(corrupt("row-id probe"))?;
+
+    Ok(embedded_row_id_position(builder.parquet_schema()).is_some())
 }
 
 /// Rows decoded at once by a streamed scoped read. A staged build step may

@@ -1,0 +1,290 @@
+diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/storage/ducklake_metadata_manager.hpp
+index ad3536f8..2c9d3b91 100644
+--- a/src/include/storage/ducklake_metadata_manager.hpp
++++ b/src/include/storage/ducklake_metadata_manager.hpp
+@@ -82,0 +83,3 @@ struct FilterPushdownInfo {
++	//! Filter on the data_file_id virtual column, applied to the file list
++	//! directly rather than through column statistics.
++	unique_ptr<TableFilter> data_file_id_filter;
+@@ -90,0 +94,3 @@ struct FilterPushdownInfo {
++		if (data_file_id_filter) {
++			result->data_file_id_filter = data_file_id_filter->Copy();
++		}
+diff --git a/src/include/storage/ducklake_multi_file_reader.hpp b/src/include/storage/ducklake_multi_file_reader.hpp
+index 1898459b..7c76fca2 100644
+--- a/src/include/storage/ducklake_multi_file_reader.hpp
++++ b/src/include/storage/ducklake_multi_file_reader.hpp
+@@ -22,0 +23 @@ public:
++	static constexpr column_t COLUMN_IDENTIFIER_DATA_FILE_ID = UINT64_C(10000000000000000001);
+diff --git a/src/storage/ducklake_metadata_manager.cpp b/src/storage/ducklake_metadata_manager.cpp
+index 487e074e..168b989d 100644
+--- a/src/storage/ducklake_metadata_manager.cpp
++++ b/src/storage/ducklake_metadata_manager.cpp
+@@ -1073,0 +1074,104 @@ static void SetSnapshotFilter(const DuckLakeSnapshot &snapshot, idx_t max_partia
++static string GenerateDataFileIdFilter(const TableFilter &filter) {
++	switch (filter.filter_type) {
++	case TableFilterType::CONSTANT_COMPARISON: {
++		auto &constant_filter = filter.Cast<ConstantFilter>();
++		if (constant_filter.constant.IsNull()) {
++			return string();
++		}
++		string comparison;
++		switch (constant_filter.comparison_type) {
++		case ExpressionType::COMPARE_EQUAL:
++			comparison = "=";
++			break;
++		case ExpressionType::COMPARE_NOTEQUAL:
++			comparison = "<>";
++			break;
++		case ExpressionType::COMPARE_LESSTHAN:
++			comparison = "<";
++			break;
++		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
++			comparison = "<=";
++			break;
++		case ExpressionType::COMPARE_GREATERTHAN:
++			comparison = ">";
++			break;
++		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
++			comparison = ">=";
++			break;
++		default:
++			return string();
++		}
++		return StringUtil::Format("data.data_file_id %s %s", comparison, constant_filter.constant.ToString());
++	}
++	case TableFilterType::IS_NOT_NULL:
++		// Every row of the file list has an id, so this excludes nothing.
++		return string();
++	case TableFilterType::IS_NULL:
++		// No file carries a NULL id: a NULL names an inlined or
++		// transaction-local row, which the file list does not describe. As a
++		// disjunct beside a located id this contributes nothing, which is
++		// what lets the null-safe join shape prune at all.
++		return "FALSE";
++	case TableFilterType::CONJUNCTION_AND: {
++		auto &conjunction_and_filter = filter.Cast<ConjunctionAndFilter>();
++		string result;
++		for (auto &child_filter : conjunction_and_filter.child_filters) {
++			auto child = GenerateDataFileIdFilter(*child_filter);
++			if (child.empty()) {
++				continue;
++			}
++			if (!result.empty()) {
++				result += " AND ";
++			}
++			result += "(" + child + ")";
++		}
++		return result;
++	}
++	case TableFilterType::CONJUNCTION_OR: {
++		auto &conjunction_or_filter = filter.Cast<ConjunctionOrFilter>();
++		string result;
++		for (auto &child_filter : conjunction_or_filter.child_filters) {
++			auto child = GenerateDataFileIdFilter(*child_filter);
++			if (child.empty()) {
++				// One unrepresentable arm makes the whole disjunction
++				// unrepresentable: dropping it would prune a file the
++				// filter admits.
++				return string();
++			}
++			if (!result.empty()) {
++				result += " OR ";
++			}
++			result += "(" + child + ")";
++		}
++		return result;
++	}
++	case TableFilterType::OPTIONAL_FILTER: {
++		auto &optional_filter = filter.Cast<OptionalFilter>();
++		if (!optional_filter.child_filter) {
++			return string();
++		}
++		return GenerateDataFileIdFilter(*optional_filter.child_filter);
++	}
++	case TableFilterType::IN_FILTER: {
++		auto &in_filter = filter.Cast<InFilter>();
++		string in_list;
++		for (auto &value : in_filter.values) {
++			if (value.IsNull()) {
++				return string();
++			}
++			if (!in_list.empty()) {
++				in_list += ", ";
++			}
++			in_list += value.ToString();
++		}
++		if (in_list.empty()) {
++			return string();
++		}
++		return StringUtil::Format("data.data_file_id IN (%s)", in_list);
++	}
++	default:
++		// An unrepresentable filter prunes nothing rather than guessing.
++		return string();
++	}
++}
++
+@@ -1668,0 +1773,12 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
++	// Prune the file list directly by id. This uses no column statistics, and
++	// an unrepresentable filter simply adds no predicate.
++	if (filter_info && filter_info->data_file_id_filter) {
++		auto data_file_id_clause = GenerateDataFileIdFilter(*filter_info->data_file_id_filter);
++		if (!data_file_id_clause.empty()) {
++			if (!where_clause.empty()) {
++				where_clause += " AND ";
++			}
++			where_clause += data_file_id_clause;
++		}
++	}
++
+diff --git a/src/storage/ducklake_multi_file_list.cpp b/src/storage/ducklake_multi_file_list.cpp
+index 568fda69..90318ab0 100644
+--- a/src/storage/ducklake_multi_file_list.cpp
++++ b/src/storage/ducklake_multi_file_list.cpp
+@@ -50,0 +51,5 @@ void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown
++	if (column_id == DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID) {
++		// Answered by the metadata file list itself, not by column statistics.
++		pushdown_info.data_file_id_filter = std::move(filter);
++		return;
++	}
+@@ -169,0 +175 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
++		extended_info->options["data_file_id"] = Value(LogicalType::UBIGINT);
+@@ -180,0 +187 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
++		extended_info->options["data_file_id"] = Value(LogicalType::UBIGINT);
+@@ -195,0 +203,5 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
++		if (file_entry.file_id.IsValid()) {
++			extended_info->options["data_file_id"] = Value::UBIGINT(file_entry.file_id.index);
++		} else {
++			extended_info->options["data_file_id"] = Value(LogicalType::UBIGINT);
++		}
+diff --git a/src/storage/ducklake_multi_file_reader.cpp b/src/storage/ducklake_multi_file_reader.cpp
+index c50cc642..43ae44ed 100644
+--- a/src/storage/ducklake_multi_file_reader.cpp
++++ b/src/storage/ducklake_multi_file_reader.cpp
+@@ -606,0 +607,14 @@ unique_ptr<Expression> DuckLakeMultiFileReader::GetVirtualColumnExpression(
++	if (column_id == COLUMN_IDENTIFIER_DATA_FILE_ID) {
++
++		// A physical file emits its persistent catalog id; inlined and
++		// transaction-local sources have none and emit NULL.
++		Value data_file_id(LogicalType::UBIGINT);
++		if (reader_data.file_to_be_opened.extended_info) {
++			auto &options = reader_data.file_to_be_opened.extended_info->options;
++			auto entry = options.find("data_file_id");
++			if (entry != options.end()) {
++				data_file_id = entry->second;
++			}
++		}
++		return make_uniq<BoundConstantExpression>(std::move(data_file_id));
++	}
+diff --git a/src/storage/ducklake_table_entry.cpp b/src/storage/ducklake_table_entry.cpp
+index 9e1650f7..ae032621 100644
+--- a/src/storage/ducklake_table_entry.cpp
++++ b/src/storage/ducklake_table_entry.cpp
+@@ -90,0 +91 @@ constexpr column_t DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID;
++constexpr column_t DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID;
+@@ -400,0 +402,2 @@ virtual_column_map_t DuckLakeTableEntry::GetVirtualColumns() const {
++	result.insert(make_pair(DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID,
++	                        TableColumn("data_file_id", LogicalType::UBIGINT)));
+diff --git a/test/sql/rowid/ducklake_data_file_id.test b/test/sql/rowid/ducklake_data_file_id.test
+new file mode 100644
+index 00000000..73aa10d6
+--- /dev/null
++++ b/test/sql/rowid/ducklake_data_file_id.test
+@@ -0,0 +1,96 @@
++# name: test/sql/rowid/ducklake_data_file_id.test
++# description: the data_file_id virtual column names each row's file and prunes the file list
++# group: [rowid]
++
++require ducklake
++
++require parquet
++
++test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
++
++test-env DATA_PATH __TEST_DIR__
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_data_file_id', METADATA_CATALOG 'data_file_id_meta', DATA_INLINING_ROW_LIMIT 0)
++
++statement ok
++CREATE TABLE ducklake.t(i INTEGER)
++
++statement ok
++INSERT INTO ducklake.t SELECT i FROM range(3) t(i)
++
++statement ok
++INSERT INTO ducklake.t SELECT i FROM range(100, 102) t(i)
++
++# Each row reports the file physically holding it.
++query II
++SELECT i, data_file_id FROM ducklake.t ORDER BY i
++----
++0	0
++1	0
++2	0
++100	1
++101	1
++
++# An equality predicate is answered by the file list, not by statistics.
++query I
++SELECT count(*) FROM ducklake.t WHERE data_file_id = 1
++----
++2
++
++query I
++SELECT count(*) FROM ducklake.t WHERE data_file_id = 0
++----
++3
++
++# An IN list admits both files.
++query I
++SELECT count(*) FROM ducklake.t WHERE data_file_id IN (0, 1)
++----
++5
++
++# A predicate matching no file prunes everything.
++query I
++SELECT count(*) FROM ducklake.t WHERE data_file_id = 999
++----
++0
++
++# Ranges push down too.
++query I
++SELECT count(*) FROM ducklake.t WHERE data_file_id >= 1
++----
++2
++
++# Joining located rows restricts both the file list and the rows read.
++query I
++SELECT count(*) FROM ducklake.t WHERE data_file_id = 1 AND i = 100
++----
++1
++
++statement ok
++CREATE TABLE ducklake.inlined(i INTEGER)
++
++statement ok
++CALL ducklake.set_option('data_inlining_row_limit', 10)
++
++statement ok
++INSERT INTO ducklake.inlined VALUES (1), (2)
++
++# An inlined row has no file, so its id is NULL rather than absent.
++query II
++SELECT i, data_file_id FROM ducklake.inlined ORDER BY i
++----
++1	NULL
++2	NULL
++
++# The null-safe shape a located join produces still prunes: no file carries a
++# NULL id, so that disjunct selects nothing rather than defeating the filter.
++query I
++SELECT count(*) FROM ducklake.t WHERE data_file_id IN (1) OR data_file_id IS NULL
++----
++2
++
++query I
++SELECT count(*) FROM ducklake.t WHERE data_file_id IS NULL
++----
++0

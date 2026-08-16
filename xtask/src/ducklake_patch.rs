@@ -16,12 +16,17 @@ const DUCKLAKE_REVISION: &str = "d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4";
 const SUPPORTED_DUCKDB_PIN: &str = "v1.5.5";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
-const PATCH_PATHS: [&str; 2] = [
+const PATCH_PATHS: [&str; 3] = [
     "patches/ducklake/0001-perf-prune-DuckLake-files-by-row-id.patch",
     "patches/ducklake/0002-feat-backfill-DuckLake-row-id-file-statistics.patch",
+    "patches/ducklake/0003-feat-expose-DuckLake-data-file-ids-to-scans.patch",
 ];
 const CONFIG_PATH: &str = "patches/ducklake/extension_config.cmake";
-const ROW_ID_TEST_PATH: &str = "test/sql/rowid/ducklake_row_id_file_pruning.test";
+/// The patched-behaviour sqllogictests, run against the built artifact.
+const REGRESSION_TEST_PATHS: [&str; 2] = [
+    "test/sql/rowid/ducklake_row_id_file_pruning.test",
+    "test/sql/rowid/ducklake_data_file_id.test",
+];
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
@@ -489,11 +494,11 @@ fn verify_loadable(artifact: &Path) -> anyhow::Result<()> {
     .context("the patched DuckLake artifact compiled but did not load in the pinned DuckDB CLI")
 }
 
-fn preload_ducklake_test(script: &str) -> anyhow::Result<String> {
+fn preload_ducklake_test(test_path: &str, script: &str) -> anyhow::Result<String> {
     const REQUIREMENT: &str = "require ducklake\n";
     ensure!(
         script.matches(REQUIREMENT).count() == 1,
-        "{ROW_ID_TEST_PATH} must contain exactly one `{}` directive",
+        "{test_path} must contain exactly one `{}` directive",
         REQUIREMENT.trim()
     );
     Ok(script.replacen(
@@ -515,38 +520,40 @@ fn run_row_id_regression(
         runner.display()
     );
 
-    let source_test = paths.source.join(ROW_ID_TEST_PATH);
-    let script = fs::read_to_string(&source_test)
-        .with_context(|| format!("reading patched test {}", source_test.display()))?;
-    let script = preload_ducklake_test(&script)?;
-    let test_root = TemporaryDirectory::create(&paths.root, "row-id-regression")?;
-    let copied_test = test_root.path().join(ROW_ID_TEST_PATH);
-    let parent = copied_test
-        .parent()
-        .context("the row-ID regression path has no parent")?;
-    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    fs::write(&copied_test, script)
-        .with_context(|| format!("writing {}", copied_test.display()))?;
+    for test_path in REGRESSION_TEST_PATHS {
+        let source_test = paths.source.join(test_path);
+        let script = fs::read_to_string(&source_test)
+            .with_context(|| format!("reading patched test {}", source_test.display()))?;
+        let script = preload_ducklake_test(test_path, &script)?;
+        let test_root = TemporaryDirectory::create(&paths.root, "ducklake-regression")?;
+        let copied_test = test_root.path().join(test_path);
+        let parent = copied_test
+            .parent()
+            .context("the regression test path has no parent")?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        fs::write(&copied_test, script)
+            .with_context(|| format!("writing {}", copied_test.display()))?;
 
-    let artifact_literal = artifact.display().to_string().replace('\'', "''");
-    let output = Command::new(&runner)
-        .args(["--test-dir"])
-        .arg(test_root.path())
-        .arg(ROW_ID_TEST_PATH)
-        .env("DUCKDB_TEST_ON_INIT", format!("LOAD '{artifact_literal}';"))
-        .output()
-        .with_context(|| format!("spawning {}", runner.display()))?;
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    ensure!(
-        output.status.success(),
-        "the patched DuckLake row-ID sqllogictest failed"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    ensure!(
-        stdout.contains("All tests passed") && stdout.contains("1 test case"),
-        "the patched DuckLake row-ID sqllogictest did not report one passing case"
-    );
+        let artifact_literal = artifact.display().to_string().replace('\'', "''");
+        let output = Command::new(&runner)
+            .args(["--test-dir"])
+            .arg(test_root.path())
+            .arg(test_path)
+            .env("DUCKDB_TEST_ON_INIT", format!("LOAD '{artifact_literal}';"))
+            .output()
+            .with_context(|| format!("spawning {}", runner.display()))?;
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        ensure!(
+            output.status.success(),
+            "the patched DuckLake sqllogictest {test_path} failed"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        ensure!(
+            stdout.contains("All tests passed") && stdout.contains("1 test case"),
+            "the patched DuckLake sqllogictest {test_path} did not report one passing case"
+        );
+    }
     Ok(())
 }
 
@@ -829,7 +836,8 @@ mod tests {
     #[test]
     fn patched_regression_preloads_only_ducklake() {
         let script = "require ducklake\n\nrequire parquet\n\nstatement ok\nSELECT 1\n";
-        let transformed = preload_ducklake_test(script).expect("DuckLake requirement");
+        let transformed =
+            preload_ducklake_test("test/sql/example.test", script).expect("DuckLake requirement");
 
         assert!(!transformed.contains("require ducklake"));
         assert!(transformed.contains("require parquet"));

@@ -222,6 +222,7 @@ fn collision(probe_index_id: u64, building: bool) -> Result<Option<u64>> {
 async fn resolve_probe(reader: ReadHandle<'_>, probe: PendingProbe) -> Result<CompletedProbe> {
     let started = Instant::now();
     let present = reader.get(probe.key.clone()).await.map_err(Error::from)?;
+
     Ok(CompletedProbe {
         probe,
         present,
@@ -280,23 +281,6 @@ fn stage_probe_put(
 /// present with a **different** row id → [`Error::Constraint`]; present with
 /// the **same** row id → no-op (a re-derived entry); absent → staged.
 /// Duplicates within the commit are caught in memory.
-///
-/// A collision against an index that is still **building** poisons it
-/// instead: the id is returned, the claim is dropped so the live holder's
-/// entry survives, and the commit proceeds. Coverage is partial until a
-/// build flips ready, so failing the finder would decide by timing which
-/// party a duplicate falls on.
-///
-/// Entries stage onto the transaction directly rather than through the
-/// caller's write list. The list is retained until the commit lands so the
-/// maintained projections can fold it, and no projection reflects an index
-/// entry — keeping one would hold a second copy of the batch's largest part
-/// in memory for nothing. A bulk load stages one entry per indexed row, so
-/// that copy is what decides whether the commit fits in RAM.
-///
-/// Puts may stage in probe-completion order. Every staged key is distinct —
-/// an entry's kind is part of its key — so only the deletes-before-puts
-/// ordering above carries meaning.
 pub(crate) async fn stage_index_entries(
     db_tx: &DbTransaction,
     entries: Vec<StagedIndexEntry>,
@@ -346,6 +330,7 @@ where
     let mut planner = ProbePlanner {
         claimed: HashMap::new(),
     };
+
     let reader = ReadHandle::Tx(db_tx);
     let mut probes =
         futures::stream::FuturesUnordered::<BoxFuture<'_, Result<CompletedProbe>>>::new();
@@ -533,6 +518,7 @@ pub(crate) fn apply_deferred_maintenance(
             let Some(value) = per_table.get_mut(index_id) else {
                 continue;
             };
+
             if value.build_state.is_none() {
                 value.begin_snapshot = new_snapshot;
                 value.build_state = Some("maintaining".to_owned());
@@ -602,19 +588,13 @@ pub(crate) async fn reclaim_entries(
             reclaim_entries_from(tx, kind, index_id, limit - deleted, None, staged).await?;
         deleted += batch;
     }
+
     Ok(deleted)
 }
 
 /// Deletes up to `limit` entries of one dropped index of one kind,
 /// resuming at `start_from` when given, and returns how many were staged
 /// alongside the last key deleted.
-///
-/// Reclaiming a whole range takes one transaction per batch, and a batch
-/// that restarted at the range's beginning would first have to step over
-/// every tombstone the earlier batches left — turning a large range into
-/// quadratic work. Handing the last key back lets the next batch resume
-/// there instead. The resume is inclusive, so it re-reads exactly one
-/// tombstone rather than needing an exclusive bound.
 pub(crate) async fn reclaim_entries_from(
     tx: &slatedb::DbTransaction,
     kind: IndexKind,
@@ -647,6 +627,7 @@ pub(crate) async fn reclaim_entries_from(
             None => break,
         }
     }
+
     Ok((deleted, last))
 }
 
@@ -672,6 +653,7 @@ pub(crate) async fn lookup_row_ids(
         .scan_prefix(prefix, .., ScanShape::Probe)
         .await
         .map_err(Error::from)?;
+
     let mut row_ids = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
@@ -777,6 +759,7 @@ pub(crate) async fn null_prefix_row_ids(
     // `index_multi_value_prefix` frames the value and appends a terminator for an
     // exact-value scan; dropping it turns the bytes into a true leading prefix.
     scan_prefix.pop();
+
     let mut iter = reader
         .scan_prefix_ordered(scan_prefix, .., ScanShape::Probe, order)
         .await

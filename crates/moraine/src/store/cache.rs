@@ -32,6 +32,8 @@ use slatedb_common::metrics::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, 
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
+use crate::data_file;
+
 /// Memory the cache takes when no budget is configured: what SlateDB
 /// gives a *single* store by default (512 MiB of blocks, 128 MiB of
 /// metadata), now for the whole process. A single-store host is therefore
@@ -43,13 +45,6 @@ const METADATA_PRIORITY_POOL_RATIO: f64 = 0.9;
 
 /// At most this much of the budget is reserved for parsed metadata outside
 /// SlateDB.
-///
-/// A ceiling is needed because this allowance is **deducted** from the
-/// budget whether the parsed-metadata cache fills it or not — it cannot
-/// share one eviction store with SlateDB's, whose key and value types are
-/// SlateDB's own. So the share scales with the budget up to here and then
-/// stops, rather than reserving hundreds of megabytes on a large host for a
-/// cache that may hold little.
 const MAX_AUXILIARY_METADATA_MEMORY: u64 = 64 * 1024 * 1024;
 
 /// The auxiliary allowance's divisor against the whole budget, up to its
@@ -109,8 +104,8 @@ pub(crate) fn metadata_shortfall(metadata_bytes: u64, capacity: u64) -> Option<u
 
 static AUXILIARY_METADATA_MEMORY: AtomicU64 = AtomicU64::new(MAX_AUXILIARY_METADATA_MEMORY);
 
-static AUXILIARY_METADATA_USAGE: AtomicU64 = AtomicU64::new(0);
 static AUXILIARY_METADATA_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
 static METADATA_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 static BLOCK_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
@@ -178,19 +173,15 @@ fn subtract_metadata_occupancy(bytes: u64) {
     });
 }
 
-/// The process-wide allowance for auxiliary parsed metadata. It is reserved
-/// from the first attach's `CACHE_MEMORY` budget.
+/// The process-wide allowance for parsed Parquet metadata and file row-id
+/// summaries. It is reserved from the first attach's `CACHE_MEMORY` budget,
+/// and is what the auxiliary cache is built to.
 pub(crate) fn auxiliary_metadata_memory() -> usize {
     usize::try_from(AUXILIARY_METADATA_MEMORY.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
 }
 
-/// Records the parsed Parquet metadata cache's current heap footprint.
-pub(crate) fn set_auxiliary_metadata_usage(bytes: usize) {
-    AUXILIARY_METADATA_USAGE.store(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
-}
-
-/// Records one parsed Parquet metadata eviction.
-pub(crate) fn auxiliary_metadata_evicted() {
+/// Records one auxiliary cache eviction, of either kind.
+pub(crate) fn auxiliary_evicted() {
     AUXILIARY_METADATA_EVICTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -464,6 +455,7 @@ impl CacheCounters {
     pub(crate) fn object_store_tally(&self) -> ObjectStoreTally {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         let duration = |counter: &AtomicU64| Duration::from_nanos(load(counter));
+
         ObjectStoreTally {
             main_gets: load(&self.main_gets),
             main_get_duration: duration(&self.main_get_nanoseconds),
@@ -778,6 +770,9 @@ pub fn cache_status() -> CacheStatus {
     let capacity = u64::try_from(observation.tier.capacity()).unwrap_or(u64::MAX);
     let usage = u64::try_from(observation.tier.usage()).unwrap_or(u64::MAX);
     let metadata_occupancy = METADATA_OCCUPANCY.load(Ordering::Relaxed);
+    // Read live rather than remembered, so a resize cannot leave the
+    // reported allowance describing a split that no longer holds.
+    let (auxiliary_capacity, auxiliary_usage) = data_file::auxiliary_occupancy();
 
     CacheStatus {
         metadata_capacity_bytes: observation.metadata_ceiling,
@@ -787,8 +782,8 @@ pub fn cache_status() -> CacheStatus {
         block_occupancy_bytes: usage.saturating_sub(metadata_occupancy),
         block_evictions: BLOCK_EVICTIONS.load(Ordering::Relaxed),
         block_disk_capacity_bytes: observation.disk_capacity,
-        auxiliary_metadata_capacity_bytes: AUXILIARY_METADATA_MEMORY.load(Ordering::Relaxed),
-        auxiliary_metadata_occupancy_bytes: AUXILIARY_METADATA_USAGE.load(Ordering::Relaxed),
+        auxiliary_metadata_capacity_bytes: auxiliary_capacity,
+        auxiliary_metadata_occupancy_bytes: auxiliary_usage,
         auxiliary_metadata_evictions: AUXILIARY_METADATA_EVICTIONS.load(Ordering::Relaxed),
     }
 }
@@ -822,7 +817,7 @@ impl EventListener for EvictionCounter {
 /// ceiling: metadata takes what the store needs up to
 /// [`METADATA_PRIORITY_POOL_RATIO`], blocks take the rest, and neither
 /// starves the other at a size the operator has to predict.
-struct PriorityDbCache {
+struct CatalogCache {
     tier: Tier,
 }
 
@@ -834,7 +829,7 @@ fn fill_failed(error: impl std::error::Error + Send + Sync + 'static) -> slatedb
     slatedb::Error::unavailable("cache fill failed".to_owned()).with_source(Box::new(error))
 }
 
-impl PriorityDbCache {
+impl CatalogCache {
     async fn fetch(
         &self,
         key: CachedKey,
@@ -843,15 +838,24 @@ impl PriorityDbCache {
     ) -> Result<CachedEntry, slatedb::Error> {
         let hint = if metadata { Hint::Normal } else { Hint::Low };
         let entry = match &self.tier {
-            Tier::Memory(cache) => cache
-                .get_or_fetch(&key, move || async move {
-                    loader()
-                        .await
-                        .map(|entry| (entry, CacheProperties::default().with_hint(hint)))
-                })
-                .await
-                .map(|entry| entry.value().clone())
-                .map_err(fill_failed)?,
+            Tier::Memory(cache) => {
+                // The memory tier reads its spawner from the ambient
+                // runtime inside the call, not on the returned future, so
+                // the guard has to be held across the call alone.
+                let fetch = {
+                    let _guard = CACHE_RUNTIME.as_ref().map(|runtime| runtime.enter());
+                    cache.get_or_fetch(&key, move || async move {
+                        loader()
+                            .await
+                            .map(|entry| (entry, CacheProperties::default().with_hint(hint)))
+                    })
+                };
+
+                fetch
+                    .await
+                    .map(|entry| entry.value().clone())
+                    .map_err(fill_failed)?
+            }
             Tier::Hybrid(cache) => cache
                 .get_or_fetch(&key, move || async move {
                     loader()
@@ -882,7 +886,7 @@ impl PriorityDbCache {
 }
 
 #[async_trait]
-impl DbCache for PriorityDbCache {
+impl DbCache for CatalogCache {
     async fn get_block(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
         self.read(key).await
     }
@@ -1038,6 +1042,10 @@ static BUILT_WITH: std::sync::Mutex<Option<CacheConfig>> = std::sync::Mutex::new
 async fn build(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
     let (auxiliary_metadata_bytes, shared_bytes) = config.slots();
     AUXILIARY_METADATA_MEMORY.store(auxiliary_metadata_bytes, Ordering::Relaxed);
+    // The block slot is built to its share below, but the auxiliary cache
+    // is built on first use — which a read arriving before any attach would
+    // do at the default allowance. Sizing it here settles it either way.
+    data_file::resize_auxiliary(usize::try_from(auxiliary_metadata_bytes).unwrap_or(usize::MAX));
 
     // The device is the only part that can fail, and a memory tier alone is
     // strictly better than no cache at all.
@@ -1066,20 +1074,23 @@ async fn build(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
         "built the shared block cache"
     );
 
-    Some(Arc::new(PriorityDbCache { tier }) as Arc<dyn DbCache>)
+    Some(Arc::new(CatalogCache { tier }) as Arc<dyn DbCache>)
 }
 
-/// The runtime the hybrid cache spawns its fetch and flush tasks on.
+/// The runtime the cache spawns its fetch and flush tasks on.
 ///
-/// It must not be an attach's runtime. The cache outlives every attach,
-/// but foyer fixes its spawner when the cache is *built* — so the first
-/// store to open would lend the process-wide cache a runtime that dies at
-/// its detach. Tokio then cancels the tasks that runtime owned, and
-/// dropping an in-flight fetch takes foyer's inflight lock with nothing
-/// left running to release it: the next attach to touch the cache blocks
-/// forever. Two workers is plenty; these tasks fetch and flush, they do
-/// not compute.
-fn cache_runtime() -> Option<tokio::runtime::Runtime> {
+/// It must not be an attach's runtime. The cache outlives every attach, so
+/// the first store to open would otherwise lend it a runtime that dies at
+/// that store's detach — after which tokio cancels the tasks that runtime
+/// owned. The hybrid tier takes this at build time, where the tasks it
+/// strands include the disk engine's and the next attach to touch the cache
+/// blocks forever. The memory tier resolves its spawner per call, where a
+/// stranded fill instead fails the readers waiting on it. Two workers is
+/// plenty; these tasks fetch and flush, they do not compute.
+static CACHE_RUNTIME: std::sync::LazyLock<Option<Arc<tokio::runtime::Runtime>>> =
+    std::sync::LazyLock::new(|| build_cache_runtime().map(Arc::new));
+
+fn build_cache_runtime() -> Option<tokio::runtime::Runtime> {
     match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("moraine-cache")
@@ -1135,7 +1146,7 @@ async fn hybrid(dir: &PathBuf, memory: u64, disk: Option<u64>) -> Option<HybridC
         .with_recover_mode(RecoverMode::None)
         // Keeps the cache's tasks off the runtime of whichever attach
         // happened to build it.
-        .with_spawner(Spawner::from(cache_runtime()?))
+        .with_spawner(Spawner::from(CACHE_RUNTIME.as_ref()?.handle().clone()))
         .with_io_engine_config(PsyncIoEngineConfig::new())
         .with_engine_config(BlockEngineConfig::new(device))
         .build()
@@ -1210,7 +1221,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let cache: Arc<dyn DbCache> = Arc::new(PriorityDbCache { tier: tier.clone() });
+        let cache: Arc<dyn DbCache> = Arc::new(CatalogCache { tier: tier.clone() });
         let order = if phase == "warm" {
             [("a", b"catalog-a"), ("b", b"catalog-b")]
         } else {

@@ -7,6 +7,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "catalog.hpp"
+#include "index_functions.hpp"
 #include "moraine_abi.h"
 #include "owned_array.hpp"
 
@@ -322,8 +323,14 @@ duckdb::unique_ptr<duckdb::FunctionData> DropBind(duckdb::ClientContext &, duckd
 // moraine_index_lookup: resolves an equality key to the rows holding it. The
 // variadic values are one per indexed column, in the index's column order.
 
-void SetRowId(duckdb::DataChunk &output, duckdb::idx_t row_index, MoraineRowId row_id) {
-	output.SetValue(0, row_index, duckdb::Value::BIGINT(static_cast<int64_t>(row_id)));
+// Emits one located row: its stable id, and the file currently holding it.
+// A NULL file id is a live inlined row or one the lookup could not place,
+// so a consumer joins the second column with null-safe equality.
+void SetRowId(duckdb::DataChunk &output, duckdb::idx_t row_index, const MoraineRowId &row_id) {
+	output.SetValue(0, row_index, duckdb::Value::BIGINT(static_cast<int64_t>(row_id.value)));
+	output.SetValue(1, row_index,
+	                row_id.has_data_file_id ? duckdb::Value::UBIGINT(row_id.data_file_id)
+	                                        : duckdb::Value(duckdb::LogicalType::UBIGINT));
 }
 
 struct LookupBindData : public duckdb::FunctionData {
@@ -482,8 +489,8 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 		bind_data->rows.push_back(row_id);
 	}
 
-	return_types = {duckdb::LogicalType::BIGINT};
-	names = {"row_id"};
+	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
+	names = {"row_id", "data_file_id"};
 	return bind_data;
 }
 
@@ -545,8 +552,8 @@ duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context,
 		bind_data->rows.push_back(row_id);
 	}
 
-	return_types = {duckdb::LogicalType::BIGINT};
-	names = {"row_id"};
+	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
+	names = {"row_id", "data_file_id"};
 	return bind_data;
 }
 
@@ -666,8 +673,8 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 		bind_data->rows.push_back(row_id);
 	}
 
-	return_types = {duckdb::LogicalType::BIGINT};
-	names = {"row_id"};
+	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
+	names = {"row_id", "data_file_id"};
 	return bind_data;
 }
 
@@ -766,8 +773,8 @@ duckdb::unique_ptr<duckdb::FunctionData> NullsBind(duckdb::ClientContext &contex
 		bind_data->rows.push_back(row_id);
 	}
 
-	return_types = {duckdb::LogicalType::BIGINT};
-	names = {"row_id"};
+	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
+	names = {"row_id", "data_file_id"};
 	return bind_data;
 }
 
@@ -800,6 +807,28 @@ void NullsImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 }
 
 } // namespace
+
+bool IsIndexRead(const std::string &name) {
+	return name == "moraine_index_lookup" || name == "moraine_index_in" || name == "moraine_index_range" ||
+	       name == "moraine_index_nulls";
+}
+
+const std::vector<MoraineRowId> *IndexReadRows(const duckdb::TableFunction &function,
+                                               const duckdb::FunctionData *bind_data) {
+	if (!bind_data) {
+		return nullptr;
+	}
+	if (function.name == "moraine_index_lookup" || function.name == "moraine_index_in") {
+		return &bind_data->Cast<LookupBindData>().rows;
+	}
+	if (function.name == "moraine_index_range") {
+		return &bind_data->Cast<RangeBindData>().rows;
+	}
+	if (function.name == "moraine_index_nulls") {
+		return &bind_data->Cast<NullsBindData>().rows;
+	}
+	return nullptr;
+}
 
 void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	using duckdb::LogicalType;

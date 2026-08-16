@@ -201,9 +201,11 @@ impl<'a> StoreBuilder<'a> {
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .with_block_cache_policy(self.block_cache_policy())
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)));
+
         if let Some(cache) = cache::shared(&self.cache_config()).await {
             builder = builder.with_db_cache(cache);
         }
+
         let db = builder.build().await.map_err(Error::from)?;
         if self.cache_preload.is_some() {
             let tx = db
@@ -214,6 +216,7 @@ impl<'a> StoreBuilder<'a> {
                 .await;
             tx.rollback();
         }
+
         Ok((db, counters))
     }
 
@@ -235,17 +238,20 @@ impl<'a> StoreBuilder<'a> {
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)))
             .with_options(options);
+
         if let Some(cache) = cache::shared(&self.cache_config()).await {
             builder = builder.with_db_cache(cache);
         }
         if let Some(checkpoint) = self.checkpoint {
             builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
         }
+
         let reader = builder.build().await.map_err(Error::from)?;
         if self.cache_preload.is_some() {
             self.warm(crate::store::handle::ReadHandle::Reader(&reader), &counters)
                 .await;
         }
+
         Ok((reader, counters))
     }
 

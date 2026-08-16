@@ -12,7 +12,7 @@ use parquet::{
 };
 
 use crate::{
-    data_file::{ParquetFile, corrupt, metadata_cache::ObjectStoreReader, values::row_id_value},
+    data_file::{ParquetFile, corrupt, reader::ObjectStoreReader, values::row_id_value},
     error::{Error, Result},
 };
 
