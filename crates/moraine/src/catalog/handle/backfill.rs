@@ -15,7 +15,7 @@ use crate::{
     },
     data_file,
     error::{Error, Result},
-    store::{inline as store_inline, key::InlineOperation},
+    store::{handle::ReadHandle, inline as store_inline, key::InlineOperation},
     transaction::commit,
 };
 
@@ -81,6 +81,24 @@ async fn collect_immediate_backfill<'a>(
             Ok(entries)
         })
         .await
+}
+
+pub(super) async fn collect_inline_delete_positions(
+    session_handle: ReadHandle<'_>,
+    table_id: u64,
+) -> Result<HashMap<u64, HashSet<u64>>> {
+    let killed = store_inline::scan_inline_file_deletes(session_handle, table_id)
+        .await?
+        .into_iter()
+        .fold(
+            HashMap::<u64, HashSet<u64>>::new(),
+            |mut killed, (data_file_id, row_id, _)| {
+                killed.entry(data_file_id).or_default().insert(row_id);
+                killed
+            },
+        );
+
+    Ok(killed)
 }
 
 pub(super) async fn collect_delete_positions<'a>(
@@ -188,66 +206,62 @@ impl ReadOnlyCatalog {
     ) -> Result<Vec<IndexEntry>> {
         let session = self.begin_read().await?;
 
-        let outcome = async {
-            let snapshot = commit::materialize(session.handle(), None).await?;
-            // `columns_of` is ordered by the column's ordinal, so a column's
-            // 0-based index here is its physical position in a file written
-            // under this schema — the mapping the scoped read needs. (Ordinals
-            // are 1-based in the stored value, so the stored order can't be
-            // used directly.)
-            let live_columns = snapshot.columns_of(table);
-            let positions = columns
-                .iter()
-                .map(|column| {
-                    live_columns
-                        .iter()
-                        .position(|c| c.id == *column)
-                        .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
-                })
-                .collect::<Result<Vec<_>>>()?;
+        let snapshot = commit::materialize(session.handle(), None).await?;
+        // `columns_of` is ordered by the column's ordinal, so a column's
+        // 0-based index here is its physical position in a file written
+        // under this schema — the mapping the scoped read needs. (Ordinals
+        // are 1-based in the stored value, so the stored order can't be
+        // used directly.)
+        let live_columns = snapshot.columns_of(table);
+        let positions = columns
+            .iter()
+            .map(|column| {
+                live_columns
+                    .iter()
+                    .position(|c| c.id == *column)
+                    .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-            let table_prefix = snapshot.table_data_prefix(table)?;
-            let resolve = |path: &str, is_relative: bool| {
-                let relative = match (is_relative, data_prefix.is_empty()) {
-                    (false, _) => path.to_owned(),
-                    (true, true) => format!("{table_prefix}{path}"),
-                    (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
-                };
-                object_store::path::Path::from(relative.as_str())
+        let table_prefix = snapshot.table_data_prefix(table)?;
+        let resolve = |path: &str, is_relative: bool| {
+            let relative = match (is_relative, data_prefix.is_empty()) {
+                (false, _) => path.to_owned(),
+                (true, true) => format!("{table_prefix}{path}"),
+                (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
             };
+            object_store::path::Path::from(relative.as_str())
+        };
 
-            // Rows already dead when the index is built must not be backfilled
-            // (entries are live-only): delete files name positions within their
-            // target, inline file-deletes name row ids.
-            let inline_deletes = async {
-                let deleted =
-                    store_inline::scan_inline_file_deletes(session.handle(), table.get()).await?;
-                Ok::<_, Error>(deleted.into_iter().fold(
-                    HashMap::<u64, HashSet<u64>>::new(),
-                    |mut killed, (data_file_id, row_id, _)| {
-                        killed.entry(data_file_id).or_default().insert(row_id);
-                        killed
-                    },
-                ))
-            };
-            let delete_files = collect_delete_positions(
-                snapshot.delete_files_of(table).into_iter(),
-                Arc::clone(&object_store),
-                &resolve,
-            );
-            let (killed_row_ids, killed_positions) =
-                futures::try_join!(inline_deletes, delete_files)?;
+        // Rows already dead when the index is built must not be backfilled
+        // (entries are live-only): delete files name positions within their
+        // target, inline file-deletes name row ids.
+        let inline_deletes = async {
+            let deleted =
+                store_inline::scan_inline_file_deletes(session.handle(), table.get()).await?;
+            Ok::<_, Error>(deleted.into_iter().fold(
+                HashMap::<u64, HashSet<u64>>::new(),
+                |mut killed, (data_file_id, row_id, _)| {
+                    killed.entry(data_file_id).or_default().insert(row_id);
+                    killed
+                },
+            ))
+        };
+        let delete_files = collect_delete_positions(
+            snapshot.delete_files_of(table).into_iter(),
+            Arc::clone(&object_store),
+            &resolve,
+        );
+        let (killed_row_ids, killed_positions) = futures::try_join!(inline_deletes, delete_files)?;
 
-            collect_immediate_backfill(
-                snapshot.data_files_of(table).into_iter(),
-                object_store,
-                &positions,
-                resolve,
-                &killed_positions,
-                &killed_row_ids,
-            )
-            .await
-        }
+        let outcome = collect_immediate_backfill(
+            snapshot.data_files_of(table).into_iter(),
+            object_store,
+            &positions,
+            resolve,
+            &killed_positions,
+            &killed_row_ids,
+        )
         .await;
         session.finish();
 
@@ -272,44 +286,45 @@ impl ReadOnlyCatalog {
     ) -> Result<Vec<IndexEntry>> {
         let session = self.begin_read().await?;
 
-        let outcome = async {
-            let snapshot = commit::materialize(session.handle(), None).await?;
-            let live_columns = snapshot.columns_of(table);
-            let positions = columns
-                .iter()
-                .map(|column| {
-                    live_columns
-                        .iter()
-                        .position(|c| c.id == *column)
-                        .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
-                })
-                .collect::<Result<Vec<_>>>()?;
+        let snapshot = commit::materialize(session.handle(), None).await?;
+        let live_columns = snapshot.columns_of(table);
+        let positions = columns
+            .iter()
+            .map(|column| {
+                live_columns
+                    .iter()
+                    .position(|c| c.id == *column)
+                    .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-            // A tombstone ends only versions begun before it. UPDATE can
-            // reinsert the same row id in the tombstone's snapshot, and that
-            // newer value is live and must be indexed.
-            let (dead, chunks) = futures::try_join!(
-                async {
-                    Ok::<_, Error>(
-                        store_inline::scan_inline_deletes(session.handle(), table.get())
-                            .await?
-                            .into_iter()
-                            .map(|(row_id, deletion)| (row_id, deletion.end_snapshot))
-                            .collect::<HashMap<u64, u64>>(),
-                    )
-                },
-                store_inline::scan_inline_chunks(session.handle(), table.get()),
-            )?;
-            let schema_versions: BTreeSet<u64> = chunks
-                .iter()
-                .filter_map(|(operation, _)| match operation {
-                    InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
-                    _ => None,
-                })
-                .collect();
-            let handle = session.handle();
-            let schemas = stream::iter(schema_versions.into_iter().map(
-                |schema_version| async move {
+        // A tombstone ends only versions begun before it. UPDATE can
+        // reinsert the same row id in the tombstone's snapshot, and that
+        // newer value is live and must be indexed.
+        let (dead, chunks) = futures::try_join!(
+            async {
+                Ok::<_, Error>(
+                    store_inline::scan_inline_deletes(session.handle(), table.get())
+                        .await?
+                        .into_iter()
+                        .map(|(row_id, deletion)| (row_id, deletion.end_snapshot))
+                        .collect::<HashMap<u64, u64>>(),
+                )
+            },
+            store_inline::scan_inline_chunks(session.handle(), table.get()),
+        )?;
+        let schema_versions: BTreeSet<u64> = chunks
+            .iter()
+            .filter_map(|(operation, _)| match operation {
+                InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
+                _ => None,
+            })
+            .collect();
+        let handle = session.handle();
+        let schemas = stream::iter(
+            schema_versions
+                .into_iter()
+                .map(|schema_version| async move {
                     let record =
                         store_inline::read_inline_schema(handle, table.get(), schema_version)
                             .await?
@@ -320,21 +335,22 @@ impl ReadOnlyCatalog {
                             })?;
                     let schema = data_file::decode_inline_schema(record.arrow_schema)?;
                     Ok::<_, Error>((schema_version, schema))
-                },
-            ))
-            .buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
-            .try_collect::<HashMap<_, _>>()
-            .await?;
+                }),
+        )
+        .buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
+        .try_collect::<HashMap<_, _>>()
+        .await?;
 
-            let mut entries = Vec::new();
-            for (op, chunk) in chunks {
+        let entries = chunks
+            .into_iter()
+            .map(|(op, chunk)| {
                 let InlineOperation::Insert {
                     schema_version,
                     begin_snapshot,
                     ..
                 } = op
                 else {
-                    continue;
+                    return Ok(vec![]);
                 };
                 let schema = schemas.get(&schema_version).cloned().ok_or_else(|| {
                     Error::Corruption(format!(
@@ -356,14 +372,17 @@ impl ReadOnlyCatalog {
                 .map(|entry| IndexEntry {
                     row_id: entry.row_id,
                     values: entry.values,
-                });
-                entries.extend(scoped);
-            }
-            Ok(entries)
-        }
-        .await;
+                })
+                .collect::<Vec<_>>();
+
+                Ok(scoped)
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         session.finish();
 
-        outcome
+        Ok(entries)
     }
 }

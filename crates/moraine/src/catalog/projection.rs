@@ -249,9 +249,6 @@ pub(crate) struct ProjectionCache {
     /// `history` when first to want it. Not folded forward — entity writes
     /// are too varied — so any committed batch drops both halves and the
     /// next read re-installs at the new head.
-    // Keyed on the whole head stamp, not the snapshot id alone: a
-    // maintenance batch reuses the id while changing what a scan would
-    // find, so an id-keyed entry would serve the state it reclaimed.
     current_entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
     /// The `history` half of the shared record set, stamped the same way.
     history_entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,

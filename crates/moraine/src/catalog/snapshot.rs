@@ -352,6 +352,7 @@ impl CatalogSnapshot {
             })
             .collect();
         infos.sort_by_key(|c| c.position);
+
         infos
     }
 
@@ -963,6 +964,7 @@ pub(crate) fn index_info(value: &IndexValue) -> IndexInfo {
             }
         })
         .collect();
+
     IndexInfo {
         id: IndexId::new(value.index_id),
         table_id: TableId::new(value.table_id),
