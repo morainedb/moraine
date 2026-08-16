@@ -6,11 +6,12 @@ mod index_build;
 mod index_lookup;
 mod maintenance;
 mod row_location;
+mod table_warm;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -346,6 +347,8 @@ pub struct ReadOnlyCatalog {
     location: Arc<StoreLocation>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     commits: Arc<commit::Coalescer>,
+    /// Tables whose probe ranges this handle has warmed on first touch.
+    warmed_tables: Arc<Mutex<HashSet<TableId>>>,
     // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
 }
@@ -652,6 +655,7 @@ impl ReadOnlyCatalog {
         table: TableId,
         at: Option<u64>,
     ) -> Result<Vec<RecentRow>> {
+        self.warm_table_on_first_touch(table);
         let handle = session.handle();
         let read_at = match at {
             Some(_) => commit::resolve_read_snapshot(handle, at).await?.0,
@@ -921,6 +925,7 @@ impl Catalog {
                 cache,
                 commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
                 projections,
+                warmed_tables: Arc::default(),
             },
         })
     }
@@ -1009,6 +1014,7 @@ impl Catalog {
             cache,
             commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
             projections,
+            warmed_tables: Arc::default(),
         })
     }
 

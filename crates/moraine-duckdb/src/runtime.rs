@@ -119,18 +119,24 @@ impl MoraineCatalogHandle {
     }
 
     /// As [`spawn_warm_all`](Self::spawn_warm_all), for the tables a commit
-    /// just registered data files against. An empty `tables` spawns nothing.
+    /// just registered data files against, and warms those tables' index
+    /// and inline ranges into the block cache. An empty `tables` spawns
+    /// nothing; without a `DATA_PATH` store only the block cache is warmed.
     pub(crate) fn spawn_warm_tables(&self, tables: Vec<TableId>) {
         if tables.is_empty() {
             return;
         }
-        let Some(data_store) = self.data_store.clone() else {
-            return;
-        };
         let catalog = self.catalog.reads().clone();
+        let data_store = self.data_store.clone();
         let data_prefix = self.data_prefix.clone();
 
         self.track(self.runtime.spawn(async move {
+            if let Err(error) = catalog.warm_tables(&tables).await {
+                warn!(%error, "table warming skipped this commit");
+            }
+            let Some(data_store) = data_store else {
+                return;
+            };
             if let Err(error) = catalog
                 .warm_selected_row_summaries(data_store, &data_prefix, tables)
                 .await

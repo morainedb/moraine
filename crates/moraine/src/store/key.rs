@@ -6,6 +6,8 @@
 //! `u64` components in field order. Variant order is permanent once
 //! written; the golden-vector tests pin the exact bytes.
 
+use std::ops::Bound;
+
 use storekey::{Decode, Encode};
 
 use crate::{
@@ -853,6 +855,92 @@ pub(crate) fn increment_prefix(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
         bytes.pop();
     }
     None
+}
+
+/// The kinds whose record counts scale with the data rather than the
+/// schema; a bulk scan walks each in split ranges.
+pub(crate) const SPLIT_SCAN_KINDS: [EntityKind; 5] = [
+    EntityKind::Column,
+    EntityKind::File,
+    EntityKind::DeleteFile,
+    EntityKind::FileColumnStats,
+    EntityKind::TableColumnStats,
+];
+
+/// How many bytes past a prefix [`even_points_between`] interpolates over:
+/// two big-endian id components.
+const SPLIT_WIDTH: usize = 16;
+
+/// A range of one prefix's keyspace, as bounds on the bytes after the
+/// prefix.
+pub(crate) type SuffixRange = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+
+/// Whether `suffix` lies within `lower` and `upper`.
+fn within(lower: &Bound<Vec<u8>>, upper: &Bound<Vec<u8>>, suffix: &[u8]) -> bool {
+    let above = match lower {
+        Bound::Unbounded => true,
+        Bound::Included(start) => suffix >= start.as_slice(),
+        Bound::Excluded(start) => suffix > start.as_slice(),
+    };
+    let below = match upper {
+        Bound::Unbounded => true,
+        Bound::Included(end) => suffix <= end.as_slice(),
+        Bound::Excluded(end) => suffix < end.as_slice(),
+    };
+    above && below
+}
+
+/// Cuts the range `lower..upper` of a prefix's keyspace at every distinct
+/// point in `points` (suffixes, any order) that lies strictly inside it:
+/// the ranges come back in key order, disjoint, and together cover exactly
+/// `lower..upper`. No usable points yields that one range.
+pub(crate) fn split_between(
+    lower: Bound<Vec<u8>>,
+    upper: Bound<Vec<u8>>,
+    mut points: Vec<Vec<u8>>,
+) -> Vec<SuffixRange> {
+    points.retain(|point| {
+        within(&lower, &upper, point) && !matches!(&lower, Bound::Included(start) if start == point)
+    });
+    points.sort_unstable();
+    points.dedup();
+
+    let mut ranges = Vec::with_capacity(points.len() + 1);
+    let mut start = lower;
+    for point in points {
+        ranges.push((start, Bound::Excluded(point.clone())));
+        start = Bound::Included(point);
+    }
+    ranges.push((start, upper));
+    ranges
+}
+
+/// Up to `parts - 1` points spaced evenly between the suffixes `low` and
+/// `high`, over their first [`SPLIT_WIDTH`] bytes read as a big-endian
+/// integer (shorter suffixes are zero-padded). Fewer, or none, when the
+/// extremes are too close to spread that many apart.
+pub(crate) fn even_points_between(low: &[u8], high: &[u8], parts: usize) -> Vec<Vec<u8>> {
+    let widen = |suffix: &[u8]| {
+        let mut bytes = [0_u8; SPLIT_WIDTH];
+        let taken = suffix.len().min(SPLIT_WIDTH);
+        bytes[..taken].copy_from_slice(&suffix[..taken]);
+        u128::from_be_bytes(bytes)
+    };
+    let (low, high) = (widen(low), widen(high));
+    let Some(step) = high
+        .checked_sub(low)
+        .map(|span| span / u128::try_from(parts.max(1)).unwrap_or(u128::MAX))
+    else {
+        return Vec::new();
+    };
+    if step == 0 {
+        return Vec::new();
+    }
+
+    (1..parts)
+        .map(|part| low + step * u128::try_from(part).unwrap_or(u128::MAX))
+        .map(|point| point.to_be_bytes().to_vec())
+        .collect()
 }
 
 /// Byte prefix of every key in a subspace (exactly `TAG_PREFIX_LEN`
@@ -1875,5 +1963,89 @@ mod tests {
                 prop_assert!(bound <= index_value_suffix(kind, index_id, higher));
             }
         }
+    }
+
+    fn arbitrary_bound() -> impl Strategy<Value = Bound<Vec<u8>>> {
+        prop_oneof![
+            Just(Bound::Unbounded),
+            prop::collection::vec(any::<u8>(), 0..20).prop_map(Bound::Included),
+            prop::collection::vec(any::<u8>(), 0..20).prop_map(Bound::Excluded),
+        ]
+    }
+
+    proptest! {
+        /// A suffix inside the outer range falls in exactly one split range
+        /// and one outside it in none: the ranges are disjoint and their
+        /// union is exactly the outer range.
+        #[test]
+        fn split_ranges_partition_the_outer_range(
+            lower in arbitrary_bound(),
+            upper in arbitrary_bound(),
+            points in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..20), 0..12),
+            suffix in prop::collection::vec(any::<u8>(), 0..24),
+        ) {
+            let ranges = split_between(lower.clone(), upper.clone(), points.clone());
+            let holders = ranges
+                .iter()
+                .filter(|range| within(&range.0, &range.1, &suffix))
+                .count();
+            let expected = usize::from(within(&lower, &upper, &suffix));
+            prop_assert_eq!(holders, expected, "{:?} in {:?}", suffix, ranges);
+
+            // Every point strictly inside the outer range starts a range.
+            for point in &points {
+                if within(&lower, &upper, point) && lower != Bound::Included(point.clone()) {
+                    prop_assert!(ranges.iter().any(|range| range.0 == Bound::Included(point.clone())));
+                }
+            }
+        }
+
+        /// The interpolated points sit strictly between the extremes and in
+        /// key order, so a split cut at them keeps every key between the
+        /// extremes and never yields an out-of-order range.
+        #[test]
+        fn even_points_lie_between_the_extremes(
+            low in prop::collection::vec(any::<u8>(), 16..24),
+            high in prop::collection::vec(any::<u8>(), 16..24),
+            parts in 1_usize..12,
+        ) {
+            let (low, high) = if low <= high { (low, high) } else { (high, low) };
+            let points = even_points_between(&low, &high, parts);
+            prop_assert!(points.len() < parts);
+            prop_assert!(points.windows(2).all(|pair| pair[0] < pair[1]));
+            for point in &points {
+                prop_assert!(point.as_slice() > low.as_slice(), "{:?} <= {:?}", point, low);
+                prop_assert!(point.as_slice() < high.as_slice(), "{:?} >= {:?}", point, high);
+            }
+        }
+    }
+
+    /// Ids clustered near zero still split: the cut interpolates between the
+    /// extremes present, not across the whole id space.
+    #[test]
+    fn even_points_split_between_the_extremes_present() {
+        let low = 7_u64
+            .to_be_bytes()
+            .iter()
+            .chain(&0_u64.to_be_bytes())
+            .copied()
+            .collect::<Vec<_>>();
+        let high = 7_u64
+            .to_be_bytes()
+            .iter()
+            .chain(&4_000_u64.to_be_bytes())
+            .copied()
+            .collect::<Vec<_>>();
+        let points = even_points_between(&low, &high, 4);
+        assert_eq!(points.len(), 3);
+        assert_eq!(&points[0][..8], &7_u64.to_be_bytes());
+        assert_eq!(&points[0][8..], &1_000_u64.to_be_bytes());
+        assert_eq!(&points[2][8..], &3_000_u64.to_be_bytes());
+
+        assert!(even_points_between(&low, &low, 4).is_empty());
+        assert_eq!(
+            split_between(Bound::Unbounded, Bound::Unbounded, Vec::new()),
+            vec![(Bound::Unbounded, Bound::Unbounded)]
+        );
     }
 }

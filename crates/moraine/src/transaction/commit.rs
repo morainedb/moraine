@@ -73,8 +73,8 @@ const RETRY_BACKOFF_MAX_MICROS: u64 = 50_000;
 const INTERVENING_READ_CONCURRENCY: usize = 64;
 
 /// Changelog and current-record reads kept in flight by an incremental head
-/// refresh.
-const REFRESH_READ_CONCURRENCY: usize = 64;
+/// refresh; sized for a remote object store.
+const REFRESH_READ_CONCURRENCY: usize = 256;
 
 /// How long to wait before re-running `attempt` (0-based; the first attempt
 /// never waits): exponential to the cap, plus jitter of up to the base

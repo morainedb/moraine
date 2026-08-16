@@ -184,3 +184,70 @@ pub(crate) async fn stage_inline_writes(
 
     Ok(writes)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use object_store::memory::InMemory;
+    use slatedb::IsolationLevel;
+
+    use super::*;
+    use crate::store::{
+        key::{InlineKey, Key},
+        open::StoreBuilder,
+        proto, value,
+    };
+
+    /// Schema records settle in op order: a version already recorded with
+    /// the same bytes writes nothing, a new one writes once, and a repeat of
+    /// a version inside the batch adds no second write.
+    #[tokio::test]
+    async fn schema_writes_keep_op_order_and_dedup_versions() {
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(
+            Key::Inline(InlineKey::Schema {
+                table_id: 7,
+                schema_version: 1,
+            })
+            .encode(),
+            value::encode_value(&proto::InlineSchemaValue {
+                arrow_schema: b"v1".to_vec().into(),
+            }),
+        )
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let schema = |schema_version: u64, bytes: &[u8]| InlineStage::Schema {
+            table_id: 7,
+            schema_version,
+            arrow_schema: bytes.to_vec(),
+        };
+        let ops = vec![
+            schema(3, b"v3"),
+            schema(1, b"v1"),
+            schema(2, b"v2"),
+            schema(3, b"v3"),
+        ];
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let writes = stage_inline_writes(&tx, &ops).await.unwrap();
+        assert_eq!(
+            writes,
+            vec![
+                inline_schema_write(7, 3, b"v3"),
+                inline_schema_write(7, 2, b"v2"),
+            ]
+        );
+
+        let conflicting = stage_inline_writes(&tx, &[schema(1, b"other")]).await;
+        assert!(matches!(conflicting, Err(Error::Constraint(_))));
+
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+}

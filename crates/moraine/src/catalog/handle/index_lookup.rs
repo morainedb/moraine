@@ -180,6 +180,7 @@ impl ReadOnlyCatalog {
         let started = Instant::now();
         let cache_before = self.cache_tally();
         let store_before = self.object_store_tally();
+        self.warm_table_on_first_touch(table);
         let session = self.begin_read().await?;
         let handle = session.handle();
 
@@ -254,6 +255,7 @@ impl ReadOnlyCatalog {
         upper: Bound<Vec<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
+        self.warm_table_on_first_touch(table);
         let session = self.begin_read().await?;
         let handle = session.handle();
 
@@ -299,6 +301,7 @@ impl ReadOnlyCatalog {
         prefix: Vec<Option<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
+        self.warm_table_on_first_touch(table);
         let session = self.begin_read().await?;
         let handle = session.handle();
 

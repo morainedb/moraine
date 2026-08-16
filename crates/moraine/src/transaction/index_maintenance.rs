@@ -58,8 +58,8 @@ fn decode_row_id(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(array))
 }
 
-/// How many uniqueness probes are in flight at once.
-const UNIQUENESS_PROBE_CONCURRENCY: usize = 512;
+/// Uniqueness probes in flight at once; sized for a remote object store.
+const UNIQUENESS_PROBE_CONCURRENCY: usize = 1024;
 
 /// Additions derived while the deletion phase is still draining. Once full,
 /// backpressure pauses addition sources without holding up deletion staging.
