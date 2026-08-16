@@ -73,6 +73,7 @@ impl RowSetCache {
         let entry = self.entries.remove(position)?;
         let rows = Arc::clone(&entry.rows);
         self.entries.push_back(entry);
+
         Some(rows)
     }
 

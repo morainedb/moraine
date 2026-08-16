@@ -1,11 +1,20 @@
 //! Opaque handles owned across the FFI boundary, and the sync↔async
 //! bridge: one tokio multi-threaded runtime per attached catalog.
 
-use std::{ffi::c_void, future::Future, sync::Arc, time::Duration};
+use std::{
+    ffi::c_void,
+    future::Future,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog};
+use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog, TableId};
 use object_store::ObjectStore;
-use tokio::runtime::{Builder, Runtime};
+use tokio::{
+    runtime::{Builder, Runtime},
+    task::JoinHandle,
+};
+use tracing::warn;
 
 use crate::{
     error::AbiError,
@@ -46,6 +55,11 @@ pub struct MoraineCatalogHandle {
     /// The bucket-relative key prefix of `DATA_PATH` (empty for a local or
     /// bare-bucket store), prepended to a data file's stored path.
     pub(crate) data_prefix: String,
+    /// Row-summary warming spawned by the attach and by each commit that
+    /// registers data files. Ended by [`finish_warming`](
+    /// MoraineCatalogHandle::finish_warming) before the catalog closes, so
+    /// a close never races an in-flight scoped read.
+    warming: Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// Which mode the attach opened in. The core types the two apart, so a
@@ -86,7 +100,86 @@ impl MoraineCatalogHandle {
             log_id,
             data_store: None,
             data_prefix: String::new(),
+            warming: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Spawns a best-effort pass building the row summaries a later located
+    /// lookup would otherwise build cold, over every table.
+    ///
+    /// Scoped reads need the `DATA_PATH` store, so an attach without one
+    /// spawns nothing.
+    pub(crate) fn spawn_warm_all(&self) {
+        let Some(data_store) = self.data_store.clone() else {
+            return;
+        };
+        let catalog = self.catalog.reads().clone();
+        let data_prefix = self.data_prefix.clone();
+
+        self.track(self.runtime.spawn(async move {
+            if let Err(error) = catalog
+                .warm_all_row_summaries(data_store, &data_prefix)
+                .await
+            {
+                warn!(%error, "row summary warming skipped this attach");
+            }
+        }));
+    }
+
+    /// As [`spawn_warm_all`](Self::spawn_warm_all), for the tables a commit
+    /// just registered data files against. An empty `tables` spawns nothing.
+    pub(crate) fn spawn_warm_tables(&self, tables: Vec<TableId>) {
+        if tables.is_empty() {
+            return;
+        }
+        let Some(data_store) = self.data_store.clone() else {
+            return;
+        };
+        let catalog = self.catalog.reads().clone();
+        let data_prefix = self.data_prefix.clone();
+
+        self.track(self.runtime.spawn(async move {
+            if let Err(error) = catalog
+                .warm_selected_row_summaries(data_store, &data_prefix, tables)
+                .await
+            {
+                warn!(%error, "row summary warming skipped this attach");
+            }
+        }));
+    }
+
+    /// Retains `task` so a detach can end it, dropping the passes that have
+    /// already finished — a long insert session spawns one per commit.
+    fn track(&self, task: JoinHandle<()>) {
+        let Ok(mut warming) = self.warming.lock() else {
+            return;
+        };
+        warming.retain(|task| !task.is_finished());
+        warming.push(task);
+    }
+
+    /// Cancels the warming passes still in flight and waits for them to
+    /// end, reporting how many were outstanding.
+    ///
+    /// Warming holds a catalog handle of its own, so this must precede the
+    /// close: a cancelled pass loses only cache, where one still reading
+    /// when the store shuts under it would not.
+    pub(crate) fn finish_warming(&self) -> usize {
+        let tasks = match self.warming.lock() {
+            Ok(mut warming) => std::mem::take(&mut *warming),
+            Err(_) => return 0,
+        };
+
+        for task in &tasks {
+            task.abort();
+        }
+        let outstanding = tasks.len();
+        for task in tasks {
+            // A cancelled pass reports `JoinError`, which is the ask here.
+            let _ = self.runtime.block_on(task);
+        }
+
+        outstanding
     }
 
     /// Runs `future` on the handle's runtime, attributing events the
@@ -252,6 +345,49 @@ pub(crate) fn new_runtime(log_id: HandleId, requested: usize) -> std::io::Result
 #[cfg(test)]
 mod tests {
     use super::{MAX_WORKER_THREADS, MIN_WORKER_THREADS, worker_threads};
+    use crate::{
+        abi::moraine_detach,
+        test_support::{TempDir, attach_ok, attach_with_data_path},
+    };
+
+    /// A scoped read needs the `DATA_PATH` store, so an attach without one
+    /// spawns no warming rather than a pass that could read nothing.
+    #[test]
+    fn an_attach_without_a_data_path_store_spawns_no_warming() {
+        let lake = TempDir::new("warm-no-store");
+        let handle = attach_ok(lake.path());
+        // SAFETY: freshly attached above and not yet detached.
+        let warming = unsafe { &*handle }.finish_warming();
+
+        assert_eq!(warming, 0);
+        // SAFETY: attached above, detached exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    #[test]
+    fn an_attach_with_a_data_path_store_spawns_one_warming_pass() {
+        let lake = TempDir::new("warm-lake");
+        let data = TempDir::new("warm-data");
+        let handle = attach_with_data_path(lake.path(), data.path());
+        // SAFETY: freshly attached above and not yet detached.
+        let warming = unsafe { &*handle }.finish_warming();
+
+        assert_eq!(warming, 1, "the attach spawned no warming pass");
+        // SAFETY: attached above, detached exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// Detach ends the warming it spawned before closing the store, so a
+    /// close never races an in-flight scoped read — and never hangs on one.
+    #[test]
+    fn detaching_ends_the_warming_the_attach_spawned() {
+        let lake = TempDir::new("warm-detach");
+        let data = TempDir::new("warm-detach-data");
+        let handle = attach_with_data_path(lake.path(), data.path());
+
+        // SAFETY: attached above, detached exactly once.
+        unsafe { moraine_detach(handle) };
+    }
 
     /// The pool tracks the host between the floor and the ceiling, and is
     /// never single-threaded — a one-worker runtime would let a CPU-bound

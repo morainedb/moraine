@@ -879,6 +879,9 @@ pub unsafe extern "C" fn moraine_attach(
         let mut handle = MoraineCatalogHandle::new(runtime, catalog, log_id);
         handle.data_store = data_store;
         handle.data_prefix = data_prefix;
+        // Spawned, not awaited: the first located lookup would otherwise
+        // build every summary itself, and an attach must not pay for it.
+        handle.spawn_warm_all();
         Ok(Box::new(handle))
     };
 
@@ -1167,6 +1170,7 @@ pub unsafe extern "C" fn moraine_detach(handle: *mut MoraineCatalogHandle) {
     let attempt = || {
         // SAFETY: caller contract above; dropped exactly once.
         let boxed = unsafe { Box::from_raw(handle) };
+        boxed.finish_warming();
         if let Err(err) = boxed.block_on(boxed.catalog.reads().close()) {
             // Detach has no error channel, so the failed close (a final
             // flush that did not land) is logged rather than lost. The

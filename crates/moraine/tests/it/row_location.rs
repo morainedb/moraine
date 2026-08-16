@@ -383,6 +383,102 @@ async fn warming_counts_a_file_it_cannot_read_rather_than_failing() {
 }
 
 #[tokio::test]
+async fn warming_every_table_reaches_tables_outside_the_first_schema() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let (orders_size, orders_footer) = write(
+        &data,
+        "main/orders/data-3.parquet",
+        &batch_with_row_ids(&[10, 20, 30], &[5, 9, 12]),
+    )
+    .await;
+    let (events_size, events_footer) = write(
+        &data,
+        "analytics/events/data-2.parquet",
+        &batch_with_row_ids(&[40, 50], &[21, 22]),
+    )
+    .await;
+    catalog
+        .commit(|tx| {
+            let main = tx.schema_by_name("main").expect("bootstrap schema").id;
+            let orders = tx.create_table(main, "orders", &[col("a")])?;
+            tx.register_data_file(
+                orders,
+                DataFile {
+                    file_size_bytes: orders_size,
+                    footer_size: orders_footer,
+                    ..datafile(3)
+                },
+                &[],
+            )?;
+
+            let analytics = tx.create_schema("analytics")?;
+            let events = tx.create_table(analytics, "events", &[col("a")])?;
+            tx.register_data_file(
+                events,
+                DataFile {
+                    file_size_bytes: events_size,
+                    footer_size: events_footer,
+                    ..datafile(2)
+                },
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let warmth = catalog.warm_all_row_summaries(data, "").await.unwrap();
+
+    assert_eq!(warmth.files_considered, 2);
+    assert_eq!(warmth.summaries_built, 2);
+    assert_eq!(warmth.files_failed, 0);
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn warming_every_table_carries_on_past_a_table_it_cannot_read() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let (events_size, events_footer) = write(
+        &data,
+        "analytics/events/data-2.parquet",
+        &batch_with_row_ids(&[40, 50], &[21, 22]),
+    )
+    .await;
+    catalog
+        .commit(|tx| {
+            let main = tx.schema_by_name("main").expect("bootstrap schema").id;
+            // Registered but never written: unreadable, and ordered before
+            // the table that must still be warmed.
+            let orders = tx.create_table(main, "orders", &[col("a")])?;
+            tx.register_data_file(orders, datafile(3), &[])?;
+
+            let analytics = tx.create_schema("analytics")?;
+            let events = tx.create_table(analytics, "events", &[col("a")])?;
+            tx.register_data_file(
+                events,
+                DataFile {
+                    file_size_bytes: events_size,
+                    footer_size: events_footer,
+                    ..datafile(2)
+                },
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let warmth = catalog.warm_all_row_summaries(data, "").await.unwrap();
+
+    assert_eq!(warmth.files_considered, 2);
+    assert_eq!(warmth.summaries_built, 1);
+    assert_eq!(warmth.files_failed, 1);
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn located_rows_keep_the_order_they_were_requested_in() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());

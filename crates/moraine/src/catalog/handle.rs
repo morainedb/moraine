@@ -47,6 +47,9 @@ use crate::{
     transaction::{MigrationReport, Transaction, commit, migration},
 };
 
+/// How many tables to warm concurrently.
+pub(crate) const WARM_TABLE_CONCURRENCY: usize = 8;
+
 /// Immutable Parquet files decoded concurrently by one scoped operation.
 pub(crate) const BACKFILL_FILE_READ_CONCURRENCY: usize = 8;
 

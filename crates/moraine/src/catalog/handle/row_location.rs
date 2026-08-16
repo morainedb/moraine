@@ -5,13 +5,13 @@ use std::{
     sync::Arc,
 };
 
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use object_store::{ObjectStore, path::Path};
 use tracing::{debug, warn};
 
-use super::{BACKFILL_FILE_READ_CONCURRENCY, ReadOnlyCatalog};
+use super::{BACKFILL_FILE_READ_CONCURRENCY, ReadOnlyCatalog, WARM_TABLE_CONCURRENCY};
 use crate::{
-    catalog::{DataFileId, DataFileInfo, FileRowCandidate, TableId},
+    catalog::{CatalogSnapshot, DataFileId, DataFileInfo, FileRowCandidate, TableId},
     data_file::{self, FileSummary},
     error::Result,
 };
@@ -181,6 +181,8 @@ impl ReadOnlyCatalog {
                     };
 
                 let file_placements = if let Some(files) = placements.get_mut(&row_id) {
+                    // Summaries resolve concurrently, so this arrives in
+                    // completion order; candidates must not vary run to run.
                     files.sort_unstable();
                     files.dedup();
                     files
@@ -219,6 +221,70 @@ impl ReadOnlyCatalog {
         table: TableId,
     ) -> Result<RowSummaryWarmth> {
         let snapshot = self.snapshot().await?;
+
+        Self::warm_table(&snapshot, &data_store, data_prefix, table).await
+    }
+
+    /// Builds and caches the summaries a lookup would otherwise build cold,
+    /// for every table the catalog currently holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the head view cannot be read. Per-file
+    /// failures are reported in [`RowSummaryWarmth::files_failed`].
+    pub async fn warm_all_row_summaries(
+        &self,
+        data_store: Arc<dyn ObjectStore>,
+        data_prefix: &str,
+    ) -> Result<RowSummaryWarmth> {
+        let snapshot = self.snapshot().await?;
+        let tables = snapshot
+            .schemas()
+            .into_iter()
+            .flat_map(|schema| snapshot.tables_in(schema.id))
+            .map(|table| table.id)
+            .collect::<Vec<_>>();
+
+        self.warm_selected_row_summaries(data_store, data_prefix, tables)
+            .await
+    }
+
+    /// Builds and caches the summaries a lookup would otherwise build cold,
+    /// for the given tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the head view cannot be read. Per-file
+    /// failures are reported in [`RowSummaryWarmth::files_failed`].
+    pub async fn warm_selected_row_summaries(
+        &self,
+        data_store: Arc<dyn ObjectStore>,
+        data_prefix: &str,
+        tables: Vec<TableId>,
+    ) -> Result<RowSummaryWarmth> {
+        let snapshot = self.snapshot().await?;
+        let total = stream::iter(tables)
+            .map(|table| Self::warm_table(&snapshot, &data_store, data_prefix, table))
+            .buffer_unordered(WARM_TABLE_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .fold(RowSummaryWarmth::default(), |acc, table| RowSummaryWarmth {
+                files_considered: acc.files_considered.saturating_add(table.files_considered),
+                summaries_built: acc.summaries_built.saturating_add(table.summaries_built),
+                files_failed: acc.files_failed.saturating_add(table.files_failed),
+            });
+
+        Ok(total)
+    }
+
+    /// One table's warming pass against an already-resolved head view.
+    async fn warm_table(
+        snapshot: &CatalogSnapshot,
+        data_store: &Arc<dyn ObjectStore>,
+        data_prefix: &str,
+        table: TableId,
+    ) -> Result<RowSummaryWarmth> {
         let table_prefix = snapshot.table_data_prefix(table)?;
         let files = snapshot.data_files_of(table);
         let mut warmth = RowSummaryWarmth {
@@ -227,7 +293,7 @@ impl ReadOnlyCatalog {
         };
 
         for (data_file_id, summary) in
-            Self::file_summaries(&data_store, data_prefix, &table_prefix, table, files).await
+            Self::file_summaries(data_store, data_prefix, &table_prefix, table, files).await
         {
             match summary {
                 Ok(summary) if summary.built => {

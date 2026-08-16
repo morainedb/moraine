@@ -494,6 +494,29 @@ impl StagedTransaction {
         self.ops.push(op);
     }
 
+    /// The tables this transaction registers new data files against,
+    /// ascending and deduplicated. Only inserts count — ending a file's
+    /// visibility window registers nothing. A row too malformed to decode
+    /// is left out rather than raised; [`commit`](Self::commit) rejects it.
+    pub fn tables_with_staged_data_files(&self) -> Vec<TableId> {
+        let mut tables: Vec<TableId> = self
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                RowOperation::Insert {
+                    table: TableKind::DataFile,
+                    cells,
+                } => decode::decode_data_file(cells).ok(),
+                _ => None,
+            })
+            .map(|file| TableId::new(file.table_id))
+            .collect();
+        tables.sort_unstable();
+        tables.dedup();
+
+        tables
+    }
+
     /// Discards every staged row without writing anything.
     pub fn rollback(self) {
         self.db_tx.rollback();
