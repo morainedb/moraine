@@ -40,6 +40,10 @@ enum {
 };
 
 
+// A parsed inline schema, opaque to C: the schema-only IPC stream of one
+// version decoded once and reused across every chunk of a scan.
+typedef struct MoraineArrowSchema MoraineArrowSchema;
+
 // An attached catalog: owns the tokio runtime created at `ATTACH` and
 // the [`Catalog`] handle opened on it. Every FFI entry point `block_on`s
 // through `runtime`.
@@ -1878,6 +1882,27 @@ int32_t moraine_arrow_decode_body(const uint8_t *schema_ipc,
                                   ArrowArray *out_array,
                                   struct MoraineError *err);
 
+// Parses a version's schema-only IPC stream (from
+// [`moraine_arrow_encode_schema`]) into a handle that
+// [`moraine_arrow_decode_inline_chunk_with_schema`] decodes bodies
+// against. Freed by [`moraine_arrow_schema_free`]; on failure `out` is
+// left untouched.
+//
+// # Safety
+// `schema_ipc` points to `schema_ipc_len` readable bytes; `out` is a valid
+// writable slot; `err` is null or writable.
+int32_t moraine_arrow_schema_decode(const uint8_t *schema_ipc,
+                                    size_t schema_ipc_len,
+                                    struct MoraineArrowSchema **out,
+                                    struct MoraineError *err);
+
+// Frees a handle from [`moraine_arrow_schema_decode`]. Null is a no-op.
+//
+// # Safety
+// `schema` is null or a handle from `moraine_arrow_schema_decode` not
+// previously freed.
+void moraine_arrow_schema_free(struct MoraineArrowSchema *schema);
+
 // Decodes and consumes one chunk returned by
 // [`crate::inline::moraine_inline_scan`]; its store-backed allocation
 // becomes Arrow's data buffer without a copy.
@@ -1893,6 +1918,21 @@ int32_t moraine_arrow_decode_inline_chunk(const uint8_t *schema_ipc,
                                           ArrowSchema *out_schema,
                                           ArrowArray *out_array,
                                           struct MoraineError *err);
+
+// [`moraine_arrow_decode_inline_chunk`] against a schema parsed once by
+// [`moraine_arrow_schema_decode`]; the handle stays owned by the caller
+// and may be reused for every chunk of that schema version.
+//
+// # Safety
+//
+// `schema` is a live handle from `moraine_arrow_schema_decode`. `chunk`
+// points to one unconsumed [`MoraineInlineChunk`]. `out_schema`/`out_array`
+// are writable slots the caller releases; `err` is writable.
+int32_t moraine_arrow_decode_inline_chunk_with_schema(const struct MoraineArrowSchema *schema,
+                                                      struct MoraineInlineChunk *chunk,
+                                                      ArrowSchema *out_schema,
+                                                      ArrowArray *out_array,
+                                                      struct MoraineError *err);
 
 // Decodes a self-contained IPC stream (from [`moraine_arrow_encode_chunk`],
 // or a schema-only stream from [`moraine_arrow_encode_schema`], which

@@ -1402,6 +1402,121 @@ async fn register_indexed_data_file(catalog: &Catalog, values: &[i64]) -> Arc<In
     store
 }
 
+/// As [`catalog_with_indexed_inline_table`], with the index under deferred
+/// maintenance.
+async fn catalog_with_deferred_indexed_table() -> (Catalog, u64) {
+    use crate::catalog::{IndexDef, IndexMaintenance, TableId};
+
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached(db_tx);
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 0),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "created_table:1"),
+    });
+    setup.commit().await.unwrap();
+
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let id = tx.create_index_ordered_with_maintenance(
+                TableId::new(1),
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![crate::catalog::ColumnId::new(1)],
+                    unique: false,
+                },
+                &[],
+                IndexMaintenance::Deferred,
+                &[],
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    (catalog, index.get().unwrap().get())
+}
+
+#[tokio::test]
+async fn commit_reports_the_deferred_indexes_it_leaves_maintaining() {
+    use crate::catalog::IndexId;
+
+    let (catalog, index_id) = catalog_with_deferred_indexed_table().await;
+    let store = Arc::new(InMemory::new());
+    let (_, batch) = bigint_batch(&[1, 2, 3]);
+    let size = write_parquet(&store, "main/t/data.parquet", &batch).await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin(
+        db_tx,
+        Arc::clone(catalog.projections()),
+        Some(store),
+        String::new(),
+    );
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: indexed_data_file_row(3, size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(3, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, "inserted_into_table:1"),
+    });
+    let report = tx.commit_reporting().await.unwrap();
+
+    assert_eq!(report.snapshot_id, SnapshotId::new(3));
+    assert_eq!(report.deferred_indexes, vec![IndexId::new(index_id)]);
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.indexes_of(crate::catalog::TableId::new(1))[0].state,
+        crate::catalog::IndexState::Maintaining
+    );
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn commit_touching_no_deferred_index_reports_none() {
+    let (catalog, _) = catalog_with_deferred_indexed_table().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(2, 0, "u", 3, None),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(3, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, "created_table:2"),
+    });
+    let report = tx.commit_reporting().await.unwrap();
+
+    assert_eq!(report.snapshot_id, SnapshotId::new(3));
+    assert!(report.deferred_indexes.is_empty());
+    catalog.close().await.unwrap();
+}
+
 /// Wraps an [`InMemory`] store, recording the most reads it ever held in
 /// flight at once. Every read suspends before it is served, so a caller
 /// that issues its reads concurrently holds all of them at once, while one

@@ -8,7 +8,9 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 
 #[doc(hidden)]
-pub use crate::transaction::staged::{Cell, RowOperation, StagedTransaction, TableKind};
+pub use crate::transaction::staged::{
+    Cell, CommitReport, RowOperation, StagedTransaction, TableKind,
+};
 use crate::{catalog::Catalog, error::Result};
 
 /// Begins a staged-row transaction at the current head. `data_store` (with

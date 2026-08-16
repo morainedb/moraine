@@ -33,7 +33,7 @@ use tracing::debug;
 
 use crate::{
     catalog::{
-        CatalogSnapshot, ColumnInfo, IndexInfo, SnapshotId, TableId,
+        CatalogSnapshot, ColumnInfo, IndexId, IndexInfo, SnapshotId, TableId,
         inline::{InlineScanKind, materialize_inline_rows},
         projection::ProjectionCache,
     },
@@ -969,8 +969,20 @@ impl StagedTransaction {
     /// the head snapshot. Returns [`Error::CommitConflict`] — **never
     /// retried internally** — if a concurrent commit advanced the head
     /// first; the store is left unchanged by the loser.
-    #[allow(clippy::too_many_lines)]
     pub async fn commit(self) -> Result<SnapshotId> {
+        self.commit_reporting()
+            .await
+            .map(|report| report.snapshot_id)
+    }
+
+    /// As [`commit`](Self::commit), also naming the deferred-maintenance
+    /// indexes this commit left awaiting repair.
+    ///
+    /// # Errors
+    ///
+    /// As [`commit`](Self::commit).
+    #[allow(clippy::too_many_lines)]
+    pub async fn commit_reporting(self) -> Result<CommitReport> {
         let started = Instant::now();
         let Self {
             diagnostic_id,
@@ -1037,6 +1049,13 @@ impl StagedTransaction {
         phases.index_metrics = index_metrics;
         uses_inline_chunk_directory |= repaired_inline_chunk_directory;
 
+        // A head-preserving commit never marks a definition maintaining.
+        let deferred_indexes = if mints_snapshot {
+            deferred.iter().copied().map(IndexId::new).collect()
+        } else {
+            Vec::new()
+        };
+
         let phase_started = Instant::now();
         match translate_batch(base_ref, &ops, &poisoned, &deferred, mints_snapshot) {
             Ok((result_id, mut writes, translated_head_view)) => {
@@ -1090,7 +1109,10 @@ impl StagedTransaction {
                             commit_timings,
                             started,
                         );
-                        Ok(SnapshotId::new(result_id))
+                        Ok(CommitReport {
+                            snapshot_id: SnapshotId::new(result_id),
+                            deferred_indexes,
+                        })
                     }
                     commit::Landed::LostRace => Err(staged_lost_race(result_id, staged_rows)),
                 }
@@ -1101,6 +1123,16 @@ impl StagedTransaction {
             }
         }
     }
+}
+
+/// What a landed commit produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CommitReport {
+    /// The snapshot the commit's rows are visible at.
+    pub snapshot_id: SnapshotId,
+    /// Deferred-maintenance indexes this commit left `Maintaining`.
+    pub deferred_indexes: Vec<IndexId>,
 }
 
 /// The writes a batch carries and the snapshot id it results in. A
@@ -1391,7 +1423,7 @@ fn translate_maintenance(
             RowOperation::Insert {
                 table: TableKind::FileColumnStats,
                 cells,
-            } => decode::decode_file_column_stats(cells)?.column_id == data_file::ROW_ID_FIELD_ID,
+            } => file_column_stats_column_id(cells)? == data_file::ROW_ID_FIELD_ID,
             _ => false,
         };
         let allowed = matches!(
@@ -1425,4 +1457,13 @@ fn translate_maintenance(
     let mut writes = commit::diff_writes(base, &state, head);
     writes.extend(direct);
     Ok(writes)
+}
+
+/// The `column_id` cell of a `ducklake_file_column_stats` row; `apply_op`
+/// decodes the whole row.
+fn file_column_stats_column_id(cells: &[Cell]) -> Result<u64> {
+    let mut cursor = Cursor::new(TableKind::FileColumnStats, cells);
+    let _data_file_id = cursor.u64()?;
+    let _table_id = cursor.u64()?;
+    cursor.u64()
 }

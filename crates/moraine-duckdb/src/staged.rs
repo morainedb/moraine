@@ -1070,32 +1070,37 @@ pub unsafe extern "C" fn moraine_tx_commit(
         let warm_tables = tx.tables_with_staged_data_files();
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
-        let id = unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, tx.commit()) }?;
+        let report =
+            unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, tx.commit_reporting()) }?;
         catalog_ref.spawn_warm_tables(warm_tables);
 
-        // Repair runs after the data snapshot is durable; its failure,
-        // including cancellation, is not a commit failure.
-        match catalog_ref.catalog.writer() {
-            Ok(writer) => {
-                let repair = writer.repair_deferred_indexes(
-                    catalog_ref.data_store.clone(),
-                    &catalog_ref.data_prefix,
-                    None,
-                );
-                // SAFETY: `probe`/`probe_ctx` validity is this function's
-                // own safety contract.
-                let repaired =
-                    unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, repair) };
-                if let Err(error) = repaired {
-                    warn!(error = ?error, "deferred index repair will resume during maintenance");
+        // Repair runs only when this commit deferred entries, after the data
+        // snapshot is durable; its failure, including cancellation, is not
+        // a commit failure. A repair that fails resumes on the next
+        // deferring commit or during maintenance.
+        if !report.deferred_indexes.is_empty() {
+            match catalog_ref.catalog.writer() {
+                Ok(writer) => {
+                    let repair = writer.repair_deferred_indexes(
+                        catalog_ref.data_store.clone(),
+                        &catalog_ref.data_prefix,
+                        None,
+                    );
+                    // SAFETY: `probe`/`probe_ctx` validity is this function's
+                    // own safety contract.
+                    let repaired =
+                        unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, repair) };
+                    if let Err(error) = repaired {
+                        warn!(error = ?error, "deferred index repair will resume later");
+                    }
                 }
-            }
-            Err(error) => {
-                warn!(error = %error, "deferred index repair will resume during maintenance");
+                Err(error) => {
+                    warn!(error = %error, "deferred index repair will resume later");
+                }
             }
         }
 
-        Ok(id.get())
+        Ok(report.snapshot_id.get())
     };
 
     // SAFETY: `err` validity is this function's own safety contract.
