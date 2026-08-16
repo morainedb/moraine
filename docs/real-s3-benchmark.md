@@ -25,8 +25,11 @@ the normal credential chain. For MinIO, also set `MORAINE_S3_ENDPOINT`,
 
 Pull requests continue to run `cargo xtask s3` against pinned MinIO. The AWS
 run uses the same ignored `object_storage` suite with CodeBuild's temporary
-service-role credentials and a unique prefix. Benchmark data expires after
-seven days; GitHub keeps the downloaded result for 30 days.
+service-role credentials and a unique prefix: the bootstrap and read-only
+round-trips, the fresh-attach latency sweep, the durable-commit latency
+sweep, and the index-lookup latency measurement (cold first lookup, warm
+lookups, IN-list, range, and an explicit `warm_tables`). Benchmark data
+expires after seven days; GitHub keeps the downloaded result for 30 days.
 
 ## One-time AWS setup
 

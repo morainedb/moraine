@@ -1,11 +1,16 @@
 //! Locating stable row ids within one immutable data file.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+use futures::TryStreamExt;
 
 use crate::{
     data_file::{
         ParquetFile, RowIdSource, ScopedRows, auxiliary_cache, carries_embedded_row_ids,
-        row_set::FileRowSet, scoped_read_recorded_entries,
+        row_set::FileRowSet, scoped_read_entry_batches,
     },
     error::Result,
 };
@@ -14,7 +19,7 @@ use crate::{
 pub(crate) struct FileSummary {
     rows: Arc<FileRowSet>,
     /// Whether this call read the file's row-id column and cached the
-    /// result. A dense range and a cache hit both read nothing.
+    /// result.
     pub(crate) built: bool,
 }
 
@@ -25,12 +30,9 @@ impl FileSummary {
     }
 }
 
-/// This file's row-id membership, from the cache when it is resident.
-///
-/// A file whose ids are the dense range its catalog row records answers
-/// without reading any column, and takes none of the summary budget. One
-/// carrying the reserved row-id column reads only that column, since its
-/// ids may hold gaps the range would exclude, and its summary is cached.
+/// This file's row-id membership, from the cache when it is resident. A
+/// file whose ids are the recorded dense range answers without a read; one
+/// carrying the reserved row-id column reads only that column and is cached.
 pub(crate) async fn file_summary(
     file: ParquetFile,
     table_id: u64,
@@ -52,7 +54,6 @@ pub(crate) async fn file_summary(
         return Ok(FileSummary { rows, built: false });
     }
 
-    // Dense range
     if let Some(start) = row_id_start
         && !carries_embedded_row_ids(file.clone()).await?
     {
@@ -61,20 +62,41 @@ pub(crate) async fn file_summary(
             built: false,
         })
     } else {
-        let entries = scoped_read_recorded_entries(
-            file,
-            &[],
-            ScopedRows::All,
-            RowIdSource::Resolve { row_id_start },
-        )
-        .await?;
-        let mut row_ids: Vec<u64> = entries.into_iter().map(|entry| entry.row_id).collect();
-        row_ids.sort_unstable();
-        row_ids.dedup();
+        let built = Arc::new(AtomicBool::new(false));
+        let read = {
+            let built = Arc::clone(&built);
+            move || async move {
+                built.store(true, Ordering::Relaxed);
+                read_row_ids(file, row_id_start).await
+            }
+        };
 
-        let rows = Arc::new(FileRowSet::from_sorted(row_ids)?);
-        auxiliary_cache::shared().insert_summary(&store, &key, &rows);
+        let rows = auxiliary_cache::shared()
+            .fetch_summary(&store, &key, read)
+            .await?;
 
-        Ok(FileSummary { rows, built: true })
+        Ok(FileSummary {
+            rows,
+            built: built.load(Ordering::Relaxed),
+        })
     }
+}
+
+async fn read_row_ids(file: ParquetFile, row_id_start: Option<u64>) -> Result<Arc<FileRowSet>> {
+    let mut row_ids = scoped_read_entry_batches(
+        file,
+        &[],
+        ScopedRows::All,
+        RowIdSource::Resolve { row_id_start },
+    )
+    .await?
+    .try_fold(Vec::new(), |mut row_ids, batch| async move {
+        row_ids.extend(batch.iter().map(|entry| entry.row_id));
+        Ok(row_ids)
+    })
+    .await?;
+    row_ids.sort_unstable();
+    row_ids.dedup();
+
+    Ok(Arc::new(FileRowSet::from_sorted(row_ids)?))
 }

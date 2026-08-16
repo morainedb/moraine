@@ -832,3 +832,99 @@ async fn a_handle_reports_what_its_decoded_catalog_holds() {
         writer.projection_bytes()
     );
 }
+
+/// Warming a table pulls the index and inline ranges its lookups probe
+/// into the cache, so the first lookup after it issues no object-store
+/// read where a cold table's first lookup pays a round trip per level.
+#[tokio::test]
+async fn a_warmed_table_pays_nothing_for_its_first_lookup() {
+    use moraine::{IndexDef, IndexEntry, IndexKeyValue, IntWidth};
+
+    let key = |value: i128| IndexKeyValue::Int {
+        value,
+        width: IntWidth::I64,
+    };
+    let seed = || async {
+        let object_store = Arc::new(InMemory::new());
+        let writer = Catalog::open(
+            Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+            CatalogOptions::default(),
+        )
+        .await
+        .unwrap();
+        let created = std::cell::Cell::new(None);
+        writer
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                let table = tx.create_table(schema, "items", &[col("value")])?;
+                let entries = (0..2_000_u64)
+                    .map(|row_id| IndexEntry {
+                        row_id,
+                        values: vec![Some(key(i128::from(row_id)))],
+                    })
+                    .collect::<Vec<_>>();
+                let index = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_value".to_owned(),
+                        columns: vec![moraine::ColumnId::new(1)],
+                        unique: false,
+                    },
+                    &entries,
+                )?;
+                created.set(Some((table, index)));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let (table, index) = created.get().unwrap();
+        (object_store, table, index)
+    };
+
+    // A cold table: the first lookup pays for the SST metadata and blocks
+    // it touches.
+    let (object_store, table, index) = seed().await;
+    let counting = Arc::new(CountingStore::new(object_store));
+    let cold = Catalog::open(
+        Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    cold.snapshot().await.unwrap();
+    counting.take_reads();
+    let found = cold
+        .index_lookup(table, index, &[key(1_500)])
+        .await
+        .unwrap();
+    assert_eq!(found, vec![1_500]);
+    let cold_reads = counting.take_reads();
+    cold.close().await.unwrap();
+
+    // The same table warmed first: the lookup finds what it needs resident.
+    let (object_store, table, index) = seed().await;
+    let counting = Arc::new(CountingStore::new(object_store));
+    let warmed = Catalog::open(
+        Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    warmed.snapshot().await.unwrap();
+    warmed.warm_tables(&[table]).await.unwrap();
+    counting.take_reads();
+    let found = warmed
+        .index_lookup(table, index, &[key(1_500)])
+        .await
+        .unwrap();
+    assert_eq!(found, vec![1_500]);
+    let warmed_reads = counting.take_reads();
+    warmed.close().await.unwrap();
+
+    assert!(cold_reads > 0, "a cold lookup read nothing");
+    assert_eq!(
+        warmed_reads, 0,
+        "warming did not spare the first lookup: {warmed_reads} reads warmed, {cold_reads} cold"
+    );
+}

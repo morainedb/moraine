@@ -6,11 +6,12 @@ mod index_build;
 mod index_lookup;
 mod maintenance;
 mod row_location;
+mod table_warm;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -59,19 +60,12 @@ pub(crate) const BACKFILL_FILE_READ_CONCURRENCY: usize = 8;
 pub struct MigrationRequest {
     /// Take a whole-store checkpoint before the first rewrite and release it
     /// once the last finish batch is durable, leaving a manual recovery point
-    /// if the migration fails partway. Off by default: migrations are
-    /// one-way and there is no automatic rollback, so the checkpoint is the
-    /// sanctioned recovery path when an operator wants one.
+    /// if the migration fails partway. Off by default.
     pub checkpoint: bool,
 }
 
 /// How a handle has served its reads, for the diagnostics a slow attach
 /// needs.
-///
-/// A materialization is meant to be rare — one per handle, then the cache
-/// serves — so the count is the diagnostic: a handle reporting hundreds is
-/// rebuilding the catalog per read, which no amount of reclaiming the store
-/// would fix.
 #[derive(Debug, Default)]
 struct ReadTally {
     materializations: AtomicU64,
@@ -79,10 +73,6 @@ struct ReadTally {
     cache_hits: AtomicU64,
     head_reads: AtomicU64,
     materialize_micros: AtomicU64,
-    // How many times each half of the shared record set was actually
-    // scanned from the store. At one head each should move at most once,
-    // however many consumers read at it — the tally is what tests pin
-    // that with.
     current_scans: AtomicU64,
     history_scans: AtomicU64,
 }
@@ -240,11 +230,6 @@ impl Default for CatalogOptions {
 }
 
 /// How much of a store to load into the on-disk object cache as it opens.
-///
-/// The choice is between paying for freshness and paying for everything:
-/// the newest objects are what a writer's own next reads want, while a
-/// whole store is what a query session wants and is only affordable when
-/// the store is small enough to sit on the local disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachePreload {
     /// The newest objects only — those a compaction has not yet merged
@@ -258,18 +243,14 @@ pub enum CachePreload {
 }
 
 /// Warns when an `All` preload cannot hold the store it is about to load.
-///
-/// The load stops at the first object that would exceed the cap and says
-/// nothing about having stopped, so an attach that silently warms half a
-/// store looks exactly like one that warmed all of it. Diagnostics only:
-/// a manifest that cannot be read here is left to the open itself to
-/// report, and nothing about the open changes either way.
-async fn warn_if_preload_cannot_fit(options: &CatalogOptions, object_store: Arc<dyn ObjectStore>) {
+/// Diagnostics only: a manifest that could not be read is left to the open
+/// itself to report.
+fn warn_if_preload_cannot_fit(options: &CatalogOptions, manifest: Option<census::ManifestBytes>) {
     if options.cache_preload != Some(CachePreload::All) || options.cache_dir.is_none() {
         return;
     }
 
-    let Ok(store_bytes) = census::manifest_bytes(&options.path, object_store).await else {
+    let Some(store_bytes) = manifest.map(|manifest| manifest.store_bytes) else {
         return;
     };
     if let Some(shortfall) = open::preload_shortfall(store_bytes, options.cache_size) {
@@ -287,9 +268,8 @@ async fn warn_if_preload_cannot_fit(options: &CatalogOptions, object_store: Arc<
 /// Warns when the process's metadata cache is smaller than the store's SST
 /// filters, indexes, and statistics.
 ///
-/// Reads the capacity after the open: the cache is process-wide, so only
-/// then is it the one in force rather than the one this attach asked for.
-/// Diagnostics only.
+/// Diagnostics only; the process-wide capacity is known only after the
+/// open.
 fn warn_if_metadata_cache_cannot_hold(path: &str, metadata_bytes: Option<u64>) {
     let Some(metadata_bytes) = metadata_bytes else {
         return;
@@ -321,21 +301,14 @@ fn parse_checkpoint(checkpoint: Option<&str>) -> Result<Option<uuid::Uuid>> {
 
 /// One member of a [`Catalog::commit_group`] batch: a closure authoring
 /// one logical commit.
-///
-/// `Sync` so a grouped commit is as spawnable as a lone one; an ordinary
-/// closure satisfies that on its own.
 pub type CommitMember<'a> = &'a (dyn Fn(&mut Transaction) -> Result<()> + Sync);
 
 /// The read surface of a moraine catalog: cheap to clone, drives every
 /// read. This is what a read-only attach hands back, and what a
-/// read-write [`Catalog`] derefs to, so the reads are written once and
-/// both modes serve them.
+/// read-write [`Catalog`] derefs to.
 ///
-/// It carries no mutator at all. That is the point: a `commit` against a
-/// catalog opened read-only is a compile error rather than a runtime
-/// [`Error::Constraint`], so the mode a handle was opened in is visible in
-/// its type. The storage substrate never appears in this API — a catalog
-/// lives in a bucket reachable through any [`ObjectStore`].
+/// It carries no mutator: a `commit` against a catalog opened read-only is
+/// a compile error rather than a runtime [`Error::Constraint`].
 ///
 /// ```compile_fail
 /// # use std::sync::Arc;
@@ -369,24 +342,14 @@ pub type CommitMember<'a> = &'a (dyn Fn(&mut Transaction) -> Result<()> + Sync);
 #[derive(Clone)]
 pub struct ReadOnlyCatalog {
     store: Arc<Store>,
-    // Shared across handle clones: how this attach has served its reads.
     reads: Arc<ReadTally>,
-    // Shared across handle clones: what the process's block cache has
-    // served for this attach in particular.
     cache: Arc<CacheCounters>,
-    // Where the store lives. Retained because the census and the store
-    // merge reach SlateDB's admin surface, which addresses a store by path
-    // rather than through an open handle.
     location: Arc<StoreLocation>,
-    // Shared across handle clones: decoded projections folded forward on
-    // commit, served without rescanning when their head matches.
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
-    // Shared across handle clones: where concurrent commits meet so
-    // several of them become one batch and one flush.
     commits: Arc<commit::Coalescer>,
-    // The writer `Db`'s status channel, so a read served from the held view
-    // can check the fence without opening a transaction to do it. `None` on
-    // a read-only handle, which holds no writer to lose.
+    /// Tables whose probe ranges this handle has warmed on first touch.
+    warmed_tables: Arc<Mutex<HashSet<TableId>>>,
+    // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
 }
 
@@ -401,9 +364,8 @@ impl std::fmt::Debug for ReadOnlyCatalog {
 /// and commits.
 ///
 /// Every read lives on [`ReadOnlyCatalog`] and reaches this type through
-/// `Deref`, so a writer serves the whole read surface without restating
-/// it; what this type adds is the mutators. Exactly one process may hold
-/// one per store.
+/// `Deref`; this type adds the mutators. Exactly one process may hold one
+/// per store.
 #[derive(Clone)]
 pub struct Catalog {
     inner: ReadOnlyCatalog,
@@ -416,9 +378,6 @@ impl std::fmt::Debug for Catalog {
     }
 }
 
-/// The whole read surface, without restating a method of it. Field access
-/// through the deref is what lets the mutators below read `self.store` and
-/// `self.commits` unchanged.
 impl std::ops::Deref for Catalog {
     type Target = ReadOnlyCatalog;
 
@@ -433,14 +392,8 @@ impl ReadOnlyCatalog {
         &self.projections
     }
 
-    /// What the block cache has served for **this catalog** since it
-    /// attached — metadata and data blocks counted apart, because they are
-    /// sized apart.
-    ///
-    /// The cache itself is the process's: every catalog a process attaches
-    /// reads through one instance under one budget. These are that
-    /// instance's numbers for this attach alone, which is what tells a
-    /// busy catalog from an idle one sharing it;
+    /// What the process-wide block cache has served for **this catalog**
+    /// since it attached, metadata and data blocks counted apart;
     /// [`cache_tally`](crate::cache_tally) is the same counts for the
     /// process.
     ///
@@ -529,19 +482,8 @@ impl ReadOnlyCatalog {
     }
 
     /// Refuses if this handle has lost the writer epoch, or its `Db` has
-    /// closed for any other reason.
-    ///
-    /// The fence check a read served from the held view performs in place
-    /// of opening a session. SlateDB reports a close by setting it on the
-    /// status channel this handle subscribed to at open, so reading it is a
-    /// borrow of a watch value — no store read, no manifest copy, and no
-    /// entry in the transaction manager, which is what opening a session
-    /// takes a global write lock to make.
-    ///
-    /// Same reach as a session's: both fail exactly once the `Db` is
-    /// closed, because closing it is what the fence does. A handle that
-    /// skipped this would serve its cache past its own displacement, and
-    /// quietly.
+    /// closed for any other reason. Reads the status channel only: no
+    /// store read and no session.
     pub(crate) fn refuse_if_closed(&self) -> Result<()> {
         let Some(status) = &self.writer_status else {
             return Ok(());
@@ -555,21 +497,10 @@ impl ReadOnlyCatalog {
         }
     }
 
-    /// The held view a read may serve without resolving the head from the
-    /// store, or `None` when it must resolve it there.
-    ///
-    /// A read-write handle holds the writer epoch, so this process is the
-    /// store's only writer: nothing can move `sys/head` under it, and every
-    /// batch that lands either folds the held view forward or drops it — a
-    /// durable write whose fate is unknown drops it too. The held view is
-    /// therefore never behind the store, and its own stamp is the head.
-    ///
-    /// Paired with [`refuse_if_closed`](Self::refuse_if_closed), never
-    /// served alone: that this handle still holds the writer is the premise
-    /// of the paragraph above, not a cost it can skip.
-    ///
-    /// A read-only handle follows another process's commits and has no
-    /// such premise, so it always reads.
+    /// The held view a read-write handle may serve without resolving the
+    /// head from the store; `None` on a read-only handle, which always
+    /// reads. Callers must pair it with
+    /// [`refuse_if_closed`](Self::refuse_if_closed).
     pub(crate) fn writer_head_view(&self) -> Option<Arc<CatalogSnapshot>> {
         if !self.holds_the_writer() {
             return None;
@@ -609,12 +540,10 @@ impl ReadOnlyCatalog {
     /// A table's inlined rows live at the latest committed snapshot, in
     /// row-id order, each carrying the Arrow IPC bytes it decodes from.
     ///
-    /// These rows are not part of a [`CatalogSnapshot`]: they are row data,
-    /// not catalog metadata, so they are served from the `inline` subspace
-    /// on demand — one contiguous range scan per call — rather than
-    /// materialized into a view every reader of the catalog shares. Rows of
-    /// one chunk share one body and rows of one schema version share one
-    /// schema, so each set of bytes is read and carried once.
+    /// These rows are not part of a [`CatalogSnapshot`]: they are served
+    /// from the `inline` subspace on demand, one range scan per call. Rows
+    /// of one chunk share one body and rows of one schema version share one
+    /// schema.
     ///
     /// # Errors
     ///
@@ -681,11 +610,9 @@ impl ReadOnlyCatalog {
     /// A table's inlined rows as of `snapshot` (time travel): the rows whose
     /// insert had landed by then and whose tombstone had not.
     ///
-    /// Only rows still inlined are found. A flush drains the chunks it
-    /// consumes, so past snapshots of flushed rows read from the backdated
-    /// data file [`CatalogSnapshot::data_files_of`] serves, never from here
-    /// — which is what keeps the rows in exactly one place at every
-    /// snapshot.
+    /// Only rows still inlined are found: past snapshots of flushed rows
+    /// read from the backdated data file
+    /// [`CatalogSnapshot::data_files_of`] serves, never from here.
     ///
     /// # Errors
     ///
@@ -728,26 +655,33 @@ impl ReadOnlyCatalog {
         table: TableId,
         at: Option<u64>,
     ) -> Result<Vec<RecentRow>> {
+        self.warm_table_on_first_touch(table);
         let handle = session.handle();
-        commit::refuse_mid_migration(handle).await?;
-        // Head takes no id and so needs no resolution; a requested snapshot
-        // is resolved exactly as `snapshot_at` resolves one.
         let read_at = match at {
             Some(_) => commit::resolve_read_snapshot(handle, at).await?.0,
             None => commit::read_head_id(handle).await?,
         };
-        let chunks = store_inline::scan_inline_chunks(handle, table.get()).await?;
-        let tombstones = store_inline::scan_inline_deletes(handle, table.get()).await?;
+        let (chunks, tombstones) = futures::try_join!(
+            store_inline::scan_inline_chunks(handle, table.get()),
+            store_inline::scan_inline_deletes(handle, table.get()),
+        )?;
 
         let live = InlineScanKind::Table.select(
             &materialize_inline_rows(&chunks, &tombstones),
             read_at,
             0,
         );
-        // One body per referenced chunk and one schema per referenced
-        // version, however many rows point at them.
+        let schema_versions = live.iter().filter_map(|row| match &chunks[row.chunk].0 {
+            InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
+            _ => None,
+        });
+        let schemas: HashMap<u64, Arc<Vec<u8>>> =
+            backfill::read_inline_schemas(handle, table, schema_versions)
+                .await?
+                .into_iter()
+                .map(|(version, record)| (version, Arc::new(record.arrow_schema.to_vec())))
+                .collect();
         let mut bodies: HashMap<usize, Arc<Vec<u8>>> = HashMap::new();
-        let mut schemas: HashMap<u64, Arc<Vec<u8>>> = HashMap::new();
         let mut rows = Vec::with_capacity(live.len());
         for row in live {
             let (operation, chunk) = &chunks[row.chunk];
@@ -758,20 +692,11 @@ impl ReadOnlyCatalog {
                     row.row_id
                 )));
             };
-            let arrow_schema = if let Some(schema) = schemas.get(schema_version) {
-                Arc::clone(schema)
-            } else {
-                let schema = store_inline::read_inline_schema(handle, table.get(), *schema_version)
-                    .await?
-                    .ok_or_else(|| {
-                        Error::Corruption(format!(
-                            "no inline schema for table {table} version {schema_version}"
-                        ))
-                    })?;
-                let schema = Arc::new(schema.arrow_schema.to_vec());
-                schemas.insert(*schema_version, Arc::clone(&schema));
-                schema
-            };
+            let arrow_schema = Arc::clone(schemas.get(schema_version).ok_or_else(|| {
+                Error::Corruption(format!(
+                    "no inline schema for table {table} version {schema_version}"
+                ))
+            })?);
             let chunk_body = Arc::clone(
                 bodies
                     .entry(row.chunk)
@@ -791,14 +716,8 @@ impl ReadOnlyCatalog {
         Ok(rows)
     }
 
-    /// Time travel always materializes: the cache holds head views only, and
-    /// a past snapshot is reconstructed from `history` rather than advanced
-    /// from a newer state.
-    ///
-    /// A read-only catalog caches too. It folds no batch of its own — it has
-    /// none — so it advances by replaying the changelog of the commits it
-    /// missed, and the head stamp its cached view carries tells it exactly
-    /// which store state it stands at.
+    /// The view at `at`, or at head when `None`. Time travel always
+    /// materializes: the cache holds head views only.
     async fn view(&self, at: Option<u64>) -> Result<Arc<CatalogSnapshot>> {
         if at.is_some() {
             let session = self.begin_read().await?;
@@ -833,11 +752,7 @@ impl ReadOnlyCatalog {
 
     /// The cached view when it already stands at head, a view refreshed
     /// across the gap when it has fallen behind and the gap is replayable,
-    /// else a fresh materialization. A read-only handle polling a quiet
-    /// catalog pays one point read and no copy: the committer folds each
-    /// batch forward, so the cache is normally current. A read-write
-    /// handle does not reach here at all while its view is held —
-    /// [`writer_head_view`](Self::writer_head_view) serves it first.
+    /// else a fresh materialization.
     async fn head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
         self.note_head_read();
         let head = commit::read_head_value(handle).await?;
@@ -886,15 +801,8 @@ impl ReadOnlyCatalog {
     /// Opens a read session at the current head — a read-write transaction or
     /// the read-only reader — the same isolation
     /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
-    /// Used by [`crate::ffi_support`]'s raw current+history dumps and inline
-    /// scans; every other reader goes through `snapshot`/`snapshot_at`.
-    ///
     /// Every read of the store opens its session here, so this is where a
-    /// store mid-structural-migration is refused. The check costs one point
-    /// read per session and belongs here rather than at each call site: a
-    /// reader that skips it scans a keyspace being rewritten under it and
-    /// returns a catalog with a hole in it, and an open-time check cannot
-    /// catch a migration that starts after the handle attached.
+    /// store mid-structural-migration is refused.
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
         let session = match self.store.as_ref() {
             Store::Writer(db) => ReadSession::Tx(
@@ -932,14 +840,8 @@ impl ReadOnlyCatalog {
 }
 
 impl Catalog {
-    /// The underlying store handle.
-    ///
-    /// A `Catalog` is only ever built around a `Store::Writer` — that is
-    /// what makes it a `Catalog` rather than a [`ReadOnlyCatalog`] — so the
-    /// reader arm is unreachable by construction. It still returns a
-    /// `Result` rather than asserting, because the invariant lives in the
-    /// two constructors above rather than in the type of the field, and a
-    /// wrong answer here would be a silent write to the wrong handle.
+    /// The underlying writer `Db`; a `Catalog` is only ever built around
+    /// one, so the reader arm is unreachable by construction.
     fn writer(&self) -> Result<&Db> {
         match self.store.as_ref() {
             Store::Writer(db) => Ok(db),
@@ -985,13 +887,12 @@ impl Catalog {
                     .to_string(),
             ));
         }
-        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
         let located = Arc::clone(&object_store);
-        // Measured before the open so the warning after it costs no second
-        // manifest read.
-        let metadata_bytes = census::manifest_metadata_bytes(&options.path, Arc::clone(&located))
+        // One manifest read serves both diagnostics, before the open.
+        let manifest = census::manifest_bytes(&options.path, Arc::clone(&located))
             .await
             .ok();
+        warn_if_preload_cannot_fit(&options, manifest);
         let store = StoreBuilder::new(&options.path, object_store)
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
@@ -1002,7 +903,10 @@ impl Catalog {
         let (db, cache) =
             commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
                 .await?;
-        warn_if_metadata_cache_cannot_hold(&options.path, metadata_bytes);
+        warn_if_metadata_cache_cannot_hold(
+            &options.path,
+            manifest.map(|manifest| manifest.metadata_bytes),
+        );
         info!(
             path = options.path,
             flush_interval_ms = options.flush_interval.as_millis(),
@@ -1021,6 +925,7 @@ impl Catalog {
                 cache,
                 commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
                 projections,
+                warmed_tables: Arc::default(),
             },
         })
     }
@@ -1030,18 +935,13 @@ impl Catalog {
     /// [`CatalogOptions::checkpoint`] is set, pinned to that checkpoint.
     ///
     /// A read-only catalog never opens the writer `Db`, so it never fences a
-    /// live read-write process — any number of read-only catalogs may attach
-    /// alongside the one writer. It never bootstraps: opening a
-    /// store no writer has initialized is refused. [`commit`](Self::commit)
-    /// returns [`Error::Constraint`].
+    /// live read-write process. It never bootstraps: opening a store no
+    /// writer has initialized is refused.
     ///
-    /// "Read-only" is a catalog property, not an IAM one: following the
-    /// latest state means writing a checkpoint into the manifest on open and
-    /// refreshing it while the catalog lives, so those credentials still
-    /// need manifest write access. A catalog opened against a checkpoint
-    /// writes nothing whatsoever, and in exchange reads the fixed cut that
-    /// checkpoint names — later commits never appear, however long it stays
-    /// open.
+    /// Following the latest state writes a checkpoint into the manifest on
+    /// open and refreshes it while the catalog lives, so those credentials
+    /// still need manifest write access. A catalog opened against a
+    /// checkpoint writes nothing and never sees a later commit.
     ///
     /// # Errors
     ///
@@ -1077,13 +977,12 @@ impl Catalog {
         options: CatalogOptions,
     ) -> Result<ReadOnlyCatalog> {
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
-        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
         let located = Arc::clone(&object_store);
-        // Measured before the open so the warning after it costs no second
-        // manifest read.
-        let metadata_bytes = census::manifest_metadata_bytes(&options.path, Arc::clone(&located))
+        // One manifest read serves both diagnostics, before the open.
+        let manifest = census::manifest_bytes(&options.path, Arc::clone(&located))
             .await
             .ok();
+        warn_if_preload_cannot_fit(&options, manifest);
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
@@ -1094,7 +993,10 @@ impl Catalog {
             .checkpoint(checkpoint);
 
         let (reader, cache) = commit::open_reader_initialized(store).await?;
-        warn_if_metadata_cache_cannot_hold(&options.path, metadata_bytes);
+        warn_if_metadata_cache_cannot_hold(
+            &options.path,
+            manifest.map(|manifest| manifest.metadata_bytes),
+        );
         info!(
             path = options.path,
             checkpoint = options.checkpoint,
@@ -1112,6 +1014,7 @@ impl Catalog {
             cache,
             commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
             projections,
+            warmed_tables: Arc::default(),
         })
     }
 
@@ -1119,12 +1022,9 @@ impl Catalog {
     /// binary understands, resuming an interrupted migration if one is in
     /// flight, and reports what it did.
     ///
-    /// Deliberately **not** part of opening a catalog. A structural rewrite
-    /// walks the keyspace and holds the single writer for its duration, so
-    /// it is the operator's explicit choice, never a side effect of someone
-    /// attaching with a newer binary. It takes the writer epoch exactly as
+    /// Not part of opening a catalog. It takes the writer epoch exactly as
     /// [`open`](Self::open) does, so it fences a running catalog and is
-    /// itself fenced by one — exactly one migrator runs.
+    /// itself fenced by one.
     ///
     /// Running it against a store already at the newest format is a no-op:
     /// the returned report names the same format twice and no units.
@@ -1184,9 +1084,7 @@ impl Catalog {
         let report = migration::run(&db).await;
         let closed = db.close().await.map_err(Error::from);
 
-        // A failed migration keeps its checkpoint: it is the recovery point
-        // the operator asked for, and releasing it here would discard the one
-        // thing that makes the failure recoverable.
+        // A failed migration keeps its checkpoint as the recovery point.
         let report = report.and_then(|report| closed.map(|()| report))?;
 
         if let Some(checkpoint) = checkpoint {
@@ -1201,15 +1099,10 @@ impl Catalog {
     /// Pins everything committed so far as a checkpoint, and reports its id.
     ///
     /// A checkpoint is an immutable cut of the store that
-    /// [`CatalogOptions::checkpoint`] opens a reader against — the one way to
-    /// read a moraine catalog with credentials that cannot write at all,
-    /// since a reader that follows the latest state maintains a checkpoint of
-    /// its own and so writes the manifest.
-    ///
-    /// It also pins every object it references against SlateDB's garbage
-    /// collection, so a checkpoint with no `lifetime` holds storage until
-    /// [`delete_checkpoint`](Self::delete_checkpoint) removes it. Give one a
-    /// lifetime unless something will.
+    /// [`CatalogOptions::checkpoint`] opens a reader against. It pins every
+    /// object it references against garbage collection, so a checkpoint
+    /// with no `lifetime` holds storage until
+    /// [`delete_checkpoint`](Self::delete_checkpoint) removes it.
     ///
     /// # Errors
     ///
@@ -1224,11 +1117,10 @@ impl Catalog {
 
     /// Deletes the checkpoint `checkpoint`, releasing the objects it pinned.
     ///
-    /// Free-standing rather than a method, exactly as
-    /// [`migrate`](Self::migrate) is: it CASes the manifest and never opens
-    /// the writer `Db`, so it runs against a live catalog without fencing
-    /// it. Readers already open against the deleted checkpoint keep
-    /// serving; a reader that opens against it afterwards is refused.
+    /// Never opens the writer `Db`, so it runs against a live catalog
+    /// without fencing it. Readers already open against the deleted
+    /// checkpoint keep serving; a reader that opens against it afterwards
+    /// is refused.
     ///
     /// # Errors
     ///
@@ -1249,13 +1141,9 @@ impl Catalog {
     /// Every checkpoint the store's manifest carries, as the ids
     /// [`create_checkpoint`](Self::create_checkpoint) hands out.
     ///
-    /// Free-standing for the same reason
-    /// [`delete_checkpoint`](Self::delete_checkpoint) is: it reads the
-    /// manifest and never opens the writer `Db`, so it runs against a live
-    /// catalog without fencing it. A checkpoint given no lifetime pins
-    /// what it references until it is deleted, so this is how an operator
-    /// finds one whose id was lost — reader-established checkpoints show
-    /// up here too, and are not theirs to delete.
+    /// Reads the manifest and never opens the writer `Db`, so it runs
+    /// against a live catalog without fencing it. Reader-established
+    /// checkpoints show up here too.
     ///
     /// # Errors
     ///

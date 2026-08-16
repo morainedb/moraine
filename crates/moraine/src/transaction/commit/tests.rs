@@ -4171,7 +4171,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
     // So the attempt's own write has to lose, or it would commit against
     // premises that omit a landed commit.
     let mut staged = diff_writes(&base, &base, head_before + 1);
-    staged.push(head_write(&attempt, head_before + 1).await.unwrap());
+    staged.push(head_stamp(head_before + 1, base.batch_seq));
     let staged_bytes = stage_writes(&attempt, &staged).unwrap();
     let landed = commit_batch(
         attempt,

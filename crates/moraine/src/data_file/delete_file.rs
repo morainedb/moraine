@@ -25,8 +25,8 @@ fn delete_position(schema: &Schema) -> Result<usize> {
         .ok_or_else(|| Error::Corruption("delete file has no `pos` column".to_owned()))
 }
 
-/// Appends the non-NULL positions in `batch` to `positions`.
-fn append_delete_positions(batch: &RecordBatch) -> Result<Vec<u64>> {
+/// The non-NULL positions in `batch`; a NULL is corruption.
+fn delete_positions(batch: &RecordBatch) -> Result<Vec<u64>> {
     let column = batch.column(0).as_ref();
     (0..batch.num_rows())
         .map(|row| {
@@ -41,11 +41,8 @@ fn append_delete_positions(batch: &RecordBatch) -> Result<Vec<u64>> {
         .collect::<Result<Vec<_>>>()
 }
 
-/// The row positions a DuckLake delete file marks dead, read from its `pos`
-/// column. A delete file names positions within one data file, so its
-/// `file_path` column carries no information the caller lacks. Small files
-/// cost one whole-object read; large files use the recorded sizes and shared
-/// metadata cache to fetch only the position column.
+/// The row positions a DuckLake delete file marks dead, read from its
+/// `pos` column alone.
 pub(crate) async fn delete_file_positions(file: ParquetFile) -> Result<Vec<u64>> {
     let ParquetFile {
         object_store,
@@ -76,7 +73,7 @@ pub(crate) async fn delete_file_positions(file: ParquetFile) -> Result<Vec<u64>>
     let positions = delete_file_stream
         .map(|batch| {
             let batch = batch.map_err(corrupt("delete-file read"))?;
-            append_delete_positions(&batch)
+            delete_positions(&batch)
         })
         .try_concat()
         .await?;

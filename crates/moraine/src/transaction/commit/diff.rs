@@ -1,7 +1,6 @@
-//! The diff engine: turning a (base, staged) snapshot pair into the
-//! store writes that transition one to the other — per-kind version
-//! transitions with history mirrors, in-place overwrites for unversioned
-//! kinds, and the orchestrating [`diff_writes`].
+//! Turning a (base, staged) snapshot pair into the store writes that
+//! transition one to the other: versioned kinds mint history mirrors,
+//! unversioned kinds are overwritten in place.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -51,7 +50,7 @@ fn stage_transition<M: prost::Message + Clone + PartialEq>(
 }
 
 /// Stages an unversioned record: overwritten in place, never mirrored to
-/// history — statistics carry no begin/end lifecycle.
+/// history.
 fn stage_overwrite<M: prost::Message + PartialEq>(
     writes: &mut Vec<StagedWrite>,
     entity: EntityKey,
@@ -114,8 +113,7 @@ fn diff_nested_versioned<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
     }
 }
 
-/// Stages the in-place overwrite of every record in one id-keyed map
-/// pair — unversioned kinds with no history mirror.
+/// Stages the in-place overwrite of every record in one id-keyed map pair.
 fn diff_overwrite_map<K: Copy + Ord, M: prost::Message + PartialEq>(
     writes: &mut Vec<StagedWrite>,
     base: &BTreeMap<K, M>,
@@ -147,9 +145,8 @@ fn diff_schemas(
 }
 
 /// As [`stage_transition`], except a change confined to the fields
-/// `internal_free` zeroes — moraine-internal bookkeeping with no
-/// lifecycle meaning — overwrites the current record in place with no
-/// history mint: the entity did not transition.
+/// `internal_free` zeroes overwrites the current record in place with no
+/// history mint.
 fn stage_transition_with_internal<M: prost::Message + Clone + PartialEq>(
     writes: &mut Vec<StagedWrite>,
     entity: EntityKey,
@@ -179,8 +176,7 @@ fn diff_tables(
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
-    // The table row minus its field-id counter: the part whose change
-    // means a version transition — the counter alone never mints history.
+    // The field-id counter alone never mints history.
     fn sans_counter(value: &proto::TableValue) -> proto::TableValue {
         proto::TableValue {
             next_column_id: 0,
@@ -246,8 +242,8 @@ fn diff_tags(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &Cata
     });
 }
 
-/// Deletion-schedule rows: live bookkeeping under `current/gcfile`,
-/// overwritten or removed in place — never mirrored to history.
+/// Deletion-schedule rows under `current/gcfile`, overwritten or removed
+/// in place.
 fn diff_gc_files(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &CatalogSnapshot) {
     let file_ids = base.gc_files.keys().chain(state.gc_files.keys());
     for &data_file_id in file_ids.collect::<BTreeSet<_>>() {
@@ -284,12 +280,8 @@ fn diff_macros(
     );
 }
 
-/// Mappings are immutable create-only records: `stage_overwrite`'s
-/// `(None, Some)` arm writes the `current` key with no history mirror,
-/// and its equality guard makes a base-present record (always
-/// byte-identical — the staged path rejects re-insertion) a no-op.
-/// Iterating `state` alone suffices: mappings are never removed from the
-/// working state, so the delete arm is unreachable.
+/// Mappings are immutable, create-only records: never removed from the
+/// working state, so `state` alone is iterated.
 fn diff_mappings(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &CatalogSnapshot) {
     for (&table_id, per_table) in &state.mappings {
         for (&mapping_id, value) in per_table {
@@ -314,8 +306,8 @@ fn diff_columns(
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
-    // The column row minus its embedded tag entries: tag entries carry
-    // their own begin/end, so a tags-only change never mints history.
+    // Tag entries carry their own begin/end, so a tags-only change never
+    // mints history.
     fn sans_tags(value: &proto::ColumnValue) -> proto::ColumnValue {
         proto::ColumnValue {
             tags: Vec::new(),
@@ -323,11 +315,11 @@ fn diff_columns(
         }
     }
 
+    let empty = BTreeMap::new();
     let column_tables = base.columns.keys().chain(state.columns.keys());
     for &table_id in column_tables.collect::<BTreeSet<_>>() {
-        static EMPTY: BTreeMap<u64, proto::ColumnValue> = BTreeMap::new();
-        let base_cols = base.columns.get(&table_id).unwrap_or(&EMPTY);
-        let state_cols = state.columns.get(&table_id).unwrap_or(&EMPTY);
+        let base_cols = base.columns.get(&table_id).unwrap_or(&empty);
+        let state_cols = state.columns.get(&table_id).unwrap_or(&empty);
         for &column_id in base_cols
             .keys()
             .chain(state_cols.keys())
@@ -494,24 +486,30 @@ fn diff_file_column_stats(
     base: &CatalogSnapshot,
     state: &CatalogSnapshot,
 ) {
+    let empty_stats = BTreeMap::new();
+    let empty_files = BTreeMap::new();
     let table_ids = base
         .file_column_stats
         .keys()
         .chain(state.file_column_stats.keys());
     for &table_id in table_ids.collect::<BTreeSet<_>>() {
-        static EMPTY: BTreeMap<(u64, u64), proto::FileColumnStatsValue> = BTreeMap::new();
-        static EMPTY_FILES: BTreeMap<u64, proto::DataFileValue> = BTreeMap::new();
-        let base_cols = base.file_column_stats.get(&table_id).unwrap_or(&EMPTY);
-        let state_cols = state.file_column_stats.get(&table_id).unwrap_or(&EMPTY);
-        let base_files = base.data_files.get(&table_id).unwrap_or(&EMPTY_FILES);
-        let state_files = state.data_files.get(&table_id).unwrap_or(&EMPTY_FILES);
+        let base_cols = base
+            .file_column_stats
+            .get(&table_id)
+            .unwrap_or(&empty_stats);
+        let state_cols = state
+            .file_column_stats
+            .get(&table_id)
+            .unwrap_or(&empty_stats);
+        let base_files = base.data_files.get(&table_id).unwrap_or(&empty_files);
+        let state_files = state.data_files.get(&table_id).unwrap_or(&empty_files);
         for &(data_file_id, column_id) in base_cols
             .keys()
             .chain(state_cols.keys())
             .collect::<BTreeSet<_>>()
         {
             // A file registered and expired within this commit exists in
-            // neither side's data_files; its stats must not be staged.
+            // neither side's data files.
             if !base_files.contains_key(&data_file_id) && !state_files.contains_key(&data_file_id) {
                 continue;
             }
@@ -532,7 +530,6 @@ fn diff_file_column_stats(
 /// The write set turning `base` into `state` at `new_snapshot`: ended
 /// versions move to history, new and changed versions land live, and
 /// chained mutations of one entity collapse to a single transition.
-/// Statistics are overwritten in place with no history mirror.
 pub(crate) fn diff_writes(
     base: &CatalogSnapshot,
     state: &CatalogSnapshot,

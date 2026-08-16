@@ -1,10 +1,5 @@
 //! Synthetic migration units, installed into the driver's registry by a
-//! fault-injection build.
-//!
-//! Every format this binary ships is additive, so the real registry is empty
-//! and no public path can put a store mid-migration. These units are what a
-//! test drives instead — installed into the registry the shipped planner
-//! reads, so the coverage is of that planner and not a parallel copy of it.
+//! fault-injection build so tests can drive the shipped planner.
 
 use futures::{FutureExt, future::BoxFuture};
 use slatedb::DbTransaction;
@@ -25,22 +20,15 @@ use crate::{
     },
 };
 
-/// The option scope kind the rewritten records start under, and the one the
-/// rewrite moves them to. Moving a record between scope kinds changes where
-/// its key sorts, which is exactly what makes a change structural rather than
-/// a value edit.
-///
-/// They are `OptionScope::Schema` and `OptionScope::Table` respectively, so a
-/// caller with only the public API can plant the records and read them back
-/// where the rewrite left them.
+/// The option scope kind the rewritten records start under
+/// (`OptionScope::Schema`).
 pub(crate) const SOURCE_SCOPE: u64 = 1;
+/// The option scope kind the rewrite moves them to (`OptionScope::Table`).
 pub(crate) const TARGET_SCOPE: u64 = 2;
 
-/// A rewriting migration in miniature: it walks the option records under
-/// [`SOURCE_SCOPE`] in key order and moves each to [`TARGET_SCOPE`], one
-/// record per batch, writing the new key before deleting the old. Shaped
-/// exactly like a real unit — idempotent, and resumable from the cursor it
-/// returns.
+/// Walks the option records under [`SOURCE_SCOPE`] in key order and moves
+/// each to [`TARGET_SCOPE`], one record per batch, writing the new key
+/// before deleting the old.
 fn move_scope_step<'a>(
     tx: &'a DbTransaction,
     cursor: &'a [u8],
@@ -52,9 +40,6 @@ fn move_scope_step<'a>(
             return Ok(None);
         };
 
-        // New key first, old key second. Within one batch the pair is
-        // atomic; the ordering is the discipline a unit that ever split its
-        // work across batches would need, so it is written that way here.
         let mut staged = StagedBytes::default();
         let target = Key::current(EntityKey::Option {
             scope_kind: TARGET_SCOPE,
@@ -92,14 +77,12 @@ fn decode_cursor(cursor: &[u8]) -> Result<Option<u64>> {
     Ok(Some(u64::from_be_bytes(bytes)))
 }
 
-/// The first record still under [`SOURCE_SCOPE`] past `start`. Records
-/// already moved sort under the target scope and are never returned, which
-/// is what makes re-running an applied step a no-op.
+/// The first record still under [`SOURCE_SCOPE`] past `start`.
 async fn next_source_record(
     tx: &DbTransaction,
     start: Option<u64>,
 ) -> Result<Option<(u64, proto::OptionScopeValue)>> {
-    let mut found: Vec<(u64, proto::OptionScopeValue)> = scan_current_entities(ReadHandle::Tx(tx))
+    Ok(scan_current_entities(ReadHandle::Tx(tx))
         .await?
         .into_iter()
         .filter_map(|record| match record {
@@ -111,15 +94,11 @@ async fn next_source_record(
             _ => None,
         })
         .filter(|(scope_id, _)| start.is_none_or(|start| *scope_id > start))
-        .collect();
-    found.sort_by_key(|(scope_id, _)| *scope_id);
-
-    Ok(found.into_iter().next())
+        .min_by_key(|(scope_id, _)| *scope_id))
 }
 
-/// The rewriting unit. Its target is the newest format this binary reads, so
-/// a store it migrates still attaches — the end state a driven crash case
-/// has to be able to observe through the public API.
+/// The rewriting unit. Its target is the newest format this binary reads,
+/// so a store it migrates still attaches.
 const MOVE_SCOPE: MigrationUnit = MigrationUnit {
     name: "move-option-scope",
     from_format: FORMAT_VERSION,
@@ -127,9 +106,7 @@ const MOVE_SCOPE: MigrationUnit = MigrationUnit {
     step: move_scope_step,
 };
 
-/// A second link, so a multi-version jump has something to compose. It walks
-/// nothing: its whole job is to prove the driver runs a chain, each link with
-/// its own start, steps, and finish.
+/// A step that walks nothing.
 fn no_work_step<'a>(
     _tx: &'a DbTransaction,
     _cursor: &'a [u8],
@@ -137,9 +114,9 @@ fn no_work_step<'a>(
     async move { Ok(None) }.boxed()
 }
 
-/// Past the newest format this binary reads, so a store carried all the way
-/// through the chain is one no attach will open — which is what makes the
-/// jump's own end state distinguishable from the rewriting unit's.
+/// A second link for a multi-version jump. Its target is past the newest
+/// format this binary reads, so a store carried through the chain will not
+/// attach.
 const SECOND_LINK: MigrationUnit = MigrationUnit {
     name: "second-link",
     from_format: MAX_FORMAT_VERSION,

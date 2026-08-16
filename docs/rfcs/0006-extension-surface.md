@@ -302,7 +302,10 @@ reading it (RFC 0009) — `'l0'` touches every subspace far enough to pull
 its SST metadata, `'all'` additionally walks the scan-shaped subspaces
 whole, `'none'` (the default) warms nothing. Neither pulls the `index`
 subspace's data bulk, so a store whose weight is a multi-GiB `index` run
-preloads in metadata-sized bytes rather than store-sized ones. It crosses
+preloads in metadata-sized bytes rather than store-sized ones; a table's
+`index` and `inline` ranges are warmed per table instead, in the
+background, the first time a query touches it and after each commit that
+writes data files against it (RFC 0009). It crosses
 the ABI as a level code (`0`, `1`, `2`) on `moraine_attach` and
 `moraine_migrate`, and any other code is refused rather than treated as
 "none", so a misspelled level surfaces as an error instead of an attach

@@ -660,8 +660,8 @@ lake never ran.
 
 The census serves read-only attaches. Both legs read; neither writes.
 
-Its scans use the core read profile: 4 MiB of read-ahead and eight fetches in
-flight. Those figures are fixed implementation choices, not maintenance
+Its scans use the core read profile: 8 MiB of read-ahead and 32 fetches in
+flight, sized for a remote object store. Those figures are fixed implementation choices, not maintenance
 attach options; RFC 0009 records the measurement required to replace them.
 
 The real-endpoint measurement pins the scale and the limit of this lever. An

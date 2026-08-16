@@ -192,6 +192,12 @@ on. Rows of one chunk share one body and rows of one schema version share one
 schema, so each set of bytes is read and returned once however many rows
 reference it.
 
+`warm_tables(&[table])` is the one read that returns nothing: it pulls the
+`index` and `inline` ranges a lookup on those tables probes into the block
+cache (RFC 0009), for a host that knows which tables a query is about to
+touch. The same pass runs on its own, in the background, the first time a
+handle serves a lookup or inline read for a table.
+
 ### Writes: closure-with-retry
 
 ```rust
