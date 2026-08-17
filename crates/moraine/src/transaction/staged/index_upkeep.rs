@@ -13,9 +13,9 @@ use futures::{
 use tokio::sync::OnceCell;
 
 use super::{
-    Arc, CatalogSnapshot, Cell, ColumnInfo, DbTransaction, Error, HashMap, HashSet, IndexInfo,
-    InlineOperation, ObjectStore, ReadHandle, Result, RowOperation, StagedEntries,
-    StagedIndexEntry, TableId, TableKind, commit, data_file,
+    Arc, CatalogSnapshot, Cell, ColumnInfo, DataStore, DbTransaction, Error, HashMap, HashSet,
+    IndexInfo, InlineOperation, ReadHandle, Result, RowOperation, StagedEntries, StagedIndexEntry,
+    TableId, TableKind, commit, data_file,
     decode::{Cursor, decode_data_file, decode_delete_file},
     inline::inline_chunk_range_write,
     proto, stage_index_entry_stream, store_inline,
@@ -109,7 +109,7 @@ impl<'a> InlineSchemaCache<'a> {
 /// can be derived.
 pub(super) struct FileContext<'a> {
     /// The `DATA_PATH` store, absent when the caller supplied none.
-    store: Option<&'a Arc<dyn ObjectStore>>,
+    store: Option<&'a DataStore>,
     /// The store-relative prefix data files resolve against.
     prefix: &'a str,
     /// Tables this commit compacts and does nothing else to.
@@ -225,7 +225,7 @@ async fn stream_data_file_index_entries(
     // add would be indistinguishable from an UPDATE's.
     let entries = data_file::scoped_read_index_entry_batches(
         data_file::ParquetFile::new(
-            Arc::clone(data_store),
+            data_store.clone(),
             path,
             file.file_size_bytes,
             file.footer_size,
@@ -307,7 +307,7 @@ pub(super) async fn stage_index_maintenance(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
-    data_store: Option<&Arc<dyn ObjectStore>>,
+    data_store: Option<&DataStore>,
     data_prefix: &str,
     metrics: Arc<data_file::ScopedReadMetrics>,
 ) -> Result<StagedEntries> {
@@ -1069,7 +1069,7 @@ async fn read_delete_file_positions(
     let path = delete_file_object_path(base, delete_file, context.prefix)?;
     let positions = data_file::delete_file_positions(
         data_file::ParquetFile::new(
-            Arc::clone(data_store),
+            data_store.clone(),
             path,
             delete_file.file_size_bytes,
             delete_file.footer_size,
@@ -1111,7 +1111,7 @@ pub(super) async fn stream_file_delete_index_entries(
     let path = data_file_object_path(base, &file, context.prefix)?;
     let entries = data_file::scoped_read_index_entry_batches(
         data_file::ParquetFile::new(
-            Arc::clone(data_store),
+            data_store.clone(),
             path,
             file.file_size_bytes,
             file.footer_size,

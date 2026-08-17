@@ -1,18 +1,15 @@
 //! Locating stable row ids in the physical files that currently hold them.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
 
 use futures::{StreamExt, TryStreamExt, stream};
-use object_store::{ObjectStore, path::Path};
+use object_store::path::Path;
 use tracing::{debug, warn};
 
 use super::{ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
 use crate::{
     catalog::{CatalogSnapshot, DataFileId, DataFileInfo, FileRowCandidate, TableId},
-    data_file::{self, FileSummary},
+    data_file::{self, DataStore, FileSummary},
     error::Result,
 };
 
@@ -34,7 +31,7 @@ impl ReadOnlyCatalog {
     /// pairing every result with the file it came from.
     async fn file_summaries(
         &self,
-        store: &Arc<dyn ObjectStore>,
+        store: &DataStore,
         data_prefix: &str,
         table_prefix: &str,
         table: TableId,
@@ -47,7 +44,7 @@ impl ReadOnlyCatalog {
                 (true, false) => format!("{data_prefix}/{table_prefix}{}", file.path),
             };
             let path = Path::from(relative.as_str());
-            let store = Arc::clone(store);
+            let store = store.clone();
             let metrics = self.data_read_metrics();
 
             async move {
@@ -92,7 +89,7 @@ impl ReadOnlyCatalog {
     /// that cannot be read is not an error: it broadens the answer instead.
     pub async fn locate_row_ids(
         &self,
-        data_store: Option<Arc<dyn ObjectStore>>,
+        data_store: Option<DataStore>,
         data_prefix: &str,
         table: TableId,
         row_ids: Vec<u64>,
@@ -204,7 +201,7 @@ impl ReadOnlyCatalog {
     /// failures are reported in [`RowSummaryWarmth::files_failed`].
     pub async fn warm_row_summaries(
         &self,
-        data_store: Arc<dyn ObjectStore>,
+        data_store: DataStore,
         data_prefix: &str,
         table: TableId,
     ) -> Result<RowSummaryWarmth> {
@@ -223,7 +220,7 @@ impl ReadOnlyCatalog {
     /// failures are reported in [`RowSummaryWarmth::files_failed`].
     pub async fn warm_all_row_summaries(
         &self,
-        data_store: Arc<dyn ObjectStore>,
+        data_store: DataStore,
         data_prefix: &str,
     ) -> Result<RowSummaryWarmth> {
         let snapshot = self.snapshot().await?;
@@ -247,7 +244,7 @@ impl ReadOnlyCatalog {
     /// failures are reported in [`RowSummaryWarmth::files_failed`].
     pub async fn warm_selected_row_summaries(
         &self,
-        data_store: Arc<dyn ObjectStore>,
+        data_store: DataStore,
         data_prefix: &str,
         tables: Vec<TableId>,
     ) -> Result<RowSummaryWarmth> {
@@ -271,7 +268,7 @@ impl ReadOnlyCatalog {
     async fn warm_table(
         &self,
         snapshot: &CatalogSnapshot,
-        data_store: &Arc<dyn ObjectStore>,
+        data_store: &DataStore,
         data_prefix: &str,
         table: TableId,
     ) -> Result<RowSummaryWarmth> {

@@ -44,12 +44,12 @@ store's recovered WAL block.
 The scope should be supplied by the caller, or derived by SlateDB from a stable
 store identity such as its object-store URI and database path. The identity
 must be stable across processes and distinct for different stores using one
-cache. Moraine can then enable Foyer recovery and make `CACHE_DIR` restart-warm
-without risking cross-store reuse.
+cache.
 
-Until that exists, moraine opens Foyer with recovery disabled. The disk tier is
-fully effective within one process, and `CACHE_PRELOAD` warms a restarted
-process by re-fetching.
+Until that exists, moraine keeps one Foyer device per store, so recovered keys
+can only be that store's, and a re-attach hits only when the store takes the
+same scope as before — the same attach order. A stable scope would let every
+store share one device and hit regardless of order.
 
 Owner: [RFC 0009](rfcs/0009-reader-consistency-and-caching.md).
 

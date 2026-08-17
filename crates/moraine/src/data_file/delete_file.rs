@@ -44,21 +44,7 @@ fn delete_positions(batch: &RecordBatch) -> Result<Vec<u64>> {
 /// The row positions a DuckLake delete file marks dead, read from its
 /// `pos` column alone.
 pub(crate) async fn delete_file_positions(file: ParquetFile) -> Result<Vec<u64>> {
-    let ParquetFile {
-        object_store,
-        path,
-        file_size,
-        footer_size,
-        metrics,
-    } = file;
-    let reader = ObjectStoreReader {
-        store: object_store,
-        path: path.clone(),
-        file_size,
-        footer_size,
-        page_index: PageIndexPolicy::Skip,
-        metrics,
-    };
+    let reader = ObjectStoreReader::new(&file, PageIndexPolicy::Skip);
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
         .await

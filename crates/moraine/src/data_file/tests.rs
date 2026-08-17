@@ -12,8 +12,8 @@ use arrow::{
 };
 use futures::stream::BoxStream;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStoreExt,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
 };
 use parquet::arrow::{ArrowWriter, ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
 
@@ -51,7 +51,7 @@ async fn scoped_read_entries(
         }
     };
     scoped_read_recorded_entries(
-        ParquetFile::new(object_store, path.clone(), file_size, 0),
+        ParquetFile::new(DataStore::new(object_store), path.clone(), file_size, 0),
         indexed_positions,
         rows,
         row_id_source,
@@ -271,13 +271,14 @@ async fn write_wide_fixture(store: &dyn ObjectStore, path: &Path, rows: usize) -
 #[tokio::test]
 async fn recorded_footer_and_metadata_cache_remove_metadata_round_trips() {
     let store = Arc::new(CountingStore::new());
+    let data = DataStore::new(store.clone());
     let path = Path::from("cached-wide.parquet");
     let (object_len, footer_size) =
         write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
     let wanted: RowPositions = [7, 19_000].into_iter().collect();
 
     let first = scoped_read_recorded_entries(
-        ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
+        ParquetFile::new(data.clone(), path.clone(), object_len, footer_size),
         &[0],
         ScopedRows::At(&wanted),
         RowIdSource::Ordinal,
@@ -288,7 +289,7 @@ async fn recorded_footer_and_metadata_cache_remove_metadata_round_trips() {
     let first_requests = store.fetch_requests();
 
     let second = scoped_read_recorded_entries(
-        ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
+        ParquetFile::new(data.clone(), path.clone(), object_len, footer_size),
         &[0],
         ScopedRows::At(&wanted),
         RowIdSource::Ordinal,
@@ -308,11 +309,12 @@ async fn recorded_footer_and_metadata_cache_remove_metadata_round_trips() {
 #[tokio::test]
 async fn large_delete_file_reads_only_positions_and_reuses_metadata() {
     let store = Arc::new(CountingStore::new());
+    let data = DataStore::new(store.clone());
     let path = Path::from("cached-wide-delete.parquet");
     let (object_len, footer_size) =
         write_wide_named_fixture_with_footer(store.as_ref(), &path, 20_000, "pos").await;
     let first = delete_file_positions(ParquetFile::new(
-        store.clone(),
+        data.clone(),
         path.clone(),
         object_len,
         footer_size,
@@ -326,7 +328,7 @@ async fn large_delete_file_reads_only_positions_and_reuses_metadata() {
     let first_bytes = store.fetched_bytes();
 
     let second = delete_file_positions(ParquetFile::new(
-        store.clone(),
+        data.clone(),
         path.clone(),
         object_len,
         footer_size,
@@ -350,19 +352,20 @@ async fn large_delete_file_reads_only_positions_and_reuses_metadata() {
 #[tokio::test]
 async fn concurrent_metadata_misses_share_one_in_flight_fill() {
     let store = Arc::new(CountingStore::with_fetch_delay(Duration::from_millis(10)));
+    let data = DataStore::new(store.clone());
     let path = Path::from("concurrent-cached-wide.parquet");
     let (object_len, footer_size) =
         write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
     let wanted: RowPositions = [7, 19_000].into_iter().collect();
 
     let first = scoped_read_recorded_entries(
-        ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
+        ParquetFile::new(data.clone(), path.clone(), object_len, footer_size),
         &[0],
         ScopedRows::At(&wanted),
         RowIdSource::Ordinal,
     );
     let second = scoped_read_recorded_entries(
-        ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
+        ParquetFile::new(data.clone(), path.clone(), object_len, footer_size),
         &[0],
         ScopedRows::At(&wanted),
         RowIdSource::Ordinal,
@@ -383,6 +386,7 @@ async fn concurrent_metadata_misses_share_one_in_flight_fill() {
 #[tokio::test]
 async fn failed_metadata_in_flight_fill_is_retryable() {
     let store = Arc::new(CountingStore::new());
+    let data = DataStore::new(store.clone());
     let path = Path::from("retry-cached-wide.parquet");
     let (object_len, footer_size) =
         write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
@@ -393,7 +397,7 @@ async fn failed_metadata_in_flight_fill_is_retryable() {
     let wanted: RowPositions = [7].into_iter().collect();
 
     let failed = scoped_read_recorded_entries(
-        ParquetFile::new(store.clone(), path.clone(), object_len, footer_size),
+        ParquetFile::new(data.clone(), path.clone(), object_len, footer_size),
         &[0],
         ScopedRows::At(&wanted),
         RowIdSource::Ordinal,
@@ -403,7 +407,7 @@ async fn failed_metadata_in_flight_fill_is_retryable() {
 
     store.inner.put(&path, valid.into()).await.unwrap();
     let retried = scoped_read_recorded_entries(
-        ParquetFile::new(store, path, object_len, footer_size),
+        ParquetFile::new(DataStore::new(store), path, object_len, footer_size),
         &[0],
         ScopedRows::At(&wanted),
         RowIdSource::Ordinal,
@@ -1073,7 +1077,7 @@ async fn streams_fused_index_entries_in_bounded_batches() {
         nulls: vec![NullOrder::First],
     }];
     let batches = scoped_read_index_entry_batches(
-        ParquetFile::new(store, path, file_size, footer_size),
+        ParquetFile::new(DataStore::new(store), path, file_size, footer_size),
         projections,
         ScopedRows::All,
         RowIdSource::Resolve {
@@ -1122,7 +1126,7 @@ async fn streams_selected_fused_index_entries() {
     }];
     let selected = RowPositions::from_unsorted(vec![19_999, 8_193, 1, 8_193]);
     let batches = scoped_read_index_entry_batches(
-        ParquetFile::new(store, path, file_size, footer_size),
+        ParquetFile::new(DataStore::new(store), path, file_size, footer_size),
         projections,
         ScopedRows::At(&selected),
         RowIdSource::Resolve {

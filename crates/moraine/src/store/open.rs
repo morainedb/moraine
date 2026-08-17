@@ -117,16 +117,17 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// Sets the local directory backing the block cache's disk tier.
+    /// Sets the local directory under which each store's block cache and
+    /// the parsed-footer cache keep, and recover, their disk tiers.
     /// Process-wide: the first store to open decides whether there is a
-    /// disk tier, and where. `None` (the default) keeps the cache in memory.
+    /// disk tier, and where. `None` (the default) keeps the caches in memory.
     pub(crate) fn cache_dir(mut self, cache_dir: Option<PathBuf>) -> Self {
         self.cache_dir = cache_dir;
         self
     }
 
-    /// Sets how many bytes of disk the block cache's device may hold.
-    /// Process-wide: the first store to open sizes the device. `None` (the
+    /// Sets how many bytes of disk each store's cache device may hold.
+    /// Process-wide: the first store to open settles it. `None` (the
     /// default) takes SlateDB's default; without a
     /// [`cache_dir`](Self::cache_dir) there is no device to bound.
     pub(crate) fn cache_size(mut self, cache_size: Option<u64>) -> Self {
@@ -134,9 +135,10 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// Sets how much memory the process-shared cache may hold across both
-    /// slots. Process-wide: the first store to open sizes it. `None` (the
-    /// default) takes SlateDB's single-store default for the whole process.
+    /// Sets how much memory every store's cache and the parsed-footer cache
+    /// may hold together. Process-wide: the first store to open sizes it.
+    /// `None` (the default) takes SlateDB's single-store default for the
+    /// whole process.
     pub(crate) fn cache_memory(mut self, cache_memory: Option<u64>) -> Self {
         self.cache_memory = cache_memory;
         self
@@ -177,7 +179,7 @@ impl<'a> StoreBuilder<'a> {
             .with_block_cache_policy(self.block_cache_policy())
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)));
 
-        if let Some(cache) = cache::shared(&self.cache_config()).await {
+        if let Some(cache) = cache::shared(&self.cache_config(), self.location()).await {
             builder = builder.with_db_cache(cache);
         }
 
@@ -209,7 +211,7 @@ impl<'a> StoreBuilder<'a> {
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)))
             .with_options(options);
 
-        if let Some(cache) = cache::shared(&self.cache_config()).await {
+        if let Some(cache) = cache::shared(&self.cache_config(), self.location()).await {
             builder = builder.with_db_cache(cache);
         }
         if let Some(checkpoint) = self.checkpoint {
@@ -251,6 +253,13 @@ impl<'a> StoreBuilder<'a> {
         Settings {
             flush_interval: Some(self.flush_interval),
             ..Default::default()
+        }
+    }
+
+    fn location(&self) -> cache::StoreLocation {
+        cache::StoreLocation {
+            object_store: self.object_store.to_string(),
+            path: self.path.to_owned(),
         }
     }
 

@@ -1262,7 +1262,7 @@ async fn measure_located_lookup_latency_against_the_endpoint() {
             0,
         );
 
-        let data_store = s3_store();
+        let data_store = moraine::DataStore::new(s3_store());
         let summaries_before = moraine::cache_status().row_summaries;
         let (elapsed, main_gets, data_gets, candidates) = timed_located(
             &reader,
@@ -1310,7 +1310,7 @@ async fn measure_located_lookup_latency_against_the_endpoint() {
         let reader = Catalog::open_read_only(store.clone(), options.clone())
             .await
             .unwrap();
-        let data_store = s3_store();
+        let data_store = moraine::DataStore::new(s3_store());
         let (elapsed, main_gets, data_gets, warmth) = timed_located(
             &reader,
             Box::pin(reader.warm_row_summaries(data_store.clone(), &data_prefix, table)),

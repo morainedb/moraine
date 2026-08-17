@@ -571,8 +571,8 @@ The caches a moraine-backed query crosses, top to bottom:
 | DuckLake catalog cache | schema/catalog entries; the per-transaction snapshot | snapshot id + `schema_version` | live-catalog-sized | `schema_version` move; transaction end |
 | shim `MetadataRows` | decoded rows per synthesized table | head stamp at first scan | per transaction | transaction end |
 | core logical caches | `CatalogSnapshot`, entity record set, maintained projections | head stamp + install epoch | one catalog's decoded size, reported by `projection_bytes` | replaced on stamp move |
-| core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep | object-store identity + path + file size + page-index policy | process-wide share of `CACHE_MEMORY`, to a ceiling | byte-bounded LRU |
-| SlateDB block + meta cache | decoded SST blocks, indexes, filters | scoped SST id + offset | process-shared memory + `CACHE_DIR` disk | LRU-ish (foyer) |
+| core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep, and file row-id summaries | object-store location + path + file size + page-index policy | process-wide share of `CACHE_MEMORY`, to a ceiling, over `CACHE_DIR/auxiliary` | byte-bounded LRU (foyer), recovered on restart |
+| SlateDB block + meta cache | decoded SST blocks, indexes, filters | scoped SST id + offset | one cache per attached store: an even share of the process budget in memory over `CACHE_DIR/<store>/blocks` | LRU-ish (foyer), recovered on restart |
 
 Two findings drove this section. Before consolidation, one catalog byte could
 be resident in five tiers at once, four of them refilled from the tier below on
@@ -586,11 +586,13 @@ with, not consolidated), the byte tier (consolidated), and the data tier
 
 ### Shared budget, separate cache engines
 
-The SlateDB cache and the scoped reader's parsed-Parquet cache share a
+The SlateDB caches and the scoped reader's parsed-Parquet cache share a
 **budget and process lifetime, not an entry store**. `CACHE_MEMORY` is split
-once when the process cache is built: the auxiliary metadata allowance comes
-off the top, and SlateDB's shared cache receives the remainder. No attach may
-construct another allowance or grow either cache beyond that split.
+once, at the first attach: the auxiliary metadata allowance comes off the
+top, and the remainder is the block budget, re-split evenly across the
+stores currently attached on every attach and detach (a store with nothing
+attached keeps 1 MiB, its blocks staying on disk if it has any). No attach
+may construct another allowance or grow any cache beyond that split.
 
 The allowance is a **share of the budget to a ceiling**, not a fixed figure.
 It cannot share one eviction store with SlateDB's — foyer's cache is
@@ -822,19 +824,30 @@ it. The next attach to touch the cache blocks forever. So the cache
 builds its own runtime and hands foyer that; nothing the cache does runs
 on an attach's runtime.
 
-SlateDB scopes a shared cache's keys per opened handle, which is what keeps two
-stores' same-numbered WAL SSTs apart during one process. The instance shares
-*budget* unconditionally but entries stay store-local — satisfied, since
-moraine holds one handle per attached store. The scope is a process-local
-counter, however, so it resets and follows attach order. The reversed-order
-restart test made the consequence concrete: after process one warmed stores A
-then B, process two opening B then A read A's recovered WAL block for B.
+SlateDB scopes a cache's keys per opened handle from a process-local counter,
+so two stores' same-numbered WAL SSTs stay apart within one process, but the
+counter resets with the process and follows attach order. One disk device
+shared by every store would therefore, after a restart in a different attach
+order, serve one store's recovered WAL block for another. So the block cache
+is **one foyer instance per store**, its device at `CACHE_DIR/<store>/blocks`
+where `<store>` hashes the object store's name and the store's path. Inside
+one store's directory the keys can only be that store's, so recovery is
+enabled: entries are written to disk on insertion (a shutdown is not needed
+to persist them) and read back on the next open. A store re-attached in the
+same order gets the same scopes and is served from disk; a different order
+misses until re-read, and can never alias. The one thing the directory
+cannot tell apart is a store deleted and recreated at the same location,
+whose WAL ids restart: its cache directory must be removed with it. Once
+SlateDB accepts a caller-supplied stable scope
+([`../slatedb.md`](../slatedb.md)) the order condition goes away.
 
-Moraine therefore opens Foyer with disk recovery disabled. A `CACHE_DIR` is a
-process-lifetime disk tier, never a source of prior-process entries; after a
-restart the preload warms it at re-fetch cost. Recovery can be enabled only
-after SlateDB accepts a caller-supplied stable store scope, tracked in
-[`../slatedb.md`](../slatedb.md).
+The auxiliary cache is one foyer hybrid at `CACHE_DIR/auxiliary`, its keys
+moraine's own, carrying the identity the caller's `DataStore` was built
+with: a durable object store is named by its location, so a footer or
+summary is served across restarts; an in-memory store is named at random,
+so nothing recovered can match it. Footers go to disk in the
+Parquet metadata writer's form, page index included; summaries in their own
+shape.
 
 **Admission follows read shape.** SlateDB's defaults already split it —
 point reads cache their blocks, scans do not — and moraine makes the
@@ -942,21 +955,19 @@ staged bytes, its durable-write wait, and the exact main/WAL request counts and
 summed latency over the same commit window. These phases are nested
 measurements, not values to add together.
 
-**One cache means one shape per process.** The first store to open builds
-it and its numbers stand; a later attach asking for different ones shares
-what is there. That is the budget being the process's rather than the
-store's, which is the whole point, but it makes the *first* attach's
-options the ones that decide — including whether there is a disk device
-at all.
+**One budget means one sizing per process.** The first store to open
+settles it and its numbers stand; a later attach asking for different ones
+is sized by what is settled. That is the budget being the process's rather
+than the store's, which is the whole point, but it makes the *first*
+attach's options the ones that decide — including whether there is a disk
+directory at all.
 
-A cache per attach is rejected. It would make each attach's options
-independent and isolate eviction, but it would also multiply `CACHE_MEMORY` by
-an unnamed attach count and reserve a protected metadata share in every copy. Each
-copy would require a different directory because Foyer devices do not lock or
-namespace their partition files, while the executor would still have to stay
-process-wide to avoid two threads and the detached-runtime failure per attach.
-One shared budget with per-attach tallies keeps the host's memory commitment
-explicit.
+A cache per attach with its own budget is rejected: it would multiply
+`CACHE_MEMORY` by an unnamed attach count. A cache per *store* under one
+budget is what is built: every attach of a store shares its instance, the
+memory split follows the attached count, and the executor stays process-wide.
+Disk is a ceiling per store, not a reservation — a store's device takes
+`CACHE_SIZE` as its cap and fills only with what that store reads.
 
 The SST block size is fixed at 4 KiB. Read-ahead removed the per-block network
 round trip from scans, while the measured probe shape is zero bytes warm and
@@ -965,16 +976,11 @@ attach option. A future profile that puts material weight on block grain must
 change this binding choice and add the option and the scan/probe benchmark
 together.
 
-Three losses, taken knowingly. Part-grain prefetch: replaced by the scan
+Two losses, taken knowingly. Part-grain prefetch: replaced by the scan
 path's own read-ahead (the measured fix for the 277 s materialization in
-`BENCHMARK.md`), with admission per the shape rule. A `CACHE_DIR` shared
-between processes: a foyer device has one owner — but the deployed
-topology never shared a directory across hosts, and within one process
-the shared cache serves the same end better. And restart-persistent
-bytes: the object cache served a restarted process from disk with zero
-GETs, where preload re-fetches. Recovery is also unsafe with attach-order
-scopes, so this loss is required for correctness until the upstream stable-
-scope work lands.
+`BENCHMARK.md`), with admission per the shape rule. And a `CACHE_DIR`
+shared between concurrent processes: a foyer device has one owner at a
+time — the deployed topology never shared a directory across hosts.
 
 ### The query data path is DuckDB's; index upkeep reads scoped metadata
 
@@ -1126,10 +1132,11 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
 - **One budget across attaches.** Several attached stores share one cache
   and one tally; a later attach's differing options are reported as
   ignored rather than silently applied.
-- **Restart scope isolation.** Two stores with colliding WAL SST ids warm one
-  cache directory in one attach order; a fresh process opens them in reverse
-  and reads the correct store from both. The test is cross-process so the
-  scope counter actually resets.
+- **Restart persistence and isolation.** Two stores with colliding WAL and
+  L0 ids are warmed by one process; a fresh process attaching them in the
+  same order reads both without a cache miss, and one attaching them in
+  reverse reads the correct store from both. The test is cross-process so
+  the scope counter actually resets.
 - **Scans cannot evict the probe path.** After a whole-subspace scan and a
   compaction through a warm cache, a probe that was GET-free stays
   GET-free.

@@ -257,6 +257,7 @@ pub use catalog::{
     SortKeyDef, SortSpec, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
     TableId, TableInfo, TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
 };
+pub use data_file::DataStore;
 pub use error::{Error, Result};
 /// Fault injection for the migration driver. Unstable and not part of the
 /// semver contract.

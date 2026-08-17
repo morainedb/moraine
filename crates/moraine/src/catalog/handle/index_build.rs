@@ -3,7 +3,7 @@
 use std::{sync::Arc, time::Instant};
 
 use futures::TryStreamExt;
-use object_store::{ObjectStore, path::Path};
+use object_store::path::Path;
 use tracing::{info, warn};
 
 use super::{Catalog, backfill};
@@ -12,7 +12,7 @@ use crate::{
         BuildStep, ColumnId, ColumnOrder, DataFileId, IndexDef, IndexEntry, IndexId,
         IndexMaintenance, IndexState, TableId, snapshot,
     },
-    data_file,
+    data_file::{self, DataStore},
     error::{Error, Result},
     store::index_encoding::{Direction, NullOrder},
 };
@@ -170,7 +170,7 @@ impl Catalog {
         table: TableId,
         def: &IndexDef,
         orders: &[ColumnOrder],
-        data_store: Option<Arc<dyn ObjectStore>>,
+        data_store: Option<DataStore>,
         data_prefix: &str,
         step: Option<BuildStep>,
     ) -> Result<IndexId> {
@@ -200,7 +200,7 @@ impl Catalog {
         def: &IndexDef,
         orders: &[ColumnOrder],
         maintenance: IndexMaintenance,
-        data_store: Option<Arc<dyn ObjectStore>>,
+        data_store: Option<DataStore>,
         data_prefix: &str,
         step: Option<BuildStep>,
     ) -> Result<IndexId> {
@@ -246,7 +246,7 @@ impl Catalog {
     /// step bound is zero.
     pub async fn repair_deferred_indexes(
         &self,
-        data_store: Option<Arc<dyn ObjectStore>>,
+        data_store: Option<DataStore>,
         data_prefix: &str,
         step: Option<BuildStep>,
     ) -> Result<u64> {
@@ -355,7 +355,7 @@ impl Catalog {
         table: TableId,
         def: &IndexDef,
         index: IndexId,
-        data_store: Option<Arc<dyn ObjectStore>>,
+        data_store: Option<DataStore>,
         data_prefix: &str,
         step: BuildStep,
     ) -> Result<()> {
@@ -418,7 +418,7 @@ impl Catalog {
 
             if let Some(store) = &data_store {
                 self.stream_backfill_files(
-                    Arc::clone(store),
+                    store.clone(),
                     data_prefix,
                     table,
                     &def.columns,
@@ -475,7 +475,7 @@ impl Catalog {
     #[allow(clippy::too_many_arguments)]
     async fn stream_backfill_files(
         &self,
-        object_store: Arc<dyn ObjectStore>,
+        object_store: DataStore,
         data_prefix: &str,
         table: TableId,
         columns: &[ColumnId],
@@ -503,7 +503,7 @@ impl Catalog {
         let metrics = self.data_read_metrics();
         let delete_files = backfill::collect_delete_positions(
             snapshot.delete_files_of(table).into_iter(),
-            Arc::clone(&object_store),
+            object_store.clone(),
             Arc::clone(&metrics),
             &resolve,
         );
@@ -527,7 +527,7 @@ impl Catalog {
             let dead_row_ids = killed_row_ids.get(&file_id);
             let mut batches = data_file::scoped_read_entry_batches(
                 data_file::ParquetFile::new(
-                    Arc::clone(&object_store),
+                    object_store.clone(),
                     path,
                     file.file_size_bytes,
                     file.footer_size,

@@ -580,7 +580,7 @@ FileRowCandidate {
 }
 ```
 
-`ReadOnlyCatalog::locate_row_ids` takes a `DATA_PATH` object store, its path
+`ReadOnlyCatalog::locate_row_ids` takes the `DATA_PATH` `DataStore`, its path
 prefix, a table id, and stable row ids, resolving every row against the same
 head view that enumerates current data files. More than one file may be a
 candidate for one row id: an update can leave an expired physical copy in an

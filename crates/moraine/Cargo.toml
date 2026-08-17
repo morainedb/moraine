@@ -19,6 +19,7 @@ object_store = { workspace = true }
 parquet = { workspace = true }
 prost = { workspace = true }
 roaring = { workspace = true }
+serde = { workspace = true }
 foyer = { workspace = true }
 slatedb = { workspace = true }
 slatedb-common = { workspace = true }

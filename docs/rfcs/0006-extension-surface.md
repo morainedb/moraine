@@ -231,32 +231,34 @@ files → stats) from the store; on an `s3://`-backed catalog those reads are
 S3 round-trips, and the in-memory tier starts empty in each new process. The
 `CACHE_DIR` attach option — `ATTACH 'ducklake:moraine:s3://…' AS lake
 (DATA_PATH '…', READ_WRITE, META_CACHE_DIR '/var/cache/moraine')`, or
-`CACHE_DIR` directly on a standalone `moraine:` attach — gives the
-process-shared block cache (RFC 0009) a disk device: data blocks evicted
-from the memory tier spill there at block grain, so repeat reads skip the
-GETs for the life of the process, and a preload rewarms at attach. It threads through
-the shim (`moraine_attach`'s `cache_dir`) into `CatalogOptions::cache_dir`
-and `StoreBuilder`, applying to both the writer and the reader; unset (the
-default), only the memory tier applies. Redundant for local/`memory://`
-stores.
+`CACHE_DIR` directly on a standalone `moraine:` attach — gives each
+store's block cache (RFC 0009) a disk device under that directory: blocks
+are written there at block grain as they are read, so repeat reads skip
+the GETs, and a new process recovers what the last one left, so a
+re-attach in the same order starts warm without a preload. It threads
+through the shim (`moraine_attach`'s `cache_dir`) into
+`CatalogOptions::cache_dir` and `StoreBuilder`, applying to both the
+writer and the reader; unset (the default), only the memory tier applies.
+Redundant for local/`memory://` stores.
 
-There is one cache, in two slots, shared by every store the process
-attaches (RFC 0009). The first attach to open sizes it and later ones
-share what it built, so these options are the process's rather than the
-attach's. SST indexes and filters are held at a higher eviction priority
-than data blocks, so a scan cannot push them out, while metadata a store
-does not need is space blocks take; data blocks spill at block grain to the
-disk device `CACHE_DIR` names, capped by `CACHE_SIZE`, with `CACHE_MEMORY`
-budgeting the memory both kinds share. There is no separate per-store
-block cache and no separate object-part cache beneath it — a byte is
-cached decoded, once.
+There is one budget, shared by every store the process attaches, and one
+cache per store under it (RFC 0009). The first attach to open settles the
+sizing and later ones are sized by it, so these options are the process's
+rather than the attach's. SST indexes and filters are held at a higher
+eviction priority than data blocks, so a scan cannot push them out, while
+metadata a store does not need is space blocks take; each store's blocks
+spill at block grain to its own device under `CACHE_DIR`, capped by
+`CACHE_SIZE`, with `CACHE_MEMORY` budgeting the memory every store's cache
+and the parsed-footer cache share, re-split across the stores attached.
+There is no separate object-part cache beneath — a byte is cached decoded,
+once.
 
 **`CACHE_SIZE` — how much disk the cache may take.** A byte count —
 `META_CACHE_SIZE 2147483648` through the DuckLake attach or `CACHE_SIZE`
-directly on a standalone `moraine:` attach — capping the disk tier for the
-whole process, however many stores are attached: the first attach to name a
-`CACHE_DIR` sizes the device, and later attaches share it rather than
-adding their own. Zero on the ABI means "not given", leaving the default
+directly on a standalone `moraine:` attach — capping each store's disk
+device: the first attach to name a `CACHE_DIR` settles it, and every
+store's device opens with that cap as a ceiling, filled only by what the
+store reads. Zero on the ABI means "not given", leaving the default
 cap (16 GiB); the option is inert without a `CACHE_DIR`, since there is no
 disk tier to bound. It threads through the shim (`moraine_attach`'s
 `cache_size_bytes`, and `moraine_migrate`'s) into

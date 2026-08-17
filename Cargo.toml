@@ -17,7 +17,7 @@ bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 parquet = { version = "59.1.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
 moraine = { path = "crates/moraine", version = "0.5.2" }
-foyer = "0.22"
+foyer = { version = "0.22", features = ["serde"] }
 object_store = "0.14"
 prost = "0.14"
 prost-build = "0.14"
@@ -25,6 +25,7 @@ protox = "0.9"
 proptest = "1"
 proptest-derive = "0.8"
 roaring = "0.11"
+serde = { version = "1", features = ["derive"] }
 slatedb = "0.15.0"
 # must move in lockstep with slatedb: it is where the metrics traits live
 slatedb-common = "0.15.0"
@@ -33,7 +34,7 @@ thiserror = "2"
 tokio = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 cbindgen = { version = "0.29", default-features = false }
 
 [workspace.lints.rust]

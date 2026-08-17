@@ -3,15 +3,11 @@
 //! types and adds the one entry point that needs a [`Catalog`].
 //! `#[doc(hidden)]`, unstable, as with all of [`crate::ffi_support`].
 
-use std::sync::Arc;
-
-use object_store::ObjectStore;
-
 #[doc(hidden)]
 pub use crate::transaction::staged::{
     Cell, CommitReport, RowOperation, StagedTransaction, TableKind,
 };
-use crate::{catalog::Catalog, error::Result};
+use crate::{catalog::Catalog, data_file::DataStore, error::Result};
 
 /// Begins a staged-row transaction at the current head. `data_store` (with
 /// its bucket-relative `data_prefix`) is the `DATA_PATH` object store the
@@ -24,7 +20,7 @@ use crate::{catalog::Catalog, error::Result};
 #[doc(hidden)]
 pub async fn staged_begin(
     catalog: &Catalog,
-    data_store: Option<Arc<dyn ObjectStore>>,
+    data_store: Option<DataStore>,
     data_prefix: String,
 ) -> Result<StagedTransaction> {
     let db_tx = catalog.begin_write_tx().await?;

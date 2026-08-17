@@ -27,7 +27,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use object_store::ObjectStore;
 use slatedb::DbTransaction;
 use tracing::debug;
 
@@ -37,7 +36,7 @@ use crate::{
         inline::{InlineScanKind, materialize_inline_rows},
         projection::ProjectionCache,
     },
-    data_file,
+    data_file::{self, DataStore},
     error::{Error, Result},
     store::{
         StagedBytes,
@@ -397,7 +396,7 @@ pub struct StagedTransaction {
     /// The `DATA_PATH` object store and its bucket-relative prefix, present
     /// when the attach supplied `META_DATA_PATH`. Index maintenance
     /// scoped-reads registered data files through it; absent it is skipped.
-    data_store: Option<Arc<dyn ObjectStore>>,
+    data_store: Option<DataStore>,
     data_prefix: String,
     data_reads: Arc<data_file::DataStoreCounters>,
 }
@@ -410,7 +409,7 @@ impl StagedTransaction {
     pub(crate) fn begin(
         db_tx: DbTransaction,
         projections: Arc<std::sync::RwLock<ProjectionCache>>,
-        data_store: Option<Arc<dyn ObjectStore>>,
+        data_store: Option<DataStore>,
         data_prefix: String,
         data_reads: Arc<data_file::DataStoreCounters>,
     ) -> Self {
@@ -457,10 +456,7 @@ impl StagedTransaction {
     /// As [`begin_detached`](Self::begin_detached), but reading registered
     /// files from `data_store` — for tests that exercise the file paths.
     #[cfg(test)]
-    pub(crate) fn begin_detached_with_store(
-        db_tx: DbTransaction,
-        data_store: Arc<dyn ObjectStore>,
-    ) -> Self {
+    pub(crate) fn begin_detached_with_store(db_tx: DbTransaction, data_store: DataStore) -> Self {
         Self::begin(
             db_tx,
             Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),

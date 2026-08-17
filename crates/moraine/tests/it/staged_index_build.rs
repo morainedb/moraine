@@ -11,9 +11,10 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
 };
 use moraine::{
-    BuildStep, Catalog, ColumnId, Error, IndexDef, IndexKeyValue, IndexState, IntWidth, TableId,
+    BuildStep, Catalog, ColumnId, DataStore, Error, IndexDef, IndexKeyValue, IndexState, IntWidth,
+    TableId,
 };
-use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
+use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 use parquet::arrow::ArrowWriter;
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{layer::Context, prelude::*};
@@ -115,7 +116,7 @@ fn captured_events() -> &'static CapturedEvents {
 /// A table holding one registered file of `values`, plus the data store
 /// that file lives in.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-async fn table_with_file(values: Vec<i64>) -> (Catalog, TableId, Arc<dyn ObjectStore>) {
+async fn table_with_file(values: Vec<i64>) -> (Catalog, TableId, DataStore) {
     let catalog = open_memory().await;
     let rows = u64::try_from(values.len()).expect("row count fits");
     let data = Arc::new(InMemory::new());
@@ -163,7 +164,7 @@ async fn table_with_file(values: Vec<i64>) -> (Catalog, TableId, Arc<dyn ObjectS
         .await
         .unwrap();
 
-    (catalog, created.get().unwrap(), data)
+    (catalog, created.get().unwrap(), DataStore::new(data))
 }
 
 /// A large explicit lookup uses one continuously refilled 512-probe window,
@@ -566,7 +567,7 @@ async fn resuming_with_a_different_definition_is_refused() {
             table,
             &def(false),
             &[],
-            Some(Arc::clone(&data)),
+            Some(data.clone()),
             "",
             Some(by_entries(2)),
         )
@@ -609,7 +610,7 @@ async fn staged_create_over_a_ready_index_is_refused() {
             table,
             &def(true),
             &[],
-            Some(Arc::clone(&data)),
+            Some(data.clone()),
             "",
             Some(by_entries(2)),
         )
@@ -684,14 +685,7 @@ async fn a_zero_step_bound_is_refused() {
         },
     ] {
         let err = catalog
-            .create_index_staged(
-                table,
-                &def(true),
-                &[],
-                Some(Arc::clone(&data)),
-                "",
-                Some(bound),
-            )
+            .create_index_staged(table, &def(true), &[], Some(data.clone()), "", Some(bound))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Constraint(_)), "{err}");

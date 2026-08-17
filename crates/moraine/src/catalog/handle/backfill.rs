@@ -6,14 +6,14 @@ use std::{
 };
 
 use futures::{StreamExt, TryStreamExt, stream};
-use object_store::{ObjectStore, path::Path};
+use object_store::path::Path;
 
 use super::{BACKFILL_FILE_READ_CONCURRENCY, ReadOnlyCatalog};
 use crate::{
     catalog::{
         ColumnId, DataFileInfo, DeleteFileInfo, FileIndexEntry, IndexEntry, IndexId, TableId,
     },
-    data_file,
+    data_file::{self, DataStore},
     error::{Error, Result},
     store::{
         handle::ReadHandle, inline as store_inline, key::InlineOperation, proto::InlineSchemaValue,
@@ -22,7 +22,7 @@ use crate::{
 
 async fn collect_immediate_backfill<'a>(
     files: impl Iterator<Item = DataFileInfo> + 'a,
-    object_store: Arc<dyn ObjectStore>,
+    object_store: DataStore,
     metrics: Arc<data_file::ScopedReadMetrics>,
     positions: &[usize],
     resolve: impl Fn(&str, bool) -> Path,
@@ -31,7 +31,7 @@ async fn collect_immediate_backfill<'a>(
 ) -> Result<Vec<IndexEntry>> {
     stream::iter(files)
         .map(move |file| {
-            let object_store = Arc::clone(&object_store);
+            let object_store = object_store.clone();
             let metrics = Arc::clone(&metrics);
             let path = resolve(&file.path, file.path_is_relative);
             let dead_positions = killed_positions.get(&file.id.get());
@@ -134,13 +134,13 @@ pub(super) async fn read_inline_schemas(
 
 pub(super) async fn collect_delete_positions<'a>(
     files: impl Iterator<Item = DeleteFileInfo> + 'a,
-    object_store: Arc<dyn ObjectStore>,
+    object_store: DataStore,
     metrics: Arc<data_file::ScopedReadMetrics>,
     resolve: &'a impl Fn(&str, bool) -> Path,
 ) -> Result<HashMap<u64, HashSet<u64>>> {
     stream::iter(files.map(|file| {
         let path = resolve(&file.path, file.path_is_relative);
-        let object_store = Arc::clone(&object_store);
+        let object_store = object_store.clone();
         let metrics = Arc::clone(&metrics);
         async move {
             let positions = data_file::delete_file_positions(
@@ -186,7 +186,7 @@ impl ReadOnlyCatalog {
     /// column.
     pub async fn scoped_file_index_entries(
         &self,
-        object_store: Arc<dyn ObjectStore>,
+        object_store: DataStore,
         path: &Path,
         file_size: u64,
         footer_size: u64,
@@ -232,7 +232,7 @@ impl ReadOnlyCatalog {
     /// source.
     pub async fn scoped_backfill_entries(
         &self,
-        object_store: Arc<dyn ObjectStore>,
+        object_store: DataStore,
         data_prefix: &str,
         table: TableId,
         columns: &[ColumnId],
@@ -258,7 +258,7 @@ impl ReadOnlyCatalog {
         let metrics = self.data_read_metrics();
         let delete_files = collect_delete_positions(
             snapshot.delete_files_of(table).into_iter(),
-            Arc::clone(&object_store),
+            object_store.clone(),
             Arc::clone(&metrics),
             &resolve,
         );

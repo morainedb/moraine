@@ -42,7 +42,7 @@ pub(crate) async fn file_summary(
 ) -> Result<FileSummary> {
     let path = file.path.clone();
     let file_size = file.file_size;
-    let store = Arc::clone(&file.object_store);
+    let store = file.store.clone();
     let key = auxiliary_cache::FileSummaryKey {
         table_id,
         data_file_id,
@@ -50,7 +50,7 @@ pub(crate) async fn file_summary(
         file_size,
     };
 
-    if let Some(rows) = auxiliary_cache::shared().summary(&store, &key) {
+    if let Some(rows) = auxiliary_cache::shared().summary(&store, &key).await {
         return Ok(FileSummary { rows, built: false });
     }
 

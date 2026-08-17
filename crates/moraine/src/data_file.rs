@@ -11,6 +11,7 @@
 
 mod auxiliary_cache;
 mod columns;
+mod data_store;
 mod delete_file;
 mod entries;
 mod inline_batch;
@@ -35,19 +36,20 @@ use futures::{
     StreamExt, TryStreamExt,
     stream::{self, BoxStream},
 };
-use object_store::{ObjectStore, path::Path};
+use object_store::path::Path;
 use parquet::{
     arrow::{arrow_reader::ArrowReaderOptions, async_reader::ParquetRecordBatchStreamBuilder},
     file::metadata::PageIndexPolicy,
 };
 
+pub use crate::data_file::data_store::DataStore;
 #[cfg(test)]
 pub(crate) use crate::data_file::inline_batch::{
     inline_batch_decode_count, inline_schema_decode_count,
 };
 pub(crate) use crate::data_file::{
     auxiliary_cache::{
-        occupancy as auxiliary_occupancy, resize as resize_auxiliary, row_summary_occupancy,
+        install as install_auxiliary, occupancy as auxiliary_occupancy, row_summary_occupancy,
     },
     delete_file::delete_file_positions,
     inline_batch::{decode_inline_schema, inline_batch_entries, inline_batch_index_entries},
@@ -159,7 +161,7 @@ pub(crate) async fn scoped_read_recorded_entries(
 /// One immutable Parquet object's location and recorded sizes.
 #[derive(Clone)]
 pub(crate) struct ParquetFile {
-    object_store: Arc<dyn ObjectStore>,
+    store: DataStore,
     path: Path,
     file_size: u64,
     footer_size: u64,
@@ -168,14 +170,9 @@ pub(crate) struct ParquetFile {
 
 impl ParquetFile {
     /// Describes one object using DuckLake's recorded sizes.
-    pub(crate) fn new(
-        object_store: Arc<dyn ObjectStore>,
-        path: Path,
-        file_size: u64,
-        footer_size: u64,
-    ) -> Self {
+    pub(crate) fn new(store: DataStore, path: Path, file_size: u64, footer_size: u64) -> Self {
         Self {
-            object_store,
+            store,
             path,
             file_size,
             footer_size,
@@ -192,14 +189,7 @@ impl ParquetFile {
 
 /// Whether `file` carries the reserved embedded row-id column.
 pub(crate) async fn carries_embedded_row_ids(file: ParquetFile) -> Result<bool> {
-    let reader = ObjectStoreReader {
-        store: file.object_store,
-        path: file.path,
-        file_size: file.file_size,
-        footer_size: file.footer_size,
-        page_index: PageIndexPolicy::Skip,
-        metrics: file.metrics,
-    };
+    let reader = ObjectStoreReader::new(&file, PageIndexPolicy::Skip);
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
         .await
@@ -225,19 +215,11 @@ pub(crate) async fn scoped_read_index_entry_batches(
         return Ok(stream::empty().boxed());
     }
 
-    let file_size = file.file_size;
     file.metrics.parquet_file();
     let source_positions = index_positions(&projections);
     let excluded_ordinals = excluded_ordinals.cloned();
 
-    let reader = ObjectStoreReader {
-        store: file.object_store,
-        path: file.path.clone(),
-        file_size,
-        footer_size: file.footer_size,
-        page_index: rows.page_index_policy(),
-        metrics: Arc::clone(&file.metrics),
-    };
+    let reader = ObjectStoreReader::new(&file, rows.page_index_policy());
     let options = ArrowReaderOptions::new().with_page_index_policy(rows.page_index_policy());
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
         .await
@@ -312,31 +294,16 @@ pub(crate) async fn scoped_read_entry_batches(
         return Ok(stream::empty().boxed());
     }
 
-    let ParquetFile {
-        object_store,
-        path,
-        file_size,
-        footer_size,
-        metrics,
-    } = file;
-
-    let reader = ObjectStoreReader {
-        store: object_store,
-        path: path.clone(),
-        file_size,
-        footer_size,
-        page_index: rows.page_index_policy(),
-        metrics,
-    };
+    let reader = ObjectStoreReader::new(&file, rows.page_index_policy());
     let options = ArrowReaderOptions::new().with_page_index_policy(rows.page_index_policy());
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
         .await
         .map_err(corrupt("scoped read"))?;
-    let total = total_rows(builder.metadata(), &path)?;
+    let total = total_rows(builder.metadata(), &file.path)?;
     let (selection, ordinals) = scoped_selection(rows, total)?;
 
     let (row_id_position, row_id_start) =
-        resolve_row_id_source(builder.parquet_schema(), row_id_source, &path)?;
+        resolve_row_id_source(builder.parquet_schema(), row_id_source, &file.path)?;
     let (mask, indexed_output, row_id_output) =
         projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
     let mut builder = builder

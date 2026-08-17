@@ -313,6 +313,12 @@ The public surface is hand-written domain types, decoupled from the
   `ColumnDef`, `DataFile`, `DeleteFile`, `PartitionSpec`, `PartitionColumnDef`,
   `SortSpec`, `SortKeyDef`, `ColumnStats`, `TableStats`, `OptionScope`,
   `TagTarget`, `InlineChunk`, `FlushedDataFile`, `RecentRow`.
+- **`DataStore`:** the `DATA_PATH` object store every data-file read takes
+  (`locate_row_ids`, `warm_row_summaries`, backfill, index build, staged
+  transactions), wrapping the `Arc<dyn ObjectStore>` with the identity the
+  footer and row-summary caches key on. Built once per store and cloned:
+  a durable store is named by its location, so cached footers outlive the
+  process; an in-memory store is named at random per `DataStore::new`.
 
 Keeping these separate from the wire types is what lets RFC 0002's protobuf
 field evolution stay an internal change instead of a public breaking one.

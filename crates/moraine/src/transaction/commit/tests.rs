@@ -2349,7 +2349,14 @@ async fn scoped_read_covers_a_registration_end_to_end() {
     // at position 0), then registration lands them — DuckLake supplied
     // none, and the read stands in for the refusal.
     let entries = catalog
-        .scoped_file_index_entries(data.clone(), &path, file_size, footer_size, index, &[0])
+        .scoped_file_index_entries(
+            crate::DataStore::new(data.clone()),
+            &path,
+            file_size,
+            footer_size,
+            index,
+            &[0],
+        )
         .await
         .unwrap();
     assert_eq!(entries.len(), 3);

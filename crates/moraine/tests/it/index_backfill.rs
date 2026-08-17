@@ -62,7 +62,12 @@ async fn scoped_backfill_reads_registered_files_from_the_data_store() {
     let table = created.get().unwrap();
 
     let entries = catalog
-        .scoped_backfill_entries(data, "", table, &[ColumnId::new(1)])
+        .scoped_backfill_entries(
+            moraine::DataStore::new(data),
+            "",
+            table,
+            &[ColumnId::new(1)],
+        )
         .await
         .unwrap();
     assert_eq!(entries.len(), 3);

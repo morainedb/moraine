@@ -4,29 +4,31 @@ use std::{sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
-use object_store::{ObjectStore, ObjectStoreExt, path::Path};
+use object_store::ObjectStoreExt;
 use parquet::{
     arrow::{arrow_reader::ArrowReaderOptions, async_reader::AsyncFileReader},
     errors::{ParquetError, Result as ParquetResult},
     file::metadata::{PageIndexPolicy, ParquetMetaData},
 };
 
-use crate::data_file::{auxiliary_cache, metrics::ScopedReadMetrics, usize_as_u64};
+use crate::data_file::{ParquetFile, auxiliary_cache, usize_as_u64};
 
 /// An [`AsyncFileReader`] over moraine's own object store: the footer and
 /// the projected column chunks arrive as byte-range reads. Not `parquet`'s
 /// built-in integration, which pins a different `object_store` major.
 #[derive(Clone)]
 pub(super) struct ObjectStoreReader {
-    pub(super) store: Arc<dyn ObjectStore>,
-    pub(super) path: Path,
-    /// The object's total length, required to locate the footer.
-    pub(super) file_size: u64,
-    /// The serialized Parquet metadata length recorded by DuckLake,
-    /// excluding the trailing eight bytes of length and magic.
-    pub(super) footer_size: u64,
+    pub(super) file: ParquetFile,
     pub(super) page_index: PageIndexPolicy,
-    pub(super) metrics: Arc<ScopedReadMetrics>,
+}
+
+impl ObjectStoreReader {
+    pub(super) fn new(file: &ParquetFile, page_index: PageIndexPolicy) -> Self {
+        Self {
+            file: file.clone(),
+            page_index,
+        }
+    }
 }
 
 fn footer_prefetch_size(footer_size: u64, file_size: u64) -> Option<usize> {
@@ -39,9 +41,9 @@ fn footer_prefetch_size(footer_size: u64, file_size: u64) -> Option<usize> {
 
 impl AsyncFileReader for ObjectStoreReader {
     fn get_bytes(&mut self, range: std::ops::Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
-        let store = Arc::clone(&self.store);
-        let path = self.path.clone();
-        let metrics = Arc::clone(&self.metrics);
+        let store = Arc::clone(self.file.store.object_store());
+        let path = self.file.path.clone();
+        let metrics = Arc::clone(&self.file.metrics);
         async move {
             let started = Instant::now();
             let bytes = store
@@ -58,9 +60,9 @@ impl AsyncFileReader for ObjectStoreReader {
         &mut self,
         ranges: Vec<std::ops::Range<u64>>,
     ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
-        let store = Arc::clone(&self.store);
-        let path = self.path.clone();
-        let metrics = Arc::clone(&self.metrics);
+        let store = Arc::clone(self.file.store.object_store());
+        let path = self.file.path.clone();
+        let metrics = Arc::clone(&self.file.metrics);
         // One `get_ranges` call, so the store can coalesce adjacent chunks.
         async move {
             let started = Instant::now();
@@ -81,7 +83,7 @@ impl AsyncFileReader for ObjectStoreReader {
         &'a mut self,
         _options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
-        let prefetch = footer_prefetch_size(self.footer_size, self.file_size);
+        let prefetch = footer_prefetch_size(self.file.footer_size, self.file.file_size);
         async move { auxiliary_cache::shared().metadata(self, prefetch).await }.boxed()
     }
 }

@@ -8,7 +8,7 @@ use std::{
 
 use futures::stream::BoxStream;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
 };
 use tracing::{Event, Subscriber, field::Visit};
@@ -1385,7 +1385,7 @@ async fn register_indexed_data_file(catalog: &Catalog, values: &[i64]) -> Arc<In
     let size = write_parquet(&store, "main/t/data.parquet", &batch).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: indexed_data_file_row(u64::try_from(values.len()).unwrap(), size),
@@ -1465,7 +1465,7 @@ async fn commit_reports_the_deferred_indexes_it_leaves_maintaining() {
     let mut tx = StagedTransaction::begin(
         db_tx,
         Arc::clone(catalog.projections()),
-        Some(store),
+        Some(DataStore::new(store)),
         String::new(),
         Arc::default(),
     );
@@ -1713,7 +1713,7 @@ async fn register_indexed_data_files(
     rows_per_file: usize,
 ) -> u64 {
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     let transaction_id = tx.diagnostic_id;
     for file in 0..files {
         let first = file * rows_per_file;
@@ -1845,7 +1845,7 @@ async fn registering_many_delete_files_reads_them_concurrently() {
     store.reset();
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     for position in 0..DELETES {
         let name = format!("d{position}.parquet");
         let size = write_delete_file(&store.inner, &name, "f0.parquet", &[position]).await;
@@ -1894,7 +1894,7 @@ async fn deletes_against_many_data_files_read_them_concurrently() {
     store.reset();
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     for file in 0..FILES {
         tx.stage(RowOperation::InlineFileDelete {
             table_id: 1,
@@ -1940,7 +1940,7 @@ async fn target_removal_does_not_wait_for_unrelated_delete_discovery() {
     store.set_path_delay("main/t/d1.parquet", CONTROLLED_READ_DELAY.saturating_mul(4));
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
         cells: delete_file_row_at(3, "d0.parquet", 1, 1, first_size),
@@ -1996,7 +1996,7 @@ async fn delete_only_index_maintenance_is_five_range_read_waves() {
 
     let size = write_delete_file(&store.inner, "delete.parquet", "f0.parquet", &[0]).await;
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     let transaction_id = tx.diagnostic_id;
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
@@ -2044,7 +2044,7 @@ async fn replace_index_maintenance_overlaps_adds_and_removals() {
     replacement_row[2] = Cell::U64(4);
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     let transaction_id = tx.diagnostic_id;
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
@@ -2100,7 +2100,7 @@ async fn compaction_only_index_maintenance_reads_no_data() {
         rewrite_data_file_row(12, 4, "merged.parquet", 3, ParquetSize::recorded(1024, 64));
     merged[11] = Cell::U64(0);
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     let transaction_id = tx.diagnostic_id;
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
@@ -2179,7 +2179,7 @@ async fn inline_flush_index_maintenance_reads_no_data() {
     store.reset();
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: rewrite_data_file_row(12, 3, "flushed.parquet", 5, file_size),
@@ -2285,7 +2285,7 @@ async fn per_row_id_registration_re_derives_entries_idempotently() {
         write_parquet_with_row_ids(&store, "main/t/rewrite.parquet", &[10, 20, 30], &[0, 1, 2])
             .await;
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: rewrite_data_file_row(12, 4, "rewrite.parquet", 3, size),
@@ -2332,7 +2332,7 @@ async fn commit_compaction(
     }
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells,
@@ -2420,7 +2420,7 @@ async fn update_shaped_registration_adds_changed_value_entries() {
     // Row 1's value changes 20 -> 99; its id is preserved.
     let size = write_parquet_with_row_ids(&store, "main/t/update.parquet", &[99], &[1]).await;
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: rewrite_data_file_row(12, 4, "update.parquet", 1, size),
@@ -2457,7 +2457,7 @@ async fn embedded_ids_win_over_a_recorded_dense_start() {
     let mut cells = rewrite_data_file_row(1, 3, "flushed.parquet", 2, size);
     cells[11] = Cell::U64(100); // row_id_start recorded, as a flush does
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells,
@@ -2500,7 +2500,7 @@ async fn register_per_row_id_file(catalog: &Catalog) -> Arc<InMemory> {
         write_parquet_with_row_ids(&store, "main/t/rewrite.parquet", &[10, 20, 30], &[5, 9, 12])
             .await;
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: rewrite_data_file_row(1, 3, "rewrite.parquet", 3, size),
@@ -2546,7 +2546,7 @@ async fn delete_file_against_per_row_id_target_removes_named_positions() {
     let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store));
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
         cells: vec![
@@ -2594,7 +2594,7 @@ async fn inline_file_delete_against_per_row_id_target_removes_the_row() {
     // Position 1 holds value 20 (embedded id 9); the delete names the
     // position, and its entry resolves out of the file.
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store));
     tx.stage(RowOperation::InlineFileDelete {
         table_id: 1,
         data_file_id: 1,
@@ -2977,7 +2977,12 @@ async fn backfill_derives_per_row_id_file_entries_under_embedded_ids() {
     let store = register_per_row_id_file(&catalog).await;
 
     let entries = catalog
-        .scoped_backfill_entries(store, "", TableId::new(1), &[ColumnId::new(1)])
+        .scoped_backfill_entries(
+            DataStore::new(store),
+            "",
+            TableId::new(1),
+            &[ColumnId::new(1)],
+        )
         .await
         .unwrap();
     let mut row_ids: Vec<u64> = entries.iter().map(|e| e.row_id).collect();
@@ -2998,7 +3003,12 @@ async fn immediate_backfill_overlaps_a_bounded_number_of_files() {
     store.reset();
 
     let entries = catalog
-        .scoped_backfill_entries(store.clone(), "", TableId::new(1), &[ColumnId::new(1)])
+        .scoped_backfill_entries(
+            DataStore::new(store.clone()),
+            "",
+            TableId::new(1),
+            &[ColumnId::new(1)],
+        )
         .await
         .unwrap();
 
@@ -3146,7 +3156,7 @@ async fn scoped_backfill_excludes_delete_file_rows() {
     let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
         cells: vec![
@@ -3177,7 +3187,12 @@ async fn scoped_backfill_excludes_delete_file_rows() {
 
     // Backfill must exclude the dead row 1 (value 20).
     let entries = catalog
-        .scoped_backfill_entries(store, "", TableId::new(1), &[ColumnId::new(1)])
+        .scoped_backfill_entries(
+            DataStore::new(store),
+            "",
+            TableId::new(1),
+            &[ColumnId::new(1)],
+        )
         .await
         .unwrap();
     let mut row_ids: Vec<u64> = entries.iter().map(|entry| entry.row_id).collect();
@@ -3202,7 +3217,7 @@ async fn inlined_file_delete_removes_the_killed_rows_index_entry() {
     );
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store));
     tx.stage(RowOperation::InlineFileDelete {
         table_id: 1,
         data_file_id: 1,
@@ -3253,7 +3268,7 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
     let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store));
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
         cells: vec![
@@ -3323,7 +3338,7 @@ async fn delete_file_may_target_a_data_file_its_own_commit_registers() {
     let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store));
     // The delete file is staged *before* its target, so the fix cannot
     // rest on DuckLake's emit order.
     tx.stage(RowOperation::Insert {
@@ -3404,7 +3419,7 @@ async fn a_row_deleted_out_of_the_file_its_own_commit_registers_is_never_indexed
     let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store));
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: indexed_data_file_row(2, file_size),
@@ -3472,7 +3487,7 @@ async fn registered_delete_file_naming_an_out_of_range_position_is_refused() {
     let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store));
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
         cells: vec![

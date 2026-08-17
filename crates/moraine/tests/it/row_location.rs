@@ -6,7 +6,7 @@ use arrow::{
     array::{Int64Array, RecordBatch},
     datatypes::{DataType, Field, Schema},
 };
-use moraine::{Catalog, DataFile, DataFileId, InlineChunk, TableId};
+use moraine::{Catalog, DataFile, DataFileId, DataStore, InlineChunk, TableId};
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
@@ -98,6 +98,7 @@ fn files_for(candidates: &[moraine::FileRowCandidate], row_id: u64) -> Vec<Optio
 async fn a_dense_file_answers_from_its_recorded_range() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     let (file_size_bytes, footer_size) = write(
         &data,
         "main/orders/data-3.parquet",
@@ -115,7 +116,7 @@ async fn a_dense_file_answers_from_its_recorded_range() {
     .await;
 
     let located = catalog
-        .locate_row_ids(Some(data), "", table, vec![0, 2, 7])
+        .locate_row_ids(Some(store), "", table, vec![0, 2, 7])
         .await
         .unwrap();
 
@@ -133,6 +134,7 @@ async fn a_dense_file_answers_from_its_recorded_range() {
 async fn a_file_whose_embedded_ids_hold_gaps_is_read_exactly() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     // A dense start of 0 would claim 0, 1 and 2; the embedded ids are the
     // truth, and a range would both invent 1 and lose 12.
     let (file_size_bytes, footer_size) = write(
@@ -152,7 +154,7 @@ async fn a_file_whose_embedded_ids_hold_gaps_is_read_exactly() {
     .await;
 
     let located = catalog
-        .locate_row_ids(Some(data), "", table, vec![1, 5, 12])
+        .locate_row_ids(Some(store), "", table, vec![1, 5, 12])
         .await
         .unwrap();
 
@@ -169,6 +171,7 @@ async fn a_file_whose_embedded_ids_hold_gaps_is_read_exactly() {
 async fn one_row_id_in_two_current_files_returns_both() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     let (size_a, footer_a) = write(
         &data,
         "main/orders/data-2.parquet",
@@ -199,7 +202,7 @@ async fn one_row_id_in_two_current_files_returns_both() {
     .await;
 
     let located = catalog
-        .locate_row_ids(Some(data), "", table, vec![8])
+        .locate_row_ids(Some(store), "", table, vec![8])
         .await
         .unwrap();
 
@@ -220,10 +223,11 @@ async fn an_unreadable_file_leaves_every_requested_row_a_candidate() {
     // The catalog registers a file the data store does not hold, so its
     // summary cannot be built.
     let data: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     let table = table_with(&catalog, vec![datafile(3)]).await;
 
     let located = catalog
-        .locate_row_ids(Some(data), "", table, vec![100, 200])
+        .locate_row_ids(Some(store), "", table, vec![100, 200])
         .await
         .unwrap();
 
@@ -292,6 +296,7 @@ async fn no_requested_rows_locate_nothing() {
 async fn warming_builds_the_summaries_a_cold_lookup_would_pay_for() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     // A compaction-output shape: embedded row ids, so a lookup must read
     // the column rather than trust a dense range.
     let (file_size_bytes, footer_size) = write(
@@ -311,7 +316,7 @@ async fn warming_builds_the_summaries_a_cold_lookup_would_pay_for() {
     .await;
 
     let first = catalog
-        .warm_row_summaries(data.clone(), "", table)
+        .warm_row_summaries(store.clone(), "", table)
         .await
         .unwrap();
     assert_eq!(first.files_considered, 1);
@@ -321,14 +326,14 @@ async fn warming_builds_the_summaries_a_cold_lookup_would_pay_for() {
     // Idempotent: the summary is now resident, so a second pass reads
     // nothing.
     let second = catalog
-        .warm_row_summaries(data.clone(), "", table)
+        .warm_row_summaries(store.clone(), "", table)
         .await
         .unwrap();
     assert_eq!(second.summaries_built, 0);
 
     // And the warmed summary answers the same as a cold lookup would.
     let located = catalog
-        .locate_row_ids(Some(data), "", table, vec![9, 11])
+        .locate_row_ids(Some(store), "", table, vec![9, 11])
         .await
         .unwrap();
     let file = catalog.snapshot().await.unwrap().data_files_of(table)[0]
@@ -343,6 +348,7 @@ async fn warming_builds_the_summaries_a_cold_lookup_would_pay_for() {
 async fn a_dense_file_needs_no_warming() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     let (file_size_bytes, footer_size) = write(
         &data,
         "main/orders/data-3.parquet",
@@ -359,7 +365,7 @@ async fn a_dense_file_needs_no_warming() {
     )
     .await;
 
-    let warmth = catalog.warm_row_summaries(data, "", table).await.unwrap();
+    let warmth = catalog.warm_row_summaries(store, "", table).await.unwrap();
 
     // It answers from its recorded range, so nothing is read or budgeted.
     assert_eq!(warmth.files_considered, 1);
@@ -372,9 +378,10 @@ async fn a_dense_file_needs_no_warming() {
 async fn warming_counts_a_file_it_cannot_read_rather_than_failing() {
     let catalog = open_memory().await;
     let data: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     let table = table_with(&catalog, vec![datafile(3)]).await;
 
-    let warmth = catalog.warm_row_summaries(data, "", table).await.unwrap();
+    let warmth = catalog.warm_row_summaries(store, "", table).await.unwrap();
 
     assert_eq!(warmth.files_considered, 1);
     assert_eq!(warmth.summaries_built, 0);
@@ -386,6 +393,7 @@ async fn warming_counts_a_file_it_cannot_read_rather_than_failing() {
 async fn warming_every_table_reaches_tables_outside_the_first_schema() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     let (orders_size, orders_footer) = write(
         &data,
         "main/orders/data-3.parquet",
@@ -428,7 +436,7 @@ async fn warming_every_table_reaches_tables_outside_the_first_schema() {
         .await
         .unwrap();
 
-    let warmth = catalog.warm_all_row_summaries(data, "").await.unwrap();
+    let warmth = catalog.warm_all_row_summaries(store, "").await.unwrap();
 
     assert_eq!(warmth.files_considered, 2);
     assert_eq!(warmth.summaries_built, 2);
@@ -440,6 +448,7 @@ async fn warming_every_table_reaches_tables_outside_the_first_schema() {
 async fn warming_every_table_carries_on_past_a_table_it_cannot_read() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     let (events_size, events_footer) = write(
         &data,
         "analytics/events/data-2.parquet",
@@ -470,7 +479,7 @@ async fn warming_every_table_carries_on_past_a_table_it_cannot_read() {
         .await
         .unwrap();
 
-    let warmth = catalog.warm_all_row_summaries(data, "").await.unwrap();
+    let warmth = catalog.warm_all_row_summaries(store, "").await.unwrap();
 
     assert_eq!(warmth.files_considered, 2);
     assert_eq!(warmth.summaries_built, 1);
@@ -482,6 +491,7 @@ async fn warming_every_table_carries_on_past_a_table_it_cannot_read() {
 async fn located_rows_keep_the_order_they_were_requested_in() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     let (file_size_bytes, footer_size) = write(
         &data,
         "main/orders/data-3.parquet",
@@ -501,7 +511,7 @@ async fn located_rows_keep_the_order_they_were_requested_in() {
     // A range or NULL scan hands its ids over already ordered; locating them
     // must not reorder them.
     let located = catalog
-        .locate_row_ids(Some(data), "", table, vec![12, 5, 9])
+        .locate_row_ids(Some(store), "", table, vec![12, 5, 9])
         .await
         .unwrap();
 
@@ -516,6 +526,7 @@ async fn located_rows_keep_the_order_they_were_requested_in() {
 async fn an_inlined_row_with_a_file_copy_keeps_both_candidates_in_any_request_order() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     let (file_size_bytes, footer_size) = write(
         &data,
         "main/orders/data-3.parquet",
@@ -559,7 +570,7 @@ async fn an_inlined_row_with_a_file_copy_keeps_both_candidates_in_any_request_or
     // Rows 0..3 are inlined and also held by the file; requested out of
     // order, every one keeps its inlined candidate beside the file one.
     let located = catalog
-        .locate_row_ids(Some(data), "", table, vec![2, 0, 1])
+        .locate_row_ids(Some(store), "", table, vec![2, 0, 1])
         .await
         .unwrap();
 
@@ -576,6 +587,7 @@ async fn an_inlined_row_with_a_file_copy_keeps_both_candidates_in_any_request_or
 async fn data_store_reads_land_in_the_handles_tally() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
     let mut files = Vec::new();
     for index in 0..3_i64 {
         let (file_size_bytes, footer_size) = write(
@@ -594,9 +606,8 @@ async fn data_store_reads_land_in_the_handles_tally() {
     let before = catalog.object_store_tally();
     assert_eq!((before.data_gets, before.data_bytes), (0, 0));
 
-    let data_store: Arc<dyn ObjectStore> = data;
     catalog
-        .locate_row_ids(Some(data_store.clone()), "", table, vec![2, 12, 24])
+        .locate_row_ids(Some(store.clone()), "", table, vec![2, 12, 24])
         .await
         .unwrap();
 
@@ -609,7 +620,7 @@ async fn data_store_reads_land_in_the_handles_tally() {
     assert!(cold.data_bytes > before.data_bytes);
 
     catalog
-        .locate_row_ids(Some(data_store), "", table, vec![2, 12, 24])
+        .locate_row_ids(Some(store), "", table, vec![2, 12, 24])
         .await
         .unwrap();
 

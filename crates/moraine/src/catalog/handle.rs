@@ -148,17 +148,17 @@ pub struct CatalogOptions {
     /// so a durable commit waits only on the object-store PUT — the lowest
     /// latency, at the cost of a busy flush loop. Defaults to 100ms.
     pub flush_interval: Duration,
-    /// Local directory backing the block cache's disk tier, which holds
-    /// data blocks evicted from memory. When set, warm queries skip repeat
-    /// object-store GETs — worthwhile for remote (`s3://`) stores,
-    /// redundant for local ones. Process-wide, like
+    /// Local directory under which each store's block cache and the parsed
+    /// Parquet metadata cache keep their disk tiers, recovered by the next
+    /// process to open them. When set, warm queries skip repeat object-store
+    /// GETs and a re-attach starts warm — worthwhile for remote (`s3://`)
+    /// stores, redundant for local ones. Process-wide, like
     /// [`cache_size`](Self::cache_size): the first catalog to open decides
     /// whether there is a disk tier at all, and where. `None` (the
-    /// default) keeps the cache in memory.
+    /// default) keeps the caches in memory.
     pub cache_dir: Option<std::path::PathBuf>,
-    /// How many bytes of disk the block cache's device may hold, for the
-    /// whole process rather than per catalog: one cache is shared by every
-    /// store a process opens, and the first to open sizes it. `None` (the
+    /// How many bytes of disk each store's cache device may hold. The
+    /// first catalog to open settles it for the process. `None` (the
     /// default) leaves a cap of 16 GiB in force, and without a
     /// [`cache_dir`](Self::cache_dir) there is no device to bound.
     pub cache_size: Option<u64>,

@@ -10,7 +10,6 @@ use std::{
 
 use futures::future::join_all;
 use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog, TableId};
-use object_store::ObjectStore;
 use tokio::{
     runtime::{Builder, Runtime},
     task::JoinHandle,
@@ -47,7 +46,7 @@ pub struct MoraineCatalogHandle {
     pub(crate) log_id: HandleId,
     /// The `DATA_PATH` object store, present only when `META_DATA_PATH`
     /// was given; index maintenance and scoped reads are skipped without it.
-    pub(crate) data_store: Option<Arc<dyn ObjectStore>>,
+    pub(crate) data_store: Option<moraine::DataStore>,
     /// The bucket-relative key prefix of `DATA_PATH` (empty for a local or
     /// bare-bucket store), prepended to a data file's stored path.
     pub(crate) data_prefix: String,

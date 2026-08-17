@@ -7,7 +7,7 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -18,12 +18,11 @@ use std::{
 use async_trait::async_trait;
 use foyer::{
     BlockEngineConfig, CacheProperties, DeviceBuilder, Event, EventListener, FsDeviceBuilder, Hint,
-    HybridCacheBuilder, HybridCacheProperties, LruConfig, PsyncIoEngineConfig, RecoverMode,
-    Spawner,
+    HybridCacheBuilder, HybridCachePolicy, HybridCacheProperties, LruConfig, PsyncIoEngineConfig,
+    RecoverMode, Spawner,
 };
 use slatedb::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache, stats};
 use slatedb_common::metrics::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn};
-use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::data_file;
@@ -167,10 +166,6 @@ pub(crate) fn auxiliary_metadata_memory() -> usize {
 pub(crate) fn auxiliary_evicted() {
     AUXILIARY_METADATA_EVICTIONS.fetch_add(1, Ordering::Relaxed);
 }
-
-/// The process's cache, built on first use. A build that failed is not
-/// retried; stores then run uncached.
-static SHARED: OnceCell<Option<Arc<dyn DbCache>>> = OnceCell::const_new();
 
 /// What the cache has served, by tier. [`cache_tally`] reports the
 /// process's;
@@ -701,8 +696,8 @@ pub fn cache_tally() -> CacheTally {
 type MemoryCache = foyer::Cache<CachedKey, CachedEntry>;
 type HybridCache = foyer::HybridCache<CachedKey, CachedEntry>;
 
-/// The one cache SlateDB metadata and data blocks share, in whichever
-/// tiering the first attach configured.
+/// One store's cache of SlateDB metadata and data blocks, in whichever
+/// tiering the process configured.
 #[derive(Clone)]
 enum Tier {
     Memory(MemoryCache),
@@ -710,13 +705,6 @@ enum Tier {
 }
 
 impl Tier {
-    fn capacity(&self) -> usize {
-        match self {
-            Self::Memory(cache) => cache.capacity(),
-            Self::Hybrid(cache) => cache.memory().capacity(),
-        }
-    }
-
     fn usage(&self) -> usize {
         match self {
             Self::Memory(cache) => cache.usage(),
@@ -730,37 +718,106 @@ impl Tier {
             Self::Hybrid(cache) => cache.memory().entries(),
         }
     }
+
+    fn resize(&self, capacity: u64) {
+        let capacity = usize::try_from(capacity).unwrap_or(usize::MAX);
+        let resized = match self {
+            Self::Memory(cache) => cache.resize(capacity),
+            Self::Hybrid(cache) => cache.memory().resize(capacity),
+        };
+        if let Err(error) = resized {
+            warn!(capacity, %error, "could not resize a store's block cache");
+        }
+    }
 }
 
-struct CacheObservation {
+/// A store's cache and how many attaches currently hold it. The tier lives
+/// for the process: a store's disk device is opened once and never raced
+/// by a re-attach.
+struct StoreCache {
     tier: Tier,
-    metadata_ceiling: u64,
-    disk_capacity: Option<u64>,
+    attached: AtomicU64,
 }
 
-static OBSERVATION: OnceCell<CacheObservation> = OnceCell::const_new();
+/// Every store's cache, by store, with the sizing in force. The first
+/// attach settles the sizing; every attach and detach re-splits the block
+/// budget evenly across the stores currently attached.
+struct Caches {
+    config: Option<CacheConfig>,
+    stores: HashMap<StoreLocation, Arc<StoreCache>>,
+}
 
-/// Current process-wide cache sizing and occupancy. The metadata figure is
-/// the ceiling past which metadata stops being protected, not a partition;
-/// the block figure is the whole cache.
+static CACHES: std::sync::LazyLock<std::sync::Mutex<Caches>> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(Caches {
+        config: None,
+        stores: HashMap::new(),
+    })
+});
+
+/// Serializes attaches, so a store's device is opened once and the first
+/// attach's sizing is settled before a second reads it.
+static OPENING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn caches() -> std::sync::MutexGuard<'static, Caches> {
+    CACHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Where a store lives: its object store's name and its path within it.
+/// Names the store's cache directory, so it must be stable across processes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct StoreLocation {
+    pub(crate) object_store: String,
+    pub(crate) path: String,
+}
+
+impl StoreLocation {
+    /// The directory this store's cache takes under the configured one.
+    fn directory(&self) -> String {
+        stable_name(&format!("{}/{}", self.object_store, self.path))
+            .simple()
+            .to_string()
+    }
+}
+
+/// A name for `location` that every build and process derives alike.
+pub(crate) fn stable_name(location: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, location.as_bytes())
+}
+
+/// Memory a store keeps while nothing is attached to it: enough to stay
+/// open, with its blocks on disk if it has any.
+const IDLE_STORE_MEMORY: u64 = 1024 * 1024;
+
+/// Current process-wide cache sizing and occupancy, summed over every
+/// store's cache. The metadata figure is the ceiling past which metadata
+/// stops being protected, not a partition; the block figure is the whole
+/// budget.
 #[must_use]
 pub fn cache_status() -> CacheStatus {
-    let Some(observation) = OBSERVATION.get() else {
+    let caches = caches();
+    let Some(config) = caches.config.as_ref() else {
         return CacheStatus::default();
     };
-    let capacity = u64::try_from(observation.tier.capacity()).unwrap_or(u64::MAX);
-    let usage = u64::try_from(observation.tier.usage()).unwrap_or(u64::MAX);
+    let (_, shared_bytes) = config.slots();
+    let usage: usize = caches.stores.values().map(|store| store.tier.usage()).sum();
+    let usage = u64::try_from(usage).unwrap_or(u64::MAX);
+    let hybrid = caches
+        .stores
+        .values()
+        .any(|store| matches!(store.tier, Tier::Hybrid(_)));
     let metadata_occupancy = METADATA_OCCUPANCY.load(Ordering::Relaxed);
     let (auxiliary_capacity, auxiliary_usage) = data_file::auxiliary_occupancy();
 
     CacheStatus {
-        metadata_capacity_bytes: observation.metadata_ceiling,
+        metadata_capacity_bytes: metadata_ceiling(shared_bytes),
         metadata_occupancy_bytes: metadata_occupancy,
         metadata_evictions: METADATA_EVICTIONS.load(Ordering::Relaxed),
-        block_capacity_bytes: capacity,
+        block_capacity_bytes: shared_bytes,
         block_occupancy_bytes: usage.saturating_sub(metadata_occupancy),
         block_evictions: BLOCK_EVICTIONS.load(Ordering::Relaxed),
-        block_disk_capacity_bytes: observation.disk_capacity,
+        block_disk_capacity_bytes: hybrid.then(|| config.disk_size.unwrap_or(DEFAULT_CACHE_DISK)),
         auxiliary_metadata_capacity_bytes: auxiliary_capacity,
         auxiliary_metadata_occupancy_bytes: auxiliary_usage,
         auxiliary_metadata_evictions: AUXILIARY_METADATA_EVICTIONS.load(Ordering::Relaxed),
@@ -788,11 +845,49 @@ impl EventListener for EvictionCounter {
     }
 }
 
-/// One cache for both kinds. Metadata enters hinted `Normal` and data
-/// blocks `Low`, so metadata is evicted only once every data block is
-/// gone, up to [`METADATA_PRIORITY_POOL_RATIO`] of the capacity.
+/// One attach's handle on its store's cache. Metadata enters hinted
+/// `Normal` and data blocks `Low`, so metadata is evicted only once every
+/// data block is gone, up to [`METADATA_PRIORITY_POOL_RATIO`] of the
+/// capacity.
 struct CatalogCache {
-    tier: Tier,
+    store: Arc<StoreCache>,
+}
+
+impl CatalogCache {
+    fn tier(&self) -> &Tier {
+        &self.store.tier
+    }
+}
+
+impl Drop for CatalogCache {
+    fn drop(&mut self) {
+        self.store.attached.fetch_sub(1, Ordering::AcqRel);
+        rebalance(&caches());
+    }
+}
+
+/// Splits the block budget evenly across attached stores; an idle store
+/// keeps [`IDLE_STORE_MEMORY`].
+fn rebalance(caches: &Caches) {
+    let Some(config) = caches.config.as_ref() else {
+        return;
+    };
+    let (_, shared_bytes) = config.slots();
+    let attached = caches
+        .stores
+        .values()
+        .filter(|store| store.attached.load(Ordering::Acquire) > 0)
+        .count();
+    let share = shared_bytes / u64::try_from(attached.max(1)).unwrap_or(u64::MAX);
+
+    for store in caches.stores.values() {
+        let capacity = if store.attached.load(Ordering::Acquire) > 0 {
+            share
+        } else {
+            IDLE_STORE_MEMORY.min(share)
+        };
+        store.tier.resize(capacity);
+    }
 }
 
 fn as_bytes(size: usize) -> u64 {
@@ -811,7 +906,7 @@ impl CatalogCache {
         metadata: bool,
     ) -> Result<CachedEntry, slatedb::Error> {
         let hint = if metadata { Hint::Normal } else { Hint::Low };
-        let entry = match &self.tier {
+        let entry = match self.tier() {
             Tier::Memory(cache) => {
                 // The memory tier reads its spawner from the ambient runtime
                 // inside the call, so the guard must be held across the call.
@@ -847,7 +942,7 @@ impl CatalogCache {
     }
 
     async fn read(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
-        match &self.tier {
+        match self.tier() {
             Tier::Memory(cache) => Ok(cache.get(key).map(|entry| entry.value().clone())),
             Tier::Hybrid(cache) => cache
                 .get(key)
@@ -880,7 +975,7 @@ impl DbCache for CatalogCache {
     /// is treated as a block; metadata is protected again on its next
     /// `fetch_*` read.
     async fn insert(&self, key: CachedKey, value: CachedEntry) {
-        match &self.tier {
+        match self.tier() {
             Tier::Memory(cache) => {
                 cache.insert_with_properties(
                     key,
@@ -899,7 +994,7 @@ impl DbCache for CatalogCache {
     }
 
     async fn remove(&self, key: &CachedKey) {
-        match &self.tier {
+        match self.tier() {
             Tier::Memory(cache) => {
                 cache.remove(key);
             }
@@ -908,7 +1003,7 @@ impl DbCache for CatalogCache {
     }
 
     fn entry_count(&self) -> u64 {
-        as_bytes(self.tier.entries())
+        as_bytes(self.tier().entries())
     }
 
     async fn fetch_block(
@@ -960,28 +1055,39 @@ fn memory_cache(capacity: u64) -> MemoryCache {
         .build()
 }
 
-/// The cache every store in this process shares, built to `config` if
-/// nothing has built it yet. `None` when the disk tier could not be opened
-/// and nothing else was configured; never an error.
-pub(crate) async fn shared(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
-    let cache = SHARED
-        .get_or_init(|| async {
-            let built = build(config).await;
-            let mut settled = BUILT_WITH
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *settled = Some(config.clone());
-            built
-        })
-        .await
-        .clone();
+/// The cache for the store at `location`, opened to `config` if this is
+/// the process's first attach and otherwise to the sizing already in
+/// force. Every attach of one store shares its cache. `None` only when
+/// the cache runtime is unavailable; never an error.
+pub(crate) async fn shared(
+    config: &CacheConfig,
+    location: StoreLocation,
+) -> Option<Arc<dyn DbCache>> {
+    let _opening = OPENING.lock().await;
 
-    let settled = BUILT_WITH
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(settled) = settled.as_ref()
-        && settled != config
-    {
+    let settled = settled_config(config).await;
+    let existing = caches().stores.get(&location).cloned();
+    let store = match existing {
+        Some(store) => store,
+        None => open_store_cache(&settled, location).await,
+    };
+
+    store.attached.fetch_add(1, Ordering::AcqRel);
+    rebalance(&caches());
+
+    Some(Arc::new(CatalogCache { store }) as Arc<dyn DbCache>)
+}
+
+/// The sizing in force, settling `config` if this is the first attach.
+async fn settled_config(config: &CacheConfig) -> CacheConfig {
+    let settled = caches().config.clone();
+    let Some(settled) = settled else {
+        settle(config).await;
+        caches().config = Some(config.clone());
+        return config.clone();
+    };
+
+    if settled != *config {
         warn!(
             requested_memory = config.memory,
             requested_disk_size = config.disk_size,
@@ -989,49 +1095,65 @@ pub(crate) async fn shared(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
             in_force_memory = settled.memory,
             in_force_disk_size = settled.disk_size,
             in_force_dir = ?settled.dir,
-            "the block cache is process-wide and already built; this attach's cache options are ignored. Set them on the first attach in the process."
+            "cache sizing is process-wide and already settled; this attach's cache options are ignored. Set them on the first attach in the process."
         );
     }
-
-    cache
+    settled
 }
 
-/// What the process's cache was built with.
-static BUILT_WITH: std::sync::Mutex<Option<CacheConfig>> = std::sync::Mutex::new(None);
+/// Opens the cache for a store attached for the first time in this
+/// process, on disk under its own directory when one is configured.
+async fn open_store_cache(settled: &CacheConfig, location: StoreLocation) -> Arc<StoreCache> {
+    let (_, shared_bytes) = settled.slots();
+    let hybrid = match settled.dir.as_ref() {
+        Some(dir) => {
+            let dir = dir.join(location.directory()).join("blocks");
+            let disk = settled.disk_size.unwrap_or(DEFAULT_CACHE_DISK);
+            hybrid(&dir, shared_bytes, disk).await
+        }
+        None => None,
+    };
+    let tier = hybrid.map_or_else(|| Tier::Memory(memory_cache(shared_bytes)), Tier::Hybrid);
+    info!(
+        object_store = %location.object_store,
+        path = %location.path,
+        disk = matches!(tier, Tier::Hybrid(_)),
+        "opened a store's block cache"
+    );
 
-async fn build(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
+    let store = Arc::new(StoreCache {
+        tier,
+        attached: AtomicU64::new(0),
+    });
+    caches().stores.insert(location, Arc::clone(&store));
+    store
+}
+
+/// Applies the first attach's sizing to the process: the auxiliary
+/// allowance, and where the auxiliary cache keeps its disk tier.
+async fn settle(config: &CacheConfig) {
     let (auxiliary_metadata_bytes, shared_bytes) = config.slots();
     AUXILIARY_METADATA_MEMORY.store(auxiliary_metadata_bytes, Ordering::Relaxed);
-    // The auxiliary cache is built on first use, possibly before any attach.
-    data_file::resize_auxiliary(usize::try_from(auxiliary_metadata_bytes).unwrap_or(usize::MAX));
-
-    let tier = match &config.dir {
-        Some(dir) => match hybrid(dir, shared_bytes, config.disk_size).await {
-            Some(cache) => Tier::Hybrid(cache),
-            None => Tier::Memory(memory_cache(shared_bytes)),
-        },
-        None => Tier::Memory(memory_cache(shared_bytes)),
-    };
-
-    let disk_capacity =
-        matches!(tier, Tier::Hybrid(_)).then(|| config.disk_size.unwrap_or(DEFAULT_CACHE_DISK));
-    let ceiling = metadata_ceiling(shared_bytes);
-    let _ = OBSERVATION.set(CacheObservation {
-        tier: tier.clone(),
-        metadata_ceiling: ceiling,
-        disk_capacity,
-    });
+    let auxiliary_disk =
+        config.disk_size.unwrap_or(DEFAULT_CACHE_DISK) / AUXILIARY_METADATA_SHARE_DIVISOR;
+    data_file::install_auxiliary(
+        usize::try_from(auxiliary_metadata_bytes).unwrap_or(usize::MAX),
+        config.dir.as_deref().map(|dir| dir.join("auxiliary")),
+        auxiliary_disk.max(MIN_AUXILIARY_DISK),
+    )
+    .await;
 
     info!(
         shared_bytes,
-        metadata_ceiling = ceiling,
+        metadata_ceiling = metadata_ceiling(shared_bytes),
         auxiliary_metadata_bytes,
         disk = config.dir.is_some(),
-        "built the shared block cache"
+        "settled the process's cache sizing"
     );
-
-    Some(Arc::new(CatalogCache { tier }) as Arc<dyn DbCache>)
 }
+
+/// The least disk the auxiliary cache's device takes when one is configured.
+const MIN_AUXILIARY_DISK: u64 = 64 * 1024 * 1024;
 
 /// The runtime the cache spawns its fetch and flush tasks on. Must not be
 /// an attach's runtime: the cache outlives every attach, and tokio cancels
@@ -1057,61 +1179,61 @@ fn build_cache_runtime() -> Option<tokio::runtime::Runtime> {
     }
 }
 
-/// The block slot backed by memory over a disk device at `dir`. `None`
-/// if the device or its runtime will not open, which the caller degrades
-/// from rather than failing.
-async fn hybrid(dir: &PathBuf, memory: u64, disk: Option<u64>) -> Option<HybridCache> {
+/// Finishes `memory` as a hybrid cache over a disk device of `disk` bytes
+/// at `dir`, recovering whatever an earlier process left there. Entries
+/// are written on insertion, so a process need not shut down cleanly for
+/// the next one to find them. `None` if the device or the cache runtime
+/// will not open; every caller degrades to memory rather than failing.
+pub(crate) async fn disk_tier<K, V>(
+    memory: foyer::HybridCacheBuilderPhaseMemory<K, V, foyer::DefaultHasher>,
+    dir: &Path,
+    disk: u64,
+) -> Option<foyer::HybridCache<K, V>>
+where
+    K: foyer::StorageKey,
+    V: foyer::StorageValue,
+{
     if let Err(error) = std::fs::create_dir_all(dir) {
-        warn!(
-            directory = %dir.display(),
-            %error,
-            "could not create the cache directory; the block cache stays in memory"
-        );
+        warn!(directory = %dir.display(), %error, "could not create the cache directory");
         return None;
     }
-
-    let capacity = usize::try_from(disk.unwrap_or(DEFAULT_CACHE_DISK)).unwrap_or(usize::MAX);
+    let capacity = usize::try_from(disk).unwrap_or(usize::MAX);
     let device = match FsDeviceBuilder::new(dir).with_capacity(capacity).build() {
         Ok(device) => device,
         Err(error) => {
-            warn!(
-                directory = %dir.display(),
-                %error,
-                "could not open the cache device; the block cache stays in memory"
-            );
+            warn!(directory = %dir.display(), %error, "could not open the cache device");
             return None;
         }
     };
+    let spawner = Spawner::from(CACHE_RUNTIME.as_ref()?.handle().clone());
 
-    let built = HybridCacheBuilder::new()
-        .with_event_listener(Arc::new(EvictionCounter))
-        .memory(usize::try_from(memory).unwrap_or(usize::MAX))
-        .with_eviction_config(eviction_config())
-        .with_weighter(|_: &CachedKey, value: &CachedEntry| value.size())
+    let built = memory
         .storage()
-        // SlateDB scopes shared-cache keys with an attach-order counter.
-        // Recovering them in a new process can bind one store's WAL blocks
-        // to another store when that order changes.
-        .with_recover_mode(RecoverMode::None)
-        // Keeps the cache's tasks off the runtime of whichever attach
-        // happened to build it.
-        .with_spawner(Spawner::from(CACHE_RUNTIME.as_ref()?.handle().clone()))
+        .with_recover_mode(RecoverMode::Quiet)
+        .with_spawner(spawner)
         .with_io_engine_config(PsyncIoEngineConfig::new())
         .with_engine_config(BlockEngineConfig::new(device))
         .build()
         .await;
-
     match built {
         Ok(cache) => Some(cache),
         Err(error) => {
-            warn!(
-                directory = %dir.display(),
-                %error,
-                "could not build the hybrid block cache; it stays in memory"
-            );
+            warn!(directory = %dir.display(), %error, "could not build the hybrid cache");
             None
         }
     }
+}
+
+/// A store's block cache backed by memory over a disk device at `dir`.
+async fn hybrid(dir: &Path, memory: u64, disk: u64) -> Option<HybridCache> {
+    let memory = HybridCacheBuilder::new()
+        .with_event_listener(Arc::new(EvictionCounter))
+        .with_policy(HybridCachePolicy::WriteOnInsertion)
+        .memory(usize::try_from(memory).unwrap_or(usize::MAX))
+        .with_eviction_config(eviction_config())
+        .with_weighter(|_: &CachedKey, value: &CachedEntry| value.size());
+
+    disk_tier(memory, dir, disk).await
 }
 
 #[cfg(test)]
@@ -1122,7 +1244,8 @@ mod tests {
     const RESTART_ROOT: &str = "MORAINE_CACHE_RESTART_ROOT";
 
     async fn run_restart_phase(phase: &str, root: &std::path::Path) {
-        use object_store::local::LocalFileSystem;
+        use futures::TryStreamExt;
+        use object_store::{ObjectStore, ObjectStoreExt, local::LocalFileSystem};
         use slatedb::{
             Db, DbReader,
             config::{FlushOptions, FlushType, PutOptions, Settings, WriteOptions},
@@ -1156,48 +1279,76 @@ mod tests {
                 .await
                 .unwrap();
                 db.flush_with_options(FlushOptions {
-                    flush_type: FlushType::Wal,
+                    flush_type: FlushType::MemTable,
                 })
                 .await
                 .unwrap();
-                drop(db);
+                db.close().await.unwrap();
+
+                // Leave only flushed SSTs, so a reader must go through
+                // the cache rather than replay the WAL.
+                let wal = object_store::path::Path::from(format!("{path}/wal"));
+                let objects: Vec<_> = object_store.list(Some(&wal)).try_collect().await.unwrap();
+                for object in objects {
+                    object_store.delete(&object.location).await.unwrap();
+                }
             }
             std::process::exit(0);
         }
 
-        let tier = Tier::Hybrid(
-            hybrid(&cache_root, 4 * 1024 * 1024, Some(64 * 1024 * 1024))
-                .await
-                .unwrap(),
-        );
-        let cache: Arc<dyn DbCache> = Arc::new(CatalogCache { tier: tier.clone() });
-        let order = if phase == "warm" {
-            [("a", b"catalog-a"), ("b", b"catalog-b")]
-        } else {
+        let config = CacheConfig {
+            memory: Some(8 * 1024 * 1024),
+            dir: Some(cache_root),
+            disk_size: Some(64 * 1024 * 1024),
+        };
+        let order = if phase == "reversed" {
             [("b", b"catalog-b"), ("a", b"catalog-a")]
+        } else {
+            [("a", b"catalog-a"), ("b", b"catalog-b")]
         };
 
         for (path, expected) in order {
+            let location = StoreLocation {
+                object_store: object_store.to_string(),
+                path: path.to_owned(),
+            };
+            let cache = shared(&config, location).await.unwrap();
+            let counters = store_counters();
             let reader = DbReader::builder(path, object_store.clone())
-                .with_db_cache(cache.clone())
+                .with_db_cache(cache)
+                .with_metrics_recorder(recorder(Arc::clone(&counters)))
                 .build()
                 .await
                 .unwrap();
             let found = reader.get(b"key").await.unwrap().unwrap();
-            assert_eq!(found.as_ref(), expected, "cache scope crossed into {path}");
+            assert_eq!(
+                found.as_ref(),
+                expected,
+                "cache served {path} another store's block"
+            );
             reader.close().await.unwrap();
+
+            let tally = counters.tally();
+            let (hits, misses) = (
+                tally.metadata_hits + tally.block_hits,
+                tally.metadata_misses + tally.block_misses,
+            );
+            match phase {
+                "warm" => assert!(misses > 0, "{path} read no blocks: {tally:?}"),
+                "probe" => {
+                    assert_eq!(misses, 0, "{path} missed the recovered cache: {tally:?}");
+                    assert!(hits > 0, "{path} read no blocks: {tally:?}");
+                }
+                _ => {}
+            }
         }
-        let Tier::Hybrid(hybrid) = tier else {
-            unreachable!("built as a hybrid tier")
-        };
-        hybrid.close().await.unwrap();
     }
 
-    /// Recovered keys must not follow attach-order scope ids into another
-    /// catalog. WAL SST ids are per store, so two stores deliberately use
-    /// the same id here; the second process attaches them in reverse order.
+    /// Blocks one process read are served from disk to the next process
+    /// attaching the same stores in the same order, and a different order
+    /// can only miss: each store's cache is its own directory.
     #[tokio::test(flavor = "multi_thread")]
-    async fn recovered_disk_entries_do_not_cross_catalog_scopes() {
+    async fn a_restarted_process_reads_flushed_blocks_from_disk() {
         if let Ok(phase) = std::env::var(RESTART_PHASE) {
             let root = PathBuf::from(std::env::var_os(RESTART_ROOT).unwrap());
             run_restart_phase(&phase, &root).await;
@@ -1209,9 +1360,9 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        let test_name = "store::cache::tests::recovered_disk_entries_do_not_cross_catalog_scopes";
+        let test_name = "store::cache::tests::a_restarted_process_reads_flushed_blocks_from_disk";
 
-        for phase in ["seed", "warm", "probe"] {
+        for phase in ["seed", "warm", "probe", "reversed"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", test_name, "--nocapture"])
                 .env(RESTART_PHASE, phase)
@@ -1283,20 +1434,23 @@ mod tests {
             memory: Some(4 * 1024 * 1024),
             ..CacheConfig::default()
         };
-        let built = shared(&first).await;
+        let location = |path: &str| StoreLocation {
+            object_store: "InMemory".to_owned(),
+            path: path.to_owned(),
+        };
+        let built = shared(&first, location("first")).await;
 
-        // Whatever the second asks for, it is served the first's cache.
+        // Whatever the second asks for, it is sized by the first's config.
         let second = CacheConfig {
             memory: Some(64 * 1024 * 1024),
             dir: Some(std::path::PathBuf::from("/tmp/moraine-ignored")),
             disk_size: Some(1),
         };
-        let served = shared(&second).await;
+        let served = shared(&second, location("second")).await;
         assert_eq!(built.is_some(), served.is_some());
         assert!(
-            BUILT_WITH
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            caches()
+                .config
                 .as_ref()
                 .is_some_and(|settled| settled.memory != second.memory),
             "the first config must be the one in force"
@@ -1478,7 +1632,11 @@ mod tests {
     /// and occupancy never exceeds the capacity enforcing it.
     #[tokio::test]
     async fn cache_status_reports_live_memory_dimensions() {
-        let _ = shared(&CacheConfig::default()).await;
+        let location = StoreLocation {
+            object_store: "InMemory".to_owned(),
+            path: "status".to_owned(),
+        };
+        let _ = shared(&CacheConfig::default(), location).await;
         let status = cache_status();
         assert!(status.metadata_capacity_bytes > 0);
         assert!(status.block_capacity_bytes > 0);

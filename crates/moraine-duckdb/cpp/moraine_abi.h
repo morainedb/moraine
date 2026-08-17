@@ -1058,12 +1058,12 @@ extern "C" {
 // stored flag ([`moraine_catalog_encrypted`]) is authoritative.
 //
 // `cache_dir`, `cache_size_bytes`, and `cache_memory_bytes` configure the
-// process-wide block cache. The first attach builds it from these; a
-// later attach naming different values logs them as ignored. `cache_dir`
-// is the disk tier's directory (null keeps the cache in memory);
-// `cache_size_bytes` bounds that directory and `cache_memory_bytes`
-// bounds memory across the metadata and data-block slots. `0` means "not
-// given" for either.
+// process-wide cache sizing. The first attach settles it; a later attach
+// naming different values logs them as ignored. `cache_dir` is where each
+// store's disk tier lives and is recovered from (null keeps the caches in
+// memory); `cache_size_bytes` caps each store's device and
+// `cache_memory_bytes` bounds memory across every store's cache and the
+// parsed-footer cache. `0` means "not given" for either.
 //
 // `cache_preload` warms this store into that cache before the attach
 // returns: `0` loads nothing, `1` each subspace's SST metadata, `2` the
