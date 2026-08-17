@@ -5,9 +5,8 @@ use std::{
     sync::Arc,
 };
 
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use object_store::path::Path;
-use tokio::sync::Semaphore;
 
 use super::{BACKFILL_FILE_READ_CONCURRENCY, ReadOnlyCatalog};
 use crate::{
@@ -21,19 +20,6 @@ use crate::{
     },
 };
 
-/// Keeps `guard` alive for exactly as long as `stream` is: it drops when the
-/// stream is exhausted or dropped, never before.
-fn stream_holding<S, G>(stream: S, guard: G) -> impl Stream<Item = S::Item>
-where
-    S: Stream + Unpin,
-    G: Send,
-{
-    stream::unfold((stream, guard), |(mut stream, guard)| async move {
-        let item = stream.next().await?;
-        Some((item, (stream, guard)))
-    })
-}
-
 async fn collect_immediate_backfill<'a>(
     files: impl Iterator<Item = DataFileInfo> + 'a,
     object_store: DataStore,
@@ -43,27 +29,17 @@ async fn collect_immediate_backfill<'a>(
     killed_positions: &'a HashMap<u64, HashSet<u64>>,
     killed_row_ids: &'a HashMap<u64, HashSet<u64>>,
 ) -> Result<Vec<IndexEntry>> {
-    // Opening a file and draining the batches behind it are separate stages
-    // of the pipeline below. One permit spans both, so the window bounds the
-    // files being read rather than each stage holding a window of its own.
-    let window = Arc::new(Semaphore::new(BACKFILL_FILE_READ_CONCURRENCY));
-
+    // Each future drains its file completely, so the one buffer below is the
+    // whole read window; a second stage would hold a window of its own.
     stream::iter(files)
         .map(move |file| {
             let object_store = object_store.clone();
             let metrics = Arc::clone(&metrics);
-            let window = Arc::clone(&window);
             let path = resolve(&file.path, file.path_is_relative);
             let dead_positions = killed_positions.get(&file.id.get());
             let dead_row_ids = killed_row_ids.get(&file.id.get());
             async move {
-                let permit = window.acquire_owned().await.map_err(|_| {
-                    Error::Interrupted(
-                        "backfill read limiter stopped before the file was read".to_owned(),
-                    )
-                })?;
-
-                let batches = data_file::scoped_read_entry_batches(
+                data_file::scoped_read_entry_batches(
                     data_file::ParquetFile::new(
                         object_store,
                         path,
@@ -77,33 +53,25 @@ async fn collect_immediate_backfill<'a>(
                         row_id_start: file.row_id_start,
                     },
                 )
-                .await?;
-
-                let entries = batches.map(move |batch| {
-                    let batch = batch?;
-                    batch
-                        .into_iter()
-                        .map(|entry| {
-                            let dead = dead_positions
-                                .is_some_and(|positions| positions.contains(&entry.ordinal))
-                                || dead_row_ids.is_some_and(|rows| rows.contains(&entry.row_id));
-                            Ok((!dead).then_some(IndexEntry {
-                                row_id: entry.row_id,
-                                values: entry.values,
-                            }))
+                .await?
+                .try_fold(Vec::new(), move |mut entries, batch| async move {
+                    entries.extend(batch.into_iter().filter_map(|entry| {
+                        let dead = dead_positions
+                            .is_some_and(|positions| positions.contains(&entry.ordinal))
+                            || dead_row_ids.is_some_and(|rows| rows.contains(&entry.row_id));
+                        (!dead).then_some(IndexEntry {
+                            row_id: entry.row_id,
+                            values: entry.values,
                         })
-                        .filter_map(Result::transpose)
-                        .collect::<Result<Vec<_>>>()
-                });
-                let entries = stream_holding(entries, permit).boxed();
-
-                Ok::<_, Error>(entries)
+                    }));
+                    Ok(entries)
+                })
+                .await
             }
         })
         .buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
-        .try_flatten_unordered(BACKFILL_FILE_READ_CONCURRENCY)
-        .try_fold(Vec::new(), |mut entries, batch| async move {
-            entries.extend(batch);
+        .try_fold(Vec::new(), |mut entries, file_entries| async move {
+            entries.extend(file_entries);
             Ok(entries)
         })
         .await
