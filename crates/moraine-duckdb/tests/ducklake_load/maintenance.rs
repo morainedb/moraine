@@ -1757,3 +1757,72 @@ fn reads_survive_an_expiry_pass_running_under_them() {
     ));
     assert_eq!(rows, vec![vec![(60 + ROUNDS).to_string()]]);
 }
+
+/// The sweep reclaims the file column statistics a dropped table leaves
+/// behind, and only once nothing can resolve them.
+///
+/// Compaction and cleanup delete statistics themselves, keyed on
+/// `data_file_id` — that path needs no help. A dropped table is the gap:
+/// expiry retires its data files without routing them through it, so the
+/// statistics outlive every file record. They are only reclaimable *after*
+/// expiry, because until then a read below the drop still resolves those
+/// files out of history and their statistics are the single copy.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn maintenance_reclaims_the_statistics_a_dropped_table_leaves() {
+    let dir = TempDir::new("sweep-stats-store");
+    let data_dir = TempDir::new("sweep-stats-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    // Each read runs in its own session, which the sweep requires: it
+    // reclaims without stamping the head, so a session that already
+    // materialized the table keeps serving what it built.
+    let counts = || -> Vec<String> {
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT (SELECT count(*) FROM m.ducklake_data_file), \
+                    (SELECT count(*) FROM m.ducklake_file_column_stats);",
+        ))
+        .into_iter()
+        .next()
+        .expect("one row of counts")
+    };
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CREATE TABLE lake.main.t (a BIGINT, b BIGINT);\
+         INSERT INTO lake.main.t SELECT range, range FROM range(0,32);\
+         CALL ducklake_flush_inlined_data('lake');",
+    );
+    let seeded = counts();
+    assert_eq!(seeded[0], "1", "one flushed file");
+    assert_ne!(seeded[1], "0", "which carries statistics");
+
+    // Dropping the table and expiring past it retires the file record.
+    run_ducklake_sql(
+        store,
+        data_path,
+        "DROP TABLE lake.main.t;\
+         CALL ducklake_expire_snapshots('lake', older_than => now());\
+         CALL ducklake_cleanup_old_files('lake', cleanup_all => true);",
+    );
+    let stranded = counts();
+    assert_eq!(stranded[0], "0", "the file record is gone");
+    assert_eq!(
+        stranded[1], seeded[1],
+        "its statistics are not — this is what the sweep exists for"
+    );
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "SELECT * FROM moraine_maintenance('lake');",
+    );
+    assert_eq!(
+        counts(),
+        vec!["0".to_string(), "0".to_string()],
+        "the sweep reclaimed them"
+    );
+}

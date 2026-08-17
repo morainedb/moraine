@@ -201,8 +201,15 @@ configure:
 
 Step 7b shares step 7's pass and its switch — one `Catalog::maintain` call
 reclaims both — and is reported separately because what orphans file column
-statistics is step 1's expiry rather than anything moraine did. Reading one
-count against the other is how a leak upstream becomes visible.
+statistics happens above moraine rather than inside it. Reading one count
+against the other is how that leak stays visible.
+
+**Most of the deleting is already done for us.** Steps 3–5 delete statistics
+themselves, keyed on `data_file_id`, alongside the data-file rows they
+retire; compaction leaves none behind. The gap is a **dropped table**: step 1
+retires its data files without routing them through that path, so the
+statistics outlive every record that could reach them. That is what step 7b
+reclaims, and on a catalog that rebuilds tables it is the whole of the leak.
 
 **File column statistics carry no snapshot**, so the single record is what
 every read of that file resolves through, including a time-travelling one
