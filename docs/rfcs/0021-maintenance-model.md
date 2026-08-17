@@ -206,10 +206,15 @@ against the other is how that leak stays visible.
 
 **Most of the deleting is already done for us.** Steps 3–5 delete statistics
 themselves, keyed on `data_file_id`, alongside the data-file rows they
-retire; compaction leaves none behind. The gap is a **dropped table**: step 1
-retires its data files without routing them through that path, so the
-statistics outlive every record that could reach them. That is what step 7b
-reclaims, and on a catalog that rebuilds tables it is the whole of the leak.
+retire; compaction leaves none behind.
+
+The gap is a **dropped table**, and it is moraine's, not DuckLake's. Run
+against a stock catalog, `DROP TABLE` followed by step 1 leaves no
+statistics behind; run against moraine it leaves all of them, with the two
+agreeing on every other count — same files retired, same deletion schedule.
+So step 7b is a backstop over a defect, not a gap in what DuckLake asks for,
+and it stays needed either way: no fix to the write path reclaims the rows a
+catalog has already stranded.
 
 **File column statistics carry no snapshot**, so the single record is what
 every read of that file resolves through, including a time-travelling one
