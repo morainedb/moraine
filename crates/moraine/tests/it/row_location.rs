@@ -568,3 +568,55 @@ async fn an_inlined_row_with_a_file_copy_keeps_both_candidates_in_any_request_or
     }
     catalog.close().await.unwrap();
 }
+
+/// A cold lookup pays one footer read and one row-id column read per file
+/// with embedded ids, and the handle's tally shows it; a warm repeat reads
+/// nothing.
+#[tokio::test]
+async fn data_store_reads_land_in_the_handles_tally() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let mut files = Vec::new();
+    for index in 0..3_i64 {
+        let (file_size_bytes, footer_size) = write(
+            &data,
+            &format!("main/orders/data-{index}.parquet"),
+            &batch_with_row_ids(&[1, 2, 3], &[index * 10, index * 10 + 2, index * 10 + 4]),
+        )
+        .await;
+        files.push(DataFile {
+            file_size_bytes,
+            footer_size,
+            ..datafile(u64::try_from(index).unwrap())
+        });
+    }
+    let table = table_with(&catalog, files).await;
+    let before = catalog.object_store_tally();
+    assert_eq!((before.data_gets, before.data_bytes), (0, 0));
+
+    let data_store: Arc<dyn ObjectStore> = data;
+    catalog
+        .locate_row_ids(Some(data_store.clone()), "", table, vec![2, 12, 24])
+        .await
+        .unwrap();
+
+    let cold = catalog.object_store_tally();
+    assert_eq!(
+        cold.data_gets - before.data_gets,
+        6,
+        "one footer and one column read per file"
+    );
+    assert!(cold.data_bytes > before.data_bytes);
+
+    catalog
+        .locate_row_ids(Some(data_store), "", table, vec![2, 12, 24])
+        .await
+        .unwrap();
+
+    let warm = catalog.object_store_tally();
+    assert_eq!(
+        (warm.data_gets, warm.data_bytes),
+        (cold.data_gets, cold.data_bytes)
+    );
+    catalog.close().await.unwrap();
+}

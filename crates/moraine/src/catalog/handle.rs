@@ -35,6 +35,7 @@ use crate::{
             install_shared_current_entities, shared_current_entities,
         },
     },
+    data_file,
     error::{Error, Result},
     store::{
         cache::{CacheCounters, CacheTally, ObjectStoreTally, cache_status, metadata_shortfall},
@@ -344,6 +345,7 @@ pub struct ReadOnlyCatalog {
     store: Arc<Store>,
     reads: Arc<ReadTally>,
     cache: Arc<CacheCounters>,
+    data_reads: Arc<data_file::DataStoreCounters>,
     location: Arc<StoreLocation>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     commits: Arc<commit::Coalescer>,
@@ -446,7 +448,22 @@ impl ReadOnlyCatalog {
     /// latency and can exceed wall-clock time when requests overlap.
     #[must_use]
     pub fn object_store_tally(&self) -> ObjectStoreTally {
-        self.cache.object_store_tally()
+        let mut tally = self.cache.object_store_tally();
+        tally.data_gets = self.data_reads.gets();
+        tally.data_bytes = self.data_reads.bytes();
+        tally
+    }
+
+    pub(crate) fn data_reads(&self) -> Arc<data_file::DataStoreCounters> {
+        Arc::clone(&self.data_reads)
+    }
+
+    /// A fresh scoped-read tally whose data-store reads also count towards
+    /// this handle's [`object_store_tally`](Self::object_store_tally).
+    pub(crate) fn data_read_metrics(&self) -> Arc<data_file::ScopedReadMetrics> {
+        Arc::new(data_file::ScopedReadMetrics::reporting_to(Arc::clone(
+            &self.data_reads,
+        )))
     }
 
     /// Records that the `current` half of the shared record set was
@@ -929,6 +946,7 @@ impl Catalog {
                 }),
                 reads: Arc::new(ReadTally::default()),
                 cache,
+                data_reads: Arc::default(),
                 commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
                 projections,
                 warmed_tables: Arc::default(),
@@ -1018,6 +1036,7 @@ impl Catalog {
             }),
             reads: Arc::new(ReadTally::default()),
             cache,
+            data_reads: Arc::default(),
             commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
             projections,
             warmed_tables: Arc::default(),

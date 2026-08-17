@@ -309,10 +309,10 @@ pub(super) async fn stage_index_maintenance(
     ops: &[RowOperation],
     data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
+    metrics: Arc<data_file::ScopedReadMetrics>,
 ) -> Result<StagedEntries> {
     let pending_schemas = pending_inline_schemas(ops);
     let inline_schemas = InlineSchemaCache::new(&pending_schemas);
-    let metrics = Arc::new(data_file::ScopedReadMetrics::default());
     let context = FileContext {
         store: data_store,
         prefix: data_prefix,

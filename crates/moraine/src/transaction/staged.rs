@@ -399,6 +399,7 @@ pub struct StagedTransaction {
     /// scoped-reads registered data files through it; absent it is skipped.
     data_store: Option<Arc<dyn ObjectStore>>,
     data_prefix: String,
+    data_reads: Arc<data_file::DataStoreCounters>,
 }
 
 impl StagedTransaction {
@@ -411,6 +412,7 @@ impl StagedTransaction {
         projections: Arc<std::sync::RwLock<ProjectionCache>>,
         data_store: Option<Arc<dyn ObjectStore>>,
         data_prefix: String,
+        data_reads: Arc<data_file::DataStoreCounters>,
     ) -> Self {
         Self {
             diagnostic_id: next_diagnostic_id(),
@@ -420,6 +422,7 @@ impl StagedTransaction {
             projections,
             data_store,
             data_prefix,
+            data_reads,
         }
     }
 
@@ -433,6 +436,7 @@ impl StagedTransaction {
             Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
             None,
             String::new(),
+            Arc::default(),
         )
     }
 
@@ -446,6 +450,7 @@ impl StagedTransaction {
             Arc::clone(catalog.projections()),
             None,
             String::new(),
+            Arc::default(),
         )
     }
 
@@ -461,6 +466,7 @@ impl StagedTransaction {
             Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
             Some(data_store),
             String::new(),
+            Arc::default(),
         )
     }
 
@@ -992,6 +998,7 @@ impl StagedTransaction {
             projections,
             data_store,
             data_prefix,
+            data_reads,
         } = self;
         let staged_rows = ops.len();
         let mut uses_inline_chunk_directory = ops
@@ -1029,15 +1036,24 @@ impl StagedTransaction {
         // Staged before translation so a poisoned index definition rides
         // the writes it produces.
         let store = data_store.as_ref();
+        let read_metrics = Arc::new(data_file::ScopedReadMetrics::reporting_to(data_reads));
         let phase_started = Instant::now();
-        let entries =
-            match stage_index_maintenance(&db_tx, base_ref, &ops, store, &data_prefix).await {
-                Ok(entries) => entries,
-                Err(err) => {
-                    db_tx.rollback();
-                    return Err(err);
-                }
-            };
+        let entries = match stage_index_maintenance(
+            &db_tx,
+            base_ref,
+            &ops,
+            store,
+            &data_prefix,
+            read_metrics,
+        )
+        .await
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                db_tx.rollback();
+                return Err(err);
+            }
+        };
         phases.index_maintenance = phase_started.elapsed();
         let StagedEntries {
             poisoned,

@@ -33,6 +33,7 @@ pub async fn staged_begin(
         catalog.projections().clone(),
         data_store,
         data_prefix,
+        catalog.data_reads(),
     ))
 }
 
