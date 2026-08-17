@@ -419,8 +419,10 @@ per-schema-version inlined-data tables) as catalog entries with the DuckLake
 schema, and implements:
 
 - **Scan** — given a table and the columns DuckDB asks for, produce rows from
-  SlateDB. Row filters are **not** pushed down, so a scan materializes the
-  addressed kind in full and DuckDB's executor filters over the returned rows.
+  SlateDB. Row filters are **not** applied by the scan, so it materializes the
+  addressed kind and DuckDB's executor filters over the returned rows. One
+  kind narrows *how much* it materializes without taking on that filtering —
+  see "Scoping the file-statistics scan" below.
   Projection is pushed down, but it selects output columns from an
   already-materialized row set rather than narrowing the read. What narrowing
   exists comes from the address, not from a predicate: the RFC 0002 key layout
@@ -496,6 +498,47 @@ convention is deliberately minimal — lifecycle columns only, everything
 else opaque — and the e2e suite pins it against every lifecycle transition
 real DuckLake SQL produces. The contract is not zero interpretation; it is
 exactly one, tested.
+
+### Scoping the file-statistics scan
+
+Materializing the addressed kind whole is affordable for every kind but one.
+`ducklake_file_column_stats` holds a row per file per column — a production
+catalog measured 145,995 of them against 1,013 data files — and each becomes
+ten `duckdb::Value`s, two of them heap strings. DuckLake's planner reads it
+to prune, so a statement pays that once and a writing transaction pays it per
+statement. Every other kind is orders of magnitude smaller; the same catalog's
+`ducklake_data_file` is 1,013 rows. So this one kind narrows, and nothing
+else does.
+
+**The scan still applies no filters.** It reads the `table_id` equality
+through `pushdown_complex_filter` and **consumes nothing**, so DuckDB keeps
+applying every predicate itself. A filter shape the match does not recognize
+costs a wider materialization, never a wrong row. `filter_pushdown` stays off
+for exactly this reason: setting it deletes the filter operator and makes the
+scan answerable for the whole of `TableFilterType`, which is a standing
+correctness liability — a filter type added upstream would begin silently
+dropping rows on a version bump.
+
+**Row identity is why only a table-major kind may narrow.** These tables have
+no physical row ids: a row's `rowid` is *its index into the materialized row
+set*, and the `UPDATE`/`DELETE` sinks resolve that index back to key cells by
+re-materializing the provider whole. A scan that simply filtered would
+renumber its rows, and a DML statement that narrowed would resolve row ids
+against the wrong rows — silently, and only when it both narrows and writes.
+The keying is the way out: this kind is keyed table-major, so a table's rows
+are a **contiguous run** of the whole dump. The scoped dump returns that run
+with where it starts, the scan emits `base + i`, and both sides keep counting
+rows of the same list. A kind whose rows do not form one run cannot narrow
+this way, which is what `scope_column` records.
+
+The filter also has to arrive before the work. Materialization otherwise
+happens in `GetScanFunction`, at bind, before a plan exists; a narrowable
+kind therefore builds nothing there and `InitGlobal` materializes instead —
+scoped when an equality reached the bind data, whole otherwise. A scan
+mid-write drops the scope: only the unscoped dump carries the staged overlay
+a read then owes. Scoped materializations are not cached, since the
+per-transaction hold is keyed by spec and a scoped set is small and built
+once per statement.
 
 ### Composition: C++ shim over the Rust core (forced)
 

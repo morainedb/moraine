@@ -20,7 +20,7 @@ use crate::{
         compaction::{self as store_compaction, MergeEnd},
         handle::{ReadHandle, ScanShape},
         key::{
-            IndexKey, IndexKind, Key, Subspace, index_index_prefix, index_kind_prefix,
+            EntityKey, IndexKey, IndexKind, Key, Subspace, index_index_prefix, index_kind_prefix,
             subspace_prefix,
         },
     },
@@ -100,6 +100,15 @@ pub struct MaintenanceRequest {
     /// orphaned by `drop_index`, or by a `drop_table` that ended the
     /// table's indexes with it.
     pub sweep_orphaned_index_entries: bool,
+    /// Reclaim file column statistics describing a data file no snapshot
+    /// can still resolve.
+    ///
+    /// Statistics carry no snapshot of their own, so the one record is
+    /// what every read of that file resolves through — including a
+    /// time-travelling one, whose file record comes from history. They
+    /// are therefore reclaimable only once the file is absent from both
+    /// live state and history, which is where expiry leaves it.
+    pub sweep_orphaned_file_column_stats: bool,
     /// Maximum entries deleted per commit. Must be nonzero.
     pub batch_size: usize,
 }
@@ -108,6 +117,7 @@ impl Default for MaintenanceRequest {
     fn default() -> Self {
         Self {
             sweep_orphaned_index_entries: true,
+            sweep_orphaned_file_column_stats: true,
             batch_size: 1024,
         }
     }
@@ -121,6 +131,8 @@ pub struct MaintenanceReport {
     pub indexes_swept: u64,
     /// Entry keys deleted across those ranges.
     pub index_entries_reclaimed: u64,
+    /// File column statistics deleted for unresolvable data files.
+    pub file_column_stats_reclaimed: u64,
 }
 
 /// One step reported by a completed maintenance pass.
@@ -389,6 +401,7 @@ impl Catalog {
     /// // A fresh catalog has nothing to reclaim.
     /// let report = catalog.maintain(MaintenanceRequest::default()).await?;
     /// assert_eq!(report.index_entries_reclaimed, 0);
+    /// assert_eq!(report.file_column_stats_reclaimed, 0);
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn maintain(&self, request: MaintenanceRequest) -> Result<MaintenanceReport> {
@@ -402,6 +415,11 @@ impl Catalog {
         }
 
         let mut report = MaintenanceReport::default();
+        if request.sweep_orphaned_file_column_stats {
+            report.file_column_stats_reclaimed = self
+                .reclaim_orphaned_file_column_stats(request.batch_size)
+                .await?;
+        }
         if !request.sweep_orphaned_index_entries {
             return Ok(report);
         }
@@ -577,6 +595,71 @@ impl Catalog {
     /// Deletes every entry of one dead index, `batch_size` per commit,
     /// returning the total. The caller has already established that the
     /// index is not live.
+    /// Every `(table_id, data_file_id)` an ended data-file version names,
+    /// which is what a time-travelling read resolves a dropped or replaced
+    /// file through.
+    async fn historical_data_files(&self) -> Result<HashSet<(u64, u64)>> {
+        let session = self.begin_read().await?;
+        let mut iter = session
+            .handle()
+            .scan_prefix(subspace_prefix(Subspace::History), .., ScanShape::Bulk)
+            .await?;
+
+        let mut seen = HashSet::new();
+        while let Some(entry) = iter.next().await? {
+            if let Ok(Key::History(history)) = Key::decode(&entry.key)
+                && let EntityKey::File {
+                    table_id,
+                    data_file_id,
+                } = history.entity
+            {
+                seen.insert((table_id, data_file_id));
+            }
+        }
+        session.finish();
+        Ok(seen)
+    }
+
+    /// Deletes the statistics of every data file absent from both live
+    /// state and history, `batch_size` per commit, and returns how many
+    /// records went.
+    async fn reclaim_orphaned_file_column_stats(&self, batch_size: usize) -> Result<u64> {
+        let snapshot = self.snapshot().await?;
+        let historical = self.historical_data_files().await?;
+
+        let mut victims = Vec::new();
+        for (&table_id, per_file) in &snapshot.file_column_stats {
+            let live = snapshot.data_files.get(&table_id);
+            for &(data_file_id, column_id) in per_file.keys() {
+                let resolvable = live.is_some_and(|files| files.contains_key(&data_file_id))
+                    || historical.contains(&(table_id, data_file_id));
+                if !resolvable {
+                    victims.push(EntityKey::FileColumnStats {
+                        table_id,
+                        data_file_id,
+                        column_id,
+                    });
+                }
+            }
+        }
+
+        let mut total = 0u64;
+        for batch in victims.chunks(batch_size) {
+            let tx = self.begin_write_tx().await?;
+            for entity in batch {
+                tx.delete(Key::current(*entity).encode())
+                    .map_err(Error::from)?;
+            }
+            // Non-durable: the deletes are idempotent, so a batch lost to a
+            // crash leaves records a later pass rediscovers.
+            tx.commit_with_options(&commit::non_durable())
+                .await
+                .map_err(Error::from)?;
+            total += batch.len() as u64;
+        }
+        Ok(total)
+    }
+
     async fn reclaim_dead_range(
         &self,
         kind: IndexKind,

@@ -565,6 +565,8 @@ fn maintenance_without_configuration_runs_only_the_sweep() {
         );
     }
     assert_eq!(by_step.get("sweep_indexes"), Some(&"ran"), "{rows:?}");
+    // Shares `sweep_indexes`' pass and its switch, so it runs with it.
+    assert_eq!(by_step.get("sweep_file_stats"), Some(&"ran"), "{rows:?}");
     assert_eq!(by_step.get("compact_store"), Some(&"skipped"), "{rows:?}");
 
     // Nothing the pass did is observable in the data.
@@ -675,6 +677,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
             "cleanup_old_files",
             "delete_orphaned_files",
             "sweep_indexes",
+            "sweep_file_stats",
             "compact_store",
         ],
         "steps must report in sequence order"
@@ -689,6 +692,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
         "merge_adjacent_files",
         "cleanup_old_files",
         "sweep_indexes",
+        "sweep_file_stats",
     ] {
         assert_eq!(by_step.get(step), Some(&"ran"), "{step} in {rows:?}");
     }
@@ -1752,4 +1756,74 @@ fn reads_survive_an_expiry_pass_running_under_them() {
         "SELECT count(*) FROM lake.main.t;",
     ));
     assert_eq!(rows, vec![vec![(60 + ROUNDS).to_string()]]);
+}
+
+/// Expiring a dropped table takes its file column statistics with it,
+/// exactly as a stock DuckLake catalog does — and the sweep reclaims
+/// whatever an older catalog stranded before that held.
+///
+/// Differential because the failure was invisible without a reference:
+/// moraine kept the statistics while stock deleted them, agreeing on every
+/// other count, and the delete DuckLake issues is dropped silently. The
+/// snapshot deletions are what made it reachable — they take the data file
+/// out of both sides of the commit diff, which is the one arm that can
+/// retire a statistics row.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn expiring_a_dropped_table_reclaims_its_file_column_stats_like_stock() {
+    let dir = TempDir::new("sweep-stats-store");
+    let data_dir = TempDir::new("sweep-stats-data");
+    let reference_meta = TempDir::new("sweep-stats-ref-meta");
+    let reference_data = TempDir::new("sweep-stats-ref-data");
+
+    let apply = |sql: &str| {
+        run_ducklake_sql(dir.path(), data_dir.path(), sql);
+        run_reference_ducklake_sql(reference_meta.path(), reference_data.path(), sql);
+    };
+    // Each read runs its own session: the sweep reclaims without stamping
+    // the head, so a session that already materialized a table keeps
+    // serving what it built.
+    let probe = |sql: &str| -> Vec<Vec<String>> {
+        let moraine_rows = csv_rows(&run_ducklake_sql(dir.path(), data_dir.path(), sql));
+        let reference_rows = csv_rows(&run_reference_ducklake_sql(
+            reference_meta.path(),
+            reference_data.path(),
+            sql,
+        ));
+        assert_eq!(
+            moraine_rows, reference_rows,
+            "moraine diverges from stock DuckLake for `{sql}`"
+        );
+        moraine_rows
+    };
+    let counts = "SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file), \
+                         (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_file_column_stats);";
+
+    apply(
+        "CREATE TABLE lake.main.t (a BIGINT, b BIGINT);\
+         INSERT INTO lake.main.t SELECT range, range FROM range(0,32);\
+         CALL ducklake_flush_inlined_data('lake');",
+    );
+    let seeded = probe(counts);
+    assert_eq!(seeded[0][0], "1", "one flushed file");
+    assert_ne!(seeded[0][1], "0", "which carries statistics");
+
+    apply(
+        "DROP TABLE lake.main.t;\
+         CALL ducklake_expire_snapshots('lake', older_than => now());\
+         CALL ducklake_cleanup_old_files('lake', cleanup_all => true);",
+    );
+    assert_eq!(
+        probe(counts),
+        vec![vec!["0".to_string(), "0".to_string()]],
+        "expiry must take the statistics with the file, as stock does"
+    );
+
+    // And the sweep is a no-op once nothing was stranded.
+    let swept = csv_rows(&run_ducklake_sql(
+        dir.path(),
+        data_dir.path(),
+        "SELECT detail FROM moraine_maintenance('lake') WHERE step = 'sweep_file_stats';",
+    ));
+    assert_eq!(swept, vec![vec!["reclaimed 0 file column statistics"]]);
 }

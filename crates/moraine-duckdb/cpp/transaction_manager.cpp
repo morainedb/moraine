@@ -28,7 +28,7 @@ MoraineTransaction::~MoraineTransaction() {
 	}
 }
 
-MoraineTxHandle *MoraineTransaction::StagedTx() {
+MoraineTxHandle *MoraineTransaction::OpenStagedTx() {
 	if (staged_tx_ == nullptr) {
 		MoraineTxHandle *tx = nullptr;
 		MoraineError err {};
@@ -41,14 +41,33 @@ MoraineTxHandle *MoraineTransaction::StagedTx() {
 			ThrowMoraineError(err);
 		}
 		staged_tx_ = tx;
+		// Reads move from the transaction's snapshot to the staged tx's own
+		// read point here, so nothing materialized against the former may
+		// be served after it.
 		metadata_rows_.clear();
 	}
 	return staged_tx_;
 }
 
+MoraineTxHandle *MoraineTransaction::StagedTx() {
+	auto *tx = OpenStagedTx();
+	metadata_rows_.clear();
+	return tx;
+}
+
+MoraineTxHandle *MoraineTransaction::StagedTxFor(const MetadataTableSpec &spec) {
+	auto *tx = OpenStagedTx();
+	metadata_rows_.erase(&spec);
+	return tx;
+}
+
 MoraineTxHandle *MoraineTransaction::TakeStagedTx() {
 	auto *result = staged_tx_;
 	staged_tx_ = nullptr;
+	// The read point every held materialization stands at leaves with the
+	// tx. Without this a read between a failed commit and the retry's fresh
+	// tx would be served the premise that attempt already lost on.
+	metadata_rows_.clear();
 	return result;
 }
 

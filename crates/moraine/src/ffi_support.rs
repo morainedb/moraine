@@ -426,6 +426,36 @@ pub async fn dump_file_column_stats(
     .await
 }
 
+/// One table's `ducklake_file_column_stats` rows, and how many rows precede
+/// them in [`dump_file_column_stats`].
+///
+/// That dump is key-ordered and this kind is keyed table-major, so a table's
+/// rows are one contiguous run of it. Returning where the run starts lets a
+/// caller address a scoped row by the position it holds in the whole, which
+/// is what the extension's metadata row ids are — so scoping a scan does not
+/// renumber its rows.
+#[doc(hidden)]
+pub async fn dump_file_column_stats_of(
+    catalog: &ReadOnlyCatalog,
+    table_id: u64,
+) -> Result<(Vec<FileColumnStatsValue>, u64)> {
+    let (_, current, _) = entity_halves(catalog, false).await?;
+
+    let mut preceding = 0u64;
+    let mut rows = Vec::new();
+    for record in current.iter() {
+        let EntityRecord::FileColumnStats(value) = record else {
+            continue;
+        };
+        if value.table_id < table_id {
+            preceding = preceding.saturating_add(1);
+        } else if value.table_id == table_id {
+            rows.push(value.clone());
+        }
+    }
+    Ok((rows, preceding))
+}
+
 /// Every `ducklake_snapshot`/`ducklake_snapshot_changes` row (merged).
 /// Snapshots are append-only, so this is the full history.
 #[doc(hidden)]
@@ -1687,6 +1717,95 @@ mod tests {
         assert_eq!(file_col_rows.len(), 1);
         assert_eq!(file_col_rows[0].min_value.as_deref(), Some("1"));
         assert_eq!(file_col_rows[0].max_value.as_deref(), Some("10"));
+    }
+
+    /// A scoped file-statistics dump is the contiguous run its offset
+    /// names in the unscoped one.
+    ///
+    /// This is what lets the extension scope a scan without renumbering its
+    /// rows: a scoped row's position in the whole is `offset + index`, so
+    /// row ids keep meaning what they meant. If the dump ever stopped being
+    /// key-ordered table-major, this is what would catch it.
+    #[tokio::test]
+    async fn scoped_file_column_stats_are_a_contiguous_run_of_the_whole() {
+        let catalog = seed().await;
+
+        // A second table, so one table's rows are a strict subset and the
+        // offset has something to skip.
+        catalog
+            .commit(|tx| {
+                let schema = tx.schemas()[0].id;
+                let table = tx.create_table(
+                    schema,
+                    "returns",
+                    &[ColumnDef {
+                        name: "id".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: false,
+                        default_value: None,
+                        children: Vec::new(),
+                    }],
+                )?;
+                let column = tx.columns_of(table)[0].id;
+                for (ordinal, path) in ["returns/a.parquet", "returns/b.parquet"]
+                    .iter()
+                    .enumerate()
+                {
+                    tx.register_data_file(
+                        table,
+                        DataFile {
+                            path: (*path).into(),
+                            path_is_relative: true,
+                            file_format: "parquet".into(),
+                            record_count: 4,
+                            file_size_bytes: 64,
+                            footer_size: 8,
+                            encryption_key: None,
+                            partition_values: vec![],
+                            column_stats: vec![FileColumnStats {
+                                column_id: column,
+                                column_size_bytes: 10,
+                                value_count: 4,
+                                null_count: 0,
+                                min_value: Some(ordinal.to_string()),
+                                max_value: Some("9".into()),
+                                contains_nan: None,
+                                extra_stats: None,
+                            }],
+                        },
+                        &[],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let whole = dump_file_column_stats(&catalog).await.unwrap();
+        assert_eq!(whole.len(), 3, "one from the seed, two from `returns`");
+
+        let table_ids: std::collections::BTreeSet<u64> =
+            whole.iter().map(|row| row.table_id).collect();
+        assert_eq!(table_ids.len(), 2);
+
+        let mut covered = 0;
+        for table_id in table_ids {
+            let (scoped, offset) = dump_file_column_stats_of(&catalog, table_id).await.unwrap();
+            assert!(!scoped.is_empty());
+            let start = usize::try_from(offset).unwrap();
+            assert_eq!(
+                &whole[start..start + scoped.len()],
+                scoped.as_slice(),
+                "table {table_id} must be the run at {offset}"
+            );
+            covered += scoped.len();
+        }
+        assert_eq!(covered, whole.len(), "the runs must tile the whole dump");
+
+        // A table with no statistics names an empty run, not a bad offset.
+        let (missing, offset) = dump_file_column_stats_of(&catalog, u64::MAX).await.unwrap();
+        assert!(missing.is_empty());
+        assert_eq!(usize::try_from(offset).unwrap(), whole.len());
     }
 
     #[tokio::test]

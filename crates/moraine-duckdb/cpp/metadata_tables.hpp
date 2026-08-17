@@ -86,6 +86,16 @@ struct MetadataTableSpec {
 	// `delete_key_columns`: reclamation gave most kinds a delete key, but
 	// overlay updates stay a statistics-table convention.
 	bool overlay_updatable = false;
+	// Index into `columns` of the `table_id` a scan may narrow to, or -1 for
+	// a kind always materialized whole. Set only where the dump is large
+	// enough to be worth narrowing *and* keyed by that column first, so one
+	// table's rows are a contiguous run of the whole and narrowing does not
+	// renumber them — `ducklake_file_column_stats` alone.
+	//
+	// Last, and it must stay last: these specs are initialized positionally,
+	// so a field added anywhere earlier silently shifts every entry that
+	// relies on declaration order.
+	int32_t scope_column = -1;
 };
 
 // The rows of `spec` as the calling DuckDB transaction sees them. Every
@@ -106,17 +116,30 @@ struct MetadataTableSpec {
 //     which DuckLake reports as "No snapshot found".
 //   - **After it has** — a writer — every read goes to the staged tx, whose
 //     own read point pins it and whose dumps overlay the rows staged so
-//     far. Nothing is cached over that: it is the surface DuckLake's commit
-//     retry re-reads between attempts, and a retry served the state its
-//     first attempt saw would re-check its conflict matrix against a
-//     premise that already lost.
+//     far. That read point holds for the tx's life, so a dump is held here
+//     too, and dropped by the only two things that can outdate it: staging
+//     into the same table, which moves its overlay, and the tx ending,
+//     which retires its read point. A commit attempt takes the staged tx,
+//     so the retry DuckLake drives between attempts re-reads through a
+//     fresh one — never the premise its last attempt lost on.
 //
-// Two limits remain. Tables are pinned independently, each at the head its
+// One limit remains: tables are pinned independently, each at the head its
 // first scan observed, so a statement joining two of them can still
-// straddle a commit; and a writer's `kNotWritable` tables have no staged
-// dump, so they re-read per scan (they are the always-empty stand-ins).
+// straddle a commit.
 std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
                                                     const MetadataTableSpec &spec);
+
+// One table's rows of a narrowable `spec`, and the row id its first row
+// carries — how many rows precede it in the unscoped materialization.
+//
+// Uncached, unlike `MetadataRowsFor`: a narrowed set is small, built once per
+// statement, and keyed by a value the transaction's cache is not keyed by.
+// Falls back to the whole set (and a base of 0) when the kind cannot be
+// narrowed, or mid-write, where only the unscoped dump carries the staged
+// overlay a read then owes.
+std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
+                                                          const MetadataTableSpec &spec, uint64_t table_id,
+                                                          uint64_t &row_id_base);
 
 // The fixed list of synthesized tables, in the order they're registered.
 // Built once; returns the same static instance every call.
@@ -167,7 +190,23 @@ struct MetadataScanBindData : public duckdb::FunctionData {
 	// Shared, never copied: a rowid is an index into this exact list, and
 	// the staged-write Sink resolves it against the same one (see
 	// `MetadataRowsFor`).
+	//
+	// Null when `spec` names a narrowable kind: that scan materializes in
+	// `InitGlobal` instead, because the filter deciding how much to build
+	// has not been pushed down yet at bind.
 	std::shared_ptr<const MetadataRows> rows;
+	// The spec a narrowable scan materializes from, and the catalog it reads
+	// through. Null for every scan that materializes at bind — the
+	// un-narrowable kinds and the inline-table entries.
+	//
+	// A raw pointer, not `optional_ptr`: `InitGlobal` reads the bind data as
+	// const and must still reach a mutable catalog.
+	const MetadataTableSpec *spec = nullptr;
+	duckdb::Catalog *catalog = nullptr;
+	// The `table_id` an equality filter pinned this scan to, set by
+	// `pushdown_complex_filter` before `InitGlobal` runs. Unset means the
+	// scan reads its kind whole.
+	duckdb::optional_idx scope;
 	// The synthesized entry this scan reads, exposed through the table
 	// function's `get_bind_info` so `LogicalGet::GetTable()` resolves it:
 	// the binder's UPDATE/DELETE paths require a resolvable base table.

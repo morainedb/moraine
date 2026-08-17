@@ -99,6 +99,10 @@ private:
 	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
 	                                const DuckLakeStep &step);
 	MaintenanceStep RunSweep();
+	// Reports what `RunSweep`'s single pass reclaimed from the file column
+	// statistics of data files no snapshot can still resolve. Runs after
+	// it and reads the counters it left.
+	MaintenanceStep RunFileStatsSweep();
 	MaintenanceStep RunStoreMerge();
 	// The DuckLake catalog sitting above this metadata catalog, found by
 	// matching attached databases on path. DuckLake's own maintenance
@@ -111,6 +115,12 @@ private:
 	std::string store_path_;
 	MoraineCatalogHandle *handle_;
 	MaintenanceConfig config_;
+
+	// What the last `RunSweep` reclaimed from file column statistics, and
+	// whether it got far enough to have reclaimed anything. Written by it,
+	// read by `RunFileStatsSweep`, which always follows it in one pass.
+	uint64_t file_stats_reclaimed_ = 0;
+	bool file_stats_swept_ = false;
 
 	// Held for the duration of a pass, so the timer and the trigger can
 	// never overlap.
