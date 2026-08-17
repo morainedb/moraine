@@ -3000,6 +3000,15 @@ async fn immediate_backfill_overlaps_a_bounded_number_of_files() {
     let (catalog, _) = catalog_with_indexed_inline_table(true).await;
     let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
     register_indexed_data_files(&catalog, &store, 12, 1).await;
+    // Files that answer instantly hand their window slot back while the slow
+    // files still hold theirs, so the builder reaches for the next file with
+    // reads outstanding — the schedule that unmasks an unbounded window.
+    for file in 4..12 {
+        store.set_path_delay(
+            &format!("main/t/f{file}.parquet"),
+            std::time::Duration::ZERO,
+        );
+    }
     store.reset();
 
     let entries = catalog
@@ -3019,7 +3028,8 @@ async fn immediate_backfill_overlaps_a_bounded_number_of_files() {
     );
     assert!(
         store.peak_in_flight() <= crate::catalog::BACKFILL_FILE_READ_CONCURRENCY,
-        "the immediate builder must retain a bounded file window"
+        "the immediate builder must retain a bounded file window: peak {}",
+        store.peak_in_flight()
     );
 }
 
