@@ -27,12 +27,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use moraine::{
-    Catalog, CatalogOptions, CensusRequest, ColumnDef, ColumnId, CompactStoreRequest, DataFile,
-    FileIndexEntry, IndexDef, IndexId, IndexKeyValue, IntWidth, MergeOutcome, ReadOnlyCatalog,
-    SubspaceName, TableId,
+use arrow::{
+    array::{Int64Array, RecordBatch},
+    datatypes::{DataType, Field, Schema},
 };
-use object_store::{ObjectStore, aws::AmazonS3Builder};
+use futures::stream::{self, StreamExt};
+use moraine::{
+    CachePreload, Catalog, CatalogOptions, CensusRequest, ColumnDef, ColumnId, CompactStoreRequest,
+    DataFile, FileIndexEntry, IndexDef, IndexId, IndexKeyValue, IntWidth, MergeOutcome,
+    ReadOnlyCatalog, SubspaceName, TableId,
+};
+use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path};
+use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
 struct TimingStats {
     median: Duration,
@@ -722,7 +728,8 @@ impl PhaseSamples {
 /// `warm_tables` row pays the burst explicitly and `lookup_after_warm` is
 /// the first lookup behind it. `locate_row_ids` runs with no data store,
 /// so it prices the catalog side only. Entries live in the store alone, so
-/// no Parquet object is written.
+/// no Parquet object is written. The `_l0` rows repeat attach, cold first
+/// lookup and `warm_tables` on attaches that preload L0 SST metadata.
 ///
 /// A measurement, not an assertion — it prints and passes.
 #[tokio::test]
@@ -763,6 +770,7 @@ async fn measure_index_lookup_latency_against_the_endpoint() {
         "# {INDEX_LOOKUP_REPEATS} repetitions, a fresh read-only attach each; \
          steady_lookup pools {INDEX_LOOKUP_STEADY_KEYS} keys per attach"
     );
+    println!("# _l0 rows attach with cache_preload = L0 (SST metadata preloaded at open)");
     println!(
         "# in_list is one index_lookup_many of {INDEX_LOOKUP_IN_LIST_KEYS} keys; \
          range is one index_range over {INDEX_LOOKUP_RANGE_ENTRIES} entries"
@@ -783,6 +791,11 @@ async fn measure_index_lookup_latency_against_the_endpoint() {
     let mut locate = PhaseSamples::default();
     let mut warm_burst = PhaseSamples::default();
     let mut after_warm = PhaseSamples::default();
+    let mut attach_l0 = PhaseSamples::default();
+    let mut cold_first_l0 = PhaseSamples::default();
+    let mut warm_burst_l0 = PhaseSamples::default();
+    let mut l0_options = options.clone();
+    l0_options.cache_preload = Some(CachePreload::L0);
 
     for repeat in 0..INDEX_LOOKUP_REPEATS as u64 {
         let salt = repeat * 97;
@@ -887,6 +900,33 @@ async fn measure_index_lookup_latency_against_the_endpoint() {
         assert_eq!(rows.unwrap(), vec![key]);
         after_warm.push(elapsed, gets);
         reader.close().await.unwrap();
+
+        let attach_start = Instant::now();
+        let reader = Catalog::open_read_only(store.clone(), l0_options.clone())
+            .await
+            .unwrap();
+        attach_l0.push(
+            attach_start.elapsed(),
+            reader.object_store_tally().main_gets,
+        );
+
+        let key = spread_keys(1, salt + 23)[0];
+        let (elapsed, gets, rows) = timed(
+            &reader,
+            reader.index_lookup(fixture.table, fixture.unique, &[int_key(key)]),
+        )
+        .await;
+        assert_eq!(rows.unwrap(), vec![key]);
+        cold_first_l0.push(elapsed, gets);
+        reader.close().await.unwrap();
+
+        let reader = Catalog::open_read_only(store.clone(), l0_options.clone())
+            .await
+            .unwrap();
+        let (elapsed, gets, warmed) = timed(&reader, reader.warm_tables(&[fixture.table])).await;
+        warmed.unwrap();
+        warm_burst_l0.push(elapsed, gets);
+        reader.close().await.unwrap();
     }
 
     attach.print("attach_read_only");
@@ -899,5 +939,421 @@ async fn measure_index_lookup_latency_against_the_endpoint() {
     locate.print("locate_row_ids");
     warm_burst.print("warm_tables");
     after_warm.print("lookup_after_warm");
+    attach_l0.print("attach_read_only_l0");
+    cold_first_l0.print("cold_first_lookup_l0");
+    warm_burst_l0.print("warm_tables_l0");
+    println!();
+}
+
+/// Data files under the located-lookup measurement: the first
+/// `LOCATED_DENSE_FILES` carry no row-id column and answer from their
+/// allocated range; the rest embed `_ducklake_internal_row_id`, so their
+/// summaries are read from the object.
+const LOCATED_FILES: u64 = 64;
+const LOCATED_DENSE_FILES: u64 = 32;
+/// Embedded-id files whose ids step by 2 (many ids per Roaring container);
+/// the remaining sparse files stride past a container per id.
+const LOCATED_STEPPED_FILES: u64 = 24;
+const LOCATED_ROWS_PER_FILE: u64 = 2_000;
+const LOCATED_SPARSE_BASE: u64 = 1 << 32;
+const LOCATED_SPARSE_SPAN: u64 = 1 << 30;
+const LOCATED_STRIDE: u64 = 65_537;
+const LOCATED_REPEATS: usize = 5;
+const LOCATED_IDS_PER_CALL: u64 = 50;
+
+/// DuckLake's reserved row-id column, tagged so discovery finds it.
+fn row_id_field() -> Field {
+    Field::new("_ducklake_internal_row_id", DataType::Int64, false).with_metadata(
+        std::collections::HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2147483540".to_string(),
+        )]),
+    )
+}
+
+/// Encodes `batch` as one Parquet object and returns
+/// `(file_size_bytes, footer_size)` as the catalog records them.
+fn encode_parquet(batch: &RecordBatch) -> (Vec<u8>, u64, u64) {
+    let mut buffer = Vec::new();
+    {
+        let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+    }
+    let footer_offset = buffer.len() - 8;
+    let footer_size = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
+    let file_size = u64::try_from(buffer.len()).unwrap();
+    (buffer, file_size, footer_size)
+}
+
+/// The embedded row ids of sparse file `file` (`file >= LOCATED_DENSE_FILES`).
+fn sparse_row_ids(file: u64) -> Vec<i64> {
+    let sparse = file - LOCATED_DENSE_FILES;
+    let step = if sparse < LOCATED_STEPPED_FILES {
+        2
+    } else {
+        LOCATED_STRIDE
+    };
+    let base = LOCATED_SPARSE_BASE + sparse * LOCATED_SPARSE_SPAN;
+    (0..LOCATED_ROWS_PER_FILE)
+        .map(|ordinal| i64::try_from(base + ordinal * step).unwrap())
+        .collect()
+}
+
+#[test]
+fn sparse_row_ids_stay_inside_their_file_span_and_apart_from_dense_ranges() {
+    for file in LOCATED_DENSE_FILES..LOCATED_FILES {
+        let ids = sparse_row_ids(file);
+        let base = LOCATED_SPARSE_BASE + (file - LOCATED_DENSE_FILES) * LOCATED_SPARSE_SPAN;
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(ids.iter().all(|id| {
+            let id = u64::try_from(*id).unwrap();
+            id >= base && id < base + LOCATED_SPARSE_SPAN
+        }));
+    }
+    const { assert!(LOCATED_FILES * LOCATED_ROWS_PER_FILE < LOCATED_SPARSE_BASE) };
+}
+
+/// One data file's rows: `a` is the ordinal; sparse files add the row-id
+/// column.
+fn located_batch(file: u64) -> RecordBatch {
+    let values: Vec<i64> = (0..LOCATED_ROWS_PER_FILE)
+        .map(|ordinal| i64::try_from(ordinal).unwrap())
+        .collect();
+    if file < LOCATED_DENSE_FILES {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
+    } else {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            row_id_field(),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(values)),
+                Arc::new(Int64Array::from(sparse_row_ids(file))),
+            ],
+        )
+        .unwrap()
+    }
+}
+
+/// Writes the Parquet objects under `data_prefix/bench/located/` and
+/// registers them, dense files first, against one table.
+async fn seed_located_lookup_measurement(
+    store: Arc<dyn ObjectStore>,
+    options: &CatalogOptions,
+    data_prefix: &str,
+) -> TableId {
+    let mut seed_options = options.clone();
+    seed_options.flush_interval = Duration::from_millis(1);
+    let catalog = Catalog::open(store.clone(), seed_options).await.unwrap();
+
+    let created = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.create_schema("bench")?;
+            let table = tx.create_table(
+                schema,
+                "located",
+                &[ColumnDef {
+                    name: "a".into(),
+                    column_type: "BIGINT".into(),
+                    nulls_allowed: false,
+                    default_value: None,
+                    children: Vec::new(),
+                }],
+            )?;
+            created.set(Some(table));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let table = created.get().expect("table created");
+
+    let files: Vec<DataFile> = stream::iter(0..LOCATED_FILES)
+        .map(|file| {
+            let store = store.clone();
+            let object_path = format!("{data_prefix}/bench/located/f{file}.parquet");
+            async move {
+                let (bytes, file_size_bytes, footer_size) = encode_parquet(&located_batch(file));
+                store
+                    .put(&Path::from(object_path.as_str()), bytes.into())
+                    .await
+                    .unwrap();
+                DataFile {
+                    path: format!("f{file}.parquet"),
+                    path_is_relative: true,
+                    file_format: "parquet".into(),
+                    record_count: LOCATED_ROWS_PER_FILE,
+                    file_size_bytes,
+                    footer_size,
+                    encryption_key: None,
+                    partition_values: Vec::new(),
+                    column_stats: Vec::new(),
+                }
+            }
+        })
+        .buffered(8)
+        .collect()
+        .await;
+
+    catalog
+        .commit(move |tx| {
+            for file in files.clone() {
+                tx.register_data_file(table, file, &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    catalog.close().await.unwrap();
+
+    table
+}
+
+/// `LOCATED_IDS_PER_CALL` present row ids, half from dense files and half
+/// from sparse ones, shifted by `salt` so repetitions touch different rows.
+fn located_ids(dense_starts: &[u64], salt: u64) -> Vec<u64> {
+    let half = LOCATED_IDS_PER_CALL / 2;
+    let dense = (0..half).map(|position| {
+        let file = (position * 5 + salt) % LOCATED_DENSE_FILES;
+        let ordinal = (position * 131 + salt * 7) % LOCATED_ROWS_PER_FILE;
+        dense_starts[usize::try_from(file).unwrap()] + ordinal
+    });
+    let sparse = (0..LOCATED_IDS_PER_CALL - half).map(|position| {
+        let file =
+            LOCATED_DENSE_FILES + (position * 5 + salt) % (LOCATED_FILES - LOCATED_DENSE_FILES);
+        let ordinal = (position * 131 + salt * 7) % LOCATED_ROWS_PER_FILE;
+        u64::try_from(sparse_row_ids(file)[usize::try_from(ordinal).unwrap()]).unwrap()
+    });
+    dense.chain(sparse).collect()
+}
+
+/// Samples of one located phase: wall time, main-store GETs and data-store
+/// GETs.
+#[derive(Default)]
+struct LocatedSamples {
+    durations: Vec<Duration>,
+    main_gets: Vec<u64>,
+    data_gets: Vec<u64>,
+}
+
+impl LocatedSamples {
+    fn push(&mut self, duration: Duration, main_gets: u64, data_gets: u64) {
+        self.durations.push(duration);
+        self.main_gets.push(main_gets);
+        self.data_gets.push(data_gets);
+    }
+
+    fn print(&self, phase: &str) {
+        let stats = TimingStats::of(self.durations.clone());
+        let mut main_gets = self.main_gets.clone();
+        main_gets.sort_unstable();
+        let mut data_gets = self.data_gets.clone();
+        data_gets.sort_unstable();
+        println!(
+            "{phase:>30}  {:>7}  {:>11.2}  {:>9.2}  {:>9.2}  {:>9}  {:>9}",
+            self.durations.len(),
+            milliseconds(stats.median),
+            milliseconds(stats.min),
+            milliseconds(stats.max),
+            main_gets[main_gets.len() / 2],
+            data_gets[data_gets.len() / 2],
+        );
+    }
+}
+
+/// One located phase's wall time and both stores' GET deltas from the
+/// handle's own tally.
+async fn timed_located<F, T>(reader: &ReadOnlyCatalog, operation: F) -> (Duration, u64, u64, T)
+where
+    F: std::future::Future<Output = T>,
+{
+    let before = reader.object_store_tally();
+    let start = Instant::now();
+    let result = operation.await;
+    let elapsed = start.elapsed();
+    let after = reader.object_store_tally();
+    (
+        elapsed,
+        after.main_gets.saturating_sub(before.main_gets),
+        after.data_gets.saturating_sub(before.data_gets),
+        result,
+    )
+}
+
+/// Located-lookup latency against the endpoint with real Parquet objects:
+/// the row-summary path that reads each file's row-id column once and
+/// answers from the resident summary afterwards.
+///
+/// Every repetition attaches fresh and hands `locate_row_ids` a fresh data
+/// store handle, so `locate_cold` builds every file's summary; the summary
+/// cache is keyed by the handle. `locate_warm` repeats the ids on the same
+/// handle. `locate_after_warm_row_summaries` is the first lookup behind an
+/// explicit `warm_row_summaries` on another fresh attach and handle.
+///
+/// A measurement, not an assertion — it prints and passes.
+#[tokio::test]
+#[ignore = "needs a live S3 endpoint; run through `cargo xtask s3`"]
+#[allow(clippy::too_many_lines)]
+async fn measure_located_lookup_latency_against_the_endpoint() {
+    let store = s3_store();
+    let options = options_at("located-lookup-latency");
+    let data_prefix = catalog_path(&options.path, "data");
+    let target = endpoint_label();
+
+    let table = seed_located_lookup_measurement(store.clone(), &options, &data_prefix).await;
+
+    let census_reader = Catalog::open_read_only(store.clone(), options.clone())
+        .await
+        .unwrap();
+    let mut files = census_reader.snapshot().await.unwrap().data_files_of(table);
+    files.sort_by_key(|file| file.id);
+    let dense_starts: Vec<u64> = files
+        .iter()
+        .take(usize::try_from(LOCATED_DENSE_FILES).unwrap())
+        .map(|file| {
+            file.row_id_start
+                .expect("registered files carry a row-id start")
+        })
+        .collect();
+    census_reader.close().await.unwrap();
+    assert_eq!(files.len() as u64, LOCATED_FILES);
+
+    println!("\n# located-lookup latency against {target}");
+    println!("# prefix `{}`, data under `{data_prefix}`", options.path);
+    println!(
+        "# {LOCATED_FILES} Parquet files x {LOCATED_ROWS_PER_FILE} rows: {LOCATED_DENSE_FILES} \
+         dense (no row-id column, answered from the allocated range), {} sparse with embedded \
+         row ids ({LOCATED_STEPPED_FILES} stepping by 2, {} striding by {LOCATED_STRIDE})",
+        LOCATED_FILES - LOCATED_DENSE_FILES,
+        LOCATED_FILES - LOCATED_DENSE_FILES - LOCATED_STEPPED_FILES
+    );
+    println!(
+        "# {LOCATED_REPEATS} repetitions, a fresh read-only attach and data-store handle each; \
+         {LOCATED_IDS_PER_CALL} present ids per locate_row_ids, half dense and half sparse"
+    );
+    println!(
+        "# main_gets/data_gets are the median GET counts the phase issued to the catalog store \
+         and the data store\n"
+    );
+
+    let mut attach = LocatedSamples::default();
+    let mut locate_cold = LocatedSamples::default();
+    let mut locate_warm = LocatedSamples::default();
+    let mut warm_summaries = LocatedSamples::default();
+    let mut locate_after_warm = LocatedSamples::default();
+    let mut first_warmth = None;
+    let mut first_summaries = None;
+
+    for repeat in 0..LOCATED_REPEATS as u64 {
+        let salt = repeat * 97;
+        let ids = located_ids(&dense_starts, salt);
+
+        let attach_start = Instant::now();
+        let reader = Catalog::open_read_only(store.clone(), options.clone())
+            .await
+            .unwrap();
+        attach.push(
+            attach_start.elapsed(),
+            reader.object_store_tally().main_gets,
+            0,
+        );
+
+        let data_store = s3_store();
+        let summaries_before = moraine::cache_status().row_summaries;
+        let (elapsed, main_gets, data_gets, candidates) = timed_located(
+            &reader,
+            Box::pin(reader.locate_row_ids(
+                Some(data_store.clone()),
+                &data_prefix,
+                table,
+                ids.clone(),
+            )),
+        )
+        .await;
+        let candidates = candidates.unwrap();
+        assert_eq!(candidates.len(), ids.len());
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.data_file_id.is_some())
+        );
+        locate_cold.push(elapsed, main_gets, data_gets);
+        first_summaries.get_or_insert_with(|| {
+            let after = moraine::cache_status().row_summaries;
+            (
+                after.range.saturating_sub(summaries_before.range),
+                after.roaring.saturating_sub(summaries_before.roaring),
+                after.sorted.saturating_sub(summaries_before.sorted),
+                after.bytes.saturating_sub(summaries_before.bytes),
+            )
+        });
+
+        let (elapsed, main_gets, data_gets, candidates) = timed_located(
+            &reader,
+            Box::pin(reader.locate_row_ids(
+                Some(data_store.clone()),
+                &data_prefix,
+                table,
+                ids.clone(),
+            )),
+        )
+        .await;
+        assert_eq!(candidates.unwrap().len(), ids.len());
+        locate_warm.push(elapsed, main_gets, data_gets);
+        reader.close().await.unwrap();
+        drop(data_store);
+
+        let reader = Catalog::open_read_only(store.clone(), options.clone())
+            .await
+            .unwrap();
+        let data_store = s3_store();
+        let (elapsed, main_gets, data_gets, warmth) = timed_located(
+            &reader,
+            Box::pin(reader.warm_row_summaries(data_store.clone(), &data_prefix, table)),
+        )
+        .await;
+        let warmth = warmth.unwrap();
+        assert_eq!(warmth.files_failed, 0);
+        first_warmth.get_or_insert(warmth);
+        warm_summaries.push(elapsed, main_gets, data_gets);
+
+        let (elapsed, main_gets, data_gets, candidates) = timed_located(
+            &reader,
+            Box::pin(reader.locate_row_ids(
+                Some(data_store.clone()),
+                &data_prefix,
+                table,
+                ids.clone(),
+            )),
+        )
+        .await;
+        assert_eq!(candidates.unwrap().len(), ids.len());
+        locate_after_warm.push(elapsed, main_gets, data_gets);
+        reader.close().await.unwrap();
+    }
+
+    let warmth = first_warmth.expect("at least one repetition");
+    let (range, roaring, sorted, bytes) = first_summaries.unwrap_or_default();
+    println!(
+        "# warm_row_summaries considered {} files and built {} summaries; the cold locate added \
+         {range} range, {roaring} roaring, and {sorted} sorted row summaries ({bytes} bytes) to \
+         the auxiliary cache\n",
+        warmth.files_considered, warmth.summaries_built,
+    );
+    println!(
+        "{:>30}  {:>7}  {:>11}  {:>9}  {:>9}  {:>9}  {:>9}",
+        "phase", "samples", "median_ms", "min_ms", "max_ms", "main_gets", "data_gets"
+    );
+    attach.print("attach_read_only");
+    locate_cold.print("locate_cold");
+    locate_warm.print("locate_warm");
+    warm_summaries.print("warm_row_summaries");
+    locate_after_warm.print("locate_after_warm_row_summaries");
     println!();
 }

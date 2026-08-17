@@ -46,10 +46,12 @@ pub(crate) use crate::data_file::inline_batch::{
     inline_batch_decode_count, inline_schema_decode_count,
 };
 pub(crate) use crate::data_file::{
-    auxiliary_cache::{occupancy as auxiliary_occupancy, resize as resize_auxiliary},
+    auxiliary_cache::{
+        occupancy as auxiliary_occupancy, resize as resize_auxiliary, row_summary_occupancy,
+    },
     delete_file::delete_file_positions,
     inline_batch::{decode_inline_schema, inline_batch_entries, inline_batch_index_entries},
-    metrics::{ScopedReadMetrics, ScopedReadTally, run_bounded_index_encoding},
+    metrics::{DataStoreCounters, ScopedReadMetrics, ScopedReadTally, run_bounded_index_encoding},
     row_location::{FileSummary, file_summary},
     selection::{RowPositions, ScopedRows},
 };

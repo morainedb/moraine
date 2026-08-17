@@ -27,8 +27,12 @@ Pull requests continue to run `cargo xtask s3` against pinned MinIO. The AWS
 run uses the same ignored `object_storage` suite with CodeBuild's temporary
 service-role credentials and a unique prefix: the bootstrap and read-only
 round-trips, the fresh-attach latency sweep, the durable-commit latency
-sweep, and the index-lookup latency measurement (cold first lookup, warm
-lookups, IN-list, range, and an explicit `warm_tables`). Benchmark data
+sweep, the index-lookup latency measurement (cold first lookup, warm
+lookups, IN-list, range, an explicit `warm_tables`, and the same attach and
+cold rows with `cache_preload = L0`), and the located-lookup latency
+measurement (`locate_row_ids` over real Parquet objects written to the run
+prefix: cold summary build, warm repeat, and an explicit
+`warm_row_summaries`). Benchmark data
 expires after seven days; GitHub keeps the downloaded result for 30 days.
 
 ## One-time AWS setup

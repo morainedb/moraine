@@ -912,7 +912,9 @@ The attach options keep their surface (RFC 0006) and change machinery:
   never surfaces. `ReadOnlyCatalog::warm_tables`
   is the same pass on demand, and the extension runs it after a commit for
   the tables the commit wrote data files against, alongside the row-summary
-  warm.
+  warm; with `CACHE_PRELOAD` set, the extension also warms every table's
+  probe ranges in the background after the open, spawned rather than
+  awaited so the attach does not wait on it, and ended by detach.
 
 **Hit rates before tuning.** The tiers report: hits and misses per slot,
 process-wide through `moraine_cache_tally()` and per attach through

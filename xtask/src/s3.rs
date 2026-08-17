@@ -31,7 +31,7 @@ const S3_BUCKET: &str = "moraine";
 /// Every `#[ignore]`d test in `object_storage.rs`, run together. A
 /// deleted test or a changed `#[ignore]` fails `s3` instead of silently
 /// shrinking the suite.
-const OBJECT_STORAGE_TEST_COUNT: &str = "5 passed";
+const OBJECT_STORAGE_TEST_COUNT: &str = "6 passed";
 
 /// Downloads/caches the pinned MinIO server and client, starts the
 /// server on `S3_ADDRESS` over a fresh data directory, creates the test

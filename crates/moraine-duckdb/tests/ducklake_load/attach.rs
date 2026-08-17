@@ -302,6 +302,39 @@ fn ducklake_attach_cache_options_are_applied() {
     );
 }
 
+/// `META_CACHE_PRELOAD` on a lake with an indexed table: the attach also
+/// warms every table's probe ranges in the background, and a lookup that
+/// may race that warm still resolves. The tally shows the attach read
+/// through the cache; how much the warm itself served is timing-dependent
+/// and not asserted.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn ducklake_attach_cache_preload_warms_indexed_tables() {
+    let dir = TempDir::new("preload-warm-store");
+    let data_dir = TempDir::new("preload-warm-data");
+    let meta = format!(", META_DATA_PATH '{}'", data_dir.path().display());
+
+    let create = |sql: &str| run_ducklake_sql_with_options(dir.path(), data_dir.path(), &meta, sql);
+    create("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    create("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
+    create("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+
+    let rows = csv_rows(&run_ducklake_sql_with_options(
+        dir.path(),
+        data_dir.path(),
+        ", META_CACHE_PRELOAD 'all'",
+        "SELECT (SELECT count(DISTINCT row_id) \
+                 FROM moraine_index_lookup('lake','main','t','by_a',42)) AS found, \
+                (SELECT metadata_hits + metadata_misses + block_hits + block_misses > 0 \
+                 FROM moraine_cache_tally('lake')) AS read_through;",
+    ));
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string(), "true".to_string()]],
+        "a lookup on a preloading attach resolves and reads through the cache"
+    );
+}
+
 /// `ENCRYPTED` end to end. The flag travels `ATTACH (ENCRYPTED,
 /// META_ENCRYPTED true)` → DuckLake's `META_` passthrough → this
 /// shim's inner attach → the store's creation-time flag, which the

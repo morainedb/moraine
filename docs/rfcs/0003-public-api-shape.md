@@ -198,6 +198,25 @@ cache (RFC 0009), for a host that knows which tables a query is about to
 touch. The same pass runs on its own, in the background, the first time a
 handle serves a lookup or inline read for a table.
 
+### Observability
+
+Two read-side counters sit beside the reads, both plain `Copy` structs
+marked `#[non_exhaustive]` so fields can be added without a break:
+
+- `cache_status()` (free function): the process-shared caches' capacity,
+  occupancy, and evictions. Its `row_summaries: RowSummaryOccupancy`
+  splits the auxiliary allowance's file row-id summaries out from the
+  Parquet footers they share it with — `range`, `roaring`, and `sorted`
+  counts of resident summaries by shape, and their `bytes` together, the
+  summary share of `auxiliary_metadata_occupancy_bytes`.
+- `ReadOnlyCatalog::object_store_tally()`: physical requests this handle
+  has issued since it attached. `main_*` and `wal_*` count what SlateDB
+  sent for the catalog store; `data_gets` and `data_bytes` count the byte
+  ranges the handle read from the data store — footers, row-id columns,
+  delete files, and scoped reads under `locate_row_ids`,
+  `warm_row_summaries`, backfill, index build, and commit-time index
+  maintenance. A footer or summary served from cache adds nothing.
+
 ### Writes: closure-with-retry
 
 ```rust

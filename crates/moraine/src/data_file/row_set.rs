@@ -20,8 +20,7 @@ const ROARING_PARTITION_OVERHEAD_BYTES: u64 = 64;
 const ROARING_BITSET_STATISTIC_PER_BYTE: u64 = 8;
 const ROARING_ARRAY_STATISTIC_PER_BYTE: u64 = 2;
 
-/// The representation selected, as the tests assert it.
-#[cfg(test)]
+/// The representation a summary took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FileRowSetKind {
     /// One contiguous half-open range.
@@ -128,7 +127,6 @@ impl FileRowSet {
         }
     }
 
-    #[cfg(test)]
     pub(super) const fn kind(&self) -> FileRowSetKind {
         match self {
             Self::Range { .. } => FileRowSetKind::Range,

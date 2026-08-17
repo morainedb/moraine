@@ -3,7 +3,7 @@ use std::sync::Arc;
 use object_store::{ObjectStore, memory::InMemory, path::Path};
 
 use super::auxiliary_cache::{AuxiliaryCache, FileSummaryKey, store_id};
-use crate::data_file::row_set::FileRowSet;
+use crate::data_file::row_set::{FileRowSet, FileRowSetKind};
 
 fn summary(row_ids: Vec<u64>) -> Arc<FileRowSet> {
     Arc::new(FileRowSet::from_sorted(row_ids).unwrap())
@@ -117,4 +117,53 @@ fn resizing_up_keeps_resident_entries() {
 
     assert_eq!(cache.capacity(), 1 << 20);
     assert!(cache.summary(&store, &key(&path)).is_some());
+}
+
+/// The shape counts and summary bytes follow what is resident, and only
+/// summaries: a footer entry contributes nothing.
+#[test]
+fn row_summary_occupancy_counts_each_shape_and_its_bytes() {
+    let cache = AuxiliaryCache::new(1 << 20);
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let range = summary((0..100).collect());
+    let roaring = summary((0..2_000).map(|row| row * 3).collect());
+    let sorted = fragmented(8);
+    let range_path = Path::from("range.parquet");
+    let roaring_path = Path::from("roaring.parquet");
+    let sorted_paths: Vec<Path> = (0..3)
+        .map(|index| Path::from(format!("sorted-{index}.parquet")))
+        .collect();
+
+    assert_eq!(range.kind(), FileRowSetKind::Range);
+    assert_eq!(roaring.kind(), FileRowSetKind::Roaring);
+    assert_eq!(sorted.kind(), FileRowSetKind::Sorted);
+
+    cache.insert_summary(&store, &key(&range_path), &range);
+    cache.insert_summary(&store, &key(&roaring_path), &roaring);
+    for path in &sorted_paths {
+        cache.insert_summary(&store, &key(path), &sorted);
+    }
+
+    let occupancy = cache.row_summaries();
+    assert_eq!(
+        (occupancy.range, occupancy.roaring, occupancy.sorted),
+        (1, 1, 3)
+    );
+    assert_eq!(
+        occupancy.bytes,
+        range.estimated_bytes() + roaring.estimated_bytes() + 3 * sorted.estimated_bytes()
+    );
+
+    // Shrinking to nothing evicts everything, and the counts follow.
+    cache.resize(1);
+    let emptied = cache.row_summaries();
+    assert_eq!(
+        (
+            emptied.range,
+            emptied.roaring,
+            emptied.sorted,
+            emptied.bytes
+        ),
+        (0, 0, 0, 0)
+    );
 }

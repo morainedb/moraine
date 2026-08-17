@@ -20,9 +20,13 @@ use parquet::{
 use tracing::warn;
 
 use crate::{
-    data_file::{reader::ObjectStoreReader, row_set::FileRowSet, usize_as_u64},
+    data_file::{
+        reader::ObjectStoreReader,
+        row_set::{FileRowSet, FileRowSetKind},
+        usize_as_u64,
+    },
     error::{Error, Result},
-    store::cache,
+    store::cache::{self, RowSummaryOccupancy},
 };
 
 /// Whether a cached footer carries the page index. Mirrors
@@ -125,17 +129,69 @@ pub(super) fn store_id(store: &Arc<dyn ObjectStore>) -> u64 {
     id
 }
 
+/// Resident row summaries by shape, and their bytes together. Counted up
+/// on insertion and down as entries leave, whatever the reason.
+#[derive(Default)]
+struct RowSummaryCounters {
+    range: AtomicU64,
+    roaring: AtomicU64,
+    sorted: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl RowSummaryCounters {
+    fn of(&self, kind: FileRowSetKind) -> &AtomicU64 {
+        match kind {
+            FileRowSetKind::Range => &self.range,
+            FileRowSetKind::Roaring => &self.roaring,
+            FileRowSetKind::Sorted => &self.sorted,
+        }
+    }
+
+    fn entered(&self, weighed: &Weighed) {
+        if let AuxiliaryValue::Summary(rows) = &weighed.value {
+            self.of(rows.kind()).fetch_add(1, Ordering::Relaxed);
+            self.bytes
+                .fetch_add(usize_as_u64(weighed.bytes), Ordering::Relaxed);
+        }
+    }
+
+    fn left(&self, weighed: &Weighed) {
+        if let AuxiliaryValue::Summary(rows) = &weighed.value {
+            saturating_decrement(self.of(rows.kind()), 1);
+            saturating_decrement(&self.bytes, usize_as_u64(weighed.bytes));
+        }
+    }
+
+    fn occupancy(&self) -> RowSummaryOccupancy {
+        RowSummaryOccupancy {
+            range: self.range.load(Ordering::Relaxed),
+            roaring: self.roaring.load(Ordering::Relaxed),
+            sorted: self.sorted.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn saturating_decrement(counter: &AtomicU64, by: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(by))
+    });
+}
+
 /// One weighted cache over both footers and summaries.
 pub(super) struct AuxiliaryCache {
     cache: Cache<AuxiliaryKey, Weighed>,
     /// What the cache was last built or resized to.
     capacity: Arc<AtomicUsize>,
+    summaries: Arc<RowSummaryCounters>,
 }
 
 impl AuxiliaryCache {
     pub(super) fn new(capacity: usize) -> Self {
         let admitted = Arc::new(AtomicUsize::new(capacity));
         let limit = Arc::clone(&admitted);
+        let summaries = Arc::new(RowSummaryCounters::default());
 
         // One shard: foyer splits capacity across shards, and a footer must
         // fit within one.
@@ -146,12 +202,15 @@ impl AuxiliaryCache {
                 let limit = limit.load(Ordering::Relaxed);
                 limit > 0 && value.bytes <= limit
             })
-            .with_event_listener(Arc::new(EvictionCounter))
+            .with_event_listener(Arc::new(EvictionCounter {
+                summaries: Arc::clone(&summaries),
+            }))
             .build();
 
         Self {
             cache,
             capacity: admitted,
+            summaries,
         }
     }
 
@@ -225,9 +284,13 @@ impl AuxiliaryCache {
         Fut: Future<Output = Result<Arc<FileRowSet>>> + Send + 'static,
     {
         let fill = fill();
+        let summaries = Arc::clone(&self.summaries);
         let fill = || async move {
-            fill.await
-                .map(|rows| Weighed::from(AuxiliaryValue::Summary(rows)))
+            fill.await.map(|rows| {
+                let weighed = Weighed::from(AuxiliaryValue::Summary(rows));
+                summaries.entered(&weighed);
+                weighed
+            })
         };
 
         let entry = self
@@ -252,10 +315,10 @@ impl AuxiliaryCache {
         key: &FileSummaryKey<'_>,
         rows: &Arc<FileRowSet>,
     ) {
-        self.cache.insert(
-            Self::file_summary_key(store, key),
-            Weighed::from(AuxiliaryValue::Summary(Arc::clone(rows))),
-        );
+        let weighed = Weighed::from(AuxiliaryValue::Summary(Arc::clone(rows)));
+        self.summaries.entered(&weighed);
+        self.cache
+            .insert(Self::file_summary_key(store, key), weighed);
     }
 
     fn file_summary_key(store: &Arc<dyn ObjectStore>, key: &FileSummaryKey<'_>) -> AuxiliaryKey {
@@ -292,6 +355,10 @@ impl AuxiliaryCache {
     pub(super) fn usage(&self) -> usize {
         self.cache.usage()
     }
+
+    pub(super) fn row_summaries(&self) -> RowSummaryOccupancy {
+        self.summaries.occupancy()
+    }
 }
 
 fn summary_of(value: &AuxiliaryValue) -> Option<Arc<FileRowSet>> {
@@ -310,13 +377,16 @@ fn metadata_of(value: &AuxiliaryValue) -> ParquetResult<Arc<ParquetMetaData>> {
     }
 }
 
-struct EvictionCounter;
+struct EvictionCounter {
+    summaries: Arc<RowSummaryCounters>,
+}
 
 impl foyer::EventListener for EvictionCounter {
     type Key = AuxiliaryKey;
     type Value = Weighed;
 
-    fn on_leave(&self, reason: foyer::Event, _: &AuxiliaryKey, _: &Weighed) {
+    fn on_leave(&self, reason: foyer::Event, _: &AuxiliaryKey, value: &Weighed) {
+        self.summaries.left(value);
         if reason == foyer::Event::Evict {
             cache::auxiliary_evicted();
         }
@@ -337,6 +407,11 @@ pub(crate) fn occupancy() -> (u64, u64) {
         usize_as_u64(SHARED.capacity()),
         usize_as_u64(SHARED.usage()),
     )
+}
+
+/// The resident row summaries by shape, for the process's cache report.
+pub(crate) fn row_summary_occupancy() -> RowSummaryOccupancy {
+    SHARED.row_summaries()
 }
 
 /// Sizes the cache to the allowance the first attach reserved.
