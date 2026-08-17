@@ -50,7 +50,15 @@ public:
 	// DuckDB transaction stages every write into, and returns it. Every
 	// subsequent INSERT/UPDATE/DELETE within the same DuckDB transaction
 	// reuses it: one moraine staged tx per DuckDB transaction.
+	//
+	// Drops every held materialization, because a caller reaching for the
+	// staged tx without naming a table may stage against any of them.
+	// `StagedTxFor` is the narrower form.
 	MoraineTxHandle *StagedTx();
+
+	// `StagedTx` for a caller staging against exactly `spec`. Only that
+	// table's overlay can change, so only its materialization is dropped.
+	MoraineTxHandle *StagedTxFor(const MetadataTableSpec &spec);
 
 	// The staged tx if one has been opened, else null — a peek for read
 	// paths that must observe the transaction's own staged writes without
@@ -66,11 +74,15 @@ public:
 
 	// The one materialization of a synthesized `ducklake_*` table this
 	// transaction serves every reader of it from, or null before its first
-	// scan. Only populated while no staged tx is open — once one is, the
-	// staged tx's own read point pins the transaction's reads instead, and
-	// `StagedTx` drops what these hold. `MetadataRowsFor`
-	// (metadata_tables.hpp) is the only caller of this pair and states what
-	// rests on the sharing.
+	// scan.
+	//
+	// Held across both read points a transaction can have, because neither
+	// moves under a materialization: before any write, the transaction's
+	// snapshot; after, the staged tx's own pinned read point. Opening a
+	// staged tx crosses between them and drops everything held; staging a
+	// row drops the table it lands in, whose overlay just changed.
+	// `MetadataRowsFor` (metadata_tables.hpp) is the only caller of this
+	// pair and states what rests on the sharing.
 	std::shared_ptr<const MetadataRows> GetMetadataRows(const MetadataTableSpec &spec) const;
 	void PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows);
 
@@ -81,6 +93,10 @@ private:
 	std::unordered_map<uint64_t, duckdb::unique_ptr<duckdb::SchemaCatalogEntry>> schema_cache_;
 	MoraineTxHandle *staged_tx_ = nullptr;
 	std::unordered_map<const MetadataTableSpec *, std::shared_ptr<const MetadataRows>> metadata_rows_;
+
+	// Opens the staged tx if this transaction has none, leaving what the
+	// two public accessors hold to them.
+	MoraineTxHandle *OpenStagedTx();
 };
 
 class MoraineTransactionManager : public duckdb::TransactionManager {

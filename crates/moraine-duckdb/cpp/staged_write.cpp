@@ -107,7 +107,9 @@ protected:
 	MoraineTxHandle *StagedTx(duckdb::ClientContext &client) const {
 		auto catalog_transaction = catalog_.GetCatalogTransaction(client);
 		auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
-		return moraine_tx.StagedTx();
+		// Named, because every row this operator stages lands in `spec_`'s
+		// table: no other table's materialization goes stale for it.
+		return moraine_tx.StagedTxFor(spec_);
 	}
 
 	// Takes the list the scan emitted its rowids into, so this Sink resolves

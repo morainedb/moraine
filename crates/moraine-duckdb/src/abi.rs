@@ -1907,10 +1907,11 @@ pub unsafe extern "C" fn moraine_index_drop(
 }
 
 /// Runs one moraine-owned maintenance pass, reclaiming the entry ranges
-/// of indexes no longer live, and writes what it reclaimed to
-/// `*indexes_swept` and `*entries_reclaimed`. The pass mints no snapshot
-/// and leaves head unchanged. `batch_size` bounds the deletes per commit;
-/// 0 takes the core default.
+/// of indexes no longer live and the file column statistics of data files
+/// no snapshot can still resolve, and writes what it reclaimed to
+/// `*indexes_swept`, `*entries_reclaimed`, and `*file_stats_reclaimed`.
+/// The pass mints no snapshot and leaves head unchanged. `batch_size`
+/// bounds the deletes per commit; 0 takes the core default.
 ///
 /// # Safety
 ///
@@ -1923,6 +1924,7 @@ pub unsafe extern "C" fn moraine_maintain(
     batch_size: u64,
     indexes_swept: *mut u64,
     entries_reclaimed: *mut u64,
+    file_stats_reclaimed: *mut u64,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
@@ -1975,6 +1977,10 @@ pub unsafe extern "C" fn moraine_maintain(
         if !entries_reclaimed.is_null() {
             // SAFETY: caller contract — non-null means writable.
             unsafe { *entries_reclaimed = report.index_entries_reclaimed };
+        }
+        if !file_stats_reclaimed.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *file_stats_reclaimed = report.file_column_stats_reclaimed };
         }
         Ok(())
     };
@@ -4207,13 +4213,15 @@ mod tests {
         // nothing and says so rather than failing.
         let mut indexes = u64::MAX;
         let mut entries = u64::MAX;
-        // SAFETY: `handle` is live; both slots are writable locals.
+        let mut file_stats = u64::MAX;
+        // SAFETY: `handle` is live; every slot is a writable local.
         let code = unsafe {
             moraine_maintain(
                 handle,
                 0,
                 &raw mut indexes,
                 &raw mut entries,
+                &raw mut file_stats,
                 None,
                 ptr::null_mut(),
                 &raw mut err,
@@ -4222,6 +4230,7 @@ mod tests {
         assert_eq!(code, codes::OK, "maintain failed");
         assert_eq!(indexes, 0);
         assert_eq!(entries, 0);
+        assert_eq!(file_stats, 0);
 
         // Null out-parameters are accepted: a caller that wants only the
         // status code passes neither slot.
@@ -4230,6 +4239,7 @@ mod tests {
             moraine_maintain(
                 handle,
                 64,
+                ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
                 None,

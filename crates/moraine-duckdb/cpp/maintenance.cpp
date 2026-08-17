@@ -498,6 +498,14 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	                     ? RunSweep()
 	                     : MaintenanceStep {"sweep_indexes", "skipped", "disabled at attach"});
 
+	// Reported separately from the pass that does the work, because what
+	// orphans file column statistics is DuckLake's expiry above rather
+	// than anything moraine's own reclamation did — reading one number
+	// against the other is how a leak here gets noticed.
+	report.push_back(config_.sweep_indexes
+	                     ? RunFileStatsSweep()
+	                     : MaintenanceStep {"sweep_file_stats", "skipped", "disabled at attach"});
+
 	// The store merge runs last, on what every step above it left behind:
 	// expiry tombstones rows and the sweep deletes index ranges, so
 	// merging earlier would leave exactly the tombstones this pass just
@@ -579,21 +587,37 @@ MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connec
 MaintenanceStep MaintenanceScheduler::RunSweep() {
 	uint64_t indexes = 0;
 	uint64_t entries = 0;
+	// One pass reclaims both, so the file-statistics count is carried out
+	// here and reported by `RunFileStatsSweep` without a second call.
+	file_stats_reclaimed_ = 0;
 	MoraineError err {};
 	// No interrupt probe: the sweep runs on the scheduler's own thread,
 	// which stops through the stop flag rather than a query interrupt.
-	auto code = moraine_maintain(handle_, config_.batch_size, &indexes, &entries, nullptr, nullptr, &err);
+	auto code =
+	    moraine_maintain(handle_, config_.batch_size, &indexes, &entries, &file_stats_reclaimed_, nullptr, nullptr,
+	                     &err);
 	if (code != MORAINE_OK) {
 		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
 		if (err.message != nullptr) {
 			moraine_error_free(err.message);
 		}
+		file_stats_swept_ = false;
 		return MaintenanceStep {"sweep_indexes", "failed", message};
 	}
+	file_stats_swept_ = true;
 	return MaintenanceStep {"sweep_indexes", "ran",
 	                        "reclaimed " + std::to_string(entries) + (entries == 1 ? " entry" : " entries") +
 	                            " from " + std::to_string(indexes) +
 	                            (indexes == 1 ? " dropped index" : " dropped indexes")};
+}
+
+MaintenanceStep MaintenanceScheduler::RunFileStatsSweep() {
+	if (!file_stats_swept_) {
+		return MaintenanceStep {"sweep_file_stats", "skipped", "the pass that reclaims them failed"};
+	}
+	return MaintenanceStep {"sweep_file_stats", "ran",
+	                        "reclaimed " + std::to_string(file_stats_reclaimed_) +
+	                            (file_stats_reclaimed_ == 1 ? " file column statistic" : " file column statistics")};
 }
 
 MaintenanceStep MaintenanceScheduler::RunStoreMerge() {

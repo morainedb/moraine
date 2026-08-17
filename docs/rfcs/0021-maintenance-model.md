@@ -196,7 +196,21 @@ configure:
 | 5 | Cleanup | `CLEANUP_OLD_FILES[_OLDER_THAN\|_CLEANUP_ALL]` | `CALL ducklake_cleanup_old_files('lake', …)` |
 | 6 | Orphans | `DELETE_ORPHANED_FILES[_OLDER_THAN\|_CLEANUP_ALL]` | `CALL ducklake_delete_orphaned_files('lake', …)` |
 | 7 | Sweep | `SWEEP_INDEXES` (default **true**) | `Catalog::maintain` — core |
+| 7b | Sweep file stats | `SWEEP_INDEXES` (default **true**) | `Catalog::maintain` — core |
 | 8 | Merge store | `COMPACT_STORE[_SUBSPACE\|_TIMEOUT]` | `Catalog::compact_store` — core |
+
+Step 7b shares step 7's pass and its switch — one `Catalog::maintain` call
+reclaims both — and is reported separately because what orphans file column
+statistics is step 1's expiry rather than anything moraine did. Reading one
+count against the other is how a leak upstream becomes visible.
+
+**File column statistics carry no snapshot**, so the single record is what
+every read of that file resolves through, including a time-travelling one
+whose file record comes from history. They are reclaimable only once the
+file is absent from **both** live state and history — which is where step 1
+followed by step 5 leaves it, and which is why nothing on the write path
+may cascade them: expiry *ends* a data file into history rather than
+erasing it, and the past still resolves it.
 
 The call syntax is what the e2e suite already exercises against real
 DuckLake (`tests/ducklake_load/maintenance.rs:47,91,150,230,333`).
@@ -370,7 +384,7 @@ Three properties the scheduler must hold:
   / `failed`), and `detail`. Retaining a window rather than only the
   newest pass is load-bearing — with one slot a failure is erased by the
   next success, and a short interval would hide strictly more than a long
-  one. Sixteen is the binding cap: at eight fixed steps it is at most 128
+  one. Sixteen is the binding cap: at nine fixed steps it is at most 144
   small diagnostic rows, enough to preserve fifteen later successes after
   one failure without turning status into an event log.
 
@@ -464,7 +478,7 @@ application's catalog to change a maintenance option. That is not a
 configuration an operator wants to keep — it is a single action. The pass
 remains the scheduled form; both call the same core verb, so neither can
 drift from the other. Its two parameters are its own rather than a copy of
-the pass's, because the pass configures eight steps and this configures one
+the pass's, because the pass configures nine steps and this configures one
 merge.
 
 `CALL moraine_store_census('lake')` is a separate table function, not a
