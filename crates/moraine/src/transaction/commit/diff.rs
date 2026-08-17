@@ -508,9 +508,19 @@ fn diff_file_column_stats(
             .chain(state_cols.keys())
             .collect::<BTreeSet<_>>()
         {
-            // A file registered and expired within this commit exists in
-            // neither side's data files.
-            if !base_files.contains_key(&data_file_id) && !state_files.contains_key(&data_file_id) {
+            let base_stats = base_cols.get(&(data_file_id, column_id));
+            let state_stats = state_cols.get(&(data_file_id, column_id));
+            let file_is_known =
+                base_files.contains_key(&data_file_id) || state_files.contains_key(&data_file_id);
+            let retiring = base_stats.is_some() && state_stats.is_none();
+            // A file in neither side's data files may not *gain*
+            // statistics — it was registered and expired within this
+            // commit. Losing them still stages: this arm is the only one
+            // that can retire a statistics row, so anything it skips is
+            // stranded for good. Expiring the snapshots that registered a
+            // file takes it out of both sides, which is exactly when a
+            // caller is deleting its statistics.
+            if !file_is_known && !retiring {
                 continue;
             }
             stage_overwrite(
@@ -520,8 +530,8 @@ fn diff_file_column_stats(
                     data_file_id,
                     column_id,
                 },
-                base_cols.get(&(data_file_id, column_id)),
-                state_cols.get(&(data_file_id, column_id)),
+                base_stats,
+                state_stats,
             );
         }
     }

@@ -627,3 +627,68 @@ fn ducklake_narrowed_file_column_stats_scan_reads_and_writes_the_right_rows() {
     assert!(per_table("second").is_empty(), "second's statistics went");
     assert_eq!(per_table("first"), first, "first's statistics stayed");
 }
+
+/// Narrowing the file-statistics scan never changes what a query returns,
+/// whatever shape the filter takes.
+///
+/// The scan reads an equality on `table_id` to decide how much to
+/// materialize and **consumes no filter**, so DuckDB still applies every
+/// one of them. That is what keeps an unrecognized shape merely slower
+/// instead of wrong — and it is the property that breaks the moment anyone
+/// sets `filter_pushdown`, which would hand this scan predicates it does
+/// not implement. Differential, because a moraine-only assertion would
+/// encode whatever it currently does as correct.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn ducklake_narrowing_the_statistics_scan_changes_no_answer() {
+    let dir = TempDir::new("scope-safe-store");
+    let data_dir = TempDir::new("scope-safe-data");
+    let reference_meta = TempDir::new("scope-safe-ref-meta");
+    let reference_data = TempDir::new("scope-safe-ref-data");
+
+    let apply = |sql: &str| {
+        run_ducklake_sql(dir.path(), data_dir.path(), sql);
+        run_reference_ducklake_sql(reference_meta.path(), reference_data.path(), sql);
+    };
+    let probe = |sql: &str| {
+        let moraine_rows = csv_rows(&run_ducklake_sql(dir.path(), data_dir.path(), sql));
+        let reference_rows = csv_rows(&run_reference_ducklake_sql(
+            reference_meta.path(),
+            reference_data.path(),
+            sql,
+        ));
+        assert_eq!(
+            moraine_rows, reference_rows,
+            "moraine diverges from stock DuckLake for `{sql}`"
+        );
+        assert!(!moraine_rows.is_empty(), "`{sql}` must match something");
+    };
+
+    apply(
+        "CREATE TABLE lake.main.first (a BIGINT, b BIGINT);\
+         CREATE TABLE lake.main.second (a BIGINT, b BIGINT);\
+         INSERT INTO lake.main.first SELECT range, range FROM range(0,32);\
+         INSERT INTO lake.main.second SELECT range, range FROM range(0,32);\
+         CALL ducklake_flush_inlined_data('lake');",
+    );
+
+    let stats = "SELECT table_id, column_id, value_count \
+                 FROM __ducklake_metadata_lake.ducklake_file_column_stats";
+    // The shape the scan narrows on, alone and carrying a second predicate
+    // it does not implement — the second must still be applied.
+    probe(&format!("{stats} WHERE table_id = 1 ORDER BY column_id;"));
+    probe(&format!(
+        "{stats} WHERE table_id = 1 AND value_count > 0 ORDER BY column_id;"
+    ));
+    // Shapes the match rejects outright: a range, a disjunction, and an
+    // equality on a column that is not the scope column.
+    probe(&format!(
+        "{stats} WHERE table_id >= 1 ORDER BY table_id, column_id;"
+    ));
+    probe(&format!(
+        "{stats} WHERE table_id = 1 OR table_id = 2 ORDER BY table_id, column_id;"
+    ));
+    probe(&format!(
+        "{stats} WHERE value_count > 0 ORDER BY table_id, column_id;"
+    ));
+}
