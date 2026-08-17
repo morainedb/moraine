@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/morainedb/moraine/compare/v0.5.2...v0.6.0) - 2026-08-17
+
+### Added
+
+- Make data caches store-scoped and persistent
+- Add attach-time warming for preloaded caches
+- locate index-resolved rows and prune scans to the files holding them ([#150](https://github.com/morainedb/moraine/pull/150))
+- *(cache)* scale the parsed-metadata allowance and report the decoded catalog ([#149](https://github.com/morainedb/moraine/pull/149))
+- *(cache)* give SST metadata eviction priority over data blocks ([#148](https://github.com/morainedb/moraine/pull/148))
+- backfill DuckLake row ID file statistics ([#145](https://github.com/morainedb/moraine/pull/145))
+
+### Fixed
+
+- Overlap table warming with reader operations
+
+### Other
+
+- *(transaction)* reuse translated head view ([#151](https://github.com/morainedb/moraine/pull/151))
+- expose and tune index lookup maintenance ([#137](https://github.com/morainedb/moraine/pull/137))
+- streamline index maintenance reads ([#135](https://github.com/morainedb/moraine/pull/135))
+
 ## [0.5.2](https://github.com/morainedb/moraine/compare/v0.5.1...v0.5.2) - 2026-08-13
 
 ### Added
