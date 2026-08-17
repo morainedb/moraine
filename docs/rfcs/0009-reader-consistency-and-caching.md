@@ -898,21 +898,20 @@ The attach options keep their surface (RFC 0006) and change machinery:
   it stays one fetch per probed block behind the filters just warmed. The
   attach contract holds: warm inside the open, caps govern, a shortfall
   is warned with both numbers, a failure is skipped rather than fatal.
-- **Per-table warm on first touch.** The `index` and `inline` subspaces
-  scale with the data, so their warm is per table and lazy: the first
-  index lookup, range, NULL probe, or inline-row read a handle serves for
-  a table runs a warm joined with that read, so the burst overlaps it and
-  no task outlives the call: it reads, in probe shape, the first entry of
-  each of that table's index ranges (`index/<kind>/<index id>`) and inline
-  ranges (`inline/<table id>` per operation kind, its schemas and
-  chunk-range locators), admitting the SST metadata and first block a
-  probe there would fetch — one burst rather than a round trip per probe.
-  A handle warms each table once (`warmed_tables`, which an explicit
-  `warm_tables` also marks); a warm that fails is logged at trace level and
-  never surfaces. `ReadOnlyCatalog::warm_tables`
-  is the same pass on demand, and the extension runs it after a commit for
-  the tables the commit wrote data files against, alongside the row-summary
-  warm.
+- **Per-table warm, explicit.** The `index` and `inline` subspaces
+  scale with the data, so their warm is per table and never implicit: no
+  read triggers it. `ReadOnlyCatalog::warm_tables` reads, in probe shape,
+  the first entry of each named table's index ranges
+  (`index/<kind>/<index id>`) and inline ranges (`inline/<table id>` per
+  operation kind, its schemas and chunk-range locators), admitting the SST
+  metadata and first block a probe there would fetch — one burst rather
+  than a round trip per probe. Ranges are read many at a time, sized for a
+  remote object store; a range that fails to read is skipped and counted
+  in the log, never surfaced. The extension runs it after a commit for the
+  tables the commit wrote data files against, alongside the row-summary
+  warm; with `CACHE_PRELOAD` set, the extension also warms every table's
+  probe ranges in the background after the open, spawned rather than
+  awaited so the attach does not wait on it, and ended by detach.
 
 **Hit rates before tuning.** The tiers report: hits and misses per slot,
 process-wide through `moraine_cache_tally()` and per attach through

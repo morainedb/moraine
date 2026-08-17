@@ -298,18 +298,20 @@ decide what stays. The option threads through the shim (`moraine_attach`'s
 the above leave a fresh process cold: the cache fills as queries ask for
 blocks, so the first query of an attach pays every first touch itself.
 `CACHE_PRELOAD` warms the store into the cache while the attach opens, by
-reading it (RFC 0009) — `'l0'` touches every subspace far enough to pull
-its SST metadata, `'all'` additionally walks the scan-shaped subspaces
-whole, `'none'` (the default) warms nothing. Neither pulls the `index`
+reading it (RFC 0009) — `'l0'` (the default) touches every subspace far
+enough to pull its SST metadata, `'all'` additionally walks the scan-shaped
+subspaces whole, `'none'` (or `'off'`) warms nothing. Neither pulls the `index`
 subspace's data bulk, so a store whose weight is a multi-GiB `index` run
 preloads in metadata-sized bytes rather than store-sized ones; a table's
 `index` and `inline` ranges are warmed per table instead, in the
 background, the first time a query touches it and after each commit that
-writes data files against it (RFC 0009). It crosses
-the ABI as a level code (`0`, `1`, `2`) on `moraine_attach` and
-`moraine_migrate`, and any other code is refused rather than treated as
-"none", so a misspelled level surfaces as an error instead of an attach
-that merely feels slow.
+writes data files against it; at any level but `'none'`, the extension also
+warms every table's probe ranges in the background after the open, so the
+first lookup on any table finds them cached (RFC 0009). The shim's option
+parsing owns the default; the level crosses the ABI as a code (`0`, `1`,
+`2`) on `moraine_attach` and `moraine_migrate`, and any other code is
+refused rather than treated as "none", so a misspelled level surfaces as an
+error instead of an attach that merely feels slow.
 
 The cost lands entirely on the attach. The warm runs inside the open — the
 handle is returned only once it finishes — with bounded parallelism, and
@@ -320,11 +322,13 @@ a half-warmed attach looking exactly like a warm one, so moraine compares
 the bytes the warm would fetch against the governing cap as it opens and
 warns with both numbers. A subspace that fails to warm is skipped rather
 than fatal: a preload is an optimization, and no attach should die
-because one read did not land. Subspace-awareness makes `'all'` the
-normal choice — it fetches metadata plus the scan-shaped subspaces, not the
-store — trading a slower ATTACH for a first query that touches object
-storage not at all; `'l0'` suits an attach that must return fast against a
-store with a deep unfolded tail.
+because one read did not land. Subspace-awareness keeps the `'l0'`
+default's cost small — on S3 it adds about 120 ms to the attach and takes
+a table's first index lookup from roughly 400 ms to 3 ms — and `'all'` the
+choice for an attach that can wait: it fetches metadata plus the
+scan-shaped subspaces, not the store, trading a slower ATTACH for a first
+query that touches object storage not at all. `'none'` suits an attach that
+must return as fast as the open allows.
 
 **`moraine_cache_tally()` — what the cache has served.** One row:
 `metadata_hits`/`metadata_misses` and `block_hits`/`block_misses` with a

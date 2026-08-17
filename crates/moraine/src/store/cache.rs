@@ -204,6 +204,7 @@ pub struct CacheTally {
 /// Current size and pressure of the process-shared caches. The disk figure
 /// is a configured capacity, not live occupancy.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheStatus {
     /// Memory reserved for decoded SlateDB filters, indexes, and stats.
     pub metadata_capacity_bytes: u64,
@@ -225,6 +226,23 @@ pub struct CacheStatus {
     pub auxiliary_metadata_occupancy_bytes: u64,
     /// Parsed Parquet metadata entries evicted since the cache was built.
     pub auxiliary_metadata_evictions: u64,
+    /// The row summaries resident within the auxiliary allowance, by shape.
+    pub row_summaries: RowSummaryOccupancy,
+}
+
+/// Resident file row-id summaries by shape, and their bytes together; the
+/// summary share of `auxiliary_metadata_occupancy_bytes`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RowSummaryOccupancy {
+    /// Summaries held as one dense range.
+    pub range: u64,
+    /// Summaries held as a compressed bitmap.
+    pub roaring: u64,
+    /// Summaries held as sorted row ids.
+    pub sorted: u64,
+    /// Estimated resident bytes across all three.
+    pub bytes: u64,
 }
 
 /// Physical object-store requests SlateDB has issued for one catalog,
@@ -232,6 +250,7 @@ pub struct CacheStatus {
 /// shares the main store. Durations sum completed request latency, so
 /// concurrent requests can exceed wall-clock time.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ObjectStoreTally {
     /// Reads from the main store.
     pub main_gets: u64,
@@ -260,6 +279,12 @@ pub struct ObjectStoreTally {
     /// Failed request attempts across both stores, including errors SlateDB
     /// handles internally such as missing-object probes.
     pub errors: u64,
+    /// Byte ranges read from the data store: Parquet footers, row-id
+    /// columns, delete files, and scoped reads. A store may coalesce
+    /// adjacent ranges into fewer requests.
+    pub data_gets: u64,
+    /// Bytes those reads returned.
+    pub data_bytes: u64,
 }
 
 impl CacheTally {
@@ -330,6 +355,8 @@ impl ObjectStoreTally {
                 .wal_delete_duration
                 .saturating_sub(before.wal_delete_duration),
             errors: self.errors.saturating_sub(before.errors),
+            data_gets: self.data_gets.saturating_sub(before.data_gets),
+            data_bytes: self.data_bytes.saturating_sub(before.data_bytes),
         }
     }
 }
@@ -433,6 +460,8 @@ impl CacheCounters {
             wal_deletes: load(&self.wal_deletes),
             wal_delete_duration: duration(&self.wal_delete_nanoseconds),
             errors: load(&self.object_store_errors),
+            data_gets: 0,
+            data_bytes: 0,
         }
     }
 
@@ -735,6 +764,7 @@ pub fn cache_status() -> CacheStatus {
         auxiliary_metadata_capacity_bytes: auxiliary_capacity,
         auxiliary_metadata_occupancy_bytes: auxiliary_usage,
         auxiliary_metadata_evictions: AUXILIARY_METADATA_EVICTIONS.load(Ordering::Relaxed),
+        row_summaries: data_file::row_summary_occupancy(),
     }
 }
 

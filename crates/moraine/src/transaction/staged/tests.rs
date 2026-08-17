@@ -1467,6 +1467,7 @@ async fn commit_reports_the_deferred_indexes_it_leaves_maintaining() {
         Arc::clone(catalog.projections()),
         Some(store),
         String::new(),
+        Arc::default(),
     );
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,

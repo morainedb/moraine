@@ -731,7 +731,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// only the first attach in the process sets them — a later attach naming
 	// different ones is served what stands. `CACHE_PUTS` and `CACHE_PRELOAD`
 	// are per attach: the first admits the SST metadata this store writes as
-	// it is written, the second warms this store's bytes as the attach opens.
+	// it is written, the second warms this store's bytes as the attach opens
+	// and defaults to 'l0'.
 	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
 	// time, so the open writes nothing at all; the ABI refuses it on a
 	// read-write attach.
@@ -741,7 +742,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	uint64_t cache_size_bytes = 0;
 	uint64_t cache_memory_bytes = 0;
 	bool cache_puts = false;
-	uint8_t cache_preload = 0;
+	uint8_t cache_preload = 1;
 	std::string checkpoint;
 	// DuckLake's `META_DATA_PATH` passthrough arrives here as `data_path`;
 	// it is the DATA_PATH the index scoped read and maintenance resolve data
@@ -782,7 +783,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			// Spelled as a level rather than a flag: "l0" is bounded by how far
 			// the store has run since its last merge, "all" by the whole store.
 			auto level = duckdb::StringUtil::Lower(option.second.GetValue<std::string>());
-			if (level == "none") {
+			if (level == "none" || level == "off") {
 				cache_preload = 0;
 			} else if (level == "l0") {
 				cache_preload = 1;
@@ -790,7 +791,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 				cache_preload = 2;
 			} else {
 				throw duckdb::InvalidInputException(
-				    "moraine: CACHE_PRELOAD must be 'none', 'l0', or 'all'; got \"%s\"", level);
+				    "moraine: CACHE_PRELOAD must be 'none' (or 'off'), 'l0', or 'all'; got \"%s\"", level);
 			}
 		} else if (name == "checkpoint") {
 			checkpoint = option.second.GetValue<std::string>();

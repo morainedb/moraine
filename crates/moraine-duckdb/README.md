@@ -152,9 +152,9 @@ Opt-in, because compaction output is cached the same way and a large merge can
 evict what reads had warmed.
 
 **`CACHE_PRELOAD` — warm the cache during ATTACH, not during the first query.**
-Both of the above still leave a fresh process cold. `META_CACHE_PRELOAD 'all'`
-loads every object the manifest references before the attach returns, `'l0'`
-only the objects no merge has folded down yet, `'none'` (the default) nothing:
+Both of the above still leave a fresh process cold. `META_CACHE_PRELOAD 'l0'`
+(the default) loads each subspace's SST metadata before the attach returns,
+`'all'` also the scan-shaped subspaces whole, `'none'` (or `'off'`) nothing:
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake

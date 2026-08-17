@@ -1068,9 +1068,12 @@ extern "C" {
 // `cache_preload` warms this store into that cache before the attach
 // returns: `0` loads nothing, `1` each subspace's SST metadata, `2` the
 // scan-shaped subspaces whole. Any other value is
-// [`codes::INVALID_ARGUMENT`]. `cache_puts` admits SST metadata (including
-// compaction output) into the cache as it is written; `false` leaves the
-// cache filled by reads alone.
+// [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller always
+// names a level (the extension's `ATTACH` passes `1` unless told
+// otherwise). A non-zero level also warms every table's probe ranges in
+// the background after the open. `cache_puts` admits SST
+// metadata (including compaction output) into the cache as it is written;
+// `false` leaves the cache filled by reads alone.
 //
 // `checkpoint` pins a read-only attach to an existing SlateDB checkpoint
 // (see [`moraine_create_checkpoint`]); the open writes nothing and serves

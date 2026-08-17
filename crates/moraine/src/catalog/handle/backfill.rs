@@ -23,6 +23,7 @@ use crate::{
 async fn collect_immediate_backfill<'a>(
     files: impl Iterator<Item = DataFileInfo> + 'a,
     object_store: Arc<dyn ObjectStore>,
+    metrics: Arc<data_file::ScopedReadMetrics>,
     positions: &[usize],
     resolve: impl Fn(&str, bool) -> Path,
     killed_positions: &'a HashMap<u64, HashSet<u64>>,
@@ -31,6 +32,7 @@ async fn collect_immediate_backfill<'a>(
     stream::iter(files)
         .map(move |file| {
             let object_store = Arc::clone(&object_store);
+            let metrics = Arc::clone(&metrics);
             let path = resolve(&file.path, file.path_is_relative);
             let dead_positions = killed_positions.get(&file.id.get());
             let dead_row_ids = killed_row_ids.get(&file.id.get());
@@ -41,7 +43,8 @@ async fn collect_immediate_backfill<'a>(
                         path,
                         file.file_size_bytes,
                         file.footer_size,
-                    ),
+                    )
+                    .with_metrics(metrics),
                     positions,
                     data_file::ScopedRows::All,
                     data_file::RowIdSource::Resolve {
@@ -132,18 +135,23 @@ pub(super) async fn read_inline_schemas(
 pub(super) async fn collect_delete_positions<'a>(
     files: impl Iterator<Item = DeleteFileInfo> + 'a,
     object_store: Arc<dyn ObjectStore>,
+    metrics: Arc<data_file::ScopedReadMetrics>,
     resolve: &'a impl Fn(&str, bool) -> Path,
 ) -> Result<HashMap<u64, HashSet<u64>>> {
     stream::iter(files.map(|file| {
         let path = resolve(&file.path, file.path_is_relative);
         let object_store = Arc::clone(&object_store);
+        let metrics = Arc::clone(&metrics);
         async move {
-            let positions = data_file::delete_file_positions(data_file::ParquetFile::new(
-                object_store,
-                path,
-                file.file_size_bytes,
-                file.footer_size,
-            ))
+            let positions = data_file::delete_file_positions(
+                data_file::ParquetFile::new(
+                    object_store,
+                    path,
+                    file.file_size_bytes,
+                    file.footer_size,
+                )
+                .with_metrics(metrics),
+            )
             .await?;
             Ok::<_, Error>((file.data_file_id.get(), positions))
         }
@@ -186,7 +194,8 @@ impl ReadOnlyCatalog {
         indexed_positions: &[usize],
     ) -> Result<Vec<FileIndexEntry>> {
         let entries = data_file::scoped_read_recorded_entries(
-            data_file::ParquetFile::new(object_store, path.clone(), file_size, footer_size),
+            data_file::ParquetFile::new(object_store, path.clone(), file_size, footer_size)
+                .with_metrics(self.data_read_metrics()),
             indexed_positions,
             data_file::ScopedRows::All,
             data_file::RowIdSource::Ordinal,
@@ -246,9 +255,11 @@ impl ReadOnlyCatalog {
         // Entries are live-only: delete files name positions within their
         // target, inline file-deletes name row ids.
         let inline_deletes = collect_inline_delete_positions(session.handle(), table.get());
+        let metrics = self.data_read_metrics();
         let delete_files = collect_delete_positions(
             snapshot.delete_files_of(table).into_iter(),
             Arc::clone(&object_store),
+            Arc::clone(&metrics),
             &resolve,
         );
         let (killed_row_ids, killed_positions) = futures::try_join!(inline_deletes, delete_files)?;
@@ -256,6 +267,7 @@ impl ReadOnlyCatalog {
         let outcome = collect_immediate_backfill(
             snapshot.data_files_of(table).into_iter(),
             object_store,
+            metrics,
             &positions,
             resolve,
             &killed_positions,

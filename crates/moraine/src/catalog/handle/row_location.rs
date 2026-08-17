@@ -9,7 +9,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use object_store::{ObjectStore, path::Path};
 use tracing::{debug, warn};
 
-use super::{BACKFILL_FILE_READ_CONCURRENCY, ReadOnlyCatalog, WARM_TABLE_CONCURRENCY};
+use super::{ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
 use crate::{
     catalog::{CatalogSnapshot, DataFileId, DataFileInfo, FileRowCandidate, TableId},
     data_file::{self, FileSummary},
@@ -33,6 +33,7 @@ impl ReadOnlyCatalog {
     /// Resolves each of the table's current data files to its summary,
     /// pairing every result with the file it came from.
     async fn file_summaries(
+        &self,
         store: &Arc<dyn ObjectStore>,
         data_prefix: &str,
         table_prefix: &str,
@@ -47,6 +48,7 @@ impl ReadOnlyCatalog {
             };
             let path = Path::from(relative.as_str());
             let store = Arc::clone(store);
+            let metrics = self.data_read_metrics();
 
             async move {
                 let summary = data_file::file_summary(
@@ -55,7 +57,8 @@ impl ReadOnlyCatalog {
                         path,
                         file.file_size_bytes,
                         file.footer_size,
-                    ),
+                    )
+                    .with_metrics(metrics),
                     table.get(),
                     file.id.get(),
                     file.row_id_start,
@@ -65,7 +68,7 @@ impl ReadOnlyCatalog {
                 (file.id, summary)
             }
         }))
-        .buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
+        .buffer_unordered(SUMMARY_READ_CONCURRENCY)
         .collect::<Vec<_>>()
         .await
     }
@@ -108,8 +111,9 @@ impl ReadOnlyCatalog {
             let files = snapshot.data_files_of(table);
 
             let mut placements = HashMap::<u64, Vec<DataFileId>>::new();
-            for (data_file_id, summary) in
-                Self::file_summaries(store, data_prefix, &table_prefix, table, files).await
+            for (data_file_id, summary) in self
+                .file_summaries(store, data_prefix, &table_prefix, table, files)
+                .await
             {
                 let matched = match summary {
                     Ok(summary) => summary.matching(&row_ids),
@@ -206,7 +210,8 @@ impl ReadOnlyCatalog {
     ) -> Result<RowSummaryWarmth> {
         let snapshot = self.snapshot().await?;
 
-        Self::warm_table(&snapshot, &data_store, data_prefix, table).await
+        self.warm_table(&snapshot, &data_store, data_prefix, table)
+            .await
     }
 
     /// Builds and caches the summaries a lookup would otherwise build cold,
@@ -248,7 +253,7 @@ impl ReadOnlyCatalog {
     ) -> Result<RowSummaryWarmth> {
         let snapshot = self.snapshot().await?;
         let total = stream::iter(tables)
-            .map(|table| Self::warm_table(&snapshot, &data_store, data_prefix, table))
+            .map(|table| self.warm_table(&snapshot, &data_store, data_prefix, table))
             .buffer_unordered(WARM_TABLE_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?
@@ -264,6 +269,7 @@ impl ReadOnlyCatalog {
 
     /// One table's warming pass against an already-resolved head view.
     async fn warm_table(
+        &self,
         snapshot: &CatalogSnapshot,
         data_store: &Arc<dyn ObjectStore>,
         data_prefix: &str,
@@ -276,8 +282,9 @@ impl ReadOnlyCatalog {
             ..RowSummaryWarmth::default()
         };
 
-        for (data_file_id, summary) in
-            Self::file_summaries(data_store, data_prefix, &table_prefix, table, files).await
+        for (data_file_id, summary) in self
+            .file_summaries(data_store, data_prefix, &table_prefix, table, files)
+            .await
         {
             match summary {
                 Ok(summary) if summary.built => {

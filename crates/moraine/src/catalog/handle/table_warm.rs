@@ -1,7 +1,7 @@
 //! Warming one table's probe ranges into the block cache.
 
 use futures::{StreamExt, stream};
-use tracing::{debug, trace};
+use tracing::debug;
 
 use super::ReadOnlyCatalog;
 use crate::{
@@ -16,8 +16,8 @@ use crate::{
     },
 };
 
-/// Ranges one table warm keeps in flight.
-const WARM_RANGE_CONCURRENCY: usize = 8;
+/// Ranges one table warm keeps in flight, sized for a remote object store.
+const WARM_RANGE_CONCURRENCY: usize = 32;
 
 /// The prefixes a lookup on `table` probes: each of its indexes' entries and
 /// its inlined data.
@@ -64,9 +64,6 @@ impl ReadOnlyCatalog {
     ///
     /// Returns a store error if the head view cannot be read.
     pub async fn warm_tables(&self, tables: &[TableId]) -> Result<()> {
-        if let Ok(mut warmed) = self.warmed_tables.lock() {
-            warmed.extend(tables.iter().copied());
-        }
         let session = self.begin_read().await?;
         let handle = session.handle();
         let view = self.head_view(handle).await?;
@@ -90,21 +87,5 @@ impl ReadOnlyCatalog {
         session.finish();
 
         Ok(())
-    }
-
-    /// Warms `table` the first time this handle touches it; later touches
-    /// return at once. Joined with the touching read so the burst overlaps
-    /// it; a failed warm is only traced.
-    pub(crate) async fn warm_on_first_touch(&self, table: TableId) {
-        let first_touch = self
-            .warmed_tables
-            .lock()
-            .is_ok_and(|mut warmed| warmed.insert(table));
-        if !first_touch {
-            return;
-        }
-        if let Err(error) = self.warm_tables(&[table]).await {
-            trace!(table_id = table.get(), %error, "table warm skipped");
-        }
     }
 }

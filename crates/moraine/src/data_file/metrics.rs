@@ -22,9 +22,31 @@ pub(super) const INDEX_ENCODING_CONCURRENCY: usize = 8;
 static INDEX_ENCODING_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(INDEX_ENCODING_CONCURRENCY)));
 
+/// Data-store reads issued on behalf of one catalog handle, across every
+/// scoped read that reports to it.
+#[derive(Debug, Default)]
+pub(crate) struct DataStoreCounters {
+    gets: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl DataStoreCounters {
+    /// Byte ranges requested; a store may coalesce adjacent ranges into
+    /// fewer requests.
+    pub(crate) fn gets(&self) -> u64 {
+        self.gets.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
 /// Per-commit work performed by scoped Parquet and inline index reads.
 #[derive(Default)]
 pub(crate) struct ScopedReadMetrics {
+    /// The handle's running totals, when the read is attributed to one.
+    upstream: Option<Arc<DataStoreCounters>>,
     metadata_hits: AtomicU64,
     metadata_misses: AtomicU64,
     range_fetches: AtomicU64,
@@ -53,6 +75,14 @@ pub(crate) struct ScopedReadTally {
 }
 
 impl ScopedReadMetrics {
+    /// A tally whose reads also count towards `upstream`.
+    pub(crate) fn reporting_to(upstream: Arc<DataStoreCounters>) -> Self {
+        Self {
+            upstream: Some(upstream),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn metadata_hit(&self) {
         self.metadata_hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -68,6 +98,12 @@ impl ScopedReadMetrics {
         self.range_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.range_nanoseconds
             .fetch_add(nanoseconds(duration), Ordering::Relaxed);
+        if let Some(upstream) = &self.upstream {
+            upstream
+                .gets
+                .fetch_add(usize_as_u64(ranges), Ordering::Relaxed);
+            upstream.bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn encoded(&self, duration: Duration) {

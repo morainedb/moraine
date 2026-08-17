@@ -62,6 +62,53 @@ Not covered: concurrency/contention, remote object stores, cross-machine
 reproducibility, or statistical rigor beyond median/min/max. It's a local
 tool; CI runs `e2e`, not this.
 
+## Located lookups
+
+`cargo xtask locate-bench` measures what file-located index lookups cost and
+save: the row summaries (a `Range`, Roaring bitmap, or sorted vector per data
+file) that turn a row id into the files that physically hold it, so a lookup
+scans those files instead of every current one.
+
+```text
+cargo xtask locate-bench [--files N] [--rows-per-file N] [--update-batches N]
+```
+
+It builds a lake of `--files` Parquet files through the pinned DuckDB CLI,
+then reports the summary cache's resident bytes, one cold lookup (a fresh
+attach that builds every summary), the first and a warm lookup on one
+attach, and the files a DuckLake scan reads with the located join against
+the row-id path — once for disjoint files, then after each of
+`--update-batches` update batches, each of which writes one file whose row-id
+range spans the whole table so statistics can no longer exclude it.
+
+Two runs on an **Apple M2 (Mac14,2), arm64**, local `DATA_PATH`:
+
+| | 16 files × 2,000 rows | 64 files × 8,000 rows |
+|---|---|---|
+| summary cache bytes | 30,416 | 121,664 |
+| cold lookup (fresh attach, builds) | 99.7 ms | 43.8 ms |
+| first lookup on an attach (builds) | 79.2 ms | 43.6 ms |
+| warm lookup | 16.0 ms | 0.2 ms |
+| files read, row id only / located | 1 / 1 | 1 / 1 |
+
+Files read after each update batch (both scales identical):
+
+| batch | row id only | located | id as a constant |
+|---|---|---|---|
+| 1 | 2 | 1 | 1 |
+| 2 | 3 | 1 | 1 |
+| 3 | 4 | 1 | 1 |
+| 6 | 7 | 1 | 1 |
+
+The summaries cost about a quarter of a byte per row (512k rows in 119 KB),
+and a warm located lookup is sub-millisecond at the larger scale. The
+files-read table is the point: without location, every update batch adds one
+file the row-id path must read, because the batch's file spans the whole
+row-id range; with location it stays at one file regardless of history —
+the same answer a constant-id predicate gets, without knowing the file. Real
+endpoint numbers for the summary build live in the located-lookup measurement
+below.
+
 # Core measurements
 
 `cargo xtask bench` times the whole stack through the DuckDB CLI. A second,
@@ -176,15 +223,15 @@ The in-memory probe measurement further down prices what an index probe
 unique and a non-unique index and 64 files x 2 000 rows (128 000 entries per
 index, spread over several SSTs by closing the seed writer every 8 files;
 no Parquet is written, since a lookup reads only the store), then times the
-current read path — per-table warm on first touch, `warm_tables`, batched
-probes, remote-sized read-ahead — from fresh read-only attaches, five
+current read path — `warm_tables`, batched probes, remote-sized read-ahead —
+from fresh read-only attaches, five
 repetitions each, reporting median/min/max and the median main-store GET
 count per phase:
 
 | phase | what it times |
 |---|---|
 | `attach_read_only` | `Catalog::open_read_only` |
-| `cold_first_lookup` | first `index_lookup` on a fresh attach (the first-touch warm starts here) |
+| `cold_first_lookup` | first `index_lookup` on a fresh attach |
 | `warm_second_lookup` | a second, different key on the same attach |
 | `steady_lookup` | 20 distinct keys on the warm attach, pooled per lookup |
 | `non_unique_lookup` | one key of the non-unique index (8 rows) |
@@ -193,15 +240,93 @@ count per phase:
 | `locate_row_ids` | 50 row ids with no data store (catalog side only) |
 | `warm_tables` | explicit `warm_tables` on a fresh attach |
 | `lookup_after_warm` | the first `index_lookup` behind that warm |
+| `attach_read_only_l0` | `Catalog::open_read_only` with `cache_preload = L0` (SST metadata preloaded at open) |
+| `cold_first_lookup_l0` | first `index_lookup` on that L0-preloaded attach |
+| `warm_tables_l0` | explicit `warm_tables` on a fresh L0-preloaded attach |
+
+The `_l0` rows show what preloading the newest SSTs' metadata at attach
+buys the cold row: what moves out of `cold_first_lookup` and into the attach.
 
 Locally, `cargo xtask s3` runs it in release against the pinned MinIO; the
 main-only [`Real S3 benchmark`](docs/real-s3-benchmark.md) workflow runs it
-against AWS S3 and keeps the printed table in the run artifact. Results are
-recorded here after a run:
+against AWS S3 and keeps the printed table in the run artifact. From an ARM
+CodeBuild worker against AWS S3 in `us-west-2` on 2026-08-16 (a run in which
+the first lookup still waited on a joined per-table warm, since removed):
 
 | phase | median | min | max | gets |
 |---|---:|---:|---:|---:|
-| _(after a run)_ | | | | |
+| `attach_read_only` | 345.3 ms | 334.2 | 438.8 | 27 |
+| `cold_first_lookup` | 396.9 ms | 357.5 | 458.6 | 56 |
+| `warm_second_lookup` | 0.28 ms | 0.27 | 0.30 | 0 |
+| `steady_lookup` | 0.16 ms | 0.16 | 0.20 | 0 |
+| `non_unique_lookup` | 0.30 ms | 0.29 | 0.32 | 0 |
+| `in_list_lookup_many` | 1.36 ms | 1.32 | 1.40 | 0 |
+| `range` | 0.34 ms | 0.33 | 0.34 | 0 |
+| `locate_row_ids` | 0.17 ms | 0.17 | 0.18 | 0 |
+| `warm_tables` | 366.2 ms | 348.4 | 594.1 | 48 |
+| `lookup_after_warm` | 0.28 ms | 0.27 | 0.28 | 0 |
+| `attach_read_only_l0` | 464.6 ms | 407.1 | 535.7 | 97 |
+| `cold_first_lookup_l0` | 2.78 ms | 2.72 | 2.96 | 0 |
+| `warm_tables_l0` | 2.33 ms | 2.29 | 2.37 | 0 |
+
+Two shapes. Once a table's SST metadata and blocks are resident every probe
+is memory-speed and issues no GET: sub-millisecond point and range lookups,
+1.4 ms for a 50-key list. Getting there is a chain of dependent round trips
+— the cold row's 56 GETs land in ~400 ms, about ten hops deep, and wider
+fan-out cannot shorten it — so the lever is *when* it is paid: with
+`cache_preload = L0` the open absorbs it (+120 ms, all concurrent) and the
+first lookup on every table costs ~3 ms instead of ~400. That is why the
+extension preloads `L0` by default.
+
+### Located lookup latency against a real endpoint
+
+The index measurement above prices `locate_row_ids` with no data store, so
+it sees the catalog side only. `measure_located_lookup_latency_against_the_endpoint`
+in the same file prices the other half: the row-summary path that reads a
+Parquet file's row-id column once and answers from the resident summary
+afterwards. It writes 64 real Parquet objects x 2 000 rows under the run
+prefix's data path and registers them with their true `file_size_bytes` and
+`footer_size`: 32 dense files carry no row-id column and answer from the
+range the commit allocated, 32 embed `_ducklake_internal_row_id` with gaps
+(24 stepping by 2, 8 striding past a Roaring container per id), so their
+summaries must be built from the object. Each of five repetitions attaches
+fresh and hands the lookup a fresh data-store handle, since the summary
+cache is keyed by the handle; every `locate_row_ids` asks for 50 present
+ids, half dense and half sparse. Rows report median/min/max and the median
+GET count against the catalog store (`main_gets`) and the data store
+(`data_gets`):
+
+| phase | what it times |
+|---|---|
+| `attach_read_only` | `Catalog::open_read_only` |
+| `locate_cold` | first `locate_row_ids` on the fresh attach and handle: every sparse file's row-id column read and summarised, every dense file's footer checked |
+| `locate_warm` | the same ids again on the same handle: summaries resident, so no data-store GET is expected |
+| `warm_row_summaries` | explicit `warm_row_summaries` on another fresh attach and handle |
+| `locate_after_warm_row_summaries` | the first `locate_row_ids` behind that warm |
+
+The conditions lines also print how many summaries the warm built and, from
+`cache_status().row_summaries`, how many the cold locate added by shape and
+their resident bytes. It runs with the rest of the suite under
+`cargo xtask s3` and in the `Real S3 benchmark` workflow. From the same
+2026-08-16 AWS S3 run (summary reads then fanned out eight files at a time;
+now 64):
+
+| phase | median | min | max | main_gets | data_gets |
+|---|---:|---:|---:|---:|---:|
+| `attach_read_only` | 362.7 ms | 291.7 | 381.1 | 27 | 0 |
+| `locate_cold` | 462.7 ms | 446.9 | 469.7 | 4 | 96 |
+| `locate_warm` | 0.45 ms | 0.44 | 0.45 | 0 | 0 |
+| `warm_row_summaries` | 471.5 ms | 453.9 | 490.6 | 4 | 96 |
+| `locate_after_warm_row_summaries` | 0.51 ms | 0.50 | 0.51 | 0 | 0 |
+
+The cold locate built 24 Roaring and 8 sorted summaries (229 KB) — the
+65 537-stride files fall past Roaring's break-even, as the representation
+choice intends — and no `Range` ones, since a dense file answers from its
+allocated range without a read. Its 96 data-store GETs are 64 footers plus 32
+row-id columns: two dependent hops per file, and at eight files in flight
+that is eight waves, which is where the ~460 ms comes from; one wave is the
+target of the wider fan-out. Warm, and after `warm_row_summaries`, a locate
+touches neither store.
 
 ### Commit throughput vs. concurrency
 

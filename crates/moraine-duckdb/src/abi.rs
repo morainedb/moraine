@@ -619,9 +619,12 @@ fn cache_preload_option(cache_preload: u8) -> Result<Option<moraine::CachePreloa
 /// `cache_preload` warms this store into that cache before the attach
 /// returns: `0` loads nothing, `1` each subspace's SST metadata, `2` the
 /// scan-shaped subspaces whole. Any other value is
-/// [`codes::INVALID_ARGUMENT`]. `cache_puts` admits SST metadata (including
-/// compaction output) into the cache as it is written; `false` leaves the
-/// cache filled by reads alone.
+/// [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller always
+/// names a level (the extension's `ATTACH` passes `1` unless told
+/// otherwise). A non-zero level also warms every table's probe ranges in
+/// the background after the open. `cache_puts` admits SST
+/// metadata (including compaction output) into the cache as it is written;
+/// `false` leaves the cache filled by reads alone.
 ///
 /// `checkpoint` pins a read-only attach to an existing SlateDB checkpoint
 /// (see [`moraine_create_checkpoint`]); the open writes nothing and serves
@@ -735,6 +738,7 @@ pub unsafe extern "C" fn moraine_attach(
         options.cache_size = cache_size_option(cache_size_bytes);
         options.cache_memory = cache_size_option(cache_memory_bytes);
         options.cache_preload = cache_preload_option(cache_preload)?;
+        let preload = options.cache_preload.is_some();
         options.cache_puts = cache_puts;
         options.checkpoint = checkpoint.map(str::to_owned);
         options.data_path.clone_from(&data_path_arg);
@@ -788,7 +792,7 @@ pub unsafe extern "C" fn moraine_attach(
         let mut handle = MoraineCatalogHandle::new(runtime, catalog, log_id);
         handle.data_store = data_store;
         handle.data_prefix = data_prefix;
-        handle.spawn_warm_all();
+        handle.spawn_warm_at_attach(preload);
         Ok(Box::new(handle))
     };
 

@@ -9,9 +9,9 @@ mod row_location;
 mod table_warm;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -35,6 +35,7 @@ use crate::{
             install_shared_current_entities, shared_current_entities,
         },
     },
+    data_file,
     error::{Error, Result},
     store::{
         cache::{CacheCounters, CacheTally, ObjectStoreTally, cache_status, metadata_shortfall},
@@ -48,8 +49,12 @@ use crate::{
     transaction::{MigrationReport, Transaction, commit, migration},
 };
 
-/// How many tables to warm concurrently.
-pub(crate) const WARM_TABLE_CONCURRENCY: usize = 8;
+/// Tables warmed concurrently, sized for a remote object store.
+pub(crate) const WARM_TABLE_CONCURRENCY: usize = 32;
+
+/// Files whose row-id summaries are read concurrently, sized for a remote
+/// object store.
+pub(crate) const SUMMARY_READ_CONCURRENCY: usize = 64;
 
 /// Immutable Parquet files decoded concurrently by one scoped operation.
 pub(crate) const BACKFILL_FILE_READ_CONCURRENCY: usize = 8;
@@ -344,11 +349,10 @@ pub struct ReadOnlyCatalog {
     store: Arc<Store>,
     reads: Arc<ReadTally>,
     cache: Arc<CacheCounters>,
+    data_reads: Arc<data_file::DataStoreCounters>,
     location: Arc<StoreLocation>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     commits: Arc<commit::Coalescer>,
-    /// Tables whose probe ranges this handle has warmed on first touch.
-    warmed_tables: Arc<Mutex<HashSet<TableId>>>,
     // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
 }
@@ -446,7 +450,22 @@ impl ReadOnlyCatalog {
     /// latency and can exceed wall-clock time when requests overlap.
     #[must_use]
     pub fn object_store_tally(&self) -> ObjectStoreTally {
-        self.cache.object_store_tally()
+        let mut tally = self.cache.object_store_tally();
+        tally.data_gets = self.data_reads.gets();
+        tally.data_bytes = self.data_reads.bytes();
+        tally
+    }
+
+    pub(crate) fn data_reads(&self) -> Arc<data_file::DataStoreCounters> {
+        Arc::clone(&self.data_reads)
+    }
+
+    /// A fresh scoped-read tally whose data-store reads also count towards
+    /// this handle's [`object_store_tally`](Self::object_store_tally).
+    pub(crate) fn data_read_metrics(&self) -> Arc<data_file::ScopedReadMetrics> {
+        Arc::new(data_file::ScopedReadMetrics::reporting_to(Arc::clone(
+            &self.data_reads,
+        )))
     }
 
     /// Records that the `current` half of the shared record set was
@@ -655,71 +674,67 @@ impl ReadOnlyCatalog {
         table: TableId,
         at: Option<u64>,
     ) -> Result<Vec<RecentRow>> {
-        let read = async {
-            let handle = session.handle();
-            let read_at = async {
-                match at {
-                    Some(_) => Ok(commit::resolve_read_snapshot(handle, at).await?.0),
-                    None => commit::read_head_id(handle).await,
-                }
-            };
-            let (read_at, chunks, tombstones) = futures::try_join!(
-                read_at,
-                store_inline::scan_inline_chunks(handle, table.get()),
-                store_inline::scan_inline_deletes(handle, table.get()),
-            )?;
-
-            let live = InlineScanKind::Table.select(
-                &materialize_inline_rows(&chunks, &tombstones),
-                read_at,
-                0,
-            );
-            let schema_versions = live.iter().filter_map(|row| match &chunks[row.chunk].0 {
-                InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
-                _ => None,
-            });
-            let schemas: HashMap<u64, Arc<Vec<u8>>> =
-                backfill::read_inline_schemas(handle, table, schema_versions)
-                    .await?
-                    .into_iter()
-                    .map(|(version, record)| (version, Arc::new(record.arrow_schema.to_vec())))
-                    .collect();
-            let mut bodies: HashMap<usize, Arc<Vec<u8>>> = HashMap::new();
-            let mut rows = Vec::with_capacity(live.len());
-            for row in live {
-                let (operation, chunk) = &chunks[row.chunk];
-                // Every chunk a row was materialized from is an insert.
-                let InlineOperation::Insert { schema_version, .. } = operation else {
-                    return Err(Error::Corruption(format!(
-                        "inline row {} of table {table} references a non-insert chunk",
-                        row.row_id
-                    )));
-                };
-                let arrow_schema = Arc::clone(schemas.get(schema_version).ok_or_else(|| {
-                    Error::Corruption(format!(
-                        "no inline schema for table {table} version {schema_version}"
-                    ))
-                })?);
-                let chunk_body = Arc::clone(
-                    bodies
-                        .entry(row.chunk)
-                        .or_insert_with(|| Arc::new(chunk.body.to_vec())),
-                );
-
-                rows.push(RecentRow {
-                    row_id: row.row_id,
-                    begin_snapshot: SnapshotId::new(row.begin_snapshot),
-                    schema_version: *schema_version,
-                    offset_in_chunk: row.offset_in_chunk,
-                    chunk_body,
-                    arrow_schema,
-                });
+        let handle = session.handle();
+        let read_at = async {
+            match at {
+                Some(_) => Ok(commit::resolve_read_snapshot(handle, at).await?.0),
+                None => commit::read_head_id(handle).await,
             }
-
-            Ok(rows)
         };
-        let (result, ()) = futures::join!(read, self.warm_on_first_touch(table));
-        result
+        let (read_at, chunks, tombstones) = futures::try_join!(
+            read_at,
+            store_inline::scan_inline_chunks(handle, table.get()),
+            store_inline::scan_inline_deletes(handle, table.get()),
+        )?;
+
+        let live = InlineScanKind::Table.select(
+            &materialize_inline_rows(&chunks, &tombstones),
+            read_at,
+            0,
+        );
+        let schema_versions = live.iter().filter_map(|row| match &chunks[row.chunk].0 {
+            InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
+            _ => None,
+        });
+        let schemas: HashMap<u64, Arc<Vec<u8>>> =
+            backfill::read_inline_schemas(handle, table, schema_versions)
+                .await?
+                .into_iter()
+                .map(|(version, record)| (version, Arc::new(record.arrow_schema.to_vec())))
+                .collect();
+        let mut bodies: HashMap<usize, Arc<Vec<u8>>> = HashMap::new();
+        let mut rows = Vec::with_capacity(live.len());
+        for row in live {
+            let (operation, chunk) = &chunks[row.chunk];
+            // Every chunk a row was materialized from is an insert.
+            let InlineOperation::Insert { schema_version, .. } = operation else {
+                return Err(Error::Corruption(format!(
+                    "inline row {} of table {table} references a non-insert chunk",
+                    row.row_id
+                )));
+            };
+            let arrow_schema = Arc::clone(schemas.get(schema_version).ok_or_else(|| {
+                Error::Corruption(format!(
+                    "no inline schema for table {table} version {schema_version}"
+                ))
+            })?);
+            let chunk_body = Arc::clone(
+                bodies
+                    .entry(row.chunk)
+                    .or_insert_with(|| Arc::new(chunk.body.to_vec())),
+            );
+
+            rows.push(RecentRow {
+                row_id: row.row_id,
+                begin_snapshot: SnapshotId::new(row.begin_snapshot),
+                schema_version: *schema_version,
+                offset_in_chunk: row.offset_in_chunk,
+                chunk_body,
+                arrow_schema,
+            });
+        }
+
+        Ok(rows)
     }
 
     /// The view at `at`, or at head when `None`. Time travel always
@@ -929,9 +944,9 @@ impl Catalog {
                 }),
                 reads: Arc::new(ReadTally::default()),
                 cache,
+                data_reads: Arc::default(),
                 commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
                 projections,
-                warmed_tables: Arc::default(),
             },
         })
     }
@@ -1018,9 +1033,9 @@ impl Catalog {
             }),
             reads: Arc::new(ReadTally::default()),
             cache,
+            data_reads: Arc::default(),
             commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
             projections,
-            warmed_tables: Arc::default(),
         })
     }
 

@@ -500,9 +500,11 @@ impl Catalog {
 
         let inline_deletes =
             backfill::collect_inline_delete_positions(session.handle(), table.get());
+        let metrics = self.data_read_metrics();
         let delete_files = backfill::collect_delete_positions(
             snapshot.delete_files_of(table).into_iter(),
             Arc::clone(&object_store),
+            Arc::clone(&metrics),
             &resolve,
         );
         let (killed_row_ids, killed_positions) = futures::try_join!(inline_deletes, delete_files)?;
@@ -529,7 +531,8 @@ impl Catalog {
                     path,
                     file.file_size_bytes,
                     file.footer_size,
-                ),
+                )
+                .with_metrics(Arc::clone(&metrics)),
                 &positions,
                 data_file::ScopedRows::From(start),
                 data_file::RowIdSource::Resolve {
