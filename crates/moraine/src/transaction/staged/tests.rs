@@ -295,6 +295,92 @@ async fn repeated_snapshot_projections_scan_once_per_transaction() {
     catalog.close().await.unwrap();
 }
 
+/// The bound decides which halves a data-file projection reads: at the
+/// transaction's read point nothing ended can match, so the ended half is
+/// left unread; behind it, and with no bound, it is read. Either way the
+/// rows a bounded reader keeps are the same.
+#[tokio::test]
+async fn a_data_file_bound_at_the_read_point_leaves_the_ended_half_unread() {
+    let events = captured_commit_events();
+
+    let catalog = open().await;
+    // A file registered in snapshot 1 and ended in snapshot 2, so the
+    // ended half holds something to leave out.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 0),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: data_file_row(1, 1, 1),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+    });
+    tx.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(1), Cell::U64(2)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    // Bounded at the read point: the ended half is not read, and the row
+    // ended in snapshot 2 is not among the rows.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    let at_head = tx.diagnostic_id.to_string();
+    let live = tx.visible_data_files_live_at(Some(2)).await.unwrap();
+    assert!(live.is_empty(), "the only file ended at the read point");
+    let scan = events.one(
+        "scanned committed entities for staged transaction",
+        &at_head,
+    );
+    assert_eq!(scan.get("versions").map(String::as_str), Some("Live"));
+    tx.rollback();
+
+    // Bounded behind it — a time-travel read — keeps the full scan, and
+    // the ended version is there to be found.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    let time_travel = tx.diagnostic_id.to_string();
+    let travelled = tx.visible_data_files_live_at(Some(1)).await.unwrap();
+    assert_eq!(travelled.len(), 1);
+    assert_eq!(travelled[0].end_snapshot, Some(2));
+    let scan = events.one(
+        "scanned committed entities for staged transaction",
+        &time_travel,
+    );
+    assert_eq!(
+        scan.get("versions").map(String::as_str),
+        Some("LiveAndEnded")
+    );
+    tx.rollback();
+
+    catalog.close().await.unwrap();
+}
+
 /// An overlaid row is removed and re-appended, so a key restaged after
 /// another one follows it — the order a projection is served in.
 #[tokio::test]

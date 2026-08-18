@@ -57,7 +57,10 @@ MoraineTxHandle *MoraineTransaction::StagedTx() {
 
 MoraineTxHandle *MoraineTransaction::StagedTxFor(const MetadataTableSpec &spec) {
 	auto *tx = OpenStagedTx();
-	metadata_rows_.erase(&spec);
+	// Both materializations of the table, since the overlay that just moved
+	// is under either one.
+	metadata_rows_.erase({&spec, false});
+	metadata_rows_.erase({&spec, true});
 	return tx;
 }
 
@@ -102,16 +105,18 @@ const std::vector<duckdb::Value> *MoraineTransaction::ScannedRow(const MetadataT
 	return nullptr;
 }
 
-std::shared_ptr<const MetadataRows> MoraineTransaction::GetMetadataRows(const MetadataTableSpec &spec) const {
-	auto it = metadata_rows_.find(&spec);
+std::shared_ptr<const MetadataRows> MoraineTransaction::GetMetadataRows(const MetadataTableSpec &spec,
+                                                                       bool live_only) const {
+	auto it = metadata_rows_.find({&spec, live_only});
 	if (it == metadata_rows_.end()) {
 		return nullptr;
 	}
 	return it->second;
 }
 
-void MoraineTransaction::PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows) {
-	metadata_rows_[&spec] = std::move(rows);
+void MoraineTransaction::PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows,
+                                         bool live_only) {
+	metadata_rows_[{&spec, live_only}] = std::move(rows);
 }
 
 duckdb::optional_ptr<duckdb::SchemaCatalogEntry> MoraineTransaction::GetCachedSchema(uint64_t schema_id) const {

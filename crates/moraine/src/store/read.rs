@@ -457,9 +457,37 @@ pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<
 /// Every current and ended record of one catalog kind. Unversioned kinds
 /// read only `current`; scheduled-file records use their sibling key kind
 /// there rather than an [`EntityKey`].
+/// Which versions of a kind a scan reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Versions {
+    /// Both subspaces: every version the store still holds.
+    LiveAndEnded,
+    /// `current` only, for a reader that has been shown no version in
+    /// `history` can match it. Unversioned kinds read this way regardless.
+    Live,
+}
+
+/// Whether a reader filtering to the versions live at `filter_snapshot`
+/// can be served from `current` alone.
+///
+/// A record reaches `history` by being ended, stamped with the snapshot
+/// that ended it, which is never past the head. A reader that keeps a row
+/// only while `filter_snapshot < end_snapshot` therefore matches nothing
+/// there once `filter_snapshot` has reached the head — and every history
+/// record carries an `end_snapshot`, so none of them is kept by the
+/// `IS NULL` arm either. Time travel reads behind the head and keeps the
+/// full scan.
+pub(crate) fn versions_for(filter_snapshot: Option<u64>, head: Option<u64>) -> Versions {
+    match (filter_snapshot, head) {
+        (Some(filter_snapshot), Some(head)) if filter_snapshot >= head => Versions::Live,
+        _ => Versions::LiveAndEnded,
+    }
+}
+
 pub(crate) async fn scan_entity_kind(
     handle: ReadHandle<'_>,
     kind: EntityRecordKind,
+    versions: Versions,
 ) -> Result<Vec<EntityRecord>> {
     let Some(entity_kind) = kind.entity_kind() else {
         return scan_decode(
@@ -489,7 +517,7 @@ pub(crate) async fn scan_entity_kind(
             ))),
         },
     );
-    if !entity_kind.is_versioned() {
+    if !entity_kind.is_versioned() || versions == Versions::Live {
         return current.await;
     }
 
@@ -658,21 +686,33 @@ mod tests {
         assert_eq!(history, vec![EntityRecord::Schema(ended.clone())]);
 
         assert_eq!(
-            scan_entity_kind(ReadHandle::Tx(&tx), EntityRecordKind::Schema)
-                .await
-                .unwrap(),
+            scan_entity_kind(
+                ReadHandle::Tx(&tx),
+                EntityRecordKind::Schema,
+                Versions::LiveAndEnded
+            )
+            .await
+            .unwrap(),
             vec![EntityRecord::Schema(schema), EntityRecord::Schema(ended),]
         );
         assert_eq!(
-            scan_entity_kind(ReadHandle::Tx(&tx), EntityRecordKind::File)
-                .await
-                .unwrap(),
+            scan_entity_kind(
+                ReadHandle::Tx(&tx),
+                EntityRecordKind::File,
+                Versions::LiveAndEnded
+            )
+            .await
+            .unwrap(),
             vec![EntityRecord::File(file)]
         );
         assert_eq!(
-            scan_entity_kind(ReadHandle::Tx(&tx), EntityRecordKind::TableStats)
-                .await
-                .unwrap(),
+            scan_entity_kind(
+                ReadHandle::Tx(&tx),
+                EntityRecordKind::TableStats,
+                Versions::LiveAndEnded
+            )
+            .await
+            .unwrap(),
             vec![EntityRecord::TableStats(tstat)]
         );
         tx.rollback();
@@ -758,7 +798,7 @@ mod tests {
             single(Subspace::History).await.unwrap()
         );
 
-        let files = scan_entity_kind(handle, EntityRecordKind::File)
+        let files = scan_entity_kind(handle, EntityRecordKind::File, Versions::LiveAndEnded)
             .await
             .unwrap();
         assert_eq!(files.len(), 2 * 40 * (3 + 7 + 9));
@@ -769,6 +809,85 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(files, expected);
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// The bound decides the halves: at or past the head nothing in
+    /// history can match, behind it the ended versions are still needed,
+    /// and an absent bound or head keeps the full scan.
+    #[test]
+    fn versions_narrow_only_at_or_past_the_head() {
+        assert_eq!(versions_for(Some(7), Some(7)), Versions::Live);
+        assert_eq!(versions_for(Some(8), Some(7)), Versions::Live);
+        assert_eq!(versions_for(Some(6), Some(7)), Versions::LiveAndEnded);
+        assert_eq!(versions_for(None, Some(7)), Versions::LiveAndEnded);
+        assert_eq!(versions_for(Some(7), None), Versions::LiveAndEnded);
+    }
+
+    /// A live-only scan returns exactly the full scan's rows that a reader
+    /// bounded at the head would have kept — the ended ones it drops are
+    /// the ones that reader discards anyway.
+    #[tokio::test]
+    async fn a_live_scan_drops_only_what_a_head_bounded_reader_discards() {
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+
+        // One live file and one ended in snapshot 4.
+        let live = DataFileValue {
+            table_id: 1,
+            data_file_id: 1,
+            begin_snapshot: 1,
+            ..DataFileValue::default()
+        };
+        let ended = DataFileValue {
+            table_id: 1,
+            data_file_id: 2,
+            begin_snapshot: 1,
+            end_snapshot: Some(4),
+            ..DataFileValue::default()
+        };
+        let entity = |data_file_id| EntityKey::File {
+            table_id: 1,
+            data_file_id,
+        };
+        tx.put(
+            Key::current(entity(1)).encode(),
+            crate::store::value::encode_value(&live),
+        )
+        .unwrap();
+        tx.put(
+            Key::history(entity(2), 4).encode(),
+            crate::store::value::encode_value(&ended),
+        )
+        .unwrap();
+
+        let handle = ReadHandle::Tx(&tx);
+        let full = scan_entity_kind(handle, EntityRecordKind::File, Versions::LiveAndEnded)
+            .await
+            .unwrap();
+        let live_only = scan_entity_kind(handle, EntityRecordKind::File, Versions::Live)
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 2);
+        assert_eq!(live_only.len(), 1);
+
+        // What the reader at the head keeps out of the full scan is
+        // exactly what the live-only scan returned.
+        let kept: Vec<_> = full
+            .iter()
+            .filter(|record| {
+                record
+                    .lifecycle()
+                    .is_none_or(|(_, end)| end.is_none_or(|end| 4 < end))
+            })
+            .cloned()
+            .collect();
+        assert_eq!(kept, live_only);
+
         tx.rollback();
         db.close().await.unwrap();
     }

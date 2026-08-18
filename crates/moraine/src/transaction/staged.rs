@@ -370,7 +370,7 @@ pub enum RowOperation {
 
 type CommittedRecords = Arc<Vec<read::EntityRecord>>;
 type CommittedRecordCache = tokio::sync::Mutex<
-    HashMap<read::EntityRecordKind, Arc<tokio::sync::OnceCell<CommittedRecords>>>,
+    HashMap<(read::EntityRecordKind, read::Versions), Arc<tokio::sync::OnceCell<CommittedRecords>>>,
 >;
 type CommittedSnapshots = tokio::sync::OnceCell<Arc<Vec<proto::SnapshotValue>>>;
 type CommittedSchemaVersions = tokio::sync::OnceCell<Arc<Vec<(u64, u64, u64)>>>;
@@ -570,19 +570,27 @@ impl StagedTransaction {
 
     /// The committed records of one kind at this transaction's read point,
     /// read through `db_tx` so current and history are one consistent cut.
-    async fn committed_entities(&self, kind: read::EntityRecordKind) -> Result<CommittedRecords> {
+    ///
+    /// Memoized per `(kind, versions)`: a live-only scan is a different set
+    /// from a full one and never stands in for it.
+    async fn committed_entities(
+        &self,
+        kind: read::EntityRecordKind,
+        versions: read::Versions,
+    ) -> Result<CommittedRecords> {
         let cell = {
             let mut committed = self.committed.lock().await;
             Arc::clone(
                 committed
-                    .entry(kind)
+                    .entry((kind, versions))
                     .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
             )
         };
         let records = cell
             .get_or_try_init(|| async {
                 let started = Instant::now();
-                let records = read::scan_entity_kind(ReadHandle::Tx(&self.db_tx), kind).await?;
+                let records =
+                    read::scan_entity_kind(ReadHandle::Tx(&self.db_tx), kind, versions).await?;
                 let history_records = records
                     .iter()
                     .filter(|record| {
@@ -595,6 +603,7 @@ impl StagedTransaction {
                 debug!(
                     transaction_id = self.diagnostic_id,
                     ?kind,
+                    ?versions,
                     current_records,
                     history_records,
                     records = records.len(),
@@ -607,14 +616,28 @@ impl StagedTransaction {
         Ok(Arc::clone(records))
     }
 
+    /// The versions a reader keeping only rows live at `filter_snapshot`
+    /// needs, resolved against this transaction's own read point.
+    async fn versions_for(&self, filter_snapshot: Option<u64>) -> Result<read::Versions> {
+        if filter_snapshot.is_none() {
+            return Ok(read::Versions::LiveAndEnded);
+        }
+        let head = read::read_head(ReadHandle::Tx(&self.db_tx))
+            .await?
+            .map(|head| head.snapshot_id);
+
+        Ok(read::versions_for(filter_snapshot, head))
+    }
+
     /// The committed records of one kind, as the overlay's starting point.
     async fn committed_rows<T>(
         &self,
         kind: read::EntityRecordKind,
+        versions: read::Versions,
         extract: impl Fn(&read::EntityRecord) -> Option<T>,
     ) -> Result<Vec<T>> {
         Ok(self
-            .committed_entities(kind)
+            .committed_entities(kind, versions)
             .await?
             .iter()
             .filter_map(extract)
@@ -628,8 +651,29 @@ impl StagedTransaction {
     ///
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_data_files(&self) -> Result<Vec<proto::DataFileValue>> {
+        self.visible_data_files_live_at(None).await
+    }
+
+    /// As [`visible_data_files`](Self::visible_data_files), for a caller
+    /// that keeps a row only while `filter_snapshot < end_snapshot` (or it
+    /// is null) — the shape every DuckLake read of this table carries.
+    ///
+    /// Once `filter_snapshot` reaches this transaction's read point, no
+    /// ended version can satisfy that, so the ended half is not read.
+    /// Behind it, or with no bound, the full set is read as before. The
+    /// staged rows overlay either the same way: a row this commit ends is
+    /// ended in place, not moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_data_files_live_at(
+        &self,
+        filter_snapshot: Option<u64>,
+    ) -> Result<Vec<proto::DataFileValue>> {
+        let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(read::EntityRecordKind::File, |r| match r {
+            .committed_rows(read::EntityRecordKind::File, versions, |r| match r {
                 read::EntityRecord::File(v) => Some(v.clone()),
                 _ => None,
             })
@@ -644,10 +688,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_delete_files(&self) -> Result<Vec<proto::DeleteFileValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::DeleteFile, |r| match r {
-                read::EntityRecord::DeleteFile(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::DeleteFile,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::DeleteFile(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -659,10 +707,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_columns(&self) -> Result<Vec<proto::ColumnValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::Column, |r| match r {
-                read::EntityRecord::Column(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::Column,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::Column(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -674,10 +726,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_tables(&self) -> Result<Vec<proto::TableValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::Table, |r| match r {
-                read::EntityRecord::Table(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::Table,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::Table(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -689,10 +745,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_file_column_stats(&self) -> Result<Vec<proto::FileColumnStatsValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::FileColumnStats, |r| match r {
-                read::EntityRecord::FileColumnStats(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::FileColumnStats,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::FileColumnStats(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_unversioned(&self.ops, committed)
     }
@@ -704,10 +764,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_schemas(&self) -> Result<Vec<proto::SchemaValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::Schema, |r| match r {
-                read::EntityRecord::Schema(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::Schema,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::Schema(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -719,10 +783,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_views(&self) -> Result<Vec<proto::ViewValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::View, |r| match r {
-                read::EntityRecord::View(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::View,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::View(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -734,10 +802,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_partition_info(&self) -> Result<Vec<proto::PartitionValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::Partition, |r| match r {
-                read::EntityRecord::Partition(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::Partition,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::Partition(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -749,10 +821,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_sort_info(&self) -> Result<Vec<proto::SortValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::Sort, |r| match r {
-                read::EntityRecord::Sort(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::Sort,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::Sort(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -764,10 +840,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_macros(&self) -> Result<Vec<proto::MacroValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::Macro, |r| match r {
-                read::EntityRecord::Macro(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::Macro,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::Macro(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -779,10 +859,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_table_stats(&self) -> Result<Vec<proto::TableStatsValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::TableStats, |r| match r {
-                read::EntityRecord::TableStats(v) => Some(*v),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::TableStats,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::TableStats(v) => Some(*v),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_unversioned(&self.ops, committed)
     }
@@ -794,10 +878,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_table_column_stats(&self) -> Result<Vec<proto::TableColumnStatsValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::TableColumnStats, |r| match r {
-                read::EntityRecord::TableColumnStats(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::TableColumnStats,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::TableColumnStats(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_unversioned(&self.ops, committed)
     }
@@ -809,10 +897,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_mappings(&self) -> Result<Vec<proto::MappingValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::Mapping, |r| match r {
-                read::EntityRecord::Mapping(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::Mapping,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::Mapping(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_unversioned(&self.ops, committed)
     }
@@ -825,10 +917,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_tag_containers(&self) -> Result<Vec<proto::TagValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::Tag, |r| match r {
-                read::EntityRecord::Tag(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::Tag,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::Tag(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_tag_containers(&self.ops, committed)
     }
@@ -842,14 +938,18 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_option_scopes(&self) -> Result<Vec<(u64, u64, proto::OptionScopeValue)>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::Option, |r| match r {
-                read::EntityRecord::Option {
-                    scope_kind,
-                    scope_id,
-                    value,
-                } => Some((*scope_kind, *scope_id, value.clone())),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::Option,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::Option {
+                        scope_kind,
+                        scope_id,
+                        value,
+                    } => Some((*scope_kind, *scope_id, value.clone())),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_option_scopes(&self.ops, committed)
     }
@@ -1007,10 +1107,14 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_scheduled_deletions(&self) -> Result<Vec<proto::GcFileValue>> {
         let committed = self
-            .committed_rows(read::EntityRecordKind::GcFile, |r| match r {
-                read::EntityRecord::GcFile(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::GcFile,
+                read::Versions::LiveAndEnded,
+                |r| match r {
+                    read::EntityRecord::GcFile(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_unversioned(&self.ops, committed)
     }
