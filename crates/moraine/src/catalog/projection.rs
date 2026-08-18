@@ -107,6 +107,19 @@ impl<K: Ord, V> Maintained<K, V> {
         }
     }
 
+    /// Clears an installed projection standing anywhere but `expected`.
+    /// Folding a batch onto rows that already missed one would leave rows
+    /// no stamp describes.
+    fn clear_unless_at(&mut self, expected: HeadValue) {
+        if self
+            .head
+            .as_ref()
+            .is_some_and(|head| !same_head(head, &expected))
+        {
+            self.clear();
+        }
+    }
+
     /// The rows if they stand at exactly `expected`, shared rather than
     /// copied so the caller can materialize them off the cache lock.
     fn serve(&self, expected: &HeadValue) -> Option<Arc<BTreeMap<K, V>>> {
@@ -269,14 +282,25 @@ pub(crate) struct ProjectionCache {
     table_stats: Maintained<u64, TableStatsValue>,
     table_column_stats: Maintained<(u64, u64), TableColumnStatsValue>,
     /// The `current` half of the shared decoded record set, stamped with
-    /// the head it was scanned at. Not folded forward: any committed batch
-    /// drops both halves.
+    /// the head it was scanned at. Dropped by a batch that writes into
+    /// that subspace; otherwise restamped, since its rows still stand.
     current_entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
     /// The `history` half of the shared record set, stamped the same way.
     history_entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
     /// The materialized head view, folded forward on every commit; a fold
     /// that cannot be applied faithfully clears it.
     head_view: Option<Arc<CatalogSnapshot>>,
+    /// The state the last folded batch left, and so the state anything
+    /// carried across a batch must already have been at.
+    ///
+    /// A reader installs what it scanned stamped with the head it read
+    /// before scanning, which a commit landing mid-scan leaves behind the
+    /// cache. Serving on an exact stamp match makes that harmless on its
+    /// own — those rows are right at that stamp — but carrying such rows
+    /// across a batch would restamp them as a state they were never
+    /// scanned at. Anything not standing here when a batch arrives is
+    /// dropped rather than carried.
+    folded_head: Option<HeadValue>,
     /// Bumped by every invalidation.
     epoch: u64,
 }
@@ -312,6 +336,7 @@ impl ProjectionCache {
             current_entities: None,
             history_entities: None,
             head_view: None,
+            folded_head: None,
             epoch: 0,
         }
     }
@@ -454,6 +479,7 @@ impl ProjectionCache {
         // Inline, index-entry, and deletion-schedule batches write neither.
         let mut wrote_current = false;
         let mut wrote_history = false;
+        self.drop_what_lags_behind();
         for (encoded_key, write) in writes {
             let bytes = write.as_deref();
             let key = Key::decode(encoded_key);
@@ -503,6 +529,30 @@ impl ProjectionCache {
         self.table_column_stats.advance(stamp);
         advance_half(&mut self.current_entities, stamp);
         advance_half(&mut self.history_entities, stamp);
+        self.folded_head = Some(stamp);
+    }
+
+    /// Drops everything not standing at the state the last batch left, so
+    /// a fold or a restamp only ever moves rows that are one batch behind.
+    /// Everything is kept the first time, when there is nothing to be
+    /// behind.
+    fn drop_what_lags_behind(&mut self) {
+        let Some(folded_head) = self.folded_head else {
+            return;
+        };
+        let lags = |half: &Option<(HeadValue, Arc<Vec<EntityRecord>>)>| {
+            half.as_ref()
+                .is_some_and(|(head, _)| !same_head(head, &folded_head))
+        };
+        if lags(&self.current_entities) {
+            self.current_entities = None;
+        }
+        if lags(&self.history_entities) {
+            self.history_entities = None;
+        }
+        self.snapshots.clear_unless_at(folded_head);
+        self.table_stats.clear_unless_at(folded_head);
+        self.table_column_stats.clear_unless_at(folded_head);
     }
 }
 
@@ -971,6 +1021,59 @@ mod tests {
         assert!(cache.snapshots_at(&stamp(4, 4)).is_none());
         assert!(cache.table_stats_at(&stamp(4, 4)).is_none());
         assert!(cache.table_column_stats_at(&stamp(4, 4)).is_none());
+    }
+
+    /// A reader whose scan straddled a commit installs rows stamped
+    /// behind the cache. Those rows are right at that stamp and may be
+    /// served there, but the next batch must not fold onto them or carry
+    /// them forward — either would leave rows no stamp describes.
+    #[test]
+    fn rows_installed_behind_the_cache_are_dropped_rather_than_carried() {
+        let mut cache = ProjectionCache::empty();
+
+        // The cache folds a batch, so it knows what state it stands at.
+        cache.install_snapshots(stamp(1, 1), vec![snapshot_value(0), snapshot_value(1)]);
+        cache.install_current_entities(
+            stamp(1, 1),
+            Arc::new(vec![EntityRecord::TableStats(stats_value(7, 10))]),
+        );
+        cache.apply_batch(
+            &[
+                (
+                    Key::Snapshot { snapshot_id: 2 }.encode(),
+                    Some(encode_value(&snapshot_value(2))),
+                ),
+                head_write(2, 2),
+            ],
+            2,
+        );
+        assert_eq!(
+            materialize(&cache.snapshots_at(&stamp(2, 2)).unwrap()).len(),
+            3
+        );
+
+        // A slow reader now installs what it scanned before that batch.
+        cache.install_snapshots(stamp(1, 1), vec![snapshot_value(0), snapshot_value(1)]);
+        cache.install_current_entities(
+            stamp(1, 1),
+            Arc::new(vec![EntityRecord::TableStats(stats_value(7, 10))]),
+        );
+
+        // The next batch writes no entity key, so the half would ride
+        // forward and the snapshot fold would land on rows missing
+        // snapshot 2. Both are dropped instead.
+        cache.apply_batch(
+            &[
+                (
+                    Key::Snapshot { snapshot_id: 3 }.encode(),
+                    Some(encode_value(&snapshot_value(3))),
+                ),
+                head_write(3, 3),
+            ],
+            3,
+        );
+        assert!(cache.snapshots_at(&stamp(3, 3)).is_none());
+        assert!(cache.current_entities_at(&stamp(3, 3)).is_none());
     }
 
     /// A batch writing neither record subspace leaves both halves in
