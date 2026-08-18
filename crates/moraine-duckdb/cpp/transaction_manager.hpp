@@ -15,6 +15,7 @@
 #include "moraine_abi.h"
 
 #include <mutex>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -87,8 +88,13 @@ public:
 	// row drops the table it lands in, whose overlay just changed.
 	// `MetadataRowsFor` (metadata_tables.hpp) is the only caller of this
 	// pair and states what rests on the sharing.
-	std::shared_ptr<const MetadataRows> GetMetadataRows(const MetadataTableSpec &spec) const;
-	void PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows);
+	//
+	// A live-narrowed materialization is a different row set from the full
+	// one, so `live_only` keys them apart rather than letting either stand
+	// in for the other.
+	std::shared_ptr<const MetadataRows> GetMetadataRows(const MetadataTableSpec &spec, bool live_only = false) const;
+	void PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows,
+	                     bool live_only = false);
 
 	// Takes the rows one metadata scan emits row ids for, returning the id
 	// its first row carries. Ids come from a counter this transaction never
@@ -115,7 +121,7 @@ private:
 	bool schemas_loaded_ = false;
 	std::unordered_map<uint64_t, duckdb::unique_ptr<duckdb::SchemaCatalogEntry>> schema_cache_;
 	MoraineTxHandle *staged_tx_ = nullptr;
-	std::unordered_map<const MetadataTableSpec *, std::shared_ptr<const MetadataRows>> metadata_rows_;
+	std::map<std::pair<const MetadataTableSpec *, bool>, std::shared_ptr<const MetadataRows>> metadata_rows_;
 	// Registered runs, by ascending base, and the next id to hand out.
 	// Guarded, because scans of one transaction init on the executor's
 	// threads while another statement's Sink resolves against them.
