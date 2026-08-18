@@ -44,33 +44,42 @@ MoraineTxHandle *MoraineTransaction::OpenStagedTx() {
 		// Reads move from the transaction's snapshot to the staged tx's own
 		// read point here, so nothing materialized against the former may
 		// be served after it.
-		metadata_rows_.clear();
+		DropMetadataRows();
 	}
 	return staged_tx_;
 }
 
 MoraineTxHandle *MoraineTransaction::StagedTx() {
+	std::lock_guard<std::mutex> guard(staged_state_lock_);
 	auto *tx = OpenStagedTx();
-	metadata_rows_.clear();
+	DropMetadataRows();
 	return tx;
 }
 
 MoraineTxHandle *MoraineTransaction::StagedTxFor(const MetadataTableSpec &spec) {
+	std::lock_guard<std::mutex> guard(staged_state_lock_);
 	auto *tx = OpenStagedTx();
-	// Both materializations of the table, since the overlay that just moved
-	// is under either one.
-	metadata_rows_.erase({&spec, false});
-	metadata_rows_.erase({&spec, true});
+	DropMetadataRowsFor(spec);
 	return tx;
 }
 
+MoraineTxHandle *MoraineTransaction::StagedTxIfOpen() const {
+	std::lock_guard<std::mutex> guard(staged_state_lock_);
+	return staged_tx_;
+}
+
 MoraineTxHandle *MoraineTransaction::TakeStagedTx() {
-	auto *result = staged_tx_;
-	staged_tx_ = nullptr;
-	// The read point every held materialization stands at leaves with the
-	// tx. Without this a read between a failed commit and the retry's fresh
-	// tx would be served the premise that attempt already lost on.
-	metadata_rows_.clear();
+	MoraineTxHandle *result = nullptr;
+	{
+		std::lock_guard<std::mutex> guard(staged_state_lock_);
+		result = staged_tx_;
+		staged_tx_ = nullptr;
+		// The read point every held materialization stands at leaves with
+		// the tx. Without this a read between a failed commit and the
+		// retry's fresh tx would be served the premise that attempt already
+		// lost on.
+		DropMetadataRows();
+	}
 	// No statement of this attempt can still resolve a row id, and the
 	// retry's own scans register runs of their own.
 	{
@@ -78,6 +87,19 @@ MoraineTxHandle *MoraineTransaction::TakeStagedTx() {
 		scanned_runs_.clear();
 	}
 	return result;
+}
+
+void MoraineTransaction::DropMetadataRows() {
+	metadata_rows_.clear();
+	metadata_rows_epoch_++;
+}
+
+void MoraineTransaction::DropMetadataRowsFor(const MetadataTableSpec &spec) {
+	// Both materializations of the table, since the overlay that just moved
+	// is under either one.
+	metadata_rows_.erase({&spec, false});
+	metadata_rows_.erase({&spec, true});
+	metadata_rows_epoch_++;
 }
 
 uint64_t MoraineTransaction::RegisterScannedRows(const MetadataTableSpec &spec,
@@ -107,6 +129,7 @@ const std::vector<duckdb::Value> *MoraineTransaction::ScannedRow(const MetadataT
 
 std::shared_ptr<const MetadataRows> MoraineTransaction::GetMetadataRows(const MetadataTableSpec &spec,
                                                                        bool live_only) const {
+	std::lock_guard<std::mutex> guard(staged_state_lock_);
 	auto it = metadata_rows_.find({&spec, live_only});
 	if (it == metadata_rows_.end()) {
 		return nullptr;
@@ -114,8 +137,19 @@ std::shared_ptr<const MetadataRows> MoraineTransaction::GetMetadataRows(const Me
 	return it->second;
 }
 
+uint64_t MoraineTransaction::MetadataRowsEpoch() const {
+	std::lock_guard<std::mutex> guard(staged_state_lock_);
+	return metadata_rows_epoch_;
+}
+
 void MoraineTransaction::PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows,
-                                         bool live_only) {
+                                         bool live_only, uint64_t epoch) {
+	std::lock_guard<std::mutex> guard(staged_state_lock_);
+	// A moved epoch means a drop landed while `rows` was built: what it
+	// holds predates an overlay change, so serving it would undo the drop.
+	if (epoch != metadata_rows_epoch_) {
+		return;
+	}
 	metadata_rows_[{&spec, live_only}] = std::move(rows);
 }
 
