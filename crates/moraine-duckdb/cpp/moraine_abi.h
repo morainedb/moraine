@@ -2532,13 +2532,9 @@ int32_t moraine_dump_file_column_stats(struct MoraineCatalogHandle *handle,
                                        struct MoraineError *err);
 
 // Dumps one table's `ducklake_file_column_stats` rows into
-// `*out_items`/`*out_len`, and writes to `*out_row_id_base` how many rows
-// precede them in [`moraine_dump_file_column_stats`].
-//
-// That dump is keyed table-major, so a table's rows are one contiguous run
-// of it: `*out_row_id_base + i` is where row `i` sits in the whole, which is
-// what a metadata scan's row ids count. Narrowing a scan therefore does not
-// renumber its rows. Free with [`moraine_dump_file_column_stats_free`].
+// `*out_items`/`*out_len`, in the order
+// [`moraine_dump_file_column_stats`] would emit them. Free with
+// [`moraine_dump_file_column_stats_free`].
 //
 // # Safety
 //
@@ -2546,12 +2542,10 @@ int32_t moraine_dump_file_column_stats(struct MoraineCatalogHandle *handle,
 // [`moraine_attach`](crate::abi::moraine_attach), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the call.
-// `out_row_id_base`, if non-null, must be writable.
 int32_t moraine_dump_file_column_stats_of(struct MoraineCatalogHandle *handle,
                                           uint64_t table_id,
                                           struct MoraineFileColumnStatsRow **out_items,
                                           size_t *out_len,
-                                          uint64_t *out_row_id_base,
                                           MoraineInterruptProbe probe,
                                           void *probe_ctx,
                                           struct MoraineError *err);

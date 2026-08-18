@@ -68,7 +68,38 @@ MoraineTxHandle *MoraineTransaction::TakeStagedTx() {
 	// tx. Without this a read between a failed commit and the retry's fresh
 	// tx would be served the premise that attempt already lost on.
 	metadata_rows_.clear();
+	// No statement of this attempt can still resolve a row id, and the
+	// retry's own scans register runs of their own.
+	{
+		std::lock_guard<std::mutex> guard(scanned_runs_lock_);
+		scanned_runs_.clear();
+	}
 	return result;
+}
+
+uint64_t MoraineTransaction::RegisterScannedRows(const MetadataTableSpec &spec,
+                                                 std::shared_ptr<const MetadataRows> rows) {
+	std::lock_guard<std::mutex> guard(scanned_runs_lock_);
+	auto base = next_scanned_row_id_;
+	next_scanned_row_id_ += rows == nullptr ? 0 : rows->size();
+	scanned_runs_.push_back(ScannedRun {&spec, base, std::move(rows)});
+	return base;
+}
+
+const std::vector<duckdb::Value> *MoraineTransaction::ScannedRow(const MetadataTableSpec &spec,
+                                                                 uint64_t row_id) const {
+	std::lock_guard<std::mutex> guard(scanned_runs_lock_);
+	// Newest first: a statement resolves against the scan it just ran.
+	for (auto run = scanned_runs_.rbegin(); run != scanned_runs_.rend(); ++run) {
+		if (run->spec != &spec || run->rows == nullptr || row_id < run->base) {
+			continue;
+		}
+		auto index = row_id - run->base;
+		if (index < run->rows->size()) {
+			return &(*run->rows)[index];
+		}
+	}
+	return nullptr;
 }
 
 std::shared_ptr<const MetadataRows> MoraineTransaction::GetMetadataRows(const MetadataTableSpec &spec) const {

@@ -2024,6 +2024,184 @@ async fn delete_only_index_maintenance_is_five_range_read_waves() {
     catalog.close().await.unwrap();
 }
 
+/// A cumulative delete file removes only the entries of the rows it newly
+/// kills, leaving a value re-inserted elsewhere findable.
+///
+/// DuckLake rewrites a data file's delete file whole, so every rewrite
+/// names every position dead so far. A unique entry's key is the value
+/// alone, so re-deriving an already-dead row's entry deletes whichever row
+/// now holds that value — here a live row in another file.
+#[tokio::test]
+async fn a_cumulative_delete_file_keeps_a_value_reinserted_elsewhere() {
+    use crate::{
+        IndexKeyValue, IntWidth,
+        catalog::{IndexId, TableId},
+    };
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
+    // f0 holds 0, 1, 2 at row ids 0, 1, 2.
+    register_indexed_data_files(&catalog, &store, 1, 3).await;
+
+    // Kill row 0 (value 0). Its unique entry goes with it.
+    let first = write_delete_file(&store.inner, "d0.parquet", "f0.parquet", &[0]).await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: delete_file_row_at(3, "d0.parquet", 1, 1, first),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+    assert_eq!(index_entry_count(&catalog, true, index_id).await, 2);
+
+    // Re-insert value 0 in a new file, at row 3. The value is claimed again,
+    // now by a row the first file never held.
+    let (_, reinserted) = bigint_batch(&[0]);
+    let size = write_parquet(&store.inner, "main/t/f1.parquet", &reinserted).await;
+    let mut reinserted_row = indexed_data_file_row_at(2, "f1.parquet", 1, size, 3);
+    reinserted_row[2] = Cell::U64(5);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: reinserted_row,
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(5, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(5, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+    assert_eq!(index_entry_count(&catalog, true, index_id).await, 3);
+
+    // Kill row 1 (value 1) from f0. The rewritten delete file carries row
+    // 0's position too, exactly as DuckLake writes it.
+    let second = write_delete_file(&store.inner, "d1.parquet", "f0.parquet", &[0, 1]).await;
+    let mut replacement = delete_file_row_at(4, "d1.parquet", 1, 2, second);
+    replacement[2] = Cell::U64(6);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DeleteFile,
+        cells: vec![Cell::U64(1), Cell::U64(3), Cell::U64(6)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: replacement,
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(6, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(6, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        catalog
+            .index_lookup(
+                TableId::new(1),
+                IndexId::new(index_id),
+                &[IndexKeyValue::Int {
+                    value: 0,
+                    width: IntWidth::I64,
+                }],
+            )
+            .await
+            .unwrap(),
+        vec![3],
+        "the live row holding the re-inserted value stays findable"
+    );
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        2,
+        "only row 1's entry goes: rows 2 and 3 keep theirs"
+    );
+
+    catalog.close().await.unwrap();
+}
+
+/// A cumulative delete file derives removals for the positions it newly
+/// kills and no others.
+///
+/// Every rewrite names every position dead so far, so a commit that derived
+/// them all would scoped-read a file's whole delete history each time —
+/// quadratic in the deletes one file accumulates.
+#[tokio::test]
+async fn a_cumulative_delete_file_derives_only_the_positions_it_newly_kills() {
+    let events = captured_commit_events();
+    let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+    let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
+    register_indexed_data_files(&catalog, &store, 1, 3).await;
+
+    let first = write_delete_file(&store.inner, "d0.parquet", "f0.parquet", &[0]).await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: delete_file_row_at(3, "d0.parquet", 1, 1, first),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+    assert_eq!(index_entry_count(&catalog, false, index_id).await, 2);
+
+    let second = write_delete_file(&store.inner, "d1.parquet", "f0.parquet", &[0, 1]).await;
+    let mut replacement = delete_file_row_at(4, "d1.parquet", 1, 2, second);
+    replacement[2] = Cell::U64(5);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
+    let transaction_id = tx.diagnostic_id.to_string();
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DeleteFile,
+        cells: vec![Cell::U64(1), Cell::U64(3), Cell::U64(5)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: replacement,
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(5, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(5, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        events
+            .one("staged commit landed", &transaction_id)
+            .get("index_deletions")
+            .map(String::as_str),
+        Some("1"),
+        "row 0 was already dead, so its entry is not derived a second time"
+    );
+    assert_eq!(index_entry_count(&catalog, false, index_id).await, 1);
+
+    catalog.close().await.unwrap();
+}
+
 /// A file-backed replacement starts its independent new-file read beside
 /// delete discovery. The old target still waits for the positions, leaving
 /// two dependent waves without putting the addition behind both of them.
@@ -4415,6 +4593,112 @@ async fn expiry_prunes_history_and_schedules_files_without_advancing_head() {
     );
     let files = crate::ffi_support::dump_data_files(&catalog).await.unwrap();
     assert!(files.is_empty(), "history row must be pruned: {files:?}");
+
+    catalog.close().await.unwrap();
+}
+
+/// The statistics sweep reclaims each orphan exactly once, and the writer's
+/// own view shrinks by what it took.
+///
+/// The sweep writes outside the commit protocol: no snapshot, no head
+/// stamp, so nothing folds its deletes into the projections a warm writer
+/// serves from. Left standing, those projections hand every later pass the
+/// same victims — the reclaimed count then measures one pass's work
+/// forever, and the memory the sweep exists to free is never released.
+#[tokio::test]
+async fn the_file_stats_sweep_reclaims_each_orphan_once() {
+    use crate::catalog::MaintenanceRequest;
+
+    let catalog = open().await;
+
+    // A file registered with statistics, then expired into history.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 0),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: data_file_row(9, 1, 1),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::FileColumnStats,
+        cells: file_column_stats_row(9, 1, 1, "0", "9"),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+    });
+    tx.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(9), Cell::U64(2)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    // Prune the history row the file was still resolvable through, which is
+    // what leaves its statistics orphaned.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Delete {
+        table: TableKind::Snapshot,
+        cells: vec![Cell::U64(1)],
+    });
+    tx.stage(RowOperation::Delete {
+        table: TableKind::SnapshotChanges,
+        cells: vec![Cell::U64(1)],
+    });
+    tx.stage(RowOperation::Delete {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(9), Cell::U64(2)],
+    });
+    tx.commit().await.unwrap();
+
+    let first = catalog
+        .maintain(MaintenanceRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(first.file_column_stats_reclaimed, 1);
+
+    assert!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .file_column_stats
+            .get(&1)
+            .is_none_or(BTreeMap::is_empty),
+        "the reclaimed row must be gone from the view the writer serves"
+    );
+
+    let second = catalog
+        .maintain(MaintenanceRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.file_column_stats_reclaimed, 0,
+        "a second pass has nothing left to reclaim"
+    );
 
     catalog.close().await.unwrap();
 }

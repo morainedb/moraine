@@ -64,17 +64,11 @@ MoraineCell CellFromValue(const duckdb::Value &value, const duckdb::LogicalType 
 
 // Shared between the Sink and Source halves of every staged-write operator
 // (the same dual-role shape DuckDB's own `PhysicalInsert` uses): the row
-// count staged so far, whether the one-row `Count` result has been
-// emitted, and — for UPDATE/DELETE — the lazily materialized old rows the
-// scan's rowids index into.
+// count staged so far and whether the one-row `Count` result has been
+// emitted.
 struct MetadataDmlState : public duckdb::GlobalSinkState {
 	duckdb::idx_t affected_count = 0;
 	bool emitted = false;
-	// The transaction's materialized table, shared with the scan that
-	// emitted the rowids resolved against it. Held for this operator's
-	// whole run, so opening the staged tx — which drops the transaction's
-	// own reference — leaves it standing. Null until pinned.
-	std::shared_ptr<const MetadataRows> old_rows;
 };
 
 // Base for the three staged-write operators: owns the spec/catalog
@@ -112,36 +106,28 @@ protected:
 		return moraine_tx.StagedTxFor(spec_);
 	}
 
-	// Takes the list the scan emitted its rowids into, so this Sink resolves
-	// them against the rows the scan actually handed out rather than a
-	// second materialization: `MetadataRowsFor` gives one list per
-	// (transaction, table) while the transaction has no staged tx, and one
-	// pinned to the staged tx's read point once it has.
+	// Resolves a rowid the metadata scan emitted back to the row it stands
+	// for, through the run that scan registered with this transaction.
 	//
-	// Called before `StagedTx`, because opening the staged tx is what moves
-	// the transaction between those two regimes, and the scan that produced
-	// these rowids bound in whichever one held before this statement ran.
-	void PinScannedRows(MetadataDmlState &state, duckdb::ClientContext &client) const {
-		if (state.old_rows == nullptr) {
-			state.old_rows = MetadataRowsFor(client, catalog_, spec_);
-		}
-	}
-
-	// Resolves a rowid the metadata scan emitted (the row's index in the
-	// list `PinScannedRows` took) back to the row itself.
-	const std::vector<duckdb::Value> &ResolveRow(MetadataDmlState &state, const duckdb::Value &row_id,
+	// The registry holds the very rows the scan handed out, so no second
+	// materialization is taken and none has to agree with the first: a
+	// commit landing under this statement, or a narrowed scan reading a
+	// different list from the one a re-dump would build, cannot move what a
+	// rowid names.
+	const std::vector<duckdb::Value> &ResolveRow(const duckdb::Value &row_id,
 	                                             duckdb::ClientContext &client) const {
-		PinScannedRows(state, client);
 		if (row_id.IsNull()) {
 			throw duckdb::InternalException("moraine: staged write received a NULL rowid");
 		}
-		auto index = static_cast<duckdb::idx_t>(row_id.GetValue<int64_t>());
-		if (index >= state.old_rows->size()) {
+		auto catalog_transaction = catalog_.GetCatalogTransaction(client);
+		auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
+		auto *row = transaction.ScannedRow(spec_, static_cast<uint64_t>(row_id.GetValue<int64_t>()));
+		if (row == nullptr) {
 			throw duckdb::InternalException(
-			    "moraine: staged write rowid is out of range — the row set this Sink resolved against is not "
-			    "the one the scan emitted rowids into");
+			    "moraine: staged write received a rowid on \"%s\" that no scan of this transaction emitted",
+			    spec_.name);
 		}
-		return (*state.old_rows)[index];
+		return *row;
 	}
 
 public:
@@ -241,7 +227,6 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
-		PinScannedRows(state, context.client);
 		auto *tx = StagedTx(context.client);
 
 		// Pinned layout: the row-id column is the last column of the sink
@@ -251,7 +236,7 @@ public:
 		auto row_id_col = chunk.ColumnCount() - 1;
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto &old_row = ResolveRow(state, chunk.GetValue(row_id_col, row), context.client);
+			auto &old_row = ResolveRow(chunk.GetValue(row_id_col, row), context.client);
 			std::deque<std::string> string_storage;
 			std::vector<MoraineCell> cells;
 
@@ -313,11 +298,10 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
-		PinScannedRows(state, context.client);
 		auto *tx = StagedTx(context.client);
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto &old_row = ResolveRow(state, chunk.GetValue(row_id_chunk_index_, row), context.client);
+			auto &old_row = ResolveRow(chunk.GetValue(row_id_chunk_index_, row), context.client);
 			std::deque<std::string> string_storage;
 			std::vector<MoraineCell> cells;
 			cells.reserve(spec_.delete_key_columns.size());
@@ -379,11 +363,10 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
-		PinScannedRows(state, context.client);
 		auto *tx = StagedTx(context.client);
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto &old_row = ResolveRow(state, chunk.GetValue(row_id_chunk_index_, row), context.client);
+			auto &old_row = ResolveRow(chunk.GetValue(row_id_chunk_index_, row), context.client);
 			// Column order: table_id, table_name, schema_version.
 			auto table_id = old_row[0].GetValue<uint64_t>();
 			auto schema_version = old_row[2].GetValue<uint64_t>();

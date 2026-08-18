@@ -199,6 +199,15 @@ pub(crate) fn invalidate_head_view(cache: &std::sync::RwLock<ProjectionCache>) {
         .clear_head_view();
 }
 
+/// Drops every projection over the `current` half, for a write that removed
+/// records without going through the commit protocol.
+pub(crate) fn invalidate_current_state(cache: &std::sync::RwLock<ProjectionCache>) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear_current_state();
+}
+
 /// The shared `current` half at exactly `head`, if installed.
 pub(crate) fn shared_current_entities(
     cache: &std::sync::RwLock<ProjectionCache>,
@@ -309,6 +318,16 @@ impl ProjectionCache {
 
     pub(crate) fn clear_head_view(&mut self) {
         self.head_view = None;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Drops the head view and the shared `current` half together. A write
+    /// that reclaims records without moving the head leaves both standing at
+    /// a stamp that no longer names what the store holds, so neither may be
+    /// served and neither can be folded forward.
+    pub(crate) fn clear_current_state(&mut self) {
+        self.head_view = None;
+        self.current_entities = None;
         self.epoch = self.epoch.wrapping_add(1);
     }
 

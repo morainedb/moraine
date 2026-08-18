@@ -426,34 +426,18 @@ pub async fn dump_file_column_stats(
     .await
 }
 
-/// One table's `ducklake_file_column_stats` rows, and how many rows precede
-/// them in [`dump_file_column_stats`].
-///
-/// That dump is key-ordered and this kind is keyed table-major, so a table's
-/// rows are one contiguous run of it. Returning where the run starts lets a
-/// caller address a scoped row by the position it holds in the whole, which
-/// is what the extension's metadata row ids are — so scoping a scan does not
-/// renumber its rows.
+/// One table's `ducklake_file_column_stats` rows, in the order
+/// [`dump_file_column_stats`] would emit them.
 #[doc(hidden)]
 pub async fn dump_file_column_stats_of(
     catalog: &ReadOnlyCatalog,
     table_id: u64,
-) -> Result<(Vec<FileColumnStatsValue>, u64)> {
-    let (_, current, _) = entity_halves(catalog, false).await?;
-
-    let mut preceding = 0u64;
-    let mut rows = Vec::new();
-    for record in current.iter() {
-        let EntityRecord::FileColumnStats(value) = record else {
-            continue;
-        };
-        if value.table_id < table_id {
-            preceding = preceding.saturating_add(1);
-        } else if value.table_id == table_id {
-            rows.push(value.clone());
-        }
-    }
-    Ok((rows, preceding))
+) -> Result<Vec<FileColumnStatsValue>> {
+    dump_current_entities(catalog, |record| match record {
+        EntityRecord::FileColumnStats(value) if value.table_id == table_id => Some(value.clone()),
+        _ => None,
+    })
+    .await
 }
 
 /// Every `ducklake_snapshot`/`ducklake_snapshot_changes` row (merged).
@@ -1788,24 +1772,23 @@ mod tests {
             whole.iter().map(|row| row.table_id).collect();
         assert_eq!(table_ids.len(), 2);
 
-        let mut covered = 0;
+        let mut tiled = Vec::new();
         for table_id in table_ids {
-            let (scoped, offset) = dump_file_column_stats_of(&catalog, table_id).await.unwrap();
-            assert!(!scoped.is_empty());
-            let start = usize::try_from(offset).unwrap();
-            assert_eq!(
-                &whole[start..start + scoped.len()],
-                scoped.as_slice(),
-                "table {table_id} must be the run at {offset}"
-            );
-            covered += scoped.len();
+            let scoped = dump_file_column_stats_of(&catalog, table_id).await.unwrap();
+            assert!(!scoped.is_empty(), "table {table_id} has statistics");
+            tiled.extend(scoped);
         }
-        assert_eq!(covered, whole.len(), "the runs must tile the whole dump");
+        assert_eq!(
+            tiled, whole,
+            "the scopes must tile the whole dump, in order"
+        );
 
-        // A table with no statistics names an empty run, not a bad offset.
-        let (missing, offset) = dump_file_column_stats_of(&catalog, u64::MAX).await.unwrap();
-        assert!(missing.is_empty());
-        assert_eq!(usize::try_from(offset).unwrap(), whole.len());
+        assert!(
+            dump_file_column_stats_of(&catalog, u64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
