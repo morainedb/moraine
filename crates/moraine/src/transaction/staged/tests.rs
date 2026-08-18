@@ -132,6 +132,8 @@ where
         event.record(&mut fields);
         if fields.0.get("message").is_some_and(|message| {
             message == "scanned committed entities for staged transaction"
+                || message == "scanned committed snapshots for staged transaction"
+                || message == "scanned committed schema versions for staged transaction"
                 || message == "staged commit landed"
         }) {
             self.0
@@ -249,6 +251,47 @@ async fn staged_commit_diagnostics_join_scan_counts_and_commit_phases() {
         );
     }
 
+    catalog.close().await.unwrap();
+}
+
+/// Repeated snapshot and schema-version projections scan the store once
+/// per transaction, however many times they are served.
+#[tokio::test]
+async fn repeated_snapshot_projections_scan_once_per_transaction() {
+    let events = captured_commit_events();
+
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let transaction_id = tx.diagnostic_id.to_string();
+
+    // Cells arrive in DuckLake's declared order: begin_snapshot, then
+    // schema_version, then table_id.
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SchemaVersions,
+        cells: vec![Cell::U64(1), Cell::U64(1), Cell::U64(5)],
+    });
+
+    // Three reads apiece: the scans the store sees must not follow.
+    let snapshots = tx.visible_snapshots().await.unwrap();
+    for _ in 0..3 {
+        assert_eq!(tx.visible_snapshots().await.unwrap(), snapshots);
+        assert_eq!(
+            tx.visible_schema_version_records().await.unwrap(),
+            vec![(5, 1, 1)]
+        );
+    }
+
+    events.one(
+        "scanned committed snapshots for staged transaction",
+        &transaction_id,
+    );
+    events.one(
+        "scanned committed schema versions for staged transaction",
+        &transaction_id,
+    );
+
+    tx.rollback();
     catalog.close().await.unwrap();
 }
 
