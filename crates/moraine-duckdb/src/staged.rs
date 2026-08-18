@@ -17,6 +17,7 @@
 use std::{
     ffi::{c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Mutex, MutexGuard},
 };
 
 use moraine::ffi_support::staged::{
@@ -64,9 +65,27 @@ pub struct MoraineCell {
 
 /// A staged-row transaction, opaque to C. Owns one [`StagedTransaction`]
 /// plus a borrowed pointer to the catalog handle it was opened on.
+///
+/// The transaction sits behind a mutex: DuckDB drives concurrent pipelines
+/// through one handle — a Sink staging while another scan's init dumps —
+/// and `stage` mutates the overlay the dumps read.
 pub struct MoraineTxHandle {
     catalog: *const MoraineCatalogHandle,
-    tx: StagedTransaction,
+    tx: Mutex<StagedTransaction>,
+}
+
+impl MoraineTxHandle {
+    /// The staged transaction, exclusively. A poisoned lock (a panic in an
+    /// earlier call, already contained) makes the staged state suspect, so
+    /// it is refused rather than served.
+    fn lock(&self) -> Result<MutexGuard<'_, StagedTransaction>, AbiError> {
+        self.tx.lock().map_err(|_| {
+            AbiError::new(
+                codes::INTERNAL,
+                "staged transaction unusable after an earlier panic",
+            )
+        })
+    }
 }
 
 /// Decodes the ABI's `table_kind` through the core's wire table
@@ -186,7 +205,7 @@ pub unsafe extern "C" fn moraine_tx_begin(
         }?;
         Ok(Box::new(MoraineTxHandle {
             catalog: handle,
-            tx,
+            tx: Mutex::new(tx),
         }))
     };
 
@@ -262,8 +281,8 @@ pub unsafe extern "C" fn moraine_tx_stage(
             },
         };
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(op);
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(op);
         Ok(())
     };
 
@@ -293,8 +312,11 @@ macro_rules! tx_dump_body {
             let tx_ref = unsafe { &*$tx };
             // SAFETY: `catalog` outlives `tx` per `moraine_tx_begin`'s contract.
             let catalog_ref = unsafe { &*tx_ref.catalog };
+            // Held across the dump, so a concurrent stage waits instead of
+            // moving the overlay under it.
+            let guard = tx_ref.lock()?;
             let rows = catalog_ref
-                .block_on($visible(&tx_ref.tx $(, $arg)*))
+                .block_on($visible(&guard $(, $arg)*))
                 .map_err(AbiError::from)?;
             $convert(rows)
         };
@@ -1089,6 +1111,18 @@ pub unsafe extern "C" fn moraine_tx_commit(
         // SAFETY: caller contract above; `tx` consumed exactly once.
         let boxed = unsafe { Box::from_raw(tx) };
         let MoraineTxHandle { catalog, tx } = *boxed;
+        let tx = match tx.into_inner() {
+            Ok(tx) => tx,
+            // A panic in an earlier call (already contained) left the
+            // staged state suspect: discard it rather than commit it.
+            Err(poisoned) => {
+                poisoned.into_inner().rollback();
+                return Err(AbiError::new(
+                    codes::INTERNAL,
+                    "staged transaction unusable after an earlier panic; rolled back",
+                ));
+            }
+        };
         // Checked after `tx` is reclaimed: the contract frees it on every
         // path, argument errors included.
         if out_snapshot_id.is_null() {
@@ -1162,7 +1196,12 @@ pub unsafe extern "C" fn moraine_tx_rollback(tx: *mut MoraineTxHandle) {
     let attempt = || {
         // SAFETY: caller contract above.
         let boxed = unsafe { Box::from_raw(tx) };
-        boxed.tx.rollback();
+        // A rollback discards either way, so a poisoned lock is drained
+        // rather than refused.
+        match boxed.tx.into_inner() {
+            Ok(tx) => tx.rollback(),
+            Err(poisoned) => poisoned.into_inner().rollback(),
+        }
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
@@ -1193,8 +1232,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_schema(
         // SAFETY: caller contract above.
         let bytes = unsafe { borrow_bytes(arrow_schema, arrow_schema_len, "arrow_schema") }?;
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineSchema {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineSchema {
             table_id,
             schema_version,
             arrow_schema: bytes.to_vec(),
@@ -1233,8 +1272,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_schema_owned(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineSchema {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineSchema {
             table_id,
             schema_version,
             arrow_schema,
@@ -1277,8 +1316,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_insert(
         // SAFETY: caller contract above.
         let bytes = unsafe { borrow_bytes(arrow_body, arrow_body_len, "arrow_body") }?;
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineInsert {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineInsert {
             table_id,
             schema_version,
             begin_snapshot,
@@ -1324,8 +1363,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_insert_owned(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineInsert {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineInsert {
             table_id,
             schema_version,
             begin_snapshot,
@@ -1363,8 +1402,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_inline_delete(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineInlineDelete {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineInlineDelete {
             table_id,
             row_id,
             end_snapshot,
@@ -1399,8 +1438,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineFileDelete {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineFileDelete {
             table_id,
             data_file_id,
             row_id,
@@ -1438,8 +1477,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete_remove(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineFileDeleteRemove {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineFileDeleteRemove {
             table_id,
             data_file_id,
             row_id,
@@ -1475,8 +1514,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_flush_delete(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineFlushDelete {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineFlushDelete {
             table_id,
             schema_version,
             flush_snapshot,
@@ -1509,8 +1548,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_drop(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineDrop { table_id });
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineDrop { table_id });
         Ok(())
     };
 
@@ -1541,8 +1580,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_schema_drop(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineSchemaDrop {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineSchemaDrop {
             table_id,
             schema_version,
         });
@@ -2311,6 +2350,49 @@ mod tests {
         // SAFETY: freed exactly once; `tx` rolled back exactly once.
         unsafe {
             crate::dumps::moraine_dump_snapshots_free(committed, committed_len);
+            moraine_tx_rollback(tx);
+            moraine_detach(handle);
+        }
+    }
+
+    /// A stage and a dump race on one handle without corrupting it: DuckDB
+    /// drives concurrent pipelines through one staged tx — a Sink staging
+    /// while another scan's init dumps — and the handle serializes them.
+    #[test]
+    fn a_stage_and_a_dump_race_safely_on_one_handle() {
+        let lake = TempDir::new("staged-race");
+        let handle = attach_ok(lake.path());
+        let tx = begin(handle);
+
+        let tx_addr = tx as usize;
+        let stager = std::thread::spawn(move || {
+            let tx = tx_addr as *mut MoraineTxHandle;
+            let mut arena = StrArena::new();
+            for i in 0..200 {
+                stage_data_file_row(tx, &mut arena, i, 1, 1);
+            }
+        });
+
+        for _ in 0..200 {
+            let mut rows: *mut MoraineDataFileRow = ptr::null_mut();
+            let mut len: usize = 0;
+            let mut err = MoraineError::default();
+            // SAFETY: `tx` stays live until the join below; outputs are
+            // valid local slots.
+            let code = unsafe {
+                moraine_tx_dump_data_files(tx, &raw mut rows, &raw mut len, &raw mut err)
+            };
+            // SAFETY: `err.message` is null or was just written by the dump.
+            let err_message = unsafe { err.message.as_ref() };
+            assert_eq!(code, codes::OK, "dump failed: {err_message:?}");
+            // SAFETY: exactly the array the dump just wrote.
+            unsafe { crate::dumps::moraine_dump_data_files_free(rows, len) };
+        }
+        stager.join().expect("the staging thread panicked");
+
+        // SAFETY: `tx` rolled back exactly once; `handle` detached exactly
+        // once.
+        unsafe {
             moraine_tx_rollback(tx);
             moraine_detach(handle);
         }
