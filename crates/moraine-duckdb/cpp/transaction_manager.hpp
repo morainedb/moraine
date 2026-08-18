@@ -68,9 +68,7 @@ public:
 	// The staged tx if one has been opened, else null — a peek for read
 	// paths that must observe the transaction's own staged writes without
 	// ever opening a write transaction themselves.
-	MoraineTxHandle *StagedTxIfOpen() const {
-		return staged_tx_;
-	}
+	MoraineTxHandle *StagedTxIfOpen() const;
 
 	// Hands ownership of the staged tx (if one was opened) to the caller,
 	// clearing this transaction's reference so the destructor's defensive
@@ -93,8 +91,14 @@ public:
 	// one, so `live_only` keys them apart rather than letting either stand
 	// in for the other.
 	std::shared_ptr<const MetadataRows> GetMetadataRows(const MetadataTableSpec &spec, bool live_only = false) const;
-	void PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows,
-	                     bool live_only = false);
+
+	// The invalidation count the held materializations stand at. Taken
+	// before building a set and handed back to `PutMetadataRows`, which
+	// drops a set whose count has moved: a staged tx opened, or a row
+	// staged into its table, while it was being built.
+	uint64_t MetadataRowsEpoch() const;
+	void PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows, bool live_only,
+	                     uint64_t epoch);
 
 	// Takes the rows one metadata scan emits row ids for, returning the id
 	// its first row carries. Ids come from a counter this transaction never
@@ -122,6 +126,14 @@ private:
 	std::unordered_map<uint64_t, duckdb::unique_ptr<duckdb::SchemaCatalogEntry>> schema_cache_;
 	MoraineTxHandle *staged_tx_ = nullptr;
 	std::map<std::pair<const MetadataTableSpec *, bool>, std::shared_ptr<const MetadataRows>> metadata_rows_;
+	// Bumped by every drop from the map above, so a Put that raced the
+	// drop is refused rather than resurrecting what it removed.
+	uint64_t metadata_rows_epoch_ = 0;
+	// Guards `staged_tx_` and the two members above, for the same
+	// concurrency `scanned_runs_lock_` serializes: scans init on the
+	// executor's threads while a Sink opens the staged tx and drops the
+	// materializations that move invalidates.
+	mutable std::mutex staged_state_lock_;
 	// Registered runs, by ascending base, and the next id to hand out.
 	// Guarded, because scans of one transaction init on the executor's
 	// threads while another statement's Sink resolves against them.
@@ -130,8 +142,13 @@ private:
 	mutable std::mutex scanned_runs_lock_;
 
 	// Opens the staged tx if this transaction has none, leaving what the
-	// two public accessors hold to them.
+	// two public accessors hold to them. Caller holds `staged_state_lock_`.
 	MoraineTxHandle *OpenStagedTx();
+
+	// Drop the held materializations — all of them, or one table's both
+	// keyings — and advance the epoch. Caller holds `staged_state_lock_`.
+	void DropMetadataRows();
+	void DropMetadataRowsFor(const MetadataTableSpec &spec);
 };
 
 class MoraineTransactionManager : public duckdb::TransactionManager {

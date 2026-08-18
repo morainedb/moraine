@@ -1901,6 +1901,10 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 		if (auto cached = transaction.GetMetadataRows(spec, live_only)) {
 			return cached;
 		}
+		// Taken before the materialization it stamps: a row staged into
+		// this table while the set is built invalidates it, and the Put
+		// drops it rather than serving it.
+		auto epoch = transaction.MetadataRowsEpoch();
 		std::shared_ptr<const MetadataRows> rows;
 		if (spec.write_table_kind != kNotWritable) {
 			if (auto staged = TxAwareRows(staged_tx, handle, context, spec.write_table_kind,
@@ -1911,13 +1915,16 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 		if (rows == nullptr) {
 			rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
 		}
-		transaction.PutMetadataRows(spec, rows, live_only);
+		transaction.PutMetadataRows(spec, rows, live_only, epoch);
 		return rows;
 	}
 
 	if (auto cached = transaction.GetMetadataRows(spec)) {
 		return cached;
 	}
+	// Taken before the materialization it stamps, as in the staged branch:
+	// a staged tx opened while the set is built invalidates it.
+	auto epoch = transaction.MetadataRowsEpoch();
 
 	// The rows this attach dumped last time are byte-identical to a fresh
 	// dump whenever no batch landed since, so ask the store where it
@@ -1928,13 +1935,13 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 	const bool stamped = ReadHeadStamp(handle, context, before);
 	if (stamped) {
 		if (auto held = moraine_catalog.HeldMetadataRows(spec, before.snapshot_id, before.batch_seq)) {
-			transaction.PutMetadataRows(spec, held);
+			transaction.PutMetadataRows(spec, held, false, epoch);
 			return held;
 		}
 	}
 
 	auto rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
-	transaction.PutMetadataRows(spec, rows);
+	transaction.PutMetadataRows(spec, rows, false, epoch);
 
 	// Hold them for the next transaction only if the store did not move
 	// under the dump: rows that straddled a commit stand at no single
