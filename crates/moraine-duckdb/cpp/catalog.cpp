@@ -555,7 +555,8 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckd
 		}
 		auto &moraine_tx = transaction.transaction->Cast<MoraineTransaction>();
 		auto entry = CreateInlineDataTable(*transaction.context, catalog, *this, moraine_catalog.Handle(),
-		                                   moraine_tx.StagedTx(), info, parsed->table_id, parsed->schema_version);
+		                                   moraine_tx.StagedTxForInline(), info, parsed->table_id,
+		                                   parsed->schema_version);
 		if (!entry) {
 			// IF NOT EXISTS against an already-registered schema version.
 			return nullptr;
@@ -634,7 +635,7 @@ void MoraineSchemaEntry::DropEntry(duckdb::ClientContext &context, duckdb::DropI
 			auto catalog_transaction = catalog.GetCatalogTransaction(context);
 			auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
 			MoraineError err {};
-			auto code = moraine_tx_stage_inline_schema_drop(moraine_tx.StagedTx(), parsed->table_id,
+			auto code = moraine_tx_stage_inline_schema_drop(moraine_tx.StagedTxForInline(), parsed->table_id,
 			                                                parsed->schema_version, &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
