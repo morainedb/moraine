@@ -47,6 +47,14 @@ pub(crate) fn materialize<K: Ord, V: Clone>(rows: &BTreeMap<K, V>) -> Vec<V> {
     rows.values().cloned().collect()
 }
 
+/// Restamps a retained record half at the state the batch left behind.
+/// The rows are unchanged, so only the stamp they answer to moves.
+fn advance_half(half: &mut Option<(HeadValue, Arc<Vec<EntityRecord>>)>, new_head: HeadValue) {
+    if let Some((head, _)) = half {
+        *head = new_head;
+    }
+}
+
 /// Whether two head records name the same store state.
 fn same_head(a: &HeadValue, b: &HeadValue) -> bool {
     a.snapshot_id == b.snapshot_id && a.batch_seq == b.batch_seq
@@ -441,11 +449,20 @@ impl ProjectionCache {
     /// the head record the batch itself wrote. An undecodable key, or a
     /// batch with no head write matching `new_head`, clears everything.
     pub(crate) fn apply_batch(&mut self, writes: &[StagedWrite], new_head: u64) {
-        self.current_entities = None;
-        self.history_entities = None;
+        // A half the batch did not write is still exactly right at the new
+        // head, so it rides the stamp forward instead of being rescanned.
+        // Inline, index-entry, and deletion-schedule batches write neither.
+        let mut wrote_current = false;
+        let mut wrote_history = false;
         for (encoded_key, write) in writes {
             let bytes = write.as_deref();
-            match Key::decode(encoded_key) {
+            let key = Key::decode(encoded_key);
+            match key {
+                Ok(Key::Current(_)) => wrote_current = true,
+                Ok(Key::History(_)) => wrote_history = true,
+                _ => {}
+            }
+            match key {
                 Ok(Key::Snapshot { snapshot_id }) => self.snapshots.fold(snapshot_id, bytes),
                 Ok(Key::Current(CurrentKey::Entity(EntityKey::TableStats { table_id }))) => {
                     self.table_stats.fold(table_id, bytes);
@@ -456,6 +473,8 @@ impl ProjectionCache {
                 }))) => self.table_column_stats.fold((table_id, column_id), bytes),
                 Ok(_) => {}
                 Err(_) => {
+                    self.current_entities = None;
+                    self.history_entities = None;
                     self.snapshots.clear();
                     self.table_stats.clear();
                     self.table_column_stats.clear();
@@ -463,9 +482,17 @@ impl ProjectionCache {
                 }
             }
         }
+        if wrote_current {
+            self.current_entities = None;
+        }
+        if wrote_history {
+            self.history_entities = None;
+        }
         // Cleared rather than asserted: this runs under the projection write
         // lock inside a spawned commit, where a panic strands the joiner.
         let Some(stamp) = head_stamp(writes).filter(|stamp| stamp.snapshot_id == new_head) else {
+            self.current_entities = None;
+            self.history_entities = None;
             self.snapshots.clear();
             self.table_stats.clear();
             self.table_column_stats.clear();
@@ -474,6 +501,8 @@ impl ProjectionCache {
         self.snapshots.advance(stamp);
         self.table_stats.advance(stamp);
         self.table_column_stats.advance(stamp);
+        advance_half(&mut self.current_entities, stamp);
+        advance_half(&mut self.history_entities, stamp);
     }
 }
 
@@ -942,6 +971,55 @@ mod tests {
         assert!(cache.snapshots_at(&stamp(4, 4)).is_none());
         assert!(cache.table_stats_at(&stamp(4, 4)).is_none());
         assert!(cache.table_column_stats_at(&stamp(4, 4)).is_none());
+    }
+
+    /// A batch writing neither record subspace leaves both halves in
+    /// place, restamped — an inline or index-entry commit costs the next
+    /// reader no rescan. A batch that does write one drops that one.
+    #[test]
+    fn untouched_record_halves_ride_the_stamp_forward() {
+        let half = || Arc::new(vec![EntityRecord::TableStats(stats_value(7, 10))]);
+
+        let mut cache = installed_at_three();
+        cache.install_current_entities(stamp(3, 3), half());
+        cache.install_history_entities(stamp(3, 3), half());
+
+        // An inline chunk names no entity key at all.
+        cache.apply_batch(
+            &[
+                (
+                    Key::Inline(crate::store::key::InlineKey::Live(
+                        crate::store::key::InlineOperation::Insert {
+                            table_id: 7,
+                            schema_version: 1,
+                            begin_snapshot: 4,
+                            chunk_seq: 0,
+                        },
+                    ))
+                    .encode(),
+                    Some(vec![1, 2, 3]),
+                ),
+                head_write(4, 4),
+            ],
+            4,
+        );
+        assert!(cache.current_entities_at(&stamp(4, 4)).is_some());
+        assert!(cache.history_entities_at(&stamp(4, 4)).is_some());
+        assert!(cache.current_entities_at(&stamp(3, 3)).is_none());
+
+        // A current write drops the current half and spares history.
+        cache.apply_batch(
+            &[
+                (
+                    Key::current(EntityKey::Schema { schema_id: 9 }).encode(),
+                    Some(vec![1, 2, 3]),
+                ),
+                head_write(5, 5),
+            ],
+            5,
+        );
+        assert!(cache.current_entities_at(&stamp(5, 5)).is_none());
+        assert!(cache.history_entities_at(&stamp(5, 5)).is_some());
     }
 
     #[test]
