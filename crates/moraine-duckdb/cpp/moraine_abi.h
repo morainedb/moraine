@@ -63,6 +63,10 @@ typedef struct MoraineSnapshotHandle MoraineSnapshotHandle;
 
 // A staged-row transaction, opaque to C. Owns one [`StagedTransaction`]
 // plus a borrowed pointer to the catalog handle it was opened on.
+//
+// The transaction sits behind a mutex: DuckDB drives concurrent pipelines
+// through one handle — a Sink staging while another scan's init dumps —
+// and `stage` mutates the overlay the dumps read.
 typedef struct MoraineTxHandle MoraineTxHandle;
 
 // Mirrors the C `MoraineS3Config`: S3 credentials for an `s3://` store,
