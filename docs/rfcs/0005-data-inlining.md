@@ -197,8 +197,32 @@ row's indexed values. It seeks the `inline/chunk_range` directory from that
 row id, reads only the owning immutable chunk, and decodes that body. A
 partially populated directory means an older chunk is still live, so the
 lookup falls back to the full chunk scan rather than risking an uncovered
-index removal. Normal table scans still read every live chunk because they
-need every row.
+index removal.
+
+The directory serves every other inline read the same way once it is known
+**complete** — naming every live chunk. Completeness is judged once, by
+comparing the directory against a full chunk walk, and remembered per
+table (RFC 0009, store facts) — but only when the store format locks out
+writers that predate the directory, because from that format on every
+chunk arrives with its locator in the same batch and completeness is
+monotone. From there:
+
+- the flush walk and the row-location probe run on locators alone — row
+  spans without the Arrow bodies, which were the bulk of a flush's block
+  misses and were paid again per DELETE statement;
+- a table scan materializes its row set from the locators, selects the
+  scan's rows, and point-reads only the chunk bodies the selected rows
+  reference — a chunk whose rows are all tombstoned, or outside an
+  incremental scan's window, is never hauled.
+
+Who judges and who repairs is split by capability. A flush that finds the
+directory incomplete heals the gap onto its own batch — locators for
+surviving uncovered chunks, deletions for locators naming no chunk — and
+remembers nothing off a repair still riding the batch: completeness is
+trusted only once it has landed. The read path never writes, so it judges
+without healing, and only on an isolated session — a manifest-following
+pass can straddle a commit and must not judge. A directory found short of
+complete costs what it always did: the full chunk scan.
 
 Each chunk carries its `schema_version` (its key component), so a
 body-only chunk is decoded against *its own* version's `inline/schema`,

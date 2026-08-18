@@ -232,35 +232,39 @@ through that handle's *own* transaction, which no migrator does. The fence
 check is the guard, and that is the one the session still performs.
 
 A **read-only** handle is the one a migration can start under — a migrator
-fences a writer but leaves a reader following the store — so it probes on
-every read, and its cold-open refuses a store already carrying a marker. A
-writer probes once while cold, which is what catches a migration a crashed
-predecessor left behind.
+fences a writer but leaves a reader following the store — so every session
+it opens re-establishes the marker's absence, and its cold-open refuses a
+store already carrying a marker. A writer establishes it while cold too,
+which is what catches a migration a crashed predecessor left behind.
 
-So a reader pays two point reads to serve a cache hit where a writer pays
-none: 6.4 µs against 0.1 µs (`BENCHMARK.md`). Both are cheaper than they
-look — measured under injected per-GET latency, a warm read-only read
-issues **no object-store GET at all**, at any latency, so the two reads are
-memory and lock rather than round trips. Halving them was worth having as a
-question and is worth nothing as a change.
+What re-establishing costs, though, is no longer a marker read per
+session. The marker is an absent key on every store that is not
+mid-migration, and an absent key is the store's most expensive read — a
+bloom filter answers "might be present", never "absent", so the read walks
+every level before it can say no. Warm-cache microbenchmarks made that
+walk look free (6.4 µs, no object-store GET — `BENCHMARK.md`); production
+flush telemetry showed it as a fixed cache-missing term under every commit
+and every read session. So a handle keys the marker's absence on the
+**head it observed it at**: a session whose head matches the recorded
+stamp opens without re-reading the marker, and one whose head moved
+re-reads and re-stamps. Soundness comes from the start batch, not the
+cache — a migration start moves the head in the same batch as the marker,
+and `migration::start` is the marker's only writer (RFC 0015), so a marker
+cannot appear under an unmoved head. A committer maintains the stamp from
+the other side without any read at all: winning the head CAS proves no
+batch — a migration start included — landed since its base, so a landed
+commit records its own resulting head as marker-free.
 
-Carrying the migration state as a field on the head record would halve
-them, and the design is recorded here as **rejected**, because the encoding
-is the easy half and the version gate is not. A reader may trust such a field only if every migration
-maintains it, and an older binary starts one by writing the marker alone —
-so field presence cannot be the signal, and the guarantee has to come from
-the format stamp. That stamp is raised lazily, by the feature needing it:
-creating an index raises it today, which is an act an operator chooses. A
-field on *every* head record is not chosen. The first commit after a binary
-upgrade would raise it, and from that moment the store cannot be opened by
-the binary that wrote it the day before — a one-way door, taken by default,
-for microseconds on a path nothing is waiting on.
-
-Overlapping the two reads was the cheaper alternative, and the same
-measurement closes it: they are independent and issued in sequence, but a
-warm read makes no round trip for either, and a cold one makes four for its
-materialization of which they are at most one. It was built against that
-idea and reverted by the number.
+Carrying the migration state as a field on the head record would buy the
+same skip, and that design stays **rejected**, because the encoding is the
+easy half and the version gate is not. A reader may trust such a field
+only if every migration maintains it, so a durable field means nothing
+until a format bump forces every writer onto it — a one-way door, taken by
+default, closing the store to yesterday's binary. The head-keyed stamp
+needs no gate: it is an in-memory judgment each handle re-derives from
+reads it was making anyway, and the start-batch invariant it rests on has
+no legacy violations to grandfather (no released binary has ever written
+the marker — RFC 0015).
 
 Making the head write unconditional has a second effect the design wants:
 `sys/head` becomes the one key every batch touches, so SlateDB's
@@ -350,9 +354,15 @@ worth it:
   snapshots and reaches the fallback above. (If the reader specifically
   wanted the *old* `S`, that snapshot is gone — see validity window.)
 - **The changelog is not there.** Either the commit declined to record one
-  — it wrote more keys than the cap, which is the same commit the size
-  threshold below would reject — or later commits swept it out of the
-  retained window. Both read as an absent record and both mean rescan.
+  — it wrote more keys than the cap — or later commits swept it out of the
+  retained window. Both read as an absent record and both mean rescan. The
+  cap (4,096 keys) bounds the record, not the replay decision, and it is
+  sized generously on purpose: a commit that records nothing forces every
+  reader behind it to rematerialize, which costs far more than the
+  changelog it declined to write, so an ordinary bulk flush — production
+  showed one at 259 keys — must land inside it. The churn threshold below
+  still decides whether a replay pays; the cap only decides whether the
+  choice exists.
 - **The gap is large** relative to catalog size: a full `current` rescan is
   cheaper than replaying a huge changelog. The crossover is measured, not
   reasoned — it sits at a churn share of **~0.57** of the live entity count
@@ -481,9 +491,11 @@ the head stamp tells it exactly which store state its held view stands at.
 That is what the validated cut buys: without it a torn view would persist
 and compound rather than being discarded with the read that built it.
 
-The migration marker is checked before the cache is consulted, so a warm
-handle refuses a mid-migration store exactly as a cold one does — a cached
-view must never be the reason a reader sails through a keyspace move.
+The migration marker's absence is established before the cache is
+consulted — from the head-keyed stamp when the head has not moved, from
+the store when it has — so a warm handle refuses a mid-migration store
+exactly as a cold one does: a cached view must never be the reason a
+reader sails through a keyspace move.
 
 There is:
 
@@ -559,6 +571,34 @@ principle as committer read-your-writes:
   it whole — populating DuckLake's metadata tables issues two dozen of
   them, and copying the catalog per call would make the cache the expensive
   path.
+
+### Store facts outlive view invalidation
+
+Everything above is keyed by the head stamp and dropped or replaced when
+the state it describes stops standing. Three cached facts follow a
+different rule, because each describes the store rather than a view of it,
+and each rests on a monotonicity the store enforces rather than on
+invalidation discipline. Invalidation leaves all three standing.
+
+- **The format floor.** `sys/format` is forward-only: no writer lowers it.
+  A version once observed is therefore a permanent lower bound — seeded at
+  open from the validated format, raised when a landed batch carries a
+  stamp (true once the batch lands, whatever a read said before). A commit
+  whose target format sits at or below the floor owes no stamp and reads
+  nothing; only a commit reaching *above* the floor reads the stamp before
+  writing it (RFC 0015 owns what the stamp means).
+- **The migration-clear head.** The head at which `sys/migration` was
+  observed absent ("A read-write handle resolves the head without reading
+  it", above). Keyed on the whole head stamp, so it is exact rather than
+  monotone; its soundness is RFC 0015's start-batch invariant, and every
+  landed commit restamps it for free.
+- **Inline chunk-directory completeness, per table.** The chunk-range
+  directory (RFC 0005) names every live chunk once verified against a full
+  chunk walk — and stays that way only when the store format shuts out
+  writers that predate the directory, since from then on every chunk
+  arrives with its locator in the same batch. Verified once, remembered,
+  and monotone from there; RFC 0005 owns who verifies, who heals, and
+  which sessions may judge.
 
 ### The stack, named end to end
 

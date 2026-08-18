@@ -573,6 +573,22 @@ verb path:
   **verb-path** property; on the extension path the equivalent behavior
   is provided by DuckLake, one layer up, where it belongs.
 
+Two of the staged path's read phases dominate its latency — the inline
+translation (chunk walks for flush-deletes and drops) and equality-index
+maintenance (scoped Parquet reads and entry staging) — and they run
+**beside** each other rather than in sequence. Both read the transaction's
+pre-commit cut, so ordering could only matter through writes: index
+maintenance stages only `index/*` keys as it streams — a subspace the
+inline translation never reads — and hands its chunk-directory repairs
+back unstaged, while the translation stages nothing at all. Neither can
+observe the other, so running them together is indistinguishable from
+running them in order. The head view resolves first (it is maintenance's
+base input, and a warm handle answers it from memory); maintenance still
+completes before the batch is assembled, so a poisoned definition rides
+the writes it produces; and its directory repairs are ordered ahead of the
+batch's own inline writes, so a flush draining a repaired chunk still
+deletes the locator the repair added.
+
 The two front doors share the commit core (staging, one-batch atomicity,
 head conflict detection, durability) and differ only in who authors the
 mutations and therefore who may retry. Keeping that split explicit is what
