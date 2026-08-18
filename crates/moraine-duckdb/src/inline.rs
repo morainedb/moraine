@@ -607,6 +607,60 @@ mod tests {
         },
     };
 
+    /// The `(table_id, schema_version)` pairs `ducklake_inlined_data_tables`
+    /// projects, freed before returning.
+    fn registered_table_count(handle: *mut MoraineCatalogHandle) -> usize {
+        let mut rows: *mut MoraineInlineTableRow = ptr::null_mut();
+        let mut len: usize = 0;
+        let mut err = MoraineError::default();
+        // SAFETY: `handle` is attached; outputs are valid local slots.
+        let code = unsafe {
+            moraine_inline_registered_tables(
+                handle,
+                &raw mut rows,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK);
+        // SAFETY: matching allocator, just populated above, not yet freed.
+        unsafe { moraine_inline_registered_tables_free(rows, len) };
+        len
+    }
+
+    /// `ducklake_inlined_data_tables` projects committed `inline/schema`
+    /// records: a staged registration is absent until its transaction lands.
+    #[test]
+    fn an_inline_schema_registers_its_table_only_once_committed() {
+        let dir = TempDir::new("registered");
+        let handle = attach_ok(dir.path());
+
+        let tx = begin(handle);
+        let mut err = MoraineError::default();
+        // SAFETY: `tx` is live; the schema bytes are owned by the call; `err`
+        // is a valid local slot.
+        let code = unsafe {
+            moraine_tx_stage_inline_schema_owned(
+                tx,
+                1,
+                0,
+                MoraineArrowBytes::from_vec(b"schema".to_vec()),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK);
+        assert_eq!(registered_table_count(handle), 0);
+
+        commit(tx);
+        assert_eq!(registered_table_count(handle), 1);
+
+        // SAFETY: `handle` came from `attach_ok` above and is detached
+        // exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
     #[test]
     fn inline_chunk_owner_moves_without_copying_the_body() {
         let body = Bytes::from_static(b"inline body");
