@@ -295,6 +295,57 @@ async fn repeated_snapshot_projections_scan_once_per_transaction() {
     catalog.close().await.unwrap();
 }
 
+/// An overlaid row is removed and re-appended, so a key restaged after
+/// another one follows it — the order a projection is served in.
+#[tokio::test]
+async fn restaging_a_key_moves_it_behind_the_keys_staged_since() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+
+    let scheduled = |id: u64, path: &str| {
+        vec![
+            Cell::U64(id),
+            Cell::Str(path.to_string()),
+            Cell::Bool(true),
+            Cell::I64(7),
+        ]
+    };
+    for (id, path) in [(10, "a.parquet"), (11, "b.parquet"), (12, "c.parquet")] {
+        tx.stage(RowOperation::Insert {
+            table: TableKind::FilesScheduledForDeletion,
+            cells: scheduled(id, path),
+        });
+    }
+    let ids = |rows: &[proto::GcFileValue]| rows.iter().map(|r| r.data_file_id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(&tx.visible_scheduled_deletions().await.unwrap()),
+        vec![10, 11, 12]
+    );
+
+    // Restaging 10 puts it last; deleting 11 and restaging it puts it
+    // after 10, not back where it began.
+    tx.stage(RowOperation::Insert {
+        table: TableKind::FilesScheduledForDeletion,
+        cells: scheduled(10, "a2.parquet"),
+    });
+    tx.stage(RowOperation::Delete {
+        table: TableKind::FilesScheduledForDeletion,
+        cells: vec![Cell::U64(11)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::FilesScheduledForDeletion,
+        cells: scheduled(11, "b2.parquet"),
+    });
+    assert_eq!(
+        ids(&tx.visible_scheduled_deletions().await.unwrap()),
+        vec![12, 10, 11]
+    );
+
+    tx.rollback();
+    catalog.close().await.unwrap();
+}
+
 /// A DuckLake-shaped snapshot bump plus table create: table `t` (id
 /// 1, schema 0 = bootstrap's `main`) with one column, staged and
 /// committed as one batch, then verified through the ordinary
