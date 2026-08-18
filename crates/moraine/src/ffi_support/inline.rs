@@ -9,10 +9,7 @@ use bytes::Bytes;
 #[doc(hidden)]
 pub use crate::catalog::inline::InlineScanKind;
 use crate::{
-    catalog::{
-        ReadOnlyCatalog,
-        inline::{InlineRow, materialize_inline_rows},
-    },
+    catalog::ReadOnlyCatalog,
     error::{Error, Result},
     store::{inline as store_inline, key::InlineOperation},
 };
@@ -48,7 +45,9 @@ pub struct InlineScanRecord {
 
 /// Materializes `table_id`'s inlined rows and selects `kind`'s variant at
 /// `snapshot` (windowed from `start` for the incremental variants) — the
-/// read model behind `moraine_inline_scan`.
+/// read model behind `moraine_inline_scan`. Served from the chunk-range
+/// directory once it is known complete, hauling only the chunk bodies the
+/// selected rows reference.
 ///
 /// # Errors
 ///
@@ -62,51 +61,36 @@ pub async fn scan_inline(
     snapshot: u64,
     start: u64,
 ) -> Result<InlineScanRecord> {
-    let session = catalog.begin_read().await?;
-    let (chunks, inline_deletes) = futures::join!(
-        store_inline::scan_inline_chunks(session.handle(), table_id),
-        store_inline::scan_inline_deletes(session.handle(), table_id),
-    );
-    session.finish();
-    let chunks = chunks?;
-    let inline_deletes = inline_deletes?;
+    let (selected, chunks) = catalog
+        .select_inline_rows(table_id, kind, snapshot, start)
+        .await?;
 
-    let rows: Vec<InlineRow> = materialize_inline_rows(&chunks, &inline_deletes);
-
-    // Referenced chunk bodies dense-index in first-reference order.
-    let mut chunk_indexes: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
-    let mut chunk_bodies: Vec<Bytes> = Vec::new();
-    let selected = kind
-        .select(&rows, snapshot, start)
+    // Rows arrive with `chunk` dense-indexed in first-reference order over
+    // exactly the referenced chunks, which is the record's shape already.
+    let chunk_bodies: Vec<Bytes> = chunks.iter().map(|(_, chunk)| chunk.body.clone()).collect();
+    let rows = selected
         .into_iter()
         .map(|row| {
-            let (operation, chunk) = &chunks[row.chunk];
+            let (operation, _) = &chunks[row.chunk];
             let InlineOperation::Insert { schema_version, .. } = operation else {
                 return Err(Error::Corruption(format!(
                     "inline row {} references a non-insert chunk key: {operation:?}",
                     row.row_id
                 )));
             };
-            let chunk_index = *chunk_indexes.entry(row.chunk).or_insert_with(|| {
-                chunk_bodies.push(chunk.body.clone());
-                chunk_bodies.len() as u64 - 1
-            });
 
             Ok(InlineRowRecord {
                 row_id: row.row_id,
                 schema_version: *schema_version,
                 begin_snapshot: row.begin_snapshot,
                 end_snapshot: row.end_snapshot,
-                chunk_index,
+                chunk_index: row.chunk as u64,
                 offset_in_chunk: row.offset_in_chunk,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(InlineScanRecord {
-        rows: selected,
-        chunk_bodies,
-    })
+    Ok(InlineScanRecord { rows, chunk_bodies })
 }
 
 /// Every `(schema_version, arrow_schema)` recorded for `table_id`, in
@@ -322,6 +306,79 @@ mod tests {
 
         let registered = inline_registered_tables(&catalog).await.unwrap();
         assert_eq!(registered, vec![(1, 0)]);
+    }
+
+    /// The first `scan_inline` walk verifies the chunk directory and
+    /// remembers it; the next serves from it, hauling only referenced
+    /// bodies. The proof is divergence: a chunk planted without a locator
+    /// is visible only to a body scan.
+    #[tokio::test]
+    async fn scan_inline_serves_from_the_directory_once_verified() {
+        use crate::store::{
+            key::{InlineKey, InlineOperation, Key},
+            proto, value,
+        };
+
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk-a".to_vec(),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0)
+            .await
+            .unwrap();
+        assert_eq!(record.rows.len(), 2);
+        assert!(
+            crate::catalog::projection::inline_directory_complete(catalog.projections(), 1),
+            "the first walk must verify and remember a complete directory"
+        );
+
+        // The divergence: a chunk with no locator, behind the memo's back.
+        let tx = catalog.begin_write_tx().await.unwrap();
+        tx.put(
+            Key::Inline(InlineKey::Live(InlineOperation::Insert {
+                table_id: 1,
+                schema_version: 0,
+                begin_snapshot: 1,
+                chunk_seq: 5,
+            }))
+            .encode(),
+            value::encode_value(&proto::InlineChunkValue {
+                body: b"rogue".to_vec().into(),
+                row_id_start: 10,
+                row_count: 2,
+                data_file_id: None,
+            }),
+        )
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0)
+            .await
+            .unwrap();
+        let row_ids: Vec<u64> = record.rows.iter().map(|row| row.row_id).collect();
+        assert_eq!(
+            row_ids,
+            [0, 1],
+            "a directory-served scan must not see a chunk only a body scan finds"
+        );
+        assert_eq!(record.chunk_bodies, vec![Bytes::from_static(b"chunk-a")]);
     }
 
     /// Staged `inline/file_delete` rows read back as

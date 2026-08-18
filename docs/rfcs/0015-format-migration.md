@@ -152,6 +152,17 @@ accidental second catalog writer safe. Readers, meanwhile, must never observe
 a half-migrated store; the resume protocol below is structured so the only
 externally visible flip of `sys/format` is atomic and last.
 
+The start batch is additionally the **only writer of the marker key**:
+`migration::start` is the one code path that puts `sys/migration`, and any
+future writer must keep its rule — the marker lands in the same batch as a
+head move. Handles cache the marker's absence keyed on the head they
+observed it at (RFC 0009), so a marker written without moving the head
+would be invisible to every warm handle. The invariant is what that caching
+is sound against, not an incidental property of today's code — and it holds
+for every store in the field, not only future ones, because the unit
+registry has been empty since the marker key was reserved: no released
+binary has ever written it.
+
 ### Crash-safe resumable migration
 
 A large migration cannot be one `WriteBatch` — the rewritten keyspace is
@@ -162,8 +173,18 @@ So migration gets its own resume protocol, modeled directly on genesis
 **1. Start (one batch).** The migrator writes a `sys/migration` marker
 recording `{ from_format, to_format, cursor }`, where `cursor` is a
 resumption position in the migration's key-ordered work (e.g. the last
-source key processed). This first batch is atomic: either the marker exists
-or it does not.
+source key processed) — **together with a `sys/head` stamp**, the standing
+head re-put with its batch count advanced, the same write every commit
+batch carries (RFC 0004). This first batch is atomic: either the marker
+exists or it does not, and if it exists the head moved with it. The stamp
+makes `sys/head` the start batch's conflict anchor too, so a commit racing
+the start wins or loses cleanly rather than interleaving; a start that
+loses the race retries under the same bounded backoff a commit uses. It is
+also what warm handles rest on: a handle that observed the marker absent
+at a head may trust that observation for as long as the head stands,
+because no marker can appear without moving it (RFC 0009). A store with no
+head yet is pre-bootstrap and has nothing to anchor to; there the marker
+goes alone.
 
 **2. Step loop (many batches, each idempotent).** The migration walks its
 work in key order. Each step batch does two things, in this order:
@@ -223,10 +244,12 @@ impossible.
 Closing it is why the **`sys/migration` marker is a reader-side gate**, not
 merely migrator bookkeeping:
 
-- Every materialization and refresh reads `sys/migration` under its pinned
-  read-snapshot (RFC 0009) and, if the marker is present, fails loudly with
-  the typed `Migration` error (RFC 0003) instead of returning a view. A
-  reader mid-migration is therefore *unavailable*, never partial.
+- Every read session checks `sys/migration` under its pinned read-snapshot
+  (RFC 0009) and, if the marker is present, fails loudly with the typed
+  `Migration` error (RFC 0003) instead of returning a view. The check may
+  be served from a head-keyed record of the marker's absence — sound
+  because a marker only appears with a head move (above) — but it is never
+  skipped outright: a reader mid-migration is *unavailable*, never partial.
 - Consequently the marker key and this check must exist **from format
   version 1, before any migration is ever written** — RFC 0002 reserves the
   key and RFC 0009 specifies the check. A reader binary that predates the
@@ -338,6 +361,12 @@ the post-migration assertions go through an ordinary attach.
   atomicity, not this protocol's.
 - **Refuse-to-open on a future format.** A store whose `sys/format` exceeds
   the binary errors typed, writes nothing.
+- **The marker rides the head.** A start moves `sys/head` in the marker's
+  batch: a handle holding the head it last observed clear re-reads the
+  marker after a migration starts, and a start racing a commit retries
+  rather than interleaving. The divergence form is the proof — a marker
+  planted under an unmoved head goes unseen, so the test that passes by
+  seeing one is the test that the head moved.
 - **Reader gate mid-migration.** With the `sys/migration` marker present, a
   materialization or refresh — on either binary version — returns the typed
   `Migration` error and never a partial view (the RFC 0009 check; this is

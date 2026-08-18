@@ -607,6 +607,18 @@ linear in catalog size. That floor is what the 8 003-entity rows show at
 ~1.6 ms with a churn of five keys — still 6× cheaper than the rescan, but it
 is why the speedup does not keep growing with catalog size at fixed churn.
 
+The same asymmetry sizes the changelog cap. A commit that writes more keys
+than the cap records nothing, and every reader behind it takes the rescan
+column — 12.3 ms at 8 003 entities here, and the full `current` scan of a
+cold object store in production — where a recorded trail costs the replay
+column. A recorded key costs roughly 20 bytes in this workload (271-byte
+records below, ~13 keys each), so even a cap-sized record is tens of
+kilobytes, swept out by the sliding window like any other. The cap is
+4 096 keys so that an ordinary bulk flush — production showed one at 259
+keys, which the previous cap of 256 silently declined — stays on the
+replay side; the churn share above still declines the replays that would
+not pay.
+
 ### What the changelog costs the read path
 
 The changelog first rode in the snapshot record. Measured there — one data
