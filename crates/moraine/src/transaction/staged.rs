@@ -1354,6 +1354,7 @@ fn translate(
     let mut children = collect_child_rows(ops)?;
     let mut direct = Vec::new();
     let hard_deleted = collect_hard_deletes(ops)?;
+    let mut touched = commit::Touched::default();
 
     let phases: [fn(&RowOperation) -> bool; 3] = [
         |op| {
@@ -1376,6 +1377,7 @@ fn translate(
                 &mut children,
                 &mut direct,
                 &hard_deleted,
+                &mut touched,
             )?;
         }
     }
@@ -1393,14 +1395,26 @@ fn translate(
             && table.next_column_id <= *max_id
         {
             table.next_column_id = max_id + 1;
+            touched.touch(EntityKey::Table {
+                table_id: *table_id,
+            });
         }
     }
 
     apply_poison(&mut state, poisoned);
     apply_deferred_maintenance(base, &mut state, deferred, new_id);
+    // Both reach index records by id alone, across every table holding one.
+    for index_id in poisoned.iter().chain(deferred) {
+        for table_id in base.indexes.keys().chain(state.indexes.keys()) {
+            touched.touch(EntityKey::Index {
+                table_id: *table_id,
+                index_id: *index_id,
+            });
+        }
+    }
     state.snapshot = snapshot.clone();
 
-    let mut writes = commit::diff_writes(base, &state, new_id);
+    let mut writes = commit::diff_touched(base, &state, new_id, &touched);
     let translated_head_view = match commit::finish_translated_head_view(&mut state, &direct) {
         Ok(()) => Some(state),
         Err(err) => {
@@ -1481,6 +1495,7 @@ fn translate_maintenance(
     let mut children = ChildRows::default();
     let mut direct = Vec::new();
     let hard_deleted = collect_hard_deletes(ops)?;
+    let mut touched = commit::Touched::default();
     for op in ops {
         let row_id_statistics_insert = match op {
             RowOperation::Insert {
@@ -1514,10 +1529,11 @@ fn translate_maintenance(
             &mut children,
             &mut direct,
             &hard_deleted,
+            &mut touched,
         )?;
     }
 
-    let mut writes = commit::diff_writes(base, &state, head);
+    let mut writes = commit::diff_touched(base, &state, head, &touched);
     writes.extend(direct);
     Ok(writes)
 }

@@ -693,7 +693,7 @@ mod diff;
 mod fold;
 mod group;
 use diff::diff_options;
-pub(crate) use diff::diff_writes;
+pub(crate) use diff::{Touched, diff_touched, diff_writes};
 pub(crate) use group::Coalescer;
 use group::Outcome;
 
@@ -976,7 +976,7 @@ where
 
     if operations.is_empty() {
         let mut writes = Vec::new();
-        diff_options(&mut writes, base, &state);
+        diff_options(&mut writes, diff::Scope::All, base, &state);
         if writes.is_empty() {
             return Ok(Prepared::Nothing { head });
         }
