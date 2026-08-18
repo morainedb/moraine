@@ -32,7 +32,7 @@ use tracing::debug;
 
 use crate::{
     catalog::{
-        CatalogSnapshot, ColumnInfo, IndexId, IndexInfo, SnapshotId, TableId,
+        CatalogSnapshot, ColumnInfo, IndexId, IndexInfo, SnapshotId, Store, TableId,
         inline::{InlineScanKind, materialize_inline_rows},
         projection::ProjectionCache,
     },
@@ -401,6 +401,10 @@ pub struct StagedTransaction {
     /// point. Scanned once; the staged rows over them are re-applied per call.
     committed_schema_versions: CommittedSchemaVersions,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    /// The open store, so a lost race can still read what it lost to after
+    /// its own transaction has been spent. Absent only in tests that drive
+    /// a transaction without a catalog.
+    store: Option<Arc<Store>>,
     /// The `DATA_PATH` object store and its bucket-relative prefix, present
     /// when the attach supplied `META_DATA_PATH`. Index maintenance
     /// scoped-reads registered data files through it; absent it is skipped.
@@ -417,6 +421,7 @@ impl StagedTransaction {
     pub(crate) fn begin(
         db_tx: DbTransaction,
         projections: Arc<std::sync::RwLock<ProjectionCache>>,
+        store: Option<Arc<Store>>,
         data_store: Option<DataStore>,
         data_prefix: String,
         data_reads: Arc<data_file::DataStoreCounters>,
@@ -429,6 +434,7 @@ impl StagedTransaction {
             committed_snapshots: tokio::sync::OnceCell::new(),
             committed_schema_versions: tokio::sync::OnceCell::new(),
             projections,
+            store,
             data_store,
             data_prefix,
             data_reads,
@@ -444,6 +450,7 @@ impl StagedTransaction {
             db_tx,
             Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
             None,
+            None,
             String::new(),
             Arc::default(),
         )
@@ -457,6 +464,7 @@ impl StagedTransaction {
         Self::begin(
             db_tx,
             Arc::clone(catalog.projections()),
+            Some(catalog.store()),
             None,
             String::new(),
             Arc::default(),
@@ -470,6 +478,7 @@ impl StagedTransaction {
         Self::begin(
             db_tx,
             Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
+            None,
             Some(data_store),
             String::new(),
             Arc::default(),
@@ -1043,6 +1052,7 @@ impl StagedTransaction {
             committed_snapshots: _,
             committed_schema_versions: _,
             projections,
+            store: catalog_store,
             data_store,
             data_prefix,
             data_reads,
@@ -1144,7 +1154,10 @@ impl StagedTransaction {
                 phases.stage = phase_started.elapsed();
                 // Landed off-task: the write cannot be retracted once
                 // issued, so a host interrupt races the wait, not the write.
-                let head_before = base_ref.snapshot.snapshot_id;
+                let head_before = proto::HeadValue {
+                    snapshot_id: base_ref.snapshot.snapshot_id,
+                    batch_seq: base_ref.batch_seq,
+                };
                 let head_view_update = translated_head_view.map_or_else(
                     || commit::HeadViewUpdate::Rebuild(Arc::clone(&base)),
                     |view| commit::HeadViewUpdate::Prepared(Arc::new(view)),
@@ -1152,7 +1165,7 @@ impl StagedTransaction {
                 let phase_started = Instant::now();
                 let landed = commit::commit_batch_off_task(
                     db_tx,
-                    head_before,
+                    head_before.snapshot_id,
                     result_id,
                     writes,
                     staged_bytes,
@@ -1177,7 +1190,19 @@ impl StagedTransaction {
                             deferred_indexes,
                         })
                     }
-                    commit::Landed::LostRace => Err(staged_lost_race(result_id, staged_rows)),
+                    commit::Landed::LostRace => {
+                        // Re-derived rather than threaded: this runs only on
+                        // the losing path.
+                        let snapshot = build_snapshot_value(&ops).ok();
+                        Err(staged_lost_race_against(
+                            catalog_store.as_deref(),
+                            head_before,
+                            snapshot.as_ref().map(|s| s.changes_made.as_str()),
+                            result_id,
+                            staged_rows,
+                        )
+                        .await)
+                    }
                 }
             }
             Err(err) => {
@@ -1321,6 +1346,68 @@ fn staged_lost_race(result_id: u64, staged_rows: usize) -> Error {
         "a concurrent commit changed state this one read or wrote \
          (attempted snapshot {result_id}); staged-row commits are never \
          retried internally"
+    ))
+}
+
+/// As [`staged_lost_race`], naming what landed in between.
+///
+/// DuckLake states each commit's effect in the `changes_made` it authors,
+/// and every landed commit's is readable from its snapshot record, so the
+/// same conflict rule the verb path retries under decides here what to
+/// say. It only ever says: the loser still re-drives, because the ids in
+/// its batch were minted against the head it read.
+///
+/// Anything unreadable — a spent changelog, a missing store, an absent
+/// `changes_made` — reports the bare race rather than guessing.
+async fn staged_lost_race_against(
+    store: Option<&Store>,
+    head_before: proto::HeadValue,
+    changes_made: Option<&str>,
+    result_id: u64,
+    staged_rows: usize,
+) -> Error {
+    let bare = || staged_lost_race(result_id, staged_rows);
+    let (Some(db), Some(changes_made)) = (store.and_then(Store::writer_db), changes_made) else {
+        return bare();
+    };
+    let ours = crate::transaction::operations::ChangeSet::parse(changes_made);
+    let Ok((conflict, snapshot_ids, accounted)) =
+        commit::conflicting_intervening_change(db, &head_before, &ours).await
+    else {
+        return bare();
+    };
+    // Nothing to name, or a gap holding a batch the walk could not see:
+    // either way this says only that the race was lost.
+    if snapshot_ids.is_empty() || (conflict.is_none() && !accounted) {
+        return bare();
+    }
+
+    let landed = snapshot_ids
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    debug!(
+        attempted_snapshot = result_id,
+        staged_rows,
+        head_before = head_before.snapshot_id,
+        conflicting_snapshot = conflict,
+        intervening = landed.as_str(),
+        "staged commit lost a write-write race; DuckLake re-drives"
+    );
+    let detail = match conflict {
+        Some(snapshot_id) => format!("snapshot {snapshot_id} changed state this one read or wrote"),
+        None => format!(
+            "snapshots {landed} landed in between, none of them touching what this one \
+             read or wrote"
+        ),
+    };
+
+    Error::CommitConflict(format!(
+        "a concurrent commit changed state this one read or wrote \
+         (attempted snapshot {result_id}, head was {}): {detail}; \
+         staged-row commits are never retried internally",
+        head_before.snapshot_id
     ))
 }
 

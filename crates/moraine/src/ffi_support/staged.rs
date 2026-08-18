@@ -27,6 +27,7 @@ pub async fn staged_begin(
     Ok(StagedTransaction::begin(
         db_tx,
         catalog.projections().clone(),
+        Some(catalog.store()),
         data_store,
         data_prefix,
         catalog.data_reads(),

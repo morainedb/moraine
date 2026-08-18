@@ -111,11 +111,23 @@ struct StoreLocation {
 /// The open store behind a catalog: the read-write `Db` writer, or a
 /// read-only `DbReader`. A read-only catalog never opens a `Db`, so it never
 /// fences a live writer.
-enum Store {
+pub(crate) enum Store {
     /// The single read-write writer.
     Writer(Db),
     /// A read-only reader following the manifest, shared into read sessions.
     Reader(Arc<DbReader>),
+}
+
+impl Store {
+    /// The writer behind this store, for a caller that needs to read after
+    /// its own transaction is spent — a lost staged commit, deciding what
+    /// it lost to.
+    pub(crate) fn writer_db(&self) -> Option<&Db> {
+        match self {
+            Self::Writer(db) => Some(db),
+            Self::Reader(_) => None,
+        }
+    }
 }
 
 /// Options for opening a catalog.
@@ -1182,6 +1194,11 @@ impl Catalog {
 
     /// Opens a read-write transaction for the staged-row commit path. Fails
     /// with [`Error::Constraint`] on a read-only catalog.
+    /// The open store, shared so a spent transaction can still read.
+    pub(crate) fn store(&self) -> Arc<Store> {
+        Arc::clone(&self.store)
+    }
+
     pub(crate) async fn begin_write_tx(&self) -> Result<DbTransaction> {
         self.writer()?
             .begin(IsolationLevel::Snapshot)

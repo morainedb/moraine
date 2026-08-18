@@ -1309,6 +1309,43 @@ fn intervening_change_stream(
     .buffered(INTERVENING_READ_CONCURRENCY)
 }
 
+/// What a staged commit lost its race to: which intervening snapshot
+/// conflicts with `ours`, every snapshot that landed above `head_before`,
+/// and whether those account for the whole gap.
+///
+/// A head-preserving batch mints no snapshot id and states no changes, so
+/// walking the ids never visits it. Every landed batch moves the batch
+/// count by one, so a gap wider than the walk saw means something landed
+/// that this cannot describe — and a race is only benign when nothing is
+/// unaccounted for.
+///
+/// Exposed for the staged path, which cannot re-run its caller and so
+/// reports the conflict rather than retrying past it.
+pub(crate) async fn conflicting_intervening_change(
+    db: &Db,
+    head_before: &proto::HeadValue,
+    ours: &ChangeSet,
+) -> Result<(Option<u64>, Vec<u64>, bool)> {
+    let classified =
+        classify_intervening_changes(db, head_before.snapshot_id, std::slice::from_ref(ours))
+            .await?;
+    let batches = u64::try_from(classified.snapshot_ids.len()).unwrap_or(u64::MAX);
+    let accounted = read_head_stamp(db)
+        .await?
+        .is_some_and(|head| head.batch_seq.saturating_sub(head_before.batch_seq) == batches);
+
+    Ok((classified.conflict, classified.snapshot_ids, accounted))
+}
+
+/// The whole head stamp, or `None` when the store carries no head yet.
+async fn read_head_stamp(db: &Db) -> Result<Option<proto::HeadValue>> {
+    db.get(Key::Sys(SysKey::Head).encode())
+        .await
+        .map_err(Error::from)?
+        .map(|bytes| value::decode_value(&bytes))
+        .transpose()
+}
+
 async fn classify_intervening_changes(
     db: &Db,
     head_before: u64,

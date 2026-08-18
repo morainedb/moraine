@@ -1559,6 +1559,7 @@ async fn commit_reports_the_deferred_indexes_it_leaves_maintaining() {
     let mut tx = StagedTransaction::begin(
         db_tx,
         Arc::clone(catalog.projections()),
+        Some(catalog.store()),
         Some(DataStore::new(store)),
         String::new(),
         Arc::default(),
@@ -5828,6 +5829,161 @@ fn table_kind_wire_order_is_pinned() {
             | TableKind::Metadata => {}
         }
     }
+}
+
+/// A lost race says what landed in between, taken from the `changes_made`
+/// each commit authors — and whether any of it touched what the loser
+/// read or wrote. It still surfaces: the ids in the batch were minted
+/// against the head it read, so only DuckLake can re-drive it.
+#[tokio::test]
+async fn a_lost_race_names_the_commits_it_lost_to() {
+    for (theirs, ours, expected) in [
+        // Both alter table 1: a real conflict, named by snapshot.
+        (
+            "altered_table:1",
+            "altered_table:1",
+            "changed state this one read or wrote",
+        ),
+        // Disjoint tables: the race is benign, and says so.
+        (
+            "altered_table:1",
+            "altered_table:2",
+            "none of them touching what this one",
+        ),
+    ] {
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut setup = StagedTransaction::begin_detached_on(&catalog, db_tx);
+        for (id, name) in [(1u64, "t"), (2, "u")] {
+            setup.stage(RowOperation::Insert {
+                table: TableKind::Table,
+                cells: table_row(id, 0, name, 1, None),
+            });
+        }
+        setup.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 3),
+        });
+        setup.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+        });
+        setup.commit().await.unwrap();
+
+        // Both read head 1. The winner lands snapshot 2; the loser
+        // authored the same id against the head it read.
+        let loser_tx = catalog.begin_write_tx().await.unwrap();
+        let mut loser = StagedTransaction::begin_detached_on(&catalog, loser_tx);
+
+        let winner_tx = catalog.begin_write_tx().await.unwrap();
+        let mut winner = StagedTransaction::begin_detached_on(&catalog, winner_tx);
+        winner.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 1, 3),
+        });
+        winner.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, theirs),
+        });
+        winner.commit().await.unwrap();
+
+        loser.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 1, 3),
+        });
+        loser.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, ours),
+        });
+        let err = loser.commit().await.unwrap_err();
+
+        assert!(matches!(&err, Error::CommitConflict(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(
+            message.to_lowercase().contains("conflict"),
+            "the loser must carry the text DuckLake's commit loop retries on: {message}"
+        );
+        assert!(message.contains("head was 1"), "{message}");
+        assert!(message.contains(expected), "{ours} vs {theirs}: {message}");
+
+        catalog.close().await.unwrap();
+    }
+}
+
+/// A head-preserving batch mints no snapshot id and states no changes, so
+/// a walk over the ids never visits it. A race whose gap holds one cannot
+/// be called benign — it reports the bare loss instead of claiming
+/// nothing touched it.
+#[tokio::test]
+async fn a_race_it_cannot_fully_account_for_is_not_called_benign() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    for (id, name) in [(1u64, "t"), (2, "u")] {
+        setup.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(id, 0, name, 1, None),
+        });
+    }
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 3),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+    });
+    setup.commit().await.unwrap();
+
+    let loser_tx = catalog.begin_write_tx().await.unwrap();
+    let mut loser = StagedTransaction::begin_detached_on(&catalog, loser_tx);
+
+    // A head-preserving batch: no `ducklake_snapshot` insert, so it moves
+    // the batch count without minting an id.
+    let maintenance_tx = catalog.begin_write_tx().await.unwrap();
+    let mut maintenance = StagedTransaction::begin_detached_on(&catalog, maintenance_tx);
+    maintenance.stage(RowOperation::Insert {
+        table: TableKind::FilesScheduledForDeletion,
+        cells: vec![
+            Cell::U64(77),
+            Cell::Str("gone.parquet".to_string()),
+            Cell::Bool(true),
+            Cell::I64(7),
+        ],
+    });
+    maintenance.commit().await.unwrap();
+
+    // A minting commit over disjoint state, which on its own would read
+    // as benign.
+    let winner_tx = catalog.begin_write_tx().await.unwrap();
+    let mut winner = StagedTransaction::begin_detached_on(&catalog, winner_tx);
+    winner.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 3),
+    });
+    winner.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "altered_table:1"),
+    });
+    winner.commit().await.unwrap();
+
+    loser.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 3),
+    });
+    loser.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "altered_table:2"),
+    });
+    let message = loser.commit().await.unwrap_err().to_string();
+
+    assert!(message.to_lowercase().contains("conflict"), "{message}");
+    assert!(
+        !message.contains("none of them touching"),
+        "a gap holding an unwalkable batch must not be called benign: {message}"
+    );
+
+    catalog.close().await.unwrap();
 }
 
 /// DuckLake mints the snapshot id from the head it read, so an id that does
