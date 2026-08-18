@@ -23,7 +23,9 @@ use crate::{
 struct Maintained<K: Ord, V> {
     // The whole head stamp: a maintenance batch reuses the snapshot id.
     head: Option<HeadValue>,
-    rows: BTreeMap<K, V>,
+    // Shared so a serve is a refcount bump: materializing rows is the
+    // caller's work to do after it has dropped the cache lock.
+    rows: Arc<BTreeMap<K, V>>,
 }
 
 /// The head record a batch leaves behind: the last head write in the
@@ -37,6 +39,12 @@ fn head_stamp(writes: &[StagedWrite]) -> Option<HeadValue> {
             .flatten()
             .and_then(|bytes| value::decode_value::<HeadValue>(bytes).ok())
     })
+}
+
+/// Copies a served projection's rows out. Called after the cache lock is
+/// dropped: the copying is what a serve deliberately leaves undone.
+pub(crate) fn materialize<K: Ord, V: Clone>(rows: &BTreeMap<K, V>) -> Vec<V> {
+    rows.values().cloned().collect()
 }
 
 /// Whether two head records name the same store state.
@@ -57,18 +65,18 @@ impl<K: Ord, V> Maintained<K, V> {
     fn empty() -> Self {
         Self {
             head: None,
-            rows: BTreeMap::new(),
+            rows: Arc::new(BTreeMap::new()),
         }
     }
 
     fn install(&mut self, head: HeadValue, rows: BTreeMap<K, V>) {
         self.head = Some(head);
-        self.rows = rows;
+        self.rows = Arc::new(rows);
     }
 
     fn clear(&mut self) {
         self.head = None;
-        self.rows.clear();
+        self.rows = Arc::new(BTreeMap::new());
     }
 
     /// Roughly what the maintained rows hold, keys included.
@@ -91,35 +99,49 @@ impl<K: Ord, V> Maintained<K, V> {
         }
     }
 
-    fn serve(&self, expected: &HeadValue) -> Option<Vec<V>>
-    where
-        V: Clone,
-    {
+    /// The rows if they stand at exactly `expected`, shared rather than
+    /// copied so the caller can materialize them off the cache lock.
+    fn serve(&self, expected: &HeadValue) -> Option<Arc<BTreeMap<K, V>>> {
         self.head
             .as_ref()
             .is_some_and(|head| same_head(head, expected))
-            .then(|| self.rows.values().cloned().collect())
+            .then(|| Arc::clone(&self.rows))
     }
 
     /// Applies one folded write; on an undecodable put, clears — the
     /// projection degrades to a rescan rather than serving wrong rows.
+    ///
+    /// Copies the rows away from any serve still holding them, so a reader
+    /// materializing off the lock never sees a batch half-applied.
     fn fold(&mut self, key: K, bytes: Option<&[u8]>)
     where
-        V: prost::Message + Default,
+        K: Clone,
+        V: prost::Message + Default + Clone,
     {
         if self.head.is_none() {
             return;
         }
-        match bytes {
-            None => {
-                self.rows.remove(&key);
+        // Decoded before the rows are copied away from any outstanding
+        // serve, so a corrupt value clears without paying for the copy.
+        let decoded = match bytes {
+            None => None,
+            Some(bytes) => {
+                let Ok(decoded) = value::decode_value(bytes) else {
+                    self.clear();
+                    return;
+                };
+                Some(decoded)
             }
-            Some(bytes) => match value::decode_value(bytes) {
-                Ok(decoded) => {
-                    self.rows.insert(key, decoded);
-                }
-                Err(_) => self.clear(),
-            },
+        };
+
+        let rows = Arc::make_mut(&mut self.rows);
+        match decoded {
+            None => {
+                rows.remove(&key);
+            }
+            Some(decoded) => {
+                rows.insert(key, decoded);
+            }
         }
     }
 }
@@ -393,18 +415,25 @@ impl ProjectionCache {
     }
 
     /// Serves the snapshot projection if it is exactly at `expected_head`.
-    pub(crate) fn snapshots_at(&self, expected: &HeadValue) -> Option<Vec<SnapshotValue>> {
+    /// Shared, not copied: [`materialize`] turns it into rows off the lock.
+    pub(crate) fn snapshots_at(
+        &self,
+        expected: &HeadValue,
+    ) -> Option<Arc<BTreeMap<u64, SnapshotValue>>> {
         self.snapshots.serve(expected)
     }
 
-    pub(crate) fn table_stats_at(&self, expected: &HeadValue) -> Option<Vec<TableStatsValue>> {
+    pub(crate) fn table_stats_at(
+        &self,
+        expected: &HeadValue,
+    ) -> Option<Arc<BTreeMap<u64, TableStatsValue>>> {
         self.table_stats.serve(expected)
     }
 
     pub(crate) fn table_column_stats_at(
         &self,
         expected: &HeadValue,
-    ) -> Option<Vec<TableColumnStatsValue>> {
+    ) -> Option<Arc<BTreeMap<(u64, u64), TableColumnStatsValue>>> {
         self.table_column_stats.serve(expected)
     }
 
@@ -822,11 +851,11 @@ mod tests {
         cache.apply_batch(&writes, 4);
 
         let at = stamp(4, 4);
-        let snapshots = cache.snapshots_at(&at).unwrap();
+        let snapshots = materialize(&cache.snapshots_at(&at).unwrap());
         assert_eq!(snapshots.len(), 5);
         assert_eq!(snapshots.last().unwrap().snapshot_id, 4);
 
-        let stats = cache.table_stats_at(&at).unwrap();
+        let stats = materialize(&cache.table_stats_at(&at).unwrap());
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].record_count, 11);
 
@@ -854,7 +883,7 @@ mod tests {
         cache.apply_batch(&writes, 3);
 
         let at = stamp(3, 4);
-        let snapshots = cache.snapshots_at(&at).unwrap();
+        let snapshots = materialize(&cache.snapshots_at(&at).unwrap());
         assert_eq!(snapshots.len(), 3);
         assert!(snapshots.iter().all(|s| s.snapshot_id != 2));
         assert!(cache.table_column_stats_at(&at).unwrap().is_empty());
