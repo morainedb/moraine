@@ -1,17 +1,16 @@
 //! Byte-range access to one immutable Parquet object.
 
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
-use object_store::ObjectStoreExt;
 use parquet::{
     arrow::{arrow_reader::ArrowReaderOptions, async_reader::AsyncFileReader},
-    errors::{ParquetError, Result as ParquetResult},
+    errors::Result as ParquetResult,
     file::metadata::{PageIndexPolicy, ParquetMetaData},
 };
 
-use crate::data_file::{ParquetFile, auxiliary_cache, usize_as_u64};
+use crate::data_file::{ParquetFile, auxiliary_cache};
 
 /// An [`AsyncFileReader`] over moraine's own object store: the footer and
 /// the projected column chunks arrive as byte-range reads. Not `parquet`'s
@@ -41,42 +40,18 @@ fn footer_prefetch_size(footer_size: u64, file_size: u64) -> Option<usize> {
 
 impl AsyncFileReader for ObjectStoreReader {
     fn get_bytes(&mut self, range: std::ops::Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
-        let store = Arc::clone(self.file.store.object_store());
-        let path = self.file.path.clone();
-        let metrics = Arc::clone(&self.file.metrics);
-        async move {
-            let started = Instant::now();
-            let bytes = store
-                .get_range(&path, range)
-                .await
-                .map_err(|err| ParquetError::External(Box::new(err)))?;
-            metrics.range_read(1, usize_as_u64(bytes.len()), started.elapsed());
-            Ok(bytes)
-        }
-        .boxed()
+        let file = self.file.clone();
+        async move { auxiliary_cache::shared().range(&file, range).await }.boxed()
     }
 
     fn get_byte_ranges(
         &mut self,
         ranges: Vec<std::ops::Range<u64>>,
     ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
-        let store = Arc::clone(self.file.store.object_store());
-        let path = self.file.path.clone();
-        let metrics = Arc::clone(&self.file.metrics);
-        // One `get_ranges` call, so the store can coalesce adjacent chunks.
-        async move {
-            let started = Instant::now();
-            let bytes = store
-                .get_ranges(&path, &ranges)
-                .await
-                .map_err(|err| ParquetError::External(Box::new(err)))?;
-            let total = bytes.iter().fold(0_u64, |sum, bytes| {
-                sum.saturating_add(usize_as_u64(bytes.len()))
-            });
-            metrics.range_read(ranges.len(), total, started.elapsed());
-            Ok(bytes)
-        }
-        .boxed()
+        let file = self.file.clone();
+        // Ranges already resident are served from the cache; the rest go
+        // out as one request, so the store can coalesce adjacent chunks.
+        async move { auxiliary_cache::shared().ranges(&file, ranges).await }.boxed()
     }
 
     fn get_metadata<'a>(

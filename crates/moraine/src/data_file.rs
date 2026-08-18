@@ -185,6 +185,12 @@ impl ParquetFile {
         self.metrics = metrics;
         self
     }
+
+    /// The tally this file's reads are recorded in.
+    #[cfg(test)]
+    pub(crate) fn metrics(&self) -> &Arc<ScopedReadMetrics> {
+        &self.metrics
+    }
 }
 
 /// Whether `file` carries the reserved embedded row-id column.
