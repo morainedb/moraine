@@ -1,8 +1,11 @@
 //! Typed reads over an open transaction: decode keys and values into the
 //! wire types. No interpretation — the domain layer owns meaning.
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use prost::Message as _;
+use tracing::debug;
 
 use crate::{
     error::{Error, Result},
@@ -22,6 +25,7 @@ use crate::{
         },
         value,
     },
+    telemetry::milliseconds,
 };
 
 /// A decoded entity record of a kind the catalog currently models.
@@ -278,6 +282,11 @@ const STABLE_READ_ATTEMPTS: usize = 8;
 /// the head record before and after the pass (every batch moves it) and
 /// re-runs a pass that straddled a commit.
 ///
+/// Retrying only helps while a pass fits inside the interval between
+/// commits: a pass that outlasts it straddles every attempt, and no
+/// budget saves it. Shortening the pass is the lever, so each straddle is
+/// logged with what it cost and the exhausted error reports the same.
+///
 /// # Errors
 ///
 /// Returns [`Error::RetryBudgetExhausted`] if the store moved under every
@@ -291,17 +300,27 @@ where
         return read().await;
     }
 
-    for _ in 0..STABLE_READ_ATTEMPTS {
+    let started = Instant::now();
+    for attempt in 1..=STABLE_READ_ATTEMPTS {
+        let pass_started = Instant::now();
         let before = read_head(handle).await?;
         let value = read().await?;
         if read_head(handle).await? == before {
             return Ok(value);
         }
+        debug!(
+            attempt,
+            attempts = STABLE_READ_ATTEMPTS,
+            pass_ms = milliseconds(pass_started.elapsed()),
+            "a read-only pass straddled a commit; re-reading"
+        );
     }
 
     Err(Error::RetryBudgetExhausted(format!(
         "a read-only pass could not observe a single store state in \
-         {STABLE_READ_ATTEMPTS} attempts; the catalog is committing faster than it reads"
+         {STABLE_READ_ATTEMPTS} attempts over {}ms; the catalog is committing \
+         faster than this pass reads, which a larger budget cannot fix",
+        milliseconds(started.elapsed())
     )))
 }
 
