@@ -21,8 +21,8 @@ use crate::{
         compaction::{self as store_compaction, MergeEnd},
         handle::{ReadHandle, ScanShape},
         key::{
-            EntityKey, IndexKey, IndexKind, Key, Subspace, index_index_prefix, index_kind_prefix,
-            subspace_prefix,
+            EntityKey, EntityKind, IndexKey, IndexKind, Key, Subspace, history_entity_kind_prefix,
+            index_index_prefix, index_kind_prefix, subspace_prefix,
         },
     },
     transaction::{commit, index_maintenance, maintenance_status},
@@ -601,9 +601,15 @@ impl Catalog {
     /// file through.
     async fn historical_data_files(&self) -> Result<HashSet<(u64, u64)>> {
         let session = self.begin_read().await?;
+        // One kind's prefix, not the whole subspace: every other kind's
+        // history would be read and decoded only to be discarded below.
         let mut iter = session
             .handle()
-            .scan_prefix(subspace_prefix(Subspace::History), .., ScanShape::Bulk)
+            .scan_prefix(
+                history_entity_kind_prefix(EntityKind::File),
+                ..,
+                ScanShape::Bulk,
+            )
             .await?;
 
         let mut seen = HashSet::new();
