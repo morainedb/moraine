@@ -267,7 +267,8 @@ async fn write_wide_fixture(store: &dyn ObjectStore, path: &Path, rows: usize) -
 
 /// DuckLake's recorded footer size collapses the footer-length probe,
 /// and immutable-file metadata is reused on the next read. The second
-/// read therefore performs only the projected-column fetch.
+/// read therefore fetches nothing: its footer and its column ranges are
+/// both resident.
 #[tokio::test]
 async fn recorded_footer_and_metadata_cache_remove_metadata_round_trips() {
     let store = Arc::new(CountingStore::new());
@@ -300,12 +301,15 @@ async fn recorded_footer_and_metadata_cache_remove_metadata_round_trips() {
 
     let second_requests = store.fetch_requests() - first_requests;
     assert_eq!(first_requests, 3, "footer, page index, projected columns");
-    assert_eq!(second_requests, 1, "projected columns only");
+    assert_eq!(
+        second_requests, 0,
+        "the second read repeats the first's ranges, which are cached"
+    );
 }
 
-/// A delete-file read fetches only its `pos` column. Its immutable footer
-/// is retained for the next pass, while the position column remains an
-/// ordinary projected read.
+/// A delete-file read fetches only its `pos` column. Both its footer and
+/// that column's ranges are retained, so a second pass over the same file
+/// fetches nothing.
 #[tokio::test]
 async fn large_delete_file_reads_only_positions_and_reuses_metadata() {
     let store = Arc::new(CountingStore::new());
@@ -339,7 +343,10 @@ async fn large_delete_file_reads_only_positions_and_reuses_metadata() {
     let second_requests = store.fetch_requests() - first_requests;
 
     assert_eq!(first_requests, 2, "footer and projected position column");
-    assert_eq!(second_requests, 1, "projected position column only");
+    assert_eq!(
+        second_requests, 0,
+        "the second pass repeats the first's ranges, which are cached"
+    );
     assert!(
         first_bytes < object_len / 4,
         "fetched {first_bytes} of {object_len} bytes"

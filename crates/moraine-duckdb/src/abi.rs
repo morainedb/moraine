@@ -608,13 +608,15 @@ fn cache_preload_option(cache_preload: u8) -> Result<Option<moraine::CachePreloa
 /// fresh store bootstraps; ignored on an already-initialized store, whose
 /// stored flag ([`moraine_catalog_encrypted`]) is authoritative.
 ///
-/// `cache_dir`, `cache_size_bytes`, and `cache_memory_bytes` configure the
-/// process-wide cache sizing. The first attach settles it; a later attach
-/// naming different values logs them as ignored. `cache_dir` is where each
+/// `cache_dir`, `cache_size_bytes`, and `cache_memory_bytes` are settled
+/// process-wide by the first attach; a later attach naming different values
+/// logs them as ignored. Settled process-wide is not the same as counted
+/// process-wide, and the three differ on that: `cache_dir` is where each
 /// store's disk tier lives and is recovered from (null keeps the caches in
-/// memory); `cache_size_bytes` caps each store's device and
-/// `cache_memory_bytes` bounds memory across every store's cache and the
-/// parsed-footer cache. `0` means "not given" for either.
+/// memory); `cache_size_bytes` caps **each store's** device, so peak disk is
+/// that figure times the attached stores; `cache_memory_bytes` is the one
+/// true process total, bounding memory across every store's cache and the
+/// parsed-footer cache. `0` means "not given" for either byte count.
 ///
 /// `cache_preload` warms this store into that cache before the attach
 /// returns: `0` loads nothing, `1` each subspace's SST metadata, `2` the

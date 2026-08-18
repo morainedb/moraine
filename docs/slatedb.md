@@ -98,3 +98,27 @@ distinguishes them. (Acting on it would also need a third priority level from
 foyer, whose `Hint` is `Normal` or `Low` and nothing else.)
 
 Owner: [RFC 0009](rfcs/0009-reader-consistency-and-caching.md).
+
+### Size the disk evictor's queue, and keep recency in process
+
+The `FsCacheEvictor` takes its work over a `tokio::sync::mpsc::channel(100)`,
+a literal with no setting behind it, and `try_send` drops the event when that
+queue is full. A store serving a working set larger than its disk tier fills
+it steadily: production runs report tens of thousands of dropped events per
+30-second window, against a queue of 100.
+
+Dropping a `Write` undercounts the directory, which is why
+`max_cache_size_bytes` is a soft cap; a periodic scan reconciles it. Dropping
+a `Read` is the one that costs reads, and no scan repairs it — the entry's
+recency is simply never recorded, and the rebuild re-derives access times from
+filesystem `atime`, which `relatime` mounts advance about once a day. The
+evictor then picks victims from timestamps that no longer order anything, so
+a hot part is as likely to be evicted as a cold one, and the next read of it
+is an object-store fetch.
+
+Make the queue's capacity a setting on `ObjectStoreCacheOptions`, and track
+access recency in process — an in-memory timestamp updated on the read path,
+rather than one recovered from `atime` — so a full queue costs accounting
+accuracy and not eviction order.
+
+Owner: [RFC 0009](rfcs/0009-reader-consistency-and-caching.md).

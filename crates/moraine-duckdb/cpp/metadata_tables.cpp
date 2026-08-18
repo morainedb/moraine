@@ -853,6 +853,11 @@ std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *ha
 // schema_version)` with a recorded `inline/schema`. The table_name column
 // carries `InlinedDataTableName` (inline_tables.cpp), matching DuckLake's
 // own inline-table naming.
+//
+// Committed records only, so a transaction's own registration is absent
+// until it lands. DuckLake reads this table while building the batch that
+// registers — before the `CREATE TABLE` staging that `inline/schema` runs —
+// or after that batch commits, never in between.
 std::vector<std::vector<duckdb::Value>> ProvideInlinedDataTables(MoraineCatalogHandle *handle,
                                                                  MoraineInterruptProbe probe, void *probe_ctx) {
 	return DumpRows<MoraineInlineTableRow>(handle, probe, probe_ctx, moraine_inline_registered_tables,
@@ -1132,8 +1137,6 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end_snapshot col */ 3,
 	        /* delete key: table_id, column_id, key, begin_snapshot */ {0, 1, 4, 2},
 	    },
-	    // Always-empty stand-ins (see `ProvideEmpty`): no dump ABI call backs
-	    // them — the store models none of these kinds.
 	    {
 	        "ducklake_inlined_data_tables",
 	        {
@@ -1234,6 +1237,8 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        0,
 	        /* delete key: data_file_id, table_id */ {0, 1},
 	    },
+	    // An always-empty stand-in (see `ProvideEmpty`): no dump ABI call
+	    // backs it — the store models no variant stats.
 	    {
 	        "ducklake_file_variant_stats",
 	        {

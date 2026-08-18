@@ -11,11 +11,12 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 
 use bytes::Bytes;
 use foyer::{Cache, HybridCache};
-use object_store::path::Path;
+use object_store::{ObjectStoreExt, path::Path};
 use parquet::{
     errors::{ParquetError, Result as ParquetResult},
     file::metadata::{
@@ -28,7 +29,7 @@ use tracing::warn;
 
 use crate::{
     data_file::{
-        DataStore,
+        DataStore, ParquetFile,
         data_store::StoreIdentity,
         reader::ObjectStoreReader,
         row_set::{FileRowSet, FileRowSetKind},
@@ -81,12 +82,23 @@ enum AuxiliaryKey {
         path: String,
         file_size: u64,
     },
+    /// One byte range of a file, exactly as a read asked for it. The
+    /// recorded size guards against a path reused at another length, as it
+    /// does for the other two.
+    Range {
+        store: StoreIdentity,
+        path: String,
+        file_size: u64,
+        start: u64,
+        end: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub(super) enum AuxiliaryValue {
     Metadata(Arc<ParquetMetaData>),
     Summary(Arc<FileRowSet>),
+    Block(Bytes),
 }
 
 /// A value with its charge measured once, at insertion.
@@ -103,6 +115,7 @@ impl From<AuxiliaryValue> for Weighed {
             AuxiliaryValue::Summary(rows) => {
                 usize::try_from(rows.estimated_bytes()).unwrap_or(usize::MAX)
             }
+            AuxiliaryValue::Block(bytes) => bytes.len(),
         };
 
         Self { value, bytes }
@@ -117,6 +130,7 @@ mod tag {
     pub(super) const RANGE: u8 = 1;
     pub(super) const ROARING: u8 = 2;
     pub(super) const SORTED: u8 = 3;
+    pub(super) const BLOCK: u8 = 4;
 }
 
 fn parse_failed(error: impl std::error::Error + Send + Sync + 'static) -> foyer::Error {
@@ -164,6 +178,10 @@ impl foyer::Code for Weighed {
                         .map_err(io)
                 }
             },
+            AuxiliaryValue::Block(bytes) => {
+                writer.write_all(&[tag::BLOCK]).map_err(io)?;
+                writer.write_all(bytes).map_err(io)
+            }
         }
     }
 
@@ -197,6 +215,11 @@ impl foyer::Code for Weighed {
                     .map(|_| read_u64(reader))
                     .collect::<foyer::Result<Vec<u64>>>()?;
                 AuxiliaryValue::Summary(Arc::new(FileRowSet::Sorted(row_ids)))
+            }
+            tag::BLOCK => {
+                let mut buffer = Vec::new();
+                reader.read_to_end(&mut buffer).map_err(io)?;
+                AuxiliaryValue::Block(Bytes::from(buffer))
             }
             other => {
                 return Err(foyer::Error::new(
@@ -335,6 +358,27 @@ impl Tier {
             }
         }
     }
+
+    /// Admits a re-fetchable block, hinted so it leaves before the
+    /// metadata sharing this allowance.
+    fn insert_block(&self, key: AuxiliaryKey, value: Weighed) {
+        match self {
+            Self::Memory(cache) => {
+                cache.insert_with_properties(
+                    key,
+                    value,
+                    foyer::CacheProperties::default().with_hint(foyer::Hint::Low),
+                );
+            }
+            Self::Hybrid(cache) => {
+                cache.insert_with_properties(
+                    key,
+                    value,
+                    foyer::HybridCacheProperties::default().with_hint(foyer::Hint::Low),
+                );
+            }
+        }
+    }
 }
 
 /// One weighted cache over both footers and summaries.
@@ -379,8 +423,11 @@ impl AuxiliaryCache {
 
         // One shard: foyer splits capacity across shards, and a footer must
         // fit within one.
+        // LRU is the policy that honours the hint separating re-fetchable
+        // blocks from metadata.
         let cache = foyer::CacheBuilder::new(capacity)
             .with_shards(1)
+            .with_eviction_config(cache::eviction_config())
             .with_weighter(|_: &AuxiliaryKey, value: &Weighed| value.bytes)
             .with_filter(parts.filter())
             .with_event_listener(Arc::clone(&parts.listener))
@@ -402,6 +449,7 @@ impl AuxiliaryCache {
             .with_policy(foyer::HybridCachePolicy::WriteOnInsertion)
             .memory(capacity)
             .with_shards(1)
+            .with_eviction_config(cache::eviction_config())
             .with_weighter(|_: &AuxiliaryKey, value: &Weighed| value.bytes)
             .with_filter(parts.filter());
 
@@ -517,6 +565,119 @@ impl AuxiliaryCache {
             .insert(Self::file_summary_key(store, key), weighed);
     }
 
+    /// The file's bytes over `range`, from the cache when that exact range
+    /// is resident and from the store otherwise.
+    ///
+    /// Keyed by the range as asked for, not by a fixed window: a selective
+    /// read fetches the pages it selected and no more, which is the
+    /// property the row selection exists to buy. Repeat reads of a file
+    /// ask for the same pages, so they still hit.
+    pub(super) async fn range(
+        &self,
+        file: &ParquetFile,
+        range: std::ops::Range<u64>,
+    ) -> ParquetResult<Bytes> {
+        if let Some(bytes) = self.cached_range(file, &range).await {
+            return Ok(bytes);
+        }
+
+        let started = Instant::now();
+        let fetched = file
+            .store
+            .object_store()
+            .get_range(&file.path, range.clone())
+            .await
+            .map_err(|error| ParquetError::External(Box::new(error)))?;
+        file.metrics
+            .range_read(1, usize_as_u64(fetched.len()), started.elapsed());
+        self.admit_range(file, &range, &fetched);
+        Ok(fetched)
+    }
+
+    /// [`Self::range`] over several ranges, fetching those that miss in one
+    /// request so the store can still coalesce adjacent chunks.
+    pub(super) async fn ranges(
+        &self,
+        file: &ParquetFile,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> ParquetResult<Vec<Bytes>> {
+        let mut out: Vec<Option<Bytes>> = Vec::with_capacity(ranges.len());
+        let mut missing = Vec::new();
+        for range in &ranges {
+            let cached = self.cached_range(file, range).await;
+            if cached.is_none() {
+                missing.push(range.clone());
+            }
+            out.push(cached);
+        }
+
+        if !missing.is_empty() {
+            let started = Instant::now();
+            let fetched = file
+                .store
+                .object_store()
+                .get_ranges(&file.path, &missing)
+                .await
+                .map_err(|error| ParquetError::External(Box::new(error)))?;
+            let total = fetched.iter().fold(0_u64, |sum, bytes| {
+                sum.saturating_add(usize_as_u64(bytes.len()))
+            });
+            file.metrics
+                .range_read(missing.len(), total, started.elapsed());
+
+            let mut filled = missing.iter().zip(fetched);
+            for (slot, range) in out.iter_mut().zip(&ranges) {
+                if slot.is_some() {
+                    continue;
+                }
+                let Some((_, bytes)) = filled.next() else {
+                    return Err(ParquetError::General(format!(
+                        "the store returned fewer ranges than {} asked for",
+                        file.path
+                    )));
+                };
+                self.admit_range(file, range, &bytes);
+                *slot = Some(bytes);
+            }
+        }
+
+        out.into_iter()
+            .map(|bytes| {
+                bytes.ok_or_else(|| {
+                    ParquetError::General(format!("a range of {} went unfilled", file.path))
+                })
+            })
+            .collect()
+    }
+
+    async fn cached_range(
+        &self,
+        file: &ParquetFile,
+        range: &std::ops::Range<u64>,
+    ) -> Option<Bytes> {
+        match self.tier.get(&Self::range_key(file, range)).await?.value {
+            AuxiliaryValue::Block(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    fn admit_range(&self, file: &ParquetFile, range: &std::ops::Range<u64>, bytes: &Bytes) {
+        self.tier.insert_block(
+            Self::range_key(file, range),
+            Weighed::from(AuxiliaryValue::Block(bytes.clone())),
+        );
+    }
+
+    fn range_key(file: &ParquetFile, range: &std::ops::Range<u64>) -> AuxiliaryKey {
+        AuxiliaryKey::Range {
+            store: file.store.identity,
+            path: file.path.to_string(),
+            file_size: file.file_size,
+            start: range.start,
+            end: range.end,
+        }
+    }
+
     fn file_summary_key(store: &DataStore, key: &FileSummaryKey<'_>) -> AuxiliaryKey {
         AuxiliaryKey::Summary {
             store: store.identity,
@@ -560,15 +721,15 @@ impl AuxiliaryCache {
 fn summary_of(value: &AuxiliaryValue) -> Option<Arc<FileRowSet>> {
     match value {
         AuxiliaryValue::Summary(rows) => Some(Arc::clone(rows)),
-        AuxiliaryValue::Metadata(_) => None,
+        AuxiliaryValue::Metadata(_) | AuxiliaryValue::Block(_) => None,
     }
 }
 
 fn metadata_of(value: &AuxiliaryValue) -> ParquetResult<Arc<ParquetMetaData>> {
     match value {
         AuxiliaryValue::Metadata(metadata) => Ok(Arc::clone(metadata)),
-        AuxiliaryValue::Summary(_) => Err(ParquetError::General(
-            "a row summary was cached under a metadata key".to_owned(),
+        AuxiliaryValue::Summary(_) | AuxiliaryValue::Block(_) => Err(ParquetError::General(
+            "a row summary or block was cached under a metadata key".to_owned(),
         )),
     }
 }

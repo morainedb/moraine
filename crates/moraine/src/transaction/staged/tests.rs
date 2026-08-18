@@ -929,6 +929,116 @@ async fn stages_inline_schema_and_sequential_inserts() {
     tx.rollback();
 }
 
+/// Every dump a metadata table is materialized from, named and rendered so
+/// two states of one transaction compare dump by dump.
+async fn metadata_dumps(tx: &StagedTransaction) -> Vec<(&'static str, String)> {
+    macro_rules! dumps {
+        ($($name:literal => $call:expr),+ $(,)?) => {
+            vec![$(($name, format!("{:?}", $call.await.unwrap()))),+]
+        };
+    }
+
+    dumps![
+        "snapshots" => tx.visible_snapshots(),
+        "data_files" => tx.visible_data_files(),
+        "data_files_live_at" => tx.visible_data_files_live_at(Some(1)),
+        "delete_files" => tx.visible_delete_files(),
+        "columns" => tx.visible_columns(),
+        "tables" => tx.visible_tables(),
+        "file_column_stats" => tx.visible_file_column_stats(),
+        "schemas" => tx.visible_schemas(),
+        "views" => tx.visible_views(),
+        "partition_info" => tx.visible_partition_info(),
+        "sort_info" => tx.visible_sort_info(),
+        "macros" => tx.visible_macros(),
+        "table_stats" => tx.visible_table_stats(),
+        "table_column_stats" => tx.visible_table_column_stats(),
+        "mappings" => tx.visible_mappings(),
+        "tag_containers" => tx.visible_tag_containers(),
+        "option_scopes" => tx.visible_option_scopes(),
+        "schema_version_records" => tx.visible_schema_version_records(),
+        "scheduled_deletions" => tx.visible_scheduled_deletions(),
+    ]
+}
+
+/// No inline operation is visible to a transaction-aware dump. An embedder
+/// that holds one materialization of a metadata table per transaction may
+/// therefore keep it across a statement that stages only inline rows.
+#[tokio::test]
+async fn inline_operations_leave_every_metadata_dump_unchanged() {
+    let catalog = open().await;
+    stage_batch(
+        &catalog,
+        1,
+        vec![
+            (TableKind::Schema, schema_row(7, "s", 1)),
+            (TableKind::Table, table_row(1, 7, "t", 1, None)),
+            (TableKind::Column, column_row(1, 1, "a", 0)),
+            (TableKind::DataFile, data_file_row(3, 1, 1)),
+            (TableKind::DeleteFile, delete_file_row(4, 1, 3, 1)),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let before = metadata_dumps(&tx).await;
+    assert!(
+        before.iter().any(|(_, dump)| dump != "[]"),
+        "the fixture must leave rows behind, or the comparison binds nothing"
+    );
+
+    for operation in [
+        RowOperation::InlineSchema {
+            table_id: 1,
+            schema_version: 0,
+            arrow_schema: b"schema".to_vec(),
+        },
+        RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 2,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk".to_vec(),
+        },
+        RowOperation::InlineInlineDelete {
+            table_id: 1,
+            row_id: 0,
+            end_snapshot: 2,
+        },
+        RowOperation::InlineFileDelete {
+            table_id: 1,
+            data_file_id: 3,
+            row_id: 5,
+            begin_snapshot: 2,
+        },
+        RowOperation::InlineFileDeleteRemove {
+            table_id: 1,
+            data_file_id: 3,
+            row_id: 5,
+        },
+        RowOperation::InlineFlushDelete {
+            table_id: 1,
+            schema_version: 0,
+            flush_snapshot: 2,
+        },
+        RowOperation::InlineSchemaDrop {
+            table_id: 1,
+            schema_version: 0,
+        },
+        RowOperation::InlineDrop { table_id: 1 },
+    ] {
+        tx.stage(operation);
+    }
+
+    for ((table, before), (_, after)) in before.iter().zip(metadata_dumps(&tx).await) {
+        assert_eq!(*before, after, "{table} moved under staged inline rows");
+    }
+    tx.rollback();
+}
+
 /// An `InlineIdel` tombstones a row: the row is absent from a
 /// `Table`-kind materialization at or after its `end_snapshot`.
 #[tokio::test]

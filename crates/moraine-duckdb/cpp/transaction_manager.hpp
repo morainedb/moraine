@@ -56,12 +56,11 @@ public:
 	// subsequent INSERT/UPDATE/DELETE within the same DuckDB transaction
 	// reuses it: one moraine staged tx per DuckDB transaction.
 	//
-	// Drops every held materialization, because a caller reaching for the
-	// staged tx without naming a table may stage against any of them.
-	// `StagedTxFor` is the narrower form.
-	MoraineTxHandle *StagedTx();
+	// For a caller staging only `inline/*` rows. No metadata table's
+	// overlay reads those, so every held materialization stands.
+	MoraineTxHandle *StagedTxForInline();
 
-	// `StagedTx` for a caller staging against exactly `spec`. Only that
+	// The same, for a caller staging against exactly `spec`. Only that
 	// table's overlay can change, so only its materialization is dropped.
 	MoraineTxHandle *StagedTxFor(const MetadataTableSpec &spec);
 
@@ -83,7 +82,8 @@ public:
 	// moves under a materialization: before any write, the transaction's
 	// snapshot; after, the staged tx's own pinned read point. Opening a
 	// staged tx crosses between them and drops everything held; staging a
-	// row drops the table it lands in, whose overlay just changed.
+	// row drops the table it lands in, whose overlay just changed. An
+	// `inline/*` row lands in no overlay and drops nothing.
 	// `MetadataRowsFor` (metadata_tables.hpp) is the only caller of this
 	// pair and states what rests on the sharing.
 	//

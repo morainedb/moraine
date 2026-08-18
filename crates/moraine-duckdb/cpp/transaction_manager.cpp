@@ -49,11 +49,12 @@ MoraineTxHandle *MoraineTransaction::OpenStagedTx() {
 	return staged_tx_;
 }
 
-MoraineTxHandle *MoraineTransaction::StagedTx() {
+MoraineTxHandle *MoraineTransaction::StagedTxForInline() {
 	std::lock_guard<std::mutex> guard(staged_state_lock_);
-	auto *tx = OpenStagedTx();
-	DropMetadataRows();
-	return tx;
+	// No drop of its own: an `inline/*` row is absent from every dump a
+	// materialization is built from, so none of them can go stale under it.
+	// Opening the tx still drops, which is the read point moving.
+	return OpenStagedTx();
 }
 
 MoraineTxHandle *MoraineTransaction::StagedTxFor(const MetadataTableSpec &spec) {

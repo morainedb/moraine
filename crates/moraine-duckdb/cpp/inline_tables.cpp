@@ -824,7 +824,7 @@ protected:
 	MoraineTxHandle *StagedTx(duckdb::ClientContext &client) const {
 		auto catalog_transaction = catalog_.GetCatalogTransaction(client);
 		auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
-		return moraine_tx.StagedTx();
+		return moraine_tx.StagedTxForInline();
 	}
 
 	// Resolves a rowid the entry's scan emitted (its index into that scan's

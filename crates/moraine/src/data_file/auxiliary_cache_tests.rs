@@ -211,6 +211,117 @@ fn values_round_trip_through_their_disk_form() {
     }
 }
 
+mod blocks {
+    use bytes::Bytes;
+    use object_store::{ObjectStoreExt, PutPayload};
+
+    use super::{Arc, InMemory, ObjectStore, Path};
+    use crate::data_file::{DataStore, ParquetFile, auxiliary_cache::AuxiliaryCache};
+
+    /// A file of `size` bytes whose contents are their own offsets, so an
+    /// assembled range is checkable against what was asked for.
+    async fn seeded(size: usize) -> (DataStore, Path, Vec<u8>) {
+        let bytes: Vec<u8> = (0..size)
+            .map(|offset| u8::try_from(offset % 251).unwrap_or(0))
+            .collect();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("blocks.parquet");
+        store
+            .put(&path, PutPayload::from_bytes(Bytes::from(bytes.clone())))
+            .await
+            .unwrap();
+        (DataStore::new(store), path, bytes)
+    }
+
+    fn file(store: &DataStore, path: &Path, size: usize) -> ParquetFile {
+        ParquetFile::new(store.clone(), path.clone(), size as u64, 0)
+    }
+
+    /// A repeated range is served from the cache: the bytes match and the
+    /// second read issues no object-store fetch.
+    #[tokio::test]
+    async fn a_repeated_range_is_served_without_a_second_fetch() {
+        let (store, path, bytes) = seeded(300_000).await;
+        let cache = AuxiliaryCache::new(4 << 20);
+        let file = file(&store, &path, bytes.len());
+
+        let first = cache.range(&file, 1_000..5_000).await.unwrap();
+        assert_eq!(first.as_ref(), &bytes[1_000..5_000]);
+        let fetched = file.metrics().tally().range_fetches;
+        assert!(fetched > 0, "the first read should have fetched");
+
+        let second = cache.range(&file, 1_000..5_000).await.unwrap();
+        assert_eq!(second.as_ref(), &bytes[1_000..5_000]);
+        assert_eq!(
+            file.metrics().tally().range_fetches,
+            fetched,
+            "the second read should have fetched nothing"
+        );
+    }
+
+    /// A multi-range read fetches only the ranges that missed, and serves
+    /// the rest from the cache.
+    #[tokio::test]
+    async fn a_multi_range_read_fetches_only_what_missed() {
+        let (store, path, bytes) = seeded(300_000).await;
+        let cache = AuxiliaryCache::new(4 << 20);
+        let file = file(&store, &path, bytes.len());
+
+        cache.range(&file, 1_000..2_000).await.unwrap();
+        let fetched = file.metrics().tally().ranges;
+
+        let served = cache
+            .ranges(&file, vec![1_000..2_000, 8_000..9_000])
+            .await
+            .unwrap();
+
+        assert_eq!(served[0].as_ref(), &bytes[1_000..2_000]);
+        assert_eq!(served[1].as_ref(), &bytes[8_000..9_000]);
+        assert_eq!(
+            file.metrics().tally().ranges,
+            fetched + 1,
+            "only the range that missed should have been fetched"
+        );
+    }
+
+    /// A large range and one running to the file's end both come back
+    /// exactly.
+    #[tokio::test]
+    async fn large_ranges_and_the_file_tail_come_back_exactly() {
+        let (store, path, bytes) = seeded(300_000).await;
+        let cache = AuxiliaryCache::new(4 << 20);
+        let file = file(&store, &path, bytes.len());
+
+        let spanning = cache.range(&file, 100..290_000).await.unwrap();
+        assert_eq!(spanning.as_ref(), &bytes[100..290_000]);
+
+        let tail = cache.range(&file, 299_000..300_000).await.unwrap();
+        assert_eq!(tail.as_ref(), &bytes[299_000..300_000]);
+    }
+
+    /// Blocks leave before footers and summaries under pressure: the cache
+    /// holds metadata whose value is not re-fetchable as cheaply.
+    #[tokio::test]
+    async fn blocks_are_evicted_before_summaries() {
+        let (store, path, bytes) = seeded(2 << 20).await;
+        let cache = AuxiliaryCache::new(512 * 1024);
+        let file = file(&store, &path, bytes.len());
+        let summary_key = super::key(&path);
+        cache.insert_summary(&store, &summary_key, &super::fragmented(1_024));
+
+        // Enough distinct ranges to overrun the allowance several times.
+        for block in 0..16 {
+            let start = block * 128 * 1024;
+            cache.range(&file, start..start + 64 * 1024).await.unwrap();
+        }
+
+        assert!(
+            cache.summary(&store, &summary_key).await.is_some(),
+            "the summary should outlive the blocks that flooded the cache"
+        );
+    }
+}
+
 /// A durable store's identity is its location, the same in every process;
 /// an in-memory store's is its own.
 #[test]

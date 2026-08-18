@@ -1041,7 +1041,7 @@ impl DbCache for CatalogCache {
 
 /// The eviction config both tiers take. Must be LRU: it is the only policy
 /// that honours the `Hint` separating metadata from blocks.
-fn eviction_config() -> LruConfig {
+pub(crate) fn eviction_config() -> LruConfig {
     LruConfig {
         high_priority_pool_ratio: METADATA_PRIORITY_POOL_RATIO,
     }
