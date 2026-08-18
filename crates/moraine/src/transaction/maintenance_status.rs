@@ -43,7 +43,7 @@ pub(crate) async fn record(catalog: &Catalog, pass: MaintenanceStatusPass) -> Re
         let tx = catalog.begin_write_tx().await?;
         let (status, stamp) = futures::try_join!(
             read::read_maintenance_status(ReadHandle::Tx(&tx)),
-            commit::format_stamp_to(&tx, FORMAT_WITH_MAINTENANCE_STATUS),
+            commit::format_stamp_to(&tx, catalog.projections(), FORMAT_WITH_MAINTENANCE_STATUS),
         )?;
         let mut status = status.unwrap_or_default();
         status.passes.push(encoded.clone());

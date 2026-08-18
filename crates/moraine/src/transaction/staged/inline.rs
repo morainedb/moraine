@@ -10,6 +10,10 @@ use super::{
     ReadHandle, Result, RowOperation, TableKind, commit, decode::decode_hard_delete,
     materialize_inline_rows, proto, store_inline, value,
 };
+use crate::catalog::{
+    inline::materialize_locator_rows,
+    projection::{self, ProjectionCache},
+};
 
 /// Independent per-table inline scans kept in flight during translation.
 const INLINE_TRANSLATION_CONCURRENCY: usize = 8;
@@ -37,37 +41,90 @@ impl ChunkSeqAllocator {
 /// for `(table_id, schema_version)`, plus the `inline/inline_delete`
 /// tombstones on those chunks' rows, reading `db_tx`'s pre-commit inline
 /// records. Returns the row ids drained.
+///
+/// A directory known complete serves the walk from its locators alone;
+/// otherwise the chunk bodies are scanned, the directory verified against
+/// them (remembered when the store format locks out writers that predate
+/// it), and any gaps healed onto this batch.
 pub(crate) async fn translate_inline_flush_delete(
     db_tx: &DbTransaction,
+    projections: &std::sync::RwLock<ProjectionCache>,
     table_id: u64,
     schema_version: u64,
     flush_snapshot: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<HashSet<u64>> {
-    let (chunks, inline_deletes) = futures::try_join!(
-        store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id),
-        store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
-    )?;
+    let rows = if projection::inline_directory_complete(projections, table_id) {
+        let (locators, inline_deletes) = futures::try_join!(
+            store_inline::scan_inline_chunk_locators(ReadHandle::Tx(db_tx), table_id),
+            store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
+        )?;
 
-    let scoped: Vec<(InlineOperation, proto::InlineChunkValue)> = chunks
-        .into_iter()
-        .filter(
-            |(op, _)| matches!(op, InlineOperation::Insert { schema_version: v, .. } if *v == schema_version),
-        )
-        .collect();
-
-    for (op, chunk) in &scoped {
-        if let InlineOperation::Insert { begin_snapshot, .. } = op
-            && *begin_snapshot <= flush_snapshot
-        {
-            writes.push((Key::Inline(InlineKey::Live(*op)).encode(), None));
-            writes.push(inline_chunk_range_delete(table_id, chunk)?);
+        let scoped: Vec<store_inline::InlineChunkLocator> = locators
+            .into_iter()
+            .filter(|locator| locator.schema_version() == Some(schema_version))
+            .collect();
+        for locator in &scoped {
+            if let InlineOperation::Insert { begin_snapshot, .. } = locator.operation()
+                && begin_snapshot <= flush_snapshot
+            {
+                writes.push((
+                    Key::Inline(InlineKey::Live(locator.operation())).encode(),
+                    None,
+                ));
+                writes.push((
+                    Key::Inline(InlineKey::ChunkRange {
+                        table_id,
+                        row_id_end: locator.row_id_end(),
+                    })
+                    .encode(),
+                    None,
+                ));
+            }
         }
-    }
+
+        materialize_locator_rows(&scoped, &inline_deletes)
+    } else {
+        let (chunks, range_ends, inline_deletes) = futures::try_join!(
+            store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id),
+            store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id),
+            store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
+        )?;
+
+        let scoped: Vec<(InlineOperation, proto::InlineChunkValue)> = chunks
+            .iter()
+            .filter(
+                |(op, _)| matches!(op, InlineOperation::Insert { schema_version: v, .. } if *v == schema_version),
+            )
+            .cloned()
+            .collect();
+
+        let mut deleted_ends = HashSet::new();
+        for (op, chunk) in &scoped {
+            if let InlineOperation::Insert { begin_snapshot, .. } = op
+                && *begin_snapshot <= flush_snapshot
+            {
+                writes.push((Key::Inline(InlineKey::Live(*op)).encode(), None));
+                let (range_key, _) = inline_chunk_range_delete(table_id, chunk)?;
+                writes.push((range_key, None));
+                deleted_ends.insert(inline_chunk_row_id_end(chunk.row_id_start, chunk.row_count));
+            }
+        }
+
+        reconcile_chunk_directory(
+            projections,
+            table_id,
+            &chunks,
+            &range_ends,
+            &deleted_ends,
+            writes,
+        )?;
+
+        materialize_inline_rows(&scoped, &inline_deletes)
+    };
 
     // Tombstones on the flushed chunks' rows (`ForFlush` includes them)
     // go with their chunk.
-    let rows = materialize_inline_rows(&scoped, &inline_deletes);
     let mut drained = HashSet::new();
     for row in InlineScanKind::ForFlush.select(&rows, flush_snapshot, 0) {
         drained.insert(row.row_id);
@@ -84,6 +141,83 @@ pub(crate) async fn translate_inline_flush_delete(
     }
 
     Ok(drained)
+}
+
+/// Compares the walked chunks against the directory. Equality is
+/// remembered — but only when the store format shuts out writers that
+/// predate the directory, since only then does a chunk always arrive with
+/// its locator. A gap stages the repair onto this batch instead: locators
+/// for uncovered surviving chunks, deletions for locators naming no chunk.
+/// Nothing is remembered off a repair still riding the batch.
+fn reconcile_chunk_directory(
+    projections: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+    chunks: &[(InlineOperation, proto::InlineChunkValue)],
+    range_ends: &[u64],
+    deleted_ends: &HashSet<Option<u64>>,
+    writes: &mut Vec<commit::StagedWrite>,
+) -> Result<()> {
+    if projection::format_floor(projections) < commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY {
+        return Ok(());
+    }
+
+    let chunk_ends: HashMap<Option<u64>, &(InlineOperation, proto::InlineChunkValue)> = chunks
+        .iter()
+        .map(|entry| {
+            (
+                inline_chunk_row_id_end(entry.1.row_id_start, entry.1.row_count),
+                entry,
+            )
+        })
+        .collect();
+    let directory: HashSet<u64> = range_ends.iter().copied().collect();
+
+    let mut complete = true;
+    for (end, (op, chunk)) in &chunk_ends {
+        let covered = end.is_some_and(|end| directory.contains(&end));
+        if covered {
+            continue;
+        }
+        complete = false;
+        if deleted_ends.contains(end) {
+            continue;
+        }
+        if let InlineOperation::Insert {
+            schema_version,
+            begin_snapshot,
+            chunk_seq,
+            ..
+        } = op
+        {
+            writes.push(inline_chunk_range_write(
+                table_id,
+                *schema_version,
+                *begin_snapshot,
+                *chunk_seq,
+                chunk.row_id_start,
+                chunk.row_count,
+            )?);
+        }
+    }
+    for end in &directory {
+        if !chunk_ends.contains_key(&Some(*end)) {
+            complete = false;
+            writes.push((
+                Key::Inline(InlineKey::ChunkRange {
+                    table_id,
+                    row_id_end: *end,
+                })
+                .encode(),
+                None,
+            ));
+        }
+    }
+
+    if complete {
+        projection::note_inline_directory_complete(projections, table_id);
+    }
+
+    Ok(())
 }
 
 /// Removes the named live `inline/file_delete` records, refusing any the
@@ -430,6 +564,7 @@ fn gather_file_delete_removals(ops: &[RowOperation]) -> BTreeMap<u64, Vec<(u64, 
 #[allow(clippy::too_many_lines)]
 pub(super) async fn translate_inline(
     db_tx: &DbTransaction,
+    projections: &std::sync::RwLock<ProjectionCache>,
     ops: &[RowOperation],
 ) -> Result<Vec<commit::StagedWrite>> {
     let mut writes = Vec::new();
@@ -476,6 +611,7 @@ pub(super) async fn translate_inline(
             } => {
                 translate_inline_flush_delete(
                     db_tx,
+                    projections,
                     *table_id,
                     *schema_version,
                     *flush_snapshot,

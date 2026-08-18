@@ -45,6 +45,27 @@ impl InlineChunkLocator {
     pub(crate) fn holds(self, row_id: u64) -> bool {
         row_id >= self.row_id_start && row_id <= self.row_id_end
     }
+
+    /// The chunk's store key operation.
+    pub(crate) fn operation(self) -> InlineOperation {
+        self.operation
+    }
+
+    /// The chunk's first row id.
+    pub(crate) fn row_id_start(self) -> u64 {
+        self.row_id_start
+    }
+
+    /// The chunk's last row id, inclusive.
+    pub(crate) fn row_id_end(self) -> u64 {
+        self.row_id_end
+    }
+
+    /// How many rows the chunk holds; ranges are validated non-inverted at
+    /// decode.
+    pub(crate) fn row_count(self) -> u64 {
+        self.row_id_end - self.row_id_start + 1
+    }
 }
 
 /// Resolves the directory entries owning `row_ids` without fetching their
@@ -143,6 +164,50 @@ pub(crate) async fn read_inline_chunk_locator(
         )));
     }
     Ok((locator.operation, chunk))
+}
+
+/// Every chunk-range locator for `table_id` as a full [`InlineChunkLocator`],
+/// ordered by inclusive range end. The directory names its chunks without
+/// carrying their bodies, so this scan stays small where
+/// [`scan_inline_chunks`] hauls every chunk's Arrow payload.
+pub(crate) async fn scan_inline_chunk_locators(
+    handle: ReadHandle<'_>,
+    table_id: u64,
+) -> Result<Vec<InlineChunkLocator>> {
+    scan_decode(
+        handle,
+        inline_chunk_range_table_prefix(table_id),
+        ScanShape::Probe,
+        |key, bytes| match key {
+            Key::Inline(InlineKey::ChunkRange {
+                table_id: owner,
+                row_id_end,
+            }) if owner == table_id => {
+                let locator: InlineChunkRangeValue = value::decode_owned(bytes)?;
+                if locator.row_id_start > row_id_end {
+                    return Err(Error::Corruption(format!(
+                        "inline chunk directory for table {table_id} has inverted range \
+                         {}..={row_id_end}",
+                        locator.row_id_start
+                    )));
+                }
+                Ok(InlineChunkLocator {
+                    operation: InlineOperation::Insert {
+                        table_id,
+                        schema_version: locator.schema_version,
+                        begin_snapshot: locator.begin_snapshot,
+                        chunk_seq: locator.chunk_seq,
+                    },
+                    row_id_start: locator.row_id_start,
+                    row_id_end,
+                })
+            }
+            other => Err(Error::Corruption(format!(
+                "non-directory key in inline chunk-range scan: {other:?}"
+            ))),
+        },
+    )
+    .await
 }
 
 /// Every chunk-range locator for `table_id`, ordered by inclusive range end.

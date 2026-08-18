@@ -8,6 +8,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use slatedb::DbTransaction;
 
 use crate::{
+    catalog::projection::ProjectionCache,
     error::{Error, Result},
     store::{handle::ReadHandle, inline as store_inline, proto},
     transaction::{
@@ -97,6 +98,7 @@ async fn recorded_schemas(
 /// concurrently.
 async fn translated_flushes(
     db_tx: &DbTransaction,
+    projections: &std::sync::RwLock<ProjectionCache>,
     ops: &[InlineStage],
 ) -> Result<Vec<(Vec<StagedWrite>, HashSet<u64>)>> {
     let flushes: Vec<(u64, u64, u64)> = ops
@@ -116,6 +118,7 @@ async fn translated_flushes(
             let mut writes = Vec::new();
             let drained = translate_inline_flush_delete(
                 db_tx,
+                projections,
                 table_id,
                 schema_version,
                 flush_snapshot,
@@ -178,6 +181,7 @@ fn refuse_tombstones_of_drained_rows(
 /// before this commit.
 pub(crate) async fn stage_inline_writes(
     db_tx: &DbTransaction,
+    projections: &std::sync::RwLock<ProjectionCache>,
     ops: &[InlineStage],
 ) -> Result<Vec<StagedWrite>> {
     let mut writes = Vec::new();
@@ -190,8 +194,10 @@ pub(crate) async fn stage_inline_writes(
             _ => None,
         })
         .collect();
-    let (recorded, flushes) =
-        futures::try_join!(recorded_schemas(db_tx, ops), translated_flushes(db_tx, ops))?;
+    let (recorded, flushes) = futures::try_join!(
+        recorded_schemas(db_tx, ops),
+        translated_flushes(db_tx, projections, ops)
+    )?;
     let mut flushes = flushes.into_iter();
     // Versions whose schema record this batch has already settled.
     let mut settled: HashSet<(u64, u64)> = HashSet::new();
@@ -315,7 +321,8 @@ mod tests {
         ];
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        let writes = stage_inline_writes(&tx, &ops).await.unwrap();
+        let projections = std::sync::RwLock::new(ProjectionCache::empty());
+        let writes = stage_inline_writes(&tx, &projections, &ops).await.unwrap();
         assert_eq!(
             writes,
             vec![
@@ -324,7 +331,7 @@ mod tests {
             ]
         );
 
-        let conflicting = stage_inline_writes(&tx, &[schema(1, b"other")]).await;
+        let conflicting = stage_inline_writes(&tx, &projections, &[schema(1, b"other")]).await;
         assert!(matches!(conflicting, Err(Error::Constraint(_))));
 
         tx.rollback();

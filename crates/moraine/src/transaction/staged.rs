@@ -1167,64 +1167,61 @@ impl StagedTransaction {
             .any(|operation| matches!(operation, RowOperation::InlineInsert { .. }));
         let mut phases = CommitPhases::default();
 
-        // Both read `db_tx`'s current state before any write in this commit
-        // is staged: `InlineFlushDelete`/`InlineDrop` name a table, not keys,
-        // and resolve against the same cut as `base`.
-        let head_view = async {
-            let phase_started = Instant::now();
-            let base = commit::head_view_for(&db_tx, &projections).await?;
-            Ok::<_, Error>((base, phase_started.elapsed()))
-        };
-        let inline = async {
-            let phase_started = Instant::now();
-            let writes = translate_inline(&db_tx, &ops).await?;
-            Ok::<_, Error>((writes, phase_started.elapsed()))
-        };
-        let (base, inline_writes) = match futures::try_join!(head_view, inline) {
-            Ok(((base, head_view_elapsed), (inline_writes, inline_elapsed))) => {
-                phases.head_view = head_view_elapsed;
-                phases.inline = inline_elapsed;
-                (base, inline_writes)
-            }
+        // The premise everything below stages against; a warm cache
+        // answers from memory, so this rarely waits on the store.
+        let phase_started = Instant::now();
+        let base = match commit::head_view_for(&db_tx, &projections).await {
+            Ok(base) => base,
             Err(err) => {
                 db_tx.rollback();
                 return Err(err);
             }
         };
+        phases.head_view = phase_started.elapsed();
         let base_ref: &CatalogSnapshot = &base;
 
         let mints_snapshot = mints_snapshot(&ops);
-        // Staged before translation so a poisoned index definition rides
-        // the writes it produces.
         let store = data_store.as_ref();
         let read_metrics = Arc::new(data_file::ScopedReadMetrics::reporting_to(data_reads));
-        let phase_started = Instant::now();
-        let entries = match stage_index_maintenance(
-            &db_tx,
-            base_ref,
-            &ops,
-            store,
-            &data_prefix,
-            read_metrics,
-        )
-        .await
-        {
-            Ok(entries) => entries,
+
+        // Both read `db_tx`'s pre-commit cut, so they run together.
+        // Maintenance stages only `index/*` keys as it streams — a subspace
+        // the inline translation never reads — and hands its directory
+        // repairs back unstaged; the translation stages nothing at all.
+        // (Index maintenance still runs before `translate_batch`, so a
+        // poisoned definition rides the writes it produces.)
+        let inline = async {
+            let phase_started = Instant::now();
+            let writes = translate_inline(&db_tx, &projections, &ops).await?;
+            Ok::<_, Error>((writes, phase_started.elapsed()))
+        };
+        let maintenance = async {
+            let phase_started = Instant::now();
+            let entries =
+                stage_index_maintenance(&db_tx, base_ref, &ops, store, &data_prefix, read_metrics)
+                    .await?;
+            Ok::<_, Error>((entries, phase_started.elapsed()))
+        };
+        let (inline_writes, entries) = match futures::try_join!(inline, maintenance) {
+            Ok(((inline_writes, inline_elapsed), (entries, maintenance_elapsed))) => {
+                phases.inline = inline_elapsed;
+                phases.index_maintenance = maintenance_elapsed;
+                (inline_writes, entries)
+            }
             Err(err) => {
                 db_tx.rollback();
                 return Err(err);
             }
         };
-        phases.index_maintenance = phase_started.elapsed();
         let StagedEntries {
             poisoned,
             deferred,
             bytes: entry_bytes,
-            uses_inline_chunk_directory: repaired_inline_chunk_directory,
+            locator_writes,
             metrics: index_metrics,
         } = entries;
         phases.index_metrics = index_metrics;
-        uses_inline_chunk_directory |= repaired_inline_chunk_directory;
+        uses_inline_chunk_directory |= !locator_writes.is_empty();
 
         // A head-preserving commit never marks a definition maintaining.
         let deferred_indexes = if mints_snapshot {
@@ -1238,12 +1235,17 @@ impl StagedTransaction {
             Ok((result_id, mut writes, translated_head_view)) => {
                 phases.translate = phase_started.elapsed();
                 let phase_started = Instant::now();
+                // Directory repairs go ahead of the inline writes, so a
+                // flush draining a repaired chunk still deletes its locator.
+                writes.extend(locator_writes);
+                // A maintenance batch stamps the head too, reusing the
+                // standing snapshot id.
+                writes.push(commit::head_stamp(result_id, base_ref.batch_seq));
                 let staged_bytes = match stage_batch(
                     &db_tx,
+                    &projections,
                     &mut writes,
                     inline_writes,
-                    result_id,
-                    base_ref.batch_seq,
                     entry_bytes,
                     uses_inline_chunk_directory,
                 )
@@ -1362,24 +1364,26 @@ fn translate_batch(
     Ok((new_id, writes, translated_head_view))
 }
 
-/// Stamps the head, folds in the inline writes, and stages the whole batch
-/// onto `db_tx`, returning what the batch weighs (`entry_bytes` included,
-/// since index entries stage directly and never join `writes`). A
-/// maintenance batch stamps the head too, reusing the standing snapshot id.
+/// Folds in the inline writes and stages the whole batch onto `db_tx`,
+/// returning what the batch weighs (`entry_bytes` included, since index
+/// entries stage directly and never join `writes`). The caller has already
+/// stamped the head.
 async fn stage_batch(
     db_tx: &DbTransaction,
+    projections: &std::sync::RwLock<ProjectionCache>,
     writes: &mut Vec<commit::StagedWrite>,
     inline_writes: Vec<commit::StagedWrite>,
-    result_id: u64,
-    standing_batch_seq: u64,
     entry_bytes: u64,
     uses_inline_chunk_directory: bool,
 ) -> Result<StagedBytes> {
-    writes.push(commit::head_stamp(result_id, standing_batch_seq));
     writes.extend(inline_writes);
     if uses_inline_chunk_directory
-        && let Some(stamp) =
-            commit::format_stamp_to(db_tx, commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY).await?
+        && let Some(stamp) = commit::format_stamp_to(
+            db_tx,
+            projections,
+            commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY,
+        )
+        .await?
     {
         writes.push(stamp);
     }

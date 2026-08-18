@@ -37,19 +37,50 @@ pub fn materialize_inline_rows(
     chunks: &[(InlineOperation, InlineChunkValue)],
     inline_deletes: &[(u64, InlineInlineDeleteValue)],
 ) -> Vec<InlineRow> {
+    materialize_spans(
+        chunks
+            .iter()
+            .map(|(op, value)| (*op, value.row_id_start, value.row_count)),
+        inline_deletes,
+    )
+}
+
+/// As [`materialize_inline_rows`], from chunk-range directory locators —
+/// the same rows without the chunk bodies in hand. `chunk` indexes into
+/// `locators`.
+pub(crate) fn materialize_locator_rows(
+    locators: &[crate::store::inline::InlineChunkLocator],
+    inline_deletes: &[(u64, InlineInlineDeleteValue)],
+) -> Vec<InlineRow> {
+    materialize_spans(
+        locators.iter().map(|locator| {
+            (
+                locator.operation(),
+                locator.row_id_start(),
+                locator.row_count(),
+            )
+        }),
+        inline_deletes,
+    )
+}
+
+fn materialize_spans(
+    spans: impl Iterator<Item = (InlineOperation, u64, u64)>,
+    inline_deletes: &[(u64, InlineInlineDeleteValue)],
+) -> Vec<InlineRow> {
     let tombstones: HashMap<u64, u64> = inline_deletes
         .iter()
         .map(|(row_id, inline_delete)| (*row_id, inline_delete.end_snapshot))
         .collect();
 
     let mut rows = Vec::new();
-    for (chunk_index, (op, value)) in chunks.iter().enumerate() {
-        let InlineOperation::Insert { begin_snapshot, .. } = *op else {
+    for (chunk_index, (op, row_id_start, row_count)) in spans.enumerate() {
+        let InlineOperation::Insert { begin_snapshot, .. } = op else {
             continue;
         };
 
-        for offset in 0..value.row_count {
-            let row_id = value.row_id_start + offset;
+        for offset in 0..row_count {
+            let row_id = row_id_start + offset;
             // A tombstone ends only a version begun before it: an `UPDATE`
             // tombstones a row and re-inserts its `row_id` in one commit,
             // and the re-inserted version must stay live (DuckLake's own

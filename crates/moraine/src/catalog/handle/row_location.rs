@@ -133,14 +133,14 @@ impl ReadOnlyCatalog {
         };
 
         // A row can be inlined and still hold an expired physical copy in a
-        // current file, so the inlined copy is its own candidate.
+        // current file, so the inlined copy is its own candidate. Only the
+        // ids are needed, so the bodies stay unread.
         let requested: HashSet<u64> = row_ids.iter().copied().collect();
         let inlined = async {
             Ok::<_, crate::Error>(
-                self.recent_rows(table)
+                self.live_inline_row_ids(table)
                     .await?
                     .into_iter()
-                    .map(|row| row.row_id)
                     .filter(|row_id| requested.contains(row_id))
                     .collect::<HashSet<u64>>(),
             )

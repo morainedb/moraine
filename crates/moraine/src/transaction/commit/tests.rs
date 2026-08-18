@@ -544,6 +544,25 @@ async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::cat
 }
 
 /// A `BIGINT`-shaped index key value.
+/// Writes the marker exactly as a migration's start batch does: the marker
+/// and the head stamp that carries it, in one batch.
+async fn plant_migration_marker(catalog: &crate::catalog::Catalog) {
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let head = read::read_head(ReadHandle::Tx(&tx)).await.unwrap().unwrap();
+    tx.put(
+        Key::Sys(SysKey::Migration).encode(),
+        value::encode_value(&proto::MigrationValue {
+            from_format: 1,
+            to_format: 2,
+            cursor: Vec::new(),
+        }),
+    )
+    .unwrap();
+    let (key, stamp) = head_stamp(head.snapshot_id, head.batch_seq);
+    tx.put(key, stamp.unwrap()).unwrap();
+    tx.commit_with_options(&durable()).await.unwrap();
+}
+
 fn int_value(value: i128) -> crate::store::index_encoding::IndexKeyValue {
     crate::store::index_encoding::IndexKeyValue::Int {
         value,
@@ -3502,17 +3521,7 @@ async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
         .unwrap();
     reader.snapshot().await.unwrap();
 
-    let tx = writer.begin_write_tx().await.unwrap();
-    tx.put(
-        Key::Sys(SysKey::Migration).encode(),
-        value::encode_value(&proto::MigrationValue {
-            from_format: 1,
-            to_format: 2,
-            cursor: Vec::new(),
-        }),
-    )
-    .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
+    plant_migration_marker(&writer).await;
 
     // A reader's state advances when its manifest poller runs, not on the
     // write, so the refusal arrives within a bounded wait rather than at
@@ -3539,17 +3548,7 @@ async fn the_migration_marker_refuses_a_commit_with_a_warm_cache() {
     let (catalog, _) = seeded_catalog(3).await;
     catalog.snapshot().await.unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
-    tx.put(
-        Key::Sys(SysKey::Migration).encode(),
-        value::encode_value(&proto::MigrationValue {
-            from_format: 1,
-            to_format: 2,
-            cursor: Vec::new(),
-        }),
-    )
-    .unwrap();
-    tx.commit().await.unwrap();
+    plant_migration_marker(&catalog).await;
 
     let err = catalog
         .commit(|tx| {
@@ -3562,6 +3561,195 @@ async fn the_migration_marker_refuses_a_commit_with_a_warm_cache() {
 
     assert!(matches!(err, Error::Migration(_)), "{err:?}");
     catalog.close().await.unwrap();
+}
+
+/// A target at or below the observed floor is answered from the floor. The
+/// store here is stamped below the target, so an answer of `None` can only
+/// mean the read was skipped.
+#[tokio::test]
+async fn a_format_target_under_the_observed_floor_costs_no_read() {
+    let (catalog, _) = seeded_catalog(1).await;
+    let projections = catalog.projections();
+    raise_format_floor(projections, MAX_FORMAT_VERSION);
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let stamp = format_stamp_to(&db_tx, projections, FORMAT_WITH_INDEX)
+        .await
+        .unwrap();
+
+    assert!(stamp.is_none(), "the floor already covers the target");
+    db_tx.rollback();
+    catalog.close().await.unwrap();
+}
+
+/// A target above the floor reads, stamps, and raises the floor to what it
+/// found, so the same question is not asked twice.
+#[tokio::test]
+async fn a_format_target_above_the_floor_reads_and_raises_it() {
+    let (catalog, _) = seeded_catalog(1).await;
+    let projections = catalog.projections();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let stamp = format_stamp_to(&db_tx, projections, FORMAT_WITH_INDEX)
+        .await
+        .unwrap();
+
+    assert!(stamp.is_some(), "a fresh store owes the index stamp");
+    assert_eq!(format_floor(projections), FORMAT_VERSION);
+    db_tx.rollback();
+    catalog.close().await.unwrap();
+}
+
+/// The stamp is keyed on the head it was taken at, so a marker planted
+/// without moving the head is invisible to it — which is why a migration
+/// start stamps the head, and what the next test pins.
+#[tokio::test]
+async fn the_migration_check_is_skipped_at_a_head_already_found_clear() {
+    let (catalog, _) = seeded_catalog(1).await;
+    let projections = catalog.projections();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let head = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
+    refuse_mid_migration_at(ReadHandle::Tx(&db_tx), projections, &head)
+        .await
+        .unwrap();
+    assert!(migration_clear_at(projections, &head));
+    db_tx.rollback();
+
+    // Planted behind the stamp's back: same head, marker present.
+    let tx = catalog.begin_write_tx().await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Migration).encode(),
+        value::encode_value(&proto::MigrationValue {
+            from_format: 1,
+            to_format: 2,
+            cursor: Vec::new(),
+        }),
+    )
+    .unwrap();
+    tx.commit_with_options(&durable()).await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let served = refuse_mid_migration_at(ReadHandle::Tx(&db_tx), projections, &head).await;
+    assert!(served.is_ok(), "the stamp answered without reading");
+
+    // The same handle at any other head reads, and finds it.
+    let moved = proto::HeadValue {
+        snapshot_id: head.snapshot_id,
+        batch_seq: head.batch_seq + 1,
+    };
+    let err = refuse_mid_migration_at(ReadHandle::Tx(&db_tx), projections, &moved)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::Migration(_)), "{err:?}");
+
+    db_tx.rollback();
+    catalog.close().await.unwrap();
+}
+
+/// A read session checks the marker through the head-keyed stamp: a head
+/// already found clear opens without re-reading it, and a marker landing
+/// the way a real one does — riding a head stamp — is still refused.
+#[tokio::test]
+async fn a_read_session_skips_the_migration_check_at_a_stamped_head() {
+    let (catalog, _) = seeded_catalog(1).await;
+
+    // The first session reads the marker and stamps the head clear.
+    let session = catalog.begin_read().await.unwrap();
+    session.finish();
+
+    // Planted behind the stamp's back: marker present, head unmoved. A
+    // session that still opens proves the check was answered from the
+    // stamp rather than read.
+    let tx = catalog.begin_write_tx().await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Migration).encode(),
+        value::encode_value(&proto::MigrationValue {
+            from_format: 1,
+            to_format: 2,
+            cursor: Vec::new(),
+        }),
+    )
+    .unwrap();
+    tx.commit_with_options(&durable()).await.unwrap();
+    let session = catalog.begin_read().await.unwrap();
+    session.finish();
+
+    // The marker as a migration start actually writes it: head moves, the
+    // stamp misses, and the session reads and refuses.
+    plant_migration_marker(&catalog).await;
+    let err = catalog.begin_read().await.err().unwrap();
+    assert!(matches!(err, Error::Migration(_)), "{err:?}");
+
+    catalog.close().await.unwrap();
+}
+
+/// A migration start moves the head, which is what makes the stamp safe: a
+/// committer holding one cannot miss a migration that began under it.
+#[tokio::test]
+async fn a_migration_start_moves_the_head() {
+    let (catalog, _) = seeded_catalog(2).await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let before = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
+    db_tx.rollback();
+
+    plant_migration_marker(&catalog).await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let after = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
+    db_tx.rollback();
+
+    assert_ne!(before, after, "the marker must not land at a still head");
+    assert_eq!(after.batch_seq, before.batch_seq + 1);
+    catalog.close().await.unwrap();
+}
+
+/// A landed commit leaves its own head stamped clear: it won the head CAS,
+/// so nothing — a migration start least of all — landed between the check
+/// its base was read under and its write.
+#[tokio::test]
+async fn a_landed_commit_stamps_its_own_head_clear() {
+    let (catalog, _) = seeded_catalog(1).await;
+    let projections = catalog.projections();
+
+    catalog
+        .commit(|tx| tx.create_schema("after").map(|_| ()))
+        .await
+        .unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let head = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
+    db_tx.rollback();
+
+    assert!(
+        migration_clear_at(projections, &head),
+        "the commit's own head should need no re-read"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// A batch far larger than a modest one still records its changelog, so a
+/// reader behind it replays rather than rematerializing.
+#[test]
+fn a_bulk_batch_still_records_a_changelog() {
+    let writes: Vec<StagedWrite> = (0..1_000)
+        .map(|id| {
+            (
+                Key::Current(crate::store::key::CurrentKey::Entity(EntityKey::Table {
+                    table_id: id,
+                }))
+                .encode(),
+                Some(Vec::new()),
+            )
+        })
+        .collect();
+
+    let (keys, complete) = refresh_keys_of(&writes);
+
+    assert!(complete, "a thousand-key batch must stay replayable");
+    assert_eq!(keys.len(), 1_000);
 }
 
 /// The first attempt never waits, later ones grow to the cap, and every
@@ -4375,7 +4563,7 @@ async fn a_read_only_pass_that_straddles_a_commit_is_discarded_and_re_run() {
 async fn catalog_with_a_reclaimed_snapshot()
 -> (Db, Arc<std::sync::RwLock<ProjectionCache>>, Arc<Coalescer>) {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let (db, _) = open_initialized(StoreBuilder::new("", object_store), false, None)
+    let (db, _, _) = open_initialized(StoreBuilder::new("", object_store), false, None)
         .await
         .unwrap();
     let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
@@ -4571,6 +4759,7 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let prepared = prepare_and_stage(
         &db_tx,
+        catalog.projections(),
         &|tx: &mut Transaction| tx.create_index(table, &def, &entries).map(|_| ()),
         &base,
     )
