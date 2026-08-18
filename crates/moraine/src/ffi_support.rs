@@ -25,7 +25,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
-    catalog::{ReadOnlyCatalog, projection::ProjectionCache},
+    catalog::{ReadOnlyCatalog, projection, projection::ProjectionCache},
     error::{Error, Result},
     store::{
         proto::{
@@ -347,25 +347,29 @@ pub async fn dump_sort_info(catalog: &ReadOnlyCatalog) -> Result<Vec<SortValue>>
 /// Serves one unversioned kind from its maintained projection when the
 /// head matches; a miss derives the rows from the shared `current` half
 /// and installs them for the next call.
-async fn dump_projected_current<T: Clone>(
+async fn dump_projected_current<K: Ord, T: Clone>(
     catalog: &ReadOnlyCatalog,
-    read: impl Fn(&ProjectionCache, &HeadValue) -> Option<Vec<T>>,
+    read: impl Fn(&ProjectionCache, &HeadValue) -> Option<Arc<BTreeMap<K, T>>>,
     install: impl Fn(&mut ProjectionCache, HeadValue, Vec<T>),
     extract: impl Fn(&EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
-    if let Some(head) = writer_head(catalog)?
-        && let Some(rows) = read(&projections_read(catalog), &head)
-    {
-        return Ok(rows);
+    // Each serve is bound in a statement of its own so the cache lock is
+    // released before the rows are copied out of it.
+    if let Some(head) = writer_head(catalog)? {
+        let served = read(&projections_read(catalog), &head);
+        if let Some(rows) = served {
+            return Ok(projection::materialize(&rows));
+        }
     }
 
     let session = catalog.begin_read().await?;
     let head = session_head(catalog, &session).await?;
-    if let Some(head) = &head
-        && let Some(rows) = read(&projections_read(catalog), head)
-    {
-        session.finish();
-        return Ok(rows);
+    if let Some(head) = &head {
+        let served = read(&projections_read(catalog), head);
+        if let Some(rows) = served {
+            session.finish();
+            return Ok(projection::materialize(&rows));
+        }
     }
     session.finish();
 
@@ -444,18 +448,22 @@ pub async fn dump_file_column_stats_of(
 /// Snapshots are append-only, so this is the full history.
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &ReadOnlyCatalog) -> Result<Vec<SnapshotValue>> {
-    if let Some(head) = writer_head(catalog)?
-        && let Some(rows) = projections_read(catalog).snapshots_at(&head)
-    {
-        return Ok(rows);
+    // Bound in a statement of its own so the cache lock is released before
+    // the rows are copied out of it.
+    if let Some(head) = writer_head(catalog)? {
+        let served = projections_read(catalog).snapshots_at(&head);
+        if let Some(rows) = served {
+            return Ok(projection::materialize(&rows));
+        }
     }
 
     let session = catalog.begin_read().await?;
     let head = session_head(catalog, &session).await?;
     if let Some(head) = head {
-        if let Some(rows) = projections_read(catalog).snapshots_at(&head) {
+        let served = projections_read(catalog).snapshots_at(&head);
+        if let Some(rows) = served {
             session.finish();
-            return Ok(rows);
+            return Ok(projection::materialize(&rows));
         }
         let result = scan_snapshots(session.handle()).await;
         session.finish();

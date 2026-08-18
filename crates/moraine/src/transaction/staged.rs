@@ -372,6 +372,8 @@ type CommittedRecords = Arc<Vec<read::EntityRecord>>;
 type CommittedRecordCache = tokio::sync::Mutex<
     HashMap<read::EntityRecordKind, Arc<tokio::sync::OnceCell<CommittedRecords>>>,
 >;
+type CommittedSnapshots = tokio::sync::OnceCell<Arc<Vec<proto::SnapshotValue>>>;
+type CommittedSchemaVersions = tokio::sync::OnceCell<Arc<Vec<(u64, u64, u64)>>>;
 
 /// A malformed staged row: wrong cell count or a cell of the wrong kind
 /// for its column.
@@ -392,6 +394,12 @@ pub struct StagedTransaction {
     /// The committed records at this transaction's read point, scanned once
     /// per requested kind and shared by later reads of that kind.
     committed: CommittedRecordCache,
+    /// The committed snapshot records at this transaction's read point.
+    /// Scanned once; the staged deletes over them are re-applied per call.
+    committed_snapshots: CommittedSnapshots,
+    /// The committed `schema_version` records at this transaction's read
+    /// point. Scanned once; the staged rows over them are re-applied per call.
+    committed_schema_versions: CommittedSchemaVersions,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     /// The `DATA_PATH` object store and its bucket-relative prefix, present
     /// when the attach supplied `META_DATA_PATH`. Index maintenance
@@ -418,6 +426,8 @@ impl StagedTransaction {
             db_tx,
             ops: Vec::new(),
             committed: tokio::sync::Mutex::new(HashMap::new()),
+            committed_snapshots: tokio::sync::OnceCell::new(),
+            committed_schema_versions: tokio::sync::OnceCell::new(),
             projections,
             data_store,
             data_prefix,
@@ -508,7 +518,7 @@ impl StagedTransaction {
     /// Returns an error if the scan fails or a staged snapshot-delete row
     /// is malformed.
     pub async fn visible_snapshots(&self) -> Result<Vec<proto::SnapshotValue>> {
-        let committed = read::scan_snapshots(ReadHandle::Tx(&self.db_tx)).await?;
+        let committed = self.committed_snapshots().await?;
 
         let mut deleted = BTreeSet::new();
         for op in &self.ops {
@@ -524,9 +534,29 @@ impl StagedTransaction {
         }
 
         Ok(committed
-            .into_iter()
+            .iter()
             .filter(|s| !deleted.contains(&s.snapshot_id))
+            .cloned()
             .collect())
+    }
+
+    /// The committed snapshot records at this transaction's read point,
+    /// scanned once and shared by later reads.
+    async fn committed_snapshots(&self) -> Result<Arc<Vec<proto::SnapshotValue>>> {
+        self.committed_snapshots
+            .get_or_try_init(|| async {
+                let started = Instant::now();
+                let records = read::scan_snapshots(ReadHandle::Tx(&self.db_tx)).await?;
+                debug!(
+                    transaction_id = self.diagnostic_id,
+                    records = records.len(),
+                    elapsed_ms = milliseconds(started.elapsed()),
+                    "scanned committed snapshots for staged transaction"
+                );
+                Ok::<_, Error>(Arc::new(records))
+            })
+            .await
+            .cloned()
     }
 
     /// The committed records of one kind at this transaction's read point,
@@ -916,7 +946,7 @@ impl StagedTransaction {
     ///
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_schema_version_records(&self) -> Result<Vec<(u64, u64, u64)>> {
-        let mut records = read::scan_schema_versions(ReadHandle::Tx(&self.db_tx)).await?;
+        let mut records = self.committed_schema_versions().await?.as_ref().clone();
 
         // A staged delete removes committed records and any staged insert
         // before it; a staged insert after the delete survives.
@@ -939,6 +969,25 @@ impl StagedTransaction {
         records.extend(inserted);
 
         Ok(records)
+    }
+
+    /// The committed `schema_version` records at this transaction's read
+    /// point, scanned once and shared by later reads.
+    async fn committed_schema_versions(&self) -> Result<Arc<Vec<(u64, u64, u64)>>> {
+        self.committed_schema_versions
+            .get_or_try_init(|| async {
+                let started = Instant::now();
+                let records = read::scan_schema_versions(ReadHandle::Tx(&self.db_tx)).await?;
+                debug!(
+                    transaction_id = self.diagnostic_id,
+                    records = records.len(),
+                    elapsed_ms = milliseconds(started.elapsed()),
+                    "scanned committed schema versions for staged transaction"
+                );
+                Ok::<_, Error>(Arc::new(records))
+            })
+            .await
+            .cloned()
     }
 
     /// `ducklake_files_scheduled_for_deletion` rows as this transaction
@@ -991,6 +1040,8 @@ impl StagedTransaction {
             db_tx,
             ops,
             committed: _,
+            committed_snapshots: _,
+            committed_schema_versions: _,
             projections,
             data_store,
             data_prefix,
@@ -1303,6 +1354,7 @@ fn translate(
     let mut children = collect_child_rows(ops)?;
     let mut direct = Vec::new();
     let hard_deleted = collect_hard_deletes(ops)?;
+    let mut touched = commit::Touched::default();
 
     let phases: [fn(&RowOperation) -> bool; 3] = [
         |op| {
@@ -1325,6 +1377,7 @@ fn translate(
                 &mut children,
                 &mut direct,
                 &hard_deleted,
+                &mut touched,
             )?;
         }
     }
@@ -1342,14 +1395,26 @@ fn translate(
             && table.next_column_id <= *max_id
         {
             table.next_column_id = max_id + 1;
+            touched.touch(EntityKey::Table {
+                table_id: *table_id,
+            });
         }
     }
 
     apply_poison(&mut state, poisoned);
     apply_deferred_maintenance(base, &mut state, deferred, new_id);
+    // Both reach index records by id alone, across every table holding one.
+    for index_id in poisoned.iter().chain(deferred) {
+        for table_id in base.indexes.keys().chain(state.indexes.keys()) {
+            touched.touch(EntityKey::Index {
+                table_id: *table_id,
+                index_id: *index_id,
+            });
+        }
+    }
     state.snapshot = snapshot.clone();
 
-    let mut writes = commit::diff_writes(base, &state, new_id);
+    let mut writes = commit::diff_touched(base, &state, new_id, &touched);
     let translated_head_view = match commit::finish_translated_head_view(&mut state, &direct) {
         Ok(()) => Some(state),
         Err(err) => {
@@ -1430,6 +1495,7 @@ fn translate_maintenance(
     let mut children = ChildRows::default();
     let mut direct = Vec::new();
     let hard_deleted = collect_hard_deletes(ops)?;
+    let mut touched = commit::Touched::default();
     for op in ops {
         let row_id_statistics_insert = match op {
             RowOperation::Insert {
@@ -1463,10 +1529,11 @@ fn translate_maintenance(
             &mut children,
             &mut direct,
             &hard_deleted,
+            &mut touched,
         )?;
     }
 
-    let mut writes = commit::diff_writes(base, &state, head);
+    let mut writes = commit::diff_touched(base, &state, head, &touched);
     writes.extend(direct);
     Ok(writes)
 }

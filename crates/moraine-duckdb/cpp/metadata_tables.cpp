@@ -12,6 +12,10 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
+// Re-resolving a deferred scan's catalog at execution time.
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
+
 #include "catalog.hpp"
 #include "inline_tables.hpp"
 #include "owned_array.hpp"
@@ -1330,6 +1334,21 @@ duckdb::BindInfo MetadataScanBindInfo(const duckdb::optional_ptr<duckdb::Functio
 	return info;
 }
 
+// The catalog a deferred scan reads through, proven still attached.
+//
+// Bind data outlives its bind: `PREPARE`, `DETACH`, then `EXECUTE` reaches
+// here with `bind_data.catalog` pointing at a freed catalog. The pointer is
+// therefore only ever compared, never followed — the reference returned is
+// the one the database manager resolves now.
+duckdb::Catalog &LiveBoundCatalog(duckdb::ClientContext &context, const MetadataScanBindData &bind_data) {
+	auto database = duckdb::DatabaseManager::Get(context).GetDatabase(context, bind_data.catalog_name);
+	if (database && &database->GetCatalog() == bind_data.catalog) {
+		return *bind_data.catalog;
+	}
+	throw duckdb::CatalogException("moraine: database \"%s\" was detached after this statement was bound",
+	                               bind_data.catalog_name);
+}
+
 struct MetadataScanGlobalState : public duckdb::GlobalTableFunctionState {
 	duckdb::idx_t offset = 0;
 	// The columns DuckDB asked for, by index into a materialized row, in
@@ -1363,21 +1382,21 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
 	if (bind_data.spec == nullptr || bind_data.catalog == nullptr) {
 		return state;
 	}
+	auto &catalog = LiveBoundCatalog(context, bind_data);
 	if (bind_data.rows == nullptr) {
 		if (bind_data.scope.IsValid()) {
-			state->rows =
-			    ScopedMetadataRowsFor(context, *bind_data.catalog, *bind_data.spec, bind_data.scope.GetIndex());
+			state->rows = ScopedMetadataRowsFor(context, catalog, *bind_data.spec, bind_data.scope.GetIndex());
 		} else {
 			// No equality survived pushdown: this scan reads its kind whole,
 			// exactly as one that never deferred would have.
-			state->rows = MetadataRowsFor(context, *bind_data.catalog, *bind_data.spec);
+			state->rows = MetadataRowsFor(context, catalog, *bind_data.spec);
 		}
 	}
 
 	// Only a scan feeding an UPDATE or a DELETE asks for row ids, and only
 	// its rows are ever resolved back from one, so only it is registered.
 	if (EmitsRowIds(state->column_ids)) {
-		auto catalog_transaction = bind_data.catalog->GetCatalogTransaction(context);
+		auto catalog_transaction = catalog.GetCatalogTransaction(context);
 		auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
 		state->row_id_base = transaction.RegisterScannedRows(
 		    *bind_data.spec, state->rows != nullptr ? state->rows : bind_data.rows);
@@ -1512,6 +1531,7 @@ duckdb::unique_ptr<duckdb::FunctionData> MetadataScanBindData::Copy() const {
 	result->rows = rows;
 	result->spec = spec;
 	result->catalog = catalog;
+	result->catalog_name = catalog_name;
 	result->scope = scope;
 	result->table_entry = table_entry;
 	return result;
@@ -1790,6 +1810,7 @@ duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientC
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
 	scan_bind_data->spec = &spec_;
 	scan_bind_data->catalog = &ParentCatalog();
+	scan_bind_data->catalog_name = ParentCatalog().GetName();
 	// A narrowable kind is left unmaterialized for `InitGlobal`: the filter
 	// deciding how much of it to build has not been pushed down yet.
 	if (spec_.scope_column < 0) {

@@ -430,9 +430,10 @@ impl ReadOnlyCatalog {
     /// pressure. It is reported so a host sizing a process can see it at
     /// all.
     ///
-    /// An estimate over the decoded record sets and maintained projections.
-    /// The head view derived from those records is a separate allocation
-    /// and is not counted, so treat this as a floor.
+    /// An estimate over the decoded record sets, the maintained
+    /// projections, and the head view derived from them. Encoded record
+    /// lengths stand in for what those records occupy in memory, so treat
+    /// this as a floor.
     #[must_use]
     pub fn projection_bytes(&self) -> u64 {
         self.projections

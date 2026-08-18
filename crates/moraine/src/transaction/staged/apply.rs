@@ -4,7 +4,9 @@
 
 use super::{
     BTreeSet, CatalogSnapshot, Cell, EntityKey, Error, HashMap, Key, Result, RowOperation,
-    TableKind, commit, corrupt_row,
+    TableKind, commit,
+    commit::Touched,
+    corrupt_row,
     decode::{
         Cursor, StatsKey, decode_column, decode_column_mapping, decode_column_tag_row,
         decode_data_file, decode_delete_file, decode_delete_key, decode_end,
@@ -150,6 +152,7 @@ pub(super) fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
 /// Applies one staged row to the working snapshot. `new_id` is this
 /// commit's own snapshot id, the only value an `UpdateSetEnd` row's
 /// `end_snapshot` cell may carry.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_op(
     base: &CatalogSnapshot,
     state: &mut CatalogSnapshot,
@@ -158,17 +161,20 @@ pub(super) fn apply_op(
     children: &mut ChildRows,
     direct: &mut Vec<commit::StagedWrite>,
     hard_deleted: &BTreeSet<EntityKey>,
+    touched: &mut Touched,
 ) -> Result<()> {
     match op {
-        RowOperation::Insert { table, cells } => apply_insert(base, state, *table, cells, children),
+        RowOperation::Insert { table, cells } => {
+            apply_insert(base, state, *table, cells, children, touched)
+        }
         RowOperation::UpdateSetEnd { table, cells } => {
-            apply_update_set_end(state, *table, cells, new_id)
+            apply_update_set_end(state, *table, cells, new_id, touched)
         }
         RowOperation::UpdateSetBegin { table, cells } => {
-            apply_update_set_begin(base, state, *table, cells, new_id)
+            apply_update_set_begin(base, state, *table, cells, new_id, touched)
         }
         RowOperation::Delete { table, cells } => {
-            apply_delete(state, *table, cells, direct, hard_deleted)
+            apply_delete(state, *table, cells, direct, hard_deleted, touched)
         }
         // Inline ops are translated by `translate_inline`, not the diff.
         RowOperation::InlineSchema { .. }
@@ -204,6 +210,7 @@ pub(super) fn apply_macro_insert(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
     children: &mut ChildRows,
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut value = decode_macro(cells)?;
     let mut implementations = children
@@ -246,6 +253,9 @@ pub(super) fn apply_macro_insert(
         implementation.parameters = parameters;
     }
     value.implementations = implementations;
+    touched.touch(EntityKey::Macro {
+        macro_id: value.macro_id,
+    });
     state.put_macro(value);
 
     Ok(())
@@ -258,6 +268,7 @@ pub(super) fn apply_mapping_insert(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
     children: &mut ChildRows,
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut value = decode_column_mapping(cells)?;
     let rows = children
@@ -298,6 +309,10 @@ pub(super) fn apply_mapping_insert(
         ));
     }
     value.name_mappings = rows;
+    touched.touch(EntityKey::Mapping {
+        table_id: value.table_id,
+        mapping_id: value.mapping_id,
+    });
     state.put_mapping(value);
 
     Ok(())
@@ -318,13 +333,20 @@ fn refuse_live_id(table: TableKind, live: bool, named: &str) -> Result<()> {
     Ok(())
 }
 
-fn apply_schema_insert(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
+fn apply_schema_insert(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
     let value = decode_schema(cells)?;
     refuse_live_id(
         TableKind::Schema,
         state.schemas.contains_key(&value.schema_id),
         &format!("schema_id {}", value.schema_id),
     )?;
+    touched.touch(EntityKey::Schema {
+        schema_id: value.schema_id,
+    });
     state.put_schema(value);
     Ok(())
 }
@@ -333,6 +355,7 @@ fn apply_data_file_insert(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
     children: &mut ChildRows,
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut value = decode_data_file(cells)?;
     refuse_live_id(
@@ -347,11 +370,19 @@ fn apply_data_file_insert(
         .file_partition_values
         .remove(&(value.table_id, value.data_file_id))
         .unwrap_or_default();
+    touched.touch(EntityKey::File {
+        table_id: value.table_id,
+        data_file_id: value.data_file_id,
+    });
     state.put_data_file(value);
     Ok(())
 }
 
-fn apply_delete_file_insert(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
+fn apply_delete_file_insert(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
     let value = decode_delete_file(cells)?;
     refuse_live_id(
         TableKind::DeleteFile,
@@ -361,7 +392,90 @@ fn apply_delete_file_insert(state: &mut CatalogSnapshot, cells: &[Cell]) -> Resu
             .is_some_and(|files| files.contains_key(&value.delete_file_id)),
         &format!("delete_file_id {}", value.delete_file_id),
     )?;
+    touched.touch(EntityKey::DeleteFile {
+        table_id: value.table_id,
+        delete_file_id: value.delete_file_id,
+    });
     state.put_delete_file(value);
+    Ok(())
+}
+
+/// Applies one tag insert: a container entry, or an entry embedded in
+/// the column record it annotates.
+fn apply_tag_insert(
+    state: &mut CatalogSnapshot,
+    table: TableKind,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
+    if table == TableKind::Tag {
+        let (object_id, entry) = decode_tag_row(cells)?;
+        touched.touch(EntityKey::Tag { object_id });
+        state
+            .tags
+            .entry(object_id)
+            .or_insert_with(|| proto::TagValue {
+                object_id,
+                entries: Vec::new(),
+            })
+            .entries
+            .push(entry);
+        return Ok(());
+    }
+
+    let ((table_id, column_id), tag) = decode_column_tag_row(cells)?;
+    let Some(column) = state
+        .columns
+        .get_mut(&table_id)
+        .and_then(|cols| cols.get_mut(&column_id))
+    else {
+        return Err(corrupt_row(
+            table,
+            format!("column tag names an absent column ({table_id}, {column_id})"),
+        ));
+    };
+    column.tags.push(tag);
+    touched.touch(EntityKey::Column {
+        table_id,
+        column_id,
+    });
+    Ok(())
+}
+
+/// Applies one unversioned statistics insert.
+fn apply_stats_insert(
+    state: &mut CatalogSnapshot,
+    table: TableKind,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
+    match table {
+        TableKind::TableStats => {
+            let value = decode_table_stats(cells)?;
+            touched.touch(EntityKey::TableStats {
+                table_id: value.table_id,
+            });
+            state.put_table_stats(value);
+        }
+        TableKind::TableColumnStats => {
+            let value = decode_table_column_stats(cells)?;
+            touched.touch(EntityKey::TableColumnStats {
+                table_id: value.table_id,
+                column_id: value.column_id,
+            });
+            state.put_table_column_stats(value);
+        }
+        TableKind::FileColumnStats => {
+            let value = decode_file_column_stats(cells)?;
+            touched.touch(EntityKey::FileColumnStats {
+                table_id: value.table_id,
+                data_file_id: value.data_file_id,
+                column_id: value.column_id,
+            });
+            state.put_file_column_stats(value);
+        }
+        _ => return Err(corrupt_row(table, "not a statistics kind")),
+    }
     Ok(())
 }
 
@@ -371,6 +485,7 @@ pub(super) fn apply_insert(
     table: TableKind,
     cells: &[Cell],
     children: &mut ChildRows,
+    touched: &mut Touched,
 ) -> Result<()> {
     match table {
         // Snapshot rows fold into the snapshot record; child rows fold into
@@ -387,6 +502,10 @@ pub(super) fn apply_insert(
         // An option row overwrites its key in the scope's record.
         TableKind::Metadata => {
             let (components, key, value) = decode_metadata(cells)?;
+            touched.touch(EntityKey::Option {
+                scope_kind: components.0,
+                scope_id: components.1,
+            });
             state
                 .options
                 .entry(components)
@@ -394,9 +513,21 @@ pub(super) fn apply_insert(
                 .options
                 .insert(key, value);
         }
-        TableKind::Schema => apply_schema_insert(state, cells)?,
-        TableKind::Table => state.put_table(table_value(base, decode_table(cells)?)),
-        TableKind::View => state.put_view(decode_view(cells)?),
+        TableKind::Schema => apply_schema_insert(state, cells, touched)?,
+        TableKind::Table => {
+            let value = table_value(base, decode_table(cells)?);
+            touched.touch(EntityKey::Table {
+                table_id: value.table_id,
+            });
+            state.put_table(value);
+        }
+        TableKind::View => {
+            let value = decode_view(cells)?;
+            touched.touch(EntityKey::View {
+                view_id: value.view_id,
+            });
+            state.put_view(value);
+        }
         TableKind::Column => {
             let mut value = decode_column(cells)?;
             crate::catalog::inline_policy::ensure_inlinable(
@@ -412,16 +543,24 @@ pub(super) fn apply_insert(
             {
                 value.tags.clone_from(&prior.tags);
             }
+            touched.touch(EntityKey::Column {
+                table_id: value.table_id,
+                column_id: value.column_id,
+            });
             state.put_column(value);
         }
-        TableKind::DataFile => apply_data_file_insert(state, cells, children)?,
-        TableKind::DeleteFile => apply_delete_file_insert(state, cells)?,
+        TableKind::DataFile => apply_data_file_insert(state, cells, children, touched)?,
+        TableKind::DeleteFile => apply_delete_file_insert(state, cells, touched)?,
         TableKind::PartitionInfo => {
             let mut value = decode_partition_info(cells)?;
             value.columns = children
                 .partition_columns
                 .remove(&value.partition_id)
                 .unwrap_or_default();
+            touched.touch(EntityKey::Partition {
+                table_id: value.table_id,
+                partition_id: value.partition_id,
+            });
             state.put_partition(value);
         }
         TableKind::SortInfo => {
@@ -430,44 +569,23 @@ pub(super) fn apply_insert(
                 .sort_expressions
                 .remove(&value.sort_id)
                 .unwrap_or_default();
+            touched.touch(EntityKey::Sort {
+                table_id: value.table_id,
+                sort_id: value.sort_id,
+            });
             state.put_sort(value);
         }
-        TableKind::Macro => apply_macro_insert(state, cells, children)?,
-        TableKind::ColumnMapping => apply_mapping_insert(state, cells, children)?,
-        TableKind::TableStats => state.put_table_stats(decode_table_stats(cells)?),
-        TableKind::TableColumnStats => {
-            state.put_table_column_stats(decode_table_column_stats(cells)?);
+        TableKind::Macro => apply_macro_insert(state, cells, children, touched)?,
+        TableKind::ColumnMapping => apply_mapping_insert(state, cells, children, touched)?,
+        TableKind::TableStats | TableKind::TableColumnStats | TableKind::FileColumnStats => {
+            apply_stats_insert(state, table, cells, touched)?;
         }
-        TableKind::FileColumnStats => state.put_file_column_stats(decode_file_column_stats(cells)?),
         TableKind::FilesScheduledForDeletion => {
-            state.put_gc_file(decode_gc_file_row(cells)?);
+            let value = decode_gc_file_row(cells)?;
+            touched.touch_gc_file(value.data_file_id);
+            state.put_gc_file(value);
         }
-        TableKind::Tag => {
-            let (object_id, entry) = decode_tag_row(cells)?;
-            state
-                .tags
-                .entry(object_id)
-                .or_insert_with(|| proto::TagValue {
-                    object_id,
-                    entries: Vec::new(),
-                })
-                .entries
-                .push(entry);
-        }
-        TableKind::ColumnTag => {
-            let ((table_id, column_id), tag) = decode_column_tag_row(cells)?;
-            let Some(column) = state
-                .columns
-                .get_mut(&table_id)
-                .and_then(|cols| cols.get_mut(&column_id))
-            else {
-                return Err(corrupt_row(
-                    table,
-                    format!("column tag names an absent column ({table_id}, {column_id})"),
-                ));
-            };
-            column.tags.push(tag);
-        }
+        TableKind::Tag | TableKind::ColumnTag => apply_tag_insert(state, table, cells, touched)?,
     }
     Ok(())
 }
@@ -510,6 +628,7 @@ pub(super) fn apply_tag_set_end(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
     new_id: u64,
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut c = Cursor::new(TableKind::Tag, cells);
     let object_id = c.u64()?;
@@ -518,6 +637,7 @@ pub(super) fn apply_tag_set_end(
     c.finish()?;
     check_end_snapshot(TableKind::Tag, end_snapshot, new_id)?;
 
+    touched.touch(EntityKey::Tag { object_id });
     let ended = state.tags.get_mut(&object_id).is_some_and(|container| {
         end_live_entry(
             &mut container.entries,
@@ -541,6 +661,7 @@ pub(super) fn apply_column_tag_set_end(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
     new_id: u64,
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut c = Cursor::new(TableKind::ColumnTag, cells);
     let table_id = c.u64()?;
@@ -550,6 +671,10 @@ pub(super) fn apply_column_tag_set_end(
     c.finish()?;
     check_end_snapshot(TableKind::ColumnTag, end_snapshot, new_id)?;
 
+    touched.touch(EntityKey::Column {
+        table_id,
+        column_id,
+    });
     let ended = state
         .columns
         .get_mut(&table_id)
@@ -576,15 +701,17 @@ pub(super) fn apply_update_set_end(
     table: TableKind,
     cells: &[Cell],
     new_id: u64,
+    touched: &mut Touched,
 ) -> Result<()> {
     match table {
-        TableKind::Tag => return apply_tag_set_end(state, cells, new_id),
-        TableKind::ColumnTag => return apply_column_tag_set_end(state, cells, new_id),
+        TableKind::Tag => return apply_tag_set_end(state, cells, new_id, touched),
+        TableKind::ColumnTag => return apply_column_tag_set_end(state, cells, new_id, touched),
         _ => {}
     }
 
     let (key, end_snapshot) = decode_end(table, cells)?;
     check_end_snapshot(table, end_snapshot, new_id)?;
+    touched.touch(key);
     // End only the one row named, never a cascade: a rename ends the table
     // row but keeps its columns live.
     let ended = match key {
@@ -653,6 +780,7 @@ pub(super) fn apply_update_set_begin(
     table: TableKind,
     cells: &[Cell],
     new_id: u64,
+    touched: &mut Touched,
 ) -> Result<()> {
     if table != TableKind::DataFile {
         return Err(Error::Constraint(format!(
@@ -683,6 +811,10 @@ pub(super) fn apply_update_set_begin(
         ));
     }
 
+    touched.touch(EntityKey::File {
+        table_id,
+        data_file_id,
+    });
     let Some(file) = state
         .data_files
         .get_mut(&table_id)
@@ -703,10 +835,12 @@ fn apply_schedule_delete(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut c = Cursor::new(table, cells);
     let data_file_id = c.u64()?;
     c.finish()?;
+    touched.touch_gc_file(data_file_id);
     if state.gc_files.remove(&data_file_id).is_none() {
         return Err(corrupt_row(
             table,
@@ -718,8 +852,16 @@ fn apply_schedule_delete(
 
 /// Removes an option row's key from its scope, and the scope's record with
 /// it once the last key goes. An absent key is a no-op.
-fn apply_option_delete(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
+fn apply_option_delete(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
     let (components, key) = decode_metadata_key(cells)?;
+    touched.touch(EntityKey::Option {
+        scope_kind: components.0,
+        scope_id: components.1,
+    });
     let Some(record) = state.options.get_mut(&components) else {
         return Ok(());
     };
@@ -764,12 +906,13 @@ pub(super) fn apply_delete(
     cells: &[Cell],
     direct: &mut Vec<commit::StagedWrite>,
     hard_deleted: &BTreeSet<EntityKey>,
+    touched: &mut Touched,
 ) -> Result<()> {
     match table {
         TableKind::TableStats | TableKind::TableColumnStats | TableKind::FileColumnStats => {
-            apply_stats_delete(state, table, cells)
+            apply_stats_delete(state, table, cells, touched)
         }
-        TableKind::FilesScheduledForDeletion => apply_schedule_delete(state, table, cells),
+        TableKind::FilesScheduledForDeletion => apply_schedule_delete(state, table, cells, touched),
         // The paired `ducklake_snapshot_changes` delete stages nothing.
         TableKind::Snapshot => {
             let mut c = Cursor::new(table, cells);
@@ -789,7 +932,7 @@ pub(super) fn apply_delete(
             c.finish()?;
             Ok(())
         }
-        TableKind::Metadata => apply_option_delete(state, cells),
+        TableKind::Metadata => apply_option_delete(state, cells, touched),
         // Mappings have no history mirror: a direct `current` key delete.
         TableKind::ColumnMapping => {
             let mut c = Cursor::new(table, cells);
@@ -825,7 +968,7 @@ pub(super) fn apply_delete(
             direct.push((key.encode(), None));
             Ok(())
         }
-        TableKind::Tag => apply_tag_delete(state, cells),
+        TableKind::Tag => apply_tag_delete(state, cells, touched),
         // A column-tag entry on a still-current column rewrites the column
         // in place; on a pruned column there is nothing to rewrite.
         TableKind::ColumnTag => {
@@ -835,6 +978,10 @@ pub(super) fn apply_delete(
             let key = c.string()?;
             let begin_snapshot = c.u64()?;
             c.finish()?;
+            touched.touch(EntityKey::Column {
+                table_id,
+                column_id,
+            });
             if let Some(column) = state
                 .columns
                 .get_mut(&table_id)
@@ -858,12 +1005,18 @@ pub(super) fn apply_delete(
 
 /// Removes a dead `ducklake_tag` entry from its container; a container
 /// left empty is removed outright.
-pub(super) fn apply_tag_delete(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
+pub(super) fn apply_tag_delete(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
     let mut c = Cursor::new(TableKind::Tag, cells);
     let object_id = c.u64()?;
     let key = c.string()?;
     let begin_snapshot = c.u64()?;
     c.finish()?;
+
+    touched.touch(EntityKey::Tag { object_id });
 
     let removed = state.tags.get_mut(&object_id).is_some_and(|container| {
         let before = container.entries.len();
@@ -977,17 +1130,28 @@ pub(super) fn apply_stats_delete(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
+    touched: &mut Touched,
 ) -> Result<()> {
     match decode_delete_key(table, cells)? {
         StatsKey::Table(table_id) => {
+            touched.touch(EntityKey::TableStats { table_id });
             state.table_stats.remove(&table_id);
         }
         StatsKey::Column(table_id, column_id) => {
+            touched.touch(EntityKey::TableColumnStats {
+                table_id,
+                column_id,
+            });
             if let Some(cols) = state.table_column_stats.get_mut(&table_id) {
                 cols.remove(&column_id);
             }
         }
         StatsKey::FileColumn(table_id, data_file_id, column_id) => {
+            touched.touch(EntityKey::FileColumnStats {
+                table_id,
+                data_file_id,
+                column_id,
+            });
             if let Some(cols) = state.file_column_stats.get_mut(&table_id) {
                 cols.remove(&(data_file_id, column_id));
             }
