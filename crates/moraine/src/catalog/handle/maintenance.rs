@@ -12,6 +12,7 @@ use crate::{
             CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
             MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
         },
+        projection::invalidate_current_state,
     },
     error::{Error, Result},
     store::{
@@ -655,6 +656,12 @@ impl Catalog {
             tx.commit_with_options(&commit::non_durable())
                 .await
                 .map_err(Error::from)?;
+            // This batch bypassed the commit protocol, so nothing folded it
+            // into the maintained projections and the head stamp they key on
+            // did not move. Unless they are dropped here, the writer keeps
+            // serving the records the batch removed — and every later pass
+            // rediscovers the same victims.
+            invalidate_current_state(&self.projections);
             total += batch.len() as u64;
         }
         Ok(total)

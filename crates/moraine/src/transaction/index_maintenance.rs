@@ -10,7 +10,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{FutureExt, Stream, StreamExt, future::BoxFuture, stream};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, future::BoxFuture, stream};
 use slatedb::DbTransaction;
 use tracing::warn;
 
@@ -238,6 +238,35 @@ fn schedule_probe_plan<'a>(
     Ok(())
 }
 
+/// Drops a unique deletion whose entry is held by some other row.
+///
+/// A unique entry's key is the value alone, so deleting it by key removes
+/// whichever row holds that value — not necessarily the row being removed.
+/// The stored row id is what says the two are the same, and a derivation
+/// that names an already-removed row must not take the entry a later
+/// insert of the same value put there.
+fn guarded_deletions<'a, D>(
+    reader: ReadHandle<'a>,
+    deletes: D,
+) -> impl Stream<Item = Result<StagedIndexEntry>> + 'a
+where
+    D: Stream<Item = Result<StagedIndexEntry>> + 'a,
+{
+    deletes
+        .map(move |entry| async move {
+            let entry = entry?;
+            if !entry.unique {
+                return Ok(Some(entry));
+            }
+            let Some(bytes) = reader.get(entry.key.clone()).await.map_err(Error::from)? else {
+                return Ok(None);
+            };
+            Ok((decode_row_id(&bytes)? == entry.row_id).then_some(entry))
+        })
+        .buffer_unordered(UNIQUENESS_PROBE_CONCURRENCY)
+        .try_filter_map(|entry| std::future::ready(Ok(entry)))
+}
+
 fn stage_probe_put(
     db_tx: &DbTransaction,
     staged: &mut StagedBytes,
@@ -296,7 +325,8 @@ where
     let mut staged = StagedBytes::default();
     let mut deleted_unique = HashSet::new();
     let mut entry_count = prior_entry_count;
-    let mut deletes = std::pin::pin!(deletes);
+    let reader = ReadHandle::Tx(db_tx);
+    let mut deletes = std::pin::pin!(guarded_deletions(reader, deletes));
     let mut entries = std::pin::pin!(entries);
     let mut ready = VecDeque::with_capacity(ADDITION_PREFETCH);
     let mut additions_done = false;
@@ -304,7 +334,6 @@ where
         claimed: HashMap::new(),
     };
 
-    let reader = ReadHandle::Tx(db_tx);
     let mut probes =
         futures::stream::FuturesUnordered::<BoxFuture<'_, Result<CompletedProbe>>>::new();
     let mut metrics = IndexMaintenanceMetrics::default();
@@ -779,6 +808,66 @@ mod tests {
         db.close().await.unwrap();
     }
 
+    /// A unique deletion removes the entry of the row it names, and only
+    /// that row's.
+    ///
+    /// The store key is the value alone, so a deletion derived for a row
+    /// that no longer holds the value would otherwise take the entry from
+    /// whichever row does.
+    #[tokio::test]
+    async fn a_unique_deletion_removes_only_the_named_row_s_entry() {
+        let (db, _) = StoreBuilder::new("guarded-deletions", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let key = Bytes::from_static(b"one value");
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(key.clone(), 3u64.to_be_bytes()).unwrap();
+        tx.commit().await.unwrap();
+
+        let deletion = |row_id: u64, key: Bytes| {
+            stream::once(async move {
+                Ok(StagedIndexEntry {
+                    index_id: 1,
+                    unique: true,
+                    key,
+                    row_id,
+                    delete: true,
+                    building: false,
+                })
+            })
+        };
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let staged = stage_index_entry_stream(&tx, deletion(0, key.clone()), stream::empty(), 0)
+            .await
+            .unwrap();
+        assert_eq!(staged.metrics.deletions, 0);
+        tx.commit().await.unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        assert!(
+            ReadHandle::Tx(&tx)
+                .get(key.clone())
+                .await
+                .unwrap()
+                .is_some(),
+            "row 3's entry survives a deletion derived for row 0"
+        );
+        let staged = stage_index_entry_stream(&tx, deletion(3, key.clone()), stream::empty(), 0)
+            .await
+            .unwrap();
+        assert_eq!(staged.metrics.deletions, 1);
+        tx.commit().await.unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        assert!(ReadHandle::Tx(&tx).get(key).await.unwrap().is_none());
+        tx.rollback();
+
+        db.close().await.unwrap();
+    }
+
     /// Addition sources may fill the bounded prefetch while a deletion is
     /// pending, but the transaction must still stage the delete first.
     #[tokio::test]
@@ -787,8 +876,14 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let key = Bytes::from_static(b"delete-before-add");
+        // The entry the deletion removes: a unique deletion is staged only
+        // for the row the committed entry names.
+        let seed = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        seed.put(key.clone(), 7_u64.to_be_bytes()).unwrap();
+        seed.commit().await.unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let (release_deletion, deletion_released) = tokio::sync::oneshot::channel();
         let deletion_key = key.clone();
         let deletions = stream::once(async move {

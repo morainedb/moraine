@@ -1,0 +1,137 @@
+# name: test/sql/metadata_rowid_resolution.test
+# group: [moraine]
+#
+# A metadata DELETE resolves every row id against the rows its own scan
+# emitted them for.
+#
+# A scan narrowed by `table_id` materializes just that table's run. If the
+# write resolving its row ids materializes the table a second time, nothing
+# makes the two lists the same: a commit landing between them adds rows
+# ahead of the narrowed run, and the same positions then name rows of
+# another table entirely — deleted with a correct-looking row count.
+#
+# Two connections over one instance are the only way to commit under an
+# open reader, which is what this runner gives and the CLI cannot.
+#
+# Skipped unless the packaged Moraine and patched DuckLake extensions are
+# named in the environment; `cargo xtask e2e` supplies both.
+
+require-env MORAINE_DUCKDB_EXT
+
+require-env MORAINE_DUCKLAKE_EXT
+
+require-env MORAINE_EXTENSION_DIR
+
+# As in commit_concurrency.test: pin one thread so the connections, not the
+# scheduler, are the concurrency.
+statement ok
+SET threads=1;
+
+statement ok
+SET extension_directory='${MORAINE_EXTENSION_DIR}';
+
+statement ok
+INSTALL parquet;
+
+statement ok
+LOAD parquet;
+
+# Moraine must be registered before DuckLake opens the metadata catalog.
+statement ok
+LOAD '${MORAINE_DUCKDB_EXT}';
+
+statement ok
+LOAD '${MORAINE_DUCKLAKE_EXT}';
+
+# Every insert writes a Parquet file, so every insert carries statistics.
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/rowid-store' AS lake (
+  DATA_PATH '__TEST_DIR__/rowid-data/',
+  DATA_INLINING_ROW_LIMIT 0
+);
+
+statement ok
+CREATE TABLE lake.main.t1(a BIGINT, b BIGINT);
+
+statement ok
+CREATE TABLE lake.main.t2(a BIGINT, b BIGINT);
+
+statement ok
+CREATE TABLE lake.main.t3(a BIGINT, b BIGINT);
+
+statement ok
+INSERT INTO lake.main.t1 VALUES (1, 1), (2, 2);
+
+statement ok
+INSERT INTO lake.main.t2 VALUES (3, 3), (4, 4);
+
+statement ok
+INSERT INTO lake.main.t3 VALUES (5, 5), (6, 6);
+
+# Statistics are keyed table-major, so t1's rows precede t2's and t2's
+# precede t3's. The DELETE below names t2 by the literal its pushdown needs
+# to narrow a scan at all, so the ids are pinned here rather than looked up.
+query IT
+SELECT table_id, table_name
+FROM __ducklake_metadata_lake.ducklake_table
+ORDER BY table_id;
+----
+1	t1
+2	t2
+3	t3
+
+statement ok con1
+BEGIN;
+
+# con1's first read materializes the whole table for its transaction.
+statement ok con1
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_file_column_stats;
+
+# A commit under con1, adding statistics rows ahead of t2's run. A write
+# resolving row ids through a second materialization would find that run
+# moved and take rows past its end.
+statement ok con2
+INSERT INTO lake.main.t1 VALUES (7, 7);
+
+statement ok
+SET VARIABLE t1_stats = (
+  SELECT count(*) FROM __ducklake_metadata_lake.ducklake_file_column_stats
+  WHERE table_id = 1
+);
+
+statement ok
+SET VARIABLE t3_stats = (
+  SELECT count(*) FROM __ducklake_metadata_lake.ducklake_file_column_stats
+  WHERE table_id = 3
+);
+
+statement ok con1
+DELETE FROM __ducklake_metadata_lake.ducklake_file_column_stats WHERE table_id = 2;
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_file_column_stats
+WHERE table_id = 2;
+----
+0
+
+# Neither neighbour lost a row: the deleted positions named t2's rows in
+# the list the scan built, and nothing else.
+query II
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_file_column_stats
+        WHERE table_id = 1) = getvariable('t1_stats'),
+       (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_file_column_stats
+        WHERE table_id = 3) = getvariable('t3_stats');
+----
+true	true
+
+# The tables themselves still read, statistics being metadata: a lost row
+# would not be visible here, which is why the counts above are the assertion.
+query III
+SELECT (SELECT count(*) FROM lake.main.t1),
+       (SELECT count(*) FROM lake.main.t2),
+       (SELECT count(*) FROM lake.main.t3);
+----
+3	2	2

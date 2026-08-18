@@ -378,7 +378,8 @@ pub(super) async fn stage_index_maintenance(
             !registered.contains(&(*table_id, *data_file_id))
         }))
         .map(|((table_id, data_file_id), deletes)| async move {
-            let killed = resolve_target_deletes(base, context_ref, deletes).await?;
+            let killed =
+                newly_killed_rows(base, *table_id, *data_file_id, context_ref, deletes).await?;
             stream_file_delete_index_entries(base, *table_id, *data_file_id, &killed, context_ref)
                 .await
         })
@@ -468,12 +469,22 @@ fn plan_deletes(
                 ..
             } if !context.compacted.contains(table_id) => {
                 // An inlined file-delete names a physical position, as a
-                // delete file's `pos` does.
-                plan.files
-                    .entry((*table_id, *data_file_id))
-                    .or_default()
-                    .positions
-                    .push(*position);
+                // delete file's `pos` does. Gated on the table's indexes as
+                // the delete-file arm is: an unindexed table derives no
+                // entries, so its target must not be planned at all —
+                // resolving one reads the file's committed delete files.
+                if !context
+                    .indexing(base, TableId::new(*table_id))?
+                    .all
+                    .indexes
+                    .is_empty()
+                {
+                    plan.files
+                        .entry((*table_id, *data_file_id))
+                        .or_default()
+                        .positions
+                        .push(*position);
+                }
             }
             RowOperation::InlineInlineDelete {
                 table_id, row_id, ..
@@ -1016,6 +1027,36 @@ impl KilledRows {
             positions: data_file::RowPositions::from_unsorted(positions),
         }
     }
+
+    fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+}
+
+/// The positions of one data file that were already dead before this
+/// commit: the union of the delete files `base` holds against it.
+async fn committed_dead_positions(
+    base: &CatalogSnapshot,
+    table_id: u64,
+    data_file_id: u64,
+    context: &FileContext<'_>,
+) -> Result<Vec<u64>> {
+    let committed = base
+        .delete_files
+        .get(&table_id)
+        .into_iter()
+        .flat_map(|per_table| per_table.values())
+        .filter(|delete_file| delete_file.data_file_id == data_file_id);
+
+    stream::iter(
+        committed.map(|delete_file| read_delete_file_positions(base, delete_file, context)),
+    )
+    .buffer_unordered(FILE_READ_CONCURRENCY)
+    .try_fold(Vec::new(), |mut positions, discovered| async move {
+        positions.extend(discovered);
+        Ok(positions)
+    })
+    .await
 }
 
 /// Resolves every delete source for one data file into one sorted, unique
@@ -1025,7 +1066,17 @@ async fn resolve_target_deletes(
     context: &FileContext<'_>,
     deletes: &TargetDeletes,
 ) -> Result<KilledRows> {
-    let positions = stream::iter(
+    let positions = named_positions(base, context, deletes).await?;
+    Ok(KilledRows::from_unsorted(positions))
+}
+
+/// The positions every delete source names, unsorted and possibly repeated.
+async fn named_positions(
+    base: &CatalogSnapshot,
+    context: &FileContext<'_>,
+    deletes: &TargetDeletes,
+) -> Result<Vec<u64>> {
+    stream::iter(
         deletes
             .files
             .iter()
@@ -1039,7 +1090,31 @@ async fn resolve_target_deletes(
             Ok(positions)
         },
     )
-    .await?;
+    .await
+}
+
+/// The positions of one committed data file this commit *newly* kills.
+///
+/// DuckLake rewrites a delete file whole, so each one names every position
+/// dead so far. Without subtracting what was already dead, one commit's
+/// removals grow with the file's whole delete history — a scoped read of
+/// rows whose entries went several commits ago.
+async fn newly_killed_rows(
+    base: &CatalogSnapshot,
+    table_id: u64,
+    data_file_id: u64,
+    context: &FileContext<'_>,
+    deletes: &TargetDeletes,
+) -> Result<KilledRows> {
+    let (mut positions, already_dead) = futures::try_join!(
+        named_positions(base, context, deletes),
+        committed_dead_positions(base, table_id, data_file_id, context)
+    )?;
+
+    if !already_dead.is_empty() {
+        let already_dead: HashSet<u64> = already_dead.into_iter().collect();
+        positions.retain(|position| !already_dead.contains(position));
+    }
 
     Ok(KilledRows::from_unsorted(positions))
 }
@@ -1094,7 +1169,7 @@ pub(super) async fn stream_file_delete_index_entries(
 ) -> Result<IndexEntryStream<'static>> {
     let table = TableId::new(table_id);
     let indexes = Arc::clone(&context.indexing(base, table)?.all);
-    if indexes.indexes.is_empty() {
+    if indexes.indexes.is_empty() || killed.is_empty() {
         return Ok(stream::empty().boxed());
     }
 

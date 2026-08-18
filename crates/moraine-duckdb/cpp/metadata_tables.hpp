@@ -129,17 +129,14 @@ struct MetadataTableSpec {
 std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
                                                     const MetadataTableSpec &spec);
 
-// One table's rows of a narrowable `spec`, and the row id its first row
-// carries — how many rows precede it in the unscoped materialization.
+// One table's rows of a narrowable `spec`.
 //
 // Uncached, unlike `MetadataRowsFor`: a narrowed set is small, built once per
 // statement, and keyed by a value the transaction's cache is not keyed by.
-// Falls back to the whole set (and a base of 0) when the kind cannot be
-// narrowed, or mid-write, where only the unscoped dump carries the staged
-// overlay a read then owes.
+// Falls back to the whole set when the kind cannot be narrowed, or mid-write,
+// where only the unscoped dump carries the staged overlay a read then owes.
 std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
-                                                          const MetadataTableSpec &spec, uint64_t table_id,
-                                                          uint64_t &row_id_base);
+                                                          const MetadataTableSpec &spec, uint64_t table_id);
 
 // The fixed list of synthesized tables, in the order they're registered.
 // Built once; returns the same static instance every call.
@@ -187,17 +184,17 @@ void PopulateMetadataTables(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry
 // by the synthesized `ducklake_*` tables (this file) and the dynamic
 // inline-table entries (inline_tables.cpp), which scan the same way.
 struct MetadataScanBindData : public duckdb::FunctionData {
-	// Shared, never copied: a rowid is an index into this exact list, and
-	// the staged-write Sink resolves it against the same one (see
-	// `MetadataRowsFor`).
+	// Shared, never copied: a scan emitting row ids registers this exact
+	// list with its transaction, and the staged-write Sink resolves each id
+	// back into it.
 	//
 	// Null when `spec` names a narrowable kind: that scan materializes in
 	// `InitGlobal` instead, because the filter deciding how much to build
 	// has not been pushed down yet at bind.
 	std::shared_ptr<const MetadataRows> rows;
-	// The spec a narrowable scan materializes from, and the catalog it reads
-	// through. Null for every scan that materializes at bind — the
-	// un-narrowable kinds and the inline-table entries.
+	// The spec this scan reads and the catalog it reads through. Null for
+	// the inline-table entries, whose rows have no spec and whose Sinks
+	// resolve row ids their own way.
 	//
 	// A raw pointer, not `optional_ptr`: `InitGlobal` reads the bind data as
 	// const and must still reach a mutable catalog.

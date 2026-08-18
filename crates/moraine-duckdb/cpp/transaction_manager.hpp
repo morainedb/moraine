@@ -14,6 +14,10 @@
 #include "metadata_tables.hpp"
 #include "moraine_abi.h"
 
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
 namespace moraine_duckdb {
 
 class MoraineCatalog;
@@ -86,13 +90,38 @@ public:
 	std::shared_ptr<const MetadataRows> GetMetadataRows(const MetadataTableSpec &spec) const;
 	void PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows);
 
+	// Takes the rows one metadata scan emits row ids for, returning the id
+	// its first row carries. Ids come from a counter this transaction never
+	// rewinds, so a run stays addressable however its table is scanned or
+	// staged into afterwards — the write that resolves those ids reaches
+	// the very rows the scan handed out, not a second materialization of
+	// them.
+	uint64_t RegisterScannedRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows);
+
+	// The row a scan emitted `row_id` for, or null if no run of this
+	// transaction covers it.
+	const std::vector<duckdb::Value> *ScannedRow(const MetadataTableSpec &spec, uint64_t row_id) const;
+
 private:
+	// One scan's rows, at the id its first row was handed out at.
+	struct ScannedRun {
+		const MetadataTableSpec *spec;
+		uint64_t base;
+		std::shared_ptr<const MetadataRows> rows;
+	};
+
 	MoraineSnapshotHandle *snapshot_;
 	MoraineCatalogHandle *catalog_handle_;
 	bool schemas_loaded_ = false;
 	std::unordered_map<uint64_t, duckdb::unique_ptr<duckdb::SchemaCatalogEntry>> schema_cache_;
 	MoraineTxHandle *staged_tx_ = nullptr;
 	std::unordered_map<const MetadataTableSpec *, std::shared_ptr<const MetadataRows>> metadata_rows_;
+	// Registered runs, by ascending base, and the next id to hand out.
+	// Guarded, because scans of one transaction init on the executor's
+	// threads while another statement's Sink resolves against them.
+	std::vector<ScannedRun> scanned_runs_;
+	uint64_t next_scanned_row_id_ = 0;
+	mutable std::mutex scanned_runs_lock_;
 
 	// Opens the staged tx if this transaction has none, leaving what the
 	// two public accessors hold to them.

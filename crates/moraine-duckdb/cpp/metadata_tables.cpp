@@ -515,16 +515,14 @@ std::vector<std::vector<duckdb::Value>> ProvideFileColumnStats(MoraineCatalogHan
 	                                           moraine_dump_file_column_stats_free, FileColumnStatsShape);
 }
 
-// One table's file column statistics, plus where its run starts in the whole
-// dump. `DumpRows` cannot serve this: the scoped entry point takes the table
-// id and returns that offset alongside the rows.
+// One table's file column statistics. `DumpRows` cannot serve this: the
+// scoped entry point takes a table id.
 std::vector<std::vector<duckdb::Value>> ProvideFileColumnStatsOf(MoraineCatalogHandle *handle, uint64_t table_id,
-                                                                 MoraineInterruptProbe probe, void *probe_ctx,
-                                                                 uint64_t &row_id_base) {
+                                                                 MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MoraineFileColumnStatsRow> rows(moraine_dump_file_column_stats_free);
 	MoraineError err {};
-	auto code = moraine_dump_file_column_stats_of(handle, table_id, rows.OutItems(), rows.OutLen(), &row_id_base, probe,
-	                                              probe_ctx, &err);
+	auto code =
+	    moraine_dump_file_column_stats_of(handle, table_id, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
@@ -1340,14 +1338,21 @@ struct MetadataScanGlobalState : public duckdb::GlobalTableFunctionState {
 	// when the table function advertises `projection_pushdown = true`.
 	std::vector<duckdb::column_t> column_ids;
 	// Set only for a scan whose bind deferred materialization, holding what
-	// this scan built and the row id its first row carries.
+	// this scan built.
 	std::shared_ptr<const MetadataRows> rows;
+	// The row id this scan's first row carries, taken from the transaction's
+	// run registry. Zero for a scan emitting no row ids, and for the inline
+	// tables, whose own Sinks index a re-materialization directly.
 	uint64_t row_id_base = 0;
 
 	idx_t MaxThreads() const override {
 		return 1;
 	}
 };
+
+bool EmitsRowIds(const std::vector<duckdb::column_t> &column_ids) {
+	return std::find(column_ids.begin(), column_ids.end(), duckdb::COLUMN_IDENTIFIER_ROW_ID) != column_ids.end();
+}
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duckdb::ClientContext &context,
                                                                             duckdb::TableFunctionInitInput &input) {
@@ -1358,13 +1363,24 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
 	if (bind_data.spec == nullptr || bind_data.catalog == nullptr) {
 		return state;
 	}
-	if (bind_data.scope.IsValid()) {
-		state->rows = ScopedMetadataRowsFor(context, *bind_data.catalog, *bind_data.spec, bind_data.scope.GetIndex(),
-		                                    state->row_id_base);
-	} else {
-		// No equality survived pushdown: this scan reads its kind whole,
-		// exactly as one that never deferred would have.
-		state->rows = MetadataRowsFor(context, *bind_data.catalog, *bind_data.spec);
+	if (bind_data.rows == nullptr) {
+		if (bind_data.scope.IsValid()) {
+			state->rows =
+			    ScopedMetadataRowsFor(context, *bind_data.catalog, *bind_data.spec, bind_data.scope.GetIndex());
+		} else {
+			// No equality survived pushdown: this scan reads its kind whole,
+			// exactly as one that never deferred would have.
+			state->rows = MetadataRowsFor(context, *bind_data.catalog, *bind_data.spec);
+		}
+	}
+
+	// Only a scan feeding an UPDATE or a DELETE asks for row ids, and only
+	// its rows are ever resolved back from one, so only it is registered.
+	if (EmitsRowIds(state->column_ids)) {
+		auto catalog_transaction = bind_data.catalog->GetCatalogTransaction(context);
+		auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
+		state->row_id_base = transaction.RegisterScannedRows(
+		    *bind_data.spec, state->rows != nullptr ? state->rows : bind_data.rows);
 	}
 	return state;
 }
@@ -1464,12 +1480,11 @@ void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInpu
 		for (duckdb::idx_t out_col = 0; out_col < state.column_ids.size(); out_col++) {
 			auto col_id = state.column_ids[out_col];
 			if (col_id == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
-				// The rowid is the row's index in the *unscoped* row set —
-				// the transaction-scoped list `MetadataRowsFor` hands out,
-				// which the staged-write Sink (staged_write.cpp) resolves
-				// the index against by asking for the same one. A narrowed
-				// scan reads a contiguous run of that list, so adding where
-				// the run starts keeps both sides counting the same rows.
+				// An id in the transaction's run registry, which the
+				// staged-write Sink (staged_write.cpp) resolves back to this
+				// very row — never to the same position in a second
+				// materialization, which a narrowed scan and a commit
+				// landing under it can each make a different list.
 				output.SetValue(
 				    out_col, out_row,
 				    duckdb::Value::BIGINT(static_cast<int64_t>(state.row_id_base + state.offset + out_row)));
@@ -1742,9 +1757,7 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 }
 
 std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
-                                                          const MetadataTableSpec &spec, uint64_t table_id,
-                                                          uint64_t &row_id_base) {
-	row_id_base = 0;
+                                                          const MetadataTableSpec &spec, uint64_t table_id) {
 	auto catalog_transaction = catalog.GetCatalogTransaction(context);
 	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
 	// Mid-write the staged tx's overlay is what a read owes, and only the
@@ -1753,21 +1766,34 @@ std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext 
 	if (spec.scope_column < 0 || transaction.StagedTxIfOpen() != nullptr) {
 		return MetadataRowsFor(context, catalog, spec);
 	}
+	// A transaction that already materialized this table narrows what it
+	// holds. Reading the store again here would serve one scan of the table
+	// rows from beyond the point every other scan of it stands at.
+	if (auto held = transaction.GetMetadataRows(spec)) {
+		auto scope = static_cast<duckdb::idx_t>(spec.scope_column);
+		MetadataRows scoped;
+		for (auto &row : *held) {
+			if (scope < row.size() && !row[scope].IsNull() &&
+			    row[scope].GetValue<int64_t>() == static_cast<int64_t>(table_id)) {
+				scoped.push_back(row);
+			}
+		}
+		return std::make_shared<const MetadataRows>(std::move(scoped));
+	}
 	auto *handle = catalog.Cast<MoraineCatalog>().Handle();
 	return std::make_shared<const MetadataRows>(
-	    ProvideFileColumnStatsOf(handle, table_id, moraine_shim_is_interrupted, &context, row_id_base));
+	    ProvideFileColumnStatsOf(handle, table_id, moraine_shim_is_interrupted, &context));
 }
 
 duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                                                  duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
+	scan_bind_data->spec = &spec_;
+	scan_bind_data->catalog = &ParentCatalog();
+	// A narrowable kind is left unmaterialized for `InitGlobal`: the filter
+	// deciding how much of it to build has not been pushed down yet.
 	if (spec_.scope_column < 0) {
 		scan_bind_data->rows = MetadataRowsFor(context, ParentCatalog(), spec_);
-	} else {
-		// Deferred to `InitGlobal`: the filter deciding how much of this
-		// kind to build has not been pushed down yet.
-		scan_bind_data->spec = &spec_;
-		scan_bind_data->catalog = &ParentCatalog();
 	}
 	scan_bind_data->table_entry = this;
 	bind_data = std::move(scan_bind_data);

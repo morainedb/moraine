@@ -311,13 +311,9 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats(
 }
 
 /// Dumps one table's `ducklake_file_column_stats` rows into
-/// `*out_items`/`*out_len`, and writes to `*out_row_id_base` how many rows
-/// precede them in [`moraine_dump_file_column_stats`].
-///
-/// That dump is keyed table-major, so a table's rows are one contiguous run
-/// of it: `*out_row_id_base + i` is where row `i` sits in the whole, which is
-/// what a metadata scan's row ids count. Narrowing a scan therefore does not
-/// renumber its rows. Free with [`moraine_dump_file_column_stats_free`].
+/// `*out_items`/`*out_len`, in the order
+/// [`moraine_dump_file_column_stats`] would emit them. Free with
+/// [`moraine_dump_file_column_stats_free`].
 ///
 /// # Safety
 ///
@@ -325,21 +321,18 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats(
 /// [`moraine_attach`](crate::abi::moraine_attach), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the call.
-/// `out_row_id_base`, if non-null, must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_file_column_stats_of(
     handle: *mut MoraineCatalogHandle,
     table_id: u64,
     out_items: *mut *mut MoraineFileColumnStatsRow,
     out_len: *mut usize,
-    out_row_id_base: *mut u64,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let base = std::cell::Cell::new(0u64);
     // SAFETY: forwarded caller contract.
-    let code = unsafe {
+    unsafe {
         dump_rows(
             handle,
             out_items,
@@ -350,17 +343,9 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats_of(
             async |catalog| {
                 moraine::ffi_support::dump_file_column_stats_of(catalog, table_id).await
             },
-            |(rows, preceding)| {
-                base.set(preceding);
-                file_column_stats_rows(rows)
-            },
+            file_column_stats_rows,
         )
-    };
-    if code == crate::error::codes::OK && !out_row_id_base.is_null() {
-        // SAFETY: caller contract — non-null means writable.
-        unsafe { *out_row_id_base = base.get() };
     }
-    code
 }
 
 /// Frees the array returned by [`moraine_dump_file_column_stats`].
