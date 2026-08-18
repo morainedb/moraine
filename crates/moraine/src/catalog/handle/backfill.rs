@@ -29,6 +29,8 @@ async fn collect_immediate_backfill<'a>(
     killed_positions: &'a HashMap<u64, HashSet<u64>>,
     killed_row_ids: &'a HashMap<u64, HashSet<u64>>,
 ) -> Result<Vec<IndexEntry>> {
+    // Each future drains its file completely, so the one buffer below is the
+    // whole read window; a second stage would hold a window of its own.
     stream::iter(files)
         .map(move |file| {
             let object_store = object_store.clone();
@@ -37,7 +39,7 @@ async fn collect_immediate_backfill<'a>(
             let dead_positions = killed_positions.get(&file.id.get());
             let dead_row_ids = killed_row_ids.get(&file.id.get());
             async move {
-                let batches = data_file::scoped_read_entry_batches(
+                data_file::scoped_read_entry_batches(
                     data_file::ParquetFile::new(
                         object_store,
                         path,
@@ -51,35 +53,25 @@ async fn collect_immediate_backfill<'a>(
                         row_id_start: file.row_id_start,
                     },
                 )
-                .await?;
-
-                let entries = batches
-                    .map(move |batch| {
-                        let batch = batch?;
-                        batch
-                            .into_iter()
-                            .map(|entry| {
-                                let dead = dead_positions
-                                    .is_some_and(|positions| positions.contains(&entry.ordinal))
-                                    || dead_row_ids
-                                        .is_some_and(|rows| rows.contains(&entry.row_id));
-                                Ok((!dead).then_some(IndexEntry {
-                                    row_id: entry.row_id,
-                                    values: entry.values,
-                                }))
-                            })
-                            .filter_map(Result::transpose)
-                            .collect::<Result<Vec<_>>>()
-                    })
-                    .boxed();
-
-                Ok::<_, Error>(entries)
+                .await?
+                .try_fold(Vec::new(), move |mut entries, batch| async move {
+                    entries.extend(batch.into_iter().filter_map(|entry| {
+                        let dead = dead_positions
+                            .is_some_and(|positions| positions.contains(&entry.ordinal))
+                            || dead_row_ids.is_some_and(|rows| rows.contains(&entry.row_id));
+                        (!dead).then_some(IndexEntry {
+                            row_id: entry.row_id,
+                            values: entry.values,
+                        })
+                    }));
+                    Ok(entries)
+                })
+                .await
             }
         })
         .buffer_unordered(BACKFILL_FILE_READ_CONCURRENCY)
-        .try_flatten_unordered(BACKFILL_FILE_READ_CONCURRENCY)
-        .try_fold(Vec::new(), |mut entries, batch| async move {
-            entries.extend(batch);
+        .try_fold(Vec::new(), |mut entries, file_entries| async move {
+            entries.extend(file_entries);
             Ok(entries)
         })
         .await
