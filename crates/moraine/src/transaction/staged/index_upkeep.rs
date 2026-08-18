@@ -397,12 +397,9 @@ pub(super) async fn stage_index_maintenance(
 
     let mut staged = stage_index_entry_stream(db_tx, deletions, additions, 0).await?;
     staged.metrics.scoped_read = metrics.tally();
-    let locator_writes = locator_writes.lock().await;
-    {
-        let locator_bytes = commit::stage_writes(db_tx, &locator_writes)?;
-        staged.bytes = staged.bytes.saturating_add(locator_bytes.0);
-        staged.uses_inline_chunk_directory = !locator_writes.is_empty();
-    }
+    // Handed back unstaged: this phase may run beside the inline
+    // translation, which reads the directory these would write.
+    staged.locator_writes = std::mem::take(&mut *locator_writes.lock().await);
     staged.deferred = deferred.into_iter().collect();
 
     Ok(staged)

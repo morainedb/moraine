@@ -16,8 +16,9 @@ use crate::{
     catalog::{
         CatalogSnapshot, SnapshotId, Timestamp,
         projection::{
-            ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch, held_head_view,
-            install_head_view, install_head_view_at, invalidate_head_view,
+            ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch, format_floor,
+            held_head_view, install_head_view, install_head_view_at, invalidate_head_view,
+            migration_clear_at, note_migration_clear, raise_format_floor,
         },
     },
     error::{Error, Result},
@@ -272,11 +273,12 @@ enum OpenFailure {
 /// double-initializing. Every exit that does not commit rolls back. Only a
 /// genesis displaced by another initializer re-attempts, up to
 /// [`GENESIS_ATTEMPTS`]; a fence anywhere else is the caller's to handle.
+/// Returns the format version the store stands at, already validated.
 pub(crate) async fn open_initialized(
     store: StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
-) -> Result<(Db, Arc<CacheCounters>)> {
+) -> Result<(Db, Arc<CacheCounters>, u64)> {
     let mut attempt = 1;
     loop {
         match open_attempt(&store, encrypted, data_path).await {
@@ -303,7 +305,7 @@ async fn open_attempt(
     store: &StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
-) -> std::result::Result<(Db, Arc<CacheCounters>), OpenFailure> {
+) -> std::result::Result<(Db, Arc<CacheCounters>, u64), OpenFailure> {
     let started = Instant::now();
     let (db, counters) = store.open_writer().await.map_err(OpenFailure::Fatal)?;
     info!(
@@ -313,9 +315,9 @@ async fn open_attempt(
     let tx = begin_snapshot(&db).await?;
 
     match validate_format(ReadHandle::Tx(&tx)).await {
-        Ok(Some(_)) => {
+        Ok(Some(format)) => {
             tx.rollback();
-            return Ok((db, counters));
+            return Ok((db, counters, format.format_version));
         }
         Ok(None) => {}
         Err(err) => {
@@ -335,7 +337,7 @@ async fn open_attempt(
     match commit_durable(tx, "bootstrap", staged).await {
         Ok(_) => {
             info!(encrypted, data_path, "bootstrapped a fresh catalog store");
-            Ok((db, counters))
+            Ok((db, counters, FORMAT_VERSION))
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
@@ -343,7 +345,7 @@ async fn open_attempt(
             let validated = validate_format(ReadHandle::Tx(&tx)).await;
             tx.rollback();
             match validated {
-                Ok(Some(_)) => Ok((db, counters)),
+                Ok(Some(format)) => Ok((db, counters, format.format_version)),
                 Ok(None) => Err(OpenFailure::Fatal(Error::Corruption(
                     "bootstrap race left the store uninitialized".to_string(),
                 ))),
@@ -366,11 +368,11 @@ async fn begin_snapshot(db: &Db) -> std::result::Result<DbTransaction, OpenFailu
 }
 
 /// Opens the store read-only as a [`DbReader`], validating the format it
-/// finds. Never fences a live writer and never bootstraps: an
-/// uninitialized store is refused.
+/// finds and returning it. Never fences a live writer and never
+/// bootstraps: an uninitialized store is refused.
 pub(crate) async fn open_reader_initialized(
     store: StoreBuilder<'_>,
-) -> Result<(DbReader, Arc<CacheCounters>)> {
+) -> Result<(DbReader, Arc<CacheCounters>, u64)> {
     let started = Instant::now();
     let (reader, counters) = store.open_reader().await?;
     let opened = started.elapsed();
@@ -384,13 +386,30 @@ pub(crate) async fn open_reader_initialized(
     );
 
     match format {
-        Some(_) => Ok((reader, counters)),
+        Some(format) => Ok((reader, counters, format.format_version)),
         None => Err(Error::Corruption(
             "store is not an initialized moraine catalog; a read-only attach \
              needs a writer to have created it first"
                 .to_string(),
         )),
     }
+}
+
+/// As [`refuse_mid_migration`], skipping the read when the marker was
+/// already observed absent at `head`. A migration starts by stamping the
+/// head, so a batch cannot begin one without moving `head` off the stamp.
+pub(crate) async fn refuse_mid_migration_at(
+    tx: ReadHandle<'_>,
+    projections: &std::sync::RwLock<ProjectionCache>,
+    head: &proto::HeadValue,
+) -> Result<()> {
+    if migration_clear_at(projections, head) {
+        return Ok(());
+    }
+    refuse_mid_migration(tx).await?;
+    note_migration_clear(projections, *head);
+
+    Ok(())
 }
 
 /// Refuses a store whose keyspace is mid-migration: any scan of it may be
@@ -545,8 +564,12 @@ pub(crate) async fn materialize_from(
 }
 
 /// The largest changelog a commit records; a batch past it records nothing
-/// and readers rescan.
-const MAX_REFRESH_KEYS: usize = 256;
+/// and readers rescan. Sized so an ordinary bulk write still leaves a
+/// replayable trail — a batch that records nothing forces every reader
+/// behind it to rematerialize, which costs far more than the changelog it
+/// declined to write. [`REFRESH_CHURN_SHARE`] still bounds what a replay
+/// will accept, so this cap governs recording alone.
+const MAX_REFRESH_KEYS: usize = 4_096;
 
 /// A refresher rescans rather than replays a gap whose churn exceeds this
 /// share of the live catalog.
@@ -772,8 +795,11 @@ pub(crate) async fn head_view_for(
     let epoch = cache_epoch(projections);
     let handle = ReadHandle::Tx(db_tx);
     // Checked here because a warm cache returns before `materialize`'s
-    // own check.
-    let ((), head) = futures::try_join!(refuse_mid_migration(handle), read_head_value(handle))?;
+    // own check. Head comes first because it keys the migration stamp; a
+    // stamped head spends no read at all, an unstamped one spends the same
+    // two this always did.
+    let head = read_head_value(handle).await?;
+    refuse_mid_migration_at(handle, projections, &head).await?;
     if let Some(view) = cached_head_view(projections, &head) {
         return Ok(view);
     }
@@ -895,23 +921,34 @@ fn target_format(state: &CatalogSnapshot, uses_inline_chunk_directory: bool) -> 
 /// The format-stamp write this commit owes, if any. The stamp is forward-only.
 async fn format_stamp(
     db_tx: &DbTransaction,
+    projections: &std::sync::RwLock<ProjectionCache>,
     state: &CatalogSnapshot,
     uses_inline_chunk_directory: bool,
 ) -> Result<Option<StagedWrite>> {
-    format_stamp_to(db_tx, target_format(state, uses_inline_chunk_directory)).await
+    format_stamp_to(
+        db_tx,
+        projections,
+        target_format(state, uses_inline_chunk_directory),
+    )
+    .await
 }
 
 /// The forward-only format stamp write required to reach `target_format`.
+/// A target at or below the highest version this handle has seen owes no
+/// write and costs no read: the stamp only ever rises, so an observed
+/// version stays a valid floor.
 pub(crate) async fn format_stamp_to(
     db_tx: &DbTransaction,
+    projections: &std::sync::RwLock<ProjectionCache>,
     target_format: u64,
 ) -> Result<Option<StagedWrite>> {
-    if target_format <= FORMAT_VERSION {
+    if target_format <= FORMAT_VERSION || format_floor(projections) >= target_format {
         return Ok(None);
     }
     let current = read::read_format(ReadHandle::Tx(db_tx))
         .await?
         .map_or(FORMAT_VERSION, |format| format.format_version);
+    raise_format_floor(projections, current);
     if current >= target_format {
         return Ok(None);
     }
@@ -955,6 +992,7 @@ pub(crate) fn schema_version_write(
 /// Options-only commits stage no snapshot record and no head advance.
 async fn prepare_and_stage<F>(
     db_tx: &DbTransaction,
+    projections: &std::sync::RwLock<ProjectionCache>,
     f: &F,
     base: &CatalogSnapshot,
 ) -> Result<Prepared>
@@ -1000,8 +1038,8 @@ where
         .any(|operation| matches!(operation, inline::InlineStage::Insert { .. }));
     let (entries, inline_writes, format_write) = futures::try_join!(
         index_maintenance::stage_index_entries(db_tx, index_entries),
-        inline::stage_inline_writes(db_tx, &inline_ops),
-        format_stamp(db_tx, &state, uses_inline_chunk_directory),
+        inline::stage_inline_writes(db_tx, projections, &inline_ops),
+        format_stamp(db_tx, projections, &state, uses_inline_chunk_directory),
     )?;
     let poisoned = entries.poisoned;
     index_maintenance::apply_poison(&mut state, &poisoned);
@@ -1078,6 +1116,29 @@ pub(crate) fn stage_writes(db_tx: &DbTransaction, writes: &[StagedWrite]) -> Res
     Ok(staged)
 }
 
+/// The head value a batch's own `sys/head` write leaves standing, if it
+/// carries one.
+fn staged_head_value(writes: &[StagedWrite]) -> Option<proto::HeadValue> {
+    staged_sys_value::<proto::HeadValue>(writes, SysKey::Head)
+}
+
+/// The format version a batch's own stamp leaves standing, if it carries
+/// one.
+fn staged_format_version(writes: &[StagedWrite]) -> Option<u64> {
+    staged_sys_value::<proto::FormatValue>(writes, SysKey::Format)
+        .map(|format| format.format_version)
+}
+
+fn staged_sys_value<M: prost::Message + Default>(writes: &[StagedWrite], key: SysKey) -> Option<M> {
+    let encoded = Key::Sys(key).encode();
+    writes
+        .iter()
+        .rev()
+        .find(|(key, _)| *key == encoded)
+        .and_then(|(_, write)| write.as_ref())
+        .and_then(|bytes| value::decode_value::<M>(bytes).ok())
+}
+
 /// Commits one staged batch and folds the result into the maintained
 /// projections. `head` is the id the batch leaves at the head pointer. The
 /// one place a catalog batch reaches the store.
@@ -1101,6 +1162,16 @@ pub(crate) async fn commit_batch(
         Ok(_) => {
             let durable = durable_started.elapsed();
             let projection_started = Instant::now();
+            // `sys/head` is the conflict anchor, so winning it proves no
+            // batch landed between the base's migration check and this
+            // write. A migration start stamps the head, so none began.
+            if let Some(head_after) = staged_head_value(writes) {
+                note_migration_clear(projections, head_after);
+            }
+            // A format stamp is true once its batch lands, not when read.
+            if let Some(stamped) = staged_format_version(writes) {
+                raise_format_floor(projections, stamped);
+            }
             fold_committed_batch(projections, writes, head);
             if head_advanced {
                 install_committed_head_view(projections, head_view_update, writes);

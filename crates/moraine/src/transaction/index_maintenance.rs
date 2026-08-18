@@ -79,8 +79,10 @@ pub(crate) struct StagedEntries {
     pub(crate) deferred: Vec<u64>,
     /// Key and value bytes staged, deletes included.
     pub(crate) bytes: u64,
-    /// Whether this batch wrote the inline chunk row-range directory.
-    pub(crate) uses_inline_chunk_directory: bool,
+    /// Inline chunk-directory repairs derived along the way, handed back
+    /// rather than staged so the caller can order them below the batch's
+    /// own directory writes.
+    pub(crate) locator_writes: Vec<crate::transaction::commit::StagedWrite>,
     pub(crate) metrics: IndexMaintenanceMetrics,
 }
 
@@ -488,7 +490,7 @@ where
         poisoned,
         deferred: Vec::new(),
         bytes: staged.0,
-        uses_inline_chunk_directory: false,
+        locator_writes: Vec::new(),
         metrics,
     })
 }

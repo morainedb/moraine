@@ -31,8 +31,8 @@ use crate::{
         CatalogSnapshot, RecentRow, SnapshotId, TableId,
         inline::{InlineScanKind, materialize_inline_rows},
         projection::{
-            ProjectionCache, cache_epoch, cached_head_view, held_head_view, install_head_view_at,
-            install_shared_current_entities, shared_current_entities,
+            self, ProjectionCache, cache_epoch, cached_head_view, held_head_view,
+            install_head_view_at, install_shared_current_entities, shared_current_entities,
         },
     },
     data_file,
@@ -750,6 +750,94 @@ impl ReadOnlyCatalog {
         Ok(rows)
     }
 
+    /// The row ids of `table`'s live inlined rows at head, without their
+    /// bodies — what a row-location probe needs. Served from the
+    /// chunk-range directory once it is known complete; the first walk
+    /// verifies it against the chunk scan and remembers the answer when
+    /// the store format shuts out writers that predate the directory.
+    pub(crate) async fn live_inline_row_ids(&self, table: TableId) -> Result<Vec<u64>> {
+        let session = self.begin_read().await?;
+        let outcome = self.scan_live_inline_row_ids(&session, table).await;
+        session.finish();
+
+        outcome
+    }
+
+    async fn scan_live_inline_row_ids(
+        &self,
+        session: &ReadSession,
+        table: TableId,
+    ) -> Result<Vec<u64>> {
+        let handle = session.handle();
+        let head = commit::read_head_id(handle);
+
+        let rows = if projection::inline_directory_complete(&self.projections, table.get()) {
+            let (head, locators, tombstones) = futures::try_join!(
+                head,
+                store_inline::scan_inline_chunk_locators(handle, table.get()),
+                store_inline::scan_inline_deletes(handle, table.get()),
+            )?;
+            (
+                head,
+                crate::catalog::inline::materialize_locator_rows(&locators, &tombstones),
+            )
+        } else {
+            let (head, chunks, tombstones) = futures::try_join!(
+                head,
+                store_inline::scan_inline_chunks(handle, table.get()),
+                store_inline::scan_inline_deletes(handle, table.get()),
+            )?;
+            self.verify_inline_directory(handle, table, &chunks).await?;
+            (head, materialize_inline_rows(&chunks, &tombstones))
+        };
+        let (head, rows) = rows;
+
+        Ok(InlineScanKind::Table
+            .select(&rows, head, 0)
+            .into_iter()
+            .map(|row| row.row_id)
+            .collect())
+    }
+
+    /// Compares the walked chunks against the directory and remembers a
+    /// complete one. Only an isolated session may judge — a
+    /// manifest-following pass can straddle a commit — and only under a
+    /// format that locks out writers that predate the directory. This path
+    /// never writes, so a gap is simply left for a flush to heal.
+    async fn verify_inline_directory(
+        &self,
+        handle: ReadHandle<'_>,
+        table: TableId,
+        chunks: &[(InlineOperation, crate::store::proto::InlineChunkValue)],
+    ) -> Result<()> {
+        if !handle.is_isolated()
+            || projection::format_floor(&self.projections)
+                < commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY
+        {
+            return Ok(());
+        }
+
+        let directory: std::collections::BTreeSet<u64> =
+            store_inline::scan_inline_chunk_ranges(handle, table.get())
+                .await?
+                .into_iter()
+                .collect();
+        let ends: Option<std::collections::BTreeSet<u64>> = chunks
+            .iter()
+            .map(|(_, chunk)| {
+                chunk
+                    .row_count
+                    .checked_sub(1)
+                    .and_then(|count| chunk.row_id_start.checked_add(count))
+            })
+            .collect();
+        if ends == Some(directory) {
+            projection::note_inline_directory_complete(&self.projections, table.get());
+        }
+
+        Ok(())
+    }
+
     /// The view at `at`, or at head when `None`. Time travel always
     /// materializes: the cache holds head views only.
     async fn view(&self, at: Option<u64>) -> Result<Arc<CatalogSnapshot>> {
@@ -836,7 +924,11 @@ impl ReadOnlyCatalog {
     /// the read-only reader — the same isolation
     /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
     /// Every read of the store opens its session here, so this is where a
-    /// store mid-structural-migration is refused.
+    /// store mid-structural-migration is refused. The check is keyed on
+    /// the head: a migration start moves it, so a head already observed
+    /// clear opens without re-reading the marker — the head is rewritten
+    /// every batch and stays hot, where the absent marker is the store's
+    /// most expensive possible read.
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
         let session = match self.store.as_ref() {
             Store::Writer(db) => ReadSession::Tx(
@@ -847,7 +939,11 @@ impl ReadOnlyCatalog {
             Store::Reader(reader) => ReadSession::Reader(reader.clone()),
         };
 
-        if let Err(error) = commit::refuse_mid_migration(session.handle()).await {
+        let refused = async {
+            let head = commit::read_head_value(session.handle()).await?;
+            commit::refuse_mid_migration_at(session.handle(), &self.projections, &head).await
+        };
+        if let Err(error) = refused.await {
             session.finish();
             return Err(error);
         }
@@ -934,7 +1030,7 @@ impl Catalog {
             .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts);
-        let (db, cache) =
+        let (db, cache, format) =
             commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
                 .await?;
         warn_if_metadata_cache_cannot_hold(
@@ -947,6 +1043,9 @@ impl Catalog {
             "opened catalog read-write"
         );
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
+        // The open already validated the stamp; commits below this floor
+        // owe no format read.
+        crate::catalog::projection::raise_format_floor(&projections, format);
         Ok(Self {
             inner: ReadOnlyCatalog {
                 writer_status: Some(db.subscribe()),
@@ -1026,7 +1125,7 @@ impl Catalog {
             .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
 
-        let (reader, cache) = commit::open_reader_initialized(store).await?;
+        let (reader, cache, format) = commit::open_reader_initialized(store).await?;
         warn_if_metadata_cache_cannot_hold(
             &options.path,
             manifest.map(|manifest| manifest.metadata_bytes),
@@ -1037,6 +1136,7 @@ impl Catalog {
             "opened catalog read-only"
         );
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
+        crate::catalog::projection::raise_format_floor(&projections, format);
         Ok(ReadOnlyCatalog {
             writer_status: None,
             store: Arc::new(Store::Reader(Arc::new(reader))),

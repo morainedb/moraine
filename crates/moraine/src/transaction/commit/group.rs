@@ -124,7 +124,11 @@ impl Batch {
 
     /// Runs every member's closure in turn and stages the result. An error
     /// leaves the batch poisoned: the caller must discard it.
-    async fn stage<F>(&mut self, members: &[F]) -> Result<(Vec<SnapshotId>, Vec<ChangeSet>)>
+    async fn stage<F>(
+        &mut self,
+        members: &[F],
+        projections: &std::sync::RwLock<ProjectionCache>,
+    ) -> Result<(Vec<SnapshotId>, Vec<ChangeSet>)>
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
@@ -135,7 +139,7 @@ impl Batch {
             self.members += 1;
             self.refold()?;
             let premise = self.premise.as_ref().unwrap_or(&self.base);
-            let prepared = prepare_and_stage(&self.db_tx, member, premise).await?;
+            let prepared = prepare_and_stage(&self.db_tx, projections, member, premise).await?;
             match prepared {
                 Prepared::Nothing { head } => ids.push(SnapshotId::new(head)),
                 Prepared::Staged {
@@ -229,7 +233,7 @@ impl Coalescer {
         };
         let staged_before = batch.writes.len();
 
-        let staged = match batch.stage(members).await {
+        let staged = match batch.stage(members, &self.projections).await {
             Ok(staged) => staged,
             Err(err) => {
                 // The batch is poisoned; its members learn that nothing

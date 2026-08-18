@@ -1388,15 +1388,22 @@ mod tests {
 
     /// Plants a `sys/migration` marker under a live catalog handle: the
     /// shape a reader meets when a migrator starts after it attached and
-    /// its open-time format check has already passed.
+    /// its open-time format check has already passed. As a real start
+    /// batch does, the marker rides a head stamp.
     async fn plant_migration_marker(catalog: &Catalog) {
-        use crate::store::{
-            key::{Key, SysKey},
-            proto::MigrationValue,
-            value::encode_value,
+        use crate::{
+            store::{
+                handle::ReadHandle,
+                key::{Key, SysKey},
+                proto::MigrationValue,
+                read,
+                value::encode_value,
+            },
+            transaction::commit,
         };
 
         let tx = catalog.begin_write_tx().await.unwrap();
+        let head = read::read_head(ReadHandle::Tx(&tx)).await.unwrap().unwrap();
         tx.put(
             Key::Sys(SysKey::Migration).encode(),
             encode_value(&MigrationValue {
@@ -1406,9 +1413,9 @@ mod tests {
             }),
         )
         .unwrap();
-        tx.commit_with_options(&crate::transaction::commit::durable())
-            .await
-            .unwrap();
+        let (key, stamp) = commit::head_stamp(head.snapshot_id, head.batch_seq);
+        tx.put(key, stamp.unwrap()).unwrap();
+        tx.commit_with_options(&commit::durable()).await.unwrap();
     }
 
     fn refuses<T>(outcome: &Result<T>) -> bool {

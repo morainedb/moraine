@@ -4,7 +4,10 @@
 //! caller observed; a mismatch (or an undecodable fold) degrades to a
 //! fresh scan, never to wrong rows.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use crate::{
     catalog::CatalogSnapshot,
@@ -235,6 +238,63 @@ pub(crate) fn install_head_view_at(
         .set_head_view_at(epoch, view);
 }
 
+/// The highest store format version this handle has observed.
+pub(crate) fn format_floor(cache: &std::sync::RwLock<ProjectionCache>) -> u64 {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .format_floor()
+}
+
+/// Records a format version read from the store.
+pub(crate) fn raise_format_floor(cache: &std::sync::RwLock<ProjectionCache>, observed: u64) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .raise_format_floor(observed);
+}
+
+/// Whether the migration marker was already found absent at `head`.
+pub(crate) fn migration_clear_at(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    head: &HeadValue,
+) -> bool {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .migration_clear_at(head)
+}
+
+/// Records the migration marker as absent at `head`.
+pub(crate) fn note_migration_clear(cache: &std::sync::RwLock<ProjectionCache>, head: HeadValue) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .note_migration_clear(head);
+}
+
+/// Whether `table_id`'s inline chunk-range directory is known complete.
+pub(crate) fn inline_directory_complete(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+) -> bool {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inline_directory_complete(table_id)
+}
+
+/// Records `table_id`'s inline chunk-range directory as verified complete.
+pub(crate) fn note_inline_directory_complete(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .note_inline_directory_complete(table_id);
+}
+
 pub(crate) fn invalidate_head_view(cache: &std::sync::RwLock<ProjectionCache>) {
     cache
         .write()
@@ -301,6 +361,23 @@ pub(crate) struct ProjectionCache {
     /// scanned at. Anything not standing here when a batch arrives is
     /// dropped rather than carried.
     folded_head: Option<HeadValue>,
+    /// The highest format version this handle has seen the store stamped
+    /// at. The stamp is forward-only and no writer lowers it, so a floor
+    /// observed once stays true; a commit whose target sits at or below it
+    /// owes no stamp and need not read one. Invalidation leaves it
+    /// standing: it describes the store, not a view of it.
+    format_floor: u64,
+    /// The head at which `sys/migration` was observed absent. A migration
+    /// starts by stamping the head, so a match means no migration had begun
+    /// there.
+    migration_clear: Option<HeadValue>,
+    /// Tables whose inline chunk-range directory names every chunk,
+    /// verified once against the chunk scan. Monotone from there: with the
+    /// store stamped at or past the directory format, every binary that
+    /// can write a chunk writes its locator in the same batch.
+    /// Invalidation leaves it standing: it describes the store, not a view
+    /// of it.
+    inline_directory_complete: BTreeSet<u64>,
     /// Bumped by every invalidation.
     epoch: u64,
 }
@@ -337,8 +414,42 @@ impl ProjectionCache {
             history_entities: None,
             head_view: None,
             folded_head: None,
+            format_floor: 0,
+            migration_clear: None,
+            inline_directory_complete: BTreeSet::new(),
             epoch: 0,
         }
+    }
+
+    /// Whether `table_id`'s chunk-range directory is known to name every
+    /// chunk.
+    pub(crate) fn inline_directory_complete(&self, table_id: u64) -> bool {
+        self.inline_directory_complete.contains(&table_id)
+    }
+
+    /// Records `table_id`'s directory as verified complete.
+    pub(crate) fn note_inline_directory_complete(&mut self, table_id: u64) {
+        self.inline_directory_complete.insert(table_id);
+    }
+
+    /// The highest format version observed, 0 before any has been.
+    pub(crate) fn format_floor(&self) -> u64 {
+        self.format_floor
+    }
+
+    /// Records an observed format version, keeping the highest.
+    pub(crate) fn raise_format_floor(&mut self, observed: u64) {
+        self.format_floor = self.format_floor.max(observed);
+    }
+
+    /// Whether `sys/migration` was observed absent at exactly `head`.
+    pub(crate) fn migration_clear_at(&self, head: &HeadValue) -> bool {
+        self.migration_clear.as_ref() == Some(head)
+    }
+
+    /// Records `sys/migration` as absent at `head`.
+    pub(crate) fn note_migration_clear(&mut self, head: HeadValue) {
+        self.migration_clear = Some(head);
     }
 
     /// The head view iff it stands at exactly the state `expected` names,

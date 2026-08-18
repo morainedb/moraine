@@ -3978,6 +3978,240 @@ async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
     );
 }
 
+/// After one flush verifies the directory complete, the next serves from
+/// it without touching chunk bodies. The proof plants a locator whose
+/// chunk key is gone: the directory path stages its deletion, where the
+/// body path could never have seen it.
+#[tokio::test]
+async fn flush_delete_serves_from_a_directory_verified_complete() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    setup.stage(RowOperation::InlineInsert {
+        table_id: 1,
+        schema_version: 0,
+        begin_snapshot: 1,
+        row_id_start: 0,
+        row_count: 2,
+        arrow_body: b"chunk".to_vec(),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 0, 1),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "inlined_insert:1"),
+    });
+    setup.commit().await.unwrap();
+
+    // A flush that drains nothing still walks the table's inline state,
+    // which is where completeness gets verified.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut verify = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    verify.stage(RowOperation::InlineFlushDelete {
+        table_id: 1,
+        schema_version: 1,
+        flush_snapshot: 1,
+    });
+    verify.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 0, 1),
+    });
+    verify.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "flushed_inlined_data:1"),
+    });
+    verify.commit().await.unwrap();
+    assert!(
+        crate::catalog::projection::inline_directory_complete(catalog.projections(), 1),
+        "a complete directory must be remembered once walked"
+    );
+
+    // The sentinel: a locator whose chunk key is already gone.
+    let tx = catalog.begin_write_tx().await.unwrap();
+    tx.delete(
+        Key::Inline(InlineKey::Live(InlineOperation::Insert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            chunk_seq: 0,
+        }))
+        .encode(),
+    )
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut flush = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    flush.stage(RowOperation::InlineFlushDelete {
+        table_id: 1,
+        schema_version: 0,
+        flush_snapshot: 2,
+    });
+    flush.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(3, 0, 1),
+    });
+    flush.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, "flushed_inlined_data:1"),
+    });
+    flush.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let locator = tx
+        .get(
+            Key::Inline(InlineKey::ChunkRange {
+                table_id: 1,
+                row_id_end: 1,
+            })
+            .encode(),
+        )
+        .await
+        .unwrap();
+    tx.rollback();
+    assert!(
+        locator.is_none(),
+        "the flush must have staged the deletion from the directory, not the body scan"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// A flush that finds the directory missing chunks heals it: surviving
+/// chunks gain their locators, stale locators go, and completeness is
+/// remembered only once a later walk observes the healed store.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn flush_delete_heals_an_incomplete_directory() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    setup.stage(RowOperation::InlineInsert {
+        table_id: 1,
+        schema_version: 0,
+        begin_snapshot: 1,
+        row_id_start: 0,
+        row_count: 2,
+        arrow_body: b"chunk".to_vec(),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 0, 1),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "inlined_insert:1"),
+    });
+    setup.commit().await.unwrap();
+
+    // Legacy shape: a chunk with no locator, and a locator naming no chunk.
+    let tx = catalog.begin_write_tx().await.unwrap();
+    tx.put(
+        Key::Inline(InlineKey::Live(InlineOperation::Insert {
+            table_id: 1,
+            schema_version: 1,
+            begin_snapshot: 2,
+            chunk_seq: 0,
+        }))
+        .encode(),
+        value::encode_value(&proto::InlineChunkValue {
+            body: b"legacy".to_vec().into(),
+            row_id_start: 10,
+            row_count: 2,
+            data_file_id: None,
+        }),
+    )
+    .unwrap();
+    tx.put(
+        Key::Inline(InlineKey::ChunkRange {
+            table_id: 1,
+            row_id_end: 99,
+        })
+        .encode(),
+        value::encode_value(&proto::InlineChunkRangeValue {
+            row_id_start: 90,
+            schema_version: 0,
+            begin_snapshot: 1,
+            chunk_seq: 7,
+        }),
+    )
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // The flush drains schema 0's chunk and heals what it walked past.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut flush = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    flush.stage(RowOperation::InlineFlushDelete {
+        table_id: 1,
+        schema_version: 0,
+        flush_snapshot: 2,
+    });
+    flush.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 0, 1),
+    });
+    flush.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "flushed_inlined_data:1"),
+    });
+    flush.commit().await.unwrap();
+    assert!(
+        !crate::catalog::projection::inline_directory_complete(catalog.projections(), 1),
+        "completeness must not be remembered off writes still riding the batch"
+    );
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let healed = tx
+        .get(
+            Key::Inline(InlineKey::ChunkRange {
+                table_id: 1,
+                row_id_end: 11,
+            })
+            .encode(),
+        )
+        .await
+        .unwrap();
+    let stale = tx
+        .get(
+            Key::Inline(InlineKey::ChunkRange {
+                table_id: 1,
+                row_id_end: 99,
+            })
+            .encode(),
+        )
+        .await
+        .unwrap();
+    tx.rollback();
+    assert!(healed.is_some(), "the surviving chunk must gain a locator");
+    assert!(stale.is_none(), "the chunkless locator must be removed");
+
+    // The next walk sees the healed directory and remembers it.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut verify = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    verify.stage(RowOperation::InlineFlushDelete {
+        table_id: 1,
+        schema_version: 0,
+        flush_snapshot: 2,
+    });
+    verify.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(3, 0, 1),
+    });
+    verify.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, "flushed_inlined_data:1"),
+    });
+    verify.commit().await.unwrap();
+    assert!(
+        crate::catalog::projection::inline_directory_complete(catalog.projections(), 1),
+        "the healed directory must be remembered on the next walk"
+    );
+    catalog.close().await.unwrap();
+}
+
 /// `InlineDrop` removes every `inline/*` record for the table:
 /// schema, chunks, and tombstones.
 #[tokio::test]

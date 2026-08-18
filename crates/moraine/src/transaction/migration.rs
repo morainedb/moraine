@@ -21,7 +21,7 @@ use crate::{
         key::{Key, SysKey},
         proto, read, value,
     },
-    transaction::commit::commit_durable,
+    transaction::commit::{self, MAX_COMMIT_ATTEMPTS, commit_durable},
 };
 
 /// Where a step left off: the cursor the next step resumes at and what it
@@ -158,22 +158,57 @@ fn stage_marker(tx: &DbTransaction, unit: &MigrationUnit, cursor: &[u8]) -> Resu
 }
 
 /// The start batch: the marker exists after it, or it does not.
+///
+/// The marker rides a head stamp, so committers that cached the store's
+/// migration-free state at a head see that head move and read the marker
+/// again. That makes `sys/head` this batch's conflict anchor too, so a
+/// commit racing it wins or loses cleanly rather than interleaving.
 async fn start(db: &Db, unit: &MigrationUnit) -> Result<()> {
-    let tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
-    let staged = match stage_marker(&tx, unit, &[]) {
-        Ok(staged) => staged,
-        Err(error) => {
-            tx.rollback();
-            return Err(error);
+    for attempt in 0..MAX_COMMIT_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(commit::retry_backoff(attempt)).await;
         }
-    };
-    commit_durable(tx, "migration start", staged)
-        .await
-        .map_err(Error::from)?;
-    Ok(())
+
+        let tx = db
+            .begin(IsolationLevel::Snapshot)
+            .await
+            .map_err(Error::from)?;
+        let staged = match stage_start(&tx, unit).await {
+            Ok(staged) => staged,
+            Err(error) => {
+                tx.rollback();
+                return Err(error);
+            }
+        };
+
+        match commit_durable(tx, "migration start", staged).await {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == slatedb::ErrorKind::Transaction => {
+                info!(attempt, "migration start lost the head race; retrying");
+            }
+            Err(error) => return Err(Error::from(error)),
+        }
+    }
+
+    Err(Error::RetryBudgetExhausted(format!(
+        "migration start from format {} to {} spent {MAX_COMMIT_ATTEMPTS} attempts without \
+         settling; commits are landing faster than it can claim the head",
+        unit.from_format, unit.to_format
+    )))
+}
+
+/// Stages the start batch: the marker and the head stamp that carries it.
+async fn stage_start(tx: &DbTransaction, unit: &MigrationUnit) -> Result<StagedBytes> {
+    let mut staged = stage_marker(tx, unit, &[])?;
+    // A store with no head is pre-bootstrap and has nothing to anchor to.
+    if let Some(head) = read::read_head(ReadHandle::Tx(tx)).await? {
+        let (key, value) = commit::head_stamp(head.snapshot_id, head.batch_seq);
+        let value = value.unwrap_or_default();
+        staged.add(key.len(), value.len());
+        tx.put(key, value).map_err(Error::from)?;
+    }
+
+    Ok(staged)
 }
 
 /// The finish batch: the format flip and the marker clear, together.
