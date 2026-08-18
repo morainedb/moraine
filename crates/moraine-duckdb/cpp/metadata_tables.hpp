@@ -93,10 +93,16 @@ struct MetadataTableSpec {
 	// table's rows are a contiguous run of the whole and narrowing does not
 	// renumber them — `ducklake_file_column_stats` alone.
 	//
+	int32_t scope_column = -1;
+	// Whether a scan of this kind may be narrowed to the versions live at
+	// a filter's snapshot, skipping the ended half. Set only where the
+	// ended half grows without bound and the core exposes a live-bounded
+	// dump for it — `ducklake_data_file` alone.
+	//
 	// Last, and it must stay last: these specs are initialized positionally,
 	// so a field added anywhere earlier silently shifts every entry that
 	// relies on declaration order.
-	int32_t scope_column = -1;
+	bool live_narrowable = false;
 };
 
 // The rows of `spec` as the calling DuckDB transaction sees them. Every
@@ -127,8 +133,15 @@ struct MetadataTableSpec {
 // One limit remains: tables are pinned independently, each at the head its
 // first scan observed, so a statement joining two of them can still
 // straddle a commit.
+// `live_bound`, when set, is the snapshot a reader keeps rows against —
+// `live_bound < end_snapshot OR end_snapshot IS NULL`. It narrows the
+// materialization to the live versions only while a staged tx is open,
+// whose read point is pinned for the transaction's life; a plain reader
+// resolves its head per scan, where a narrowed and an unnarrowed read of
+// one table could stand at two heads, so it is ignored there.
 std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
-                                                    const MetadataTableSpec &spec);
+                                                    const MetadataTableSpec &spec,
+                                                    duckdb::optional_idx live_bound = duckdb::optional_idx());
 
 // One table's rows of a narrowable `spec`.
 //
@@ -205,6 +218,10 @@ struct MetadataScanBindData : public duckdb::FunctionData {
 	const MetadataTableSpec *spec = nullptr;
 	duckdb::Catalog *catalog = nullptr;
 	std::string catalog_name;
+	// The snapshot a `live_bound < end_snapshot OR end_snapshot IS NULL`
+	// filter pinned this scan to, set by `pushdown_complex_filter` before
+	// `InitGlobal` runs. Unset means the scan reads every version.
+	duckdb::optional_idx live_bound;
 	// The `table_id` an equality filter pinned this scan to, set by
 	// `pushdown_complex_filter` before `InitGlobal` runs. Unset means the
 	// scan reads its kind whole.

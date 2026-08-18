@@ -2070,6 +2070,27 @@ int32_t moraine_dump_data_files(struct MoraineCatalogHandle *handle,
                                 void *probe_ctx,
                                 struct MoraineError *err);
 
+// As [`moraine_dump_data_files`], for a caller that keeps a row only
+// while `filter_snapshot < end_snapshot` (or it is null) — the shape
+// every DuckLake read of this table carries.
+//
+// Once `filter_snapshot` reaches the head this call observes, no ended
+// version can satisfy that, so the ended half is not read; the rows are
+// the same ones either way. A bound behind the head is a time-travel
+// read and gets the full set. Freed with
+// [`moraine_dump_data_files_free`].
+//
+// # Safety
+//
+// As [`moraine_dump_data_files`].
+int32_t moraine_dump_data_files_live_at(struct MoraineCatalogHandle *handle,
+                                        uint64_t filter_snapshot,
+                                        struct MoraineDataFileRow **out_items,
+                                        size_t *out_len,
+                                        MoraineInterruptProbe probe,
+                                        void *probe_ctx,
+                                        struct MoraineError *err);
+
 // Frees the array returned by [`moraine_dump_data_files`].
 //
 // # Safety
@@ -2852,6 +2873,23 @@ int32_t moraine_tx_dump_data_files(struct MoraineTxHandle *tx,
                                    struct MoraineDataFileRow **out_items,
                                    size_t *out_len,
                                    struct MoraineError *err);
+
+// As [`moraine_tx_dump_data_files`], for a caller that keeps a row only
+// while `filter_snapshot < end_snapshot` (or it is null) — the shape
+// every DuckLake read of this table carries.
+//
+// Once `filter_snapshot` reaches the transaction's read point, no ended
+// version can satisfy that, so the ended half is not read; the rows are
+// the same ones either way. Freed with `moraine_dump_data_files_free`.
+//
+// # Safety
+//
+// As [`moraine_tx_dump_data_files`].
+int32_t moraine_tx_dump_data_files_live_at(struct MoraineTxHandle *tx,
+                                           uint64_t filter_snapshot,
+                                           struct MoraineDataFileRow **out_items,
+                                           size_t *out_len,
+                                           struct MoraineError *err);
 
 // Dumps every `ducklake_delete_file` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over

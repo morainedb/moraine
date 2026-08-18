@@ -671,6 +671,53 @@ fold and the changelog replay advance view and record set together — one
 cache entry with two faces, installed and invalidated under the existing
 install-epoch rule.
 
+### A reader that cannot match an ended version does not read them
+
+`history` grows with every ended version and is pruned only by snapshot
+expiry, so a scan pair that always reads both halves sawtooths against the
+expiry cycle rather than against the live catalog. Most of what it reads is
+discarded: every DuckLake read of a versioned table carries
+`{SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < end_snapshot OR
+end_snapshot IS NULL)`, and at the head the second half of that keeps
+nothing from `history`.
+
+The rule: **a scan may read `current` alone when its caller has been shown
+that no version in `history` can satisfy it.** One filter shape proves
+that, and the core — not the shim — checks it:
+
+- A record reaches `history` by being ended, stamped with the snapshot that
+  ended it, which is never past the head. A record there always carries an
+  `end_snapshot`; the `IS NULL` arm never keeps one.
+- So a reader keeping rows only while `filter_snapshot < end_snapshot`
+  matches nothing in `history` once `filter_snapshot` has reached the head.
+- Time travel reads behind the head and keeps the full pair, which is what
+  makes the narrowing safe by construction rather than by care.
+
+The bound crosses the ABI as a snapshot id, not as a boolean, and the
+comparison against the head happens inside the same consistent read that
+serves the dump. A shim that compared them itself would be racing: a commit
+landing between its check and the dump moves the head past a bound that was
+at it, and the rows that commit ended would be dropped from a reader that
+still matches them.
+
+The shim's side is recognizing the shape. It is a `pushdown_complex_filter`
+that consumes nothing — the filter stays, DuckLake keeps applying it — so a
+bound recognized too generously costs a narrower materialization, never a
+wrong row, and the core still refuses a bound behind its read point.
+
+Two scans are left out deliberately. A scan emitting row ids feeds an
+UPDATE or DELETE whose Sink resolves those ids back into the very rows the
+scan handed out, so it reads what every other writer of that table reads,
+never a narrowed set. And outside a staged transaction the narrowing is not
+applied at all: a plain reader resolves its head per scan, so a narrowed and
+an unnarrowed read of one table could stand at two heads — the tear
+"one materialization per metadata table" exists to prevent. Inside a staged
+transaction the read point is pinned for the transaction's life, so no such
+tear exists, and that is where the flush path lives.
+
+The narrowed materialization is cached beside the full one, never in place
+of it, and staging into the table drops both.
+
 ### The stamp crosses the ABI
 
 The shim's per-transaction pin is correct but wasteful as a lifetime:
