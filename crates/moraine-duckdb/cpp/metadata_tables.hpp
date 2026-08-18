@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "duckdb.hpp"
@@ -197,9 +198,13 @@ struct MetadataScanBindData : public duckdb::FunctionData {
 	// resolve row ids their own way.
 	//
 	// A raw pointer, not `optional_ptr`: `InitGlobal` reads the bind data as
-	// const and must still reach a mutable catalog.
+	// const and must still reach a mutable catalog. Bind data outlives its
+	// bind (a prepared statement holds it across a DETACH), so `InitGlobal`
+	// re-resolves `catalog_name` and compares before dereferencing; the
+	// pointer is an identity, never a borrow.
 	const MetadataTableSpec *spec = nullptr;
 	duckdb::Catalog *catalog = nullptr;
+	std::string catalog_name;
 	// The `table_id` an equality filter pinned this scan to, set by
 	// `pushdown_complex_filter` before `InitGlobal` runs. Unset means the
 	// scan reads its kind whole.
