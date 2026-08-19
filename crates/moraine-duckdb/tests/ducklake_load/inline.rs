@@ -489,3 +489,59 @@ fn deleting_one_inlined_row_costs_one_pass_over_the_table() {
          is reading the table a second time to invert the rowid"
     );
 }
+
+/// Reading a table costs no inlined schema it does not decode against.
+///
+/// Every table carries a registered inlined table from `CREATE TABLE`
+/// onwards, and DuckLake scans each registered schema version on every
+/// read of the base table. Reading the schema list per version turns that
+/// into one whole-list scan per version; the list is only needed to decode
+/// a body, so a version holding no inlined row must not read it at all.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn reading_a_table_costs_no_inlined_schema_it_does_not_decode_against() {
+    let lookups_over_versions = |added_columns: usize| -> u64 {
+        let dir = TempDir::new("inline-schema-cost");
+        let data_dir = TempDir::new("inline-schema-cost-data");
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        let alters = (0..added_columns)
+            .map(|column| format!("ALTER TABLE lake.main.t ADD COLUMN c{column} BIGINT;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        run_ducklake_sql(
+            store,
+            data_path,
+            &format!(
+                "CREATE TABLE lake.main.t (i BIGINT);\nINSERT INTO lake.main.t VALUES (1);\n{alters}"
+            ),
+        );
+
+        // As in `deleting_one_inlined_row_costs_one_pass_over_the_table`:
+        // the counters belong to the attach, so both tallies and the
+        // statement between them share one session.
+        let tally = "SELECT metadata_hits + metadata_misses + block_hits + block_misses \
+                       FROM moraine_cache_tally('lake');";
+        let rows = csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            &format!("{tally}\nSELECT i FROM lake.main.t;\n{tally}"),
+        ));
+        let read = |row: &Vec<String>| row[0].parse::<u64>().expect("a tally is a number");
+        read(rows.last().expect("a closing tally")) - read(rows.first().expect("an opening tally"))
+    };
+
+    // One version against thirteen. The single inlined row lives in the
+    // first, so the other twelve decode nothing and must cost no schema
+    // read — leaving the growth in the scans DuckLake itself performs.
+    let one_version = lookups_over_versions(0);
+    let many_versions = lookups_over_versions(12);
+    let budget = one_version * 43 / 10;
+    assert!(
+        many_versions <= budget,
+        "thirteen schema versions cost {many_versions} lookups against a budget of {budget} \
+         (one version costs {one_version}): each version is re-reading the whole schema list \
+         to decode nothing"
+    );
+}

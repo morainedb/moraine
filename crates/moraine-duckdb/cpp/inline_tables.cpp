@@ -351,28 +351,34 @@ InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHand
 	// that version decode against its schema-only stream (`inline/schema`).
 	// The scan below spans every version of the table, so chunks of other
 	// versions — a schema-evolved table holds several — are filtered out.
+	//
+	// Read on the first body decode and not before, so a caller that decodes
+	// nothing reads nothing: a metadata-only scan touches no body by
+	// definition, and a flushed table has none left to touch — its
+	// registration outlives its rows, so every read of the base table scans
+	// it. `schemas` owns the bytes `decoded_schema` is built from, so it
+	// outlives every decode below.
 	OwnedArray<MoraineInlineSchemaRow> schemas(moraine_inline_schemas_free);
-	MoraineError schema_err {};
-	if (moraine_inline_schemas(handle, table_id, schemas.OutItems(), schemas.OutLen(), moraine_shim_is_interrupted,
-	                           &context, &schema_err) != MORAINE_OK) {
-		ThrowMoraineError(schema_err);
-	}
-	const uint8_t *schema_ipc = nullptr;
-	size_t schema_ipc_len = 0;
-	for (auto &s : schemas) {
-		if (s.schema_version == schema_version) {
-			schema_ipc = s.arrow_schema;
-			schema_ipc_len = s.arrow_schema_len;
-			break;
+	duckdb::unique_ptr<DecodedInlineSchema> decoded_schema;
+	auto schema_to_decode_against = [&]() -> const DecodedInlineSchema & {
+		if (decoded_schema) {
+			return *decoded_schema;
 		}
-	}
-	if (!schema_ipc) {
+		MoraineError schema_err {};
+		if (moraine_inline_schemas(handle, table_id, schemas.OutItems(), schemas.OutLen(), moraine_shim_is_interrupted,
+		                           &context, &schema_err) != MORAINE_OK) {
+			ThrowMoraineError(schema_err);
+		}
+		for (auto &s : schemas) {
+			if (s.schema_version == schema_version) {
+				decoded_schema = duckdb::make_uniq<DecodedInlineSchema>(s.arrow_schema, s.arrow_schema_len);
+				return *decoded_schema;
+			}
+		}
 		throw duckdb::InternalException("moraine: no inline schema recorded for table %llu schema version %llu",
 		                                static_cast<unsigned long long>(table_id),
 		                                static_cast<unsigned long long>(schema_version));
-	}
-	// Parsed once here; every chunk of this version decodes against it.
-	DecodedInlineSchema decoded_schema(schema_ipc, schema_ipc_len);
+	};
 
 	// The scan returns rows plus the deduplicated chunk bodies they
 	// reference; both arrays are owned together and freed by the one
@@ -418,7 +424,7 @@ InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHand
 		if (with_values) {
 			if (first_piece[r.chunk_index] == std::numeric_limits<size_t>::max()) {
 				auto &chunk = scan.chunks[r.chunk_index];
-				auto decoded = DecodeInlineChunkPieces(context, decoded_schema, chunk, user_types);
+				auto decoded = DecodeInlineChunkPieces(context, schema_to_decode_against(), chunk, user_types);
 				first_piece[r.chunk_index] = result.pieces.size();
 				chunk_rows[r.chunk_index] = 0;
 				for (auto &p : decoded) {
