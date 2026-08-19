@@ -555,12 +555,12 @@ void InlineDataScanImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &dat
 		auto col_id = state.column_ids[out_col];
 		auto &target = output.data[out_col];
 		if (col_id == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
-			// The rowid is the row's index in this scan's row list, which the
-			// UPDATE/DELETE sinks resolve back by re-materializing the same
-			// list — metadata only, so nothing is decoded twice.
+			// The row's own id, not its position in this scan. A tombstoning
+			// sink stages that id directly, so inverting a rowid costs no
+			// second pass over the table.
 			auto rowids = duckdb::FlatVector::GetData<int64_t>(target);
 			for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
-				rowids[out_row] = static_cast<int64_t>(state.offset + out_row);
+				rowids[out_row] = static_cast<int64_t>(scan.rows[state.offset + out_row].row_id);
 			}
 			continue;
 		}
@@ -827,10 +827,11 @@ protected:
 		return moraine_tx.StagedTxForInline();
 	}
 
-	// Resolves a rowid the entry's scan emitted (its index into that scan's
-	// row list) back to the row itself, re-materializing on first use.
-	// Metadata only: a rowid resolves to `row_id` and `begin_snapshot`, and
-	// neither needs an Arrow body decoded.
+	// Resolves a rowid the entry's scan emitted — the row's own id — back to
+	// the row, for the one sink that needs a field the id does not carry.
+	// Materializes the row list on first use and binary-searches it, which
+	// the scan's `(row_id, begin_snapshot)` order admits. Metadata only: no
+	// Arrow body is decoded.
 	const InlineDataRow &ResolveRow(duckdb::ClientContext &context, InlineDmlState &state, MoraineCatalogHandle *handle,
 	                                uint64_t table_id, uint64_t schema_version,
 	                                const std::vector<duckdb::LogicalType> &user_types,
@@ -843,13 +844,15 @@ protected:
 		if (row_id.IsNull()) {
 			throw duckdb::InternalException("moraine: staged write received a NULL rowid");
 		}
-		auto index = static_cast<duckdb::idx_t>(row_id.GetValue<int64_t>());
-		if (index >= state.old_rows.size()) {
+		auto wanted = static_cast<uint64_t>(row_id.GetValue<int64_t>());
+		auto found = std::lower_bound(state.old_rows.begin(), state.old_rows.end(), wanted,
+		                              [](const InlineDataRow &row, uint64_t id) { return row.row_id < id; });
+		if (found == state.old_rows.end() || found->row_id != wanted) {
 			throw duckdb::InternalException(
-			    "moraine: staged write rowid is out of range — the committed head moved between this "
-			    "statement's scan and its write, which the supported topology excludes");
+			    "moraine: staged write names a rowid this statement's scan did not emit — the committed "
+			    "head moved between the scan and the write, which the supported topology excludes");
 		}
-		return state.old_rows[index];
+		return *found;
 	}
 
 public:
@@ -922,12 +925,11 @@ public:
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<InlineDmlState>();
 		auto *tx = StagedTx(context.client);
-		// The row-id column is appended last.
+		// The row-id column is appended last, and carries the row's own id,
+		// which is what a tombstone names — so this stages without reading.
 		auto row_id_col = chunk.ColumnCount() - 1;
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto &old_row = ResolveRow(context.client, state, handle_, table_id_, schema_version_, user_types_,
-			                           chunk.GetValue(row_id_col, row));
-			auto real_row_id = old_row.row_id;
+			auto real_row_id = CellAsU64(chunk.GetValue(row_id_col, row));
 			auto end_snapshot = CellAsU64(chunk.GetValue(set_ref_, row));
 			MoraineError err {};
 			auto code = moraine_tx_stage_inline_inline_delete(tx, table_id_, real_row_id, end_snapshot, &err);
