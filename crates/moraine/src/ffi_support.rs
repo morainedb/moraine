@@ -1457,7 +1457,9 @@ mod tests {
         assert!(refuses(&dump_snapshots(&catalog).await), "dump_snapshots");
 
         assert!(
-            refuses(&inline::scan_inline(&catalog, 1, inline::InlineScanKind::Table, 1, 0).await),
+            refuses(
+                &inline::scan_inline(&catalog, 1, inline::InlineScanKind::Table, 1, 0, None).await
+            ),
             "scan_inline"
         );
         assert!(

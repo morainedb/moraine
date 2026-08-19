@@ -2637,7 +2637,10 @@ void moraine_dump_column_tags_free(struct MoraineColumnTagRow *items, size_t len
 // variant (`0` = `SCAN_TABLE`, `1` = `SCAN_INSERTIONS`, `2` =
 // `SCAN_DELETIONS`, `3` = `SCAN_FOR_FLUSH`) at `snapshot`, windowed from
 // `start` for the incremental variants (ignored by `SCAN_TABLE`/
-// `SCAN_FOR_FLUSH`).
+// `SCAN_FOR_FLUSH`). Only rows written under `schema_version` are
+// selected, and only their chunks' bodies are hauled: every caller
+// serves one `ducklake_inlined_data_<t>_<v>` projection, so a
+// schema-evolved table's other versions cost it nothing.
 //
 // Cancellable: races the core read against `probe` (polled immediately,
 // then ~100 ms; a null `probe` disables polling). If a cancellation
@@ -2657,6 +2660,7 @@ int32_t moraine_inline_scan(struct MoraineCatalogHandle *handle,
                             int32_t scan_kind,
                             uint64_t snapshot,
                             uint64_t start,
+                            uint64_t schema_version,
                             struct MoraineInlineRow **out_items,
                             size_t *out_len,
                             struct MoraineInlineChunk **out_chunks,

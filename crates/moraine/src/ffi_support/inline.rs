@@ -47,7 +47,9 @@ pub struct InlineScanRecord {
 /// `snapshot` (windowed from `start` for the incremental variants) — the
 /// read model behind `moraine_inline_scan`. Served from the chunk-range
 /// directory once it is known complete, hauling only the chunk bodies the
-/// selected rows reference.
+/// selected rows reference. `schema_version`, when set, keeps only rows
+/// whose chunk was written under that version, so a caller serving one
+/// version's projection never hauls another version's bodies.
 ///
 /// # Errors
 ///
@@ -60,9 +62,10 @@ pub async fn scan_inline(
     kind: InlineScanKind,
     snapshot: u64,
     start: u64,
+    schema_version: Option<u64>,
 ) -> Result<InlineScanRecord> {
     let (selected, chunks) = catalog
-        .select_inline_rows(table_id, kind, snapshot, start)
+        .select_inline_rows(table_id, kind, snapshot, start, schema_version)
         .await?;
 
     // Rows arrive with `chunk` dense-indexed in first-reference order over
@@ -276,7 +279,7 @@ mod tests {
         });
         inline_delete.commit().await.unwrap();
 
-        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 2, 0)
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 2, 0, None)
             .await
             .unwrap();
         let mut by_id: Vec<(u64, Bytes, u64)> = record
@@ -340,7 +343,7 @@ mod tests {
         });
         tx.commit().await.unwrap();
 
-        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0)
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0, None)
             .await
             .unwrap();
         assert_eq!(record.rows.len(), 2);
@@ -369,7 +372,7 @@ mod tests {
         .unwrap();
         tx.commit().await.unwrap();
 
-        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0)
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0, None)
             .await
             .unwrap();
         let row_ids: Vec<u64> = record.rows.iter().map(|row| row.row_id).collect();
@@ -379,6 +382,62 @@ mod tests {
             "a directory-served scan must not see a chunk only a body scan finds"
         );
         assert_eq!(record.chunk_bodies, vec![Bytes::from_static(b"chunk-a")]);
+    }
+
+    /// A version-filtered scan returns one version's rows and hauls one
+    /// version's bodies — the other version's chunks are not in the record
+    /// at all, so a caller serving one version's projection never touches
+    /// the rest of the table.
+    #[tokio::test]
+    async fn scan_inline_filtered_to_a_version_hauls_only_its_bodies() {
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(db_tx);
+
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk-v0".to_vec(),
+        });
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 1,
+            begin_snapshot: 1,
+            row_id_start: 2,
+            row_count: 1,
+            arrow_body: b"chunk-v1".to_vec(),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        // Once eagerly (verifying the directory), once served from it: the
+        // filter must narrow both paths the same way.
+        for pass in ["chunk scan", "directory"] {
+            let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0, Some(1))
+                .await
+                .unwrap();
+            let rows: Vec<(u64, u64, u64)> = record
+                .rows
+                .iter()
+                .map(|row| (row.row_id, row.schema_version, row.chunk_index))
+                .collect();
+            assert_eq!(rows, vec![(2, 1, 0)], "one version-1 row ({pass})");
+            assert_eq!(
+                record.chunk_bodies,
+                vec![Bytes::from_static(b"chunk-v1")],
+                "the other version's body must not be hauled ({pass})"
+            );
+        }
     }
 
     /// Staged `inline/file_delete` rows read back as

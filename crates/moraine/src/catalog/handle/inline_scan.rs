@@ -36,6 +36,18 @@ pub(super) enum InlineRowSource {
 }
 
 impl InlineRowSource {
+    /// Whether the chunk at `index` was written under `schema_version`.
+    fn chunk_is_version(&self, index: usize, schema_version: u64) -> bool {
+        let operation = match self {
+            Self::Locators(locators) => locators[index].operation(),
+            Self::Chunks(chunks) => chunks[index].0,
+        };
+        matches!(
+            operation,
+            InlineOperation::Insert { schema_version: version, .. } if version == schema_version
+        )
+    }
+
     /// Hands back the chunks `selected` references, remapping each row's
     /// `chunk` index into the returned set: point reads of exactly the
     /// referenced chunks in directory mode, a reference-order compaction
@@ -116,18 +128,24 @@ impl ReadOnlyCatalog {
     /// `kind`'s selection over `table_id`'s inline rows at `snapshot`
     /// (windowed from `start`), each row's `chunk` indexing the returned
     /// chunk set — only the chunks the selected rows reference.
+    /// `schema_version`, when set, drops rows of other versions before the
+    /// chunks resolve, so their bodies are never fetched.
     pub(crate) async fn select_inline_rows(
         &self,
         table_id: u64,
         kind: InlineScanKind,
         snapshot: u64,
         start: u64,
+        schema_version: Option<u64>,
     ) -> Result<(Vec<InlineRow>, Vec<(InlineOperation, InlineChunkValue)>)> {
         let table = TableId::new(table_id);
         let session = self.begin_read().await?;
         let outcome = async {
             let (source, rows) = self.inline_row_source(session.handle(), table).await?;
-            let selected = kind.select(&rows, snapshot, start);
+            let mut selected = kind.select(&rows, snapshot, start);
+            if let Some(version) = schema_version {
+                selected.retain(|row| source.chunk_is_version(row.chunk, version));
+            }
             source
                 .resolve_chunks(session.handle(), table, selected)
                 .await
