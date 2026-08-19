@@ -142,7 +142,10 @@ impl MoraineInlineChunk {
 /// variant (`0` = `SCAN_TABLE`, `1` = `SCAN_INSERTIONS`, `2` =
 /// `SCAN_DELETIONS`, `3` = `SCAN_FOR_FLUSH`) at `snapshot`, windowed from
 /// `start` for the incremental variants (ignored by `SCAN_TABLE`/
-/// `SCAN_FOR_FLUSH`).
+/// `SCAN_FOR_FLUSH`). Only rows written under `schema_version` are
+/// selected, and only their chunks' bodies are hauled: every caller
+/// serves one `ducklake_inlined_data_<t>_<v>` projection, so a
+/// schema-evolved table's other versions cost it nothing.
 ///
 /// Cancellable: races the core read against `probe` (polled immediately,
 /// then ~100 ms; a null `probe` disables polling). If a cancellation
@@ -164,6 +167,7 @@ pub unsafe extern "C" fn moraine_inline_scan(
     scan_kind: i32,
     snapshot: u64,
     start: u64,
+    schema_version: u64,
     out_items: *mut *mut MoraineInlineRow,
     out_len: *mut usize,
     out_chunks: *mut *mut MoraineInlineChunk,
@@ -198,6 +202,7 @@ pub unsafe extern "C" fn moraine_inline_scan(
                     kind,
                     snapshot,
                     start,
+                    Some(schema_version),
                 ),
             )
         }?;
@@ -825,6 +830,7 @@ mod tests {
                 0,
                 1,
                 0,
+                0,
                 &raw mut rows,
                 &raw mut len,
                 &raw mut chunks,
@@ -940,6 +946,7 @@ mod tests {
                 0,
                 2,
                 0,
+                0,
                 &raw mut rows2,
                 &raw mut len2,
                 &raw mut chunks2,
@@ -982,6 +989,7 @@ mod tests {
                 1,
                 0,
                 3,
+                0,
                 0,
                 &raw mut rows3,
                 &raw mut len3,

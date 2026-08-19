@@ -330,27 +330,20 @@ struct InlineDataScan {
 // `ducklake_inlined_data_<t>_<v>`.
 constexpr duckdb::column_t kInlineUserColumnStart = 3;
 
-// Materializes every live row of `table_id` (the `ForFlush` scan at the
-// maximum snapshot) so DuckDB's query engine applies the WHERE clause; the
-// shim serves raw rows, never interprets the predicate.
+// Materializes every live row of `(table_id, schema_version)` (the
+// `ForFlush` scan at the maximum snapshot) so DuckDB's query engine applies
+// the WHERE clause; the shim serves raw rows, never interprets the
+// predicate. The scan is version-scoped in the core, so a schema-evolved
+// table's other versions cost this entry neither rows nor chunk bodies.
 //
 // `with_values` decodes the chunk bodies the rows point into. A caller that
 // needs only `row_id`/`begin_snapshot` — resolving a rowid back to its row
 // for an UPDATE or DELETE — passes `false` and touches no Arrow body at all.
-//
-// `moraine_inline_scan` scans the whole `table_id` across every schema
-// version and a returned row carries no schema-version tag, so decoding
-// every body against `user_types` is only correct when `table_id` has a
-// single schema version live. A table that underwent a schema change while
-// still holding unflushed inlined data under the old version would misdecode
-// here.
 InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHandle *handle, uint64_t table_id,
                               uint64_t schema_version, const std::vector<duckdb::LogicalType> &user_types,
                               bool with_values) {
 	// This entry serves one `(table_id, schema_version)`; body-only chunks of
 	// that version decode against its schema-only stream (`inline/schema`).
-	// The scan below spans every version of the table, so chunks of other
-	// versions — a schema-evolved table holds several — are filtered out.
 	//
 	// Read on the first body decode and not before, so a caller that decodes
 	// nothing reads nothing: a metadata-only scan touches no body by
@@ -394,7 +387,7 @@ InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHand
 	} scan;
 	MoraineError err {};
 	auto code = moraine_inline_scan(handle, table_id, /* SCAN_FOR_FLUSH */ 3, std::numeric_limits<uint64_t>::max(), 0,
-	                                &scan.rows, &scan.rows_len, &scan.chunks, &scan.chunks_len,
+	                                schema_version, &scan.rows, &scan.rows_len, &scan.chunks, &scan.chunks_len,
 	                                moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -410,11 +403,10 @@ InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHand
 	std::vector<duckdb::idx_t> chunk_rows(scan.chunks_len, 0);
 	for (size_t i = 0; i < scan.rows_len; i++) {
 		auto &r = scan.rows[i];
-		// The scan spans every schema version of the table; this entry serves
-		// exactly its own version's `ducklake_inlined_data_<t>_<v>`, so a chunk
-		// from another version (its columns and schema differ) is not ours.
+		// The core scoped the scan to this version; another version's chunk
+		// would decode against the wrong schema.
 		if (r.schema_version != schema_version) {
-			continue;
+			throw duckdb::InternalException("moraine: a version-scoped inline scan returned a row of another version");
 		}
 		if (r.chunk_index >= scan.chunks_len) {
 			throw duckdb::InternalException("moraine: inline scan chunk index out of range");

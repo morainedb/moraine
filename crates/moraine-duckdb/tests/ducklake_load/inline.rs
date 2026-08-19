@@ -545,3 +545,64 @@ fn reading_a_table_costs_no_inlined_schema_it_does_not_decode_against() {
          to decode nothing"
     );
 }
+
+/// A schema-evolved table's read costs each version its own rows, not the
+/// whole table again.
+///
+/// DuckLake reads every registered `ducklake_inlined_data_<t>_<v>` on
+/// every scan of the base table, so a table evolved through V versions is
+/// read V times per statement. Each of those reads must haul only its own
+/// version's chunks: an unscoped scan turns V versions into V whole-table
+/// materializations, and the read cost grows with V twice over. Both
+/// tables live in one lake so commit depth — which prices every lookup —
+/// cancels out of the comparison.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn an_evolved_tables_read_hauls_each_version_once() {
+    let dir = TempDir::new("inline-version-cost");
+    let data_dir = TempDir::new("inline-version-cost-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    // The same twelve rows twice: `plain` under one schema version,
+    // `evolved` spread across thirteen, commits interleaved.
+    let setup: String = std::iter::once(
+        "CREATE TABLE lake.main.plain (i BIGINT);\nCREATE TABLE lake.main.evolved (i BIGINT);"
+            .to_string(),
+    )
+    .chain((1..=12).map(|row| {
+        format!(
+            "INSERT INTO lake.main.plain VALUES ({row});\n\
+             INSERT INTO lake.main.evolved (i) VALUES ({row});\n\
+             ALTER TABLE lake.main.evolved ADD COLUMN c{row} BIGINT;"
+        )
+    }))
+    .collect::<Vec<_>>()
+    .join("\n");
+    run_ducklake_sql(store, data_path, &setup);
+
+    // As in `deleting_one_inlined_row_costs_one_pass_over_the_table`: the
+    // counters belong to the attach, so each tally pair and the statement
+    // between them share one session.
+    let lookups = |table: &str| -> u64 {
+        let tally = "SELECT metadata_hits + metadata_misses + block_hits + block_misses \
+                       FROM moraine_cache_tally('lake');";
+        let rows = csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            &format!("{tally}\nSELECT count(i) FROM lake.main.{table};\n{tally}"),
+        ));
+        let read = |row: &Vec<String>| row[0].parse::<u64>().expect("a tally is a number");
+        read(rows.last().expect("a closing tally")) - read(rows.first().expect("an opening tally"))
+    };
+
+    let plain = lookups("plain");
+    let evolved = lookups("evolved");
+    let budget = plain * 8;
+    assert!(
+        evolved <= budget,
+        "the evolved table cost {evolved} lookups against a budget of {budget} (the plain one \
+         costs {plain}): each version's read is materializing the whole table instead of its \
+         own rows"
+    );
+}
