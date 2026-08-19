@@ -185,7 +185,7 @@ async fn start(db: &Db, unit: &MigrationUnit) -> Result<()> {
         tx.rollback();
         return Err(error);
     }
-    commit_durable(tx, "migration start")
+    commit_durable(db, tx, "migration start")
         .await
         .map_err(Error::from)?;
     Ok(())
@@ -213,7 +213,7 @@ async fn finish(db: &Db, unit: &MigrationUnit) -> Result<()> {
         return Err(Error::from(error));
     }
 
-    commit_durable(tx, "migration finish")
+    commit_durable(db, tx, "migration finish")
         .await
         .map_err(Error::from)?;
     Ok(())
@@ -255,7 +255,7 @@ async fn run_unit(db: &Db, unit: &MigrationUnit, resume: Option<Vec<u8>>) -> Res
             tx.rollback();
             return Err(error);
         }
-        commit_durable(tx, "migration step")
+        commit_durable(db, tx, "migration step")
             .await
             .map_err(Error::from)?;
         crash_seam(CrashPoint::AfterStep)?;

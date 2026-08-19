@@ -716,7 +716,7 @@ mod tests {
         for (value, row_id) in [(10_u128, 1_u64), (20, 2), (30, 3)] {
             tx.put(multi_key(7, value, row_id), []).unwrap();
         }
-        crate::transaction::commit::commit_durably(tx)
+        crate::transaction::commit::commit_durably(&db, tx)
             .await
             .unwrap();
 

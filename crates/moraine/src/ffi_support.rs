@@ -1156,7 +1156,7 @@ mod tests {
                     }),
                 )
                 .map_err(crate::error::Error::from)?;
-                commit::commit_durably(tx)
+                commit::commit_durably(db, tx)
                     .await
                     .map_err(crate::error::Error::from)
             })

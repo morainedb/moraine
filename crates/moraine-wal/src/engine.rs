@@ -8,9 +8,10 @@
 //!
 //! The log is written by committers racing conditional puts, never by the
 //! store: [`WalWriter::append`] refuses, so a store that plugs this in must
-//! run with SlateDB's own journaling off. Payload keys and values stay opaque
-//! here; the one place meaning could leak in — what a leader advert writes —
-//! is the embedder's [`AdvertProjection`].
+//! run with SlateDB's own journaling off. It may still write rows of its own —
+//! see [`slot_sequence`] for the numbers those take. Payload keys and values
+//! stay opaque here; the one place meaning could leak in — what a leader
+//! advert writes — is the embedder's [`AdvertProjection`].
 
 use std::{
     collections::BTreeMap,
@@ -35,6 +36,30 @@ use crate::{envelope::LeaderAdvert, error::Error, slot::SlotLog};
 /// How long a tail-following iterator waits before re-reading a log it has
 /// drained.
 const DEFAULT_TAIL_POLL: Duration = Duration::from_millis(100);
+
+/// The sequence number the log's first slot takes. SlateDB draws row sequence
+/// numbers from one space, so the log starts above whatever a store wrote
+/// before it adopted the log: that history stays ordered before every slot,
+/// and no ordinal lands underneath it. A store whose own writes have already
+/// reached this is refused rather than folded into a shadowed keyspace.
+const SEQUENCE_BASE: u64 = 1 << 32;
+
+/// How many sequence numbers each slot reserves. A store still writes some
+/// rows itself — whatever derived state its maintenance keeps — and those take
+/// the numbers between one slot and the next, so they order after every folded
+/// slot and before every unfolded one. Crossing into the next slot's number
+/// would make the fold skip that slot, which is why
+/// [`slot_sequence`] is public: a store writing directly must check its own
+/// writes against the ceiling.
+const SEQUENCE_STRIDE: u64 = 1 << 20;
+
+/// The row sequence number slot `ordinal` writes at. The numbers strictly
+/// between this and `slot_sequence(ordinal + 1)` belong to the store's own
+/// writes, and a store that exhausts them must fold before writing more.
+#[must_use]
+pub fn slot_sequence(ordinal: u64) -> u64 {
+    SEQUENCE_BASE.saturating_add(ordinal.saturating_mul(SEQUENCE_STRIDE))
+}
 
 /// What a slot's leader advert writes into the store, if the embedder folds
 /// adverts at all. The key and value are the embedder's; the advert is this
@@ -186,7 +211,7 @@ impl SlotWal {
                     Some(value) => ValueDeletable::Value(Bytes::from(value)),
                     None => ValueDeletable::Tombstone,
                 },
-                seq: sequence,
+                seq: slot_sequence(sequence),
                 create_ts: Some(read_at),
                 expire_ts: None,
             })
@@ -255,6 +280,19 @@ impl WriterInit for SlotWriterInit {
         manifest: &mut WriterManifest,
     ) -> Result<WriterInitResult, WalError> {
         let folded = manifest.replay_after_wal_id();
+
+        // Adoption is one-way: before the first fold the store's own rows must
+        // all sit below the log's first sequence, or folding would file every
+        // slot underneath them and the store would serve its own history over
+        // the log's.
+        let last_row = manifest.manifest().last_l0_seq();
+        if folded == 0 && last_row >= SEQUENCE_BASE {
+            return Err(WalError::DataError(Arc::new(Error::corruption(format!(
+                "the store has written {last_row} rows of its own, at or past the sequence \
+                 {SEQUENCE_BASE} the log's first slot takes; it cannot adopt this log"
+            )))));
+        }
+
         let end = match self.wal.replay_limit {
             Some(limit) => self
                 .wal
@@ -712,7 +750,11 @@ mod tests {
 
         let rows = wal.rows(7, &envelope);
         assert_eq!(rows.len(), 1, "one row per key");
-        assert_eq!(rows[0].seq, 7, "the slot's ordinal is the sequence number");
+        assert_eq!(
+            rows[0].seq,
+            slot_sequence(7),
+            "the slot's ordinal fixes the sequence number"
+        );
         assert_eq!(
             rows[0].value,
             ValueDeletable::Value(Bytes::from_static(b"second"))
@@ -906,15 +948,13 @@ mod tests {
             Err(WalError::DataError(_))
         ));
     }
-    /// A store whose WAL is the log must take no writes of its own. A direct
-    /// write advances SlateDB's sequence counter into the space slot ordinals
-    /// occupy, and the replay filter — which skips rows at or below the last
-    /// sequence L0 holds — then drops the slots underneath it. The fold is
-    /// silently short, which is why [`SlotWalWriter::append`] refuses and why
-    /// an embedder must route every store write through the log.
+    /// A store still writes some rows of its own, and the stride is what keeps
+    /// those from shadowing the log: they take the numbers between the slot
+    /// last folded and the next one, so a fold that follows them still lands,
+    /// and the writes stay visible over everything folded before them.
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
-    async fn a_store_that_writes_directly_loses_the_slots_below_its_own_sequences() {
+    async fn a_stores_own_writes_interleave_with_the_slots_it_folds() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let log = SlotLog::new(Arc::clone(&store), "");
         let wal = SlotWal::new(log.clone());
@@ -928,8 +968,7 @@ mod tests {
         db.flush().await.unwrap();
         db.close().await.unwrap();
 
-        // Commits then arrive through the log, at slots whose ordinals sit
-        // below the sequences those direct writes consumed.
+        // Commits then arrive through the log and fold over them.
         for sequence in 1..=3u64 {
             win(
                 &log,
@@ -939,14 +978,65 @@ mod tests {
             )
             .await;
         }
-
         let db = open_folder(&wal, "", Arc::clone(&store)).await;
-        let folded = db.get(b"orders").await.unwrap();
-        db.close().await.unwrap();
-        assert!(
-            folded.is_none(),
-            "the replay filter drops slots at or below L0's last sequence, so a store that \
-             writes directly cannot also fold the log"
+        assert_eq!(
+            db.get(b"orders").await.unwrap().unwrap().as_ref(),
+            b"committed",
+            "the fold lands over the store's own writes"
         );
+
+        // A write the store takes after that fold outranks what the fold
+        // applied, and the slot that follows outranks the write.
+        db.put(b"orders", b"maintenance").await.unwrap();
+        db.flush().await.unwrap();
+        assert_eq!(
+            db.get(b"orders").await.unwrap().unwrap().as_ref(),
+            b"maintenance"
+        );
+        db.close().await.unwrap();
+
+        win(&log, 4, 4, &[(b"orders", Some(b"later commit"))]).await;
+        let db = open_folder(&wal, "", store).await;
+        assert_eq!(
+            db.get(b"orders").await.unwrap().unwrap().as_ref(),
+            b"later commit",
+            "a slot folded after a direct write outranks it"
+        );
+        db.close().await.unwrap();
+    }
+
+    /// A store that has already written past the log's first sequence cannot
+    /// adopt it: folding would file every slot under its own history.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn a_store_past_the_first_sequence_cannot_adopt_the_log() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let log = SlotLog::new(Arc::clone(&store), "");
+        let wal = SlotWal::new(log.clone());
+
+        // A store whose own rows reach the log's first sequence: written with
+        // an explicit sequence number, since no test writes four billion rows.
+        let db = open_folder(&wal, "", Arc::clone(&store)).await;
+        db.write_with_options(
+            {
+                let mut batch = slatedb::WriteBatch::new();
+                batch.put(b"k", b"far along");
+                batch
+            },
+            &slatedb::config::WriteOptions {
+                seqnum: slot_sequence(1),
+            },
+        )
+        .await
+        .unwrap();
+        db.flush().await.unwrap();
+        db.close().await.unwrap();
+
+        let refused = Db::builder("", store)
+            .with_settings(folding_settings())
+            .with_wal_writer(wal.writer_init())
+            .build()
+            .await;
+        assert!(refused.is_err(), "adoption must be refused, not folded");
     }
 }

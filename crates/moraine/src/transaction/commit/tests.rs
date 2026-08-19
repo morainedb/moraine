@@ -140,7 +140,7 @@ async fn materialize_gate_refuses_on_marker() {
         }),
     )
     .unwrap();
-    commit_durably(tx).await.unwrap();
+    commit_durably(&db, tx).await.unwrap();
 
     let read = db.begin(IsolationLevel::Snapshot).await.unwrap();
     let err = refuse_mid_migration(ReadHandle::Tx(&read))
@@ -3170,7 +3170,7 @@ async fn drop_index_ends_definition_and_keeps_format() {
 }
 
 #[tokio::test]
-async fn multi_writer_bootstrap_stamps_format_four_and_fold_zero() {
+async fn multi_writer_bootstrap_stamps_format_four_and_folds_nothing() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
     let db = open_initialized(StoreBuilder::new("", object_store.clone()), false, None)
         .await
@@ -3180,9 +3180,45 @@ async fn multi_writer_bootstrap_stamps_format_four_and_fold_zero() {
         .await
         .unwrap()
         .unwrap();
-    let fold = read::read_fold(ReadHandle::Tx(&tx)).await.unwrap().unwrap();
     assert_eq!(format.format_version, 4);
-    assert_eq!(fold.folded_sequence, 0);
     tx.rollback();
+    db.close().await.unwrap();
+
+    // A bootstrapped store has folded no slot: its replay point is zero, so
+    // the whole log — empty here — is still ahead of it.
+    let reader = StoreBuilder::new("", object_store.clone())
+        .open_reader()
+        .await
+        .unwrap();
+    assert_eq!(crate::transaction::folder::reader_cursor(&reader), 0);
+    reader.close().await.unwrap();
+}
+
+/// A store write takes the numbers between the slot last folded and the next
+/// one. One that reaches the next slot's own number is refused: the fold would
+/// otherwise skip that slot as already covered, losing a committed slot with
+/// no error anywhere.
+#[tokio::test]
+async fn a_store_write_reaching_the_next_slots_sequence_is_refused() {
+    let db = open_initialized(
+        StoreBuilder::new("", Arc::new(InMemory::new())),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Nothing is folded, so slot 1 owns the ceiling and everything below it is
+    // the store's to use.
+    let inside =
+        slatedb::WriteHandle::new(moraine_wal::slot_sequence(1) - 1, 0, || async { Ok(()) });
+    assert!(refuse_a_write_past_the_next_slot(&db, &inside).is_ok());
+
+    let at_the_ceiling =
+        slatedb::WriteHandle::new(moraine_wal::slot_sequence(1), 0, || async { Ok(()) });
+    let err = refuse_a_write_past_the_next_slot(&db, &at_the_ceiling).unwrap_err();
+    assert_eq!(err.kind(), slatedb::ErrorKind::Invalid, "{err}");
+    assert!(err.to_string().contains("fold the log"), "{err}");
+
     db.close().await.unwrap();
 }

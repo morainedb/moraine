@@ -411,7 +411,7 @@ async fn ensure_secret(store: &SlotStore) -> Result<[u8; commit::SECRET_LEN]> {
             .map_err(Error::from)?;
             token
         };
-        commit::commit_durably(tx).await.map_err(Error::from)?;
+        commit::commit_durably(db, tx).await.map_err(Error::from)?;
         Ok(token)
     })
     .await;
@@ -459,9 +459,7 @@ fn token_bytes(value: &proto::SecretValue) -> Result<[u8; commit::SECRET_LEN]> {
 /// the serving leader's supersession monitor both read through it.
 pub(crate) async fn current_advert(store: &SlotStore) -> Result<Option<LeaderAdvert>> {
     let handle = ReadHandle::Reader(&store.reader);
-    let fold = read::read_fold(handle)
-        .await?
-        .map_or(0, |fold| fold.folded_sequence);
+    let fold = crate::transaction::folder::reader_cursor(&store.reader);
     let tail = store.slots.read_tail(fold.saturating_add(1)).await?;
     let freshest = tail
         .slots

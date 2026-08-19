@@ -1870,7 +1870,7 @@ impl Catalog {
             for (key, value) in &entries {
                 tx.put(key.clone(), value.clone()).map_err(Error::from)?;
             }
-            commit::commit_durably(tx).await.map_err(Error::from)?;
+            commit::commit_durably(db, tx).await.map_err(Error::from)?;
             Ok(())
         })
         .await
@@ -2339,7 +2339,7 @@ impl Catalog {
             };
             let (poisoned, writes) = index_maintenance::plan_index_entries(probe, &staged).await?;
             commit::stage_writes(&tx, &writes)?;
-            commit::commit_durably(tx).await.map_err(Error::from)?;
+            commit::commit_durably(db, tx).await.map_err(Error::from)?;
             Ok(!poisoned.is_empty())
         })
         .await;
@@ -2447,7 +2447,7 @@ impl Catalog {
                 .await
                 .map_err(Error::from)?;
             let deleted = index_maintenance::reclaim_entries(&tx, index.get(), limit).await?;
-            commit::commit_durably(tx).await.map_err(Error::from)?;
+            commit::commit_durably(db, tx).await.map_err(Error::from)?;
             Ok(deleted)
         })
         .await

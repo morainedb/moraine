@@ -1349,8 +1349,8 @@ async fn a_slot_that_landed_before_the_ack_is_durable_and_discoverable() {
 /// tail concurrently; each outcome is `Ok` or a typed `Fenced`, never anything
 /// else, and at least one advances the cursor. The folded state equals the
 /// pre-fold tail-replay state, and a fresh attach materializes it without
-/// corruption — proof `sys/fold` never ran past the last real slot, since an
-/// over-fold would surface as a replay corruption.
+/// corruption — proof the fold cursor never ran past the last real slot, since
+/// an over-fold would surface as a replay corruption.
 #[tokio::test(flavor = "multi_thread")]
 async fn duelling_folders_waste_but_never_corrupt() {
     let store = Arc::new(InMemory::new());
@@ -1587,20 +1587,20 @@ async fn a_destroyed_slot_fails_loudly() {
     let slots = SlotLog::new(store.clone() as Arc<dyn ObjectStore>, "");
     slots.delete_slot(2).await.unwrap();
 
-    let fresh = open_multi_writer(&store).await;
-    let err = fresh.snapshot().await.unwrap_err();
+    // The store reads the log as its own write-ahead log, so the hole stops
+    // the attach itself: nothing serves a prefix that hides a committed slot,
+    // and no commit can re-win the destroyed sequence.
+    let err = Catalog::open(
+        store.clone() as Arc<dyn ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, Error::Corruption(_)), "{err:?}");
     assert!(
         err.to_string().contains("slot 2"),
         "names the destroyed sequence: {err}"
     );
-
-    // No fresh commit re-wins the hole: the commit premise hits the same hole.
-    let err = fresh
-        .commit(|tx| tx.create_schema("four").map(|_| ()))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::Corruption(_)), "{err:?}");
 }
 
 /// A substituted slot fails loudly. Overwriting slot 2 with slot 3's bytes,

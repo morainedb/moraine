@@ -149,6 +149,10 @@ impl From<moraine_wal::Error> for Error {
 pub(crate) const MANIFEST_VERSION_EXISTS: &str =
     "transactional object (e.g. manifest) version already exists";
 
+/// The marker SlateDB's message carries when a data error came from the
+/// write-ahead log rather than from the store's own objects.
+const WAL_DATA_ERROR: &str = "wal data error";
+
 impl From<slatedb::Error> for Error {
     fn from(err: slatedb::Error) -> Self {
         // Every store error crosses here, so this is the one place fencing
@@ -171,6 +175,14 @@ impl From<slatedb::Error> for Error {
                  nothing was written — open again to adopt the store it created"
                     .to_string(),
             );
+        }
+
+        // Damage the store reports against its write-ahead log is damage to
+        // the commit-slot log, which the store reads as one — a destroyed slot
+        // arrives here. Other data errors are the store's own and stay store
+        // errors; a missing manifest is how an uninitialized store reads.
+        if err.kind() == slatedb::ErrorKind::Data && err.to_string().contains(WAL_DATA_ERROR) {
+            return Self::Corruption(err.to_string());
         }
 
         Self::Store(Box::new(err))

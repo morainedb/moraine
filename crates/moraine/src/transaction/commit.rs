@@ -61,17 +61,49 @@ pub(crate) fn now_micros() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
-/// Commits `tx` and waits for the batch to reach object storage. An empty
-/// transaction writes nothing, so it has nothing to wait on.
+/// Commits `tx` into `db` and flushes, which is what makes the write durable:
+/// the store journals nothing of its own — the slot log is its journal — so a
+/// batch sits in the memtable until a flush lands it in an L0 SST. An empty
+/// transaction writes nothing, so it has nothing to flush.
 pub(crate) async fn commit_durably(
+    db: &Db,
     tx: DbTransaction,
 ) -> std::result::Result<Option<WriteHandle>, slatedb::Error> {
     let handle = tx.commit().await?;
-    if let Some(handle) = &handle {
-        handle.await_durable().await?;
+    let Some(handle) = handle else {
+        return Ok(None);
+    };
+    db.flush().await?;
+    refuse_a_write_past_the_next_slot(db, &handle)?;
+
+    Ok(Some(handle))
+}
+
+/// Refuses a store write that has run into the sequence number the next
+/// unfolded slot will take.
+///
+/// The store's own writes share a sequence space with the log's slots and take
+/// the numbers between the slot last folded and the one after it, so they
+/// order after everything folded and before everything still to fold. Writing
+/// past that ceiling would put a store write at a slot's own number, and the
+/// fold would then skip that slot as already covered. The interval is a
+/// million writes wide, so reaching it means a session wrote without ever
+/// folding; the fix is to fold, not to widen it.
+fn refuse_a_write_past_the_next_slot(
+    db: &Db,
+    handle: &WriteHandle,
+) -> std::result::Result<(), slatedb::Error> {
+    let folded = db.status().current_manifest.replay_after_wal_id();
+    let ceiling = moraine_wal::slot_sequence(folded.saturating_add(1));
+    if handle.seqnum() >= ceiling {
+        return Err(slatedb::Error::invalid(format!(
+            "this store write took sequence {}, at or past the {ceiling} the slot after the \
+             fold cursor {folded} will take; fold the log before writing more",
+            handle.seqnum()
+        )));
     }
 
-    Ok(handle)
+    Ok(())
 }
 
 /// The width of the store-held forwarding token.
@@ -141,10 +173,6 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>)
             format_version: FORMAT_MULTI_WRITER,
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
         }),
-    )?;
-    stage(
-        Key::Sys(SysKey::Fold),
-        value::encode_value(&moraine_wal::FoldValue { folded_sequence: 0 }),
     )?;
     stage(
         Key::Sys(SysKey::Secret),
@@ -242,7 +270,7 @@ pub(crate) async fn open_initialized(
         return Err(err);
     }
 
-    match commit_durably(tx).await {
+    match commit_durably(&db, tx).await {
         Ok(_) => {
             // Once per store, ever: the commit that created the catalog.
             info!(encrypted, data_path, "bootstrapped a fresh catalog store");
@@ -301,10 +329,9 @@ pub(crate) async fn migrate_to_slot_log(store: StoreBuilder<'_>) -> Result<()> {
     }
 }
 
-/// Stamps the slot-log format and fold cursor through the fenced writer, in one
-/// `WriteBatch` — a crash between the two would leave a half-migrated store, so
-/// they must land together. Re-reads the format under the fence, so a store a
-/// racing migration already converted stamps nothing.
+/// Stamps the slot-log format through the fenced writer. Re-reads the format
+/// under the fence, so a store a racing migration already converted stamps
+/// nothing.
 async fn migrate_stamp(db: &Db) -> Result<()> {
     let tx = db
         .begin(IsolationLevel::Snapshot)
@@ -336,18 +363,12 @@ async fn migrate_stamp(db: &Db) -> Result<()> {
             format_version: FORMAT_MULTI_WRITER,
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
         }),
-    )
-    .and_then(|()| {
-        stamp(
-            Key::Sys(SysKey::Fold),
-            value::encode_value(&moraine_wal::FoldValue { folded_sequence: 0 }),
-        )
-    }) {
+    ) {
         tx.rollback();
         return Err(err);
     }
 
-    match commit_durably(tx).await {
+    match commit_durably(db, tx).await {
         Ok(_) => {
             warn!(
                 from_format,
@@ -442,6 +463,7 @@ const STALL_INTERVAL: Duration = Duration::from_secs(10);
 /// caller re-driving it would apply it twice. A stall that says so in the
 /// log is the half of that trade worth having.
 pub(crate) async fn commit_durable(
+    db: &Db,
     tx: DbTransaction,
     operation: &'static str,
 ) -> std::result::Result<Option<WriteHandle>, slatedb::Error> {
@@ -449,7 +471,7 @@ pub(crate) async fn commit_durable(
         return Ok(None);
     };
 
-    let mut durable = Box::pin(handle.await_durable());
+    let mut durable = Box::pin(db.flush());
     let mut waited = Duration::ZERO;
     loop {
         if let Ok(outcome) = tokio::time::timeout(STALL_INTERVAL, &mut durable).await {

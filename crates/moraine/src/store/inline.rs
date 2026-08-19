@@ -320,7 +320,7 @@ mod tests {
         )
         .unwrap();
 
-        crate::transaction::commit::commit_durably(tx)
+        crate::transaction::commit::commit_durably(&db, tx)
             .await
             .unwrap();
 
@@ -455,7 +455,7 @@ mod tests {
             )
             .unwrap();
         }
-        crate::transaction::commit::commit_durably(tx)
+        crate::transaction::commit::commit_durably(&db, tx)
             .await
             .unwrap();
 

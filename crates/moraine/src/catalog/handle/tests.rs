@@ -25,16 +25,12 @@ async fn stored_format_and_fold(object_store: &Arc<dyn ObjectStore>) -> (u64, u6
         .open_reader()
         .await
         .unwrap();
-    let handle = ReadHandle::Reader(&reader);
-    let format = read::read_format(handle)
+    let format = read::read_format(ReadHandle::Reader(&reader))
         .await
         .unwrap()
         .unwrap()
         .format_version;
-    let fold = read::read_fold(handle)
-        .await
-        .unwrap()
-        .map_or(0, |fold| fold.folded_sequence);
+    let fold = crate::transaction::folder::reader_cursor(&reader);
     reader.close().await.unwrap();
     (format, fold)
 }
@@ -63,7 +59,6 @@ async fn legacy_store_with_schema(object_store: Arc<dyn ObjectStore>) {
         }),
     )
     .unwrap();
-    tx.delete(Key::Sys(SysKey::Fold).encode()).unwrap();
     tx.put(
         Key::Snapshot { snapshot_id: 1 }.encode(),
         value::encode_value(&proto::SnapshotValue {
@@ -103,7 +98,7 @@ async fn legacy_store_with_schema(object_store: Arc<dyn ObjectStore>) {
         }),
     )
     .unwrap();
-    commit::commit_durably(tx).await.unwrap();
+    commit::commit_durably(&db, tx).await.unwrap();
     db.close().await.unwrap();
 }
 
@@ -277,7 +272,7 @@ async fn migration_fences_a_live_legacy_writer_with_a_typed_error() {
                 batch_seq: 0,
             }),
         )?;
-        commit::commit_durably(tx).await?;
+        commit::commit_durably(&incumbent, tx).await?;
         Ok(())
     }
     .await;
@@ -325,7 +320,7 @@ async fn seed_orphaned_entries(object_store: &Arc<dyn ObjectStore>, index_id: u6
         .encode();
         tx.put(key, Vec::new()).unwrap();
     }
-    commit::commit_durably(tx).await.unwrap();
+    commit::commit_durably(&db, tx).await.unwrap();
     db.close().await.unwrap();
 }
 

@@ -8,6 +8,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use moraine_wal::{SlotLog, SlotWal};
 use object_store::ObjectStore;
 use slatedb::{
     Db, DbReader, DbReaderMode,
@@ -22,11 +23,13 @@ use uuid::Uuid;
 use crate::{
     catalog::CachePreload,
     error::{Error, Result},
-    store::segment::TagSegmentExtractor,
+    store::{
+        key::{Key, SysKey},
+        proto::LeaderValue,
+        segment::TagSegmentExtractor,
+        value,
+    },
 };
-
-/// The default WAL flush cadence when none is configured.
-const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The default reader manifest-poll cadence when none is configured. A reader
 /// following the log lags the head by up to this interval.
@@ -72,14 +75,14 @@ pub(crate) fn preload_shortfall(store_bytes: u64, cache_size: Option<u64>) -> Op
 /// Opens a moraine store on `object_store` — a read-write [`Db`] via
 /// [`open_writer`](Self::open_writer) or a read-only [`DbReader`] via
 /// [`open_reader`](Self::open_reader) — carrying the shared open
-/// configuration: the WAL flush cadence (writer only), the reader
-/// manifest-poll cadence (reader only), and the on-disk object cache.
+/// configuration: the reader manifest-poll cadence (reader only), the
+/// on-disk object cache, and the commit-slot log every store plugs in as
+/// its write-ahead log.
 pub(crate) struct StoreBuilder<'a> {
     path: &'a str,
     object_store: Arc<dyn ObjectStore>,
-    flush_interval: Duration,
     refresh_interval: Duration,
-    wal_enabled: bool,
+    replay_limit: Option<u64>,
     cache_dir: Option<PathBuf>,
     cache_size: Option<u64>,
     cache_preload: Option<CachePreload>,
@@ -89,14 +92,13 @@ pub(crate) struct StoreBuilder<'a> {
 
 impl<'a> StoreBuilder<'a> {
     /// A builder for the store at `path` on `object_store`, with the default
-    /// flush and refresh cadences and no on-disk object cache.
+    /// refresh cadence and no on-disk object cache.
     pub(crate) fn new(path: &'a str, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             path,
             object_store,
-            flush_interval: DEFAULT_FLUSH_INTERVAL,
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
-            wal_enabled: true,
+            replay_limit: None,
             cache_dir: None,
             cache_size: None,
             cache_preload: None,
@@ -105,15 +107,30 @@ impl<'a> StoreBuilder<'a> {
         }
     }
 
-    /// Sets the WAL flush cadence. Durable commits wait for the next flush,
-    /// so this bounds per-commit latency; smaller values mean more frequent
-    /// (on S3, costlier) object-store PUTs. Zero flushes continuously (no
-    /// timer), so a durable commit waits only on the object-store PUT — the
-    /// lowest latency, at the cost of a busy flush loop. Writer only — a
-    /// reader never flushes.
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub(crate) fn flush_interval(mut self, flush_interval: Duration) -> Self {
-        self.flush_interval = flush_interval;
+    /// The slot log this store's writes ride, plugged in as its write-ahead
+    /// log: opening the writer replays the slots past the store's fold cursor,
+    /// and a reader replays them for itself. A slot's leader advert folds into
+    /// `sys/leader`, so an announcement outlives the slot that carried it.
+    fn wal(&self) -> SlotWal {
+        SlotWal::new(SlotLog::new(Arc::clone(&self.object_store), self.path))
+            .with_replay_limit(self.replay_limit)
+            .with_advert_projection(Arc::new(|advert: &moraine_wal::LeaderAdvert| {
+                Some((
+                    Key::Sys(SysKey::Leader).encode(),
+                    value::encode_value(&LeaderValue {
+                        instance: advert.instance.to_vec(),
+                        endpoint: advert.endpoint.clone(),
+                    }),
+                ))
+            }))
+    }
+
+    /// Bounds how many slots this open's replay folds, so a bounded fold
+    /// sprint advances the store's cursor by at most `limit` and the next open
+    /// resumes where it stopped. `None` (the default) replays the whole tail.
+    /// Writer only — a reader always follows the log to its end.
+    pub(crate) fn replay_limit(mut self, limit: Option<u64>) -> Self {
+        self.replay_limit = limit;
         self
     }
 
@@ -123,17 +140,6 @@ impl<'a> StoreBuilder<'a> {
     /// for less fold lag. Reader only — a writer follows its own cadence.
     pub(crate) fn refresh_interval(mut self, refresh_interval: Duration) -> Self {
         self.refresh_interval = refresh_interval;
-        self
-    }
-
-    /// Enables or disables SlateDB's write-ahead log for this writer. Disabling
-    /// it writes straight into the memtable, so durability arrives only at an
-    /// L0 flush — a caller that disables the WAL must force [`Db::flush`]
-    /// before close, since no WAL and a size-triggered flush that rarely
-    /// fires leave nothing else to make writes durable. Writer only; a
-    /// reader never writes.
-    pub(crate) fn wal_enabled(mut self, wal_enabled: bool) -> Self {
-        self.wal_enabled = wal_enabled;
         self
     }
 
@@ -189,12 +195,17 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// Opens (or creates) the store as a read-write [`Db`].
+    /// Opens (or creates) the store as a read-write [`Db`], folding the slot
+    /// log as it opens: the replay past the store's cursor *is* the fold, and
+    /// [`Db::flush`] is what makes it durable. The store journals nothing of
+    /// its own — the log is the journal — so every write a session takes is
+    /// durable only once it flushes.
     pub(crate) async fn open_writer(&self) -> Result<Db> {
         let settings = self.settings();
         Db::builder(self.path, Arc::clone(&self.object_store))
             .with_settings(settings)
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
+            .with_wal_writer(self.wal().writer_init())
             .build()
             .await
             .map_err(Error::from)
@@ -212,6 +223,7 @@ impl<'a> StoreBuilder<'a> {
         let options = self.reader_options();
         let mut builder = DbReader::builder(self.path, Arc::clone(&self.object_store))
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
+            .with_wal_reader(self.wal().reader())
             .with_options(options);
         if let Some(checkpoint) = self.checkpoint {
             builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
@@ -237,8 +249,10 @@ impl<'a> StoreBuilder<'a> {
     /// checkpoint does.
     pub(crate) async fn open_reader_at(self, checkpoint_id: Uuid) -> Result<DbReader> {
         let options = self.reader_options();
+        let wal = self.wal();
         DbReader::builder(self.path, self.object_store)
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
+            .with_wal_reader(wal.reader())
             .with_options(options)
             .with_reader_mode(DbReaderMode::Checkpoint(checkpoint_id))
             .build()
@@ -273,13 +287,13 @@ impl<'a> StoreBuilder<'a> {
         Ok(checkpoints.into_iter().map(|c| c.id).collect())
     }
 
-    /// SlateDB settings for a writer. A zero flush interval flushes
-    /// continuously rather than on a timer: durable commits then wait only
-    /// on the object-store PUT, at the cost of a busy flush loop.
+    /// SlateDB settings for a writer. The store's own journaling stays off:
+    /// the slot log is the journal, so journaling a fold again would double
+    /// every logged byte, and a write the store takes directly is durable at
+    /// its flush.
     fn settings(&self) -> Settings {
         Settings {
-            flush_interval: Some(self.flush_interval),
-            wal_enabled: self.wal_enabled,
+            wal_enabled: false,
             object_store_cache_options: self.cache_options(),
             ..Default::default()
         }
@@ -341,7 +355,7 @@ mod tests {
         tx.put(&head, b"head").unwrap();
         tx.put(&snapshot, b"snap").unwrap();
         tx.put(&table, b"table").unwrap();
-        crate::transaction::commit::commit_durably(tx)
+        crate::transaction::commit::commit_durably(&db, tx)
             .await
             .unwrap();
 
@@ -363,40 +377,6 @@ mod tests {
         let entry = iter.next().await.unwrap().unwrap();
         assert_eq!(entry.key.as_ref(), snapshot.as_slice());
         assert!(iter.next().await.unwrap().is_none());
-
-        db.close().await.unwrap();
-    }
-
-    /// A zero flush interval is allowed: SlateDB flushes continuously
-    /// rather than on a timer, so the store opens and a durable write lands.
-    #[tokio::test]
-    async fn zero_flush_interval_opens_a_working_store() {
-        let db = StoreBuilder::new("test/store", memory_store())
-            .flush_interval(Duration::ZERO)
-            .open_writer()
-            .await
-            .unwrap();
-
-        let head = Key::Sys(SysKey::Head).encode();
-        db.put(&head, b"head").await.unwrap();
-        assert_eq!(db.get(&head).await.unwrap().unwrap().as_ref(), b"head");
-
-        db.close().await.unwrap();
-    }
-
-    /// An explicit flush interval reaches the SlateDB builder: the store
-    /// opens, and a durable commit still lands.
-    #[tokio::test]
-    async fn explicit_flush_interval_opens_a_working_store() {
-        let db = StoreBuilder::new("test/store", memory_store())
-            .flush_interval(Duration::from_millis(1))
-            .open_writer()
-            .await
-            .unwrap();
-
-        let head = Key::Sys(SysKey::Head).encode();
-        db.put(&head, b"head").await.unwrap();
-        assert_eq!(db.get(&head).await.unwrap().unwrap().as_ref(), b"head");
 
         db.close().await.unwrap();
     }
@@ -430,7 +410,6 @@ mod tests {
 
         let head = Key::Sys(SysKey::Head).encode();
         let db = StoreBuilder::new("s", object_store.clone())
-            .flush_interval(Duration::from_millis(1))
             .cache_dir(Some(cache.clone()))
             .open_writer()
             .await
@@ -542,7 +521,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
 
         let db = StoreBuilder::new("s", Arc::clone(&object_store))
-            .flush_interval(Duration::from_millis(1))
             .open_writer()
             .await
             .unwrap();
@@ -608,7 +586,6 @@ mod tests {
         for (tag, cache_puts) in [("off", false), ("on", true)] {
             let cache = root.join(tag);
             let db = StoreBuilder::new(tag, Arc::clone(&object_store))
-                .flush_interval(Duration::from_millis(1))
                 .cache_dir(Some(cache.clone()))
                 .cache_puts(cache_puts)
                 .open_writer()

@@ -65,7 +65,7 @@ async fn seeded_store() -> Arc<InMemory> {
         )
         .unwrap();
     }
-    commit_durably(tx).await.unwrap();
+    commit_durably(&db, tx).await.unwrap();
     db.close().await.unwrap();
 
     object_store

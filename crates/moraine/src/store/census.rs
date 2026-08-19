@@ -345,9 +345,10 @@ mod tests {
         assert!(census.segment(&[]).is_none(), "{census:?}");
     }
 
-    /// The census reads the manifest, so a write still in the write-ahead
-    /// log is not in it. Anyone reading a census against a busy writer is
-    /// reading what has been written out, not what has been accepted.
+    /// The census reads the manifest, so a write the store has accepted but
+    /// not yet flushed is not in it. Anyone reading a census against a busy
+    /// writer is reading what has been written out, not what has been
+    /// accepted.
     #[tokio::test]
     async fn manifest_census_omits_unflushed_writes() {
         let store = memory_store();
@@ -362,7 +363,6 @@ mod tests {
             b"schema".as_slice(),
         );
         db.write(batch).await.unwrap();
-        db.flush().await.unwrap();
 
         let census = read_manifest_census("census/unflushed", store)
             .await

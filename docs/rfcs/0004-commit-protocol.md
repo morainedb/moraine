@@ -75,7 +75,7 @@ Non-goals:
 ## Background
 
 RFC 0002 established the keyspace: `sys/head` holds the latest committed
-`snapshot_id` (as folded; RFC 0022 adds `sys/fold` and a tail past it);
+`snapshot_id` (as folded; RFC 0022 adds a tail past the store's replay point);
 the `snapshot` subspace is append-only snapshot records; `current` and
 `history` split live from ended entity versions.
 
@@ -132,7 +132,7 @@ they are the other operations that must write the store directly.
 Readers open the store through SlateDB's `DbReader` — a handle that
 follows the manifest, never becomes a writer, and never participates in
 fencing (only `Db::open` and the compactor bump manifest epochs) — plus a
-tail replay past `sys/fold` for slots the folder has not yet applied
+tail replay past the store's replay point for slots no fold has applied
 (RFC 0022). There is no bound on their number, and unlike commits, reading
 never required a single owner.
 
@@ -183,7 +183,7 @@ operation and rides the same machinery. On open, the catalog reads
   that check from format v1).
 - **Absent (empty store)** → bootstrap: stage one atomic batch writing
   `sys/format` (format version 4 plus the writing moraine version),
-  `sys/fold` → `0`, snapshot `0` (empty catalog: no entities, counters at
+  snapshot `0` (empty catalog: no entities, counters at
   their initial values so the first allocation yields id 0, `schema_version`
   0, empty `changes_made`), and `sys/head` → `0`, then write it directly as
   one atomic batch. Genesis is folder-role work (RFC 0022): it precedes the
@@ -209,7 +209,7 @@ A commit takes a set of staged catalog mutations (entity inserts, entity
 ends, inlined writes) and lands them atomically:
 
 1. **Materialize the head.** The current view is `DbReader` state plus tail
-   replay past `sys/fold` (RFC 0022) — reading through it gives snapshot id
+   replay past the store's replay point (RFC 0022) — reading through it gives snapshot id
    `N`, the snapshot `N` record for the global counters, and the `tstat`
    records for any tables this commit inserts rows into. This is a read,
    not a lock; RFC 0022's continuity check is what later proves the view
@@ -725,7 +725,7 @@ their guard, and a data-only re-drive lands a second time (RFC 0011,
 Step 4 makes a commit **durable** the instant the slot PUT is acked
 (RFC 0022), and durability and visibility are the same event: nothing
 mediates between them. Every reader resolves the head as `DbReader` state
-plus tail replay past `sys/fold` (RFC 0022), and the tail is read fresh
+plus tail replay past the store's replay point (RFC 0022), and the tail is read fresh
 from the bucket on every materialization: there is no manifest poll
 interval standing between an acked slot and a reader observing it, because
 no process's flush timer sits in the freshness path. A reader that opened
@@ -742,7 +742,7 @@ head in memory and reads its own writes. It matters most at the boundary
 where another process must observe a
 just-returned commit: read-your-writes across processes, and folder
 takeover, where a successor folder resumes tailing from exactly the
-predecessor's `sys/fold` cursor.
+predecessor's fold cursor.
 
 ### Test obligations
 

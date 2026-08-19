@@ -17,7 +17,13 @@ use tracing::warn;
 use crate::{
     catalog::{CatalogSnapshot, Contention, SlotStore},
     error::{Error, Result},
-    store::{handle::ReadHandle, open::StoreBuilder, read},
+    store::{
+        handle::ReadHandle,
+        key::{Key, SysKey},
+        open::StoreBuilder,
+        proto::HeadValue,
+        read, value,
+    },
     transaction::{
         commit::{self, StagedWrite, fold},
         operations::{ChangeSet, conflicts},
@@ -426,9 +432,17 @@ pub(crate) async fn materialize_slot_view_at(
 ) -> Result<CatalogSnapshot> {
     let handle = ReadHandle::Reader(&store.reader);
     // The head pointer routes between two reads that each establish their own
-    // consistency, so it needs no cursor read before it. A head read stale low
-    // routes to the replay, which resolves the target below.
-    if snapshot <= folded_head(handle).await? {
+    // consistency. A reader that has taken the whole log answers by itself: its
+    // view holds every commit, including one whose record is backdated to at or
+    // below the target. A reader short of the log's end cannot, however high its
+    // head reads, so it routes to the replay below.
+    let cursor = crate::transaction::folder::reader_cursor(&store.reader);
+    let tail = store.slots.tail_extent(cursor.saturating_add(1)).await?;
+    let reader_holds_the_log = tail.gap_at.is_none()
+        && tail
+            .last
+            .is_none_or(|end| crate::transaction::folder::reader_reached(&store.reader, end));
+    if reader_holds_the_log && snapshot <= folded_head(handle).await? {
         return commit::materialize(handle, Some(snapshot)).await;
     }
 
@@ -499,7 +513,7 @@ async fn resolve_outcome(
         return Ok(Some(snapshot_id));
     }
 
-    let fold = fold_cursor(handle).await?;
+    let fold = crate::transaction::folder::reader_cursor(reader);
     match slots
         .find_transaction(fold.saturating_add(1), transaction_id)
         .await?
@@ -550,7 +564,8 @@ async fn slot_head(store: &SlotStore, until: Option<u64>, fresh: bool) -> Result
     if store.pinned {
         let handle = ReadHandle::Reader(&store.reader);
         let view = commit::materialize(handle, None).await?;
-        let next_sequence = fold_cursor(handle).await?.saturating_add(1);
+        let next_sequence =
+            crate::transaction::folder::reader_cursor(&store.reader).saturating_add(1);
         return Ok(SlotHead {
             view,
             overlay: Overlay::default(),
@@ -610,7 +625,7 @@ async fn replay(reader: &DbReader, slots: &SlotLog, until: Option<u64>) -> Resul
     // land between the two reads: a cursor stale against fresher data replays
     // slots the admission rule below skips, while a cursor ahead of the data
     // would drop the slots between them and serve a gapped catalog.
-    let folded = fold_cursor(handle).await?;
+    let folded = crate::transaction::folder::reader_cursor(reader);
     let mut view = commit::materialize(handle, None).await?;
 
     // A fold cursor of `n` means slots `1..=n` are applied, so the tail starts
@@ -628,8 +643,25 @@ async fn replay(reader: &DbReader, slots: &SlotLog, until: Option<u64>) -> Resul
     // commit that applies, one that does not is a broken chain, not a fold this
     // cursor had not caught up to.
     let mut applied = false;
+    // The head each commit in the tail leaves behind, checked slot by slot: the
+    // next commit must have been validated against exactly that. A slot whose
+    // commit was validated against anything else was substituted or reordered,
+    // which the view cannot reveal — it already reflects the tail the reader
+    // replayed for itself.
+    let mut chain: Option<u64> = None;
     'tail: for (sequence, envelope) in &tail.slots {
         for commit in &envelope.commits {
+            if let Some(expected) = chain
+                && commit.payload.validated_head != expected
+            {
+                return Err(Error::Corruption(format!(
+                    "slot {sequence} was validated against snapshot {} where the slot before it \
+                     leaves {expected}; its commit does not chain onto the one before it",
+                    commit.payload.validated_head
+                )));
+            }
+            chain = Some(committed_head(commit)?.unwrap_or(commit.payload.validated_head));
+
             if until.is_some_and(|target| view.snapshot.snapshot_id >= target) {
                 break 'tail;
             }
@@ -660,7 +692,24 @@ async fn replay(reader: &DbReader, slots: &SlotLog, until: Option<u64>) -> Resul
     })))
 }
 
+/// The head a commit leaves behind, read from its own `sys/head` write.
+/// `None` when it writes no head — a commit that changes state without minting
+/// a snapshot leaves the head where it found it.
+fn committed_head(commit: &Commit) -> Result<Option<u64>> {
+    let head_key = Key::Sys(SysKey::Head).encode();
+    commit
+        .payload
+        .writes
+        .iter()
+        .rev()
+        .find(|write| write.key == head_key)
+        .and_then(|write| write.value.as_ref())
+        .map(|bytes| Ok(value::decode_value::<HeadValue>(bytes)?.snapshot_id))
+        .transpose()
+}
+
 /// Whether one commit's writes belong on the replaying view.
+#[derive(Debug)]
 enum Admission {
     /// The commit staged against exactly this head.
     Apply,
@@ -746,18 +795,8 @@ fn classify_lost_race(ours: Option<&ChangeSet>, winner: &Envelope) -> Race {
 /// read failure reports 0 rather than failing the commit it only narrates, and
 /// a lagged reader over-reports the tail, which is safe for a warning signal.
 pub(super) async fn unfolded_tail_at(store: &SlotStore, next_sequence: u64) -> u64 {
-    let folded = fold_cursor(ReadHandle::Reader(&store.reader))
-        .await
-        .unwrap_or(0);
+    let folded = crate::transaction::folder::reader_cursor(&store.reader);
     next_sequence.saturating_sub(folded.saturating_add(1))
-}
-
-/// The fold cursor; absent reads as 0, since a store with no cursor has no
-/// folded slots.
-async fn fold_cursor(handle: ReadHandle<'_>) -> Result<u64> {
-    Ok(read::read_fold(handle)
-        .await?
-        .map_or(0, |fold| fold.folded_sequence))
 }
 
 /// The head snapshot id the folded store carries.
@@ -1077,33 +1116,29 @@ mod tests {
         assert!(err.to_string().contains("slot 2"), "{err}");
     }
 
-    /// The legitimate `less` case the skip rule exists for: slot 1 is folded
-    /// into the store while the cursor lags at 0, so replay re-reads it, finds
-    /// it already reflected, and skips it — then applies slot 2. No commit has
-    /// applied when the skip happens, so the latch does not fire.
-    #[tokio::test]
-    async fn a_slot_already_folded_under_a_lagging_cursor_is_skipped() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = bootstrap(Arc::clone(&object_store)).await;
-        let first = schema_slot(1, 1, "sales", 0);
-        store.slots.put_slot(1, &first).await.unwrap();
-        store
-            .slots
-            .put_slot(2, &schema_slot(2, 2, "staging", 1))
-            .await
-            .unwrap();
+    /// The legitimate `less` case the skip rule exists for: a commit already
+    /// reflected in the view is skipped rather than applied twice, while one
+    /// staged against the view's own head applies and one staged above it is
+    /// damage. The store's writes and its cursor now advance as one manifest,
+    /// so the lagging cursor this rule guards against is a reader's, and the
+    /// rule is pinned here rather than staged through a store.
+    #[test]
+    fn a_commit_already_reflected_in_the_view_is_skipped() {
+        let view = view_at_head(2);
 
-        // Slot 1's writes are in the store, but the cursor still reads 0, so
-        // replay starts at slot 1 and must skip it rather than re-apply.
-        fold_through(&object_store, &store.options, &first, 0).await;
+        let folded = commit_validated_against(1);
+        assert!(matches!(admit(&view, &folded, 5).unwrap(), Admission::Skip));
 
-        let store = reopen(store, &object_store).await;
-        let head = materialize_slot_head(&store).await.unwrap();
+        let current = commit_validated_against(2);
+        assert!(matches!(
+            admit(&view, &current, 5).unwrap(),
+            Admission::Apply
+        ));
 
-        assert_eq!(head.view.current_snapshot().id, SnapshotId::new(2));
-        assert!(head.view.schema_by_name("sales").is_some());
-        assert!(head.view.schema_by_name("staging").is_some());
-        assert_eq!(head.next_sequence, 3);
+        let ahead = commit_validated_against(3);
+        let err = admit(&view, &ahead, 5).unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)), "{err}");
+        assert!(err.to_string().contains("slot 5"), "{err}");
     }
 
     /// A well-chained multi-commit envelope replays commit by commit to
@@ -1192,7 +1227,7 @@ mod tests {
 
         // A peer folds slot 1 into the store, advances the cursor, and
         // truncates the slot it no longer needs.
-        fold_through(&object_store, &store.options, &first, 1).await;
+        fold_more(&object_store, &store.options, 1).await;
         store.slots.truncate_through(1).await.unwrap();
 
         // Whether or not this handle's reader has caught up, the head is the
@@ -1205,10 +1240,10 @@ mod tests {
         assert_eq!(head.next_sequence, 3);
     }
 
-    /// After a hole retry the head carries the reader its view came from, so a
-    /// probe scanning entries through it sees the writes the truncated slots
-    /// left — reads through the handle's stale reader would miss them, and the
-    /// view would claim rows the probe cannot find.
+    /// A handle whose reader was open before a peer folded and truncated still
+    /// materializes the head those slots reached, and the head's own probe
+    /// handle reads the records they left in the store — whether the reader
+    /// caught up on its own or the materialization adopted a fresh one.
     #[tokio::test]
     async fn the_head_reader_travels_past_a_truncation() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1228,28 +1263,20 @@ mod tests {
         // A peer folds slots 1..=3 into the store, advancing the cursor, then
         // truncates them. This handle's reader still sees the bootstrap
         // manifest — cursor 0, none of those writes.
-        for (offset, slot) in slots[..3].iter().enumerate() {
-            let through = offset as u64 + 1;
-            fold_through(&object_store, &store.options, slot, through).await;
-        }
+        fold_more(&object_store, &store.options, 3).await;
         store.slots.truncate_through(3).await.unwrap();
 
         let head = materialize_slot_head(&store).await.unwrap();
-        assert!(head.reader.is_some(), "a hole retry adopts a fresh reader");
         assert_eq!(head.view.current_snapshot().id, SnapshotId::new(4));
         assert!(head.view.schema_by_name("sales").is_some());
 
-        // The record slot 1 wrote is now in the store but not in this handle's
-        // stale reader. A probe must read it through the head's own reader.
+        // A probe reads through the head's own handle, which is the reader the
+        // view came from rather than whichever one the caller holds.
         let sales_key = Key::current(EntityKey::Schema { schema_id: 1 }).encode();
-        let stale = ReadHandle::Reader(&store.reader);
+        let handle = ReadHandle::Reader(&store.reader);
         assert!(
-            head.handle(stale).get(&sales_key).await.unwrap().is_some(),
-            "the head's reader sees the folded record"
-        );
-        assert!(
-            stale.get(&sales_key).await.unwrap().is_none(),
-            "the handle's reader is stale and would skew the probe"
+            head.handle(handle).get(&sales_key).await.unwrap().is_some(),
+            "the head's handle sees the folded record"
         );
 
         release_reader(head.reader.as_ref()).await;
@@ -1347,7 +1374,7 @@ mod tests {
     async fn transaction_outcome_resolves_a_folded_hit_above_the_floor() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = bootstrap(Arc::clone(&object_store)).await;
-        seed_folded_snapshot(&object_store, &store.options, 3, [5; 16], 3).await;
+        seed_folded_snapshot(&object_store, &store.options, 3, [5; 16]).await;
 
         assert_eq!(
             transaction_outcome(&store, [5; 16], 2).await.unwrap(),
@@ -1379,15 +1406,12 @@ mod tests {
     }
 
     /// Writes one snapshot record carrying `transaction_id` straight into the
-    /// folded store and advances the fold cursor, the state a completed fold
-    /// leaves — so a folded hit can be resolved before a fold implementation
-    /// lands.
+    /// store, the state a completed fold leaves behind.
     async fn seed_folded_snapshot(
         object_store: &Arc<dyn ObjectStore>,
         options: &CatalogOptions,
         snapshot_id: u64,
         transaction_id: [u8; 16],
-        through: u64,
     ) {
         let db = StoreBuilder::new(&options.path, Arc::clone(object_store))
             .open_writer()
@@ -1411,59 +1435,46 @@ mod tests {
             }),
         )
         .unwrap();
-        tx.put(
-            Key::Sys(SysKey::Fold).encode(),
-            value::encode_value(&moraine_wal::FoldValue {
-                folded_sequence: through,
-            }),
-        )
-        .unwrap();
-        commit::commit_durably(tx).await.unwrap();
+        commit::commit_durably(&db, tx).await.unwrap();
         db.close().await.unwrap();
     }
 
-    /// Reopens the store's reader against the current manifest, so a test sees
-    /// a fold without waiting on the reader's poll interval.
-    async fn reopen(store: SlotStore, object_store: &Arc<dyn ObjectStore>) -> SlotStore {
-        let reader = StoreBuilder::new(&store.options.path, Arc::clone(object_store))
-            .open_reader()
-            .await
-            .unwrap();
-        SlotStore {
-            reader: Arc::new(reader),
-            ..store
+    /// A view whose head snapshot is `head`, carrying nothing else: the
+    /// admission rule reads the head and nothing more.
+    fn view_at_head(head: u64) -> CatalogSnapshot {
+        CatalogSnapshot::build(
+            proto::SnapshotValue {
+                snapshot_id: head,
+                ..proto::SnapshotValue::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// A commit that writes nothing, staged against `validated_head`.
+    fn commit_validated_against(validated_head: u64) -> Commit {
+        Commit {
+            transaction_id: [9; 16],
+            payload: SlotPayload {
+                validated_head,
+                changes_made: String::new(),
+                writes: Vec::new(),
+            },
         }
     }
 
-    /// Folds one envelope's writes into the store the way the folder will,
-    /// stamping the cursor in the same batch.
-    async fn fold_through(
-        object_store: &Arc<dyn ObjectStore>,
-        options: &CatalogOptions,
-        envelope: &Envelope,
-        through: u64,
-    ) {
+    /// Folds `slots` more of the log into the store the way a peer's sprint
+    /// does: opening the writer replays them, and the flush makes the fold —
+    /// and the cursor it advances — durable.
+    async fn fold_more(object_store: &Arc<dyn ObjectStore>, options: &CatalogOptions, slots: u64) {
         let db = StoreBuilder::new(&options.path, Arc::clone(object_store))
+            .replay_limit(Some(slots))
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(slatedb::IsolationLevel::Snapshot).await.unwrap();
-        for commit in &envelope.commits {
-            for write in &commit.payload.writes {
-                match &write.value {
-                    Some(bytes) => tx.put(write.key.clone(), bytes.clone()).unwrap(),
-                    None => tx.delete(write.key.clone()).unwrap(),
-                }
-            }
-        }
-        tx.put(
-            Key::Sys(SysKey::Fold).encode(),
-            value::encode_value(&moraine_wal::FoldValue {
-                folded_sequence: through,
-            }),
-        )
-        .unwrap();
-        commit::commit_durably(tx).await.unwrap();
+        db.flush().await.unwrap();
         db.close().await.unwrap();
     }
 

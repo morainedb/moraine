@@ -156,10 +156,14 @@
 //! [`Overlay`] of their own, and [`WalGc`](SlotWal) truncation follows the
 //! ranges live manifests still reference.
 //!
-//! A store folding this way must take no writes of its own: SlateDB draws row
-//! sequence numbers and slot ordinals from one space, so a direct write pushes
-//! the store's counter past the ordinals of slots not yet folded, and replay
-//! skips them. [`SlotWal`]'s writer refuses appends for the same reason.
+//! Row sequence numbers and slot ordinals come from one space, so the log
+//! starts above whatever the store wrote before adopting it and each slot
+//! reserves a stride of numbers ([`slot_sequence`]). The writes a store still
+//! makes for itself take the numbers between the slot last folded and the
+//! next, ordering after everything folded and before everything still to fold;
+//! a store must not let its own writes reach the next slot's number, or the
+//! fold would skip that slot. [`SlotWal`]'s writer refuses appends: the log
+//! takes committed slots, not a store's journaling.
 
 #![forbid(unsafe_code)]
 
@@ -177,7 +181,7 @@ pub use driver::{
     CommitDrive, Committer, CursorStore, FoldReport, FolderRole, Jitter, Race, RetryPolicy,
     drive_commit, drive_fold, drive_fold_if_stalled,
 };
-pub use engine::{AdvertProjection, AppendRefused, SlotWal};
+pub use engine::{AdvertProjection, AppendRefused, SlotWal, slot_sequence};
 pub use envelope::{Commit, Envelope, LeaderAdvert, Overlay, SlotPayload, SlotWrite};
 pub use error::Error;
 pub use proto::FoldValue;

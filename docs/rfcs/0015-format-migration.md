@@ -305,14 +305,14 @@ migration qualifies when it is a single atomic `WriteBatch` touching only
 start/step/finish machinery above collapses to one step, so there is no
 half-migrated intermediate a rolling reader could ever observe. RFC 0022's
 format 4 migration is the exemplar, and so far the only member: converting
-a format 1–3 store writes `sys/format = 4` and `sys/fold = 0` in one batch
+a format 1–3 store writes `sys/format = 4`
 — the existing store already *is* the folded state and the commit log
 starts empty, so there is nothing else to rewrite. It auto-runs the moment
 any process attaches read-write, exactly as bootstrap (RFC 0004) auto-runs
 on first open: opening the writer to migrate fences any incumbent
 old-binary writer, safe by RFC 0004's fencing and called out in release
 notes. Read-only attaches never trigger it and need not: an absent
-`sys/fold` reads as 0 with an empty tail, so a format 1–3 store served
+The store's replay point reads as 0 with an empty tail, so a format 1–3 store served
 read-only is already a valid (empty) slot store. A future bounded
 `system`-only migration gets the same trigger for the same reason; a
 migration that walks the keyspace does not, no matter how small it looks

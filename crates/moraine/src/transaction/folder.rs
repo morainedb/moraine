@@ -9,33 +9,22 @@
 //! corrupting anything.
 //!
 //! Folding drains the slot log into that store so the store is an accurate
-//! derived index of the log. The fold loop itself is
-//! [`moraine_wal::drive_fold`]; this module supplies the [`SlateDbCursorStore`]
-//! that gives it a SlateDB target, applying each slot's writes and advancing
-//! the `sys/fold` cursor as one atomic [`WriteBatch`].
+//! derived index of the log — and the store does it itself. The log is the
+//! store's write-ahead log, so opening the writer replays every slot past its
+//! fold cursor into the memtable, and the flush that follows is what makes the
+//! fold durable. The cursor is the store's own replay point: nothing here
+//! applies a slot or advances a cursor by hand.
 
-use std::{
-    sync::{Arc, Mutex, PoisonError},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
-use moraine_wal::{
-    CursorStore, Envelope, FoldReport, FoldValue, FolderRole, Jitter, drive_fold,
-    drive_fold_if_stalled,
-};
-use slatedb::{Checkpoint, Db, DbReader, WriteBatch};
+use moraine_wal::{FoldReport, Jitter};
+use slatedb::{Checkpoint, Db, DbReader};
 use uuid::Uuid;
 
 use crate::{
     catalog::SlotStore,
     error::{Error, Result},
-    store::{
-        handle::ReadHandle,
-        key::{Key, SysKey},
-        open::StoreBuilder,
-        proto::HeadValue,
-        read, value,
-    },
+    store::open::StoreBuilder,
     transaction::slot_commit::FOLD_STALL_THRESHOLD,
 };
 
@@ -43,11 +32,14 @@ use crate::{
 /// The writer is the single direct writer of the slot-backed store; a second
 /// session opened concurrently fences this one, which surfaces the fencing as
 /// an error from `body` rather than a corrupt store.
+///
+/// Opening folds: the session starts from a store that has replayed every slot
+/// the log holds, so derived-state work reads the same state a reader does.
 pub(crate) async fn with_folder<T, F>(store: &SlotStore, body: F) -> Result<T>
 where
     F: AsyncFnOnce(&Db) -> Result<T>,
 {
-    let db = open_folder_writer(store, true).await?;
+    let db = open_folder_writer(store, None).await?;
 
     let outcome = body(&db).await;
 
@@ -59,11 +51,11 @@ where
     }
 }
 
-/// Opens the fenced writer `Db` over the store's retained builder shape. The
-/// WAL stays on for a maintenance session and off for folding (`wal_enabled`).
-async fn open_folder_writer(store: &SlotStore, wal_enabled: bool) -> Result<Db> {
+/// Opens the fenced writer `Db` over the store's retained builder shape,
+/// folding at most `limit` slots as it opens.
+async fn open_folder_writer(store: &SlotStore, limit: Option<u64>) -> Result<Db> {
     StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
-        .wal_enabled(wal_enabled)
+        .replay_limit(limit)
         .cache_dir(store.options.cache_dir.clone())
         .cache_size(store.options.cache_size)
         .cache_preload(store.options.cache_preload)
@@ -72,162 +64,59 @@ async fn open_folder_writer(store: &SlotStore, wal_enabled: bool) -> Result<Db> 
         .await
 }
 
-/// Opens the folder's fenced writer for a fold, WAL off. Every fold — the
-/// explicit sprint and the appointed fold alike — runs the store directly into
-/// the memtable, so [`SlateDbCursorStore::finish`]'s explicit flush is the
-/// fold's only durability barrier.
-async fn open_fold_writer(store: &SlotStore) -> Result<Db> {
-    open_folder_writer(store, false).await
+/// The fold cursor a writer stands at: the last slot its own manifest records
+/// as folded, which is where its next open resumes.
+fn writer_cursor(db: &Db) -> u64 {
+    db.status().current_manifest.replay_after_wal_id()
 }
 
-/// The SlateDB store as a fold target: the cursor is `sys/fold`, and applying a
-/// slot plus advancing the cursor is one [`WriteBatch`]. Applying and advancing
-/// as two writes would double-apply on a crash-resume, so they are one unit.
-pub(crate) struct SlateDbCursorStore {
-    db: Arc<Db>,
-    /// The head this session has folded to, tracked across the sprint from each
-    /// batch's `sys/head` write; `None` until the first apply reads the folded
-    /// store's head.
-    head: Option<u64>,
+/// The fold cursor a reader sees: the last slot the store had durably folded
+/// as of the manifest this reader follows.
+pub(crate) fn reader_cursor(reader: &DbReader) -> u64 {
+    reader.manifest().replay_after_wal_id()
 }
 
-impl SlateDbCursorStore {
-    fn new(db: Arc<Db>) -> Self {
-        Self { db, head: None }
-    }
-
-    /// The folded store's current head snapshot id, read through the writer.
-    async fn store_head(&self) -> Result<u64> {
-        let bytes = self
-            .db
-            .get(Key::Sys(SysKey::Head).encode())
-            .await
-            .map_err(Error::from)?;
-        match bytes {
-            Some(bytes) => Ok(value::decode_value::<HeadValue>(&bytes)?.snapshot_id),
-            None => Err(Error::Corruption("store has no head pointer".to_string())),
-        }
-    }
+/// Whether `reader` has taken the log through `sequence` — folded or replayed
+/// for itself, which its view does not distinguish. A reader replays the slots
+/// past its cursor on its own cadence, so its view can hold commits its cursor
+/// has not reached; the sequence numbers it has applied are what say how far
+/// it has actually come.
+pub(crate) fn reader_reached(reader: &DbReader, sequence: u64) -> bool {
+    reader.status().durable_seq >= moraine_wal::slot_sequence(sequence)
 }
 
-impl CursorStore for SlateDbCursorStore {
-    type Error = Error;
-
-    async fn cursor(&mut self) -> Result<u64> {
-        let bytes = self
-            .db
-            .get(Key::Sys(SysKey::Fold).encode())
-            .await
-            .map_err(Error::from)?;
-        Ok(match bytes {
-            Some(bytes) => value::decode_value::<FoldValue>(&bytes)?.folded_sequence,
-            None => 0,
-        })
-    }
-
-    async fn apply(&mut self, sequence: u64, envelope: &Envelope) -> Result<()> {
-        let head_key = Key::Sys(SysKey::Head).encode();
-        let mut head = match self.head {
-            Some(head) => head,
-            None => self.store_head().await?,
-        };
-
-        let mut batch = WriteBatch::new();
-        for commit in &envelope.commits {
-            // The same continuity check replay makes: a slot must chain onto the
-            // head the fold has reached, or its predecessors are missing and
-            // folding the prefix would hide committed state.
-            if commit.payload.validated_head != head {
-                return Err(Error::Corruption(format!(
-                    "slot {sequence} was validated against snapshot {} but the fold has reached \
-                     {head}; its commit does not chain onto the one before it",
-                    commit.payload.validated_head
-                )));
-            }
-
-            for write in &commit.payload.writes {
-                match &write.value {
-                    Some(bytes) => batch.put(&write.key, bytes),
-                    None => batch.delete(&write.key),
-                }
-                if write.key == head_key
-                    && let Some(bytes) = &write.value
-                {
-                    head = value::decode_value::<HeadValue>(bytes)?.snapshot_id;
-                }
-            }
-        }
-
-        // The freshest advert riding this slot folds into `sys/leader`, so a
-        // leader announcement survives the truncation of the slot that carried
-        // it — an absent-endpoint advert records a withdrawal all the same.
-        if let Some(advert) = &envelope.leader {
-            batch.put(
-                Key::Sys(SysKey::Leader).encode(),
-                value::encode_value(&crate::store::proto::LeaderValue {
-                    instance: advert.instance.to_vec(),
-                    endpoint: advert.endpoint.clone(),
-                }),
-            );
-        }
-
-        batch.put(
-            Key::Sys(SysKey::Fold).encode(),
-            value::encode_value(&FoldValue {
-                folded_sequence: sequence,
-            }),
-        );
-
-        // Apply and advance in one batch: a size-triggered flush might land the
-        // memtable mid-sprint, so the two must never split across a batch
-        // boundary. Durability is the sprint's end barrier, not each apply's.
-        self.db.write(batch).await.map_err(Error::from)?;
-
-        self.head = Some(head);
-        Ok(())
-    }
-
-    async fn finish(&mut self) -> Result<()> {
-        // The sprint's only durability barrier: with the writer's WAL off, the
-        // per-apply batches sit in the memtable, and no WAL timer or (64 MiB) L0
-        // size trigger will flush a catalog-sized sprint, so this explicit flush
-        // to a durable L0 SST is what makes the fold cursor survive close. A
-        // sprint killed before it costs no correctness — the memtable folds are
-        // lost, the log still holds those slots, and the successor re-folds them.
-        // Truncation stays safe even if this fails, since its horizon is what a
-        // reader can see, so a barrier that lost the folds costs retained slots,
-        // never a deleted one.
-        self.db.flush().await.map_err(Error::from)
-    }
-}
-
-/// One bounded fold pass: opens the fenced writer with its WAL off, applies up
-/// to `limit` unfolded slots (each as one atomic batch advancing the fold
-/// cursor), flushes, and closes. The attach's reader is undisturbed. With the
-/// WAL off the folds are durable only once [`SlateDbCursorStore::finish`]
-/// flushes, so a sprint killed before that loses its memtable folds and the
-/// successor re-folds those slots from the log — the cursor never advances past
-/// what is durable, so no slot is ever double-applied.
+/// One bounded fold pass: opens the fenced writer, which replays up to `limit`
+/// unfolded slots into the memtable, flushes them to a durable L0 SST, and
+/// closes. The attach's reader is undisturbed.
 ///
-/// `limit` bounds the applies, not the listing: `drive_fold` reads the whole
-/// contiguous tail every pass, because hole detection needs the full run. A
-/// post-migration first fold can therefore hold a long tail's slot bodies in
-/// memory even under a small `limit` — the bound paces the writes, not the
-/// read.
+/// The flush is the fold's only durability barrier — no journaling stands
+/// behind it, since the log is the journal. A sprint killed before it costs no
+/// correctness: the memtable folds are lost, the log still holds those slots,
+/// and the successor re-folds them. The cursor never advances past what is
+/// durable, so no slot is ever double-applied.
 pub(crate) async fn fold_sprint(store: &SlotStore, limit: u64) -> Result<FoldReport> {
-    let db = Arc::new(open_fold_writer(store).await?);
-    let mut session = SlateDbCursorStore::new(Arc::clone(&db));
-    let report = drive_fold(&store.slots, &mut session, limit).await;
-    drop(session);
+    let db = open_folder_writer(store, Some(limit)).await?;
+    let folded_from = writer_cursor(&db);
 
-    if let Ok(report) = &report {
-        narrate_fold(report);
-    }
+    let flushed = db.flush().await.map_err(Error::from);
+    let folded_through = writer_cursor(&db);
 
-    match db.close().await {
-        Ok(()) => report,
-        Err(err) => report.and(Err(Error::from(err))),
-    }
+    let closed = db.close().await.map_err(Error::from);
+    flushed.and(closed)?;
+
+    let tail_remaining = store
+        .slots
+        .tail_length(folded_through.saturating_add(1))
+        .await
+        .map_err(Error::from)?;
+    let report = FoldReport {
+        slots_folded: folded_through.saturating_sub(folded_from),
+        folded_through,
+        tail_remaining,
+    };
+    narrate_fold(&report);
+
+    Ok(report)
 }
 
 /// Narrates one fold pass's [`FoldReport`]: the counts a host reads back from
@@ -264,15 +153,11 @@ pub(crate) async fn unfolded_tail(store: &SlotStore) -> Result<u64> {
         .cache_puts(store.options.cache_puts)
         .open_reader()
         .await?;
-    let fold = fold_cursor(ReadHandle::Reader(&reader)).await;
-    let unfolded = match fold {
-        Ok(fold) => store
-            .slots
-            .tail_length(fold.saturating_add(1))
-            .await
-            .map_err(Error::from),
-        Err(err) => Err(err),
-    };
+    let unfolded = store
+        .slots
+        .tail_length(reader_cursor(&reader).saturating_add(1))
+        .await
+        .map_err(Error::from);
 
     if let Err(err) = reader.close().await {
         tracing::warn!(error = %err, "could not close the reader opened for the unfolded-tail probe");
@@ -301,7 +186,7 @@ pub(crate) async fn truncate_folded_slots(store: &SlotStore) -> Result<u64> {
     // durable frontier (not the attach reader's lagged poll), and its manifest
     // lists every live reader checkpoint.
     let horizon = async {
-        let durable = fold_cursor(ReadHandle::Reader(&reader)).await?;
+        let durable = reader_cursor(&reader);
         let reader_floor = oldest_reader_fold_cursor(store, &reader, durable).await?;
         Ok::<u64, Error>(
             durable
@@ -398,12 +283,12 @@ async fn fold_cursor_as_of(store: &SlotStore, checkpoint_id: Uuid) -> Result<u64
         .cache_puts(store.options.cache_puts)
         .open_reader_at(checkpoint_id)
         .await?;
-    let cursor = fold_cursor(ReadHandle::Reader(&reader)).await;
+    let cursor = reader_cursor(&reader);
 
     if let Err(err) = reader.close().await {
         tracing::warn!(error = %err, "could not close the checkpoint-pinned reader");
     }
-    cursor
+    Ok(cursor)
 }
 
 /// A reader at the manifest as it stands now, for discovering live checkpoints.
@@ -417,86 +302,52 @@ async fn reopen_reader(store: &SlotStore) -> Result<DbReader> {
         .await
 }
 
-/// The self-appointment rule over the real log: if the unfolded tail exceeds
-/// `threshold`, wait `delay` plus jitter, re-check fold progress, and sprint
-/// only if no other folder advanced the cursor. The stampede logic is
-/// [`drive_fold_if_stalled`]'s; moraine supplies the policy values and the
-/// [`FolderRole`] whose `peek_cursor` reads the cursor without opening the
-/// writer and whose `open` is the fencing writer open.
+/// The self-appointment rule: if the unfolded tail exceeds `threshold`, wait
+/// `delay` plus jitter, re-read the cursor, and sprint only if no other folder
+/// advanced it. The wait is what keeps a fleet from stampeding one stalled
+/// tail — every process draws its own jitter, so the first to wake folds and
+/// the rest stand down on the cursor it moved.
 pub(crate) async fn fold_if_stalled(
     store: &SlotStore,
     threshold: u64,
     delay: Duration,
     limit: u64,
 ) -> Result<Option<FoldReport>> {
-    let role = SlotFolder {
-        store,
-        opened: Mutex::new(None),
-    };
+    let cursor = reader_cursor(&store.reader);
+    let unfolded = store
+        .slots
+        .tail_length(cursor.saturating_add(1))
+        .await
+        .map_err(Error::from)?;
+    if unfolded <= threshold {
+        return Ok(None);
+    }
+
     let jitter = Jitter::from_entropy();
-    let outcome =
-        drive_fold_if_stalled(&store.slots, &role, threshold, delay, limit, &jitter).await;
+    tokio::time::sleep(delay.saturating_add(jitter.draw(delay))).await;
 
-    // Close the writer the appointment opened, if it opened one. A close failure
-    // surfaces only when the fold itself succeeded.
-    let opened = role
-        .opened
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
-    match opened {
-        Some(db) => match db.close().await {
-            Ok(()) => outcome,
-            Err(err) => outcome.and(Err(Error::from(err))),
-        },
-        None => outcome,
+    // The attach's reader follows the manifest on its own cadence, so a fresh
+    // one is what tells whether a peer's fold has landed since.
+    let peer = reopen_reader(store).await?;
+    let advanced = reader_cursor(&peer) > cursor;
+    if let Err(err) = peer.close().await {
+        tracing::warn!(error = %err, "could not close the reader opened for the fold appointment");
     }
-}
-
-/// Appoints and opens the folder role over a slot-backed store: `peek_cursor`
-/// reads the cursor through the attach's reader without acquiring anything;
-/// `open` acquires the fenced writer. The opened writer is retained so the
-/// caller can close it once the appointment's fold completes.
-struct SlotFolder<'a> {
-    store: &'a SlotStore,
-    opened: Mutex<Option<Arc<Db>>>,
-}
-
-impl FolderRole for SlotFolder<'_> {
-    type Error = Error;
-    type Session = SlateDbCursorStore;
-
-    async fn peek_cursor(&self) -> Result<u64> {
-        fold_cursor(ReadHandle::Reader(&self.store.reader)).await
+    if advanced {
+        return Ok(None);
     }
 
-    async fn open(&self) -> Result<SlateDbCursorStore> {
-        let db = Arc::new(open_fold_writer(self.store).await?);
-        *self.opened.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&db));
-        Ok(SlateDbCursorStore::new(db))
-    }
-}
-
-/// The fold cursor read through `handle`; absent reads as 0, since a store with
-/// no cursor has no folded slots.
-async fn fold_cursor(handle: ReadHandle<'_>) -> Result<u64> {
-    Ok(read::read_fold(handle)
-        .await?
-        .map_or(0, |fold| fold.folded_sequence))
+    fold_sprint(store, limit).await.map(Some)
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use moraine_wal::{CursorStore, SlotLog};
     use object_store::{ObjectStore, memory::InMemory};
 
-    use super::SlateDbCursorStore;
-    use crate::{
-        catalog::{Catalog, CatalogOptions},
-        store::open::StoreBuilder,
-    };
+    use super::StoreBuilder;
+    use crate::catalog::{Catalog, CatalogOptions};
 
     #[allow(clippy::unwrap_used)]
     async fn open_catalog(store: &Arc<InMemory>) -> Catalog {
@@ -534,13 +385,15 @@ mod tests {
         (snapshot.current_snapshot().id.get(), schemas)
     }
 
-    /// With the WAL off, a sprint killed before `finish()` flushes loses its
-    /// memtable folds — the log has no WAL to recover them — so the reopened
-    /// store still counts every slot as unfolded, and a full sprint re-folds
-    /// them from the log to the same state a never-interrupted fold reaches.
+    /// A sprint killed before its flush loses the fold it held in the
+    /// memtable: nothing journals it, since the log is the journal. The
+    /// reopened store therefore still counts every slot unfolded, a full
+    /// sprint re-folds them, and the result matches a fold that was never
+    /// interrupted — the cursor never advances past what is durable, so no
+    /// slot is applied twice.
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
-    async fn a_killed_wal_off_sprint_loses_memtable_folds_and_reconverges() {
+    async fn a_killed_sprint_loses_its_memtable_fold_and_reconverges() {
         let store = Arc::new(InMemory::new());
         let object_store = store.clone() as Arc<dyn ObjectStore>;
         let names = ["a", "b", "c", "d"];
@@ -549,30 +402,22 @@ mod tests {
         commit_schemas(&catalog, &names).await;
         assert_eq!(catalog.unfolded_tail().await.unwrap(), 4);
 
-        // A killed sprint: open the fold writer exactly as `fold_sprint` does
-        // (WAL off), apply the first slot into the memtable, then drop the
-        // writer without `finish()`'s flush or `close()` — a process kill.
+        // A killed sprint: open the fold writer, which replays the tail into
+        // the memtable, then drop it without the flush or the close that make
+        // the fold durable — a process kill.
         {
             let db = StoreBuilder::new("", object_store.clone())
-                .wal_enabled(false)
                 .open_writer()
                 .await
                 .unwrap();
-            let mut session = SlateDbCursorStore::new(Arc::new(db));
-            let slots = SlotLog::new(object_store.clone(), "");
-            let tail = slots.read_tail(1).await.unwrap();
-            let (sequence, envelope) = &tail.slots[0];
-            session.apply(*sequence, envelope).await.unwrap();
-            drop(session);
+            drop(db);
         }
 
-        // The killed fold left nothing durable: the reopened store still counts
-        // every slot as unfolded.
         let reopened = open_catalog(&store).await;
         assert_eq!(
             reopened.unfolded_tail().await.unwrap(),
             4,
-            "a killed WAL-off sprint's memtable fold is lost, not recovered"
+            "a killed sprint's memtable fold is lost, not recovered"
         );
 
         // A full sprint re-folds every slot from the log and drains the tail.
@@ -580,8 +425,8 @@ mod tests {
         assert_eq!(report.slots_folded, 4, "every slot re-folded from the log");
         assert_eq!(reopened.unfolded_tail().await.unwrap(), 0);
 
-        // Convergence: the killed-then-refolded store matches a never-interrupted
-        // fold of the identical workload.
+        // Convergence: the killed-then-refolded store matches a
+        // never-interrupted fold of the identical workload.
         let reference_store = Arc::new(InMemory::new());
         let reference = open_catalog(&reference_store).await;
         commit_schemas(&reference, &names).await;
@@ -592,5 +437,26 @@ mod tests {
             logical_state(&reference_store).await,
             "a killed-then-refolded store converges to the never-interrupted state"
         );
+    }
+
+    /// A bounded sprint folds only as far as its limit and the next one
+    /// resumes from the cursor it left: the bound is on the replay, so the
+    /// store's own cursor is what carries the sprint boundary.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn a_bounded_sprint_folds_to_its_limit_and_the_next_resumes() {
+        let store = Arc::new(InMemory::new());
+        let catalog = open_catalog(&store).await;
+        commit_schemas(&catalog, &["a", "b", "c"]).await;
+
+        let first = catalog.fold_sprint(2).await.unwrap();
+        assert_eq!(first.slots_folded, 2);
+        assert_eq!(first.folded_through, 2);
+        assert_eq!(first.tail_remaining, 1);
+
+        let second = catalog.fold_sprint(2).await.unwrap();
+        assert_eq!(second.slots_folded, 1, "the sprint resumes at the cursor");
+        assert_eq!(second.folded_through, 3);
+        assert_eq!(second.tail_remaining, 0);
     }
 }
