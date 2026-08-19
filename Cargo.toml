@@ -28,7 +28,7 @@ prost-build = "0.14"
 protox = "0.9"
 proptest = "1"
 proptest-derive = "0.8"
-slatedb = { version = "0.14.1", features = ["wal_disable"] }
+slatedb = { git = "https://github.com/slatedb/slatedb", rev = "2a2fdd146", features = ["wal_disable"] }
 storekey = "0.11"
 thiserror = "2"
 tokio = "1"

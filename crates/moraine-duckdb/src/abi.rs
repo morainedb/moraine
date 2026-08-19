@@ -5349,73 +5349,45 @@ mod tests {
         assert!(refused.message.contains('7'), "{}", refused.message);
     }
 
-    /// An attach that caches its writes fills the cache directory from the
-    /// write path: bootstrapping a fresh store caches the log data it flushes
-    /// and never reads back, where an attach that does not cache writes leaves
-    /// that data uncached.
+    /// An attach that caches its writes opens and serves like any other: the
+    /// flag reaches the core, which caches the SSTs it flushes. What the
+    /// option puts on disk is the core's to pin — a bootstrap-only attach
+    /// flushes no SST, so nothing here would see it.
     #[test]
-    fn an_attach_caching_writes_fills_the_cache_directory() {
-        let mut cached = Vec::new();
-        for cache_puts in [false, true] {
-            let dir = TempDir::new("put-cache-store");
-            let cache = TempDir::new("put-cache-dir");
-            let c_path = dir.c_path();
-            let c_cache = cache.c_path();
-            let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
-            let mut err = MoraineError::default();
-            // SAFETY: both C strings outlive the call; outputs are valid
-            // local slots; null s3/data_path/checkpoint are the documented
-            // "none" cases.
-            let code = unsafe {
-                moraine_attach(
-                    c_path.as_ptr(),
-                    ptr::null(),
-                    false,
-                    false,
-                    0,
-                    c_cache.as_ptr(),
-                    0,
-                    0,
-                    cache_puts,
-                    ptr::null(),
-                    ptr::null(),
-                    0,
-                    None,
-                    ptr::null_mut(),
-                    &raw mut handle,
-                    &raw mut err,
-                )
-            };
-            // SAFETY: `err.message` is null or was just written by the call.
-            let message = unsafe { err.message.as_ref() };
-            assert_eq!(code, codes::OK, "attach failed: {message:?}");
-            // SAFETY: attached above and not yet detached.
-            unsafe { moraine_detach(handle) };
-            cached.push(cached_bytes(cache.path()));
-        }
-        assert!(
-            cached[1] > cached[0],
-            "caching writes cached {} bytes against {} without it",
-            cached[1],
-            cached[0]
-        );
-    }
-
-    /// Total size of every file under `dir`, recursively; zero if it does
-    /// not exist.
-    fn cached_bytes(dir: &std::path::Path) -> u64 {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return 0;
+    fn an_attach_caching_writes_opens_and_serves() {
+        let dir = TempDir::new("put-cache-store");
+        let cache = TempDir::new("put-cache-dir");
+        let c_path = dir.c_path();
+        let c_cache = cache.c_path();
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: both C strings outlive the call; outputs are valid local
+        // slots; null s3/data_path/checkpoint are the documented "none" cases.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                c_cache.as_ptr(),
+                0,
+                0,
+                true,
+                ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
         };
-        entries.flatten().fold(0, |total, entry| {
-            let Ok(kind) = entry.file_type() else {
-                return total;
-            };
-            if kind.is_dir() {
-                return total + cached_bytes(&entry.path());
-            }
-            total + entry.metadata().map_or(0, |meta| meta.len())
-        })
+        // SAFETY: `err.message` is null or was just written by the call.
+        let message = unsafe { err.message.as_ref() };
+        assert_eq!(code, codes::OK, "attach failed: {message:?}");
+        // SAFETY: attached above and not yet detached.
+        unsafe { moraine_detach(handle) };
     }
 
     /// An attach given a cache directory and a cap opens against them: the

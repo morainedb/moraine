@@ -103,7 +103,7 @@ async fn legacy_store_with_schema(object_store: Arc<dyn ObjectStore>) {
         }),
     )
     .unwrap();
-    tx.commit_with_options(&commit::durable()).await.unwrap();
+    commit::commit_durably(tx).await.unwrap();
     db.close().await.unwrap();
 }
 
@@ -277,7 +277,7 @@ async fn migration_fences_a_live_legacy_writer_with_a_typed_error() {
                 batch_seq: 0,
             }),
         )?;
-        tx.commit_with_options(&commit::durable()).await?;
+        commit::commit_durably(tx).await?;
         Ok(())
     }
     .await;
@@ -325,7 +325,7 @@ async fn seed_orphaned_entries(object_store: &Arc<dyn ObjectStore>, index_id: u6
         .encode();
         tx.put(key, Vec::new()).unwrap();
     }
-    tx.commit_with_options(&commit::durable()).await.unwrap();
+    commit::commit_durably(tx).await.unwrap();
     db.close().await.unwrap();
 }
 

@@ -140,7 +140,7 @@ async fn materialize_gate_refuses_on_marker() {
         }),
     )
     .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
+    commit_durably(tx).await.unwrap();
 
     let read = db.begin(IsolationLevel::Snapshot).await.unwrap();
     let err = refuse_mid_migration(ReadHandle::Tx(&read))

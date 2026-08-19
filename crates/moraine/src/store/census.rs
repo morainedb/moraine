@@ -206,7 +206,7 @@ fn census_of_manifest(manifest: &VersionedManifest) -> ManifestCensus {
             manifest
                 .compacted()
                 .iter()
-                .map(|sr| sr.sst_views.len())
+                .map(|sr| sr.sst_views().len())
                 .sum(),
         ),
     };
@@ -234,7 +234,7 @@ fn size_of_segment(segment: &Segment) -> SegmentSize {
             segment
                 .compacted()
                 .iter()
-                .map(|run| run.sst_views.len())
+                .map(|run| run.sst_views().len())
                 .sum(),
         ),
     }

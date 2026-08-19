@@ -411,9 +411,7 @@ async fn ensure_secret(store: &SlotStore) -> Result<[u8; commit::SECRET_LEN]> {
             .map_err(Error::from)?;
             token
         };
-        tx.commit_with_options(&commit::durable())
-            .await
-            .map_err(Error::from)?;
+        commit::commit_durably(tx).await.map_err(Error::from)?;
         Ok(token)
     })
     .await;

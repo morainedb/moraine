@@ -703,7 +703,7 @@ async fn delete_secret(store: &Arc<dyn ObjectStore>) {
         .unwrap();
     let tx = db.begin(slatedb::IsolationLevel::Snapshot).await.unwrap();
     tx.delete(Key::Sys(SysKey::Secret).encode()).unwrap();
-    tx.commit_with_options(&crate::transaction::commit::durable())
+    crate::transaction::commit::commit_durably(tx)
         .await
         .unwrap();
     db.close().await.unwrap();

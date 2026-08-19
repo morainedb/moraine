@@ -651,7 +651,7 @@ mod tests {
 
     use moraine_wal::{Commit, Envelope, SlotPayload, SlotWrite};
     use object_store::memory::InMemory;
-    use slatedb::{IsolationLevel, config::WriteOptions};
+    use slatedb::IsolationLevel;
 
     use super::*;
     use crate::store::{
@@ -716,12 +716,9 @@ mod tests {
         for (value, row_id) in [(10_u128, 1_u64), (20, 2), (30, 3)] {
             tx.put(multi_key(7, value, row_id), []).unwrap();
         }
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        crate::transaction::commit::commit_durably(tx)
+            .await
+            .unwrap();
 
         // The tail adds value 20 for row 4 and 40 for row 5, and deletes the
         // stored entry for 30.

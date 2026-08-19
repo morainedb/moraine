@@ -184,7 +184,7 @@ mod tests {
     use std::sync::Arc;
 
     use object_store::memory::InMemory;
-    use slatedb::{IsolationLevel, config::WriteOptions};
+    use slatedb::IsolationLevel;
 
     use super::*;
     use crate::store::open::StoreBuilder;
@@ -320,12 +320,9 @@ mod tests {
         )
         .unwrap();
 
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        crate::transaction::commit::commit_durably(tx)
+            .await
+            .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
 
@@ -458,12 +455,9 @@ mod tests {
             )
             .unwrap();
         }
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        crate::transaction::commit::commit_durably(tx)
+            .await
+            .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let all = scan_all_inline_schemas(ReadHandle::Tx(&tx), None)

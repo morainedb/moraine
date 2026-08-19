@@ -14,7 +14,7 @@ use crate::{
         open::StoreBuilder,
         read::{EntityRecord, scan_current_entities},
     },
-    transaction::commit::{FORMAT_VERSION, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION, durable},
+    transaction::commit::{FORMAT_VERSION, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION, commit_durably},
 };
 
 /// The format the rewriting synthetic unit lands on: the newest this binary
@@ -65,7 +65,7 @@ async fn seeded_store() -> Arc<InMemory> {
         )
         .unwrap();
     }
-    tx.commit_with_options(&durable()).await.unwrap();
+    commit_durably(tx).await.unwrap();
     db.close().await.unwrap();
 
     object_store

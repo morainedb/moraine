@@ -734,7 +734,7 @@ impl Catalog {
             ));
         }
         warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
-        let reader = Self::open_read_write_reader(&object_store, &options).await?;
+        let reader = Box::pin(Self::open_read_write_reader(&object_store, &options)).await?;
         info!(
             path = options.path,
             refresh_interval_ms = options.refresh_interval.as_millis(),
@@ -1870,9 +1870,7 @@ impl Catalog {
             for (key, value) in &entries {
                 tx.put(key.clone(), value.clone()).map_err(Error::from)?;
             }
-            tx.commit_with_options(&commit::durable())
-                .await
-                .map_err(Error::from)?;
+            commit::commit_durably(tx).await.map_err(Error::from)?;
             Ok(())
         })
         .await
@@ -2341,9 +2339,7 @@ impl Catalog {
             };
             let (poisoned, writes) = index_maintenance::plan_index_entries(probe, &staged).await?;
             commit::stage_writes(&tx, &writes)?;
-            tx.commit_with_options(&commit::durable())
-                .await
-                .map_err(Error::from)?;
+            commit::commit_durably(tx).await.map_err(Error::from)?;
             Ok(!poisoned.is_empty())
         })
         .await;
@@ -2451,9 +2447,7 @@ impl Catalog {
                 .await
                 .map_err(Error::from)?;
             let deleted = index_maintenance::reclaim_entries(&tx, index.get(), limit).await?;
-            tx.commit_with_options(&commit::durable())
-                .await
-                .map_err(Error::from)?;
+            commit::commit_durably(tx).await.map_err(Error::from)?;
             Ok(deleted)
         })
         .await
@@ -2830,9 +2824,7 @@ impl Catalog {
             // here. A dead index id is never reused and the deletes are
             // idempotent, so a batch lost to a crash simply leaves entries a
             // later pass rediscovers.
-            tx.commit_with_options(&commit::non_durable())
-                .await
-                .map_err(Error::from)?;
+            tx.commit().await.map_err(Error::from)?;
             total += deleted as u64;
             cursor = last;
         }

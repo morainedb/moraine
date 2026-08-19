@@ -23,7 +23,7 @@ use moraine_wal::{
     CursorStore, Envelope, FoldReport, FoldValue, FolderRole, Jitter, drive_fold,
     drive_fold_if_stalled,
 };
-use slatedb::{Checkpoint, Db, DbReader, WriteBatch, config::WriteOptions};
+use slatedb::{Checkpoint, Db, DbReader, WriteBatch};
 use uuid::Uuid;
 
 use crate::{
@@ -181,16 +181,7 @@ impl CursorStore for SlateDbCursorStore {
         // Apply and advance in one batch: a size-triggered flush might land the
         // memtable mid-sprint, so the two must never split across a batch
         // boundary. Durability is the sprint's end barrier, not each apply's.
-        self.db
-            .write_with_options(
-                batch,
-                &WriteOptions {
-                    await_durable: false,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(Error::from)?;
+        self.db.write(batch).await.map_err(Error::from)?;
 
         self.head = Some(head);
         Ok(())

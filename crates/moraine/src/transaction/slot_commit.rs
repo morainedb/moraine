@@ -1418,7 +1418,7 @@ mod tests {
             }),
         )
         .unwrap();
-        tx.commit_with_options(&commit::durable()).await.unwrap();
+        commit::commit_durably(tx).await.unwrap();
         db.close().await.unwrap();
     }
 
@@ -1463,7 +1463,7 @@ mod tests {
             }),
         )
         .unwrap();
-        tx.commit_with_options(&commit::durable()).await.unwrap();
+        commit::commit_durably(tx).await.unwrap();
         db.close().await.unwrap();
     }
 

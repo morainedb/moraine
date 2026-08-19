@@ -6,7 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
+use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, WriteHandle};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -61,11 +61,17 @@ pub(crate) fn now_micros() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
-pub(crate) fn durable() -> WriteOptions {
-    WriteOptions {
-        await_durable: true,
-        ..Default::default()
+/// Commits `tx` and waits for the batch to reach object storage. An empty
+/// transaction writes nothing, so it has nothing to wait on.
+pub(crate) async fn commit_durably(
+    tx: DbTransaction,
+) -> std::result::Result<Option<WriteHandle>, slatedb::Error> {
+    let handle = tx.commit().await?;
+    if let Some(handle) = &handle {
+        handle.await_durable().await?;
     }
+
+    Ok(handle)
 }
 
 /// The width of the store-held forwarding token.
@@ -236,7 +242,7 @@ pub(crate) async fn open_initialized(
         return Err(err);
     }
 
-    match tx.commit_with_options(&durable()).await {
+    match commit_durably(tx).await {
         Ok(_) => {
             // Once per store, ever: the commit that created the catalog.
             info!(encrypted, data_path, "bootstrapped a fresh catalog store");
@@ -341,7 +347,7 @@ async fn migrate_stamp(db: &Db) -> Result<()> {
         return Err(err);
     }
 
-    match tx.commit_with_options(&durable()).await {
+    match commit_durably(tx).await {
         Ok(_) => {
             warn!(
                 from_format,
@@ -438,13 +444,17 @@ const STALL_INTERVAL: Duration = Duration::from_secs(10);
 pub(crate) async fn commit_durable(
     tx: DbTransaction,
     operation: &'static str,
-) -> std::result::Result<Option<slatedb::WriteHandle>, slatedb::Error> {
-    let options = durable();
-    let mut commit = Box::pin(tx.commit_with_options(&options));
+) -> std::result::Result<Option<WriteHandle>, slatedb::Error> {
+    let Some(handle) = tx.commit().await? else {
+        return Ok(None);
+    };
+
+    let mut durable = Box::pin(handle.await_durable());
     let mut waited = Duration::ZERO;
     loop {
-        if let Ok(outcome) = tokio::time::timeout(STALL_INTERVAL, &mut commit).await {
-            return outcome;
+        if let Ok(outcome) = tokio::time::timeout(STALL_INTERVAL, &mut durable).await {
+            drop(durable);
+            return outcome.map(|()| Some(handle));
         }
         waited = waited.saturating_add(STALL_INTERVAL);
         warn!(
@@ -453,18 +463,6 @@ pub(crate) async fn commit_durable(
             "still waiting for object storage to accept a durable write; writes are retried \
              indefinitely, so check credentials and bucket policy"
         );
-    }
-}
-
-/// A commit that returns without waiting for the write to reach object
-/// storage. The write is still atomic and visible to this handle at once;
-/// only the durability wait — a flush-cadence tick — is skipped. Use it
-/// where a lost write is self-correcting, never where a caller treats the
-/// return as a durable fact.
-pub(crate) fn non_durable() -> WriteOptions {
-    WriteOptions {
-        await_durable: false,
-        ..Default::default()
     }
 }
 
