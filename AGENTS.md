@@ -13,11 +13,13 @@ this file is the operational summary.
 - `crates/moraine-wal` — the commit-slot log protocol: sequence naming, the
   envelope wire format, the conditional-put race, tail enumeration and
   truncation, plus the protocol's loops behind embedder traits (retry-and-
-  rebase commit, resumable fold, and the folder appointment rule).
-  Sits below `moraine` and knows nothing of DuckLake, SlateDB, or
-  moraine's key layout — payload keys, values, and the classification string
-  are opaque bytes here. The boundary is shape versus meaning; if a change
-  wants to teach this crate what a payload means, it belongs in `moraine`.
+  rebase commit, resumable fold, and the folder appointment rule), and
+  `engine`, which presents the log as SlateDB's own write-ahead log.
+  Sits below `moraine` and knows nothing of DuckLake or moraine's key
+  layout — payload keys, values, and the classification string are opaque
+  bytes here, `engine` included. The boundary is shape versus meaning; if a
+  change wants to teach this crate what a payload means, it belongs in
+  `moraine`.
 - `crates/moraine-duckdb` — DuckDB extension: a thin C++ shim registering a
   `StorageExtension` over a C ABI to the Rust core (RFC 0006). Thin by policy:
   if logic accumulates here, move it to the core.

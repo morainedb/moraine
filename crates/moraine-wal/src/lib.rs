@@ -126,6 +126,10 @@
 //! - `driver` — the loops over the log: the retry/rebase commit round, the fold
 //!   round, and the folder appointment rule, each generic over the embedder's
 //!   semantics.
+//! - `engine` — the log presented as SlateDB's write-ahead log, so a store
+//!   folds it by replaying it and a reader serves its unfolded tail. The only
+//!   module that names a storage engine; payload keys and values stay opaque
+//!   even there.
 //!
 //! The crate spawns no threads and schedules nothing: every call is one
 //! bounded piece of work the host drives. The log's own safety is
@@ -142,10 +146,25 @@
 //! its [`FolderRole`] at all. The embedder supplies commit semantics and
 //! derived state; the loops supply sequencing, backoff, budgets, resume, and
 //! the stand-down rule.
+//!
+//! # Folding without a fold loop
+//!
+//! [`SlotWal`] hands the same job to SlateDB instead: plugged in as a store's
+//! write-ahead log, opening the store replays the slots past its cursor — that
+//! replay *is* the fold — and the store's own replay point is the cursor.
+//! Readers plugged in the same way serve the unfolded tail without an
+//! [`Overlay`] of their own, and [`WalGc`](SlotWal) truncation follows the
+//! ranges live manifests still reference.
+//!
+//! A store folding this way must take no writes of its own: SlateDB draws row
+//! sequence numbers and slot ordinals from one space, so a direct write pushes
+//! the store's counter past the ordinals of slots not yet folded, and replay
+//! skips them. [`SlotWal`]'s writer refuses appends for the same reason.
 
 #![forbid(unsafe_code)]
 
 mod driver;
+mod engine;
 mod envelope;
 mod error;
 #[cfg(test)]
@@ -158,7 +177,8 @@ pub use driver::{
     CommitDrive, Committer, CursorStore, FoldReport, FolderRole, Jitter, Race, RetryPolicy,
     drive_commit, drive_fold, drive_fold_if_stalled,
 };
+pub use engine::{AdvertProjection, AppendRefused, SlotWal};
 pub use envelope::{Commit, Envelope, LeaderAdvert, Overlay, SlotPayload, SlotWrite};
 pub use error::Error;
 pub use proto::FoldValue;
-pub use slot::{CommitOutcome, SlotLog, SlotRace, Tail};
+pub use slot::{CommitOutcome, Extent, SlotLog, SlotMeta, SlotRace, Tail};

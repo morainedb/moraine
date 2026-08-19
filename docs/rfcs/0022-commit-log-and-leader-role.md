@@ -518,12 +518,27 @@ decorator alongside drop-and-reopen.
 - **Mandatory leader (no leaderless base).** Hangs commit liveness on one
   process, and a partitioned client could only seize the writer role,
   inviting ping-pong. The contention-triggered role dissolves both.
-- **Cooperative multi-writer inside SlateDB.** Its WAL SSTs are already
-  `PutMode::Create`; treating a lost race as contention rather than
-  fencing would make the WAL itself the commit log. The preferred
-  endgame, and it belongs upstream. This design is shaped so it lands as
-  a deletion: `moraine-wal` retires; the folder, coalescing, and the
-  leader role survive, since none depend on how commits are serialized.
+- **The log as SlateDB's own write-ahead log.** SlateDB takes a WAL
+  implementation, so the slot log can be one: WAL file ids are slot
+  sequences, a slot's writes are the batch at that sequence, and the
+  store's replay point is the fold cursor. `moraine-wal`'s `engine`
+  implements it, and under it the fold is not a loop at all — opening the
+  writer replays the unfolded slots, and the flush that follows is what
+  makes the fold durable. A reader plugged in the same way serves the
+  unfolded tail, so the byte-level overlay and the tail replay above it
+  retire. Truncation becomes the collector's, driven by the ranges live
+  manifests still reference — the same two bounds this design states,
+  computed upstream.
+
+  One invariant gates adopting it: **a store folding the log may take no
+  writes of its own.** Row sequence numbers and slot ordinals come from
+  one space, so a direct write — bootstrap, a migration stamp, a
+  derived-state batch under the folder role — pushes the store's counter
+  past the ordinals of slots it has not folded, and replay skips them as
+  already covered. The fold is then silently short. So the topology lands
+  only once every write reaches the store through a slot, which is the
+  same deletion this design was shaped for, with bootstrap and
+  derived-state maintenance joining the commits already in the log.
 - **External object-storage queue (e.g. OpenData Buffer).** Its consumer
   contracts (deterministic commit identity, ack after durable sink
   commit) validate the folder design and are borrowed. The queue itself

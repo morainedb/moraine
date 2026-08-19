@@ -317,6 +317,69 @@ impl SlotLog {
         Ok(length)
     }
 
+    /// How far the contiguous run from `from` reaches, and where the log
+    /// continues past a hole — one LIST, no bodies fetched.
+    ///
+    /// `last` is the run's final sequence, `None` when the log holds nothing
+    /// at `from`. `gap_at` carries the same meaning as
+    /// [`Tail::gap_at`](Tail::gap_at): a sequence absent while higher ones are
+    /// present. `from` is treated as in [`SlotLog::read_tail`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Transport`] if the listing failed.
+    pub async fn tail_extent(&self, from: u64) -> Result<Extent, Error> {
+        let from = from.max(FIRST_SEQUENCE);
+        let mut extent = Extent {
+            last: None,
+            gap_at: None,
+        };
+
+        let mut expected = from;
+        for sequence in self.list_sequences(from).await? {
+            if sequence != expected {
+                extent.gap_at = Some(expected);
+                break;
+            }
+            extent.last = Some(sequence);
+            expected = sequence.saturating_add(1);
+        }
+
+        Ok(extent)
+    }
+
+    /// Every slot present at or above `from`, ascending, with the wall-clock
+    /// second each object was last written — one LIST, no bodies fetched.
+    /// Sequences are contiguous only if the log is; a hole simply shows as a
+    /// jump.
+    ///
+    /// The timestamp is the store's, not this crate's: nothing here reads a
+    /// clock, and a policy that ages slots out supplies its own present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Transport`] if the listing failed.
+    pub async fn list_slots(&self, from: u64) -> Result<Vec<SlotMeta>, Error> {
+        let listing = self.list_with_metadata(from).await?;
+        let mut slots: Vec<SlotMeta> = listing
+            .into_iter()
+            .map(|(sequence, written_unix_seconds)| SlotMeta {
+                sequence,
+                written_unix_seconds,
+            })
+            .collect();
+        slots.sort_unstable_by_key(|slot| slot.sequence);
+
+        Ok(slots)
+    }
+
+    /// The object store the log lives on, for a caller that must open a
+    /// sibling log — a clone's destination, another store's slots.
+    #[must_use]
+    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.store)
+    }
+
     /// Scans the tail from `from` for a transaction id; the sequence of the
     /// slot that carries it, if any.
     ///
@@ -362,9 +425,23 @@ impl SlotLog {
     }
 
     /// Every sequence present at or above `from`, ascending, from one LIST.
-    /// Only objects at a sequence's exact path count as slots, so anything
-    /// else under the prefix — a nested key, a directory marker — is skipped.
     async fn list_sequences(&self, from: u64) -> Result<Vec<u64>, Error> {
+        let mut sequences: Vec<u64> = self
+            .list_with_metadata(from)
+            .await?
+            .into_iter()
+            .map(|(sequence, _)| sequence)
+            .collect();
+        sequences.sort_unstable();
+
+        Ok(sequences)
+    }
+
+    /// Every sequence present at or above `from` with its object's last-write
+    /// timestamp, in listing order, from one LIST. Only objects at a
+    /// sequence's exact path count as slots, so anything else under the
+    /// prefix — a nested key, a directory marker — is skipped.
+    async fn list_with_metadata(&self, from: u64) -> Result<Vec<(u64, i64)>, Error> {
         // `list_with_offset` is exclusive, so offset by the predecessor's
         // name; below sequence 1 the prefix itself sorts before every slot.
         let offset = match from.checked_sub(1) {
@@ -379,17 +456,35 @@ impl SlotLog {
             .await
             .map_err(|err| Error::transport(format!("listing slots from {from}: {err}")))?;
 
-        let mut sequences: Vec<u64> = listing
+        Ok(listing
             .iter()
             .filter_map(|meta| {
                 let sequence = parse_sequence(&meta.location)?;
-                (sequence >= from && meta.location == self.slot_path(sequence)).then_some(sequence)
+                (sequence >= from && meta.location == self.slot_path(sequence))
+                    .then(|| (sequence, meta.last_modified.timestamp()))
             })
-            .collect();
-        sequences.sort_unstable();
-
-        Ok(sequences)
+            .collect())
     }
+}
+
+/// How far a contiguous run of slots reaches, and where the log continues
+/// past a hole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extent {
+    /// The run's final sequence; `None` when the run is empty.
+    pub last: Option<u64>,
+    /// A sequence absent while higher sequences are present.
+    pub gap_at: Option<u64>,
+}
+
+/// One listed slot: its sequence and when its object was last written, in
+/// seconds since the Unix epoch as the object store reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotMeta {
+    /// The slot's sequence.
+    pub sequence: u64,
+    /// When the object was last written, per the store's own clock.
+    pub written_unix_seconds: i64,
 }
 
 /// What a slot's landed envelope says about an attempt whose outcome is
