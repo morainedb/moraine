@@ -394,6 +394,10 @@ async fn a_cancelled_participant_does_not_wedge_the_handle() {
     let store = Arc::new(InMemory::new());
     let mut options = CatalogOptions::default();
     options.commit_batch_window = Duration::from_millis(100);
+    // Below the guard timeouts. A cold head revalidation waits on the reader's
+    // manifest refresh, and under a paused clock the guard would otherwise be
+    // the sooner timer and read that wait as a wedge.
+    options.reader_poll_interval = Duration::from_millis(50);
     let catalog = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
 
     // The leader holds the batch open for its window, so the others queue.
@@ -469,6 +473,8 @@ async fn a_cancelled_leader_hands_off_and_keeps_the_handle_live() {
     let store = Arc::new(InMemory::new());
     let mut options = CatalogOptions::default();
     options.commit_batch_window = Duration::from_millis(100);
+    // Below the guard timeouts, as in the participant-drop case above.
+    options.reader_poll_interval = Duration::from_millis(50);
     let catalog = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
 
     let leader = {

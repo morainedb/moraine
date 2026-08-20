@@ -102,6 +102,52 @@ pub enum SyntheticMigration {
     MoveOptionScopeThenLink,
 }
 
+/// Stamps an existing store back to the base format, leaving its records as
+/// they are.
+///
+/// A store this binary writes carries the newest format it reads, which
+/// leaves a synthetic migration nothing to act on — every unit finds its
+/// `from` unmatched. Stamping down is what gives one a gap to close, and it
+/// runs after the fixture's content so a read-write attach cannot upgrade it
+/// again.
+///
+/// # Panics
+///
+/// Panics if the store cannot be written; it is a test fixture.
+#[cfg(any(test, feature = "fault-injection"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub async fn stamp_base_format(object_store: std::sync::Arc<dyn object_store::ObjectStore>) {
+    use slatedb::IsolationLevel;
+
+    use crate::{
+        store::{
+            key::{Key, SysKey},
+            open::StoreBuilder,
+            proto, value,
+        },
+        transaction::commit,
+    };
+
+    let (db, _, _) = commit::open_initialized(
+        StoreBuilder::new("", std::sync::Arc::clone(&object_store)),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Format).encode(),
+        value::encode_value(&proto::FormatValue {
+            format_version: commit::FORMAT_VERSION,
+            writer_version: "legacy".into(),
+        }),
+    )
+    .unwrap();
+    commit::commit_durably(&db, tx).await.unwrap();
+    db.close().await.unwrap();
+}
+
 #[cfg(any(test, feature = "fault-injection"))]
 mod armed {
     use std::cell::Cell;

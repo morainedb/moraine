@@ -165,7 +165,7 @@ async fn a_crash_mid_rewrite_leaves_the_store_old_and_unreadable() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(error, Error::Corruption(_)), "{error:?}");
+    assert!(matches!(error, Error::Migration(_)), "{error:?}");
 }
 
 /// Every seam: crash there, reopen, resume, and land on a coherent store

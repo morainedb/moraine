@@ -1249,8 +1249,11 @@ impl Catalog {
     async fn classify_format(reader: &DbReader) -> Result<(FormatClass, u64)> {
         let handle = ReadHandle::Reader(reader);
         if crate::store::read::read_migration(handle).await?.is_some() {
-            return Err(Error::Corruption(
-                "store is mid-migration; refusing to open".to_string(),
+            return Err(Error::Migration(
+                "store is mid-migration; refusing to open — Catalog::migrate resumes it from \
+                 the durable cursor, and takes a store path rather than an open catalog, so it \
+                 runs against a store no attach will touch"
+                    .to_string(),
             ));
         }
         match crate::store::read::read_format(handle).await? {

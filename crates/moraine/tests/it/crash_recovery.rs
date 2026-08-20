@@ -702,6 +702,9 @@ async fn catalog_with_planted_options(backing: &Arc<InMemory>) -> Vec<SchemaId> 
         .await
         .unwrap();
     catalog.close().await.unwrap();
+    // After the content, so a read-write attach cannot upgrade it back: the
+    // synthetic migration needs a format gap to act on.
+    moraine::stamp_base_format(backing.clone()).await;
     created.into_inner()
 }
 
