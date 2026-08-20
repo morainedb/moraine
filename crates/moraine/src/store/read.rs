@@ -205,6 +205,24 @@ pub(crate) async fn scan_decode<T>(
     Ok(records)
 }
 
+/// As [`scan_decode`], but for a scan whose answer is in the keys. The
+/// value never reaches `extract`, so a record decodes no body — the store
+/// still delivers the bytes, since a key and its value share an SST block.
+pub(crate) async fn scan_keys<T>(
+    handle: ReadHandle<'_>,
+    prefix: Vec<u8>,
+    shape: ScanShape,
+    mut extract: impl FnMut(Key) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut iter = handle.scan_prefix(prefix, .., shape).await?;
+    let mut records = Vec::new();
+    while let Some(entry) = iter.next().await? {
+        records.push(extract(Key::decode(&entry.key)?)?);
+    }
+
+    Ok(records)
+}
+
 /// As [`scan_decode`], splitting each of `splits` (the data-scaled kinds'
 /// prefixes under `prefix`) into concurrent sub-ranges once it outgrows one
 /// read-ahead; the records still come back in key order.

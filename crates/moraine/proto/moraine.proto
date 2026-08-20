@@ -412,9 +412,16 @@ message MaintenanceStatusValue {
   repeated MaintenanceStatusPassValue passes = 1;
 }
 
-// inline/schema: the Arrow IPC schema message, verbatim.
+// inline/schema: the Arrow IPC schema message, verbatim — or, once a
+// flush has deregistered this version, a reference to the version of the
+// same table whose bytes are identical. Deregistered versions are
+// retained forever so their names keep binding, and a mint that changed
+// no column produces a byte-identical duplicate, so collapsing one to a
+// reference is what keeps that retention cheap. Exactly one of the two
+// fields is set, and a reference always names a version carrying bytes.
 message InlineSchemaValue {
   bytes arrow_schema = 1;
+  optional uint64 same_as_version = 2;
 }
 
 // inline/insert and its archive form: an Arrow IPC record-batch body.
@@ -454,3 +461,10 @@ message InlineFileDeleteValue {
 // deletion is currently recorded: a flush empties them, and an emptied
 // SQL table still exists.
 message InlineFileDeleteTableValue {}
+
+// inline/schema_dropped: marks that a (table, schema_version)'s
+// ducklake_inlined_data_<t>_<v> has been flushed away and deregistered.
+// Empty — the key is the fact. The schema record itself is retained
+// beside it, so a reader still holding the pre-flush registry binds the
+// name and scans it empty rather than failing to bind at all.
+message InlineSchemaDroppedValue {}

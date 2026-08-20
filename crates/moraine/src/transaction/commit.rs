@@ -54,9 +54,13 @@ pub(crate) const FORMAT_WITH_MAINTENANCE_STATUS: u64 = 5;
 /// Format stamped the first time an inline chunk row-range locator is
 /// written.
 pub(crate) const FORMAT_WITH_INLINE_CHUNK_DIRECTORY: u64 = 6;
+/// A deregistered inline schema may be a reference to another version of
+/// the same table rather than the Arrow bytes themselves, which a reader
+/// that predates the field would decode as a schema with no columns.
+pub(crate) const FORMAT_WITH_INLINE_SCHEMA_REFERENCE: u64 = 7;
 /// The highest format this binary understands. It opens any store in
 /// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
-pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_CHUNK_DIRECTORY;
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_SCHEMA_REFERENCE;
 /// The lowest format this binary reads directly; a store below it must be
 /// migrated up first. Rises only when a format rewrites the keyspace.
 pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_VERSION;

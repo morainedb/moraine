@@ -1192,8 +1192,9 @@ impl StagedTransaction {
         // poisoned definition rides the writes it produces.)
         let inline = async {
             let phase_started = Instant::now();
-            let writes = translate_inline(&db_tx, &projections, &ops).await?;
-            Ok::<_, Error>((writes, phase_started.elapsed()))
+            let (writes, uses_schema_reference) =
+                translate_inline(&db_tx, &projections, &ops).await?;
+            Ok::<_, Error>((writes, uses_schema_reference, phase_started.elapsed()))
         };
         let maintenance = async {
             let phase_started = Instant::now();
@@ -1202,17 +1203,21 @@ impl StagedTransaction {
                     .await?;
             Ok::<_, Error>((entries, phase_started.elapsed()))
         };
-        let (inline_writes, entries) = match futures::try_join!(inline, maintenance) {
-            Ok(((inline_writes, inline_elapsed), (entries, maintenance_elapsed))) => {
-                phases.inline = inline_elapsed;
-                phases.index_maintenance = maintenance_elapsed;
-                (inline_writes, entries)
-            }
-            Err(err) => {
-                db_tx.rollback();
-                return Err(err);
-            }
-        };
+        let (inline_writes, uses_inline_schema_reference, entries) =
+            match futures::try_join!(inline, maintenance) {
+                Ok((
+                    (inline_writes, uses_schema_reference, inline_elapsed),
+                    (entries, maintenance_elapsed),
+                )) => {
+                    phases.inline = inline_elapsed;
+                    phases.index_maintenance = maintenance_elapsed;
+                    (inline_writes, uses_schema_reference, entries)
+                }
+                Err(err) => {
+                    db_tx.rollback();
+                    return Err(err);
+                }
+            };
         let StagedEntries {
             poisoned,
             deferred,
@@ -1248,6 +1253,7 @@ impl StagedTransaction {
                     inline_writes,
                     entry_bytes,
                     uses_inline_chunk_directory,
+                    uses_inline_schema_reference,
                 )
                 .await
                 {
@@ -1375,15 +1381,20 @@ async fn stage_batch(
     inline_writes: Vec<commit::StagedWrite>,
     entry_bytes: u64,
     uses_inline_chunk_directory: bool,
+    uses_inline_schema_reference: bool,
 ) -> Result<StagedBytes> {
     writes.extend(inline_writes);
-    if uses_inline_chunk_directory
-        && let Some(stamp) = commit::format_stamp_to(
-            db_tx,
-            projections,
-            commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY,
-        )
-        .await?
+    // A schema reference is the newer shape, and its floor subsumes the
+    // directory's.
+    let floor = if uses_inline_schema_reference {
+        Some(commit::FORMAT_WITH_INLINE_SCHEMA_REFERENCE)
+    } else if uses_inline_chunk_directory {
+        Some(commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY)
+    } else {
+        None
+    };
+    if let Some(floor) = floor
+        && let Some(stamp) = commit::format_stamp_to(db_tx, projections, floor).await?
     {
         writes.push(stamp);
     }

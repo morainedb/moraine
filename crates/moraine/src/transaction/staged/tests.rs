@@ -14,7 +14,7 @@ use object_store::{
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{layer::Context, prelude::*};
 
-use super::*;
+use super::{inline::inline_schema_collapse_target, *};
 use crate::catalog::{Catalog, CatalogOptions};
 
 fn schema_row(id: u64, name: &str, begin: u64) -> Vec<Cell> {
@@ -919,6 +919,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
             0,
             proto::InlineSchemaValue {
                 arrow_schema: b"schema".to_vec().into(),
+                same_as_version: None,
             }
         )]
     );
@@ -4399,13 +4400,13 @@ async fn stages_inline_drop_removes_every_record_for_the_table() {
     assert!(directory.is_none());
 }
 
-/// `InlineSchemaDrop` removes only the named schema version's
-/// `inline/schema` record, leaving a different schema version's
-/// record (and its chunks) untouched — the scoped cleanup a
+/// `InlineSchemaDrop` marks only the named schema version dropped,
+/// retaining its `inline/schema` record and leaving a different schema
+/// version's record (and its chunks) untouched — the scoped cleanup a
 /// superseded-inlined-table flush needs, as opposed to `InlineDrop`'s
 /// whole-table sweep.
 #[tokio::test]
-async fn stages_inline_schema_drop_removes_only_the_named_schema_version() {
+async fn stages_inline_schema_drop_marks_only_the_named_schema_version() {
     let catalog = open().await;
 
     let db_tx1 = catalog.begin_write_tx().await.unwrap();
@@ -4458,20 +4459,307 @@ async fn stages_inline_schema_drop_removes_only_the_named_schema_version() {
     let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
+    let dropped = store_inline::scan_inline_dropped_schemas(ReadHandle::Tx(&tx), 1)
+        .await
+        .unwrap();
     let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
     tx.rollback();
     assert_eq!(
         schemas,
-        vec![(
-            1,
-            proto::InlineSchemaValue {
-                arrow_schema: b"schema-v1".to_vec().into()
-            }
-        )]
+        vec![
+            (
+                0,
+                proto::InlineSchemaValue {
+                    arrow_schema: b"schema-v0".to_vec().into(),
+                    same_as_version: None,
+                }
+            ),
+            (
+                1,
+                proto::InlineSchemaValue {
+                    arrow_schema: b"schema-v1".to_vec().into(),
+                    same_as_version: None,
+                }
+            )
+        ],
+        "a dropped version's columns stay resolvable"
     );
+    assert_eq!(dropped, vec![0]);
     assert_eq!(chunks.len(), 1, "schema_version 1's chunk must survive");
+}
+
+/// Staging a schema at a version that was dropped re-registers it: the
+/// drop marker goes with the same batch, so a version is never both
+/// registered and marked.
+#[tokio::test]
+async fn stages_inline_schema_at_a_dropped_version_clears_its_marker() {
+    let catalog = open().await;
+
+    let db_tx1 = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached(db_tx1);
+    setup.stage(RowOperation::InlineSchema {
+        table_id: 1,
+        schema_version: 0,
+        arrow_schema: b"schema-v0".to_vec(),
+    });
+    setup.stage(RowOperation::InlineSchemaDrop {
+        table_id: 1,
+        schema_version: 0,
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 0, 1),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "flushed_inlined_data:1"),
+    });
+    setup.commit().await.unwrap();
+
+    let db_tx2 = catalog.begin_write_tx().await.unwrap();
+    let mut again = StagedTransaction::begin_detached(db_tx2);
+    again.stage(RowOperation::InlineSchema {
+        table_id: 1,
+        schema_version: 0,
+        arrow_schema: b"schema-v0".to_vec(),
+    });
+    again.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 0, 1),
+    });
+    again.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "inlined_insert:1"),
+    });
+    again.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let dropped = store_inline::scan_inline_dropped_schemas(ReadHandle::Tx(&tx), 1)
+        .await
+        .unwrap();
+    tx.rollback();
+    assert!(dropped.is_empty());
+}
+
+/// The collapse decision, over the record shapes a table can hold. A
+/// duplicate collapses; unique bytes, a record that is already a
+/// reference, and a record another reference resolves through do not.
+#[test]
+fn a_schema_version_collapses_only_onto_an_unreferenced_twin() {
+    fn bytes(arrow_schema: &[u8]) -> proto::InlineSchemaValue {
+        proto::InlineSchemaValue {
+            arrow_schema: arrow_schema.to_vec().into(),
+            same_as_version: None,
+        }
+    }
+    fn reference(same_as_version: u64) -> proto::InlineSchemaValue {
+        proto::InlineSchemaValue {
+            arrow_schema: bytes::Bytes::new(),
+            same_as_version: Some(same_as_version),
+        }
+    }
+
+    let twins = [(0, bytes(b"same")), (1, bytes(b"same"))];
+    assert_eq!(inline_schema_collapse_target(&twins, 0), Some(1));
+
+    let distinct = [(0, bytes(b"first")), (1, bytes(b"second"))];
+    assert_eq!(inline_schema_collapse_target(&distinct, 0), None);
+
+    // Already a reference: collapsing again would chain.
+    let collapsed = [(0, reference(1)), (1, bytes(b"same"))];
+    assert_eq!(inline_schema_collapse_target(&collapsed, 0), None);
+
+    // Version 1 is what version 0 resolves through, so its bytes stay
+    // even though version 2 carries the same ones.
+    let referenced = [(0, reference(1)), (1, bytes(b"same")), (2, bytes(b"same"))];
+    assert_eq!(inline_schema_collapse_target(&referenced, 1), None);
+
+    assert_eq!(inline_schema_collapse_target(&twins, 9), None);
+}
+
+/// A deregistration that collapses a duplicate carries the store to the
+/// format that shuts out readers which would misdecode a reference, in
+/// the batch that writes one — as a live index or an inline chunk
+/// locator carries it to theirs. One that collapses nothing moves
+/// nothing.
+#[tokio::test]
+async fn a_collapsing_deregistration_stamps_the_reference_format() {
+    for (versions, collapses) in [
+        ([(0u64, b"same".as_slice()), (1, b"same".as_slice())], true),
+        ([(0, b"first".as_slice()), (1, b"second".as_slice())], false),
+    ] {
+        let catalog = open().await;
+
+        let db_tx1 = catalog.begin_write_tx().await.unwrap();
+        let mut setup = StagedTransaction::begin_detached_on(&catalog, db_tx1);
+        for (schema_version, arrow_schema) in versions {
+            setup.stage(RowOperation::InlineSchema {
+                table_id: 1,
+                schema_version,
+                arrow_schema: arrow_schema.to_vec(),
+            });
+        }
+        setup.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 0, 1),
+        });
+        setup.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, "inlined_insert:1"),
+        });
+        setup.commit().await.unwrap();
+
+        let db_tx2 = catalog.begin_write_tx().await.unwrap();
+        let mut drop_tx = StagedTransaction::begin_detached_on(&catalog, db_tx2);
+        drop_tx.stage(RowOperation::InlineSchemaDrop {
+            table_id: 1,
+            schema_version: 0,
+        });
+        drop_tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 0, 1),
+        });
+        drop_tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "flushed_inlined_data:1"),
+        });
+        drop_tx.commit().await.unwrap();
+
+        let tx = catalog.begin_write_tx().await.unwrap();
+        let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
+            .await
+            .unwrap();
+        let format = crate::store::read::read_format(ReadHandle::Tx(&tx))
+            .await
+            .unwrap()
+            .map_or(crate::transaction::commit::FORMAT_VERSION, |stamp| {
+                stamp.format_version
+            });
+        tx.rollback();
+
+        assert_eq!(schemas[0].1.same_as_version.is_some(), collapses);
+        assert_eq!(
+            format >= crate::transaction::commit::FORMAT_WITH_INLINE_SCHEMA_REFERENCE,
+            collapses,
+            "only the batch that writes a reference owes the stamp"
+        );
+    }
+}
+
+/// A collapsed version still resolves to the bytes it was registered
+/// with: the reference is a storage shape, not a change of answer.
+#[tokio::test]
+async fn a_collapsed_version_still_resolves_to_its_bytes() {
+    let catalog = open().await;
+
+    let db_tx1 = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached_on(&catalog, db_tx1);
+    for schema_version in [0, 1] {
+        setup.stage(RowOperation::InlineSchema {
+            table_id: 1,
+            schema_version,
+            arrow_schema: b"same".to_vec(),
+        });
+    }
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 0, 1),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "inlined_insert:1"),
+    });
+    setup.commit().await.unwrap();
+
+    let db_tx2 = catalog.begin_write_tx().await.unwrap();
+    let mut drop_tx = StagedTransaction::begin_detached_on(&catalog, db_tx2);
+    drop_tx.stage(RowOperation::InlineSchemaDrop {
+        table_id: 1,
+        schema_version: 0,
+    });
+    drop_tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 0, 1),
+    });
+    drop_tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "flushed_inlined_data:1"),
+    });
+    drop_tx.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
+        .await
+        .unwrap();
+    let resolved = store_inline::scan_inline_schemas_resolved(ReadHandle::Tx(&tx), 1)
+        .await
+        .unwrap();
+    tx.rollback();
+
+    assert_eq!(schemas[0].1.same_as_version, Some(1));
+    assert!(schemas[0].1.arrow_schema.is_empty());
+    assert_eq!(
+        resolved,
+        vec![
+            (0, bytes::Bytes::from_static(b"same")),
+            (1, bytes::Bytes::from_static(b"same"))
+        ]
+    );
+}
+
+/// `InlineDrop`'s whole-table sweep takes the drop markers with
+/// everything else, so a re-created table starts with no inherited
+/// deregistrations.
+#[tokio::test]
+async fn stages_inline_drop_removes_the_dropped_schema_markers() {
+    let catalog = open().await;
+
+    let db_tx1 = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached(db_tx1);
+    setup.stage(RowOperation::InlineSchema {
+        table_id: 1,
+        schema_version: 0,
+        arrow_schema: b"schema-v0".to_vec(),
+    });
+    setup.stage(RowOperation::InlineSchemaDrop {
+        table_id: 1,
+        schema_version: 0,
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 0, 1),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "flushed_inlined_data:1"),
+    });
+    setup.commit().await.unwrap();
+
+    let db_tx2 = catalog.begin_write_tx().await.unwrap();
+    let mut drop_tx = StagedTransaction::begin_detached(db_tx2);
+    drop_tx.stage(RowOperation::InlineDrop { table_id: 1 });
+    drop_tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 0, 1),
+    });
+    drop_tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "dropped_table:1"),
+    });
+    drop_tx.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
+        .await
+        .unwrap();
+    let dropped = store_inline::scan_inline_dropped_schemas(ReadHandle::Tx(&tx), 1)
+        .await
+        .unwrap();
+    tx.rollback();
+    assert!(schemas.is_empty());
+    assert!(dropped.is_empty());
 }
 
 fn partition_info_row(partition_id: u64, table_id: u64, begin: u64) -> Vec<Cell> {

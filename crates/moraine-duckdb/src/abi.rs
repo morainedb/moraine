@@ -982,6 +982,61 @@ pub unsafe extern "C" fn moraine_migrate(
     }
 }
 
+/// Raises the store `handle` names to the newest purely additive format
+/// this binary writes, opening the record shapes gated behind it, and
+/// reports the formats either side of the move.
+///
+/// A one-way door, and the only thing that opens it: the shapes it
+/// admits are ones an older binary misreads rather than refuses, so the
+/// store can no longer be opened by a binary that predates the format.
+/// A reader already attached on an older binary is not refused by this —
+/// raise the format only once every reader understands it. `dry_run`
+/// reports the move it would make and stamps nothing, which is the only
+/// way to read a store's format without changing it.
+///
+/// # Safety
+///
+/// `handle` must be a pointer previously returned by [`moraine_attach`]
+/// and not yet detached.
+/// `out_from`/`out_to` must be valid, writable pointers, and `err`, if
+/// non-null, a valid, writable [`MoraineError`], for the duration of the
+/// call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_raise_format(
+    handle: *mut MoraineCatalogHandle,
+    dry_run: bool,
+    out_from: *mut u64,
+    out_to: *mut u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_from.is_null() || out_to.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        let catalog = handle_ref.catalog.writer().map_err(AbiError::from)?;
+        let raised = handle_ref
+            .block_on(catalog.raise_format(dry_run))
+            .map_err(AbiError::from)?;
+        // SAFETY: checked non-null above; caller contract for validity.
+        unsafe {
+            *out_from = raised.from_format;
+            *out_to = raised.to_format;
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
 /// Frees an owned string a `moraine_*` call returned (such as
 /// [`moraine_data_path`]'s `out`). A null pointer is ignored.
 ///

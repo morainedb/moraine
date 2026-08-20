@@ -1827,3 +1827,71 @@ fn expiring_a_dropped_table_reclaims_its_file_column_stats_like_stock() {
     ));
     assert_eq!(swept, vec![vec!["reclaimed 0 file column statistics"]]);
 }
+
+/// `moraine_raise_format` takes the newest additive format deliberately,
+/// ahead of the commit that would otherwise take it. It reports the move
+/// and is idempotent, and `dry_run` reads a store's format without
+/// moving it. The store here writes no shape needing the newest format —
+/// its inserts inline, but nothing deregisters a duplicate schema — so
+/// it sits below one until the verb runs.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn raising_the_store_format_is_explicit_and_idempotent() {
+    let dir = TempDir::new("raise-format-store");
+    let data_dir = TempDir::new("raise-format-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CREATE TABLE lake.main.t (i BIGINT);\nINSERT INTO lake.main.t VALUES (1);",
+    );
+
+    let raise_with = |label: &str, options: &str| -> (u64, u64) {
+        let rows = csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            &format!("SELECT from_format, to_format FROM moraine_raise_format('lake'{options});"),
+        ));
+        let row = rows.first().unwrap_or_else(|| panic!("{label}: a row"));
+        let read = |cell: &String| cell.parse::<u64>().expect("a format is a number");
+        (read(&row[0]), read(&row[1]))
+    };
+
+    // A dry run answers what a raise would do, twice over, without doing
+    // it — the pre-flight a one-way door needs.
+    let probed = raise_with("the dry run", ", dry_run := true");
+    assert!(
+        probed.0 < probed.1,
+        "a fresh store must sit below this binary's newest additive format, got {probed:?}"
+    );
+    assert_eq!(
+        raise_with("the second dry run", ", dry_run := true"),
+        probed,
+        "a dry run must leave the store where it found it"
+    );
+
+    let (from_format, to_format) = raise_with("the first raise", "");
+    assert_eq!((from_format, to_format), probed);
+    assert!(
+        from_format < to_format,
+        "a store writing no shape that needs the newest format must sit below it, \
+         got {from_format} -> {to_format}"
+    );
+
+    let (again_from, again_to) = raise_with("the second raise", "");
+    assert_eq!(
+        (again_from, again_to),
+        (to_format, to_format),
+        "raising an already-raised store must be a no-op"
+    );
+
+    // The lake still reads, and reads the same rows.
+    let rows = csv_rows(&run_ducklake_sql(
+        store,
+        data_path,
+        "SELECT i FROM lake.main.t ORDER BY i;",
+    ));
+    assert_eq!(rows, vec![vec!["1"]]);
+}
