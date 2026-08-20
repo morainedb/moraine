@@ -454,3 +454,10 @@ message InlineFileDeleteValue {
 // deletion is currently recorded: a flush empties them, and an emptied
 // SQL table still exists.
 message InlineFileDeleteTableValue {}
+
+// inline/schema_dropped: marks that a (table, schema_version)'s
+// ducklake_inlined_data_<t>_<v> has been flushed away and deregistered.
+// Empty — the key is the fact. The schema record itself is retained
+// beside it, so a reader still holding the pre-flush registry binds the
+// name and scans it empty rather than failing to bind at all.
+message InlineSchemaDroppedValue {}

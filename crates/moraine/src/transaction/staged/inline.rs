@@ -320,12 +320,13 @@ pub(super) async fn translate_inline_drop(
     table_id: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
-    let (chunks, ranges, inline_deletes, file_deletes, schemas) = futures::try_join!(
+    let (chunks, ranges, inline_deletes, file_deletes, schemas, dropped_schemas) = futures::try_join!(
         store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id),
         store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id),
         store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
         store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id),
         store_inline::scan_inline_schemas(ReadHandle::Tx(db_tx), table_id),
+        store_inline::scan_inline_dropped_schemas(ReadHandle::Tx(db_tx), table_id),
     )?;
 
     for (op, _) in chunks {
@@ -365,6 +366,16 @@ pub(super) async fn translate_inline_drop(
     for (schema_version, _) in schemas {
         writes.push((
             Key::Inline(InlineKey::Schema {
+                table_id,
+                schema_version,
+            })
+            .encode(),
+            None,
+        ));
+    }
+    for schema_version in dropped_schemas {
+        writes.push((
+            Key::Inline(InlineKey::SchemaDropped {
                 table_id,
                 schema_version,
             })
@@ -496,10 +507,29 @@ pub(crate) fn inline_inline_delete_write(
     )
 }
 
-/// Deregisters one `(table_id, schema_version)`'s Arrow schema.
+/// Deregisters one `(table_id, schema_version)` from
+/// `ducklake_inlined_data_tables`, retaining its Arrow schema so the
+/// name still resolves. DuckLake caches an inlined table's existence for
+/// the life of an attach and never re-probes, so a reader holding the
+/// pre-flush registry keeps naming a version this drop removed; retaining
+/// the schema turns that from a failed bind into an empty scan, and the
+/// rows it wanted are in the file the flush wrote.
 pub(super) fn inline_schema_drop_write(table_id: u64, schema_version: u64) -> commit::StagedWrite {
     (
-        Key::Inline(InlineKey::Schema {
+        Key::Inline(InlineKey::SchemaDropped {
+            table_id,
+            schema_version,
+        })
+        .encode(),
+        Some(value::encode_value(&proto::InlineSchemaDroppedValue {})),
+    )
+}
+
+/// Clears a version's drop marker, so registering it again cannot leave
+/// it both listed and deregistered.
+fn inline_schema_undrop_write(table_id: u64, schema_version: u64) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::SchemaDropped {
             table_id,
             schema_version,
         })
@@ -640,11 +670,14 @@ pub(super) async fn translate_inline(
                 table_id,
                 schema_version,
                 arrow_schema,
-            } => writes.push(inline_schema_write(
-                *table_id,
-                *schema_version,
-                arrow_schema,
-            )),
+            } => {
+                writes.push(inline_schema_write(
+                    *table_id,
+                    *schema_version,
+                    arrow_schema,
+                ));
+                writes.push(inline_schema_undrop_write(*table_id, *schema_version));
+            }
             RowOperation::InlineInsert {
                 table_id,
                 schema_version,

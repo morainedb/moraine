@@ -81,6 +81,7 @@ inherit that limitation.
 | `inline/inline_delete` | `table_id, row_id` | `end_snapshot` (tombstone for an inlined insert row) |
 | `inline/file_delete` | `table_id, data_file_id, row_id` | `begin_snapshot` (inlined delete against a Parquet file) |
 | `inline/file_delete_table` | `table_id` | Empty — the key is the fact. Marks that `ducklake_inlined_delete_<table_id>` exists |
+| `inline/schema_dropped` | `table_id, schema_version` | Empty — the key is the fact. Marks that `ducklake_inlined_data_<t>_<v>` has been deregistered by a flush |
 | `inline/chunk_range` | `table_id, row_id_end` | `row_id_start, schema_version, begin_snapshot, chunk_seq` — one locator per live insert chunk; `row_id_end` is inclusive |
 
 The insert and tombstone records are append-only on the commit path. The
@@ -93,7 +94,37 @@ content-derived existence disappears under it mid-session and every later
 bind fails. Written idempotently by both paths that prove the table
 exists — staging a deletion into it, and removing one from it, the latter
 so a store written before the marker heals on its first flush — and
-removed by the `DROP TABLE` cascade. The chunk-range record is an immutable
+removed by the `DROP TABLE` cascade.
+
+The dropped-schema marker answers the same caching for the insert side,
+where the flush's cleanup deregisters and drops a superseded, emptied
+`ducklake_inlined_data_<t>_<v>`. DuckLake caches a table's inlined-table
+list under the *schema version*, and a flush does not move that version,
+so nothing tells a reader in another process that the list it holds has
+gone stale; the reader keeps naming the dropped table and every later
+bind fails. The marker splits registration from existence: it deregisters
+the version from `ducklake_inlined_data_tables` — so a reader that loads
+the list afterwards never learns the version, and the flush's cleanup
+does not re-target it — while the `inline/schema` record stays, so the
+name still resolves and scans empty. That is the correct answer for a
+stale reader: the rows it is asking for are in the file the flush wrote,
+and the retained record holds no chunks to double-count. Registering a
+version clears its marker in the same batch, so a version is never both
+listed and marked; the `DROP TABLE` cascade takes the markers with
+everything else. What this does not do is bound the retained schemas: one
+per inlined table a live DuckLake table has ever registered, reclaimed
+only when that table is dropped. They sit under their own key prefix, off
+every scan but the deregistration subtraction, and a tighter bound would
+have to come from expiry.
+
+The marker carries no store-format floor, unlike the chunk directory.
+Nothing here caches a judgment that a writer predating the marker could
+falsify: a writer that old deletes the schema record outright, which
+costs that one version its bind and leaves an inert marker the drop
+cascade sweeps. Mixed writers degrade a version at a time; they do not
+make a reader wrong.
+
+The chunk-range record is an immutable
 secondary directory written and removed atomically with its owning chunk.
 Its inclusive end is the ordered key, so a forward seek beginning at a
 deleted row id lands on the first range that could own the row; the value's
@@ -312,7 +343,7 @@ The operation → keyspace mapping (source-verified against DuckLake
 | `SELECT <cols> FROM ducklake_inlined_data_<t>_<v> WHERE {snap} >= begin_snapshot AND ({snap} < end_snapshot OR end_snapshot IS NULL) ORDER BY row_id` (and the `SCAN_INSERTIONS`/`SCAN_DELETIONS`/`SCAN_FOR_FLUSH` filter variants) | range-scan `inline/insert` for `t` at `v`, decode Arrow, reconstruct the three virtual columns, apply the snapshot predicate, subtract `inline/inline_delete` tombstones, project and order by `row_id` |
 | `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id, {snap}), …` | `inline/file_delete` at `(t, file_id, row_id)` holding `begin_snapshot={snap}`, plus the `inline/file_delete_table` marker for `t` |
 | `DELETE FROM ducklake_inlined_delete_<t>` (the flush's clean-up, once those deletions are written out as a real delete file) | remove the `inline/file_delete` record behind each matched row, keeping the `inline/file_delete_table` marker. Translated per row rather than as a table-wide clear: DuckLake's flush happens to delete every row, but what it issues is an ordinary SQL `DELETE`, so a filtered one removes exactly what it matched. Naming a record the table does not carry is a typed error, not a silent no-op |
-| `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <= {flush_snap}` then `DROP TABLE …` + `DELETE FROM ducklake_inlined_data_tables …` (flush / superseded-table cleanup) | remove the flushed `inline/insert` chunks, their `inline/chunk_range` locators, and consumed `inline/inline_delete`; drop the `inline/schema` and deregister. The flushed data lives on as the backdated `ducklake_data_file` DuckLake registers through the ordinary file path |
+| `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <= {flush_snap}` then `DROP TABLE …` + `DELETE FROM ducklake_inlined_data_tables …` (flush / superseded-table cleanup) | remove the flushed `inline/insert` chunks, their `inline/chunk_range` locators, and consumed `inline/inline_delete`; write the version's `inline/schema_dropped` marker, retaining its `inline/schema`. The flushed data lives on as the backdated `ducklake_data_file` DuckLake registers through the ordinary file path |
 | hard `DELETE FROM ducklake_data_file` naming `(t, file_id)` (a merge pruning its sources, cleanup draining the schedule) | remove every `inline/file_delete` record targeting that file, keeping the marker. Silent on a miss, unlike the removal above: this cascade names a file rather than records, and a pruned file carrying no inlined deletion is the ordinary case |
 | `UPDATE ducklake_data_file SET end_snapshot` (a rewrite ending its source) | nothing — see below |
 | `DROP TABLE lake.<schema>.<t>` cascade | drop every `inline/*` record for `t` |

@@ -606,3 +606,83 @@ fn an_evolved_tables_read_hauls_each_version_once() {
          own rows"
     );
 }
+
+/// A flush deregisters the inlined table it emptied, and the name keeps
+/// resolving anyway. DuckLake caches a table's inlined-table list under
+/// its schema version for the life of an attach, and a flush does not
+/// move that version, so a session that read the list before the flush
+/// goes on naming a table the flush dropped; answering with an empty
+/// scan is what keeps its next read from failing to bind. A session that
+/// reads the list after the flush never sees the version at all, so the
+/// retained schema costs no scan.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn a_flushed_inline_table_deregisters_but_still_resolves() {
+    let dir = TempDir::new("inline-deregistered-store");
+    let data_dir = TempDir::new("inline-deregistered-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    // An ALTER between inserts mints a second inlined table, which is
+    // what makes the first superseded — and a superseded, emptied table
+    // is exactly what the flush's cleanup drops.
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CREATE TABLE lake.main.t (i BIGINT);\n\
+         INSERT INTO lake.main.t VALUES (1);\n\
+         ALTER TABLE lake.main.t ADD COLUMN s VARCHAR;\n\
+         INSERT INTO lake.main.t VALUES (2, 'b');",
+    );
+
+    let registered = |label: &str| -> Vec<(String, String)> {
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT table_id, schema_version FROM m.ducklake_inlined_data_tables \
+             ORDER BY schema_version;",
+        ))
+        .into_iter()
+        .map(|row| {
+            let mut cells = row.into_iter();
+            let table_id = cells.next().unwrap_or_else(|| panic!("{label}: table_id"));
+            let version = cells.next().unwrap_or_else(|| panic!("{label}: version"));
+            (table_id, version)
+        })
+        .collect()
+    };
+
+    let before = registered("before the flush");
+    assert!(
+        before.len() >= 2,
+        "the ALTER must have minted a second inlined table, got {before:?}"
+    );
+    let (table_id, superseded) = before[0].clone();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CALL ducklake_flush_inlined_data('lake');",
+    );
+
+    let after = registered("after the flush");
+    assert!(
+        !after.iter().any(|(_, version)| *version == superseded),
+        "the flushed version must leave ducklake_inlined_data_tables, got {after:?}"
+    );
+
+    // The bind a pre-flush session still issues. Its rows are in the
+    // file the flush wrote, so an empty answer is the correct one.
+    let scan = csv_rows(&run_standalone_sql(
+        store,
+        &format!("SELECT count(*) FROM m.ducklake_inlined_data_{table_id}_{superseded};"),
+    ));
+    assert_eq!(scan, vec![vec!["0".to_string()]]);
+
+    // And the table itself still reads whole, through the flushed file.
+    let rows = csv_rows(&run_ducklake_sql(
+        store,
+        data_path,
+        "SELECT i, s FROM lake.main.t ORDER BY i;",
+    ));
+    assert_eq!(rows, vec![vec!["1", "NULL"], vec!["2", "b"]]);
+}

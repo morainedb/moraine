@@ -10,7 +10,8 @@ use crate::{
         handle::{ReadHandle, ScanShape},
         key::{
             InlineKey, InlineOperation, InlineOperationKind, Key, inline_chunk_range_suffix,
-            inline_chunk_range_table_prefix, inline_live_table_prefix, inline_schema_prefix,
+            inline_chunk_range_table_prefix, inline_live_table_prefix,
+            inline_schema_dropped_prefix, inline_schema_dropped_table_prefix, inline_schema_prefix,
             inline_schema_table_prefix,
         },
         proto::{
@@ -342,6 +343,49 @@ pub(crate) async fn scan_inline_schemas(
             }
             other => Err(Error::Corruption(format!(
                 "non-schema key in inline schema scan: {other:?}"
+            ))),
+        },
+    )
+    .await
+}
+
+/// Every deregistered schema version of `table_id`, in key order. Their
+/// `inline/schema` records are retained, so this is what separates a
+/// version DuckLake still lists from one it has flushed away.
+pub(crate) async fn scan_inline_dropped_schemas(
+    handle: ReadHandle<'_>,
+    table_id: u64,
+) -> Result<Vec<u64>> {
+    scan_decode(
+        handle,
+        inline_schema_dropped_table_prefix(table_id),
+        ScanShape::Probe,
+        |key, _| match key {
+            Key::Inline(InlineKey::SchemaDropped { schema_version, .. }) => Ok(schema_version),
+            other => Err(Error::Corruption(format!(
+                "non-drop key in inline dropped-schema scan: {other:?}"
+            ))),
+        },
+    )
+    .await
+}
+
+/// Every deregistered `(table_id, schema_version)` across every table, in
+/// key order.
+pub(crate) async fn scan_all_inline_dropped_schemas(
+    handle: ReadHandle<'_>,
+) -> Result<Vec<(u64, u64)>> {
+    scan_decode(
+        handle,
+        inline_schema_dropped_prefix(),
+        ScanShape::Probe,
+        |key, _| match key {
+            Key::Inline(InlineKey::SchemaDropped {
+                table_id,
+                schema_version,
+            }) => Ok((table_id, schema_version)),
+            other => Err(Error::Corruption(format!(
+                "non-drop key in all-table inline dropped-schema scan: {other:?}"
             ))),
         },
     )

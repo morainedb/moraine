@@ -185,4 +185,9 @@ mod tests {
         garbage_inline_file_delete,
         InlineFileDeleteValue
     );
+    codec_tests!(
+        roundtrip_inline_schema_dropped,
+        garbage_inline_schema_dropped,
+        InlineSchemaDroppedValue
+    );
 }

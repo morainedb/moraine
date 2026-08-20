@@ -4,6 +4,8 @@
 //! otherwise-private `catalog`. Each function opens a fresh read-only
 //! transaction, scans, and rolls back.
 
+use std::collections::HashSet;
+
 use bytes::Bytes;
 
 #[doc(hidden)]
@@ -114,9 +116,11 @@ pub async fn inline_schemas(catalog: &ReadOnlyCatalog, table_id: u64) -> Result<
         .collect())
 }
 
-/// Every `(table_id, schema_version)` with a recorded inline schema,
-/// across every table — feeds the `ducklake_inlined_data_tables`
-/// projection behind `moraine_inline_registered_tables`.
+/// Every `(table_id, schema_version)` still registered, across every
+/// table — feeds the `ducklake_inlined_data_tables` projection behind
+/// `moraine_inline_registered_tables`. A flushed-away version's schema
+/// record is retained so its name keeps resolving, so the drop markers
+/// are what deregister it here.
 ///
 /// # Errors
 ///
@@ -125,11 +129,17 @@ pub async fn inline_schemas(catalog: &ReadOnlyCatalog, table_id: u64) -> Result<
 #[doc(hidden)]
 pub async fn inline_registered_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<(u64, u64)>> {
     let session = catalog.begin_read().await?;
-    let schemas = store_inline::scan_all_inline_schemas(session.handle()).await;
+    let scans = futures::try_join!(
+        store_inline::scan_all_inline_schemas(session.handle()),
+        store_inline::scan_all_inline_dropped_schemas(session.handle()),
+    );
     session.finish();
-    Ok(schemas?
+    let (schemas, dropped) = scans?;
+    let dropped: HashSet<(u64, u64)> = dropped.into_iter().collect();
+    Ok(schemas
         .into_iter()
         .map(|(table_id, schema_version, _)| (table_id, schema_version))
+        .filter(|pair| !dropped.contains(pair))
         .collect())
 }
 
@@ -309,6 +319,92 @@ mod tests {
 
         let registered = inline_registered_tables(&catalog).await.unwrap();
         assert_eq!(registered, vec![(1, 0)]);
+    }
+
+    /// A dropped schema version leaves `ducklake_inlined_data_tables`
+    /// but stays resolvable by name. A reader that cached the registry
+    /// before the drop still binds `ducklake_inlined_data_<t>_<v>` and
+    /// scans it empty, where a deregistration that also took the columns
+    /// would fail its bind; a reader that loads the registry after the
+    /// drop never learns the version at all.
+    #[tokio::test]
+    async fn a_dropped_schema_version_deregisters_but_stays_resolvable() {
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(db_tx);
+
+        for (schema_version, schema) in [(0u64, b"schema-v0"), (1, b"schema-v1")] {
+            tx.stage(RowOperation::InlineSchema {
+                table_id: 1,
+                schema_version,
+                arrow_schema: schema.to_vec(),
+            });
+        }
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 1,
+            arrow_body: b"chunk".to_vec(),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            inline_registered_tables(&catalog).await.unwrap(),
+            vec![(1, 0), (1, 1)]
+        );
+
+        let db_tx2 = catalog.begin_write_tx().await.unwrap();
+        let mut flush = StagedTransaction::begin_detached(db_tx2);
+        flush.stage(RowOperation::InlineFlushDelete {
+            table_id: 1,
+            schema_version: 0,
+            flush_snapshot: 2,
+        });
+        flush.stage(RowOperation::InlineSchemaDrop {
+            table_id: 1,
+            schema_version: 0,
+        });
+        flush.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2),
+        });
+        flush.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2),
+        });
+        flush.commit().await.unwrap();
+
+        assert_eq!(
+            inline_registered_tables(&catalog).await.unwrap(),
+            vec![(1, 1)],
+            "the flushed version leaves the registry"
+        );
+        assert_eq!(
+            inline_schemas(&catalog, 1).await.unwrap(),
+            vec![
+                (0, Bytes::from_static(b"schema-v0")),
+                (1, Bytes::from_static(b"schema-v1"))
+            ],
+            "the flushed version still resolves its columns"
+        );
+
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 2, 0, Some(0))
+            .await
+            .unwrap();
+        assert!(
+            record.rows.is_empty(),
+            "the retained version scans empty; its rows are in the flushed file"
+        );
     }
 
     /// The first `scan_inline` walk verifies the chunk directory and
