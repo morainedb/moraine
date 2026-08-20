@@ -225,86 +225,187 @@ store the shim rewrites the terse store error to name this fix (add
 paths are not remote-file URIs — a Postgres/MySQL connection string never
 matches the prefix rule, and local DuckDB/SQLite files default read-write.
 
-**`CACHE_DIR` — an on-disk object cache for S3 stores.** Every query rebinds the
-catalog by reading its metadata (snapshot → tables → columns → files → stats)
-from the store; on an `s3://`-backed catalog those reads are S3 round-trips, and
-the in-memory caches start empty in each new process. The `CACHE_DIR` attach
-option — `ATTACH 'ducklake:moraine:s3://…' AS lake (DATA_PATH '…', READ_WRITE,
-META_CACHE_DIR '/var/cache/moraine')`, or `CACHE_DIR` directly on a standalone
-`moraine:` attach — points SlateDB's `object_store_cache_options` at a local
-directory, where whole object parts are kept, so warm reads survive restarts and
-repeat queries skip the GETs. It threads through the shim (`moraine_attach`'s
-`cache_dir`) into `CatalogOptions::cache_dir` and `StoreBuilder`, applying to
-both the writer and the reader; unset (the default), only the in-memory caches
-apply. Redundant for local/`memory://` stores.
+**`CACHE_DIR` — the block cache's disk tier, for S3 stores.** Every query
+rebinds the catalog by reading its metadata (snapshot → tables → columns →
+files → stats) from the store; on an `s3://`-backed catalog those reads are
+S3 round-trips, and the in-memory tier starts empty in each new process. The
+`CACHE_DIR` attach option — `ATTACH 'ducklake:moraine:s3://…' AS lake
+(DATA_PATH '…', READ_WRITE, META_CACHE_DIR '/var/cache/moraine')`, or
+`CACHE_DIR` directly on a standalone `moraine:` attach — gives each
+store's block cache (RFC 0009) a disk device under that directory: blocks
+are written there at block grain as they are read, so repeat reads skip
+the GETs, and a new process recovers what the last one left, so a
+re-attach in the same order starts warm without a preload. It threads
+through the shim (`moraine_attach`'s `cache_dir`) into
+`CatalogOptions::cache_dir` and `StoreBuilder`, applying to both the
+writer and the reader; unset (the default), only the memory tier applies.
+Redundant for local/`memory://` stores.
 
-This is not the block cache, and the two are worth keeping apart. SlateDB's
-block cache is in memory, holds decoded blocks, and comes with a metadata cache
-beside it; both are per open store and moraine configures neither, so each
-attached store carries SlateDB's own sizes for them. `CACHE_DIR` and
-`CACHE_SIZE` govern only the disk tier.
+There is one budget, shared by every store the process attaches, and one
+cache per store under it (RFC 0009). The first attach to open settles the
+sizing and later ones are sized by it, so these options are the process's
+rather than the attach's. SST indexes and filters are held at a higher
+eviction priority than data blocks, so a scan cannot push them out, while
+metadata a store does not need is space blocks take; each store's blocks
+spill at block grain to its own device under `CACHE_DIR`, capped by
+`CACHE_SIZE`, with `CACHE_MEMORY` budgeting the memory every store's cache
+and the parsed-footer cache share, re-split across the stores attached.
+There is no separate object-part cache beneath — a byte is cached decoded,
+once.
 
-**`CACHE_SIZE` — how much disk that object cache may take.** It is uncapped
-only in the sense that moraine never chose a cap: SlateDB's own default is
-16 GiB, and it is enforced per open store, not per directory, so several
-stores pointed at one `CACHE_DIR` each spend up to their own cap there. A
-host that attaches four stores and sizes its disk for one is therefore sized
-for a quarter of what it can consume. `CACHE_SIZE` — a byte count,
+**`CACHE_SIZE` — how much disk the cache may take.** A byte count —
 `META_CACHE_SIZE 2147483648` through the DuckLake attach or `CACHE_SIZE`
-directly on a standalone `moraine:` attach — sets that cap explicitly,
-threading through the shim (`moraine_attach`'s `cache_size_bytes`, and
-`moraine_migrate`'s) into `CatalogOptions::cache_size` and `StoreBuilder`.
-Zero on the ABI means "not given", so the SlateDB default stands; the option
-is inert without a `CACHE_DIR`, since there is no object cache to bound.
-Multiply by the number of attached stores to size the volume. Part size and
-scan interval stay at SlateDB's defaults, and so do the in-memory caches,
-because nothing has yet shown which way to move them.
+directly on a standalone `moraine:` attach — capping each store's disk
+device: the first attach to name a `CACHE_DIR` settles it, and every
+store's device opens with that cap as a ceiling, filled only by what the
+store reads. Zero on the ABI means "not given", leaving the default
+cap (16 GiB); the option is inert without a `CACHE_DIR`, since there is no
+disk tier to bound. It threads through the shim (`moraine_attach`'s
+`cache_size_bytes`, and `moraine_migrate`'s) into
+`CatalogOptions::cache_size` and `StoreBuilder`.
 
-**`CACHE_PUTS` — fill that cache from the write path too.** Left alone, the
-object cache is filled only by reads: an object the store just wrote is
-fetched back from object storage the first time something asks for it, even
-though the writer had the bytes in hand. `CACHE_PUTS true` writes each object
-into the local cache as it is PUT, which costs one local write and no fetch.
-Two consequences make it worth more than that arithmetic suggests. Store
-objects are immutable and parts land by atomic rename, so a reader pointed at
-the same `CACHE_DIR` reads what the writer cached — one host running a writer
-and its read-only sessions warms one cache between them. And the widening is
-per part, so a cached write also covers the neighbouring keys in that part,
-not only the ones just written.
+**`CACHE_MEMORY` — how much memory the cache may take.** The same shape for
+the memory side — `META_CACHE_MEMORY` through the DuckLake attach,
+`CACHE_MEMORY` standalone — and the one cache option that is never inert,
+because the memory tiers exist with or without a disk device. It is one
+budget across both kinds, which share one cache and are separated by
+eviction priority rather than by capacity; `moraine_store_census` reports a
+store's index and filter bytes, and the attach warns when the budget cannot
+hold them. Unset, the budget is what SlateDB would give a *single*
+store by default — now for the whole process, so a multi-store host is
+strictly smaller than before, and a single-store host is unchanged. This
+is the number to weigh against DuckDB's `memory_limit` when sizing a
+host: DuckDB's budget covers its own buffers and the data-file cache, and
+this cache is the process-wide memory consumer beside it. A handle's
+decoded catalog is not in it: that is bounded by the catalog's size rather
+than by an option, and is reported rather than budgeted.
 
-It is opt-in because compaction output goes through the same path under an
-admit-everything policy: a merge writing a large object can evict parts that
-reads had warmed, and a store whose merges outpace its queries is better off
-letting reads decide what stays. The option threads through the shim
-(`moraine_attach`'s `cache_puts`) into `CatalogOptions::cache_puts` and
-`StoreBuilder`, and is inert without a `CACHE_DIR`.
+**`CACHE_PUTS` — fill the cache from the write path too.** Left alone, the
+cache fills only from reads: blocks the store just flushed are fetched back
+from object storage and decoded the first time something asks for them,
+even though the writer had them in hand. `CACHE_PUTS true` inserts the
+blocks of flushed and compacted SSTs into the cache as they are written —
+decoded, on the write path, at the cost of memory-tier space and no fetch.
+Within the process the effect reaches every handle: a reader session served
+by the shared cache reads what the writer just flushed with no round trip
+at all.
+
+It is opt-in because compaction output goes through the same insertion
+policy: a merge writing a large SST can evict blocks that reads had warmed,
+and a store whose merges outpace its queries is better off letting reads
+decide what stays. The option threads through the shim (`moraine_attach`'s
+`cache_puts`) into `CatalogOptions::cache_puts` and `StoreBuilder`.
 
 **`CACHE_PRELOAD` — fill it before the first query, not during it.** Both of
 the above leave a fresh process cold: the cache fills as queries ask for
-objects, so the first query of an attach pays every first touch itself.
-`CACHE_PRELOAD` loads the store into the cache while the attach opens —
-`'l0'` for the objects no merge has folded down yet, `'all'` for every object
-the manifest references, `'none'` (the default) for today's behaviour. It
-crosses the ABI as a level code (`0`, `1`, `2`) on `moraine_attach` and
-`moraine_migrate`, and any other code is refused rather than treated as
-"none", so a misspelled level surfaces as an error instead of an attach that
-merely feels slow.
+blocks, so the first query of an attach pays every first touch itself.
+`CACHE_PRELOAD` warms the store into the cache while the attach opens, by
+reading it (RFC 0009) — `'l0'` (the default) touches every subspace far
+enough to pull its SST metadata, `'all'` additionally walks the scan-shaped
+subspaces whole, `'none'` (or `'off'`) warms nothing. Neither pulls the `index`
+subspace's data bulk, so a store whose weight is a multi-GiB `index` run
+preloads in metadata-sized bytes rather than store-sized ones; a table's
+`index` and `inline` ranges are warmed per table instead, in the
+background, the first time a query touches it and after each commit that
+writes data files against it; at any level but `'none'`, the extension also
+warms every table's probe ranges in the background after the open, so the
+first lookup on any table finds them cached (RFC 0009). The shim's option
+parsing owns the default; the level crosses the ABI as a code (`0`, `1`,
+`2`) on `moraine_attach` and `moraine_migrate`, and any other code is
+refused rather than treated as "none", so a misspelled level surfaces as an
+error instead of an attach that merely feels slow.
 
-The cost lands entirely on the attach. The load runs inside the open — the
-handle is returned only once it finishes — fetching each object whole with
-bounded parallelism, and it stops at the first object that would exceed
-`CACHE_SIZE`, so the cap governs the preload as well as the cache. Stopping
-is not skipping: the objects after the one that did not fit go unloaded even
-where they would have, and the store is enumerated newest-first, so what goes
-unloaded is the levelled tail. Nothing in that path says it happened, which
-would leave a half-warmed attach looking exactly like a warm one, so moraine
-compares the manifest's bytes against the cap as it opens and warns with both
-numbers. Fetches that fail are skipped rather than fatal: a preload is an
-optimization, and no attach should die because one object could not be
-warmed. `'all'` therefore
-suits a store small enough to sit on local disk with room to spare, where the
-trade is a slower ATTACH for a first query that touches object storage not at
-all; `'l0'` suits everything else.
+The cost lands entirely on the attach. The warm runs inside the open — the
+handle is returned only once it finishes — with bounded parallelism, and
+the cache's caps govern the load: what exceeds them is admitted and evicted
+by the cache's own policy, newest-first enumeration putting the levelled
+tail last in line. Nothing in that path says it happened, which would leave
+a half-warmed attach looking exactly like a warm one, so moraine compares
+the bytes the warm would fetch against the governing cap as it opens and
+warns with both numbers. A subspace that fails to warm is skipped rather
+than fatal: a preload is an optimization, and no attach should die
+because one read did not land. Subspace-awareness keeps the `'l0'`
+default's cost small — on S3 it adds about 120 ms to the attach and takes
+a table's first index lookup from roughly 400 ms to 3 ms — and `'all'` the
+choice for an attach that can wait: it fetches metadata plus the
+scan-shaped subspaces, not the store, trading a slower ATTACH for a first
+query that touches object storage not at all. `'none'` suits an attach that
+must return as fast as the open allows.
+
+**`moraine_cache_tally()` — what the cache has served.** One row:
+`metadata_hits`/`metadata_misses` and `block_hits`/`block_misses` with a
+rate beside each, plus `errors` for lookups the cache itself failed and
+read through. `preload_metadata_hits`/`misses`, `preload_block_hits`/`misses`,
+and `preload_failures` attribute the attach-time warm subset. Without
+arguments the numbers are the host's — a process
+keeps one cache and every attached store reads through it — which is the
+scope the budget is set at.
+
+`moraine_cache_tally('lake')` narrows the same row to one attach. The
+cache and its budget stay the process's; what the lake name adds is which
+attach is spending them, which is the question a host with several
+catalogs on one cache has and the process-wide numbers cannot answer. A
+detached catalog's counts leave with it, while the process's keep them,
+so the two forms do not have to agree on totals.
+
+The two slots are reported apart because they are budgeted apart: a
+healthy stack keeps metadata near fully served — that is the slot being
+sized to hold the store's filters and indexes — while blocks land
+wherever the working set does. A metadata rate that is not near 1 says
+`CACHE_MEMORY` is too small for the store's SST metadata, which
+`moraine_store_census` measures directly; a low block rate with a healthy
+metadata rate says the working set exceeds the block slot, which is a
+`CACHE_MEMORY` or `CACHE_DIR` decision rather than a correctness one.
+
+The metadata case does not wait to be noticed: the attach itself compares
+the store's filter and index bytes against the share of the cache metadata
+holds under eviction protection, and warns when that share cannot hold
+them, so a rate read later confirms a sizing problem rather than
+discovering one.
+
+A rate is NULL, not zero, before anything has been looked up: zero would
+read as a cold cache to a monitoring query, and "nothing asked" is not
+the same fact.
+
+**`moraine_cache_status()` — what the process-wide caches occupy.** One row
+reports capacity, current occupancy, and cumulative evictions for SlateDB
+metadata, SlateDB data-block memory, and parsed Parquet metadata. It also
+reports the configured data-block disk capacity, NULL without a disk tier.
+Disk occupancy is omitted because Foyer does not expose a reliable live
+value through the cache interface; configured capacity is not mislabeled as
+usage. `moraine_store_census` adds `filter_bytes`, `index_bytes`, and
+`stats_bytes` per subspace from the manifest, which is the store-side demand
+to compare with metadata capacity.
+
+**`moraine_object_store_tally('lake')` — what SlateDB sent to storage.**
+One cumulative row per attach reports `main_gets`, `main_puts`, and
+`main_deletes`, the same three counts for a separately configured WAL store,
+and summed request time beside every count in milliseconds. Moraine currently
+uses one physical store, so WAL-object traffic appears in the `main_*` fields;
+the `wal_*` fields are reserved for an explicit second store. A GET includes
+the read-shaped APIs such as range, head, and list, and a PUT includes multipart
+operations. The instrumentation is inside SlateDB's retry loop, so attempts and
+their durations, not only logical calls, are counted.
+
+`errors` counts failed attempts, including errors SlateDB handles internally
+such as an expected missing-object probe; it is diagnostic, not a statement
+that the catalog operation failed. Durations are sums and can exceed wall time
+when requests overlap. The core surface is
+`ReadOnlyCatalog::object_store_tally`, carrying an `ObjectStoreTally`; the C ABI
+copies it through `moraine_catalog_object_store_tally` without exposing the
+metrics recorder. There is deliberately no process-wide SQL form: unlike the
+one shared cache budget, physical requests belong to the catalog handle that
+issued them.
+
+The data path needs none of this and gets none of it. Parquet reads are
+DuckDB's, not moraine's, and DuckDB caches them itself: a lake read goes
+through its caching file system, so data bytes sit under `memory_limit`
+rather than in a budget of moraine's (RFC 0009). What the embedding host
+should set beside a moraine attach — `validate_external_file_cache =
+'NO_VALIDATION'` (safe: DuckLake data files are immutable),
+`parquet_metadata_cache = true`, `enable_http_metadata_cache = true` —
+is embedding guidance, documented with the attach options; the shim
+never sets a global for the user.
 
 ### Interception level: catalog-entry, row-faithful (B1)
 
@@ -318,8 +419,10 @@ per-schema-version inlined-data tables) as catalog entries with the DuckLake
 schema, and implements:
 
 - **Scan** — given a table and the columns DuckDB asks for, produce rows from
-  SlateDB. Row filters are **not** pushed down, so a scan materializes the
-  addressed kind in full and DuckDB's executor filters over the returned rows.
+  SlateDB. Row filters are **not** applied by the scan, so it materializes the
+  addressed kind and DuckDB's executor filters over the returned rows. One
+  kind narrows *how much* it materializes without taking on that filtering —
+  see "Scoping the file-statistics scan" below.
   Projection is pushed down, but it selects output columns from an
   already-materialized row set rather than narrowing the read. What narrowing
   exists comes from the address, not from a predicate: the RFC 0002 key layout
@@ -395,6 +498,47 @@ convention is deliberately minimal — lifecycle columns only, everything
 else opaque — and the e2e suite pins it against every lifecycle transition
 real DuckLake SQL produces. The contract is not zero interpretation; it is
 exactly one, tested.
+
+### Scoping the file-statistics scan
+
+Materializing the addressed kind whole is affordable for every kind but one.
+`ducklake_file_column_stats` holds a row per file per column — a production
+catalog measured 145,995 of them against 1,013 data files — and each becomes
+ten `duckdb::Value`s, two of them heap strings. DuckLake's planner reads it
+to prune, so a statement pays that once and a writing transaction pays it per
+statement. Every other kind is orders of magnitude smaller; the same catalog's
+`ducklake_data_file` is 1,013 rows. So this one kind narrows, and nothing
+else does.
+
+**The scan still applies no filters.** It reads the `table_id` equality
+through `pushdown_complex_filter` and **consumes nothing**, so DuckDB keeps
+applying every predicate itself. A filter shape the match does not recognize
+costs a wider materialization, never a wrong row. `filter_pushdown` stays off
+for exactly this reason: setting it deletes the filter operator and makes the
+scan answerable for the whole of `TableFilterType`, which is a standing
+correctness liability — a filter type added upstream would begin silently
+dropping rows on a version bump.
+
+**Row identity is why only a table-major kind may narrow.** These tables have
+no physical row ids: a row's `rowid` is *its index into the materialized row
+set*, and the `UPDATE`/`DELETE` sinks resolve that index back to key cells by
+re-materializing the provider whole. A scan that simply filtered would
+renumber its rows, and a DML statement that narrowed would resolve row ids
+against the wrong rows — silently, and only when it both narrows and writes.
+The keying is the way out: this kind is keyed table-major, so a table's rows
+are a **contiguous run** of the whole dump. The scoped dump returns that run
+with where it starts, the scan emits `base + i`, and both sides keep counting
+rows of the same list. A kind whose rows do not form one run cannot narrow
+this way, which is what `scope_column` records.
+
+The filter also has to arrive before the work. Materialization otherwise
+happens in `GetScanFunction`, at bind, before a plan exists; a narrowable
+kind therefore builds nothing there and `InitGlobal` materializes instead —
+scoped when an equality reached the bind data, whole otherwise. A scan
+mid-write drops the scope: only the unscoped dump carries the staged overlay
+a read then owes. Scoped materializations are not cached, since the
+per-transaction hold is keyed by spec and a scoped set is small and built
+once per statement.
 
 ### Composition: C++ shim over the Rust core (forced)
 
@@ -648,9 +792,9 @@ extension boundary; the rest of this section is what paying it looks like.
 **A build is bound to one DuckDB version string, exactly.** DuckDB refuses a
 C++-ABI extension whose metadata footer names a different version —
 `ParsedExtensionMetaData::GetInvalidMetadataError` compares the strings, patch
-releases included — so a v1.5.3 user cannot load a v1.5.4 build. "Supporting
-v1.5" therefore means building each v1.5.x release separately, and the
-distribution unit is a DuckDB *release*, not a series.
+releases included — so a user on one patch release cannot load another's
+build. Supporting a series therefore means building each release in it
+separately, and the distribution unit is a DuckDB *release*, not a series.
 
 **One manifest owns the pin.** `.github/duckdb-versions` lists the releases
 moraine builds for, newest first, the first line carrying the commit each
@@ -660,7 +804,11 @@ matrix from it, assets are published as
 coexist in one release, and `cargo xtask check-pins` fails if any other place
 naming a version disagrees. That check exists because the failure mode is
 silent: a bump that misses one of the six places produces an artifact that
-builds, passes every other job, and then refuses to load.
+builds, passes every other job, and then refuses to load. `cargo xtask
+bump-duckdb <version>` writes those places, so the check guards a
+transcription no one has to make by hand. It covers the DuckLake commit
+too, which DuckDB chooses rather than moraine — otherwise a DuckDB bump
+moves it silently and only e2e says so.
 
 **Which releases are listed** is a judgement, and a short list is the default.
 Each entry multiplies the release build by five platforms, and only the
@@ -690,14 +838,14 @@ consequence of DuckDB's design rather than an unbuilt piece of moraine's.
 
 | What | Pinned at | Notes |
 |---|---|---|
-| DuckDB | **v1.5.4** | the primary entry of `.github/duckdb-versions`; both submodules sit on it, and it is the version the e2e suite proves the chain against |
-| DuckLake extension | **`d318a545`** | what `INSTALL ducklake` resolves to against the pinned CLI: DuckDB v1.5.4 hard-codes the commit in `.github/config/extensions/ducklake.cmake`, so the pair moves only when the DuckDB pin does. Verified by running, not assumed |
+| DuckDB | **v1.5.5** | the primary entry of `.github/duckdb-versions`; both submodules sit on it, and it is the version the e2e suite proves the chain against |
+| DuckLake extension | **`d8a1881e`** | what `INSTALL ducklake` resolves to against the pinned CLI: DuckDB v1.5.5 hard-codes the commit in `.github/config/extensions/ducklake.cmake`, so the pair moves only when the DuckDB pin does. Verified by running, not assumed |
 | DuckLake branch | **`v1.5-variegata`** | DuckLake publishes no release tags — it versions by DuckDB-series branches (`v1.3-ossivalis`, `v1.4-andium`, `v1.5-variegata`); `main` is development |
 | DuckLake catalog format | **`1.0`** (`DuckLakeVersion::V1_0`) | the highest version the stable branch writes (its migration chain ends at `'1.0'`); `V1_1_DEV_1` exists on `main` only and is not targeted |
 
 **Patch-level ABI friction between the two does not appear.** DuckDB's own CI
 builds the DuckLake extension against v1.5.3 while moraine statically links
-v1.5.4, and the concern was that objects crossing the extension↔host boundary
+v1.5.5, and the concern was that objects crossing the extension↔host boundary
 by pointer between those two builds might disagree. They do not: both
 extensions load into one process and the full chain answers correctly, pinned
 by `wire_contract.rs` alongside the version strings, so a bump that introduces
@@ -738,7 +886,8 @@ unrelated to the extension link, generating `cpp/moraine_abi.h` from the
 `extern "C"` surface with cbindgen so the header cannot drift from the
 Rust definitions. Two build details the toolchain needs supplied per
 target: a C++17 bump on the shim targets (it uses `std::optional`; DuckDB
-pins the global standard to C++11), and, on macOS, the `IOKit`/`Security`/
+pins the global standard to C++11), GCC 14 for Linux to match DuckLake's
+extension pipeline, and, on macOS, the `IOKit`/`Security`/
 `CoreFoundation`/`SystemConfiguration` frameworks the Rust dependency tree
 links.
 
@@ -792,20 +941,27 @@ write; a lost race at commit returns an error whose message contains the
 literal substring `conflict` (never retried internally, per the C ABI
 error mapping table above).
 
-### `ducklake_metadata` synthesis: `data_inlining_row_limit = 10` and dynamic inline-table interception
+### `data_inlining_row_limit` is deliberately not synthesized, and dynamic inline-table interception
 
 Beyond the keys the exists-probe path reads (version, encrypted,
 created_by — see the metadata-catalog section below), the synthesized
-`ducklake_metadata` also serves `data_inlining_row_limit = "10"` —
-DuckLake's own compiled default, declaring catalog-wide that inlining is
-**on**. (An earlier revision of this shim served `"0"` to keep inlining
-off while RFC 0005 was unimplemented; that stopgap is gone now that it
-is.) This is load-bearing, not informational: DuckLake's
-`WriteNewInlinedTables` (source-verified) skips registering a table's
-per-schema-version inlined-data table when `DataInliningRowLimit(...)`
-resolves to 0 for that table, and that limit's only inputs are catalog
-configuration options — absent a served value the default is 10 anyway,
-so serving `10` explicitly just makes the choice legible.
+`ducklake_metadata` serves **no** row for `data_inlining_row_limit`.
+Inlining is on regardless: DuckLake's `WriteNewInlinedTables`
+(source-verified) skips registering a table's per-schema-version
+inlined-data table only when `DataInliningRowLimit(...)` resolves to 0,
+and absent any served value that resolves to a compiled default of 10.
+(An earlier revision served `"0"` to keep inlining off while RFC 0005 was
+unimplemented, then `"10"` to make the choice legible.)
+
+Serving it is worse than redundant. `DataInliningRowLimit` reads the
+catalog's configuration options first and only then the DuckDB setting
+`ducklake_default_data_inlining_row_limit`, and an
+`ATTACH ... (DATA_INLINING_ROW_LIMIT n)` lands in that same option map —
+so a served row outranks both knobs and shadows them silently, leaving an
+operator with no way to raise the limit. Serving nothing keeps the same
+default and keeps both knobs working; a store that wants a different
+limit records a real option row, which overrides the default as any
+stored option does.
 
 With inlining on, DuckLake **dynamically creates and drives per-table
 physical tables** in the metadata catalog rather than writing fixed

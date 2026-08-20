@@ -72,8 +72,8 @@ Non-goals:
   are complements only in the sense that they address different costs, and
   for a slow attach RFC 0009's is usually the one that matters. Step 8
   reduces dead bytes, and a store may have none.
-- **Checkpoint lifecycle** — an RFC 0017 / RFC 0006 concern; if it lands it
-  becomes a consumer of this surface.
+- **Checkpoint lifecycle.** SlateDB's built-in collector owns it; adding the
+  same read-modify-write operation to this pass would create a second owner.
 
 ## Background
 
@@ -196,7 +196,33 @@ configure:
 | 5 | Cleanup | `CLEANUP_OLD_FILES[_OLDER_THAN\|_CLEANUP_ALL]` | `CALL ducklake_cleanup_old_files('lake', …)` |
 | 6 | Orphans | `DELETE_ORPHANED_FILES[_OLDER_THAN\|_CLEANUP_ALL]` | `CALL ducklake_delete_orphaned_files('lake', …)` |
 | 7 | Sweep | `SWEEP_INDEXES` (default **true**) | `Catalog::maintain` — core |
+| 7b | Sweep file stats | `SWEEP_INDEXES` (default **true**) | `Catalog::maintain` — core |
 | 8 | Merge store | `COMPACT_STORE[_SUBSPACE\|_TIMEOUT]` | `Catalog::compact_store` — core |
+
+Step 7b shares step 7's pass and its switch — one `Catalog::maintain` call
+reclaims both — and is reported separately because what orphans file column
+statistics happens above moraine rather than inside it. Reading one count
+against the other is how that leak stays visible.
+
+**Most of the deleting is already done for us.** Steps 3–5 delete statistics
+themselves, keyed on `data_file_id`, alongside the data-file rows they
+retire; compaction leaves none behind.
+
+The gap is a **dropped table**, and it is moraine's, not DuckLake's. Run
+against a stock catalog, `DROP TABLE` followed by step 1 leaves no
+statistics behind; run against moraine it leaves all of them, with the two
+agreeing on every other count — same files retired, same deletion schedule.
+So step 7b is a backstop over a defect, not a gap in what DuckLake asks for,
+and it stays needed either way: no fix to the write path reclaims the rows a
+catalog has already stranded.
+
+**File column statistics carry no snapshot**, so the single record is what
+every read of that file resolves through, including a time-travelling one
+whose file record comes from history. They are reclaimable only once the
+file is absent from **both** live state and history — which is where step 1
+followed by step 5 leaves it, and which is why nothing on the write path
+may cascade them: expiry *ends* a data file into history rather than
+erasing it, and the past still resolves it.
 
 The call syntax is what the e2e suite already exercises against real
 DuckLake (`tests/ducklake_load/maintenance.rs:47,91,150,230,333`).
@@ -305,6 +331,16 @@ copy — and it asks at bind, because a name checked only when a pass runs
 would let a typo attach cleanly and then fail every scheduled pass,
 unattended, for as long as it stood.
 
+**DuckLake compatibility is strict.** Each moraine build targets the DuckDB
+and DuckLake versions pinned by the repository, so the function names and
+parameter signatures above are part of that supported build combination. A
+missing function or changed signature is an incompatibility, not a capability
+to detect and silently degrade: the configured call fails clearly. New
+DuckLake parameters become available only when moraine exposes them and the
+pinned-version e2e suite exercises them. The pin checker prevents an
+unreviewed version drift, and the maintenance e2e cases make a signature
+change fail while updating a pin rather than in a supported release.
+
 **Defaults are the safe floor.** Steps 1–6 mutate the lake — writing
 Parquet, minting snapshots, or deleting bytes — so none has a default. Step 8
 destroys nothing a query can observe, but rewrites gigabytes and pays for
@@ -317,17 +353,42 @@ that they should.
 ### The scheduler
 
 One thread per read-write attach, started at `ATTACH` when an interval is
-configured, stopped and joined at detach *before* `moraine_detach`
-(`abi.rs:775`) releases the handle. Three properties it must hold:
+configured. Explicit `DETACH` stops and joins it before `moraine_detach`
+(`abi.rs:775`) releases the handle. Without `DETACH`, destruction of the last
+host `ClientContext` stops and joins it before that context releases its
+`DatabaseInstance` reference. Moraine tags the connection a pass creates and
+excludes it from the host count. DuckLake's temporary connection for the nested
+metadata attach remains a host, but closing it does not stop the scheduler while
+the caller's connection remains. The catalog destructor repeats the operation
+as an idempotent fallback.
+
+The connection-lifecycle hook is load-bearing. A running pass owns a DuckDB
+`Connection`, and that connection retains the `DatabaseInstance`; waiting for
+the database or catalog destructor to initiate the join creates an ownership
+cycle. The last-host hook breaks the cycle while both the database and catalog
+handle are still live. DuckDB calls connection-close callbacks under its
+connection-manager lock, so the callback records a context state and that
+state's destructor performs the join after the lock is released. Otherwise the
+worker connection's own close would deadlock on the same lock.
+
+Once every host context has closed, scheduled passes for that attachment stay
+stopped even if an embedder retains the `DuckDB` object and later opens another
+connection. Queries and manually triggered maintenance remain available. A new
+schedule requires a new attach; this keeps one unambiguous ownership boundary
+rather than reviving a thread whose original database-close sequence already
+began.
+
+Three properties the scheduler must hold:
 
 - **Single-flight.** A pass still running when the next tick fires skips
   that tick rather than overlapping. Concurrent passes are safe — the sweep
   is idempotent — but their DuckLake steps collide under RFC 0008's
   conflict matrix, and a scheduler that manufactures its own conflicts is
   indefensible.
-- **Stops before the database does.** Detach sets the stop flag and joins;
-  the thread holds no reference that would keep the `DatabaseInstance`
-  alive past shutdown.
+- **Stops before the database does.** Detach or destruction of the last host
+  context sets the stop flag and joins. A pass already in flight completes
+  before the join returns, so its connection and handle cannot outlive DuckDB
+  state.
 - **Failures are visible.** An unattended pass has no one to return an
   error to, so `moraine_maintenance_status` serves the **last 16 passes**,
   newest first, each carrying `started_at` and whether it was `scheduled`
@@ -335,8 +396,32 @@ configured, stopped and joined at detach *before* `moraine_detach`
   / `failed`), and `detail`. Retaining a window rather than only the
   newest pass is load-bearing — with one slot a failure is erased by the
   next success, and a short interval would hide strictly more than a long
-  one. The window is in-memory per attach and bounded so a fast interval
-  cannot grow it without limit.
+  one. Sixteen is the binding cap: at nine fixed steps it is at most 144
+  small diagnostic rows, enough to preserve fifteen later successes after
+  one failure without turning status into an event log.
+
+  The window is durable **inside the catalog**, as one unversioned
+  `sys/maintenance_status` value holding the passes oldest-to-newest. A
+  completed pass atomically reads the value, appends itself, drops the oldest
+  overflow, and overwrites it. The status write is a separate durable SlateDB
+  transaction after the pass: it mints no DuckLake snapshot, does not move
+  `sys/head`, and therefore neither invalidates a catalog view nor appears in
+  time travel. The first write lazily stamps additive format 5 so older
+  binaries, which would otherwise silently omit the record, refuse the store.
+  A status-write failure is logged and does not rewrite the outcome of the
+  maintenance work that already completed.
+
+  `started_at` is a `Timestamp`: microseconds from the Unix epoch, the width
+  the record stores and the ABI passes. Carrying that width end to end keeps
+  the conversion total in both directions, so neither the store boundary nor
+  the ABI needs a range check on a value DuckDB already hands over as a
+  microsecond count.
+
+  Catalog storage wins over an external sidecar: it follows the lake through
+  moves and credentials, uses the existing writer fence and durability path,
+  and lets a read-only attach inspect the prior writer's failures. The value
+  is bounded and overwritten, so it adds neither an unbounded subspace nor a
+  cleanup policy.
 
 **Read-only attaches never schedule.** A `DbReader` never opens a writer, so
 no step runs — including step 8, whose merge only a writer's compactor could
@@ -358,9 +443,11 @@ effects stand, and the next tick re-runs from the top.
 
 Single-tier by design: one interval, one step set. Steps have genuinely
 different natural cadences — the sweep is two seeks when nothing was
-dropped, while `delete_orphaned_files` LISTs the entire data prefix — but
-encoding tiers into flat attach options is unwieldy, and a second attach
-with a different configuration covers the case. Deferred until asked for.
+dropped, while `delete_orphaned_files` LISTs the entire data prefix — but no
+measured deployment needs multiple in-process cadences. Encoding tiers into
+flat attach options would multiply scheduler state and lifecycle ownership,
+so this surface deliberately keeps one cadence. Evidence of missed work or
+material excess cost would motivate a replacement design.
 
 ### The on-demand trigger
 
@@ -388,7 +475,14 @@ an operator needs a way to run one before a backup or after a bulk load
 without re-attaching.
 
 **The store merge gets a trigger of its own**, `CALL
-moraine_compact_store('lake')`, taking an optional `subspace` and `timeout`.
+moraine_compact_store('lake')`, taking an optional `subspace`, `timeout`, and
+`require_completed`. The last requires a timeout and turns any pending or
+failed target into a query error; a skipped tree with no sorted runs is a
+verified no-op. This is the operator-safe form for an index-only merge:
+`moraine_compact_store('lake', subspace := 'index', timeout := 600,
+require_completed := true)` cannot mistake successful submission for a
+completed merge.
+
 This is the one place a second configuration surface is worth its cost: the
 case that motivated the merge is a store that bloated once and needs merging
 once, and reaching it only through the pass would mean re-attaching a live
@@ -396,7 +490,7 @@ application's catalog to change a maintenance option. That is not a
 configuration an operator wants to keep — it is a single action. The pass
 remains the scheduled form; both call the same core verb, so neither can
 drift from the other. Its two parameters are its own rather than a copy of
-the pass's, because the pass configures eight steps and this configures one
+the pass's, because the pass configures nine steps and this configures one
 merge.
 
 `CALL moraine_store_census('lake')` is a separate table function, not a
@@ -416,6 +510,20 @@ never ran, or neither.
 second connection writes the catalog, so running inside a user's `BEGIN`
 invites a self-deadlock. Refused unless
 `context.transaction.IsAutoCommit()` (`transaction_context.hpp:49`).
+
+That refusal is a guard on the caller's own transaction, and it says nothing
+about what else may be open elsewhere. The autocommit case is now driven
+rather than assumed: a trigger runs to completion while another connection
+holds an uncommitted write transaction against the same lake, and while the
+calling connection's own implicit transaction is the most recent writer,
+with the pass configured to do real work — DuckLake steps issuing SQL on its
+connection, and a per-entry sweep committing throughout. What the concurrent
+writer meets is a **conflict, not a wait**: the pass expires snapshots and so
+alters the table under it, and DuckLake reports that in the retryable
+language its own writers already handle. Contending for catalog state is
+expected; deadlocking over it is what the refusal exists to prevent, and one
+connection cannot express the question — hence a sqllogictest rather than a
+CLI case.
 
 ### Orphaned index-entry reclamation
 
@@ -578,6 +686,23 @@ lake never ran.
 
 The census serves read-only attaches. Both legs read; neither writes.
 
+Its scans use the core read profile: 8 MiB of read-ahead and 32 fetches in
+flight, sized for a remote object store. Those figures are fixed implementation choices, not maintenance
+attach options; RFC 0009 records the measurement required to replace them.
+
+The real-endpoint measurement pins the scale and the limit of this lever. An
+ARM worker and bucket in the same `us-west-2` region opened a deliberately
+churned 40-table catalog in 401.1 ms median over seven fresh read-only handles:
+248.4 ms to open the reader and 150.6 ms to materialize the first view. A full
+merge completed four subspaces, reducing their physical bytes from 135,443 to
+75,379 and their SST count from 24 to 11, yet the next seven handles took
+411.6 ms median, with wholly overlapping ranges. The census also showed 257
+WAL objects and 5,011,208 manifest bytes after the merge — object classes the
+subspace merge does not reclaim. So a merge's measured GET reduction remains
+real, but only matters when those GETs carry material weight in the attach;
+the census is a prerequisite, not merely post-hoc reporting (`BENCHMARK.md`,
+"Cold attach against AWS S3").
+
 ### The core verb
 
 ```rust
@@ -594,6 +719,26 @@ pub struct MaintenanceReport {
 impl Catalog {
     pub async fn maintain(&self, request: MaintenanceRequest)
         -> Result<MaintenanceReport>;
+
+    pub async fn record_maintenance_pass(&self, pass: MaintenanceStatusPass)
+        -> Result<()>;
+}
+
+impl ReadOnlyCatalog {
+    pub async fn maintenance_status(&self)
+        -> Result<Vec<MaintenanceStatusPass>>;
+}
+
+pub struct MaintenanceStatusPass {
+    pub started_at: Timestamp,
+    pub trigger: String,
+    pub steps: Vec<MaintenanceStatusStep>,
+}
+
+pub struct MaintenanceStatusStep {
+    pub step: String,
+    pub status: String,
+    pub detail: String,
 }
 ```
 
@@ -696,6 +841,37 @@ value already recorded for the lake. DuckLake keeps its own unprefixed
 `DATA_PATH` for the data layer and does not forward it to this metadata
 attach, so an attach naming only that leaves nothing to compare.
 
+### The close hazard on a multi-threaded runtime
+
+A store handle that is written to and then closed can wedge on close, and
+repeating that cycle in one process eventually hits it. The subject is
+SlateDB's `Db::close`, not anything moraine owns: the same loop against
+SlateDB alone — build, one `put`, close, no moraine in the chain —
+reproduces it, and `Catalog::close` is a one-line delegation to that call.
+
+Three conditions have to hold together, and dropping any one of them
+clears 300 cycles: a write between the open and the close, repeated
+cycles, and a multi-threaded runtime. The cycle at which it wedges varies
+run to run, so it is a race rather than a threshold. At the wedge every
+worker is parked at zero CPU with the close future suspended and nothing
+runnable anywhere — a lost wakeup in the shutdown path, not a lock cycle
+or a spin — and the stall sometimes swallows the runtime's timer with it,
+so a `timeout` around the close is not a reliable escape.
+
+This is not a hazard only an embedder can meet. The attach path builds a
+multi-threaded runtime deliberately (a one-worker pool would let a
+CPU-bound poll stall SlateDB's flush), so a session that repeatedly
+attaches, writes, and detaches is running the same cycle. The exposure is
+bounded by how the shipped paths use it: one attach opens once and closes
+once, and neither the scheduler nor the on-demand trigger opens or closes
+a handle — they run passes against the handle the attach already holds.
+
+Nothing here is worked around in moraine, because a wedge inside the
+store's shutdown has no seam above it to unwedge: a caller that gives up
+waiting still leaves the handle live. It is pinned by a reproducer that
+asserts the hang's *presence* against SlateDB alone, so that test failing
+is the signal the pin can be removed.
+
 ### Test obligations
 
 Per RFC 0001, core tests run against real SlateDB on in-memory
@@ -764,8 +940,9 @@ Live (e2e):
   step disabled alongside its own parameter.
 - **Status retains earlier passes.** A pass that reclaimed stays visible
   after a later pass that did not, each carrying its trigger.
-- **Read-only never schedules.** A read-only attach starts no thread, so
-  its status window stays empty.
+- **Read-only never schedules but does report.** A read-only attach starts no
+  thread and refuses the trigger, but `moraine_maintenance_status` reads the
+  durable window left by the writer.
 - **A failed step does not suppress the sweep.** With a step DuckLake
   rejects, the later DuckLake steps report `skipped` naming what aborted
   them, and the sweep still reclaims its range.
@@ -784,6 +961,9 @@ Live (e2e):
   per pass rather than frozen at attach.
 - **Detach during a running pass completes**, rather than hanging on the
   join or failing.
+- **Process teardown without detach completes a running pass** before the
+  last host context releases the database, rather than letting the pass's own
+  connection keep the database alive until process exit.
 - **Path overlap refused**; sibling locations attach normally.
 - **The census table function** reports one row per subspace on a lake with
   data, from a read-write and a read-only attach alike.
@@ -791,14 +971,14 @@ Live (e2e):
   reports it `skipped`; a pass whose merge fails reports `failed` and leaves
   the lake queryable.
 
-The timer tests hold one session open across a real pause: the retained
-window is per-attach and in memory, so a second session would observe a
-fresh, empty one. Contention is provoked with shipped knobs rather than
-test-only scaffolding — `MAINTENANCE_BATCH_SIZE 1` makes the sweep take
-one durable commit per entry, each waiting out the WAL flush cadence, so
-a twenty-entry range reliably outruns a 100ms interval. Together they
-cost a few seconds of the suite, and the paused-session helper bounds its
-own wait so a deadlock fails loudly instead of wedging the gate.
+The timer tests hold one session open across a real pause so the scheduler
+remains alive long enough to run; a later session can read the durable passes
+but cannot reproduce live timer contention. Contention is provoked with
+shipped knobs rather than test-only scaffolding — `MAINTENANCE_BATCH_SIZE 1`
+makes the sweep take one durable commit per entry, each waiting out the WAL
+flush cadence, so a twenty-entry range reliably outruns a 100ms interval.
+Together they cost a few seconds of the suite, and the paused-session helper
+bounds its own wait so a deadlock fails loudly instead of wedging the gate.
 
 Counting passes would *not* pin single-flight: once the slow pass ends,
 later ticks correctly run fast empty passes for the rest of the window.
@@ -851,6 +1031,11 @@ and sibling-versus-nested prefixes without needing a lake.
   error and continues (`garbage_collector.rs:384-398`) and `run_gc_once`
   returns `()`, so a wholly failed pass is indistinguishable from a clean
   one. Redundant, mildly racy, and unobservable.
+
+- **Checkpoint lifecycle as a maintenance-pass step.** Rejected for the same
+  ownership reason. SlateDB's built-in collector already expires checkpoints
+  on its own cadence; a pass step would create a second lifecycle owner and
+  race the read-modify-write operation instead of adding capability.
 
 - **Declining a forced-compaction lever**, as an earlier revision of this
   RFC did. It gave three reasons and each has since proved false. *Choosing

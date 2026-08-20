@@ -1,33 +1,27 @@
 //! The inline read seam: materializes DuckLake's four inline scan variants
 //! over the `inline/*` keyspace and re-exports
 //! [`InlineScanKind`](crate::catalog::inline::InlineScanKind) from the
-//! otherwise-private `catalog`. Each function opens a fresh dump read and,
-//! on a slot-backed attach, overlays the unfolded tail — so inline data
-//! committed to a slot but not yet folded is served (a folder-less
-//! multi-writer attach is the operating condition until one exists).
+//! otherwise-private `catalog`. Each function opens a fresh read-only
+//! transaction, scans, and rolls back.
+
+use bytes::Bytes;
 
 #[doc(hidden)]
 pub use crate::catalog::inline::InlineScanKind;
 use crate::{
-    catalog::{
-        Catalog,
-        inline::{InlineRow, materialize_inline_rows},
-    },
+    catalog::ReadOnlyCatalog,
     error::{Error, Result},
     store::{inline as store_inline, key::InlineOperation},
 };
 
 /// One inlined row selected by [`scan_inline`], referencing its chunk's
 /// body by index into the scan's deduplicated
-/// [`chunk_bodies`](InlineScanRecord::chunk_bodies) — a chunk's body
-/// crosses the ABI once however many rows it holds, and the reader
-/// decodes it once.
+/// [`chunk_bodies`](InlineScanRecord::chunk_bodies).
 #[doc(hidden)]
 pub struct InlineRowRecord {
     /// The row's dense id.
     pub row_id: u64,
-    /// The schema version the owning chunk was written under — selects the
-    /// `inline/schema` record its body decodes against.
+    /// The schema version the owning chunk was written under.
     pub schema_version: u64,
     /// The commit snapshot that inserted this row.
     pub begin_snapshot: u64,
@@ -46,12 +40,16 @@ pub struct InlineScanRecord {
     pub rows: Vec<InlineRowRecord>,
     /// The referenced chunks' full Arrow IPC record-batch bodies, each
     /// appearing once, indexed by [`InlineRowRecord::chunk_index`].
-    pub chunk_bodies: Vec<Vec<u8>>,
+    pub chunk_bodies: Vec<Bytes>,
 }
 
 /// Materializes `table_id`'s inlined rows and selects `kind`'s variant at
 /// `snapshot` (windowed from `start` for the incremental variants) — the
-/// read model behind `moraine_inline_scan`.
+/// read model behind `moraine_inline_scan`. Served from the chunk-range
+/// directory once it is known complete, hauling only the chunk bodies the
+/// selected rows reference. `schema_version`, when set, keeps only rows
+/// whose chunk was written under that version, so a caller serving one
+/// version's projection never hauls another version's bodies.
 ///
 /// # Errors
 ///
@@ -59,58 +57,43 @@ pub struct InlineScanRecord {
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn scan_inline(
-    catalog: &Catalog,
+    catalog: &ReadOnlyCatalog,
     table_id: u64,
     kind: InlineScanKind,
     snapshot: u64,
     start: u64,
+    schema_version: Option<u64>,
 ) -> Result<InlineScanRecord> {
-    let read = catalog.begin_dump().await?;
-    let chunks = store_inline::scan_inline_chunks(read.handle(), read.overlay(), table_id).await;
-    let inline_deletes =
-        store_inline::scan_inline_inline_deletes(read.handle(), read.overlay(), table_id).await;
-    read.finish().await;
-    let chunks = chunks?;
-    let inline_deletes = inline_deletes?;
+    let (selected, chunks) = catalog
+        .select_inline_rows(table_id, kind, snapshot, start, schema_version)
+        .await?;
 
-    let rows: Vec<InlineRow> = materialize_inline_rows(&chunks, &inline_deletes);
-
-    // Referenced chunk bodies dense-index in first-reference order.
-    let mut chunk_indexes: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
-    let mut chunk_bodies: Vec<Vec<u8>> = Vec::new();
-    let selected = kind
-        .select(&rows, snapshot, start)
+    // Rows arrive with `chunk` dense-indexed in first-reference order over
+    // exactly the referenced chunks, which is the record's shape already.
+    let chunk_bodies: Vec<Bytes> = chunks.iter().map(|(_, chunk)| chunk.body.clone()).collect();
+    let rows = selected
         .into_iter()
         .map(|row| {
-            let (operation, chunk) = &chunks[row.chunk];
-            // Every chunk a row references is an insert — the row was
-            // materialized from it.
+            let (operation, _) = &chunks[row.chunk];
             let InlineOperation::Insert { schema_version, .. } = operation else {
                 return Err(Error::Corruption(format!(
                     "inline row {} references a non-insert chunk key: {operation:?}",
                     row.row_id
                 )));
             };
-            let chunk_index = *chunk_indexes.entry(row.chunk).or_insert_with(|| {
-                chunk_bodies.push(chunk.body.clone());
-                chunk_bodies.len() as u64 - 1
-            });
 
             Ok(InlineRowRecord {
                 row_id: row.row_id,
                 schema_version: *schema_version,
                 begin_snapshot: row.begin_snapshot,
                 end_snapshot: row.end_snapshot,
-                chunk_index,
+                chunk_index: row.chunk as u64,
                 offset_in_chunk: row.offset_in_chunk,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(InlineScanRecord {
-        rows: selected,
-        chunk_bodies,
-    })
+    Ok(InlineScanRecord { rows, chunk_bodies })
 }
 
 /// Every `(schema_version, arrow_schema)` recorded for `table_id`, in
@@ -121,7 +104,7 @@ pub async fn scan_inline(
 /// Returns an error if the underlying store scan fails or decodes
 /// corrupt bytes.
 #[doc(hidden)]
-pub async fn inline_schemas(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64, Vec<u8>)>> {
+pub async fn inline_schemas(catalog: &ReadOnlyCatalog, table_id: u64) -> Result<Vec<(u64, Bytes)>> {
     let read = catalog.begin_dump().await?;
     let schemas = store_inline::scan_inline_schemas(read.handle(), read.overlay(), table_id).await;
     read.finish().await;
@@ -140,7 +123,7 @@ pub async fn inline_schemas(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64
 /// Returns an error if the underlying store scan fails or decodes
 /// corrupt bytes.
 #[doc(hidden)]
-pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64)>> {
+pub async fn inline_registered_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<(u64, u64)>> {
     let read = catalog.begin_dump().await?;
     let schemas = store_inline::scan_all_inline_schemas(read.handle(), read.overlay()).await;
     read.finish().await;
@@ -150,25 +133,20 @@ pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64
         .collect())
 }
 
-/// Whether `table_id`'s `ducklake_inlined_delete_<table_id>` exists.
-/// DuckLake probes it via a catalog bind that must error until the first
-/// `inline/file_delete` is staged, so this reports the table missing (not
-/// merely unreferenced) until then.
-///
-/// Existing once it has existed is the other half, and the reason this
-/// consults a marker rather than only the records: a flush materializes
-/// the table's deletions into a real delete file and clears them, and an
-/// emptied SQL table still exists — which is what DuckLake, having cached
-/// the table's existence for the life of the catalog, goes on assuming.
-/// The record fallback covers stores written before the marker did, whose
-/// first write of either kind heals them.
+/// Whether `table_id`'s `ducklake_inlined_delete_<table_id>` exists: it
+/// does not until the first `inline/file_delete` is staged, and stays
+/// existing after a flush clears the records. The record fallback covers
+/// stores written before the marker.
 ///
 /// # Errors
 ///
 /// Returns an error if the underlying store read fails or decodes
 /// corrupt bytes.
 #[doc(hidden)]
-pub async fn inline_file_delete_table_exists(catalog: &Catalog, table_id: u64) -> Result<bool> {
+pub async fn inline_file_delete_table_exists(
+    catalog: &ReadOnlyCatalog,
+    table_id: u64,
+) -> Result<bool> {
     let read = catalog.begin_dump().await?;
     let marked =
         store_inline::read_inline_file_delete_table(read.handle(), read.overlay(), table_id).await;
@@ -194,7 +172,10 @@ pub async fn inline_file_delete_table_exists(catalog: &Catalog, table_id: u64) -
 /// Returns an error if the underlying store scan fails or decodes
 /// corrupt bytes.
 #[doc(hidden)]
-pub async fn inline_file_deletes(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64, u64, u64)>> {
+pub async fn inline_file_deletes(
+    catalog: &ReadOnlyCatalog,
+    table_id: u64,
+) -> Result<Vec<(u64, u64, u64)>> {
     let read = catalog.begin_dump().await?;
     let file_deletes =
         store_inline::scan_inline_file_deletes(read.handle(), read.overlay(), table_id).await;
@@ -214,11 +195,10 @@ mod tests {
     use super::*;
     use crate::{
         catalog::CatalogOptions,
-        transaction::staged::{RowOperation, TableKind},
+        transaction::staged::{Cell, RowOperation, TableKind},
     };
 
-    fn snapshot_row(id: u64) -> Vec<crate::transaction::staged::Cell> {
-        use crate::transaction::staged::Cell;
+    fn snapshot_row(id: u64) -> Vec<Cell> {
         vec![
             Cell::U64(id),
             Cell::I64(1),
@@ -228,8 +208,7 @@ mod tests {
         ]
     }
 
-    fn snapshot_changes_row(id: u64) -> Vec<crate::transaction::staged::Cell> {
-        use crate::transaction::staged::Cell;
+    fn snapshot_changes_row(id: u64) -> Vec<Cell> {
         vec![
             Cell::U64(id),
             Cell::Str("inlined_insert:1".to_string()),
@@ -239,18 +218,15 @@ mod tests {
         ]
     }
 
-    /// A slot-backed catalog: inline data committed through the log is served
-    /// through the unfolded tail until a folder applies it.
-    async fn open() -> Catalog {
-        Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+    async fn open() -> crate::catalog::Catalog {
+        crate::catalog::Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
             .await
             .unwrap()
     }
 
     /// Inline rows committed to a slot with no folder running are served by
-    /// the inline dump through the tail overlay — the reroute the fix made.
-    /// Against the pre-fix folded-only read the tail is invisible and this
-    /// scan returns nothing.
+    /// the inline dump through the tail overlay. Against a folded-only read
+    /// the tail is invisible and this scan returns nothing.
     #[tokio::test]
     async fn scan_inline_serves_unfolded_rows_on_a_slot_backed_attach() {
         let catalog = open().await;
@@ -282,7 +258,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         // No folder has run: the rows live only in the unfolded tail.
-        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0)
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0, None)
             .await
             .unwrap();
         let mut ids: Vec<u64> = record.rows.iter().map(|r| r.row_id).collect();
@@ -292,10 +268,10 @@ mod tests {
             vec![0, 1],
             "unfolded inline rows are served through the overlay"
         );
-        assert_eq!(record.chunk_bodies, vec![b"chunk-a".to_vec()]);
+        assert_eq!(record.chunk_bodies, vec![Bytes::from_static(b"chunk-a")]);
 
         let schemas = inline_schemas(&catalog, 1).await.unwrap();
-        assert_eq!(schemas, vec![(0, b"schema".to_vec())]);
+        assert_eq!(schemas, vec![(0, Bytes::from_static(b"schema"))]);
     }
 
     /// Two chunks (rows 0-1, row 2) staged in one commit, one tombstone
@@ -355,10 +331,10 @@ mod tests {
         });
         inline_delete.commit().await.unwrap();
 
-        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 2, 0)
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 2, 0, None)
             .await
             .unwrap();
-        let mut by_id: Vec<(u64, Vec<u8>, u64)> = record
+        let mut by_id: Vec<(u64, Bytes, u64)> = record
             .rows
             .iter()
             .map(|r| {
@@ -372,16 +348,164 @@ mod tests {
         by_id.sort_by_key(|(id, ..)| *id);
         assert_eq!(
             by_id,
-            vec![(0, b"chunk-a".to_vec(), 0), (2, b"chunk-b".to_vec(), 0)]
+            vec![
+                (0, Bytes::from_static(b"chunk-a"), 0),
+                (2, Bytes::from_static(b"chunk-b"), 0)
+            ]
         );
         // Each referenced chunk's body crosses once.
         assert_eq!(record.chunk_bodies.len(), 2);
 
         let schemas = inline_schemas(&catalog, 1).await.unwrap();
-        assert_eq!(schemas, vec![(0, b"schema".to_vec())]);
+        assert_eq!(schemas, vec![(0, Bytes::from_static(b"schema"))]);
 
         let registered = inline_registered_tables(&catalog).await.unwrap();
         assert_eq!(registered, vec![(1, 0)]);
+    }
+
+    /// The first `scan_inline` walk verifies the chunk directory and
+    /// remembers it; the next serves from it, hauling only referenced
+    /// bodies. The proof is divergence: a chunk planted without a locator
+    /// is visible only to a body scan.
+    ///
+    /// Verification needs one store state across the chunk scan and the
+    /// directory scan, which only a transaction handle gives. A slot-backed
+    /// read goes through a manifest-following reader, so the fast path stays
+    /// dormant and every walk takes the body scan — correct, just not the
+    /// cheap route this pins.
+    #[ignore = "the directory fast path needs an isolated handle a slot-backed read does not have"]
+    #[tokio::test]
+    async fn scan_inline_serves_from_the_directory_once_verified() {
+        use crate::store::{
+            key::{InlineKey, InlineOperation, Key},
+            proto, value,
+        };
+
+        let catalog = open().await;
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk-a".to_vec(),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(record.rows.len(), 2);
+        assert!(
+            crate::catalog::projection::inline_directory_complete(catalog.projections(), 1),
+            "the first walk must verify and remember a complete directory"
+        );
+
+        // The divergence: a chunk with no locator, behind the memo's back.
+        catalog
+            .with_folder_writer(async |db| {
+                let tx = db
+                    .begin(slatedb::IsolationLevel::Snapshot)
+                    .await
+                    .map_err(crate::error::Error::from)?;
+                tx.put(
+                    Key::Inline(InlineKey::Live(InlineOperation::Insert {
+                        table_id: 1,
+                        schema_version: 0,
+                        begin_snapshot: 1,
+                        chunk_seq: 5,
+                    }))
+                    .encode(),
+                    value::encode_value(&proto::InlineChunkValue {
+                        body: b"rogue".to_vec().into(),
+                        row_id_start: 10,
+                        row_count: 2,
+                        data_file_id: None,
+                    }),
+                )
+                .unwrap();
+                crate::transaction::commit::commit_durably(db, tx)
+                    .await
+                    .unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0, None)
+            .await
+            .unwrap();
+        let row_ids: Vec<u64> = record.rows.iter().map(|row| row.row_id).collect();
+        assert_eq!(
+            row_ids,
+            [0, 1],
+            "a directory-served scan must not see a chunk only a body scan finds"
+        );
+        assert_eq!(record.chunk_bodies, vec![Bytes::from_static(b"chunk-a")]);
+    }
+
+    /// A version-filtered scan returns one version's rows and hauls one
+    /// version's bodies — the other version's chunks are not in the record
+    /// at all, so a caller serving one version's projection never touches
+    /// the rest of the table.
+    #[tokio::test]
+    async fn scan_inline_filtered_to_a_version_hauls_only_its_bodies() {
+        let catalog = open().await;
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
+
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk-v0".to_vec(),
+        });
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 1,
+            begin_snapshot: 1,
+            row_id_start: 2,
+            row_count: 1,
+            arrow_body: b"chunk-v1".to_vec(),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        // Once eagerly (verifying the directory), once served from it: the
+        // filter must narrow both paths the same way.
+        for pass in ["chunk scan", "directory"] {
+            let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0, Some(1))
+                .await
+                .unwrap();
+            let rows: Vec<(u64, u64, u64)> = record
+                .rows
+                .iter()
+                .map(|row| (row.row_id, row.schema_version, row.chunk_index))
+                .collect();
+            assert_eq!(rows, vec![(2, 1, 0)], "one version-1 row ({pass})");
+            assert_eq!(
+                record.chunk_bodies,
+                vec![Bytes::from_static(b"chunk-v1")],
+                "the other version's body must not be hauled ({pass})"
+            );
+        }
     }
 
     /// Staged `inline/file_delete` rows read back as

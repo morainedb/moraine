@@ -2,6 +2,11 @@
 use tracing::warn;
 
 /// Errors returned by moraine operations.
+///
+/// DuckLake's commit loop retries any error whose message contains
+/// `conflict`, `concurrent`, `unique`, or `primary key`. Only
+/// [`CommitConflict`](Self::CommitConflict) may carry one of those
+/// substrings; every other variant's wording must stay clear of them.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -13,13 +18,6 @@ pub enum Error {
     /// A commit spent its whole internal retry budget on benign races
     /// without settling; the caller must re-drive the work itself, usually
     /// as smaller commits.
-    ///
-    /// The text carries none of the four substrings DuckLake's commit loop
-    /// keys its retry decision on (`conflict`, `concurrent`, `unique`,
-    /// `primary key`), so an exhausted budget surfaces at once instead of
-    /// being re-run against a premise that already failed to settle ten
-    /// times. That wording is part of the wire contract, not incidental
-    /// diagnostics.
     #[error("retry budget exhausted: {0}")]
     RetryBudgetExhausted(String),
 
@@ -43,38 +41,23 @@ pub enum Error {
     Constraint(String),
 
     /// A DuckLake feature moraine does not implement (e.g. inlining a
-    /// `VARIANT` column, RFC 0005). Terminal: re-running cannot help.
-    ///
-    /// Like every non-conflict variant, the message avoids the four
-    /// substrings DuckLake's commit loop retries on (`conflict`,
-    /// `concurrent`, `unique`, `primary key`) — a caller must not word a
-    /// payload so it trips a pointless re-drive.
+    /// `VARIANT` column). Terminal: re-running cannot help.
     #[error("unsupported: {0}")]
     Unsupported(String),
 
     /// A held or requested snapshot fell below the retention horizon and
-    /// its record is gone; the reader must re-resolve from head rather
-    /// than dereference reclaimed files. Not a conflict — the message
-    /// stays clear of DuckLake's retry substrings.
+    /// its record is gone; the reader must re-resolve from head.
     #[error("snapshot expired: {0}")]
     SnapshotExpired(String),
 
     /// A host interrupt cancelled the operation before its point of no
     /// return, or a durable write past that point never reported its
-    /// outcome. Distinct from a store failure so the bridge can raise
-    /// DuckDB's interrupt, and free of retry substrings — an interrupted
-    /// commit whose durability is ambiguous must never be re-driven as a
-    /// conflict.
-    ///
-    /// The two cases differ only in what the caller must do next: nothing
-    /// after a clean pre-write cancellation, and a re-resolve of head
-    /// after an unreported write, which may or may not have landed.
+    /// outcome; after the latter the caller must re-resolve head.
     #[error("interrupted: {0}")]
     Interrupted(String),
 
     /// The store requires, is undergoing, or was written by a structural
-    /// format this binary does not support (RFC 0015). Terminal, and free
-    /// of retry substrings: a migration is never a commit conflict.
+    /// format this binary does not support. Terminal.
     #[error("migration required: {0}")]
     Migration(String),
 
@@ -94,34 +77,25 @@ pub enum Error {
     Fenced(String),
 
     /// The commit-slot log could not be reached: a slot put or read failed,
-    /// and a put's outcome may be unknown.
-    ///
-    /// Like [`Error::RetryBudgetExhausted`], the text carries none of the
-    /// four substrings DuckLake's commit loop keys its retry decision on —
-    /// an unreachable bucket is not a conflict, and re-driving the
-    /// transaction against the same unreachable bucket would only fail
-    /// again.
+    /// and a put's outcome may be unknown. The text carries none of the four
+    /// substrings DuckLake's commit loop keys its retry decision on — an
+    /// unreachable bucket is not a conflict.
     #[error("commit-slot log unavailable: {0}")]
     SlotLog(String),
 
-    /// Another process created this store while this open was creating it.
-    /// Benign: the store exists now, so opening again adopts it. Distinct
-    /// from [`Error::Fenced`], which displaces a writer that had already
-    /// attached — here nothing was ever attached, and nothing was written.
-    ///
-    /// Only reachable on an empty store. Once a store exists, the writer
-    /// epoch is claimed under a retry that absorbs the same race, so a
-    /// second open takes over rather than failing.
-    ///
-    /// Free of the four substrings DuckLake's commit loop retries on: this
-    /// is an attach-time race, not a commit conflict, and re-driving a
-    /// commit would be the wrong response to it.
+    /// Another process created this store while this open was creating it;
+    /// nothing was written, and opening again adopts it. Only reachable on
+    /// an empty store.
     #[error("open raced: {0}")]
     OpenRaced(String),
 
     /// The underlying store failed (SlateDB / object-store I/O).
     #[error("store error")]
     Store(#[source] Box<slatedb::Error>),
+
+    /// Concurrent modification detected during index maintenance.
+    #[error("concurrent modification")]
+    ConcurrentModification,
 }
 
 impl From<moraine_wal::Error> for Error {
@@ -136,16 +110,10 @@ impl From<moraine_wal::Error> for Error {
     }
 }
 
-/// What SlateDB reports when a compare-and-swap loses to a version that
-/// already landed — for moraine, the first manifest two processes both try
-/// to create on an empty store.
-///
-/// Matched as text because the condition behind it is `pub(crate)` upstream:
-/// this and a damaged manifest both arrive as [`slatedb::ErrorKind::Data`],
-/// so the kind alone cannot separate a benign race from real corruption.
-/// The crash-recovery suite pins this wording by failing a real manifest
-/// CAS, so a SlateDB bump that rewords it fails there rather than silently
-/// sending every genesis race back to the untyped [`Error::Store`].
+/// What SlateDB reports when a manifest compare-and-swap loses to a version
+/// that already landed. Matched as text because SlateDB reports it and a
+/// damaged manifest under the same [`slatedb::ErrorKind::Data`]; the
+/// crash-recovery suite pins the wording.
 pub(crate) const MANIFEST_VERSION_EXISTS: &str =
     "transactional object (e.g. manifest) version already exists";
 
@@ -153,17 +121,20 @@ pub(crate) const MANIFEST_VERSION_EXISTS: &str =
 /// write-ahead log rather than from the store's own objects.
 const WAL_DATA_ERROR: &str = "wal data error";
 
+/// The fenced error, worded once for every path that reports it.
+pub(crate) fn fenced() -> Error {
+    warn!("another process attached this catalog read-write; this writer is fenced");
+    Error::Fenced(
+        "another process attached this catalog read-write and took over as \
+         the writer; this handle can no longer commit — re-attach to write"
+            .to_string(),
+    )
+}
+
 impl From<slatedb::Error> for Error {
     fn from(err: slatedb::Error) -> Self {
-        // Every store error crosses here, so this is the one place fencing
-        // can be told apart from ordinary I/O failure.
         if err.kind() == slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced) {
-            warn!("another process attached this catalog read-write; this writer is fenced");
-            return Self::Fenced(
-                "another process attached this catalog read-write and took over as \
-                 the writer; this handle can no longer commit — re-attach to write"
-                    .to_string(),
-            );
+            return fenced();
         }
 
         if err.kind() == slatedb::ErrorKind::Data
@@ -200,11 +171,7 @@ mod tests {
     /// and scans for, retrying the commit if any is present.
     const RETRY_SUBSTRINGS: [&str; 4] = ["conflict", "concurrent", "unique", "primary key"];
 
-    /// Only `CommitConflict` may carry a retry substring: it is the one
-    /// error DuckLake should re-drive. Every other variant that can surface
-    /// from a commit must be free of them, or an unretryable failure gets
-    /// retried until the budget is spent. This pins the wording as the wire
-    /// contract it is.
+    /// Only `CommitConflict` renders with a retry substring.
     #[test]
     fn only_commit_conflict_carries_a_retry_substring() {
         let sample = "index \"unique_by_primary key\" saw a concurrent conflict";
@@ -224,9 +191,8 @@ mod tests {
             Error::Migration(sample.into()),
         ];
 
-        // The variants' own prefixes carry no retry substring — a payload
-        // that does is the caller's responsibility, so this asserts the
-        // prefix alone by stripping the shared sample.
+        // Payload wording is the caller's responsibility; only the prefix
+        // is asserted.
         for err in non_retryable {
             let rendered = err.to_string();
             let prefix = rendered

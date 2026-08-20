@@ -69,8 +69,8 @@
 //! stores a chunk of rows in the catalog itself — Arrow IPC bytes the caller
 //! encodes, carried by the same single write the commit already performs —
 //! and the rows draw ids from the table's row-id counter exactly as a
-//! registered file's do. [`Catalog::recent_rows`] reads them back — or
-//! [`Catalog::recent_rows_at`], for the rows a past snapshot saw —
+//! registered file's do. [`ReadOnlyCatalog::recent_rows`] reads them back — or
+//! [`ReadOnlyCatalog::recent_rows_at`], for the rows a past snapshot saw —
 //! [`Transaction::inline_delete`] tombstones one, and
 //! [`Transaction::flush_inlined_data`] drains them into a data file the
 //! caller wrote, preserving their ids and backdating the file's record so
@@ -79,8 +79,12 @@
 //! # Readers
 //!
 //! [`Catalog::open_read_only`] opens the same store without becoming its
-//! writer, so it never fences one. It comes in two forms, and the
-//! difference is what the reader's credentials must be allowed to do.
+//! writer, so it never fences one. What it hands back is a
+//! [`ReadOnlyCatalog`], which carries the reads and no mutator at all — so
+//! committing through a read-only handle is a compile error rather than a
+//! runtime one, and a [`Catalog`] serves the same reads by dereferencing to
+//! it. Read-only comes in two forms, and the difference is what the
+//! reader's credentials must be allowed to do.
 //!
 //! The default follows the latest state: it sees every commit as it lands,
 //! and pays for that by writing a checkpoint into the manifest on open and
@@ -142,8 +146,8 @@
 //! the old version readable-through until a merge rewrites the SSTs
 //! holding it — which the substrate's own scheduler only does under write
 //! pressure, so a store that goes quiet keeps its dead weight
-//! indefinitely. [`Catalog::store_census`] says where the weight is, from
-//! the store's manifest alone:
+//! indefinitely. [`ReadOnlyCatalog::store_census`] says where the weight is,
+//! from the store's manifest alone:
 //!
 //! ```
 //! # use std::sync::Arc;
@@ -204,10 +208,9 @@
 //! A bump that *moves* existing keys does need a rewrite, and
 //! [`Catalog::migrate`] performs it: a one-way, crash-resumable pass that
 //! takes the single writer, walks the keyspace under a durable cursor, and
-//! flips the version stamp in one final atomic batch. It is deliberately a
-//! separate verb rather than part of opening a catalog — the cost and timing
-//! are the operator's to choose. While it runs, every reader refuses the
-//! store rather than serving a view of a keyspace in motion.
+//! flips the version stamp in one final atomic batch. It is a separate verb
+//! from opening a catalog, so the operator chooses when to pay for it. While
+//! it runs, every reader refuses the store.
 //!
 //! No such rewrite exists yet, so `migrate` reports a no-op against every
 //! store this release can open.
@@ -215,14 +218,13 @@
 //! # Features
 //!
 //! - `fault-injection` — compiles the crash-injection seams the migration
-//!   driver consults between its durable batches, and exposes `CrashPoint` and
-//!   `inject_crash` so a test can arm one and stop a migration at a named
-//!   durable boundary. It also exposes `SyntheticMigration` and
-//!   `install_migration`, which put a unit into the driver's registry — every
-//!   shipped format is additive, so without one there is no migration to crash
-//!   — and `CrashCase`, the enumeration of crash cases the suites drive. Off by
-//!   default; a build without it carries an empty function at each seam, an
-//!   empty installed registry, and no fault surface.
+//!   driver consults between its durable batches, and exposes `CrashPoint`,
+//!   `inject_crash`, `SyntheticMigration`, `install_migration`, and `CrashCase`
+//!   so a test can install a migration unit and stop it at a named durable
+//!   boundary. Off by default; a build without it carries no fault surface.
+//! - `fuzzing` — exposes the codec and read-path decode entry points the
+//!   `fuzz/` targets drive. They live in their own crate and so cannot reach
+//!   the crate-private codecs; nothing else needs this. Off by default.
 //! - `leader` (off by default) — the advisory leader role: a long-lived folder
 //!   opens a network port and becomes a group-commit funnel for forwarded
 //!   sessions, announcing itself through the commit log. Additive: nothing in
@@ -252,6 +254,7 @@
 #![forbid(unsafe_code)]
 
 mod catalog;
+mod data_file;
 mod error;
 mod fault;
 #[doc(hidden)]
@@ -259,31 +262,42 @@ pub mod ffi_support;
 #[cfg(feature = "leader")]
 mod leader;
 mod store;
+mod telemetry;
 mod transaction;
 
 pub use catalog::{
-    CachePreload, Catalog, CatalogOptions, CatalogSnapshot, CensusRequest, ColumnAlteration,
-    ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats, CompactStoreReport,
-    CompactStoreRequest, CompactionTarget, Contention, DataFile, DataFileId, DataFileInfo,
-    DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval,
-    FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState, InlineChunk, LiveCount,
-    MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport,
-    MaintenanceRequest, MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef,
-    OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, RecentRow, RowHolder, RowLocation,
-    ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef,
-    SortSpec, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId,
-    TableInfo, TableStats, TagEntry, TagTarget, ViewId, ViewInfo,
+    BuildStep, CachePreload, Catalog, CatalogOptions, CatalogSnapshot, CensusRequest,
+    ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats,
+    CompactStoreReport, CompactStoreRequest, CompactionTarget, Contention, DataFile, DataFileId,
+    DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry,
+    FileIndexRemoval, FileRowCandidate, FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo,
+    IndexMaintenance, IndexState, InlineChunk, LiveCount, MacroId, MacroImplementationDef,
+    MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass,
+    MaintenanceStatusStep, MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef,
+    OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow,
+    RowSummaryWarmth, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId,
+    SortKeyDef, SortSpec, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
+    TableId, TableInfo, TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
 };
+pub use data_file::DataStore;
 pub use error::{Error, Result};
-/// Fault injection: the crash seams a test drives a migration to and stops
-/// it at, the synthetic units that give the migration driver something to
-/// run, and the enumeration of crash cases. Unstable and not part of the
+/// Fault injection for the migration driver. Unstable and not part of the
 /// semver contract.
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use fault::{CrashCase, CrashPoint, SyntheticMigration, inject_crash, install_migration};
+/// Decode entry points for the out-of-crate fuzz targets. Unstable and not
+/// part of the semver contract.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz;
 #[cfg(feature = "leader")]
 pub use leader::{Leader, LeaderConfig, LeaderStats};
 pub use moraine_wal::FoldReport;
-pub use store::index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder};
+pub use store::{
+    cache::{
+        CacheStatus, CacheTally, ObjectStoreTally, RowSummaryOccupancy, cache_status, cache_tally,
+    },
+    index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder},
+};
 pub use transaction::{MigrationReport, Transaction};

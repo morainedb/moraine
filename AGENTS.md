@@ -9,7 +9,9 @@ this file is the operational summary.
 - `crates/moraine` — core library. `catalog` (DuckLake domain) owns the
   store handle but no key/value knowledge — that lives in `store`
   (keys/codecs, which knows nothing about DuckLake); `transaction` (the commit
-  protocol) bridges them. `lib.rs` is docs + re-exports only.
+  protocol) bridges them. `data_file` is the only module that reads Parquet:
+  scoped reads of registered files, knowing nothing about the catalog
+  keyspace. `lib.rs` is docs + re-exports only.
 - `crates/moraine-wal` — the commit-slot log protocol: sequence naming, the
   envelope wire format, the conditional-put race, tail enumeration and
   truncation, plus the protocol's loops behind embedder traits (retry-and-
@@ -48,12 +50,16 @@ this file is the operational summary.
   Comments carry content, not typography; if a file needs section markers,
   split the module instead.
 - Comments are direct and succinct: state what the item does and any hard
-  constraint, no rationale essays. A well-named declaration earns no comment
-  at all — write one only for a constraint a reader cannot infer from the name
-  and type: a permanent tag or discriminant, an invariant the code enforces, a
-  compatibility rule. Never explain why a design choice was made; that is an
-  RFC's job. This binds `.proto` comments as much as Rust doc comments, and
-  where `missing_docs` demands one, a single clause discharges it.
+  constraint, no rationale essays. One or two sentences is the norm; a third
+  needs a caller who would otherwise get it wrong. A well-named declaration
+  earns no comment at all — write one only for a constraint a reader cannot
+  infer from the name and type: a permanent tag or discriminant, an invariant
+  the code enforces, a compatibility rule. Never restate the design above a
+  function — that is the RFC's job — and never argue for the code in its own
+  doc comment. Test docs name the property, not the case for it. A doc comment
+  longer than the item it documents is the signal to cut. This binds `.proto`
+  comments as much as Rust doc comments, and where `missing_docs` demands one,
+  a single clause discharges it.
 - Use blank lines to group code into readable stanzas.
 - Names prefer full words, for every symbol; abbreviate only when the word
   is long and the abbreviation is conventional (`tx`, not `tbl`).
@@ -86,8 +92,13 @@ this file is the operational summary.
 cargo +nightly fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
   && cargo test --workspace --locked \
   && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
-  && cargo deny check && cargo xtask check-pins && cargo xtask e2e
+  && cargo deny check -D advisory-not-detected \
+  && cargo xtask check-pins && cargo xtask e2e
 ```
+
+`e2e` compiles DuckDB itself, and DuckDB's cmake picks up `ccache` or
+`sccache` off `PATH` on its own. Installing one is the difference between
+a ten-minute and a one-minute rebuild in a fresh worktree.
 
 The fmt/clippy portion also runs as a pre-commit hook from `.githooks/`,
 and a commit-msg hook there rejects non-conventional commit subjects (the

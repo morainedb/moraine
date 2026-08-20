@@ -291,6 +291,9 @@ struct Base {
     view: CatalogSnapshot,
     overlay: Overlay,
     reader: Arc<DbReader>,
+    /// The attach's projection cache, carried so an assembling member can
+    /// consult the format floor.
+    projections: Arc<std::sync::RwLock<crate::catalog::projection::ProjectionCache>>,
     /// Whether `reader` is one this batch opened past a truncated prefix, so
     /// closing it is the batch's to do.
     owns_reader: bool,
@@ -309,12 +312,14 @@ impl Base {
                 view,
                 overlay,
                 reader: Arc::new(reader),
+                projections: Arc::clone(&store.projections),
                 owns_reader: true,
             },
             None => Self {
                 view,
                 overlay,
                 reader: Arc::clone(&store.reader),
+                projections: Arc::clone(&store.projections),
                 owns_reader: false,
             },
         }
@@ -478,6 +483,7 @@ where
             overlay: self.base.overlay.clone(),
             reader: Arc::clone(&self.base.reader),
             commits: Vec::new(),
+            projections: Arc::clone(&self.base.projections),
         }));
 
         if self.leader_slot.terminal.is_none() {
@@ -707,6 +713,9 @@ struct Accum {
     overlay: Overlay,
     reader: Arc<DbReader>,
     commits: Vec<Commit>,
+    /// The attach's projection cache, for the format floor the inline
+    /// translation consults.
+    projections: Arc<std::sync::RwLock<crate::catalog::projection::ProjectionCache>>,
 }
 
 /// Runs one member's closure against the accumulating head and folds its
@@ -722,13 +731,15 @@ where
         overlay,
         reader,
         commits,
+        projections,
     } = &mut *accum;
 
     let probe = ProbeHandle::Overlaid {
         store: ReadHandle::Reader(reader.as_ref()),
         overlay,
     };
-    match assemble_commit(probe, f, view, None, Some(txid.into_bytes())).await {
+    let projections = &*projections;
+    match assemble_commit(probe, f, view, projections, None, Some(txid.into_bytes())).await {
         Ok(Prepared::Nothing) => Product::Nothing,
         Ok(Prepared::Staged(assembled)) => {
             let commit = commit_from(txid, &assembled);

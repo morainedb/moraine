@@ -7,6 +7,11 @@ rustup toolchain install  # respects rust-toolchain.toml
 cargo install cargo-deny
 ```
 
+`cargo xtask e2e` compiles DuckDB itself. Install `ccache` (or `sccache`)
+and DuckDB's cmake finds it on `PATH` by itself, which turns the
+ten-minute rebuild a fresh worktree otherwise pays into about a minute.
+There is nothing else to configure.
+
 ## The local gate
 
 Everything CI enforces, runnable locally:
@@ -16,7 +21,7 @@ cargo +nightly fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo deny check
+cargo deny check -D advisory-not-detected
 cargo xtask e2e
 ```
 

@@ -1,24 +1,19 @@
 //! Read-your-writes for the `dump_*` projections: the committed records a
 //! staged transaction can see, with its own uncommitted rows applied over
-//! them.
+//! them in stage order, decoded by the same decoders translation uses.
 //!
-//! A staged row is stored untranslated — DuckLake's own cells, carrying the
-//! snapshot ids DuckLake itself authored — so what the transaction will
-//! *see* is fully determined the moment the row is staged, without waiting
-//! for commit-time translation. That is what makes an overlay possible at
-//! all: it decodes each staged row with the same decoders translation uses
-//! and applies it to the scanned records, in stage order.
-//!
-//! The overlay is deliberately not translation. It never validates, never
-//! diffs, and never touches the store: a row translation would refuse still
-//! shows up here, and fails loudly at commit where it belongs.
+//! The overlay is not translation: it never validates, never diffs, and
+//! never touches the store. A row translation would refuse still shows up
+//! here and fails at commit.
+
+use std::collections::{BTreeMap, HashMap};
 
 use super::{
     Cell, EntityKey, Error, Result, RowOperation, TableKind,
     decode::{
         Cursor, StatsKey, decode_column, decode_column_mapping, decode_data_file,
         decode_delete_file, decode_delete_key, decode_end, decode_file_column_stats,
-        decode_gc_file_row, decode_hard_delete, decode_macro, decode_metadata,
+        decode_gc_file_row, decode_hard_delete, decode_macro, decode_metadata, decode_metadata_key,
         decode_partition_info, decode_schema, decode_sort_info, decode_table,
         decode_table_column_stats, decode_table_stats, decode_tag_row, decode_view,
     },
@@ -39,54 +34,84 @@ pub(super) trait Versioned: Sized {
 
     fn set_end_snapshot(&mut self, end: u64);
 
-    /// Rebases the live version's `begin_snapshot`. Defaulted to a no-op:
-    /// an `UPDATE ... SET begin_snapshot` is refused at decode for every
-    /// kind but `ducklake_data_file`, so no other implementation is ever
-    /// reached.
+    /// Rebases the live version's `begin_snapshot`. Defaulted to a no-op;
+    /// only `ducklake_data_file` reaches it.
     fn set_begin_snapshot(&mut self, begin: u64) {
         let _ = begin;
     }
 
-    /// Builds a record from one staged insert's cells, given the records
-    /// already in hand for the fields DuckLake does not supply.
-    fn decode_row(cells: &[Cell], committed: &[Self]) -> Result<Self>;
+    /// Builds a record from one staged insert's cells.
+    fn decode_row(cells: &[Cell]) -> Result<Self>;
+
+    /// Fills the fields DuckLake does not supply from the versions already
+    /// visible for the same entity. Defaulted to a no-op; only
+    /// `ducklake_table` reaches it, to carry its field-id counter forward.
+    fn carry_forward(&mut self, prior: &[&Self]) {
+        let _ = prior;
+    }
 }
 
 /// `rows` with the transaction's staged rows for `T::KIND` applied, in
-/// stage order.
-///
-/// Inserts append; a hard delete drops exactly the version it names
-/// (`end_snapshot` `NULL` for the live one, a value for that history one);
-/// an `UPDATE ... SET end_snapshot` ends the live version; an
-/// `UPDATE ... SET begin_snapshot` rebases it. Stage order is load-bearing:
-/// a transaction that inserts a row and then ends it must see both, in that
-/// order.
+/// stage order: inserts append, a hard delete drops exactly the version it
+/// names, an `UPDATE ... SET end_snapshot` ends the live version, and an
+/// `UPDATE ... SET begin_snapshot` rebases it.
 pub(super) fn overlay_versioned<T: Versioned>(
     ops: &[RowOperation],
-    mut rows: Vec<T>,
+    rows: Vec<T>,
 ) -> Result<Vec<T>> {
+    // A delete vacates its slot rather than shifting the rest down, so the
+    // positions an entity holds stay valid for the whole pass. Every op
+    // reaches its entity's versions through `positions` instead of walking
+    // the rows, which is what keeps a flush off the length of the lake.
+    let mut rows: Vec<Option<T>> = rows.into_iter().map(Some).collect();
+    let mut positions: BTreeMap<EntityKey, Vec<usize>> = BTreeMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        if let Some(row) = row {
+            positions.entry(row.key()).or_default().push(index);
+        }
+    }
+
     for op in ops {
         match op {
             RowOperation::Insert { table, cells } if *table == T::KIND => {
-                let row = T::decode_row(cells, &rows)?;
-                rows.push(row);
+                let mut row = T::decode_row(cells)?;
+                let key = row.key();
+                let slots = positions.entry(key).or_default();
+                let prior: Vec<&T> = slots
+                    .iter()
+                    .filter_map(|&index| rows[index].as_ref())
+                    .collect();
+                row.carry_forward(&prior);
+                slots.push(rows.len());
+                rows.push(Some(row));
             }
             RowOperation::Delete { table, cells } if *table == T::KIND => {
                 let (key, end_snapshot) = decode_hard_delete(*table, cells)?;
-                rows.retain(|row| !(row.key() == key && row.end_snapshot() == end_snapshot));
+                for &index in positions.get(&key).into_iter().flatten() {
+                    if rows[index]
+                        .as_ref()
+                        .is_some_and(|row| row.end_snapshot() == end_snapshot)
+                    {
+                        rows[index] = None;
+                    }
+                }
             }
             RowOperation::UpdateSetEnd { table, cells } if *table == T::KIND => {
                 let (key, end_snapshot) = decode_end(*table, cells)?;
-                for row in &mut rows {
-                    if row.key() == key && row.end_snapshot().is_none() {
+                for &index in positions.get(&key).into_iter().flatten() {
+                    if let Some(row) = rows[index].as_mut()
+                        && row.end_snapshot().is_none()
+                    {
                         row.set_end_snapshot(end_snapshot);
                     }
                 }
             }
             RowOperation::UpdateSetBegin { table, cells } if *table == T::KIND => {
                 let (key, begin_snapshot) = decode_begin(*table, cells)?;
-                for row in &mut rows {
-                    if row.key() == key && row.end_snapshot().is_none() {
+                for &index in positions.get(&key).into_iter().flatten() {
+                    if let Some(row) = rows[index].as_mut()
+                        && row.end_snapshot().is_none()
+                    {
                         row.set_begin_snapshot(begin_snapshot);
                     }
                 }
@@ -94,7 +119,8 @@ pub(super) fn overlay_versioned<T: Versioned>(
             _ => {}
         }
     }
-    Ok(rows)
+
+    Ok(rows.into_iter().flatten().collect())
 }
 
 /// The `(entity, new begin_snapshot)` an `UPDATE ... SET begin_snapshot`
@@ -124,7 +150,7 @@ pub(super) trait Unversioned: Sized {
     const KIND: TableKind;
 
     /// What identifies a row for overwrite and for removal.
-    type Key: PartialEq;
+    type Key: Eq + std::hash::Hash + Copy;
 
     fn key(&self) -> Self::Key;
 
@@ -140,24 +166,56 @@ pub(super) trait Unversioned: Sized {
 /// a delete removes it.
 pub(super) fn overlay_unversioned<T: Unversioned>(
     ops: &[RowOperation],
-    mut rows: Vec<T>,
+    rows: Vec<T>,
 ) -> Result<Vec<T>> {
+    // Every op on a key replaces whatever that key held, so one pass over
+    // the ops decides each touched key outright. Re-appending put a
+    // touched key after the untouched ones, in the order of the *last* op
+    // naming it, which is what `staged_order` reconstructs.
+    let mut staged: HashMap<T::Key, Option<T>> = HashMap::new();
+    let mut order: Vec<T::Key> = Vec::new();
     for op in ops {
-        match op {
+        let (key, row) = match op {
             RowOperation::Insert { table, cells } if *table == T::KIND => {
                 let row = T::decode_row(cells)?;
-                let key = row.key();
-                rows.retain(|existing| existing.key() != key);
-                rows.push(row);
+                (row.key(), Some(row))
             }
             RowOperation::Delete { table, cells } if *table == T::KIND => {
-                let key = T::decode_key(cells)?;
-                rows.retain(|existing| existing.key() != key);
+                (T::decode_key(cells)?, None)
             }
-            _ => {}
-        }
+            _ => continue,
+        };
+        staged.insert(key, row);
+        order.push(key);
     }
-    Ok(rows)
+    if staged.is_empty() {
+        return Ok(rows);
+    }
+
+    let mut overlaid: Vec<T> = rows
+        .into_iter()
+        .filter(|existing| !staged.contains_key(&existing.key()))
+        .collect();
+    overlaid.extend(
+        staged_order(order)
+            .into_iter()
+            .filter_map(|key| staged.remove(&key).flatten()),
+    );
+
+    Ok(overlaid)
+}
+
+/// `keys` reduced to one entry apiece, each at its last occurrence — the
+/// position a key that was removed and re-appended ends up in.
+fn staged_order<K: Eq + std::hash::Hash + Copy>(keys: Vec<K>) -> Vec<K> {
+    let mut seen = std::collections::HashSet::new();
+    let mut last: Vec<K> = keys
+        .into_iter()
+        .rev()
+        .filter(|key| seen.insert(*key))
+        .collect();
+    last.reverse();
+    last
 }
 
 impl Versioned for proto::DataFileValue {
@@ -185,7 +243,7 @@ impl Versioned for proto::DataFileValue {
     /// Partition values ride a child table of their own, so a staged file
     /// carries none here — the `ducklake_data_file` projection does not
     /// report them either.
-    fn decode_row(cells: &[Cell], _committed: &[Self]) -> Result<Self> {
+    fn decode_row(cells: &[Cell]) -> Result<Self> {
         decode_data_file(cells)
     }
 }
@@ -208,7 +266,7 @@ impl Versioned for proto::DeleteFileValue {
         self.end_snapshot = Some(end);
     }
 
-    fn decode_row(cells: &[Cell], _committed: &[Self]) -> Result<Self> {
+    fn decode_row(cells: &[Cell]) -> Result<Self> {
         decode_delete_file(cells)
     }
 }
@@ -231,7 +289,7 @@ impl Versioned for proto::ColumnValue {
         self.end_snapshot = Some(end);
     }
 
-    fn decode_row(cells: &[Cell], _committed: &[Self]) -> Result<Self> {
+    fn decode_row(cells: &[Cell]) -> Result<Self> {
         decode_column(cells)
     }
 }
@@ -253,19 +311,8 @@ impl Versioned for proto::TableValue {
         self.end_snapshot = Some(end);
     }
 
-    /// `next_column_id` is moraine's own counter, not a DuckLake column, so
-    /// a staged row carries no value for it: it is inherited from whatever
-    /// the table already had, and starts at 1 for a table this transaction
-    /// is creating. It reaches no projection either way — translation
-    /// recomputes it at commit.
-    fn decode_row(cells: &[Cell], committed: &[Self]) -> Result<Self> {
+    fn decode_row(cells: &[Cell]) -> Result<Self> {
         let cells = decode_table(cells)?;
-        let next_column_id = committed
-            .iter()
-            .filter(|row| row.table_id == cells.table_id)
-            .map(|row| row.next_column_id)
-            .max()
-            .unwrap_or(1);
         Ok(proto::TableValue {
             table_id: cells.table_id,
             table_uuid: cells.table_uuid,
@@ -275,8 +322,17 @@ impl Versioned for proto::TableValue {
             table_name: cells.table_name,
             path: cells.path,
             path_is_relative: cells.path_is_relative,
-            next_column_id,
+            next_column_id: 1,
         })
+    }
+
+    /// `next_column_id` is not a DuckLake column: it is inherited from the
+    /// table's committed row, or left at 1 for a table this transaction
+    /// creates.
+    fn carry_forward(&mut self, prior: &[&Self]) {
+        if let Some(next_column_id) = prior.iter().map(|row| row.next_column_id).max() {
+            self.next_column_id = next_column_id;
+        }
     }
 }
 
@@ -341,7 +397,7 @@ impl Versioned for proto::SchemaValue {
         self.end_snapshot = Some(end);
     }
 
-    fn decode_row(cells: &[Cell], _committed: &[Self]) -> Result<Self> {
+    fn decode_row(cells: &[Cell]) -> Result<Self> {
         decode_schema(cells)
     }
 }
@@ -363,7 +419,7 @@ impl Versioned for proto::ViewValue {
         self.end_snapshot = Some(end);
     }
 
-    fn decode_row(cells: &[Cell], _committed: &[Self]) -> Result<Self> {
+    fn decode_row(cells: &[Cell]) -> Result<Self> {
         decode_view(cells)
     }
 }
@@ -389,7 +445,7 @@ impl Versioned for proto::PartitionValue {
     /// The spec's partition columns ride a child table of their own, so a
     /// staged spec carries none here; the `ducklake_partition_column`
     /// projection folds them back in from the staged child rows.
-    fn decode_row(cells: &[Cell], _committed: &[Self]) -> Result<Self> {
+    fn decode_row(cells: &[Cell]) -> Result<Self> {
         decode_partition_info(cells)
     }
 }
@@ -412,7 +468,7 @@ impl Versioned for proto::SortValue {
         self.end_snapshot = Some(end);
     }
 
-    fn decode_row(cells: &[Cell], _committed: &[Self]) -> Result<Self> {
+    fn decode_row(cells: &[Cell]) -> Result<Self> {
         decode_sort_info(cells)
     }
 }
@@ -434,7 +490,7 @@ impl Versioned for proto::MacroValue {
         self.end_snapshot = Some(end);
     }
 
-    fn decode_row(cells: &[Cell], _committed: &[Self]) -> Result<Self> {
+    fn decode_row(cells: &[Cell]) -> Result<Self> {
         decode_macro(cells)
     }
 }
@@ -497,8 +553,7 @@ impl Unversioned for proto::MappingValue {
         decode_column_mapping(cells)
     }
 
-    /// Mappings are unversioned but their delete is a hard one, keyed like
-    /// the versioned kinds' rather than like the statistics kinds'.
+    /// A mapping delete is keyed like the versioned kinds'.
     fn decode_key(cells: &[Cell]) -> Result<Self::Key> {
         match decode_hard_delete(Self::KIND, cells)?.0 {
             EntityKey::Mapping { mapping_id, .. } => Ok(mapping_id),
@@ -509,24 +564,16 @@ impl Unversioned for proto::MappingValue {
     }
 }
 
-/// A statistics delete that decoded as another kind's key — unreachable
-/// while [`decode_delete_key`] switches on the same kind the caller asked
-/// for, and a loud error rather than a silent mismatch if that changes.
+/// A statistics delete that decoded as another kind's key.
 fn stats_key_mismatch(kind: TableKind) -> Error {
     Error::Constraint(format!("{kind:?} delete decoded as another statistics key"))
 }
 
-/// `containers` with the transaction's staged `ducklake_tag` rows applied.
-///
-/// A tag row is an *entry* inside its object's container record, not a
-/// record of its own, so this folds rather than appends: an insert adds an
-/// entry (minting the container if the object has none yet), an
+/// `containers` with the transaction's staged `ducklake_tag` rows folded
+/// in: an insert adds an entry (minting the container if needed), an
 /// `UPDATE ... SET end_snapshot` ends the live entry with that key, and a
 /// delete removes the entry it names, taking an emptied container with it.
-///
-/// Naming an entry that is not there is a shape error translation refuses
-/// at commit; the overlay leaves the view unchanged rather than deciding
-/// that here.
+/// Naming an absent entry leaves the view unchanged.
 pub(super) fn overlay_tag_containers(
     ops: &[RowOperation],
     mut containers: Vec<proto::TagValue>,
@@ -578,13 +625,10 @@ pub(super) fn overlay_tag_containers(
     Ok(containers)
 }
 
-/// `scopes` with the transaction's staged `ducklake_metadata` rows applied.
-///
-/// Options live outside the snapshot protocol — last write wins, no
-/// lifecycle — so an insert sets its key in the scope's record (minting the
-/// scope if it is new) and a delete removes it, taking an emptied scope with
-/// it. A delete of a key already gone is a no-op, matching translation: two
-/// writers agreeing a key is absent is not a disagreement about state.
+/// `scopes` with the transaction's staged `ducklake_metadata` rows applied:
+/// an insert sets its key in the scope's record (minting the scope if
+/// needed) and a delete removes it, taking an emptied scope with it. A
+/// delete of an absent key is a no-op.
 pub(super) fn overlay_option_scopes(
     ops: &[RowOperation],
     mut scopes: Vec<(u64, u64, proto::OptionScopeValue)>,
@@ -596,7 +640,7 @@ pub(super) fn overlay_option_scopes(
                 (components, key, Some(value))
             }
             RowOperation::Delete { table, cells } if *table == TableKind::Metadata => {
-                let (components, key, _) = decode_metadata(cells)?;
+                let (components, key) = decode_metadata_key(cells)?;
                 (components, key, None)
             }
             _ => continue,

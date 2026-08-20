@@ -200,15 +200,25 @@ async fn a_deleted_checkpoint_no_longer_opens() {
 
 /// Creating a checkpoint is a manifest write, so a read-only catalog cannot
 /// do it — the reader mode consumes checkpoints, the writer mints them.
+/// Minting a checkpoint is a writer's verb, and a read-only handle does not
+/// carry it — `reader.create_checkpoint(..)` does not compile, which the
+/// crate root pins with a `compile_fail` doctest. What a pinned reader can
+/// still do is read the cut it was opened against.
 #[tokio::test]
 #[allow(clippy::unwrap_used)]
-async fn a_read_only_catalog_cannot_create_a_checkpoint() {
+async fn a_read_only_catalog_reads_the_cut_it_is_pinned_to() {
     let (store, checkpoint) = seeded_with_checkpoint().await;
 
     let reader = Catalog::open_read_only(store, pinned_to(&checkpoint))
         .await
         .unwrap();
-    let err = reader.create_checkpoint(None).await.unwrap_err();
-    assert!(matches!(err, Error::Constraint(_)), "{err:?}");
+    assert!(
+        reader
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("sales")
+            .is_some()
+    );
     reader.close().await.unwrap();
 }

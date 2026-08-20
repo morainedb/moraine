@@ -39,10 +39,14 @@ Non-goals:
   If a
   case here cannot be made to pass, the bug is in the referenced RFC's
   implementation, not in this one.
-- **Fuzzing / randomized fault injection.** RFC 0001 reserves `cargo-fuzz`
-  for `store` codecs and the read path as future work. This list is
-  enumerated and deterministic; a randomized harness that crashes at
-  arbitrary WAL offsets is a complementary future layer, not built here.
+- **Fuzzing / randomized fault injection.** The list below is enumerated and
+  deterministic, and stays the floor. The complementary layer is built and
+  lives in the fuzzing tier (RFC 0001) as the `crash_recovery` target: it
+  picks the write offset to freeze the store at, so a commit dies at
+  boundaries no named case enumerates, and asserts the atomicity guarantee
+  on reopen. It runs at single-digit executions per second — each one
+  builds and reopens a real store — so it is breadth over a long horizon,
+  not a gate.
 - **Real-object-storage crash behavior** (MinIO/localstack, torn multipart
   uploads). RFC 0001 lists real-object-storage tests as a later tier; these
   cases run on in-memory `object_store`, where the crash seam is the store
@@ -140,7 +144,7 @@ commit, with its physical half belonging to the e2e boundary above.
 | `TakeoverMidCommit` | Writer A dies mid-commit; writer B opens the store and takes over (SlateDB epoch fence) | B reads a consistent head. If A's flush had not landed, B sees `sys/head` = `N` and A's batch is invisible. If A's flush *had* landed, B sees `N+1` and continues from there. No split-brain, no partial-A visibility. |
 | `FencedWriterResumes` | A wakes and attempts its CAS/flush *after* B has taken over and bumped the writer epoch | A is fenced: it loses the `sys/head` CAS or is epoch-fenced by SlateDB, returns a typed error, and writes nothing. The store is byte-identical to the timeline in which A never woke. Confirms RFC 0004's "an accidental second writer never corrupts." |
 | `GenesisInterrupted` | A single initializer dies after writing `sys/format` but before `sys/head`/snapshot `0` | Reopen shows the store **empty** (genesis re-attempted from scratch) or **fully initialized** — never half-initialized (a `sys/format` with no head). This forces initialization to be **one `WriteBatch`** like any commit, i.e. the atomicity guarantee extends to genesis. |
-| `ConcurrentGenesis` | Two processes initialize the *same empty* store concurrently, each trying to write `sys/format` + genesis `sys/head`/snapshot `0` | Exactly one wins. There is no create-if-absent primitive to lean on; the guards are the real ones: SlateDB's `writer_epoch` (the second `Db::open` fences the first, so the fenced initializer's genesis batch writes nothing) and, within one writer, transactional write-write conflict detection on `sys/format`. The loser observes the store already initialized and adopts it, or returns a typed error — `OpenRaced` if it lost the race to create the first manifest, `Fenced` if it was displaced after creating one, never an untyped store error — and never writes a second `sys/format`, a divergent genesis snapshot, or a conflicting head. Reopen shows a single, coherent genesis. |
+| `ConcurrentGenesis` | Two processes initialize the *same empty* store concurrently, each trying to write `sys/format` + genesis `sys/head`/snapshot `0` | At most one genesis lands. There is no create-if-absent primitive to lean on; the guards are the real ones: SlateDB's `writer_epoch` (the second `Db::open` fences the first, so the fenced initializer's genesis batch writes nothing) and, within one writer, transactional write-write conflict detection on `sys/format`. An initializer observes the store already initialized and adopts it, re-attempts a genesis it was displaced from, or returns a typed error — `OpenRaced` if it lost the race to create the first manifest, `Fenced` if it was displaced after creating one and its re-attempts are spent, never an untyped store error — and never writes a second `sys/format`, a divergent genesis snapshot, or a conflicting head. Reopen shows a single, coherent genesis. |
 
 `TakeoverMidCommit` decomposes into the two atomicity outcomes under a *new*
 process rather than being a third outcome. `FencedWriterResumes` is its
@@ -153,16 +157,33 @@ processes plus conflict detection on `sys/format` within one, and the
 loser's correct behavior is to **adopt**, not to conflict — a fresh store is
 not a true conflict but a benign "someone beat me to genesis" race.
 
-The losing open is **not** re-attempted, and the reason is a property of
-the fence rather than a preference. Every open takes the writer epoch by a
-manifest compare-and-swap, so a concurrent open loses that CAS — but
-re-attempting takes the epoch in turn, which fences whichever initializer
-had just won. Two initializers that both re-attempt can therefore both
-lose, trading a race that always leaves a winner for one that sometimes
-leaves none. Failing the losing open immediately is what makes "exactly one
-wins" hold.
+A genesis displaced mid-bootstrap **is** re-attempted, up to a small
+bound. The displaced attempt staged its genesis and never landed it, so
+nothing of it reached the store, and the re-attempt either adopts the
+catalog the winner created or creates one itself. What the bound buys is
+termination: every open takes the writer epoch by a manifest
+compare-and-swap, so a re-attempt takes the epoch in turn and may displace
+whichever initializer had just won — which is what opening read-write does
+anyway, and what the displaced attempt would have done had it been a
+moment slower, but two initializers that keep displacing each other would
+loop rather than finish. Once the bound is spent, the fence reaches the
+caller.
 
-The loser still fails **typed**, by one of two guards depending on how far
+Only *genesis* re-attempts. An open that finds a catalog returns before it
+stages anything, so a fence from anywhere else means a live writer took the
+store over, and re-taking it is the caller's decision rather than the
+open's.
+
+"Exactly one wins" is not what this race guarantees, and never was. A
+writer claims the writer epoch and its compactor claims the compactor
+epoch in two races that are ordered independently, so the handle that wins
+the writer epoch can lose the compactor epoch — and a fenced compactor
+closes the handle it belongs to, leaving both initializers fenced. The
+re-attempt makes that rare rather than routine. What holds regardless is
+the guarantee worth having: genesis is whole or absent, every failure is
+typed, and opening again adopts whatever is there.
+
+A loser still fails **typed**, by one of two guards depending on how far
 it got. If it lost the race to create the store's first manifest it never
 attached at all, and that is `OpenRaced`: benign, nothing written, and
 opening again adopts the store the winner created. If it created the store
@@ -294,6 +315,13 @@ real protocol: open writer A, open writer B over the same `object_store` (B
 bumps the epoch — the takeover), assert B's view, then have the still-live A
 attempt its commit and assert it fails fenced, writing nothing.
 
+The genesis *re-attempt* is the one fencing behavior a real race samples
+too rarely to pin, so it is staged from outside with the same decorator the
+lost-manifest case uses: refusing the first WAL object that carries a batch
+is what a writer displaced between taking the epoch and flushing its first
+commit finds, so the fence is SlateDB's own and the re-attempt runs the
+production path.
+
 Nothing here needs an in-code fault-injection hook, and no case needs a
 production knob added for it. The resumability cases are interruptible by
 construction — their batches are separate commits, so the harness stops
@@ -373,8 +401,8 @@ half — reclaiming entries in resumable batches — is
 - **Randomized/fuzz crash injection only.** Rejected as the *primary*
   mechanism: a fuzzer that crashes at random offsets gives breadth but no
   stable per-scenario identity, so a regression cannot be named, pinned, or
-  guaranteed to re-run. The named list is the floor; fuzzing is a future
-  ceiling.
+  guaranteed to re-run. The named list is the floor and the fuzz target the
+  ceiling; both exist, and the ordering between them is the point.
 - **One crash test per RFC, owned by that RFC.** Rejected: the invariants
   are cross-cutting (atomicity recurs in commit, drop, takeover, and
   genesis; resumability in backfill, reclamation, and the migration

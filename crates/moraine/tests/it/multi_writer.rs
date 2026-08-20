@@ -28,7 +28,7 @@ async fn open_multi_writer_over(store: Arc<dyn ObjectStore>, options: CatalogOpt
 /// head, so a peer's commit is seen without waiting out the window.
 fn zero_refresh() -> CatalogOptions {
     let mut options = CatalogOptions::default();
-    options.refresh_interval = Duration::ZERO;
+    options.reader_poll_interval = Duration::ZERO;
     options
 }
 
@@ -599,7 +599,7 @@ async fn repeated_snapshots_within_the_window_serve_the_cached_head() {
 async fn a_handles_own_commit_is_visible_within_the_window() {
     let store = Arc::new(InMemory::new());
     let mut options = CatalogOptions::default();
-    options.refresh_interval = Duration::from_secs(3600);
+    options.reader_poll_interval = Duration::from_secs(3600);
     let catalog = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
 
     // Warm the cache at the bootstrap head.
@@ -635,7 +635,7 @@ async fn a_handles_own_commit_is_visible_within_the_window() {
 async fn a_peer_commit_becomes_visible_after_the_window() {
     let store = Arc::new(InMemory::new());
     let mut options = CatalogOptions::default();
-    options.refresh_interval = Duration::ZERO;
+    options.reader_poll_interval = Duration::ZERO;
     let a = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options.clone()).await;
     let b = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
 
@@ -749,34 +749,6 @@ async fn transaction_outcome_resolves_from_a_folded_snapshot_after_a_sprint() {
         .await
         .unwrap();
     assert_eq!(resolved, Some(SnapshotId::new(1)));
-}
-
-/// A read-only attach refuses every folder surface with a typed error: folding
-/// is the writer's monopoly.
-#[tokio::test]
-async fn folder_surfaces_refuse_a_read_only_attach() {
-    let store = Arc::new(InMemory::new());
-    open_multi_writer(&store).await; // bootstrap so the read-only open succeeds
-
-    let read_only = Catalog::open_read_only(
-        store.clone() as Arc<dyn ObjectStore>,
-        CatalogOptions::default(),
-    )
-    .await
-    .unwrap();
-
-    assert!(matches!(
-        read_only.fold_sprint(u64::MAX).await,
-        Err(Error::Constraint(_))
-    ));
-    assert!(matches!(
-        read_only.unfolded_tail().await,
-        Err(Error::Constraint(_))
-    ));
-    assert!(matches!(
-        read_only.fold_if_stalled(0, Duration::ZERO, u64::MAX).await,
-        Err(Error::Constraint(_))
-    ));
 }
 
 /// The self-appointment rule wired over the real log: a stalled tail past the
@@ -1136,7 +1108,7 @@ async fn truncation_holds_the_live_reader_bound_past_the_margin() {
     // polls again, so its checkpoint stays the oldest live one in the manifest.
     writer.fold_sprint(70).await.unwrap();
     let mut lagging_opts = CatalogOptions::default();
-    lagging_opts.refresh_interval = Duration::from_secs(3600);
+    lagging_opts.reader_poll_interval = Duration::from_secs(3600);
     let lagging = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, lagging_opts).await;
 
     // Fold the rest, then drop the committer so the only checkpoints left are
@@ -1178,7 +1150,7 @@ async fn a_stale_reader_survives_a_peer_fold_and_truncation() {
     // B's reader will not poll the fold for the test's duration, and its head
     // cache stays cold so the first read materializes straight from the tail.
     let mut stale = CatalogOptions::default();
-    stale.refresh_interval = Duration::from_secs(3600);
+    stale.reader_poll_interval = Duration::from_secs(3600);
     let b = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, stale).await;
 
     let a = open_multi_writer(&store).await;

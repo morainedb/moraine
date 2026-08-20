@@ -599,7 +599,23 @@ verb path:
   **verb-path** property; on the extension path the equivalent behavior
   is provided by DuckLake, one layer up, where it belongs.
 
-The two front doors share the commit core (staging, one-unit atomicity,
+Two of the staged path's read phases dominate its latency — the inline
+translation (chunk walks for flush-deletes and drops) and equality-index
+maintenance (scoped Parquet reads and entry staging) — and they run
+**beside** each other rather than in sequence. Both read the transaction's
+pre-commit cut, so ordering could only matter through writes: index
+maintenance stages only `index/*` keys as it streams — a subspace the
+inline translation never reads — and hands its chunk-directory repairs
+back unstaged, while the translation stages nothing at all. Neither can
+observe the other, so running them together is indistinguishable from
+running them in order. The head view resolves first (it is maintenance's
+base input, and a warm handle answers it from memory); maintenance still
+completes before the batch is assembled, so a poisoned definition rides
+the writes it produces; and its directory repairs are ordered ahead of the
+batch's own inline writes, so a flush draining a repaired chunk still
+deletes the locator the repair added.
+
+The two front doors share the commit core (staging, one-batch atomicity,
 slot arbitration, durability) and differ only in who authors the
 mutations and therefore who may retry. Keeping that split explicit is what
 lets the verb path be aggressive (closure re-run, append-append benign)
@@ -640,10 +656,9 @@ in-memory `object_store` (`concurrent_commits_coalesce_into_few_slots`);
 the leader role that chains commits forwarded across processes is RFC
 0022's to build.
 
-**Implemented** two ways over one core — a lone commit is a group of one,
-so there is one commit path, not two. `Catalog::commit_group` batches what
-one caller hands it; concurrent callers of the ordinary `Catalog::commit`
-are batched without asking. A commit that finds the store free opens a
+**Implemented** over one core — a lone commit is a group of one, so there
+is one commit path, not two. Concurrent callers of `Catalog::commit` are
+batched without asking. A commit that finds the store free opens a
 batch, one that finds a batch forming joins it, one that finds a batch in
 flight waits for the next, and a batch seals as soon as no caller is on its
 way into it — so the flush already in the air is the batching window and an
@@ -667,6 +682,13 @@ concurrent commits land as two full batches at the same rate 64 do
 (`BENCHMARK.md`, "Commit throughput vs. concurrency"). The ceiling, not the
 flush cadence, is what binds first under saturation, and it is the lever if
 a workload ever needs past it.
+
+The single-commit floor is measured against AWS S3 as well as the local and
+injected-latency stores. From a worker in the bucket's `us-west-2` region,
+1 ms and 25 ms flush cadences both land at roughly 28–30 ms median, while a
+100 ms cadence lands at 101.9 ms (`BENCHMARK.md`, "Durable-commit latency
+against a real endpoint"). The endpoint round trip therefore replaces the
+short cadence as the binding term; it does not add a second serial wait.
 
 The batch is the unit of failure. A member that fails discards the batch,
 and its other members re-run; a lost race re-runs every member, conflicting

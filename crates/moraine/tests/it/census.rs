@@ -128,11 +128,8 @@ async fn a_read_only_catalog_measures_but_does_not_merge() {
     counting.count_live_entries = true;
     reader.store_census(counting).await.unwrap();
 
-    let refused = reader
-        .compact_store(CompactStoreRequest::default())
-        .await
-        .unwrap_err();
-    assert!(matches!(refused, Error::Constraint(_)), "{refused:?}");
+    // The merge is a mutator, so it is not on `ReadOnlyCatalog` at all —
+    // the census is the whole read-only maintenance surface.
 }
 
 /// A subspace this build cannot name addresses no keys, so it cannot be a
@@ -152,6 +149,20 @@ async fn an_unknown_subspace_is_not_a_merge_target() {
         .unwrap_err();
 
     assert!(matches!(refused, Error::Configuration(_)), "{refused:?}");
+}
+
+/// Verification without a wait cannot distinguish submission from a
+/// completed merge, so the core refuses that contradictory request.
+#[tokio::test]
+async fn verified_compaction_requires_a_wait_budget() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let mut request = merge_request(CompactionTarget::Subspace(SubspaceName::Index), None);
+    request.require_completed = true;
+
+    let error = catalog.compact_store(request).await.unwrap_err();
+    assert!(matches!(error, Error::Configuration(_)), "{error:?}");
 }
 
 /// A catalog with nothing to merge reports every measured subspace skipped

@@ -1,13 +1,13 @@
 use crate::helpers::*;
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_inline_data_round_trip_through_flush() {
     let dir = TempDir::new("inline-store");
     let data_dir = TempDir::new("inline-data");
     // No fixture seed: bootstrap alone (an empty attach mints `main`)
-    // is enough for a CREATE TABLE; row inlining is on by default
-    // (`data_inlining_row_limit = 10`), so these small inserts inline.
+    // is enough for a CREATE TABLE; row inlining is on at DuckLake's
+    // compiled default of ten rows, so these small inserts inline.
     let store = dir.path();
     let data_path = data_dir.path();
 
@@ -115,7 +115,7 @@ fn ducklake_inline_data_round_trip_through_flush() {
 /// back through scalar extractors so the comma-splitting `csv_rows`
 /// never sees a nested value's internal commas.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_inline_nested_types_round_trip_through_flush() {
     let dir = TempDir::new("inline-nested-store");
     let data_dir = TempDir::new("inline-nested-data");
@@ -188,7 +188,7 @@ fn ducklake_inline_nested_types_round_trip_through_flush() {
 /// DuckLake issues an unqualified `DELETE FROM
 /// ducklake_inlined_delete_<table_id>` to do it.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_flush_clears_inlined_file_deletions() {
     let dir = TempDir::new("idel-flush-store");
     let data_dir = TempDir::new("idel-flush-data");
@@ -299,5 +299,310 @@ fn ducklake_flush_clears_inlined_file_deletions() {
         after.last().expect("a count row"),
         &vec!["98".to_string()],
         "the emptied inlined-deletion table must still exist for the rest of the session"
+    );
+}
+
+/// Rows for `count` parents' worth of data in one insert, and the number
+/// of Parquet files the catalog holds afterwards. Inlining writes none.
+fn data_files_after_inserting(
+    store: &std::path::Path,
+    data_path: &std::path::Path,
+    attach_options: &str,
+    rows: u64,
+) -> String {
+    run_ducklake_sql_with_options(
+        store,
+        data_path,
+        attach_options,
+        &format!(
+            "CREATE TABLE lake.main.t (i BIGINT);\n\
+             INSERT INTO lake.main.t SELECT range FROM range({rows});"
+        ),
+    );
+    csv_rows(&run_standalone_sql(
+        store,
+        "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+    ))
+    .into_iter()
+    .next()
+    .and_then(|row| row.into_iter().next())
+    .expect("a count row")
+}
+
+/// DuckLake's compiled default bounds an insert at ten rows, and moraine
+/// serves no option row of its own to displace it: a small insert inlines,
+/// a large one writes a file.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn ducklake_inlining_defaults_to_ten_rows() {
+    let small = TempDir::new("limit-small-store");
+    let small_data = TempDir::new("limit-small-data");
+    assert_eq!(
+        data_files_after_inserting(small.path(), small_data.path(), "", 5),
+        "0",
+        "five rows are under the default, so they inline"
+    );
+
+    let large = TempDir::new("limit-large-store");
+    let large_data = TempDir::new("limit-large-data");
+    assert_eq!(
+        data_files_after_inserting(large.path(), large_data.path(), "", 400),
+        "1",
+        "four hundred are over it, so they land as a data file"
+    );
+}
+
+/// `ATTACH ... (DATA_INLINING_ROW_LIMIT n)` raises the limit.
+///
+/// DuckLake resolves the limit from its config options first and only
+/// falls back to the setting and its compiled default, and an ATTACH
+/// option and a `ducklake_metadata` row land in the same map — so any row
+/// moraine serves for this key silently outranks what the attach asked
+/// for. Serving none is what keeps the option meaningful.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn ducklake_attach_option_raises_the_inlining_row_limit() {
+    let dir = TempDir::new("limit-attach-store");
+    let data_dir = TempDir::new("limit-attach-data");
+    assert_eq!(
+        data_files_after_inserting(
+            dir.path(),
+            data_dir.path(),
+            ", DATA_INLINING_ROW_LIMIT 1000",
+            400
+        ),
+        "0",
+        "the attach option must take effect, so 400 rows inline"
+    );
+}
+
+/// `SET ducklake_default_data_inlining_row_limit` raises it too — the
+/// same shadowing question, reached through DuckDB's setting rather than
+/// through an ATTACH option.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn ducklake_session_setting_raises_the_inlining_row_limit() {
+    let dir = TempDir::new("limit-setting-store");
+    let data_dir = TempDir::new("limit-setting-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "SET ducklake_default_data_inlining_row_limit = 1000;\n\
+         CREATE TABLE lake.main.t (i BIGINT);\n\
+         INSERT INTO lake.main.t SELECT range FROM range(400);",
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+        )),
+        vec![vec!["0"]],
+        "the session setting must take effect, so 400 rows inline"
+    );
+}
+
+/// A stored option raises the limit as well, which is the durable form of
+/// the two knobs above: `set_option` records a `ducklake_metadata` row,
+/// and a stored row is what DuckLake resolves before either of them.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn ducklake_stored_option_raises_the_inlining_row_limit() {
+    let dir = TempDir::new("limit-stored-store");
+    let data_dir = TempDir::new("limit-stored-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CALL lake.set_option('data_inlining_row_limit', 1000);",
+    );
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CREATE TABLE lake.main.t (i BIGINT);\n\
+         INSERT INTO lake.main.t SELECT range FROM range(400);",
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+        )),
+        vec![vec!["0"]],
+        "the stored option must take effect, so 400 rows inline"
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT count(*) FROM lake.main.t;",
+        )),
+        vec![vec!["400"]]
+    );
+}
+
+/// A single-row delete costs one pass over the table, not two.
+///
+/// Evaluating the predicate scans, and that is inherent. What is not is a
+/// second materialization to invert the rowid the scan emitted: the scan
+/// emits the row's own id, so the tombstoning sink stages it directly. The
+/// delete therefore costs what the equivalent read costs.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn deleting_one_inlined_row_costs_one_pass_over_the_table() {
+    let dir = TempDir::new("inline-delete-cost");
+    let data_dir = TempDir::new("inline-delete-cost-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(store, data_path, "CREATE TABLE lake.main.t (i BIGINT);");
+    for chunk in 0..40 {
+        run_ducklake_sql(
+            store,
+            data_path,
+            &format!("INSERT INTO lake.main.t VALUES ({chunk});"),
+        );
+    }
+
+    // Both tallies and the statement between them share one session: the
+    // counters belong to the attach, so a second process restarts them.
+    let lookups = |statement: &str| -> u64 {
+        let tally = "SELECT metadata_hits + metadata_misses + block_hits + block_misses \
+                       FROM moraine_cache_tally('lake');";
+        let rows = csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            &format!("{tally}\n{statement}\n{tally}"),
+        ));
+        let read = |row: &Vec<String>| row[0].parse::<u64>().expect("a tally is a number");
+        read(rows.last().expect("a closing tally")) - read(rows.first().expect("an opening tally"))
+    };
+
+    let scanned = lookups("SELECT count(*) FROM lake.main.t WHERE i = 39;");
+    let deleted = lookups("DELETE FROM lake.main.t WHERE i = 0;");
+    assert!(
+        deleted <= scanned + scanned / 10,
+        "the delete cost {deleted} lookups against the {scanned} its scan alone costs: the sink \
+         is reading the table a second time to invert the rowid"
+    );
+}
+
+/// Reading a table costs no inlined schema it does not decode against.
+///
+/// Every table carries a registered inlined table from `CREATE TABLE`
+/// onwards, and DuckLake scans each registered schema version on every
+/// read of the base table. Reading the schema list per version turns that
+/// into one whole-list scan per version; the list is only needed to decode
+/// a body, so a version holding no inlined row must not read it at all.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn reading_a_table_costs_no_inlined_schema_it_does_not_decode_against() {
+    let lookups_over_versions = |added_columns: usize| -> u64 {
+        let dir = TempDir::new("inline-schema-cost");
+        let data_dir = TempDir::new("inline-schema-cost-data");
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        let alters = (0..added_columns)
+            .map(|column| format!("ALTER TABLE lake.main.t ADD COLUMN c{column} BIGINT;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        run_ducklake_sql(
+            store,
+            data_path,
+            &format!(
+                "CREATE TABLE lake.main.t (i BIGINT);\nINSERT INTO lake.main.t VALUES (1);\n{alters}"
+            ),
+        );
+
+        // As in `deleting_one_inlined_row_costs_one_pass_over_the_table`:
+        // the counters belong to the attach, so both tallies and the
+        // statement between them share one session.
+        let tally = "SELECT metadata_hits + metadata_misses + block_hits + block_misses \
+                       FROM moraine_cache_tally('lake');";
+        let rows = csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            &format!("{tally}\nSELECT i FROM lake.main.t;\n{tally}"),
+        ));
+        let read = |row: &Vec<String>| row[0].parse::<u64>().expect("a tally is a number");
+        read(rows.last().expect("a closing tally")) - read(rows.first().expect("an opening tally"))
+    };
+
+    // One version against thirteen. The single inlined row lives in the
+    // first, so the other twelve decode nothing and must cost no schema
+    // read — leaving the growth in the scans DuckLake itself performs.
+    let one_version = lookups_over_versions(0);
+    let many_versions = lookups_over_versions(12);
+    let budget = one_version * 43 / 10;
+    assert!(
+        many_versions <= budget,
+        "thirteen schema versions cost {many_versions} lookups against a budget of {budget} \
+         (one version costs {one_version}): each version is re-reading the whole schema list \
+         to decode nothing"
+    );
+}
+
+/// A schema-evolved table's read costs each version its own rows, not the
+/// whole table again.
+///
+/// DuckLake reads every registered `ducklake_inlined_data_<t>_<v>` on
+/// every scan of the base table, so a table evolved through V versions is
+/// read V times per statement. Each of those reads must haul only its own
+/// version's chunks: an unscoped scan turns V versions into V whole-table
+/// materializations, and the read cost grows with V twice over. Both
+/// tables live in one lake so commit depth — which prices every lookup —
+/// cancels out of the comparison.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn an_evolved_tables_read_hauls_each_version_once() {
+    let dir = TempDir::new("inline-version-cost");
+    let data_dir = TempDir::new("inline-version-cost-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    // The same twelve rows twice: `plain` under one schema version,
+    // `evolved` spread across thirteen, commits interleaved.
+    let setup: String = std::iter::once(
+        "CREATE TABLE lake.main.plain (i BIGINT);\nCREATE TABLE lake.main.evolved (i BIGINT);"
+            .to_string(),
+    )
+    .chain((1..=12).map(|row| {
+        format!(
+            "INSERT INTO lake.main.plain VALUES ({row});\n\
+             INSERT INTO lake.main.evolved (i) VALUES ({row});\n\
+             ALTER TABLE lake.main.evolved ADD COLUMN c{row} BIGINT;"
+        )
+    }))
+    .collect::<Vec<_>>()
+    .join("\n");
+    run_ducklake_sql(store, data_path, &setup);
+
+    // As in `deleting_one_inlined_row_costs_one_pass_over_the_table`: the
+    // counters belong to the attach, so each tally pair and the statement
+    // between them share one session.
+    let lookups = |table: &str| -> u64 {
+        let tally = "SELECT metadata_hits + metadata_misses + block_hits + block_misses \
+                       FROM moraine_cache_tally('lake');";
+        let rows = csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            &format!("{tally}\nSELECT count(i) FROM lake.main.{table};\n{tally}"),
+        ));
+        let read = |row: &Vec<String>| row[0].parse::<u64>().expect("a tally is a number");
+        read(rows.last().expect("a closing tally")) - read(rows.first().expect("an opening tally"))
+    };
+
+    let plain = lookups("plain");
+    let evolved = lookups("evolved");
+    let budget = plain * 8;
+    assert!(
+        evolved <= budget,
+        "the evolved table cost {evolved} lookups against a budget of {budget} (the plain one \
+         costs {plain}): each version's read is materializing the whole table instead of its \
+         own rows"
     );
 }

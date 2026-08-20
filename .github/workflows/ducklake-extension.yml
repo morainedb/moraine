@@ -1,0 +1,129 @@
+name: Patched DuckLake extension
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Companion release tag, e.g. ducklake-rowid-v0.1.0"
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  versions:
+    name: Read the DuckDB version matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^ducklake-rowid-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag must match ducklake-rowid-vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+      - id: read
+        run: echo "matrix=$(cargo run -q -p xtask -- version-matrix)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build patched DuckLake for ${{ matrix.duckdb_version }}
+    needs: versions
+    strategy:
+      fail-fast: false
+      matrix:
+        duckdb_version: ${{ fromJson(needs.versions.outputs.matrix) }}
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
+    with:
+      extension_name: ducklake
+      duckdb_version: ${{ matrix.duckdb_version }}
+      ci_tools_version: v1.5.5
+      exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
+      reduced_ci_mode: disabled
+      use_merged_vcpkg_manifest: "1"
+      skip_tests: true
+
+  validate:
+    name: Validate ${{ matrix.duckdb_version }} on ${{ matrix.runner }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux_amd64
+            duckdb_version: v1.5.5
+          - runner: ubuntu-24.04
+            platform: linux_amd64
+            duckdb_version: v1.5.4
+          - runner: macos-15
+            platform: osx_arm64
+            duckdb_version: v1.5.5
+          - runner: macos-15
+            platform: osx_arm64
+            duckdb_version: v1.5.4
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: ducklake-${{ matrix.duckdb_version }}-extension-${{ matrix.platform }}
+          path: artifact
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v6
+        with:
+          path: target/duckdb-cli
+          key: duckdb-cli-${{ matrix.platform }}-${{ matrix.duckdb_version }}
+      - run: >-
+          cargo xtask validate-ducklake-release-artifact
+          ${{ matrix.duckdb_version }}
+          artifact/ducklake.duckdb_extension
+
+  release:
+    name: Publish complete companion release
+    needs: [build, validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Stage per-version, per-architecture assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          for directory in artifacts/ducklake-*-extension-*/; do
+            name=${directory%/}
+            name=${name##*/}
+            architecture=${name##*-extension-}
+            duckdb_version=${name#ducklake-}
+            duckdb_version=${duckdb_version%-extension-*}
+            cp "$directory/ducklake.duckdb_extension" \
+              "dist/ducklake.${duckdb_version}.${architecture}.duckdb_extension"
+          done
+          ls -l dist
+      - name: Require every version and architecture
+        run: cargo run -q -p xtask -- check-ducklake-release-assets dist
+      - name: Create draft release, attach binaries, and reveal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.tag }}'
+          versions=$(ls dist \
+            | sed -E 's/^ducklake\.(v[0-9.]+)\..*/\1/' \
+            | sort -u \
+            | paste -sd', ' -)
+          gh release create "$tag" --target '${{ github.sha }}' --draft \
+            --title "$tag" \
+            --notes "Unsigned DuckLake with Moraine's row-ID file-statistics backfill and file-pruning patch, built for DuckDB ${versions}. Assets are named ducklake.<duckdb-version>.<platform>.duckdb_extension and only load into the exact DuckDB version they name. Load Moraine first, then load this artifact by path; do not INSTALL or LOAD stock ducklake afterward." \
+            || true
+          gh release upload "$tag" dist/*.duckdb_extension --clobber
+          gh release edit "$tag" --draft=false

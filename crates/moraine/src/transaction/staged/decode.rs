@@ -97,8 +97,7 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// Confirms every cell was consumed — a row longer than its table's
-    /// column list is as much a shape mismatch as one too short.
+    /// Confirms every cell was consumed.
     pub(super) fn finish(mut self) -> Result<()> {
         if self.items.next().is_some() {
             Err(corrupt_row(self.table, "too many cells"))
@@ -152,10 +151,8 @@ pub(super) fn decode_table(cells: &[Cell]) -> Result<TableCells> {
     Ok(value)
 }
 
-/// Builds the full `TableValue`: `next_column_id` is moraine-internal
-/// per-table field-id bookkeeping, not a DuckLake column. Carried forward
-/// from the table's prior version in `base` when one exists (floor of 1
-/// for a brand-new id).
+/// Builds the full `TableValue`, carrying `next_column_id` forward from
+/// the table's prior version in `base` (floor of 1 for a new id).
 pub(super) fn table_value(base: &CatalogSnapshot, cells: TableCells) -> proto::TableValue {
     let next_column_id = base
         .tables
@@ -529,8 +526,7 @@ pub(super) fn decode_end(table: TableKind, cells: &[Cell]) -> Result<(EntityKey,
             sort_id: c.u64()?,
         },
         TableKind::Macro => EntityKey::Macro { macro_id: c.u64()? },
-        // Tag entries end via their own path (`apply_update_set_end`
-        // handles them before this decoder) — reaching here is a bug.
+        // Tag entries end via `apply_update_set_end`'s own path.
         TableKind::Snapshot
         | TableKind::SnapshotChanges
         | TableKind::SchemaVersions
@@ -558,14 +554,15 @@ pub(super) fn decode_end(table: TableKind, cells: &[Cell]) -> Result<(EntityKey,
     Ok((key, end_snapshot))
 }
 
-/// Decodes a raw-delete row's key. Defined only for the three unversioned
-/// statistics kinds.
+/// The key of one unversioned statistics row.
 pub(super) enum StatsKey {
     Table(u64),
     Column(u64, u64),
     FileColumn(u64, u64, u64),
 }
 
+/// Decodes a raw-delete row's key. Defined only for the three unversioned
+/// statistics kinds.
 pub(super) fn decode_delete_key(table: TableKind, cells: &[Cell]) -> Result<StatsKey> {
     let mut c = Cursor::new(table, cells);
     let key = match table {
@@ -587,14 +584,27 @@ pub(super) fn decode_delete_key(table: TableKind, cells: &[Cell]) -> Result<Stat
     Ok(key)
 }
 
-/// Decodes a versioned kind's hard-delete row: the entity's key columns
-/// (decoder order) followed by the row's `end_snapshot` — `NULL` names
-/// the live `current` record, a value names that `history` record.
+/// Decodes a hard-delete row: the entity's key columns (decoder order)
+/// followed by the row's `end_snapshot` — `NULL` names the live `current`
+/// record, a value names that `history` record. `ducklake_column_mapping`
+/// has no `end_snapshot` column and returns `None`.
 pub(super) fn decode_hard_delete(
     table: TableKind,
     cells: &[Cell],
 ) -> Result<(EntityKey, Option<u64>)> {
     let mut c = Cursor::new(table, cells);
+    if table == TableKind::ColumnMapping {
+        let mapping_id = c.u64()?;
+        let table_id = c.u64()?;
+        c.finish()?;
+        return Ok((
+            EntityKey::Mapping {
+                table_id,
+                mapping_id,
+            },
+            None,
+        ));
+    }
     let key = match table {
         TableKind::Schema => EntityKey::Schema {
             schema_id: c.u64()?,
@@ -631,13 +641,8 @@ pub(super) fn decode_hard_delete(
 }
 
 /// Decodes a `ducklake_metadata` row into the option it names: the scope's
-/// key components and the key/value pair.
-///
-/// DuckLake's `scope` is a name (`schema` / `table`, absent for a global
-/// option) where moraine's key carries a scope kind, so this is the one
-/// place the two vocabularies meet. `value` may be absent — DuckLake
-/// writes a NULL value for an option it wants recorded as empty — and is
-/// stored as the empty string, since a scope's map holds strings.
+/// key components and the key/value pair. A `NULL` value is stored as the
+/// empty string.
 pub(super) fn decode_metadata(cells: &[Cell]) -> Result<((u64, u64), String, String)> {
     let mut c = Cursor::new(TableKind::Metadata, cells);
     let key = c.string()?;
@@ -645,8 +650,24 @@ pub(super) fn decode_metadata(cells: &[Cell]) -> Result<((u64, u64), String, Str
     let scope = c.opt_string()?;
     let scope_id = c.opt_u64()?.unwrap_or_default();
     c.finish()?;
+    Ok((option_scope(scope.as_deref(), scope_id)?, key, value))
+}
 
-    let scope_kind = match scope.as_deref() {
+/// Decodes a `ducklake_metadata` delete row: the key and the scope,
+/// without the value.
+pub(super) fn decode_metadata_key(cells: &[Cell]) -> Result<((u64, u64), String)> {
+    let mut c = Cursor::new(TableKind::Metadata, cells);
+    let key = c.string()?;
+    let scope = c.opt_string()?;
+    let scope_id = c.opt_u64()?.unwrap_or_default();
+    c.finish()?;
+    Ok((option_scope(scope.as_deref(), scope_id)?, key))
+}
+
+/// The scope components of an option row, from DuckLake's scope name and
+/// id.
+fn option_scope(scope: Option<&str>, scope_id: u64) -> Result<(u64, u64)> {
+    let scope_kind = match scope {
         None => 0,
         Some("schema") => 1,
         Some("table") => 2,
@@ -658,8 +679,7 @@ pub(super) fn decode_metadata(cells: &[Cell]) -> Result<((u64, u64), String, Str
         }
     };
     // A global option carries no id, whatever the row says.
-    let scope_id = if scope_kind == 0 { 0 } else { scope_id };
-    Ok(((scope_kind, scope_id), key, value))
+    Ok((scope_kind, if scope_kind == 0 { 0 } else { scope_id }))
 }
 
 /// A `ducklake_schema_versions` row: `(table_id, begin_snapshot,

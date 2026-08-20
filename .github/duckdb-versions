@@ -10,12 +10,13 @@
 # Why a list rather than a single pin: a C++-ABI extension carries the
 # exact DuckDB version string in its metadata footer, and DuckDB refuses
 # any whose string differs — patch releases included
-# (`ParsedExtensionMetaData::GetInvalidMetadataError`). A user on v1.5.3
-# cannot load a v1.5.4 build, so "supporting v1.5" means building each
-# v1.5.x release separately.
+# (`ParsedExtensionMetaData::GetInvalidMetadataError`). A user on one
+# patch release cannot load another's build, so "supporting a series"
+# means building each release in it separately.
 #
-# Bumping: put the new release on top with both submodule commits, move
-# the submodules there, and run `cargo xtask check-pins` — it fails until
-# every other place naming a version agrees. Dropping an old line only
-# stops future releases from carrying it; published assets stay.
-v1.5.4 duckdb=08e34c447bae34eaee3723cac61f2878b6bdf787 extension-ci-tools=b777c70d30942cca5bef62d6d4fa23a13362f398
+# Bumping: `cargo xtask bump-duckdb <version>` writes this file and every
+# other place naming the version, then `cargo xtask check-pins` fails until
+# they all agree. Dropping an old line only stops future releases from
+# carrying it; published assets stay.
+v1.5.5 duckdb=d8cdaa33fda8df955cc76ef58a280f68f4cd43fa extension-ci-tools=72e76e99cd7fee45a99739cd118ec2db64e034ec
+v1.5.4

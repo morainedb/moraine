@@ -73,7 +73,7 @@ pub unsafe extern "C" fn moraine_dump_table_stats(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_table_stats(catalog)),
+            moraine::ffi_support::dump_table_stats,
             table_stats_rows,
         )
     }
@@ -126,8 +126,6 @@ pub struct MoraineTableColumnStatsRow {
 pub(crate) fn table_column_stats_rows(
     rows: Vec<moraine::ffi_support::TableColumnStatsRecord>,
 ) -> Result<Vec<MoraineTableColumnStatsRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
         .map(|v| {
@@ -185,7 +183,7 @@ pub unsafe extern "C" fn moraine_dump_table_column_stats(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_table_column_stats(catalog)),
+            moraine::ffi_support::dump_table_column_stats,
             table_column_stats_rows,
         )
     }
@@ -248,8 +246,6 @@ pub struct MoraineFileColumnStatsRow {
 pub(crate) fn file_column_stats_rows(
     rows: Vec<moraine::ffi_support::FileColumnStatsRecord>,
 ) -> Result<Vec<MoraineFileColumnStatsRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
         .map(|v| {
@@ -308,7 +304,45 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_file_column_stats(catalog)),
+            moraine::ffi_support::dump_file_column_stats,
+            file_column_stats_rows,
+        )
+    }
+}
+
+/// Dumps one table's `ducklake_file_column_stats` rows into
+/// `*out_items`/`*out_len`, in the order
+/// [`moraine_dump_file_column_stats`] would emit them. Free with
+/// [`moraine_dump_file_column_stats_free`].
+///
+/// # Safety
+///
+/// The shared dump-entry contract (`dump_rows`): a live `handle` from
+/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+/// thread, and a null-or-writable `err`, all for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_file_column_stats_of(
+    handle: *mut MoraineCatalogHandle,
+    table_id: u64,
+    out_items: *mut *mut MoraineFileColumnStatsRow,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            async |catalog| {
+                moraine::ffi_support::dump_file_column_stats_of(catalog, table_id).await
+            },
             file_column_stats_rows,
         )
     }

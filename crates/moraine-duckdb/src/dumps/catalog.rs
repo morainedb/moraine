@@ -37,14 +37,12 @@ pub struct MoraineSchemaRow {
 pub(crate) fn schema_rows(
     rows: Vec<moraine::ffi_support::SchemaRecord>,
 ) -> Result<Vec<MoraineSchemaRow>, AbiError> {
-    // Owned-first: every string in the whole batch converts before any
-    // raw pointer is minted, so a partial failure leaks nothing.
     let owned = rows
         .into_iter()
-        .map(|v| {
-            let schema_uuid = to_c_string(&v.schema_uuid)?;
-            let schema_name = to_c_string(&v.schema_name)?;
-            let path = to_c_string(&v.path)?;
+        .map(|mut v| {
+            let schema_uuid = to_c_string(std::mem::take(&mut v.schema_uuid))?;
+            let schema_name = to_c_string(std::mem::take(&mut v.schema_name))?;
+            let path = to_c_string(std::mem::take(&mut v.path))?;
             Ok((v, schema_uuid, schema_name, path))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -95,7 +93,7 @@ pub unsafe extern "C" fn moraine_dump_schemas(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_schemas(catalog)),
+            moraine::ffi_support::dump_schemas,
             schema_rows,
         )
     }
@@ -150,14 +148,12 @@ pub struct MoraineTableRow {
 pub(crate) fn table_rows(
     rows: Vec<moraine::ffi_support::TableRecord>,
 ) -> Result<Vec<MoraineTableRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|v| {
-            let table_uuid = to_c_string(&v.table_uuid)?;
-            let table_name = to_c_string(&v.table_name)?;
-            let path = to_c_string(&v.path)?;
+        .map(|mut v| {
+            let table_uuid = to_c_string(std::mem::take(&mut v.table_uuid))?;
+            let table_name = to_c_string(std::mem::take(&mut v.table_name))?;
+            let path = to_c_string(std::mem::take(&mut v.path))?;
             Ok((v, table_uuid, table_name, path))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -208,7 +204,7 @@ pub unsafe extern "C" fn moraine_dump_tables(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_tables(catalog)),
+            moraine::ffi_support::dump_tables,
             table_rows,
         )
     }
@@ -263,15 +259,13 @@ pub struct MoraineViewRow {
 pub(crate) fn view_rows(
     rows: Vec<moraine::ffi_support::ViewRecord>,
 ) -> Result<Vec<MoraineViewRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|v| {
-            let view_uuid = to_c_string(&v.view_uuid)?;
-            let view_name = to_c_string(&v.view_name)?;
-            let dialect = to_c_string(&v.dialect)?;
-            let sql = to_c_string(&v.sql)?;
+        .map(|mut v| {
+            let view_uuid = to_c_string(std::mem::take(&mut v.view_uuid))?;
+            let view_name = to_c_string(std::mem::take(&mut v.view_name))?;
+            let dialect = to_c_string(std::mem::take(&mut v.dialect))?;
+            let sql = to_c_string(std::mem::take(&mut v.sql))?;
             let column_aliases = opt_c_string(v.column_aliases.as_deref())?;
             Ok((v, view_uuid, view_name, dialect, sql, column_aliases))
         })
@@ -325,7 +319,7 @@ pub unsafe extern "C" fn moraine_dump_views(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_views(catalog)),
+            moraine::ffi_support::dump_views,
             view_rows,
         )
     }
@@ -394,13 +388,11 @@ pub struct MoraineColumnRow {
 pub(crate) fn column_rows(
     rows: Vec<moraine::ffi_support::ColumnRecord>,
 ) -> Result<Vec<MoraineColumnRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|v| {
-            let column_name = to_c_string(&v.column_name)?;
-            let column_type = to_c_string(&v.column_type)?;
+        .map(|mut v| {
+            let column_name = to_c_string(std::mem::take(&mut v.column_name))?;
+            let column_type = to_c_string(std::mem::take(&mut v.column_type))?;
             let initial_default = opt_c_string(v.initial_default.as_deref())?;
             let default_value = opt_c_string(v.default_value.as_deref())?;
             let default_value_type = opt_c_string(v.default_value_type.as_deref())?;
@@ -481,7 +473,7 @@ pub unsafe extern "C" fn moraine_dump_columns(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_columns(catalog)),
+            moraine::ffi_support::dump_columns,
             column_rows,
         )
     }
@@ -599,12 +591,9 @@ mod tests {
         }
     }
 
-    /// A catalog string with an embedded NUL (reachable via a view's SQL)
-    /// cannot cross the C boundary: `moraine_dump_views` must fail with
-    /// `CORRUPTION`, leaving the outputs untouched. The clean view (ordered
-    /// first, by id) converts before the poisoned one fails, so this
-    /// exercises the owned-first discipline: no raw pointer is minted until
-    /// every row's strings convert, or the clean view's `CString`s leak.
+    /// A catalog string with an embedded NUL fails `moraine_dump_views`
+    /// with `CORRUPTION`, leaves the outputs untouched, and leaks nothing
+    /// from the rows that converted before it.
     #[test]
     fn embedded_nul_in_view_sql_reports_corruption_and_leaks_nothing() {
         let dir = TempDir::new("embedded-nul");

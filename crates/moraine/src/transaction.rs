@@ -5,6 +5,7 @@ pub(crate) mod commit;
 pub(crate) mod folder;
 pub(crate) mod index_maintenance;
 pub(crate) mod inline;
+pub(crate) mod maintenance_status;
 pub(crate) mod migration;
 pub(crate) mod operations;
 pub(crate) mod slot_commit;

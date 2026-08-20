@@ -23,6 +23,7 @@ pub struct CountingStore {
     inner: Arc<InMemory>,
     gets: AtomicU64,
     ranged_gets: AtomicU64,
+    bytes: AtomicU64,
 }
 
 impl CountingStore {
@@ -31,6 +32,7 @@ impl CountingStore {
             inner,
             gets: AtomicU64::new(0),
             ranged_gets: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
         }
     }
 
@@ -41,6 +43,15 @@ impl CountingStore {
         let gets = self.gets.swap(0, Ordering::SeqCst);
         let ranged = self.ranged_gets.swap(0, Ordering::SeqCst);
         gets + ranged
+    }
+
+    /// Bytes those reads carried since the last call, and resets the
+    /// tally. What a read *fetches* is the grain question: a block-grained
+    /// cache faults blocks where a part-grained one faults whole parts,
+    /// and only the byte count tells them apart.
+    #[allow(dead_code)]
+    pub fn take_bytes(&self) -> u64 {
+        self.bytes.swap(0, Ordering::SeqCst)
     }
 }
 
@@ -75,7 +86,10 @@ impl ObjectStore for CountingStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         self.gets.fetch_add(1, Ordering::SeqCst);
-        self.inner.get_opts(location, options).await
+        let result = self.inner.get_opts(location, options).await?;
+        self.bytes
+            .fetch_add(result.range.end - result.range.start, Ordering::SeqCst);
+        Ok(result)
     }
 
     async fn get_ranges(
@@ -85,6 +99,10 @@ impl ObjectStore for CountingStore {
     ) -> object_store::Result<Vec<bytes::Bytes>> {
         self.ranged_gets
             .fetch_add(ranges.len() as u64, Ordering::SeqCst);
+        self.bytes.fetch_add(
+            ranges.iter().map(|range| range.end - range.start).sum(),
+            Ordering::SeqCst,
+        );
         self.inner.get_ranges(location, ranges).await
     }
 

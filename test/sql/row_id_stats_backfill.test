@@ -1,0 +1,123 @@
+# name: test/sql/row_id_stats_backfill.test
+# group: [moraine]
+#
+# The patched DuckLake backfill repairs legacy row-ID file statistics through
+# Moraine's metadata catalog without rewriting Parquet or minting a snapshot.
+# The upstream patch suite covers dense and sparse Parquet resolution against
+# DuckDB's SQL metadata backend; this file pins the staged-write protocol that
+# makes the same metadata-only operation durable through Moraine.
+
+require-env MORAINE_DUCKDB_EXT
+
+require-env MORAINE_DUCKLAKE_EXT
+
+require-env MORAINE_EXTENSION_DIR
+
+statement ok
+SET threads=1;
+
+statement ok
+SET extension_directory='${MORAINE_EXTENSION_DIR}';
+
+statement ok
+INSTALL parquet;
+
+statement ok
+LOAD parquet;
+
+# Moraine must be registered before DuckLake opens the metadata catalog.
+statement ok
+LOAD '${MORAINE_DUCKDB_EXT}';
+
+statement ok
+LOAD '${MORAINE_DUCKLAKE_EXT}';
+
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/row-id-backfill-store' AS lake (
+  DATA_PATH '__TEST_DIR__/row-id-backfill-data/',
+  DATA_INLINING_ROW_LIMIT 0
+);
+
+statement ok
+CREATE TABLE lake.main.items(value BIGINT);
+
+statement ok
+INSERT INTO lake.main.items VALUES (0), (1), (2);
+
+statement ok
+INSERT INTO lake.main.items VALUES (3), (4);
+
+statement ok
+INSERT INTO lake.main.items VALUES (5), (6), (7), (8);
+
+statement ok
+SET VARIABLE snapshot_before_backfill = (
+  SELECT max(snapshot_id)
+  FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
+statement ok
+DELETE FROM __ducklake_metadata_lake.ducklake_file_column_stats
+WHERE column_id = 2147483540;
+
+query I
+SELECT count(*)
+FROM __ducklake_metadata_lake.ducklake_file_column_stats
+WHERE column_id = 2147483540;
+----
+0
+
+query TTII
+SELECT schema_name, table_name, files_backfilled, files_remaining
+FROM ducklake_backfill_row_id_stats(
+  'lake', schema => 'main', table_name => 'items', max_files => 2
+);
+----
+main	items	2	1
+
+query I
+SELECT count(*)
+FROM __ducklake_metadata_lake.ducklake_file_column_stats
+WHERE column_id = 2147483540;
+----
+2
+
+# The repair is a head-preserving metadata commit, not a DuckLake snapshot.
+query I
+SELECT max(snapshot_id) = getvariable('snapshot_before_backfill')
+FROM __ducklake_metadata_lake.ducklake_snapshot;
+----
+true
+
+query TTII
+SELECT schema_name, table_name, files_backfilled, files_remaining
+FROM ducklake_backfill_row_id_stats(
+  'lake', schema => 'main', table_name => 'items'
+);
+----
+main	items	1	0
+
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/row-id-backfill-store' AS lake (
+  DATA_PATH '__TEST_DIR__/row-id-backfill-data/',
+  DATA_INLINING_ROW_LIMIT 0
+);
+
+# Reattaching forces a fresh projection from SlateDB and proves durability.
+query I
+SELECT count(*)
+FROM __ducklake_metadata_lake.ducklake_file_column_stats
+WHERE column_id = 2147483540;
+----
+3
+
+query TTII
+SELECT schema_name, table_name, files_backfilled, files_remaining
+FROM ducklake_backfill_row_id_stats(
+  'lake', schema => 'main', table_name => 'items'
+);
+----
+main	items	0	0

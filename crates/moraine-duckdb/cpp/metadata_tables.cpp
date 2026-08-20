@@ -5,6 +5,19 @@
 #include <set>
 #include <string>
 
+// The bound-expression shapes `MetadataScanPushdownComplexFilter` matches,
+// and the `LogicalGet` it reads the scan's projection from.
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+
+// Re-resolving a deferred scan's catalog at execution time.
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
+
 #include "catalog.hpp"
 #include "inline_tables.hpp"
 #include "owned_array.hpp"
@@ -13,6 +26,29 @@
 namespace moraine_duckdb {
 
 namespace {
+
+// The store state a dump's rows stand at.
+struct MoraineHeadStamp {
+	uint64_t snapshot_id;
+	uint64_t batch_seq;
+};
+
+// Reads the head stamp, reporting whether one exists. A store with no
+// head yet (mid-bootstrap) and a failed read both report false, which
+// costs a caller only the caching it would otherwise have done — never
+// correctness, so the error is swallowed rather than raised.
+bool ReadHeadStamp(MoraineCatalogHandle *handle, duckdb::ClientContext &context, MoraineHeadStamp &out) {
+	MoraineError err {};
+	bool present = false;
+	if (moraine_head_stamp(handle, &out.snapshot_id, &out.batch_seq, &present, moraine_shim_is_interrupted, &context,
+	                       &err) != MORAINE_OK) {
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		return false;
+	}
+	return present;
+}
 
 duckdb::Value OptVarchar(const char *s) {
 	if (s == nullptr) {
@@ -405,6 +441,25 @@ std::vector<std::vector<duckdb::Value>> ProvideDataFiles(MoraineCatalogHandle *h
 	                                    DataFileShape);
 }
 
+// The `ducklake_data_file` rows live at `live_bound`. The core compares the
+// bound against the read point it serves this dump from, so a bound that
+// has fallen behind one simply reads every version.
+std::vector<std::vector<duckdb::Value>> ProvideDataFilesLiveAt(MoraineCatalogHandle *handle, uint64_t live_bound,
+                                                               MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineDataFileRow> rows(moraine_dump_data_files_free);
+	MoraineError err {};
+	if (moraine_dump_data_files_live_at(handle, live_bound, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err) !=
+	    MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back(DataFileShape(r));
+	}
+	return result;
+}
+
 // One `ducklake_delete_file` record's column list, shared by the committed
 // dump and the transaction-aware one.
 std::vector<duckdb::Value> DeleteFileShape(const MoraineDeleteFileRow &r) {
@@ -483,6 +538,25 @@ std::vector<std::vector<duckdb::Value>> ProvideFileColumnStats(MoraineCatalogHan
                                                                MoraineInterruptProbe probe, void *probe_ctx) {
 	return DumpRows<MoraineFileColumnStatsRow>(handle, probe, probe_ctx, moraine_dump_file_column_stats,
 	                                           moraine_dump_file_column_stats_free, FileColumnStatsShape);
+}
+
+// One table's file column statistics. `DumpRows` cannot serve this: the
+// scoped entry point takes a table id.
+std::vector<std::vector<duckdb::Value>> ProvideFileColumnStatsOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                                 MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineFileColumnStatsRow> rows(moraine_dump_file_column_stats_free);
+	MoraineError err {};
+	auto code =
+	    moraine_dump_file_column_stats_of(handle, table_id, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back(FileColumnStatsShape(r));
+	}
+	return result;
 }
 
 // `ducklake_schema_versions` rows are flattened out of the snapshot
@@ -655,16 +729,19 @@ std::vector<std::vector<duckdb::Value>> ProvideScheduledDeletions(MoraineCatalog
 //     uses it when no DATA_PATH is supplied, so a re-attach need not repeat
 //     it; a store with none served leaves the ATTACH DATA_PATH as authority.
 //   - "created_by": never read back; served because it costs nothing.
-//   - "data_inlining_row_limit": "10" (DuckLake's compiled default). Load-
-//     bearing: a non-zero value is what makes DuckLake's write path emit
-//     `INSERT INTO ducklake_inlined_data_tables`; "0" would suppress inlining
-//     entirely. inline_tables.cpp serves the dynamic inline catalog surface
-//     this drives.
+// No row is served for "data_inlining_row_limit". DuckLake resolves that
+// limit from its config options first and falls back to the DuckDB setting
+// and then a compiled default of 10, and an ATTACH option lands in the same
+// map an option row does — so a row served here would outrank both
+// `ATTACH ... (DATA_INLINING_ROW_LIMIT n)` and
+// `SET ducklake_default_data_inlining_row_limit`, silently. Serving none
+// leaves inlining on at that same default of 10 and leaves both knobs
+// meaningful; a store that wants another limit records a real option row.
 // All rows are global (scope/scope_id NULL).
 // The `ducklake_metadata` rows moraine serves from its own facts rather
 // than from stored options: the protocol version, the writer, the
-// creation-time `encrypted` flag, the inlining default, and the recorded
-// data root in the normalized form DuckLake compares against.
+// creation-time `encrypted` flag, and the recorded data root in the
+// normalized form DuckLake compares against.
 std::vector<std::vector<duckdb::Value>> FixedMetadataRows(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                           void *probe_ctx) {
 	bool encrypted = false;
@@ -679,7 +756,6 @@ std::vector<std::vector<duckdb::Value>> FixedMetadataRows(MoraineCatalogHandle *
 	    {Varchar("version"), Varchar("1.0"), null_varchar, null_bigint},
 	    {Varchar("created_by"), Varchar("moraine"), null_varchar, null_bigint},
 	    {Varchar("encrypted"), Varchar(encrypted ? "true" : "false"), null_varchar, null_bigint},
-	    {Varchar("data_inlining_row_limit"), Varchar("10"), null_varchar, null_bigint},
 	};
 	// The recorded data root, when the store has one, so DuckLake reads it
 	// back on attach instead of requiring DATA_PATH again.
@@ -705,7 +781,7 @@ std::vector<std::vector<duckdb::Value>> FixedMetadataRows(MoraineCatalogHandle *
 	// Stored options last. Most override a fixed row of the same key and
 	// scope — the rows above are what a store *without* a setting serves,
 	// and `set_option` is what replaces one; without the override a user
-	// could set `data_inlining_row_limit` and never see it take effect.
+	// could set an option and never see it take effect.
 	//
 	// The exceptions are the keys above that are *store facts* rather than
 	// defaults: `version` is the protocol constant, `encrypted` is fixed
@@ -731,8 +807,7 @@ std::vector<duckdb::Value> OptionShape(const MoraineOptionRow &r) {
 // Merges the store's own option rows over the fixed ones. Most override a
 // fixed row of the same key and scope — the fixed rows are what a store
 // *without* a setting serves, and `set_option` is what replaces one; without
-// the override a user could set `data_inlining_row_limit` and never see it
-// take effect.
+// the override a user could set an option and never see it take effect.
 //
 // The exceptions are the keys that are *store facts* rather than defaults:
 // `version` is the protocol constant, `encrypted` is fixed when the catalog
@@ -778,6 +853,11 @@ std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *ha
 // schema_version)` with a recorded `inline/schema`. The table_name column
 // carries `InlinedDataTableName` (inline_tables.cpp), matching DuckLake's
 // own inline-table naming.
+//
+// Committed records only, so a transaction's own registration is absent
+// until it lands. DuckLake reads this table while building the batch that
+// registers — before the `CREATE TABLE` staging that `inline/schema` runs —
+// or after that batch commits, never in between.
 std::vector<std::vector<duckdb::Value>> ProvideInlinedDataTables(MoraineCatalogHandle *handle,
                                                                  MoraineInterruptProbe probe, void *probe_ctx) {
 	return DumpRows<MoraineInlineTableRow>(handle, probe, probe_ctx, moraine_inline_registered_tables,
@@ -930,6 +1010,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end key: table_id, data_file_id (decoder order) */ {1, 0},
 	        /* end_snapshot col */ 3,
 	        /* delete key: table_id, data_file_id, end_snapshot */ {1, 0, 3},
+	        /* overlay_updatable */ false,
+	        /* scope_column */ -1,
+	        /* live_narrowable */ true,
 	    },
 	    {
 	        "ducklake_delete_file",
@@ -1007,6 +1090,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        0,
 	        /* delete key: data_file_id, table_id, column_id (decoder order) */ {0, 1, 2},
 	        /* overlay updates */ true,
+	        /* scope column: table_id */ 1,
 	    },
 	    {
 	        // Three-column form: (begin_snapshot, schema_version, table_id).
@@ -1053,8 +1137,6 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end_snapshot col */ 3,
 	        /* delete key: table_id, column_id, key, begin_snapshot */ {0, 1, 4, 2},
 	    },
-	    // Always-empty stand-ins (see `ProvideEmpty`): no dump ABI call backs
-	    // them — the store models none of these kinds.
 	    {
 	        "ducklake_inlined_data_tables",
 	        {
@@ -1155,6 +1237,8 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        0,
 	        /* delete key: data_file_id, table_id */ {0, 1},
 	    },
+	    // An always-empty stand-in (see `ProvideEmpty`): no dump ABI call
+	    // backs it — the store models no variant stats.
 	    {
 	        "ducklake_file_variant_stats",
 	        {
@@ -1256,13 +1340,17 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"scope_id", "BIGINT", false},
 	        },
 	        ProvideMetadata,
-	        // Options are unversioned and outside the snapshot protocol, so
-	        // DuckLake's `set_option` writes them as a delete of the old row
-	        // (by its whole key) followed by an insert of the new one.
+	        // Options are unversioned and outside the snapshot protocol.
+	        // `set_option` counts the rows already holding the key at that
+	        // scope and writes an INSERT only when there are none, so every
+	        // later set arrives as `SET value` on the matched row — the
+	        // overlay below. A key moraine serves a default for takes that
+	        // branch on the first set, since a synthesized row counts.
 	        25,
 	        {},
 	        0,
 	        /* delete key: key, scope, scope_id */ {0, 2, 3},
+	        /* overlay_updatable */ true,
 	    },
 	};
 	return specs;
@@ -1275,6 +1363,21 @@ duckdb::BindInfo MetadataScanBindInfo(const duckdb::optional_ptr<duckdb::Functio
 	return info;
 }
 
+// The catalog a deferred scan reads through, proven still attached.
+//
+// Bind data outlives its bind: `PREPARE`, `DETACH`, then `EXECUTE` reaches
+// here with `bind_data.catalog` pointing at a freed catalog. The pointer is
+// therefore only ever compared, never followed — the reference returned is
+// the one the database manager resolves now.
+duckdb::Catalog &LiveBoundCatalog(duckdb::ClientContext &context, const MetadataScanBindData &bind_data) {
+	auto database = duckdb::DatabaseManager::Get(context).GetDatabase(context, bind_data.catalog_name);
+	if (database && &database->GetCatalog() == bind_data.catalog) {
+		return *bind_data.catalog;
+	}
+	throw duckdb::CatalogException("moraine: database \"%s\" was detached after this statement was bound",
+	                               bind_data.catalog_name);
+}
+
 struct MetadataScanGlobalState : public duckdb::GlobalTableFunctionState {
 	duckdb::idx_t offset = 0;
 	// The columns DuckDB asked for, by index into a materialized row, in
@@ -1282,38 +1385,272 @@ struct MetadataScanGlobalState : public duckdb::GlobalTableFunctionState {
 	// `SELECT NULL FROM ducklake_metadata LIMIT 1`), which DuckDB emits only
 	// when the table function advertises `projection_pushdown = true`.
 	std::vector<duckdb::column_t> column_ids;
+	// Set only for a scan whose bind deferred materialization, holding what
+	// this scan built.
+	std::shared_ptr<const MetadataRows> rows;
+	// The row id this scan's first row carries, taken from the transaction's
+	// run registry. Zero for a scan emitting no row ids, and for the inline
+	// tables, whose own Sinks index a re-materialization directly.
+	uint64_t row_id_base = 0;
 
 	idx_t MaxThreads() const override {
 		return 1;
 	}
 };
 
-duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duckdb::ClientContext &,
+bool EmitsRowIds(const std::vector<duckdb::column_t> &column_ids) {
+	return std::find(column_ids.begin(), column_ids.end(), duckdb::COLUMN_IDENTIFIER_ROW_ID) != column_ids.end();
+}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duckdb::ClientContext &context,
                                                                             duckdb::TableFunctionInitInput &input) {
 	auto state = duckdb::make_uniq<MetadataScanGlobalState>();
 	state->column_ids = input.column_ids;
-	return std::move(state);
+
+	auto &bind_data = input.bind_data->Cast<MetadataScanBindData>();
+	if (bind_data.spec == nullptr || bind_data.catalog == nullptr) {
+		return state;
+	}
+	auto &catalog = LiveBoundCatalog(context, bind_data);
+	if (bind_data.rows == nullptr) {
+		if (bind_data.scope.IsValid()) {
+			state->rows = ScopedMetadataRowsFor(context, catalog, *bind_data.spec, bind_data.scope.GetIndex());
+		} else {
+			// A scan emitting row ids has its rows resolved back from them by
+			// the staged-write Sink, so it reads the same materialization
+			// every other writer of this table does — never a narrowed one.
+			auto live_bound = EmitsRowIds(state->column_ids) ? duckdb::optional_idx() : bind_data.live_bound;
+			state->rows = MetadataRowsFor(context, catalog, *bind_data.spec, live_bound);
+		}
+	}
+
+	// Only a scan feeding an UPDATE or a DELETE asks for row ids, and only
+	// its rows are ever resolved back from one, so only it is registered.
+	if (EmitsRowIds(state->column_ids)) {
+		auto catalog_transaction = catalog.GetCatalogTransaction(context);
+		auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
+		state->row_id_base = transaction.RegisterScannedRows(
+		    *bind_data.spec, state->rows != nullptr ? state->rows : bind_data.rows);
+	}
+	return state;
+}
+
+// Where `column` sits in this scan's projection, if it is projected at
+// all. A filter's column reference binds to the projection, not to the
+// table's own column order.
+duckdb::optional_idx ProjectedColumn(const duckdb::LogicalGet &get, duckdb::idx_t column) {
+	auto &column_ids = get.GetColumnIds();
+	for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
+		if (!column_ids[i].IsVirtualColumn() && column_ids[i].GetPrimaryIndex() == column) {
+			return i;
+		}
+	}
+	return duckdb::optional_idx();
+}
+
+// Whether `expression` is a reference to the scan's `projected` column.
+bool IsColumnRef(const duckdb::Expression &expression, const duckdb::LogicalGet &get, duckdb::idx_t projected) {
+	if (expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &column = expression.Cast<duckdb::BoundColumnRefExpression>();
+	return column.binding.table_index == get.table_index && column.binding.column_index == projected;
+}
+
+// The non-negative BIGINT constant `expression` holds, if it is one.
+duckdb::optional_idx ConstantSnapshot(const duckdb::Expression &expression) {
+	if (expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+		return duckdb::optional_idx();
+	}
+	auto &value = expression.Cast<duckdb::BoundConstantExpression>().value;
+	if (value.IsNull() || value.type().id() != duckdb::LogicalTypeId::BIGINT) {
+		return duckdb::optional_idx();
+	}
+	// Read signed and refused if negative: no snapshot carries a negative
+	// id, and `optional_idx` throws on the sentinel an unsigned read of -1
+	// would produce.
+	auto snapshot = value.GetValue<int64_t>();
+	if (snapshot < 0) {
+		return duckdb::optional_idx();
+	}
+	return static_cast<duckdb::idx_t>(snapshot);
+}
+
+// The snapshot `S` of a `S < end_snapshot OR end_snapshot IS NULL` filter
+// over this scan's `end_snapshot` column — the shape every DuckLake read of
+// a versioned table carries, alongside its `S >= begin_snapshot` half.
+//
+// Only rows the disjunction keeps matter, so recognizing it is what proves
+// the ended half unreachable: an ended version's `end_snapshot` is the
+// snapshot that ended it, never past the head, and is never null. Both arms
+// therefore reject every ended version once `S` has reached the head — which
+// the core, not this function, is what checks.
+duckdb::optional_idx LiveBoundOf(const duckdb::Expression &filter, const duckdb::LogicalGet &get,
+                                 duckdb::idx_t projected) {
+	if (filter.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONJUNCTION) {
+		return duckdb::optional_idx();
+	}
+	auto &disjunction = filter.Cast<duckdb::BoundConjunctionExpression>();
+	if (disjunction.GetExpressionType() != duckdb::ExpressionType::CONJUNCTION_OR ||
+	    disjunction.children.size() != 2) {
+		return duckdb::optional_idx();
+	}
+
+	duckdb::optional_idx bound;
+	bool saw_is_null = false;
+	for (auto &child : disjunction.children) {
+		if (child->GetExpressionType() == duckdb::ExpressionType::OPERATOR_IS_NULL) {
+			auto &is_null = child->Cast<duckdb::BoundOperatorExpression>();
+			if (is_null.children.size() == 1 && IsColumnRef(*is_null.children[0], get, projected)) {
+				saw_is_null = true;
+			}
+			continue;
+		}
+		auto type = child->GetExpressionType();
+		if (type != duckdb::ExpressionType::COMPARE_LESSTHAN &&
+		    type != duckdb::ExpressionType::COMPARE_GREATERTHAN) {
+			continue;
+		}
+		auto &comparison = child->Cast<duckdb::BoundComparisonExpression>();
+		// `S < end_snapshot` either way round; anything else, including the
+		// inclusive forms, is left alone.
+		auto &constant = type == duckdb::ExpressionType::COMPARE_LESSTHAN ? comparison.left : comparison.right;
+		auto &column = type == duckdb::ExpressionType::COMPARE_LESSTHAN ? comparison.right : comparison.left;
+		if (!IsColumnRef(*column, get, projected)) {
+			continue;
+		}
+		if (auto snapshot = ConstantSnapshot(*constant); snapshot.IsValid()) {
+			bound = snapshot;
+		}
+	}
+
+	return saw_is_null ? bound : duckdb::optional_idx();
+}
+
+// Records the snapshot a lifecycle filter keeps this scan's rows against,
+// so `InitGlobal` can leave the ended half unread.
+//
+// **Consumes nothing**, as with the scope pushdown below: the filter stays
+// in `filters` and DuckLake keeps applying it, so a bound recognized too
+// generously costs a narrower materialization, never a wrong row — the core
+// still refuses to narrow a bound that has fallen behind its read point.
+void MetadataScanPushdownLiveBound(duckdb::LogicalGet &get, MetadataScanBindData &bind_data,
+                                   const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &filters) {
+	// `end_snapshot_column` only names a column on a kind that declares an
+	// end key, so a kind marked narrowable without one narrows nothing
+	// rather than reading column zero as a lifecycle.
+	if (!bind_data.spec->live_narrowable || bind_data.spec->end_key_columns.empty() ||
+	    bind_data.live_bound.IsValid()) {
+		return;
+	}
+	auto projected = ProjectedColumn(get, bind_data.spec->end_snapshot_column);
+	if (!projected.IsValid()) {
+		return;
+	}
+	for (auto &filter : filters) {
+		if (auto bound = LiveBoundOf(*filter, get, projected.GetIndex()); bound.IsValid()) {
+			bind_data.live_bound = bound;
+			return;
+		}
+	}
+}
+
+// Records the `table_id` an equality filter pins this scan to, so
+// `InitGlobal` can materialize just that table's run.
+//
+// **Consumes nothing.** Every filter stays in `filters`, so DuckDB keeps
+// applying all of them and this scan never owes a predicate it did not
+// implement — a shape not matched here costs a wider materialization, never
+// a wrong row. That is also why `filter_pushdown` stays off: setting it
+// would delete the filter operator and make the scan responsible for the
+// whole of `TableFilterType`.
+void MetadataScanPushdownComplexFilter(duckdb::ClientContext &, duckdb::LogicalGet &get,
+                                       duckdb::FunctionData *bind_data_p,
+                                       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &filters) {
+	if (bind_data_p == nullptr) {
+		return;
+	}
+	auto &bind_data = bind_data_p->Cast<MetadataScanBindData>();
+	if (bind_data.spec == nullptr) {
+		return;
+	}
+	MetadataScanPushdownLiveBound(get, bind_data, filters);
+	if (bind_data.spec->scope_column < 0 || bind_data.scope.IsValid()) {
+		return;
+	}
+
+	auto projected = ProjectedColumn(get, static_cast<duckdb::idx_t>(bind_data.spec->scope_column));
+	if (!projected.IsValid()) {
+		return;
+	}
+
+	for (auto &filter : filters) {
+		if (filter->GetExpressionType() != duckdb::ExpressionType::COMPARE_EQUAL) {
+			continue;
+		}
+		auto &comparison = filter->Cast<duckdb::BoundComparisonExpression>();
+		// Either side may hold the column reference.
+		duckdb::Expression *orderings[2][2] = {
+		    {comparison.left.get(), comparison.right.get()},
+		    {comparison.right.get(), comparison.left.get()},
+		};
+		for (auto &ordering : orderings) {
+			auto *reference = ordering[0];
+			auto *constant = ordering[1];
+			if (reference->GetExpressionClass() != duckdb::ExpressionClass::BOUND_COLUMN_REF ||
+			    constant->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+				continue;
+			}
+			auto &column = reference->Cast<duckdb::BoundColumnRefExpression>();
+			if (column.binding.table_index != get.table_index ||
+			    column.binding.column_index != projected.GetIndex()) {
+				continue;
+			}
+			auto &value = constant->Cast<duckdb::BoundConstantExpression>().value;
+			if (value.IsNull() || value.type().id() != duckdb::LogicalTypeId::BIGINT) {
+				continue;
+			}
+			// Read signed and refused if negative: no table carries a
+			// negative id, and `optional_idx` throws on the sentinel an
+			// unsigned read of -1 would produce.
+			auto table_id = value.GetValue<int64_t>();
+			if (table_id < 0) {
+				continue;
+			}
+			bind_data.scope = static_cast<duckdb::idx_t>(table_id);
+			return;
+		}
+	}
 }
 
 void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<MetadataScanBindData>();
 	auto &state = data.global_state->Cast<MetadataScanGlobalState>();
-	if (state.offset >= bind_data.rows.size()) {
+	// A scan that deferred materialization holds its rows on the state;
+	// every other one holds them on the bind data.
+	auto &materialized = state.rows != nullptr ? state.rows : bind_data.rows;
+	if (materialized == nullptr) {
+		throw duckdb::InternalException("moraine: metadata scan bound without a materialized row set");
+	}
+	auto &rows = *materialized;
+	if (state.offset >= rows.size()) {
 		output.SetCardinality(0);
 		return;
 	}
-	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
+	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, rows.size() - state.offset);
 	for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
-		auto &row = bind_data.rows[state.offset + out_row];
+		auto &row = rows[state.offset + out_row];
 		for (duckdb::idx_t out_col = 0; out_col < state.column_ids.size(); out_col++) {
 			auto col_id = state.column_ids[out_col];
 			if (col_id == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
-				// The rowid is the row's index in this scan's materialized
-				// row set. The provider's output order is deterministic for a
-				// fixed committed head, so the staged-write Sink
-				// (staged_write.cpp) resolves this index back to the row by
-				// re-materializing the same provider.
-				output.SetValue(out_col, out_row, duckdb::Value::BIGINT(static_cast<int64_t>(state.offset + out_row)));
+				// An id in the transaction's run registry, which the
+				// staged-write Sink (staged_write.cpp) resolves back to this
+				// very row — never to the same position in a second
+				// materialization, which a narrowed scan and a commit
+				// landing under it can each make a different list.
+				output.SetValue(
+				    out_col, out_row,
+				    duckdb::Value::BIGINT(static_cast<int64_t>(state.row_id_base + state.offset + out_row)));
 				continue;
 			}
 			if (duckdb::IsVirtualColumn(col_id) || col_id >= row.size()) {
@@ -1336,13 +1673,26 @@ void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInpu
 duckdb::unique_ptr<duckdb::FunctionData> MetadataScanBindData::Copy() const {
 	auto result = duckdb::make_uniq<MetadataScanBindData>();
 	result->rows = rows;
+	result->spec = spec;
+	result->catalog = catalog;
+	result->catalog_name = catalog_name;
+	result->scope = scope;
+	result->live_bound = live_bound;
 	result->table_entry = table_entry;
-	return std::move(result);
+	return result;
 }
 
 bool MetadataScanBindData::Equals(const duckdb::FunctionData &other_p) const {
 	auto &other = other_p.Cast<MetadataScanBindData>();
-	return rows == other.rows && table_entry.get() == other.table_entry.get();
+	// `spec` and `scope` carry the identity `rows` does elsewhere: a
+	// deferred scan has no row set at bind to compare, and two scans of one
+	// kind narrowed to different tables are not interchangeable.
+	auto same_scope = scope.IsValid() == other.scope.IsValid() &&
+	                  (!scope.IsValid() || scope.GetIndex() == other.scope.GetIndex());
+	auto same_live_bound = live_bound.IsValid() == other.live_bound.IsValid() &&
+	                       (!live_bound.IsValid() || live_bound.GetIndex() == other.live_bound.GetIndex());
+	return rows == other.rows && spec == other.spec && same_scope && same_live_bound &&
+	       table_entry.get() == other.table_entry.get();
 }
 
 duckdb::TableFunction MetadataScanTableFunction() {
@@ -1354,6 +1704,11 @@ duckdb::TableFunction MetadataScanTableFunction() {
 	// exists-probe query uses (see `MetadataScanGlobalState::column_ids`);
 	// real projection pushdown falls out of the same mechanism.
 	function.projection_pushdown = true;
+	// Reads the equality a narrowable kind scopes its materialization by,
+	// without consuming it (`MetadataScanPushdownComplexFilter`).
+	// `filter_pushdown` deliberately stays off: it would delete the filter
+	// operator and make this scan answerable for every `TableFilterType`.
+	function.pushdown_complex_filter = MetadataScanPushdownComplexFilter;
 	// Resolves `LogicalGet::GetTable()` so UPDATE/DELETE statements bind
 	// against these tables.
 	function.get_bind_info = MetadataScanBindInfo;
@@ -1398,6 +1753,24 @@ std::vector<std::vector<duckdb::Value>> TxDumpRows(MoraineTxHandle *tx, DumpFn d
 	return result;
 }
 
+// As `TxDumpRows`, for a dump that takes the snapshot a reader keeps rows
+// against.
+template <typename Row, typename DumpFn, typename ShapeFn>
+std::vector<std::vector<duckdb::Value>> TxDumpRowsLiveAt(MoraineTxHandle *tx, uint64_t live_bound, DumpFn dump,
+                                                         void (*free_fn)(Row *, size_t), ShapeFn shape) {
+	OwnedArray<Row> rows(free_fn);
+	MoraineError err {};
+	if (dump(tx, live_bound, rows.OutItems(), rows.OutLen(), &err) != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back(shape(r));
+	}
+	return result;
+}
+
 // The transaction-aware rows for one `write_table_kind`, or an empty
 // optional where no such dump exists yet.
 //
@@ -1415,7 +1788,13 @@ std::vector<std::vector<duckdb::Value>> TxDumpRows(MoraineTxHandle *tx, DumpFn d
 // then the catalog tables they hang off.
 std::optional<std::vector<std::vector<duckdb::Value>>> TxAwareRows(MoraineTxHandle *tx, MoraineCatalogHandle *handle,
                                                                    duckdb::ClientContext &context,
-                                                                   int32_t write_table_kind) {
+                                                                   int32_t write_table_kind,
+                                                                   duckdb::optional_idx live_bound) {
+	if (write_table_kind == 6 && live_bound.IsValid()) {
+		return TxDumpRowsLiveAt<MoraineDataFileRow>(tx, static_cast<uint64_t>(live_bound.GetIndex()),
+		                                            moraine_tx_dump_data_files_live_at, moraine_dump_data_files_free,
+		                                            DataFileShape);
+	}
 	switch (write_table_kind) {
 	case 0:
 		return TxDumpRows<MoraineSnapshotRow>(tx, moraine_tx_dump_snapshots, moraine_dump_snapshots_free,
@@ -1502,27 +1881,125 @@ std::optional<std::vector<std::vector<duckdb::Value>>> TxAwareRows(MoraineTxHand
 
 } // namespace
 
-std::optional<std::vector<std::vector<duckdb::Value>>>
-MetadataTxAwareRows(duckdb::ClientContext &context, duckdb::Catalog &catalog, int32_t write_table_kind) {
-	if (write_table_kind == kNotWritable) {
-		return std::nullopt;
-	}
+std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
+                                                    const MetadataTableSpec &spec,
+                                                    duckdb::optional_idx live_bound) {
 	auto catalog_transaction = catalog.GetCatalogTransaction(context);
-	auto *staged_tx = catalog_transaction.transaction->Cast<MoraineTransaction>().StagedTxIfOpen();
-	if (staged_tx == nullptr) {
-		return std::nullopt;
+	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
+	auto *handle = catalog.Cast<MoraineCatalog>().Handle();
+	auto *staged_tx = transaction.StagedTxIfOpen();
+
+	if (staged_tx != nullptr) {
+		// A writing transaction reads through its staged tx, which pins one
+		// read point for its whole life and overlays the rows staged so far.
+		// That is the pinning this function otherwise supplies.
+		//
+		// The read point cannot move under a materialization, so what makes
+		// one stale is this transaction staging into the same table —
+		// `StagedTxFor` drops exactly that entry as it hands out the tx.
+		// A commit attempt takes the staged tx, so the retry DuckLake drives
+		// between attempts opens a fresh one and re-reads through it.
+		// The staged tx pins one read point for its whole life, so a
+		// narrowed and an unnarrowed read of one table cannot stand at two
+		// heads — which is what confines the narrowing to this branch.
+		const bool live_only = live_bound.IsValid() && spec.live_narrowable;
+		if (auto cached = transaction.GetMetadataRows(spec, live_only)) {
+			return cached;
+		}
+		// Taken before the materialization it stamps: a row staged into
+		// this table while the set is built invalidates it, and the Put
+		// drops it rather than serving it.
+		auto epoch = transaction.MetadataRowsEpoch();
+		std::shared_ptr<const MetadataRows> rows;
+		if (spec.write_table_kind != kNotWritable) {
+			if (auto staged = TxAwareRows(staged_tx, handle, context, spec.write_table_kind,
+			                              live_only ? live_bound : duckdb::optional_idx())) {
+				rows = std::make_shared<const MetadataRows>(std::move(*staged));
+			}
+		}
+		if (rows == nullptr) {
+			rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
+		}
+		transaction.PutMetadataRows(spec, rows, live_only, epoch);
+		return rows;
 	}
-	return TxAwareRows(staged_tx, catalog.Cast<MoraineCatalog>().Handle(), context, write_table_kind);
+
+	if (auto cached = transaction.GetMetadataRows(spec)) {
+		return cached;
+	}
+	// Taken before the materialization it stamps, as in the staged branch:
+	// a staged tx opened while the set is built invalidates it.
+	auto epoch = transaction.MetadataRowsEpoch();
+
+	// The rows this attach dumped last time are byte-identical to a fresh
+	// dump whenever no batch landed since, so ask the store where it
+	// stands (one point read) before paying the ABI crossing again. A
+	// store with no head yet, or a stamp read that fails, simply dumps.
+	auto &moraine_catalog = catalog.Cast<MoraineCatalog>();
+	MoraineHeadStamp before;
+	const bool stamped = ReadHeadStamp(handle, context, before);
+	if (stamped) {
+		if (auto held = moraine_catalog.HeldMetadataRows(spec, before.snapshot_id, before.batch_seq)) {
+			transaction.PutMetadataRows(spec, held, false, epoch);
+			return held;
+		}
+	}
+
+	auto rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
+	transaction.PutMetadataRows(spec, rows, false, epoch);
+
+	// Hold them for the next transaction only if the store did not move
+	// under the dump: rows that straddled a commit stand at no single
+	// stamp, and holding them under the earlier one would serve a
+	// concurrent reader at that stamp a row set from beyond it.
+	MoraineHeadStamp after;
+	if (stamped && ReadHeadStamp(handle, context, after) && after.snapshot_id == before.snapshot_id &&
+	    after.batch_seq == before.batch_seq) {
+		moraine_catalog.HoldMetadataRows(spec, before.snapshot_id, before.batch_seq, rows);
+	}
+	return rows;
+}
+
+std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
+                                                          const MetadataTableSpec &spec, uint64_t table_id) {
+	auto catalog_transaction = catalog.GetCatalogTransaction(context);
+	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
+	// Mid-write the staged tx's overlay is what a read owes, and only the
+	// unscoped dump carries it, so the scope is dropped rather than served
+	// without it. `MetadataRowsFor` holds that set for the transaction.
+	if (spec.scope_column < 0 || transaction.StagedTxIfOpen() != nullptr) {
+		return MetadataRowsFor(context, catalog, spec);
+	}
+	// A transaction that already materialized this table narrows what it
+	// holds. Reading the store again here would serve one scan of the table
+	// rows from beyond the point every other scan of it stands at.
+	if (auto held = transaction.GetMetadataRows(spec)) {
+		auto scope = static_cast<duckdb::idx_t>(spec.scope_column);
+		MetadataRows scoped;
+		for (auto &row : *held) {
+			if (scope < row.size() && !row[scope].IsNull() &&
+			    row[scope].GetValue<int64_t>() == static_cast<int64_t>(table_id)) {
+				scoped.push_back(row);
+			}
+		}
+		return std::make_shared<const MetadataRows>(std::move(scoped));
+	}
+	auto *handle = catalog.Cast<MoraineCatalog>().Handle();
+	return std::make_shared<const MetadataRows>(
+	    ProvideFileColumnStatsOf(handle, table_id, moraine_shim_is_interrupted, &context));
 }
 
 duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                                                  duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
-
-	auto tx_rows = MetadataTxAwareRows(context, ParentCatalog(), spec_.write_table_kind);
-	scan_bind_data->rows =
-	    tx_rows ? std::move(*tx_rows) : spec_.provider(handle_, moraine_shim_is_interrupted, &context);
-
+	scan_bind_data->spec = &spec_;
+	scan_bind_data->catalog = &ParentCatalog();
+	scan_bind_data->catalog_name = ParentCatalog().GetName();
+	// A narrowable kind is left unmaterialized for `InitGlobal`: the filter
+	// deciding how much of it to build has not been pushed down yet.
+	if (spec_.scope_column < 0 && !spec_.live_narrowable) {
+		scan_bind_data->rows = MetadataRowsFor(context, ParentCatalog(), spec_);
+	}
 	scan_bind_data->table_entry = this;
 	bind_data = std::move(scan_bind_data);
 	return MetadataScanTableFunction();

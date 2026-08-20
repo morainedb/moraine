@@ -12,8 +12,9 @@ mod racing_store;
 use std::sync::Arc;
 
 use moraine::{
-    Catalog, CatalogOptions, ColumnId, CrashCase, Error, IndexDef, IndexEntry, IndexKeyValue,
-    IndexState, IntWidth, MaintenanceRequest, TableId,
+    Catalog, CatalogOptions, ColumnId, CrashCase, CrashPoint, Error, IndexDef, IndexEntry,
+    IndexKeyValue, IndexState, IntWidth, MaintenanceRequest, MigrationRequest, OptionScope,
+    SchemaId, SyntheticMigration, TableId, inject_crash, install_migration,
 };
 use object_store::memory::InMemory;
 
@@ -218,27 +219,37 @@ async fn durable_commit_survives_a_crash_before_its_acknowledgement() {
 /// the real ones: SlateDB's writer epoch across processes (the second
 /// `Db::open` fences the first, so the fenced initializer's genesis batch
 /// writes nothing) and write-write conflict detection on `sys/format`
-/// within one writer. Exactly one wins, and reopen shows a single coherent
-/// genesis — never a second `sys/format`, a divergent genesis snapshot, or
-/// a conflicting head.
+/// within one writer. At most one genesis lands, and reopen shows it —
+/// never a second `sys/format`, a divergent genesis snapshot, or a
+/// conflicting head.
 ///
 /// The race runs repeatedly because its two guards trip at different
 /// points and one round samples only one of them.
 ///
-/// The loser fails typed, whichever of the two guards caught it: it lost
-/// the manifest race and never created the store ([`Error::OpenRaced`]),
-/// or it created the store and was displaced ([`Error::Fenced`]). What it
-/// never does is fail as an untyped store error, which "adopts it, or
-/// returns a typed error" does not admit.
+/// A round may still leave *both* initializers failed, and that is not a
+/// torn store. A writer claims the writer epoch and its compactor claims
+/// the compactor epoch in two races that are ordered independently, so the
+/// handle that wins the writer epoch can lose the compactor epoch — and a
+/// fenced compactor closes the handle it belongs to. A fenced genesis
+/// re-attempts, which is why this is rare rather than routine, but the
+/// re-attempts are bounded and initializers that keep arriving can spend
+/// them. Genesis is whole or absent either way, and the recovery is the
+/// same one this test then performs: open again.
+///
+/// [`a_genesis_fenced_mid_bootstrap_re_attempts_and_lands`] stages that
+/// fence deterministically and pins the re-attempt, which a round here
+/// samples too rarely to hold up on its own.
+///
+/// A loser fails typed, whichever guard caught it: it lost the manifest
+/// race and never created the store ([`Error::OpenRaced`]), or it created
+/// the store and was displaced ([`Error::Fenced`]). What it never does is
+/// fail as an untyped store error, which "adopts it, or returns a typed
+/// error" does not admit.
 ///
 /// The typing rests on matching SlateDB's message text, which a round that
 /// happens not to collide would not exercise —
 /// [`a_lost_manifest_race_surfaces_typed_rather_than_as_a_store_error`]
 /// stages the collision deterministically and pins the wording.
-///
-/// Re-attempting the losing open was tried and rejected: the re-attempt
-/// takes the writer epoch in turn and fences whichever initializer had
-/// just won, so both can lose. That is what the first assertion pins.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_genesis_leaves_exactly_one_catalog() {
     for round in 0..25 {
@@ -252,11 +263,7 @@ async fn concurrent_genesis_leaves_exactly_one_catalog() {
             tokio::spawn(async move { Catalog::open(second, CatalogOptions::default()).await });
         let results = [left.await.unwrap(), right.await.unwrap()];
 
-        assert!(
-            results.iter().any(Result::is_ok),
-            "round {round}: at least one initializer must win"
-        );
-        // A fresh store is not a true conflict, so the loser's failure is
+        // A fresh store is not a true conflict, so a loser's failure is
         // benign. It must never be a *catalog* error: reporting corruption,
         // a duplicate, or a missing entity would mean genesis itself tore.
         for result in &results {
@@ -286,6 +293,36 @@ async fn concurrent_genesis_leaves_exactly_one_catalog() {
         assert_eq!(schemas[0].name, "main");
         reopened.close().await.unwrap();
     }
+}
+
+/// A genesis open displaced mid-bootstrap re-attempts instead of handing
+/// the caller a fence. The staged genesis never landed, so the store still
+/// has no catalog and the second attempt creates it — the caller sees the
+/// catalog it asked for rather than an error it could only answer by
+/// opening again itself.
+///
+/// The displacement is staged from outside: refusing the first batch the
+/// writer flushes is what a writer that lost the epoch finds, so the fence
+/// here is SlateDB's real one.
+#[tokio::test]
+async fn a_genesis_fenced_mid_bootstrap_re_attempts_and_lands() {
+    let backing: Arc<InMemory> = Arc::new(InMemory::new());
+    let store = Arc::new(RacingStore::losing_the_first_batch_write(backing.clone()));
+
+    let catalog = Catalog::open(store, CatalogOptions::default())
+        .await
+        .expect("the re-attempt creates the catalog the fenced attempt could not");
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.current_snapshot().id.get(),
+        0,
+        "one genesis, not one per attempt"
+    );
+    let schemas = snapshot.schemas();
+    assert_eq!(schemas.len(), 1);
+    assert_eq!(schemas[0].name, "main");
+    catalog.close().await.unwrap();
 }
 
 /// The genesis race's loser fails **typed**, and this pins the one thread
@@ -637,6 +674,197 @@ async fn interrupted_entry_reclamation_converges_on_re_run() {
     assert_eq!(snapshot.data_files_of(table).len(), 1);
     assert!(snapshot.table_by_id(table).is_some());
     reopened.close().await.unwrap();
+}
+
+/// How many schema-scoped option records the migration case plants. The
+/// rewriting unit moves one per batch, so more than one record means the
+/// crash lands with some moved and some not.
+const PLANTED_OPTIONS: u64 = 3;
+
+/// A catalog carrying [`PLANTED_OPTIONS`] schemas, each with a
+/// schema-scoped `planted` option naming its own id, closed so a migrator
+/// can take the writer.
+#[allow(clippy::unwrap_used)]
+async fn catalog_with_planted_options(backing: &Arc<InMemory>) -> Vec<SchemaId> {
+    let catalog = Catalog::open(backing.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    let created = std::cell::RefCell::new(Vec::new());
+    catalog
+        .commit(|tx| {
+            for index in 1..=PLANTED_OPTIONS {
+                let schema = tx.create_schema(&format!("s{index}"))?;
+                tx.set_option(OptionScope::Schema(schema), "planted", &schema.to_string())?;
+                created.borrow_mut().push(schema);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    catalog.close().await.unwrap();
+    created.into_inner()
+}
+
+/// `MigrationInterrupted` — a structural format migration runs as a start
+/// batch planting the marker, one batch per bounded piece of the rewrite,
+/// and a finish batch flipping the format and clearing the marker together.
+/// A crash can land at any of those boundaries.
+///
+/// The one case crashed from *inside* a library call: the boundaries are
+/// internal to `Catalog::migrate`, so [`CrashPoint`] is the only way in.
+/// The unit is installed rather than shipped — every format to date is
+/// additive, so the registry is empty and no store in the world needs a
+/// rewrite — but it runs through the shipped planner, and the verb driving
+/// it is the public one.
+///
+/// What must hold, at every seam: while the marker is down no attach may
+/// open the store at all, and a re-run resumes from what is durable and
+/// moves every record exactly once.
+#[tokio::test]
+async fn interrupted_migration_refuses_readers_and_resumes_exactly_once() {
+    for point in CrashCase::MigrationInterrupted.seams() {
+        let backing: Arc<InMemory> = Arc::new(InMemory::new());
+        let schemas = catalog_with_planted_options(&backing).await;
+
+        install_migration(SyntheticMigration::MoveOptionScope);
+        inject_crash(Some(*point));
+        let crashed = Catalog::migrate(
+            backing.clone(),
+            CatalogOptions::default(),
+            MigrationRequest::default(),
+        )
+        .await;
+
+        // Every seam stops the call. `AfterFinish` stops one that had in
+        // fact completed: the finish batch was already durable, so no
+        // marker is left and the store is coherently new — the caller just
+        // never heard so.
+        assert!(crashed.is_err(), "{point:?}");
+        let completed = *point == CrashPoint::AfterFinish;
+
+        if !completed {
+            // No reader sees the half-rewritten middle. The marker is down,
+            // so the attach refuses rather than serving a keyspace in motion.
+            let refused = Catalog::open(backing.clone(), CatalogOptions::default())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("an attach mid-migration must refuse at {point:?}"));
+            assert!(matches!(refused, Error::Migration(_)), "{point:?}");
+        }
+
+        inject_crash(None);
+        let report = Catalog::migrate(
+            backing.clone(),
+            CatalogOptions::default(),
+            MigrationRequest::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("resume after {point:?}: {error:?}"));
+        assert_eq!(report.resumed, !completed, "{point:?}");
+        if completed {
+            // Nothing left to do: the format already names the target.
+            assert_eq!(report.from_format, report.to_format, "{point:?}");
+            assert!(report.units_run.is_empty(), "{point:?}");
+        } else {
+            assert!(report.to_format > report.from_format, "{point:?}");
+            assert_eq!(report.units_run, vec!["move-option-scope"], "{point:?}");
+        }
+
+        // Coherent, and moved exactly once: every planted record now reads
+        // back at the scope the rewrite moved it to, and none is left behind
+        // at the one it came from.
+        let reopened = Catalog::open(backing.clone(), CatalogOptions::default())
+            .await
+            .unwrap_or_else(|error| panic!("attach after {point:?}: {error:?}"));
+        let snapshot = reopened.snapshot().await.unwrap();
+        for schema in &schemas {
+            assert_eq!(
+                snapshot.option(OptionScope::Table(TableId::new(schema.get())), "planted"),
+                Some(schema.to_string()),
+                "{point:?}"
+            );
+            assert_eq!(
+                snapshot.option(OptionScope::Schema(*schema), "planted"),
+                None,
+                "{point:?}"
+            );
+        }
+        assert_eq!(
+            snapshot.schemas().len(),
+            usize::try_from(PLANTED_OPTIONS).unwrap() + 1,
+            "the rewrite touched options, not schemas, at {point:?}"
+        );
+        reopened.close().await.unwrap();
+    }
+
+    // The registry is thread-local; leave the thread as it was found, since
+    // a single-threaded run reuses it for the next case.
+    install_migration(SyntheticMigration::None);
+}
+
+/// The reader-side half of the migration gate: a marker planted by another
+/// process *after* a read-only handle attached. The gate itself is shared —
+/// every read opens its session through one place, which refuses — and the
+/// read-write side is covered by the case above; what this stages is a
+/// reader that was already live and healthy when the keyspace started
+/// moving.
+///
+/// "Another process" here is another writer handle: the marker is durable
+/// object-storage state, so a second handle over the same store is
+/// indistinguishable from a second process to the reader polling it.
+#[tokio::test]
+async fn a_live_reader_refuses_once_another_writer_plants_a_marker() {
+    let backing: Arc<InMemory> = Arc::new(InMemory::new());
+    let schemas = catalog_with_planted_options(&backing).await;
+
+    let mut options = CatalogOptions::default();
+    options.reader_poll_interval = std::time::Duration::from_millis(5);
+    let reader = Catalog::open_read_only(backing.clone(), options)
+        .await
+        .unwrap();
+    assert_eq!(
+        reader.snapshot().await.unwrap().schemas().len(),
+        schemas.len() + 1,
+        "the reader is healthy before the keyspace starts moving"
+    );
+
+    // A second handle starts a migration and dies at its first seam, leaving
+    // the marker down and the store stamped old.
+    install_migration(SyntheticMigration::MoveOptionScope);
+    inject_crash(Some(CrashPoint::AfterStart));
+    Catalog::migrate(
+        backing.clone(),
+        CatalogOptions::default(),
+        MigrationRequest::default(),
+    )
+    .await
+    .expect_err("the seam stops the migration with its marker durable");
+    inject_crash(None);
+    install_migration(SyntheticMigration::None);
+
+    // The live reader polls, meets the marker, and refuses — the typed
+    // error, not a stale view and not a partial one.
+    let refused = poll_until_refused(&reader).await;
+    assert!(matches!(refused, Error::Migration(_)), "{refused:?}");
+    reader.close().await.unwrap();
+}
+
+/// Reads until one refuses, or panics after long enough that the reader was
+/// plainly never going to notice. A read-only catalog polls object storage
+/// on its own cadence, so the marker becomes visible a poll after it lands.
+#[allow(clippy::unwrap_used)]
+async fn poll_until_refused(reader: &moraine::ReadOnlyCatalog) -> Error {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match reader.snapshot().await {
+            Err(error) => return error,
+            Ok(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "the reader never noticed the marker"
+            ),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// Asserts an operation stopped short of success once the store froze. It

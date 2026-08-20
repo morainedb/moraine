@@ -128,9 +128,11 @@ impl Session<'_> {
             }
             Request::VisibleSnapshots => {
                 let head = self.pinned()?;
-                let rows =
-                    read::scan_snapshots_overlaid(ReadHandle::Reader(&head.reader), &head.overlay)
-                        .await?;
+                let rows = read::scan_snapshots_overlaid(
+                    ReadHandle::Reader(&head.reader),
+                    Some(&head.overlay),
+                )
+                .await?;
                 Ok(Response::Snapshot(
                     rows.iter().map(value::encode_value).collect(),
                 ))
@@ -196,7 +198,19 @@ impl Session<'_> {
         );
 
         let client_id = (transaction_id != [0; 16]).then_some(transaction_id);
-        let assembly = staged::assemble(&backing, &ops, None, "", client_id).await?;
+        // Cloned into a local so the assembly's borrow is of this frame, not
+        // of the shared `SessionContext` the spawned session holds.
+        let projections = Arc::clone(self.context.catalog.projections());
+        let assembly = staged::assemble(
+            &backing,
+            &ops,
+            None,
+            "",
+            &projections,
+            Arc::new(crate::data_file::ScopedReadMetrics::default()),
+            client_id,
+        )
+        .await?;
         let validated_head = head.view.snapshot.snapshot_id;
         self.context.funnel.submit(validated_head, assembly).await
     }
@@ -210,6 +224,7 @@ fn error_response(err: &Error) -> Response {
         Error::CommitConflict(message) => (ErrorKind::Conflict, message.clone()),
         Error::RetryBudgetExhausted(message) => (ErrorKind::RetryBudgetExhausted, message.clone()),
         Error::Corruption(message) => (ErrorKind::Corruption, message.clone()),
+        Error::ConcurrentModification => (ErrorKind::Conflict, String::new()),
         Error::NotFound(message) => (ErrorKind::NotFound, message.clone()),
         Error::AlreadyExists(message) => (ErrorKind::AlreadyExists, message.clone()),
         Error::Constraint(message) => (ErrorKind::Constraint, message.clone()),

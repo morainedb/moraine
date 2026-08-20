@@ -19,7 +19,11 @@
 #include "duckdb/storage/storage_extension.hpp"
 
 #include "maintenance.hpp"
+#include "metadata_tables.hpp"
 #include "moraine_abi.h"
+
+#include <mutex>
+#include <unordered_map>
 
 namespace moraine_duckdb {
 
@@ -161,8 +165,8 @@ private:
 // duckdb::NotImplementedException.
 class MoraineCatalog : public duckdb::Catalog {
 public:
-	MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandle *handle, std::string path,
-	               MaintenanceConfig maintenance);
+	MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientContext &context,
+	               MoraineCatalogHandle *handle, std::string path, MaintenanceConfig maintenance);
 	~MoraineCatalog() override;
 
 	// The attach_function_t the storage extension registers.
@@ -218,10 +222,38 @@ public:
 		return *scheduler_;
 	}
 
+	// The rows this attach last dumped for `spec`, if the store still
+	// stands where they were dumped from. A miss (nothing held, or the
+	// stamp moved) returns null and the caller re-dumps.
+	std::shared_ptr<const MetadataRows> HeldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id,
+	                                                     uint64_t batch_seq) const;
+
+	// Holds `rows` as this attach's rows for `spec` at the given stamp,
+	// replacing whatever it held. Shared by every connection on the
+	// attach, so it is guarded.
+	void HoldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id, uint64_t batch_seq,
+	                      std::shared_ptr<const MetadataRows> rows);
+
 private:
 	MoraineCatalogHandle *handle_;
 	std::string path_;
-	duckdb::unique_ptr<MaintenanceScheduler> scheduler_;
+	duckdb::shared_ptr<MaintenanceScheduler> scheduler_;
+
+	// One dumped row set per synthesized table, stamped with the store
+	// state it was dumped at. DuckLake re-reads its metadata at every
+	// transaction start and autocommit makes every statement a
+	// transaction, so without this every statement re-pays the ABI
+	// crossing for rows that are byte-identical whenever no commit landed
+	// between them. Shared across the attach's connections, hence the
+	// mutex; the per-transaction pin above it is what makes a row index
+	// mean something within one transaction.
+	struct HeldRows {
+		uint64_t snapshot_id;
+		uint64_t batch_seq;
+		std::shared_ptr<const MetadataRows> rows;
+	};
+	mutable std::mutex held_rows_lock_;
+	std::unordered_map<const MetadataTableSpec *, HeldRows> held_rows_;
 
 	// Ensures the active transaction's schema cache is populated from the
 	// listing ABI, then returns it.

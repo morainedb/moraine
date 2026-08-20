@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Ephemeral CodeBuild worker and least-privilege roles for moraine's real S3 benchmark
+
+Parameters:
+  GitHubOidcProviderArn:
+    Type: String
+    Description: ARN of the account's token.actions.githubusercontent.com OIDC provider
+  GitHubOrganization:
+    Type: String
+    Default: morainedb
+  GitHubOrganizationId:
+    Type: String
+    Default: '310371634'
+    AllowedPattern: '^[0-9]+$'
+    Description: Immutable numeric ID of the GitHub organization
+  GitHubRepository:
+    Type: String
+    Default: moraine
+  GitHubRepositoryId:
+    Type: String
+    Default: '1294736153'
+    AllowedPattern: '^[0-9]+$'
+    Description: Immutable numeric ID of the GitHub repository
+Resources:
+  BenchmarkBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireBenchmarkObjects
+            Status: Enabled
+            ExpirationInDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BenchmarkBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BenchmarkBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt BenchmarkBucket.Arn
+              - !Sub '${BenchmarkBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BenchmarkData
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucketMultipartUploads
+                Resource: !GetAtt BenchmarkBucket.Arn
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt BenchmarkBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - benchmarks/runs/*
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:ListMultipartUploadParts
+                  - s3:PutObject
+                Resource: !Sub '${BenchmarkBucket.Arn}/benchmarks/runs/*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${BenchmarkBucket.Arn}/benchmark-results/*'
+        - PolicyName: BuildLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/moraine-real-s3-benchmark*'
+
+  BenchmarkProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: moraine-real-s3-benchmark
+      Description: One ephemeral managed worker per manually dispatched real-S3 benchmark
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 60
+      QueuedTimeoutInMinutes: 10
+      ConcurrentBuildLimit: 1
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+          phases:
+            pre_build:
+              commands:
+                - git init source
+                - git -C source remote add origin "$MORAINE_GIT_REPOSITORY"
+                - git -C source fetch --depth=1 origin "$MORAINE_GIT_SHA"
+                - git -C source checkout --detach FETCH_HEAD
+                - test "$(git -C source rev-parse HEAD)" = "$MORAINE_GIT_SHA"
+            build:
+              commands:
+                - mkdir -p "$CODEBUILD_SRC_DIR/benchmark-results"
+                - cd source
+                - set -o pipefail; cargo test --release --locked -p moraine --test object_storage -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$CODEBUILD_SRC_DIR/benchmark-results/object-storage.txt"
+              finally:
+                - aws s3 cp "$CODEBUILD_SRC_DIR/benchmark-results/object-storage.txt" "s3://$MORAINE_S3_BUCKET/$MORAINE_RESULTS_KEY"
+      Environment:
+        ComputeType: BUILD_GENERAL1_LARGE
+        # This current managed image includes rustup; the repository's
+        # rust-toolchain.toml then selects and installs the exact pinned Rust.
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        Type: ARM_CONTAINER
+        PrivilegedMode: false
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+
+  GitHubLauncherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrganization}@${GitHubOrganizationId}/${GitHubRepository}@${GitHubRepositoryId}:ref:refs/heads/main'
+      Policies:
+        - PolicyName: LaunchBenchmark
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                Resource: !GetAtt BenchmarkProject.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${BenchmarkBucket.Arn}/benchmark-results/*'
+
+Outputs:
+  AwsRegion:
+    Value: !Ref AWS::Region
+  BenchmarkBucketName:
+    Value: !Ref BenchmarkBucket
+  CodeBuildProjectName:
+    Value: !Ref BenchmarkProject
+  GitHubLauncherRoleArn:
+    Value: !GetAtt GitHubLauncherRole.Arn

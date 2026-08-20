@@ -62,6 +62,53 @@ Not covered: concurrency/contention, remote object stores, cross-machine
 reproducibility, or statistical rigor beyond median/min/max. It's a local
 tool; CI runs `e2e`, not this.
 
+## Located lookups
+
+`cargo xtask locate-bench` measures what file-located index lookups cost and
+save: the row summaries (a `Range`, Roaring bitmap, or sorted vector per data
+file) that turn a row id into the files that physically hold it, so a lookup
+scans those files instead of every current one.
+
+```text
+cargo xtask locate-bench [--files N] [--rows-per-file N] [--update-batches N]
+```
+
+It builds a lake of `--files` Parquet files through the pinned DuckDB CLI,
+then reports the summary cache's resident bytes, one cold lookup (a fresh
+attach that builds every summary), the first and a warm lookup on one
+attach, and the files a DuckLake scan reads with the located join against
+the row-id path — once for disjoint files, then after each of
+`--update-batches` update batches, each of which writes one file whose row-id
+range spans the whole table so statistics can no longer exclude it.
+
+Two runs on an **Apple M2 (Mac14,2), arm64**, local `DATA_PATH`:
+
+| | 16 files × 2,000 rows | 64 files × 8,000 rows |
+|---|---|---|
+| summary cache bytes | 30,416 | 121,664 |
+| cold lookup (fresh attach, builds) | 99.7 ms | 43.8 ms |
+| first lookup on an attach (builds) | 79.2 ms | 43.6 ms |
+| warm lookup | 16.0 ms | 0.2 ms |
+| files read, row id only / located | 1 / 1 | 1 / 1 |
+
+Files read after each update batch (both scales identical):
+
+| batch | row id only | located | id as a constant |
+|---|---|---|---|
+| 1 | 2 | 1 | 1 |
+| 2 | 3 | 1 | 1 |
+| 3 | 4 | 1 | 1 |
+| 6 | 7 | 1 | 1 |
+
+The summaries cost about a quarter of a byte per row (512k rows in 119 KB),
+and a warm located lookup is sub-millisecond at the larger scale. The
+files-read table is the point: without location, every update batch adds one
+file the row-id path must read, because the batch's file spans the whole
+row-id range; with location it stays at one file regardless of history —
+the same answer a constant-id predicate gets, without knowing the file. Real
+endpoint numbers for the summary build live in the located-lookup measurement
+below.
+
 # Core measurements
 
 `cargo xtask bench` times the whole stack through the DuckDB CLI. A second,
@@ -149,11 +196,137 @@ release against a pinned MinIO):
 
 A loopback MinIO's PUT costs about a millisecond, so it lands in the
 `RTT ≈ 0` row of the table above and the flush cadence dominates everywhere:
-this *validates the composition against a real object-storage protocol*, but
-it understates S3, whose PUT is tens of milliseconds. For the number a given
-deployment will see, point the same harness at the real bucket
-(`MORAINE_S3_ENDPOINT`/`MORAINE_S3_BUCKET`); the injected-RTT table says what
-to expect before you do.
+this validates the composition against a real object-storage protocol, but
+it understates S3.
+
+The main-only [`Real S3 benchmark`](docs/real-s3-benchmark.md) ran the same
+sweep from an ARM CodeBuild worker against AWS S3 in `us-west-2`, with the
+worker and bucket in the same region. Twenty sequential commits per interval
+on 2026-08-09 produced:
+
+| flush interval | median commit | min | max |
+|---|---|---|---|
+| 1 ms | 29.6 ms | 24.0 ms | 40.6 ms |
+| 25 ms | 28.1 ms | 22.2 ms | 35.7 ms |
+| 100 ms | 101.9 ms | 73.9 ms | 143.4 ms |
+
+The production endpoint puts the durable-write floor at roughly 28–30 ms for
+this deployment: lowering the cadence from 25 ms to 1 ms buys nothing, while
+the 100 ms cadence still binds. This is the real-endpoint row the injected-RTT
+model predicted, not a new term in the composition.
+
+### Index lookup latency against a real endpoint
+
+The in-memory probe measurement further down prices what an index probe
+*fetches*; this prices what it *waits*. `object_storage.rs`'s
+`measure_index_lookup_latency_against_the_endpoint` seeds one table with a
+unique and a non-unique index and 64 files x 2 000 rows (128 000 entries per
+index, spread over several SSTs by closing the seed writer every 8 files;
+no Parquet is written, since a lookup reads only the store), then times the
+current read path — `warm_tables`, batched probes, remote-sized read-ahead —
+from fresh read-only attaches, five
+repetitions each, reporting median/min/max and the median main-store GET
+count per phase:
+
+| phase | what it times |
+|---|---|
+| `attach_read_only` | `Catalog::open_read_only` |
+| `cold_first_lookup` | first `index_lookup` on a fresh attach |
+| `warm_second_lookup` | a second, different key on the same attach |
+| `steady_lookup` | 20 distinct keys on the warm attach, pooled per lookup |
+| `non_unique_lookup` | one key of the non-unique index (8 rows) |
+| `in_list_lookup_many` | one `index_lookup_many` of 50 keys |
+| `range` | one `index_range` over 100 entries |
+| `locate_row_ids` | 50 row ids with no data store (catalog side only) |
+| `warm_tables` | explicit `warm_tables` on a fresh attach |
+| `lookup_after_warm` | the first `index_lookup` behind that warm |
+| `attach_read_only_l0` | `Catalog::open_read_only` with `cache_preload = L0` (SST metadata preloaded at open) |
+| `cold_first_lookup_l0` | first `index_lookup` on that L0-preloaded attach |
+| `warm_tables_l0` | explicit `warm_tables` on a fresh L0-preloaded attach |
+
+The `_l0` rows show what preloading the newest SSTs' metadata at attach
+buys the cold row: what moves out of `cold_first_lookup` and into the attach.
+
+Locally, `cargo xtask s3` runs it in release against the pinned MinIO; the
+main-only [`Real S3 benchmark`](docs/real-s3-benchmark.md) workflow runs it
+against AWS S3 and keeps the printed table in the run artifact. From an ARM
+CodeBuild worker against AWS S3 in `us-west-2` on 2026-08-16 (a run in which
+the first lookup still waited on a joined per-table warm, since removed):
+
+| phase | median | min | max | gets |
+|---|---:|---:|---:|---:|
+| `attach_read_only` | 345.3 ms | 334.2 | 438.8 | 27 |
+| `cold_first_lookup` | 396.9 ms | 357.5 | 458.6 | 56 |
+| `warm_second_lookup` | 0.28 ms | 0.27 | 0.30 | 0 |
+| `steady_lookup` | 0.16 ms | 0.16 | 0.20 | 0 |
+| `non_unique_lookup` | 0.30 ms | 0.29 | 0.32 | 0 |
+| `in_list_lookup_many` | 1.36 ms | 1.32 | 1.40 | 0 |
+| `range` | 0.34 ms | 0.33 | 0.34 | 0 |
+| `locate_row_ids` | 0.17 ms | 0.17 | 0.18 | 0 |
+| `warm_tables` | 366.2 ms | 348.4 | 594.1 | 48 |
+| `lookup_after_warm` | 0.28 ms | 0.27 | 0.28 | 0 |
+| `attach_read_only_l0` | 464.6 ms | 407.1 | 535.7 | 97 |
+| `cold_first_lookup_l0` | 2.78 ms | 2.72 | 2.96 | 0 |
+| `warm_tables_l0` | 2.33 ms | 2.29 | 2.37 | 0 |
+
+Two shapes. Once a table's SST metadata and blocks are resident every probe
+is memory-speed and issues no GET: sub-millisecond point and range lookups,
+1.4 ms for a 50-key list. Getting there is a chain of dependent round trips
+— the cold row's 56 GETs land in ~400 ms, about ten hops deep, and wider
+fan-out cannot shorten it — so the lever is *when* it is paid: with
+`cache_preload = L0` the open absorbs it (+120 ms, all concurrent) and the
+first lookup on every table costs ~3 ms instead of ~400. That is why the
+extension preloads `L0` by default.
+
+### Located lookup latency against a real endpoint
+
+The index measurement above prices `locate_row_ids` with no data store, so
+it sees the catalog side only. `measure_located_lookup_latency_against_the_endpoint`
+in the same file prices the other half: the row-summary path that reads a
+Parquet file's row-id column once and answers from the resident summary
+afterwards. It writes 64 real Parquet objects x 2 000 rows under the run
+prefix's data path and registers them with their true `file_size_bytes` and
+`footer_size`: 32 dense files carry no row-id column and answer from the
+range the commit allocated, 32 embed `_ducklake_internal_row_id` with gaps
+(24 stepping by 2, 8 striding past a Roaring container per id), so their
+summaries must be built from the object. Each of five repetitions attaches
+fresh and hands the lookup a fresh data-store handle, since the summary
+cache is keyed by the handle; every `locate_row_ids` asks for 50 present
+ids, half dense and half sparse. Rows report median/min/max and the median
+GET count against the catalog store (`main_gets`) and the data store
+(`data_gets`):
+
+| phase | what it times |
+|---|---|
+| `attach_read_only` | `Catalog::open_read_only` |
+| `locate_cold` | first `locate_row_ids` on the fresh attach and handle: every sparse file's row-id column read and summarised, every dense file's footer checked |
+| `locate_warm` | the same ids again on the same handle: summaries resident, so no data-store GET is expected |
+| `warm_row_summaries` | explicit `warm_row_summaries` on another fresh attach and handle |
+| `locate_after_warm_row_summaries` | the first `locate_row_ids` behind that warm |
+
+The conditions lines also print how many summaries the warm built and, from
+`cache_status().row_summaries`, how many the cold locate added by shape and
+their resident bytes. It runs with the rest of the suite under
+`cargo xtask s3` and in the `Real S3 benchmark` workflow. From the same
+2026-08-16 AWS S3 run (summary reads then fanned out eight files at a time;
+now 64):
+
+| phase | median | min | max | main_gets | data_gets |
+|---|---:|---:|---:|---:|---:|
+| `attach_read_only` | 362.7 ms | 291.7 | 381.1 | 27 | 0 |
+| `locate_cold` | 462.7 ms | 446.9 | 469.7 | 4 | 96 |
+| `locate_warm` | 0.45 ms | 0.44 | 0.45 | 0 | 0 |
+| `warm_row_summaries` | 471.5 ms | 453.9 | 490.6 | 4 | 96 |
+| `locate_after_warm_row_summaries` | 0.51 ms | 0.50 | 0.51 | 0 | 0 |
+
+The cold locate built 24 Roaring and 8 sorted summaries (229 KB) — the
+65 537-stride files fall past Roaring's break-even, as the representation
+choice intends — and no `Range` ones, since a dense file answers from its
+allocated range without a read. Its 96 data-store GETs are 64 footers plus 32
+row-id columns: two dependent hops per file, and at eight files in flight
+that is eight waves, which is where the ~460 ms comes from; one wave is the
+target of the wider fan-out. Warm, and after `warm_row_summaries`, a locate
+touches neither store.
 
 ### Commit throughput vs. concurrency
 
@@ -297,6 +470,39 @@ merge asked for straight after an attach found every tree already being
 merged by the writer's own compactor and skipped them all; adopting the
 in-flight merge instead is what makes this column mean anything.
 
+### Cold attach against AWS S3
+
+The main-only real-S3 workflow ran that same catalog shape from an ARM
+CodeBuild worker against a bucket in the worker's `us-west-2` region: 40
+tables x 8 columns, 160 stats-rewrite rounds, then seven fresh read-only
+handles before and after `compact_store`. Open and first materialized view
+were timed separately; total excludes close.
+
+The census immediately before each timing row was:
+
+| state | subspace bytes / SSTs | `current` bytes / SSTs | WAL objects / bytes | manifest bytes |
+|---|---:|---:|---:|---:|
+| churned | 135 443 / 24 | 25 631 / 4 | 265 / 231 099 | 5 209 474 |
+| merged | 75 379 / 11 | 22 763 / 2 | 257 / 211 119 | 5 011 208 |
+
+And the cold timings, median of seven:
+
+| state | open | first view | total | total min | total max |
+|---|---:|---:|---:|---:|---:|
+| churned | 248.4 ms | 150.6 ms | 401.1 ms | 391.6 ms | 436.2 ms |
+| merged | 262.8 ms | 148.8 ms | 411.6 ms | 383.9 ms | 446.5 ms |
+
+**The absolute same-region endpoint number for this small catalog is about
+0.4 s, split roughly 0.25 s opening the reader and 0.15 s materializing its
+first view.** The merge completed four subspaces and removed 44% of subspace
+bytes and 54% of SSTs, but the timing distributions overlap completely; it
+bought no measurable attach improvement here. That does not contradict the
+injected-GET slope: this store is dominated in the census by object classes a
+subspace merge does not reclaim, and the fixed reader-open work is already
+larger than the materialization. It does make the operational rule concrete:
+use the census before merging, and do not treat a fall in total SST count as a
+promise of lower attach latency.
+
 ### Does a cold attach pay for the `index` subspace?
 
 A production store measured 3.364 GB in `index` — 75.6M live entries, 99.6%
@@ -401,6 +607,18 @@ linear in catalog size. That floor is what the 8 003-entity rows show at
 ~1.6 ms with a churn of five keys — still 6× cheaper than the rescan, but it
 is why the speedup does not keep growing with catalog size at fixed churn.
 
+The same asymmetry sizes the changelog cap. A commit that writes more keys
+than the cap records nothing, and every reader behind it takes the rescan
+column — 12.3 ms at 8 003 entities here, and the full `current` scan of a
+cold object store in production — where a recorded trail costs the replay
+column. A recorded key costs roughly 20 bytes in this workload (271-byte
+records below, ~13 keys each), so even a cap-sized record is tens of
+kilobytes, swept out by the sliding window like any other. The cap is
+4 096 keys so that an ordinary bulk flush — production showed one at 259
+keys, which the previous cap of 256 silently declined — stays on the
+replay side; the churn share above still declines the replays that would
+not pay.
+
 ### What the changelog costs the read path
 
 The changelog first rode in the snapshot record. Measured there — one data
@@ -421,6 +639,87 @@ Snapshot records and their scan are back to exactly what they were without
 the changelog, and the changelog subspace is flat: each commit deletes the
 record 64 snapshots back, so a sliding window bounds it whatever the commit
 count and nothing else has to reclaim it.
+
+### What a warm read on a read-write handle has left
+
+A read-write handle holds the writer epoch, so it resolves the head from
+the view it already holds rather than reading `sys/head`, and skips the
+`sys/migration` probe a scan it will not perform would need. What a warm
+read does now is open a read session, take the held view, and release. The
+session is the fence check, and it issues no store IO — `Db::begin` is a
+closed-check plus a registration in SlateDB's transaction manager, under
+that manager's global write lock.
+
+A session was measured first and then removed, because it did not scale:
+serving the view *through* one ran at 2.7M reads/s with a single reader and
+fell to **519k** at 24, where the same reads without it held flat at ~27M/s.
+That shape is the global write lock, not any work being done. A warm read
+now checks the fence on the writer's status channel instead — a watch
+borrow, which readers share.
+
+Three series over one 50-table catalog: a warm read on the read-write
+handle, the same on a read-only handle (which has no writer-local premise,
+so it opens a session and issues both point reads), and the floor of
+handing back the view with no check at all.
+
+| threads | read-write µs | read-write /s | read-only µs | read-only /s | floor µs | floor /s |
+|---|---|---|---|---|---|---|
+| 1 | 0.12 | 8 118 267 | 6.36 | 157 263 | 0.05 | 22 178 604 |
+| 2 | 0.70 | 2 844 847 | 8.70 | 229 925 | 0.09 | 22 244 096 |
+| 4 | 0.85 | 4 718 678 | 13.86 | 288 599 | 0.18 | 22 494 405 |
+| 8 | 1.80 | 4 434 621 | 25.81 | 309 965 | 0.33 | 24 125 416 |
+| 16 | 3.52 | 4 544 039 | 51.96 | 307 900 | 0.68 | 23 627 536 |
+| 24 | 5.07 | 4 736 871 | 45.95 | 522 321 | 0.98 | 24 421 714 |
+
+One run per rung, so aggregate rates move a few tens of percent between
+runs; the single-reader costs and the *shapes* are what reproduce.
+
+**A warm read is ~0.1 µs and plateaus rather than degrades.** Against the
+session it is 3× faster with one reader and **~9× at 24** (4.7M/s against
+519k), and the curve flattens from four readers on instead of falling away.
+The residue against the floor is the watch borrow's read lock, which shares.
+
+**A read-only warm read costs ~70× a read-write one** — 6.36 µs against
+0.12 µs, the most stable figure in the table. It cannot hold a writer-local
+premise, so it opens a session and issues two point reads before it can
+serve a cache hit. Folding the migration state onto `sys/head` would halve
+that and is rejected on cost — it would put the store behind a format stamp
+older binaries cannot open, by default, on the first commit after an upgrade
+(RFC 0009). The next section measures what those two reads are worth in
+round trips, which is the other half of why.
+
+The absolute figures matter for reading a production trace. Even a
+read-only read fully contended at 24 threads costs tens of microseconds. A
+warm read measured in the hundreds of milliseconds is therefore neither of
+these — it is IO the warm path no longer issues, or serialization above
+moraine (DuckLake's own metadata connection is serialized; see RFC 0006).
+
+### How many round trips a read-only read costs
+
+The section above measures a read-only read at ~6 µs and attributes it to a
+session and two point reads. That says nothing about *round trips*, and a
+get has to cost something before round trips are visible — so this injects
+per-GET latency and reads the answer off the ratio. 20 tables, median of 9:
+
+| get latency | warm median | warm round trips | cold median | cold round trips |
+|---|---|---|---|---|
+| 2 ms | 0.02 ms | 0.01 | 13.26 ms | 6.63 |
+| 5 ms | 0.02 ms | 0.00 | 25.44 ms | 5.09 |
+| 10 ms | 0.02 ms | 0.00 | 45.45 ms | 4.54 |
+| 20 ms | 0.02 ms | 0.00 | 85.49 ms | 4.27 |
+
+**A warm read-only read issues no object-store GET at all.** 0.02 ms at
+every injected latency, including 20 ms — so both point reads are served
+from SlateDB's in-memory state, and the ~6 µs the section above measures is
+CPU and lock, not IO. The `sys/migration` probe is a guaranteed *key* miss,
+but a miss the filters answer in memory once they are resident; it is not a
+round trip.
+
+The cold column fits `4 × latency + 5.4 ms` at every rung — a constant four
+GETs, which is the manifest and the SSTs a first materialization touches,
+not the point reads. So a reader's two point reads are worth no round trip
+warm and at most one of four cold. Overlapping them was implemented against
+this measurement and reverted by it: there was nothing there to save.
 
 ### Read concurrency under IO latency
 
@@ -483,3 +782,38 @@ scheduled promptly, and a `spawn_blocking` discipline buys nothing on this
 axis. Both halves of the worker-pool question are now answered the same
 way: the pool does not need protecting from either IO latency or decode
 compute.
+
+### What an index probe fetches, cold and warm
+
+The design replaced a part-grained object cache (4 MiB parts) with a
+block-grained one, and argued the swap from grain arithmetic alone. This
+puts bytes under it: 32 probes spread across the whole `index` run, so no
+probe rides another's block, against a counting object store. On an
+in-memory store a fetch costs no round trip, so the milliseconds are
+decode and the **bytes** are the transferable number.
+
+| entries | index bytes | cold gets | cold bytes/probe | warm gets | warm bytes/probe | warm ms/probe |
+|---|---|---|---|---|---|---|
+| 8 192 | 297 KB | 48 | 4 554 | 0 | 0 | 0.086 |
+| 65 536 | 2.38 MB | 48 | 7 733 | 0 | 0 | 0.097 |
+| 262 144 | 9.48 MB | 48 | 18 630 | 0 | 0 | 0.107 |
+| 1 048 576 | 37.8 MB | 54 | 61 926 | 0 | 0 | 0.154 |
+
+**The grain claim holds with room to spare.** A cold probe into a
+37.8 MB run fetches 62 KB — against the 4 MiB a part-grained cache would
+have faulted to answer the same lookup, a 68× difference, and the gap
+widens as the run grows because a part is a fixed size while a probe's
+block working set is not.
+
+**A warm probe fetches nothing at all.** Zero bytes and zero GETs at
+every size: the blocks are resident and the probe's own scan admits
+them, which is what the block slot and the probe shape are for.
+
+That row is the *second* reading. The first found a warm probe still
+costing one to two GETs and 0.5–9.6 KB, which was not the cache failing
+but `index_lookup` calling `materialize` instead of serving the handle's
+held view — so every probe re-scanned `current` under a bulk shape that
+admits nothing. Serving the held view took warm probes to zero and cut
+the cold path too (79 GETs to 48, 71 KB to 62 KB per probe), because the
+rescan was in both. The measurement found the defect; the numbers above
+are after the fix.

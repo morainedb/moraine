@@ -405,9 +405,13 @@ async fn a_read_only_catalog_serves_a_cached_view_that_matches_the_store() {
     writer.close().await.unwrap();
 }
 
-/// A cache size bounds the on-disk object cache without disabling it: the
-/// catalog is served through a capped cache on the writer's side and the
-/// reader's alike, and the cache directory fills.
+/// A cache size bounds the cache without disabling it: the catalog is
+/// served through a capped cache on the writer's side and the reader's
+/// alike.
+///
+/// That a directory becomes a device is `store::cache`'s to assert, not
+/// this test's: one cache serves the whole process, so whichever store
+/// opens first in this binary decides whether there is a device at all.
 #[tokio::test]
 async fn a_bounded_disk_cache_serves_a_writer_and_a_reader() {
     let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
@@ -443,7 +447,461 @@ async fn a_bounded_disk_cache_serves_a_writer_and_a_reader() {
     assert!(view.table_by_name(schema, "t").is_some());
     reader.close().await.unwrap();
 
-    let populated = std::fs::read_dir(&cache).is_ok_and(|mut entries| entries.next().is_some());
-    assert!(populated, "expected an object cache under {cache:?}");
     let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// The cache reports what it served. Reads run through the process's one
+/// instance, so the counters move as soon as anything reads a store —
+/// which is what makes the budget sizable from measurement instead of
+/// from the defaults.
+///
+/// Asserted as a delta, not an absolute: every other test in this binary
+/// shares the same process-wide cache, so only this test's own reads are
+/// its to claim.
+#[tokio::test]
+async fn the_cache_reports_what_it_served() {
+    let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+
+    let before = moraine::cache_tally();
+
+    let writer = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            tx.create_table(schema, "t", &[col("a")])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    // A cold reader must fetch and decode the store's SSTs to answer, so
+    // the metadata slot is consulted whatever it can serve.
+    let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let view = reader.snapshot().await.unwrap();
+    assert!(
+        view.table_by_name(view.schema_by_name("main").expect("bootstrap").id, "t")
+            .is_some()
+    );
+    reader.close().await.unwrap();
+
+    let after = moraine::cache_tally();
+    let metadata_lookups = (after.metadata_hits + after.metadata_misses)
+        - (before.metadata_hits + before.metadata_misses);
+    assert!(
+        metadata_lookups > 0,
+        "reads did not reach the cache: {before:?} then {after:?}"
+    );
+    assert!(
+        after.metadata_hit_rate().is_some(),
+        "a cache that has served has a rate to report"
+    );
+}
+
+/// Two catalogs in one process share the cache but not the tally: what one
+/// reads lands in its own counts and not the other's, and the process's
+/// counts take both.
+///
+/// The point is attribution. A host with several catalogs on one budget
+/// can read the process's numbers today; what it cannot do without this is
+/// tell which attach is spending them.
+#[tokio::test]
+async fn each_catalog_tallies_its_own_reads() {
+    let quiet = Catalog::open(
+        Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let busy_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+    let writer = Catalog::open(Arc::clone(&busy_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            tx.create_table(schema, "t", &[col("a")])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let quiet_before = quiet.cache_tally();
+    let process_before = moraine::cache_tally();
+
+    // A cold reader fetches and decodes the store's SSTs, so its own
+    // metadata counters must move.
+    let busy = Catalog::open_read_only(busy_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let view = busy.snapshot().await.unwrap();
+    assert!(
+        view.table_by_name(view.schema_by_name("main").expect("bootstrap").id, "t")
+            .is_some()
+    );
+
+    let busy_tally = busy.cache_tally();
+    let busy_lookups = busy_tally.metadata_hits + busy_tally.metadata_misses;
+    assert!(
+        busy_lookups > 0,
+        "the reading catalog's own tally must move: {busy_tally:?}"
+    );
+
+    assert_eq!(
+        quiet.cache_tally(),
+        quiet_before,
+        "an idle catalog must not be charged for another's reads"
+    );
+
+    let process_after = moraine::cache_tally();
+    assert!(
+        (process_after.metadata_hits + process_after.metadata_misses)
+            - (process_before.metadata_hits + process_before.metadata_misses)
+            >= busy_lookups,
+        "the process's counts still cover every attach's reads"
+    );
+
+    busy.close().await.unwrap();
+    quiet.close().await.unwrap();
+}
+
+/// A bulk scan must not cost the probe path its residency. The meta slot
+/// holds SST indexes and filters and data blocks cannot compete for it,
+/// so a whole-subspace scan between two probes leaves the second probe
+/// served exactly as the first was.
+///
+/// Read on the metadata counters rather than on timing: an in-memory
+/// store makes a fetch nearly free, so a regression here would be
+/// invisible in milliseconds and obvious in misses.
+#[tokio::test]
+async fn a_scan_does_not_evict_what_probes_need() {
+    let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+    let writer = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+
+    // Enough tables that a `current` scan walks real blocks rather than
+    // one, so the scan is a genuine eviction opportunity.
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            for n in 0..64 {
+                tx.create_table(schema, &format!("t{n}"), &[col("a")])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
+        .await
+        .unwrap();
+
+    // Warm: whatever this costs, it is what a repeat should cost.
+    let _ = reader.snapshot().await.unwrap();
+    let before_repeat = moraine::cache_tally();
+    let _ = reader.snapshot().await.unwrap();
+    let warm_misses = moraine::cache_tally().metadata_misses - before_repeat.metadata_misses;
+
+    // A full scan of every subspace, then the same read again.
+    let census = reader
+        .store_census({
+            let mut request = moraine::CensusRequest::default();
+            request.count_live_entries = true;
+            request
+        })
+        .await
+        .unwrap();
+    assert!(!census.subspaces.is_empty());
+
+    let before_after_scan = moraine::cache_tally();
+    let _ = reader.snapshot().await.unwrap();
+    let after_scan_misses =
+        moraine::cache_tally().metadata_misses - before_after_scan.metadata_misses;
+    reader.close().await.unwrap();
+
+    assert!(
+        after_scan_misses <= warm_misses,
+        "a scan cost the probe path its residency: {warm_misses} misses warm, \
+         {after_scan_misses} after a scan"
+    );
+}
+
+/// Several catalogs in one process share one cache and one budget, so a
+/// second attach neither builds its own nor resets the first's tally.
+#[tokio::test]
+async fn attached_catalogs_share_one_cache() {
+    let first_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+    let second_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+
+    for store in [&first_store, &second_store] {
+        let writer = Catalog::open(Arc::clone(store), CatalogOptions::default())
+            .await
+            .unwrap();
+        writer
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                tx.create_table(schema, "t", &[col("a")])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+    }
+
+    let first = Catalog::open_read_only(first_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let _ = first.snapshot().await.unwrap();
+    let after_first = moraine::cache_tally();
+
+    let second = Catalog::open_read_only(second_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let _ = second.snapshot().await.unwrap();
+    let after_second = moraine::cache_tally();
+
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+
+    // One tally across both: the second catalog's reads add to it rather
+    // than starting their own.
+    let first_lookups = after_first.metadata_hits + after_first.metadata_misses;
+    let second_lookups = after_second.metadata_hits + after_second.metadata_misses;
+    assert!(
+        second_lookups > first_lookups,
+        "the second catalog's reads did not reach the shared cache: \
+         {first_lookups} then {second_lookups}"
+    );
+}
+
+/// A preload warms the cache before anything reads through it, so the
+/// first read after an attach finds more resident than it would have.
+#[tokio::test]
+async fn a_preload_warms_before_the_first_read() {
+    let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+    let writer = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            for n in 0..32 {
+                tx.create_table(schema, &format!("t{n}"), &[col("a")])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let mut options = CatalogOptions::default();
+    options.cache_preload = Some(moraine::CachePreload::All);
+
+    let reader = Catalog::open_read_only(object_store, options)
+        .await
+        .unwrap();
+    let after_open = reader.cache_tally();
+
+    // The warm ran during the open, before any read was issued.
+    let open_lookups = after_open.metadata_hits
+        + after_open.metadata_misses
+        + after_open.block_hits
+        + after_open.block_misses;
+    assert!(
+        open_lookups > 0,
+        "a preload consulted the cache not at all: {after_open:?}"
+    );
+    let attributed = after_open.preload_metadata_hits
+        + after_open.preload_metadata_misses
+        + after_open.preload_block_hits
+        + after_open.preload_block_misses;
+    assert!(
+        attributed > 0 && attributed <= open_lookups,
+        "preload traffic was not attributed separately: {after_open:?}"
+    );
+
+    let view = reader.snapshot().await.unwrap();
+    assert!(view.schema_by_name("main").is_some());
+    reader.close().await.unwrap();
+}
+
+/// One shared cache still reports SST metadata apart from data blocks.
+///
+/// Nothing outside SlateDB can classify a cached entry, so the split comes
+/// from what each typed admission recorded. If that broke, metadata occupancy
+/// would read zero however full the cache was, and the attach-time sizing
+/// warning would never fire.
+#[tokio::test]
+async fn the_shared_cache_reports_metadata_apart_from_data_blocks() {
+    let object_store = Arc::new(InMemory::new());
+    let writer = Catalog::open(
+        Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "t", &[col("a")])?;
+            for _ in 0..256 {
+                tx.register_data_file(table, datafile(100), &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    // A cold reader walks every SST's filter and index out of object storage.
+    let reader = Catalog::open_read_only(
+        object_store as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    reader.snapshot().await.unwrap();
+
+    let status = moraine::cache_status();
+    assert!(status.metadata_occupancy_bytes > 0, "{status:?}");
+
+    // Metadata is protected up to a share of the one capacity rather than
+    // partitioned into its own, so its ceiling is under the whole.
+    assert!(status.metadata_capacity_bytes > 0, "{status:?}");
+    assert!(
+        status.metadata_capacity_bytes < status.block_capacity_bytes,
+        "{status:?}"
+    );
+}
+
+/// The handle's decoded catalog is reported, so a host sizing a process can
+/// see the one cache no byte budget covers. It grows with the catalog and is
+/// replaced when the head moves, never evicted under pressure.
+#[tokio::test]
+async fn a_handle_reports_what_its_decoded_catalog_holds() {
+    let object_store = Arc::new(InMemory::new());
+    let writer = Catalog::open(
+        Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // Nothing materialized yet.
+    assert_eq!(writer.projection_bytes(), 0);
+
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "t", &[col("a")])?;
+            for _ in 0..64 {
+                tx.register_data_file(table, datafile(100), &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.snapshot().await.unwrap();
+    let small = writer.projection_bytes();
+    assert!(small > 0, "a materialized catalog reports nothing");
+
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "u", &[col("b")])?;
+            for _ in 0..512 {
+                tx.register_data_file(table, datafile(100), &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.snapshot().await.unwrap();
+
+    assert!(
+        writer.projection_bytes() > small,
+        "a larger catalog must report more: {small} then {}",
+        writer.projection_bytes()
+    );
+}
+
+/// Warming a table reads its index and inline probe ranges, and an index
+/// lookup on the warmed handle still answers. Whether those blocks stay
+/// resident is a property of the shared cache under load, measured by the
+/// object-storage benchmark rather than pinned here.
+#[tokio::test]
+async fn warming_a_table_reads_its_probe_ranges() {
+    use moraine::{IndexDef, IndexEntry, IndexKeyValue, IntWidth};
+
+    let key = |value: i128| IndexKeyValue::Int {
+        value,
+        width: IntWidth::I64,
+    };
+    let seed = || async {
+        let object_store = Arc::new(InMemory::new());
+        let writer = Catalog::open(
+            Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+            CatalogOptions::default(),
+        )
+        .await
+        .unwrap();
+        let created = std::cell::Cell::new(None);
+        writer
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                let table = tx.create_table(schema, "items", &[col("value")])?;
+                let entries = (0..2_000_u64)
+                    .map(|row_id| IndexEntry {
+                        row_id,
+                        values: vec![Some(key(i128::from(row_id)))],
+                    })
+                    .collect::<Vec<_>>();
+                let index = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_value".to_owned(),
+                        columns: vec![moraine::ColumnId::new(1)],
+                        unique: false,
+                    },
+                    &entries,
+                )?;
+                created.set(Some((table, index)));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let (table, index) = created.get().unwrap();
+        (object_store, table, index)
+    };
+
+    let (object_store, table, index) = seed().await;
+    let counting = Arc::new(CountingStore::new(object_store));
+    let reader = Catalog::open_read_only(
+        Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    reader.snapshot().await.unwrap();
+    counting.take_reads();
+
+    reader.warm_tables(&[table]).await.unwrap();
+    let warm_reads = counting.take_reads();
+    assert!(warm_reads > 0, "warming a cold table read nothing");
+
+    let found = reader
+        .index_lookup(table, index, &[key(1_500)])
+        .await
+        .unwrap();
+    assert_eq!(found, vec![1_500]);
+    reader.close().await.unwrap();
 }

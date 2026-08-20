@@ -62,6 +62,7 @@ async fn open_folder_writer(store: &SlotStore, limit: Option<u64>) -> Result<Db>
         .cache_puts(store.options.cache_puts)
         .open_writer()
         .await
+        .map(|(db, _)| db)
 }
 
 /// The fold cursor a writer stands at: the last slot its own manifest records
@@ -146,7 +147,7 @@ fn narrate_fold(report: &FoldReport) {
 /// so a sprint this handle just ran is reflected rather than lagged behind the
 /// attach reader's poll interval.
 pub(crate) async fn unfolded_tail(store: &SlotStore) -> Result<u64> {
-    let reader = StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
+    let (reader, _) = StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
         .cache_dir(store.options.cache_dir.clone())
         .cache_size(store.options.cache_size)
         .cache_preload(store.options.cache_preload)
@@ -300,6 +301,7 @@ async fn reopen_reader(store: &SlotStore) -> Result<DbReader> {
         .cache_puts(store.options.cache_puts)
         .open_reader()
         .await
+        .map(|(reader, _)| reader)
 }
 
 /// The self-appointment rule: if the unfolded tail exceeds `threshold`, wait

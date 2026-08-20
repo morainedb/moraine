@@ -358,13 +358,9 @@ async fn read_only_reads_the_committed_catalog_but_rejects_writes() {
     let snap = reader.snapshot().await.unwrap();
     assert!(snap.schema_by_name("sales").is_some());
 
-    // A write through the read-only catalog is refused (a typed error, not a
-    // fence): the writer was never opened, so nothing could be fenced.
-    let err = reader
-        .commit(|tx| tx.create_schema("more").map(|_| ()))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::Constraint(_)), "got {err:?}");
+    // A write through the read-only catalog does not compile at all —
+    // `ReadOnlyCatalog` carries no mutator — which the crate root pins with
+    // a `compile_fail` doctest. There is no runtime refusal left to assert.
 
     writer.close().await.unwrap();
     reader.close().await.unwrap();
@@ -478,7 +474,7 @@ async fn two_read_write_attaches_coexist_without_fencing() {
     // window elapses.
     let options = || {
         let mut options = CatalogOptions::default();
-        options.refresh_interval = std::time::Duration::ZERO;
+        options.reader_poll_interval = std::time::Duration::ZERO;
         options
     };
 

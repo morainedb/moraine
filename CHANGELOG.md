@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/morainedb/moraine/compare/v0.5.2...v0.6.0) - 2026-08-17
+
+### Added
+
+- Make data caches store-scoped and persistent
+- Add attach-time warming for preloaded caches
+- locate index-resolved rows and prune scans to the files holding them ([#150](https://github.com/morainedb/moraine/pull/150))
+- *(cache)* scale the parsed-metadata allowance and report the decoded catalog ([#149](https://github.com/morainedb/moraine/pull/149))
+- *(cache)* give SST metadata eviction priority over data blocks ([#148](https://github.com/morainedb/moraine/pull/148))
+- backfill DuckLake row ID file statistics ([#145](https://github.com/morainedb/moraine/pull/145))
+
+### Fixed
+
+- Overlap table warming with reader operations
+
+### Other
+
+- *(transaction)* reuse translated head view ([#151](https://github.com/morainedb/moraine/pull/151))
+- expose and tune index lookup maintenance ([#137](https://github.com/morainedb/moraine/pull/137))
+- streamline index maintenance reads ([#135](https://github.com/morainedb/moraine/pull/135))
+
+## [0.5.2](https://github.com/morainedb/moraine/compare/v0.5.1...v0.5.2) - 2026-08-13
+
+### Added
+
+- expose staged commit phase diagnostics ([#126](https://github.com/morainedb/moraine/pull/126))
+- expose object-store commit diagnostics ([#124](https://github.com/morainedb/moraine/pull/124))
+
+### Other
+
+- stream and parallelize index maintenance ([#134](https://github.com/morainedb/moraine/pull/134))
+- overlap delete discovery with index upkeep ([#133](https://github.com/morainedb/moraine/pull/133))
+- reduce index upkeep copies and barriers ([#132](https://github.com/morainedb/moraine/pull/132))
+- reduce index upkeep copies and barriers ([#131](https://github.com/morainedb/moraine/pull/131))
+- stream staged index maintenance ([#130](https://github.com/morainedb/moraine/pull/130))
+- reduce staged index maintenance overhead ([#129](https://github.com/morainedb/moraine/pull/129))
+- parallelize equality index maintenance ([#127](https://github.com/morainedb/moraine/pull/127))
+
+## [0.5.1](https://github.com/morainedb/moraine/compare/v0.4.6...v0.5.1) - 2026-08-10
+
+### Added
+
+- add real S3 benchmark workflow ([#118](https://github.com/morainedb/moraine/pull/118))
+- persist maintenance status across restarts ([#117](https://github.com/morainedb/moraine/pull/117))
+- settle staged index concurrency and reverse scans ([#114](https://github.com/morainedb/moraine/pull/114))
+- bound and defer index maintenance ([#112](https://github.com/morainedb/moraine/pull/112))
+- add batched SQL index lookups ([#109](https://github.com/morainedb/moraine/pull/109))
+
+### Fixed
+
+- prevent cross-catalog cache recovery ([#116](https://github.com/morainedb/moraine/pull/116))
+- avoid schema churn during staged index builds ([#111](https://github.com/morainedb/moraine/pull/111))
+- join maintenance scheduler on shutdown ([#115](https://github.com/morainedb/moraine/pull/115))
+
+### Other
+
+- prune DuckLake files by row id ([#123](https://github.com/morainedb/moraine/pull/123))
+- carry catalog timestamps as micros ([#122](https://github.com/morainedb/moraine/pull/122))
+- measure real S3 attach latency ([#119](https://github.com/morainedb/moraine/pull/119))
+- allow inserts during staged index steps ([#113](https://github.com/morainedb/moraine/pull/113))
+- elide scans for empty index lookups ([#121](https://github.com/morainedb/moraine/pull/121))
+
+## [0.4.6](https://github.com/morainedb/moraine/compare/v0.4.5...v0.4.6) - 2026-08-07
+
+### Added
+
+- bound a commit by the bytes it must transfer, and report them ([#108](https://github.com/morainedb/moraine/pull/108))
+- report the block cache tally per attach ([#104](https://github.com/morainedb/moraine/pull/104))
+
+### Fixed
+
+- make catalog options settable, resettable, and unshadowed ([#106](https://github.com/morainedb/moraine/pull/106))
+
+### Other
+
+- read only the rows a delete kills, not the file holding them ([#107](https://github.com/morainedb/moraine/pull/107))
+- pin what a delete against flushed inline data costs ([#105](https://github.com/morainedb/moraine/pull/105))
+
+## [0.4.5](https://github.com/morainedb/moraine/compare/v0.4.4...v0.4.5) - 2026-08-05
+
+### Added
+
+- close out the open work across RFCs 0001, 0007, 0011, 0012, 0014, 0017, 0018, 0021 ([#86](https://github.com/morainedb/moraine/pull/86))
+
+### Fixed
+
+- keep the block cache's tasks off an attach's runtime ([#98](https://github.com/morainedb/moraine/pull/98))
+- re-attempt a genesis open that is fenced mid-bootstrap ([#93](https://github.com/morainedb/moraine/pull/93))
+- materialize a metadata table once per DuckDB transaction ([#87](https://github.com/morainedb/moraine/pull/87))
+
+### Other
+
+- unify the cache stack across DuckDB, the shim, and SlateDB ([#96](https://github.com/morainedb/moraine/pull/96))
+- read a commit's index-maintenance files concurrently ([#95](https://github.com/morainedb/moraine/pull/95))
+- resolve the head from the held view on a read-write handle ([#94](https://github.com/morainedb/moraine/pull/94))
+- *(deps)* Bump slatedb from 0.14.1 to 0.15.0 ([#85](https://github.com/morainedb/moraine/pull/85))
+- pin DuckDB v1.5.5 and stop Dependabot raising the ci-tools ref ([#89](https://github.com/morainedb/moraine/pull/89))
+
 ## [0.4.4](https://github.com/morainedb/moraine/compare/v0.4.3...v0.4.4) - 2026-08-04
 
 ### Added

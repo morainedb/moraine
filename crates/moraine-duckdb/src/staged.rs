@@ -9,26 +9,25 @@
 //! `crate::abi::guard`, no internal retry (a lost race at commit surfaces
 //! [`codes::COMMIT_CONFLICT`] with the literal substring `conflict` in the
 //! message). This module is translate-only: it decodes [`MoraineCell`]s
-//! into [`Cell`]s and forwards them, never interpreting DuckLake's row
-//! values itself.
+//! into [`Cell`]s and forwards them.
 //!
 //! [`MoraineTxHandle`] borrows the owning [`MoraineCatalogHandle`]'s tokio
-//! runtime for [`moraine_tx_begin`] and [`moraine_tx_commit`] (the only
-//! two async operations here; `stage` and `rollback` are synchronous). The
-//! caller contract requires the catalog outlive every open transaction on
-//! it.
+//! runtime; the catalog must outlive every open transaction on it.
 
 use std::{
     ffi::{c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Mutex, MutexGuard},
 };
 
 use moraine::ffi_support::staged::{
     self, Cell, RowOperation, StagedTransaction, TableKind, staged_begin,
 };
+use tracing::warn;
 
 use crate::{
     abi::{borrow_bytes, borrow_str, guard, write_array},
+    arrow_ipc::MoraineArrowBytes,
     dumps::{
         MoraineColumnMappingRow, MoraineColumnRow, MoraineColumnTagRow, MoraineDataFileRow,
         MoraineDeleteFileRow, MoraineFileColumnStatsRow, MoraineFilePartitionValueRow,
@@ -65,16 +64,32 @@ pub struct MoraineCell {
 }
 
 /// A staged-row transaction, opaque to C. Owns one [`StagedTransaction`]
-/// plus a borrowed pointer to the catalog handle it was opened on, used to
-/// `block_on` the async core calls in [`moraine_tx_begin`] and
-/// [`moraine_tx_commit`].
+/// plus a borrowed pointer to the catalog handle it was opened on.
+///
+/// The transaction sits behind a mutex: DuckDB drives concurrent pipelines
+/// through one handle — a Sink staging while another scan's init dumps —
+/// and `stage` mutates the overlay the dumps read.
 pub struct MoraineTxHandle {
     catalog: *const MoraineCatalogHandle,
-    tx: StagedTransaction,
+    tx: Mutex<StagedTransaction>,
 }
 
-/// Decodes the ABI's `table_kind` through the core's own wire table
-/// (`TableKind::ALL`), so the mapping can never drift from the enum.
+impl MoraineTxHandle {
+    /// The staged transaction, exclusively. A poisoned lock (a panic in an
+    /// earlier call, already contained) makes the staged state suspect, so
+    /// it is refused rather than served.
+    fn lock(&self) -> Result<MutexGuard<'_, StagedTransaction>, AbiError> {
+        self.tx.lock().map_err(|_| {
+            AbiError::new(
+                codes::INTERNAL,
+                "staged transaction unusable after an earlier panic",
+            )
+        })
+    }
+}
+
+/// Decodes the ABI's `table_kind` through the core's wire table
+/// (`TableKind::ALL`).
 fn decode_table_kind(v: i32) -> Result<TableKind, AbiError> {
     TableKind::try_from(v).map_err(|other| {
         AbiError::invalid_argument(format!("moraine_tx_stage: unknown table_kind {other}"))
@@ -182,7 +197,7 @@ pub unsafe extern "C" fn moraine_tx_begin(
                 probe,
                 probe_ctx,
                 staged_begin(
-                    &handle_ref.catalog,
+                    handle_ref.catalog.writer()?,
                     handle_ref.data_store.clone(),
                     handle_ref.data_prefix.clone(),
                 ),
@@ -190,7 +205,7 @@ pub unsafe extern "C" fn moraine_tx_begin(
         }?;
         Ok(Box::new(MoraineTxHandle {
             catalog: handle,
-            tx,
+            tx: Mutex::new(tx),
         }))
     };
 
@@ -266,8 +281,8 @@ pub unsafe extern "C" fn moraine_tx_stage(
             },
         };
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(op);
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(op);
         Ok(())
     };
 
@@ -278,68 +293,14 @@ pub unsafe extern "C" fn moraine_tx_stage(
     }
 }
 
-/// Dumps every `ducklake_snapshot` row **as this transaction sees it**:
-/// committed rows at the transaction's read point minus the snapshot
-/// deletes staged so far. The expiry cascade's own `NOT EXISTS`
-/// subqueries re-read `ducklake_snapshot` after staging deletes and must
-/// observe them — a committed-state dump would silently under-reclaim.
-/// Freed with `moraine_dump_snapshots_free`.
-///
-/// # Safety
-///
-/// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
-/// and not yet committed or rolled back; its catalog must still be
-/// attached. `out_items`/`out_len` must be valid, writable pointers.
-/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
-/// for the duration of this call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_tx_dump_snapshots(
-    tx: *mut MoraineTxHandle,
-    out_items: *mut *mut MoraineSnapshotRow,
-    out_len: *mut usize,
-    err: *mut MoraineError,
-) -> i32 {
-    let attempt = || -> Result<Vec<MoraineSnapshotRow>, AbiError> {
-        if tx.is_null() {
-            return Err(AbiError::invalid_argument("`tx` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract above.
-        let tx_ref = unsafe { &*tx };
-        // SAFETY: `catalog` outlives `tx` per `moraine_tx_begin`'s contract.
-        let catalog_ref = unsafe { &*tx_ref.catalog };
-        let rows = catalog_ref
-            .runtime
-            .block_on(tx_ref.tx.visible_snapshots())
-            .map_err(AbiError::from)?;
-        snapshot_rows(rows)
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
-    }
-}
-
 /// The shared body of every `moraine_tx_dump_*` below: check the pointers,
 /// run the named projection against the open transaction, and convert its
-/// records with the very same function the committed dump uses — so the two
-/// can only ever differ in *which* rows they carry, never in their shape.
-///
-/// A macro rather than a generic function because the projection borrows the
-/// transaction — as a method on it, or as a free function over it, depending
-/// on whether the kind is a record set or a flattening of one — and each
-/// entry point's signature has to stay written out regardless: the C header
-/// is generated by parsing them.
+/// records with the same function the committed dump uses. Each entry
+/// point's signature stays written out: the C header is generated by
+/// parsing them.
 macro_rules! tx_dump_body {
-    ($tx:ident, $out_items:ident, $out_len:ident, $err:ident, $visible:path, $convert:path) => {{
+    ($tx:ident, $out_items:ident, $out_len:ident, $err:ident, $visible:path, $convert:path
+     $(, $arg:expr)*) => {{
         let attempt = || {
             if $tx.is_null() {
                 return Err(AbiError::invalid_argument("`tx` is null"));
@@ -351,9 +312,11 @@ macro_rules! tx_dump_body {
             let tx_ref = unsafe { &*$tx };
             // SAFETY: `catalog` outlives `tx` per `moraine_tx_begin`'s contract.
             let catalog_ref = unsafe { &*tx_ref.catalog };
+            // Held across the dump, so a concurrent stage waits instead of
+            // moving the overlay under it.
+            let guard = tx_ref.lock()?;
             let rows = catalog_ref
-                .runtime
-                .block_on($visible(&tx_ref.tx))
+                .block_on($visible(&guard $(, $arg)*))
                 .map_err(AbiError::from)?;
             $convert(rows)
         };
@@ -370,11 +333,37 @@ macro_rules! tx_dump_body {
     }};
 }
 
-/// Dumps every `ducklake_data_file` row **as this transaction sees it**:
+/// Dumps every `ducklake_snapshot` row as this transaction sees it:
+/// committed rows at the transaction's read point minus the snapshot
+/// deletes staged so far. Freed with `moraine_dump_snapshots_free`.
+///
+/// # Safety
+///
+/// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
+/// and not yet committed or rolled back; its catalog must still be
+/// attached. `out_items`/`out_len` must be valid, writable pointers.
+/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
+/// for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_snapshots(
+    tx: *mut MoraineTxHandle,
+    out_items: *mut *mut MoraineSnapshotRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        StagedTransaction::visible_snapshots,
+        snapshot_rows
+    )
+}
+
+/// Dumps every `ducklake_data_file` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
-/// them. A cascade that re-reads this table after staging its deletes must
-/// observe them, or it re-plans work it has already done.
-/// Freed with `moraine_dump_data_files_free`.
+/// them. Freed with `moraine_dump_data_files_free`.
 ///
 /// # Safety
 ///
@@ -400,11 +389,39 @@ pub unsafe extern "C" fn moraine_tx_dump_data_files(
     )
 }
 
-/// Dumps every `ducklake_delete_file` row **as this transaction sees it**:
+/// As [`moraine_tx_dump_data_files`], for a caller that keeps a row only
+/// while `filter_snapshot < end_snapshot` (or it is null) — the shape
+/// every DuckLake read of this table carries.
+///
+/// Once `filter_snapshot` reaches the transaction's read point, no ended
+/// version can satisfy that, so the ended half is not read; the rows are
+/// the same ones either way. Freed with `moraine_dump_data_files_free`.
+///
+/// # Safety
+///
+/// As [`moraine_tx_dump_data_files`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_data_files_live_at(
+    tx: *mut MoraineTxHandle,
+    filter_snapshot: u64,
+    out_items: *mut *mut MoraineDataFileRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        StagedTransaction::visible_data_files_live_at,
+        data_file_rows,
+        Some(filter_snapshot)
+    )
+}
+
+/// Dumps every `ducklake_delete_file` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
-/// them. A cascade that re-reads this table after staging its deletes must
-/// observe them, or it re-plans work it has already done.
-/// Freed with `moraine_dump_delete_files_free`.
+/// them. Freed with `moraine_dump_delete_files_free`.
 ///
 /// # Safety
 ///
@@ -430,11 +447,9 @@ pub unsafe extern "C" fn moraine_tx_dump_delete_files(
     )
 }
 
-/// Dumps every `ducklake_file_column_stats` row **as this transaction sees
-/// it**: committed rows at the transaction's read point with its own staged
-/// rows over them. A cascade that re-reads this table after staging its deletes
-/// must observe them, or it re-plans work it has already done.
-/// Freed with `moraine_dump_file_column_stats_free`.
+/// Dumps every `ducklake_file_column_stats` row as this transaction sees
+/// it: committed rows at the transaction's read point with its own staged
+/// rows over them. Freed with `moraine_dump_file_column_stats_free`.
 ///
 /// # Safety
 ///
@@ -460,11 +475,10 @@ pub unsafe extern "C" fn moraine_tx_dump_file_column_stats(
     )
 }
 
-/// Dumps every `ducklake_files_scheduled_for_deletion` row **as this
-/// transaction sees it**: committed rows at the transaction's read point with
-/// its own staged rows over them. A cascade that re-reads this table after
-/// staging its deletes must observe them, or it re-plans work it has already
-/// done. Freed with `moraine_dump_scheduled_deletions_free`.
+/// Dumps every `ducklake_files_scheduled_for_deletion` row as this
+/// transaction sees it: committed rows at the transaction's read point with
+/// its own staged rows over them. Freed with
+/// `moraine_dump_scheduled_deletions_free`.
 ///
 /// # Safety
 ///
@@ -490,10 +504,8 @@ pub unsafe extern "C" fn moraine_tx_dump_scheduled_deletions(
     )
 }
 
-/// Dumps every `ducklake_column` row **as this transaction sees it**: committed
+/// Dumps every `ducklake_column` row as this transaction sees it: committed
 /// rows at the transaction's read point with its own staged rows over them.
-/// A cascade that re-reads this table after staging its deletes must
-/// observe them, or it re-plans work it has already done.
 /// Freed with `moraine_dump_columns_free`.
 ///
 /// # Safety
@@ -520,10 +532,8 @@ pub unsafe extern "C" fn moraine_tx_dump_columns(
     )
 }
 
-/// Dumps every `ducklake_table` row **as this transaction sees it**: committed
+/// Dumps every `ducklake_table` row as this transaction sees it: committed
 /// rows at the transaction's read point with its own staged rows over them.
-/// A cascade that re-reads this table after staging its deletes must
-/// observe them, or it re-plans work it has already done.
 /// Freed with `moraine_dump_tables_free`.
 ///
 /// # Safety
@@ -550,7 +560,7 @@ pub unsafe extern "C" fn moraine_tx_dump_tables(
     )
 }
 
-/// Dumps every `ducklake_schema` row **as this transaction sees it**: committed
+/// Dumps every `ducklake_schema` row as this transaction sees it: committed
 /// rows at the transaction's read point with its own staged rows over them.
 /// Freed with `moraine_dump_schemas_free`.
 ///
@@ -578,7 +588,7 @@ pub unsafe extern "C" fn moraine_tx_dump_schemas(
     )
 }
 
-/// Dumps every `ducklake_view` row **as this transaction sees it**: committed
+/// Dumps every `ducklake_view` row as this transaction sees it: committed
 /// rows at the transaction's read point with its own staged rows over them.
 /// Freed with `moraine_dump_views_free`.
 ///
@@ -606,7 +616,7 @@ pub unsafe extern "C" fn moraine_tx_dump_views(
     )
 }
 
-/// Dumps every `ducklake_table_stats` row **as this transaction sees it**:
+/// Dumps every `ducklake_table_stats` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_table_stats_free`.
 ///
@@ -634,8 +644,8 @@ pub unsafe extern "C" fn moraine_tx_dump_table_stats(
     )
 }
 
-/// Dumps every `ducklake_table_column_stats` row **as this transaction sees
-/// it**: committed rows at the transaction's read point with its own staged
+/// Dumps every `ducklake_table_column_stats` row as this transaction sees
+/// it: committed rows at the transaction's read point with its own staged
 /// rows over them. Freed with `moraine_dump_table_column_stats_free`.
 ///
 /// # Safety
@@ -662,7 +672,7 @@ pub unsafe extern "C" fn moraine_tx_dump_table_column_stats(
     )
 }
 
-/// Dumps every `ducklake_partition_info` row **as this transaction sees it**:
+/// Dumps every `ducklake_partition_info` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_partition_info_free`.
 ///
@@ -690,7 +700,7 @@ pub unsafe extern "C" fn moraine_tx_dump_partition_info(
     )
 }
 
-/// Dumps every `ducklake_sort_info` row **as this transaction sees it**:
+/// Dumps every `ducklake_sort_info` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_sort_info_free`.
 ///
@@ -718,7 +728,7 @@ pub unsafe extern "C" fn moraine_tx_dump_sort_info(
     )
 }
 
-/// Dumps every `ducklake_macro` row **as this transaction sees it**: committed
+/// Dumps every `ducklake_macro` row as this transaction sees it: committed
 /// rows at the transaction's read point with its own staged rows over them.
 /// Freed with `moraine_dump_macros_free`.
 ///
@@ -746,7 +756,7 @@ pub unsafe extern "C" fn moraine_tx_dump_macros(
     )
 }
 
-/// Dumps every `ducklake_column_mapping` row **as this transaction sees it**:
+/// Dumps every `ducklake_column_mapping` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_column_mappings_free`.
 ///
@@ -774,7 +784,7 @@ pub unsafe extern "C" fn moraine_tx_dump_column_mappings(
     )
 }
 
-/// Dumps every `ducklake_partition_column` row **as this transaction sees it**:
+/// Dumps every `ducklake_partition_column` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_partition_columns_free`.
 ///
@@ -802,8 +812,8 @@ pub unsafe extern "C" fn moraine_tx_dump_partition_columns(
     )
 }
 
-/// Dumps every `ducklake_file_partition_value` row **as this transaction sees
-/// it**: committed rows at the transaction's read point with its own staged
+/// Dumps every `ducklake_file_partition_value` row as this transaction sees
+/// it: committed rows at the transaction's read point with its own staged
 /// rows over them. Freed with `moraine_dump_file_partition_values_free`.
 ///
 /// # Safety
@@ -830,7 +840,7 @@ pub unsafe extern "C" fn moraine_tx_dump_file_partition_values(
     )
 }
 
-/// Dumps every `ducklake_sort_expression` row **as this transaction sees it**:
+/// Dumps every `ducklake_sort_expression` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_sort_expressions_free`.
 ///
@@ -858,7 +868,7 @@ pub unsafe extern "C" fn moraine_tx_dump_sort_expressions(
     )
 }
 
-/// Dumps every `ducklake_column_tag` row **as this transaction sees it**:
+/// Dumps every `ducklake_column_tag` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_column_tags_free`.
 ///
@@ -886,7 +896,7 @@ pub unsafe extern "C" fn moraine_tx_dump_column_tags(
     )
 }
 
-/// Dumps every `ducklake_macro_impl` row **as this transaction sees it**:
+/// Dumps every `ducklake_macro_impl` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_macro_impls_free`.
 ///
@@ -914,7 +924,7 @@ pub unsafe extern "C" fn moraine_tx_dump_macro_impls(
     )
 }
 
-/// Dumps every `ducklake_macro_parameters` row **as this transaction sees it**:
+/// Dumps every `ducklake_macro_parameters` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_macro_parameters_free`.
 ///
@@ -942,7 +952,7 @@ pub unsafe extern "C" fn moraine_tx_dump_macro_parameters(
     )
 }
 
-/// Dumps every `ducklake_name_mapping` row **as this transaction sees it**:
+/// Dumps every `ducklake_name_mapping` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_name_mappings_free`.
 ///
@@ -970,7 +980,7 @@ pub unsafe extern "C" fn moraine_tx_dump_name_mappings(
     )
 }
 
-/// Dumps every `ducklake_tag` row **as this transaction sees it**: committed
+/// Dumps every `ducklake_tag` row as this transaction sees it: committed
 /// rows at the transaction's read point with its own staged rows over them.
 /// Freed with `moraine_dump_tags_free`.
 ///
@@ -998,7 +1008,7 @@ pub unsafe extern "C" fn moraine_tx_dump_tags(
     )
 }
 
-/// Dumps every `ducklake_metadata` row **as this transaction sees it**:
+/// Dumps every `ducklake_metadata` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_options_free`.
 ///
@@ -1026,7 +1036,7 @@ pub unsafe extern "C" fn moraine_tx_dump_options(
     )
 }
 
-/// Dumps every `ducklake_schema_versions` row **as this transaction sees it**:
+/// Dumps every `ducklake_schema_versions` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_schema_versions_free`.
 ///
@@ -1066,28 +1076,16 @@ pub unsafe extern "C" fn moraine_tx_dump_schema_versions(
 ///
 /// Cancellable: races the commit against `probe` (polled immediately, then
 /// ~100 ms; a null `probe` disables polling). Where the cancellation lands
-/// decides what it means, and one of the three outcomes is ambiguous:
+/// decides what it means:
 ///
-/// - **Before the durable write is issued** — translation, index maintenance,
-///   and staging are in-memory only, so cancelling discards them.
-///   [`codes::INTERRUPTED`], catalog unchanged, head where it was.
-/// - **While the durable write is in flight** — the write is spawned past the
-///   point of no return and is never dropped mid-batch, so it runs to
-///   completion in the background while this call returns
-///   [`codes::INTERRUPTED`] promptly. **The commit may still land.** The
-///   outcome is therefore ambiguous in exactly the way an unacknowledged
-///   durable write is: the batch is atomic, so head ends at either the old id
-///   or the new one and never in between, but this return does not say which. A
-///   caller that needs to know re-resolves head and reads it — it must not
-///   treat [`codes::INTERRUPTED`] as "nothing landed", and must not re-drive
-///   the rows blind.
-/// - **After the write completed** — there is nothing left to cancel, so the
-///   committed snapshot id is reported normally.
-///
-/// The interrupt is honored rather than ridden out because the wait it
-/// escapes is unbounded: a durable write against an unreachable endpoint
-/// is retried beneath moraine indefinitely, and a session with no way out
-/// of it is the worse failure.
+/// - Before the durable write is issued: [`codes::INTERRUPTED`], catalog
+///   unchanged, head where it was.
+/// - While the durable write is in flight: the write runs to completion in the
+///   background and this call returns [`codes::INTERRUPTED`] promptly, so the
+///   commit may still land. Head ends at either the old id or the new one; a
+///   caller that needs to know re-resolves head, and must not treat
+///   [`codes::INTERRUPTED`] as "nothing landed".
+/// - After the write completed: the committed snapshot id is reported normally.
 ///
 /// # Safety
 ///
@@ -1113,6 +1111,18 @@ pub unsafe extern "C" fn moraine_tx_commit(
         // SAFETY: caller contract above; `tx` consumed exactly once.
         let boxed = unsafe { Box::from_raw(tx) };
         let MoraineTxHandle { catalog, tx } = *boxed;
+        let tx = match tx.into_inner() {
+            Ok(tx) => tx,
+            // A panic in an earlier call (already contained) left the
+            // staged state suspect: discard it rather than commit it.
+            Err(poisoned) => {
+                poisoned.into_inner().rollback();
+                return Err(AbiError::new(
+                    codes::INTERNAL,
+                    "staged transaction unusable after an earlier panic; rolled back",
+                ));
+            }
+        };
         // Checked after `tx` is reclaimed: the contract frees it on every
         // path, argument errors included.
         if out_snapshot_id.is_null() {
@@ -1121,11 +1131,41 @@ pub unsafe extern "C" fn moraine_tx_commit(
         }
         // SAFETY: `catalog` outlives `tx` per `moraine_tx_begin`'s contract.
         let catalog_ref = unsafe { &*catalog };
+        // Read before the commit consumes `tx`, spawned after it lands.
+        let warm_tables = tx.tables_with_staged_data_files();
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
-        let id = unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, tx.commit()) }?;
+        let report =
+            unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, tx.commit_reporting()) }?;
+        catalog_ref.spawn_warm_tables(warm_tables);
 
-        Ok(id.get())
+        // Repair runs only when this commit deferred entries, after the data
+        // snapshot is durable; its failure, including cancellation, is not
+        // a commit failure. A repair that fails resumes on the next
+        // deferring commit or during maintenance.
+        if !report.deferred_indexes.is_empty() {
+            match catalog_ref.catalog.writer() {
+                Ok(writer) => {
+                    let repair = writer.repair_deferred_indexes(
+                        catalog_ref.data_store.clone(),
+                        &catalog_ref.data_prefix,
+                        None,
+                    );
+                    // SAFETY: `probe`/`probe_ctx` validity is this function's
+                    // own safety contract.
+                    let repaired =
+                        unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, repair) };
+                    if let Err(error) = repaired {
+                        warn!(error = ?error, "deferred index repair will resume later");
+                    }
+                }
+                Err(error) => {
+                    warn!(error = %error, "deferred index repair will resume later");
+                }
+            }
+        }
+
+        Ok(report.snapshot_id.get())
     };
 
     // SAFETY: `err` validity is this function's own safety contract.
@@ -1156,7 +1196,12 @@ pub unsafe extern "C" fn moraine_tx_rollback(tx: *mut MoraineTxHandle) {
     let attempt = || {
         // SAFETY: caller contract above.
         let boxed = unsafe { Box::from_raw(tx) };
-        boxed.tx.rollback();
+        // A rollback discards either way, so a poisoned lock is drained
+        // rather than refused.
+        match boxed.tx.into_inner() {
+            Ok(tx) => tx.rollback(),
+            Err(poisoned) => poisoned.into_inner().rollback(),
+        }
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
@@ -1187,13 +1232,52 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_schema(
         // SAFETY: caller contract above.
         let bytes = unsafe { borrow_bytes(arrow_schema, arrow_schema_len, "arrow_schema") }?;
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineSchema {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineSchema {
             table_id,
             schema_version,
             arrow_schema: bytes.to_vec(),
         });
 
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Consumes an encoded Arrow schema buffer directly into the staged row.
+///
+/// # Safety
+///
+/// Same `tx`/`err` contract as [`moraine_tx_stage_inline_schema`].
+/// `arrow_schema` must be an unconsumed value returned by
+/// [`crate::arrow_ipc::moraine_arrow_encode_schema`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_stage_inline_schema_owned(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    schema_version: u64,
+    arrow_schema: MoraineArrowBytes,
+    err: *mut MoraineError,
+) -> i32 {
+    // Reclaim first so every return path consumes the caller's buffer.
+    // SAFETY: caller contract guarantees the buffer came from the encoder.
+    let arrow_schema = unsafe { arrow_schema.into_vec() };
+    let attempt = || -> Result<(), AbiError> {
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
+        }
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineSchema {
+            table_id,
+            schema_version,
+            arrow_schema,
+        });
         Ok(())
     };
 
@@ -1232,8 +1316,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_insert(
         // SAFETY: caller contract above.
         let bytes = unsafe { borrow_bytes(arrow_body, arrow_body_len, "arrow_body") }?;
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineInsert {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineInsert {
             table_id,
             schema_version,
             begin_snapshot,
@@ -1242,6 +1326,52 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_insert(
             arrow_body: bytes.to_vec(),
         });
 
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Consumes an encoded Arrow chunk body directly into the staged row.
+///
+/// # Safety
+///
+/// Same metadata and `tx`/`err` contract as
+/// [`moraine_tx_stage_inline_insert`]. `arrow_body` must be an unconsumed
+/// value returned by [`crate::arrow_ipc::moraine_arrow_encode_chunk`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn moraine_tx_stage_inline_insert_owned(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    schema_version: u64,
+    begin_snapshot: u64,
+    row_id_start: u64,
+    row_count: u64,
+    arrow_body: MoraineArrowBytes,
+    err: *mut MoraineError,
+) -> i32 {
+    // Reclaim first so every return path consumes the caller's buffer.
+    // SAFETY: caller contract guarantees the buffer came from the encoder.
+    let arrow_body = unsafe { arrow_body.into_vec() };
+    let attempt = || -> Result<(), AbiError> {
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
+        }
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineInsert {
+            table_id,
+            schema_version,
+            begin_snapshot,
+            row_id_start,
+            row_count,
+            arrow_body,
+        });
         Ok(())
     };
 
@@ -1272,8 +1402,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_inline_delete(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineInlineDelete {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineInlineDelete {
             table_id,
             row_id,
             end_snapshot,
@@ -1308,8 +1438,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineFileDelete {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineFileDelete {
             table_id,
             data_file_id,
             row_id,
@@ -1326,16 +1456,10 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete(
     }
 }
 
-/// Stages the removal of one live `inline/file_delete` record — the
-/// row-grain counterpart of [`moraine_tx_stage_inline_file_delete`],
-/// which a `DELETE` against `ducklake_inlined_delete_<table_id>`
-/// translates to.
-///
-/// DuckLake issues that `DELETE` at the end of
-/// `ducklake_flush_inlined_data`, once it has materialized the table's
-/// inlined deletions into a real delete file: leaving the inlined form
-/// behind would count those rows deleted twice. Naming a record the table
-/// does not carry is [`codes::CORRUPTION`], not a no-op.
+/// Stages the removal of one live `inline/file_delete` record, which a
+/// `DELETE` against `ducklake_inlined_delete_<table_id>` translates to.
+/// Naming a record the table does not carry is [`codes::CORRUPTION`], not
+/// a no-op.
 ///
 /// # Safety
 ///
@@ -1353,8 +1477,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete_remove(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineFileDeleteRemove {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineFileDeleteRemove {
             table_id,
             data_file_id,
             row_id,
@@ -1390,8 +1514,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_flush_delete(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineFlushDelete {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineFlushDelete {
             table_id,
             schema_version,
             flush_snapshot,
@@ -1424,8 +1548,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_drop(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineDrop { table_id });
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineDrop { table_id });
         Ok(())
     };
 
@@ -1456,8 +1580,8 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_schema_drop(
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &mut *tx };
-        tx_ref.tx.stage(RowOperation::InlineSchemaDrop {
+        let tx_ref = unsafe { &*tx };
+        tx_ref.lock()?.stage(RowOperation::InlineSchemaDrop {
             table_id,
             schema_version,
         });
@@ -1480,9 +1604,94 @@ mod tests {
     use crate::{
         abi::moraine_detach,
         test_support::{
-            StrArena, TempDir, attach_ok, begin, bool_cell, i64_cell, null_cell, stage, u64_cell,
+            StrArena, TempDir, attach_ok, attach_with_data_path, begin, bool_cell, commit,
+            i64_cell, null_cell, stage, u64_cell,
         },
     };
+
+    /// Stages a full `ducklake_data_file` row (`table_kind` 6,
+    /// `operation_kind` 0) against `table_id`.
+    fn stage_data_file_row(
+        tx: *mut MoraineTxHandle,
+        arena: &mut StrArena,
+        data_file_id: u64,
+        table_id: u64,
+        begin_snapshot: u64,
+    ) {
+        stage(
+            tx,
+            6,
+            0,
+            &[
+                u64_cell(data_file_id),
+                u64_cell(table_id),
+                u64_cell(begin_snapshot),
+                null_cell(),
+                null_cell(),
+                arena.cell("data-1.parquet"),
+                bool_cell(true),
+                arena.cell("parquet"),
+                u64_cell(10),
+                u64_cell(1024),
+                u64_cell(64),
+                u64_cell(0),
+                null_cell(),
+                null_cell(),
+                null_cell(),
+                null_cell(),
+            ],
+        );
+    }
+
+    /// A commit that registers data files warms the tables it touched.
+    #[test]
+    fn a_commit_registering_data_files_warms_those_tables() {
+        let lake = TempDir::new("commit-warm");
+        let data = TempDir::new("commit-warm-data");
+        let handle = attach_with_data_path(lake.path(), data.path());
+        // Drained first, so what remains at the end is the commit's own.
+        // SAFETY: attached above and not yet detached.
+        unsafe { &*handle }.finish_warming();
+
+        let tx = begin(handle);
+        let mut arena = StrArena::new();
+        stage_table_row(tx, &mut arena, 1, (1, None), 0, "t", "t/");
+        stage_data_file_row(tx, &mut arena, 1, 1, 1);
+        stage_snapshot_and_changes(tx, &mut arena, 1, 1, 2, "inserted_into_table:1");
+        stage(tx, 11, 0, &[u64_cell(1), u64_cell(1), u64_cell(1)]);
+        commit(tx);
+
+        // SAFETY: still attached.
+        let warming = unsafe { &*handle }.finish_warming();
+
+        assert_eq!(warming, 1, "the commit spawned no warming pass");
+        // SAFETY: attached above, detached exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// A commit that registers no data files spawns no warming.
+    #[test]
+    fn a_commit_registering_no_data_files_warms_nothing() {
+        let lake = TempDir::new("commit-warm-none");
+        let data = TempDir::new("commit-warm-none-data");
+        let handle = attach_with_data_path(lake.path(), data.path());
+        // SAFETY: attached above and not yet detached.
+        unsafe { &*handle }.finish_warming();
+
+        let tx = begin(handle);
+        let mut arena = StrArena::new();
+        stage_table_row(tx, &mut arena, 1, (1, None), 0, "t", "t/");
+        stage_snapshot_and_changes(tx, &mut arena, 1, 1, 2, r#"created_table:"main"."t""#);
+        stage(tx, 11, 0, &[u64_cell(1), u64_cell(1), u64_cell(1)]);
+        commit(tx);
+
+        // SAFETY: still attached.
+        let warming = unsafe { &*handle }.finish_warming();
+
+        assert_eq!(warming, 0);
+        // SAFETY: attached above, detached exactly once.
+        unsafe { moraine_detach(handle) };
+    }
 
     /// Stages a full `ducklake_table` row (`table_kind` 3, `operation_kind` 0):
     /// id, a synthetic uuid, begin/end snapshot (`lifecycle`), schema id,
@@ -2141,6 +2350,49 @@ mod tests {
         // SAFETY: freed exactly once; `tx` rolled back exactly once.
         unsafe {
             crate::dumps::moraine_dump_snapshots_free(committed, committed_len);
+            moraine_tx_rollback(tx);
+            moraine_detach(handle);
+        }
+    }
+
+    /// A stage and a dump race on one handle without corrupting it: DuckDB
+    /// drives concurrent pipelines through one staged tx — a Sink staging
+    /// while another scan's init dumps — and the handle serializes them.
+    #[test]
+    fn a_stage_and_a_dump_race_safely_on_one_handle() {
+        let lake = TempDir::new("staged-race");
+        let handle = attach_ok(lake.path());
+        let tx = begin(handle);
+
+        let tx_addr = tx as usize;
+        let stager = std::thread::spawn(move || {
+            let tx = tx_addr as *mut MoraineTxHandle;
+            let mut arena = StrArena::new();
+            for i in 0..200 {
+                stage_data_file_row(tx, &mut arena, i, 1, 1);
+            }
+        });
+
+        for _ in 0..200 {
+            let mut rows: *mut MoraineDataFileRow = ptr::null_mut();
+            let mut len: usize = 0;
+            let mut err = MoraineError::default();
+            // SAFETY: `tx` stays live until the join below; outputs are
+            // valid local slots.
+            let code = unsafe {
+                moraine_tx_dump_data_files(tx, &raw mut rows, &raw mut len, &raw mut err)
+            };
+            // SAFETY: `err.message` is null or was just written by the dump.
+            let err_message = unsafe { err.message.as_ref() };
+            assert_eq!(code, codes::OK, "dump failed: {err_message:?}");
+            // SAFETY: exactly the array the dump just wrote.
+            unsafe { crate::dumps::moraine_dump_data_files_free(rows, len) };
+        }
+        stager.join().expect("the staging thread panicked");
+
+        // SAFETY: `tx` rolled back exactly once; `handle` detached exactly
+        // once.
+        unsafe {
             moraine_tx_rollback(tx);
             moraine_detach(handle);
         }

@@ -280,7 +280,10 @@ fn run_two_attach_sql(store: &Path, data: &Path, sql: &str) -> String {
         .arg("-c")
         .arg(format!(
             "SET extension_directory='{}';",
-            extension_directory().display()
+            ducklake_ext_path()
+                .parent()
+                .unwrap_or(Path::new("."))
+                .display()
         ))
         .arg("-c")
         .arg("INSTALL ducklake;")

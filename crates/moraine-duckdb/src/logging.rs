@@ -1,34 +1,16 @@
-//! Carrying [`moraine`]'s `tracing` events into DuckDB's logger.
+//! Carrying [`moraine`]'s `tracing` events into DuckDB's logger. The
+//! extension is a separately loaded library with its own `tracing`, so it
+//! consumes its own events.
 //!
-//! The core emits `tracing` events; nothing in a loaded extension consumes
-//! them by default. The extension is a separate dynamically-loaded library
-//! with its own statically-linked `tracing`, so even a host process that
-//! installs a subscriber never sees them — the extension must consume its
-//! own.
+//! Routing rides on threads: a handle's runtime tags its worker threads at
+//! spawn, and its `block_on` wrappers tag the calling thread per call. An
+//! event is attributed to whatever handle tagged the thread it fires on
+//! and, while that handle has a sink registered, written straight through
+//! it as it fires.
 //!
-//! Events fire on the handle's tokio worker threads, where no DuckDB
-//! `ClientContext` is in scope. While a catalog is attached, the shim keeps
-//! a database-scoped sink registered for its handle
-//! (`Logger::Get(DatabaseInstance&)` is thread-safe), and the handle's
-//! events write straight through it as they fire — so a caller watching
-//! `duckdb_logs` from another connection sees a running commit's
-//! diagnostics while it runs, which is the case the logs exist to explain.
-//!
-//! `tracing` is process-global while handles are per-attach, so routing
-//! rides on threads: a handle's runtime tags its worker threads at spawn,
-//! and its `block_on` wrappers tag the calling thread for the duration of
-//! each call. An event is attributed to whatever handle tagged the thread
-//! it fires on, and delivered only to that handle's sink — one process may
-//! serve many attached lakes without one lake's diagnostics surfacing in
-//! another's logs.
-//!
-//! Events with no attributed sink — fired before the handle's sink
-//! registers, after it unregisters, or outside any handle's threads — fall
-//! back to a buffering `tracing` layer, which the shim drains at operation
-//! boundaries on threads that do hold a context, writing each record
-//! through `Logger::Get(context)`. The buffer is bounded and drops
-//! oldest-first: diagnostics must never grow without limit behind a caller
-//! that stops draining.
+//! Events with no attributed sink fall back to a bounded buffering layer
+//! (oldest dropped first), which the shim drains at operation boundaries on
+//! threads that hold a `ClientContext`.
 
 use std::{
     cell::Cell,
@@ -36,7 +18,7 @@ use std::{
     ffi::{CString, c_char, c_void},
     fmt::Write as _,
     sync::{
-        Mutex, OnceLock,
+        Mutex, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -64,14 +46,14 @@ thread_local! {
     static CURRENT_HANDLE: Cell<Option<HandleId>> = const { Cell::new(None) };
 }
 
-/// Tags this thread as belonging to `handle_id` for its whole life — for a
-/// runtime's worker threads, which exist only to run that handle's work.
+/// Tags this thread as belonging to `handle_id` for its whole life (for a
+/// runtime's worker threads).
 pub(crate) fn tag_thread_for_handle(handle_id: HandleId) {
     CURRENT_HANDLE.set(Some(handle_id));
 }
 
 /// Tags the current thread as running `handle_id`'s work until the guard
-/// drops — for `block_on` callers, which borrow a DuckDB thread per call.
+/// drops (for `block_on` callers).
 pub(crate) fn enter_handle(handle_id: HandleId) -> HandleGuard {
     let previous = CURRENT_HANDLE.replace(Some(handle_id));
     HandleGuard { previous }
@@ -88,9 +70,7 @@ impl Drop for HandleGuard {
     }
 }
 
-/// How many records the buffer holds before dropping the oldest. One
-/// commit's retry trace is a handful of events, so this spans many
-/// operations' worth of history.
+/// How many records the buffer holds before dropping the oldest.
 const LOG_BUFFER_CAPACITY: usize = 512;
 
 /// DuckDB's `LogLevel` values, which the sink forwards unchanged.
@@ -141,15 +121,20 @@ struct RegisteredSink {
 // SAFETY: `ctx` is opaque to this module; the registration contract makes
 // the shim keep it valid and callable from any thread until unregistered.
 unsafe impl Send for RegisteredSink {}
+// SAFETY: as above — a shared entry is only ever read, and its `sink` is
+// callable from any thread while it is registered.
+unsafe impl Sync for RegisteredSink {}
 
-fn sinks() -> &'static Mutex<Vec<RegisteredSink>> {
-    static SINKS: OnceLock<Mutex<Vec<RegisteredSink>>> = OnceLock::new();
-    SINKS.get_or_init(|| Mutex::new(Vec::new()))
+/// Registered sinks. Events take the read side; registration takes the
+/// write side.
+fn sinks() -> &'static RwLock<Vec<RegisteredSink>> {
+    static SINKS: OnceLock<RwLock<Vec<RegisteredSink>>> = OnceLock::new();
+    SINKS.get_or_init(|| RwLock::new(Vec::new()))
 }
 
 /// The lowest level captured, from `MORAINE_LOG` (`trace`, `debug`, `info`,
 /// `warn`, `error`); defaults to `info`. Events below it are never
-/// buffered, so a chatty level cannot evict the warnings that matter.
+/// buffered.
 fn capture_level() -> Level {
     static LEVEL: OnceLock<Level> = OnceLock::new();
     *LEVEL.get_or_init(|| match std::env::var("MORAINE_LOG") {
@@ -193,8 +178,7 @@ impl MessageVisitor {
         }
         self.fields.push_str(name);
         self.fields.push('=');
-        // Writing into a `String` is infallible; the result is ignored
-        // rather than unwrapped.
+        // Writing into a `String` is infallible.
         let _ = write!(self.fields, "{value:?}");
     }
 
@@ -240,20 +224,16 @@ where
             message: visitor.finish(metadata.target()),
         };
 
-        // An event attributed to a handle with a registered sink goes
-        // straight through instead of waiting in the buffer for a drain
-        // that, during a long commit, cannot come until the commit ends.
-        // The lock is held across the sink call so unregistration
-        // returning means no call is in flight.
+        // The read lock is held across the sink call, so unregistration
+        // (write lock) returning means no call is in flight.
         if let Some(handle) = record.handle
-            && let Ok(sinks) = sinks().lock()
+            && let Ok(sinks) = sinks().read()
+            && let Some(registered) = sinks.iter().find(|registered| registered.handle == handle)
         {
-            if let Some(registered) = sinks.iter().find(|registered| registered.handle == handle) {
-                // SAFETY: the registration contract keeps `sink` callable
-                // with `ctx` from any thread while the entry is present.
-                unsafe { write_record(registered.sink, registered.ctx, &record) };
-                return;
-            }
+            // SAFETY: the registration contract keeps `sink` callable
+            // with `ctx` from any thread while the entry is present.
+            unsafe { write_record(registered.sink, registered.ctx, &record) };
+            return;
         }
 
         let Ok(mut buffer) = buffer().lock() else {
@@ -268,13 +248,15 @@ where
 }
 
 /// Hands one record to `sink`, dropping a message that cannot cross as a C
-/// string — the level alone still tells the reader something happened.
+/// string.
 ///
 /// # Safety
 ///
 /// `sink` must be callable with `ctx` on this thread and must not unwind.
 unsafe fn write_record(sink: LogSinkFunction, ctx: *mut c_void, record: &LogRecord) {
-    let Ok(message) = CString::new(record.message.replace('\0', "")) else {
+    let Ok(message) = CString::new(record.message.as_str())
+        .or_else(|_| CString::new(record.message.replace('\0', "")))
+    else {
         return;
     };
     // SAFETY: caller contract; pointer valid for this call only.
@@ -293,8 +275,7 @@ unsafe fn drain_buffer_into(sink: LogSinkFunction, ctx: *mut c_void) {
     };
     let dropped = std::mem::take(&mut buffer.dropped);
     let records: Vec<LogRecord> = buffer.records.drain(..).collect();
-    // Released before calling out, so a sink that logs cannot deadlock on
-    // an event this same thread emits.
+    // Released before calling out, so a sink that logs cannot deadlock.
     drop(buffer);
 
     if dropped > 0 {
@@ -314,14 +295,13 @@ unsafe fn drain_buffer_into(sink: LogSinkFunction, ctx: *mut c_void) {
     }
 }
 
-/// Installs the buffering subscriber, once per process. Called on every
-/// `ATTACH`; every call after the first is a no-op, and a host that already
-/// installed a global subscriber wins — this never displaces one.
+/// Installs the buffering subscriber, once per process. Every call after
+/// the first is a no-op, and a host that already installed a global
+/// subscriber wins.
 pub fn install() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
-        // `try_init` fails only when a global subscriber already exists,
-        // which is a valid state, not an error to report.
+        // `try_init` fails only when a global subscriber already exists.
         let _ = tracing_subscriber::registry().with(BufferLayer).try_init();
     });
 }
@@ -331,12 +311,8 @@ pub fn install() {
 pub type MoraineLogSink =
     Option<unsafe extern "C" fn(ctx: *mut c_void, level: i32, message: *const c_char)>;
 
-/// Drains every buffered log record into `sink`, oldest first.
-///
-/// Called by the shim on a thread that holds a DuckDB `ClientContext`, so
-/// the records can be written through DuckDB's own logger. Never fails and
-/// never allocates on the caller's behalf: each message is borrowed for the
-/// duration of its `sink` call and freed after it returns.
+/// Drains every buffered log record into `sink`, oldest first. Never
+/// fails; each message is borrowed for the duration of its `sink` call.
 ///
 /// # Safety
 ///
@@ -352,14 +328,10 @@ pub unsafe extern "C" fn moraine_drain_logs(sink: MoraineLogSink, sink_ctx: *mut
 }
 
 /// Registers `sink` as the delivery target for `handle`'s events, first
-/// handing it whatever the buffer already holds from that handle so
-/// nothing captured before registration is lost.
-///
-/// While registered, the handle's events bypass the buffer and the
-/// boundary drains — records surface as they happen, which for a long
-/// commit is while the commit still runs. Other handles' events are
-/// untouched: each routes to its own sink or, without one, to the buffer.
-/// Registering again for the same handle replaces its sink.
+/// handing it whatever the buffer already holds from that handle. While
+/// registered, the handle's events bypass the buffer; other handles'
+/// events are untouched. Registering again for the same handle replaces
+/// its sink.
 ///
 /// # Safety
 ///
@@ -390,13 +362,11 @@ pub unsafe extern "C" fn moraine_register_log_sink(
 ///
 /// As [`moraine_register_log_sink`], minus the handle-pointer clause.
 pub(crate) unsafe fn register_sink(handle: HandleId, sink: LogSinkFunction, ctx: *mut c_void) {
-    let Ok(mut sinks) = sinks().lock() else {
+    let Ok(mut sinks) = sinks().write() else {
         return;
     };
-    // Flushed under the registry lock: an event on another thread either
-    // lands in the buffer before this flush, or waits and routes through
-    // the registered sink directly — either way it arrives exactly once,
-    // in order.
+    // Flushed under the registry lock, so a concurrent event arrives
+    // exactly once, in order.
     // SAFETY: caller contract.
     unsafe { flush_handle_backlog(handle, sink, ctx) };
 
@@ -430,15 +400,14 @@ pub unsafe extern "C" fn moraine_unregister_log_sink(handle: *const MoraineCatal
 
 /// [`moraine_unregister_log_sink`] with the routing identity in hand.
 pub(crate) fn unregister_sink(handle: HandleId) {
-    let Ok(mut sinks) = sinks().lock() else {
+    let Ok(mut sinks) = sinks().write() else {
         return;
     };
     sinks.retain(|registered| registered.handle != handle);
 }
 
 /// Hands every buffered record attributed to `handle` to `sink`, oldest
-/// first, leaving other handles' and unattributed records for their own
-/// sinks or the boundary drains.
+/// first, leaving other records in the buffer.
 ///
 /// # Safety
 ///
@@ -447,17 +416,12 @@ unsafe fn flush_handle_backlog(handle: HandleId, sink: LogSinkFunction, ctx: *mu
     let Ok(mut buffer) = buffer().lock() else {
         return;
     };
-    let records = std::mem::take(&mut buffer.records);
-    let mut matching = Vec::new();
-    for record in records {
-        if record.handle == Some(handle) {
-            matching.push(record);
-        } else {
-            buffer.records.push_back(record);
-        }
-    }
-    // Released before calling out, so a sink that logs cannot deadlock on
-    // an event this same thread emits.
+    let (matching, remaining): (VecDeque<LogRecord>, VecDeque<LogRecord>) =
+        std::mem::take(&mut buffer.records)
+            .into_iter()
+            .partition(|record| record.handle == Some(handle));
+    buffer.records = remaining;
+    // Released before calling out, so a sink that logs cannot deadlock.
     drop(buffer);
 
     for record in matching {
@@ -507,8 +471,6 @@ mod tests {
     }
 
     /// What the routing test's sinks received: `(ctx-as-number, message)`.
-    /// Process-wide like the registry itself; the test tells its records
-    /// apart by `ctx` and unique message text.
     fn received() -> &'static Mutex<Vec<(usize, String)>> {
         static RECEIVED: OnceLock<Mutex<Vec<(usize, String)>>> = OnceLock::new();
         RECEIVED.get_or_init(|| Mutex::new(Vec::new()))
@@ -528,8 +490,7 @@ mod tests {
     /// Events route by the handle that tagged the emitting thread: a
     /// registered handle's events push straight to its own sink, another
     /// handle's events do not touch it, and unregistering restores
-    /// buffering. One test, not several: the registry and buffer are
-    /// process-wide, so parallel tests would receive each other's records.
+    /// buffering. One test, since the registry and buffer are process-wide.
     #[test]
     fn events_route_to_the_emitting_handles_sink() {
         let ours = allocate_handle_id();

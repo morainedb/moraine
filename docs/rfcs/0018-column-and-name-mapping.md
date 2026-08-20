@@ -46,9 +46,19 @@ Non-goals:
   columns through its mapping is DuckLake's scanner's job. moraine stores
   and serves.
 - **Physical deletion.** DuckLake deletes mapping rows only during snapshot
-  expiry (by `table_id`, then a referential orphan sweep). That is RFC 0007
-  work; this RFC records the contract so 0007 can honor it, and the served
-  tables stay insert-only until then.
+  expiry, by `table_id` for dropped tables and then a referential orphan
+  sweep over `ducklake_name_mapping`. moraine honors both. The record's
+  delete carries its key columns — `(mapping_id, table_id)` — and no
+  `end_snapshot`, mappings being unversioned, which makes it the one
+  unversioned kind on the hard-delete path.
+
+  The orphan sweep has nothing left to remove here. The name-mapping rows
+  are embedded in the record the first DELETE just reclaimed (RFC 0002), so
+  where a SQL catalog needs a second pass to collect rows its foreign key
+  never cascaded, this keyspace frees them with their parent. The sweep is
+  still *accepted* — DuckLake issues it either way — and lands as a no-op,
+  whether it arrives in the same transaction as the parent's delete or
+  after the parent is already gone.
 
 ## Background: the DuckLake contract
 

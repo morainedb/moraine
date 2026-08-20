@@ -8,9 +8,10 @@ Defines the public API of the `moraine` core crate: how a host opens a
 catalog, reads it, and commits changes to it. This is the third
 expensive-to-reverse decision the project requires an RFC for (key layout —
 RFC 0002/0005; commit protocol — RFC 0004; public API shape — here). The
-surface is three types — `Catalog` (the handle), `CatalogSnapshot` (an
-immutable materialized read view), and `Transaction` (the mutation handle passed to a
-commit closure) — over an error taxonomy with one variant per failure domain.
+surface is four types — `Catalog` (the read-write handle), `ReadOnlyCatalog`
+(the read surface a read-only attach gets, which `Catalog` derefs to),
+`CatalogSnapshot` (an immutable materialized read view), and `Transaction`
+(the mutation handle passed to a commit closure) — over an error taxonomy with one variant per failure domain.
 Writes go through a closure-with-retry model so the RFC 0002 single-`WriteBatch`
 atomicity invariant and conflict-retry loop live in the core, not duplicated in
 every host. SlateDB never appears in a public signature: the substrate is an
@@ -74,9 +75,21 @@ Three public types map onto the existing private modules (`catalog`, `store`,
 `transaction`). `store` stays entirely private; `lib.rs` re-exports the public types
 alongside `Error`/`Result`.
 
-- **`Catalog`** — the handle. Owns the `slatedb::Db` (private field).
-  Constructed once via `open`, cheap to clone (an `Arc` internally), drives
-  reads and commits. Lives in `catalog`.
+- **`ReadOnlyCatalog`** — the read surface, and the whole of it. Every read
+  is defined here once; it carries no mutator at all. Lives in `catalog`.
+- **`Catalog`** — the read-write handle. Owns the store handle (private
+  field), constructed via `open`, cheap to clone (an `Arc` internally). It
+  adds the mutators and reaches the reads through
+  `Deref<Target = ReadOnlyCatalog>`, so a writer serves the whole read
+  surface without restating a method of it.
+
+  **The mode is in the type.** `Catalog::open_read_only` returns a
+  `ReadOnlyCatalog`, so `commit` on a read-only handle is a compile error
+  rather than a runtime `Error::Constraint` — a `compile_fail` doctest on
+  `ReadOnlyCatalog` pins that, and the tests that used to assert the runtime
+  refusal are gone with it. The runtime check survives in exactly one place,
+  the extension shim, because a C ABI has one handle type and no types of
+  its own to refuse with; that is the boundary where a type argument ends.
 - **`CatalogSnapshot`** — an immutable, materialized read view built by
   scanning `current` (or `current` + the relevant `history` ranges, for time travel) per
   RFC 0002. All accessors are in-memory; after construction it never touches
@@ -86,6 +99,12 @@ alongside `Error`/`Result`.
   name→id resolution and validation, and adds the mutators. The commit
   machinery (retry, `WriteBatch` assembly, `current`↔`history` bookkeeping) lives in
   `transaction`; `Transaction` is its public face.
+
+Public catalog instants use `Timestamp`, a signed microsecond count from the
+Unix epoch. `SnapshotInfo::time`, `ScheduledDeletion::schedule_start`, and
+maintenance status pass start times carry that type so pre-epoch values and
+the full persisted `i64` range cross the core API unchanged. Storage records
+and host ABIs keep the raw microsecond count and convert only at the boundary.
 
 ### Front door
 
@@ -173,6 +192,31 @@ on. Rows of one chunk share one body and rows of one schema version share one
 schema, so each set of bytes is read and returned once however many rows
 reference it.
 
+`warm_tables(&[table])` is the one read that returns nothing: it pulls the
+`index` and `inline` ranges a lookup on those tables probes into the block
+cache (RFC 0009), for a host that knows which tables a query is about to
+touch. The same pass runs on its own, in the background, the first time a
+handle serves a lookup or inline read for a table.
+
+### Observability
+
+Two read-side counters sit beside the reads, both plain `Copy` structs
+marked `#[non_exhaustive]` so fields can be added without a break:
+
+- `cache_status()` (free function): the process-shared caches' capacity,
+  occupancy, and evictions. Its `row_summaries: RowSummaryOccupancy`
+  splits the auxiliary allowance's file row-id summaries out from the
+  Parquet footers they share it with — `range`, `roaring`, and `sorted`
+  counts of resident summaries by shape, and their `bytes` together, the
+  summary share of `auxiliary_metadata_occupancy_bytes`.
+- `ReadOnlyCatalog::object_store_tally()`: physical requests this handle
+  has issued since it attached. `main_*` and `wal_*` count what SlateDB
+  sent for the catalog store; `data_gets` and `data_bytes` count the byte
+  ranges the handle read from the data store — footers, row-id columns,
+  delete files, and scoped reads under `locate_row_ids`,
+  `warm_row_summaries`, backfill, index build, and commit-time index
+  maintenance. A footer or summary served from cache adds nothing.
+
 ### Writes: closure-with-retry
 
 ```rust
@@ -208,24 +252,11 @@ snapshot, and anything slow — writing Parquet, say — happens *before*
 is implicit — a successful `commit` produces one new snapshot; there is no
 explicit `begin_snapshot` verb.
 
-`commit_group` is the same surface for several closures at once:
-
-```rust
-let ids: Vec<SnapshotId> = catalog.commit_group(&[
-    &|tx: &mut Transaction| tx.create_schema("sales").map(|_| ()),
-    &|tx: &mut Transaction| tx.create_schema("ops").map(|_| ()),
-]).await?;
-```
-
-Members are `CommitMember`: a trait object, so one call can pass closures
-that do different things, and `Sync`, so a grouped commit is as spawnable
-as a lone one. Every contract above holds per member, purity included — a
-lost race re-runs the whole group. One snapshot id comes back per member,
-in member order.
-
-This is the explicit half of RFC 0004's group commit. The implicit half
-needs no API, since concurrent `commit` callers are batched without asking;
-either way the batching is invisible in what is returned here.
+Batching needs no API of its own: concurrent `commit` callers are chained
+into one slot without asking, bounded by
+`CatalogOptions::commit_batch_window`. The batching is invisible in what is
+returned here — every caller gets its own snapshot id, exactly as if it had
+committed alone.
 
 This closure/verb surface is the **embedding API** — one of RFC 0004's two
 commit front doors. The DuckDB extension (RFC 0006) does not call it: that
@@ -269,6 +300,12 @@ The public surface is hand-written domain types, decoupled from the
   `ColumnDef`, `DataFile`, `DeleteFile`, `PartitionSpec`, `PartitionColumnDef`,
   `SortSpec`, `SortKeyDef`, `ColumnStats`, `TableStats`, `OptionScope`,
   `TagTarget`, `InlineChunk`, `FlushedDataFile`, `RecentRow`.
+- **`DataStore`:** the `DATA_PATH` object store every data-file read takes
+  (`locate_row_ids`, `warm_row_summaries`, backfill, index build, staged
+  transactions), wrapping the `Arc<dyn ObjectStore>` with the identity the
+  footer and row-summary caches key on. Built once per store and cloned:
+  a durable store is named by its location, so cached footers outlive the
+  process; an in-memory store is named at random per `DataStore::new`.
 
 Keeping these separate from the wire types is what lets RFC 0002's protobuf
 field evolution stay an internal change instead of a public breaking one.

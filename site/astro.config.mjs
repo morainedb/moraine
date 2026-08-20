@@ -27,6 +27,7 @@ export default defineConfig({
 						{ slug: 'guide/getting-started' },
 						{ slug: 'guide/architecture' },
 						{ slug: 'guide/embedding' },
+						{ slug: 'guide/operating' },
 					],
 				},
 				{

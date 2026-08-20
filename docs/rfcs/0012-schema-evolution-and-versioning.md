@@ -262,12 +262,14 @@ real DuckLake catalog:
 
 Externally-written Parquet may not carry DuckLake field ids, so DuckLake
 maps physical columns to logical ones via `ducklake_column_mapping` and
-`ducklake_name_mapping`. These become new entity kinds under RFC 0002's
+`ducklake_name_mapping`. These are entity kinds under RFC 0002's
 key structure — `(tag, kind, u64 components)` tuples, keyed
 `table_id`-first so a table's mapping is one contiguous
-range — and are stored row-faithfully. The exact kinds and key components
-are added to RFC 0002's keyspace map as implementation reaches them, per
-that RFC's "added here as implementation reaches them" convention. A
+range — and are stored row-faithfully. RFC 0002's keyspace map pins the
+shape: one `mapping` kind keyed `table_id, mapping_id`, with the
+`ducklake_name_mapping` rows embedded in its value rather than given keys
+of their own, since they are pure child rows with no independent
+lifecycle. A
 mapping registration is **data-only** — it rides the data-file
 registration that carries it and does not bump `schema_version`
 (source-verified: mapping writes sit outside DuckLake's

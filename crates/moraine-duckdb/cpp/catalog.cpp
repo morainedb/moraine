@@ -555,7 +555,8 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckd
 		}
 		auto &moraine_tx = transaction.transaction->Cast<MoraineTransaction>();
 		auto entry = CreateInlineDataTable(*transaction.context, catalog, *this, moraine_catalog.Handle(),
-		                                   moraine_tx.StagedTx(), info, parsed->table_id, parsed->schema_version);
+		                                   moraine_tx.StagedTxForInline(), info, parsed->table_id,
+		                                   parsed->schema_version);
 		if (!entry) {
 			// IF NOT EXISTS against an already-registered schema version.
 			return nullptr;
@@ -634,7 +635,7 @@ void MoraineSchemaEntry::DropEntry(duckdb::ClientContext &context, duckdb::DropI
 			auto catalog_transaction = catalog.GetCatalogTransaction(context);
 			auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
 			MoraineError err {};
-			auto code = moraine_tx_stage_inline_schema_drop(moraine_tx.StagedTx(), parsed->table_id,
+			auto code = moraine_tx_stage_inline_schema_drop(moraine_tx.StagedTxForInline(), parsed->table_id,
 			                                                parsed->schema_version, &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
@@ -650,8 +651,8 @@ void MoraineSchemaEntry::Alter(duckdb::CatalogTransaction transaction, duckdb::A
 	throw duckdb::NotImplementedException("moraine: altering an entry is not supported (read-only catalog)");
 }
 
-MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandle *handle, std::string path,
-                               MaintenanceConfig maintenance)
+MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientContext &context,
+                               MoraineCatalogHandle *handle, std::string path, MaintenanceConfig maintenance)
     : duckdb::Catalog(db), handle_(handle), path_(std::move(path)) {
 	// A throw here would abandon a partially constructed object, whose
 	// destructor never runs — so the handle would leak with no
@@ -663,11 +664,12 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandl
 		std::string leader_bind = maintenance.leader_address;
 		std::string leader_advertise = maintenance.leader_advertise;
 		uint64_t leader_sessions = maintenance.leader_max_sessions;
-		scheduler_ = duckdb::make_uniq<MaintenanceScheduler>(db.GetDatabase(), db.GetName(), path_, handle_,
-		                                                     std::move(maintenance));
+		scheduler_ = duckdb::make_shared_ptr<MaintenanceScheduler>(db.GetDatabase(), db.GetName(), path_, handle_,
+		                                                           std::move(maintenance));
 		// A read-only attach never schedules — maintenance mutates, and
 		// a `DbReader` never opens a writer. The trigger refuses too.
 		if (!db.IsReadOnly()) {
+			BindMaintenanceScheduler(context, scheduler_);
 			scheduler_->Start();
 		}
 		if (lead) {
@@ -741,14 +743,16 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// ignores it afterward. `FLUSH_INTERVAL_MS` sets the WAL flush cadence; 0 on
 	// the ABI means "not given", so an explicit zero (flush continuously, no
 	// timer) is mapped to the ABI's continuous-flush sentinel (UINT64_MAX).
-	// `CACHE_DIR` is a local directory for SlateDB's on-disk object cache,
-	// which holds fetched object parts; it must outlive the moraine_attach
-	// call, so it lives in this scope. `CACHE_SIZE` bounds that cache in
-	// bytes, per attach rather than per directory; 0 on the ABI means "not
-	// given" and leaves the store's cap. `CACHE_PUTS` additionally fills
-	// that cache from the write path, so a flushed object is local without a
-	// later fetch, and `CACHE_PRELOAD` fills it as the attach opens. None of
-	// them touches the in-memory caches.
+	// `CACHE_DIR` is a local directory for the block cache's disk tier; it
+	// must outlive the moraine_attach call, so it lives in this scope.
+	// `CACHE_SIZE` bounds that directory and `CACHE_MEMORY` bounds the
+	// cache's memory; 0 on the ABI means "not given" for either. All three
+	// configure a cache the process shares rather than this attach's, so
+	// only the first attach in the process sets them — a later attach naming
+	// different ones is served what stands. `CACHE_PUTS` and `CACHE_PRELOAD`
+	// are per attach: the first admits the SST metadata this store writes as
+	// it is written, the second warms this store's bytes as the attach opens
+	// and defaults to 'l0'.
 	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
 	// time, so the open writes nothing at all; the ABI refuses it on a
 	// read-write attach.
@@ -756,8 +760,9 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	uint64_t flush_interval_ms = 0;
 	std::string cache_dir;
 	uint64_t cache_size_bytes = 0;
+	uint64_t cache_memory_bytes = 0;
 	bool cache_puts = false;
-	uint8_t cache_preload = 0;
+	uint8_t cache_preload = 1;
 	std::string checkpoint;
 	// DuckLake's `META_DATA_PATH` passthrough arrives here as `data_path`;
 	// it is the DATA_PATH the index scoped read and maintenance resolve data
@@ -790,13 +795,15 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			cache_dir = option.second.GetValue<std::string>();
 		} else if (name == "cache_size") {
 			cache_size_bytes = option.second.GetValue<uint64_t>();
+		} else if (name == "cache_memory") {
+			cache_memory_bytes = option.second.GetValue<uint64_t>();
 		} else if (name == "cache_puts") {
 			cache_puts = option.second.GetValue<bool>();
 		} else if (name == "cache_preload") {
 			// Spelled as a level rather than a flag: "l0" is bounded by how far
 			// the store has run since its last merge, "all" by the whole store.
 			auto level = duckdb::StringUtil::Lower(option.second.GetValue<std::string>());
-			if (level == "none") {
+			if (level == "none" || level == "off") {
 				cache_preload = 0;
 			} else if (level == "l0") {
 				cache_preload = 1;
@@ -804,7 +811,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 				cache_preload = 2;
 			} else {
 				throw duckdb::InvalidInputException(
-				    "moraine: CACHE_PRELOAD must be 'none', 'l0', or 'all'; got \"%s\"", level);
+				    "moraine: CACHE_PRELOAD must be 'none' (or 'off'), 'l0', or 'all'; got \"%s\"", level);
 			}
 		} else if (name == "checkpoint") {
 			checkpoint = option.second.GetValue<std::string>();
@@ -821,7 +828,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
-	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_preload, cache_puts,
+	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_memory_bytes,
+	                           cache_preload, cache_puts,
 	                           data_path.empty() ? nullptr : data_path.c_str(),
 	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
 	                           moraine_shim_is_interrupted, &context, &handle, &err);
@@ -838,7 +846,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
-	return duckdb::make_uniq<MoraineCatalog>(db, handle, info.path, std::move(maintenance));
+	return duckdb::make_uniq<MoraineCatalog>(db, context, handle, info.path, std::move(maintenance));
 }
 
 void MoraineCatalog::Initialize(bool load_builtin) {
@@ -1004,6 +1012,29 @@ std::string MoraineCatalog::GetDBPath() {
 	return path_;
 }
 
+std::shared_ptr<const MetadataRows> MoraineCatalog::HeldMetadataRows(const MetadataTableSpec &spec,
+                                                                     uint64_t snapshot_id,
+                                                                     uint64_t batch_seq) const {
+	std::lock_guard<std::mutex> guard(held_rows_lock_);
+	auto it = held_rows_.find(&spec);
+	if (it == held_rows_.end()) {
+		return nullptr;
+	}
+	// The whole stamp, not the snapshot id alone: a maintenance batch
+	// reuses the id while changing what a scan finds, so an id-keyed hit
+	// would serve the state that batch reclaimed.
+	if (it->second.snapshot_id != snapshot_id || it->second.batch_seq != batch_seq) {
+		return nullptr;
+	}
+	return it->second.rows;
+}
+
+void MoraineCatalog::HoldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id, uint64_t batch_seq,
+                                      std::shared_ptr<const MetadataRows> rows) {
+	std::lock_guard<std::mutex> guard(held_rows_lock_);
+	held_rows_[&spec] = HeldRows {snapshot_id, batch_seq, std::move(rows)};
+}
+
 void MoraineCatalog::OnDetach(duckdb::ClientContext &context) {
 	// The handle is deliberately *not* freed here: doing so would race a
 	// concurrent StartTransaction reading it via Handle(); only the
@@ -1011,7 +1042,8 @@ void MoraineCatalog::OnDetach(duckdb::ClientContext &context) {
 	// it issues SQL against a database that is being detached, so it is
 	// stopped and joined here, at the last point a live context proves
 	// nothing is mid-teardown. Stop is idempotent; the destructor repeats
-	// it for the paths that never reach this hook.
+	// it as a fallback; destruction of the last host context stops it before
+	// that context releases its database reference on the no-DETACH path.
 	if (scheduler_) {
 		scheduler_->Stop();
 	}

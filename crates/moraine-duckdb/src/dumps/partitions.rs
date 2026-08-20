@@ -82,7 +82,7 @@ pub unsafe extern "C" fn moraine_dump_partition_info(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_partition_info(catalog)),
+            moraine::ffi_support::dump_partition_info,
             partition_info_rows,
         )
     }
@@ -128,12 +128,10 @@ pub struct MorainePartitionColumnRow {
 pub(crate) fn partition_column_rows(
     rows: Vec<moraine::ffi_support::PartitionColumnRow>,
 ) -> Result<Vec<MorainePartitionColumnRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|row| {
-            let transform = to_c_string(&row.transform)?;
+        .map(|mut row| {
+            let transform = to_c_string(std::mem::take(&mut row.transform))?;
             Ok((row, transform))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -179,7 +177,7 @@ pub unsafe extern "C" fn moraine_dump_partition_columns(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_partition_column_rows(catalog)),
+            moraine::ffi_support::dump_partition_column_rows,
             partition_column_rows,
         )
     }
@@ -275,7 +273,7 @@ pub unsafe extern "C" fn moraine_dump_sort_info(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_sort_info(catalog)),
+            moraine::ffi_support::dump_sort_info,
             sort_info_rows,
         )
     }
@@ -322,15 +320,13 @@ pub struct MoraineSortExpressionRow {
 pub(crate) fn sort_expression_rows(
     rows: Vec<moraine::ffi_support::SortExpressionRow>,
 ) -> Result<Vec<MoraineSortExpressionRow>, AbiError> {
-    // Owned-first (see `moraine_dump_schemas`): every string in the
-    // whole batch converts before any raw pointer is minted.
     let owned = rows
         .into_iter()
-        .map(|row| {
-            let expression = to_c_string(&row.expression)?;
-            let dialect = to_c_string(&row.dialect)?;
-            let sort_direction = to_c_string(&row.sort_direction)?;
-            let null_order = to_c_string(&row.null_order)?;
+        .map(|mut row| {
+            let expression = to_c_string(std::mem::take(&mut row.expression))?;
+            let dialect = to_c_string(std::mem::take(&mut row.dialect))?;
+            let sort_direction = to_c_string(std::mem::take(&mut row.sort_direction))?;
+            let null_order = to_c_string(std::mem::take(&mut row.null_order))?;
             Ok((row, expression, dialect, sort_direction, null_order))
         })
         .collect::<Result<Vec<_>, AbiError>>()?;
@@ -380,7 +376,7 @@ pub unsafe extern "C" fn moraine_dump_sort_expressions(
             probe,
             probe_ctx,
             err,
-            |catalog| Box::pin(moraine::ffi_support::dump_sort_expression_rows(catalog)),
+            moraine::ffi_support::dump_sort_expression_rows,
             sort_expression_rows,
         )
     }

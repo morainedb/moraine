@@ -90,11 +90,13 @@ src/
 ├── lib.rs            # crate docs + re-exports only; no logic
 ├── error.rs          # thiserror-based Error enum + crate Result alias
 ├── catalog.rs        # DuckLake domain: snapshots, schemas, tables, data-file metadata
+├── data_file.rs      # Parquet layer: scoped reads of registered data files
 ├── store.rs          # SlateDB layer: key layout, value codec
 └── transaction.rs            # commit protocol: catalog transaction → atomic SlateDB write
 ```
 
-- **Layering:** `catalog` never touches SlateDB directly; `store` knows nothing about DuckLake semantics. The small API between them keeps catalog logic testable against an in-memory store and concentrates key-encoding decisions in one reviewable place.
+- **Layering:** `catalog` never touches SlateDB directly; `store` knows nothing about DuckLake semantics; `data_file` is the only module that reads Parquet, and knows nothing about either. The small API between them keeps catalog logic testable against an in-memory store and concentrates key-encoding decisions in one reviewable place.
+- **Two kinds of read:** `store` reads the catalog's own keyspace out of SlateDB; `data_file` reads the Parquet objects DuckLake registers, fetching only the columns and rows an index entry needs. Keeping them separate is what makes the second one auditable — a bounded projection is a different thing from a scan, and the boundary is where that stays visible.
 - **Module growth:** start as `foo.rs`; split into `foo.rs` + `foo/` submodules when needed (no `mod.rs` files — enforced via clippy `mod_module_files`).
 - **Visibility:** private by default; `pub` only what `lib.rs` deliberately re-exports. `#![warn(missing_docs)]` on the core crate.
 - **Docs teach by example:** the crate root doc is a worked example, not a summary; key public items carry doctests (compiled by CI, so they can't rot); `examples/` holds at least one runnable end-to-end program. This is the single strongest habit of the best crates.
@@ -135,10 +137,19 @@ One workflow (`ci.yml`), parallel jobs, all required:
 | `clippy` | `cargo clippy --workspace --all-targets`, warnings denied |
 | `test` | `cargo test --workspace --locked` (Unit + Integration, doctests, examples) |
 | `doc` | `cargo doc` with `RUSTDOCFLAGS="-D warnings"` |
-| `deny` | `cargo deny check` |
+| `deny` | `cargo deny check -D advisory-not-detected` — a stale `ignore` (one whose advisory no longer matches any crate) is otherwise only a warning and still exits 0, so a suppression can outlive the vulnerability it was written for |
 | `e2e` | `cargo xtask e2e` (E2E; separate job so it doesn't gate fast feedback) |
 
-Toolchain pinned via `rust-toolchain.toml`. `rust-version` declared in workspace metadata; a dedicated MSRV-check job is deferred until there are external users. Rust build caching (e.g. `Swatinem/rust-cache`) for CI speed. Workflows set a `concurrency` group with cancel-in-progress so superseded pushes don't burn CI minutes. Dependabot keeps both cargo dependencies and pinned GitHub Actions current (weekly, so `deny` advisories surface as PRs rather than red CI).
+A `fuzz/` directory holds the `cargo-fuzz` targets: `key_decode` and
+`record_decode` over the `store` codecs and the read path, and
+`crash_recovery` over the commit protocol's atomicity guarantee (RFC 0011).
+It is its own workspace — the targets need nightly's sanitizer and coverage
+instrumentation, and must stay out of the ordinary build, test, and lint
+pass — and runs on a nightly schedule rather than per-PR, a fuzz run being
+a search rather than a check. Its corpus is cached between runs so each
+night resumes the search instead of restarting it.
+
+Toolchain pinned via `rust-toolchain.toml`. `rust-version` declared in workspace metadata and gated by an MSRV job that reads the declared value and compiles the workspace with that toolchain, so the promise cannot drift from what builds. Rust build caching (e.g. `Swatinem/rust-cache`) for CI speed. Workflows set a `concurrency` group with cancel-in-progress so superseded pushes don't burn CI minutes. Dependabot keeps both cargo dependencies and pinned GitHub Actions current (weekly, so `deny` advisories surface as PRs rather than red CI).
 
 ## Release and git conventions
 

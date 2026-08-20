@@ -37,9 +37,10 @@ Non-goals:
   the newest-writer-wins hazard — RFC 0004. This RFC consumes that topology;
   it does not re-argue it.
 - **The core read-only *handle* shape** — which operations a read-only
-  `Catalog` exposes, and how `commit` is typed out rather than failing at
-  runtime — RFC 0003. This RFC specifies only the attach→mode plumbing that
-  decides *which* handle is opened.
+  handle exposes, and how `commit` is typed out rather than failing at
+  runtime — RFC 0003, where it is now built as `ReadOnlyCatalog`. This RFC
+  specifies only the attach→mode plumbing that decides *which* handle is
+  opened.
 - **The extension surface mechanics** (StorageExtension registration, the
   C ABI, the sync↔async bridge) — RFC 0006. This RFC adds one bit to that
   surface and leaves the rest.
@@ -72,11 +73,12 @@ split, and every typed read runs through a `ReadHandle` that dispatches to a
 transaction (read-write) or the reader (read-only). The shim reads DuckDB's
 `AttachOptions::access_mode` and forwards it. Verified live: standalone
 `moraine: (READ_ONLY)` and a read-only DuckLake chain both read through the
-`DbReader` (`ducklake_load.rs`), and the core suite pins reads, the
-write-rejection (typed `Constraint`, not a fence), and that a reader never
-fences the live writer (`tests/catalog.rs`). Writes on a read-only catalog
-return `Error::Constraint`; the fully typed-out read-only handle is RFC 0003's
-concern.
+`DbReader` (`ducklake_load.rs`), and the core suite pins reads and that a
+reader never fences the live writer (`tests/catalog.rs`). A write on a
+read-only catalog is no longer a runtime rejection to test for: `open_read_only`
+returns RFC 0003's `ReadOnlyCatalog`, which carries no mutator, so the
+attempt does not compile. The shim keeps a runtime refusal because its
+handle is one C type for both modes.
 
 **Losing the store is typed, not opaque.** When the rule above is broken —
 a second process attaches read-write — the incumbent's next operation fails

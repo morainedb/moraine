@@ -15,7 +15,7 @@ use crate::helpers::*;
 /// consequence of the reader having stopped polling the manifest, the same
 /// thing that makes the attach write-free.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn checkpoint_pinned_attach_serves_a_fixed_cut() {
     let dir = TempDir::new("ckpt-store");
     let data_dir = TempDir::new("ckpt-data");
@@ -102,7 +102,7 @@ fn checkpoint_pinned_attach_serves_a_fixed_cut() {
 /// cut), and an id the manifest does not carry (a reader told to serve a
 /// fixed cut must never quietly serve a different one).
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn checkpoint_id_is_refused_read_write_and_when_unknown() {
     let dir = TempDir::new("ckpt-refuse-store");
     let data_dir = TempDir::new("ckpt-refuse-data");
@@ -156,7 +156,7 @@ fn checkpoint_id_is_refused_read_write_and_when_unknown() {
 /// checkpoint, so it *does* add a manifest object. That contrast is the
 /// point of the option.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn a_pinned_attach_leaves_the_store_untouched() {
     let dir = TempDir::new("ckpt-ro-store");
     let data_dir = TempDir::new("ckpt-ro-data");

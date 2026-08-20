@@ -18,6 +18,8 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 arrow = { workspace = true, features = ["ffi", "ipc"] }
+bytes = { workspace = true }
+futures = { workspace = true }
 moraine = { workspace = true, features = ["leader"] }
 object_store = { workspace = true, features = ["aws"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }

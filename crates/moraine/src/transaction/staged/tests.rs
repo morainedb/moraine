@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use object_store::memory::InMemory;
 
 use super::*;
-use crate::catalog::{Catalog, CatalogOptions};
+use crate::{
+    catalog::{Catalog, CatalogOptions},
+    store::handle::ScanShape,
+};
 
 fn schema_row(id: u64, name: &str, begin: u64) -> Vec<Cell> {
     vec![
@@ -512,7 +516,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
             chunk_seq: 0,
         }
     );
-    assert_eq!(chunks[0].1.body, b"chunk-a");
+    assert_eq!(chunks[0].1.body, Bytes::from_static(b"chunk-a"));
     assert_eq!(chunks[0].1.row_id_start, 0);
     assert_eq!(chunks[0].1.row_count, 2);
     assert_eq!(
@@ -524,7 +528,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
             chunk_seq: 1,
         }
     );
-    assert_eq!(chunks[1].1.body, b"chunk-b");
+    assert_eq!(chunks[1].1.body, Bytes::from_static(b"chunk-b"));
 
     let schemas = store_inline::scan_inline_schemas(dump.handle(), dump.overlay(), 1)
         .await
@@ -534,7 +538,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
         vec![(
             0,
             proto::InlineSchemaValue {
-                arrow_schema: b"schema".to_vec(),
+                arrow_schema: Bytes::from_static(b"schema"),
             }
         )]
     );
@@ -586,7 +590,7 @@ async fn stages_inline_idel_and_row_disappears_from_table_scan_after_it() {
     let chunks = store_inline::scan_inline_chunks(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
-    let inline_deletes = store_inline::scan_inline_inline_deletes(dump.handle(), dump.overlay(), 1)
+    let inline_deletes = store_inline::scan_inline_deletes(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
     dump.finish().await;
@@ -616,7 +620,7 @@ async fn stages_inline_idel_and_row_disappears_from_table_scan_after_it() {
 
 /// The schema-only Arrow IPC stream stored once per inline schema
 /// version, matching what the extension's encoder produces.
-fn inline_schema_ipc(schema: &arrow::datatypes::Schema) -> Vec<u8> {
+pub(super) fn inline_schema_ipc(schema: &arrow::datatypes::Schema) -> Vec<u8> {
     let mut buffer = Vec::new();
     {
         let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, schema).unwrap();
@@ -856,7 +860,11 @@ async fn index_entries_overlaid(
     let dump = catalog.begin_dump().await.unwrap();
     let mut merged: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
         std::collections::BTreeMap::new();
-    let mut iter = dump.handle().scan_prefix(prefix.clone(), ..).await.unwrap();
+    let mut iter = dump
+        .handle()
+        .scan_prefix(prefix.clone(), .., ScanShape::Bulk)
+        .await
+        .unwrap();
     while let Some(entry) = iter.next().await.unwrap() {
         merged.insert(entry.key.to_vec(), entry.value.to_vec());
     }
@@ -1049,7 +1057,18 @@ async fn inline_row_delete_removes_its_non_unique_index_entry() {
 /// written object's size — the maintenance read locates the footer by
 /// the recorded `file_size_bytes`, so fixtures must record the truth,
 /// exactly as DuckLake records the real written size.
-async fn write_parquet(store: &InMemory, path: &str, batch: &arrow::array::RecordBatch) -> u64 {
+#[derive(Clone, Copy)]
+struct ParquetSize {
+    file: u64,
+    footer: u64,
+}
+
+/// Writes `batch` to `path` and returns the two sizes DuckLake records.
+async fn write_parquet(
+    store: &InMemory,
+    path: &str,
+    batch: &arrow::array::RecordBatch,
+) -> ParquetSize {
     use object_store::ObjectStoreExt;
 
     let mut buffer = Vec::new();
@@ -1059,12 +1078,16 @@ async fn write_parquet(store: &InMemory, path: &str, batch: &arrow::array::Recor
         writer.write(batch).unwrap();
         writer.close().unwrap();
     }
-    let object_len = u64::try_from(buffer.len()).unwrap();
+    let footer_offset = buffer.len() - 8;
+    let footer = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
+    let file = u64::try_from(buffer.len()).unwrap();
     store
         .put(&object_store::path::Path::from(path), buffer.into())
         .await
         .unwrap();
-    object_len
+    ParquetSize { file, footer }
 }
 
 /// A `ducklake_data_file` row for a file of `record_count` rows and
@@ -1096,11 +1119,13 @@ async fn register_indexed_data_file(catalog: &Catalog, values: &[i64]) -> Arc<In
     let store = Arc::new(InMemory::new());
     let (_, batch) = bigint_batch(values);
     // `s/` and `t/` are the bootstrap schema and table path prefixes.
-    let file_size = write_parquet(&store, "main/t/data.parquet", &batch).await;
+    let file_size = write_parquet(&store, "main/t/data.parquet", &batch)
+        .await
+        .file;
 
     let mut tx = catalog
         .begin_staged(
-            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            Some(crate::data_file::DataStore::new(store.clone())),
             String::new(),
         )
         .await
@@ -1149,7 +1174,7 @@ async fn write_parquet_with_row_ids(
         ],
     )
     .unwrap();
-    write_parquet(store, path, &batch).await
+    write_parquet(store, path, &batch).await.file
 }
 
 /// A `ducklake_data_file` row for a rewrite file: per-row ids
@@ -1198,7 +1223,7 @@ async fn rewrite_registration_re_derives_entries_idempotently() {
             .await;
     let mut tx = catalog
         .begin_staged(
-            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            Some(crate::data_file::DataStore::new(store.clone())),
             String::new(),
         )
         .await
@@ -1243,7 +1268,7 @@ async fn update_shaped_registration_adds_changed_value_entries() {
     let size = write_parquet_with_row_ids(&store, "main/t/update.parquet", &[99], &[1]).await;
     let mut tx = catalog
         .begin_staged(
-            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            Some(crate::data_file::DataStore::new(store.clone())),
             String::new(),
         )
         .await
@@ -1283,7 +1308,7 @@ async fn embedded_ids_win_over_a_recorded_dense_start() {
     cells[11] = Cell::U64(100); // row_id_start recorded, as a flush does
     let mut tx = catalog
         .begin_staged(
-            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            Some(crate::data_file::DataStore::new(store.clone())),
             String::new(),
         )
         .await
@@ -1322,7 +1347,7 @@ async fn register_per_row_id_file(catalog: &Catalog) -> Arc<InMemory> {
             .await;
     let mut tx = catalog
         .begin_staged(
-            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            Some(crate::data_file::DataStore::new(store.clone())),
             String::new(),
         )
         .await
@@ -1369,13 +1394,10 @@ async fn delete_file_against_per_row_id_target_removes_named_positions() {
         ],
     )
     .unwrap();
-    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+    let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let mut tx = catalog
-        .begin_staged(
-            Some(store as std::sync::Arc<dyn object_store::ObjectStore>),
-            String::new(),
-        )
+        .begin_staged(Some(crate::data_file::DataStore::new(store)), String::new())
         .await
         .unwrap();
     tx.stage(RowOperation::Insert {
@@ -1390,8 +1412,8 @@ async fn delete_file_against_per_row_id_target_removes_named_positions() {
             Cell::Bool(true),
             Cell::Str("parquet".into()),
             Cell::U64(1), // delete_count
-            Cell::U64(512),
-            Cell::U64(64),
+            Cell::U64(delete_size.file),
+            Cell::U64(delete_size.footer),
             Cell::Null,
             Cell::Null,
         ],
@@ -1425,10 +1447,7 @@ async fn inline_file_delete_against_per_row_id_target_removes_the_row() {
     // Position 1 holds value 20 (embedded id 9); the delete names the
     // position, and its entry resolves out of the file.
     let mut tx = catalog
-        .begin_staged(
-            Some(store as std::sync::Arc<dyn object_store::ObjectStore>),
-            String::new(),
-        )
+        .begin_staged(Some(crate::data_file::DataStore::new(store)), String::new())
         .await
         .unwrap();
     tx.stage(RowOperation::InlineFileDelete {
@@ -1464,7 +1483,12 @@ async fn backfill_derives_per_row_id_file_entries_under_embedded_ids() {
     let store = register_per_row_id_file(&catalog).await;
 
     let entries = catalog
-        .scoped_backfill_entries(store, "", TableId::new(1), &[ColumnId::new(1)])
+        .scoped_backfill_entries(
+            crate::data_file::DataStore::new(store),
+            "",
+            TableId::new(1),
+            &[ColumnId::new(1)],
+        )
         .await
         .unwrap();
     let mut row_ids: Vec<u64> = entries.iter().map(|e| e.row_id).collect();
@@ -1565,7 +1589,7 @@ async fn create_index_backfills_inline_null_rows() {
         .await
         .unwrap();
     assert_eq!(
-        nulls.into_iter().map(|hit| hit.row_id).collect::<Vec<_>>(),
+        nulls,
         vec![1],
         "IS NULL finds the pre-existing inline NULL row"
     );
@@ -1600,11 +1624,11 @@ async fn scoped_backfill_excludes_delete_file_rows() {
         ],
     )
     .unwrap();
-    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+    let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let mut tx = catalog
         .begin_staged(
-            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            Some(crate::data_file::DataStore::new(store.clone())),
             String::new(),
         )
         .await
@@ -1621,8 +1645,8 @@ async fn scoped_backfill_excludes_delete_file_rows() {
             Cell::Bool(true),
             Cell::Str("parquet".into()),
             Cell::U64(1),
-            Cell::U64(512),
-            Cell::U64(64),
+            Cell::U64(delete_size.file),
+            Cell::U64(delete_size.footer),
             Cell::Null,
             Cell::Null,
         ],
@@ -1639,7 +1663,12 @@ async fn scoped_backfill_excludes_delete_file_rows() {
 
     // Backfill must exclude the dead row 1 (value 20).
     let entries = catalog
-        .scoped_backfill_entries(store, "", TableId::new(1), &[ColumnId::new(1)])
+        .scoped_backfill_entries(
+            crate::data_file::DataStore::new(store),
+            "",
+            TableId::new(1),
+            &[ColumnId::new(1)],
+        )
         .await
         .unwrap();
     let mut row_ids: Vec<u64> = entries.iter().map(|entry| entry.row_id).collect();
@@ -1664,10 +1693,7 @@ async fn inlined_file_delete_removes_the_killed_rows_index_entry() {
     );
 
     let mut tx = catalog
-        .begin_staged(
-            Some(store as std::sync::Arc<dyn object_store::ObjectStore>),
-            String::new(),
-        )
+        .begin_staged(Some(crate::data_file::DataStore::new(store)), String::new())
         .await
         .unwrap();
     tx.stage(RowOperation::InlineFileDelete {
@@ -1717,13 +1743,10 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
         ],
     )
     .unwrap();
-    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+    let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let mut tx = catalog
-        .begin_staged(
-            Some(store as std::sync::Arc<dyn object_store::ObjectStore>),
-            String::new(),
-        )
+        .begin_staged(Some(crate::data_file::DataStore::new(store)), String::new())
         .await
         .unwrap();
     tx.stage(RowOperation::Insert {
@@ -1738,8 +1761,8 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
             Cell::Bool(true),
             Cell::Str("parquet".into()),
             Cell::U64(2), // delete_count
-            Cell::U64(512),
-            Cell::U64(64),
+            Cell::U64(delete_size.file),
+            Cell::U64(delete_size.footer),
             Cell::Null,
             Cell::Null,
         ],
@@ -1786,13 +1809,10 @@ async fn registered_delete_file_naming_an_out_of_range_position_is_refused() {
         ],
     )
     .unwrap();
-    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+    let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
     let mut tx = catalog
-        .begin_staged(
-            Some(store as std::sync::Arc<dyn object_store::ObjectStore>),
-            String::new(),
-        )
+        .begin_staged(Some(crate::data_file::DataStore::new(store)), String::new())
         .await
         .unwrap();
     tx.stage(RowOperation::Insert {
@@ -1807,8 +1827,8 @@ async fn registered_delete_file_naming_an_out_of_range_position_is_refused() {
             Cell::Bool(true),
             Cell::Str("parquet".into()),
             Cell::U64(1), // delete_count
-            Cell::U64(512),
-            Cell::U64(64),
+            Cell::U64(delete_size.file),
+            Cell::U64(delete_size.footer),
             Cell::Null,
             Cell::Null,
         ],
@@ -1891,7 +1911,7 @@ async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
     let chunks = store_inline::scan_inline_chunks(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
-    let inline_deletes = store_inline::scan_inline_inline_deletes(dump.handle(), dump.overlay(), 1)
+    let inline_deletes = store_inline::scan_inline_deletes(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
     dump.finish().await;
@@ -2032,7 +2052,7 @@ async fn stages_inline_schema_drop_removes_only_the_named_schema_version() {
         vec![(
             1,
             proto::InlineSchemaValue {
-                arrow_schema: b"schema-v1".to_vec()
+                arrow_schema: Bytes::from_static(b"schema-v1")
             }
         )]
     );
@@ -4140,9 +4160,14 @@ async fn visible_option_scopes_overlay_last_write_wins() {
         Some("second")
     );
 
+    // The delete carries the key cells alone, as the shim sends them.
     tx.stage(RowOperation::Delete {
         table: TableKind::Metadata,
-        cells: option(2, 9, "k", "second"),
+        cells: vec![
+            Cell::Str("k".to_string()),
+            Cell::Str("table".to_string()),
+            Cell::U64(9),
+        ],
     });
     let scopes = tx.visible_option_scopes().await.unwrap();
     assert!(

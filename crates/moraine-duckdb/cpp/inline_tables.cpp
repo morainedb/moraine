@@ -103,8 +103,8 @@ std::optional<uint64_t> ParseInlinedDeleteTableName(const std::string &name) {
 	return ParseTrailingU64(name, prefix.size());
 }
 
-std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
-                                        const std::vector<DecodedInlineColumn> &user_columns) {
+MoraineArrowBytes EncodeInlineSchema(duckdb::ClientContext &context,
+                                     const std::vector<DecodedInlineColumn> &user_columns) {
 	duckdb::vector<duckdb::LogicalType> types;
 	duckdb::vector<std::string> names;
 	types.reserve(user_columns.size());
@@ -142,9 +142,7 @@ std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
 	if (moraine_arrow_encode_schema(&c_schema, &bytes, &err) != 0) {
 		ThrowMoraineError(err);
 	}
-	std::vector<uint8_t> out(bytes.data, bytes.data + bytes.len);
-	moraine_arrow_bytes_free(bytes);
-	return out;
+	return bytes;
 }
 
 std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &context, const uint8_t *data, size_t len) {
@@ -173,8 +171,8 @@ std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &conte
 	return result;
 }
 
-std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::DataChunk &chunk,
-                                           duckdb::idx_t user_col_start) {
+MoraineArrowBytes EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::DataChunk &chunk,
+                                        duckdb::idx_t user_col_start) {
 	auto user_count = chunk.ColumnCount() - user_col_start;
 	duckdb::vector<duckdb::LogicalType> types;
 	duckdb::vector<std::string> names;
@@ -212,18 +210,27 @@ std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckd
 	if (moraine_arrow_encode_chunk(&c_schema, &c_array, &bytes, &err) != 0) {
 		ThrowMoraineError(err);
 	}
-	std::vector<uint8_t> out(bytes.data, bytes.data + bytes.len);
-	moraine_arrow_bytes_free(bytes);
-	return out;
+	return bytes;
+}
+
+DecodedInlineSchema::DecodedInlineSchema(const uint8_t *schema_ipc, size_t schema_ipc_len) : handle_(nullptr) {
+	MoraineError err {};
+	if (moraine_arrow_schema_decode(schema_ipc, schema_ipc_len, &handle_, &err) != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+}
+
+DecodedInlineSchema::~DecodedInlineSchema() {
+	moraine_arrow_schema_free(handle_);
 }
 
 std::vector<duckdb::unique_ptr<duckdb::DataChunk>>
-DecodeInlineChunkPieces(duckdb::ClientContext &context, const uint8_t *schema_ipc, size_t schema_ipc_len,
-                        const uint8_t *data, size_t len, const std::vector<duckdb::LogicalType> &user_types) {
+DecodeInlineChunkPieces(duckdb::ClientContext &context, const DecodedInlineSchema &schema, MoraineInlineChunk &chunk,
+                        const std::vector<duckdb::LogicalType> &user_types) {
 	ArrowSchema c_schema;
 	ArrowArray c_array;
 	MoraineError err {};
-	if (moraine_arrow_decode_body(schema_ipc, schema_ipc_len, data, len, &c_schema, &c_array, &err) != 0) {
+	if (moraine_arrow_decode_inline_chunk_with_schema(schema.Get(), &chunk, &c_schema, &c_array, &err) != 0) {
 		ThrowMoraineError(err);
 	}
 
@@ -323,47 +330,48 @@ struct InlineDataScan {
 // `ducklake_inlined_data_<t>_<v>`.
 constexpr duckdb::column_t kInlineUserColumnStart = 3;
 
-// Materializes every live row of `table_id` (the `ForFlush` scan at the
-// maximum snapshot) so DuckDB's query engine applies the WHERE clause; the
-// shim serves raw rows, never interprets the predicate.
+// Materializes every live row of `(table_id, schema_version)` (the
+// `ForFlush` scan at the maximum snapshot) so DuckDB's query engine applies
+// the WHERE clause; the shim serves raw rows, never interprets the
+// predicate. The scan is version-scoped in the core, so a schema-evolved
+// table's other versions cost this entry neither rows nor chunk bodies.
 //
 // `with_values` decodes the chunk bodies the rows point into. A caller that
 // needs only `row_id`/`begin_snapshot` — resolving a rowid back to its row
 // for an UPDATE or DELETE — passes `false` and touches no Arrow body at all.
-//
-// `moraine_inline_scan` scans the whole `table_id` across every schema
-// version and a returned row carries no schema-version tag, so decoding
-// every body against `user_types` is only correct when `table_id` has a
-// single schema version live. A table that underwent a schema change while
-// still holding unflushed inlined data under the old version would misdecode
-// here.
 InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHandle *handle, uint64_t table_id,
                               uint64_t schema_version, const std::vector<duckdb::LogicalType> &user_types,
                               bool with_values) {
 	// This entry serves one `(table_id, schema_version)`; body-only chunks of
 	// that version decode against its schema-only stream (`inline/schema`).
-	// The scan below spans every version of the table, so chunks of other
-	// versions — a schema-evolved table holds several — are filtered out.
+	//
+	// Read on the first body decode and not before, so a caller that decodes
+	// nothing reads nothing: a metadata-only scan touches no body by
+	// definition, and a flushed table has none left to touch — its
+	// registration outlives its rows, so every read of the base table scans
+	// it. `schemas` owns the bytes `decoded_schema` is built from, so it
+	// outlives every decode below.
 	OwnedArray<MoraineInlineSchemaRow> schemas(moraine_inline_schemas_free);
-	MoraineError schema_err {};
-	if (moraine_inline_schemas(handle, table_id, schemas.OutItems(), schemas.OutLen(), moraine_shim_is_interrupted,
-	                           &context, &schema_err) != MORAINE_OK) {
-		ThrowMoraineError(schema_err);
-	}
-	const uint8_t *schema_ipc = nullptr;
-	size_t schema_ipc_len = 0;
-	for (auto &s : schemas) {
-		if (s.schema_version == schema_version) {
-			schema_ipc = s.arrow_schema;
-			schema_ipc_len = s.arrow_schema_len;
-			break;
+	duckdb::unique_ptr<DecodedInlineSchema> decoded_schema;
+	auto schema_to_decode_against = [&]() -> const DecodedInlineSchema & {
+		if (decoded_schema) {
+			return *decoded_schema;
 		}
-	}
-	if (!schema_ipc) {
+		MoraineError schema_err {};
+		if (moraine_inline_schemas(handle, table_id, schemas.OutItems(), schemas.OutLen(), moraine_shim_is_interrupted,
+		                           &context, &schema_err) != MORAINE_OK) {
+			ThrowMoraineError(schema_err);
+		}
+		for (auto &s : schemas) {
+			if (s.schema_version == schema_version) {
+				decoded_schema = duckdb::make_uniq<DecodedInlineSchema>(s.arrow_schema, s.arrow_schema_len);
+				return *decoded_schema;
+			}
+		}
 		throw duckdb::InternalException("moraine: no inline schema recorded for table %llu schema version %llu",
 		                                static_cast<unsigned long long>(table_id),
 		                                static_cast<unsigned long long>(schema_version));
-	}
+	};
 
 	// The scan returns rows plus the deduplicated chunk bodies they
 	// reference; both arrays are owned together and freed by the one
@@ -379,7 +387,7 @@ InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHand
 	} scan;
 	MoraineError err {};
 	auto code = moraine_inline_scan(handle, table_id, /* SCAN_FOR_FLUSH */ 3, std::numeric_limits<uint64_t>::max(), 0,
-	                                &scan.rows, &scan.rows_len, &scan.chunks, &scan.chunks_len,
+	                                schema_version, &scan.rows, &scan.rows_len, &scan.chunks, &scan.chunks_len,
 	                                moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -395,11 +403,10 @@ InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHand
 	std::vector<duckdb::idx_t> chunk_rows(scan.chunks_len, 0);
 	for (size_t i = 0; i < scan.rows_len; i++) {
 		auto &r = scan.rows[i];
-		// The scan spans every schema version of the table; this entry serves
-		// exactly its own version's `ducklake_inlined_data_<t>_<v>`, so a chunk
-		// from another version (its columns and schema differ) is not ours.
+		// The core scoped the scan to this version; another version's chunk
+		// would decode against the wrong schema.
 		if (r.schema_version != schema_version) {
-			continue;
+			throw duckdb::InternalException("moraine: a version-scoped inline scan returned a row of another version");
 		}
 		if (r.chunk_index >= scan.chunks_len) {
 			throw duckdb::InternalException("moraine: inline scan chunk index out of range");
@@ -409,8 +416,7 @@ InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHand
 		if (with_values) {
 			if (first_piece[r.chunk_index] == std::numeric_limits<size_t>::max()) {
 				auto &chunk = scan.chunks[r.chunk_index];
-				auto decoded = DecodeInlineChunkPieces(context, schema_ipc, schema_ipc_len, chunk.body, chunk.body_len,
-				                                       user_types);
+				auto decoded = DecodeInlineChunkPieces(context, schema_to_decode_against(), chunk, user_types);
 				first_piece[r.chunk_index] = result.pieces.size();
 				chunk_rows[r.chunk_index] = 0;
 				for (auto &p : decoded) {
@@ -449,7 +455,7 @@ struct InlineDataScanBindData : public duckdb::FunctionData {
 		auto result = duckdb::make_uniq<InlineDataScanBindData>();
 		result->scan = scan;
 		result->table_entry = table_entry;
-		return std::move(result);
+		return result;
 	}
 
 	bool Equals(const duckdb::FunctionData &other) const override {
@@ -474,7 +480,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InlineDataScanInitGlobal(du
                                                                               duckdb::TableFunctionInitInput &input) {
 	auto state = duckdb::make_uniq<InlineDataScanGlobalState>();
 	state->column_ids = input.column_ids;
-	return std::move(state);
+	return state;
 }
 
 duckdb::BindInfo InlineDataScanBindInfo(const duckdb::optional_ptr<duckdb::FunctionData> bind_data) {
@@ -547,12 +553,12 @@ void InlineDataScanImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &dat
 		auto col_id = state.column_ids[out_col];
 		auto &target = output.data[out_col];
 		if (col_id == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
-			// The rowid is the row's index in this scan's row list, which the
-			// UPDATE/DELETE sinks resolve back by re-materializing the same
-			// list — metadata only, so nothing is decoded twice.
+			// The row's own id, not its position in this scan. A tombstoning
+			// sink stages that id directly, so inverting a rowid costs no
+			// second pass over the table.
 			auto rowids = duckdb::FlatVector::GetData<int64_t>(target);
 			for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
-				rowids[out_row] = static_cast<int64_t>(state.offset + out_row);
+				rowids[out_row] = static_cast<int64_t>(scan.rows[state.offset + out_row].row_id);
 			}
 			continue;
 		}
@@ -664,7 +670,8 @@ duckdb::TableFunction
 MoraineInlineDeleteTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                                duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
-	scan_bind_data->rows = ProvideInlineFileDeleteRows(context, handle_, table_id_);
+	scan_bind_data->rows =
+	    std::make_shared<const MetadataRows>(ProvideInlineFileDeleteRows(context, handle_, table_id_));
 	scan_bind_data->table_entry = this;
 	bind_data = std::move(scan_bind_data);
 	return MetadataScanTableFunction();
@@ -763,8 +770,7 @@ duckdb::unique_ptr<duckdb::CatalogEntry> CreateInlineDataTable(duckdb::ClientCon
 	}
 	auto schema_bytes = EncodeInlineSchema(context, user_columns);
 	MoraineError stage_err {};
-	auto stage_code = moraine_tx_stage_inline_schema(tx, table_id, schema_version, schema_bytes.data(),
-	                                                 schema_bytes.size(), &stage_err);
+	auto stage_code = moraine_tx_stage_inline_schema_owned(tx, table_id, schema_version, schema_bytes, &stage_err);
 	if (stage_code != MORAINE_OK) {
 		ThrowMoraineError(stage_err);
 	}
@@ -816,13 +822,14 @@ protected:
 	MoraineTxHandle *StagedTx(duckdb::ClientContext &client) const {
 		auto catalog_transaction = catalog_.GetCatalogTransaction(client);
 		auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
-		return moraine_tx.StagedTx();
+		return moraine_tx.StagedTxForInline();
 	}
 
-	// Resolves a rowid the entry's scan emitted (its index into that scan's
-	// row list) back to the row itself, re-materializing on first use.
-	// Metadata only: a rowid resolves to `row_id` and `begin_snapshot`, and
-	// neither needs an Arrow body decoded.
+	// Resolves a rowid the entry's scan emitted — the row's own id — back to
+	// the row, for the one sink that needs a field the id does not carry.
+	// Materializes the row list on first use and binary-searches it, which
+	// the scan's `(row_id, begin_snapshot)` order admits. Metadata only: no
+	// Arrow body is decoded.
 	const InlineDataRow &ResolveRow(duckdb::ClientContext &context, InlineDmlState &state, MoraineCatalogHandle *handle,
 	                                uint64_t table_id, uint64_t schema_version,
 	                                const std::vector<duckdb::LogicalType> &user_types,
@@ -835,13 +842,15 @@ protected:
 		if (row_id.IsNull()) {
 			throw duckdb::InternalException("moraine: staged write received a NULL rowid");
 		}
-		auto index = static_cast<duckdb::idx_t>(row_id.GetValue<int64_t>());
-		if (index >= state.old_rows.size()) {
+		auto wanted = static_cast<uint64_t>(row_id.GetValue<int64_t>());
+		auto found = std::lower_bound(state.old_rows.begin(), state.old_rows.end(), wanted,
+		                              [](const InlineDataRow &row, uint64_t id) { return row.row_id < id; });
+		if (found == state.old_rows.end() || found->row_id != wanted) {
 			throw duckdb::InternalException(
-			    "moraine: staged write rowid is out of range — the committed head moved between this "
-			    "statement's scan and its write, which the supported topology excludes");
+			    "moraine: staged write names a rowid this statement's scan did not emit — the committed "
+			    "head moved between the scan and the write, which the supported topology excludes");
 		}
-		return state.old_rows[index];
+		return *found;
 	}
 
 public:
@@ -884,8 +893,8 @@ public:
 		auto begin_snapshot = CellAsU64(chunk.GetValue(1, 0));
 		auto body = EncodeInlineChunkRows(context.client, chunk, /* user_col_start */ 3);
 		MoraineError err {};
-		auto code = moraine_tx_stage_inline_insert(tx, table_id_, schema_version_, begin_snapshot, row_id_start,
-		                                           chunk.size(), body.data(), body.size(), &err);
+		auto code = moraine_tx_stage_inline_insert_owned(tx, table_id_, schema_version_, begin_snapshot, row_id_start,
+		                                                 chunk.size(), body, &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
 		}
@@ -914,12 +923,11 @@ public:
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<InlineDmlState>();
 		auto *tx = StagedTx(context.client);
-		// The row-id column is appended last.
+		// The row-id column is appended last, and carries the row's own id,
+		// which is what a tombstone names — so this stages without reading.
 		auto row_id_col = chunk.ColumnCount() - 1;
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto &old_row = ResolveRow(context.client, state, handle_, table_id_, schema_version_, user_types_,
-			                           chunk.GetValue(row_id_col, row));
-			auto real_row_id = old_row.row_id;
+			auto real_row_id = CellAsU64(chunk.GetValue(row_id_col, row));
 			auto end_snapshot = CellAsU64(chunk.GetValue(set_ref_, row));
 			MoraineError err {};
 			auto code = moraine_tx_stage_inline_inline_delete(tx, table_id_, real_row_id, end_snapshot, &err);

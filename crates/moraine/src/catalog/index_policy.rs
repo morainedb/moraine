@@ -1,7 +1,5 @@
 //! DuckLake column-type policy for indexes: base-type extraction and the
-//! indexability check. Lives in the catalog (the DuckLake domain) so index
-//! creation and the ABI's value coercion share one type vocabulary, and the
-//! rule is enforced at the verb boundary rather than by each caller.
+//! indexability check.
 
 use crate::error::{Error, Result};
 
@@ -17,10 +15,8 @@ pub(crate) fn ducklake_base_type(column_type: &str) -> String {
         .to_ascii_uppercase()
 }
 
-/// Refuses a column equality indexes cannot cover faithfully. DuckDB writes a
-/// 128-bit integer to Parquet as a lossy `double`, so distinct values could
-/// collide and the column's data-file and inline forms disagree — refused
-/// rather than indexed silently wrong.
+/// Refuses a column equality indexes cannot cover faithfully: DuckDB writes
+/// a 128-bit integer to Parquet as a lossy `double`.
 pub(crate) fn ensure_indexable(column_name: &str, column_type: &str) -> Result<()> {
     if matches!(
         ducklake_base_type(column_type).as_str(),

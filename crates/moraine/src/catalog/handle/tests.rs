@@ -21,7 +21,7 @@ use crate::{
 /// The stored structural format and fold cursor of a store (fold absent reads
 /// as 0), read through a fresh reader.
 async fn stored_format_and_fold(object_store: &Arc<dyn ObjectStore>) -> (u64, u64) {
-    let reader = StoreBuilder::new("", Arc::clone(object_store))
+    let (reader, _) = StoreBuilder::new("", Arc::clone(object_store))
         .open_reader()
         .await
         .unwrap();
@@ -43,7 +43,7 @@ async fn legacy_store_with_schema(object_store: Arc<dyn ObjectStore>) {
     // Bootstrap supplies the base records (snapshot 0, the `main` schema, the
     // encrypted option, head 0); the raw writes below downgrade the stamp to
     // format 1, drop the fold cursor, and land a `legacy` schema at snapshot 1.
-    let db = commit::open_initialized(
+    let (db, _, _) = commit::open_initialized(
         StoreBuilder::new("", Arc::clone(&object_store)),
         false,
         None,
@@ -240,7 +240,7 @@ async fn migration_fences_a_live_legacy_writer_with_a_typed_error() {
     legacy_store_with_schema(Arc::clone(&object_store)).await;
 
     // An incumbent old-binary writer holds the store open over the legacy data.
-    let incumbent = StoreBuilder::new("", Arc::clone(&object_store))
+    let (incumbent, _) = StoreBuilder::new("", Arc::clone(&object_store))
         .open_writer()
         .await
         .unwrap();
@@ -296,9 +296,10 @@ fn value_key(value: u128) -> CanonicalKey {
 /// Bootstraps a fresh slot-backed store through the writer and closes it, so a
 /// later attach opens a reader that already sees everything seeded below.
 async fn bootstrap_multi(object_store: &Arc<dyn ObjectStore>) {
-    let db = commit::open_initialized(StoreBuilder::new("", Arc::clone(object_store)), false, None)
-        .await
-        .unwrap();
+    let (db, _, _) =
+        commit::open_initialized(StoreBuilder::new("", Arc::clone(object_store)), false, None)
+            .await
+            .unwrap();
     db.close().await.unwrap();
 }
 
@@ -306,7 +307,7 @@ async fn bootstrap_multi(object_store: &Arc<dyn ObjectStore>) {
 /// store, as a completed fold would have left them. The index id is never made
 /// live, so the entries are exactly what a dropped index orphans.
 async fn seed_orphaned_entries(object_store: &Arc<dyn ObjectStore>, index_id: u64, rows: u64) {
-    let db = StoreBuilder::new("", Arc::clone(object_store))
+    let (db, _) = StoreBuilder::new("", Arc::clone(object_store))
         .open_writer()
         .await
         .unwrap();
@@ -397,6 +398,7 @@ async fn a_commit_lands_unimpeded_during_a_maintenance_sweep() {
 
     let (swept, committed) = tokio::join!(
         catalog.maintain(MaintenanceRequest {
+            sweep_orphaned_file_column_stats: false,
             sweep_orphaned_index_entries: true,
             batch_size: 1,
         }),

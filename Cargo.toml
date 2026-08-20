@@ -3,24 +3,25 @@ resolver = "3"
 members = ["crates/*", "xtask"]
 
 [workspace.package]
-version = "0.4.4"
+version = "0.6.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alexpropp/moraine"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1"
-arrow = { version = "59.1.0", default-features = false }
+arrow = { version = "59.2.0", default-features = false }
 async-trait = "0.1"
 bytes = "1"
 constant_time_eq = "0.4"
 fastrand = "2"
 futures = { version = "0.3", default-features = false, features = ["std"] }
-parquet = { version = "59.1.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
-moraine = { path = "crates/moraine", version = "0.4.4" }
-moraine-remote = { path = "crates/moraine-remote", version = "0.4.4" }
-moraine-wal = { path = "crates/moraine-wal", version = "0.4.4" }
+parquet = { version = "59.2.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
+moraine = { path = "crates/moraine", version = "0.6.0" }
+moraine-remote = { path = "crates/moraine-remote", version = "0.6.0" }
+moraine-wal = { path = "crates/moraine-wal", version = "0.6.0" }
+foyer = { version = "0.22", features = ["serde"] }
 # object_store must stay on the same minor as slatedb's
 object_store = "0.14"
 prost = "0.14"
@@ -28,13 +29,17 @@ prost-build = "0.14"
 protox = "0.9"
 proptest = "1"
 proptest-derive = "0.8"
+roaring = "0.11"
+serde = { version = "1", features = ["derive"] }
 slatedb = { git = "https://github.com/slatedb/slatedb", rev = "2a2fdd146", features = ["wal_disable"] }
+# must move in lockstep with slatedb: it is where the metrics traits live
+slatedb-common = { git = "https://github.com/slatedb/slatedb", rev = "2a2fdd146" }
 storekey = "0.11"
 thiserror = "2"
 tokio = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 cbindgen = { version = "0.29", default-features = false }
 
 [workspace.lints.rust]

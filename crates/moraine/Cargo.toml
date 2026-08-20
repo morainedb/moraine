@@ -23,11 +23,13 @@ leader = [
     "tokio/rt",
 ]
 # Exposes crash-injection seams for the format-migration driver.
-# Off by default; production builds carry no seam code.
 fault-injection = []
+# Exposes the codec entry points the `fuzz/` targets drive.
+fuzzing = []
 
 [dependencies]
 arrow = { workspace = true, features = ["ipc"] }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 constant_time_eq = { workspace = true, optional = true }
 futures = { workspace = true }
@@ -36,10 +38,14 @@ moraine-wal = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
 prost = { workspace = true }
+roaring = { workspace = true }
+serde = { workspace = true }
+foyer = { workspace = true }
 slatedb = { workspace = true }
+slatedb-common = { workspace = true }
 storekey = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
@@ -50,14 +56,11 @@ protox = { workspace = true }
 [dev-dependencies]
 moraine = { path = ".", features = ["fault-injection"] }
 
-async-trait = { workspace = true }
-moraine-wal = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
-uuid = { workspace = true }
 
 [lints]
 workspace = true

@@ -8,3 +8,7 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    ignore:
+      # The reusable-workflow ref mirrors the primary DuckDB pin in
+      # .github/duckdb-versions; it is not an independent dependency.
+      - dependency-name: "duckdb/extension-ci-tools/*"

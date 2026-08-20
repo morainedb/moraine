@@ -8,6 +8,14 @@
 /build
 /.cache
 
+# Fuzzing. `fuzz/` is its own workspace, so the root `/target` rule above
+# does not reach its build tree. The corpus and any crash artifacts are
+# machine-generated: a reproducing input belongs in an issue, not the tree.
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+
 # macOS
 .DS_Store
 

@@ -290,41 +290,48 @@ impl Leader {
         // waits a full poll, giving a rival time to announce.
         monitor.tick().await;
 
-        loop {
-            tokio::select! {
-                () = shutdown.notified() => break,
-                _ = monitor.tick() => {
-                    if self.superseded_by_rival().await {
-                        info!(
-                            instance = %Uuid::from_bytes(self.instance),
-                            "leader superseded by a fresher advert; standing down"
-                        );
-                        break;
+        // Sessions are `!Send`; the set gives them somewhere to run and keeps
+        // the drain below inside the scope that drives them.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                loop {
+                    tokio::select! {
+                        () = shutdown.notified() => break,
+                        _ = monitor.tick() => {
+                            if self.superseded_by_rival().await {
+                                info!(
+                                    instance = %Uuid::from_bytes(self.instance),
+                                    "leader superseded by a fresher advert; standing down"
+                                );
+                                break;
+                            }
+                        }
+                        accepted = self.listener.accept() => {
+                            let (stream, _) = match accepted {
+                                Ok(pair) => pair,
+                                Err(err) => {
+                                    warn!(error = %err, "leader accept failed");
+                                    continue;
+                                }
+                            };
+                            spawn_session(&sessions, &context, stream);
+                        }
                     }
                 }
-                accepted = self.listener.accept() => {
-                    let (stream, _) = match accepted {
-                        Ok(pair) => pair,
-                        Err(err) => {
-                            warn!(error = %err, "leader accept failed");
-                            continue;
-                        }
-                    };
-                    spawn_session(&sessions, &context, stream);
-                }
-            }
-        }
 
-        // Drain: stop accepting and let admitted sessions settle by reclaiming
-        // every permit. A durable slot PUT precedes every acknowledgement, so an
-        // idle-but-open connection that outlasts the bound loses no committed
-        // work when the drain gives up.
-        let permits = u32::try_from(max_sessions).unwrap_or(u32::MAX);
-        let _ = tokio::time::timeout(
-            DRAIN_TIMEOUT,
-            Arc::clone(&sessions).acquire_many_owned(permits),
-        )
-        .await;
+                // Drain: stop accepting and let admitted sessions settle by reclaiming
+                // every permit. A durable slot PUT precedes every acknowledgement, so an
+                // idle-but-open connection that outlasts the bound loses no committed
+                // work when the drain gives up.
+                let permits = u32::try_from(max_sessions).unwrap_or(u32::MAX);
+                let _ = tokio::time::timeout(
+                    DRAIN_TIMEOUT,
+                    Arc::clone(&sessions).acquire_many_owned(permits),
+                )
+                .await;
+            })
+            .await;
 
         // Withdraw only while still the effective leader; a fresher rival advert
         // already names the fleet's leader, and clobbering it would send clients
@@ -367,10 +374,17 @@ impl Leader {
 
 /// Spawns one session under a permit, so at most `max_sessions` run at once. A
 /// session that fails is logged; its connection drops with no trace.
+///
+/// Sessions run on the leader's own `LocalSet`, not the runtime's task pool. A
+/// session assembles a commit through the staged pipeline, whose per-addition
+/// futures borrow the operations they read, so the session future is not
+/// `Send`. Confining that here keeps the commit path free of the copies a
+/// `Send` bound would otherwise force on every commit — [`Leader::serve`] is
+/// itself `!Send` as a result, and its host gives it a thread of its own.
 fn spawn_session(sessions: &Arc<Semaphore>, context: &Arc<SessionContext>, stream: TcpStream) {
     let sessions = Arc::clone(sessions);
     let context = Arc::clone(context);
-    tokio::spawn(async move {
+    tokio::task::spawn_local(async move {
         let Ok(permit) = sessions.acquire_owned().await else {
             return;
         };
@@ -434,6 +448,7 @@ async fn read_token(store: &SlotStore) -> Result<Option<[u8; commit::SECRET_LEN]
             .cache_dir(store.options.cache_dir.clone())
             .open_reader()
             .await?;
+    let (reader, _) = reader;
     let secret = read::read_secret(ReadHandle::Reader(&reader)).await;
     if let Err(err) = reader.close().await {
         warn!(error = %err, "could not close the reader opened for the token read");

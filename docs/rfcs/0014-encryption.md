@@ -22,6 +22,11 @@ is what every surveyed catalog does with its own metadata (see Prior art) —
 and it means no crypto machinery, no on-disk format change, and no key
 material in the moraine core.
 
+An untrusted catalog bucket is not a supported deployment. moraine does not
+offer client-side catalog encryption; deployments that cannot trust the
+object store must place the catalog behind a trusted, encrypted storage
+boundary.
+
 | Layer | Owner | Protects | moraine's role |
 |---|---|---|---|
 | Data-file encryption | DuckLake | Parquet data and delete files | Faithful conduit: round-trip key rows verbatim, decrypt nothing |
@@ -73,6 +78,9 @@ The bucket holding SlateDB's objects is configured with SSE-KMS: the object
 store encrypts every SST and WAL object at rest, keys live in the KMS, and
 moraine reads and writes plaintext through the object-store client. The
 entire cost is bucket configuration.
+
+Key policy, grants, and rotation posture are documented for operators in
+the "Operating a lake" guide.
 
 This mirrors DuckLake's own trust model. Its manifesto pitches "zero-trust
 data hosting" with "keys managed by the catalog database", and its FAQ
@@ -137,9 +145,9 @@ application-level encryption of its own store.
   proposal ([delta#2269](https://github.com/delta-io/delta/issues/2269)).
 - **SlateDB** ships no encryption of its own, but exposes a
   `BlockTransformer` hook (v0.10.1) for a user-supplied SST-block cipher —
-  with real gaps today: manifests and SST footers stay plaintext. If store
-  objects ever need encryption independent of the bucket, that hook is the
-  seam: below moraine's value format, invisible to codecs and migration.
+  with real gaps today: manifests and SST footers stay plaintext. It is the
+  substrate seam for a different design, not a facility moraine configures or
+  a complete answer for an untrusted bucket.
 
 ## Alternatives considered
 
@@ -153,9 +161,8 @@ application-level encryption of its own store.
   tooling that must read a value's fields (RFC 0015); and ciphertext defeats
   SlateDB's SST block compression, inflating inlined data by exactly the
   cross-chunk redundancy RFC 0005 counts on reclaiming. No surveyed catalog
-  application-encrypts its own metadata (Prior art); if bucket-independent
-  encryption is ever required, SlateDB's `BlockTransformer` is the right
-  layer, not moraine's value format.
+  application-encrypts its own metadata (Prior art), and the partial coverage
+  of SlateDB's `BlockTransformer` does not change the SSE-KMS decision.
 - **Encrypting the stats values to plug the min/max leak.** Rejected:
   DuckLake reads those strings for file pruning (RFC 0002, RFC 0009);
   encrypting them breaks pruning. The leak is the cost of usable,

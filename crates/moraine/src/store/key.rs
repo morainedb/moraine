@@ -6,11 +6,13 @@
 //! `u64` components in field order. Variant order is permanent once
 //! written; the golden-vector tests pin the exact bytes.
 
+use std::ops::Bound;
+
 use storekey::{Decode, Encode};
 
 use crate::{
     error::{Error, Result},
-    store::index_encoding::CanonicalKey,
+    store::index_encoding::{CanonicalKey, IndexKeyValue, nominal_key_bytes},
 };
 
 /// Length in bytes of the encoded subspace prefix — one discriminant
@@ -24,7 +26,7 @@ pub(crate) const TAG_PREFIX_LEN: usize = 1;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum Key {
     /// Store-level singletons: format version, head pointer, migration
-    /// marker. Overwritten in place.
+    /// marker, and maintenance status. Overwritten in place.
     Sys(SysKey),
     /// One record per snapshot — `ducklake_snapshot` +
     /// `ducklake_snapshot_changes`, merged. Append-only.
@@ -43,9 +45,8 @@ pub(crate) enum Key {
     Index(IndexKey),
     /// `ducklake_schema_versions`: one record per snapshot at which a
     /// table's shape changed, holding the catalog schema version that
-    /// snapshot minted. Retained across snapshot expiry — a data file
-    /// resolves its schema version through these long after the snapshot
-    /// that wrote it is gone — and removed only with the table.
+    /// snapshot minted. Retained across snapshot expiry; removed only with
+    /// the table.
     SchemaVersion {
         /// The created-or-altered table (or view).
         table_id: u64,
@@ -53,24 +54,18 @@ pub(crate) enum Key {
         begin_snapshot: u64,
     },
     /// The `current` keys one commit's batch wrote — the changelog a reader
-    /// replays to advance a held view across that commit. Its own subspace
-    /// rather than a field of the snapshot record: snapshot records are
-    /// scanned in full on a read path DuckLake takes every transaction, and
-    /// the changelog is several times their size. Only a refresh reads
-    /// these, one point read per snapshot in the gap. A sliding window of
-    /// the most recent commits' records is retained; older ones are deleted
-    /// by later commits, so nothing else has to reclaim them.
+    /// replays to advance a held view across that commit. Only a sliding
+    /// window of the most recent commits' records is retained; later
+    /// commits delete the rest.
     Changelog {
         /// The snapshot whose batch wrote these keys.
         snapshot_id: u64,
     },
 }
 
-/// An equality-index entry key. The unique kind keys on the value alone —
-/// the store key *is* the uniqueness claim, so two commits inserting the
-/// same value collide in the store's write-write detection. The non-unique
-/// kind appends the row id, so rows sharing a value occupy distinct keys
-/// and concurrent appends stay benign.
+/// An equality-index entry key. The unique kind keys on the value alone,
+/// so two commits inserting the same value collide in write-write
+/// detection; the non-unique kind appends the row id.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum IndexKey {
     /// A unique-index entry; value is the holding row id.
@@ -100,6 +95,8 @@ pub(crate) enum SysKey {
     Head,
     /// Structural-migration marker. Reserved from format v1.
     Migration,
+    /// Bounded history of completed maintenance passes.
+    MaintenanceStatus,
     /// The freshest leader advert, folded here so it survives truncation.
     Leader,
     /// The 32-byte forwarding token a leader authenticates sessions against.
@@ -112,10 +109,8 @@ pub(crate) enum SysKey {
 pub(crate) enum CurrentKey {
     /// A live entity version.
     Entity(EntityKey),
-    /// `ducklake_files_scheduled_for_deletion`. Keyed by the scheduled
-    /// file's id — the row's identity in DuckLake's own schema (inserts
-    /// carry it, cleanup deletes by it), unique because a file's catalog
-    /// rows are removed in the same transaction that schedules it.
+    /// `ducklake_files_scheduled_for_deletion`, keyed by the scheduled
+    /// file's id.
     GcFile {
         /// The scheduled data or delete file's id.
         data_file_id: u64,
@@ -260,10 +255,104 @@ impl EntityKey {
     }
 }
 
+/// One [`EntityKey`] variant, without the fields identifying a record.
+/// Used to derive a prefix that selects one catalog kind without scanning
+/// every entity in `current` or `history`.
+///
+/// The set names every kind the keyspace holds, not the subset some scan
+/// currently selects on, so variants stay whether or not a caller builds a
+/// prefix for them.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EntityKind {
+    /// `ducklake_schema`.
+    Schema,
+    /// `ducklake_table`.
+    Table,
+    /// `ducklake_view`.
+    View,
+    /// `ducklake_column`.
+    Column,
+    /// `ducklake_partition_info`.
+    Partition,
+    /// `ducklake_data_file`.
+    File,
+    /// `ducklake_delete_file`.
+    DeleteFile,
+    /// `ducklake_file_column_stats`.
+    FileColumnStats,
+    /// `ducklake_table_stats`.
+    TableStats,
+    /// `ducklake_table_column_stats`.
+    TableColumnStats,
+    /// `ducklake_tag`.
+    Tag,
+    /// `ducklake_metadata`.
+    Option,
+    /// `ducklake_sort_info`.
+    Sort,
+    /// `ducklake_macro`.
+    Macro,
+    /// `ducklake_column_mapping`.
+    Mapping,
+}
+
+impl EntityKind {
+    /// A minimal key of this kind for prefix derivation.
+    const fn sample(self) -> EntityKey {
+        match self {
+            Self::Schema => EntityKey::Schema { schema_id: 0 },
+            Self::Table => EntityKey::Table { table_id: 0 },
+            Self::View => EntityKey::View { view_id: 0 },
+            Self::Column => EntityKey::Column {
+                table_id: 0,
+                column_id: 0,
+            },
+            Self::Partition => EntityKey::Partition {
+                table_id: 0,
+                partition_id: 0,
+            },
+            Self::File => EntityKey::File {
+                table_id: 0,
+                data_file_id: 0,
+            },
+            Self::DeleteFile => EntityKey::DeleteFile {
+                table_id: 0,
+                delete_file_id: 0,
+            },
+            Self::FileColumnStats => EntityKey::FileColumnStats {
+                table_id: 0,
+                data_file_id: 0,
+                column_id: 0,
+            },
+            Self::TableStats => EntityKey::TableStats { table_id: 0 },
+            Self::TableColumnStats => EntityKey::TableColumnStats {
+                table_id: 0,
+                column_id: 0,
+            },
+            Self::Tag => EntityKey::Tag { object_id: 0 },
+            Self::Option => EntityKey::Option {
+                scope_kind: 0,
+                scope_id: 0,
+            },
+            Self::Sort => EntityKey::Sort {
+                table_id: 0,
+                sort_id: 0,
+            },
+            Self::Macro => EntityKey::Macro { macro_id: 0 },
+            Self::Mapping => EntityKey::Mapping {
+                table_id: 0,
+                mapping_id: 0,
+            },
+        }
+    }
+}
+
 /// An inlined-data key: the per-schema-version Arrow schema, a live
 /// record, the archived (post-flush) form of a live record, or a
-/// delete-table existence marker. `Live` and `Arch` share [`InlineOp`], so
-/// an archive key has exactly the components of its live form.
+/// delete-table existence marker, or a live chunk's row-range locator.
+/// `Live` and `Arch` share [`InlineOperation`], so an archive key has exactly
+/// the components of its live form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum InlineKey {
     /// Arrow IPC schema message, once per `(table, schema_version)`. Has
@@ -279,17 +368,18 @@ pub(crate) enum InlineKey {
     /// The archived form of an inlined-data record.
     Arch(InlineOperation),
     /// Marks that a table's `ducklake_inlined_delete_<table_id>` exists,
-    /// once per table. Appended last so the variants above keep their
-    /// discriminants.
-    ///
-    /// Existence has to be recorded rather than derived from whether any
-    /// `FileDelete` record is currently live: a flush materializes those
-    /// into a real delete file and clears them, and an emptied SQL table
-    /// still exists — which is what DuckLake, having cached the table's
-    /// existence for the life of the catalog, goes on assuming.
+    /// once per table; the table outlives its `FileDelete` records, which
+    /// a flush clears.
     FileDeleteTable {
         /// Owning table.
         table_id: u64,
+    },
+    /// One live inline chunk's inclusive row-id end.
+    ChunkRange {
+        /// Owning table.
+        table_id: u64,
+        /// Inclusive end of the chunk's contiguous row-id range.
+        row_id_end: u64,
     },
 }
 
@@ -355,6 +445,33 @@ impl Key {
     }
 }
 
+/// Encodes one equality-index entry from a borrowed canonical value,
+/// byte-identical to [`Key::Index`] without cloning the payload.
+pub(crate) fn encode_index_entry(
+    index_id: u64,
+    unique: bool,
+    key: &CanonicalKey,
+    row_id: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut writer = storekey::Writer::new(&mut bytes);
+    // Infallible by construction: a `Vec` sink raises no I/O error and these
+    // primitive/canonical encoders raise no custom error.
+    let result = (|| -> std::result::Result<(), storekey::EncodeError> {
+        writer.write_u8(INDEX_SUBSPACE_TAG)?;
+        writer.write_u8(index_kind_tag(unique))?;
+        writer.write_u64(index_id)?;
+        <CanonicalKey as Encode<()>>::encode(key, &mut writer)?;
+        if !unique {
+            writer.write_u64(row_id)?;
+        }
+        Ok(())
+    })();
+    #[allow(clippy::expect_used)]
+    result.expect("storekey encode into a Vec cannot fail");
+    bytes
+}
+
 /// A subspace, fieldless — for building scan prefixes without naming
 /// discriminant bytes; prefixes are derived by encoding a sample key and
 /// truncating.
@@ -418,8 +535,6 @@ impl Subspace {
 
 /// The kinds whose live keys are scoped `table_id`-first — the only kinds
 /// [`current_table_prefix`] accepts.
-// No caller needs "everything about table T" yet (cascading table drop and
-// per-table GC land in later slices); the prefix math is pinned by tests.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TableScopedKind {
@@ -495,9 +610,11 @@ impl TableScopedKind {
 
 /// Discriminant bytes preceding an entity's components in a live key:
 /// subspace, `CurrentKey::Entity`, entity kind.
-// Only `current_table_prefix` consumes this, and it has no caller yet.
-#[allow(dead_code)]
 const CUR_KIND_PREFIX_LEN: usize = 3;
+
+/// Discriminant bytes preceding an entity's components in a history key:
+/// subspace, then entity kind.
+const HISTORY_KIND_PREFIX_LEN: usize = 2;
 
 /// The three live-record kinds inside the inline subspace — the only kinds
 /// [`inline_live_table_prefix`] builds a prefix for.
@@ -582,18 +699,64 @@ pub(crate) fn inline_schema_prefix() -> Vec<u8> {
     )
 }
 
+/// Discriminant bytes preceding an `inline/chunk_range` key's components:
+/// subspace, then `InlineKey::ChunkRange`.
+const INLINE_CHUNK_RANGE_PREFIX_LEN: usize = 2;
+
+/// Byte prefix of every chunk-range locator scoped to `table_id`.
+pub(crate) fn inline_chunk_range_table_prefix(table_id: u64) -> Vec<u8> {
+    prefix_of(
+        &Key::Inline(InlineKey::ChunkRange {
+            table_id,
+            row_id_end: 0,
+        }),
+        INLINE_CHUNK_RANGE_PREFIX_LEN + size_of::<u64>(),
+    )
+}
+
+/// The range suffix that seeks to the first chunk ending at or after
+/// `row_id` within [`inline_chunk_range_table_prefix`].
+pub(crate) fn inline_chunk_range_suffix(table_id: u64, row_id: u64) -> Vec<u8> {
+    Key::Inline(InlineKey::ChunkRange {
+        table_id,
+        row_id_end: row_id,
+    })
+    .encode()
+    .split_off(INLINE_CHUNK_RANGE_PREFIX_LEN + size_of::<u64>())
+}
+
+/// The `index` subspace discriminant byte, as [`Key::Index`] encodes it.
+pub(crate) const INDEX_SUBSPACE_TAG: u8 = 7;
+/// The [`IndexKey::Unique`] discriminant byte.
+pub(crate) const INDEX_UNIQUE_TAG: u8 = 2;
+/// The [`IndexKey::Multi`] discriminant byte.
+pub(crate) const INDEX_MULTI_TAG: u8 = 3;
 /// Discriminant bytes preceding an index entry's components: the `index`
 /// subspace byte and the [`IndexKey`] kind byte.
 const INDEX_KIND_PREFIX_LEN: usize = 2;
 /// Bytes preceding an index entry's value: the kind discriminants and the
 /// eight-byte index id.
-const INDEX_ENTRY_PREFIX_LEN: usize = INDEX_KIND_PREFIX_LEN + size_of::<u64>();
+pub(crate) const INDEX_ENTRY_PREFIX_LEN: usize = INDEX_KIND_PREFIX_LEN + size_of::<u64>();
+
+/// The [`IndexKey`] discriminant byte for a unique or non-unique entry.
+pub(crate) const fn index_kind_tag(unique: bool) -> u8 {
+    if unique {
+        INDEX_UNIQUE_TAG
+    } else {
+        INDEX_MULTI_TAG
+    }
+}
+
+/// The nominal bytes one index entry stages, key and value together: the
+/// entry prefix, the framed value, and one row id (in the key or as the
+/// value). Escaping can make the real entry larger, never smaller.
+pub(crate) fn index_entry_bytes(values: &[Option<IndexKeyValue>]) -> u64 {
+    let bytes = INDEX_ENTRY_PREFIX_LEN + nominal_key_bytes(values) + size_of::<u64>();
+    bytes as u64
+}
 
 /// The two entry kinds inside the `index` subspace. An index is exclusively
 /// one kind, so its entries form one contiguous `(kind, index_id)` range.
-// The prefix builders below have no caller until index lookups and
-// reclamation land; the ranges are pinned by tests.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexKind {
     /// `index/unique`.
@@ -602,8 +765,7 @@ pub(crate) enum IndexKind {
     Multi,
 }
 
-/// Byte prefix of every entry of one kind, across all indexes — the range
-/// the orphan sweep walks, seeking by index id.
+/// Byte prefix of every entry of one kind, across all indexes.
 pub(crate) fn index_kind_prefix(kind: IndexKind) -> Vec<u8> {
     let key = match kind {
         IndexKind::Unique => Key::Index(IndexKey::Unique {
@@ -620,8 +782,7 @@ pub(crate) fn index_kind_prefix(kind: IndexKind) -> Vec<u8> {
     prefix_of(&key, INDEX_KIND_PREFIX_LEN)
 }
 
-/// Byte prefix of every entry of one index — the range reclamation sweeps
-/// after a drop.
+/// Byte prefix of every entry of one index.
 pub(crate) fn index_index_prefix(kind: IndexKind, index_id: u64) -> Vec<u8> {
     let key = match kind {
         IndexKind::Unique => Key::Index(IndexKey::Unique {
@@ -637,10 +798,8 @@ pub(crate) fn index_index_prefix(kind: IndexKind, index_id: u64) -> Vec<u8> {
     prefix_of(&key, INDEX_ENTRY_PREFIX_LEN)
 }
 
-/// Byte prefix of every non-unique entry sharing one `(index_id, value)` —
-/// the ascending scan a non-unique lookup runs. The row id is the fixed
-/// eight-byte final component, so dropping it yields the value prefix.
-#[allow(dead_code)]
+/// Byte prefix of every non-unique entry sharing one `(index_id, value)`:
+/// the entry key without its fixed eight-byte row id.
 pub(crate) fn index_multi_value_prefix(index_id: u64, value: &CanonicalKey) -> Vec<u8> {
     let mut bytes = Key::Index(IndexKey::Multi {
         index_id,
@@ -702,6 +861,92 @@ pub(crate) fn increment_prefix(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
     None
 }
 
+/// The kinds whose record counts scale with the data rather than the
+/// schema; a bulk scan walks each in split ranges.
+pub(crate) const SPLIT_SCAN_KINDS: [EntityKind; 5] = [
+    EntityKind::Column,
+    EntityKind::File,
+    EntityKind::DeleteFile,
+    EntityKind::FileColumnStats,
+    EntityKind::TableColumnStats,
+];
+
+/// How many bytes past a prefix [`even_points_between`] interpolates over:
+/// two big-endian id components.
+const SPLIT_WIDTH: usize = 16;
+
+/// A range of one prefix's keyspace, as bounds on the bytes after the
+/// prefix.
+pub(crate) type SuffixRange = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+
+/// Whether `suffix` lies within `lower` and `upper`.
+fn within(lower: &Bound<Vec<u8>>, upper: &Bound<Vec<u8>>, suffix: &[u8]) -> bool {
+    let above = match lower {
+        Bound::Unbounded => true,
+        Bound::Included(start) => suffix >= start.as_slice(),
+        Bound::Excluded(start) => suffix > start.as_slice(),
+    };
+    let below = match upper {
+        Bound::Unbounded => true,
+        Bound::Included(end) => suffix <= end.as_slice(),
+        Bound::Excluded(end) => suffix < end.as_slice(),
+    };
+    above && below
+}
+
+/// Cuts the range `lower..upper` of a prefix's keyspace at every distinct
+/// point in `points` (suffixes, any order) that lies strictly inside it:
+/// the ranges come back in key order, disjoint, and together cover exactly
+/// `lower..upper`. No usable points yields that one range.
+pub(crate) fn split_between(
+    lower: Bound<Vec<u8>>,
+    upper: Bound<Vec<u8>>,
+    mut points: Vec<Vec<u8>>,
+) -> Vec<SuffixRange> {
+    points.retain(|point| {
+        within(&lower, &upper, point) && !matches!(&lower, Bound::Included(start) if start == point)
+    });
+    points.sort_unstable();
+    points.dedup();
+
+    let mut ranges = Vec::with_capacity(points.len() + 1);
+    let mut start = lower;
+    for point in points {
+        ranges.push((start, Bound::Excluded(point.clone())));
+        start = Bound::Included(point);
+    }
+    ranges.push((start, upper));
+    ranges
+}
+
+/// Up to `parts - 1` points spaced evenly between the suffixes `low` and
+/// `high`, over their first [`SPLIT_WIDTH`] bytes read as a big-endian
+/// integer (shorter suffixes are zero-padded). Fewer, or none, when the
+/// extremes are too close to spread that many apart.
+pub(crate) fn even_points_between(low: &[u8], high: &[u8], parts: usize) -> Vec<Vec<u8>> {
+    let widen = |suffix: &[u8]| {
+        let mut bytes = [0_u8; SPLIT_WIDTH];
+        let taken = suffix.len().min(SPLIT_WIDTH);
+        bytes[..taken].copy_from_slice(&suffix[..taken]);
+        u128::from_be_bytes(bytes)
+    };
+    let (low, high) = (widen(low), widen(high));
+    let Some(step) = high
+        .checked_sub(low)
+        .map(|span| span / u128::try_from(parts.max(1)).unwrap_or(u128::MAX))
+    else {
+        return Vec::new();
+    };
+    if step == 0 {
+        return Vec::new();
+    }
+
+    (1..parts)
+        .map(|part| low + step * u128::try_from(part).unwrap_or(u128::MAX))
+        .map(|point| point.to_be_bytes().to_vec())
+        .collect()
+}
+
 /// Byte prefix of every key in a subspace (exactly `TAG_PREFIX_LEN`
 /// bytes — the same prefix the segment extractor derives).
 pub(crate) fn subspace_prefix(subspace: Subspace) -> Vec<u8> {
@@ -709,13 +954,22 @@ pub(crate) fn subspace_prefix(subspace: Subspace) -> Vec<u8> {
 }
 
 /// Byte prefix of every live key of `kind` scoped to `table_id`.
-// No caller yet; pinned by the prefix tests below.
 #[allow(dead_code)]
 pub(crate) fn current_table_prefix(kind: TableScopedKind, table_id: u64) -> Vec<u8> {
     prefix_of(
         &Key::current(kind.sample(table_id)),
         CUR_KIND_PREFIX_LEN + size_of::<u64>(),
     )
+}
+
+/// Byte prefix of every live entity of `kind`.
+pub(crate) fn current_entity_kind_prefix(kind: EntityKind) -> Vec<u8> {
+    prefix_of(&Key::current(kind.sample()), CUR_KIND_PREFIX_LEN)
+}
+
+/// Byte prefix of every ended entity version of `kind`.
+pub(crate) fn history_entity_kind_prefix(kind: EntityKind) -> Vec<u8> {
+    prefix_of(&Key::history(kind.sample(), 0), HISTORY_KIND_PREFIX_LEN)
 }
 
 #[cfg(test)]
@@ -739,8 +993,12 @@ mod tests {
         assert_eq!(Key::Sys(SysKey::Format).encode(), vec![0x02, 0x02]);
         assert_eq!(Key::Sys(SysKey::Head).encode(), vec![0x02, 0x03]);
         assert_eq!(Key::Sys(SysKey::Migration).encode(), vec![0x02, 0x04]);
-        assert_eq!(Key::Sys(SysKey::Leader).encode(), vec![0x02, 0x05]);
-        assert_eq!(Key::Sys(SysKey::Secret).encode(), vec![0x02, 0x06]);
+        assert_eq!(
+            Key::Sys(SysKey::MaintenanceStatus).encode(),
+            vec![0x02, 0x05]
+        );
+        assert_eq!(Key::Sys(SysKey::Leader).encode(), vec![0x02, 0x06]);
+        assert_eq!(Key::Sys(SysKey::Secret).encode(), vec![0x02, 0x07]);
     }
 
     #[test]
@@ -872,6 +1130,18 @@ mod tests {
     }
 
     #[test]
+    fn golden_inline_chunk_range_key() {
+        let mut expect = vec![0x06, 0x06];
+        expect.extend(be(7));
+        expect.extend(be(29));
+        let key = Key::Inline(InlineKey::ChunkRange {
+            table_id: 7,
+            row_id_end: 29,
+        });
+        assert_eq!(key.encode(), expect);
+    }
+
+    #[test]
     fn golden_arch_kinds_are_distinct_from_live() {
         let ops = [
             InlineOperation::Insert {
@@ -922,6 +1192,34 @@ mod tests {
         let mut prefix = vec![0x07, 0x02];
         prefix.extend(be(1));
         assert!(bytes.starts_with(&prefix), "{bytes:?}");
+    }
+
+    #[test]
+    fn borrowed_index_entry_encoder_matches_owned_key() {
+        let canonical = canon(&[
+            IndexKeyValue::Str("a\0\u{1}z".to_owned()),
+            IndexKeyValue::Bytes(vec![0, 1, 0xff]),
+        ]);
+        for unique in [false, true] {
+            for row_id in [0, 1_u64 << 56, u64::MAX] {
+                let owned = if unique {
+                    Key::Index(IndexKey::Unique {
+                        index_id: 7,
+                        key: canonical.clone(),
+                    })
+                } else {
+                    Key::Index(IndexKey::Multi {
+                        index_id: 7,
+                        key: canonical.clone(),
+                        row_id,
+                    })
+                };
+                assert_eq!(
+                    encode_index_entry(7, unique, &canonical, row_id),
+                    owned.encode()
+                );
+            }
+        }
     }
 
     /// A non-unique entry key ends in a raw row id, directly after the
@@ -1021,6 +1319,30 @@ mod tests {
             ]),
         });
         assert_ne!(ab_c.encode(), a_bc.encode());
+    }
+
+    /// The hand-written index tags match what the derive encodes.
+    #[test]
+    fn index_tags_match_the_encoded_discriminants() {
+        let unique = Key::Index(IndexKey::Unique {
+            index_id: 9,
+            key: CanonicalKey::empty(),
+        })
+        .encode();
+        let multi = Key::Index(IndexKey::Multi {
+            index_id: 9,
+            key: CanonicalKey::empty(),
+            row_id: 0,
+        })
+        .encode();
+
+        assert_eq!(unique[0], INDEX_SUBSPACE_TAG);
+        assert_eq!(multi[0], INDEX_SUBSPACE_TAG);
+        assert_eq!(unique[1], INDEX_UNIQUE_TAG);
+        assert_eq!(multi[1], INDEX_MULTI_TAG);
+        assert_eq!(index_kind_tag(true), INDEX_UNIQUE_TAG);
+        assert_eq!(index_kind_tag(false), INDEX_MULTI_TAG);
+        assert_eq!(&unique[2..INDEX_ENTRY_PREFIX_LEN], &9_u64.to_be_bytes());
     }
 
     #[test]
@@ -1210,6 +1532,28 @@ mod tests {
         assert!(!bytes.starts_with(&current_table_prefix(TableScopedKind::File, 2)));
         // A different kind's prefix must not match.
         assert!(!bytes.starts_with(&current_table_prefix(TableScopedKind::DeleteFile, 1)));
+    }
+
+    #[test]
+    fn entity_kind_prefixes_select_only_the_requested_kind() {
+        let current = Key::current(EntityKey::File {
+            table_id: 1,
+            data_file_id: 2,
+        })
+        .encode();
+        let history = Key::history(
+            EntityKey::File {
+                table_id: 1,
+                data_file_id: 2,
+            },
+            3,
+        )
+        .encode();
+
+        assert!(current.starts_with(&current_entity_kind_prefix(EntityKind::File)));
+        assert!(history.starts_with(&history_entity_kind_prefix(EntityKind::File)));
+        assert!(!current.starts_with(&current_entity_kind_prefix(EntityKind::Table)));
+        assert!(!history.starts_with(&history_entity_kind_prefix(EntityKind::Table)));
     }
 
     /// Every table-scoped kind's prefix matches a live key of that kind
@@ -1402,6 +1746,7 @@ mod tests {
             Just(Key::Sys(SysKey::Format)),
             Just(Key::Sys(SysKey::Head)),
             Just(Key::Sys(SysKey::Migration)),
+            Just(Key::Sys(SysKey::MaintenanceStatus)),
             Just(Key::Sys(SysKey::Leader)),
             Just(Key::Sys(SysKey::Secret)),
             any::<u64>().prop_map(|snapshot_id| Key::Snapshot { snapshot_id }),
@@ -1417,12 +1762,43 @@ mod tests {
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Live(op))),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Arch(op))),
             any::<u64>().prop_map(|table_id| Key::Inline(InlineKey::FileDeleteTable { table_id })),
+            any::<(u64, u64)>().prop_map(|(table_id, row_id_end)| {
+                Key::Inline(InlineKey::ChunkRange {
+                    table_id,
+                    row_id_end,
+                })
+            }),
             arb_index().prop_map(Key::Index),
             any::<u64>().prop_map(|snapshot_id| Key::Changelog { snapshot_id }),
         ]
     }
 
     proptest! {
+        #[test]
+        fn borrowed_index_entry_encoding_matches_owned(
+            index_id in any::<u64>(),
+            key in arb_canonical_key(),
+            row_id in any::<u64>(),
+            unique in any::<bool>(),
+        ) {
+            let owned = if unique {
+                Key::Index(IndexKey::Unique {
+                    index_id,
+                    key: key.clone(),
+                })
+            } else {
+                Key::Index(IndexKey::Multi {
+                    index_id,
+                    key: key.clone(),
+                    row_id,
+                })
+            };
+            prop_assert_eq!(
+                encode_index_entry(index_id, unique, &key, row_id),
+                owned.encode()
+            );
+        }
+
         #[test]
         fn roundtrip(key in arb_key()) {
             let decoded = Key::decode(&key.encode()).unwrap();
@@ -1590,5 +1966,89 @@ mod tests {
                 prop_assert!(bound <= index_value_suffix(kind, index_id, higher));
             }
         }
+    }
+
+    fn arbitrary_bound() -> impl Strategy<Value = Bound<Vec<u8>>> {
+        prop_oneof![
+            Just(Bound::Unbounded),
+            prop::collection::vec(any::<u8>(), 0..20).prop_map(Bound::Included),
+            prop::collection::vec(any::<u8>(), 0..20).prop_map(Bound::Excluded),
+        ]
+    }
+
+    proptest! {
+        /// A suffix inside the outer range falls in exactly one split range
+        /// and one outside it in none: the ranges are disjoint and their
+        /// union is exactly the outer range.
+        #[test]
+        fn split_ranges_partition_the_outer_range(
+            lower in arbitrary_bound(),
+            upper in arbitrary_bound(),
+            points in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..20), 0..12),
+            suffix in prop::collection::vec(any::<u8>(), 0..24),
+        ) {
+            let ranges = split_between(lower.clone(), upper.clone(), points.clone());
+            let holders = ranges
+                .iter()
+                .filter(|range| within(&range.0, &range.1, &suffix))
+                .count();
+            let expected = usize::from(within(&lower, &upper, &suffix));
+            prop_assert_eq!(holders, expected, "{:?} in {:?}", suffix, ranges);
+
+            // Every point strictly inside the outer range starts a range.
+            for point in &points {
+                if within(&lower, &upper, point) && lower != Bound::Included(point.clone()) {
+                    prop_assert!(ranges.iter().any(|range| range.0 == Bound::Included(point.clone())));
+                }
+            }
+        }
+
+        /// The interpolated points sit strictly between the extremes and in
+        /// key order, so a split cut at them keeps every key between the
+        /// extremes and never yields an out-of-order range.
+        #[test]
+        fn even_points_lie_between_the_extremes(
+            low in prop::collection::vec(any::<u8>(), 16..24),
+            high in prop::collection::vec(any::<u8>(), 16..24),
+            parts in 1_usize..12,
+        ) {
+            let (low, high) = if low <= high { (low, high) } else { (high, low) };
+            let points = even_points_between(&low, &high, parts);
+            prop_assert!(points.len() < parts);
+            prop_assert!(points.windows(2).all(|pair| pair[0] < pair[1]));
+            for point in &points {
+                prop_assert!(point.as_slice() > low.as_slice(), "{:?} <= {:?}", point, low);
+                prop_assert!(point.as_slice() < high.as_slice(), "{:?} >= {:?}", point, high);
+            }
+        }
+    }
+
+    /// Ids clustered near zero still split: the cut interpolates between the
+    /// extremes present, not across the whole id space.
+    #[test]
+    fn even_points_split_between_the_extremes_present() {
+        let low = 7_u64
+            .to_be_bytes()
+            .iter()
+            .chain(&0_u64.to_be_bytes())
+            .copied()
+            .collect::<Vec<_>>();
+        let high = 7_u64
+            .to_be_bytes()
+            .iter()
+            .chain(&4_000_u64.to_be_bytes())
+            .copied()
+            .collect::<Vec<_>>();
+        let points = even_points_between(&low, &high, 4);
+        assert_eq!(points.len(), 3);
+        assert_eq!(&points[0][..8], &7_u64.to_be_bytes());
+        assert_eq!(&points[0][8..], &1_000_u64.to_be_bytes());
+        assert_eq!(&points[2][8..], &3_000_u64.to_be_bytes());
+
+        assert!(even_points_between(&low, &low, 4).is_empty());
+        assert_eq!(
+            split_between(Bound::Unbounded, Bound::Unbounded, Vec::new()),
+            vec![(Bound::Unbounded, Bound::Unbounded)]
+        );
     }
 }

@@ -241,9 +241,17 @@ impl Spawned {
         let secret = leader.secret();
         let instance = leader.instance();
         let shutdown = Arc::new(Notify::new());
-        let join = tokio::spawn({
+        // The leader's sessions are `!Send`, so `serve` needs a runtime of its
+        // own rather than a slot on the shared pool.
+        let join = tokio::task::spawn_blocking({
             let shutdown = Arc::clone(&shutdown);
-            async move { leader.serve(shutdown).await }
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("leader test runtime")
+                    .block_on(leader.serve(shutdown))
+            }
         });
         Self {
             addr,
@@ -285,6 +293,7 @@ async fn fresh_reader(catalog: &Arc<Catalog>) -> slatedb::DbReader {
     crate::store::open::StoreBuilder::new(&store.options.path, store.object_store.clone())
         .open_reader()
         .await
+        .map(|(reader, _)| reader)
         .unwrap()
 }
 
@@ -697,7 +706,7 @@ async fn the_secret_is_minted_lazily_for_a_store_that_predates_it() {
 /// Deletes `sys/secret` through the fenced writer, standing in for a store
 /// created before the token existed.
 async fn delete_secret(store: &Arc<dyn ObjectStore>) {
-    let db = crate::store::open::StoreBuilder::new("", Arc::clone(store))
+    let (db, _) = crate::store::open::StoreBuilder::new("", Arc::clone(store))
         .open_writer()
         .await
         .unwrap();

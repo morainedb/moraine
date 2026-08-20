@@ -13,11 +13,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Both gates on one runner and one checkout: the matrix is only ever read
+  # when a release is happening, and a second job for it would put another
+  # runner start and another `cargo run` ahead of a half-hour build.
   should-release:
     runs-on: ubuntu-latest
     outputs:
       release: ${{ steps.check.outputs.release }}
       version: ${{ steps.check.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
       - id: check
@@ -35,40 +39,45 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
             echo "moraine $version not on crates.io - release pending."
           fi
-
-  # A C++-ABI extension only loads into the exact DuckDB version stamped in
-  # its footer, so every supported release gets its own build. The list lives
-  # in .github/duckdb-versions.
-  versions:
-    needs: should-release
-    if: needs.should-release.outputs.release == 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.read.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v7
-      - id: read
+      # A C++-ABI extension only loads into the exact DuckDB version stamped
+      # in its footer, so every supported release gets its own build. The
+      # list lives in .github/duckdb-versions.
+      - id: matrix
+        if: steps.check.outputs.release == 'true'
         run: echo "matrix=$(cargo run -q -p xtask -- version-matrix)" >> "$GITHUB_OUTPUT"
 
   build-extension:
-    needs: [should-release, versions]
+    needs: should-release
     if: needs.should-release.outputs.release == 'true'
     strategy:
       fail-fast: false
       matrix:
-        duckdb_version: ${{ fromJson(needs.versions.outputs.matrix) }}
-    # Pinned to the primary release; its inputs, not this ref, select which
-    # DuckDB and toolchain each matrix entry checks out.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
+        duckdb_version: ${{ fromJson(needs.should-release.outputs.matrix) }}
+    # Pinned to the primary release; `duckdb_version`, not this ref, selects
+    # which DuckDB each matrix entry checks out. `ci_tools_version` has to
+    # name this same ref: it decides which distribution matrix the build is
+    # generated from, and a matrix from an older ref omits fields this one's
+    # jobs read — v1.5.4's carries no macOS runner, which drops both macOS
+    # legs. A dropped leg leaves no job, no check run and no annotation: the
+    # run goes red with every visible job green, and `publish` is skipped.
+    # `cargo xtask check-pins` enforces it.
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
     with:
       extension_name: moraine
       duckdb_version: ${{ matrix.duckdb_version }}
-      ci_tools_version: ${{ matrix.duckdb_version }}
+      ci_tools_version: v1.5.5
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
       # the same set.
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
+      # The Linux builds run in a container with a ccache directory mounted
+      # at /ccache_dir and cached between runs, but nothing points ccache at
+      # it, so every release recompiles DuckDB from scratch into a cache
+      # that dies with the container. `test_env_variables` is appended to
+      # the env file that same container is built with, which is the one
+      # hook this workflow gives us to set it.
+      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir"}}'
 
   publish:
     needs: [should-release, build-extension]

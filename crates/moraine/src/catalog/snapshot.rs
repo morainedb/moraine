@@ -3,6 +3,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use prost::Message as _;
+
 use crate::{
     catalog::types::{
         ColumnId, ColumnInfo, ColumnStats, DataFileId, DataFileInfo, DeleteFileId, DeleteFileInfo,
@@ -10,7 +12,7 @@ use crate::{
         MacroParameterDef, MappingId, MappingInfo, NameMappingDef, OptionScope, PartitionColumnDef,
         PartitionId, PartitionSpec, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId,
         SnapshotInfo, SortId, SortKeyDef, SortSpec, TableId, TableInfo, TableStats, TagEntry,
-        ViewId, ViewInfo,
+        Timestamp, ViewId, ViewInfo,
     },
     error::{Error, Result},
     store::{
@@ -33,9 +35,7 @@ use crate::{
 pub struct CatalogSnapshot {
     pub(crate) snapshot: SnapshotValue,
     /// The head record's batch count when this view was built, zero for a
-    /// time-travel view. A maintenance batch changes committed state
-    /// without minting a snapshot, so the snapshot id alone does not say
-    /// which store state a head view stands at; this does.
+    /// time-travel view.
     pub(crate) batch_seq: u64,
     pub(crate) schemas: BTreeMap<u64, SchemaValue>,
     pub(crate) tables: BTreeMap<u64, TableValue>,
@@ -138,7 +138,48 @@ fn remove_nested<K: Ord, V>(map: &mut BTreeMap<u64, BTreeMap<K, V>>, table_id: u
     }
 }
 
+/// Encoded bytes of one map's values, keys included.
+fn flat_bytes<K, V: prost::Message>(map: &BTreeMap<K, V>) -> u64 {
+    map.values()
+        .map(|value| u64::try_from(value.encoded_len()).unwrap_or(u64::MAX))
+        .sum::<u64>()
+        + u64::try_from(map.len() * std::mem::size_of::<K>()).unwrap_or(0)
+}
+
+/// As [`flat_bytes`], for a map of maps.
+fn nested_bytes<K1, K2, V: prost::Message>(map: &BTreeMap<K1, BTreeMap<K2, V>>) -> u64 {
+    map.values().map(flat_bytes).sum::<u64>()
+        + u64::try_from(map.len() * std::mem::size_of::<K1>()).unwrap_or(0)
+}
+
 impl CatalogSnapshot {
+    /// Roughly what this view holds, in bytes: the encoded length of every
+    /// entity it carries, name indexes excluded.
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        [
+            flat_bytes(&self.schemas),
+            flat_bytes(&self.tables),
+            flat_bytes(&self.views),
+            flat_bytes(&self.macros),
+            flat_bytes(&self.table_stats),
+            flat_bytes(&self.tags),
+            flat_bytes(&self.gc_files),
+            flat_bytes(&self.options),
+            nested_bytes(&self.columns),
+            nested_bytes(&self.data_files),
+            nested_bytes(&self.delete_files),
+            nested_bytes(&self.partitions),
+            nested_bytes(&self.sorts),
+            nested_bytes(&self.mappings),
+            nested_bytes(&self.indexes),
+            nested_bytes(&self.table_column_stats),
+            nested_bytes(&self.file_column_stats),
+            u64::try_from(self.snapshot.encoded_len()).unwrap_or(u64::MAX),
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add)
+    }
+
     /// Builds the view. With `at: None` every `current` record is live and
     /// `history` is unused (allocation reads the table's persisted counter,
     /// not history); with `at: Some(s)` a record is included iff
@@ -146,8 +187,8 @@ impl CatalogSnapshot {
     /// never have; `history` records carry their end).
     pub(crate) fn build(
         snapshot: SnapshotValue,
-        current: Vec<EntityRecord>,
-        history: Vec<EntityRecord>,
+        current: &[EntityRecord],
+        history: &[EntityRecord],
         at: Option<u64>,
     ) -> Self {
         let mut view = Self {
@@ -159,7 +200,7 @@ impl CatalogSnapshot {
             None => end.is_none(),
             Some(s) => begin <= s && end.is_none_or(|e| e > s),
         };
-        for record in current.into_iter().chain(history) {
+        for record in current.iter().chain(history) {
             // Unversioned kinds (no lifecycle) are live at any time-travel
             // target: mappings are immutable, tag entries filter at read,
             // stats/options/gc rows are current-state bookkeeping.
@@ -169,14 +210,13 @@ impl CatalogSnapshot {
             {
                 continue;
             }
-            view.put_record(record);
+            view.put_record(record.clone());
         }
         view
     }
 
     /// Inserts one decoded record into the maps it belongs to, keeping the
-    /// name indexes coherent. Shared by [`build`](Self::build) and the
-    /// commit-time fold that folds a batch forward without rescanning.
+    /// name indexes coherent.
     pub(crate) fn put_record(&mut self, record: EntityRecord) {
         match record {
             EntityRecord::Schema(s) => self.put_schema(s),
@@ -208,7 +248,7 @@ impl CatalogSnapshot {
     pub fn current_snapshot(&self) -> SnapshotInfo {
         SnapshotInfo {
             id: SnapshotId::new(self.snapshot.snapshot_id),
-            time_micros: self.snapshot.snapshot_time_micros,
+            time: Timestamp::from_micros(self.snapshot.snapshot_time_micros),
             schema_version: self.snapshot.schema_version,
         }
     }
@@ -278,7 +318,31 @@ impl CatalogSnapshot {
             })
             .collect();
         infos.sort_by_key(|c| c.position);
+
         infos
+    }
+
+    /// The physical position of each of `columns` in a file written under
+    /// `table`'s current column order.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if a column is not live.
+    pub(crate) fn column_positions(
+        &self,
+        table: TableId,
+        columns: &[ColumnId],
+    ) -> Result<Vec<usize>> {
+        let live_columns = self.columns_of(table);
+        columns
+            .iter()
+            .map(|column| {
+                live_columns
+                    .iter()
+                    .position(|candidate| candidate.id == *column)
+                    .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
+            })
+            .collect()
     }
 
     /// The schema's live views, ordered by id.
@@ -341,10 +405,8 @@ impl CatalogSnapshot {
     }
 
     /// The table's partition spec live at this view's snapshot, or `None`
-    /// when the table is unpartitioned. A table has at most one live spec;
-    /// a store carrying more (only reachable through the staged path, which
-    /// stores DuckLake's rows verbatim) yields the lowest-numbered, the one
-    /// a scan in key order meets first.
+    /// when the table is unpartitioned. A store carrying more than one
+    /// yields the lowest-numbered.
     #[must_use]
     pub fn partitioning_of(&self, table: TableId) -> Option<PartitionSpec> {
         self.partitions
@@ -354,10 +416,8 @@ impl CatalogSnapshot {
     }
 
     /// The table's sort spec live at this view's snapshot, or `None` when
-    /// the table is unsorted. A table has at most one live spec; a store
-    /// carrying more (only reachable through the staged path, which stores
-    /// DuckLake's rows verbatim) yields the lowest-numbered, the one a scan
-    /// in key order meets first.
+    /// the table is unsorted. A store carrying more than one yields the
+    /// lowest-numbered.
     #[must_use]
     pub fn sorting_of(&self, table: TableId) -> Option<SortSpec> {
         self.sorts
@@ -408,24 +468,15 @@ impl CatalogSnapshot {
 
     pub(crate) fn put_index(&mut self, value: IndexValue) {
         let per_table = self.indexes.entry(value.table_id).or_default();
-        if let Some(old) = per_table.get(&value.index_id) {
-            let (_, old_scope, old_name) = index_identity(old);
-            let (old_scope, old_name) = (old_scope, old_name.to_owned());
-            remove_scoped_name(&mut self.index_names, old_scope, &old_name);
-        }
-        self.index_names
-            .entry(value.table_id)
-            .or_default()
-            .insert(value.index_name.clone(), value.index_id);
-        per_table.insert(value.index_id, value);
+        put_named(per_table, &mut self.index_names, value, index_identity);
     }
 
     pub(crate) fn delete_index(&mut self, table_id: u64, index_id: u64) {
-        if let Some(per_table) = self.indexes.get_mut(&table_id) {
-            if let Some(old) = per_table.remove(&index_id) {
-                let (_, scope, name) = index_identity(&old);
-                remove_scoped_name(&mut self.index_names, scope, name);
-            }
+        if let Some(per_table) = self.indexes.get_mut(&table_id)
+            && let Some(old) = per_table.remove(&index_id)
+        {
+            let (_, scope, name) = index_identity(&old);
+            remove_scoped_name(&mut self.index_names, scope, name);
         }
     }
 
@@ -497,7 +548,7 @@ impl CatalogSnapshot {
                 data_file_id: g.data_file_id,
                 path: g.path.clone(),
                 path_is_relative: g.path_is_relative,
-                schedule_start_micros: g.schedule_start_micros,
+                schedule_start: Timestamp::from_micros(g.schedule_start_micros),
             })
             .collect()
     }
@@ -548,10 +599,8 @@ impl CatalogSnapshot {
         self.table_stats.remove(&table_id);
         self.table_column_stats.remove(&table_id);
         self.remove_option_record(OptionScope::Table(TableId::new(table_id)).key_components());
-        // file_column_stats is kept: per-file stats outlive the file's
-        // live version until its history is garbage-collected. mappings
-        // are kept for the same reason: historical file reads still
-        // resolve through them.
+        // file_column_stats and mappings are kept: historical file reads
+        // still resolve through them.
     }
 
     pub(crate) fn put_view(&mut self, value: ViewValue) {
@@ -716,9 +765,7 @@ impl CatalogSnapshot {
     }
 
     /// Removes a schema and its name entry, without the option-scope
-    /// cascade [`delete_schema`](Self::delete_schema) applies. The
-    /// commit-time fold mirrors the store key by key, so a cascade would
-    /// drop rows the batch keeps.
+    /// cascade [`delete_schema`](Self::delete_schema) applies.
     pub(crate) fn remove_schema_only(&mut self, schema_id: u64) {
         if let Some(old) = self.schemas.remove(&schema_id) {
             self.schema_names.remove(&old.schema_name);
@@ -849,10 +896,15 @@ fn partition_spec(value: &PartitionValue) -> PartitionSpec {
     }
 }
 
-fn index_info(value: &IndexValue) -> IndexInfo {
-    use crate::store::index_encoding::{Direction, NullOrder};
+pub(crate) fn index_info(value: &IndexValue) -> IndexInfo {
+    use crate::{
+        catalog::IndexMaintenance,
+        store::index_encoding::{Direction, NullOrder},
+    };
     let state = if value.poisoned == Some(true) {
         IndexState::Poisoned
+    } else if value.build_state.as_deref() == Some("maintaining") {
+        IndexState::Maintaining
     } else if value.build_state.is_some() {
         IndexState::Building
     } else {
@@ -864,8 +916,7 @@ fn index_info(value: &IndexValue) -> IndexInfo {
         .copied()
         .map(ColumnId::new)
         .collect();
-    // Absent per-column orders default to ascending / NULLS LAST, so an
-    // ascending index reads the same whether or not it recorded them.
+    // Absent per-column orders default to ascending / NULLS LAST.
     let directions = (0..columns.len())
         .map(|i| {
             if value.column_descending.get(i).copied().unwrap_or(false) {
@@ -884,6 +935,7 @@ fn index_info(value: &IndexValue) -> IndexInfo {
             }
         })
         .collect();
+
     IndexInfo {
         id: IndexId::new(value.index_id),
         table_id: TableId::new(value.table_id),
@@ -892,8 +944,15 @@ fn index_info(value: &IndexValue) -> IndexInfo {
         directions,
         nulls,
         unique: value.unique,
+        maintenance: if value.deferred_maintenance == Some(true) {
+            IndexMaintenance::Deferred
+        } else {
+            IndexMaintenance::Synchronous
+        },
         state,
         build_cursor: value.build_cursor_row_id,
+        build_file_cursor: value.build_cursor_file.map(DataFileId::new),
+        build_position_cursor: value.build_cursor_position,
     }
 }
 
@@ -1123,7 +1182,7 @@ mod tests {
             EntityRecord::Column(column_rec(1, 0, "id", 0, 2)),
             EntityRecord::Column(column_rec(1, 1, "amount", 1, 2)),
         ];
-        let view = CatalogSnapshot::build(snap(2), current, vec![], None);
+        let view = CatalogSnapshot::build(snap(2), &current, &[], None);
 
         let s = view.schema_by_name("main").unwrap();
         assert_eq!(s.id, SchemaId::new(0));
@@ -1147,12 +1206,12 @@ mod tests {
         ];
         let history = vec![EntityRecord::Schema(schema_rec(0, "original", 1, Some(3)))];
 
-        let at2 = CatalogSnapshot::build(snap(2), current.clone(), history.clone(), Some(2));
+        let at2 = CatalogSnapshot::build(snap(2), &current.clone(), &history.clone(), Some(2));
         assert!(at2.schema_by_name("original").is_some());
         assert!(at2.schema_by_name("renamed").is_none());
         assert!(at2.table_by_id(TableId::new(1)).is_none());
 
-        let at4 = CatalogSnapshot::build(snap(4), current, history, Some(4));
+        let at4 = CatalogSnapshot::build(snap(4), &current, &history, Some(4));
         assert!(at4.schema_by_name("renamed").is_some());
         assert!(at4.table_by_id(TableId::new(1)).is_some());
     }
@@ -1166,13 +1225,35 @@ mod tests {
             end_snapshot: Some(3),
             ..column_rec(1, 5, "gone", 0, 1)
         })];
-        let view = CatalogSnapshot::build(snap(3), vec![], history, None);
+        let view = CatalogSnapshot::build(snap(3), &[], &history, None);
         assert!(view.columns_of(TableId::new(1)).is_empty());
+    }
+
+    /// Both projected instants are `Timestamp`, and the projection is total:
+    /// a pre-epoch count survives it unchanged.
+    #[test]
+    fn instants_project_unchanged_including_before_the_epoch() {
+        let mut value = snap(7);
+        value.snapshot_time_micros = -1_000;
+
+        let mut view = CatalogSnapshot::build(value, &[], &[], None);
+        view.put_gc_file(GcFileValue {
+            data_file_id: 9,
+            path: "f9.parquet".into(),
+            path_is_relative: true,
+            schedule_start_micros: -2_000,
+        });
+
+        assert_eq!(view.current_snapshot().time, Timestamp::from_micros(-1_000));
+        assert_eq!(
+            view.scheduled_deletions()[0].schedule_start,
+            Timestamp::from_micros(-2_000)
+        );
     }
 
     #[test]
     fn mutation_helpers_keep_indexes_coherent() {
-        let mut view = CatalogSnapshot::build(snap(1), vec![], vec![], None);
+        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
         view.put_schema(schema_rec(0, "main", 2, None));
         view.put_table(table_rec(1, 0, "orders", 2));
         view.put_column(column_rec(1, 0, "id", 0, 2));
@@ -1201,7 +1282,7 @@ mod tests {
         let history = vec![EntityRecord::File(file_rec(1, 9, 50, 1, Some(5)))];
 
         // Head view: only the live file; stats present.
-        let head = CatalogSnapshot::build(snap(6), current.clone(), vec![], None);
+        let head = CatalogSnapshot::build(snap(6), &current.clone(), &[], None);
         let files = head.data_files_of(TableId::new(1));
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].id, DataFileId::new(10));
@@ -1209,7 +1290,7 @@ mod tests {
 
         // Time travel to snapshot 3: the ended file was live, the new one
         // not yet; stats are unversioned and served as-is.
-        let past = CatalogSnapshot::build(snap(3), current, history, Some(3));
+        let past = CatalogSnapshot::build(snap(3), &current, &history, Some(3));
         let files = past.data_files_of(TableId::new(1));
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].id, DataFileId::new(9));
@@ -1218,7 +1299,7 @@ mod tests {
 
     #[test]
     fn stats_accessors_and_helpers() {
-        let mut view = CatalogSnapshot::build(snap(1), vec![], vec![], None);
+        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
         assert!(view.table_stats(TableId::new(1)).is_none());
         assert!(
             view.column_stats(TableId::new(1), ColumnId::new(1))
@@ -1299,13 +1380,13 @@ mod tests {
     fn views_are_versioned_and_indexed() {
         let current = vec![EntityRecord::View(view_rec(3, 0, "v2", 4, None))];
         let history = vec![EntityRecord::View(view_rec(3, 0, "v1", 1, Some(4)))];
-        let head = CatalogSnapshot::build(snap(5), current.clone(), vec![], None);
+        let head = CatalogSnapshot::build(snap(5), &current.clone(), &[], None);
         assert_eq!(
             head.view_by_name(SchemaId::new(0), "v2").unwrap().id,
             ViewId::new(3)
         );
         assert!(head.view_by_name(SchemaId::new(0), "v1").is_none());
-        let past = CatalogSnapshot::build(snap(2), current, history, Some(2));
+        let past = CatalogSnapshot::build(snap(2), &current, &history, Some(2));
         assert_eq!(past.view_by_id(ViewId::new(3)).unwrap().name, "v1");
     }
 
@@ -1324,12 +1405,8 @@ mod tests {
             }],
         };
         // Unversioned: included regardless of the time-travel target.
-        let past = CatalogSnapshot::build(
-            snap(12),
-            vec![EntityRecord::Mapping(mapping)],
-            vec![],
-            Some(1),
-        );
+        let past =
+            CatalogSnapshot::build(snap(12), &[EntityRecord::Mapping(mapping)], &[], Some(1));
         let mappings = past.mappings_of(TableId::new(4));
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].id, MappingId::new(21));
@@ -1342,14 +1419,14 @@ mod tests {
     fn macros_are_versioned_and_indexed() {
         let current = vec![EntityRecord::Macro(macro_rec(1, 5, "add", 10, None))];
         let history = vec![EntityRecord::Macro(macro_rec(2, 5, "old", 1, Some(10)))];
-        let head = CatalogSnapshot::build(snap(12), current.clone(), vec![], None);
+        let head = CatalogSnapshot::build(snap(12), &current.clone(), &[], None);
         assert_eq!(
             head.macro_by_name(SchemaId::new(5), "add").unwrap().id,
             MacroId::new(1)
         );
         assert!(head.macro_by_name(SchemaId::new(5), "old").is_none());
         assert_eq!(head.macros_in(SchemaId::new(5)).len(), 1);
-        let past = CatalogSnapshot::build(snap(2), current, history, Some(2));
+        let past = CatalogSnapshot::build(snap(2), &current, &history, Some(2));
         assert_eq!(past.macro_by_id(MacroId::new(2)).unwrap().name, "old");
         assert_eq!(
             past.macro_by_id(MacroId::new(2)).unwrap().implementations[0].macro_type,
@@ -1379,9 +1456,11 @@ mod tests {
             build_state: None,
             build_cursor_file: None,
             build_cursor_row_id: None,
+            build_cursor_position: None,
             build_deletes_scanned: None,
             poisoned: None,
             ducklake_index_id: None,
+            deferred_maintenance: None,
         }
     }
 
@@ -1407,7 +1486,7 @@ mod tests {
             Some(4),
         ))];
 
-        let head = CatalogSnapshot::build(snap(5), current.clone(), vec![], None);
+        let head = CatalogSnapshot::build(snap(5), &current.clone(), &[], None);
         let infos = head.indexes_of(TableId::new(1));
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].id, IndexId::new(7));
@@ -1423,13 +1502,13 @@ mod tests {
 
         // Time travel to snapshot 2: the ended index was live, the new one
         // not yet.
-        let past = CatalogSnapshot::build(snap(2), current, history, Some(2));
+        let past = CatalogSnapshot::build(snap(2), &current, &history, Some(2));
         assert_eq!(past.indexes_of(TableId::new(1))[0].id, IndexId::new(8));
     }
 
     #[test]
     fn dropping_a_table_clears_its_indexes() {
-        let mut view = CatalogSnapshot::build(snap(1), vec![], vec![], None);
+        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
         view.put_table(table_rec(1, 0, "t", 1));
         view.put_index(index_rec(7, 1, "by_id", vec![0], true, 1, None));
         assert!(view.index_by_name(TableId::new(1), "by_id").is_some());
@@ -1440,8 +1519,8 @@ mod tests {
     }
 
     #[test]
-    fn building_and_poisoned_states_are_projected() {
-        use crate::catalog::types::IndexState;
+    fn building_maintaining_and_poisoned_states_are_projected() {
+        use crate::catalog::types::{IndexMaintenance, IndexState};
         let building = crate::store::proto::IndexValue {
             build_state: Some("building".into()),
             ..index_rec(7, 1, "b", vec![0], true, 1, None)
@@ -1451,20 +1530,36 @@ mod tests {
             poisoned: Some(true),
             ..index_rec(8, 1, "p", vec![0], true, 1, None)
         };
+        let maintaining = crate::store::proto::IndexValue {
+            build_state: Some("maintaining".into()),
+            deferred_maintenance: Some(true),
+            ..index_rec(9, 1, "m", vec![0], false, 1, None)
+        };
         let view = CatalogSnapshot::build(
             snap(1),
-            vec![EntityRecord::Index(building), EntityRecord::Index(poisoned)],
-            vec![],
+            &[
+                EntityRecord::Index(building),
+                EntityRecord::Index(poisoned),
+                EntityRecord::Index(maintaining),
+            ],
+            &[],
             None,
         );
         let by_name = |n: &str| view.index_by_name(TableId::new(1), n).unwrap().state;
         assert_eq!(by_name("b"), IndexState::Building);
         assert_eq!(by_name("p"), IndexState::Poisoned);
+        assert_eq!(by_name("m"), IndexState::Maintaining);
+        assert_eq!(
+            view.index_by_name(TableId::new(1), "m")
+                .unwrap()
+                .maintenance,
+            IndexMaintenance::Deferred
+        );
     }
 
     #[test]
     fn option_resolution_cascades() {
-        let mut view = CatalogSnapshot::build(snap(1), vec![], vec![], None);
+        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
         view.put_schema(schema_rec(0, "s", 1, None));
         view.put_table(table_rec(1, 0, "t", 1));
         let mk = |pairs: &[(&str, &str)]| OptionScopeValue {

@@ -9,7 +9,7 @@ use super::*;
 #[tokio::test]
 async fn unknown_format_is_refused() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = StoreBuilder::new("", object_store.clone())
+    let (db, _) = StoreBuilder::new("", object_store.clone())
         .open_writer()
         .await
         .unwrap();
@@ -37,7 +37,7 @@ async fn unknown_format_is_refused() {
 #[tokio::test]
 async fn migration_marker_is_refused() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = StoreBuilder::new("", object_store.clone())
+    let (db, _) = StoreBuilder::new("", object_store.clone())
         .open_writer()
         .await
         .unwrap();
@@ -79,7 +79,7 @@ async fn migration_marker_is_refused() {
 #[tokio::test]
 async fn older_format_refuses_toward_migrate() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = StoreBuilder::new("", object_store.clone())
+    let (db, _) = StoreBuilder::new("", object_store.clone())
         .open_writer()
         .await
         .unwrap();
@@ -118,7 +118,7 @@ async fn older_format_refuses_toward_migrate() {
 #[tokio::test]
 async fn materialize_gate_refuses_on_marker() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = StoreBuilder::new("", object_store)
+    let (db, _) = StoreBuilder::new("", object_store)
         .open_writer()
         .await
         .unwrap();
@@ -182,7 +182,7 @@ fn renaming_one_column_stages_no_write_for_any_sibling() {
         transaction_id: None,
         deleted_data_file_ids: Vec::new(),
     };
-    let mut setup = Transaction::new(CatalogSnapshot::build(snap0, vec![], vec![], None), 1);
+    let mut setup = Transaction::new(CatalogSnapshot::build(snap0, &[], &[], None), 1);
     let schema = setup.create_schema("s").unwrap();
     let table = setup
         .create_table(
@@ -250,7 +250,7 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
         transaction_id: None,
         deleted_data_file_ids: Vec::new(),
     };
-    let empty = CatalogSnapshot::build(snap0, vec![], vec![], None);
+    let empty = CatalogSnapshot::build(snap0, &[], &[], None);
     let mut setup = Transaction::new(empty, 1);
     let schema = setup.create_schema("s").unwrap();
     let table = setup
@@ -407,7 +407,7 @@ async fn verb_ddl_records_schema_changed_table_ids() {
         .unwrap();
 
     let dump = catalog.begin_dump().await.unwrap();
-    let snapshots = read::scan_snapshots_overlaid(dump.handle(), dump.overlay().unwrap())
+    let snapshots = read::scan_snapshots_overlaid(dump.handle(), dump.overlay())
         .await
         .unwrap();
     dump.finish().await;
@@ -425,7 +425,7 @@ async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::cat
     let catalog = Catalog::open(
         Arc::new(InMemory::new()),
         CatalogOptions {
-            refresh_interval: std::time::Duration::ZERO,
+            reader_poll_interval: std::time::Duration::ZERO,
             ..CatalogOptions::default()
         },
     )
@@ -480,8 +480,7 @@ fn pair_entry(row_id: u64, first: i128, second: i128) -> crate::catalog::IndexEn
 }
 
 /// The row ids a query resolved, sorted — hit order is asserted separately.
-fn sorted_row_ids(hits: Vec<crate::catalog::RowLocation>) -> Vec<u64> {
-    let mut ids: Vec<u64> = hits.into_iter().map(|hit| hit.row_id).collect();
+fn sorted_row_ids(mut ids: Vec<u64>) -> Vec<u64> {
     ids.sort_unstable();
     ids
 }
@@ -666,10 +665,10 @@ async fn register_three_row_file(
 
 #[tokio::test]
 async fn index_lookup_resolves_unique_value_to_its_data_file_row() {
-    use crate::catalog::{ColumnId, IndexDef, RowHolder};
+    use crate::catalog::{ColumnId, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
     // Rows 0,1,2 land in this file (row_id_start = 0).
-    let file = register_three_row_file(&catalog, table).await;
+    register_three_row_file(&catalog, table).await;
 
     let index = std::cell::Cell::new(None);
     catalog
@@ -694,13 +693,7 @@ async fn index_lookup_resolves_unique_value_to_its_data_file_row() {
         .index_lookup(table, index, &[int_value(20)])
         .await
         .unwrap();
-    assert_eq!(
-        hits,
-        vec![crate::catalog::RowLocation {
-            row_id: 1,
-            holder: RowHolder::DataFile(file),
-        }]
-    );
+    assert_eq!(hits, vec![1]);
     // A value no row holds resolves to nothing.
     assert!(
         catalog
@@ -745,7 +738,6 @@ async fn index_lookup_returns_all_rows_for_a_non_unique_value() {
         .await
         .unwrap()
         .into_iter()
-        .map(|location| location.row_id)
         .collect();
     rows.sort_unstable();
     assert_eq!(rows, vec![0, 2]);
@@ -756,9 +748,9 @@ async fn index_lookup_returns_all_rows_for_a_non_unique_value() {
 async fn index_range_selects_unique_values_in_a_bounded_interval() {
     use std::ops::Bound;
 
-    use crate::catalog::{ColumnId, IndexDef, RowHolder};
+    use crate::catalog::{ColumnId, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
-    let file = register_three_row_file(&catalog, table).await;
+    register_three_row_file(&catalog, table).await;
 
     let index = std::cell::Cell::new(None);
     catalog
@@ -791,13 +783,7 @@ async fn index_range_selects_unique_values_in_a_bounded_interval() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        between,
-        vec![crate::catalog::RowLocation {
-            row_id: 1,
-            holder: RowHolder::DataFile(file),
-        }]
-    );
+    assert_eq!(between, vec![1]);
 
     // > 20 (half-open) — value 30 (row 2).
     let above = catalog
@@ -868,9 +854,7 @@ async fn index_range_reverse_serves_the_opposite_order() {
         .unwrap();
     let index = index.get().unwrap();
 
-    let order = |query: Vec<crate::catalog::RowLocation>| {
-        query.into_iter().map(|hit| hit.row_id).collect::<Vec<_>>()
-    };
+    let order = |query: Vec<u64>| query;
 
     // Ascending index: default order is low-to-high, `reverse` is high-to-low.
     let ascending = catalog
@@ -1105,9 +1089,7 @@ async fn descending_index_scans_high_value_first() {
     let index = index.get().unwrap();
 
     // Results come back in the index's stored order — descending by value.
-    let order = |hits: Vec<crate::catalog::RowLocation>| {
-        hits.into_iter().map(|hit| hit.row_id).collect::<Vec<u64>>()
-    };
+    let order = |hits: Vec<u64>| hits;
 
     // Closed [10, 30]: 30, 20, 10 -> rows 2, 1, 0.
     let all = catalog
@@ -1157,9 +1139,9 @@ async fn descending_index_scans_high_value_first() {
 
 #[tokio::test]
 async fn unique_index_admits_null_rows_and_index_nulls_finds_them() {
-    use crate::catalog::{ColumnId, IndexDef, RowHolder};
+    use crate::catalog::{ColumnId, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
-    let file = register_three_row_file(&catalog, table).await;
+    register_three_row_file(&catalog, table).await;
 
     let index = std::cell::Cell::new(None);
     catalog
@@ -1188,7 +1170,6 @@ async fn unique_index_admits_null_rows_and_index_nulls_finds_them() {
         .await
         .unwrap()
         .into_iter()
-        .map(|hit| hit.row_id)
         .collect();
     nulls.sort_unstable();
     assert_eq!(nulls, vec![1, 2], "IS NULL finds both NULL rows");
@@ -1200,10 +1181,7 @@ async fn unique_index_admits_null_rows_and_index_nulls_finds_them() {
     }];
     assert_eq!(
         catalog.index_lookup(table, index, &value).await.unwrap(),
-        vec![crate::catalog::RowLocation {
-            row_id: 0,
-            holder: RowHolder::DataFile(file),
-        }]
+        vec![0]
     );
     // A pure-equality prefix through index_nulls is refused.
     let err = catalog
@@ -1631,7 +1609,7 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].row_id, 1);
+    assert_eq!(hits[0], 1);
     catalog.close().await.unwrap();
 }
 
@@ -2182,13 +2160,25 @@ async fn scoped_read_covers_a_registration_end_to_end() {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
     }
+    let file_size = u64::try_from(buffer.len()).unwrap();
+    let footer_offset = buffer.len() - 8;
+    let footer_size = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
     data.put(&path, buffer.into()).await.unwrap();
 
     // moraine derives coverage entries by the scoped read (column "a"
     // at position 0), then registration lands them — DuckLake supplied
     // none, and the read stands in for the refusal.
     let entries = catalog
-        .scoped_file_index_entries(data.clone(), &path, index, &[0])
+        .scoped_file_index_entries(
+            crate::data_file::DataStore::new(data.clone()),
+            &path,
+            file_size,
+            footer_size,
+            index,
+            &[0],
+        )
         .await
         .unwrap();
     assert_eq!(entries.len(), 3);
@@ -2220,7 +2210,7 @@ async fn scoped_read_covers_a_registration_end_to_end() {
     };
     let hits = catalog.index_lookup(table, index, &[value]).await.unwrap();
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].row_id, 1);
+    assert_eq!(hits[0], 1);
     catalog.close().await.unwrap();
 }
 
@@ -2381,7 +2371,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].row_id, 1);
+    assert_eq!(hits[0], 1);
     assert_eq!(
         scan_index_entries(&single, single_index).await,
         scan_index_entries(&staged, staged_index).await
@@ -2835,13 +2825,7 @@ async fn maintain_spares_live_indexes_interleaved_by_id() {
             )
             .await
             .unwrap();
-        assert_eq!(
-            found
-                .iter()
-                .map(|location| location.row_id)
-                .collect::<Vec<_>>(),
-            vec![row_id]
-        );
+        assert_eq!(found, vec![row_id]);
     }
 
     catalog.close().await.unwrap();
@@ -2947,40 +2931,6 @@ async fn maintain_refuses_a_zero_batch_size() {
         Err(Error::Configuration(_))
     ));
     catalog.close().await.unwrap();
-}
-
-/// Maintenance mutates, so a read-only catalog refuses it rather than
-/// reporting a no-op pass.
-#[tokio::test]
-async fn maintain_refuses_a_read_only_catalog() {
-    use crate::catalog::{Catalog, CatalogOptions, MaintenanceRequest};
-    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-
-    // Bootstrap and release the writer so the reader has a store to open.
-    let writer = Catalog::open(object_store.clone(), CatalogOptions::default())
-        .await
-        .unwrap();
-    writer.close().await.unwrap();
-
-    let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
-        .await
-        .unwrap();
-    assert!(matches!(
-        reader.maintain(MaintenanceRequest::default()).await,
-        Err(Error::Constraint(_))
-    ));
-    // A request with nothing to do is refused just the same: the answer
-    // depends on the handle, not on what the request happens to ask for.
-    assert!(matches!(
-        reader
-            .maintain(MaintenanceRequest {
-                sweep_orphaned_index_entries: false,
-                ..MaintenanceRequest::default()
-            })
-            .await,
-        Err(Error::Constraint(_))
-    ));
-    reader.close().await.unwrap();
 }
 
 /// Discovery seeks by index id: from any starting id it returns the
@@ -3169,10 +3119,12 @@ async fn drop_index_ends_definition_and_keeps_format() {
     catalog.close().await.unwrap();
 }
 
+/// A multi-writer bootstrap stamps the format that topology requires, and
+/// folds no slot: its replay point is zero.
 #[tokio::test]
-async fn multi_writer_bootstrap_stamps_format_four_and_folds_nothing() {
+async fn multi_writer_bootstrap_stamps_its_format_and_folds_nothing() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = open_initialized(StoreBuilder::new("", object_store.clone()), false, None)
+    let (db, _, _) = open_initialized(StoreBuilder::new("", object_store.clone()), false, None)
         .await
         .unwrap();
     let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
@@ -3180,13 +3132,13 @@ async fn multi_writer_bootstrap_stamps_format_four_and_folds_nothing() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(format.format_version, 4);
+    assert_eq!(format.format_version, FORMAT_MULTI_WRITER);
     tx.rollback();
     db.close().await.unwrap();
 
     // A bootstrapped store has folded no slot: its replay point is zero, so
     // the whole log — empty here — is still ahead of it.
-    let reader = StoreBuilder::new("", object_store.clone())
+    let (reader, _) = StoreBuilder::new("", object_store.clone())
         .open_reader()
         .await
         .unwrap();
@@ -3200,7 +3152,7 @@ async fn multi_writer_bootstrap_stamps_format_four_and_folds_nothing() {
 /// no error anywhere.
 #[tokio::test]
 async fn a_store_write_reaching_the_next_slots_sequence_is_refused() {
-    let db = open_initialized(
+    let (db, _, _) = open_initialized(
         StoreBuilder::new("", Arc::new(InMemory::new())),
         false,
         None,

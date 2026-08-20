@@ -1,5 +1,5 @@
 name: Publish extension release
-description: Attach built per-DuckDB-version, per-arch extensions to a draft ext-v* release, reveal it, and pin the descriptor ref.
+description: Attach built per-DuckDB-version, per-arch extensions to a draft ext-v* release once every supported combination is present, reveal it, and pin the descriptor ref.
 inputs:
   tag:
     description: The ext-v<version>[-build.N] release/tag name.
@@ -22,7 +22,6 @@ runs:
         set -euo pipefail
         mkdir -p dist
         shopt -s nullglob
-        staged=0
         for d in artifacts/moraine-*-extension-*/; do
           name=${d%/}
           name=${name##*/}
@@ -31,13 +30,14 @@ runs:
           duckdb_version=${duckdb_version%-extension-*}
           cp "$d/moraine.duckdb_extension" \
              "dist/moraine.${duckdb_version}.${arch}.duckdb_extension"
-          staged=$((staged + 1))
         done
-        if [ "$staged" -eq 0 ]; then
-          echo "no built extensions found under artifacts/ - nothing to publish" >&2
-          exit 1
-        fi
         ls -l dist
+    # The last check that a release is whole, and the only one that says
+    # which build is missing: a leg the upstream matrix never starts leaves
+    # no job and no annotation behind to name.
+    - name: Require a build for every supported version on every platform
+      shell: bash
+      run: cargo run -q -p xtask -- check-release-assets dist
     - name: Create draft release, attach binaries, reveal
       shell: bash
       env:

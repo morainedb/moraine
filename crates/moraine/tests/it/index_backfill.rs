@@ -16,19 +16,6 @@ use crate::fixtures::{col, datafile, open_memory};
 #[tokio::test]
 async fn scoped_backfill_reads_registered_files_from_the_data_store() {
     let catalog = open_memory().await;
-    let created = std::cell::Cell::new(None);
-    catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
-            let table = tx.create_table(schema, "orders", &[col("a")])?;
-            tx.register_data_file(table, datafile(3), &[])?;
-            created.set(Some(table));
-            Ok(())
-        })
-        .await
-        .unwrap();
-    let table = created.get().unwrap();
-
     // The data store holds the registered file under the table's data
     // directory (`<schema path><table path>` = `main/orders/`).
     let data = Arc::new(InMemory::new());
@@ -44,12 +31,43 @@ async fn scoped_backfill_reads_registered_files_from_the_data_store() {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
     }
+    let footer_offset = buffer.len() - 8;
+    let footer_size = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
+    let file_size_bytes = u64::try_from(buffer.len()).unwrap();
     data.put(&Path::from("main/orders/data-3.parquet"), buffer.into())
         .await
         .unwrap();
 
+    let created = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
+            let table = tx.create_table(schema, "orders", &[col("a")])?;
+            tx.register_data_file(
+                table,
+                moraine::DataFile {
+                    file_size_bytes,
+                    footer_size,
+                    ..datafile(3)
+                },
+                &[],
+            )?;
+            created.set(Some(table));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let table = created.get().unwrap();
+
     let entries = catalog
-        .scoped_backfill_entries(data, "", table, &[ColumnId::new(1)])
+        .scoped_backfill_entries(
+            moraine::DataStore::new(data),
+            "",
+            table,
+            &[ColumnId::new(1)],
+        )
         .await
         .unwrap();
     assert_eq!(entries.len(), 3);

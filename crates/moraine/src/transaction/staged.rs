@@ -5,7 +5,7 @@
 //! Three rules bound this path: every value DuckLake supplies is stored
 //! **verbatim** except one interpreted convention (an `UPDATE` setting
 //! `end_snapshot` becomes current-delete + history-write); one commit is one
-//! atomic batch, reusing [`super::commit::diff_writes`]; and a lost race at
+//! atomic batch, reusing [`super::commit::diff_touched`]; and a lost race at
 //! commit is **never retried** — DuckLake authored the ids and counters in
 //! the batch. The loser's error always carries the substring `conflict`
 //! (via [`Error::CommitConflict`]'s `Display`), the wire contract
@@ -15,7 +15,7 @@
 //! [`CatalogSnapshot`], then diffs it against the unmodified base exactly
 //! as a verb-path commit diffs its closure's output. An `UPDATE ... SET
 //! end_snapshot` row's value is validated, not trusted: DuckLake always
-//! sets it to this commit's own new snapshot id — the value `diff_writes`
+//! sets it to this commit's own new snapshot id — the value `diff_touched`
 //! stamps on its own — so a mismatch is drift caught loudly.
 
 use std::{
@@ -24,27 +24,29 @@ use std::{
 };
 
 use moraine_wal::{CommitOutcome, Envelope, Overlay, SlotLog};
-use object_store::ObjectStore;
 use slatedb::DbReader;
 use tracing::debug;
 
 use crate::{
     catalog::{
-        CatalogSnapshot, ColumnInfo, IndexInfo, SnapshotId, TableId,
+        CatalogSnapshot, ColumnInfo, IndexId, IndexInfo, SnapshotId, TableId,
         inline::{InlineScanKind, materialize_inline_rows},
-        scoped_read::{self, ScopedReadEntry},
     },
+    data_file::{self, DataStore},
     error::{Error, Result},
     store::{
         handle::ReadHandle,
-        index_encoding::encode_ordered_values,
         inline as store_inline,
-        key::{EntityKey, InlineKey, InlineOperation, Key, SysKey},
+        key::{EntityKey, InlineKey, InlineOperation, Key},
         proto, read, value,
     },
+    telemetry::milliseconds,
     transaction::{
         commit::{self, StagedWrite},
-        index_maintenance::{ProbeHandle, StagedIndexEntry, plan_index_entries},
+        index_maintenance::{
+            IndexMaintenanceMetrics, ProbeHandle, StagedEntries, StagedIndexEntry,
+            plan_index_entry_stream,
+        },
         slot_commit::{HeadCache, SlotHead, commit_from, release_reader},
     },
 };
@@ -439,10 +441,10 @@ impl StagedBacking {
 
     /// The handle and unfolded-tail overlay for a committed-records scan: the
     /// folded store overlaid with the tail the pinned head carries.
-    fn committed_scan(&self) -> (ReadHandle<'_>, &Overlay) {
+    fn committed_scan(&self) -> (ReadHandle<'_>, Option<&Overlay>) {
         match self {
             Self::Slots { head, reader, .. } => {
-                (head.handle(ReadHandle::Reader(reader)), &head.overlay)
+                (head.handle(ReadHandle::Reader(reader)), Some(&head.overlay))
             }
         }
     }
@@ -465,8 +467,14 @@ pub struct StagedTransaction {
     /// The `DATA_PATH` object store and its bucket-relative prefix, present
     /// when the attach supplied `META_DATA_PATH`. Index maintenance
     /// scoped-reads registered data files through it; absent it is skipped.
-    data_store: Option<Arc<dyn ObjectStore>>,
+    data_store: Option<DataStore>,
     data_prefix: String,
+    /// Where this transaction's scoped reads of registered data files are
+    /// tallied, shared with the handle that opened it.
+    data_reads: Arc<data_file::DataStoreCounters>,
+    /// The handle's projection cache, for the format floor and the inline
+    /// chunk-directory completeness this commit's translation consults.
+    projections: Arc<std::sync::RwLock<crate::catalog::projection::ProjectionCache>>,
     /// The handle's head cache, updated on a successful commit so a read on the
     /// same handle sees this write regardless of the refresh window.
     head_cache: HeadCache,
@@ -484,14 +492,17 @@ pub struct StagedTransaction {
 impl StagedTransaction {
     /// Opens a fresh transaction over a pinned slot-log head; a successful
     /// commit races one slot at `head.next_sequence`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_slots(
         head: SlotHead,
         reader: Arc<DbReader>,
         slots: SlotLog,
-        data_store: Option<Arc<dyn ObjectStore>>,
+        data_store: Option<DataStore>,
         data_prefix: String,
         head_cache: HeadCache,
         contention: Arc<crate::transaction::slot_commit::ContentionCounters>,
+        data_reads: Arc<data_file::DataStoreCounters>,
+        projections: Arc<std::sync::RwLock<crate::catalog::projection::ProjectionCache>>,
     ) -> Self {
         Self {
             backing: StagedBacking::Slots {
@@ -503,6 +514,8 @@ impl StagedTransaction {
             committed: tokio::sync::OnceCell::new(),
             data_store,
             data_prefix,
+            data_reads,
+            projections,
             head_cache,
             contention,
             #[cfg(feature = "leader")]
@@ -522,6 +535,28 @@ impl StagedTransaction {
     /// [`commit`](Self::commit).
     pub fn stage(&mut self, op: RowOperation) {
         self.ops.push(op);
+    }
+
+    /// The tables this transaction registered data files on, for a caller
+    /// that warms their metadata before the commit lands.
+    #[must_use]
+    pub fn tables_with_staged_data_files(&self) -> Vec<TableId> {
+        let mut tables: Vec<TableId> = self
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                RowOperation::Insert {
+                    table: TableKind::DataFile,
+                    cells,
+                } => decode::decode_data_file(cells).ok(),
+                _ => None,
+            })
+            .map(|file| TableId::new(file.table_id))
+            .collect();
+        tables.sort_unstable();
+        tables.dedup();
+
+        tables
     }
 
     /// Discards every staged row without writing anything. A slot-backed
@@ -547,7 +582,7 @@ impl StagedTransaction {
             StagedBacking::Slots { head, reader, .. } => {
                 read::scan_snapshots_overlaid(
                     head.handle(ReadHandle::Reader(reader)),
-                    &head.overlay,
+                    Some(&head.overlay),
                 )
                 .await?
             }
@@ -615,6 +650,25 @@ impl StagedTransaction {
             })
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// `ducklake_data_file` rows as this transaction sees them, for a reader
+    /// filtering to the versions live at `filter_snapshot`.
+    ///
+    /// `filter_snapshot` selects only how much of the store a scan must
+    /// cover — `current` alone, or `current` and `history` — and this
+    /// transaction's committed scan is cached whole either way, so it changes
+    /// nothing here. The caller applies the version filter it wants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_data_files_live_at(
+        &self,
+        filter_snapshot: Option<u64>,
+    ) -> Result<Vec<proto::DataFileValue>> {
+        let _ = filter_snapshot;
+        self.visible_data_files().await
     }
 
     /// `ducklake_delete_file` rows as this transaction sees them.
@@ -994,6 +1048,18 @@ impl StagedTransaction {
     /// retried internally** — if a concurrent commit advanced the head
     /// first; the store is left unchanged by the loser.
     pub async fn commit(self) -> Result<SnapshotId> {
+        self.commit_reporting()
+            .await
+            .map(|report| report.snapshot_id)
+    }
+
+    /// As [`commit`](Self::commit), also naming the deferred-maintenance
+    /// indexes this commit left awaiting repair.
+    ///
+    /// # Errors
+    ///
+    /// As [`commit`](Self::commit).
+    pub async fn commit_reporting(self) -> Result<CommitReport> {
         let started = std::time::Instant::now();
         let Self {
             backing,
@@ -1001,6 +1067,8 @@ impl StagedTransaction {
             committed: _,
             data_store,
             data_prefix,
+            data_reads,
+            projections,
             head_cache,
             contention,
             #[cfg(feature = "leader")]
@@ -1020,7 +1088,12 @@ impl StagedTransaction {
                     // let the next read or transaction re-materialize the tail.
                     head_cache.invalidate();
                     backing.release_head().await;
-                    return Ok(id);
+                    // The leader assembled the batch, so this process never saw
+                    // which definitions it deferred.
+                    return Ok(CommitReport {
+                        snapshot_id: id,
+                        deferred_indexes: Vec::new(),
+                    });
                 }
                 forward::Forwarded::Surface(err) => {
                     backing.release_head().await;
@@ -1030,7 +1103,17 @@ impl StagedTransaction {
             }
         }
 
-        let assembled = assemble(&backing, &ops, data_store.as_ref(), &data_prefix, None).await;
+        let read_metrics = Arc::new(data_file::ScopedReadMetrics::reporting_to(data_reads));
+        let assembled = assemble(
+            &backing,
+            &ops,
+            data_store.as_ref(),
+            &data_prefix,
+            &projections,
+            read_metrics,
+            None,
+        )
+        .await;
 
         match backing {
             StagedBacking::Slots { head, slots, .. } => {
@@ -1050,6 +1133,16 @@ impl StagedTransaction {
 }
 
 /// Everything one staged commit assembles before racing its slot.
+/// What a landed commit produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CommitReport {
+    /// The snapshot the commit's rows are visible at.
+    pub snapshot_id: SnapshotId,
+    /// Deferred-maintenance indexes this commit left `Maintaining`.
+    pub deferred_indexes: Vec<IndexId>,
+}
+
 pub(crate) struct Assembly {
     /// The snapshot id a successful commit reports: the minted id, or the
     /// unchanged head for a maintenance commit.
@@ -1063,6 +1156,13 @@ pub(crate) struct Assembly {
     /// The commit's classification string, for the slot envelope a lost race
     /// judges against; empty for a maintenance commit.
     pub(crate) changes_made: String,
+    /// Definitions this commit left awaiting deferred repair, reported back so
+    /// the caller can schedule it.
+    pub(crate) deferred_indexes: Vec<IndexId>,
+    /// Key and value bytes the index entries staged, deletes included.
+    pub(crate) index_bytes: u64,
+    /// What index maintenance spent producing those entries.
+    pub(crate) index_metrics: IndexMaintenanceMetrics,
 }
 
 /// Translates every staged row into the atomic batch the slot commit lands.
@@ -1071,8 +1171,10 @@ pub(crate) struct Assembly {
 pub(crate) async fn assemble(
     backing: &StagedBacking,
     ops: &[RowOperation],
-    data_store: Option<&Arc<dyn ObjectStore>>,
+    data_store: Option<&DataStore>,
     data_prefix: &str,
+    projections: &std::sync::RwLock<crate::catalog::projection::ProjectionCache>,
+    read_metrics: Arc<data_file::ScopedReadMetrics>,
     transaction_id: Option<[u8; 16]>,
 ) -> Result<Assembly> {
     let handle = backing.scan_handle();
@@ -1091,7 +1193,7 @@ pub(crate) async fn assemble(
     // Read before any write is staged: `InlineFlushDelete`/`InlineDrop` name a
     // table, not keys, and resolve against the pre-commit state exactly like
     // `base`.
-    let inline_writes = translate_inline(handle, overlay, ops).await?;
+    let inline_writes = translate_inline(handle, overlay, projections, ops).await?;
 
     let mints_snapshot = ops.iter().any(|op| {
         matches!(
@@ -1108,19 +1210,25 @@ pub(crate) async fn assemble(
     // no-op unless a live index covers the file's table. Planned before the
     // translation so a poisoned definition rides the writes it produces, and
     // returned as writes rather than staged so the slot envelope carries them.
-    let (poisoned, index_writes) = stage_index_maintenance(
-        handle,
-        overlay,
+    let StagedEntries {
+        writes: index_writes,
+        poisoned,
+        deferred,
+        locator_writes,
+        bytes: index_bytes,
+        metrics: index_metrics,
+    } = stage_index_maintenance(
         backing.probe(),
         base_ref,
         ops,
         data_store,
         data_prefix,
+        read_metrics,
     )
     .await?;
 
     let (result_id, mut writes, changes_made) = if mints_snapshot {
-        let (new_id, mut writes, mut snap) = translate(base_ref, ops, &poisoned)?;
+        let (new_id, mut writes, mut snap) = translate(base_ref, ops, &poisoned, &deferred)?;
         snap.transaction_id = transaction_id.map(|id| id.to_vec());
         let changes_made = snap.changes_made.clone();
         writes.push((
@@ -1130,27 +1238,41 @@ pub(crate) async fn assemble(
             .encode(),
             Some(value::encode_value(&snap)),
         ));
-        writes.push((
-            Key::Sys(SysKey::Head).encode(),
-            Some(value::encode_value(&proto::HeadValue {
-                snapshot_id: new_id,
-                batch_seq: 0,
-            })),
-        ));
+        writes.push(commit::head_stamp(new_id, base_ref.batch_seq));
         (new_id, writes, changes_made)
     } else {
-        let writes = translate_maintenance(base_ref, ops)?;
+        let mut writes = translate_maintenance(base_ref, ops)?;
+        // A maintenance batch reuses the snapshot id, so the batch count is
+        // the only thing that says the store moved.
+        writes.push(commit::head_stamp(
+            base_ref.snapshot.snapshot_id,
+            base_ref.batch_seq,
+        ));
         (base_ref.snapshot.snapshot_id, writes, String::new())
     };
 
+    // Directory repairs go ahead of the inline writes, so a flush draining a
+    // repaired chunk still deletes its locator. A maintenance-only commit
+    // carries them too, so this sits outside the snapshot-minting branch.
+    writes.extend(locator_writes);
     writes.extend(index_writes);
     writes.extend(inline_writes);
+
+    // A head-preserving commit never marks a definition maintaining.
+    let deferred_indexes = if mints_snapshot {
+        deferred.into_iter().map(IndexId::new).collect()
+    } else {
+        Vec::new()
+    };
 
     Ok(Assembly {
         result_id,
         writes,
         transaction_id,
         changes_made,
+        deferred_indexes,
+        index_bytes,
+        index_metrics,
     })
 }
 
@@ -1175,7 +1297,7 @@ async fn commit_slots(
     started: std::time::Instant,
     head_cache: &HeadCache,
     contention: &crate::transaction::slot_commit::ContentionCounters,
-) -> Result<SnapshotId> {
+) -> Result<CommitReport> {
     let outcome = match assembled {
         Ok(assembly) => {
             let transaction_id = assembly
@@ -1194,8 +1316,17 @@ async fn commit_slots(
             match slots.commit_slot(head.next_sequence, &envelope).await {
                 Ok(CommitOutcome::Won) => {
                     record_committed_head(head_cache, &head, &envelope, &assembly.writes);
-                    staged_landed(assembly.result_id, staged_rows, started);
-                    Ok(SnapshotId::new(assembly.result_id))
+                    staged_landed(
+                        assembly.result_id,
+                        staged_rows,
+                        assembly.index_bytes,
+                        &assembly.index_metrics,
+                        started,
+                    );
+                    Ok(CommitReport {
+                        snapshot_id: SnapshotId::new(assembly.result_id),
+                        deferred_indexes: assembly.deferred_indexes,
+                    })
                 }
                 Ok(CommitOutcome::Lost(_)) => {
                     // The lost race is contention proof: it arms the next
@@ -1235,11 +1366,41 @@ fn record_committed_head(
 }
 
 /// One landed staged commit's summary event.
-fn staged_landed(result_id: u64, staged_rows: usize, started: std::time::Instant) {
+fn staged_landed(
+    result_id: u64,
+    staged_rows: usize,
+    index_bytes: u64,
+    index: &IndexMaintenanceMetrics,
+    started: std::time::Instant,
+) {
+    let read = &index.scoped_read;
     debug!(
         snapshot = result_id,
         staged_rows,
-        elapsed_ms = started.elapsed().as_millis(),
+        index_bytes,
+        index_delete_derivation_ms = milliseconds(index.deletion_derivation),
+        index_add_derivation_ms = milliseconds(index.addition_derivation),
+        index_probe_window_ms = milliseconds(index.probe_window),
+        index_probe_service_ms = milliseconds(index.probe_service),
+        index_stage_ms = milliseconds(index.staging),
+        index_encode_ms = milliseconds(read.encode_duration),
+        index_parquet_read_ms = milliseconds(read.range_duration),
+        index_additions = index.additions,
+        index_deletions = index.deletions,
+        index_unique_probes = index.unique_probes,
+        index_probe_hits = index.probe_hits,
+        index_probe_misses = index.probe_misses,
+        index_probe_peak_in_flight = index.probe_peak_in_flight,
+        index_probes_completed_during_deletions = index.probes_completed_during_deletions,
+        index_metadata_hits = read.metadata_hits,
+        index_metadata_misses = read.metadata_misses,
+        index_range_fetches = read.range_fetches,
+        index_ranges = read.ranges,
+        index_range_bytes = read.range_bytes,
+        index_files = read.parquet_files,
+        index_inline_chunks = read.inline_chunks,
+        index_arrow_batches = read.arrow_batches,
+        elapsed_ms = milliseconds(started.elapsed()),
         "staged commit landed"
     );
 }
@@ -1265,6 +1426,7 @@ fn translate(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     poisoned: &[u64],
+    deferred: &[u64],
 ) -> Result<(u64, Vec<commit::StagedWrite>, proto::SnapshotValue)> {
     let snapshot = build_snapshot_value(ops)?;
     let new_id = snapshot.snapshot_id;
@@ -1293,6 +1455,7 @@ fn translate(
     let mut state = base.clone();
     let mut children = collect_child_rows(ops)?;
     let mut direct = Vec::new();
+    let mut touched = commit::Touched::default();
     let hard_deleted = collect_hard_deletes(ops)?;
 
     for op in ops {
@@ -1310,6 +1473,7 @@ fn translate(
                 &mut children,
                 &mut direct,
                 &hard_deleted,
+                &mut touched,
             )?;
         }
     }
@@ -1324,6 +1488,7 @@ fn translate(
                 &mut children,
                 &mut direct,
                 &hard_deleted,
+                &mut touched,
             )?;
         }
     }
@@ -1338,6 +1503,7 @@ fn translate(
                 &mut children,
                 &mut direct,
                 &hard_deleted,
+                &mut touched,
             )?;
         }
     }
@@ -1359,8 +1525,11 @@ fn translate(
     }
 
     crate::transaction::index_maintenance::apply_poison(&mut state, poisoned);
+    crate::transaction::index_maintenance::apply_deferred_maintenance(
+        base, &mut state, deferred, new_id,
+    );
 
-    let mut writes = commit::diff_writes(base, &state, new_id);
+    let mut writes = commit::diff_touched(base, &state, new_id, &touched);
     writes.extend(direct);
     // The `ducklake_schema_versions` rows this commit staged, as records of
     // their own: `snapshot` carries them too, but only until expiry deletes
@@ -1438,6 +1607,7 @@ fn translate_maintenance(
     let mut state = base.clone();
     let mut children = ChildRows::default();
     let mut direct = Vec::new();
+    let mut touched = commit::Touched::default();
     let hard_deleted = collect_hard_deletes(ops)?;
     for op in ops {
         let allowed = matches!(
@@ -1469,10 +1639,11 @@ fn translate_maintenance(
             &mut children,
             &mut direct,
             &hard_deleted,
+            &mut touched,
         )?;
     }
 
-    let mut writes = commit::diff_writes(base, &state, head);
+    let mut writes = commit::diff_touched(base, &state, head, &touched);
     writes.extend(direct);
     Ok(writes)
 }

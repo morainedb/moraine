@@ -241,6 +241,19 @@ impl Overlay {
         }
     }
 
+    /// Roughly what the held writes occupy, keys and values together. A
+    /// delete counts its key alone.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> u64 {
+        self.writes
+            .iter()
+            .map(|(key, value)| {
+                let held = key.len() + value.as_ref().map_or(0, Vec::len);
+                u64::try_from(held).unwrap_or(u64::MAX)
+            })
+            .fold(0_u64, u64::saturating_add)
+    }
+
     /// `Some(Some(bytes))` = written, `Some(None)` = deleted, `None` =
     /// untouched by the tail.
     #[must_use]

@@ -70,8 +70,8 @@ struct DecodedInlineColumn {
 };
 
 // Serializes `user_columns` as a schema-only Arrow IPC stream.
-std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
-                                        const std::vector<DecodedInlineColumn> &user_columns);
+MoraineArrowBytes EncodeInlineSchema(duckdb::ClientContext &context,
+                                     const std::vector<DecodedInlineColumn> &user_columns);
 
 // Inverse of `EncodeInlineSchema`: reconstructs each column's name and
 // DuckDB type from the stream's Arrow schema. Throws on malformed bytes or
@@ -80,20 +80,37 @@ std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &conte
 
 // Serializes columns `[user_col_start, chunk.ColumnCount())` of every row
 // `0..chunk.size()` as one Arrow IPC record-batch body (no schema message).
-std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::DataChunk &chunk,
-                                           duckdb::idx_t user_col_start);
+MoraineArrowBytes EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::DataChunk &chunk,
+                                        duckdb::idx_t user_col_start);
+
+// A version's schema-only stream (`inline/schema`) parsed once by the Rust
+// side, reused for every chunk of that version. Throws on malformed bytes.
+class DecodedInlineSchema {
+public:
+	DecodedInlineSchema(const uint8_t *schema_ipc, size_t schema_ipc_len);
+	~DecodedInlineSchema();
+	DecodedInlineSchema(const DecodedInlineSchema &) = delete;
+	DecodedInlineSchema &operator=(const DecodedInlineSchema &) = delete;
+
+	const MoraineArrowSchema *Get() const {
+		return handle_;
+	}
+
+private:
+	MoraineArrowSchema *handle_;
+};
 
 // Inverse of `EncodeInlineChunkRows`, imported through DuckDB's Arrow
 // reader and left as the `DataChunk`s that reader produced — one per
 // `STANDARD_VECTOR_SIZE` rows, in order, so the chunk's row `o` is row
 // `o % STANDARD_VECTOR_SIZE` of piece `o / STANDARD_VECTOR_SIZE`. Columnar
 // on both sides: nothing is transcoded through `duckdb::Value`.
-// `schema_ipc` is the version's schema-only stream (`inline/schema`),
-// against which the body-only chunk decodes. Throws InternalException on
-// malformed bytes or a column count mismatch against `user_types`.
-std::vector<duckdb::unique_ptr<duckdb::DataChunk>> DecodeInlineChunkPieces(
-    duckdb::ClientContext &context, const uint8_t *schema_ipc, size_t schema_ipc_len, const uint8_t *data, size_t len,
-    const std::vector<duckdb::LogicalType> &user_types);
+// `schema` is the version's decoded schema, against which the body-only
+// chunk decodes. Throws InternalException on malformed bytes or a column
+// count mismatch against `user_types`.
+std::vector<duckdb::unique_ptr<duckdb::DataChunk>>
+DecodeInlineChunkPieces(duckdb::ClientContext &context, const DecodedInlineSchema &schema, MoraineInlineChunk &chunk,
+                        const std::vector<duckdb::LogicalType> &user_types);
 
 // A synthesized `ducklake_inlined_data_<t>_<v>` entry: columns are
 // `(row_id, begin_snapshot, end_snapshot, <user columns>)`.

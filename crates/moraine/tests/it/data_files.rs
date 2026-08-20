@@ -273,3 +273,106 @@ async fn expired_delete_files_vanish_at_head_but_time_travel_sees_them() {
     assert_eq!(past.delete_files_of(t).len(), 1);
     catalog.close().await.unwrap();
 }
+
+/// Expiry leaves a file's column statistics in place, and the
+/// maintenance sweep leaves them alone.
+///
+/// The statistics carry no snapshot of their own, so the one record is
+/// what a time-travelling read of the expired file resolves through —
+/// its file record comes from history, its statistics from here. They
+/// become reclaimable only once the file is gone from history too, which
+/// is what the sweep tests for.
+#[tokio::test]
+async fn expiry_keeps_file_column_stats_the_past_still_resolves() {
+    use moraine::MaintenanceRequest;
+
+    let (catalog, t) = seeded().await;
+    catalog
+        .commit(move |tx| {
+            tx.register_data_file(
+                t,
+                DataFile {
+                    column_stats: vec![FileColumnStats {
+                        column_id: ColumnId::new(1),
+                        column_size_bytes: 10,
+                        value_count: 100,
+                        null_count: 0,
+                        min_value: Some("1".into()),
+                        max_value: Some("99".into()),
+                        contains_nan: None,
+                        extra_stats: None,
+                    }],
+                    ..datafile(100)
+                },
+                &[],
+            )
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+    let registered = catalog.snapshot().await.unwrap().current_snapshot().id;
+
+    let file_id = catalog.snapshot().await.unwrap().data_files_of(t)[0].id;
+    catalog
+        .commit(move |tx| tx.expire_data_file(t, file_id))
+        .await
+        .unwrap();
+    assert!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .data_files_of(t)
+            .is_empty()
+    );
+
+    let report = catalog
+        .maintain(MaintenanceRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        report.file_column_stats_reclaimed, 0,
+        "history still resolves the file, so its statistics stay"
+    );
+    assert_eq!(
+        catalog
+            .snapshot_at(registered)
+            .await
+            .unwrap()
+            .data_files_of(t)
+            .len(),
+        1
+    );
+    catalog.close().await.unwrap();
+}
+
+/// A catalog with nothing unresolvable reclaims nothing, and the sweep
+/// is refused the zero batch size that would never terminate.
+#[tokio::test]
+async fn file_column_stats_sweep_is_bounded_and_idempotent() {
+    use moraine::MaintenanceRequest;
+
+    let (catalog, t) = seeded().await;
+    catalog
+        .commit(move |tx| tx.register_data_file(t, datafile(100), &[]).map(|_| ()))
+        .await
+        .unwrap();
+
+    // Field-by-field: `MaintenanceRequest` is `#[non_exhaustive]`, so a
+    // struct literal is out of reach from here.
+    let mut request = MaintenanceRequest::default();
+    request.batch_size = 0;
+    assert!(matches!(
+        catalog.maintain(request).await.unwrap_err(),
+        Error::Configuration(_)
+    ));
+
+    for _ in 0..2 {
+        let report = catalog
+            .maintain(MaintenanceRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(report.file_column_stats_reclaimed, 0);
+    }
+    catalog.close().await.unwrap();
+}

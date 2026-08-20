@@ -30,18 +30,24 @@ jobs:
       fail-fast: false
       matrix:
         duckdb_version: ${{ fromJson(needs.versions.outputs.matrix) }}
-    # Pinned to the primary release; its inputs, not this ref, select which
-    # DuckDB and toolchain each matrix entry checks out.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
+    # Pinned to the primary release; `duckdb_version`, not this ref, selects
+    # which DuckDB each matrix entry checks out. `ci_tools_version` names the
+    # same ref for the reason release.yml gives: a matrix generated from an
+    # older ref silently drops the platforms its config cannot describe.
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
     with:
       extension_name: moraine
       duckdb_version: ${{ matrix.duckdb_version }}
-      ci_tools_version: ${{ matrix.duckdb_version }}
+      ci_tools_version: v1.5.5
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
       # the same set.
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
+      # Point ccache at the directory the Linux container already mounts and
+      # caches; without it every build recompiles DuckDB from scratch. See
+      # release.yml, which passes the same thing for the same reason.
+      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir"}}'
 
   release:
     needs: build

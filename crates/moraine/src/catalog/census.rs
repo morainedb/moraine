@@ -7,12 +7,9 @@ use std::{fmt, time::Duration};
 
 use crate::store::key::{Subspace, subspace_prefix};
 
-/// One subspace of the keyspace, as a census names it.
-///
-/// The names are moraine's own. A store carrying a segment this build does
-/// not recognize — written by a newer format, or damaged — is reported as
-/// [`Unknown`](Self::Unknown) rather than dropped: a census exists to
-/// describe a store that has gone wrong.
+/// One subspace of the keyspace, as a census names it. A segment this
+/// build does not recognize is reported as [`Unknown`](Self::Unknown)
+/// rather than dropped.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum SubspaceName {
@@ -102,17 +99,13 @@ impl fmt::Display for SubspaceName {
     }
 }
 
-/// How a [`Catalog::store_census`](crate::Catalog::store_census) call
+/// How a [`ReadOnlyCatalog::store_census`](crate::ReadOnlyCatalog::store_census) call
 /// should run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CensusRequest {
-    /// Also scan every subspace and count its live keys.
-    ///
-    /// Off by default, because it costs a full read of the store where the
-    /// physical measurement costs two object reads. It is the only way to
-    /// learn what fraction of a subspace is live — that is, how much a
-    /// merge would reclaim rather than merely rewrite.
+    /// Also scan every subspace and count its live keys. Off by default:
+    /// it costs a full read of the store.
     pub count_live_entries: bool,
 }
 
@@ -126,18 +119,14 @@ pub struct LiveCount {
     pub key_bytes: u64,
     /// Encoded bytes of their values.
     pub value_bytes: u64,
-    /// Deletion-schedule entries among `keys`. Only `current` carries any;
-    /// they are live rows a merge cannot reclaim and only DuckLake's
-    /// `cleanup_old_files` drains.
+    /// Deletion-schedule entries among `keys`; only `current` carries any.
     pub scheduled_files: u64,
 }
 
-/// What one subspace weighs.
-///
-/// The physical figures come from the store's manifest and count what has
-/// been written out — a write still in the write-ahead log is in none of
-/// them. They include superseded versions and tombstones, which is the
-/// point: the gap between `bytes` and `live` is what a merge reclaims.
+/// What one subspace weighs. The physical figures come from the store's
+/// manifest and count what has been written out, superseded versions and
+/// tombstones included; a write still in the write-ahead log is in none of
+/// them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SubspaceCensus {
@@ -145,6 +134,12 @@ pub struct SubspaceCensus {
     pub subspace: SubspaceName,
     /// Physical bytes across its SSTs.
     pub bytes: u64,
+    /// Bloom-filter bytes recorded across the subspace's SSTs.
+    pub filter_bytes: u64,
+    /// SST index-block bytes recorded across the subspace's SSTs.
+    pub index_bytes: u64,
+    /// SST statistics-block bytes recorded across the subspace's SSTs.
+    pub stats_bytes: u64,
     /// SSTs not yet merged into a sorted run.
     pub l0_ssts: u32,
     /// Sorted runs. A merge collapses these to one.
@@ -155,13 +150,9 @@ pub struct SubspaceCensus {
     pub live: Option<LiveCount>,
 }
 
-/// What the object store holds, by the kind of object holding it.
-///
-/// The manifest accounts for SST bytes only, so a store whose weight is in
-/// its write-ahead log reads as nearly empty subspace by subspace while
-/// costing every reader dearly — a read attach replays the log before it
-/// materializes anything, and no merge touches those bytes. Comparing
-/// `sst_bytes` against `total_bytes` is what tells the two apart.
+/// What the object store holds, by the kind of object holding it. The
+/// per-subspace figures account for SST bytes only; the write-ahead log
+/// shows up only here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StoreObjects {
@@ -208,9 +199,6 @@ impl StoreCensus {
     /// Bytes the object store holds that no subspace accounts for — the
     /// write-ahead log, the manifest, and anything else. `None` when the
     /// store could not be listed.
-    ///
-    /// A large figure here is the signature of a slow read attach that a
-    /// merge will not fix: a reader replays the log at open.
     #[must_use]
     pub fn unaccounted_bytes(&self) -> Option<u64> {
         self.objects
@@ -249,6 +237,9 @@ pub struct CompactStoreRequest {
     /// as soon as they are submitted. A merge that outlives the wait is not
     /// cancelled: it keeps running, and a later census shows the result.
     pub wait: Option<Duration>,
+    /// Return an error unless every targeted merge completed or had no
+    /// sorted runs to merge. Requires [`wait`](Self::wait).
+    pub require_completed: bool,
 }
 
 /// How one subspace's merge ended.
@@ -317,9 +308,7 @@ mod tests {
         assert_eq!(SubspaceName::SchemaVersion.to_string(), "schema_version");
     }
 
-    /// The bytes no subspace accounts for — the write-ahead log and the
-    /// manifest — are what a merge cannot touch, so a census that omitted
-    /// them would point an operator at the wrong lever.
+    /// Unaccounted bytes are the total less the SSTs.
     #[test]
     fn unaccounted_bytes_is_everything_outside_the_ssts() {
         let mut census = StoreCensus {
@@ -348,6 +337,9 @@ mod tests {
                 SubspaceCensus {
                     subspace: SubspaceName::Current,
                     bytes: 10,
+                    filter_bytes: 1,
+                    index_bytes: 2,
+                    stats_bytes: 3,
                     l0_ssts: 1,
                     sorted_runs: 0,
                     sorted_run_ssts: 0,
@@ -356,6 +348,9 @@ mod tests {
                 SubspaceCensus {
                     subspace: SubspaceName::Index,
                     bytes: 32,
+                    filter_bytes: 4,
+                    index_bytes: 5,
+                    stats_bytes: 6,
                     l0_ssts: 0,
                     sorted_runs: 1,
                     sorted_run_ssts: 2,

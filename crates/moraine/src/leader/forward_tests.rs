@@ -135,9 +135,17 @@ impl RunningLeader {
     async fn spawn(catalog: Arc<Catalog>, config: LeaderConfig) -> Self {
         let leader = Leader::bind(catalog, config).await.unwrap();
         let shutdown = Arc::new(Notify::new());
-        let join = tokio::spawn({
+        // The leader's sessions are `!Send`, so `serve` needs a runtime of its
+        // own rather than a slot on the shared pool.
+        let join = tokio::task::spawn_blocking({
             let shutdown = Arc::clone(&shutdown);
-            async move { leader.serve(shutdown).await }
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("leader test runtime")
+                    .block_on(leader.serve(shutdown))
+            }
         });
         Self { shutdown, join }
     }
@@ -434,18 +442,30 @@ async fn two_contending_handles_converge_onto_the_leader() {
     let per_client = 10u64;
     let task_a = {
         let client = Arc::clone(&client_a);
-        tokio::spawn(async move {
-            for i in 0..per_client {
-                drive_staged(&client, gc_insert(1_000 + i)).await.unwrap();
-            }
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("client runtime")
+                .block_on(async move {
+                    for i in 0..per_client {
+                        drive_staged(&client, gc_insert(1_000 + i)).await.unwrap();
+                    }
+                });
         })
     };
     let task_b = {
         let client = Arc::clone(&client_b);
-        tokio::spawn(async move {
-            for i in 0..per_client {
-                drive_staged(&client, gc_insert(2_000 + i)).await.unwrap();
-            }
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("client runtime")
+                .block_on(async move {
+                    for i in 0..per_client {
+                        drive_staged(&client, gc_insert(2_000 + i)).await.unwrap();
+                    }
+                });
         })
     };
     task_a.await.unwrap();
@@ -656,10 +676,16 @@ async fn a_mixed_fleet_holds_one_winner_and_exactly_once() {
         (Arc::clone(&forward_b), 20_000u64),
         (Arc::clone(&direct_c), 30_000u64),
     ] {
-        tasks.push(tokio::spawn(async move {
-            for i in 0..each {
-                drive_staged(&catalog, gc_insert(base + i)).await.unwrap();
-            }
+        tasks.push(tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("client runtime")
+                .block_on(async move {
+                    for i in 0..each {
+                        drive_staged(&catalog, gc_insert(base + i)).await.unwrap();
+                    }
+                });
         }));
     }
     for task in tasks {

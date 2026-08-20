@@ -1,0 +1,318 @@
+# name: test/sql/metadata_read_pinning.test
+# group: [moraine]
+#
+# One DuckLake transaction's view of the metadata catalog, while another
+# connection commits under it.
+#
+# DuckLake resolves a transaction's snapshot by reading `ducklake_snapshot`
+# twice in one statement — the row whose id is the maximum, and the maximum
+# itself. Each scan of a synthesized `ducklake_*` table is one dump, and two
+# dumps observe two committed heads, so a commit or an expiry landing between
+# them leaves the maximum naming a row the other scan never saw. DuckLake
+# reports the tear as "No snapshot found" and cannot re-resolve, because it
+# was handed an empty result rather than a typed error.
+#
+# So each table is materialized once per DuckDB transaction and every reader
+# of it in that transaction is served the same rows. That is what this pins:
+# a commit landing under an open reader does not change what the reader's
+# transaction sees, and the reader's next transaction sees it.
+#
+# Two connections over one instance are the only way to overlap a commit with
+# an open reader, which is what this runner gives and the CLI cannot.
+#
+# Skipped unless the packaged Moraine and patched DuckLake extensions are
+# named in the environment; `cargo xtask e2e` supplies both.
+
+require-env MORAINE_DUCKDB_EXT
+
+require-env MORAINE_DUCKLAKE_EXT
+
+require-env MORAINE_EXTENSION_DIR
+
+# As in commit_concurrency.test: pin one thread so the connections, not the
+# scheduler, are the concurrency.
+statement ok
+SET threads=1;
+
+statement ok
+SET extension_directory='${MORAINE_EXTENSION_DIR}';
+
+statement ok
+INSTALL parquet;
+
+statement ok
+LOAD parquet;
+
+statement ok
+LOAD '${MORAINE_DUCKLAKE_EXT}';
+
+statement ok
+LOAD '${MORAINE_DUCKDB_EXT}';
+
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/pin-store' AS lake (DATA_PATH '__TEST_DIR__/pin-data/');
+
+statement ok
+CREATE TABLE lake.main.t(a BIGINT);
+
+statement ok con1
+BEGIN;
+
+# con1's first read materializes `ducklake_snapshot` for its transaction.
+# Held in a connection-local variable so every comparison below is against
+# what con1 itself saw, and none needs an absolute snapshot id.
+statement ok con1
+SET VARIABLE baseline = (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot);
+
+statement ok con2
+INSERT INTO lake.main.t VALUES (1);
+
+# The commit landed under con1, and con1 still reads the rows it took. A
+# second dump here would have returned con2's snapshot as well.
+query I con1
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) = getvariable('baseline');
+----
+true
+
+# The shape DuckLake's own resolution uses, inside the same transaction: one
+# statement, two scans of the table. Both are the same row set, so the
+# maximum resolves to a row rather than to nothing.
+query I con1
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot
+WHERE snapshot_id = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot);
+----
+1
+
+statement ok con1
+COMMIT;
+
+# The pin is the transaction's, not the connection's: con1's next
+# transaction sees the commit.
+query I con1
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) > getvariable('baseline');
+----
+true
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+1
+
+# A writing transaction is not pinned this way: it reads through its staged
+# transaction, so it must still see its own uncommitted rows across
+# statements. One INSERT, then a read of the table it wrote, both inside one
+# transaction — DuckLake's commit path depends on exactly this.
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO lake.main.t VALUES (2);
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+2
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+2
+
+# Every snapshot the exchange minted is intact and consecutive.
+query I
+SELECT count(*) = max(snapshot_id) + 1 FROM __ducklake_metadata_lake.ducklake_snapshot;
+----
+true
+
+# Rows dumped for one transaction are held for the next, keyed on the store's
+# head stamp, so a quiet catalog re-crosses the ABI once per commit rather
+# than once per transaction. Held rows must never outlive the state they
+# stand at, which is what the rest of this file pins: each round commits on
+# one connection and reads on the other, so a stamp that failed to
+# invalidate would serve the round's reader the previous round's rows.
+statement ok con2
+INSERT INTO lake.main.t VALUES (3);
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+3
+
+statement ok con2
+INSERT INTO lake.main.t VALUES (4);
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+4
+
+# Two held tables read in one statement, so a stale hold on either would
+# disagree with the other: every data file the file table names belongs to a
+# snapshot the snapshot table has, and the snapshot lineage is unbroken.
+query II con1
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file f
+        WHERE f.begin_snapshot > (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot)),
+       (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) = max(snapshot_id) + 1
+FROM __ducklake_metadata_lake.ducklake_snapshot;
+----
+0	true
+
+# A batch that mints no snapshot still moves the stamp's other half. Setting
+# an option is such a batch: the snapshot id is unchanged, so rows held under
+# it would keep serving if the batch count were not part of the key.
+statement ok con2
+CALL lake.set_option('parquet_compression', 'zstd');
+
+query I con1
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_metadata
+WHERE key = 'parquet_compression' AND value = 'zstd';
+----
+1
+
+# The block cache reports what it served, so the budgets can be sized from
+# measured curves instead of from the defaults. Handle-free, because the
+# budget is the process's: every attached store reads through the one cache.
+query I
+SELECT count(*) FROM moraine_cache_tally();
+----
+1
+
+# Named a lake, the same row is that attach's share of the one cache —
+# which is what says who is spending the budget the process-wide numbers
+# report.
+query I
+SELECT count(*) FROM moraine_cache_tally('lake');
+----
+1
+
+# Cache sizing is process-wide and exposes actual in-memory occupancy.
+query I
+SELECT count(*) FROM moraine_cache_status();
+----
+1
+
+query I
+SELECT metadata_occupancy_bytes <= metadata_capacity_bytes
+   AND block_occupancy_bytes <= block_capacity_bytes
+   AND auxiliary_metadata_occupancy_bytes <= auxiliary_metadata_capacity_bytes
+FROM moraine_cache_status();
+----
+true
+
+# SlateDB's physical object-store requests are reported per attach. Local
+# storage uses the same instrumentation seam as S3, so this contract proves
+# the SQL surface without making the ordinary e2e gate network-dependent.
+query I
+SELECT count(*) FROM moraine_object_store_tally('lake');
+----
+1
+
+query I
+SELECT main_gets > 0 AND main_puts > 0
+   AND errors <= main_gets + main_puts + main_deletes
+              + wal_gets + wal_puts + wal_deletes
+   AND main_get_ms >= 0 AND main_put_ms >= 0 AND main_delete_ms >= 0
+   AND wal_get_ms >= 0 AND wal_put_ms >= 0 AND wal_delete_ms >= 0
+FROM moraine_object_store_tally('lake');
+----
+true
+
+# An attach cannot have served more than the process it reads through.
+query I
+SELECT (SELECT metadata_hits + block_hits FROM moraine_cache_tally('lake'))
+    <= (SELECT metadata_hits + block_hits FROM moraine_cache_tally());
+----
+true
+
+# The per-lake form reports absence the same way the process-wide one
+# does: a rate is NULL exactly when nothing was looked up, never zero.
+# (A catalog this small is served from the memtable, so an attach can
+# genuinely have looked nothing up.)
+query I
+SELECT (metadata_hit_rate IS NOT NULL) = ((metadata_hits + metadata_misses) > 0)
+FROM moraine_cache_tally('lake');
+----
+true
+
+# Rates are NULL before a lookup and a fraction after — never zero for
+# "nothing asked", which a monitoring query would read as a cold cache.
+query I
+SELECT metadata_hit_rate IS NULL OR metadata_hit_rate BETWEEN 0 AND 1
+FROM moraine_cache_tally();
+----
+true
+
+# Hits and misses are counted apart per slot and add up to the lookups.
+query I
+SELECT metadata_hit_rate IS NOT NULL
+   = ((metadata_hits + metadata_misses) > 0)
+FROM moraine_cache_tally();
+----
+true
+
+# Data files are DuckDB's to cache, not moraine's, and DuckDB does cache
+# them: a lake read goes through its caching file system, which is what
+# keeps the data tier inside `memory_limit`. This pins that, and pins the
+# two shapes that make a working cache look like an absent one.
+#
+# Past the inlining row limit deliberately — below it a table has no
+# Parquet file at all and every reading below would be vacuous.
+statement ok con1
+SET enable_external_file_cache = true;
+
+statement ok con1
+CREATE TABLE lake.main.wide AS SELECT range AS a FROM range(500);
+
+# First shape: a lake `count(*)` is answered from catalog statistics and
+# opens no data file, so it caches nothing no matter how the reader works.
+query I con1
+SELECT count(*) FROM lake.main.wide;
+----
+500
+
+query I con1
+SELECT count(*) FROM duckdb_external_file_cache()
+WHERE path LIKE '%pin-data%';
+----
+0
+
+# A read that touches data does cache — the lake path reaches the caching
+# file system. A regression that routes lake reads around it fails here.
+statement ok con1
+SELECT sum(a) FROM lake.main.wide WHERE a % 7 = 3;
+
+query I con1
+SELECT count(*) > 0 FROM duckdb_external_file_cache()
+WHERE path LIKE '%pin-data%';
+----
+true
+
+# Second shape: data ranges are cached only when the Parquet reader
+# prefetches, which it does for remote files and not for local ones — so
+# this local harness has cached the footer and stopped there. Remember how
+# much that was, to compare against.
+statement ok con1
+CREATE TEMP TABLE footer_only_bytes AS
+SELECT coalesce(sum(nr_bytes), 0) AS bytes FROM duckdb_external_file_cache()
+WHERE path LIKE '%pin-data%';
+
+# Forcing the prefetch a deployment's `s3://` path takes anyway extends the
+# cache past the footer to the data ranges — the property that puts lake
+# data under `memory_limit`. Relative to the footer reading rather than a
+# byte count: how large DuckLake writes a 500-row file is not this test's
+# business, and a threshold would silently pass once it changed.
+statement ok con1
+SET prefetch_all_parquet_files = true;
+
+statement ok con1
+SELECT sum(a) FROM lake.main.wide WHERE a % 11 = 5;
+
+query I con1
+SELECT (SELECT coalesce(sum(nr_bytes), 0) FROM duckdb_external_file_cache()
+        WHERE path LIKE '%pin-data%')
+     > (SELECT bytes FROM footer_only_bytes);
+----
+true

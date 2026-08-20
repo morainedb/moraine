@@ -85,6 +85,52 @@ id_type!(
     SortId
 );
 
+/// An instant, as microseconds from the Unix epoch in UTC — the precision
+/// the catalog persists and the extension ABI carries. Negative counts
+/// precede the epoch.
+///
+/// Conversion to and from the raw count is total in both directions, so a
+/// timestamp survives a round trip through storage or the ABI unchanged and
+/// neither boundary needs a range check.
+///
+/// ```
+/// use moraine::Timestamp;
+///
+/// let stamp = Timestamp::from_micros(1_700_000_000_000_000);
+/// assert_eq!(stamp.as_micros(), 1_700_000_000_000_000);
+/// assert!(stamp > Timestamp::UNIX_EPOCH);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp(i64);
+
+impl Timestamp {
+    /// The Unix epoch itself.
+    pub const UNIX_EPOCH: Self = Self(0);
+
+    /// Wraps a microsecond count from the Unix epoch.
+    #[must_use]
+    pub const fn from_micros(micros: i64) -> Self {
+        Self(micros)
+    }
+
+    /// The microsecond count from the Unix epoch.
+    #[must_use]
+    pub const fn as_micros(self) -> i64 {
+        self.0
+    }
+
+    /// Reads the system clock. Clamped, never panicking: a clock before the
+    /// epoch stamps the epoch.
+    #[must_use]
+    pub fn now() -> Self {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(Self::UNIX_EPOCH, |elapsed| {
+                Self(i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
+            })
+    }
+}
+
 /// A data file to register: the file already exists on object storage
 /// (data before metadata). `row_id_start` is allocated by the commit,
 /// never caller-provided.
@@ -280,6 +326,21 @@ pub struct DataFileInfo {
     /// here by the latest. `None` when every row arrived at the file's
     /// begin snapshot.
     pub partial_max: Option<SnapshotId>,
+}
+
+/// Where one stable row id may physically live at head.
+///
+/// A row id can yield more than one candidate: an update can leave an
+/// expired copy in an otherwise-current file while writing the visible copy
+/// elsewhere. Choosing between them stays DuckLake's delete and snapshot
+/// processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileRowCandidate {
+    /// The stable row id located.
+    pub row_id: u64,
+    /// The file holding it, or `None` for a live inlined row and for one
+    /// located nowhere at all.
+    pub data_file_id: Option<DataFileId>,
 }
 
 /// A live delete file, as read from a snapshot.
@@ -484,9 +545,22 @@ pub enum IndexState {
     /// A staged backfill is in progress; lookups fail typed and a unique
     /// violation poisons the build rather than failing the writer.
     Building,
+    /// SQL additions committed ahead of bounded non-unique index repair;
+    /// lookups refuse until the repair flips the index ready.
+    Maintaining,
     /// A duplicate was discovered during a staged build; the definition is
     /// terminally poisoned and will be dropped by its driver.
     Poisoned,
+}
+
+/// When SQL writes add entries to an index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IndexMaintenance {
+    /// Entries land atomically with the data snapshot.
+    #[default]
+    Synchronous,
+    /// Non-unique additions land in bounded commits after the data snapshot.
+    Deferred,
 }
 
 /// The sort order of one indexed column: its direction and NULL placement.
@@ -525,11 +599,20 @@ pub struct IndexInfo {
     pub nulls: Vec<crate::store::index_encoding::NullOrder>,
     /// Whether the index enforces uniqueness.
     pub unique: bool,
+    /// Whether SQL additions are maintained synchronously or after commit.
+    pub maintenance: IndexMaintenance,
     /// The build lifecycle state.
     pub state: IndexState,
     /// A staged build's watermark: the highest row id covered so far, or
     /// `None` before its first step. Always `None` on a single-commit index.
     pub build_cursor: Option<u64>,
+    /// The data file currently covered through [`Self::build_position_cursor`].
+    /// `None` while the build is still covering inline rows or was written by
+    /// a binary that used only the row-id cursor.
+    pub build_file_cursor: Option<DataFileId>,
+    /// The physical row position durably covered in
+    /// [`Self::build_file_cursor`].
+    pub build_position_cursor: Option<u64>,
 }
 
 /// The definition of an equality index to create.
@@ -557,35 +640,53 @@ pub struct IndexEntry {
     pub values: Vec<Option<crate::store::index_encoding::IndexKeyValue>>,
 }
 
-/// Where a row a lookup found currently lives. moraine returns candidates;
-/// the consumer applies delete files, as any DuckLake scan does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowHolder {
-    /// A data file whose live row-id range contains the row.
-    DataFile(DataFileId),
-    /// The row is inlined (or its holder is not a dense-range data file),
-    /// so it is not resolvable from data-file ranges alone.
-    Inline,
+impl IndexEntry {
+    /// What this entry will weigh on a batch, key and value together,
+    /// before escaping; escaping can make the staged entry up to twice
+    /// this, never smaller.
+    pub(crate) fn nominal_bytes(&self) -> u64 {
+        crate::store::key::index_entry_bytes(&self.values)
+    }
 }
 
-/// A row an index lookup resolved: its stable id and current holder.
+/// How much one step of a staged index build may commit. A step ends at
+/// whichever bound it reaches first, and always carries at least one
+/// entry. `entries` bounds memory; `bytes` bounds the single object-store
+/// request a batch becomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RowLocation {
-    /// The stable row id the entry points at.
-    pub row_id: u64,
-    /// The row's current holder in this snapshot.
-    pub holder: RowHolder,
+pub struct BuildStep {
+    /// Entries per step.
+    pub entries: usize,
+    /// Staged key and value bytes per step, summed over each entry's key
+    /// and value before either is encoded. Framing escapes `0x00` and
+    /// `0x01`, so the committed batch can be up to twice this.
+    pub bytes: u64,
+}
+
+/// Entries per step when [`BuildStep`] is left to its default.
+const DEFAULT_STEP_ENTRIES: usize = 1_000_000;
+
+/// Staged bytes per step when [`BuildStep`] is left to its default. Eight
+/// mebibytes clears `object_store`'s 30-second default request timeout at
+/// a little over 270 KiB/s, so a step lands on links far slower than a
+/// build has any right to expect.
+const DEFAULT_STEP_BYTES: u64 = 8 * 1024 * 1024;
+
+impl Default for BuildStep {
+    fn default() -> Self {
+        Self {
+            entries: DEFAULT_STEP_ENTRIES,
+            bytes: DEFAULT_STEP_BYTES,
+        }
+    }
 }
 
 /// A column definition: the input to table creation and column addition.
 ///
-/// A nested type is a *tree*, not a type string to parse: the parent carries
+/// A nested type is a tree, not a type string to parse: the parent carries
 /// DuckLake's marker (`"STRUCT"`, `"LIST"`, `"MAP"`) as its
 /// [`column_type`](Self::column_type) and its fields as
-/// [`children`](Self::children). That is exactly the shape DuckLake itself
-/// authors over the staged-row path — a parent row plus one row per field —
-/// so both paths write the same records, and moraine never has to parse a
-/// SQL type string to find out what a column contains.
+/// [`children`](Self::children).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ColumnDef {
     /// Column name, unique among its **siblings**: DuckLake scopes a nested
@@ -643,8 +744,8 @@ pub struct ColumnAlteration {
 pub struct SnapshotInfo {
     /// The snapshot's id.
     pub id: SnapshotId,
-    /// Commit time, microseconds since the Unix epoch (UTC).
-    pub time_micros: i64,
+    /// When the snapshot was committed.
+    pub time: Timestamp,
     /// Catalog schema version: advances only when a commit changes the
     /// catalog's shape, so clients can key schema caches on it.
     pub schema_version: u64,
@@ -676,8 +777,8 @@ pub struct ScheduledDeletion {
     pub path: String,
     /// Whether `path` is relative to the table's data prefix.
     pub path_is_relative: bool,
-    /// Microseconds since epoch, UTC, when the file was scheduled.
-    pub schedule_start_micros: i64,
+    /// When the file was scheduled.
+    pub schedule_start: Timestamp,
 }
 
 /// A chunk of rows to inline: one Arrow IPC record-batch body over the
@@ -687,9 +788,7 @@ pub struct ScheduledDeletion {
 /// data-file registration performs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineChunk {
-    /// The catalog schema version the body's columns match. Chunks are
-    /// decoded against their own version's schema, so evolving the table
-    /// never rewrites an existing chunk.
+    /// The catalog schema version the body's columns match.
     pub schema_version: u64,
     /// The Arrow IPC schema-only stream for `schema_version`. Written once
     /// per version; a chunk for a version already recorded may repeat it
@@ -708,9 +807,8 @@ pub struct InlineChunk {
 /// read finds them in the file rather than in the drained chunks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushedDataFile {
-    /// The written file. Its rows are already counted in the table's
-    /// statistics from when they were inlined, so registering it adds only
-    /// its bytes.
+    /// The written file. Registering it adds only its bytes to the table's
+    /// statistics; its rows were counted when inlined.
     pub file: DataFile,
     /// The first row id the file carries — preserved from the inlined
     /// rows, never reallocated.
@@ -729,8 +827,7 @@ pub struct FlushedDataFile {
 
 /// One inlined row, with the Arrow IPC bytes a caller needs to decode it.
 /// Rows of one chunk share one `chunk_body`, and rows of one schema
-/// version share one `arrow_schema`, so a scan carries each set of bytes
-/// once however many rows reference it.
+/// version share one `arrow_schema`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentRow {
     /// The row's dense id.
@@ -771,7 +868,32 @@ impl OptionScope {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    proptest! {
+        /// The micros conversion is total in both directions, pre-epoch
+        /// included.
+        #[test]
+        fn timestamps_round_trip_through_their_micros(micros in any::<i64>()) {
+            prop_assert_eq!(Timestamp::from_micros(micros).as_micros(), micros);
+        }
+
+        /// Timestamps order by their micros.
+        #[test]
+        fn timestamps_order_by_their_micros(left in any::<i64>(), right in any::<i64>()) {
+            prop_assert_eq!(
+                Timestamp::from_micros(left).cmp(&Timestamp::from_micros(right)),
+                left.cmp(&right)
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_now_is_after_the_epoch() {
+        assert!(Timestamp::now() > Timestamp::UNIX_EPOCH);
+    }
 
     #[test]
     fn ids_round_trip_and_display() {

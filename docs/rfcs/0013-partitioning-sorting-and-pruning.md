@@ -19,8 +19,8 @@ table's files and their partition values are one contiguous scan. Sorting:
 exactly: moraine stores specs, transforms, expressions, and values
 **verbatim** and serves them efficiently; DuckLake's planner does the pruning
 and DuckLake's writer does the sorting. Server-side partition pruning is
-deferred, and is the same unresolved question as RFC 0002's stats-pruning
-pushdown.
+not a moraine responsibility under this architecture, matching RFC 0002's
+answer for stats-pruning pushdown.
 
 ## Goals
 
@@ -36,8 +36,8 @@ pushdown.
 
 Non-goals:
 
-- Server-side partition pruning — deferred, the same posture RFC 0002 takes
-  on stats pruning.
+- Server-side partition pruning. DuckLake owns typed predicate evaluation;
+  moraine serves the complete row-faithful metadata view.
 - Evaluating transforms or sort expressions. moraine stores transform
   definitions and sort expressions verbatim and never applies them (RFC 0006
   row-faithfulness).
@@ -179,18 +179,18 @@ each candidate file's partition values (in the same scan), applies the
 transforms it already understands, and prunes. moraine returns rows; the
 planner decides which files to read.
 
-A future **server-side partition-pruning pushdown** is deferred, and it is the
-**same unresolved question** as RFC 0002's stats-pruning pushdown and RFC 0006's
-pushdown surface. No row filter is pushed into moraine at all today, so there
-is no predicate here to prune with, and RFC 0009 sets the condition under which
-one would be worth accepting. If it is ever added it must be both
-**transform-aware** and **type-aware**:
+A moraine-side **server-side partition-pruning pushdown** is rejected under
+this architecture, with the same answer as RFC 0002's stats-pruning pushdown,
+RFC 0006's pushdown surface, and RFC 0009's partial materialization. No row
+filter is pushed into moraine, the whole live catalog is already resident, and
+DuckLake owns the typed planner semantics. Any replacement would have to be
+both **transform-aware** and **type-aware**:
 correctly pruning a `bucket(16)` or `year(...)` partition means reproducing
 DuckLake's transform semantics, and comparing a value means DuckLake's typed
 comparison, never a lexicographic compare over stored strings. Doing it wrong
-silently drops correct rows — the exact failure RFC 0002 warns against. Until
-there is e2e evidence that a real DuckLake access pattern demands it, moraine
-stays row-faithful.
+silently drops correct rows — the exact failure RFC 0002 warns against.
+moraine therefore stays row-faithful; evidence for a different architecture
+would require a new design rather than an attach option or a dormant code path.
 
 ### Sorting — moraine does not sort, DuckLake does
 

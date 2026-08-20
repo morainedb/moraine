@@ -150,9 +150,17 @@ impl StandDownLeader {
         let leader = Leader::bind(catalog, config).await.unwrap();
         let instance = leader.instance();
         let shutdown = Arc::new(Notify::new());
-        let join = tokio::spawn({
+        // The leader's sessions are `!Send`, so `serve` needs a runtime of its
+        // own rather than a slot on the shared pool.
+        let join = tokio::task::spawn_blocking({
             let shutdown = Arc::clone(&shutdown);
-            async move { leader.serve(shutdown).await }
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("leader test runtime")
+                    .block_on(leader.serve(shutdown))
+            }
         });
         Self {
             endpoint,

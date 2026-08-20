@@ -30,7 +30,7 @@ struct MigrateBindData : public duckdb::FunctionData {
 		auto copy = duckdb::make_uniq<MigrateBindData>();
 		copy->path = path;
 		copy->checkpoint = checkpoint;
-		return std::move(copy);
+		return copy;
 	}
 
 	bool Equals(const duckdb::FunctionData &other) const override {
@@ -72,7 +72,7 @@ duckdb::unique_ptr<duckdb::FunctionData> MigrateBind(duckdb::ClientContext &, du
 	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::BOOLEAN,
 	                duckdb::LogicalType::VARCHAR};
 	names = {"from_format", "to_format", "resumed", "units_run"};
-	return std::move(bind_data);
+	return bind_data;
 }
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MigrateInitGlobal(duckdb::ClientContext &context,
@@ -111,7 +111,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MigrateInitGlobal(duckdb::C
 		state->units_run = report.units_run;
 		moraine_string_free(report.units_run);
 	}
-	return std::move(state);
+	return state;
 }
 
 void MigrateImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {

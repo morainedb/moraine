@@ -1,0 +1,70 @@
+name: Fuzz
+
+# Nightly rather than per-PR: a fuzz run is a search, not a check, and its
+# value comes from accumulating time across many runs. `workflow_dispatch`
+# is for reproducing a finding or giving a codec change a longer look.
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes to run each target
+        required: false
+        default: '15'
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      # One target's finding must not cancel the others' runs.
+      fail-fast: false
+      matrix:
+        include:
+          - target: key_decode
+          - target: record_decode
+          # A catalog whose store froze mid-commit cannot be closed, so the
+          # target abandons it; without this every abandoned one reports as
+          # a leak alongside the finding being looked for.
+          - target: crash_recovery
+            asan_options: detect_leaks=0
+    steps:
+      - uses: actions/checkout@v7
+      # cargo-fuzz builds with sanitizer and coverage instrumentation, which
+      # is nightly-only.
+      - run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      # The corpus from previous runs, so each night resumes the search
+      # rather than restarting it. `restore-keys` takes the newest prior
+      # corpus when the run-keyed entry misses.
+      - uses: actions/cache@v6
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          ASAN_OPTIONS: ${{ matrix.asan_options }}
+        run: |
+          minutes="${{ github.event.inputs.minutes || '15' }}"
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=$((minutes * 60)) -print_final_stats=1
+      # The input that reproduces a finding is the whole artifact; without
+      # it the run reports only that something crashed.
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

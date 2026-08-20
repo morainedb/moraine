@@ -1,20 +1,30 @@
 //! Typed reads over an open transaction: decode keys and values into the
 //! wire types. No interpretation — the domain layer owns meaning.
 
+use std::{collections::BTreeMap, time::Instant};
+
+use bytes::Bytes;
+use prost::Message as _;
+use tracing::debug;
+
 use crate::{
     error::{Error, Result},
     store::{
-        handle::ReadHandle,
-        key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
+        handle::{ReadHandle, ScanShape},
+        key::{
+            CurrentKey, EntityKey, EntityKind, Key, SPLIT_SCAN_KINDS, Subspace, SysKey,
+            current_entity_kind_prefix, history_entity_kind_prefix, subspace_prefix,
+        },
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
-            GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue, MigrationValue,
-            OptionScopeValue, PartitionValue, SchemaValue, SchemaVersionValue, SecretValue,
-            SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
-            ViewValue,
+            GcFileValue, HeadValue, IndexValue, MacroValue, MaintenanceStatusValue, MappingValue,
+            MigrationValue, OptionScopeValue, PartitionValue, SchemaValue, SchemaVersionValue,
+            SecretValue, SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue,
+            TableValue, TagValue, ViewValue,
         },
         value,
     },
+    telemetry::milliseconds,
 };
 
 /// A decoded entity record of a kind the catalog currently models.
@@ -66,6 +76,34 @@ pub(crate) enum EntityRecord {
 }
 
 impl EntityRecord {
+    /// A cheap estimate of the record's footprint: its encoded length plus
+    /// the enum's own size. Understates the decoded form.
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        let encoded = match self {
+            Self::Schema(value) => value.encoded_len(),
+            Self::Table(value) => value.encoded_len(),
+            Self::View(value) => value.encoded_len(),
+            Self::Column(value) => value.encoded_len(),
+            Self::File(value) => value.encoded_len(),
+            Self::DeleteFile(value) => value.encoded_len(),
+            Self::Partition(value) => value.encoded_len(),
+            Self::Sort(value) => value.encoded_len(),
+            Self::Macro(value) => value.encoded_len(),
+            Self::Mapping(value) => value.encoded_len(),
+            Self::Index(value) => value.encoded_len(),
+            Self::FileColumnStats(value) => value.encoded_len(),
+            Self::TableStats(value) => value.encoded_len(),
+            Self::TableColumnStats(value) => value.encoded_len(),
+            Self::Option { value, .. } => value.encoded_len(),
+            Self::Tag(value) => value.encoded_len(),
+            Self::GcFile(value) => value.encoded_len(),
+        };
+        u64::try_from(encoded).unwrap_or(u64::MAX)
+            + u64::try_from(std::mem::size_of::<Self>()).unwrap_or(0)
+    }
+}
+
+impl EntityRecord {
     /// The record's begin/end lifecycle; `None` for unversioned kinds,
     /// which are live at any time-travel target.
     pub(crate) fn lifecycle(&self) -> Option<(u64, Option<u64>)> {
@@ -99,22 +137,23 @@ pub(crate) async fn read_singleton<M: prost::Message + Default>(
     handle
         .get(key.encode())
         .await?
-        .map(|bytes| value::decode_value(&bytes))
+        .map(value::decode_owned)
         .transpose()
 }
 
-/// Scans every key under `prefix`, decoding each entry with `extract`;
-/// `extract` rejects keys of the wrong kind with its scan's corruption
-/// error.
+/// Scans every key under `prefix`, moving each store value into `extract`.
+/// Extractors may retain shared fields from the store allocation or borrow
+/// the value for an ordinary decode.
 pub(crate) async fn scan_decode<T>(
     handle: ReadHandle<'_>,
     prefix: Vec<u8>,
-    mut extract: impl FnMut(Key, &[u8]) -> Result<T>,
+    shape: ScanShape,
+    mut extract: impl FnMut(Key, Bytes) -> Result<T>,
 ) -> Result<Vec<T>> {
-    let mut iter = handle.scan_prefix(prefix, ..).await?;
+    let mut iter = handle.scan_prefix(prefix, .., shape).await?;
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await? {
-        records.push(extract(Key::decode(&entry.key)?, &entry.value)?);
+        records.push(extract(Key::decode(&entry.key)?, entry.value)?);
     }
 
     Ok(records)
@@ -123,23 +162,23 @@ pub(crate) async fn scan_decode<T>(
 /// As [`scan_decode`], but with the unfolded tail overlaid over the store:
 /// a tail write shadows the stored value, a tail delete hides it. The merge
 /// is last-writer-wins by key, so a slot-backed dump sees a winner no folder
-/// has applied yet.
+/// has applied yet. Unsplit — the tail is merged against the whole prefix.
 pub(crate) async fn scan_decode_overlaid<T>(
     handle: ReadHandle<'_>,
     overlay: &moraine_wal::Overlay,
     prefix: Vec<u8>,
-    mut extract: impl FnMut(Key, &[u8]) -> Result<T>,
+    shape: ScanShape,
+    mut extract: impl FnMut(Key, Bytes) -> Result<T>,
 ) -> Result<Vec<T>> {
-    let mut merged: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
-        std::collections::BTreeMap::new();
-    let mut iter = handle.scan_prefix(prefix.clone(), ..).await?;
+    let mut merged: BTreeMap<Vec<u8>, Bytes> = BTreeMap::new();
+    let mut iter = handle.scan_prefix(prefix.clone(), .., shape).await?;
     while let Some(entry) = iter.next().await? {
-        merged.insert(entry.key.to_vec(), entry.value.to_vec());
+        merged.insert(entry.key.to_vec(), entry.value);
     }
     for (key, value) in overlay.prefixed(&prefix) {
         match value {
             Some(bytes) => {
-                merged.insert(key.to_vec(), bytes.to_vec());
+                merged.insert(key.to_vec(), Bytes::copy_from_slice(bytes));
             }
             None => {
                 merged.remove(key);
@@ -148,8 +187,8 @@ pub(crate) async fn scan_decode_overlaid<T>(
     }
 
     merged
-        .iter()
-        .map(|(key, value)| extract(Key::decode(key)?, value))
+        .into_iter()
+        .map(|(key, value)| extract(Key::decode(&key)?, value))
         .collect()
 }
 
@@ -161,12 +200,43 @@ pub(crate) async fn scan_decode_maybe<T>(
     handle: ReadHandle<'_>,
     overlay: Option<&moraine_wal::Overlay>,
     prefix: Vec<u8>,
-    extract: impl FnMut(Key, &[u8]) -> Result<T>,
+    shape: ScanShape,
+    extract: impl FnMut(Key, Bytes) -> Result<T>,
 ) -> Result<Vec<T>> {
     match overlay {
-        Some(overlay) => scan_decode_overlaid(handle, overlay, prefix, extract).await,
-        None => scan_decode(handle, prefix, extract).await,
+        Some(overlay) => scan_decode_overlaid(handle, overlay, prefix, shape, extract).await,
+        None => scan_decode(handle, prefix, shape, extract).await,
     }
+}
+
+/// As [`scan_decode`], splitting each of `splits` (the data-scaled kinds'
+/// prefixes under `prefix`) into concurrent sub-ranges once it outgrows one
+/// read-ahead; the records still come back in key order.
+async fn scan_decode_split<T>(
+    handle: ReadHandle<'_>,
+    prefix: Vec<u8>,
+    splits: &[Vec<u8>],
+    mut extract: impl FnMut(Key, Bytes) -> Result<T>,
+) -> Result<Vec<T>> {
+    handle
+        .scan_prefix_split(&prefix, splits, ScanShape::Bulk)
+        .await?
+        .into_iter()
+        .map(|entry| extract(Key::decode(&entry.key)?, entry.value))
+        .collect()
+}
+
+/// As [`scan_decode`] over a whole subspace, splitting the data-scaled
+/// kinds (`kind_prefix` names each one's prefix).
+async fn scan_decode_subspace<T>(
+    handle: ReadHandle<'_>,
+    subspace: Subspace,
+    kind_prefix: fn(EntityKind) -> Vec<u8>,
+    extract: impl FnMut(Key, Bytes) -> Result<T>,
+) -> Result<Vec<T>> {
+    let splits = SPLIT_SCAN_KINDS.map(kind_prefix);
+
+    scan_decode_split(handle, subspace_prefix(subspace), &splits, extract).await
 }
 
 /// The layout-format stamp, if the store has been initialized.
@@ -179,9 +249,67 @@ pub(crate) async fn read_migration(handle: ReadHandle<'_>) -> Result<Option<Migr
     read_singleton(handle, Key::Sys(SysKey::Migration)).await
 }
 
+/// The bounded durable history of completed maintenance passes.
+pub(crate) async fn read_maintenance_status(
+    handle: ReadHandle<'_>,
+) -> Result<Option<MaintenanceStatusValue>> {
+    read_singleton(handle, Key::Sys(SysKey::MaintenanceStatus)).await
+}
+
 /// The head pointer: the latest committed snapshot id and batch count.
 pub(crate) async fn read_head(handle: ReadHandle<'_>) -> Result<Option<HeadValue>> {
     read_singleton(handle, Key::Sys(SysKey::Head)).await
+}
+
+/// How many times a read-only pass is re-run before its instability is
+/// reported.
+const STABLE_READ_ATTEMPTS: usize = 8;
+
+/// Runs `read` so that everything it observes belongs to one store state.
+/// A transaction handle runs it once; a manifest-following reader compares
+/// the head record before and after the pass (every batch moves it) and
+/// re-runs a pass that straddled a commit.
+///
+/// Retrying only helps while a pass fits inside the interval between
+/// commits: a pass that outlasts it straddles every attempt, and no
+/// budget saves it. Shortening the pass is the lever, so each straddle is
+/// logged with what it cost and the exhausted error reports the same.
+///
+/// # Errors
+///
+/// Returns [`Error::RetryBudgetExhausted`] if the store moved under every
+/// attempt, or whatever `read` itself returns.
+pub(crate) async fn consistent<T, F, Fut>(handle: ReadHandle<'_>, read: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    if handle.is_isolated() {
+        return read().await;
+    }
+
+    let started = Instant::now();
+    for attempt in 1..=STABLE_READ_ATTEMPTS {
+        let pass_started = Instant::now();
+        let before = read_head(handle).await?;
+        let value = read().await?;
+        if read_head(handle).await? == before {
+            return Ok(value);
+        }
+        debug!(
+            attempt,
+            attempts = STABLE_READ_ATTEMPTS,
+            pass_ms = milliseconds(pass_started.elapsed()),
+            "a read-only pass straddled a commit; re-reading"
+        );
+    }
+
+    Err(Error::RetryBudgetExhausted(format!(
+        "a read-only pass could not observe a single store state in \
+         {STABLE_READ_ATTEMPTS} attempts over {}ms; the catalog is committing \
+         faster than this pass reads, which a larger budget cannot fix",
+        milliseconds(started.elapsed())
+    )))
 }
 
 /// Reads the forwarding token; `None` on a store predating it (a leader mints
@@ -201,11 +329,7 @@ pub(crate) async fn read_snapshot(
     read_singleton(handle, Key::Snapshot { snapshot_id }).await
 }
 
-/// [`read_snapshot`] with the unfolded tail overlaid: a tail write shadows the
-/// stored record. A tail *delete*, though, is an expiry the folder has not
-/// applied — the store still holds the record — so time travel resolves it from
-/// there until a fold prunes it, the one place the unfolded view outlives the
-/// folded one rather than matching it.
+/// One snapshot record, with the unfolded tail overlaid.
 pub(crate) async fn read_snapshot_overlaid(
     handle: ReadHandle<'_>,
     overlay: &moraine_wal::Overlay,
@@ -233,7 +357,9 @@ pub(crate) async fn snapshot_of_transaction(
     .encode();
     let suffix = start[prefix.len()..].to_vec();
 
-    let mut iter = handle.scan_prefix(prefix, suffix..).await?;
+    let mut iter = handle
+        .scan_prefix(prefix, suffix.., ScanShape::Bulk)
+        .await?;
     while let Some(entry) = iter.next().await? {
         let snapshot: SnapshotValue = value::decode_value(&entry.value)?;
         if snapshot.transaction_id.as_deref() == Some(transaction_id) {
@@ -244,40 +370,32 @@ pub(crate) async fn snapshot_of_transaction(
     Ok(None)
 }
 
-/// Decodes one entry of a `ducklake_snapshot` scan.
-fn extract_snapshot(key: Key, bytes: &[u8]) -> Result<SnapshotValue> {
-    match key {
-        Key::Snapshot { .. } => value::decode_value(bytes),
-        other => Err(Error::Corruption(format!(
-            "non-snapshot key in snapshot scan: {other:?}"
-        ))),
-    }
-}
-
-/// Every committed snapshot record (`ducklake_snapshot` +
-/// `ducklake_snapshot_changes`, merged), in key order.
-pub(crate) async fn scan_snapshots(handle: ReadHandle<'_>) -> Result<Vec<SnapshotValue>> {
-    scan_decode(
-        handle,
-        subspace_prefix(Subspace::Snapshot),
-        extract_snapshot,
-    )
-    .await
-}
-
 /// [`scan_snapshots`] with the unfolded tail overlaid, for a slot-backed
 /// attach whose folder has not applied every committed snapshot yet.
 pub(crate) async fn scan_snapshots_overlaid(
     handle: ReadHandle<'_>,
-    overlay: &moraine_wal::Overlay,
+    overlay: Option<&moraine_wal::Overlay>,
 ) -> Result<Vec<SnapshotValue>> {
-    scan_decode_overlaid(
+    scan_decode_maybe(
         handle,
         overlay,
         subspace_prefix(Subspace::Snapshot),
+        ScanShape::Bulk,
         extract_snapshot,
     )
     .await
+}
+
+/// Decodes one entry of a `snapshot`-subspace scan.
+// Signature fixed by the scan callback the decoders are passed as.
+#[allow(clippy::needless_pass_by_value)]
+fn extract_snapshot(key: Key, bytes: Bytes) -> Result<SnapshotValue> {
+    match key {
+        Key::Snapshot { .. } => value::decode_value(&bytes),
+        other => Err(Error::Corruption(format!(
+            "non-snapshot key in snapshot scan: {other:?}"
+        ))),
+    }
 }
 
 pub(crate) fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
@@ -312,54 +430,31 @@ pub(crate) fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRec
     }
 }
 
-/// Decodes one entry of a `current`-subspace scan.
-fn extract_current(key: Key, bytes: &[u8]) -> Result<EntityRecord> {
-    match key {
-        Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
-        Key::Current(CurrentKey::GcFile { .. }) => {
-            Ok(EntityRecord::GcFile(value::decode_value(bytes)?))
-        }
-        other => Err(Error::Corruption(format!(
-            "non-current key in current scan: {other:?}"
-        ))),
-    }
-}
-
-/// Every `ducklake_schema_versions` record as `(table_id,
-/// begin_snapshot, schema_version)`, in key order. Retained across
-/// snapshot expiry, so this is the projection's durable source — the
-/// snapshot records only carry the same rows for as long as they live.
-pub(crate) async fn scan_schema_versions(handle: ReadHandle<'_>) -> Result<Vec<(u64, u64, u64)>> {
-    scan_decode(
-        handle,
-        subspace_prefix(Subspace::SchemaVersion),
-        extract_schema_version,
-    )
-    .await
-}
-
-/// [`scan_schema_versions`] with the unfolded tail overlaid, for a slot-backed
-/// attach whose folder has not applied every committed schema-version row yet.
+/// [`scan_schema_versions`] with the unfolded tail overlaid.
 pub(crate) async fn scan_schema_versions_overlaid(
     handle: ReadHandle<'_>,
-    overlay: &moraine_wal::Overlay,
+    overlay: Option<&moraine_wal::Overlay>,
 ) -> Result<Vec<(u64, u64, u64)>> {
-    scan_decode_overlaid(
+    scan_decode_maybe(
         handle,
         overlay,
         subspace_prefix(Subspace::SchemaVersion),
+        ScanShape::Bulk,
         extract_schema_version,
     )
     .await
 }
 
-fn extract_schema_version(key: Key, bytes: &[u8]) -> Result<(u64, u64, u64)> {
+/// Decodes one entry of a `schema-version`-subspace scan.
+// Signature fixed by the scan callback the decoders are passed as.
+#[allow(clippy::needless_pass_by_value)]
+fn extract_schema_version(key: Key, bytes: Bytes) -> Result<(u64, u64, u64)> {
     match key {
         Key::SchemaVersion {
             table_id,
             begin_snapshot,
         } => {
-            let value: SchemaVersionValue = value::decode_value(bytes)?;
+            let value: SchemaVersionValue = value::decode_value(&bytes)?;
             Ok((table_id, begin_snapshot, value.schema_version))
         }
         other => Err(Error::Corruption(format!(
@@ -370,41 +465,68 @@ fn extract_schema_version(key: Key, bytes: &[u8]) -> Result<(u64, u64, u64)> {
 
 /// Every live entity record.
 pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
-    scan_decode(handle, subspace_prefix(Subspace::Current), extract_current).await
-}
-
-/// [`scan_current_entities`] with the unfolded tail overlaid.
-pub(crate) async fn scan_current_entities_overlaid(
-    handle: ReadHandle<'_>,
-    overlay: &moraine_wal::Overlay,
-) -> Result<Vec<EntityRecord>> {
-    scan_decode_overlaid(
+    scan_decode_subspace(
         handle,
-        overlay,
-        subspace_prefix(Subspace::Current),
+        Subspace::Current,
+        current_entity_kind_prefix,
         extract_current,
     )
     .await
 }
 
+/// [`scan_current_entities`] with the unfolded tail overlaid.
+pub(crate) async fn scan_current_entities_overlaid(
+    handle: ReadHandle<'_>,
+    overlay: Option<&moraine_wal::Overlay>,
+) -> Result<Vec<EntityRecord>> {
+    scan_decode_maybe(
+        handle,
+        overlay,
+        subspace_prefix(Subspace::Current),
+        ScanShape::Bulk,
+        extract_current,
+    )
+    .await
+}
+
+/// Decodes one entry of a `current`-subspace scan.
+// Signature fixed by the scan callback the decoders are passed as.
+#[allow(clippy::needless_pass_by_value)]
+fn extract_current(key: Key, bytes: Bytes) -> Result<EntityRecord> {
+    match key {
+        Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, &bytes),
+        Key::Current(CurrentKey::GcFile { .. }) => {
+            Ok(EntityRecord::GcFile(value::decode_value(&bytes)?))
+        }
+        other => Err(Error::Corruption(format!(
+            "non-current key in current scan: {other:?}"
+        ))),
+    }
+}
+
 /// Every ended entity-version record. Unversioned kinds
-/// ([`EntityKey::is_versioned`]) are overwritten in place and never
-/// mirrored to history; finding one there is store damage, refused here —
-/// before any consumer, snapshot build or raw dump, could replay it over
-/// the live record.
+/// ([`EntityKey::is_versioned`]) are never mirrored to history; finding one
+/// there is store damage and is refused.
 pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
-    scan_decode(handle, subspace_prefix(Subspace::History), extract_history).await
+    scan_decode_subspace(
+        handle,
+        Subspace::History,
+        history_entity_kind_prefix,
+        extract_history,
+    )
+    .await
 }
 
 /// [`scan_history_entities`] with the unfolded tail overlaid.
 pub(crate) async fn scan_history_entities_overlaid(
     handle: ReadHandle<'_>,
-    overlay: &moraine_wal::Overlay,
+    overlay: Option<&moraine_wal::Overlay>,
 ) -> Result<Vec<EntityRecord>> {
-    scan_decode_overlaid(
+    scan_decode_maybe(
         handle,
         overlay,
         subspace_prefix(Subspace::History),
+        ScanShape::Bulk,
         extract_history,
     )
     .await
@@ -412,16 +534,48 @@ pub(crate) async fn scan_history_entities_overlaid(
 
 /// Decodes one entry of a `history`-subspace scan, refusing an unversioned
 /// kind mirrored there.
-fn extract_history(key: Key, bytes: &[u8]) -> Result<EntityRecord> {
+// Signature fixed by the scan callback the decoders are passed as.
+#[allow(clippy::needless_pass_by_value)]
+fn extract_history(key: Key, bytes: Bytes) -> Result<EntityRecord> {
     match key {
         Key::History(history) if !history.entity.is_versioned() => Err(Error::Corruption(format!(
             "unversioned key in history scan: {:?}",
             history.entity
         ))),
-        Key::History(history) => decode_entity(history.entity, bytes),
+        Key::History(history) => decode_entity(history.entity, &bytes),
         other => Err(Error::Corruption(format!(
             "non-history key in history scan: {other:?}"
         ))),
+    }
+}
+
+/// Every current and ended record of one catalog kind. Unversioned kinds
+/// read only `current`; scheduled-file records use their sibling key kind
+/// there rather than an [`EntityKey`].
+/// Which versions of a kind a scan reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Versions {
+    /// Both subspaces: every version the store still holds.
+    LiveAndEnded,
+    /// `current` only, for a reader that has been shown no version in
+    /// `history` can match it. Unversioned kinds read this way regardless.
+    Live,
+}
+
+/// Whether a reader filtering to the versions live at `filter_snapshot`
+/// can be served from `current` alone.
+///
+/// A record reaches `history` by being ended, stamped with the snapshot
+/// that ended it, which is never past the head. A reader that keeps a row
+/// only while `filter_snapshot < end_snapshot` therefore matches nothing
+/// there once `filter_snapshot` has reached the head — and every history
+/// record carries an `end_snapshot`, so none of them is kept by the
+/// `IS NULL` arm either. Time travel reads behind the head and keeps the
+/// full scan.
+pub(crate) fn versions_for(filter_snapshot: Option<u64>, head: Option<u64>) -> Versions {
+    match (filter_snapshot, head) {
+        (Some(filter_snapshot), Some(head)) if filter_snapshot >= head => Versions::Live,
+        _ => Versions::LiveAndEnded,
     }
 }
 
@@ -430,7 +584,7 @@ mod tests {
     use std::sync::Arc;
 
     use object_store::memory::InMemory;
-    use slatedb::IsolationLevel;
+    use slatedb::{IsolationLevel, config::WriteOptions};
 
     use super::*;
     use crate::store::open::StoreBuilder;
@@ -438,7 +592,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn reads_decode_what_was_written() {
-        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
             .open_writer()
             .await
             .unwrap();
@@ -545,7 +699,7 @@ mod tests {
         )
         .unwrap();
 
-        crate::transaction::commit::commit_durably(&db, tx)
+        tx.commit_with_options(&WriteOptions::default())
             .await
             .unwrap();
 
@@ -557,8 +711,8 @@ mod tests {
 
         let current = scan_current_entities(ReadHandle::Tx(&tx)).await.unwrap();
         assert_eq!(current.len(), 5);
-        assert!(current.contains(&EntityRecord::Schema(schema)));
-        assert!(current.contains(&EntityRecord::File(file)));
+        assert!(current.contains(&EntityRecord::Schema(schema.clone())));
+        assert!(current.contains(&EntityRecord::File(file.clone())));
         assert!(current.contains(&EntityRecord::TableStats(tstat)));
         assert!(current.contains(&EntityRecord::View(view)));
         assert!(current.contains(&EntityRecord::Option {
@@ -567,17 +721,173 @@ mod tests {
             value: option,
         }));
         let history = scan_history_entities(ReadHandle::Tx(&tx)).await.unwrap();
-        assert_eq!(history, vec![EntityRecord::Schema(ended)]);
+        assert_eq!(history, vec![EntityRecord::Schema(ended.clone())]);
+
         tx.rollback();
         db.close().await.unwrap();
     }
 
-    /// Unversioned kinds are never written to history; one found there is
-    /// store damage. Refusing it keeps the later current-then-history
-    /// replay from silently overwriting the live record.
+    /// A split scan returns exactly what one iterator over the same prefix
+    /// returns, in the same order — records of every kind, in and out of
+    /// the split kinds, across the sub-range cuts.
+    #[tokio::test]
+    async fn a_split_scan_equals_a_single_scan() {
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        for table_id in [3_u64, 7, 9] {
+            tx.put(
+                Key::current(EntityKey::Table { table_id }).encode(),
+                value::encode_value(&TableValue {
+                    table_id,
+                    ..TableValue::default()
+                }),
+            )
+            .unwrap();
+            for data_file_id in 0..(table_id * 40) {
+                let file = DataFileValue {
+                    data_file_id,
+                    table_id,
+                    ..DataFileValue::default()
+                };
+                tx.put(
+                    Key::current(EntityKey::File {
+                        table_id,
+                        data_file_id,
+                    })
+                    .encode(),
+                    value::encode_value(&file),
+                )
+                .unwrap();
+                tx.put(
+                    Key::history(
+                        EntityKey::File {
+                            table_id,
+                            data_file_id,
+                        },
+                        2,
+                    )
+                    .encode(),
+                    value::encode_value(&file),
+                )
+                .unwrap();
+            }
+        }
+        tx.commit_with_options(&WriteOptions::default())
+            .await
+            .unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let handle = ReadHandle::Tx(&tx);
+        let single = |subspace| {
+            scan_decode(
+                handle,
+                subspace_prefix(subspace),
+                ScanShape::Bulk,
+                |key, bytes| match key {
+                    Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, &bytes),
+                    Key::History(history) => decode_entity(history.entity, &bytes),
+                    other => Err(Error::Corruption(format!("{other:?}"))),
+                },
+            )
+        };
+
+        let current = scan_current_entities(handle).await.unwrap();
+        assert_eq!(current.len(), 3 + 40 * (3 + 7 + 9));
+        assert_eq!(current, single(Subspace::Current).await.unwrap());
+        assert_eq!(
+            scan_history_entities(handle).await.unwrap(),
+            single(Subspace::History).await.unwrap()
+        );
+
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// The bound decides the halves: at or past the head nothing in
+    /// history can match, behind it the ended versions are still needed,
+    /// and an absent bound or head keeps the full scan.
+    #[test]
+    fn versions_narrow_only_at_or_past_the_head() {
+        assert_eq!(versions_for(Some(7), Some(7)), Versions::Live);
+        assert_eq!(versions_for(Some(8), Some(7)), Versions::Live);
+        assert_eq!(versions_for(Some(6), Some(7)), Versions::LiveAndEnded);
+        assert_eq!(versions_for(None, Some(7)), Versions::LiveAndEnded);
+        assert_eq!(versions_for(Some(7), None), Versions::LiveAndEnded);
+    }
+
+    /// A live-only scan returns exactly the full scan's rows that a reader
+    /// bounded at the head would have kept — the ended ones it drops are
+    /// the ones that reader discards anyway.
+    #[tokio::test]
+    async fn a_live_scan_drops_only_what_a_head_bounded_reader_discards() {
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+
+        // One live file and one ended in snapshot 4.
+        let live = DataFileValue {
+            table_id: 1,
+            data_file_id: 1,
+            begin_snapshot: 1,
+            ..DataFileValue::default()
+        };
+        let ended = DataFileValue {
+            table_id: 1,
+            data_file_id: 2,
+            begin_snapshot: 1,
+            end_snapshot: Some(4),
+            ..DataFileValue::default()
+        };
+        let entity = |data_file_id| EntityKey::File {
+            table_id: 1,
+            data_file_id,
+        };
+        tx.put(
+            Key::current(entity(1)).encode(),
+            crate::store::value::encode_value(&live),
+        )
+        .unwrap();
+        tx.put(
+            Key::history(entity(2), 4).encode(),
+            crate::store::value::encode_value(&ended),
+        )
+        .unwrap();
+
+        let handle = ReadHandle::Tx(&tx);
+        // A live-only read skips the history half outright; a full one adds it.
+        let live_only = scan_current_entities(handle).await.unwrap();
+        let mut full = live_only.clone();
+        full.extend(scan_history_entities(handle).await.unwrap());
+        assert_eq!(full.len(), 2);
+        assert_eq!(live_only.len(), 1);
+
+        // What the reader at the head keeps out of the full scan is
+        // exactly what the live-only scan returned.
+        let kept: Vec<_> = full
+            .iter()
+            .filter(|record| {
+                record
+                    .lifecycle()
+                    .is_none_or(|(_, end)| end.is_none_or(|end| 4 < end))
+            })
+            .cloned()
+            .collect();
+        assert_eq!(kept, live_only);
+
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// An unversioned kind found in history is refused as store damage.
     #[tokio::test]
     async fn unversioned_kind_in_history_is_refused() {
-        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
             .open_writer()
             .await
             .unwrap();
@@ -594,7 +904,7 @@ mod tests {
             value::encode_value(&stats),
         )
         .unwrap();
-        crate::transaction::commit::commit_durably(&db, tx)
+        tx.commit_with_options(&WriteOptions::default())
             .await
             .unwrap();
 
@@ -607,11 +917,10 @@ mod tests {
         db.close().await.unwrap();
     }
 
-    /// Mappings are write-once and never mirrored to history; one found
-    /// there is refused like every other unversioned kind.
+    /// A mapping found in history is refused like every unversioned kind.
     #[tokio::test]
     async fn mapping_in_history_is_refused() {
-        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
             .open_writer()
             .await
             .unwrap();
@@ -635,7 +944,7 @@ mod tests {
             value::encode_value(&mapping),
         )
         .unwrap();
-        crate::transaction::commit::commit_durably(&db, tx)
+        tx.commit_with_options(&WriteOptions::default())
             .await
             .unwrap();
 

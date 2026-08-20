@@ -30,17 +30,6 @@ ignore = [
     # Revisit on slatedb bumps.
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; transitive via slatedb->foyer" },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive via slatedb->foyer" },
-    # quick-xml quadratic-time parse of duplicate attribute names. Reached
-    # only when parsing XML responses from the configured object store (a
-    # trusted service), and object_store 0.14 pins the affected minor.
-    # Revisit when object_store bumps quick-xml.
-    { id = "RUSTSEC-2026-0194", reason = "DoS-shaped XML parse issue; input comes from the trusted object store; no compatible fixed version yet" },
-    { id = "RUSTSEC-2026-0195", reason = "quick-xml NsReader memory exhaustion; same trusted-object-store input as 2026-0194; no compatible fixed version yet" },
-    # time RFC 2822 stack exhaustion needs malicious input; the transitive
-    # user (slatedb->duration-str) parses moraine-controlled config
-    # strings only. The patched time 0.3.47 requires Rust 1.88 (> our
-    # declared MSRV 1.85); take the fix when the MSRV moves.
-    { id = "RUSTSEC-2026-0009", reason = "reachable only via config strings we control; fixed version exceeds declared MSRV" },
 ]
 
 [sources]

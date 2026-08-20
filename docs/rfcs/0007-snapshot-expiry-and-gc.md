@@ -156,10 +156,15 @@ moraine must translate into one atomic batch:
   record ceases to exist.
 - **Embedded rows.** Deletes against tables whose rows embed in a parent
   record (`ducklake_column_tag`, `ducklake_partition_column`,
-  `ducklake_sort_expression`, `ducklake_file_partition_value`) ride their
-  parent's deletion in the same cascade and translate as validated
-  no-ops. Unmodeled stand-in tables (macros, mappings, variant stats)
-  accept void-deletes — they can never have a live row.
+  `ducklake_sort_expression`, `ducklake_file_partition_value`,
+  `ducklake_name_mapping`) ride their parent's deletion in the same cascade
+  and translate as validated no-ops. Step 6's orphan sweep over
+  `ducklake_name_mapping` is one of these: the rows it looks for were freed
+  with the record step 5 deleted, so the sweep is accepted and lands as a
+  no-op whether it shares that transaction or follows it.
+- **The mapping record itself** takes a real hard delete in step 5, keyed
+  `(mapping_id, table_id)` and carrying no `end_snapshot` — the one
+  unversioned kind on that path.
 - **Schema-version rows.** `ducklake_schema_versions` rows are **not**
   expired with the snapshots that wrote them. They live in their own
   subspace (RFC 0002) and are deleted only where DuckLake's own catalogs
@@ -170,14 +175,21 @@ moraine must translate into one atomic batch:
   for the whole table. A store that lost its rows that way is repaired on
   read: the projection floors each affected table at its oldest data
   file, carrying the oldest schema version still known for it.
+- **Derived row-ID file statistics.** The patched DuckLake backfill may
+  insert an unversioned `ducklake_file_column_stats` row for DuckDB's
+  reserved row-ID field id `2147483540` without inserting a snapshot. The
+  row is derived from an immutable active Parquet file: its dense
+  `row_id_start` range, or the embedded row-ID column for a sparse rewrite.
+  This one insert shape is maintenance; ordinary file-column statistics and
+  every versioned-entity insert still require a snapshot-minting commit.
 - **No snapshot minted.** A staged transaction whose operations are all
-  maintenance operations commits without a `ducklake_snapshot` insert:
-  one `WriteBatch`, no new snapshot record, no head update. Atomicity is
-  unchanged; a racing writer is caught by the store transaction's
-  write-write conflict detection and surfaces the same `conflict`-substring
-  error every staged commit uses. A mixed set (entity mutations but no
-  snapshot row) stays a constraint error — DuckLake always mints a
-  snapshot for real catalog changes.
+  maintenance operations commits without a `ducklake_snapshot` insert: one
+  `WriteBatch`, no new snapshot record, and `sys/head` retains its snapshot
+  id while advancing its batch count. Atomicity is unchanged; a racing writer
+  is caught by the store transaction's write-write conflict detection and
+  surfaces the same `conflict`-substring error every staged commit uses. A
+  mixed set (entity mutations but no snapshot row) stays a constraint error —
+  DuckLake always mints a snapshot for real catalog changes.
 
 ### Read-your-writes projections
 
@@ -242,26 +254,47 @@ the view a view.
 
 **The scan and the write path must overlay identically.** A rowid a
 metadata scan emits is the row's index into whatever list that scan
-materialized, and the staged-write sink resolves the index back by
-re-materializing the same list. Making a kind tx-aware for the scan alone
-is therefore not a partial improvement but a corruption: an
-`UPDATE`/`DELETE ... WHERE ctid`-shaped statement would resolve an index
-into the overlaid list against the committed one, and name a different row
-or none. The sink materializes on the first row it resolves — before that
-statement has staged anything of its own — which is what keeps its list
-equal to the one the scan handed out.
+materialized, and the staged-write sink resolves the index back against a
+list of its own. Making a kind tx-aware for the scan alone is therefore
+not a partial improvement but a corruption: an `UPDATE`/`DELETE ... WHERE
+ctid`-shaped statement would resolve an index into the overlaid list
+against the committed one, and name a different row or none.
+
+Identical *content* is not enough, because two materializations taken at
+two committed heads can differ in content — which is why the two are one
+materialization rather than two that agree. **A table is materialized once
+per DuckDB transaction and shared** (RFC 0009's read-side companion to
+this): the scan takes the list, the sink takes the same list, and the
+index cannot mean two things. The sink pins it *before* opening the staged
+transaction, because opening one is what moves the transaction from
+reading the pinned committed dump to reading through the staged
+transaction's own read point — and the scan that emitted the rowids bound
+in whichever of those held.
+
+That sharing is confined to the reader side. Once a transaction has opened
+a staged transaction, every read of a writable kind goes to the staged
+dump and nothing caches over it: DuckLake's commit loop re-reads exactly
+that surface between attempts, and a retry served the state its first
+attempt saw would re-check its conflict matrix against a premise that
+already lost.
 
 ### Reader safety
 
-The safety contract is unchanged from DuckLake's own and must be
-documented for operators: **the retention window must exceed the maximum
-expected read/attach duration**, and the cleanup grace period
+The safety contract is unchanged from DuckLake's own, and is documented
+for operators in the "Operating a lake" guide: **the retention window must
+exceed the maximum expected read/attach duration**, and the cleanup grace period
 (`cleanup_old_files`' `older_than`) must exceed the maximum reader/scan
 duration. Logical expiry deletes no bytes; a reader holding a view of an
 expired snapshot keeps scanning bytes that survive until a cleanup whose
 grace period has passed. A reader that held a view longer than the window
 may find its snapshot expired and must re-resolve from head
 (`SnapshotExpired`, RFC 0003/0009).
+
+moraine exposes no registry of live reader snapshots. Readers are
+cross-process and uncoordinated (RFC 0004), so an extension-local registry
+would be incomplete and could not safely derive a retention window. Operators
+set the window from the workload's externally observed transaction and scan
+durations; a process-local diagnostic would not change that contract.
 
 ### One reclamation path for flush and compaction
 

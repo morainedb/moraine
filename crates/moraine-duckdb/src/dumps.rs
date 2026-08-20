@@ -6,9 +6,8 @@
 //! Shares [`crate::abi`]'s conventions: `catch_unwind`/null/UTF-8
 //! discipline via [`guard`](crate::abi), owned-first `CString`
 //! construction, one `_free` per dump. Every function opens its own fresh
-//! transaction against [`moraine::ffi_support`] — no snapshot handle is
-//! involved, and no two dump calls are guaranteed to observe the same
-//! head.
+//! transaction against [`moraine::ffi_support`]; no two dump calls are
+//! guaranteed to observe the same head.
 //!
 //! Two nullability conventions cross the C boundary:
 //! - an optional **string** is a null pointer for `None`;
@@ -28,7 +27,6 @@ mod tags;
 
 use std::{
     ffi::{CString, c_char, c_void},
-    future::Future,
     ptr,
 };
 
@@ -72,9 +70,8 @@ pub(crate) fn opt_into_raw(s: Option<CString>) -> *mut c_char {
 
 /// The shared shell of every dump entry point: null checks, the
 /// cancellable bridge into the core `fetch`, `convert` to C rows, and
-/// `write_array`, all under [`guard`](crate::abi). Every `moraine_dump_*`
-/// export is a thin wrapper over this, so each concrete signature stays
-/// visible to cbindgen (which generates `cpp/moraine_abi.h`).
+/// `write_array`, all under [`guard`](crate::abi). Each `moraine_dump_*`
+/// signature stays written out for cbindgen.
 ///
 /// Cancellable via `probe`/`probe_ctx` (polled immediately, then ~100 ms;
 /// a null `probe` disables polling): a cancellation returns
@@ -88,8 +85,6 @@ pub(crate) fn opt_into_raw(s: Option<CString>) -> *mut c_char {
 /// non-null, must be safe to call with `probe_ctx` from any thread.
 /// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
 /// for the duration of the call.
-// Six of the eight parameters mirror the fixed C signature every dump
-// entry point exposes; grouping them would only obscure the mirror.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn dump_rows<Row, Rows>(
     handle: *mut MoraineCatalogHandle,
@@ -98,11 +93,7 @@ pub(crate) unsafe fn dump_rows<Row, Rows>(
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
-    fetch: impl for<'c> FnOnce(
-        &'c moraine::Catalog,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<Rows, moraine::Error>> + 'c>,
-    >,
+    fetch: impl AsyncFnOnce(&moraine::ReadOnlyCatalog) -> Result<Rows, moraine::Error>,
     convert: impl FnOnce(Rows) -> Result<Vec<Row>, AbiError>,
 ) -> i32 {
     let attempt = || -> Result<Vec<Row>, AbiError> {
@@ -116,7 +107,7 @@ pub(crate) unsafe fn dump_rows<Row, Rows>(
         let handle_ref = unsafe { &*handle };
         // SAFETY: `probe`/`probe_ctx` validity is the caller's contract.
         let rows = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, fetch(&handle_ref.catalog))
+            handle_ref.block_on_cancellable(probe, probe_ctx, fetch(handle_ref.catalog.reads()))
         }?;
         convert(rows)
     };
@@ -133,8 +124,8 @@ pub(crate) unsafe fn dump_rows<Row, Rows>(
 }
 
 /// The shared shell of every dump `_free`: `release` each element's owned
-/// strings and reclaim the array, under `catch_unwind` so a teardown can
-/// never unwind into C++. Null `items` is a no-op.
+/// strings and reclaim the array, under `catch_unwind`. Null `items` is a
+/// no-op.
 ///
 /// # Safety
 ///

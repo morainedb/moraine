@@ -1,0 +1,150 @@
+# name: test/sql/maintenance_concurrency.test
+# group: [moraine]
+#
+# The on-demand maintenance trigger against a concurrently held catalog.
+#
+# The trigger runs its pass through a connection of its own, and the caller
+# blocks while that connection writes. Running it inside the caller's own
+# `BEGIN` is refused outright, which the CLI suite pins. What that refusal
+# does *not* answer is the case it leaves open: a caller in autocommit is
+# still inside an implicit transaction while its statement runs, and there
+# may be a second connection's transaction open elsewhere at the same time.
+# If either of those held something the pass's connection needs, the trigger
+# would wedge rather than fail.
+#
+# One connection is not enough to ask this — the CLI holds exactly one, so
+# nothing can be open elsewhere while the trigger runs. This file uses
+# DuckDB's own sqllogictest runner for several connections over one
+# instance, which is what makes "held elsewhere" expressible at all.
+#
+# The answer is that they contend but do not deadlock: every trigger below
+# completes, and the concurrent writer is told it lost by DuckLake's own
+# conflict path rather than waiting on a lock nobody will release.
+#
+# A regression here hangs rather than fails, since a deadlock has nothing to
+# report. That is the honest failure mode for the question being asked.
+#
+# Skipped unless the packaged Moraine and patched DuckLake extensions are
+# named in the environment; `cargo xtask e2e` supplies both.
+
+require-env MORAINE_DUCKDB_EXT
+
+require-env MORAINE_DUCKLAKE_EXT
+
+require-env MORAINE_EXTENSION_DIR
+
+# DuckLake's catalog cache races under multiple threads independently of
+# moraine, so pin one thread and let the connections be the concurrency.
+statement ok
+SET threads=1;
+
+statement ok
+SET extension_directory='${MORAINE_EXTENSION_DIR}';
+
+statement ok
+INSTALL parquet;
+
+statement ok
+LOAD parquet;
+
+statement ok
+LOAD '${MORAINE_DUCKLAKE_EXT}';
+
+statement ok
+LOAD '${MORAINE_DUCKDB_EXT}';
+
+# Configured so the pass actually writes. A bare attach skips every
+# DuckLake step and sweeps nothing, which would make this file assert that
+# a pass doing no work deadlocks with nobody. `BATCH_SIZE 1` makes the
+# sweep take one durable commit per entry, so the trigger's connection is
+# writing the catalog for the whole of the window con1 holds open.
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/maint-store' AS lake (DATA_PATH '__TEST_DIR__/maint-data/', META_DATA_PATH '__TEST_DIR__/maint-data/', META_MAINTENANCE_EXPIRE_SNAPSHOTS true, META_MAINTENANCE_CLEANUP_OLD_FILES true, META_MAINTENANCE_BATCH_SIZE 1);
+
+statement ok
+CREATE TABLE lake.main.t(a BIGINT);
+
+statement ok
+INSERT INTO lake.main.t SELECT i FROM range(200) t(i);
+
+# A dropped index leaves a range for the sweep to reclaim, one commit at a
+# time.
+statement ok
+SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],false);
+
+statement ok
+SELECT * FROM moraine_index_drop('lake','main','t','by_a');
+
+# The baseline: an autocommit trigger with nothing else in flight. Nine
+# steps report, whatever their individual statuses — the pass ran.
+query I con2
+SELECT count(*) FROM moraine_maintenance('lake');
+----
+9
+
+# And it did real work rather than skipping past everything.
+query I con2
+SELECT count(*) FROM moraine_maintenance('lake') WHERE status = 'ran';
+----
+4
+
+# The case the refusal leaves open. `con1` holds an *uncommitted* write
+# transaction against the same lake, so a DuckLake transaction is open on
+# another connection for the whole of the trigger below.
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO lake.main.t SELECT i + 1000 FROM range(20) t(i);
+
+# Another dropped index, so the pass below has a range to reclaim while
+# con1's transaction is open rather than an already-swept one.
+statement ok con3
+SELECT * FROM moraine_index_create('lake','main','t','by_a2',['a'],false);
+
+statement ok con3
+SELECT * FROM moraine_index_drop('lake','main','t','by_a2');
+
+# The trigger, in autocommit, on a third connection while con1's write
+# transaction is still open. It must complete: the pass's connection takes
+# nothing con1 holds, and the caller's own implicit transaction is not in
+# its way either.
+query I con2
+SELECT count(*) FROM moraine_maintenance('lake');
+----
+9
+
+# And again from the connection that itself just wrote in autocommit, so the
+# caller's implicit transaction is the most recent writer.
+statement ok con3
+INSERT INTO lake.main.t VALUES (999);
+
+query I con3
+SELECT count(*) FROM moraine_maintenance('lake');
+----
+9
+
+# What con1 gets is a *conflict*, not a hang and not corruption: the pass
+# expired snapshots and so altered the table con1 was inserting into, and
+# DuckLake says exactly that, in the retryable language its own writers
+# understand. That is the answer this file was written to get — the two
+# contend for catalog state, they do not deadlock over it.
+statement error con1
+COMMIT;
+----
+Transaction conflict
+
+
+# con1's rows are gone with its conflicted transaction; the autocommit
+# write from con3 and the seed rows stand.
+query I
+SELECT count(*) FROM lake.main.t;
+----
+201
+
+# A pass after the dust settles still runs, so no earlier one left the
+# single-flight lock held.
+query I con2
+SELECT count(*) FROM moraine_maintenance('lake');
+----
+9

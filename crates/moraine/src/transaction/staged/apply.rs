@@ -4,15 +4,18 @@
 
 use super::{
     BTreeSet, CatalogSnapshot, Cell, EntityKey, Error, HashMap, Key, Result, RowOperation,
-    TableKind, commit, corrupt_row,
+    TableKind, commit,
+    commit::Touched,
+    corrupt_row,
     decode::{
         Cursor, StatsKey, decode_column, decode_column_mapping, decode_column_tag_row,
         decode_data_file, decode_delete_file, decode_delete_key, decode_end,
         decode_file_column_stats, decode_file_partition_value, decode_gc_file_row,
         decode_hard_delete, decode_macro, decode_macro_impl, decode_macro_parameter,
-        decode_metadata, decode_name_mapping, decode_partition_column, decode_partition_info,
-        decode_schema, decode_sort_expression, decode_sort_info, decode_table,
-        decode_table_column_stats, decode_table_stats, decode_tag_row, decode_view, table_value,
+        decode_metadata, decode_metadata_key, decode_name_mapping, decode_partition_column,
+        decode_partition_info, decode_schema, decode_sort_expression, decode_sort_info,
+        decode_table, decode_table_column_stats, decode_table_stats, decode_tag_row, decode_view,
+        table_value,
     },
     proto,
 };
@@ -32,11 +35,9 @@ pub(super) struct ChildRows {
 }
 
 /// The entities this batch hard-deletes, gathered before anything is
-/// applied. A hard delete emits a raw key delete and deliberately leaves
-/// the working state untouched, so an embedded child's parent still reads
-/// as live there however the deletes are ordered. Compaction deletes a
-/// parent and its embedded children in one batch, so the check needs the
-/// batch's intent rather than its progress.
+/// applied. A hard delete leaves the working state untouched, so a parent
+/// still reads as live there; embedded-child deletes consult this set
+/// instead.
 pub(super) fn collect_hard_deletes(ops: &[RowOperation]) -> Result<BTreeSet<EntityKey>> {
     ops.iter()
         .filter_map(|op| match op {
@@ -149,8 +150,9 @@ pub(super) fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
 }
 
 /// Applies one staged row to the working snapshot. `new_id` is this
-/// commit's own new snapshot id — the only value an `UpdateSetEnd` row's
-/// `end_snapshot` cell is ever allowed to carry (see the module doc).
+/// commit's own snapshot id, the only value an `UpdateSetEnd` row's
+/// `end_snapshot` cell may carry.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_op(
     base: &CatalogSnapshot,
     state: &mut CatalogSnapshot,
@@ -159,21 +161,22 @@ pub(super) fn apply_op(
     children: &mut ChildRows,
     direct: &mut Vec<commit::StagedWrite>,
     hard_deleted: &BTreeSet<EntityKey>,
+    touched: &mut Touched,
 ) -> Result<()> {
     match op {
-        RowOperation::Insert { table, cells } => apply_insert(base, state, *table, cells, children),
+        RowOperation::Insert { table, cells } => {
+            apply_insert(base, state, *table, cells, children, touched)
+        }
         RowOperation::UpdateSetEnd { table, cells } => {
-            apply_update_set_end(state, *table, cells, new_id)
+            apply_update_set_end(state, *table, cells, new_id, touched)
         }
         RowOperation::UpdateSetBegin { table, cells } => {
-            apply_update_set_begin(base, state, *table, cells, new_id)
+            apply_update_set_begin(base, state, *table, cells, new_id, touched)
         }
         RowOperation::Delete { table, cells } => {
-            apply_delete(state, *table, cells, direct, hard_deleted)
+            apply_delete(state, *table, cells, direct, hard_deleted, touched)
         }
-        // Inline ops contribute no snapshot diff — their writes come from
-        // `translate_inline` — so both `translate` and
-        // `translate_maintenance` pass them through here as no-ops.
+        // Inline ops are translated by `translate_inline`, not the diff.
         RowOperation::InlineSchema { .. }
         | RowOperation::InlineInsert { .. }
         | RowOperation::InlineInlineDelete { .. }
@@ -185,8 +188,7 @@ pub(super) fn apply_op(
     }
 }
 
-/// Whether `op` is one of the eight inline variants — routed to
-/// `translate_inline`, never to [`apply_op`]'s `CatalogSnapshot` diff.
+/// Whether `op` is one of the inline variants `translate_inline` handles.
 pub(super) fn is_inline_op(op: &RowOperation) -> bool {
     matches!(
         op,
@@ -208,6 +210,7 @@ pub(super) fn apply_macro_insert(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
     children: &mut ChildRows,
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut value = decode_macro(cells)?;
     let mut implementations = children
@@ -250,6 +253,9 @@ pub(super) fn apply_macro_insert(
         implementation.parameters = parameters;
     }
     value.implementations = implementations;
+    touched.touch(EntityKey::Macro {
+        macro_id: value.macro_id,
+    });
     state.put_macro(value);
 
     Ok(())
@@ -262,6 +268,7 @@ pub(super) fn apply_mapping_insert(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
     children: &mut ChildRows,
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut value = decode_column_mapping(cells)?;
     let rows = children
@@ -302,29 +309,20 @@ pub(super) fn apply_mapping_insert(
         ));
     }
     value.name_mappings = rows;
+    touched.touch(EntityKey::Mapping {
+        table_id: value.table_id,
+        mapping_id: value.mapping_id,
+    });
     state.put_mapping(value);
 
     Ok(())
 }
 
-/// The id-collision backstop for one primary-keyed kind: an insert whose
-/// id already names a live row is refused, rather than displacing that row
-/// and minting a history version DuckLake never authored.
-///
-/// Scoped to the kinds DuckLake's own schema declares a `PRIMARY KEY` on
-/// (`ducklake_schema`, `ducklake_data_file`, `ducklake_delete_file`, and
-/// the two snapshot tables, whose backstop is instead the head-advance
-/// check — a snapshot record exists only at or below head). Extending it
-/// to kinds DuckLake leaves unconstrained would refuse rows another
-/// DuckLake backend accepts.
-///
-/// Checked against the working state, not the base, so the shape DuckLake
-/// really writes — end the old version, re-insert under the same id —
-/// still passes: ends apply before inserts and free the id.
-///
-/// The message carries none of the four substrings DuckLake's commit loop
-/// retries on: a duplicate id that survived the head CAS is drift, and
-/// re-driving it would produce the same row again.
+/// Refuses an insert whose id already names a live row, for the kinds
+/// DuckLake's schema declares a `PRIMARY KEY` on. Checked against the
+/// working state (ends apply first, freeing the id). The message must not
+/// contain `conflict`: DuckLake would retry, and re-driving reproduces the
+/// row.
 fn refuse_live_id(table: TableKind, live: bool, named: &str) -> Result<()> {
     if live {
         return Err(Error::Constraint(format!(
@@ -335,13 +333,20 @@ fn refuse_live_id(table: TableKind, live: bool, named: &str) -> Result<()> {
     Ok(())
 }
 
-fn apply_schema_insert(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
+fn apply_schema_insert(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
     let value = decode_schema(cells)?;
     refuse_live_id(
         TableKind::Schema,
         state.schemas.contains_key(&value.schema_id),
         &format!("schema_id {}", value.schema_id),
     )?;
+    touched.touch(EntityKey::Schema {
+        schema_id: value.schema_id,
+    });
     state.put_schema(value);
     Ok(())
 }
@@ -350,6 +355,7 @@ fn apply_data_file_insert(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
     children: &mut ChildRows,
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut value = decode_data_file(cells)?;
     refuse_live_id(
@@ -364,11 +370,19 @@ fn apply_data_file_insert(
         .file_partition_values
         .remove(&(value.table_id, value.data_file_id))
         .unwrap_or_default();
+    touched.touch(EntityKey::File {
+        table_id: value.table_id,
+        data_file_id: value.data_file_id,
+    });
     state.put_data_file(value);
     Ok(())
 }
 
-fn apply_delete_file_insert(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
+fn apply_delete_file_insert(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
     let value = decode_delete_file(cells)?;
     refuse_live_id(
         TableKind::DeleteFile,
@@ -378,7 +392,90 @@ fn apply_delete_file_insert(state: &mut CatalogSnapshot, cells: &[Cell]) -> Resu
             .is_some_and(|files| files.contains_key(&value.delete_file_id)),
         &format!("delete_file_id {}", value.delete_file_id),
     )?;
+    touched.touch(EntityKey::DeleteFile {
+        table_id: value.table_id,
+        delete_file_id: value.delete_file_id,
+    });
     state.put_delete_file(value);
+    Ok(())
+}
+
+/// Applies one tag insert: a container entry, or an entry embedded in
+/// the column record it annotates.
+fn apply_tag_insert(
+    state: &mut CatalogSnapshot,
+    table: TableKind,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
+    if table == TableKind::Tag {
+        let (object_id, entry) = decode_tag_row(cells)?;
+        touched.touch(EntityKey::Tag { object_id });
+        state
+            .tags
+            .entry(object_id)
+            .or_insert_with(|| proto::TagValue {
+                object_id,
+                entries: Vec::new(),
+            })
+            .entries
+            .push(entry);
+        return Ok(());
+    }
+
+    let ((table_id, column_id), tag) = decode_column_tag_row(cells)?;
+    let Some(column) = state
+        .columns
+        .get_mut(&table_id)
+        .and_then(|cols| cols.get_mut(&column_id))
+    else {
+        return Err(corrupt_row(
+            table,
+            format!("column tag names an absent column ({table_id}, {column_id})"),
+        ));
+    };
+    column.tags.push(tag);
+    touched.touch(EntityKey::Column {
+        table_id,
+        column_id,
+    });
+    Ok(())
+}
+
+/// Applies one unversioned statistics insert.
+fn apply_stats_insert(
+    state: &mut CatalogSnapshot,
+    table: TableKind,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
+    match table {
+        TableKind::TableStats => {
+            let value = decode_table_stats(cells)?;
+            touched.touch(EntityKey::TableStats {
+                table_id: value.table_id,
+            });
+            state.put_table_stats(value);
+        }
+        TableKind::TableColumnStats => {
+            let value = decode_table_column_stats(cells)?;
+            touched.touch(EntityKey::TableColumnStats {
+                table_id: value.table_id,
+                column_id: value.column_id,
+            });
+            state.put_table_column_stats(value);
+        }
+        TableKind::FileColumnStats => {
+            let value = decode_file_column_stats(cells)?;
+            touched.touch(EntityKey::FileColumnStats {
+                table_id: value.table_id,
+                data_file_id: value.data_file_id,
+                column_id: value.column_id,
+            });
+            state.put_file_column_stats(value);
+        }
+        _ => return Err(corrupt_row(table, "not a statistics kind")),
+    }
     Ok(())
 }
 
@@ -388,11 +485,11 @@ pub(super) fn apply_insert(
     table: TableKind,
     cells: &[Cell],
     children: &mut ChildRows,
+    touched: &mut Touched,
 ) -> Result<()> {
     match table {
-        // Snapshot rows fold into the snapshot record separately; child
-        // rows fold into their parent records via `collect_child_rows`.
-        // Neither is an entity mutation of its own.
+        // Snapshot rows fold into the snapshot record; child rows fold into
+        // their parent records via `collect_child_rows`.
         TableKind::Snapshot
         | TableKind::SnapshotChanges
         | TableKind::SchemaVersions
@@ -402,30 +499,43 @@ pub(super) fn apply_insert(
         | TableKind::MacroImpl
         | TableKind::MacroParameters
         | TableKind::NameMapping => {}
-        // An option row overwrites its key in the scope's record: outside
-        // the snapshot protocol, last write wins.
+        // An option row overwrites its key in the scope's record.
         TableKind::Metadata => {
             let (components, key, value) = decode_metadata(cells)?;
-            let mut record = state.options.get(&components).cloned().unwrap_or_default();
-            record.options.insert(key, value);
-            state.set_option_record(components, record);
+            touched.touch(EntityKey::Option {
+                scope_kind: components.0,
+                scope_id: components.1,
+            });
+            state
+                .options
+                .entry(components)
+                .or_default()
+                .options
+                .insert(key, value);
         }
-        TableKind::Schema => apply_schema_insert(state, cells)?,
-        TableKind::Table => state.put_table(table_value(base, decode_table(cells)?)),
-        TableKind::View => state.put_view(decode_view(cells)?),
+        TableKind::Schema => apply_schema_insert(state, cells, touched)?,
+        TableKind::Table => {
+            let value = table_value(base, decode_table(cells)?);
+            touched.touch(EntityKey::Table {
+                table_id: value.table_id,
+            });
+            state.put_table(value);
+        }
+        TableKind::View => {
+            let value = decode_view(cells)?;
+            touched.touch(EntityKey::View {
+                view_id: value.view_id,
+            });
+            state.put_view(value);
+        }
         TableKind::Column => {
             let mut value = decode_column(cells)?;
-            // The column-type policy is the core's on both front doors, so
-            // a type moraine cannot store is refused where the column
-            // enters the catalog rather than at its first insert.
             crate::catalog::inline_policy::ensure_inlinable(
                 &value.column_name,
                 &value.column_type,
             )?;
-            // Column tags outlive column versions (DuckLake keys them by
-            // (table_id, column_id) with their own lifecycle), so a new
-            // version carries the prior version's entries forward —
-            // DuckLake never re-authors tag rows on a column alter.
+            // Column tags outlive column versions: a new version carries
+            // the prior version's entries forward.
             if let Some(prior) = base
                 .columns
                 .get(&value.table_id)
@@ -433,16 +543,24 @@ pub(super) fn apply_insert(
             {
                 value.tags.clone_from(&prior.tags);
             }
+            touched.touch(EntityKey::Column {
+                table_id: value.table_id,
+                column_id: value.column_id,
+            });
             state.put_column(value);
         }
-        TableKind::DataFile => apply_data_file_insert(state, cells, children)?,
-        TableKind::DeleteFile => apply_delete_file_insert(state, cells)?,
+        TableKind::DataFile => apply_data_file_insert(state, cells, children, touched)?,
+        TableKind::DeleteFile => apply_delete_file_insert(state, cells, touched)?,
         TableKind::PartitionInfo => {
             let mut value = decode_partition_info(cells)?;
             value.columns = children
                 .partition_columns
                 .remove(&value.partition_id)
                 .unwrap_or_default();
+            touched.touch(EntityKey::Partition {
+                table_id: value.table_id,
+                partition_id: value.partition_id,
+            });
             state.put_partition(value);
         }
         TableKind::SortInfo => {
@@ -451,51 +569,29 @@ pub(super) fn apply_insert(
                 .sort_expressions
                 .remove(&value.sort_id)
                 .unwrap_or_default();
+            touched.touch(EntityKey::Sort {
+                table_id: value.table_id,
+                sort_id: value.sort_id,
+            });
             state.put_sort(value);
         }
-        TableKind::Macro => apply_macro_insert(state, cells, children)?,
-        TableKind::ColumnMapping => apply_mapping_insert(state, cells, children)?,
-        TableKind::TableStats => state.put_table_stats(decode_table_stats(cells)?),
-        TableKind::TableColumnStats => {
-            state.put_table_column_stats(decode_table_column_stats(cells)?);
+        TableKind::Macro => apply_macro_insert(state, cells, children, touched)?,
+        TableKind::ColumnMapping => apply_mapping_insert(state, cells, children, touched)?,
+        TableKind::TableStats | TableKind::TableColumnStats | TableKind::FileColumnStats => {
+            apply_stats_insert(state, table, cells, touched)?;
         }
-        TableKind::FileColumnStats => state.put_file_column_stats(decode_file_column_stats(cells)?),
         TableKind::FilesScheduledForDeletion => {
-            state.put_gc_file(decode_gc_file_row(cells)?);
+            let value = decode_gc_file_row(cells)?;
+            touched.touch_gc_file(value.data_file_id);
+            state.put_gc_file(value);
         }
-        TableKind::Tag => {
-            let (object_id, entry) = decode_tag_row(cells)?;
-            state
-                .tags
-                .entry(object_id)
-                .or_insert_with(|| proto::TagValue {
-                    object_id,
-                    entries: Vec::new(),
-                })
-                .entries
-                .push(entry);
-        }
-        TableKind::ColumnTag => {
-            let ((table_id, column_id), tag) = decode_column_tag_row(cells)?;
-            let Some(column) = state
-                .columns
-                .get_mut(&table_id)
-                .and_then(|cols| cols.get_mut(&column_id))
-            else {
-                return Err(corrupt_row(
-                    table,
-                    format!("column tag names an absent column ({table_id}, {column_id})"),
-                ));
-            };
-            column.tags.push(tag);
-        }
+        TableKind::Tag | TableKind::ColumnTag => apply_tag_insert(state, table, cells, touched)?,
     }
     Ok(())
 }
 
-/// Ends the one live entry (`end_snapshot IS NULL`) for `key` in
-/// `entries`, in place. `false` means no live entry matched — the caller
-/// reports the shape error (DuckLake's UPDATE only names rows it read).
+/// Ends the first entry of `entries` matching `is_match`, in place;
+/// `false` means none matched.
 pub(super) fn end_live_entry<E>(
     entries: &mut [E],
     is_match: impl Fn(&E) -> bool,
@@ -532,6 +628,7 @@ pub(super) fn apply_tag_set_end(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
     new_id: u64,
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut c = Cursor::new(TableKind::Tag, cells);
     let object_id = c.u64()?;
@@ -540,6 +637,7 @@ pub(super) fn apply_tag_set_end(
     c.finish()?;
     check_end_snapshot(TableKind::Tag, end_snapshot, new_id)?;
 
+    touched.touch(EntityKey::Tag { object_id });
     let ended = state.tags.get_mut(&object_id).is_some_and(|container| {
         end_live_entry(
             &mut container.entries,
@@ -563,6 +661,7 @@ pub(super) fn apply_column_tag_set_end(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
     new_id: u64,
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut c = Cursor::new(TableKind::ColumnTag, cells);
     let table_id = c.u64()?;
@@ -572,6 +671,10 @@ pub(super) fn apply_column_tag_set_end(
     c.finish()?;
     check_end_snapshot(TableKind::ColumnTag, end_snapshot, new_id)?;
 
+    touched.touch(EntityKey::Column {
+        table_id,
+        column_id,
+    });
     let ended = state
         .columns
         .get_mut(&table_id)
@@ -598,22 +701,19 @@ pub(super) fn apply_update_set_end(
     table: TableKind,
     cells: &[Cell],
     new_id: u64,
+    touched: &mut Touched,
 ) -> Result<()> {
-    // Tag entries are embedded, not entity records of their own: ending
-    // one rewrites its container in place rather than moving a key to
-    // history.
     match table {
-        TableKind::Tag => return apply_tag_set_end(state, cells, new_id),
-        TableKind::ColumnTag => return apply_column_tag_set_end(state, cells, new_id),
+        TableKind::Tag => return apply_tag_set_end(state, cells, new_id, touched),
+        TableKind::ColumnTag => return apply_column_tag_set_end(state, cells, new_id, touched),
         _ => {}
     }
 
     let (key, end_snapshot) = decode_end(table, cells)?;
     check_end_snapshot(table, end_snapshot, new_id)?;
-    // End only the one row DuckLake named — never a cascade. DuckLake
-    // authors every row change explicitly (a rename ends the table row but
-    // keeps its columns live); the verb-path `delete_*` helpers would
-    // cascade and end those siblings.
+    touched.touch(key);
+    // End only the one row named, never a cascade: a rename ends the table
+    // row but keeps its columns live.
     let ended = match key {
         EntityKey::Schema { schema_id } => state.schemas.remove(&schema_id).is_some(),
         EntityKey::Table { table_id } => state.tables.remove(&table_id).is_some(),
@@ -662,8 +762,6 @@ pub(super) fn apply_update_set_end(
         // decode_end only ever returns the keys matched above.
         _ => return Err(corrupt_row(table, "unreachable entity key")),
     };
-    // DuckLake's UPDATE only names rows it read; ending an absent row is
-    // drift and must fail loudly, never pass as a no-op.
     if !ended {
         return Err(corrupt_row(
             table,
@@ -675,15 +773,14 @@ pub(super) fn apply_update_set_end(
 }
 
 /// Rebases a data file's `begin_snapshot` in place. The target must have
-/// been inserted by this same transaction (absent from `base`): DuckLake
-/// only rebases the replacement file a delete-rewrite just created, and
-/// rebasing a pre-existing row would rewrite committed visibility.
+/// been inserted by this same transaction (absent from `base`).
 pub(super) fn apply_update_set_begin(
     base: &CatalogSnapshot,
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
     new_id: u64,
+    touched: &mut Touched,
 ) -> Result<()> {
     if table != TableKind::DataFile {
         return Err(Error::Constraint(format!(
@@ -714,6 +811,10 @@ pub(super) fn apply_update_set_begin(
         ));
     }
 
+    touched.touch(EntityKey::File {
+        table_id,
+        data_file_id,
+    });
     let Some(file) = state
         .data_files
         .get_mut(&table_id)
@@ -728,22 +829,18 @@ pub(super) fn apply_update_set_begin(
     Ok(())
 }
 
-/// A raw `DELETE` row. Three shapes share the op: unversioned records
-/// (statistics, the deletion schedule) leave the working state and their
-/// removal reaches the store through the diff; versioned rows and
-/// snapshot records are pruned with direct key deletes (`history` keys
-/// Removes a row from the physical-deletion schedule. Unlike an option
-/// delete, a missing entry is an error: the schedule is the record of what
-/// still needs deleting, and a cleanup pass claiming to have deleted
-/// something never scheduled has lost track of the store.
+/// Removes a row from the physical-deletion schedule; a missing entry is
+/// an error.
 fn apply_schedule_delete(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
+    touched: &mut Touched,
 ) -> Result<()> {
     let mut c = Cursor::new(table, cells);
     let data_file_id = c.u64()?;
     c.finish()?;
+    touched.touch_gc_file(data_file_id);
     if state.gc_files.remove(&data_file_id).is_none() {
         return Err(corrupt_row(
             table,
@@ -754,27 +851,29 @@ fn apply_schedule_delete(
 }
 
 /// Removes an option row's key from its scope, and the scope's record with
-/// it once the last key goes. Absent keys are a no-op: options are
-/// unversioned and last-write-wins, so a delete of one already gone is not
-/// a disagreement about state.
-fn apply_option_delete(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
-    let (components, key, _value) = decode_metadata(cells)?;
-    let Some(mut record) = state.options.get(&components).cloned() else {
+/// it once the last key goes. An absent key is a no-op.
+fn apply_option_delete(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
+    let (components, key) = decode_metadata_key(cells)?;
+    touched.touch(EntityKey::Option {
+        scope_kind: components.0,
+        scope_id: components.1,
+    });
+    let Some(record) = state.options.get_mut(&components) else {
         return Ok(());
     };
     record.options.remove(&key);
     if record.options.is_empty() {
         state.remove_option_record(components);
-    } else {
-        state.set_option_record(components, record);
     }
     Ok(())
 }
 
-/// The dead-table cleanup's `DELETE FROM ducklake_schema_versions WHERE
-/// table_id IN (...)`: the record goes, exactly as it does in a
-/// SQL-backed catalog. The row's copy inside the snapshot record needs no
-/// removal — expiry deletes that record whole.
+/// Deletes one `schema_version` record; the copy inside the snapshot
+/// record is left for expiry.
 fn apply_schema_version_delete(
     cells: &[Cell],
     direct: &mut Vec<commit::StagedWrite>,
@@ -796,23 +895,25 @@ fn apply_schema_version_delete(
     Ok(())
 }
 
-/// exist only in the store, never in the working state); embedded rows
-/// (tag entries, spec columns) rewrite or ride their parent.
+/// A raw `DELETE` row. Unversioned records (statistics, the deletion
+/// schedule, options) leave the working state and reach the store through
+/// the diff; versioned rows and snapshot records are pruned with direct
+/// key deletes; embedded rows (tag entries, spec columns) rewrite or ride
+/// their parent.
 pub(super) fn apply_delete(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
     direct: &mut Vec<commit::StagedWrite>,
     hard_deleted: &BTreeSet<EntityKey>,
+    touched: &mut Touched,
 ) -> Result<()> {
     match table {
         TableKind::TableStats | TableKind::TableColumnStats | TableKind::FileColumnStats => {
-            apply_stats_delete(state, table, cells)
+            apply_stats_delete(state, table, cells, touched)
         }
-        TableKind::FilesScheduledForDeletion => apply_schedule_delete(state, table, cells),
-        // The merged snapshot record dies with the `ducklake_snapshot`
-        // delete; the paired `ducklake_snapshot_changes` delete names the
-        // same id and stages nothing.
+        TableKind::FilesScheduledForDeletion => apply_schedule_delete(state, table, cells, touched),
+        // The paired `ducklake_snapshot_changes` delete stages nothing.
         TableKind::Snapshot => {
             let mut c = Cursor::new(table, cells);
             let snapshot_id = c.u64()?;
@@ -831,11 +932,8 @@ pub(super) fn apply_delete(
             c.finish()?;
             Ok(())
         }
-        TableKind::Metadata => apply_option_delete(state, cells),
-        // Mappings are unversioned create-only records with no history
-        // mirror: cleanup is a direct `current` key delete. The working
-        // state keeps its (now equal-to-base) entry, which the create-only
-        // diff no-ops on.
+        TableKind::Metadata => apply_option_delete(state, cells, touched),
+        // Mappings have no history mirror: a direct `current` key delete.
         TableKind::ColumnMapping => {
             let mut c = Cursor::new(table, cells);
             let mapping_id = c.u64()?;
@@ -865,25 +963,14 @@ pub(super) fn apply_delete(
                 Some(end) => Key::history(entity, end),
                 None => Key::current(entity),
             };
-            // The direct delete is the whole store mutation. The working
-            // state is deliberately left alone: removing a live row from
-            // it would make the diff stage an end-transition — minting a
-            // history mirror DuckLake never authored — on top of this
-            // delete. The row therefore still reads as live in the working
-            // state, so anything that asks whether a deleted row survived
-            // must consult `collect_hard_deletes` rather than the state —
-            // compaction deletes a parent and its embedded children in one
-            // batch and would otherwise see its own parent as surviving.
+            // The working state is left alone: removing the row would make
+            // the diff stage an end-transition on top of this delete.
             direct.push((key.encode(), None));
             Ok(())
         }
-        TableKind::Tag => apply_tag_delete(state, cells),
-        // Embedded rows ride their parent: the cascade deletes them only
-        // alongside the parent record (a dead table's columns, a dead
-        // file's partition values), so with the parent already pruned
-        // there is nothing left to rewrite. A column-tag entry on a
-        // still-current column is the one live case (its column survives
-        // the entry's death) and rewrites the column in place.
+        TableKind::Tag => apply_tag_delete(state, cells, touched),
+        // A column-tag entry on a still-current column rewrites the column
+        // in place; on a pruned column there is nothing to rewrite.
         TableKind::ColumnTag => {
             let mut c = Cursor::new(table, cells);
             let table_id = c.u64()?;
@@ -891,6 +978,10 @@ pub(super) fn apply_delete(
             let key = c.string()?;
             let begin_snapshot = c.u64()?;
             c.finish()?;
+            touched.touch(EntityKey::Column {
+                table_id,
+                column_id,
+            });
             if let Some(column) = state
                 .columns
                 .get_mut(&table_id)
@@ -913,13 +1004,19 @@ pub(super) fn apply_delete(
 }
 
 /// Removes a dead `ducklake_tag` entry from its container; a container
-/// left empty is removed outright (the key must not linger).
-pub(super) fn apply_tag_delete(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
+/// left empty is removed outright.
+pub(super) fn apply_tag_delete(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
     let mut c = Cursor::new(TableKind::Tag, cells);
     let object_id = c.u64()?;
     let key = c.string()?;
     let begin_snapshot = c.u64()?;
     c.finish()?;
+
+    touched.touch(EntityKey::Tag { object_id });
 
     let removed = state.tags.get_mut(&object_id).is_some_and(|container| {
         let before = container.entries.len();
@@ -944,10 +1041,8 @@ pub(super) fn apply_tag_delete(state: &mut CatalogSnapshot, cells: &[Cell]) -> R
     Ok(())
 }
 
-/// A spec-column / partition-value delete: only ever issued alongside its
-/// parent record's own deletion, so a parent that is neither already dead
-/// nor dying in this batch means the cascade named a row this model says
-/// cannot die alone.
+/// An embedded-row delete: the parent must be dead already or dying in
+/// this batch, since an embedded row cannot die alone.
 pub(super) fn apply_embedded_delete(
     state: &mut CatalogSnapshot,
     table: TableKind,
@@ -1019,8 +1114,6 @@ pub(super) fn apply_embedded_delete(
         }
         _ => return Err(corrupt_row(table, "not an embedded kind")),
     };
-    // Remaining identity cells vary by kind and are not needed: the row
-    // dies with its parent.
     let (parent_is_current, parent_key) = parent;
     if parent_is_current && !hard_deleted.contains(&parent_key) {
         return Err(corrupt_row(
@@ -1031,28 +1124,34 @@ pub(super) fn apply_embedded_delete(
     Ok(())
 }
 
-/// A stats delete naming an absent row is a no-op, unlike every other
-/// delete path (where a miss means drift and fails loudly). The snapshot-
-/// expiry cleanup fires one bulk `DELETE ... WHERE table_id IN (<ids>)` per
-/// metadata table across the whole dropped-table id set — the stats tables
-/// among a dozen others — without reading any of them first, so a dropped
-/// table that carried no stats rows legitimately matches zero, exactly as
-/// in SQL.
+/// Removes a statistics row; an absent row is a no-op, since dead-table
+/// cleanup deletes by table id without reading first.
 pub(super) fn apply_stats_delete(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
+    touched: &mut Touched,
 ) -> Result<()> {
     match decode_delete_key(table, cells)? {
         StatsKey::Table(table_id) => {
+            touched.touch(EntityKey::TableStats { table_id });
             state.table_stats.remove(&table_id);
         }
         StatsKey::Column(table_id, column_id) => {
+            touched.touch(EntityKey::TableColumnStats {
+                table_id,
+                column_id,
+            });
             if let Some(cols) = state.table_column_stats.get_mut(&table_id) {
                 cols.remove(&column_id);
             }
         }
         StatsKey::FileColumn(table_id, data_file_id, column_id) => {
+            touched.touch(EntityKey::FileColumnStats {
+                table_id,
+                data_file_id,
+                column_id,
+            });
             if let Some(cols) = state.file_column_stats.get_mut(&table_id) {
                 cols.remove(&(data_file_id, column_id));
             }
@@ -1112,10 +1211,8 @@ pub(super) fn build_snapshot_value(ops: &[RowOperation]) -> Result<proto::Snapsh
         ));
     }
 
-    // `ducklake_schema_versions` rows name their tables here and are
-    // written as records of their own by the caller; the two redundant
-    // columns are validated against this commit's own snapshot values
-    // rather than trusted, so a mismatch is drift caught loudly.
+    // `ducklake_schema_versions` rows must carry this commit's own
+    // snapshot id and schema version.
     let schema_changed_table_ids = ops
         .iter()
         .filter_map(|op| match op {
@@ -1156,9 +1253,8 @@ pub(super) fn build_snapshot_value(ops: &[RowOperation]) -> Result<proto::Snapsh
         commit_extra_info,
         schema_changed_table_ids,
         transaction_id: None,
-        // DuckLake authored this snapshot and names only the tables it
-        // deleted from, so the file set stays empty and a later commit
-        // classifies against it at table grain.
+        // DuckLake names only the tables it deleted from; a later commit
+        // classifies against this snapshot at table grain.
         deleted_data_file_ids: Vec::new(),
     })
 }

@@ -88,7 +88,7 @@ fn one(rows: &[Vec<String>]) -> String {
 ///   `ducklake_merge_adjacent_files_preserves_rows_and_time_travel` pins over a
 ///   merge.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_row_id_allocation_matches_stock_ducklake() {
     let twin = Twin::new("rowid");
 
@@ -178,7 +178,7 @@ fn ducklake_row_id_allocation_matches_stock_ducklake() {
 /// (its own test below), and `set_option` neither bumps nor mints a
 /// snapshot at all — global or table-scoped — while still taking effect.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_schema_version_classification_matches_stock_ducklake() {
     let twin = Twin::new("schemaver");
     let history = || {
@@ -278,13 +278,77 @@ fn ducklake_schema_version_classification_matches_stock_ducklake() {
     );
 }
 
+/// Re-setting an option overwrites its row rather than failing.
+///
+/// DuckLake's `SetConfigOption` counts the rows already holding the key
+/// at that scope and issues an `INSERT` only when there are none, so
+/// every set after the first arrives as `UPDATE ducklake_metadata SET
+/// value` — a spelling the staged path has to translate, or an option
+/// can be set exactly once and never corrected.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn ducklake_set_option_overwrites_an_existing_option_row() {
+    let twin = Twin::new("setopt-twice");
+    let value = || {
+        twin.probe(
+            "SELECT value FROM __ducklake_metadata_lake.ducklake_metadata \
+             WHERE key = 'parquet_compression' AND scope IS NULL;",
+        )
+    };
+
+    twin.apply("CALL lake.set_option('parquet_compression', 'zstd');");
+    assert_eq!(value(), vec![vec!["zstd".to_string()]]);
+
+    twin.apply("CALL lake.set_option('parquet_compression', 'snappy');");
+    assert_eq!(
+        value(),
+        vec![vec!["snappy".to_string()]],
+        "the second set must overwrite the row, not duplicate it or fail"
+    );
+}
+
+/// An option row can be removed, which is what resets an option to its
+/// default. The staged delete carries the row's key columns — key and
+/// scope — as every other raw-delete kind does, so the core has to decode
+/// that shape rather than a whole row.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn ducklake_an_option_row_can_be_deleted() {
+    let dir = TempDir::new("setopt-delete-store");
+    let data_dir = TempDir::new("setopt-delete-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CALL lake.set_option('parquet_compression', 'zstd');",
+    );
+    run_ducklake_sql(
+        store,
+        data_path,
+        "DELETE FROM __ducklake_metadata_lake.ducklake_metadata \
+         WHERE key = 'parquet_compression';",
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_metadata \
+             WHERE key = 'parquet_compression';",
+        )),
+        vec![vec!["0"]],
+        "the option is gone, so it resolves to its default again"
+    );
+}
+
 /// A name-mapping registration is data-only: registering foreign Parquet
 /// writes `ducklake_column_mapping` / `ducklake_name_mapping` rows and a
 /// data file, and must carry `schema_version` forward — the mapping
 /// describes a *file*, not the table's shape, so DuckDB's cached column
 /// list stays valid.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_name_mapping_registration_carries_schema_version_forward() {
     let twin = Twin::new("mapping");
     let foreign = TempDir::new("mapping-foreign");
@@ -331,6 +395,66 @@ fn ducklake_name_mapping_registration_carries_schema_version_forward() {
     );
 }
 
+/// Expiry is the only thing that deletes mapping rows, and this drives it
+/// end to end: register foreign Parquet so a real
+/// `ducklake_column_mapping` record and its `ducklake_name_mapping` rows
+/// exist, drop the table that owns them, then expire. The dead-table
+/// cleanup reclaims the record, and the name-mapping rows — embedded in it
+/// here rather than a table of their own — go with it.
+///
+/// Differential throughout: every probe asserts moraine agrees with stock
+/// DuckLake row for row, so an over- or under-reclaim on either side fails.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn expiry_reclaims_the_mappings_of_a_dropped_table() {
+    let twin = Twin::new("mapping-expiry");
+    let foreign = TempDir::new("mapping-expiry-foreign");
+
+    twin.apply("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    twin.apply("INSERT INTO lake.main.t SELECT i, 'v' FROM range(100) t(i);");
+
+    // A plain DuckDB `COPY` writes no DuckLake field ids, so registering it
+    // forces the name-mapping path.
+    let file = foreign.path().join("foreign.parquet");
+    run_ducklake_sql(
+        twin.store.path(),
+        twin.data.path(),
+        &format!(
+            "COPY (SELECT i::BIGINT AS a, 'f' AS b FROM range(20) t(i)) TO '{}' (FORMAT PARQUET);",
+            file.display()
+        ),
+    );
+    twin.apply(&format!(
+        "CALL ducklake_add_data_files('lake', 't', '{}');",
+        file.display()
+    ));
+    assert_ne!(
+        one(&twin.probe(
+            "SELECT count(*)::BIGINT FROM __ducklake_metadata_lake.ducklake_column_mapping;"
+        )),
+        "0",
+        "the registration is expected to write the file's mapping"
+    );
+
+    twin.apply("DROP TABLE lake.main.t;");
+    twin.apply("CALL ducklake_expire_snapshots('lake', older_than => now());");
+    twin.apply("CALL ducklake_cleanup_old_files('lake', older_than => now());");
+
+    assert_eq!(
+        one(&twin.probe(
+            "SELECT count(*)::BIGINT FROM __ducklake_metadata_lake.ducklake_column_mapping;"
+        )),
+        "0",
+        "the dropped table's mapping record must be reclaimed"
+    );
+    assert_eq!(
+        one(&twin
+            .probe("SELECT count(*)::BIGINT FROM __ducklake_metadata_lake.ducklake_name_mapping;")),
+        "0",
+        "its name-mapping rows must go with it"
+    );
+}
+
 /// The retry contract moraine composes with, pinned against the tracked
 /// DuckLake version rather than assumed from its prose.
 ///
@@ -349,7 +473,7 @@ fn ducklake_name_mapping_registration_carries_schema_version_forward() {
 /// Verb-path commits (here, a maintenance merge) are the ones moraine
 /// authors the field for, so those are compared to stock byte-for-byte.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_commit_retry_contract_and_change_grammar_hold() {
     let twin = Twin::new("retry");
 

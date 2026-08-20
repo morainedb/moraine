@@ -165,9 +165,17 @@ impl RunningLeader {
             .await
             .unwrap();
         let shutdown = Arc::new(Notify::new());
-        let join = tokio::spawn({
+        // The leader's sessions are `!Send`, so `serve` needs a runtime of its
+        // own rather than a slot on the shared pool.
+        let join = tokio::task::spawn_blocking({
             let shutdown = Arc::clone(&shutdown);
-            async move { leader.serve(shutdown).await }
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("leader test runtime")
+                    .block_on(leader.serve(shutdown))
+            }
         });
         Self {
             store,
@@ -343,10 +351,18 @@ async fn run_fleet(
     for (offset, client) in clients.iter().enumerate() {
         let client = Arc::clone(client);
         let base = 1_000_000 + offset as u64 * 10_000;
-        tasks.push(tokio::spawn(async move {
-            for i in 0..per {
-                drive_staged(&client, gc_insert(base + i)).await.unwrap();
-            }
+        // Its own runtime: a staged commit's futures borrow the operations
+        // they read, so this work is `!Send` and cannot ride the shared pool.
+        tasks.push(tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("client runtime")
+                .block_on(async move {
+                    for i in 0..per {
+                        drive_staged(&client, gc_insert(base + i)).await.unwrap();
+                    }
+                });
         }));
     }
     for task in tasks {

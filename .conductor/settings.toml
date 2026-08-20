@@ -7,6 +7,15 @@
 setup = '''
 set -e
 
+# DuckLake's Linux extension pipeline uses GCC 14. Match it here so the
+# extension shim and downstream patch exercise the same corrected C++11
+# implicit-move behavior as the published build.
+if [ "$(uname -s)" = "Linux" ] && command -v dnf >/dev/null 2>&1; then
+  if ! command -v gcc14-gcc >/dev/null 2>&1 || ! command -v gcc14-g++ >/dev/null 2>&1; then
+    sudo dnf install -y gcc14 gcc14-c++
+  fi
+fi
+
 # Cloud workspaces start bare; a developer machine already has a toolchain,
 # so this whole block is skipped there. The pinned channel installs itself
 # on first use from rust-toolchain.toml, but the gate's `cargo +nightly fmt`
@@ -28,6 +37,42 @@ fi
 # Materialize the pinned toolchain now rather than during someone's first
 # commit, when it would look like the hook hanging.
 cargo --version >/dev/null
+
+# `cargo xtask e2e` compiles DuckDB itself, and every workspace builds it
+# in its own tree, so without a compiler cache each one pays ten minutes
+# for the same objects. DuckDB's cmake routes compiles through ccache or
+# sccache whenever it finds one on PATH, which takes that to about one
+# minute. On a Mac the cache sits under $HOME, so every workspace on the
+# machine reads what the first one built.
+#
+# Not fatal if it fails: a workspace without a compiler cache builds
+# slowly, which beats one that refused to be created. Branching on the
+# host OS rather than CONDUCTOR_IS_LOCAL — installing a Linux binary on a
+# developer's Mac is the one outcome worth ruling out structurally.
+if ! command -v ccache >/dev/null 2>&1 && ! command -v sccache >/dev/null 2>&1; then
+  if [ "$(uname -s)" = "Darwin" ]; then
+    command -v brew >/dev/null 2>&1 && brew install ccache || true
+  else
+    # Amazon Linux packages neither, and sccache ships a static binary.
+    # Bumping this pin only changes how fast a fresh workspace builds.
+    sccache_version=v0.10.0
+    case "$(uname -m)" in
+      aarch64) sccache_target=aarch64-unknown-linux-musl ;;
+      *)       sccache_target=x86_64-unknown-linux-musl ;;
+    esac
+    sccache_archive="sccache-$sccache_version-$sccache_target"
+    if curl -sSfL --retry 3 \
+         "https://github.com/mozilla/sccache/releases/download/$sccache_version/$sccache_archive.tar.gz" \
+         | tar xz -C /tmp; then
+      sudo install -m755 "/tmp/$sccache_archive/sccache" /usr/local/bin/sccache
+      # A cloud workspace's disk also holds the cargo target directory, so
+      # cap the cache rather than let it grow into the default 10G.
+      mkdir -p "$HOME/.config/sccache"
+      printf '[cache.disk]\nsize = %d\n' $((2 * 1024 * 1024 * 1024)) \
+        > "$HOME/.config/sccache/config"
+    fi
+  fi
+fi
 
 git config core.hooksPath .githooks
 '''

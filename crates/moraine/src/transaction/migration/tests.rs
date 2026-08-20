@@ -78,6 +78,7 @@ async fn open_migrator(object_store: &Arc<InMemory>) -> Db {
         .open_writer()
         .await
         .unwrap()
+        .0
 }
 
 /// The two durable facts a reopen reads: the format stamp and the marker.

@@ -1,13 +1,13 @@
 # RFC 0016: Equality and range indexes
 
-- **Date:** 2026-07-10
+- **Date:** 2026-07-10 (reverse iteration settled 2026-08-08)
 
 ## Summary
 
 Adds a moraine-native **equality index**: a catalog object (`create_index` /
 `drop_index` on the [RFC 0003](0003-public-api-shape.md) verb surface) whose
-entries live in a new `index` subspace and serve two reads — **row location**
-(key values → row ids and the files/chunks that hold them) and **uniqueness
+entries live in a new `index` subspace and serve two reads — **row identity**
+(key values → stable row ids) and **uniqueness
 enforcement** at commit. DuckLake v1.0 models no indexes, so this is a native
 feature: real inside moraine, invisible to every DuckLake catalog scan.
 Entries are **live-only** (no temporal versioning) and point at **row ids**,
@@ -29,19 +29,19 @@ every type, so the same `index` storage answers comparison queries
 (`<`, `<=`, `>`, `>=`, `BETWEEN`, half-open) as a bounded sub-scan —
 equality is the degenerate closed `[v, v]` case. Each column carries a
 declared **direction** (`ASC`/`DESC`, realized by complementing its framed
-bytes, so one forward-only scan yields the declared order) and a **NULL
-placement** (`NULLS FIRST`/`LAST`). None of this adds a maintenance path:
-coverage, staged builds, uniqueness, and the scoped read are unchanged —
-they just call the ordered encoder (Range and comparison queries).
+bytes, so an ascending store scan yields the declared order) and a **NULL
+placement** (`NULLS FIRST`/`LAST`). A descending store scan serves the exact
+opposite order from the same index. None of this adds a maintenance path:
+coverage, staged builds, uniqueness, and the scoped read are unchanged — they
+just call the ordered encoder (Range and comparison queries).
 
 The store is one index; the ways in are two. The **embedding (verb) API**
 creates and maintains indexes directly — the bulk of this RFC. The
 **extension path** reaches the same `index` storage from DuckDB SQL through
 registered moraine functions, and covers DuckLake-written Parquet by the
 scoped read, which also enforces uniqueness over SQL writes.
-DuckLake-native `CREATE INDEX` waits on DuckLake itself, which owns the
-user-table binder and refuses index DDL before moraine is consulted
-(Extension path).
+DuckLake-native `CREATE INDEX` belongs to DuckLake, which owns the user-table
+binder and refuses index DDL before moraine is consulted (Extension path).
 
 ## Goals
 
@@ -63,14 +63,10 @@ user-table binder and refuses index DDL before moraine is consulted
 Non-goals:
 
 - **Serving DuckLake's planner transparently.** DuckLake owns the user-table
-  binder and optimizer, so index-routed pushdown — including range and
-  `ORDER BY` pushdown — waits on DuckLake (Extension path, Future
-  directions). The extension path integrates through an explicit surface —
-  registered functions and the scoped read — never `ducklake_*` changes or
-  the planner.
-- **Reverse iteration.** The store scans forward only (RFC 0002). One index
-  serves one declared order; the exact opposite order is a second index or a
-  future reverse-scan capability, not this RFC.
+  binder and optimizer. The extension path integrates through an explicit
+  surface — registered functions and the scoped read — never downstream
+  `ducklake_*` changes or a planner fork. Requests for a supported upstream
+  integration live in [`../ducklake.md`](../ducklake.md).
 - **Locale/collation-aware order.** String order is DuckDB's default binary
   (bytewise) order; collation-sensitive ordering is out of scope.
 - **Approximate structures** (bloom filters, zone maps) — they cannot carry
@@ -87,10 +83,11 @@ Three established facts carry most of this design:
 
 - **Row ids are stable identity.** DuckLake allocates row ids per table
   (`next_row_id` in `tstat`, RFC 0004) and preserves them across inline
-  flush, UPDATE's delete-and-rewrite, and compaction — row lineage. Every
-  data file records its row-id range, and RFC 0005's inlined chunks carry
-  `row_id_start`/`row_count`. A row id therefore resolves to its current
-  location(s) from the materialized catalog snapshot alone.
+  flush, UPDATE's delete-and-rewrite, and compaction — row lineage. Ordinary
+  files derive dense ids from `row_id_start`; rewrite and flush files may
+  instead carry arbitrary preserved ids in `_ducklake_internal_row_id`.
+  The row id is therefore the durable join key, while physical placement and
+  delete application remain DuckLake's responsibility.
 - **moraine does not read Parquet on the scan path** (RFC 0006 non-goal) —
   merge-on-read, lineage, and pushdown are DuckLake's. On the embedding API
   it sees row contents at exactly two moments: `inline_insert` and flush
@@ -204,9 +201,9 @@ store codec:
 **Direction** is per column. A `DESC` column stores the bitwise complement
 of its fully framed component (terminator included, so variable-length
 values reverse correctly — `"ab" < "a"`); the leading NULL flag is not
-complemented, so NULL placement is independent of direction. A forward-only
-scan then yields the declared composite order in one pass, no reverse
-iterator.
+complemented, so NULL placement is independent of direction. An ascending
+scan yields the declared composite order and a descending scan yields its
+exact opposite, both directly from SlateDB's iterator.
 
 **NULL placement** is per column (`NULLS FIRST`/`LAST`). Each column's
 component carries a leading flag byte separating NULL from non-null, ordered
@@ -215,10 +212,14 @@ per the placement. A row with a NULL in an indexed column **is stored** — so
 **multi-shaped** (the row id is in the key) and **exempt from the value
 collision**: SQL treats NULLs as distinct, so a unique index still admits any
 number of NULL rows. An equality *point* lookup on NULL still has no answer
-(`= NULL` is unknown); NULL rows are reached only through `IS NULL`. What the
-flag does not yet drive is *ordered emission* of NULL rows at the declared end
-for `ORDER BY … NULLS FIRST/LAST` — that waits on `ORDER BY` pushdown (Open
-questions).
+(`= NULL` is unknown); NULL rows are reached only through `IS NULL`.
+
+The explicit read surface deliberately keeps comparison and NULL scans
+separate. `index_range` clamps open sides to the non-null region, while
+`index_nulls` emits only the matching NULL subrange in either scan direction.
+It does not combine the two into an `ORDER BY … NULLS FIRST/LAST` result;
+that behavior belongs to any future DuckLake planner integration, not this
+API's contract.
 
 **Oversized values are refused.** Indexed values beyond a fixed cap fail
 with `Constraint` at insert/registration — huge keys degrade the whole
@@ -266,8 +267,11 @@ writer-supplied backfill entries passed to `create_index` — except through
 `moraine_create_index`, which has no writer and backfills by scoped-reading
 **every live data file** of the table, so its build cost is the table's
 indexed columns, and the one-commit bound bites hardest exactly there. The
-whole build is one commit, one batch; uniqueness is validated over the
-assembled entry set before staging, and a duplicate aborts the create. A
+reader overlaps a fixed number of immutable files and sends bounded Arrow
+batches through a bounded channel, so it retains no complete per-file result
+sets. The transaction still owns the table-wide encoded entry set: the whole
+build is one commit and one atomic batch, uniqueness is validated over that
+assembled set before staging, and a duplicate aborts the create. A
 backfill that exceeds the store's batch bound fails typed before staging
 anything, and the caller re-drives as a staged build (Staged builds).
 
@@ -340,10 +344,10 @@ The refusal's text avoids DuckLake's four retry substrings, as the
 uniqueness rejection does: it is terminal, and re-running it reaches the
 same answer more slowly.
 
-The limit is currently a constant rather than a `CatalogOptions` field.
-Making it configurable means threading it through both commit paths and the
-FFI; that is worth doing if a caller ever has a legitimate reason to raise
-it, and is not yet justified.
+The limit is a fixed safety invariant, not a `CatalogOptions` field. A caller
+cannot raise it and turn a bounded commit back into memory thrash; workloads
+above it must split the load or use a staged build. Changing the limit or
+making it configurable requires new measurements and a new design decision.
 
 The remedy the refusal names — split the load — is only available to a
 writer that chooses its own batch boundaries. A DuckLake maintenance call
@@ -353,17 +357,108 @@ therefore hit an unsplittable refusal, and an indexed table past a few
 million rows could never be compacted again. It derives none (Compaction
 derives nothing), so the limit binds only writers who can obey it.
 
+### Two bounds on a step
+
+Entry count is not the only thing that can make a commit impossible, and
+the second bound is not a smaller version of the first — they fail
+differently and are set by different facts about the machine.
+
+The memory bound above is about the process: a kilobyte of write-path
+memory per staged entry, so a big enough batch thrashes. The **transfer**
+bound is about the link. A durable commit becomes exactly one object-store
+request: the store guarantees a write batch lands in a single WAL object,
+and WAL objects are written with a conditional single PUT — the fencing
+they rely on cannot be expressed through the multipart API — so the whole
+batch goes in one request body. `object_store` applies its request timeout
+(30 seconds by default) per attempt to that entire request, upload
+included. A batch too large to push inside the timeout therefore does not
+fail: it times out, is retried from the first byte, and is retried beneath
+moraine indefinitely. It never lands and never errors.
+
+So a staged build step carries two bounds, and ends at whichever it reaches
+first:
+
+- `entries` — the memory bound, defaulting to a million.
+- `bytes` — the transfer bound, defaulting to 8 MiB. That clears the
+  30-second default at a little over 270 KiB/s, which is slower than any
+  link a build has a right to expect.
+
+A step always carries at least one entry: an entry wider than the byte
+bound still has to be committed, and a step that admitted nothing would
+never advance.
+
+At the defaults the byte bound always binds first, and the entry bound
+never does: an entry costs at least 19 bytes (the entry prefix, a one-byte
+NULL flag, and the row id), so 8 MiB admits at most about 440,000 of them.
+The entry bound is therefore not a second safety net at rest — it is what
+holds when `bytes` is *raised*. An operator on a fast in-region link who
+lifts the byte bound to cut commit count is exactly who needs a step still
+capped at a million entries, because at 256 MiB the byte bound alone would
+admit fourteen million and the memory limit above is real.
+
+The byte figure is **nominal** — summed before the keys are encoded, since
+the step boundary has to be chosen first. Framing escapes `0x00` and
+`0x01`, which at worst doubles a value, so the committed batch can be up to
+twice the bound. The margin against the timeout absorbs that; a property
+test pins the bracket.
+
+Both are settable per call, because neither default can know the link. The
+transfer bound is the one an operator on a slow or distant link reaches
+for, and lowering it is strictly a latency trade: more commits, each
+cheaper and independently resumable from the cursor.
+
+The commit stall warning reports the batch's staged bytes for the same
+reason. A stalled durable write carries no error — the failure is retried
+below moraine, so there is nothing to report but the wait — and the batch's
+size is the one fact that separates a batch that cannot be transferred from
+credentials that will not authorize it.
+
+### Deferred upkeep for non-unique indexes
+
+Synchronous upkeep remains the default: the data snapshot and every index
+entry land atomically. An index created with `maintenance := 'deferred'`
+instead moves **additions** out of DuckLake's data commit. This mode is
+limited to non-unique indexes: unique enforcement cannot acknowledge a row
+before its value has won the index collision.
+
+When a SQL commit adds rows covered by a deferred index, the same snapshot
+that registers the rows flips that index from `ready` to `maintaining` and
+persists the repair cursor. It stages no additions for that index. Deletions
+remain synchronous in every state, so no stale entry survives while a repair
+is pending. An UPDATE therefore removes the old value in its data commit and
+leaves the new value for the repair.
+
+`maintaining` is unavailable, never partially readable: every lookup fails
+with the same typed building error used by an initial staged backfill. After
+the data snapshot is durable, the extension drives the ordinary bounded
+backfill machinery over the missing live rows and flips the index back to
+`ready`. Repair failure cannot roll back a data snapshot that already landed;
+it is logged and leaves the durable `maintaining` marker for the next SQL
+commit or moraine maintenance pass to resume. Process loss has the same
+outcome. The maintenance scheduler repairs maintaining indexes before
+sweeping dropped ones.
+
+Further writers arriving while a repair runs continue to defer additions and
+maintain deletions. Intermediate repair steps classify
+`inserted_into_table`, so they can advance beside concurrent appends while
+retaining conflicts with deletes, schema alters, and drops. The final `ready`
+flip uses a non-schema-changing `altered_table` operation, so a racing writer
+makes the repair re-derive from its durable source cursor rather than publish
+incomplete coverage. Both operations mint snapshots for durability but add no
+`ducklake_schema_versions` rows. Only an index's initial publication and first
+build-to-ready flip are schema changes; routine upkeep cannot churn table
+schema history.
+
 ### What data movement costs the index: nothing
 
 The entry payload is a row id, not a location. Flush re-homes rows from
 chunks to Parquet; compaction and UPDATE rewrites re-home them across files;
-row ids survive all three. Resolution to a current location happens at read
-time against the materialized snapshot: chunks and files declare row-id
-ranges, so the lookup finds the holder by interval — in memory, at catalog
-scale. No maintenance operation rewrites an entry. This is why live-only
-entries plus row-id payloads is the whole design: every alternative payload
-(file id, chunk key) turns flush and compaction into index rewrites
-proportional to moved rows.
+row ids survive all three. Moraine returns that identity directly. DuckLake
+uses its own file statistics and delete metadata to locate and adjudicate the
+row under the scan's snapshot. No maintenance operation rewrites an entry.
+This is why live-only entries plus row-id payloads is the whole design: every
+alternative payload (file id, chunk key) turns flush and compaction into index
+rewrites proportional to moved rows.
 
 Nothing removes a live index's entries when a data file's *row* leaves the
 catalog, either — the maintenance sweep reclaims only the entries of
@@ -379,10 +474,10 @@ sources. Expiry and cleanup prune rows a replacement already covers. The
 whole sequence is held to the table's own answer by the e2e test
 `moraine_index_entries_survive_the_data_file_lifecycle`.
 
-A leaked entry would not be silent: a row id no live file's range holds
-resolves as `Inline` rather than being filtered out, so it surfaces as a
-lookup that still finds a deleted value — and, under a unique index, as a
-bogus duplicate rejection when that value is claimed again.
+A leaked entry would not be silent: the lookup table function exposes the
+stale row id directly and, under a unique index, the entry causes a bogus
+duplicate rejection when its value is claimed again. The ordinary DuckLake
+join still filters that identity when no live row carries it.
 
 ### Compaction derives nothing
 
@@ -427,28 +522,174 @@ One accessor family on `CatalogSnapshot`, served under the snapshot's pinned
 read handle so the lookup and the catalog it points into are one consistent
 cut:
 
-- `index_lookup(table, index, key_values) -> Vec<RowLocation>` — point-get
-  (unique) or prefix scan (non-unique) in `index`, then resolve each row id
-  against the snapshot's chunk and file ranges. A `RowLocation` names the
-  row id and its holder: an inlined chunk, or candidate data file(s) whose
-  live row-id range contains the id. The consumer applies delete files as
-  any DuckLake scan does — moraine returns candidates, not adjudicated rows.
-  The extension path surfaces this accessor as `moraine_index_lookup`.
-- `index_range(table, index, lower, upper) -> Vec<RowLocation>` — the
+- `index_lookup(table, index, key_values) -> Vec<u64>` — point-get
+  (unique) or prefix scan (non-unique) in `index`. Consumers join the returned
+  row ids to DuckLake and let it select files and apply deletes. The extension
+  path surfaces this accessor as `moraine_index_lookup`.
+- `index_lookup_many(table, index, keys) -> Vec<u64>` — the `IN`
+  accessor: deduplicate complete equality keys, resolve every distinct key
+  under the same pinned read as one logical lookup, and return the union of
+  their row ids. An empty key set returns no rows after validating the
+  index. The probes run through a continuously refilled bounded window of
+  512 futures, matching uniqueness enforcement: completion frees one slot
+  immediately rather than waiting for a fixed chunk's slowest read. The
+  extension path surfaces this accessor as `moraine_index_in`.
+- `index_range(table, index, lower, upper) -> Vec<u64>` — the
   comparison accessor (Range and comparison queries). Each bound is
   `Included`/`Excluded`/`Unbounded`; results come back in the index's stored
   order. The extension path surfaces it as `moraine_index_range`.
-- `index_nulls(table, index, prefix) -> Vec<RowLocation>` — the `IS NULL`
+- `index_nulls(table, index, prefix) -> Vec<u64>` — the `IS NULL`
   accessor. `prefix` is a leading run of `Some(value)` (equality) and `None`
   (`IS NULL`) predicates — `[None]` is `a IS NULL`, `[Some(5), None]` is
   `a = 5 AND b IS NULL`. At least one `None` is required; a gap (an
   unconstrained leading column, so a bare non-leading `IS NULL`) is not
   expressible and is left to a scan filter. Surfaced as `moraine_index_nulls`.
 
+Every equality lookup emits one `index lookup resolved` diagnostic event.
+Durations are integer milliseconds: total lookup, head view, probe wall
+window, and summed probe service. Counts include requested and deduplicated
+keys, hits, misses, peak in flight, metadata/block cache deltas, cache errors,
+and object-store GET count, duration, and errors. The event measures the
+whole pinned lookup without changing the SQL result surface.
+
 Lookups, ranges, and null queries are **head-only**: entries are live-only, so
 `snapshot_at(S)` fails with a typed error and time travel falls back to what
 it always was — a scan problem. The hot path (current head) gets the index;
 the rare path pays nothing to keep it honest.
+
+### File-located lookups
+
+A lookup resolves an indexed value to stable row ids as above. It may then
+locate those rows in the current physical data files, so a DuckLake scan
+prunes by file id as well as row id.
+
+Physical location is **derived cache state**. It is not stored in the
+equality entry, takes no part in the commit protocol, and adds no `index`
+subspace keys — compaction and file rewrites leave every entry untouched.
+That is the same property as [What data movement costs the index:
+nothing](#what-data-movement-costs-the-index-nothing), extended to
+location: the index knows row ids, and where a row id currently lives is
+recomputable from the head view at any time.
+
+The core returns a located row:
+
+```text
+FileRowCandidate {
+    row_id: u64,
+    data_file_id: Option<DataFileId>,
+}
+```
+
+`ReadOnlyCatalog::locate_row_ids` takes the `DATA_PATH` `DataStore`, its path
+prefix, a table id, and stable row ids, resolving every row against the same
+head view that enumerates current data files. More than one file may be a
+candidate for one row id: an update can leave an expired physical copy in an
+otherwise-current source file while the visible copy is written elsewhere.
+
+`None` names a live inlined row. A row id in neither a current data file nor
+current inline data is also returned with `None` — a conservative fallback,
+so incomplete cache construction or catalog state cannot hide a row.
+
+The extension surfaces two columns, `row_id BIGINT` and
+`data_file_id UBIGINT`, the latter nullable for inlined or unlocated rows.
+A consumer joins with null-safe equality on file id and ordinary equality on
+row id; a caller selecting only `row_id` is unaffected.
+
+### File-row sets
+
+One immutable summary describes the physical row ids of one immutable data
+file, in whichever representation is smallest for that file:
+
+- a half-open dense range, for a file carrying `row_id_start` and no
+  reserved row-id column;
+- a run-optimized 64-bit Roaring set, when it beats the raw ids;
+- a sorted `u64` vector, when fragmentation makes Roaring larger.
+
+A recorded `row_id_start` does not by itself imply the range: a flushed file
+carries both a dense start and the reserved column, and that column's ids may
+hold gaps a range would invent rows across and, worse, end before — excluding
+a row the file holds. Which representation applies is therefore a question
+about the file's schema, settled by its footer, and only then does a dense
+file skip reading any column. A miss on any other file reads only the
+reserved internal-row-id column, and reads of separate immutable files
+overlap under the bounded concurrency index backfill already uses.
+
+Summaries are built lazily, by the lookup that first needs one. Nothing
+constructs them at write time, and nothing could cheaply: for a file the
+catalog numbers itself the summary *is* the catalog record, and for one
+carrying embedded ids — a compaction output or a rewrite — moraine holds only
+the file's metadata, never its rows, so building at registration would mean
+reading back the Parquet it was just told about, inside the commit path. A
+summary is also process-local, and the writer is not the process that reads.
+
+`ReadOnlyCatalog::warm_row_summaries` therefore exists to move that cost off
+the first lookup rather than into the commit: a caller spawns it after a
+commit that lands compaction outputs, and it builds exactly the summaries a
+cold lookup would. It is best-effort and idempotent — a resident or dense
+file costs nothing, an unreadable one is counted rather than raised — and
+warms one process, so a separate reader still builds its own. A pass that
+never runs changes latency and nothing else.
+
+The summary cache is keyed by store identity, table id, data file id, path,
+and recorded file size. The store is held weakly, which both keeps the
+process-wide cache from pinning a catalog alive and separates two catalogs
+whose table and file ids coincide. Catalog ids are never reused; path and
+size make stale reuse fail
+closed even against an imported catalog that violates that. Decoded sparse
+summaries are byte-budgeted (RFC 0009); range summaries are cheap enough to
+rederive and take none of the budget.
+
+A batch lookup sorts and deduplicates its row ids once, then intersects each
+file summary against that set — file-grouped candidates without a per-row
+location map.
+
+### Locating cannot lose a row
+
+Equality entries remain the sole source of indexed values and uniqueness, so
+the location cache can neither create nor remove a result. Every degraded
+path *broadens* the candidate file set: a missing, evicted, unsupported, or
+failed summary leaves every requested row id a candidate for that file. The
+optimization may read files it did not have to; it cannot exclude a matching
+row. Choosing the visible physical copy of a stable row id remains DuckLake's
+delete and snapshot processing.
+
+Locating is head-only, exactly as equality lookup is: a time-travel scan
+consumes neither live-only entries nor this cache.
+
+### Locating across the DuckLake file list
+
+The companion DuckLake patch exposes `data_file_id` as an internal virtual
+`UBIGINT` column. A physical file emits its persistent catalog id as a
+constant; inlined and transaction-local sources emit NULL.
+
+Static and dynamic filters on that column are pushed into DuckLake's
+metadata file-list query as predicates on `ducklake_data_file.data_file_id`,
+using no column statistics; row-id filters continue through the existing
+reserved-field statistics path. A predicate naming both columns therefore
+restricts the file list and the rows read within the files that survive.
+
+A join condition does not reach that far by itself. A hash join's runtime
+filters are generated after DuckLake has built its file list, and DuckDB
+generates none at all for the null-safe equality the file-id column requires.
+Left alone, a located join reads every file whose row-id statistics admit the
+key — which, because each update writes a file spanning the ids it preserved,
+is every update the table has taken.
+
+An extension optimizer rule closes that gap. An index read resolves its rows
+while binding, so a join against one is a join against a list of constants
+already visible to the planner; the rule restates that list as an `IN` filter
+on the other side of an inner join, where the ordinary pushdown carries it
+into the scan. The filter only repeats what the join enforces, so it is added
+beside the join rather than replacing it: whatever the query projects from
+either side is unaffected, and an outer join — which keeps rows meeting no
+condition — is left alone. A file id resolved as NULL contributes an
+`IS NULL` disjunct under null-safe equality and nothing under plain equality,
+matching what each comparison would have accepted. Past a bounded list length
+the rule declines, a lookup that wide being a scan in disguise.
+
+The current DuckLake catalog view stays authoritative for file lifetime.
+Ended compaction inputs are simply absent, new outputs are cache misses, and
+nothing pairs sources with outputs or hooks catalog changes.
 
 ### Range and comparison queries
 
@@ -519,27 +760,58 @@ does not fail the writer (below).
 
 **Backfill batches.** The builder covers the rows live at its current
 snapshot; everything committed after the definition is writer-covered by
-the paragraph above, so the two sets meet with no gap. Each derivation
-pass assembles the whole live backfill — inline chunks by scanning,
-external files by the scoped read, delete files and inline deletes already
-applied — sorts it by row id, and streams it as bounded step commits of at
-most `BUILD_STEP_ENTRIES` entries, in row-id order. Each step atomically
-advances a **cursor** persisted in the definition value — the highest row
-id covered — so a crashed or cancelled build resumes by re-deriving and
-skipping entries at or below the watermark; re-derived entries land as
-idempotent puts (multi keys include the row id; unique puts hit the
-same-row-id no-op arm). Row-id order is what makes the single watermark
-sufficient, and the global sort is what makes per-row-id rewrite files
-(whose embedded ids interleave with dense ranges) safe to cover. The
-derivation holds the raw entry set in driver memory — two orders of
-magnitude cheaper per entry than the store's write path, so the commit
-bound's rationale does not apply; the cost is recorded rather than capped.
-Two builders racing the same build both write the definition key and
-collide write-write — the cursor serializes them mechanically. Steps carry
-the definition write, so they classify `altered_table:<table_id>` like the
-create: conservative — a step racing any same-table write surfaces a
-conflict rather than interleaving (a benign `inserted_into_table`
-refinement is unsettled).
+the paragraph above, so the two sets meet with no gap. A derivation pass
+walks live inline chunks and then external files in durable source order.
+Parquet is decoded as bounded Arrow batches and entries flow directly into
+the next `BuildStep`; the driver never assembles or sorts the table-wide
+entry set. Delete files and inline deletes are applied as each source is
+read. Each step ends at whichever `BuildStep` bound it reaches first (Two
+bounds on a step) and always carries at least one entry.
+
+SQL-write upkeep compiles one projection plan per live index, deduplicates
+shared Arrow columns, and decodes each Parquet or inline batch once. A scalar
+stays borrowed from its Arrow array while the store-layer canonical builder
+writes its NULL flag, canonical bytes, escaping, terminator, and direction
+transform directly into the final key. No row-wide value vector or per-index
+value copy crosses the batch boundary. NULL presence is accumulated by the
+same builder and selects the multi-shaped unique-NULL entry. The builder then
+expands those canonical bytes in place into the final physical `index` key;
+the staged entry retains no intermediate canonical value or second payload
+allocation. For inline input, each `(table, schema version)` IPC schema is
+decoded once per commit and shared by all of its chunks. A chunk's owning
+`Bytes` is sliced directly into Arrow's immutable data buffer, avoiding a
+second copy of the body after it moves to a blocking decode worker.
+
+Delete sources are grouped by physical target from their staged metadata
+before any object is opened. Each target resolves its own delete files, so
+independent additions and inline removals start beside delete discovery; only
+the target whose positions are still being discovered waits. Data-file
+additions and removals retain their bounded producer windows; nested
+delete-file reads share one commit-wide allowance rather than multiplying
+that bound per target.
+
+Each step atomically advances a **source cursor** persisted in the definition
+value: the completed inline row watermark, then the data-file id and physical
+position most recently covered. Files are immutable and ids are monotonic, so
+the cursor survives a crash without depending on embedded row-id order. A
+replacement file receives a later id and is safe to re-derive; entries name
+stable row ids, so the put is idempotent whether the source row was already
+covered. A crash within one file resumes after its last durable physical
+position. Deferred repair seeds the file cursor at the preceding snapshot's
+tail, so it consumes only later files. It re-derives the policy-bounded inline
+live set because UPDATE may preserve a row id while changing its value. The
+driver retains at most one step of derived entries plus one Arrow batch, so
+its entry memory is bounded by `BuildStep` rather than table size.
+Two builders racing the same build both write the definition key and collide
+write-write. Re-running either batch is idempotent, and the persisted source
+cursor advances monotonically, so a stale retry cannot move it backward.
+Intermediate steps classify `inserted_into_table:<table_id>`: a concurrent
+append is benign and re-runs whichever commit loses the head race, while the
+ordinary conflict matrix still rejects a concurrent delete, schema alter, or
+drop. An intermediate cursor advance does **not** change the table schema: it
+mints its ordinary snapshot while retaining the current global schema version
+and writes no `ducklake_schema_versions` row. Only the initial definition
+publication and final `ready` flip advance schema history.
 
 **The delete race.** A row live at one derivation pass can die before its
 step lands, and a stale entry for a dead row is corruption — for a unique
@@ -549,8 +821,9 @@ mechanism: derivation from a fresh snapshot.
 - *Past deletes* (committed before the pass's snapshot): excluded by
   construction — the scoped read applies the table's delete bookkeeping,
   so a dead row produces no entry.
-- *Concurrent deletes* (racing a step): the killing commit writes the
-  table the step's `altered_table` classification conflicts with, so the
+- *Concurrent deletes* (racing a step): the killing commit writes
+  `deleted_from_table`, which conflicts with the step's
+  `inserted_into_table` classification, so the
   loser surfaces `CommitConflict` — never an internal closure re-run that
   would re-stage a stale batch. The driver answers a surfaced conflict by
   re-deriving at a fresh snapshot (which excludes the newly dead rows) and
@@ -602,6 +875,16 @@ resumes from the cursor, and `moraine_index_drop` abandons the build.
 `drop_index` on a building index is an ordinary drop: the builder's next
 step re-runs against the ended definition and stops.
 
+The driver emits progress at `info`. A derivation-started event makes the
+otherwise quiet Parquet-read phase explicit; the matching derived event names
+the live entry total and the derivation and sort times. Every successfully
+durable step then reports the entries in that step, cumulative entries for the
+current invocation, the live-table total estimate, percentage, row and source
+cursors, final-step flag, and commit time. A resumed invocation starts its
+counter at zero but names its durable starting cursor. A conflicting step
+emits a warning with the last durable count before the driver re-derives.
+Attempted but non-durable work is never reported as completed.
+
 **Format.** Staged builds stamp **format 3** at the first staged
 `create_index` — lazily, like format 2. A format-2 binary would ignore the
 unknown state field, see a `building` definition as a ready index, and
@@ -629,12 +912,19 @@ written `…` below for brevity.
 
 | Function | Effect |
 |---|---|
-| `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'], staged := b)` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST. `staged := true` runs the multi-commit build (Staged builds) — required past the single-commit bound, resumable by re-issuing the call |
+| `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'], staged := b, maintenance := 'synchronous'\|'deferred', step_entries := n, step_bytes := n)` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST. `staged := true` runs the multi-commit build (Staged builds) — required past the single-commit bound, resumable by re-issuing the call. `maintenance := 'deferred'` opts a non-unique index into bounded post-commit SQL-write upkeep; unique indexes refuse it. `step_entries`/`step_bytes` bound one staged build step (Two bounds on a step); each must be positive |
 | `moraine_index_drop(…)` | end the definition (Reclamation) |
-| `moraine_index_lookup(…, v…)` | table function: row ids and holders for the equality key `v…` — one variadic value per indexed column, in the index's column order (a single value for a single-column index); the count must equal the index width |
-| `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids and holders for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
-| `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids and holders for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
+| `moraine_index_lookup(…, v…)` | table function: row ids for the equality key `v…` — one variadic value per indexed column, in the index's column order (a single value for a single-column index); the count must equal the index width |
+| `moraine_index_in(…, keys)` | table function: row ids for the union of complete equality keys in `keys`. A single-column index takes a list of scalar values; a composite index takes a list of `row(...)` values in index-column order. Duplicate keys are one predicate, a key containing NULL matches no row, and an empty list returns no rows |
+| `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
+| `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
 | `moraine_indexes(catalog, schema, table)` | table function: index introspection |
+
+`moraine_index_in` binds `keys` as one constant list value (including a
+prepared-statement parameter), like the arguments of the other explicit
+lookup functions; it does not consume keys streamed from another relation.
+A DuckLake read joins on `row_id` alone, so UPDATE, compaction, inline flush,
+and delete semantics remain under DuckLake's snapshot-aware scan.
 
 A multi-column range bound is a tuple. Tuple windows require every named
 column to sort the same way; one byte range then spans them. With mixed
@@ -725,22 +1015,22 @@ and the permanent `Constraint` surfaces then. On a bulk violation the Parquet
 DuckLake already wrote is left orphaned for ordinary cleanup — space, not
 correctness.
 
-**Reads are explicit.** DuckLake owns the planner, so no optimizer routing.
-The extension path reads through `moraine_index_lookup`; the caller joins
-back to the table, whose scan DuckLake adjudicates against delete files. v1
-scope: creation, uniqueness enforcement, explicit lookup. Pushdown waits on a
-DuckLake change (below).
+**Reads are explicit.** DuckLake owns the planner, so nothing routes a
+predicate to an index. The extension path reads through
+`moraine_index_lookup`; the caller joins back to the table, whose scan
+DuckLake adjudicates against delete files. The optimizer rule above does not
+change that: it restates a join the caller already wrote, and never chooses
+an index. v1 scope: creation, uniqueness enforcement, and explicit equality,
+range, and NULL reads.
 
-**Future directions — noted, and ruled out of the main design: both require
-DuckLake to move first.** (a) *DuckLake grows index metadata.* That catalog
-state would land in moraine like every other `ducklake_*` mapping, with
-maintenance arriving as writer-supplied entries (the Coverage contract,
-DuckLake as the writer); the protobuf definition value reserves a
-`ducklake_index_id` field for mapping such an index onto the same `index`
-range, and that reservation is the entire commitment made here. (b) *A
-DuckLake binder patch* — native `CREATE INDEX`/`PRIMARY KEY`, entry
-maintenance delegated to the metadata catalog, index-served pushdown; an
-upstream change moraine would own. Neither is designed further in this RFC.
+**The upstream boundary is explicit.** Moraine does not carry a downstream
+DuckLake binder or optimizer patch. If DuckLake defines native index metadata,
+the protobuf definition value's reserved `ducklake_index_id` can map its
+stable identifier onto the existing `index` range; the reservation preserves
+that option but commits to no implementation. Native DDL, writer-supplied
+maintenance, and equality, comparison, or `ORDER BY` pushdown are upstream
+requests tracked in [`../ducklake.md`](../ducklake.md), not open work in this
+RFC.
 
 Read-only attaches over an indexed store are unaffected.
 
@@ -769,6 +1059,27 @@ row ids the rows do not have — silent index corruption, no error raised.
 Any resolution that consults `row_id_start` first is therefore wrong by
 construction; the fallback order is fixed as column, then range, then
 refusal.
+
+**File-level row-ID statistics are derived, repairable metadata.** The
+patched DuckLake writer records min/max under the same reserved field id for
+every new non-empty file and uses those values to prune the physical-file list
+for static and dynamic `rowid` filters. A missing row is "unknown" and keeps
+the file, so installing the patch over an existing lake is safe but does not
+accelerate legacy files until they are repaired.
+
+`ducklake_backfill_row_id_stats(catalog [, schema := name] [, table_name :=
+name] [, max_files := n])` is the migration surface. It returns one row per
+selected table — schema, table, files repaired, and files still missing — and
+is idempotent. `max_files` is a positive global bound across the selected
+tables; omitting it repairs all missing non-empty active files. Dense files
+first prove the embedded field is absent and derive `[row_id_start,
+row_id_start + record_count - 1]`. Sparse rewrite and flush files use the
+embedded BIGINT field's Parquet min/max, falling back to reading only that
+column when its footer lacks statistics. The operation never rewrites a data
+file and never mints a DuckLake snapshot. Through Moraine, its reserved-stat
+inserts land as head-preserving maintenance batches; other file-stat inserts
+remain illegal without a snapshot. A bounded partial run remains correct
+because every unrepaired file is still included conservatively.
 
 **Resolution lives inside the scoped read.** The reader already fetches the
 file's footer; discovering the field-id column there costs nothing and
@@ -840,9 +1151,11 @@ validation). Index-free stores stay format 1, byte-identical to today,
 compatible in both directions. Format 2 is format 1 plus the `index` subspace
 and `index` kind — no migration, no rewrite; dropping the last index does not
 downgrade the stamp. Staged builds bump once more, to format 3 (Staged
-builds), under the same lazy posture. The `index` discriminant leaves the
-segment extractor ("first byte") untouched, so existing segments and the
-RFC 0011 crash cases are unaffected.
+builds), under the same lazy posture. Deferred upkeep bumps to format 4: a
+format-3 writer does not know the deferred marker and could otherwise rewrite
+a partially covered definition as ready. The `index` discriminant leaves the
+segment extractor ("first byte") untouched, so existing segments and the RFC
+0011 crash cases are unaffected.
 
 ### Reclamation
 
@@ -852,14 +1165,14 @@ ends, so reclamation is pure space hygiene: a bounded sweep deletes
 `index/{index_id}` in batches — never inside the dropping commit, whose
 batch must stay bounded.
 
-RFC 0021 specifies and implements that sweep, and gives it the home this
-RFC deferred: `Catalog::maintain` discovers dead index ids by seeking
+RFC 0021 specifies and implements that sweep: `Catalog::maintain` discovers
+dead index ids by seeking
 through the `index` subspace (ids are monotonic and never reused, so an id
 absent from the live catalog is dead forever) and reclaims each range in
-head-preserving batches. It runs as one step of the maintenance pass. The
-SlateDB range-delete that would collapse the sweep into one call still
-does not exist at the pinned version, so the batched scan-and-delete is
-the answer for now.
+head-preserving batches. It runs as one step of the maintenance pass. Batched
+scan-and-delete is the binding design. A SlateDB range delete could optimize
+the mechanism without changing its semantics; that upstream request is
+tracked in [`../slatedb.md`](../slatedb.md).
 
 ### Test obligations
 
@@ -869,7 +1182,15 @@ tests against real SlateDB on in-memory `object_store`:
 - **Encoding roundtrips + goldens.** `decode(encode(k)) == k` for both entry
   kinds; golden vectors pin the `index` discriminant and the canonical
   encoding of every indexable type, including the float normalizations, NULL
-  skip, and composite framing (`("ab","c") ≠ ("a","bc")`).
+  skip, and composite framing (`("ab","c") ≠ ("a","bc")`). The borrowed
+  builder is differential-tested byte-for-byte against the former owned
+  encoder across all scalar categories, directions, NULL orders, composite
+  keys, NaNs, signed zero, and framing escape bytes. In-place physical
+  finalization is compared with the owned `Key::Index` encoder under arbitrary
+  values, index ids, unique shapes, NULLs, and row ids. Arrow extraction has
+  the same differential coverage across every supported Arrow representation
+  and overlapping projections; a multi-chunk commit proves every body is
+  decoded once while its table-version schema is decoded once for the commit.
 - **Order preservation.** For every indexable type, `encode(x) < encode(y)`
   iff `x < y` in the type's SQL order (proptest); `DESC` reverses it,
   variable-length strings included (`"ab" < "a"`); a mixed `(a ASC, b DESC)`
@@ -909,7 +1230,9 @@ tests against real SlateDB on in-memory `object_store`:
 - **Staged lifecycle.** A staged build over a table too large for one batch,
   under concurrent inserts, deletes, and updates: lookups fail typed while
   `building`; after the flip, the `index` range is byte-identical to a
-  from-scratch single-commit build over the same live rows.
+  from-scratch single-commit build over the same live rows. Intermediate
+  steps serialize as `inserted_into_table`; publication commits remain
+  `altered_table`.
 - **Staged delete races.** A row deleted between `S₀` and its batch is
   excluded via the delete bookkeeping; a row deleted *concurrently* with its
   batch collides on the entry key, the batch re-runs, and the entry is
@@ -924,7 +1247,8 @@ tests against real SlateDB on in-memory `object_store`:
   than failing the step.
 - **Staged resume and racing builders.** A builder killed mid-build resumes
   from the persisted cursor with idempotent re-puts; two builders advancing
-  one build serialize on the definition key.
+  one build serialize on the definition key, and a stale retry cannot regress
+  the source cursor.
 - **Ready-flip visibility.** A write in flight across the flip re-runs
   (altered-table conflict) and commits under full enforcement — a duplicate
   in that write gets `Constraint`, not poison.
@@ -981,6 +1305,17 @@ tests against real SlateDB on in-memory `object_store`:
   correct after each; a `DELETE` against the rewritten file removes its
   entries; `moraine_create_index` on a table already holding rewrite
   files backfills them.
+- **File-located lookups.** Each summary representation is chosen and
+  intersected correctly — dense range, Roaring, and sorted vector — and the
+  intersections are exact for both dense and sparse files. A duplicate
+  physical row id across two current files returns both as candidates; an
+  inlined row returns a NULL file id. An unreadable sparse file falls back
+  to every requested row id remaining a candidate for it, proving the
+  degradation is conservative rather than lossy. Over DuckLake:
+  `data_file_id` projects, prunes statically and dynamically, and an
+  indexed sparse-file lookup opens only the candidate Parquet files.
+  Benchmarks report cache bytes, sparse-summary build time, located-lookup
+  time, and `Total Files Read` warm and cold.
 
 ## Alternatives considered
 

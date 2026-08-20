@@ -7,7 +7,14 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseding a push is right on a branch and wrong on `main`: a
+  # cancelled job skips every post step, so the run loses the caches it
+  # just spent twenty minutes filling — and `main` is the only ref whose
+  # caches every other run can read. Merges landing inside one CI run
+  # cancelled two in a row that way, which is enough to keep the caches
+  # permanently cold. Without cancellation the group queues instead, so
+  # the second merge starts from what the first one saved.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,6 +49,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
 
+  # The declared MSRV, compiled with the toolchain it names. The version is
+  # read out of the workspace manifest rather than repeated here, so the
+  # gate and the declaration cannot drift apart. `check --all-targets`
+  # rather than `test`: what the MSRV promises is that the workspace
+  # compiles, and the test job already runs the suite on the pinned
+  # toolchain.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - id: declared
+        run: echo "version=$(grep -oP '(?<=^rust-version = ")[^"]+' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - run: rustup toolchain install ${{ steps.declared.outputs.version }} --profile minimal
+      - run: cargo +${{ steps.declared.outputs.version }} check --workspace --locked --all-targets
+
   doc:
     runs-on: ubuntu-latest
     env:
@@ -56,6 +79,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # An `ignore` entry whose advisory no longer matches anything is
+          # only a warning, and the check still exits 0 — which is how two
+          # suppressions outlived their advisories unnoticed. Failing on it
+          # makes a stale one say so. `command-arguments` lands after the
+          # subcommand, which is where a `check` flag belongs.
+          command-arguments: -D advisory-not-detected
 
   pins:
     runs-on: ubuntu-latest
@@ -69,7 +99,7 @@ jobs:
   # e2e builds the loadable extension through the DuckDB toolchain (`make
   # release`), which compiles DuckDB from the `duckdb` submodule and links
   # moraine's Rust core — so it needs the submodules, a ninja generator,
-  # and a cache of the toolchain build tree.
+  # and the caches that keep that build off the critical path.
   e2e:
     runs-on: ubuntu-latest
     steps:
@@ -77,26 +107,58 @@ jobs:
         with:
           submodules: recursive
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build
-      # The DuckDB toolchain build tree (keyed on the submodule refs and the
-      # C++ shim), declared after rust-cache so its save fires before
-      # rust-cache's post-step cleanup of unrecognized target/ dirs.
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build ccache gcc-14 g++-14
+      # The C++ half of the build. Caching ninja's build tree instead does
+      # nothing: a checkout stamps every source with the current time, so
+      # ninja sees restored objects as stale and recompiles all ~550 of
+      # them. ccache keys on content, so the same objects come back off
+      # disk. The key rotates per commit and falls back to the newest
+      # prior cache, which is how ccache stays warm across a series of
+      # pushes.
       - uses: actions/cache@v6
         with:
-          path: build
-          key: duckdb-build-${{ runner.os }}-${{ hashFiles('.gitmodules', 'CMakeLists.txt', 'extension_config.cmake', 'crates/moraine-duckdb/cpp/**') }}
-          # Fall back to the newest prior build tree when the key changes (a
-          # cpp/cmake/submodule touch) so cargo goes incremental instead of
-          # cold-rebuilding the whole dependency graph.
+          path: ~/.cache/ccache
+          key: ccache-e2e-${{ runner.os }}-${{ github.sha }}
           restore-keys: |
-            duckdb-build-${{ runner.os }}-
-      # The pinned DuckDB CLI xtask downloads, keyed on the versions
-      # manifest, which owns the pin.
+            ccache-e2e-${{ runner.os }}-
+      # The Rust half: corrosion builds the core into the cmake tree
+      # rather than the workspace `target/`, so rust-cache above doesn't
+      # reach it. Declared after rust-cache so its save fires before
+      # rust-cache's post-step cleanup of unrecognized target/ dirs — as
+      # does the CLI cache below.
       - uses: actions/cache@v6
         with:
-          path: target/duckdb-cli/cli
+          path: build/release/cargo
+          key: duckdb-corrosion-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            duckdb-corrosion-${{ runner.os }}-
+      # The pinned DuckDB CLI xtask downloads, keyed on the versions
+      # manifest, which owns the pin. The whole directory, not the `cli`
+      # subdirectory: xtask nests the download under the version it is
+      # for, so a narrower path names nothing and caches nothing.
+      - uses: actions/cache@v6
+        with:
+          path: target/duckdb-cli
           key: duckdb-cli-${{ runner.os }}-${{ hashFiles('.github/duckdb-versions') }}
+      # Tests still install supporting extensions such as spatial and
+      # parquet into this directory; DuckLake itself is built from the
+      # repository patch and loaded by path.
+      - uses: actions/cache@v6
+        with:
+          path: target/duckdb-extensions
+          key: duckdb-extensions-${{ runner.os }}-${{ hashFiles('.github/duckdb-versions') }}
       - run: cargo xtask e2e
+        env:
+          # Room for the whole DuckDB object set with headroom for a few
+          # generations of it, well under the 10 GB the repo's caches
+          # share. On this step rather than the job: rust-cache hashes
+          # every job-level variable whose name starts with CC into its
+          # key, so a job-level `CCACHE_*` throws away the Rust cache.
+          CCACHE_MAXSIZE: 1G
+      # A collapsed hit rate is the first sign the cache stopped working,
+      # and it is invisible unless the run prints it.
+      - run: ccache --show-stats
+        if: always()
 
   s3:
     runs-on: ubuntu-latest
