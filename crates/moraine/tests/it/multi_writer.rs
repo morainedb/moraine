@@ -297,23 +297,41 @@ async fn concurrent_commits_coalesce_into_few_slots() {
 }
 
 /// The default (ZERO) window declines to *wait*: a lone commit issues its PUT
-/// without sleeping for a batching window. Under a paused clock a fixed
-/// batching delay would advance virtual time; an opportunistic batch does not.
+/// without sleeping for a batching window, where a fixed window is paid in
+/// full.
+///
+/// The two are compared rather than read absolutely. Under a paused clock
+/// tokio advances virtual time to the next pending timer whenever every task
+/// is idle, and the reader's manifest poll is such a timer, so an absolute
+/// reading measures that poll and not the commit. A window far above the poll
+/// interval separates the two.
 #[tokio::test(start_paused = true)]
 async fn an_uncontended_commit_waits_for_nothing() {
-    let store = Arc::new(InMemory::new());
-    let catalog = open_multi_writer(&store).await;
+    const WINDOW: Duration = Duration::from_secs(600);
 
+    let batching = {
+        let mut options = CatalogOptions::default();
+        options.commit_batch_window = WINDOW;
+        open_multi_writer_over(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>, options).await
+    };
     let started = tokio::time::Instant::now();
-    catalog
-        .commit(|tx| tx.create_schema("solo").map(|_| ()))
+    batching
+        .commit(|tx| tx.create_schema("batched").map(|_| ()))
         .await
         .unwrap();
+    let waited = started.elapsed();
+    assert!(waited >= WINDOW, "a fixed window is waited out: {waited:?}");
 
-    assert_eq!(
-        started.elapsed(),
-        Duration::ZERO,
-        "the default window pays no batching delay"
+    let store = Arc::new(InMemory::new());
+    let solo = open_multi_writer(&store).await;
+    let started = tokio::time::Instant::now();
+    solo.commit(|tx| tx.create_schema("solo").map(|_| ()))
+        .await
+        .unwrap();
+    let unwaited = started.elapsed();
+    assert!(
+        unwaited < WINDOW,
+        "the default window pays no batching delay: {unwaited:?}"
     );
 }
 
@@ -982,7 +1000,7 @@ async fn folding_is_invisible_across_a_dropped_schema() {
 /// it commits — the same answer a folded store gives, never a window where the
 /// two disagree.
 #[tokio::test]
-async fn an_expired_snapshot_resolves_to_not_found() {
+async fn an_expired_snapshot_is_refused_as_expired() {
     use moraine::ffi_support::staged::{Cell, RowOperation, TableKind, staged_begin};
 
     let store = Arc::new(InMemory::new());
@@ -1021,25 +1039,32 @@ async fn an_expired_snapshot_resolves_to_not_found() {
     );
 
     // Pruned: the record is gone from the store the unfolded view resolves
-    // against, so time travel to snapshot 1 is NotFound the moment the expiry
-    // commits — no unfolded window where it lingers.
+    // against, so time travel to snapshot 1 is refused the moment the expiry
+    // commits — no unfolded window where it lingers. Ids run to head, so an
+    // absent record at or below it is expired, not absent.
     let err = open_multi_writer(&store)
         .await
         .snapshot_at(SnapshotId::new(1))
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::NotFound(_)), "before fold: {err:?}");
+    assert!(
+        matches!(err, Error::SnapshotExpired(_)),
+        "before fold: {err:?}"
+    );
 
     catalog.fold_sprint(u64::MAX).await.unwrap();
     assert_eq!(catalog.unfolded_tail().await.unwrap(), 0);
 
-    // Folding changes nothing: still NotFound.
+    // Folding changes nothing.
     let err = open_multi_writer(&store)
         .await
         .snapshot_at(SnapshotId::new(1))
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::NotFound(_)), "after fold: {err:?}");
+    assert!(
+        matches!(err, Error::SnapshotExpired(_)),
+        "after fold: {err:?}"
+    );
 
     // The surviving snapshot and its schemas are unaffected.
     let head = open_multi_writer(&store).await.snapshot().await.unwrap();
