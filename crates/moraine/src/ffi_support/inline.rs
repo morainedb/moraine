@@ -108,12 +108,9 @@ pub async fn scan_inline(
 #[doc(hidden)]
 pub async fn inline_schemas(catalog: &ReadOnlyCatalog, table_id: u64) -> Result<Vec<(u64, Bytes)>> {
     let session = catalog.begin_read().await?;
-    let schemas = store_inline::scan_inline_schemas(session.handle(), table_id).await;
+    let schemas = store_inline::scan_inline_schemas_resolved(session.handle(), table_id).await;
     session.finish();
-    Ok(schemas?
-        .into_iter()
-        .map(|(schema_version, value)| (schema_version, value.arrow_schema))
-        .collect())
+    schemas
 }
 
 /// Every `(table_id, schema_version)` still registered, across every
@@ -130,15 +127,14 @@ pub async fn inline_schemas(catalog: &ReadOnlyCatalog, table_id: u64) -> Result<
 pub async fn inline_registered_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<(u64, u64)>> {
     let session = catalog.begin_read().await?;
     let scans = futures::try_join!(
-        store_inline::scan_all_inline_schemas(session.handle()),
+        store_inline::scan_all_inline_schema_keys(session.handle()),
         store_inline::scan_all_inline_dropped_schemas(session.handle()),
     );
     session.finish();
-    let (schemas, dropped) = scans?;
+    let (registered, dropped) = scans?;
     let dropped: HashSet<(u64, u64)> = dropped.into_iter().collect();
-    Ok(schemas
+    Ok(registered
         .into_iter()
-        .map(|(table_id, schema_version, _)| (table_id, schema_version))
         .filter(|pair| !dropped.contains(pair))
         .collect())
 }

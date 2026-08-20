@@ -402,6 +402,7 @@ pub(crate) fn inline_schema_write(
         })
         .encode(),
         Some(value::encode_value(&proto::InlineSchemaValue {
+            same_as_version: None,
             arrow_schema: arrow_schema.to_vec().into(),
         })),
     )
@@ -525,6 +526,86 @@ pub(super) fn inline_schema_drop_write(table_id: u64, schema_version: u64) -> co
     )
 }
 
+/// Points one version's schema record at another version of the same
+/// table, whose bytes are identical.
+fn inline_schema_reference_write(
+    table_id: u64,
+    schema_version: u64,
+    same_as_version: u64,
+) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::Schema {
+            table_id,
+            schema_version,
+        })
+        .encode(),
+        Some(value::encode_value(&proto::InlineSchemaValue {
+            arrow_schema: bytes::Bytes::new(),
+            same_as_version: Some(same_as_version),
+        })),
+    )
+}
+
+/// The version whose bytes `schema_version`'s record can be replaced by a
+/// reference to, if any. Resolution is one hop onto a version carrying
+/// bytes, so a version that is already a reference and a version some
+/// other reference resolves through are both left whole.
+pub(super) fn inline_schema_collapse_target(
+    schemas: &[(u64, proto::InlineSchemaValue)],
+    schema_version: u64,
+) -> Option<u64> {
+    let (_, dropped) = schemas
+        .iter()
+        .find(|(version, _)| *version == schema_version)?;
+    if dropped.same_as_version.is_some()
+        || schemas
+            .iter()
+            .any(|(_, value)| value.same_as_version == Some(schema_version))
+    {
+        return None;
+    }
+
+    schemas
+        .iter()
+        .find(|(version, value)| {
+            *version != schema_version
+                && value.same_as_version.is_none()
+                && value.arrow_schema == dropped.arrow_schema
+        })
+        .map(|(version, _)| *version)
+}
+
+/// Deregisters `schema_version` and, when its columns duplicate another
+/// version's, collapses its record to a reference. Deregistered records
+/// are retained for as long as their table lives, and a mint that changed
+/// no column writes the same bytes again, so this is what keeps the
+/// retention from growing with every mint.
+///
+/// A reference is a shape an older reader would decode as a schema with
+/// no columns, so the batch that writes one carries the store to the
+/// format that shuts those readers out — the same way a live index or an
+/// inline chunk locator carries it to theirs. Reports whether it wrote
+/// one, which is what owes that stamp.
+async fn translate_inline_schema_drop(
+    db_tx: &DbTransaction,
+    table_id: u64,
+    schema_version: u64,
+    writes: &mut Vec<commit::StagedWrite>,
+) -> Result<bool> {
+    writes.push(inline_schema_drop_write(table_id, schema_version));
+
+    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(db_tx), table_id).await?;
+    let Some(target) = inline_schema_collapse_target(&schemas, schema_version) else {
+        return Ok(false);
+    };
+    writes.push(inline_schema_reference_write(
+        table_id,
+        schema_version,
+        target,
+    ));
+    Ok(true)
+}
+
 /// Clears a version's drop marker, so registering it again cannot leave
 /// it both listed and deregistered.
 fn inline_schema_undrop_write(table_id: u64, schema_version: u64) -> commit::StagedWrite {
@@ -596,7 +677,7 @@ pub(super) async fn translate_inline(
     db_tx: &DbTransaction,
     projections: &std::sync::RwLock<ProjectionCache>,
     ops: &[RowOperation],
-) -> Result<Vec<commit::StagedWrite>> {
+) -> Result<(Vec<commit::StagedWrite>, bool)> {
     let mut writes = Vec::new();
     let mut chunk_seqs = ChunkSeqAllocator::default();
     // One existence marker per table per commit.
@@ -627,12 +708,15 @@ pub(super) async fn translate_inline(
         .filter(|op| {
             matches!(
                 op,
-                RowOperation::InlineFlushDelete { .. } | RowOperation::InlineDrop { .. }
+                RowOperation::InlineFlushDelete { .. }
+                    | RowOperation::InlineDrop { .. }
+                    | RowOperation::InlineSchemaDrop { .. }
             )
         })
         .collect();
     let scoped = stream::iter(table_scoped.into_iter().map(|op| async move {
         let mut writes = Vec::new();
+        let mut referenced = false;
         match op {
             RowOperation::InlineFlushDelete {
                 table_id,
@@ -652,9 +736,17 @@ pub(super) async fn translate_inline(
             RowOperation::InlineDrop { table_id } => {
                 translate_inline_drop(db_tx, *table_id, &mut writes).await?;
             }
+            RowOperation::InlineSchemaDrop {
+                table_id,
+                schema_version,
+            } => {
+                referenced =
+                    translate_inline_schema_drop(db_tx, *table_id, *schema_version, &mut writes)
+                        .await?;
+            }
             _ => {}
         }
-        Ok::<_, Error>(writes)
+        Ok::<_, Error>((writes, referenced))
     }))
     .buffer_unordered(INLINE_TRANSLATION_CONCURRENCY)
     .try_collect::<Vec<_>>();
@@ -727,13 +819,10 @@ pub(super) async fn translate_inline(
                     inline_file_delete_write(*table_id, *data_file_id, *row_id, *begin_snapshot);
                 writes.push(write);
             }
-            RowOperation::InlineSchemaDrop {
-                table_id,
-                schema_version,
-            } => writes.push(inline_schema_drop_write(*table_id, *schema_version)),
             // Removals, flushes and drops are handled above; entity ops
             // belong to `translate`.
-            RowOperation::InlineFlushDelete { .. }
+            RowOperation::InlineSchemaDrop { .. }
+            | RowOperation::InlineFlushDelete { .. }
             | RowOperation::InlineDrop { .. }
             | RowOperation::InlineFileDeleteRemove { .. }
             | RowOperation::Insert { .. }
@@ -743,7 +832,11 @@ pub(super) async fn translate_inline(
         }
     }
 
-    writes.extend(scoped_writes.into_iter().flatten());
+    let mut uses_schema_reference = false;
+    for (scoped, referenced) in scoped_writes {
+        writes.extend(scoped);
+        uses_schema_reference |= referenced;
+    }
 
-    Ok(writes)
+    Ok((writes, uses_schema_reference))
 }

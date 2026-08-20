@@ -834,6 +834,33 @@ impl Catalog {
         }
     }
 
+    /// Raises the store's format to the newest purely additive one this
+    /// binary writes, ahead of the commit that would otherwise take it.
+    ///
+    /// One-way: a store that has taken the format can no longer be opened
+    /// by a binary that predates it, and a reader already attached on one
+    /// is not refused — it keeps running and may misread later commits.
+    /// Raise it only once every reader is on a binary that understands
+    /// it.
+    ///
+    /// `dry_run` reports the move it would make and stamps nothing — the
+    /// only way to read a store's format without moving it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store is mid-migration, or if the stamp
+    /// cannot be committed durably.
+    pub async fn raise_format(
+        &self,
+        dry_run: bool,
+    ) -> Result<crate::transaction::migration::FormatRaise> {
+        let raised = crate::transaction::migration::raise_format(self.writer()?, dry_run).await?;
+        if !dry_run {
+            crate::catalog::projection::raise_format_floor(self.projections(), raised.to_format);
+        }
+        Ok(raised)
+    }
+
     /// Opens (creating and initializing if empty) the catalog in
     /// `object_store` at `options.path`.
     ///

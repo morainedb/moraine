@@ -76,7 +76,7 @@ inherit that limitation.
 
 | Kind | Key components | Value |
 |---|---|---|
-| `inline/schema` | `table_id, schema_version` | Arrow IPC schema-only stream (written once per schema version) |
+| `inline/schema` | `table_id, schema_version` | Arrow IPC schema-only stream (written once per schema version), or — once deregistered — a reference to the version of the same table whose bytes are identical |
 | `inline/insert` | `table_id, schema_version, begin_snapshot, chunk_seq` | Arrow IPC record-batch **body** (the batch message + buffers, no schema) over the user columns + `row_id_start`, `row_count`. Decoded against the version's `inline/schema` stream, so the schema is not re-serialized per chunk |
 | `inline/inline_delete` | `table_id, row_id` | `end_snapshot` (tombstone for an inlined insert row) |
 | `inline/file_delete` | `table_id, data_file_id, row_id` | `begin_snapshot` (inlined delete against a Parquet file) |
@@ -111,18 +111,59 @@ stale reader: the rows it is asking for are in the file the flush wrote,
 and the retained record holds no chunks to double-count. Registering a
 version clears its marker in the same batch, so a version is never both
 listed and marked; the `DROP TABLE` cascade takes the markers with
-everything else. What this does not do is bound the retained schemas: one
-per inlined table a live DuckLake table has ever registered, reclaimed
-only when that table is dropped. They sit under their own key prefix, off
-every scan but the deregistration subtraction, and a tighter bound would
-have to come from expiry.
+everything else.
 
-The marker carries no store-format floor, unlike the chunk directory.
-Nothing here caches a judgment that a writer predating the marker could
-falsify: a writer that old deletes the schema record outright, which
-costs that one version its bind and leaves an inert marker the drop
-cascade sweeps. Mixed writers degrade a version at a time; they do not
-make a reader wrong.
+Retention is not bounded — one record per inlined table a live DuckLake
+table has ever registered, reclaimed only when that table is dropped — so
+what keeps it cheap is that the records deduplicate. DuckLake mints a new
+inlined table whenever it finds no registration for one, which includes
+the case where a session's *cached* list is empty; the version is fresh
+but the columns are unchanged, so the schema it registers is byte-
+identical to the one already stored. A deregistration therefore collapses
+its record to a `same_as_version` reference when another version of the
+same table carries the same bytes, and the bytes are stored once however
+many versions accumulate. Resolution is one hop and only onto a version
+carrying bytes: a version that is already a reference, and a version some
+other reference resolves through, are both left whole. A reference naming
+a version that carries no bytes is corruption, not an empty schema.
+
+This is the one part of the design with a store-format floor. A reader
+that predates the field decodes a reference as a schema with no columns,
+which is wrong rather than merely stale, so the batch that writes one
+carries the store to the format that shuts those readers out — the same
+way a live index carries it to `FORMAT_WITH_INDEX` and an inline chunk
+locator to `FORMAT_WITH_INLINE_CHUNK_DIRECTORY`. A deregistration that
+collapses nothing stamps nothing, so a store takes the floor exactly when
+duplicate versions first accumulate, and never before.
+
+The stamp is one-way: a store that has taken the format cannot be opened
+by a binary that predates it, and a reader *already attached* on such a
+binary is not refused — it keeps running and may misread what later
+commits write. That is the same exposure every earlier format carries,
+and the same discipline answers it: upgrade every reader of a store
+before the writers start producing shapes the readers do not know.
+`moraine_raise_format` takes the format deliberately for an operator who
+would rather not wait for the first collapse to take it, and
+`dry_run := true` reports a store's format without moving it — the only
+way to read it.
+
+A structural migration is the wrong instrument for a purely additive
+format: the registry's floor invariant ties `MIN_FORMAT_VERSION` to the
+newest unit's target, so a unit here would refuse every un-migrated store
+at attach.
+
+The registration read is keys-only for the same reason: it needs the
+`(table, version)` pairs, not the columns, and a scan that decoded every
+retained schema would grow with the retention. It walks the key range
+instead — the store still delivers each value, since a key and its value
+share an SST block, but nothing decodes them.
+
+The marker itself carries no store-format floor, unlike the chunk
+directory and the schema reference above. Nothing about it caches a
+judgment that a writer predating it could falsify: a writer that old
+deletes the schema record outright, which costs that one version its bind
+and leaves an inert marker the drop cascade sweeps. Mixed writers degrade
+a version at a time; they do not make a reader wrong.
 
 The chunk-range record is an immutable
 secondary directory written and removed atomically with its owning chunk.

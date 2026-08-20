@@ -185,7 +185,7 @@ impl ReadOnlyCatalog {
             backfill::read_inline_schemas(handle, table, schema_versions)
                 .await?
                 .into_iter()
-                .map(|(version, record)| (version, Arc::new(record.arrow_schema.to_vec())))
+                .map(|(version, record)| (version, Arc::new(record.to_vec())))
                 .collect();
         let mut bodies: HashMap<usize, Arc<Vec<u8>>> = HashMap::new();
         let mut rows = Vec::with_capacity(live.len());
