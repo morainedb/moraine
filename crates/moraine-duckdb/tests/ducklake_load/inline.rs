@@ -686,3 +686,103 @@ fn a_flushed_inline_table_deregisters_but_still_resolves() {
     ));
     assert_eq!(rows, vec![vec!["1", "NULL"], vec!["2", "b"]]);
 }
+
+/// A deregistered version whose columns duplicate a live one's collapses
+/// onto it, and the name still binds through the reference.
+///
+/// Adding a column and dropping it again is what makes that shape
+/// reachable end to end: each column change mints an inlined table, and
+/// the third has exactly the columns the first had, so the first's
+/// record has a twin to collapse onto while the second's does not. The
+/// store's format is the SQL-visible proof — a collapse stamps it, and
+/// nothing else here does.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn a_flushed_duplicate_schema_collapses_and_still_binds() {
+    let dir = TempDir::new("inline-collapse-store");
+    let data_dir = TempDir::new("inline-collapse-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CREATE TABLE lake.main.t (i BIGINT);\n\
+         INSERT INTO lake.main.t VALUES (1);\n\
+         ALTER TABLE lake.main.t ADD COLUMN c BIGINT;\n\
+         INSERT INTO lake.main.t VALUES (2, 20);\n\
+         ALTER TABLE lake.main.t DROP COLUMN c;\n\
+         INSERT INTO lake.main.t VALUES (3);",
+    );
+
+    let registered = || -> Vec<(String, String)> {
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT table_id, schema_version FROM m.ducklake_inlined_data_tables \
+             ORDER BY schema_version;",
+        ))
+        .into_iter()
+        .map(|row| (row[0].clone(), row[1].clone()))
+        .collect()
+    };
+    let format = |label: &str| -> u64 {
+        let rows = csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT from_format FROM moraine_raise_format('lake', dry_run := true);",
+        ));
+        rows.first().unwrap_or_else(|| panic!("{label}: a row"))[0]
+            .parse()
+            .expect("a format is a number")
+    };
+
+    let before = registered();
+    assert_eq!(
+        before.len(),
+        3,
+        "each column change mints an inlined table, got {before:?}"
+    );
+    let (table_id, first) = before[0].clone();
+    let (_, middle) = before[1].clone();
+    let before_format = format("before the flush");
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CALL ducklake_flush_inlined_data('lake');",
+    );
+
+    let after = registered();
+    assert_eq!(
+        after.len(),
+        1,
+        "the two superseded versions must leave the registry, got {after:?}"
+    );
+
+    // The collapse is what carries the store's format, so a move here is
+    // the proof one happened — nothing else in this test writes a shape
+    // that needs the newer format.
+    let after_format = format("after the flush");
+    assert!(
+        after_format > before_format,
+        "a collapsed schema must carry the store's format, which stayed at {before_format}"
+    );
+
+    // Both deregistered versions still bind and scan empty: the first
+    // through its reference to the surviving version's bytes, the middle
+    // — whose columns are its own — through the bytes it kept.
+    for version in [&first, &middle] {
+        let scan = csv_rows(&run_standalone_sql(
+            store,
+            &format!("SELECT count(*) FROM m.ducklake_inlined_data_{table_id}_{version};"),
+        ));
+        assert_eq!(scan, vec![vec!["0".to_string()]], "version {version}");
+    }
+
+    let rows = csv_rows(&run_ducklake_sql(
+        store,
+        data_path,
+        "SELECT i FROM lake.main.t ORDER BY i;",
+    ));
+    assert_eq!(rows, vec![vec!["1"], vec!["2"], vec!["3"]]);
+}
