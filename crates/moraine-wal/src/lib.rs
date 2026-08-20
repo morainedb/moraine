@@ -184,5 +184,4 @@ pub use driver::{
 pub use engine::{AdvertProjection, AppendRefused, SlotWal, slot_sequence};
 pub use envelope::{Commit, Envelope, LeaderAdvert, Overlay, SlotPayload, SlotWrite};
 pub use error::Error;
-pub use proto::FoldValue;
 pub use slot::{CommitOutcome, Extent, SlotLog, SlotMeta, SlotRace, Tail};

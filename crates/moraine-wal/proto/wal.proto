@@ -43,9 +43,3 @@ message SlotWriteValue {
   bytes key = 1;
   optional bytes value = 2;
 }
-
-// The standard fold-cursor value a CursorStore implementation may
-// persist: the highest sequence applied to the derived state.
-message FoldValue {
-  uint64 folded_sequence = 1;
-}

@@ -373,13 +373,6 @@ impl SlotLog {
         Ok(slots)
     }
 
-    /// The object store the log lives on, for a caller that must open a
-    /// sibling log — a clone's destination, another store's slots.
-    #[must_use]
-    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
-        Arc::clone(&self.store)
-    }
-
     /// Scans the tail from `from` for a transaction id; the sequence of the
     /// slot that carries it, if any.
     ///
