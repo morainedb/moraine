@@ -4230,3 +4230,112 @@ async fn visible_schema_version_records_follow_the_staged_rows() {
     tx.rollback();
     catalog.close().await.unwrap();
 }
+
+/// A staged commit that registers a data file on a table carrying a
+/// deferred-maintenance index reports that definition back and marks it
+/// awaiting repair, the state a later repair selects on.
+#[tokio::test]
+async fn a_registered_file_marks_the_table_s_deferred_indexes_for_repair() {
+    use crate::catalog::{ColumnId, IndexDef, IndexMaintenance, IndexState, TableId};
+
+    let catalog = open().await;
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 0),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+    });
+    tx.commit().await.unwrap();
+
+    catalog
+        .commit(|tx| {
+            tx.create_index_ordered_with_maintenance(
+                TableId::new(1),
+                &IndexDef {
+                    name: "by_a".to_owned(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: false,
+                },
+                &[],
+                IndexMaintenance::Deferred,
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    let indexes = snapshot.indexes_of(TableId::new(1));
+    assert_eq!(indexes.len(), 1, "the definition survives its own commit");
+    let index_id = indexes[0].id;
+    let head = snapshot.snapshot.snapshot_id;
+    let next_id = head + 1;
+    assert_eq!(
+        indexes[0].maintenance,
+        IndexMaintenance::Deferred,
+        "the upkeep mode survives its own commit"
+    );
+
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: vec![
+            Cell::U64(1),
+            Cell::U64(1),
+            Cell::U64(next_id),
+            Cell::Null,
+            Cell::Null,
+            Cell::Str("data.parquet".into()),
+            Cell::Bool(true),
+            Cell::Str("parquet".into()),
+            Cell::U64(10),
+            Cell::U64(1024),
+            Cell::U64(64),
+            Cell::U64(0),
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+        ],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(next_id, 1, next_id + 10),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(next_id, "inserted_into_table:1"),
+    });
+
+    let report = tx.commit_reporting().await.unwrap();
+    assert_eq!(
+        report.deferred_indexes,
+        vec![index_id],
+        "the commit names what it left for repair"
+    );
+
+    let indexes = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .indexes_of(TableId::new(1));
+    assert_eq!(
+        indexes[0].state,
+        IndexState::Maintaining,
+        "the commit stages the marker a repair selects on"
+    );
+
+    catalog.close().await.unwrap();
+}

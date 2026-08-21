@@ -969,8 +969,17 @@ where
         locator_writes,
         ..
     } = index_maintenance::plan_index_entries(probe, index_entries).await?;
-    index_maintenance::apply_poison(&mut state, &poisoned);
-    index_maintenance::apply_deferred_maintenance(base, &mut state, &deferred, new_id);
+    // The verb path diffs the whole catalog, so nothing here consumes the
+    // record of which definitions those two rewrote.
+    let mut touched = Touched::default();
+    index_maintenance::apply_poison(&mut state, &poisoned, &mut touched);
+    index_maintenance::apply_deferred_maintenance(
+        base,
+        &mut state,
+        &deferred,
+        new_id,
+        &mut touched,
+    );
     let uses_inline_chunk_directory = !locator_writes.is_empty();
     writes.extend(locator_writes);
 

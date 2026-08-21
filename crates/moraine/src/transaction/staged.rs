@@ -1533,9 +1533,13 @@ fn translate(
         }
     }
 
-    crate::transaction::index_maintenance::apply_poison(&mut state, poisoned);
+    crate::transaction::index_maintenance::apply_poison(&mut state, poisoned, &mut touched);
     crate::transaction::index_maintenance::apply_deferred_maintenance(
-        base, &mut state, deferred, new_id,
+        base,
+        &mut state,
+        deferred,
+        new_id,
+        &mut touched,
     );
 
     let mut writes = commit::diff_touched(base, &state, new_id, &touched);

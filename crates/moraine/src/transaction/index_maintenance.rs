@@ -22,7 +22,7 @@ use crate::{
         handle::{ReadHandle, ScanOrder, ScanShape},
         index_encoding::{CanonicalKey, NullOrder, non_null_flag_key},
         key::{
-            IndexKey, IndexKind, Key, encode_index_entry, index_index_prefix,
+            EntityKey, IndexKey, IndexKind, Key, encode_index_entry, index_index_prefix,
             index_multi_value_prefix, index_value_above, index_value_body, index_value_suffix,
         },
     },
@@ -507,15 +507,21 @@ where
 
 /// Records `poisoned` on the working state's definitions, so the commit's
 /// ordinary entity diff stages the flag. Poisoning is terminal.
-pub(crate) fn apply_poison(state: &mut crate::catalog::CatalogSnapshot, poisoned: &[u64]) {
+pub(crate) fn apply_poison(
+    state: &mut crate::catalog::CatalogSnapshot,
+    poisoned: &[u64],
+    touched: &mut crate::transaction::commit::Touched,
+) {
     let poisoned: HashSet<&u64> = poisoned.iter().collect();
-    for value in state
-        .indexes
-        .values_mut()
-        .flat_map(|per_table| per_table.values_mut())
-    {
-        if poisoned.contains(&value.index_id) {
-            value.poisoned = Some(true);
+    for (table_id, per_table) in &mut state.indexes {
+        for value in per_table.values_mut() {
+            if poisoned.contains(&value.index_id) {
+                value.poisoned = Some(true);
+                touched.touch(EntityKey::Index {
+                    table_id: *table_id,
+                    index_id: value.index_id,
+                });
+            }
         }
     }
 }
@@ -527,6 +533,7 @@ pub(crate) fn apply_deferred_maintenance(
     state: &mut crate::catalog::CatalogSnapshot,
     deferred: &[u64],
     new_snapshot: u64,
+    touched: &mut crate::transaction::commit::Touched,
 ) {
     for index_id in deferred {
         for (table_id, per_table) in &mut state.indexes {
@@ -550,6 +557,10 @@ pub(crate) fn apply_deferred_maintenance(
                 value.build_cursor_file = Some(tail.map_or(0, |file| file.data_file_id));
                 value.build_cursor_position =
                     Some(tail.map_or(0, |file| file.record_count.saturating_sub(1)));
+                touched.touch(EntityKey::Index {
+                    table_id: *table_id,
+                    index_id: *index_id,
+                });
             }
         }
     }
