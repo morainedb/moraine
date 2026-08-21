@@ -110,7 +110,23 @@ impl ReadOnlyCatalog {
         handle: ReadHandle<'_>,
         overlay: Option<&moraine_wal::Overlay>,
         table: TableId,
+        schema_version: Option<u64>,
     ) -> Result<(InlineRowSource, Vec<InlineRow>)> {
+        // A caller after one version's rows takes only that version's chunks:
+        // the others are dropped before their bodies resolve anyway, and a
+        // base-table scan asks once per registered version. The directory is
+        // left unjudged, since a partial chunk set cannot say it is complete.
+        if let Some(version) = schema_version
+            && !projection::inline_directory_complete(&self.projections, table.get())
+        {
+            let (chunks, tombstones) = futures::try_join!(
+                store_inline::scan_inline_chunks_of_version(handle, overlay, table.get(), version),
+                store_inline::scan_inline_deletes(handle, overlay, table.get()),
+            )?;
+            let rows = materialize_inline_rows(&chunks, &tombstones);
+            return Ok((InlineRowSource::Chunks(chunks), rows));
+        }
+
         if projection::inline_directory_complete(&self.projections, table.get()) {
             let (locators, tombstones) = futures::try_join!(
                 store_inline::scan_inline_chunk_locators(handle, overlay, table.get()),
@@ -148,7 +164,7 @@ impl ReadOnlyCatalog {
         let read = self.begin_probe().await?;
         let outcome = async {
             let (source, rows) = self
-                .inline_row_source(read.handle(), read.tail(), table)
+                .inline_row_source(read.handle(), read.tail(), table, schema_version)
                 .await?;
             let mut selected = kind.select(&rows, snapshot, start);
             if let Some(version) = schema_version {
@@ -180,7 +196,7 @@ impl ReadOnlyCatalog {
             Some(_) => commit::resolve_read_snapshot(handle, at).await?.0,
             None => read.view().snapshot.snapshot_id,
         };
-        let (source, rows) = self.inline_row_source(handle, overlay, table).await?;
+        let (source, rows) = self.inline_row_source(handle, overlay, table, None).await?;
 
         let live = InlineScanKind::Table.select(&rows, read_at, 0);
         let (live, chunks) = source.resolve_chunks(handle, overlay, table, live).await?;
@@ -237,7 +253,7 @@ impl ReadOnlyCatalog {
     ) -> Result<Vec<u64>> {
         let head = read.view().snapshot.snapshot_id;
         let (_, rows) = self
-            .inline_row_source(read.handle(), read.tail(), table)
+            .inline_row_source(read.handle(), read.tail(), table, None)
             .await?;
 
         Ok(InlineScanKind::Table

@@ -672,6 +672,21 @@ pub(crate) fn inline_live_table_prefix(kind: InlineOperationKind, table_id: u64)
     )
 }
 
+/// Byte prefix of every inlined-insert chunk of `table_id` written under
+/// `schema_version`. The version is the key component after the table, so a
+/// scan for one version's chunks seeks straight past every other version's.
+pub(crate) fn inline_chunk_version_prefix(table_id: u64, schema_version: u64) -> Vec<u8> {
+    prefix_of(
+        &Key::Inline(InlineKey::Live(InlineOperation::Insert {
+            table_id,
+            schema_version,
+            begin_snapshot: 0,
+            chunk_seq: 0,
+        })),
+        INLINE_LIVE_KIND_PREFIX_LEN + 2 * size_of::<u64>(),
+    )
+}
+
 /// Discriminant bytes preceding an `inline/schema` key's components:
 /// subspace, `InlineKey::Schema`.
 const INLINE_SCHEMA_PREFIX_LEN: usize = 2;
