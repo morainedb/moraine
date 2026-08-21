@@ -699,6 +699,9 @@ fn a_flushed_inline_table_deregisters_but_still_resolves() {
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn a_flushed_duplicate_schema_collapses_and_still_binds() {
+    /// The floor at which a schema recorded as a reference is legible.
+    const SCHEMA_REFERENCE_FORMAT: u64 = 7;
+
     let dir = TempDir::new("inline-collapse-store");
     let data_dir = TempDir::new("inline-collapse-data");
     let store = dir.path();
@@ -744,7 +747,6 @@ fn a_flushed_duplicate_schema_collapses_and_still_binds() {
     );
     let (table_id, first) = before[0].clone();
     let (_, middle) = before[1].clone();
-    let before_format = format("before the flush");
 
     run_ducklake_sql(
         store,
@@ -759,13 +761,14 @@ fn a_flushed_duplicate_schema_collapses_and_still_binds() {
         "the two superseded versions must leave the registry, got {after:?}"
     );
 
-    // The collapse is what carries the store's format, so a move here is
-    // the proof one happened — nothing else in this test writes a shape
-    // that needs the newer format.
+    // The inline inserts above already carry the chunk-identity floor,
+    // which subsumes this one, so the stamp cannot move here; what it must
+    // not do is sit below the shape the collapse just wrote.
     let after_format = format("after the flush");
     assert!(
-        after_format > before_format,
-        "a collapsed schema must carry the store's format, which stayed at {before_format}"
+        after_format >= SCHEMA_REFERENCE_FORMAT,
+        "a collapsed schema must be fenced off from binaries that cannot read it, \
+         got {after_format}"
     );
 
     // Both deregistered versions still bind and scan empty: the first

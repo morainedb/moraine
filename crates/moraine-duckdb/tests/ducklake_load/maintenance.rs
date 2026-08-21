@@ -1845,7 +1845,11 @@ fn raising_the_store_format_is_explicit_and_idempotent() {
     run_ducklake_sql(
         store,
         data_path,
-        "CREATE TABLE lake.main.t (i BIGINT);\nINSERT INTO lake.main.t VALUES (1);",
+        // Inlining is off: a locator carries the newest format, and this
+        // test needs a store that sits below it.
+        "SET ducklake_default_data_inlining_row_limit = 0;\n\
+         CREATE TABLE lake.main.t (i BIGINT);\n\
+         INSERT INTO lake.main.t VALUES (1);",
     );
 
     let raise_with = |label: &str, options: &str| -> (u64, u64) {

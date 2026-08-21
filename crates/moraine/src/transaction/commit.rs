@@ -891,40 +891,62 @@ enum Prepared {
     },
 }
 
-/// The store format the staged state requires: deferred upkeep implies
-/// [`FORMAT_WITH_DEFERRED_INDEX`], a `building` index
-/// [`FORMAT_WITH_STAGED_INDEX`], any other index [`FORMAT_WITH_INDEX`], and
-/// inline chunk locators [`FORMAT_WITH_INLINE_CHUNK_IDENTITY`].
-fn target_format(state: &CatalogSnapshot, uses_inline_chunk_directory: bool) -> u64 {
-    let index_format = if state
-        .indexes
-        .values()
-        .flat_map(BTreeMap::values)
-        .any(|index| index.deferred_maintenance == Some(true))
-    {
-        FORMAT_WITH_DEFERRED_INDEX
-    } else if state
-        .indexes
-        .values()
-        .flat_map(BTreeMap::values)
-        .any(|index| index.build_state.is_some())
-    {
-        FORMAT_WITH_STAGED_INDEX
-    } else if state
-        .indexes
-        .values()
-        .any(|per_table| !per_table.is_empty())
-    {
-        FORMAT_WITH_INDEX
-    } else {
-        FORMAT_VERSION
-    };
+/// The inline shapes a batch wrote. Each carries its own format floor, and
+/// neither subsumes the other.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct InlineShapes {
+    /// A locator carrying its chunk's identity.
+    pub(crate) chunk_directory: bool,
+    /// A schema recorded as a reference to another version.
+    pub(crate) schema_reference: bool,
+}
 
-    if uses_inline_chunk_directory {
-        index_format.max(FORMAT_WITH_INLINE_CHUNK_IDENTITY)
-    } else {
-        index_format
-    }
+/// The format floor `state`'s index records require: deferred upkeep
+/// implies [`FORMAT_WITH_DEFERRED_INDEX`], a `building` index
+/// [`FORMAT_WITH_STAGED_INDEX`], and any other index [`FORMAT_WITH_INDEX`].
+/// The floor is the highest term that applies, never the first.
+pub(crate) fn index_format(state: &CatalogSnapshot) -> u64 {
+    let indexes = || state.indexes.values().flat_map(BTreeMap::values);
+
+    [
+        indexes()
+            .any(|index| index.deferred_maintenance == Some(true))
+            .then_some(FORMAT_WITH_DEFERRED_INDEX),
+        indexes()
+            .any(|index| index.build_state.is_some())
+            .then_some(FORMAT_WITH_STAGED_INDEX),
+        state
+            .indexes
+            .values()
+            .any(|per_table| !per_table.is_empty())
+            .then_some(FORMAT_WITH_INDEX),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(FORMAT_VERSION)
+}
+
+/// The format floor the inline shapes `wrote` require. Neither shape
+/// subsumes the other, so a batch writing both owes the higher.
+pub(crate) fn inline_format(wrote: InlineShapes) -> u64 {
+    [
+        wrote
+            .schema_reference
+            .then_some(FORMAT_WITH_INLINE_SCHEMA_REFERENCE),
+        wrote
+            .chunk_directory
+            .then_some(FORMAT_WITH_INLINE_CHUNK_IDENTITY),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(FORMAT_VERSION)
+}
+
+/// The store format `state` requires once `wrote` is folded in.
+pub(crate) fn target_format(state: &CatalogSnapshot, wrote: InlineShapes) -> u64 {
+    index_format(state).max(inline_format(wrote))
 }
 
 /// The format-stamp write this commit owes, if any. The stamp is forward-only.
@@ -932,14 +954,9 @@ async fn format_stamp(
     db_tx: &DbTransaction,
     projections: &std::sync::RwLock<ProjectionCache>,
     state: &CatalogSnapshot,
-    uses_inline_chunk_directory: bool,
+    wrote: InlineShapes,
 ) -> Result<Option<StagedWrite>> {
-    format_stamp_to(
-        db_tx,
-        projections,
-        target_format(state, uses_inline_chunk_directory),
-    )
-    .await
+    format_stamp_to(db_tx, projections, target_format(state, wrote)).await
 }
 
 /// The forward-only format stamp write required to reach `target_format`.
@@ -1042,13 +1059,18 @@ where
     // that diff. The three reads touch disjoint subspaces, so they run
     // together.
     let index_entry_count = index_entries.len();
-    let uses_inline_chunk_directory = inline_ops
-        .iter()
-        .any(|operation| matches!(operation, inline::InlineStage::Insert { .. }));
+    // This path records every schema whole; only the staged one writes a
+    // schema as a reference to another version.
+    let wrote_inline = InlineShapes {
+        chunk_directory: inline_ops
+            .iter()
+            .any(|operation| matches!(operation, inline::InlineStage::Insert { .. })),
+        schema_reference: false,
+    };
     let (entries, inline_writes, format_write) = futures::try_join!(
         index_maintenance::stage_index_entries(db_tx, index_entries),
         inline::stage_inline_writes(db_tx, projections, &inline_ops),
-        format_stamp(db_tx, projections, &state, uses_inline_chunk_directory),
+        format_stamp(db_tx, projections, &state, wrote_inline),
     )?;
     let poisoned = entries.poisoned;
     index_maintenance::apply_poison(&mut state, &poisoned);
