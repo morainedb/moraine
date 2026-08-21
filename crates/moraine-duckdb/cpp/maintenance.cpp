@@ -697,6 +697,7 @@ MaintenanceStep MaintenanceScheduler::RunTruncate() {
 	}
 	return MaintenanceStep {"truncate_slots", "ran",
 	                        "removed " + std::to_string(removed) + (removed == 1 ? " slot" : " slots")};
+}
 
 MaintenanceStep MaintenanceScheduler::RunFileStatsSweep() {
 	if (!file_stats_swept_) {
