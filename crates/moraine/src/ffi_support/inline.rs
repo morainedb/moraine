@@ -367,13 +367,6 @@ mod tests {
     /// remembers it; the next serves from it, hauling only referenced
     /// bodies. The proof is divergence: a chunk planted without a locator
     /// is visible only to a body scan.
-    ///
-    /// Verification needs one store state across the chunk scan and the
-    /// directory scan, which only a transaction handle gives. A slot-backed
-    /// read goes through a manifest-following reader, so the fast path stays
-    /// dormant and every walk takes the body scan — correct, just not the
-    /// cheap route this pins.
-    #[ignore = "the directory fast path needs an isolated handle a slot-backed read does not have"]
     #[tokio::test]
     async fn scan_inline_serves_from_the_directory_once_verified() {
         use crate::store::{

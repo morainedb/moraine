@@ -248,10 +248,15 @@ impl ReadOnlyCatalog {
     }
 
     /// Compares the walked chunks against the directory and remembers a
-    /// complete one. Only an isolated session may judge — a
-    /// manifest-following pass can straddle a commit — and only under a
-    /// format that locks out writers that predate the directory. This path
-    /// never writes, so a gap is simply left for a flush to heal.
+    /// complete one, under a format that locks out writers predating the
+    /// directory.
+    ///
+    /// The two scans must describe one store state. A transaction gives that
+    /// outright; a manifest-following reader does not, so the head is read
+    /// again afterwards and a judgement is only recorded when it has not
+    /// moved — a commit landing between the scans leaves the directory
+    /// unjudged rather than wrongly complete. This path never writes, so a
+    /// gap is simply left for a flush to heal.
     async fn verify_inline_directory(
         &self,
         handle: ReadHandle<'_>,
@@ -259,12 +264,19 @@ impl ReadOnlyCatalog {
         table: TableId,
         chunks: &[(InlineOperation, InlineChunkValue)],
     ) -> Result<()> {
-        if !handle.is_isolated()
-            || projection::format_floor(&self.projections)
-                < commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY
+        if projection::format_floor(&self.projections) < commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY
         {
             return Ok(());
         }
+
+        // Read before the directory scan, compared after it: the walked
+        // chunks were taken at this head too, so an unmoved head means all
+        // of it described one state.
+        let before = if handle.is_isolated() {
+            None
+        } else {
+            Some(commit::read_head_value(handle).await?)
+        };
 
         let directory: BTreeSet<u64> =
             store_inline::scan_inline_chunk_ranges(handle, overlay, table.get())
@@ -280,7 +292,14 @@ impl ReadOnlyCatalog {
                     .and_then(|count| chunk.row_id_start.checked_add(count))
             })
             .collect();
-        if ends == Some(directory) {
+        let steady = match &before {
+            None => true,
+            Some(before) => {
+                let after = commit::read_head_value(handle).await?;
+                after.snapshot_id == before.snapshot_id && after.batch_seq == before.batch_seq
+            }
+        };
+        if steady && ends == Some(directory) {
             projection::note_inline_directory_complete(&self.projections, table.get());
         }
 
