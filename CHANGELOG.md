@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/morainedb/moraine/compare/v0.6.0...v0.6.1) - 2026-08-21
+
+### Added
+
+- name what a staged commit lost its race to ([#162](https://github.com/morainedb/moraine/pull/162))
+
+### Fixed
+
+- three inline defects that hide live rows or strand index entries ([#172](https://github.com/morainedb/moraine/pull/172))
+- keep a flushed inline table bindable, and dedupe what that retains ([#170](https://github.com/morainedb/moraine/pull/170))
+- pin metadata row ids, invalidate after the sweep, guard unique deletes ([#160](https://github.com/morainedb/moraine/pull/160))
+- hold one read window across both backfill stages ([#158](https://github.com/morainedb/moraine/pull/158))
+- serialize the staged tx behind its handle's own lock ([#166](https://github.com/morainedb/moraine/pull/166))
+- guard the transaction's held materializations against executor races ([#164](https://github.com/morainedb/moraine/pull/164))
+
+### Other
+
+- scope an inline scan to the schema version it serves ([#169](https://github.com/morainedb/moraine/pull/169))
+- serve a data file's byte ranges from the auxiliary cache ([#167](https://github.com/morainedb/moraine/pull/167))
+- serve inline table scans from the chunk directory ([#165](https://github.com/morainedb/moraine/pull/165))
+- cut the commit and read paths' serialized store reads ([#163](https://github.com/morainedb/moraine/pull/163))
+- skip the ended half for a data-file read bounded at the head ([#161](https://github.com/morainedb/moraine/pull/161))
+- cut the flush path's per-commit and per-statement catalog walks ([#159](https://github.com/morainedb/moraine/pull/159))
+- cut what a statement materializes to plan itself ([#156](https://github.com/morainedb/moraine/pull/156))
+- emit an inlined row's own id as its rowid ([#168](https://github.com/morainedb/moraine/pull/168))
+
 ## [0.6.0](https://github.com/morainedb/moraine/compare/v0.5.2...v0.6.0) - 2026-08-17
 
 ### Added
