@@ -315,8 +315,12 @@ impl ReadOnlyCatalog {
         // `scan_prefix` takes its bounds as a suffix of the prefix.
         let suffix = start[kind_prefix.len()..].to_vec();
 
-        let session = self.begin_read().await?;
-        let first = session
+        // Through the dump read for its fresh reader: the sweep folds the tail
+        // first and then reads the store, and the shared reader only refreshes
+        // on its poll interval, so it can still be behind that fold. The
+        // overlay is deliberately unused — what the fold left is the subject.
+        let read = self.begin_dump().await?;
+        let first = read
             .handle()
             .scan_prefix(kind_prefix, suffix.., ScanShape::Probe)
             .await
@@ -324,7 +328,7 @@ impl ReadOnlyCatalog {
             .next()
             .await
             .map_err(Error::from)?;
-        session.finish();
+        read.finish().await;
 
         let Some(entry) = first else {
             return Ok(None);
