@@ -615,9 +615,18 @@ impl StagedTransaction {
     async fn committed_entities(&self) -> Result<&Arc<Vec<read::EntityRecord>>> {
         self.committed
             .get_or_try_init(|| async {
+                let started = std::time::Instant::now();
                 let (handle, overlay) = self.backing.committed_scan();
                 let mut records = read::scan_current_entities_overlaid(handle, overlay).await?;
+                let current_records = records.len();
                 records.extend(read::scan_history_entities_overlaid(handle, overlay).await?);
+                debug!(
+                    current_records,
+                    history_records = records.len().saturating_sub(current_records),
+                    records = records.len(),
+                    elapsed_ms = milliseconds(started.elapsed()),
+                    "scanned committed entities for staged transaction"
+                );
                 Ok(Arc::new(records))
             })
             .await

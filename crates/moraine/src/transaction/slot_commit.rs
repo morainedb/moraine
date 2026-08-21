@@ -585,7 +585,7 @@ async fn slot_head(store: &SlotStore, until: Option<u64>, fresh: bool) -> Result
         });
     }
 
-    if !fresh && let Replayed::Head(head) = replay(&store.reader, &store.slots, until).await? {
+    if !fresh && let Replayed::Head(head) = replay(&store.reader, store, until).await? {
         return Ok(*head);
     }
 
@@ -594,7 +594,7 @@ async fn slot_head(store: &SlotStore, until: Option<u64>, fresh: bool) -> Result
     // a live `DbReader` cannot be refreshed, so only a freshly opened one can
     // tell a stale cursor from a slot destroyed outside the protocol.
     let reader = reopen_reader(store).await?;
-    match replay(&reader, &store.slots, until).await {
+    match replay(&reader, store, until).await {
         // The view came from this reader, so it travels with the head: an entry
         // scan must read through it, not the handle's staler reader.
         Ok(Replayed::Head(mut head)) => {
@@ -628,7 +628,7 @@ enum Replayed {
 /// Replays the tail onto the folded view, stopping once `until` is reached. A
 /// truncated replay's overlay and `next_sequence` cover only the slots it
 /// applied, so only an `until` of `None` describes the head.
-async fn replay(reader: &DbReader, slots: &SlotLog, until: Option<u64>) -> Result<Replayed> {
+async fn replay(reader: &DbReader, store: &SlotStore, until: Option<u64>) -> Result<Replayed> {
     let handle = ReadHandle::Reader(reader);
 
     // The cursor is read before the view, both through this reader. A
@@ -642,7 +642,7 @@ async fn replay(reader: &DbReader, slots: &SlotLog, until: Option<u64>) -> Resul
     // A fold cursor of `n` means slots `1..=n` are applied, so the tail starts
     // at `n + 1`.
     let from = folded.saturating_add(1);
-    let tail = slots.read_tail(from).await?;
+    let tail = store.slots.read_tail(from).await?;
     if let Some(gap_at) = tail.gap_at {
         return Ok(Replayed::Hole { gap_at, folded });
     }
@@ -667,7 +667,7 @@ async fn replay(reader: &DbReader, slots: &SlotLog, until: Option<u64>) -> Resul
     let mut chain: Option<u64> = if tail.slots.is_empty() {
         None
     } else {
-        tail_anchor(slots, folded).await?
+        tail_anchor(store, folded).await?
     };
     'tail: for (sequence, envelope) in &tail.slots {
         for commit in &envelope.commits {
@@ -721,12 +721,15 @@ async fn replay(reader: &DbReader, slots: &SlotLog, until: Option<u64>) -> Resul
 /// tail folded into that view, so it cannot read the two apart. An unanchored
 /// tail is still checked slot against slot; it is the first slot that goes
 /// unchecked.
-async fn tail_anchor(slots: &SlotLog, folded: u64) -> Result<Option<u64>> {
+async fn tail_anchor(store: &SlotStore, folded: u64) -> Result<Option<u64>> {
+    // Nothing folded leaves the store the only record of the head, and the
+    // fold cursor and a folded-only reader answer from different manifests,
+    // which can disagree — so there is nothing here to anchor on safely.
     if folded == 0 {
         return Ok(None);
     }
 
-    let Some(envelope) = slots.read_slot(folded).await? else {
+    let Some(envelope) = store.slots.read_slot(folded).await? else {
         return Ok(None);
     };
 
@@ -1168,23 +1171,21 @@ mod tests {
             .unwrap();
 
         // Slot 1 leaves head 1, so a slot following it owes exactly that.
-        assert_eq!(tail_anchor(&store.slots, 1).await.unwrap(), Some(1));
-        // Nothing folded, and a truncated slot, leave the store the only
-        // record of the head.
-        assert_eq!(tail_anchor(&store.slots, 0).await.unwrap(), None);
-        assert_eq!(tail_anchor(&store.slots, 9).await.unwrap(), None);
+        assert_eq!(tail_anchor(&store, 1).await.unwrap(), Some(1));
+        // Nothing folded, and a truncated slot, leave nothing to anchor on.
+        assert_eq!(tail_anchor(&store, 0).await.unwrap(), None);
+        assert_eq!(tail_anchor(&store, 9).await.unwrap(), None);
     }
 
     /// A commit validated above the replayed head means the slots between them
     /// are missing, so its writes never apply.
     ///
-    /// Refusing it needs the head the tail must start from, and here nothing
-    /// is folded, so the log cannot supply it — see `tail_anchor`. Whether the
-    /// bootstrap fold has reached this reader's manifest decides whether the
-    /// anchor exists at all, which makes the outcome a race rather than a
-    /// result. Reading the folded head apart from the replayed tail is what
-    /// this needs.
-    #[ignore = "the first slot is unanchored when nothing is folded; needs a folded-only head read"]
+    /// Refusing it needs the head the tail must start from. Nothing is folded
+    /// here, and the fold cursor and a reader that does not replay the log
+    /// answer from different manifests, which can disagree — so `tail_anchor`
+    /// has nothing it can trust. Telling the folded state from the tail under
+    /// one manifest is what this needs.
+    #[ignore = "the first slot is unanchored when nothing is folded"]
     #[tokio::test]
     async fn a_commit_validated_above_the_view_refuses() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
