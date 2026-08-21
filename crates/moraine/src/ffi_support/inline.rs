@@ -106,12 +106,30 @@ pub async fn scan_inline(
 #[doc(hidden)]
 pub async fn inline_schemas(catalog: &ReadOnlyCatalog, table_id: u64) -> Result<Vec<(u64, Bytes)>> {
     let read = catalog.begin_catalog_read().await?;
+    let head = read.head_value();
+    // A base-table scan asks once per registered schema version and every ask
+    // returns the same whole list, so the scan is paid once per head.
+    if let Some(schemas) =
+        crate::catalog::projection::inline_schemas_at(catalog.projections(), table_id, &head)
+    {
+        read.finish().await;
+        return Ok(schemas.as_ref().clone());
+    }
+
     let schemas = store_inline::scan_inline_schemas(read.handle(), read.overlay(), table_id).await;
     read.finish().await;
-    Ok(schemas?
+    let schemas: Vec<(u64, Bytes)> = schemas?
         .into_iter()
         .map(|(schema_version, value)| (schema_version, value.arrow_schema))
-        .collect())
+        .collect();
+    crate::catalog::projection::install_inline_schemas(
+        catalog.projections(),
+        table_id,
+        head,
+        std::sync::Arc::new(schemas.clone()),
+    );
+
+    Ok(schemas)
 }
 
 /// Every `(table_id, schema_version)` with a recorded inline schema,

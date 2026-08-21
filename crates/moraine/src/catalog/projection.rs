@@ -30,6 +30,9 @@ pub(crate) fn materialize<K: Ord, V: Clone>(rows: &BTreeMap<K, V>) -> Vec<V> {
     rows.values().cloned().collect()
 }
 
+/// One table's recorded inline schemas, shared so a serve is a refcount bump.
+pub(crate) type InlineSchemas = Arc<Vec<(u64, bytes::Bytes)>>;
+
 /// Whether two head records name the same store state.
 fn same_head(a: &HeadValue, b: &HeadValue) -> bool {
     a.snapshot_id == b.snapshot_id && a.batch_seq == b.batch_seq
@@ -88,6 +91,31 @@ pub(crate) fn raise_format_floor(cache: &std::sync::RwLock<ProjectionCache>, obs
         .raise_format_floor(observed);
 }
 
+/// `table_id`'s inline schemas iff they stand at exactly `expected`.
+pub(crate) fn inline_schemas_at(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+    expected: &HeadValue,
+) -> Option<InlineSchemas> {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inline_schemas_at(table_id, expected)
+}
+
+/// Records `table_id`'s inline schemas as scanned at `head`.
+pub(crate) fn install_inline_schemas(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+    head: HeadValue,
+    schemas: InlineSchemas,
+) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .install_inline_schemas(table_id, head, schemas);
+}
+
 /// Whether `table_id`'s inline chunk-range directory is known complete.
 pub(crate) fn inline_directory_complete(
     cache: &std::sync::RwLock<ProjectionCache>,
@@ -144,6 +172,10 @@ pub(crate) struct ProjectionCache {
     /// Invalidation leaves it standing: it describes the store, not a view
     /// of it.
     inline_directory_complete: BTreeSet<u64>,
+    /// One table's recorded inline schemas, stamped with the head they were
+    /// scanned at. A base-table scan asks for them once per registered
+    /// schema version, and every ask returns the same whole list.
+    inline_schemas: BTreeMap<u64, (HeadValue, InlineSchemas)>,
 }
 
 impl ProjectionCache {
@@ -173,7 +205,30 @@ impl ProjectionCache {
             history_entities: None,
             format_floor: 0,
             inline_directory_complete: BTreeSet::new(),
+            inline_schemas: BTreeMap::new(),
         }
+    }
+
+    /// `table_id`'s inline schemas iff they stand at exactly `expected`.
+    pub(crate) fn inline_schemas_at(
+        &self,
+        table_id: u64,
+        expected: &HeadValue,
+    ) -> Option<InlineSchemas> {
+        self.inline_schemas
+            .get(&table_id)
+            .filter(|(head, _)| same_head(head, expected))
+            .map(|(_, schemas)| Arc::clone(schemas))
+    }
+
+    /// Records `table_id`'s inline schemas as scanned at `head`.
+    pub(crate) fn install_inline_schemas(
+        &mut self,
+        table_id: u64,
+        head: HeadValue,
+        schemas: InlineSchemas,
+    ) {
+        self.inline_schemas.insert(table_id, (head, schemas));
     }
 
     /// Whether `table_id`'s chunk-range directory is known to name every
