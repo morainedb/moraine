@@ -810,6 +810,12 @@ impl CatalogSnapshot {
         );
     }
 
+    /// Drops one column mapping. A mapping is immutable while its table
+    /// lives; reclaiming a dropped table's mappings is what removes one.
+    pub(crate) fn remove_mapping(&mut self, table_id: u64, mapping_id: u64) {
+        remove_nested(&mut self.mappings, table_id, &mapping_id);
+    }
+
     pub(crate) fn remove_tag(&mut self, object_id: u64) {
         self.tags.remove(&object_id);
     }

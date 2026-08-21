@@ -6,7 +6,7 @@
 use super::StagedWrite;
 use crate::{
     catalog::CatalogSnapshot,
-    error::{Error, Result},
+    error::Result,
     store::{
         key::{CurrentKey, EntityKey, Key, SysKey},
         proto::{HeadValue, SnapshotValue},
@@ -27,7 +27,7 @@ pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> 
         match Key::decode(encoded_key)? {
             Key::Current(CurrentKey::Entity(entity)) => match bytes {
                 Some(bytes) => view.put_record(decode_entity(entity, bytes)?),
-                None => remove_entity(view, entity)?,
+                None => remove_entity(view, entity),
             },
             Key::Current(CurrentKey::GcFile { data_file_id }) => match bytes {
                 Some(bytes) => view.put_gc_file(value::decode_value(bytes)?),
@@ -63,7 +63,7 @@ pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> 
 
 /// Removes exactly the entity at one `current` key, keeping the name
 /// indexes coherent and cascading to nothing.
-fn remove_entity(view: &mut CatalogSnapshot, entity: EntityKey) -> Result<()> {
+fn remove_entity(view: &mut CatalogSnapshot, entity: EntityKey) {
     match entity {
         EntityKey::Schema { schema_id } => view.remove_schema_only(schema_id),
         EntityKey::Table { table_id } => view.remove_table_only(table_id),
@@ -102,11 +102,12 @@ fn remove_entity(view: &mut CatalogSnapshot, entity: EntityKey) -> Result<()> {
             scope_id,
         } => view.remove_option_record((scope_kind, scope_id)),
         EntityKey::Tag { object_id } => view.remove_tag(object_id),
-        EntityKey::Mapping { .. } => {
-            return Err(Error::Corruption(
-                "column-mapping deletion is unexpected; mappings are immutable".to_string(),
-            ));
-        }
+        // A mapping is immutable while its table lives, but reclaiming a
+        // dropped table's mappings deletes one, and the log has to replay
+        // every write a commit makes.
+        EntityKey::Mapping {
+            table_id,
+            mapping_id,
+        } => view.remove_mapping(table_id, mapping_id),
     }
-    Ok(())
 }
