@@ -1048,6 +1048,89 @@ void CompactImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 
 } // namespace
 
+// moraine_raise_format: the operator's opt-in to the store formats that
+// add record shapes an older binary would misread rather than refuse.
+//
+// It is a one-way door, and deliberately the only one: nothing a commit
+// does moves a store past a format its readers may not understand, so a
+// flush cannot strand them as a side effect. Raise it once every reader
+// of the store is on a binary that understands the format — an already
+// attached older reader is not refused by anything here.
+struct RaiseFormatBindData : public duckdb::FunctionData {
+	std::string catalog_name;
+	// Reports the move without making it: the only way to read a store's
+	// format without moving it, and the pre-flight for a one-way door.
+	bool dry_run = false;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<RaiseFormatBindData>();
+		*result = *this;
+		return result;
+	}
+	bool Equals(const duckdb::FunctionData &other_p) const override {
+		auto &other = other_p.Cast<RaiseFormatBindData>();
+		return catalog_name == other.catalog_name && dry_run == other.dry_run;
+	}
+};
+
+duckdb::unique_ptr<duckdb::FunctionData> RaiseFormatBind(duckdb::ClientContext &,
+                                                         duckdb::TableFunctionBindInput &input,
+                                                         duckdb::vector<duckdb::LogicalType> &return_types,
+                                                         duckdb::vector<duckdb::string> &names) {
+	names = {"from_format", "to_format"};
+	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
+
+	if (input.inputs[0].IsNull()) {
+		throw duckdb::BinderException("moraine_raise_format: the lake name must not be NULL");
+	}
+	auto bind_data = duckdb::make_uniq<RaiseFormatBindData>();
+	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
+	if (bind_data->catalog_name.empty()) {
+		throw duckdb::BinderException("moraine_raise_format: the lake name must not be empty");
+	}
+	for (auto &option : input.named_parameters) {
+		if (duckdb::StringUtil::CIEquals(option.first, "dry_run")) {
+			if (option.second.IsNull()) {
+				throw duckdb::BinderException("moraine_raise_format: dry_run must not be NULL");
+			}
+			bind_data->dry_run = option.second.GetValue<bool>();
+		}
+	}
+	return bind_data;
+}
+
+struct RaiseFormatGlobalState : public duckdb::GlobalTableFunctionState {
+	bool emitted = false;
+};
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> RaiseFormatInitGlobal(duckdb::ClientContext &,
+                                                                          duckdb::TableFunctionInitInput &) {
+	return duckdb::make_uniq<RaiseFormatGlobalState>();
+}
+
+void RaiseFormatImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<RaiseFormatBindData>();
+	auto &state = data.global_state->Cast<RaiseFormatGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+
+	auto &catalog = ResolveMoraineCatalog(context, bind_data.catalog_name);
+	uint64_t from_format = 0;
+	uint64_t to_format = 0;
+	MoraineError err {};
+	auto code = moraine_raise_format(catalog.Handle(), bind_data.dry_run, &from_format, &to_format, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+
+	output.SetValue(0, 0, duckdb::Value::UBIGINT(from_format));
+	output.SetValue(1, 0, duckdb::Value::UBIGINT(to_format));
+	output.SetCardinality(1);
+}
+
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader) {
 	duckdb::ExtensionCallback::Register(loader.GetDatabaseInstance().config,
 	                                    duckdb::make_shared_ptr<MaintenanceLifecycle>());
@@ -1065,6 +1148,11 @@ void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader) {
 	compact.named_parameters["timeout"] = duckdb::LogicalType::ANY;
 	compact.named_parameters["require_completed"] = duckdb::LogicalType::BOOLEAN;
 	loader.RegisterFunction(compact);
+
+	duckdb::TableFunction raise_format("moraine_raise_format", {duckdb::LogicalType::VARCHAR}, RaiseFormatImpl,
+	                                   RaiseFormatBind, RaiseFormatInitGlobal);
+	raise_format.named_parameters["dry_run"] = duckdb::LogicalType::BOOLEAN;
+	loader.RegisterFunction(raise_format);
 }
 
 } // namespace moraine_duckdb

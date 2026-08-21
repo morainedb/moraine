@@ -1181,6 +1181,31 @@ int32_t moraine_migrate(const char *path,
                         struct MoraineMigrationReport *out,
                         struct MoraineError *err);
 
+// Raises the store `handle` names to the newest purely additive format
+// this binary writes, opening the record shapes gated behind it, and
+// reports the formats either side of the move.
+//
+// A one-way door, and the only thing that opens it: the shapes it
+// admits are ones an older binary misreads rather than refuses, so the
+// store can no longer be opened by a binary that predates the format.
+// A reader already attached on an older binary is not refused by this —
+// raise the format only once every reader understands it. `dry_run`
+// reports the move it would make and stamps nothing, which is the only
+// way to read a store's format without changing it.
+//
+// # Safety
+//
+// `handle` must be a pointer previously returned by [`moraine_attach`]
+// and not yet detached.
+// `out_from`/`out_to` must be valid, writable pointers, and `err`, if
+// non-null, a valid, writable [`MoraineError`], for the duration of the
+// call.
+int32_t moraine_raise_format(struct MoraineCatalogHandle *handle,
+                             bool dry_run,
+                             uint64_t *out_from,
+                             uint64_t *out_to,
+                             struct MoraineError *err);
+
 // Frees an owned string a `moraine_*` call returned (such as
 // [`moraine_data_path`]'s `out`). A null pointer is ignored.
 //

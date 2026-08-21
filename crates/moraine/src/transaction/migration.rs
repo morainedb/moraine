@@ -59,6 +59,45 @@ pub(crate) struct MigrationUnit {
 /// Empty: every format to date is additive, so no keyspace is rewritten.
 pub(crate) const MIGRATIONS: &[MigrationUnit] = &[];
 
+/// What one raise call did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FormatRaise {
+    /// The format the store carried when the call began.
+    pub from_format: u64,
+    /// The format it carries now. Equal to `from_format` when there was
+    /// nothing to raise.
+    pub to_format: u64,
+}
+
+/// The highest format `current` can reach without a structural rewrite:
+/// the newest a stamp alone describes, stopped below the first format some
+/// migration unit reads. Past that one the keys have moved, and only that
+/// unit puts them where the new format says they are.
+fn additive_ceiling(current: u64) -> u64 {
+    registry()
+        .into_iter()
+        .map(|unit| unit.from_format)
+        .filter(|from| *from >= current)
+        .min()
+        .map_or(commit::MAX_ADDITIVE_FORMAT, |rewrite_at| {
+            rewrite_at.min(commit::MAX_ADDITIVE_FORMAT)
+        })
+}
+
+/// What a raise would do to a store whose commits ride the slot log.
+///
+/// Nothing: bootstrap stamps such a store at [`commit::FORMAT_MULTI_WRITER`],
+/// which is above every format a stamp alone reaches, so the ceiling is always
+/// below it and there is no move to make. The report says so rather than the
+/// call being absent, since an operator asking a store its format asks here.
+pub(crate) fn raise_format_stamped(from_format: u64) -> FormatRaise {
+    FormatRaise {
+        from_format,
+        to_format: additive_ceiling(from_format).max(from_format),
+    }
+}
+
 /// The units a call plans over: everything this binary ships, plus whatever
 /// a fault-injection build installed.
 fn registry() -> Vec<&'static MigrationUnit> {

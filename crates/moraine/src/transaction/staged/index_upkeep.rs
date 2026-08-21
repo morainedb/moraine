@@ -97,7 +97,6 @@ impl<'a> InlineSchemaCache<'a> {
                             "no inline schema for table {table_id} version {schema_version}"
                         ))
                     })?
-                    .arrow_schema
                 };
                 data_file::decode_inline_schema(schema_ipc)
             })
@@ -1363,6 +1362,7 @@ mod tests {
             })
             .encode(),
             value::encode_value(&proto::InlineSchemaValue {
+                same_as_version: None,
                 arrow_schema: schema_ipc.into(),
             }),
         )

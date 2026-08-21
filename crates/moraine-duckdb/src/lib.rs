@@ -131,6 +131,38 @@
 //! );
 //! ```
 //!
+//! # Store format
+//!
+//! A store's format rises on its own, stamped by the commit that first
+//! writes a record shape needing it — a live index, an inline chunk
+//! locator, a collapsed inline schema. Each step is one-way: a store that
+//! has taken a format can no longer be opened by a binary that predates
+//! it, and a reader already attached on such a binary is not refused, so
+//! it keeps running and may misread later commits. Upgrade every reader
+//! of a store before its writers start producing shapes the readers do
+//! not know.
+//!
+//! `moraine_raise_format` takes the newest purely additive format
+//! deliberately, for an operator who would rather not wait for the first
+//! commit that needs it, and reports the move.
+//!
+//! ```sql
+//! -- What format is this store, and where would a raise take it?
+//! SELECT from_format, to_format
+//! FROM moraine_raise_format('lake', dry_run := true);
+//!
+//! -- Take it, once every reader is on a binary that understands it.
+//! SELECT from_format, to_format FROM moraine_raise_format('lake');
+//! ```
+//!
+//! `dry_run := true` reports the move without making it — the only way
+//! to read a store's format without moving it, and the way to check
+//! where a store sits before an upgrade.
+//!
+//! It is distinct from `moraine_migrate`, which rewrites a keyspace to
+//! make a store readable by this binary at all, and it stops below any
+//! format such a rewrite targets.
+//!
 //! # Diagnostics
 //!
 //! The core emits `tracing` events; this crate forwards them to DuckDB's

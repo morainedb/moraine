@@ -1119,6 +1119,36 @@ impl ReadOnlyCatalog {
 }
 
 impl Catalog {
+    /// Reports the store's format and the highest a stamp alone could raise
+    /// it to.
+    ///
+    /// A store whose commits ride the slot log is stamped at bootstrap with a
+    /// format above every one a stamp reaches, so there is never a move to
+    /// make and `dry_run` reads the same either way. It is still how an
+    /// operator asks a store what format it carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be read, or is mid-migration.
+    pub async fn raise_format(
+        &self,
+        dry_run: bool,
+    ) -> Result<crate::transaction::migration::FormatRaise> {
+        let _ = dry_run;
+        let Store::Slots(store) = self.store.as_ref();
+        let handle = ReadHandle::Reader(&store.reader);
+        // The unmemoized look: an operator asking about a migration is owed a
+        // current answer, not one a read window may still be standing on.
+        commit::refuse_mid_migration(handle).await?;
+        let from_format = crate::store::read::read_format(handle)
+            .await?
+            .map_or(commit::FORMAT_VERSION, |stamp| stamp.format_version);
+
+        Ok(crate::transaction::migration::raise_format_stamped(
+            from_format,
+        ))
+    }
+
     /// Opens (creating and initializing if empty) the catalog in
     /// `object_store` at `options.path`.
     ///

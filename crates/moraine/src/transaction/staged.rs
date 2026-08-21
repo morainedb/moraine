@@ -1202,7 +1202,10 @@ pub(crate) async fn assemble(
     // Read before any write is staged: `InlineFlushDelete`/`InlineDrop` name a
     // table, not keys, and resolve against the pre-commit state exactly like
     // `base`.
-    let inline_writes = translate_inline(handle, overlay, projections, ops).await?;
+    // The reference flag the translation reports is nothing to act on here: a
+    // slot-backed store is stamped above that format at bootstrap, so the
+    // shape is always already admitted.
+    let (inline_writes, _) = translate_inline(handle, overlay, projections, ops).await?;
 
     let mints_snapshot = ops.iter().any(|op| {
         matches!(

@@ -4,13 +4,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use moraine_wal::Overlay;
 
 use crate::{
     catalog::projection::ProjectionCache,
     error::{Error, Result},
-    store::{handle::ReadHandle, inline as store_inline, proto},
+    store::{handle::ReadHandle, inline as store_inline},
     transaction::{
         commit::StagedWrite,
         staged::inline::{
@@ -67,7 +68,7 @@ async fn recorded_schemas(
     handle: ReadHandle<'_>,
     overlay: Option<&Overlay>,
     ops: &[InlineStage],
-) -> Result<HashMap<(u64, u64), Option<proto::InlineSchemaValue>>> {
+) -> Result<HashMap<(u64, u64), Option<Bytes>>> {
     let mut versions = Vec::new();
     let mut seen = HashSet::new();
     for op in ops {
@@ -138,13 +139,13 @@ async fn translated_flushes(
 /// The schema record a version owes, or nothing when it already has one.
 /// A version's schema is fixed once written; a differing one is refused.
 fn schema_write_if_new(
-    recorded: Option<&proto::InlineSchemaValue>,
+    recorded: Option<&Bytes>,
     table_id: u64,
     schema_version: u64,
     arrow_schema: &[u8],
 ) -> Result<Option<StagedWrite>> {
     match recorded {
-        Some(recorded) if recorded.arrow_schema == arrow_schema => Ok(None),
+        Some(recorded) if recorded == arrow_schema => Ok(None),
         Some(_) => Err(Error::Constraint(format!(
             "table {table_id} already records a different schema for version {schema_version}; \
              a version's schema is fixed once its first chunk is written"
@@ -306,6 +307,7 @@ mod tests {
             .encode(),
             value::encode_value(&proto::InlineSchemaValue {
                 arrow_schema: b"v1".to_vec().into(),
+                same_as_version: None,
             }),
         )
         .unwrap();

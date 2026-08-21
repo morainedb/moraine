@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use object_store::path::Path;
 
@@ -15,9 +16,7 @@ use crate::{
     },
     data_file::{self, DataStore},
     error::{Error, Result},
-    store::{
-        handle::ReadHandle, inline as store_inline, key::InlineOperation, proto::InlineSchemaValue,
-    },
+    store::{handle::ReadHandle, inline as store_inline, key::InlineOperation},
 };
 
 async fn collect_immediate_backfill<'a>(
@@ -103,7 +102,7 @@ pub(super) async fn read_inline_schemas(
     overlay: Option<&moraine_wal::Overlay>,
     table: TableId,
     schema_versions: impl IntoIterator<Item = u64>,
-) -> Result<HashMap<u64, InlineSchemaValue>> {
+) -> Result<HashMap<u64, Bytes>> {
     let schema_versions: BTreeSet<u64> = schema_versions.into_iter().collect();
 
     stream::iter(
@@ -338,7 +337,7 @@ impl ReadOnlyCatalog {
             .await?
             .into_iter()
             .map(|(schema_version, record)| {
-                let schema = data_file::decode_inline_schema(record.arrow_schema)?;
+                let schema = data_file::decode_inline_schema(record)?;
                 Ok::<_, Error>((schema_version, schema))
             })
             .collect::<Result<HashMap<_, _>>>()?;

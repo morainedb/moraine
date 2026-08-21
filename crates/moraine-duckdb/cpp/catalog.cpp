@@ -627,7 +627,9 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateType(duckdb
 void MoraineSchemaEntry::DropEntry(duckdb::ClientContext &context, duckdb::DropInfo &info) {
 	// The flush cleanup's `DROP TABLE ducklake_inlined_data_<t>_<v>` is the
 	// only DROP reaching here: deregister just this schema version, leaving
-	// other schema versions' inline/* records untouched. The whole-table
+	// other schema versions' inline/* records untouched. The version's Arrow
+	// schema survives the deregistration, so a session still holding the
+	// pre-flush registry binds the name and scans it empty. The whole-table
 	// cascade (`moraine_tx_stage_inline_drop`) runs on the DuckLake attach's
 	// own catalog, not this metadata connection's schema.
 	if (info.type == duckdb::CatalogType::TABLE_ENTRY) {

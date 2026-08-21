@@ -209,6 +209,56 @@ pub(crate) async fn scan_decode_maybe<T>(
     }
 }
 
+/// [`scan_keys`], overlaying the unfolded tail when one is given: a tail
+/// write adds its key, a tail delete hides it. The values stay undecoded on
+/// both sides — this is for scans whose answer is the key.
+pub(crate) async fn scan_keys_maybe<T>(
+    handle: ReadHandle<'_>,
+    overlay: Option<&moraine_wal::Overlay>,
+    prefix: Vec<u8>,
+    shape: ScanShape,
+    mut extract: impl FnMut(Key) -> Result<T>,
+) -> Result<Vec<T>> {
+    let Some(overlay) = overlay else {
+        return scan_keys(handle, prefix, shape, extract).await;
+    };
+
+    let mut keys: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut iter = handle.scan_prefix(prefix.clone(), .., shape).await?;
+    while let Some(entry) = iter.next().await? {
+        keys.insert(entry.key.to_vec());
+    }
+    for (key, value) in overlay.prefixed(&prefix) {
+        if value.is_some() {
+            keys.insert(key.to_vec());
+        } else {
+            keys.remove(key);
+        }
+    }
+
+    keys.into_iter()
+        .map(|key| extract(Key::decode(&key)?))
+        .collect()
+}
+
+/// As [`scan_decode`], but for a scan whose answer is in the keys. The
+/// value never reaches `extract`, so a record decodes no body — the store
+/// still delivers the bytes, since a key and its value share an SST block.
+pub(crate) async fn scan_keys<T>(
+    handle: ReadHandle<'_>,
+    prefix: Vec<u8>,
+    shape: ScanShape,
+    mut extract: impl FnMut(Key) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut iter = handle.scan_prefix(prefix, .., shape).await?;
+    let mut records = Vec::new();
+    while let Some(entry) = iter.next().await? {
+        records.push(extract(Key::decode(&entry.key)?)?);
+    }
+
+    Ok(records)
+}
+
 /// As [`scan_decode`], splitting each of `splits` (the data-scaled kinds'
 /// prefixes under `prefix`) into concurrent sub-ranges once it outgrows one
 /// read-ahead; the records still come back in key order.

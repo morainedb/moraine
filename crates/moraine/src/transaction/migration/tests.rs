@@ -14,8 +14,14 @@ use crate::{
         open::StoreBuilder,
         read::{EntityRecord, scan_current_entities},
     },
-    transaction::commit::{FORMAT_VERSION, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION, commit_durably},
+    transaction::commit::{
+        FORMAT_VERSION, MAX_ADDITIVE_FORMAT, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION, commit_durably,
+    },
 };
+
+/// A store is bootstrapped past every format a stamp alone reaches, so a
+/// raise never has one to make.
+const _: () = assert!(MAX_ADDITIVE_FORMAT < MAX_FORMAT_VERSION);
 
 /// The format the rewriting synthetic unit lands on: the newest this binary
 /// reads, so a store it migrated still attaches.
@@ -444,5 +450,102 @@ fn the_registry_and_the_readable_floor_agree() {
     assert_eq!(
         MIN_FORMAT_VERSION, expected_floor,
         "the floor must sit at the newest rewritten layout: below it the keys are somewhere else"
+    );
+}
+
+/// The ceiling is the newest format a stamp alone describes, stopped below
+/// the first one a unit reads: past that the keys have moved, and only that
+/// unit's rewrite puts them where the format says they are. It stops below
+/// the topology formats too — nothing drifts into one.
+#[test]
+fn the_additive_ceiling_stops_below_the_first_rewrite() {
+    assert_eq!(additive_ceiling(FORMAT_VERSION), MAX_ADDITIVE_FORMAT);
+
+    install_migration(SyntheticMigration::MoveOptionScope);
+    let units = registry();
+    let Some(first) = units.iter().map(|unit| unit.from_format).min() else {
+        return;
+    };
+    assert!(
+        additive_ceiling(FORMAT_VERSION) <= first,
+        "the ceiling must not stamp past a format whose keys a unit moves"
+    );
+}
+
+/// A raise reports a slot-backed store settled, whatever it is asked and
+/// however often: bootstrap stamps such a store past every format a stamp
+/// alone reaches, so there is never a move to make and a dry run reads the
+/// same as a live one.
+#[tokio::test]
+async fn raising_the_format_is_idempotent_and_never_implicit() {
+    let object_store = Arc::new(InMemory::new());
+    let catalog = Catalog::open(object_store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+
+    let probed = catalog.raise_format(true).await.unwrap();
+    assert_eq!(
+        probed.from_format, MAX_FORMAT_VERSION,
+        "bootstrap stamps the topology format"
+    );
+    assert_eq!(
+        probed.from_format, probed.to_format,
+        "a store already past the additive ceiling has nowhere to go"
+    );
+    assert_eq!(
+        catalog.raise_format(false).await.unwrap(),
+        probed,
+        "asking to raise reads the same as asking what a raise would do"
+    );
+    assert_eq!(
+        catalog.raise_format(true).await.unwrap(),
+        probed,
+        "and asking again changes nothing"
+    );
+    catalog.close().await.unwrap();
+
+    // Reopening reads the stamp back rather than resetting it.
+    let reopened = Catalog::open(object_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(reopened.raise_format(false).await.unwrap(), probed);
+    reopened.close().await.unwrap();
+}
+
+/// A store whose keyspace is mid-migration never reaches the raise at
+/// all: the marker refuses the open, which is what keeps readers off a
+/// keyspace in motion — and a raise is asked for through a catalog, which
+/// there is no way to obtain on a marked store.
+#[tokio::test]
+async fn a_mid_migration_store_never_reaches_the_raise() {
+    let object_store = Arc::new(InMemory::new());
+    let catalog = Catalog::open(object_store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    catalog.close().await.unwrap();
+
+    let (db, _) = StoreBuilder::new("", object_store.clone())
+        .open_writer()
+        .await
+        .unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Migration).encode(),
+        value::encode_value(&proto::MigrationValue {
+            from_format: FORMAT_VERSION,
+            to_format: FORMAT_VERSION + 1,
+            cursor: Vec::new(),
+        }),
+    )
+    .unwrap();
+    tx.commit().await.unwrap();
+    db.close().await.unwrap();
+
+    let refused = Catalog::open(object_store, CatalogOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, Error::Migration(_)),
+        "expected the open to refuse a marked store, got {refused:?}"
     );
 }

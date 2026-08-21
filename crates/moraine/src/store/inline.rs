@@ -2,8 +2,9 @@
 //! per-schema-version schema records. Mirrors `store::read`'s decode-only
 //! contract — no DuckLake interpretation here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
+use bytes::Bytes;
 use moraine_wal::Overlay;
 
 use crate::{
@@ -12,14 +13,15 @@ use crate::{
         handle::{ReadHandle, ScanShape},
         key::{
             InlineKey, InlineOperation, InlineOperationKind, Key, inline_chunk_range_suffix,
-            inline_chunk_range_table_prefix, inline_live_table_prefix, inline_schema_prefix,
+            inline_chunk_range_table_prefix, inline_live_table_prefix,
+            inline_schema_dropped_prefix, inline_schema_dropped_table_prefix, inline_schema_prefix,
             inline_schema_table_prefix,
         },
         proto::{
             InlineChunkRangeValue, InlineChunkValue, InlineFileDeleteTableValue,
             InlineFileDeleteValue, InlineInlineDeleteValue, InlineSchemaValue,
         },
-        read::{read_singleton, scan_decode_maybe},
+        read::{read_singleton, scan_decode_maybe, scan_keys_maybe},
         value,
     },
 };
@@ -333,10 +335,70 @@ pub(crate) async fn read_inline_file_delete_table(
     Ok(marker.is_some())
 }
 
+/// Resolves `schemas` (a table's records in key order) to each version's
+/// Arrow bytes, following the one hop a `same_as_version` reference is
+/// allowed. A reference naming a missing version, itself, or another
+/// reference is corruption, not a fallback.
+fn resolve_inline_schemas(
+    table_id: u64,
+    schemas: &[(u64, InlineSchemaValue)],
+) -> Result<Vec<(u64, Bytes)>> {
+    let canonical: HashMap<u64, &Bytes> = schemas
+        .iter()
+        .filter(|(_, value)| value.same_as_version.is_none())
+        .map(|(schema_version, value)| (*schema_version, &value.arrow_schema))
+        .collect();
+
+    schemas
+        .iter()
+        .map(|(schema_version, value)| match value.same_as_version {
+            None => Ok((*schema_version, value.arrow_schema.clone())),
+            Some(target) => canonical
+                .get(&target)
+                .map(|bytes| (*schema_version, (*bytes).clone()))
+                .ok_or_else(|| {
+                    Error::Corruption(format!(
+                        "inline schema {table_id}/{schema_version} references version {target}, \
+                         which carries no schema of its own"
+                    ))
+                }),
+        })
+        .collect()
+}
+
 /// One table's Arrow IPC schema at `schema_version`, if recorded. `overlay`
 /// resolves a tail write or tombstone ahead of the store on a slot-backed
 /// attach.
 pub(crate) async fn read_inline_schema(
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
+    table_id: u64,
+    schema_version: u64,
+) -> Result<Option<Bytes>> {
+    let Some(record) = read_inline_schema_record(handle, overlay, table_id, schema_version).await?
+    else {
+        return Ok(None);
+    };
+    let Some(target) = record.same_as_version else {
+        return Ok(Some(record.arrow_schema));
+    };
+
+    // The hop reads through the overlay too: a tail that deregistered one
+    // version may carry the version it now points at.
+    let canonical = read_inline_schema_record(handle, overlay, table_id, target).await?;
+    match canonical {
+        Some(value) if value.same_as_version.is_none() => Ok(Some(value.arrow_schema)),
+        _ => Err(Error::Corruption(format!(
+            "inline schema {table_id}/{schema_version} references version {target}, which carries \
+             no schema of its own"
+        ))),
+    }
+}
+
+/// One table's schema record at `schema_version`, unresolved. `overlay`
+/// resolves a tail write or tombstone ahead of the store on a slot-backed
+/// attach.
+async fn read_inline_schema_record(
     handle: ReadHandle<'_>,
     overlay: Option<&Overlay>,
     table_id: u64,
@@ -354,6 +416,17 @@ pub(crate) async fn read_inline_schema(
         }
     }
     read_singleton(handle, key).await
+}
+
+/// Every schema version recorded for `table_id` with its Arrow bytes,
+/// references resolved, in key order.
+pub(crate) async fn scan_inline_schemas_resolved(
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
+    table_id: u64,
+) -> Result<Vec<(u64, Bytes)>> {
+    let schemas = scan_inline_schemas(handle, overlay, table_id).await?;
+    resolve_inline_schemas(table_id, &schemas)
 }
 
 /// Every schema version recorded for `table_id`, in key order.
@@ -379,8 +452,82 @@ pub(crate) async fn scan_inline_schemas(
     .await
 }
 
+/// Every `(table_id, schema_version)` with a schema record, in key order,
+/// without decoding the schemas themselves — the registry needs the pair,
+/// not the columns.
+pub(crate) async fn scan_all_inline_schema_keys(
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
+) -> Result<Vec<(u64, u64)>> {
+    scan_keys_maybe(
+        handle,
+        overlay,
+        inline_schema_prefix(),
+        ScanShape::Probe,
+        |key| match key {
+            Key::Inline(InlineKey::Schema {
+                table_id,
+                schema_version,
+            }) => Ok((table_id, schema_version)),
+            other => Err(Error::Corruption(format!(
+                "non-schema key in all-table inline schema key scan: {other:?}"
+            ))),
+        },
+    )
+    .await
+}
+
+/// Every deregistered schema version of `table_id`, in key order. Their
+/// `inline/schema` records are retained, so this is what separates a
+/// version DuckLake still lists from one it has flushed away.
+pub(crate) async fn scan_inline_dropped_schemas(
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
+    table_id: u64,
+) -> Result<Vec<u64>> {
+    scan_keys_maybe(
+        handle,
+        overlay,
+        inline_schema_dropped_table_prefix(table_id),
+        ScanShape::Probe,
+        |key| match key {
+            Key::Inline(InlineKey::SchemaDropped { schema_version, .. }) => Ok(schema_version),
+            other => Err(Error::Corruption(format!(
+                "non-drop key in inline dropped-schema scan: {other:?}"
+            ))),
+        },
+    )
+    .await
+}
+
+/// Every deregistered `(table_id, schema_version)` across every table, in
+/// key order.
+pub(crate) async fn scan_all_inline_dropped_schemas(
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
+) -> Result<Vec<(u64, u64)>> {
+    scan_keys_maybe(
+        handle,
+        overlay,
+        inline_schema_dropped_prefix(),
+        ScanShape::Probe,
+        |key| match key {
+            Key::Inline(InlineKey::SchemaDropped {
+                table_id,
+                schema_version,
+            }) => Ok((table_id, schema_version)),
+            other => Err(Error::Corruption(format!(
+                "non-drop key in all-table inline dropped-schema scan: {other:?}"
+            ))),
+        },
+    )
+    .await
+}
+
 /// Every `inline/schema` record across every table, in key order
-/// (`table_id`, then `schema_version`).
+/// (`table_id`, then `schema_version`). Registration reads take
+/// [`scan_all_inline_schema_keys`]; this hauls the bodies too.
+#[cfg(test)]
 pub(crate) async fn scan_all_inline_schemas(
     handle: ReadHandle<'_>,
     overlay: Option<&Overlay>,
@@ -502,9 +649,11 @@ mod tests {
 
         let schema_v0 = InlineSchemaValue {
             arrow_schema: b"schema-v0".to_vec().into(),
+            same_as_version: None,
         };
         let schema_v1 = InlineSchemaValue {
             arrow_schema: b"schema-v1".to_vec().into(),
+            same_as_version: None,
         };
 
         let chunk_v0_seq0 = InlineChunkValue {
@@ -683,13 +832,13 @@ mod tests {
             read_inline_schema(ReadHandle::Tx(&tx), None, 7, 0)
                 .await
                 .unwrap(),
-            Some(schema_v0)
+            Some(schema_v0.arrow_schema)
         );
         assert_eq!(
             read_inline_schema(ReadHandle::Tx(&tx), None, 7, 1)
                 .await
                 .unwrap(),
-            Some(schema_v1)
+            Some(schema_v1.arrow_schema)
         );
         assert_eq!(
             read_inline_schema(ReadHandle::Tx(&tx), None, 7, 2)
@@ -730,12 +879,15 @@ mod tests {
 
         let table_one_v0 = InlineSchemaValue {
             arrow_schema: b"a-0".to_vec().into(),
+            same_as_version: None,
         };
         let table_one_v1 = InlineSchemaValue {
             arrow_schema: b"a-1".to_vec().into(),
+            same_as_version: None,
         };
         let table_two_v0 = InlineSchemaValue {
             arrow_schema: b"b-0".to_vec().into(),
+            same_as_version: None,
         };
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
@@ -769,6 +921,134 @@ mod tests {
                 (1, 1, table_one_v1),
                 (2, 0, table_two_v0),
             ]
+        );
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// A reference resolves to its target's bytes in one hop, and a
+    /// reference naming a version that carries none is corruption rather
+    /// than a silently empty schema.
+    #[tokio::test]
+    async fn a_schema_reference_resolves_to_its_target_or_reports_corruption() {
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        for (table_id, schema_version, value) in [
+            (
+                1,
+                0,
+                InlineSchemaValue {
+                    arrow_schema: Bytes::new(),
+                    same_as_version: Some(1),
+                },
+            ),
+            (
+                1,
+                1,
+                InlineSchemaValue {
+                    arrow_schema: b"columns".to_vec().into(),
+                    same_as_version: None,
+                },
+            ),
+            (
+                2,
+                0,
+                InlineSchemaValue {
+                    arrow_schema: Bytes::new(),
+                    same_as_version: Some(9),
+                },
+            ),
+        ] {
+            tx.put(
+                Key::Inline(InlineKey::Schema {
+                    table_id,
+                    schema_version,
+                })
+                .encode(),
+                value::encode_value(&value),
+            )
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        assert_eq!(
+            scan_inline_schemas_resolved(ReadHandle::Tx(&tx), None, 1)
+                .await
+                .unwrap(),
+            vec![
+                (0, Bytes::from_static(b"columns")),
+                (1, Bytes::from_static(b"columns"))
+            ]
+        );
+        assert_eq!(
+            read_inline_schema(ReadHandle::Tx(&tx), None, 1, 0)
+                .await
+                .unwrap(),
+            Some(Bytes::from_static(b"columns"))
+        );
+        assert!(
+            scan_inline_schemas_resolved(ReadHandle::Tx(&tx), None, 2)
+                .await
+                .is_err()
+        );
+        assert!(
+            read_inline_schema(ReadHandle::Tx(&tx), None, 2, 0)
+                .await
+                .is_err()
+        );
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// The registration scan reads keys and never the schema bodies
+    /// beside them. Proved by divergence: a record whose value cannot be
+    /// decoded is still a registration, and only the scan that wants the
+    /// columns fails on it.
+    #[tokio::test]
+    async fn scan_all_inline_schema_keys_never_decodes_a_schema_body() {
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(
+            Key::Inline(InlineKey::Schema {
+                table_id: 1,
+                schema_version: 0,
+            })
+            .encode(),
+            value::encode_value(&InlineSchemaValue {
+                arrow_schema: b"a-0".to_vec().into(),
+                same_as_version: None,
+            }),
+        )
+        .unwrap();
+        tx.put(
+            Key::Inline(InlineKey::Schema {
+                table_id: 1,
+                schema_version: 1,
+            })
+            .encode(),
+            b"not a value at all",
+        )
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let keys = scan_all_inline_schema_keys(ReadHandle::Tx(&tx), None)
+            .await
+            .unwrap();
+        assert_eq!(keys, vec![(1, 0), (1, 1)]);
+        assert!(
+            scan_all_inline_schemas(ReadHandle::Tx(&tx), None)
+                .await
+                .is_err()
         );
         tx.rollback();
         db.close().await.unwrap();

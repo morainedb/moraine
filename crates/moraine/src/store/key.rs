@@ -349,8 +349,10 @@ impl EntityKind {
 }
 
 /// An inlined-data key: the per-schema-version Arrow schema, a live
-/// record, the archived (post-flush) form of a live record, or a
-/// delete-table existence marker, or a live chunk's row-range locator.
+/// record, the archived (post-flush) form of a live record, a
+/// delete-table existence marker, a live chunk's row-range locator, or a
+/// deregistered schema version's marker. New variants append: the
+/// discriminant is the encoded byte.
 /// `Live` and `Arch` share [`InlineOperation`], so an archive key has exactly
 /// the components of its live form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
@@ -380,6 +382,16 @@ pub(crate) enum InlineKey {
         table_id: u64,
         /// Inclusive end of the chunk's contiguous row-id range.
         row_id_end: u64,
+    },
+    /// Marks that `(table_id, schema_version)`'s
+    /// `ducklake_inlined_data_<t>_<v>` has been deregistered by a flush.
+    /// Its [`Schema`](Self::Schema) record is retained beside it: the
+    /// name still resolves, and scans it empty.
+    SchemaDropped {
+        /// Owning table.
+        table_id: u64,
+        /// The deregistered schema version.
+        schema_version: u64,
     },
 }
 
@@ -696,6 +708,33 @@ pub(crate) fn inline_schema_prefix() -> Vec<u8> {
             schema_version: 0,
         }),
         INLINE_SCHEMA_PREFIX_LEN,
+    )
+}
+
+/// Discriminant bytes preceding an `inline/schema_dropped` key's
+/// components: subspace, `InlineKey::SchemaDropped`.
+const INLINE_SCHEMA_DROPPED_PREFIX_LEN: usize = 2;
+
+/// Byte prefix of every `inline/schema_dropped` key scoped to `table_id`,
+/// across all schema versions.
+pub(crate) fn inline_schema_dropped_table_prefix(table_id: u64) -> Vec<u8> {
+    prefix_of(
+        &Key::Inline(InlineKey::SchemaDropped {
+            table_id,
+            schema_version: 0,
+        }),
+        INLINE_SCHEMA_DROPPED_PREFIX_LEN + size_of::<u64>(),
+    )
+}
+
+/// Byte prefix of every `inline/schema_dropped` key, across every table.
+pub(crate) fn inline_schema_dropped_prefix() -> Vec<u8> {
+    prefix_of(
+        &Key::Inline(InlineKey::SchemaDropped {
+            table_id: 0,
+            schema_version: 0,
+        }),
+        INLINE_SCHEMA_DROPPED_PREFIX_LEN,
     )
 }
 
@@ -1126,6 +1165,18 @@ mod tests {
         let mut expect = vec![0x06, 0x05];
         expect.extend(be(7));
         let key = Key::Inline(InlineKey::FileDeleteTable { table_id: 7 });
+        assert_eq!(key.encode(), expect);
+    }
+
+    #[test]
+    fn golden_inline_schema_dropped_key() {
+        let mut expect = vec![0x06, 0x07];
+        expect.extend(be(7));
+        expect.extend(be(3));
+        let key = Key::Inline(InlineKey::SchemaDropped {
+            table_id: 7,
+            schema_version: 3,
+        });
         assert_eq!(key.encode(), expect);
     }
 
@@ -1637,6 +1688,41 @@ mod tests {
         );
     }
 
+    /// The dropped-schema prefixes match every version of the same table
+    /// and never a live `inline/schema` key, so subtracting one scan from
+    /// the other cannot confuse the two.
+    #[test]
+    fn inline_schema_dropped_prefixes_are_disjoint_from_live_schemas() {
+        for schema_version in [0, 1, 42] {
+            let key = Key::Inline(InlineKey::SchemaDropped {
+                table_id: 9,
+                schema_version,
+            });
+            assert!(
+                key.encode()
+                    .starts_with(&inline_schema_dropped_table_prefix(9))
+            );
+            assert!(key.encode().starts_with(&inline_schema_dropped_prefix()));
+            assert!(!key.encode().starts_with(&inline_schema_prefix()));
+        }
+
+        let live = Key::Inline(InlineKey::Schema {
+            table_id: 9,
+            schema_version: 0,
+        });
+        assert!(!live.encode().starts_with(&inline_schema_dropped_prefix()));
+
+        let other_table = Key::Inline(InlineKey::SchemaDropped {
+            table_id: 10,
+            schema_version: 0,
+        });
+        assert!(
+            !other_table
+                .encode()
+                .starts_with(&inline_schema_dropped_table_prefix(9))
+        );
+    }
+
     // Property tests: roundtrip, order preservation, uniqueness.
 
     fn arb_entity() -> impl Strategy<Value = EntityKey> {
@@ -1762,6 +1848,12 @@ mod tests {
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Live(op))),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Arch(op))),
             any::<u64>().prop_map(|table_id| Key::Inline(InlineKey::FileDeleteTable { table_id })),
+            any::<(u64, u64)>().prop_map(|(table_id, schema_version)| {
+                Key::Inline(InlineKey::SchemaDropped {
+                    table_id,
+                    schema_version,
+                })
+            }),
             any::<(u64, u64)>().prop_map(|(table_id, row_id_end)| {
                 Key::Inline(InlineKey::ChunkRange {
                     table_id,
