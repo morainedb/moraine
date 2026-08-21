@@ -855,8 +855,14 @@ async fn folded_head(handle: ReadHandle<'_>) -> Result<u64> {
 
 /// A reader at the manifest as it stands now.
 async fn reopen_reader(store: &SlotStore) -> Result<DbReader> {
+    // Every cache option the attach settled, not just the directory: a reader
+    // that asks for a different sizing than the one in force is refused it and
+    // warned about, and the warning reaches whatever is reading stdout.
     StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
         .cache_dir(store.options.cache_dir.clone())
+        .cache_size(store.options.cache_size)
+        .cache_preload(store.options.cache_preload)
+        .cache_puts(store.options.cache_puts)
         .open_reader()
         .await
         .map(|(reader, _)| reader)

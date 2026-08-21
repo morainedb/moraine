@@ -446,6 +446,9 @@ async fn read_token(store: &SlotStore) -> Result<Option<[u8; commit::SECRET_LEN]
     let reader =
         crate::store::open::StoreBuilder::new(&store.options.path, store.object_store.clone())
             .cache_dir(store.options.cache_dir.clone())
+            .cache_size(store.options.cache_size)
+            .cache_preload(store.options.cache_preload)
+            .cache_puts(store.options.cache_puts)
             .open_reader()
             .await?;
     let (reader, _) = reader;
