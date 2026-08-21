@@ -20,7 +20,10 @@ use super::{
     inline::inline_chunk_range_write,
     proto, stage_index_entry_stream, store_inline,
 };
-use crate::transaction::operations::ChangeSet;
+use crate::{
+    catalog::projection::{self, ProjectionCache},
+    transaction::operations::ChangeSet,
+};
 
 /// How many files one upkeep phase reads at once.
 const FILE_READ_CONCURRENCY: usize = 64;
@@ -117,6 +120,9 @@ pub(super) struct FileContext<'a> {
     metrics: Arc<data_file::ScopedReadMetrics>,
     /// Per-table index metadata and compiled projections, built on first use.
     indexing: std::sync::Mutex<HashMap<u64, Arc<TableIndexing>>>,
+    /// The handle's projection cache, for the inline locator scan's width
+    /// bound.
+    projections: &'a std::sync::RwLock<ProjectionCache>,
 }
 
 impl FileContext<'_> {
@@ -309,6 +315,7 @@ pub(super) async fn stage_index_maintenance(
     data_store: Option<&DataStore>,
     data_prefix: &str,
     metrics: Arc<data_file::ScopedReadMetrics>,
+    projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Result<StagedEntries> {
     let pending_schemas = pending_inline_schemas(ops);
     let inline_schemas = InlineSchemaCache::new(&pending_schemas);
@@ -319,6 +326,7 @@ pub(super) async fn stage_index_maintenance(
         delete_file_permits: Arc::new(tokio::sync::Semaphore::new(FILE_READ_CONCURRENCY)),
         metrics: Arc::clone(&metrics),
         indexing: std::sync::Mutex::new(HashMap::new()),
+        projections,
     };
 
     let DeletePlan {
@@ -777,14 +785,15 @@ async fn derive_located_inline_removals(
     sorted_row_ids: &[u64],
     locators: Vec<store_inline::InlineChunkLocator>,
 ) -> Result<(Vec<StagedIndexEntry>, HashSet<u64>)> {
-    let mut next = 0usize;
     let resolved = stream::iter(locators)
         .map(|locator| {
-            let start = next;
-            while next < sorted_row_ids.len() && locator.holds(sorted_row_ids[next]) {
-                next += 1;
-            }
-            let held: HashSet<u64> = sorted_row_ids[start..next].iter().copied().collect();
+            // Ranges can overlap — an UPDATE re-inlines a row inside another
+            // live chunk's range — so each locator takes the rows its own
+            // bounds hold rather than consuming a shared cursor, which would
+            // give a shared row to whichever locator came first.
+            let low = sorted_row_ids.partition_point(|&row| row < locator.row_id_start());
+            let high = sorted_row_ids.partition_point(|&row| row <= locator.row_id_end());
+            let held: HashSet<u64> = sorted_row_ids[low..high].iter().copied().collect();
 
             async move {
                 let (operation, value) = store_inline::read_inline_chunk_locator(
@@ -925,6 +934,7 @@ async fn stage_inline_delete_entries(
             ReadHandle::Tx(db_tx),
             table_id,
             row_ids,
+            projection::inline_chunk_width(context.projections, table_id),
         )
         .await?;
         if let Some(locators) = locators {

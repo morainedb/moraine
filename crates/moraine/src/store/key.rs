@@ -372,7 +372,11 @@ pub(crate) enum InlineKey {
         /// Owning table.
         table_id: u64,
     },
-    /// One live inline chunk's inclusive row-id end.
+    /// A superseded locator, keyed by range end alone. Two live chunks can
+    /// end at one row id, so this could name only one of them; nothing
+    /// writes it any more and [`ChunkLocator`](Self::ChunkLocator) replaces
+    /// it. Retained so a store written before the change still decodes,
+    /// and so the directory's repair can sweep what it left.
     ChunkRange {
         /// Owning table.
         table_id: u64,
@@ -388,6 +392,23 @@ pub(crate) enum InlineKey {
         table_id: u64,
         /// The deregistered schema version.
         schema_version: u64,
+    },
+    /// One live inline chunk's inclusive row-id end, then the chunk's own
+    /// identity. Two live chunks can end at one row id — an UPDATE
+    /// re-inlines a row whose id another chunk's range still ends on — so
+    /// the end alone cannot name a locator. The end leads, so a scan still
+    /// seeks by row id.
+    ChunkLocator {
+        /// Owning table.
+        table_id: u64,
+        /// Inclusive end of the chunk's contiguous row-id range.
+        row_id_end: u64,
+        /// Schema version the chunk decodes against.
+        schema_version: u64,
+        /// Snapshot the chunk was written in.
+        begin_snapshot: u64,
+        /// The chunk's sequence within its schema version and snapshot.
+        chunk_seq: u64,
     },
 }
 
@@ -738,7 +759,12 @@ pub(crate) fn inline_schema_dropped_prefix() -> Vec<u8> {
 /// subspace, then `InlineKey::ChunkRange`.
 const INLINE_CHUNK_RANGE_PREFIX_LEN: usize = 2;
 
-/// Byte prefix of every chunk-range locator scoped to `table_id`.
+/// Discriminant bytes preceding an `inline/chunk_locator` key's components:
+/// subspace, then `InlineKey::ChunkLocator`.
+const INLINE_CHUNK_LOCATOR_PREFIX_LEN: usize = 2;
+
+/// Byte prefix of every superseded chunk-range key scoped to `table_id`,
+/// for the repair that sweeps them.
 pub(crate) fn inline_chunk_range_table_prefix(table_id: u64) -> Vec<u8> {
     prefix_of(
         &Key::Inline(InlineKey::ChunkRange {
@@ -749,15 +775,32 @@ pub(crate) fn inline_chunk_range_table_prefix(table_id: u64) -> Vec<u8> {
     )
 }
 
+/// Byte prefix of every chunk locator scoped to `table_id`.
+pub(crate) fn inline_chunk_locator_table_prefix(table_id: u64) -> Vec<u8> {
+    prefix_of(
+        &Key::Inline(InlineKey::ChunkLocator {
+            table_id,
+            row_id_end: 0,
+            schema_version: 0,
+            begin_snapshot: 0,
+            chunk_seq: 0,
+        }),
+        INLINE_CHUNK_LOCATOR_PREFIX_LEN + size_of::<u64>(),
+    )
+}
+
 /// The range suffix that seeks to the first chunk ending at or after
-/// `row_id` within [`inline_chunk_range_table_prefix`].
-pub(crate) fn inline_chunk_range_suffix(table_id: u64, row_id: u64) -> Vec<u8> {
-    Key::Inline(InlineKey::ChunkRange {
+/// `row_id` within [`inline_chunk_locator_table_prefix`].
+pub(crate) fn inline_chunk_locator_suffix(table_id: u64, row_id: u64) -> Vec<u8> {
+    Key::Inline(InlineKey::ChunkLocator {
         table_id,
         row_id_end: row_id,
+        schema_version: 0,
+        begin_snapshot: 0,
+        chunk_seq: 0,
     })
     .encode()
-    .split_off(INLINE_CHUNK_RANGE_PREFIX_LEN + size_of::<u64>())
+    .split_off(INLINE_CHUNK_LOCATOR_PREFIX_LEN + size_of::<u64>())
 }
 
 /// The `index` subspace discriminant byte, as [`Key::Index`] encodes it.
@@ -1189,6 +1232,44 @@ mod tests {
             row_id_end: 29,
         });
         assert_eq!(key.encode(), expect);
+    }
+
+    #[test]
+    fn golden_inline_chunk_locator_key() {
+        let mut expect = vec![0x06, 0x08];
+        expect.extend(be(7));
+        expect.extend(be(29));
+        expect.extend(be(3));
+        expect.extend(be(11));
+        expect.extend(be(2));
+        let key = Key::Inline(InlineKey::ChunkLocator {
+            table_id: 7,
+            row_id_end: 29,
+            schema_version: 3,
+            begin_snapshot: 11,
+            chunk_seq: 2,
+        });
+        assert_eq!(key.encode(), expect);
+    }
+
+    /// The superseded key and its replacement share a prefix only as far as
+    /// the subspace: a legacy locator can never be read as a current one.
+    #[test]
+    fn golden_inline_locator_kinds_are_distinct() {
+        let legacy = Key::Inline(InlineKey::ChunkRange {
+            table_id: 7,
+            row_id_end: 29,
+        })
+        .encode();
+        let current = Key::Inline(InlineKey::ChunkLocator {
+            table_id: 7,
+            row_id_end: 29,
+            schema_version: 0,
+            begin_snapshot: 0,
+            chunk_seq: 0,
+        })
+        .encode();
+        assert_ne!(legacy[1], current[1]);
     }
 
     #[test]
@@ -1857,6 +1938,17 @@ mod tests {
                     row_id_end,
                 })
             }),
+            any::<(u64, u64, u64, u64, u64)>().prop_map(
+                |(table_id, row_id_end, schema_version, begin_snapshot, chunk_seq)| {
+                    Key::Inline(InlineKey::ChunkLocator {
+                        table_id,
+                        row_id_end,
+                        schema_version,
+                        begin_snapshot,
+                        chunk_seq,
+                    })
+                },
+            ),
             arb_index().prop_map(Key::Index),
             any::<u64>().prop_map(|snapshot_id| Key::Changelog { snapshot_id }),
         ]

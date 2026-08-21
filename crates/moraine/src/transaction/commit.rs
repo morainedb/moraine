@@ -58,9 +58,14 @@ pub(crate) const FORMAT_WITH_INLINE_CHUNK_DIRECTORY: u64 = 6;
 /// the same table rather than the Arrow bytes themselves, which a reader
 /// that predates the field would decode as a schema with no columns.
 pub(crate) const FORMAT_WITH_INLINE_SCHEMA_REFERENCE: u64 = 7;
+/// An inline chunk locator carries the chunk's identity, not its range end
+/// alone. A reader that predates it looks for the superseded key and finds
+/// no directory at all, so it must be locked out rather than left to serve
+/// reads from a directory it cannot see.
+pub(crate) const FORMAT_WITH_INLINE_CHUNK_IDENTITY: u64 = 8;
 /// The highest format this binary understands. It opens any store in
 /// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
-pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_SCHEMA_REFERENCE;
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_CHUNK_IDENTITY;
 /// The lowest format this binary reads directly; a store below it must be
 /// migrated up first. Rises only when a format rewrites the keyspace.
 pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_VERSION;
@@ -889,7 +894,7 @@ enum Prepared {
 /// The store format the staged state requires: deferred upkeep implies
 /// [`FORMAT_WITH_DEFERRED_INDEX`], a `building` index
 /// [`FORMAT_WITH_STAGED_INDEX`], any other index [`FORMAT_WITH_INDEX`], and
-/// inline chunk locators [`FORMAT_WITH_INLINE_CHUNK_DIRECTORY`].
+/// inline chunk locators [`FORMAT_WITH_INLINE_CHUNK_IDENTITY`].
 fn target_format(state: &CatalogSnapshot, uses_inline_chunk_directory: bool) -> u64 {
     let index_format = if state
         .indexes
@@ -916,7 +921,7 @@ fn target_format(state: &CatalogSnapshot, uses_inline_chunk_directory: bool) -> 
     };
 
     if uses_inline_chunk_directory {
-        index_format.max(FORMAT_WITH_INLINE_CHUNK_DIRECTORY)
+        index_format.max(FORMAT_WITH_INLINE_CHUNK_IDENTITY)
     } else {
         index_format
     }

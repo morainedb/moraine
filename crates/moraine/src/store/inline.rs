@@ -11,10 +11,10 @@ use crate::{
     store::{
         handle::{ReadHandle, ScanShape},
         key::{
-            InlineKey, InlineOperation, InlineOperationKind, Key, inline_chunk_range_suffix,
-            inline_chunk_range_table_prefix, inline_live_table_prefix,
-            inline_schema_dropped_prefix, inline_schema_dropped_table_prefix, inline_schema_prefix,
-            inline_schema_table_prefix,
+            InlineKey, InlineOperation, InlineOperationKind, Key, inline_chunk_locator_suffix,
+            inline_chunk_locator_table_prefix, inline_chunk_range_table_prefix,
+            inline_live_table_prefix, inline_schema_dropped_prefix,
+            inline_schema_dropped_table_prefix, inline_schema_prefix, inline_schema_table_prefix,
         },
         proto::{
             InlineChunkRangeValue, InlineChunkValue, InlineFileDeleteTableValue,
@@ -42,11 +42,6 @@ impl InlineChunkLocator {
             InlineOperation::Insert { schema_version, .. } => Some(schema_version),
             InlineOperation::InlineDelete { .. } | InlineOperation::FileDelete { .. } => None,
         }
-    }
-
-    /// Whether this chunk owns `row_id`.
-    pub(crate) fn holds(self, row_id: u64) -> bool {
-        row_id >= self.row_id_start && row_id <= self.row_id_end
     }
 
     /// The chunk's store key operation.
@@ -77,6 +72,7 @@ pub(crate) async fn find_inline_chunk_locators_for_rows(
     handle: ReadHandle<'_>,
     table_id: u64,
     row_ids: &[u64],
+    width_bound: Option<u64>,
 ) -> Result<Option<Vec<InlineChunkLocator>>> {
     let targets: Vec<u64> = row_ids
         .iter()
@@ -88,29 +84,50 @@ pub(crate) async fn find_inline_chunk_locators_for_rows(
         return Ok(Some(Vec::new()));
     };
 
-    let prefix = inline_chunk_range_table_prefix(table_id);
-    let start = inline_chunk_range_suffix(table_id, first);
+    let prefix = inline_chunk_locator_table_prefix(table_id);
+    let start = inline_chunk_locator_suffix(table_id, first);
     let mut iter = handle
         .scan_prefix(prefix, start.., ScanShape::Probe)
         .await?;
-    let mut target_index = 0usize;
     let mut locators = Vec::new();
+    let mut found = 0usize;
 
-    while target_index < targets.len() {
-        let Some(entry) = iter.next().await? else {
-            return Ok(None);
-        };
-        let row_id_end = match Key::decode(&entry.key)? {
-            Key::Inline(InlineKey::ChunkRange {
+    // Ranges can overlap — an UPDATE re-inlines a row inside another live
+    // chunk's range — so a target is not owned by the first range that
+    // covers it, and the walk cannot stop at a match. It can stop once no
+    // remaining chunk could reach back to a target: a chunk holding `t`
+    // spans at most `width_bound`, so it ends at or before `t + bound`.
+    // An absent bound stops nothing.
+    let last = targets.last().copied().unwrap_or(first);
+    let scan_until = width_bound.map(|bound| last.saturating_add(bound));
+
+    while let Some(entry) = iter.next().await? {
+        let (row_id_end, operation) = match Key::decode(&entry.key)? {
+            Key::Inline(InlineKey::ChunkLocator {
                 table_id: owner,
                 row_id_end,
-            }) if owner == table_id => row_id_end,
+                schema_version,
+                begin_snapshot,
+                chunk_seq,
+            }) if owner == table_id => (
+                row_id_end,
+                InlineOperation::Insert {
+                    table_id,
+                    schema_version,
+                    begin_snapshot,
+                    chunk_seq,
+                },
+            ),
             other => {
                 return Err(Error::Corruption(format!(
                     "non-directory key in inline chunk-range scan: {other:?}"
                 )));
             }
         };
+        if scan_until.is_some_and(|until| row_id_end > until) {
+            break;
+        }
+
         let locator: InlineChunkRangeValue = value::decode_owned(entry.value)?;
         if locator.row_id_start > row_id_end {
             return Err(Error::Corruption(format!(
@@ -119,26 +136,23 @@ pub(crate) async fn find_inline_chunk_locators_for_rows(
             )));
         }
 
-        let target = targets[target_index];
-        if target < locator.row_id_start {
-            return Ok(None);
-        }
-        if target > row_id_end {
+        let low = targets.partition_point(|&target| target < locator.row_id_start);
+        let high = targets.partition_point(|&target| target <= row_id_end);
+        if low == high {
             continue;
         }
-
-        let operation = InlineOperation::Insert {
-            table_id,
-            schema_version: locator.schema_version,
-            begin_snapshot: locator.begin_snapshot,
-            chunk_seq: locator.chunk_seq,
-        };
+        found += high - low;
         locators.push(InlineChunkLocator {
             operation,
             row_id_start: locator.row_id_start,
             row_id_end,
         });
-        target_index += targets[target_index..].partition_point(|&target| target <= row_id_end);
+    }
+
+    // Every target must land in some chunk; a row the directory cannot
+    // place means it is absent or incomplete, and the caller falls back.
+    if found < targets.len() {
+        return Ok(None);
     }
 
     Ok(Some(locators))
@@ -179,12 +193,15 @@ pub(crate) async fn scan_inline_chunk_locators(
 ) -> Result<Vec<InlineChunkLocator>> {
     scan_decode(
         handle,
-        inline_chunk_range_table_prefix(table_id),
+        inline_chunk_locator_table_prefix(table_id),
         ScanShape::Probe,
         |key, bytes| match key {
-            Key::Inline(InlineKey::ChunkRange {
+            Key::Inline(InlineKey::ChunkLocator {
                 table_id: owner,
                 row_id_end,
+                schema_version,
+                begin_snapshot,
+                chunk_seq,
             }) if owner == table_id => {
                 let locator: InlineChunkRangeValue = value::decode_owned(bytes)?;
                 if locator.row_id_start > row_id_end {
@@ -197,9 +214,9 @@ pub(crate) async fn scan_inline_chunk_locators(
                 Ok(InlineChunkLocator {
                     operation: InlineOperation::Insert {
                         table_id,
-                        schema_version: locator.schema_version,
-                        begin_snapshot: locator.begin_snapshot,
-                        chunk_seq: locator.chunk_seq,
+                        schema_version,
+                        begin_snapshot,
+                        chunk_seq,
                     },
                     row_id_start: locator.row_id_start,
                     row_id_end,
@@ -213,8 +230,45 @@ pub(crate) async fn scan_inline_chunk_locators(
     .await
 }
 
-/// Every chunk-range locator for `table_id`, ordered by inclusive range end.
+/// Every chunk-range locator for `table_id` as its range end and the
+/// identity of the chunk it names, ordered by inclusive range end. Reads no
+/// values: the identity rides in the key.
 pub(crate) async fn scan_inline_chunk_ranges(
+    handle: ReadHandle<'_>,
+    table_id: u64,
+) -> Result<Vec<(u64, InlineOperation)>> {
+    scan_decode(
+        handle,
+        inline_chunk_locator_table_prefix(table_id),
+        ScanShape::Probe,
+        |key, _| match key {
+            Key::Inline(InlineKey::ChunkLocator {
+                table_id: owner,
+                row_id_end,
+                schema_version,
+                begin_snapshot,
+                chunk_seq,
+            }) if owner == table_id => Ok((
+                row_id_end,
+                InlineOperation::Insert {
+                    table_id,
+                    schema_version,
+                    begin_snapshot,
+                    chunk_seq,
+                },
+            )),
+            other => Err(Error::Corruption(format!(
+                "non-directory key in inline chunk-range scan: {other:?}"
+            ))),
+        },
+    )
+    .await
+}
+
+/// Every superseded chunk-range key for `table_id`. Nothing writes these
+/// any more; a store carried across the change still holds them, and the
+/// directory's repair deletes what it finds.
+pub(crate) async fn scan_legacy_inline_chunk_ranges(
     handle: ReadHandle<'_>,
     table_id: u64,
 ) -> Result<Vec<u64>> {
@@ -228,7 +282,7 @@ pub(crate) async fn scan_inline_chunk_ranges(
                 row_id_end,
             }) if owner == table_id => Ok(row_id_end),
             other => Err(Error::Corruption(format!(
-                "non-directory key in inline chunk-range scan: {other:?}"
+                "non-directory key in superseded chunk-range scan: {other:?}"
             ))),
         },
     )
@@ -546,9 +600,12 @@ mod tests {
             .unwrap();
             if table_id == 7 {
                 tx.put(
-                    Key::Inline(InlineKey::ChunkRange {
+                    Key::Inline(InlineKey::ChunkLocator {
                         table_id,
                         row_id_end,
+                        schema_version: 3,
+                        begin_snapshot: 11,
+                        chunk_seq,
                     })
                     .encode(),
                     value::encode_value(&InlineChunkRangeValue {
@@ -564,10 +621,11 @@ mod tests {
         tx.commit().await.unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        let selected = find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 7, &[105, 1_005])
-            .await
-            .unwrap()
-            .unwrap();
+        let selected =
+            find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 7, &[105, 1_005], None)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].row_id_start, 100);
         assert_eq!(selected[1].row_id_start, 1_000);
@@ -576,10 +634,128 @@ mod tests {
             .unwrap();
         assert_eq!(first.body.as_ref(), b"chunk-7-1");
         assert_eq!(
-            find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 8, &[5])
+            find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 8, &[5], None)
                 .await
                 .unwrap(),
             None,
+        );
+
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// The width bound stops the walk once no remaining chunk could reach
+    /// back to a target — but never before an overlapping chunk that does.
+    /// An absent bound stops nothing.
+    #[tokio::test]
+    async fn locator_width_bound_stops_the_walk_without_skipping_an_overlap() {
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+
+        // A wide chunk, a single-row chunk re-inlined inside it (sharing its
+        // end), and a distant chunk the bound should exclude.
+        for (row_id_start, row_id_end, chunk_seq) in [(0, 100, 0), (100, 100, 1), (9_000, 9_000, 2)]
+        {
+            tx.put(
+                Key::Inline(InlineKey::Live(InlineOperation::Insert {
+                    table_id: 7,
+                    schema_version: 3,
+                    begin_snapshot: 11,
+                    chunk_seq,
+                }))
+                .encode(),
+                value::encode_value(&InlineChunkValue {
+                    body: format!("chunk-{chunk_seq}").into_bytes().into(),
+                    row_id_start,
+                    row_count: row_id_end - row_id_start + 1,
+                    data_file_id: None,
+                }),
+            )
+            .unwrap();
+            tx.put(
+                Key::Inline(InlineKey::ChunkLocator {
+                    table_id: 7,
+                    row_id_end,
+                    schema_version: 3,
+                    begin_snapshot: 11,
+                    chunk_seq,
+                })
+                .encode(),
+                value::encode_value(&InlineChunkRangeValue {
+                    row_id_start,
+                    schema_version: 3,
+                    begin_snapshot: 11,
+                    chunk_seq,
+                }),
+            )
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+
+        // Row 100 sits in both the wide chunk and the re-inlined one; the
+        // bound must admit both.
+        let bounded =
+            find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 7, &[100], Some(100))
+                .await
+                .unwrap()
+                .unwrap();
+        let mut starts: Vec<u64> = bounded.iter().map(|locator| locator.row_id_start).collect();
+        starts.sort_unstable();
+        assert_eq!(
+            starts,
+            vec![0, 100],
+            "the bound skipped a chunk that holds the target"
+        );
+
+        // Unbounded agrees, so the bound changed only how far the walk ran.
+        let unbounded = find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 7, &[100], None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unbounded.len(), bounded.len());
+
+        tx.rollback();
+
+        // Proof the bound truncates rather than merely agreeing: an
+        // inverted locator far past it is refused by a full walk and never
+        // reached by a bounded one.
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(
+            Key::Inline(InlineKey::ChunkLocator {
+                table_id: 7,
+                row_id_end: 50_000,
+                schema_version: 3,
+                begin_snapshot: 11,
+                chunk_seq: 9,
+            })
+            .encode(),
+            value::encode_value(&InlineChunkRangeValue {
+                row_id_start: 60_000,
+                schema_version: 3,
+                begin_snapshot: 11,
+                chunk_seq: 9,
+            }),
+        )
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        assert!(
+            find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 7, &[100], None)
+                .await
+                .is_err(),
+            "a full walk must reach the sentinel"
+        );
+        assert!(
+            find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 7, &[100], Some(100))
+                .await
+                .is_ok(),
+            "the bound must stop the walk before the sentinel"
         );
 
         tx.rollback();

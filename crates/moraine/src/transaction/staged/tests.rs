@@ -897,7 +897,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
     assert_eq!(chunks[1].1.body.as_ref(), b"chunk-b");
 
     let selected =
-        store_inline::find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 1, &[1, 2])
+        store_inline::find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 1, &[1, 2], None)
             .await
             .unwrap();
     assert_eq!(
@@ -1359,22 +1359,13 @@ async fn indexed_delete_lazily_repairs_legacy_inline_chunk_locators() {
     inline_insert(&catalog, 4, SECOND_ROW, &[8], false).await;
 
     let tx = catalog.begin_write_tx().await.unwrap();
-    tx.delete(
-        Key::Inline(InlineKey::ChunkRange {
-            table_id: 1,
-            row_id_end: FIRST_ROW,
-        })
-        .encode(),
-    )
-    .unwrap();
-    tx.delete(
-        Key::Inline(InlineKey::ChunkRange {
-            table_id: 1,
-            row_id_end: SECOND_ROW,
-        })
-        .encode(),
-    )
-    .unwrap();
+    for (row_id_end, operation) in store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(&tx), 1)
+        .await
+        .unwrap()
+    {
+        tx.delete(super::inline::chunk_range_key(1, row_id_end, operation).unwrap())
+            .unwrap();
+    }
     tx.commit_with_options(&commit::durable()).await.unwrap();
 
     let tx = catalog.begin_write_tx().await.unwrap();
@@ -1405,7 +1396,10 @@ async fn indexed_delete_lazily_repairs_legacy_inline_chunk_locators() {
     assert_eq!(
         store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(&tx), 1)
             .await
-            .unwrap(),
+            .unwrap()
+            .into_iter()
+            .map(|(row_id_end, _)| row_id_end)
+            .collect::<Vec<_>>(),
         vec![FIRST_ROW, SECOND_ROW]
     );
     tx.rollback();
@@ -3684,6 +3678,55 @@ async fn scoped_backfill_excludes_delete_file_rows() {
     );
 }
 
+/// An inlined file-delete names a physical position, so a backfill must
+/// resolve it against each row's ordinal — not its row id. On a file
+/// carrying embedded ids the two spaces are disjoint, and reading the
+/// record as a row id excludes nothing. Regression.
+#[tokio::test]
+async fn scoped_backfill_excludes_inline_file_deleted_rows_of_a_per_row_id_file() {
+    use crate::catalog::{ColumnId, TableId};
+
+    let (catalog, _) = catalog_with_indexed_inline_table(true).await;
+    // Values 10, 20, 30 at positions 0, 1, 2 with embedded ids 5, 9, 12.
+    let store = register_per_row_id_file(&catalog).await;
+
+    // Kill position 1 (value 20, embedded id 9).
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
+    tx.stage(RowOperation::InlineFileDelete {
+        table_id: 1,
+        data_file_id: 1,
+        row_id: 1,
+        begin_snapshot: 4,
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "inlined_delete:1"),
+    });
+    tx.commit().await.unwrap();
+
+    let entries = catalog
+        .scoped_backfill_entries(
+            DataStore::new(store),
+            "",
+            TableId::new(1),
+            &[ColumnId::new(1)],
+        )
+        .await
+        .unwrap();
+    let mut row_ids: Vec<u64> = entries.iter().map(|entry| entry.row_id).collect();
+    row_ids.sort_unstable();
+    assert_eq!(
+        row_ids,
+        vec![5, 12],
+        "the inline-file-deleted position is excluded from backfill"
+    );
+}
+
 /// An inlined delete against a Parquet-file row removes that row's
 /// entry, read back out of the target file.
 #[tokio::test]
@@ -4070,16 +4113,11 @@ async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
     let inline_deletes = store_inline::scan_inline_deletes(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
-    let directory = tx
-        .get(
-            Key::Inline(InlineKey::ChunkRange {
-                table_id: 1,
-                row_id_end: 1,
-            })
-            .encode(),
-        )
+    let directory = store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(&tx), 1)
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .find(|(row_id_end, _)| *row_id_end == 1);
     tx.rollback();
     assert!(chunks.is_empty(), "flushed chunk must be gone: {chunks:?}");
     assert!(directory.is_none(), "flushed locator must be gone");
@@ -4172,21 +4210,101 @@ async fn flush_delete_serves_from_a_directory_verified_complete() {
     flush.commit().await.unwrap();
 
     let tx = catalog.begin_write_tx().await.unwrap();
-    let locator = tx
-        .get(
-            Key::Inline(InlineKey::ChunkRange {
-                table_id: 1,
-                row_id_end: 1,
-            })
-            .encode(),
-        )
+    let locator = store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(&tx), 1)
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .find(|(row_id_end, _)| *row_id_end == 1);
     tx.rollback();
     assert!(
         locator.is_none(),
         "the flush must have staged the deletion from the directory, not the body scan"
     );
+    catalog.close().await.unwrap();
+}
+
+/// A store written before a locator carried its chunk's identity holds the
+/// superseded range-end keys. Nothing reads them, so the flush's repair
+/// sweeps them while it writes the locators that replace them. Regression.
+#[tokio::test]
+async fn flush_delete_sweeps_superseded_chunk_range_keys() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    setup.stage(RowOperation::InlineInsert {
+        table_id: 1,
+        schema_version: 0,
+        begin_snapshot: 1,
+        row_id_start: 0,
+        row_count: 2,
+        arrow_body: b"chunk".to_vec(),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 0, 1),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "inlined_insert:1"),
+    });
+    setup.commit().await.unwrap();
+
+    // What the superseded layout left behind.
+    let tx = catalog.begin_write_tx().await.unwrap();
+    tx.put(
+        Key::Inline(InlineKey::ChunkRange {
+            table_id: 1,
+            row_id_end: 1,
+        })
+        .encode(),
+        value::encode_value(&proto::InlineChunkRangeValue {
+            row_id_start: 0,
+            schema_version: 0,
+            begin_snapshot: 1,
+            chunk_seq: 0,
+        }),
+    )
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    assert_eq!(
+        store_inline::scan_legacy_inline_chunk_ranges(ReadHandle::Tx(&tx), 1)
+            .await
+            .unwrap(),
+        vec![1],
+        "the superseded key must be planted for the sweep to have work"
+    );
+    tx.rollback();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut flush = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    flush.stage(RowOperation::InlineFlushDelete {
+        table_id: 1,
+        schema_version: 0,
+        flush_snapshot: 2,
+    });
+    flush.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 0, 1),
+    });
+    flush.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "flushed_inlined_data:1"),
+    });
+    flush.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let legacy = store_inline::scan_legacy_inline_chunk_ranges(ReadHandle::Tx(&tx), 1)
+        .await
+        .unwrap();
+    tx.rollback();
+    assert!(
+        legacy.is_empty(),
+        "the repair must sweep the superseded keys: {legacy:?}"
+    );
+
     catalog.close().await.unwrap();
 }
 
@@ -4237,9 +4355,12 @@ async fn flush_delete_heals_an_incomplete_directory() {
     )
     .unwrap();
     tx.put(
-        Key::Inline(InlineKey::ChunkRange {
+        Key::Inline(InlineKey::ChunkLocator {
             table_id: 1,
             row_id_end: 99,
+            schema_version: 0,
+            begin_snapshot: 1,
+            chunk_seq: 7,
         })
         .encode(),
         value::encode_value(&proto::InlineChunkRangeValue {
@@ -4275,26 +4396,11 @@ async fn flush_delete_heals_an_incomplete_directory() {
     );
 
     let tx = catalog.begin_write_tx().await.unwrap();
-    let healed = tx
-        .get(
-            Key::Inline(InlineKey::ChunkRange {
-                table_id: 1,
-                row_id_end: 11,
-            })
-            .encode(),
-        )
+    let ranges = store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
-    let stale = tx
-        .get(
-            Key::Inline(InlineKey::ChunkRange {
-                table_id: 1,
-                row_id_end: 99,
-            })
-            .encode(),
-        )
-        .await
-        .unwrap();
+    let healed = ranges.iter().find(|(row_id_end, _)| *row_id_end == 11);
+    let stale = ranges.iter().find(|(row_id_end, _)| *row_id_end == 99);
     tx.rollback();
     assert!(healed.is_some(), "the surviving chunk must gain a locator");
     assert!(stale.is_none(), "the chunkless locator must be removed");
@@ -4383,16 +4489,11 @@ async fn stages_inline_drop_removes_every_record_for_the_table() {
     let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap();
-    let directory = tx
-        .get(
-            Key::Inline(InlineKey::ChunkRange {
-                table_id: 1,
-                row_id_end: 0,
-            })
-            .encode(),
-        )
+    let directory = store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(&tx), 1)
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .find(|(row_id_end, _)| *row_id_end == 0);
     tx.rollback();
     assert!(chunks.is_empty());
     assert!(file_deletes.is_empty());

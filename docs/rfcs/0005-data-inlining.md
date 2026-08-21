@@ -82,7 +82,41 @@ inherit that limitation.
 | `inline/file_delete` | `table_id, data_file_id, row_id` | `begin_snapshot` (inlined delete against a Parquet file) |
 | `inline/file_delete_table` | `table_id` | Empty — the key is the fact. Marks that `ducklake_inlined_delete_<table_id>` exists |
 | `inline/schema_dropped` | `table_id, schema_version` | Empty — the key is the fact. Marks that `ducklake_inlined_data_<t>_<v>` has been deregistered by a flush |
-| `inline/chunk_range` | `table_id, row_id_end` | `row_id_start, schema_version, begin_snapshot, chunk_seq` — one locator per live insert chunk; `row_id_end` is inclusive |
+| `inline/chunk_locator` | `table_id, row_id_end, schema_version, begin_snapshot, chunk_seq` | `row_id_start, schema_version, begin_snapshot, chunk_seq` — one locator per live insert chunk; `row_id_end` is inclusive |
+| `inline/chunk_range` | `table_id, row_id_end` | superseded by `inline/chunk_locator`; nothing writes it, and the directory's repair sweeps what an older store left |
+
+A locator is keyed by its range end **and the chunk's own identity**. The
+end alone cannot key it: an UPDATE re-inlines a row whose id another live
+chunk's range still ends on, and that pair shares an end. Keyed by end
+alone, the second chunk overwrites the first's locator and takes the
+first's other rows out of every directory-served read — and because both
+completeness checks compared *sets* of ends, the truncated directory
+compared equal, was memoized complete, and was never healed. The end still
+leads the key, so a scan seeks by row id as before.
+
+Ranges may therefore **overlap**, and readers must not assume otherwise: a
+point lookup collects every chunk whose range holds the target rather than
+stopping at the first, and coverage is judged by chunk identity rather than
+by range end.
+
+Collecting every such chunk would otherwise walk a table's whole directory,
+since a chunk holding the target can sit at any larger end. The walk is
+bounded instead by the widest chunk the table is known to hold: a chunk
+holding `t` spans at most `W`, so it ends at or before `t + W`. `W` is
+memoized per table rather than stored — raised as chunks are written and
+again by the walk that already verifies the directory — and is **only ever
+raised**, so however stale it is it still bounds the true width from above.
+A bound that could fall would silently skip a chunk, which is the failure
+this key layout exists to prevent; an unknown `W` bounds nothing and the
+walk runs in full.
+
+The identity-carrying locator takes its own key kind rather than widening
+the old one, so a store written before the change needs no migration to be
+read: its superseded keys decode as `inline/chunk_range`, sit outside the
+directory's prefix, and the repair that already heals a missing locator
+rebuilds the directory and sweeps them. Writing a locator stamps
+`FORMAT_WITH_INLINE_CHUNK_IDENTITY`, which shuts out a binary that would
+look for the superseded key and conclude the table has no directory.
 
 The insert and tombstone records are append-only on the commit path. The
 file-delete-table record is a marker, and exists because existence cannot be
