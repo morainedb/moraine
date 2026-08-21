@@ -303,3 +303,7 @@ pub use store::{
     index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder},
 };
 pub use transaction::{MigrationReport, Transaction};
+
+/// The newest structural store format this binary reads and writes. A store
+/// bootstrapped here carries it, so `migrate` finds nothing to rewrite.
+pub const MAX_FORMAT_VERSION: u64 = transaction::commit::MAX_FORMAT_VERSION;
