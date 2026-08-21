@@ -1181,12 +1181,19 @@ mod tests {
     /// A commit validated above the replayed head means the slots between them
     /// are missing, so its writes never apply.
     ///
-    /// Refusing it needs the head the tail must start from. Nothing is folded
-    /// here, and the fold cursor and a reader that does not replay the log
-    /// answer from different manifests, which can disagree — so `tail_anchor`
-    /// has nothing it can trust. Telling the folded state from the tail under
-    /// one manifest is what this needs.
-    #[ignore = "the first slot is unanchored when nothing is folded"]
+    /// Detection here races the reader. A reader serves the unfolded tail by
+    /// replaying it, so once it has taken slot 1 its view already holds that
+    /// commit's writes and `admit` reads the slot as one the view reflects
+    /// rather than one above it; before it has, the view stands at the
+    /// bootstrap head and the slot is refused. The fold cursor says nothing
+    /// either way — it reads 0 under both.
+    ///
+    /// The chain check covers every later slot, seeded from the head the one
+    /// before it leaves. Only the first slot of an unfolded log goes
+    /// unchecked, and anchoring it needs the pre-tail head, which no reader
+    /// that replays the log can be asked for. Telling the folded state from
+    /// the tail under one manifest is what this needs.
+    #[ignore = "detection races the reader's own replay of the tail"]
     #[tokio::test]
     async fn a_commit_validated_above_the_view_refuses() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
