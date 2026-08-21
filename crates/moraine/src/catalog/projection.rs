@@ -36,6 +36,15 @@ pub(crate) type InlineSchemas = Arc<Vec<(u64, bytes::Bytes)>>;
 /// One table's inline row tombstones, shared the same way.
 pub(crate) type InlineTombstones = Arc<Vec<(u64, crate::store::proto::InlineInlineDeleteValue)>>;
 
+/// One table's inline chunks, in scan order. Bodies are `Bytes`, so the
+/// walk that produced them and every reader of it share one buffer.
+pub(crate) type InlineChunks = Arc<
+    Vec<(
+        crate::store::key::InlineOperation,
+        crate::store::proto::InlineChunkValue,
+    )>,
+>;
+
 /// Whether two head records name the same store state.
 fn same_head(a: &HeadValue, b: &HeadValue) -> bool {
     a.snapshot_id == b.snapshot_id && a.batch_seq == b.batch_seq
@@ -131,6 +140,31 @@ pub(crate) fn install_inline_tombstones(
         .install_inline_tombstones(table_id, head, rows);
 }
 
+/// `table_id`'s inline chunks iff they stand at exactly `expected`.
+pub(crate) fn inline_chunks_at(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+    expected: &HeadValue,
+) -> Option<InlineChunks> {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inline_chunks_at(table_id, expected)
+}
+
+/// Records `table_id`'s inline chunks as walked at `head`.
+pub(crate) fn install_inline_chunks(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+    head: HeadValue,
+    chunks: InlineChunks,
+) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .install_inline_chunks(table_id, head, chunks);
+}
+
 /// Records `table_id`'s inline schemas as scanned at `head`.
 pub(crate) fn install_inline_schemas(
     cache: &std::sync::RwLock<ProjectionCache>,
@@ -207,6 +241,10 @@ pub(crate) struct ProjectionCache {
     /// One table's inline tombstones, stamped with the head they were scanned
     /// at. Every per-version scan of a base table asks for the same set.
     inline_tombstones: BTreeMap<u64, (HeadValue, InlineTombstones)>,
+    /// One table's inline chunks, stamped with the head they were walked at.
+    /// A base-table scan asks once per registered schema version and every
+    /// ask walks the same chunks.
+    inline_chunks: BTreeMap<u64, (HeadValue, InlineChunks)>,
 }
 
 impl ProjectionCache {
@@ -225,6 +263,17 @@ impl ProjectionCache {
             .saturating_add(self.snapshots.estimated_bytes())
             .saturating_add(self.table_stats.estimated_bytes())
             .saturating_add(self.table_column_stats.estimated_bytes())
+            .saturating_add(self.inline_chunk_bytes())
+    }
+
+    /// What the remembered inline chunks weigh, bodies included.
+    fn inline_chunk_bytes(&self) -> u64 {
+        self.inline_chunks
+            .values()
+            .flat_map(|(_, chunks)| chunks.iter())
+            .fold(0, |total, (_, chunk)| {
+                total.saturating_add(chunk.body.len() as u64)
+            })
     }
 
     pub(crate) fn empty() -> Self {
@@ -238,6 +287,7 @@ impl ProjectionCache {
             inline_directory_complete: BTreeSet::new(),
             inline_schemas: BTreeMap::new(),
             inline_tombstones: BTreeMap::new(),
+            inline_chunks: BTreeMap::new(),
         }
     }
 
@@ -273,6 +323,28 @@ impl ProjectionCache {
         rows: InlineTombstones,
     ) {
         self.inline_tombstones.insert(table_id, (head, rows));
+    }
+
+    /// `table_id`'s inline chunks iff they stand at exactly `expected`.
+    pub(crate) fn inline_chunks_at(
+        &self,
+        table_id: u64,
+        expected: &HeadValue,
+    ) -> Option<InlineChunks> {
+        self.inline_chunks
+            .get(&table_id)
+            .filter(|(head, _)| same_head(head, expected))
+            .map(|(_, chunks)| Arc::clone(chunks))
+    }
+
+    /// Records `table_id`'s inline chunks as walked at `head`.
+    pub(crate) fn install_inline_chunks(
+        &mut self,
+        table_id: u64,
+        head: HeadValue,
+        chunks: InlineChunks,
+    ) {
+        self.inline_chunks.insert(table_id, (head, chunks));
     }
 
     /// Records `table_id`'s inline schemas as scanned at `head`.

@@ -248,35 +248,10 @@ pub(crate) async fn scan_inline_chunks(
     overlay: Option<&Overlay>,
     table_id: u64,
 ) -> Result<Vec<(InlineOperation, InlineChunkValue)>> {
-    scan_inline_chunks_maybe_versioned(handle, overlay, table_id, None).await
-}
-
-/// As [`scan_inline_chunks`], restricted to one schema version when asked.
-/// The version is the key component after the table, so a scoped scan seeks
-/// past every other version rather than reading and discarding it.
-pub(crate) async fn scan_inline_chunks_of_version(
-    handle: ReadHandle<'_>,
-    overlay: Option<&Overlay>,
-    table_id: u64,
-    schema_version: u64,
-) -> Result<Vec<(InlineOperation, InlineChunkValue)>> {
-    scan_inline_chunks_maybe_versioned(handle, overlay, table_id, Some(schema_version)).await
-}
-
-async fn scan_inline_chunks_maybe_versioned(
-    handle: ReadHandle<'_>,
-    overlay: Option<&Overlay>,
-    table_id: u64,
-    schema_version: Option<u64>,
-) -> Result<Vec<(InlineOperation, InlineChunkValue)>> {
-    let prefix = schema_version.map_or_else(
-        || inline_live_table_prefix(InlineOperationKind::Insert, table_id),
-        |version| crate::store::key::inline_chunk_version_prefix(table_id, version),
-    );
     scan_decode_maybe(
         handle,
         overlay,
-        prefix,
+        inline_live_table_prefix(InlineOperationKind::Insert, table_id),
         ScanShape::Probe,
         |key, bytes| match key {
             Key::Inline(InlineKey::Live(op @ InlineOperation::Insert { .. })) => {

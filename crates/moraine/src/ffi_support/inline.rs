@@ -292,6 +292,66 @@ mod tests {
         assert_eq!(schemas, vec![(0, Bytes::from_static(b"schema"))]);
     }
 
+    /// A base-table scan asks once per registered schema version; the walk
+    /// those asks share is paid once.
+    #[tokio::test]
+    async fn per_version_scans_share_one_walk_of_the_chunks() {
+        let catalog = open().await;
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
+        for version in 0..3u64 {
+            tx.stage(RowOperation::InlineSchema {
+                table_id: 1,
+                schema_version: version,
+                arrow_schema: b"schema".to_vec(),
+            });
+        }
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 1,
+            arrow_body: b"chunk-a".to_vec(),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        let read = catalog.begin_dump().await.unwrap();
+        let head = read.head_value();
+        read.finish().await;
+        assert!(
+            crate::catalog::projection::inline_chunks_at(catalog.projections(), 1, &head).is_none(),
+            "nothing is remembered before the first ask"
+        );
+
+        for version in 0..3u64 {
+            scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0, Some(version))
+                .await
+                .unwrap();
+        }
+
+        let read = catalog.begin_dump().await.unwrap();
+        let later_head = read.head_value();
+        read.finish().await;
+        assert_eq!(
+            (later_head.snapshot_id, later_head.batch_seq),
+            (head.snapshot_id, head.batch_seq),
+            "a read moves no head, so every ask of one statement shares one"
+        );
+        assert!(
+            crate::catalog::projection::inline_chunks_at(catalog.projections(), 1, &later_head)
+                .is_some(),
+            "the walk the first ask paid for is there for the rest"
+        );
+    }
+
     /// Two chunks (rows 0-1, row 2) staged in one commit, one tombstone
     /// on row 1: `scan_inline` with `Table` at the tombstone's snapshot
     /// returns rows 0 and 2 with their chunk bodies attached, and

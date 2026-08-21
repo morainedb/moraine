@@ -1,5 +1,7 @@
 //! Inline row scans: materialized from the chunk-range directory when it
 //! is known complete, with only the referenced chunk bodies point-read.
+//! Otherwise from one walk of the chunks per head, which every schema
+//! version's ask of the same statement shares.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -29,7 +31,7 @@ const CHUNK_READ_CONCURRENCY: usize = 8;
 /// without bodies — or the full chunk scan, bodies in hand.
 pub(super) enum InlineRowSource {
     Locators(Vec<store_inline::InlineChunkLocator>),
-    Chunks(Vec<(InlineOperation, InlineChunkValue)>),
+    Chunks(projection::InlineChunks),
 }
 
 impl InlineRowSource {
@@ -87,12 +89,11 @@ impl InlineRowSource {
                 .try_collect()
                 .await?
             }
-            Self::Chunks(mut chunks) => referenced
+            // Cloned rather than moved out: the walk is shared, and a
+            // chunk body is a refcounted buffer either way.
+            Self::Chunks(chunks) => referenced
                 .into_iter()
-                .map(|index| {
-                    let (operation, chunk) = &mut chunks[index];
-                    (*operation, std::mem::take(chunk))
-                })
+                .map(|index| chunks[index].clone())
                 .collect(),
         };
 
@@ -138,20 +139,13 @@ impl ReadOnlyCatalog {
         handle: ReadHandle<'_>,
         overlay: Option<&moraine_wal::Overlay>,
         table: TableId,
-        schema_version: Option<u64>,
         head: &crate::store::proto::HeadValue,
     ) -> Result<(InlineRowSource, Vec<InlineRow>)> {
-        // A caller after one version's rows takes only that version's chunks:
-        // the others are dropped before their bodies resolve anyway, and a
-        // base-table scan asks once per registered version. The directory is
-        // left unjudged, since a partial chunk set cannot say it is complete.
-        if let Some(version) = schema_version
-            && !projection::inline_directory_complete(&self.projections, table.get())
-        {
-            let (chunks, tombstones) = futures::try_join!(
-                store_inline::scan_inline_chunks_of_version(handle, overlay, table.get(), version),
-                self.inline_tombstones(handle, overlay, table, head),
-            )?;
+        // A base-table scan asks once per registered schema version and every
+        // ask walks the same chunks, so the walk is paid once per head and the
+        // asks after it select out of it.
+        if let Some(chunks) = projection::inline_chunks_at(&self.projections, table.get(), head) {
+            let tombstones = self.inline_tombstones(handle, overlay, table, head).await?;
             let rows = materialize_inline_rows(&chunks, &tombstones);
             return Ok((InlineRowSource::Chunks(chunks), rows));
         }
@@ -171,7 +165,14 @@ impl ReadOnlyCatalog {
         )?;
         self.verify_inline_directory(handle, overlay, table, &chunks)
             .await?;
+        let chunks = Arc::new(chunks);
         let rows = materialize_inline_rows(&chunks, &tombstones);
+        projection::install_inline_chunks(
+            &self.projections,
+            table.get(),
+            *head,
+            Arc::clone(&chunks),
+        );
 
         Ok((InlineRowSource::Chunks(chunks), rows))
     }
@@ -194,7 +195,7 @@ impl ReadOnlyCatalog {
         let head = read.head_value();
         let outcome = async {
             let (source, rows) = self
-                .inline_row_source(read.handle(), read.tail(), table, schema_version, &head)
+                .inline_row_source(read.handle(), read.tail(), table, &head)
                 .await?;
             let mut selected = kind.select(&rows, snapshot, start);
             if let Some(version) = schema_version {
@@ -228,7 +229,7 @@ impl ReadOnlyCatalog {
             None => read.view().snapshot.snapshot_id,
         };
         let (source, rows) = self
-            .inline_row_source(handle, overlay, table, None, &head_value)
+            .inline_row_source(handle, overlay, table, &head_value)
             .await?;
 
         let live = InlineScanKind::Table.select(&rows, read_at, 0);
@@ -287,7 +288,7 @@ impl ReadOnlyCatalog {
         let head = read.view().snapshot.snapshot_id;
         let head_value = read.head_value();
         let (_, rows) = self
-            .inline_row_source(read.handle(), read.tail(), table, None, &head_value)
+            .inline_row_source(read.handle(), read.tail(), table, &head_value)
             .await?;
 
         Ok(InlineScanKind::Table
