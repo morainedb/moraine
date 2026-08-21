@@ -973,6 +973,30 @@ impl ReadOnlyCatalog {
         })
     }
 
+    /// Opens a read of commit-written catalog state: the cached slot head with
+    /// its unfolded tail.
+    ///
+    /// A slot-committed record reaches a reader through the overlay, so
+    /// serving one needs no reader of its own — where
+    /// [`begin_dump`](Self::begin_dump) opens one per call because a
+    /// folder-role write appears in neither the cached head nor the tail. A
+    /// caller reading records this handle's own commits produce belongs here;
+    /// one reading what a folder wrote does not.
+    pub(crate) async fn begin_catalog_read(&self) -> Result<DumpRead> {
+        let Store::Slots(store) = self.store.as_ref();
+        let head = slot_commit::cached_slot_head(store).await?;
+        if let Err(err) =
+            commit::refuse_mid_migration(head.handle(ReadHandle::Reader(&store.reader))).await
+        {
+            slot_commit::release_reader(head.reader.as_ref()).await;
+            return Err(err);
+        }
+        Ok(DumpRead::Slots {
+            reader: store.reader.clone(),
+            head: Box::new(head),
+        })
+    }
+
     /// Test-only: every stored `(key, value)` under `prefix`, read through a
     /// fresh slot head — the folded store overlaid with the unfolded tail — so
     /// both folder-written entries and slot-committed ones are seen.

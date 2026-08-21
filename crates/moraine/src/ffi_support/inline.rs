@@ -105,7 +105,7 @@ pub async fn scan_inline(
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_schemas(catalog: &ReadOnlyCatalog, table_id: u64) -> Result<Vec<(u64, Bytes)>> {
-    let read = catalog.begin_dump().await?;
+    let read = catalog.begin_catalog_read().await?;
     let schemas = store_inline::scan_inline_schemas(read.handle(), read.overlay(), table_id).await;
     read.finish().await;
     Ok(schemas?
@@ -124,7 +124,7 @@ pub async fn inline_schemas(catalog: &ReadOnlyCatalog, table_id: u64) -> Result<
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_registered_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<(u64, u64)>> {
-    let read = catalog.begin_dump().await?;
+    let read = catalog.begin_catalog_read().await?;
     let schemas = store_inline::scan_all_inline_schemas(read.handle(), read.overlay()).await;
     read.finish().await;
     Ok(schemas?
@@ -147,7 +147,7 @@ pub async fn inline_file_delete_table_exists(
     catalog: &ReadOnlyCatalog,
     table_id: u64,
 ) -> Result<bool> {
-    let read = catalog.begin_dump().await?;
+    let read = catalog.begin_catalog_read().await?;
     let marked =
         store_inline::read_inline_file_delete_table(read.handle(), read.overlay(), table_id).await;
     let exists = match marked {
@@ -176,7 +176,7 @@ pub async fn inline_file_deletes(
     catalog: &ReadOnlyCatalog,
     table_id: u64,
 ) -> Result<Vec<(u64, u64, u64)>> {
-    let read = catalog.begin_dump().await?;
+    let read = catalog.begin_catalog_read().await?;
     let file_deletes =
         store_inline::scan_inline_file_deletes(read.handle(), read.overlay(), table_id).await;
     read.finish().await;
