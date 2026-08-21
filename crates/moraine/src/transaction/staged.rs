@@ -1607,10 +1607,10 @@ fn refuse_orphaned_children(children: &ChildRows) -> Result<()> {
 /// file cleanup arrive with no `ducklake_snapshot` insert (DuckLake mints
 /// no snapshot for them), so nothing advances head and no snapshot record
 /// is written. Only reclamation-shaped operations are legal — raw
-/// deletes, schedule inserts, and the inline drops a dead table's cleanup
-/// issues; any entity insert or lifecycle update without a snapshot row
-/// is a constraint violation (DuckLake always mints a snapshot for real
-/// catalog changes).
+/// deletes, schedule inserts, per-file statistics a repair derives, and
+/// the inline drops a dead table's cleanup issues; any entity insert or
+/// lifecycle update without a snapshot row is a constraint violation
+/// (DuckLake always mints a snapshot for real catalog changes).
 fn translate_maintenance(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
@@ -1632,7 +1632,12 @@ fn translate_maintenance(
                         // DuckLake writes `ducklake_metadata` within its
                         // metadata connection, outside the protocol — so it
                         // arrives here exactly as reclamation does.
-                        | TableKind::Metadata,
+                        | TableKind::Metadata
+                        // A row-id statistics backfill re-derives per-file
+                        // statistics for files already registered. The rows
+                        // carry no lifecycle of their own, so repairing them
+                        // changes nothing a snapshot would record.
+                        | TableKind::FileColumnStats,
                     ..
                 }
         ) || is_inline_op(op);
