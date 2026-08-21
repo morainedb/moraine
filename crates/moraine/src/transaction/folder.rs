@@ -294,11 +294,11 @@ async fn fold_cursor_as_of(store: &SlotStore, checkpoint_id: Uuid) -> Result<u64
 
 /// A reader at the manifest as it stands now, for discovering live checkpoints.
 async fn reopen_reader(store: &SlotStore) -> Result<DbReader> {
-    StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
-        .cache_dir(store.options.cache_dir.clone())
-        .cache_size(store.options.cache_size)
-        .cache_preload(store.options.cache_preload)
-        .cache_puts(store.options.cache_puts)
+    crate::transaction::slot_commit::CacheOptions::of(&store.options)
+        .apply(StoreBuilder::new(
+            &store.options.path,
+            Arc::clone(&store.object_store),
+        ))
         .open_reader()
         .await
         .map(|(reader, _)| reader)

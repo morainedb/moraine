@@ -157,7 +157,7 @@ pub(crate) fn forward_context(
         Arc::clone(&store.forwarding),
         Arc::clone(&store.object_store),
         store.options.path.clone(),
-        store.options.cache_dir.clone(),
+        CacheOptions::of(&store.options),
         store.slots.clone(),
     )
 }
@@ -495,13 +495,13 @@ pub(crate) async fn transaction_outcome(
 pub(crate) async fn transaction_outcome_from(
     object_store: &Arc<dyn object_store::ObjectStore>,
     path: &str,
-    cache_dir: Option<std::path::PathBuf>,
+    cache: &CacheOptions,
     slots: &SlotLog,
     transaction_id: [u8; 16],
     floor: u64,
 ) -> Result<Option<u64>> {
-    let reader = StoreBuilder::new(path, Arc::clone(object_store))
-        .cache_dir(cache_dir)
+    let reader = cache
+        .apply(StoreBuilder::new(path, Arc::clone(object_store)))
         .open_reader()
         .await?;
     let (reader, _) = reader;
@@ -854,15 +854,42 @@ async fn folded_head(handle: ReadHandle<'_>) -> Result<u64> {
 }
 
 /// A reader at the manifest as it stands now.
+/// The cache options an attach settled, carried to wherever a reader is opened
+/// away from the attach itself. Sizing is process-wide: a reader asking for
+/// anything but what is in force is refused it and warned about.
+#[derive(Clone)]
+pub(crate) struct CacheOptions {
+    pub(crate) dir: Option<std::path::PathBuf>,
+    pub(crate) size: Option<u64>,
+    pub(crate) preload: Option<crate::catalog::CachePreload>,
+    pub(crate) puts: bool,
+}
+
+impl CacheOptions {
+    pub(crate) fn of(options: &crate::catalog::CatalogOptions) -> Self {
+        Self {
+            dir: options.cache_dir.clone(),
+            size: options.cache_size,
+            preload: options.cache_preload,
+            puts: options.cache_puts,
+        }
+    }
+
+    pub(crate) fn apply<'a>(&self, builder: StoreBuilder<'a>) -> StoreBuilder<'a> {
+        builder
+            .cache_dir(self.dir.clone())
+            .cache_size(self.size)
+            .cache_preload(self.preload)
+            .cache_puts(self.puts)
+    }
+}
+
 async fn reopen_reader(store: &SlotStore) -> Result<DbReader> {
-    // Every cache option the attach settled, not just the directory: a reader
-    // that asks for a different sizing than the one in force is refused it and
-    // warned about, and the warning reaches whatever is reading stdout.
-    StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
-        .cache_dir(store.options.cache_dir.clone())
-        .cache_size(store.options.cache_size)
-        .cache_preload(store.options.cache_preload)
-        .cache_puts(store.options.cache_puts)
+    CacheOptions::of(&store.options)
+        .apply(StoreBuilder::new(
+            &store.options.path,
+            Arc::clone(&store.object_store),
+        ))
         .open_reader()
         .await
         .map(|(reader, _)| reader)

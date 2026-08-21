@@ -40,7 +40,7 @@ pub(crate) struct Forward {
     forwarding: Arc<slot_commit::Forwarding>,
     object_store: Arc<dyn ObjectStore>,
     path: String,
-    cache_dir: Option<std::path::PathBuf>,
+    cache: slot_commit::CacheOptions,
     slots: SlotLog,
 }
 
@@ -51,7 +51,7 @@ impl Forward {
         forwarding: Arc<slot_commit::Forwarding>,
         object_store: Arc<dyn ObjectStore>,
         path: String,
-        cache_dir: Option<std::path::PathBuf>,
+        cache: slot_commit::CacheOptions,
         slots: SlotLog,
     ) -> Self {
         Self {
@@ -60,7 +60,7 @@ impl Forward {
             forwarding,
             object_store,
             path,
-            cache_dir,
+            cache,
             slots,
         }
     }
@@ -117,7 +117,7 @@ async fn resolve_ambiguous(forward: &Forward, transaction_id: [u8; 16], floor: u
     match slot_commit::transaction_outcome_from(
         &forward.object_store,
         &forward.path,
-        forward.cache_dir.clone(),
+        &forward.cache,
         &forward.slots,
         transaction_id,
         floor,
