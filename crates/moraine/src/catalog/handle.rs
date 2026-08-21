@@ -134,6 +134,9 @@ pub(crate) struct SlotStore {
     /// The handle's projection cache, shared so the commit path can consult
     /// the format floor without a handle to hand.
     pub(crate) projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    /// When this handle last read the migration marker absent, so a run of
+    /// reads inside one poll interval pays for one look rather than one each.
+    pub(crate) migration_clear: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// Slot-race and retry counters accumulated across commits, shared by every
     /// clone of the handle through the store's `Arc` and by the staged
     /// transactions it opens, which arm forwarding by counting their lost
@@ -907,12 +910,42 @@ impl ReadOnlyCatalog {
         let Store::Slots(store) = self.store.as_ref();
         let session = ReadSession::Reader(store.reader.clone());
 
-        if let Err(error) = commit::refuse_mid_migration(session.handle()).await {
+        if let Err(error) = self.refuse_mid_migration_bounded(session.handle()).await {
             session.finish();
             return Err(error);
         }
 
         Ok(session)
+    }
+
+    /// [`commit::refuse_mid_migration`], looked up at most once per
+    /// `reader_poll_interval`.
+    ///
+    /// The marker is read through the session's own reader, whose view of the
+    /// store only advances on that interval, so asking again inside one window
+    /// returns the bytes already read. A marker planted by a migrator is met on
+    /// the first read past the window either way, and a marker found is never
+    /// memoized.
+    async fn refuse_mid_migration_bounded(&self, handle: ReadHandle<'_>) -> Result<()> {
+        let Store::Slots(store) = self.store.as_ref();
+        let window = store.options.reader_poll_interval;
+        {
+            let clear = store
+                .migration_clear
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if clear.is_some_and(|at| at.elapsed() < window) {
+                return Ok(());
+            }
+        }
+
+        commit::refuse_mid_migration(handle).await?;
+
+        *store
+            .migration_clear
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+        Ok(())
     }
 
     /// Closes the catalog, flushing background work.
@@ -1153,6 +1186,7 @@ impl Catalog {
                     pinned: false,
                     coalescer,
                     projections: Arc::clone(&projections),
+                    migration_clear: Arc::new(std::sync::Mutex::new(None)),
                     head_cache: slot_commit::HeadCache::default(),
                     contention: Arc::new(slot_commit::ContentionCounters::default()),
                     #[cfg(feature = "leader")]
@@ -1465,6 +1499,7 @@ impl Catalog {
                 pinned,
                 coalescer,
                 projections: Arc::clone(&projections),
+                migration_clear: Arc::new(std::sync::Mutex::new(None)),
                 head_cache: slot_commit::HeadCache::default(),
                 contention: Arc::new(slot_commit::ContentionCounters::default()),
                 #[cfg(feature = "leader")]

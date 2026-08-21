@@ -960,6 +960,7 @@ mod tests {
             projections: Arc::new(std::sync::RwLock::new(
                 crate::catalog::projection::ProjectionCache::empty(),
             )),
+            migration_clear: Arc::new(std::sync::Mutex::new(None)),
             head_cache: HeadCache::default(),
             contention: Arc::new(ContentionCounters::default()),
             #[cfg(feature = "leader")]
