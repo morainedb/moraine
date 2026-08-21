@@ -16,6 +16,9 @@
 //! variables. The builder accepts temporary session and container-role
 //! credentials, so the benchmark needs no static access key.
 
+// Test bodies await whole catalog operations in sequence; boxing each
+// call would say nothing about the code under test.
+#![allow(clippy::large_futures)]
 // The tests-exempt lints (`clippy.toml`) reach `#[test]` functions and
 // `#[cfg(test)]` modules, not an integration crate's plain helper
 // functions — exempted here instead, crate-wide, as tests.
@@ -178,8 +181,7 @@ async fn seed_attach_measurement(
     columns_per_table: usize,
     rounds: usize,
 ) {
-    let mut seed_options = options.clone();
-    seed_options.flush_interval = Duration::from_millis(1);
+    let seed_options = options.clone();
     let catalog = Catalog::open(store.clone(), seed_options.clone())
         .await
         .unwrap();
@@ -291,8 +293,7 @@ fn attach_case_path(state: &str) -> String {
 }
 
 async fn compact_attach_store(store: Arc<dyn ObjectStore>, options: &CatalogOptions) -> usize {
-    let mut writer_options = options.clone();
-    writer_options.flush_interval = Duration::from_millis(1);
+    let writer_options = options.clone();
     let writer = Catalog::open(store, writer_options).await.unwrap();
     let mut request = CompactStoreRequest::default();
     request.wait = Some(Duration::from_secs(120));
@@ -311,8 +312,7 @@ async fn fixed_checkpoint_options(
     options: &CatalogOptions,
 ) -> (CatalogOptions, String) {
     let mut reader_options = options.clone();
-    let mut writer_options = options.clone();
-    writer_options.flush_interval = Duration::from_millis(1);
+    let writer_options = options.clone();
     let writer = Catalog::open(store, writer_options).await.unwrap();
     let checkpoint = writer.create_checkpoint(None).await.unwrap();
     writer.close().await.unwrap();
@@ -467,7 +467,7 @@ async fn measure_commit_latency_against_the_endpoint() {
 
     for (row, flush_ms) in intervals.iter().enumerate() {
         let mut options = options_at(&format!("latency-{flush_ms}-{row}"));
-        options.flush_interval = Duration::from_millis(*flush_ms);
+        options.commit_batch_window = Duration::from_millis(*flush_ms);
         let catalog = Catalog::open(store.clone(), options).await.unwrap();
 
         let mut samples = Vec::with_capacity(COMMITS);
@@ -586,8 +586,7 @@ async fn seed_index_lookup_measurement(
     store: Arc<dyn ObjectStore>,
     options: &CatalogOptions,
 ) -> IndexLookupFixture {
-    let mut seed_options = options.clone();
-    seed_options.flush_interval = Duration::from_millis(1);
+    let seed_options = options.clone();
     let catalog = Catalog::open(store.clone(), seed_options.clone())
         .await
         .unwrap();
@@ -1046,8 +1045,7 @@ async fn seed_located_lookup_measurement(
     options: &CatalogOptions,
     data_prefix: &str,
 ) -> TableId {
-    let mut seed_options = options.clone();
-    seed_options.flush_interval = Duration::from_millis(1);
+    let seed_options = options.clone();
     let catalog = Catalog::open(store.clone(), seed_options).await.unwrap();
 
     let created = std::cell::Cell::new(None);

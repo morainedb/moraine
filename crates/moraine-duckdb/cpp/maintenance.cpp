@@ -104,6 +104,33 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 			config.sweep_indexes = option.second.GetValue<bool>();
 			continue;
 		}
+		if (rest == "fold_slots") {
+			config.fold_slots = option.second.GetValue<bool>();
+			continue;
+		}
+		if (rest == "truncate_slots") {
+			config.truncate_slots = option.second.GetValue<bool>();
+			continue;
+		}
+		if (rest == "leader") {
+			config.leader = option.second.GetValue<bool>();
+			continue;
+		}
+		if (rest == "leader_address") {
+			config.leader_address = option.second.GetValue<std::string>();
+			continue;
+		}
+		if (rest == "leader_advertise") {
+			config.leader_advertise = option.second.GetValue<std::string>();
+			continue;
+		}
+		if (rest == "leader_max_sessions") {
+			config.leader_max_sessions = option.second.GetValue<uint64_t>();
+			if (config.leader_max_sessions == 0) {
+				throw duckdb::BinderException("MAINTENANCE_LEADER_MAX_SESSIONS must be positive");
+			}
+			continue;
+		}
 		if (rest == "compact_store") {
 			config.compact_store = option.second.GetValue<bool>();
 			compact_store_explicitly_disabled = !config.compact_store;
@@ -222,6 +249,10 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 		if (step.enabled && !step.explicitly_disabled) {
 			config.ducklake_steps.push_back(DuckLakeStep {StepSpecs()[i].name, step.arguments});
 		}
+	}
+	if (config.leader && config.leader_address.empty()) {
+		throw duckdb::BinderException(
+		    "MAINTENANCE_LEADER needs MAINTENANCE_LEADER_ADDRESS: a leader must bind an address clients can reach");
 	}
 	return config;
 }
@@ -464,6 +495,14 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	duckdb::Connection connection(db_);
 	auto lake = ResolveLakeName(connection);
 
+	// Fold leads the pass. The reclaim sweep reads the folded store, but a
+	// dropped index's definition rides an unfolded slot until folded — so
+	// without this first, the sweep cannot see the drop and reclaims
+	// nothing. Truncation's horizon is the durable fold cursor, which
+	// folding just advanced, so it too runs on what folding left behind.
+	report.push_back(config_.fold_slots ? RunFold()
+	                                     : MaintenanceStep {"fold_slots", "skipped", "disabled at attach"});
+
 	// A failed step abandons the rest of the *DuckLake* sequence, whose
 	// steps depend on each other — cleanup drains what merge scheduled,
 	// so running it after a failed merge does partial work on a premise
@@ -506,13 +545,18 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	                     ? RunFileStatsSweep()
 	                     : MaintenanceStep {"sweep_file_stats", "skipped", "disabled at attach"});
 
-	// The store merge runs last, on what every step above it left behind:
+	// The store merge runs on what every step above it left behind:
 	// expiry tombstones rows and the sweep deletes index ranges, so
 	// merging earlier would leave exactly the tombstones this pass just
 	// created for the next pass to reclaim.
 	report.push_back(config_.compact_store
 	                     ? RunStoreMerge()
 	                     : MaintenanceStep {"compact_store", "skipped", "not configured at attach"});
+
+	// Truncation closes the pass, on the fold cursor folding advanced.
+	report.push_back(config_.truncate_slots
+	                     ? RunTruncate()
+	                     : MaintenanceStep {"truncate_slots", "skipped", "disabled at attach"});
 
 	RecordPass(started_at, trigger, report);
 
@@ -609,6 +653,50 @@ MaintenanceStep MaintenanceScheduler::RunSweep() {
 	                        "reclaimed " + std::to_string(entries) + (entries == 1 ? " entry" : " entries") +
 	                            " from " + std::to_string(indexes) +
 	                            (indexes == 1 ? " dropped index" : " dropped indexes")};
+}
+
+MaintenanceStep MaintenanceScheduler::RunFold() {
+	uint64_t folded = 0;
+	uint64_t remaining = 0;
+	MoraineError err {};
+	// UINT64_MAX folds the whole unfolded tail this pass, so the sweep that
+	// follows sees every drop. No interrupt probe: the pass runs on the
+	// scheduler's own thread.
+	auto code = moraine_fold_sprint(handle_, UINT64_MAX, &folded, &remaining, &err);
+	if (code == MORAINE_FENCED) {
+		// A duelling folder already holds the writer and is advancing the
+		// cursor. Its work stands in for this pass's; wasted effort, not an
+		// error, so the pass records it and moves on.
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		return MaintenanceStep {"fold_slots", "skipped", "another session holds the folder"};
+	}
+	if (code != MORAINE_OK) {
+		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		return MaintenanceStep {"fold_slots", "failed", message};
+	}
+	return MaintenanceStep {"fold_slots", "ran",
+	                        "folded " + std::to_string(folded) + (folded == 1 ? " slot, " : " slots, ") +
+	                            std::to_string(remaining) + " remaining"};
+}
+
+MaintenanceStep MaintenanceScheduler::RunTruncate() {
+	uint64_t removed = 0;
+	MoraineError err {};
+	auto code = moraine_truncate_slots(handle_, &removed, &err);
+	if (code != MORAINE_OK) {
+		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		return MaintenanceStep {"truncate_slots", "failed", message};
+	}
+	return MaintenanceStep {"truncate_slots", "ran",
+	                        "removed " + std::to_string(removed) + (removed == 1 ? " slot" : " slots")};
 }
 
 MaintenanceStep MaintenanceScheduler::RunFileStatsSweep() {
@@ -746,6 +834,23 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MaintenanceInitGlobal(duckd
 			state->rows.push_back(ReportRow {
 			    duckdb::timestamp_t(row.started_at_micros), std::string(row.trigger),
 			    MaintenanceStep {std::string(row.step), std::string(row.status), std::string(row.detail)}});
+		}
+
+		// The leader role, reported as a synthetic step only while this catalog
+		// holds it — an attach that does not lead adds no row, so the column
+		// schema and the empty-status shape are unchanged. The detail carries
+		// the live session and forwarded-commit counters.
+		bool held = false;
+		uint64_t sessions = 0;
+		uint64_t forwarded = 0;
+		auto leader_code = moraine_leader_status(catalog.Handle(), &held, &sessions, &forwarded, &err);
+		if (leader_code == MORAINE_OK && held) {
+			std::string detail = "sessions=" + std::to_string(sessions) +
+			                     " forwarded_commits=" + std::to_string(forwarded);
+			state->rows.push_back(
+			    ReportRow {duckdb::timestamp_t(0), "status", MaintenanceStep {"leader_role", "held", detail}});
+		} else if (err.message != nullptr) {
+			moraine_error_free(err.message);
 		}
 		return state;
 	}

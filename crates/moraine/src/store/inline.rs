@@ -5,6 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use bytes::Bytes;
+use moraine_wal::Overlay;
 
 use crate::{
     error::{Error, Result},
@@ -20,7 +21,7 @@ use crate::{
             InlineChunkRangeValue, InlineChunkValue, InlineFileDeleteTableValue,
             InlineFileDeleteValue, InlineInlineDeleteValue, InlineSchemaValue,
         },
-        read::{read_singleton, scan_decode, scan_keys},
+        read::{read_singleton, scan_decode_maybe, scan_keys_maybe},
         value,
     },
 };
@@ -75,6 +76,7 @@ impl InlineChunkLocator {
 /// chunk bodies. `None` means the directory is absent or incomplete.
 pub(crate) async fn find_inline_chunk_locators_for_rows(
     handle: ReadHandle<'_>,
+    _overlay: Option<&Overlay>,
     table_id: u64,
     row_ids: &[u64],
 ) -> Result<Option<Vec<InlineChunkLocator>>> {
@@ -147,6 +149,7 @@ pub(crate) async fn find_inline_chunk_locators_for_rows(
 /// Fetches and validates the immutable chunk named by `locator`.
 pub(crate) async fn read_inline_chunk_locator(
     handle: ReadHandle<'_>,
+    _overlay: Option<&Overlay>,
     table_id: u64,
     locator: InlineChunkLocator,
 ) -> Result<(InlineOperation, InlineChunkValue)> {
@@ -175,10 +178,12 @@ pub(crate) async fn read_inline_chunk_locator(
 /// [`scan_inline_chunks`] hauls every chunk's Arrow payload.
 pub(crate) async fn scan_inline_chunk_locators(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
 ) -> Result<Vec<InlineChunkLocator>> {
-    scan_decode(
+    scan_decode_maybe(
         handle,
+        overlay,
         inline_chunk_range_table_prefix(table_id),
         ScanShape::Probe,
         |key, bytes| match key {
@@ -216,10 +221,12 @@ pub(crate) async fn scan_inline_chunk_locators(
 /// Every chunk-range locator for `table_id`, ordered by inclusive range end.
 pub(crate) async fn scan_inline_chunk_ranges(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
 ) -> Result<Vec<u64>> {
-    scan_decode(
+    scan_decode_maybe(
         handle,
+        overlay,
         inline_chunk_range_table_prefix(table_id),
         ScanShape::Probe,
         |key, _| match key {
@@ -237,13 +244,15 @@ pub(crate) async fn scan_inline_chunk_ranges(
 
 /// Every inlined-insert chunk for `table_id`, across all schema versions,
 /// in key order (schema version, then commit snapshot, then chunk
-/// sequence).
+/// sequence). `overlay` merges the unfolded tail on a slot-backed attach.
 pub(crate) async fn scan_inline_chunks(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
 ) -> Result<Vec<(InlineOperation, InlineChunkValue)>> {
-    scan_decode(
+    scan_decode_maybe(
         handle,
+        overlay,
         inline_live_table_prefix(InlineOperationKind::Insert, table_id),
         ScanShape::Probe,
         |key, bytes| match key {
@@ -261,10 +270,12 @@ pub(crate) async fn scan_inline_chunks(
 /// Every inlined-insert-row tombstone for `table_id`, keyed by row id.
 pub(crate) async fn scan_inline_deletes(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
 ) -> Result<Vec<(u64, InlineInlineDeleteValue)>> {
-    scan_decode(
+    scan_decode_maybe(
         handle,
+        overlay,
         inline_live_table_prefix(InlineOperationKind::InlineDelete, table_id),
         ScanShape::Probe,
         |key, bytes| match key {
@@ -283,10 +294,12 @@ pub(crate) async fn scan_inline_deletes(
 /// `(data_file_id, row_id)`.
 pub(crate) async fn scan_inline_file_deletes(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
 ) -> Result<Vec<(u64, u64, InlineFileDeleteValue)>> {
-    scan_decode(
+    scan_decode_maybe(
         handle,
+        overlay,
         inline_live_table_prefix(InlineOperationKind::FileDelete, table_id),
         ScanShape::Probe,
         |key, bytes| match key {
@@ -307,10 +320,18 @@ pub(crate) async fn scan_inline_file_deletes(
 /// marked as existing.
 pub(crate) async fn read_inline_file_delete_table(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
 ) -> Result<bool> {
-    let marker: Option<InlineFileDeleteTableValue> =
-        read_singleton(handle, Key::Inline(InlineKey::FileDeleteTable { table_id })).await?;
+    let key = Key::Inline(InlineKey::FileDeleteTable { table_id });
+    if let Some(overlay) = overlay {
+        match overlay.get(&key.encode()) {
+            Some(Some(_)) => return Ok(true),
+            Some(None) => return Ok(false),
+            None => {}
+        }
+    }
+    let marker: Option<InlineFileDeleteTableValue> = read_singleton(handle, key).await?;
     Ok(marker.is_some())
 }
 
@@ -345,20 +366,16 @@ fn resolve_inline_schemas(
         .collect()
 }
 
-/// One table's Arrow IPC schema at `schema_version`, if recorded.
+/// One table's Arrow IPC schema at `schema_version`, if recorded. `overlay`
+/// resolves a tail write or tombstone ahead of the store on a slot-backed
+/// attach.
 pub(crate) async fn read_inline_schema(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
     schema_version: u64,
 ) -> Result<Option<Bytes>> {
-    let Some(record): Option<InlineSchemaValue> = read_singleton(
-        handle,
-        Key::Inline(InlineKey::Schema {
-            table_id,
-            schema_version,
-        }),
-    )
-    .await?
+    let Some(record) = read_inline_schema_record(handle, overlay, table_id, schema_version).await?
     else {
         return Ok(None);
     };
@@ -366,14 +383,9 @@ pub(crate) async fn read_inline_schema(
         return Ok(Some(record.arrow_schema));
     };
 
-    let canonical: Option<InlineSchemaValue> = read_singleton(
-        handle,
-        Key::Inline(InlineKey::Schema {
-            table_id,
-            schema_version: target,
-        }),
-    )
-    .await?;
+    // The hop reads through the overlay too: a tail that deregistered one
+    // version may carry the version it now points at.
+    let canonical = read_inline_schema_record(handle, overlay, table_id, target).await?;
     match canonical {
         Some(value) if value.same_as_version.is_none() => Ok(Some(value.arrow_schema)),
         _ => Err(Error::Corruption(format!(
@@ -383,23 +395,49 @@ pub(crate) async fn read_inline_schema(
     }
 }
 
+/// One table's schema record at `schema_version`, unresolved. `overlay`
+/// resolves a tail write or tombstone ahead of the store on a slot-backed
+/// attach.
+async fn read_inline_schema_record(
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
+    table_id: u64,
+    schema_version: u64,
+) -> Result<Option<InlineSchemaValue>> {
+    let key = Key::Inline(InlineKey::Schema {
+        table_id,
+        schema_version,
+    });
+    if let Some(overlay) = overlay {
+        match overlay.get(&key.encode()) {
+            Some(Some(bytes)) => return Ok(Some(value::decode_value(bytes)?)),
+            Some(None) => return Ok(None),
+            None => {}
+        }
+    }
+    read_singleton(handle, key).await
+}
+
 /// Every schema version recorded for `table_id` with its Arrow bytes,
 /// references resolved, in key order.
 pub(crate) async fn scan_inline_schemas_resolved(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
 ) -> Result<Vec<(u64, Bytes)>> {
-    let schemas = scan_inline_schemas(handle, table_id).await?;
+    let schemas = scan_inline_schemas(handle, overlay, table_id).await?;
     resolve_inline_schemas(table_id, &schemas)
 }
 
 /// Every schema version recorded for `table_id`, in key order.
 pub(crate) async fn scan_inline_schemas(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
 ) -> Result<Vec<(u64, InlineSchemaValue)>> {
-    scan_decode(
+    scan_decode_maybe(
         handle,
+        overlay,
         inline_schema_table_prefix(table_id),
         ScanShape::Probe,
         |key, bytes| match key {
@@ -417,9 +455,13 @@ pub(crate) async fn scan_inline_schemas(
 /// Every `(table_id, schema_version)` with a schema record, in key order,
 /// without decoding the schemas themselves — the registry needs the pair,
 /// not the columns.
-pub(crate) async fn scan_all_inline_schema_keys(handle: ReadHandle<'_>) -> Result<Vec<(u64, u64)>> {
-    scan_keys(
+pub(crate) async fn scan_all_inline_schema_keys(
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
+) -> Result<Vec<(u64, u64)>> {
+    scan_keys_maybe(
         handle,
+        overlay,
         inline_schema_prefix(),
         ScanShape::Probe,
         |key| match key {
@@ -440,13 +482,15 @@ pub(crate) async fn scan_all_inline_schema_keys(handle: ReadHandle<'_>) -> Resul
 /// version DuckLake still lists from one it has flushed away.
 pub(crate) async fn scan_inline_dropped_schemas(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
 ) -> Result<Vec<u64>> {
-    scan_decode(
+    scan_keys_maybe(
         handle,
+        overlay,
         inline_schema_dropped_table_prefix(table_id),
         ScanShape::Probe,
-        |key, _| match key {
+        |key| match key {
             Key::Inline(InlineKey::SchemaDropped { schema_version, .. }) => Ok(schema_version),
             other => Err(Error::Corruption(format!(
                 "non-drop key in inline dropped-schema scan: {other:?}"
@@ -460,12 +504,14 @@ pub(crate) async fn scan_inline_dropped_schemas(
 /// key order.
 pub(crate) async fn scan_all_inline_dropped_schemas(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
 ) -> Result<Vec<(u64, u64)>> {
-    scan_decode(
+    scan_keys_maybe(
         handle,
+        overlay,
         inline_schema_dropped_prefix(),
         ScanShape::Probe,
-        |key, _| match key {
+        |key| match key {
             Key::Inline(InlineKey::SchemaDropped {
                 table_id,
                 schema_version,
@@ -484,9 +530,11 @@ pub(crate) async fn scan_all_inline_dropped_schemas(
 #[cfg(test)]
 pub(crate) async fn scan_all_inline_schemas(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
 ) -> Result<Vec<(u64, u64, InlineSchemaValue)>> {
-    scan_decode(
+    scan_decode_maybe(
         handle,
+        overlay,
         inline_schema_prefix(),
         ScanShape::Probe,
         |key, bytes| match key {
@@ -507,7 +555,7 @@ mod tests {
     use std::sync::Arc;
 
     use object_store::memory::InMemory;
-    use slatedb::{IsolationLevel, config::WriteOptions};
+    use slatedb::IsolationLevel;
 
     use super::*;
     use crate::store::open::StoreBuilder;
@@ -564,19 +612,20 @@ mod tests {
         tx.commit().await.unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        let selected = find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 7, &[105, 1_005])
-            .await
-            .unwrap()
-            .unwrap();
+        let selected =
+            find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), None, 7, &[105, 1_005])
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].row_id_start, 100);
         assert_eq!(selected[1].row_id_start, 1_000);
-        let (_, first) = read_inline_chunk_locator(ReadHandle::Tx(&tx), 7, selected[0])
+        let (_, first) = read_inline_chunk_locator(ReadHandle::Tx(&tx), None, 7, selected[0])
             .await
             .unwrap();
         assert_eq!(first.body.as_ref(), b"chunk-7-1");
         assert_eq!(
-            find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 8, &[5])
+            find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), None, 8, &[5])
                 .await
                 .unwrap(),
             None,
@@ -719,16 +768,15 @@ mod tests {
         )
         .unwrap();
 
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        crate::transaction::commit::commit_durably(&db, tx)
+            .await
+            .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
 
-        let chunks = scan_inline_chunks(ReadHandle::Tx(&tx), 7).await.unwrap();
+        let chunks = scan_inline_chunks(ReadHandle::Tx(&tx), None, 7)
+            .await
+            .unwrap();
         assert_eq!(
             chunks,
             vec![
@@ -762,34 +810,46 @@ mod tests {
             ]
         );
 
-        let inline_deletes = scan_inline_deletes(ReadHandle::Tx(&tx), 7).await.unwrap();
+        let inline_deletes = scan_inline_deletes(ReadHandle::Tx(&tx), None, 7)
+            .await
+            .unwrap();
         assert_eq!(inline_deletes, vec![(3, inline_delete)]);
 
-        let file_deletes = scan_inline_file_deletes(ReadHandle::Tx(&tx), 7)
+        let file_deletes = scan_inline_file_deletes(ReadHandle::Tx(&tx), None, 7)
             .await
             .unwrap();
         assert_eq!(file_deletes, vec![(5, 1, file_delete)]);
 
-        let schemas = scan_inline_schemas(ReadHandle::Tx(&tx), 7).await.unwrap();
+        let schemas = scan_inline_schemas(ReadHandle::Tx(&tx), None, 7)
+            .await
+            .unwrap();
         assert_eq!(
             schemas,
             vec![(0, schema_v0.clone()), (1, schema_v1.clone())]
         );
 
         assert_eq!(
-            read_inline_schema(ReadHandle::Tx(&tx), 7, 0).await.unwrap(),
+            read_inline_schema(ReadHandle::Tx(&tx), None, 7, 0)
+                .await
+                .unwrap(),
             Some(schema_v0.arrow_schema)
         );
         assert_eq!(
-            read_inline_schema(ReadHandle::Tx(&tx), 7, 1).await.unwrap(),
+            read_inline_schema(ReadHandle::Tx(&tx), None, 7, 1)
+                .await
+                .unwrap(),
             Some(schema_v1.arrow_schema)
         );
         assert_eq!(
-            read_inline_schema(ReadHandle::Tx(&tx), 7, 2).await.unwrap(),
+            read_inline_schema(ReadHandle::Tx(&tx), None, 7, 2)
+                .await
+                .unwrap(),
             None
         );
 
-        let other_table_chunks = scan_inline_chunks(ReadHandle::Tx(&tx), 8).await.unwrap();
+        let other_table_chunks = scan_inline_chunks(ReadHandle::Tx(&tx), None, 8)
+            .await
+            .unwrap();
         assert_eq!(
             other_table_chunks,
             vec![(
@@ -846,15 +906,14 @@ mod tests {
             )
             .unwrap();
         }
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        crate::transaction::commit::commit_durably(&db, tx)
+            .await
+            .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        let all = scan_all_inline_schemas(ReadHandle::Tx(&tx)).await.unwrap();
+        let all = scan_all_inline_schemas(ReadHandle::Tx(&tx), None)
+            .await
+            .unwrap();
         assert_eq!(
             all,
             vec![
@@ -914,16 +973,11 @@ mod tests {
             )
             .unwrap();
         }
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        tx.commit().await.unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         assert_eq!(
-            scan_inline_schemas_resolved(ReadHandle::Tx(&tx), 1)
+            scan_inline_schemas_resolved(ReadHandle::Tx(&tx), None, 1)
                 .await
                 .unwrap(),
             vec![
@@ -932,15 +986,21 @@ mod tests {
             ]
         );
         assert_eq!(
-            read_inline_schema(ReadHandle::Tx(&tx), 1, 0).await.unwrap(),
+            read_inline_schema(ReadHandle::Tx(&tx), None, 1, 0)
+                .await
+                .unwrap(),
             Some(Bytes::from_static(b"columns"))
         );
         assert!(
-            scan_inline_schemas_resolved(ReadHandle::Tx(&tx), 2)
+            scan_inline_schemas_resolved(ReadHandle::Tx(&tx), None, 2)
                 .await
                 .is_err()
         );
-        assert!(read_inline_schema(ReadHandle::Tx(&tx), 2, 0).await.is_err());
+        assert!(
+            read_inline_schema(ReadHandle::Tx(&tx), None, 2, 0)
+                .await
+                .is_err()
+        );
         tx.rollback();
         db.close().await.unwrap();
     }
@@ -978,19 +1038,18 @@ mod tests {
             b"not a value at all",
         )
         .unwrap();
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        tx.commit().await.unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        let keys = scan_all_inline_schema_keys(ReadHandle::Tx(&tx))
+        let keys = scan_all_inline_schema_keys(ReadHandle::Tx(&tx), None)
             .await
             .unwrap();
         assert_eq!(keys, vec![(1, 0), (1, 1)]);
-        assert!(scan_all_inline_schemas(ReadHandle::Tx(&tx)).await.is_err());
+        assert!(
+            scan_all_inline_schemas(ReadHandle::Tx(&tx), None)
+                .await
+                .is_err()
+        );
         tx.rollback();
         db.close().await.unwrap();
     }

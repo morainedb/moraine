@@ -18,7 +18,6 @@ use crate::{
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
         },
-        read,
     },
     telemetry::milliseconds,
     transaction::index_maintenance,
@@ -45,6 +44,7 @@ struct LookupResolution {
 
 async fn resolve_encoded(
     handle: ReadHandle<'_>,
+    tail: Option<&moraine_wal::Overlay>,
     index_id: u64,
     unique: bool,
     encoded: Vec<CanonicalKey>,
@@ -69,7 +69,8 @@ async fn resolve_encoded(
             first_probe.get_or_insert_with(Instant::now);
             probes.push(async move {
                 let started = Instant::now();
-                let found = index_maintenance::lookup_row_ids(handle, index_id, unique, &key).await;
+                let found =
+                    index_maintenance::lookup_row_ids(handle, tail, index_id, unique, &key).await;
                 (found, started.elapsed(), Instant::now())
             });
         }
@@ -180,14 +181,15 @@ impl ReadOnlyCatalog {
         let started = Instant::now();
         let cache_before = self.cache_tally();
         let store_before = self.object_store_tally();
-        let session = self.begin_read().await?;
-        let handle = session.handle();
+        // The probe materializes head and unfolded tail as one cut, so the
+        // entries and the catalog they resolve against agree without a
+        // stable-read retry.
+        let head_started = Instant::now();
+        let read = self.begin_probe().await?;
+        let head = head_started.elapsed();
 
-        let index_row_ids = read::consistent(handle, || async {
-            let head_started = Instant::now();
-            let view = self.head_view(handle).await?;
-            let head = head_started.elapsed();
-            let info = ready_index(&view, table, index)?;
+        let index_row_ids = async {
+            let info = ready_index(read.view(), table, index)?;
 
             let mut encoded = keys.iter().map(|key| {
                 if key.len() != info.columns.len() {
@@ -207,12 +209,19 @@ impl ReadOnlyCatalog {
             encoded.sort_unstable();
             encoded.dedup();
 
-            let mut resolution = resolve_encoded(handle, index.get(), info.unique, encoded).await?;
+            let mut resolution = resolve_encoded(
+                read.handle(),
+                read.tail(),
+                index.get(),
+                info.unique,
+                encoded,
+            )
+            .await?;
             resolution.metrics.head = head;
             Ok(resolution)
-        })
+        }
         .await;
-        session.finish();
+        read.finish().await;
 
         match index_row_ids {
             Ok(resolution) => {
@@ -254,28 +263,30 @@ impl ReadOnlyCatalog {
         upper: Bound<Vec<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
-        let session = self.begin_read().await?;
-        let handle = session.handle();
+        let read = self.begin_probe().await?;
 
-        let view = self.head_view(handle).await?;
-        let info = ready_index(&view, table, index)?;
+        let outcome = async {
+            let info = ready_index(read.view(), table, index)?;
 
-        let (byte_lower, byte_upper) = encode_range_bounds(&info, index, lower, upper)?;
-        let leading_nulls = info.nulls.first().copied().unwrap_or(NullOrder::Last);
+            let (byte_lower, byte_upper) = encode_range_bounds(&info, index, lower, upper)?;
+            let leading_nulls = info.nulls.first().copied().unwrap_or(NullOrder::Last);
 
-        let range_row_ids = index_maintenance::range_row_ids(
-            handle,
-            index.get(),
-            info.unique,
-            leading_nulls,
-            byte_lower,
-            byte_upper,
-            ScanOrder::from_reverse(reverse),
-        )
+            index_maintenance::range_row_ids(
+                read.handle(),
+                read.tail(),
+                index.get(),
+                info.unique,
+                leading_nulls,
+                byte_lower,
+                byte_upper,
+                ScanOrder::from_reverse(reverse),
+            )
+            .await
+        }
         .await;
-        session.finish();
+        read.finish().await;
 
-        range_row_ids
+        outcome
     }
 
     /// Resolves an `IS NULL` query to the rows whose leading indexed columns
@@ -299,40 +310,41 @@ impl ReadOnlyCatalog {
         prefix: Vec<Option<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
-        let session = self.begin_read().await?;
-        let handle = session.handle();
+        let read = self.begin_probe().await?;
 
-        let view = self.head_view(handle).await?;
-        let info = ready_index(&view, table, index)?;
+        let outcome = async {
+            let info = ready_index(read.view(), table, index)?;
 
-        if prefix.is_empty() || prefix.len() > info.columns.len() {
-            return Err(Error::Constraint(format!(
-                "index_nulls: a prefix of {} predicates does not fit the {}-column index \
+            if prefix.is_empty() || prefix.len() > info.columns.len() {
+                return Err(Error::Constraint(format!(
+                    "index_nulls: a prefix of {} predicates does not fit the {}-column index \
                      {index}",
-                prefix.len(),
-                info.columns.len()
-            )));
-        }
-        if prefix.iter().all(Option::is_some) {
-            return Err(Error::Constraint(
-                "index_nulls: the prefix names no IS NULL; use index_lookup for pure equality"
-                    .to_owned(),
-            ));
-        }
+                    prefix.len(),
+                    info.columns.len()
+                )));
+            }
+            if prefix.iter().all(Option::is_some) {
+                return Err(Error::Constraint(
+                    "index_nulls: the prefix names no IS NULL; use index_lookup for pure equality"
+                        .to_owned(),
+                ));
+            }
 
-        let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
+            let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
 
-        let null_prefix_row_ids = index_maintenance::null_prefix_row_ids(
-            handle,
-            index.get(),
-            &key,
-            ScanOrder::from_reverse(reverse),
-        )
+            index_maintenance::null_prefix_row_ids(
+                read.handle(),
+                read.tail(),
+                index.get(),
+                &key,
+                ScanOrder::from_reverse(reverse),
+            )
+            .await
+        }
         .await;
+        read.finish().await;
 
-        session.finish();
-
-        null_prefix_row_ids
+        outcome
     }
 }
 

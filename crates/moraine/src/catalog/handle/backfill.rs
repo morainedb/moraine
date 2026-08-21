@@ -78,9 +78,10 @@ async fn collect_immediate_backfill<'a>(
 
 pub(super) async fn collect_inline_delete_positions(
     session_handle: ReadHandle<'_>,
+    overlay: Option<&moraine_wal::Overlay>,
     table_id: u64,
 ) -> Result<HashMap<u64, HashSet<u64>>> {
-    let killed = store_inline::scan_inline_file_deletes(session_handle, table_id)
+    let killed = store_inline::scan_inline_file_deletes(session_handle, overlay, table_id)
         .await?
         .into_iter()
         .fold(
@@ -98,6 +99,7 @@ pub(super) async fn collect_inline_delete_positions(
 /// fetched concurrently.
 pub(super) async fn read_inline_schemas(
     session_handle: ReadHandle<'_>,
+    overlay: Option<&moraine_wal::Overlay>,
     table: TableId,
     schema_versions: impl IntoIterator<Item = u64>,
 ) -> Result<HashMap<u64, Bytes>> {
@@ -107,14 +109,18 @@ pub(super) async fn read_inline_schemas(
         schema_versions
             .into_iter()
             .map(|schema_version| async move {
-                let record =
-                    store_inline::read_inline_schema(session_handle, table.get(), schema_version)
-                        .await?
-                        .ok_or_else(|| {
-                            Error::Corruption(format!(
-                                "no inline schema for table {table} version {schema_version}"
-                            ))
-                        })?;
+                let record = store_inline::read_inline_schema(
+                    session_handle,
+                    overlay,
+                    table.get(),
+                    schema_version,
+                )
+                .await?
+                .ok_or_else(|| {
+                    Error::Corruption(format!(
+                        "no inline schema for table {table} version {schema_version}"
+                    ))
+                })?;
                 Ok::<_, Error>((schema_version, record))
             }),
     )
@@ -228,9 +234,9 @@ impl ReadOnlyCatalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
-        let session = self.begin_read().await?;
+        let read = self.begin_probe().await?;
 
-        let snapshot = self.head_view(session.handle()).await?;
+        let snapshot = read.view();
         let positions = snapshot.column_positions(table, columns)?;
 
         let table_prefix = snapshot.table_data_prefix(table)?;
@@ -245,7 +251,8 @@ impl ReadOnlyCatalog {
 
         // Entries are live-only: delete files name positions within their
         // target, inline file-deletes name row ids.
-        let inline_deletes = collect_inline_delete_positions(session.handle(), table.get());
+        let inline_deletes =
+            collect_inline_delete_positions(read.handle(), read.tail(), table.get());
         let metrics = self.data_read_metrics();
         let delete_files = collect_delete_positions(
             snapshot.delete_files_of(table).into_iter(),
@@ -265,7 +272,7 @@ impl ReadOnlyCatalog {
             &killed_row_ids,
         )
         .await;
-        session.finish();
+        read.finish().await;
 
         outcome
     }
@@ -286,9 +293,25 @@ impl ReadOnlyCatalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
-        let session = self.begin_read().await?;
+        let read = self.begin_probe().await?;
 
-        let snapshot = self.head_view(session.handle()).await?;
+        let outcome = self.inline_backfill_from(&read, table, columns).await;
+        read.finish().await;
+
+        outcome
+    }
+
+    /// The backfill entries of `table`'s live inline rows, read through
+    /// `read` — the folded store overlaid with the unfolded tail — so rows in
+    /// slots no folder has applied are covered rather than silently skipped.
+    /// An index built without them would flip ready covering nothing.
+    async fn inline_backfill_from(
+        &self,
+        read: &super::ProbeRead,
+        table: TableId,
+        columns: &[ColumnId],
+    ) -> Result<Vec<IndexEntry>> {
+        let snapshot = read.view();
         let positions = snapshot.column_positions(table, columns)?;
 
         // A tombstone ends only versions begun before it. UPDATE can
@@ -297,20 +320,20 @@ impl ReadOnlyCatalog {
         let (dead, chunks) = futures::try_join!(
             async {
                 Ok::<_, Error>(
-                    store_inline::scan_inline_deletes(session.handle(), table.get())
+                    store_inline::scan_inline_deletes(read.handle(), read.tail(), table.get())
                         .await?
                         .into_iter()
                         .map(|(row_id, deletion)| (row_id, deletion.end_snapshot))
                         .collect::<HashMap<u64, u64>>(),
                 )
             },
-            store_inline::scan_inline_chunks(session.handle(), table.get()),
+            store_inline::scan_inline_chunks(read.handle(), read.tail(), table.get()),
         )?;
         let schema_versions = chunks.iter().filter_map(|(operation, _)| match operation {
             InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
             _ => None,
         });
-        let schemas = read_inline_schemas(session.handle(), table, schema_versions)
+        let schemas = read_inline_schemas(read.handle(), read.tail(), table, schema_versions)
             .await?
             .into_iter()
             .map(|(schema_version, record)| {
@@ -354,7 +377,6 @@ impl ReadOnlyCatalog {
                     }),
             );
         }
-        session.finish();
 
         Ok(entries)
     }

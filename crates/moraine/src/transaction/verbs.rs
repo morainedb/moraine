@@ -1162,6 +1162,57 @@ impl Transaction {
         Ok(resulting_state)
     }
 
+    /// Advances a staged build's cursor to `covered_through` and, with
+    /// `is_final`, flips the index ready — staging no entries, for a build
+    /// whose entry batch was written straight into the store under the folder
+    /// role. The cursor only ever advances.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the index does not exist, or
+    /// [`Error::Constraint`] if it is not building.
+    pub fn advance_index_build(
+        &mut self,
+        index: IndexId,
+        covered_through: Option<u64>,
+        is_final: bool,
+    ) -> Result<IndexState> {
+        let (table_id, mut value) = self.live_index(index)?;
+        if value.build_state.as_deref() != Some("building") {
+            return Err(Error::Constraint(format!("index {index} is not building")));
+        }
+
+        value.begin_snapshot = self.new_snapshot_id;
+        if let Some(row_id) = covered_through {
+            value.build_cursor_row_id = Some(value.build_cursor_row_id.unwrap_or(0).max(row_id));
+        }
+        let resulting_state = if is_final {
+            value.build_state = None;
+            IndexState::Ready
+        } else {
+            IndexState::Building
+        };
+        self.state.put_index(value);
+        self.mark_altered(table_id);
+        Ok(resulting_state)
+    }
+
+    /// Poisons a staged build's definition — terminal, for a duplicate the
+    /// folder-role backfill discovered. The flag flips through this commit so
+    /// replay and every peer see the build poisoned; its driver then drops it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the index does not exist.
+    pub fn poison_index_build(&mut self, index: IndexId) -> Result<()> {
+        let (table_id, mut value) = self.live_index(index)?;
+        value.begin_snapshot = self.new_snapshot_id;
+        value.poisoned = Some(true);
+        self.state.put_index(value);
+        self.mark_altered(table_id);
+        Ok(())
+    }
+
     fn live_table_stats(&self, table: TableId) -> Result<TableStatsValue> {
         self.state
             .table_stats
@@ -2395,6 +2446,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            transaction_id: None,
             deleted_data_file_ids: Vec::new(),
         };
         Transaction::new(CatalogSnapshot::build(snapshot, &[], &[], None), 5)
@@ -2920,6 +2972,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            transaction_id: None,
             deleted_data_file_ids: Vec::new(),
         };
         let table = TableValue {
@@ -3318,6 +3371,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            transaction_id: None,
             deleted_data_file_ids: Vec::new(),
         };
         let main = SchemaValue {

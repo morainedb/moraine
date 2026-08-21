@@ -17,6 +17,18 @@ catalog database. Guides and design docs live on the project site:
 > validated against real DuckDB in CI. Most of the v0.1 feature set (below)
 > is in. Released on crates.io; APIs may still change before 1.0.
 
+## Upgrading
+
+Attaching read-write with the release that lands the fleet commit log
+([RFC 0022](docs/rfcs/0022-commit-log-and-leader-role.md)) migrates an
+existing store once, irreversibly, to format 4. Data is unaffected —
+schemas, tables, and history read exactly as before — but the migration
+fences any still-running older-binary writer, and an older binary refuses
+the store afterward. Read-only attaches never migrate: an unmigrated
+store keeps serving read-only exactly as it always has. There is no
+separate migration step — the first read-write attach performs it as one
+atomic batch.
+
 ## Why
 
 DuckLake keeps table data in object storage but stores its catalog — the
@@ -45,8 +57,10 @@ bucket next to the Parquet files:
   service in the path.
 
 The trade-off is commit latency: a commit is durable only once an
-object-store PUT lands (~5–10 ms on S3 Express One Zone, ~50–100 ms on S3
-Standard). For lakehouse workloads that commit after writing Parquet files
+object-store PUT lands and is acknowledged by redundant, multi-zone storage
+(~50–100 ms on S3 Standard; single-zone classes such as S3 Express One Zone
+cannot back the commit log, since their PUT ack does not mean durable). For
+lakehouse workloads that commit after writing Parquet files
 for seconds, this is noise; small inserts use DuckLake **data inlining** to
 skip the per-commit Parquet-file tax. Workloads needing sub-PUT commit
 latency want a hot server with local state — moraine stays serverless and

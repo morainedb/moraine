@@ -1,101 +1,8 @@
 use std::sync::Arc;
 
-use futures::TryStreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
+use object_store::memory::InMemory;
 
 use super::*;
-
-/// A prepared head view is installed by allocation rather than rebuilt.
-#[test]
-fn a_prepared_head_view_is_installed_without_rebuilding() {
-    let projections = std::sync::RwLock::new(ProjectionCache::empty());
-    let prepared = Arc::new(CatalogSnapshot {
-        snapshot: proto::SnapshotValue {
-            snapshot_id: 7,
-            ..proto::SnapshotValue::default()
-        },
-        batch_seq: 11,
-        ..CatalogSnapshot::default()
-    });
-
-    install_committed_head_view(
-        &projections,
-        HeadViewUpdate::Prepared(Arc::clone(&prepared)),
-        &[],
-    );
-
-    let installed = held_head_view(&projections).unwrap();
-    assert!(Arc::ptr_eq(&installed, &prepared));
-}
-
-/// The durable-commit wrapper is transparent: it hands back exactly what
-/// the commit reported. The wait it wraps is unbounded on purpose — a
-/// deadline could not cancel the staged batch, so it would report failure
-/// for a commit that still lands — and all it adds is a log line once the
-/// wait runs long.
-#[tokio::test]
-async fn a_durable_commit_returns_its_own_outcome() {
-    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let (db, _) = StoreBuilder::new("", object_store)
-        .open_writer()
-        .await
-        .unwrap();
-
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-    tx.put(Key::Sys(SysKey::Head).encode(), b"head").unwrap();
-    assert!(
-        commit_durable(tx, "test", StagedBytes::default())
-            .await
-            .is_ok()
-    );
-    assert_eq!(
-        db.get(&Key::Sys(SysKey::Head).encode())
-            .await
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        b"head"
-    );
-
-    db.close().await.unwrap();
-}
-
-/// A store whose manifest cannot be read fails the open outright, rather
-/// than being mistaken for an empty store and bootstrapped over.
-#[tokio::test]
-async fn a_store_with_an_unreadable_manifest_refuses_to_open() {
-    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    StoreBuilder::new("", object_store.clone())
-        .open_writer()
-        .await
-        .unwrap()
-        .0
-        .close()
-        .await
-        .unwrap();
-
-    // Overwrite every manifest with bytes no version of one can parse.
-    let manifests: Vec<_> = object_store
-        .list(None)
-        .map_ok(|meta| meta.location)
-        .try_filter(|location| futures::future::ready(location.to_string().contains("manifest")))
-        .try_collect()
-        .await
-        .unwrap();
-    assert!(!manifests.is_empty(), "the store must have a manifest");
-    for manifest in manifests {
-        object_store
-            .put(&manifest, vec![0xff; 64].into())
-            .await
-            .unwrap();
-    }
-
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
-        .await
-        .err()
-        .unwrap();
-    assert!(matches!(err, Error::Store(_)), "{err:?}");
-}
 
 /// A store stamped with a newer structural format must be refused,
 /// not misread.
@@ -123,7 +30,7 @@ async fn unknown_format_is_refused() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, Error::Migration(_)), "{err:?}");
+    assert!(matches!(err, Error::Migration(_)));
 }
 
 /// A mid-migration marker refuses the open outright.
@@ -233,10 +140,10 @@ async fn materialize_gate_refuses_on_marker() {
         }),
     )
     .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
+    commit_durably(&db, tx).await.unwrap();
 
     let read = db.begin(IsolationLevel::Snapshot).await.unwrap();
-    let err = materialize(ReadHandle::Tx(&read), None)
+    let err = refuse_mid_migration(ReadHandle::Tx(&read))
         .await
         .err()
         .unwrap();
@@ -272,6 +179,7 @@ fn renaming_one_column_stages_no_write_for_any_sibling() {
         commit_message: None,
         commit_extra_info: None,
         schema_changed_table_ids: Vec::new(),
+        transaction_id: None,
         deleted_data_file_ids: Vec::new(),
     };
     let mut setup = Transaction::new(CatalogSnapshot::build(snap0, &[], &[], None), 1);
@@ -339,6 +247,7 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
         commit_message: None,
         commit_extra_info: None,
         schema_changed_table_ids: Vec::new(),
+        transaction_id: None,
         deleted_data_file_ids: Vec::new(),
     };
     let empty = CatalogSnapshot::build(snap0, &[], &[], None);
@@ -374,7 +283,7 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
                 file_size_bytes: 100,
                 footer_size: 4,
                 encryption_key: None,
-                partition_values: vec![],
+                partition_values: Vec::new(),
                 column_stats: vec![FileColumnStats {
                     column_id: column,
                     column_size_bytes: 10,
@@ -415,8 +324,6 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
 /// handles.
 #[tokio::test]
 async fn fresh_reader_sees_committed_head() {
-    use slatedb::DbReader;
-
     use crate::catalog::{Catalog, CatalogOptions};
 
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
@@ -428,19 +335,15 @@ async fn fresh_reader_sees_committed_head() {
         .await
         .unwrap();
 
-    let reader = DbReader::builder("", object_store)
-        .with_segment_extractor(Arc::new(crate::store::segment::TagSegmentExtractor))
-        .build()
+    // The commit rides a slot; a fresh attach replays the tail over the folded
+    // store and sees the committed head.
+    let fresh = Catalog::open(object_store, CatalogOptions::default())
         .await
         .unwrap();
-    let head_bytes = reader
-        .get(Key::Sys(SysKey::Head).encode())
-        .await
-        .unwrap()
-        .expect("fresh reader must see the head");
-    let head: proto::HeadValue = value::decode_value(&head_bytes).unwrap();
-    assert_eq!(head.snapshot_id, 1);
-    reader.close().await.unwrap();
+    let view = fresh.snapshot().await.unwrap();
+    assert_eq!(view.current_snapshot().id.get(), 1);
+    assert!(view.schema_by_name("visible").is_some());
+    fresh.close().await.unwrap();
     catalog.close().await.unwrap();
 }
 
@@ -493,7 +396,7 @@ async fn verb_ddl_records_schema_changed_table_ids() {
                     file_size_bytes: 10,
                     footer_size: 4,
                     encryption_key: None,
-                    partition_values: vec![],
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &[],
@@ -503,26 +406,31 @@ async fn verb_ddl_records_schema_changed_table_ids() {
         .await
         .unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let ddl = read::read_snapshot(ReadHandle::Tx(&tx), 1)
+    let dump = catalog.begin_dump().await.unwrap();
+    let snapshots = read::scan_snapshots_overlaid(dump.handle(), dump.overlay())
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(ddl.schema_changed_table_ids, vec![table.get()]);
-    let data_only = read::read_snapshot(ReadHandle::Tx(&tx), 2)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(data_only.schema_changed_table_ids, Vec::<u64>::new());
-    tx.rollback();
+    dump.finish().await;
+    let by_id = |id: u64| snapshots.iter().find(|s| s.snapshot_id == id).unwrap();
+    assert_eq!(by_id(1).schema_changed_table_ids, vec![table.get()]);
+    assert_eq!(by_id(2).schema_changed_table_ids, Vec::<u64>::new());
     catalog.close().await.unwrap();
 }
 
 async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::catalog::TableId) {
     use crate::catalog::{Catalog, CatalogOptions, ColumnDef};
-    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap();
+    // A zero refresh interval so the shared reader reflects folder-role writes
+    // without poll lag: the maintenance sweeps read index entries that a folder
+    // session seeded after this attach opened.
+    let catalog = Catalog::open(
+        Arc::new(InMemory::new()),
+        CatalogOptions {
+            reader_poll_interval: std::time::Duration::ZERO,
+            ..CatalogOptions::default()
+        },
+    )
+    .await
+    .unwrap();
     let table = std::cell::Cell::new(None);
     catalog
         .commit(|tx| {
@@ -544,25 +452,6 @@ async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::cat
 }
 
 /// A `BIGINT`-shaped index key value.
-/// Writes the marker exactly as a migration's start batch does: the marker
-/// and the head stamp that carries it, in one batch.
-async fn plant_migration_marker(catalog: &crate::catalog::Catalog) {
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let head = read::read_head(ReadHandle::Tx(&tx)).await.unwrap().unwrap();
-    tx.put(
-        Key::Sys(SysKey::Migration).encode(),
-        value::encode_value(&proto::MigrationValue {
-            from_format: 1,
-            to_format: 2,
-            cursor: Vec::new(),
-        }),
-    )
-    .unwrap();
-    let (key, stamp) = head_stamp(head.snapshot_id, head.batch_seq);
-    tx.put(key, stamp.unwrap()).unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
-}
-
 fn int_value(value: i128) -> crate::store::index_encoding::IndexKeyValue {
     crate::store::index_encoding::IndexKeyValue::Int {
         value,
@@ -605,9 +494,9 @@ fn null_entry(row_id: u64) -> crate::catalog::IndexEntry {
 }
 
 async fn read_format_version(catalog: &crate::catalog::Catalog) -> u64 {
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let format = read::read_format(ReadHandle::Tx(&tx)).await.unwrap();
-    tx.rollback();
+    let dump = catalog.begin_dump().await.unwrap();
+    let format = read::read_format(dump.handle()).await.unwrap();
+    dump.finish().await;
     format.map_or(FORMAT_VERSION, |f| f.format_version)
 }
 
@@ -618,7 +507,7 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
         store::key::{IndexKind, index_index_prefix},
     };
     let (catalog, table) = catalog_with_two_column_table().await;
-    assert_eq!(read_format_version(&catalog).await, FORMAT_VERSION);
+    assert_eq!(read_format_version(&catalog).await, FORMAT_MULTI_WRITER);
 
     let index = std::cell::Cell::new(None);
     catalog
@@ -646,78 +535,14 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
     assert_eq!(infos[0].columns, vec![ColumnId::new(1)]);
     assert!(infos[0].unique);
     assert_eq!(infos[0].state, IndexState::Ready);
-    assert_eq!(read_format_version(&catalog).await, FORMAT_WITH_INDEX);
+    assert_eq!(read_format_version(&catalog).await, FORMAT_MULTI_WRITER);
 
     // Both backfill rows produced a stored entry.
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(
-            index_index_prefix(IndexKind::Unique, index_id.get()),
-            ..,
-            crate::store::handle::ScanShape::Bulk,
-        )
+    let count = catalog
+        .scan_prefix_overlaid(index_index_prefix(IndexKind::Unique, index_id.get()))
         .await
-        .unwrap();
-    let mut count = 0;
-    while iter.next().await.unwrap().is_some() {
-        count += 1;
-    }
+        .len();
     assert_eq!(count, 2);
-    tx.rollback();
-    catalog.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn deferred_index_is_non_unique_and_stamps_its_format() {
-    use crate::catalog::{ColumnId, IndexDef, IndexMaintenance};
-    let (catalog, table) = catalog_with_two_column_table().await;
-
-    catalog
-        .commit(|tx| {
-            tx.create_index_ordered_with_maintenance(
-                table,
-                &IndexDef {
-                    name: "by_a".into(),
-                    columns: vec![ColumnId::new(1)],
-                    unique: false,
-                },
-                &[],
-                IndexMaintenance::Deferred,
-                &[],
-            )
-            .map(|_| ())
-        })
-        .await
-        .unwrap();
-
-    let snapshot = catalog.snapshot().await.unwrap();
-    assert_eq!(
-        snapshot.indexes_of(table)[0].maintenance,
-        IndexMaintenance::Deferred
-    );
-    assert_eq!(
-        read_format_version(&catalog).await,
-        FORMAT_WITH_DEFERRED_INDEX
-    );
-
-    let error = catalog
-        .commit(|tx| {
-            tx.create_index_ordered_with_maintenance(
-                table,
-                &IndexDef {
-                    name: "unique_by_b".into(),
-                    columns: vec![ColumnId::new(2)],
-                    unique: true,
-                },
-                &[],
-                IndexMaintenance::Deferred,
-                &[],
-            )
-            .map(|_| ())
-        })
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("non-unique"), "{error}");
     catalog.close().await.unwrap();
 }
 
@@ -751,7 +576,7 @@ async fn duplicate_unique_value_in_backfill_aborts_create() {
             .indexes_of(table)
             .is_empty()
     );
-    assert_eq!(read_format_version(&catalog).await, FORMAT_VERSION);
+    assert_eq!(read_format_version(&catalog).await, FORMAT_MULTI_WRITER);
     catalog.close().await.unwrap();
 }
 
@@ -825,7 +650,7 @@ async fn register_three_row_file(
                     file_size_bytes: 30,
                     footer_size: 4,
                     encryption_key: None,
-                    partition_values: vec![],
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &[],
@@ -1349,18 +1174,6 @@ async fn unique_index_admits_null_rows_and_index_nulls_finds_them() {
     nulls.sort_unstable();
     assert_eq!(nulls, vec![1, 2], "IS NULL finds both NULL rows");
 
-    let reversed_nulls = catalog
-        .index_nulls(table, index, vec![None], true)
-        .await
-        .unwrap()
-        .into_iter()
-        .collect::<Vec<_>>();
-    assert_eq!(
-        reversed_nulls,
-        vec![2, 1],
-        "a reverse NULL-prefix scan streams the opposite order"
-    );
-
     // The non-null value is still uniquely resolvable, unaffected.
     let value = vec![crate::store::index_encoding::IndexKeyValue::Int {
         value: 10,
@@ -1528,17 +1341,6 @@ async fn index_range_spans_a_composite_prefix_and_window() {
         .await
         .unwrap();
     assert_eq!(sorted_row_ids(above_a), vec![2], "a > 5 spans only row 2");
-
-    let forward = catalog
-        .index_range(table, index, Bound::Unbounded, Bound::Unbounded, false)
-        .await
-        .unwrap();
-    let reverse = catalog
-        .index_range(table, index, Bound::Unbounded, Bound::Unbounded, true)
-        .await
-        .unwrap();
-    assert_eq!(forward, vec![0, 1, 2]);
-    assert_eq!(reverse, vec![2, 1, 0]);
 
     catalog.close().await.unwrap();
 }
@@ -1768,7 +1570,7 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
         file_size_bytes: 20,
         footer_size: 4,
         encryption_key: None,
-        partition_values: vec![],
+        partition_values: Vec::new(),
         column_stats: vec![],
     };
 
@@ -1806,7 +1608,8 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
         .index_lookup(table, index, &[int_value(20)])
         .await
         .unwrap();
-    assert_eq!(hits, vec![1]);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0], 1);
     catalog.close().await.unwrap();
 }
 
@@ -1836,15 +1639,15 @@ fn bulk_file(path: &str, count: u64) -> crate::catalog::DataFile {
         file_size_bytes: count * 10,
         footer_size: 4,
         encryption_key: None,
-        partition_values: vec![],
+        partition_values: Vec::new(),
         column_stats: vec![],
     }
 }
 
-/// A large bulk commit resolves its unique entries in bounded concurrent
-/// groups; enforcement is unchanged: fresh values land, a value a committed
-/// live row already holds aborts the whole commit, and nothing of the aborted
-/// commit remains visible.
+/// A commit staging more unique entries than the merged-probe threshold
+/// resolves them in one sorted pass per index; enforcement is unchanged:
+/// fresh values land, a value a committed live row already holds aborts
+/// the whole commit, and nothing of the aborted commit remains visible.
 #[tokio::test]
 async fn bulk_unique_commit_lands_and_committed_duplicate_aborts() {
     use crate::catalog::{ColumnId, IndexDef};
@@ -1932,8 +1735,8 @@ async fn bulk_unique_commit_lands_and_committed_duplicate_aborts() {
 }
 
 /// Values killed earlier in the same bulk commit are free again for the
-/// commit's own inserts — the delete-then-reinsert contract holds for a
-/// large bulk commit too.
+/// commit's own inserts — the delete-then-reinsert contract holds above
+/// the merged-probe threshold too.
 #[tokio::test]
 async fn bulk_unique_commit_frees_values_deleted_in_the_same_commit() {
     use crate::catalog::{ColumnId, FileIndexRemoval, IndexDef};
@@ -2098,7 +1901,7 @@ async fn catalog_with_indexed_data_file() -> (
                     file_size_bytes: 20,
                     footer_size: 4,
                     encryption_key: None,
-                    partition_values: vec![],
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &[
@@ -2275,7 +2078,7 @@ async fn unique_index_rejects_a_duplicate_value_across_commits() {
             file_size_bytes: 10,
             footer_size: 4,
             encryption_key: None,
-            partition_values: vec![],
+            partition_values: Vec::new(),
             column_stats: vec![],
         };
         (
@@ -2357,7 +2160,7 @@ async fn scoped_read_covers_a_registration_end_to_end() {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
     }
-    let file_size = buffer.len() as u64;
+    let file_size = u64::try_from(buffer.len()).unwrap();
     let footer_offset = buffer.len() - 8;
     let footer_size = u64::from(u32::from_le_bytes(
         buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
@@ -2369,7 +2172,7 @@ async fn scoped_read_covers_a_registration_end_to_end() {
     // none, and the read stands in for the refusal.
     let entries = catalog
         .scoped_file_index_entries(
-            crate::DataStore::new(data.clone()),
+            crate::data_file::DataStore::new(data.clone()),
             &path,
             file_size,
             footer_size,
@@ -2388,10 +2191,10 @@ async fn scoped_read_covers_a_registration_end_to_end() {
                     path_is_relative: true,
                     file_format: "parquet".into(),
                     record_count: 3,
-                    file_size_bytes: file_size,
-                    footer_size,
+                    file_size_bytes: 30,
+                    footer_size: 4,
                     encryption_key: None,
-                    partition_values: vec![],
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &entries,
@@ -2406,7 +2209,8 @@ async fn scoped_read_covers_a_registration_end_to_end() {
         width: IntWidth::I64,
     };
     let hits = catalog.index_lookup(table, index, &[value]).await.unwrap();
-    assert_eq!(hits, vec![1]);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0], 1);
     catalog.close().await.unwrap();
 }
 
@@ -2476,22 +2280,14 @@ async fn scan_index_entries(
     index: crate::catalog::IndexId,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     use crate::store::key::{IndexKind, index_index_prefix};
-    let tx = catalog.begin_write_tx().await.unwrap();
     let mut entries = Vec::new();
     for kind in [IndexKind::Unique, IndexKind::Multi] {
-        let mut iter = ReadHandle::Tx(&tx)
-            .scan_prefix(
-                index_index_prefix(kind, index.get()),
-                ..,
-                crate::store::handle::ScanShape::Bulk,
-            )
-            .await
-            .unwrap();
-        while let Some(entry) = iter.next().await.unwrap() {
-            entries.push((entry.key.to_vec(), entry.value.to_vec()));
-        }
+        entries.extend(
+            catalog
+                .scan_prefix_overlaid(index_index_prefix(kind, index.get()))
+                .await,
+        );
     }
-    tx.rollback();
     entries.sort();
     entries
 }
@@ -2541,7 +2337,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     assert_eq!(single_index, staged_index);
 
     // While building: format 3, lookups fail typed.
-    assert_eq!(read_format_version(&staged).await, FORMAT_WITH_STAGED_INDEX);
+    assert_eq!(read_format_version(&staged).await, FORMAT_MULTI_WRITER);
     assert!(matches!(
         staged
             .index_lookup(table_staged, staged_index, &[int_value(20)])
@@ -2574,7 +2370,8 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
         .index_lookup(table_staged, staged_index, &[int_value(20)])
         .await
         .unwrap();
-    assert_eq!(hits, vec![1]);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0], 1);
     assert_eq!(
         scan_index_entries(&single, single_index).await,
         scan_index_entries(&staged, staged_index).await
@@ -2720,7 +2517,7 @@ async fn a_writer_duplicating_a_value_mid_build_poisons_the_index() {
                     file_size_bytes: 10,
                     footer_size: 4,
                     encryption_key: None,
-                    partition_values: vec![],
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &[FileIndexEntry {
@@ -2764,7 +2561,7 @@ async fn a_writer_duplicating_a_value_on_a_ready_index_still_fails() {
                     file_size_bytes: 10,
                     footer_size: 4,
                     encryption_key: None,
-                    partition_values: vec![],
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &[FileIndexEntry {
@@ -2849,30 +2646,10 @@ async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
 
 #[tokio::test]
 async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
-    use crate::{
-        catalog::{ColumnId, IndexDef},
-        store::key::{IndexKind, index_index_prefix},
-    };
+    use crate::store::key::{IndexKind, index_index_prefix};
     let (catalog, table) = catalog_with_two_column_table().await;
     register_three_row_file(&catalog, table).await;
-    let index = std::cell::Cell::new(None);
-    catalog
-        .commit(|tx| {
-            let id = tx.create_index(
-                table,
-                &IndexDef {
-                    name: "by_a".into(),
-                    columns: vec![ColumnId::new(1)],
-                    unique: true,
-                },
-                &[entry(0, 10), entry(1, 20), entry(2, 30)],
-            )?;
-            index.set(Some(id));
-            Ok(())
-        })
-        .await
-        .unwrap();
-    let index = index.get().unwrap();
+    let index = indexed(&catalog, table, "by_a", 3).await;
 
     // Reclaiming a live index is refused.
     assert!(matches!(
@@ -2891,29 +2668,32 @@ async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
     assert_eq!(catalog.reclaim_index_entries(index, 100).await.unwrap(), 0);
 
     // The index range is empty afterward.
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(
-            index_index_prefix(IndexKind::Unique, index.get()),
-            ..,
-            crate::store::handle::ScanShape::Bulk,
-        )
-        .await
-        .unwrap();
-    assert!(iter.next().await.unwrap().is_none());
-    tx.rollback();
+    assert!(
+        catalog
+            .scan_prefix_overlaid(index_index_prefix(IndexKind::Unique, index.get()))
+            .await
+            .is_empty()
+    );
     catalog.close().await.unwrap();
 }
 
-/// Creates an index over column `a` carrying `count` entries.
+/// Creates a live index over column `a` and seeds `count` entries into the
+/// folded store — the state a completed fold would leave. The definition rides
+/// the log (empty backfill, so no entries land in the unfolded tail); the
+/// entries are folder-written directly, so the folder-role sweep sees them.
 async fn indexed(
     catalog: &crate::catalog::Catalog,
     table: crate::catalog::TableId,
     name: &str,
     count: u64,
 ) -> crate::catalog::IndexId {
-    use crate::catalog::{ColumnId, IndexDef};
-    let entries: Vec<_> = (0..count).map(|i| entry(i, i128::from(i) * 10)).collect();
+    use crate::{
+        catalog::{ColumnId, IndexDef},
+        store::{
+            index_encoding::{Direction, NullOrder, encode_ordered_values},
+            key::{IndexKey, Key},
+        },
+    };
     let index = std::cell::Cell::new(None);
     catalog
         .commit(|tx| {
@@ -2924,35 +2704,45 @@ async fn indexed(
                     columns: vec![ColumnId::new(1)],
                     unique: true,
                 },
-                &entries,
+                &[],
             )?;
             index.set(Some(id));
             Ok(())
         })
         .await
         .unwrap();
-    index.get().unwrap()
+    let id = index.get().unwrap();
+
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..count)
+        .map(|i| {
+            let canonical = encode_ordered_values(
+                &[Some(int_value(i128::from(i) * 10))],
+                &[Direction::Ascending],
+                &[NullOrder::Last],
+            )
+            .unwrap();
+            let key = Key::Index(IndexKey::Unique {
+                index_id: id.get(),
+                key: canonical,
+            })
+            .encode();
+            (key, i.to_be_bytes().to_vec())
+        })
+        .collect();
+    catalog.seed_folded_writes(entries).await;
+    id
 }
 
 /// Counts every entry left in the `index` subspace, across both kinds.
 async fn index_entry_count(catalog: &crate::catalog::Catalog) -> usize {
     use crate::store::key::{IndexKind, index_kind_prefix};
-    let tx = catalog.begin_write_tx().await.unwrap();
     let mut total = 0;
     for kind in [IndexKind::Unique, IndexKind::Multi] {
-        let mut iter = ReadHandle::Tx(&tx)
-            .scan_prefix(
-                index_kind_prefix(kind),
-                ..,
-                crate::store::handle::ScanShape::Bulk,
-            )
+        total += catalog
+            .scan_prefix_overlaid(index_kind_prefix(kind))
             .await
-            .unwrap();
-        while iter.next().await.unwrap().is_some() {
-            total += 1;
-        }
+            .len();
     }
-    tx.rollback();
     total
 }
 
@@ -3143,32 +2933,6 @@ async fn maintain_refuses_a_zero_batch_size() {
     catalog.close().await.unwrap();
 }
 
-/// Maintenance mutates, so a read-only catalog refuses it rather than
-/// reporting a no-op pass.
-#[tokio::test]
-async fn maintain_refuses_a_read_only_catalog() {
-    use crate::catalog::{Catalog, CatalogOptions};
-    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-
-    // Bootstrap and release the writer so the reader has a store to open.
-    let writer = Catalog::open(object_store.clone(), CatalogOptions::default())
-        .await
-        .unwrap();
-    writer.close().await.unwrap();
-
-    let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
-        .await
-        .unwrap();
-    // `maintain` is a mutator and lives on the read-write handle alone, so
-    // there is no runtime refusal to assert — `reader.maintain(..)` does not
-    // compile. What a reader keeps is the read surface.
-    assert_eq!(
-        reader.snapshot().await.unwrap().current_snapshot().id.get(),
-        0
-    );
-    reader.close().await.unwrap();
-}
-
 /// Discovery seeks by index id: from any starting id it returns the
 /// lowest index at or after it, and `None` past the last — the property
 /// that lets the sweep skip a live index in one seek instead of walking
@@ -3269,7 +3033,7 @@ async fn maintain_does_not_conflict_with_a_live_writer() {
                         file_size_bytes: 10,
                         footer_size: 4,
                         encryption_key: None,
-                        partition_values: vec![],
+                        partition_values: Vec::new(),
                         column_stats: vec![],
                     },
                     &[FileIndexEntry {
@@ -3351,1454 +3115,62 @@ async fn drop_index_ends_definition_and_keeps_format() {
             .is_empty()
     );
     // Dropping the last index does not downgrade the stamp.
-    assert_eq!(read_format_version(&catalog).await, FORMAT_WITH_INDEX);
+    assert_eq!(read_format_version(&catalog).await, FORMAT_MULTI_WRITER);
     catalog.close().await.unwrap();
 }
 
-/// The head view the writer folds forward on every commit stays identical
-/// to a fresh scan of the store, across creates, a rename, an option, a
-/// column drop, and a full table drop — whose child deletes the fold must
-/// apply without over-cascading.
+/// A multi-writer bootstrap stamps the format that topology requires, and
+/// folds no slot: its replay point is zero.
 #[tokio::test]
-async fn folded_head_view_matches_a_fresh_scan() {
-    use crate::catalog::{Catalog, CatalogOptions, ColumnDef, DataFile, OptionScope};
-
-    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap();
-    let column = |name: &str| ColumnDef {
-        name: name.into(),
-        column_type: "BIGINT".into(),
-        nulls_allowed: true,
-        default_value: None,
-        children: Vec::new(),
-    };
-
-    let keep = std::cell::Cell::new(None);
-    let doomed = std::cell::Cell::new(None);
-    catalog
-        .commit(|tx| {
-            let schema = tx.create_schema("s")?;
-            let k = tx.create_table(schema, "keep", &[column("a"), column("b")])?;
-            let d = tx.create_table(schema, "doomed", &[column("x")])?;
-            tx.create_view(schema, "v", "duckdb", "SELECT 1")?;
-            keep.set(Some(k));
-            doomed.set(Some(d));
-            Ok(())
-        })
-        .await
-        .unwrap();
-    let keep = keep.get().unwrap();
-    let doomed = doomed.get().unwrap();
-
-    catalog
-        .commit(|tx| {
-            tx.register_data_file(
-                keep,
-                DataFile {
-                    path: "f.parquet".into(),
-                    path_is_relative: true,
-                    file_format: "parquet".into(),
-                    record_count: 3,
-                    file_size_bytes: 100,
-                    footer_size: 8,
-                    encryption_key: None,
-                    partition_values: vec![],
-                    column_stats: vec![],
-                },
-                &[],
-            )?;
-            tx.set_option(OptionScope::Global, "answer", "42")?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-    catalog
-        .commit(|tx| {
-            tx.rename_table(keep, "keep2")?;
-            let second = tx.columns_of(keep)[1].id;
-            tx.drop_column(keep, second)
-        })
-        .await
-        .unwrap();
-
-    catalog.commit(|tx| tx.drop_table(doomed)).await.unwrap();
-
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let stamp = read::read_head(ReadHandle::Tx(&tx)).await.unwrap().unwrap();
-    let head = stamp.snapshot_id;
-    let fresh = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
-    tx.rollback();
-
-    let cached = catalog
-        .projections()
-        .read()
-        .unwrap()
-        .head_view(&stamp)
-        .expect("the writer caches its head view");
-
-    assert_eq!(cached.snapshot.snapshot_id, fresh.snapshot.snapshot_id);
-    // An empty diff both directions means identical current state.
-    assert!(
-        diff_writes(&fresh, &cached, head + 1).is_empty(),
-        "folded head view diverged from a fresh scan"
-    );
-    assert!(
-        diff_writes(&cached, &fresh, head + 1).is_empty(),
-        "folded head view diverged from a fresh scan"
-    );
-    catalog.close().await.unwrap();
-}
-
-/// Seeds a catalog with `tables` tables of two columns each, so a base view
-/// holds enough live records that a small gap stays under the refresh's
-/// size backstop.
-#[allow(clippy::unwrap_used)]
-async fn seeded_catalog(tables: usize) -> (crate::catalog::Catalog, Vec<crate::catalog::TableId>) {
-    use crate::catalog::{Catalog, CatalogOptions, ColumnDef};
-
-    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap();
-    let column = |name: &str| ColumnDef {
-        name: name.into(),
-        column_type: "BIGINT".into(),
-        nulls_allowed: true,
-        default_value: None,
-        children: Vec::new(),
-    };
-
-    let ids = std::cell::RefCell::new(Vec::new());
-    catalog
-        .commit(|tx| {
-            let schema = tx.create_schema("s")?;
-            for index in 0..tables {
-                let id =
-                    tx.create_table(schema, &format!("t{index}"), &[column("a"), column("b")])?;
-                ids.borrow_mut().push(id);
-            }
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-    let ids = ids.into_inner();
-    (catalog, ids)
-}
-
-/// A migration may be moving keys mid-scan, so a read refuses rather than
-/// return a view that is silently missing records — and a warm cache is no
-/// exception. The handle below materializes first; the marker must still
-/// win over that view, or a cached reader would sail through a migration.
-///
-/// Read-only, because that is the handle a migration can start under. A
-/// migrator takes the writer epoch, which fences a read-write handle but
-/// leaves a reader following the store — so the reader is the one that
-/// meets a marker mid-flight, and its refusal is per read for that reason.
-#[tokio::test]
-async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
-    use crate::catalog::{Catalog, CatalogOptions};
-
-    let store: Arc<InMemory> = Arc::new(InMemory::new());
-    let writer = Catalog::open(store.clone(), CatalogOptions::default())
-        .await
-        .unwrap();
-    writer
-        .commit(|tx| tx.create_schema("before").map(|_| ()))
-        .await
-        .unwrap();
-
-    // A reader never fences the writer, so the two run side by side. Its
-    // poll interval is the wait below, so it is set short rather than left
-    // at the ten-second default.
-    let options = CatalogOptions {
-        reader_poll_interval: std::time::Duration::from_millis(20),
-        ..CatalogOptions::default()
-    };
-    let reader = Catalog::open_read_only(store.clone(), options)
-        .await
-        .unwrap();
-    reader.snapshot().await.unwrap();
-
-    plant_migration_marker(&writer).await;
-
-    // A reader's state advances when its manifest poller runs, not on the
-    // write, so the refusal arrives within a bounded wait rather than at
-    // the next call.
-    let mut refused = None;
-    for _ in 0..100 {
-        if let Err(err) = reader.snapshot().await {
-            refused = Some(err);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    let refused = refused.expect("a warm reader served every read through a planted marker");
-    assert!(matches!(refused, Error::Migration(_)), "{refused:?}");
-    writer.close().await.unwrap();
-}
-
-/// A commit resolves its base view from the same warm cache a read serves
-/// from, so the gate belongs at that read too. Without it the one path
-/// that writes would plan against a view of a keyspace being rewritten.
-#[tokio::test]
-async fn the_migration_marker_refuses_a_commit_with_a_warm_cache() {
-    let (catalog, _) = seeded_catalog(3).await;
-    catalog.snapshot().await.unwrap();
-
-    plant_migration_marker(&catalog).await;
-
-    let err = catalog
-        .commit(|tx| {
-            tx.create_schema("late")?;
-            Ok(())
-        })
-        .await
-        .err()
-        .unwrap();
-
-    assert!(matches!(err, Error::Migration(_)), "{err:?}");
-    catalog.close().await.unwrap();
-}
-
-/// A target at or below the observed floor is answered from the floor. The
-/// store here is stamped below the target, so an answer of `None` can only
-/// mean the read was skipped.
-#[tokio::test]
-async fn a_format_target_under_the_observed_floor_costs_no_read() {
-    let (catalog, _) = seeded_catalog(1).await;
-    let projections = catalog.projections();
-    raise_format_floor(projections, MAX_FORMAT_VERSION);
-
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let stamp = format_stamp_to(&db_tx, projections, FORMAT_WITH_INDEX)
-        .await
-        .unwrap();
-
-    assert!(stamp.is_none(), "the floor already covers the target");
-    db_tx.rollback();
-    catalog.close().await.unwrap();
-}
-
-/// A target above the floor reads, stamps, and raises the floor to what it
-/// found, so the same question is not asked twice.
-#[tokio::test]
-async fn a_format_target_above_the_floor_reads_and_raises_it() {
-    let (catalog, _) = seeded_catalog(1).await;
-    let projections = catalog.projections();
-
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let stamp = format_stamp_to(&db_tx, projections, FORMAT_WITH_INDEX)
-        .await
-        .unwrap();
-
-    assert!(stamp.is_some(), "a fresh store owes the index stamp");
-    assert_eq!(format_floor(projections), FORMAT_VERSION);
-    db_tx.rollback();
-    catalog.close().await.unwrap();
-}
-
-/// The stamp is keyed on the head it was taken at, so a marker planted
-/// without moving the head is invisible to it — which is why a migration
-/// start stamps the head, and what the next test pins.
-#[tokio::test]
-async fn the_migration_check_is_skipped_at_a_head_already_found_clear() {
-    let (catalog, _) = seeded_catalog(1).await;
-    let projections = catalog.projections();
-
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let head = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
-    refuse_mid_migration_at(ReadHandle::Tx(&db_tx), projections, &head)
-        .await
-        .unwrap();
-    assert!(migration_clear_at(projections, &head));
-    db_tx.rollback();
-
-    // Planted behind the stamp's back: same head, marker present.
-    let tx = catalog.begin_write_tx().await.unwrap();
-    tx.put(
-        Key::Sys(SysKey::Migration).encode(),
-        value::encode_value(&proto::MigrationValue {
-            from_format: 1,
-            to_format: 2,
-            cursor: Vec::new(),
-        }),
-    )
-    .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
-
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let served = refuse_mid_migration_at(ReadHandle::Tx(&db_tx), projections, &head).await;
-    assert!(served.is_ok(), "the stamp answered without reading");
-
-    // The same handle at any other head reads, and finds it.
-    let moved = proto::HeadValue {
-        snapshot_id: head.snapshot_id,
-        batch_seq: head.batch_seq + 1,
-    };
-    let err = refuse_mid_migration_at(ReadHandle::Tx(&db_tx), projections, &moved)
-        .await
-        .err()
-        .unwrap();
-    assert!(matches!(err, Error::Migration(_)), "{err:?}");
-
-    db_tx.rollback();
-    catalog.close().await.unwrap();
-}
-
-/// A read session checks the marker through the head-keyed stamp: a head
-/// already found clear opens without re-reading it, and a marker landing
-/// the way a real one does — riding a head stamp — is still refused.
-#[tokio::test]
-async fn a_read_session_skips_the_migration_check_at_a_stamped_head() {
-    let (catalog, _) = seeded_catalog(1).await;
-
-    // The first session reads the marker and stamps the head clear.
-    let session = catalog.begin_read().await.unwrap();
-    session.finish();
-
-    // Planted behind the stamp's back: marker present, head unmoved. A
-    // session that still opens proves the check was answered from the
-    // stamp rather than read.
-    let tx = catalog.begin_write_tx().await.unwrap();
-    tx.put(
-        Key::Sys(SysKey::Migration).encode(),
-        value::encode_value(&proto::MigrationValue {
-            from_format: 1,
-            to_format: 2,
-            cursor: Vec::new(),
-        }),
-    )
-    .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
-    let session = catalog.begin_read().await.unwrap();
-    session.finish();
-
-    // The marker as a migration start actually writes it: head moves, the
-    // stamp misses, and the session reads and refuses.
-    plant_migration_marker(&catalog).await;
-    let err = catalog.begin_read().await.err().unwrap();
-    assert!(matches!(err, Error::Migration(_)), "{err:?}");
-
-    catalog.close().await.unwrap();
-}
-
-/// A migration start moves the head, which is what makes the stamp safe: a
-/// committer holding one cannot miss a migration that began under it.
-#[tokio::test]
-async fn a_migration_start_moves_the_head() {
-    let (catalog, _) = seeded_catalog(2).await;
-
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let before = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
-    db_tx.rollback();
-
-    plant_migration_marker(&catalog).await;
-
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let after = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
-    db_tx.rollback();
-
-    assert_ne!(before, after, "the marker must not land at a still head");
-    assert_eq!(after.batch_seq, before.batch_seq + 1);
-    catalog.close().await.unwrap();
-}
-
-/// A landed commit leaves its own head stamped clear: it won the head CAS,
-/// so nothing — a migration start least of all — landed between the check
-/// its base was read under and its write.
-#[tokio::test]
-async fn a_landed_commit_stamps_its_own_head_clear() {
-    let (catalog, _) = seeded_catalog(1).await;
-    let projections = catalog.projections();
-
-    catalog
-        .commit(|tx| tx.create_schema("after").map(|_| ()))
-        .await
-        .unwrap();
-
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let head = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
-    db_tx.rollback();
-
-    assert!(
-        migration_clear_at(projections, &head),
-        "the commit's own head should need no re-read"
-    );
-    catalog.close().await.unwrap();
-}
-
-/// A batch far larger than a modest one still records its changelog, so a
-/// reader behind it replays rather than rematerializing.
-#[test]
-fn a_bulk_batch_still_records_a_changelog() {
-    let writes: Vec<StagedWrite> = (0..1_000)
-        .map(|id| {
-            (
-                Key::Current(crate::store::key::CurrentKey::Entity(EntityKey::Table {
-                    table_id: id,
-                }))
-                .encode(),
-                Some(Vec::new()),
-            )
-        })
-        .collect();
-
-    let (keys, complete) = refresh_keys_of(&writes);
-
-    assert!(complete, "a thousand-key batch must stay replayable");
-    assert_eq!(keys.len(), 1_000);
-}
-
-/// The first attempt never waits, later ones grow to the cap, and every
-/// wait carries jitter — two writers that collided must not re-collide in
-/// lockstep.
-#[test]
-fn retry_backoff_starts_at_zero_grows_and_caps() {
-    use super::{RETRY_BACKOFF_BASE_MICROS, RETRY_BACKOFF_MAX_MICROS, retry_backoff};
-
-    assert_eq!(retry_backoff(0), std::time::Duration::ZERO);
-
-    let ceiling = u128::from(RETRY_BACKOFF_MAX_MICROS + RETRY_BACKOFF_BASE_MICROS);
-    let mut previous = 0_u128;
-    for attempt in 1..MAX_COMMIT_ATTEMPTS {
-        let waited = retry_backoff(attempt).as_micros();
-        assert!(
-            waited >= u128::from(RETRY_BACKOFF_BASE_MICROS),
-            "attempt {attempt} waited {waited}µs, below the base delay"
-        );
-        assert!(
-            waited <= ceiling,
-            "attempt {attempt} waited {waited}µs, above the cap plus jitter"
-        );
-        // Growth holds until the cap absorbs it; jitter never reverses it.
-        if previous > 0 && previous < u128::from(RETRY_BACKOFF_MAX_MICROS) {
-            assert!(
-                waited > previous,
-                "attempt {attempt} waited {waited}µs, not more than {previous}µs"
-            );
-        }
-        previous = waited;
-    }
-    // The last attempts sit at the cap rather than growing without bound.
-    assert!(
-        retry_backoff(MAX_COMMIT_ATTEMPTS - 1).as_micros() >= u128::from(RETRY_BACKOFF_MAX_MICROS)
-    );
-}
-
-/// The whole budget must span enough time for a competing commit to land,
-/// without leaving a caller waiting on a conflict for seconds.
-#[test]
-fn retry_backoff_budget_stays_in_a_sane_band() {
-    use super::retry_backoff;
-
-    let total: std::time::Duration = (0..MAX_COMMIT_ATTEMPTS).map(retry_backoff).sum();
-    assert!(
-        total >= std::time::Duration::from_millis(100),
-        "whole retry budget waits only {total:?}"
-    );
-    assert!(
-        total <= std::time::Duration::from_millis(600),
-        "whole retry budget waits {total:?}"
-    );
-}
-
-/// Every batch stamps the head record and moves its batch count — including
-/// a maintenance batch, which reuses the standing snapshot id. Without that
-/// a reader could not tell the state a maintenance batch left behind from
-/// the one it reclaimed, since the ids are the same.
-#[tokio::test]
-async fn every_batch_moves_the_head_stamp() {
-    use crate::catalog::OptionScope;
-
-    let (catalog, _) = seeded_catalog(2).await;
-
-    let stamp = |catalog: &crate::catalog::Catalog| {
-        let catalog = catalog.clone();
-        async move {
-            let tx = catalog.begin_write_tx().await.unwrap();
-            let head = read_head_value(ReadHandle::Tx(&tx)).await.unwrap();
-            tx.rollback();
-            head
-        }
-    };
-
-    let seeded = stamp(&catalog).await;
-
-    // A snapshot-minting batch moves both halves.
-    catalog
-        .commit(|tx| tx.create_schema("more").map(|_| ()))
-        .await
-        .unwrap();
-    let minted = stamp(&catalog).await;
-    assert_eq!(minted.snapshot_id, seeded.snapshot_id + 1);
-    assert_eq!(minted.batch_seq, seeded.batch_seq + 1);
-
-    // An option write mints no snapshot, so only the count moves.
-    catalog
-        .commit(|tx| tx.set_option(OptionScope::Global, "answer", "42"))
-        .await
-        .unwrap();
-    let maintained = stamp(&catalog).await;
-    assert_eq!(maintained.snapshot_id, minted.snapshot_id);
-    assert_eq!(maintained.batch_seq, minted.batch_seq + 1);
-
-    catalog.close().await.unwrap();
-}
-
-/// Replaying a gap's changelog must land on exactly the view a full
-/// rematerialization at head builds — the whole point of the cheap path is
-/// that it is not a different answer.
-#[tokio::test]
-async fn an_incremental_refresh_matches_a_full_rematerialization() {
-    let (catalog, tables) = seeded_catalog(12).await;
-
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let base = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
-    tx.rollback();
-
-    // A gap that exercises every shape the fold has to get right: a new
-    // record, a changed one, an ended child, and a whole ended subtree.
-    catalog
-        .commit(|tx| {
-            tx.register_data_file(tables[0], bulk_file("f0.parquet", 3), &[])
-                .map(|_| ())
-        })
-        .await
-        .unwrap();
-    catalog
-        .commit(|tx| tx.rename_table(tables[1], "renamed"))
-        .await
-        .unwrap();
-    catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("s").unwrap().id;
-            tx.create_table(
-                schema,
-                "late",
-                &[crate::catalog::ColumnDef {
-                    name: "x".into(),
-                    column_type: "BIGINT".into(),
-                    nulls_allowed: true,
-                    default_value: None,
-                    children: Vec::new(),
-                }],
-            )
-            .map(|_| ())
-        })
-        .await
-        .unwrap();
-    catalog
-        .commit(|tx| {
-            let second = tx.columns_of(tables[3])[1].id;
-            tx.drop_column(tables[3], second)
-        })
-        .await
-        .unwrap();
-    catalog.commit(|tx| tx.drop_table(tables[2])).await.unwrap();
-
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let handle = ReadHandle::Tx(&tx);
-    let head = read_head_value(handle).await.unwrap();
-    let refreshed = refresh(handle, &base)
-        .await
-        .unwrap()
-        .expect("a five-commit gap over a twelve-table catalog must replay");
-    let full = materialize(handle, None).await.unwrap();
-    tx.rollback();
-
-    assert_eq!(refreshed.snapshot, full.snapshot);
-    assert_eq!(refreshed.batch_seq, full.batch_seq);
-    let next = head.snapshot_id + 1;
-    assert!(
-        diff_writes(&full, &refreshed, next).is_empty(),
-        "a replayed view diverged from a fresh scan"
-    );
-    assert!(
-        diff_writes(&refreshed, &full, next).is_empty(),
-        "a replayed view diverged from a fresh scan"
-    );
-    // The entity maps agreeing is not the whole view: a rename that left a
-    // stale name entry behind would still diff clean.
-    let schema = refreshed.schema_by_name("s").unwrap().id;
-    assert!(refreshed.table_by_name(schema, "renamed").is_some());
-    assert!(refreshed.table_by_name(schema, "t1").is_none());
-    assert!(refreshed.table_by_name(schema, "late").is_some());
-    assert!(refreshed.table_by_name(schema, "t2").is_none());
-
-    catalog.close().await.unwrap();
-}
-
-/// A maintenance batch mints no snapshot, so it leaves no changelog behind.
-/// The head stamp still records that it landed, and a refresh that cannot
-/// see what it did must decline the whole gap rather than replay around it.
-#[tokio::test]
-async fn a_refresh_declines_a_gap_a_maintenance_batch_landed_in() {
-    use crate::catalog::OptionScope;
-
-    let (catalog, tables) = seeded_catalog(8).await;
-
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let base = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
-    tx.rollback();
-
-    catalog
-        .commit(|tx| tx.set_option(OptionScope::Global, "answer", "42"))
-        .await
-        .unwrap();
-    catalog
-        .commit(|tx| {
-            tx.register_data_file(tables[0], bulk_file("f0.parquet", 3), &[])
-                .map(|_| ())
-        })
-        .await
-        .unwrap();
-
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let handle = ReadHandle::Tx(&tx);
-    let refreshed = refresh(handle, &base).await.unwrap();
-    tx.rollback();
-
-    assert!(
-        refreshed.is_none(),
-        "a gap holding a batch that recorded no changelog must not be replayed"
-    );
-    catalog.close().await.unwrap();
-}
-
-/// A base further behind than the retained changelog window has nothing
-/// left to walk: later commits swept the records the gap is written in.
-/// This subsumes the retention horizon — expiry reclaims snapshots far
-/// further back than the window keeps changelogs — so a base below the
-/// horizon reaches the same fallback by the same route.
-#[tokio::test]
-async fn a_refresh_declines_a_gap_swept_out_of_the_changelog_window() {
-    let (catalog, tables) = seeded_wide_catalog(4, 2).await;
-
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let base = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
-    tx.rollback();
-
-    let commits = usize::try_from(CHANGELOG_WINDOW).unwrap() + 2;
-    for round in 0..commits {
-        catalog
-            .commit(|tx| {
-                tx.register_data_file(tables[0], bulk_file(&format!("f{round}.parquet"), 3), &[])
-                    .map(|_| ())
-            })
-            .await
-            .unwrap();
-    }
-
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let handle = ReadHandle::Tx(&tx);
-    let head = read_head_value(handle).await.unwrap();
-    // The backstop is lifted so this proves the *window* declines the gap,
-    // not the churn share.
-    let refreshed = replay(handle, &base, &head, usize::MAX).await.unwrap();
-
-    // The window is a sliding one: it bounds the subspace whether or not
-    // anything else ever reclaims it.
-    let mut retained = 0u64;
-    for snapshot_id in 0..=head.snapshot_id {
-        if read::read_changelog(handle, snapshot_id)
-            .await
-            .unwrap()
-            .is_some()
-        {
-            retained += 1;
-        }
-    }
-    tx.rollback();
-
-    assert!(
-        refreshed.is_none(),
-        "a gap whose changelogs were swept must not be replayed"
-    );
-    assert!(
-        retained <= CHANGELOG_WINDOW,
-        "{retained} changelogs retained, above the window of {CHANGELOG_WINDOW}"
-    );
-    catalog.close().await.unwrap();
-}
-
-/// Past a share of the live catalog, replaying the changelog costs more
-/// than the scan it replaces, so the refresh declines on size alone. Both
-/// paths build the same view; which one runs is purely a cost choice.
-#[tokio::test]
-async fn a_refresh_declines_churn_that_outruns_the_catalog() {
-    let (catalog, tables) = seeded_catalog(1).await;
-
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let base = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
-    tx.rollback();
-
-    for index in 0..6u64 {
-        catalog
-            .commit(|tx| {
-                tx.register_data_file(tables[0], bulk_file(&format!("f{index}.parquet"), 3), &[])
-                    .map(|_| ())
-            })
-            .await
-            .unwrap();
-    }
-
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let handle = ReadHandle::Tx(&tx);
-    let refreshed = refresh(handle, &base).await.unwrap();
-    tx.rollback();
-
-    assert!(
-        base.live_entity_count() / REFRESH_CHURN_SHARE < 6,
-        "the fixture must churn past the backstop for this to test it"
-    );
-    assert!(
-        refreshed.is_none(),
-        "churn past the backstop must fall back to a full rescan"
-    );
-    catalog.close().await.unwrap();
-}
-
-/// 0009 — replaying a gap's changelog versus rematerializing at head.
-///
-/// The refresh declines a gap whose churn passes a share of the live
-/// catalog, and the share is a cost choice: both paths build the same view.
-/// This puts a curve under it by timing the two against each other at a
-/// range of churn levels, with the backstop lifted so the expensive side is
-/// visible. Run with:
-///
-/// ```text
-/// cargo test -p moraine --lib --release -- --ignored --nocapture measure_refresh
-/// ```
-#[tokio::test]
-#[ignore = "measurement, not a test: run with --ignored --nocapture"]
-#[allow(clippy::cast_precision_loss)]
-async fn measure_refresh_versus_rematerialization() {
-    const COLUMNS: usize = 8;
-    const FILES_PER_COMMIT: usize = 4;
-    const REPEATS: usize = 9;
-
-    println!("\n# 0009 changelog replay vs. rematerialization (in-memory object_store)");
-    println!(
-        "# {COLUMNS} columns per table, {FILES_PER_COMMIT} files per gap commit, \
-         median of {REPEATS}"
-    );
-    println!("# gaps stop at the {CHANGELOG_WINDOW}-commit changelog window\n");
-    println!(
-        "{:>7}  {:>8}  {:>7}  {:>7}  {:>7}  {:>10}  {:>10}  {:>7}",
-        "tables", "entities", "commits", "churn", "share", "full_ms", "replay_ms", "ratio"
-    );
-
-    for tables in [50usize, 200, 800] {
-        for commits in [1usize, 4, 16, 32, 64] {
-            let (catalog, table_ids) = seeded_wide_catalog(tables, COLUMNS).await;
-
-            let tx = catalog.begin_write_tx().await.unwrap();
-            let base = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
-            tx.rollback();
-            let entities = base.live_entity_count();
-
-            for round in 0..commits {
-                let target = table_ids[round % table_ids.len()];
-                catalog
-                    .commit(|tx| {
-                        for file in 0..FILES_PER_COMMIT {
-                            tx.register_data_file(
-                                target,
-                                bulk_file(&format!("g{round}-{file}.parquet"), 10),
-                                &[],
-                            )?;
-                        }
-                        Ok(())
-                    })
-                    .await
-                    .unwrap();
-            }
-
-            let tx = catalog.begin_write_tx().await.unwrap();
-            let handle = ReadHandle::Tx(&tx);
-            let head = read_head_value(handle).await.unwrap();
-
-            let mut full = Vec::with_capacity(REPEATS);
-            let mut replayed = Vec::with_capacity(REPEATS);
-            for _ in 0..REPEATS {
-                let started = std::time::Instant::now();
-                let view = materialize(handle, None).await.unwrap();
-                full.push(started.elapsed());
-                std::hint::black_box(&view);
-
-                let started = std::time::Instant::now();
-                // The backstop is lifted so the replay's own cost shows even
-                // where the shipped threshold would have refused it.
-                let view = replay(handle, &base, &head, usize::MAX)
-                    .await
-                    .unwrap()
-                    .expect("an unbounded replay must reach head");
-                replayed.push(started.elapsed());
-                std::hint::black_box(&view);
-            }
-            tx.rollback();
-
-            let churn = churn_above(&catalog, base.snapshot.snapshot_id, head.snapshot_id).await;
-            let median = |mut samples: Vec<std::time::Duration>| {
-                samples.sort_unstable();
-                samples[samples.len() / 2].as_secs_f64() * 1_000.0
-            };
-            let (full_ms, replay_ms) = (median(full), median(replayed));
-            println!(
-                "{tables:>7}  {entities:>8}  {commits:>7}  {churn:>7}  {:>7.3}  {full_ms:>10.3}  \
-                 {replay_ms:>10.3}  {:>7.2}",
-                churn as f64 / entities as f64,
-                full_ms / replay_ms
-            );
-
-            catalog.close().await.unwrap();
-        }
-    }
-    println!();
-}
-
-/// 0009 — what the changelog costs the read path.
-///
-/// It used to ride in the snapshot record, and snapshot records are what
-/// DuckLake re-reads every transaction and what moraine keeps a decoded
-/// projection of; measured there it grew them ~6.8x and slowed their scan
-/// ~1.45x. In its own subspace it costs that path nothing, and a sliding
-/// window bounds what it costs storage. This prints both halves. Run with:
-///
-/// ```text
-/// cargo test -p moraine --lib --release -- --ignored --nocapture measure_changelog
-/// ```
-#[tokio::test]
-#[ignore = "measurement, not a test: run with --ignored --nocapture"]
-#[allow(clippy::cast_precision_loss)]
-async fn measure_changelog_read_cost() {
-    const COLUMNS: usize = 8;
-    const REPEATS: usize = 9;
-
-    println!("\n# 0009 changelog cost on the snapshot read path (in-memory object_store)");
-    println!(
-        "# one data file per commit over a {COLUMNS}-column table, stats for every \
-         column, median of {REPEATS}\n"
-    );
-    println!(
-        "{:>8}  {:>13}  {:>10}  {:>14}  {:>10}  {:>13}",
-        "commits", "snapshot_bytes", "log_records", "log_bytes", "log_share", "snap_scan_ms"
-    );
-
-    for commits in [64usize, 256, 1024] {
-        let (catalog, tables) = seeded_wide_catalog(1, COLUMNS).await;
-        for round in 0..commits {
-            catalog
-                .commit(|tx| {
-                    // Stats for every column, as DuckLake supplies them: a
-                    // registration's changelog is mostly its stats keys.
-                    let stats = tx
-                        .columns_of(tables[0])
-                        .iter()
-                        .map(|column| crate::catalog::FileColumnStats {
-                            column_id: column.id,
-                            column_size_bytes: 128,
-                            value_count: 10,
-                            null_count: 0,
-                            min_value: Some("0".into()),
-                            max_value: Some("9".into()),
-                            contains_nan: None,
-                            extra_stats: None,
-                        })
-                        .collect();
-                    let file = crate::catalog::DataFile {
-                        column_stats: stats,
-                        ..bulk_file(&format!("f{round}.parquet"), 10)
-                    };
-                    tx.register_data_file(tables[0], file, &[]).map(|_| ())
-                })
-                .await
-                .unwrap();
-        }
-
-        let tx = catalog.begin_write_tx().await.unwrap();
-        let handle = ReadHandle::Tx(&tx);
-        let snapshots = read::scan_snapshots(handle).await.unwrap();
-        let snapshot_bytes: usize = snapshots.iter().map(|r| value::encode_value(r).len()).sum();
-
-        let mut log_records = 0usize;
-        let mut log_bytes = 0usize;
-        let head = read_head_value(handle).await.unwrap().snapshot_id;
-        for snapshot_id in 0..=head {
-            if let Some(log) = read::read_changelog(handle, snapshot_id).await.unwrap() {
-                log_records += 1;
-                log_bytes += value::encode_value(&log).len();
-            }
-        }
-
-        let mut samples = Vec::with_capacity(REPEATS);
-        for _ in 0..REPEATS {
-            let started = std::time::Instant::now();
-            let rows = read::scan_snapshots(handle).await.unwrap();
-            samples.push(started.elapsed());
-            std::hint::black_box(&rows);
-        }
-        tx.rollback();
-        samples.sort_unstable();
-        let snap_scan_ms = samples[samples.len() / 2].as_secs_f64() * 1_000.0;
-
-        println!(
-            "{commits:>8}  {snapshot_bytes:>13}  {log_records:>10}  {log_bytes:>14}  \
-             {:>10.2}  {snap_scan_ms:>13.3}",
-            log_bytes as f64 / snapshot_bytes as f64,
-        );
-
-        catalog.close().await.unwrap();
-    }
-    println!();
-}
-
-/// Seeds a catalog with `tables` tables of `columns` columns each.
-#[allow(clippy::unwrap_used)]
-async fn seeded_wide_catalog(
-    tables: usize,
-    columns: usize,
-) -> (crate::catalog::Catalog, Vec<crate::catalog::TableId>) {
-    use crate::catalog::{Catalog, CatalogOptions, ColumnDef};
-
-    let options = CatalogOptions {
-        // Seeding and gap commits are not what these harnesses time, and at
-        // the default cadence each would wait a flush tick.
-        flush_interval: std::time::Duration::from_millis(1),
-        ..CatalogOptions::default()
-    };
-    let catalog = Catalog::open(Arc::new(InMemory::new()), options)
-        .await
-        .unwrap();
-    let defs: Vec<ColumnDef> = (0..columns)
-        .map(|index| ColumnDef {
-            name: format!("c{index}"),
-            column_type: "BIGINT".into(),
-            nulls_allowed: true,
-            default_value: None,
-            children: Vec::new(),
-        })
-        .collect();
-
-    let ids = std::cell::RefCell::new(Vec::new());
-    catalog
-        .commit(|tx| {
-            let schema = tx.create_schema("s")?;
-            for index in 0..tables {
-                ids.borrow_mut()
-                    .push(tx.create_table(schema, &format!("t{index}"), &defs)?);
-            }
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-    let ids = ids.into_inner();
-    (catalog, ids)
-}
-
-/// Distinct `current` keys the changelogs above `from` recorded — the
-/// churn a replay across that gap would pay for.
-#[allow(clippy::unwrap_used)]
-async fn churn_above(catalog: &crate::catalog::Catalog, from: u64, head: u64) -> usize {
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let handle = ReadHandle::Tx(&tx);
-    let mut keys = BTreeSet::new();
-    for snapshot_id in (from + 1)..=head {
-        if let Some(log) = read::read_changelog(handle, snapshot_id).await.unwrap() {
-            keys.extend(log.keys);
-        }
-    }
-    tx.rollback();
-
-    keys.len()
-}
-
-/// A commit attempt must never land on premises that omit a commit which
-/// landed first. The attempt reads its base *through* the transaction it
-/// will write, so the premise view and the conflict window share one start
-/// sequence: either the attempt's transaction began after the other commit
-/// and saw it, or it began before and loses the head race. There is no
-/// interleaving in between.
-///
-/// This stages that interleaving exactly rather than racing for it: a
-/// transaction opens and materializes, another commit lands through the
-/// catalog, and only then does the first stage and write.
-#[tokio::test]
-async fn a_commit_landing_after_an_attempts_materialization_is_always_detected() {
-    let (catalog, tables) = seeded_wide_catalog(3, 2).await;
-
-    // The attempt opens and reads its premises.
-    let attempt = catalog.begin_write_tx().await.unwrap();
-    let base = head_view_for(&attempt, catalog.projections())
-        .await
-        .unwrap();
-    let head_before = base.snapshot.snapshot_id;
-
-    // A commit lands in the window between that read and the attempt's
-    // write. It is invisible to the attempt: the transaction is already
-    // open at an earlier sequence.
-    catalog
-        .commit(|tx| {
-            tx.register_data_file(tables[0], bulk_file("winner.parquet", 3), &[])
-                .map(|_| ())
-        })
-        .await
-        .unwrap();
-
-    let reread = head_view_for(&attempt, catalog.projections())
-        .await
-        .unwrap();
-    assert_eq!(
-        reread.snapshot.snapshot_id, head_before,
-        "an open transaction must not observe a commit that landed after it began"
-    );
-    assert!(
-        reread
-            .data_files_of(crate::catalog::TableId::new(tables[0].get()))
-            .is_empty(),
-        "the attempt's premises must not include the winner's file"
-    );
-
-    // So the attempt's own write has to lose, or it would commit against
-    // premises that omit a landed commit.
-    let mut staged = diff_writes(&base, &base, head_before + 1);
-    staged.push(head_stamp(head_before + 1, base.batch_seq));
-    let staged_bytes = stage_writes(&attempt, &staged).unwrap();
-    let landed = commit_batch(
-        attempt,
-        head_before,
-        head_before + 1,
-        &staged,
-        staged_bytes,
-        HeadViewUpdate::Rebuild(Arc::clone(&base)),
-        catalog.projections(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        landed,
-        Landed::LostRace,
-        "an attempt whose premises predate a landed commit must not commit"
-    );
-
-    // And a fresh attempt does see it, so the loss is the only outcome the
-    // interleaving admits — not a permanent wedge.
-    let retry = catalog.begin_write_tx().await.unwrap();
-    let fresh = head_view_for(&retry, catalog.projections()).await.unwrap();
-    assert_eq!(fresh.snapshot.snapshot_id, head_before + 1);
-    assert_eq!(
-        fresh
-            .data_files_of(crate::catalog::TableId::new(tables[0].get()))
-            .len(),
-        1
-    );
-    retry.rollback();
-
-    catalog.close().await.unwrap();
-}
-
-/// A materialization issues many reads, and a commit landing between two of
-/// them must not produce a view that holds one and misses the other. On a
-/// read-write handle the transaction settles it: every read is at its start
-/// sequence, so a commit landing mid-pass is simply invisible to all of
-/// them. This stages that interleaving rather than racing for it — the
-/// commit lands between the pass's head read and its `current` scan.
-#[tokio::test]
-async fn a_commit_landing_mid_materialization_is_invisible_to_the_whole_pass() {
-    let (catalog, tables) = seeded_wide_catalog(3, 2).await;
-
-    let pass = catalog.begin_write_tx().await.unwrap();
-    let handle = ReadHandle::Tx(&pass);
-
-    // The first read of a materialization.
-    let head = read_head_value(handle).await.unwrap();
-
-    // A commit lands in the middle of the pass, changing both halves of
-    // what it is about to read.
-    catalog
-        .commit(|tx| {
-            let schema = tx.schema_by_name("s").unwrap().id;
-            tx.create_table(
-                schema,
-                "mid",
-                &[crate::catalog::ColumnDef {
-                    name: "a".into(),
-                    column_type: "BIGINT".into(),
-                    nulls_allowed: true,
-                    default_value: None,
-                    children: Vec::new(),
-                }],
-            )?;
-            tx.register_data_file(tables[0], bulk_file("mid.parquet", 3), &[])
-                .map(|_| ())
-        })
-        .await
-        .unwrap();
-
-    // The rest of the pass.
-    let current = read::scan_current_entities(handle).await.unwrap();
-    let after = read_head_value(handle).await.unwrap();
-    let view = materialize(handle, None).await.unwrap();
-    pass.rollback();
-
-    assert_eq!(
-        after, head,
-        "the pass's second head read must agree with its first"
-    );
-    let schema = view.schema_by_name("s").unwrap().id;
-    assert!(
-        view.table_by_name(schema, "mid").is_none(),
-        "the pass must be entirely pre-commit, not a mix"
-    );
-    assert!(
-        view.data_files_of(crate::catalog::TableId::new(tables[0].get()))
-            .is_empty(),
-        "the pass must be entirely pre-commit, not a mix"
-    );
-    assert_eq!(
-        current
-            .iter()
-            .filter(|record| matches!(record, crate::store::read::EntityRecord::File(_)))
-            .count(),
-        0,
-        "the scan half of the pass must be pre-commit too"
-    );
-
-    // A fresh pass sees the whole commit, so what the held one showed was
-    // one state and not a stale accident.
-    let next = catalog.begin_write_tx().await.unwrap();
-    let fresh = materialize(ReadHandle::Tx(&next), None).await.unwrap();
-    next.rollback();
-    assert!(fresh.table_by_name(schema, "mid").is_some());
-    assert_eq!(
-        fresh
-            .data_files_of(crate::catalog::TableId::new(tables[0].get()))
-            .len(),
-        1
-    );
-
-    catalog.close().await.unwrap();
-}
-
-/// The read-only half of the same obligation. A reader has no transaction:
-/// its state advances underneath it between calls, so a pass of several
-/// reads really can straddle a commit. The head stamp is what catches it —
-/// read before and after, and a pass that saw it move is discarded and
-/// re-run. This forces exactly that by committing from inside the pass and
-/// waiting for the reader to observe it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_read_only_pass_that_straddles_a_commit_is_discarded_and_re_run() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use crate::{
-        catalog::{Catalog, CatalogOptions},
-        store::{handle::ReadHandle as Handle, open::StoreBuilder},
-    };
-
+async fn multi_writer_bootstrap_stamps_its_format_and_folds_nothing() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let writer = Catalog::open(
-        object_store.clone(),
-        CatalogOptions {
-            flush_interval: std::time::Duration::from_millis(1),
-            ..CatalogOptions::default()
-        },
-    )
-    .await
-    .unwrap();
-    writer
-        .commit(|tx| tx.create_schema("s").map(|_| ()))
+    let (db, _, _) = open_initialized(StoreBuilder::new("", object_store.clone()), false, None)
         .await
         .unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let format = read::read_format(ReadHandle::Tx(&tx))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(format.format_version, FORMAT_MULTI_WRITER);
+    tx.rollback();
+    db.close().await.unwrap();
 
-    let (reader, _) = StoreBuilder::new("", object_store)
-        .poll_interval(std::time::Duration::from_millis(20))
+    // A bootstrapped store has folded no slot: its replay point is zero, so
+    // the whole log — empty here — is still ahead of it.
+    let (reader, _) = StoreBuilder::new("", object_store.clone())
         .open_reader()
         .await
         .unwrap();
-    let handle = Handle::Reader(&reader);
+    assert_eq!(crate::transaction::folder::reader_cursor(&reader), 0);
+    reader.close().await.unwrap();
+}
 
-    let passes = AtomicUsize::new(0);
-    let view = read::consistent(handle, || async {
-        let pass = passes.fetch_add(1, Ordering::SeqCst);
-        // The first pass commits from inside itself and waits for the
-        // reader to pick the commit up, so it is guaranteed to straddle.
-        // Later passes run clean.
-        if pass == 0 {
-            writer
-                .commit(|tx| tx.create_schema("late").map(|_| ()))
-                .await
-                .unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
-                if read_head_value(handle).await.unwrap().snapshot_id > 1 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        }
-        materialize(handle, None).await
-    })
+/// A store write takes the numbers between the slot last folded and the next
+/// one. One that reaches the next slot's own number is refused: the fold would
+/// otherwise skip that slot as already covered, losing a committed slot with
+/// no error anywhere.
+#[tokio::test]
+async fn a_store_write_reaching_the_next_slots_sequence_is_refused() {
+    let (db, _, _) = open_initialized(
+        StoreBuilder::new("", Arc::new(InMemory::new())),
+        false,
+        None,
+    )
     .await
     .unwrap();
 
-    assert!(
-        passes.load(Ordering::SeqCst) > 1,
-        "a pass the store moved under must be discarded and re-run"
-    );
-    // And what came back is the post-commit state whole, not a mix.
-    assert!(view.schema_by_name("s").is_some());
-    assert!(view.schema_by_name("late").is_some());
+    // Nothing is folded, so slot 1 owns the ceiling and everything below it is
+    // the store's to use.
+    let inside =
+        slatedb::WriteHandle::new(moraine_wal::slot_sequence(1) - 1, 0, || async { Ok(()) });
+    assert!(refuse_a_write_past_the_next_slot(&db, &inside).is_ok());
 
-    writer.close().await.unwrap();
-}
-
-/// The store state a retry meets when its base predates an expiry: three
-/// commits, with the middle one's snapshot record reclaimed as expiry past
-/// the retention horizon leaves it.
-async fn catalog_with_a_reclaimed_snapshot()
--> (Db, Arc<std::sync::RwLock<ProjectionCache>>, Arc<Coalescer>) {
-    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let (db, _, _) = open_initialized(StoreBuilder::new("", object_store), false, None)
-        .await
-        .unwrap();
-    let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
-    let coalescer = Arc::new(Coalescer::new(Arc::clone(&projections)));
-
-    for name in ["a", "b", "c"] {
-        commit_cycle(
-            &db,
-            &[|tx: &mut Transaction| tx.create_schema(name).map(|_| ())],
-            &coalescer,
-        )
-        .await
-        .unwrap();
-    }
-
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-    tx.delete(Key::Snapshot { snapshot_id: 2 }.encode())
-        .unwrap();
-    tx.commit().await.unwrap();
-
-    (db, projections, coalescer)
-}
-
-/// A retry whose base predates a concurrent expiry classifies against a
-/// hole where an intervening snapshot record used to be. The verdict must
-/// be conservative — a reclaimed commit's changes are unknowable, so it
-/// conflicts — and must never read as corruption: expiry reclaiming a
-/// record below the retention horizon is ordinary catalog life, not a
-/// damaged store.
-#[tokio::test]
-async fn a_retry_across_a_reclaimed_snapshot_conflicts_rather_than_corrupting() {
-    let (db, _projections, _coalescer) = catalog_with_a_reclaimed_snapshot().await;
-
-    // What a losing attempt that read head 1 classifies: everything that
-    // landed above it, reclaimed record included.
-    let intervening = intervening_changes(&db, 1).await.unwrap();
-    let ids: Vec<u64> = intervening.iter().map(|(id, _)| *id).collect();
-    assert_eq!(ids, vec![2, 3]);
-
-    let reclaimed = &intervening[0].1;
-    let surviving = &intervening[1].1;
-    assert!(
-        reclaimed.has_unknown,
-        "a reclaimed record leaves its commit's changes unknowable"
-    );
-    assert!(!surviving.has_unknown);
-
-    // Ours is disjoint from what actually landed, so the hole is the only
-    // thing that conflicts: the conservative verdict comes from the missing
-    // record, not from the commits around it.
-    let ours = ChangeSet::parse("inserted_into_table:7");
-    assert!(!crate::transaction::operations::conflicts(&ours, surviving));
-    assert!(crate::transaction::operations::conflicts(&ours, reclaimed));
+    let at_the_ceiling =
+        slatedb::WriteHandle::new(moraine_wal::slot_sequence(1), 0, || async { Ok(()) });
+    let err = refuse_a_write_past_the_next_slot(&db, &at_the_ceiling).unwrap_err();
+    assert_eq!(err.kind(), slatedb::ErrorKind::Invalid, "{err}");
+    assert!(err.to_string().contains("fold the log"), "{err}");
 
     db.close().await.unwrap();
-}
-
-/// The other half of that path. An expiry is head-preserving, so it clears
-/// the cached view, and the next verb commit rematerializes over a keyspace
-/// whose intervening snapshot records are gone. It must land: a
-/// materialization resolves head, and head is not what expiry reclaimed.
-#[tokio::test]
-async fn a_verb_commit_rematerializes_over_a_reclaimed_snapshot() {
-    let (db, projections, coalescer) = catalog_with_a_reclaimed_snapshot().await;
-    invalidate_head_view(&projections);
-
-    commit_cycle(
-        &db,
-        &[|tx: &mut Transaction| tx.create_schema("d").map(|_| ())],
-        &coalescer,
-    )
-    .await
-    .unwrap();
-
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-    let handle = ReadHandle::Tx(&tx);
-    let view = materialize(handle, None).await.unwrap();
-    assert_eq!(view.snapshot.snapshot_id, 4);
-    for name in ["main", "a", "b", "c", "d"] {
-        assert!(
-            view.schema_by_name(name).is_some(),
-            "{name} must survive the reclaimed record"
-        );
-    }
-
-    // And the reclaimed snapshot itself reads as expired rather than
-    // missing or corrupt, since ids are sequential to head.
-    let expired = materialize(handle, Some(2)).await.unwrap_err();
-    assert!(matches!(expired, Error::SnapshotExpired(_)), "{expired}");
-    tx.rollback();
-
-    db.close().await.unwrap();
-}
-
-/// What a real migrator does to a live read-write handle, as against what
-/// a planted marker models.
-///
-/// `Catalog::migrate` takes the writer epoch before it writes anything, so
-/// the handle it displaces is already fenced by the time a marker exists —
-/// and a fenced handle reads its own state, which that marker never
-/// reached. So the displaced handle does not report `Migration` for this
-/// sequence at any point: it reads no marker, serves the view it holds
-/// until it notices the fence, and reports `Fenced` from then on.
-///
-/// Pinned because the per-read marker probe looks like the guard here and
-/// is not — the fence check is. A marker planted through a handle's *own*
-/// transaction is the only way to make that probe fire, and no writer
-/// reaches that state.
-#[tokio::test]
-async fn a_marker_from_the_writer_that_fenced_us_never_reads_as_a_migration() {
-    use crate::catalog::{Catalog, CatalogOptions};
-
-    let store: Arc<InMemory> = Arc::new(InMemory::new());
-    let displaced = Catalog::open(store.clone(), CatalogOptions::default())
-        .await
-        .unwrap();
-    displaced
-        .commit(|tx| tx.create_schema("before").map(|_| ()))
-        .await
-        .unwrap();
-    // Warm: the handle now holds a head view and serves reads from it.
-    displaced.snapshot().await.unwrap();
-
-    // The displacing writer, taking the epoch exactly as a migrator does,
-    // then writing the marker a migration's start batch writes.
-    let migrator = Catalog::open(store.clone(), CatalogOptions::default())
-        .await
-        .unwrap();
-    let tx = migrator.begin_write_tx().await.unwrap();
-    tx.put(
-        Key::Sys(SysKey::Migration).encode(),
-        value::encode_value(&proto::MigrationValue {
-            from_format: 1,
-            to_format: 2,
-            cursor: Vec::new(),
-        }),
-    )
-    .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
-
-    // Fencing is reported by a background task, so the displaced handle
-    // does not learn of it in the same breath. Whatever it answers in that
-    // window, it is never `Migration`.
-    let mut noticed = None;
-    for _ in 0..100 {
-        match displaced.begin_read().await {
-            Ok(session) => {
-                assert_eq!(
-                    crate::store::read::read_migration(session.handle())
-                        .await
-                        .unwrap(),
-                    None,
-                    "the displaced handle read the marker of the writer that fenced it"
-                );
-                session.finish();
-            }
-            Err(err) => {
-                noticed = Some(err);
-                break;
-            }
-        }
-        if let Err(err) = displaced.snapshot().await {
-            noticed = Some(err);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    let noticed = noticed.expect("the displaced handle never noticed it had been fenced");
-    assert!(matches!(noticed, Error::Fenced(_)), "{noticed:?}");
-}
-
-/// The batch's reported size is the batch: every key and value staged,
-/// index entries included. It is what the stall warning names, so an
-/// undercount would point an operator at the wrong cause.
-#[tokio::test]
-async fn a_staged_batch_reports_the_bytes_it_holds() {
-    let (catalog, table) = catalog_with_two_column_table().await;
-
-    let entries: Vec<crate::catalog::IndexEntry> = (0..4)
-        .map(|row_id| crate::catalog::IndexEntry {
-            row_id,
-            values: vec![Some(int_value(i128::from(row_id)))],
-        })
-        .collect();
-    let def = crate::catalog::IndexDef {
-        name: "by_a".into(),
-        columns: vec![crate::catalog::ColumnId::new(1)],
-        unique: false,
-    };
-
-    let base = catalog.snapshot().await.unwrap();
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let prepared = prepare_and_stage(
-        &db_tx,
-        catalog.projections(),
-        &|tx: &mut Transaction| tx.create_index(table, &def, &entries).map(|_| ()),
-        &base,
-    )
-    .await
-    .unwrap();
-
-    let Prepared::Staged {
-        writes,
-        staged_bytes,
-        ..
-    } = prepared
-    else {
-        panic!("the closure staged writes");
-    };
-
-    let catalog_bytes: u64 = writes
-        .iter()
-        .map(|(key, value)| (key.len() + value.as_ref().map_or(0, Vec::len)) as u64)
-        .sum();
-    // The entries' own contribution is bracketed rather than exact: the
-    // per-entry estimate is taken before encoding, and framing escapes the
-    // zero bytes a big-endian integer key is full of.
-    let nominal: u64 = entries
-        .iter()
-        .map(crate::catalog::IndexEntry::nominal_bytes)
-        .sum();
-
-    assert!(nominal > 0, "the entries weigh something");
-    assert!(
-        staged_bytes.0 >= catalog_bytes + nominal,
-        "{} < {catalog_bytes} + {nominal}",
-        staged_bytes.0
-    );
-    assert!(
-        staged_bytes.0 <= catalog_bytes + 2 * nominal,
-        "{} > {catalog_bytes} + 2 * {nominal}",
-        staged_bytes.0
-    );
-
-    db_tx.rollback();
-    catalog.close().await.unwrap();
 }

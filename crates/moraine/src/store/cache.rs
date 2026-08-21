@@ -1258,7 +1258,6 @@ mod tests {
 
         if phase == "seed" {
             let settings = Settings {
-                flush_interval: None,
                 ..Settings::default()
             };
             for (path, value) in [("a", b"catalog-a"), ("b", b"catalog-b")] {
@@ -1271,10 +1270,7 @@ mod tests {
                     b"key",
                     value,
                     &PutOptions::default(),
-                    &WriteOptions {
-                        await_durable: false,
-                        ..WriteOptions::default()
-                    },
+                    &WriteOptions::default(),
                 )
                 .await
                 .unwrap();

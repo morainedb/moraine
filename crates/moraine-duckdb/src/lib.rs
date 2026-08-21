@@ -58,6 +58,12 @@
 //! thread that performs the same pass on that cadence. Without an interval
 //! no thread starts, and a read-only attach never schedules.
 //!
+//! A session running maintenance is the store's designated folder: its
+//! passes drain the commit log into the store and reclaim its slots.
+//! Commits never wait on folding — it is invisible to readers and holds the
+//! writer only for the pass — and a pass fenced by a competing folder
+//! records the fold `skipped` and carries on.
+//!
 //! ```sql
 //! ATTACH 'ducklake:moraine:/lake/catalog' AS lake (
 //!     DATA_PATH '/lake/data', META_DATA_PATH '/lake/data',
@@ -76,16 +82,22 @@
 //! DuckLake's own names: `META_MAINTENANCE_<function minus its `ducklake_`
 //! prefix>` enables a step with DuckLake's defaults, and appending
 //! `_<parameter>` passes one through unaltered. The steps run in this
-//! order: `expire_snapshots`, `flush_inlined_data`, `merge_adjacent_files`,
-//! `rewrite_data_files`, `cleanup_old_files`, `delete_orphaned_files`,
-//! then moraine's orphaned-index sweep, then the store merge
-//! (`META_MAINTENANCE_COMPACT_STORE`). A failed step abandons the rest of
-//! the DuckLake sequence but never the sweep.
-//! `META_MAINTENANCE_SWEEP_INDEXES false` disables the sweep and
-//! `META_MAINTENANCE_BATCH_SIZE` bounds its deletes per commit. DuckLake
-//! rejects a list-valued `META_` option, so `expire_snapshots`' `versions`
-//! is spelled as a string: `META_MAINTENANCE_EXPIRE_SNAPSHOTS_VERSIONS
-//! '[1,2]'`.
+//! order: the fold of the commit log into the store, `expire_snapshots`,
+//! `flush_inlined_data`, `merge_adjacent_files`, `rewrite_data_files`,
+//! `cleanup_old_files`, `delete_orphaned_files`, then moraine's
+//! orphaned-index sweep, the store merge
+//! (`META_MAINTENANCE_COMPACT_STORE`), and a truncation of the folded
+//! slots. The fold leads because the sweep reads the folded store: a
+//! dropped index's definition rides an unfolded slot until folded.
+//! Truncation trails because its horizon is the fold cursor the fold just
+//! advanced. A failed step abandons the rest of the DuckLake sequence but
+//! never the sweep. `META_MAINTENANCE_SWEEP_INDEXES false` disables the
+//! sweep, `META_MAINTENANCE_FOLD_SLOTS false` the fold,
+//! `META_MAINTENANCE_TRUNCATE_SLOTS false` the truncation, and
+//! `META_MAINTENANCE_BATCH_SIZE` bounds the sweep's deletes per commit.
+//! DuckLake rejects a list-valued `META_` option, so `expire_snapshots`'
+//! `versions` is spelled as a string:
+//! `META_MAINTENANCE_EXPIRE_SNAPSHOTS_VERSIONS '[1,2]'`.
 //!
 //! # Measurement
 //!
@@ -111,7 +123,7 @@
 //! -- Reclaim it, once, without re-attaching.
 //! SELECT * FROM moraine_compact_store('lake', timeout := INTERVAL 10 MINUTES);
 //!
-//! -- ...or on a cadence, as the last step of the maintenance pass.
+//! -- ...or on a cadence, as a step of the maintenance pass.
 //! ATTACH 'ducklake:moraine:s3://bucket/catalog' AS lake (
 //!   DATA_PATH 's3://bucket/data',
 //!   META_MAINTENANCE_INTERVAL INTERVAL 1 HOUR,

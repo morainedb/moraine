@@ -3,12 +3,20 @@
 //! transactional KV store over object storage, instead of the usual
 //! relational catalog database.
 //!
-//! Exactly one process holds a read-write [`Catalog`] per store at a time
-//! (opening a second fences the first); any number of processes may read
-//! snapshots concurrently. Schemas, tables, views, data files, and
-//! statistics all commit through the same transaction; catalog options
-//! live outside the snapshot protocol (last-write-wins, no snapshot
-//! minted).
+//! Every commit races a conditional put against an object-storage commit
+//! log, so any number of processes may open a [`Catalog`] read-write and
+//! commit concurrently — the bucket is the only thing coordinating them.
+//! The one fenced SlateDB writer belongs to the **folder** role, not the
+//! commit path: it tails the log and applies each won commit into SlateDB
+//! as a derived index, so a dead folder cannot lose a commit, only lengthen
+//! the tail a reader replays past. Folding is host-driven — this crate
+//! spawns no threads — through [`Catalog::fold_sprint`] and
+//! [`Catalog::fold_if_stalled`]. A large fleet of readers should open
+//! against one shared, existing checkpoint id rather than each minting its
+//! own — traffic hygiene, not correctness. Schemas, tables, views, data
+//! files, and statistics all commit through the same transaction; catalog
+//! options live outside the snapshot protocol (last-write-wins, no
+//! snapshot minted).
 //!
 //! # A worked example
 //!
@@ -182,6 +190,13 @@
 //! sequenced for you; see that crate's docs for `moraine_maintenance`,
 //! `moraine_store_census`, and `moraine_compact_store`.
 //!
+//! Folding the commit log into SlateDB is the same kind of host-driven
+//! work: nothing here opens the fenced writer unasked, so an embedder
+//! chooses when to fold and how — one bounded pass
+//! ([`Catalog::fold_sprint`]) or a standing appointment
+//! ([`Catalog::fold_if_stalled`]) that stands down the moment a peer is
+//! already folding.
+//!
 //! # Format migration
 //!
 //! A store records the structural layout version it was written at. A binary
@@ -210,6 +225,11 @@
 //! - `fuzzing` — exposes the codec and read-path decode entry points the
 //!   `fuzz/` targets drive. They live in their own crate and so cannot reach
 //!   the crate-private codecs; nothing else needs this. Off by default.
+//! - `leader` (off by default) — the advisory leader role: a long-lived folder
+//!   opens a network port and becomes a group-commit funnel for forwarded
+//!   sessions, announcing itself through the commit log. Additive: nothing in
+//!   the direct or folder commit path depends on it, and with the feature off
+//!   the whole module is absent and the fleet is purely direct.
 //!
 //! # Diagnostics
 //!
@@ -239,18 +259,20 @@ mod error;
 mod fault;
 #[doc(hidden)]
 pub mod ffi_support;
+#[cfg(feature = "leader")]
+mod leader;
 mod store;
 mod telemetry;
 mod transaction;
 
 pub use catalog::{
     BuildStep, CachePreload, Catalog, CatalogOptions, CatalogSnapshot, CensusRequest,
-    ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats, CommitMember,
-    CompactStoreReport, CompactStoreRequest, CompactionTarget, DataFile, DataFileId, DataFileInfo,
-    DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval,
-    FileRowCandidate, FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexMaintenance,
-    IndexState, InlineChunk, LiveCount, MacroId, MacroImplementationDef, MacroInfo,
-    MacroParameterDef, MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass,
+    ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats,
+    CompactStoreReport, CompactStoreRequest, CompactionTarget, Contention, DataFile, DataFileId,
+    DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry,
+    FileIndexRemoval, FileRowCandidate, FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo,
+    IndexMaintenance, IndexState, InlineChunk, LiveCount, MacroId, MacroImplementationDef,
+    MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass,
     MaintenanceStatusStep, MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef,
     OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow,
     RowSummaryWarmth, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId,
@@ -263,12 +285,17 @@ pub use error::{Error, Result};
 /// semver contract.
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
-pub use fault::{CrashCase, CrashPoint, SyntheticMigration, inject_crash, install_migration};
+pub use fault::{
+    CrashCase, CrashPoint, SyntheticMigration, inject_crash, install_migration, stamp_base_format,
+};
 /// Decode entry points for the out-of-crate fuzz targets. Unstable and not
 /// part of the semver contract.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzz;
+#[cfg(feature = "leader")]
+pub use leader::{Leader, LeaderConfig, LeaderStats};
+pub use moraine_wal::FoldReport;
 pub use store::{
     cache::{
         CacheStatus, CacheTally, ObjectStoreTally, RowSummaryOccupancy, cache_status, cache_tally,
@@ -276,3 +303,7 @@ pub use store::{
     index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder},
 };
 pub use transaction::{MigrationReport, Transaction};
+
+/// The newest structural store format this binary reads and writes. A store
+/// bootstrapped here carries it, so `migrate` finds nothing to rewrite.
+pub const MAX_FORMAT_VERSION: u64 = transaction::commit::MAX_FORMAT_VERSION;

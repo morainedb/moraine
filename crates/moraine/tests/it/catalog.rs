@@ -461,46 +461,47 @@ async fn set_table_schema_moves_a_table_between_schemas() {
     catalog.close().await.unwrap();
 }
 
-/// SlateDB's newest-writer-wins fencing, surfaced typed: after a second
-/// read-write open of the same store, the first writer's next commit fails
-/// as [`Error::Fenced`] — not an opaque store error — and the message
-/// carries none of DuckLake's four retry substrings, because a fenced
-/// writer is dead for writes and re-running the commit cannot revive it.
+/// Two read-write attaches of one store coexist: commits ride the slot log
+/// rather than a single fenced writer, so a second open never fences the
+/// first, both processes commit, and each sees the other's writes through
+/// tail replay.
 #[tokio::test]
-async fn second_writer_fences_the_first_with_a_typed_error() {
+async fn two_read_write_attaches_coexist_without_fencing() {
     let store: Arc<InMemory> = Arc::new(InMemory::new());
 
-    let first = Catalog::open(store.clone(), CatalogOptions::default())
+    // A zero refresh window makes each read revalidate its cached head, so a
+    // peer's latest commit is seen through tail replay rather than after the
+    // window elapses.
+    let options = || {
+        let mut options = CatalogOptions::default();
+        options.reader_poll_interval = std::time::Duration::ZERO;
+        options
+    };
+
+    let first = Catalog::open(store.clone(), options()).await.unwrap();
+    first
+        .commit(|tx| tx.create_schema("from_first").map(|_| ()))
+        .await
+        .unwrap();
+
+    // A second read-write open does not fence the first; both keep committing.
+    let second = Catalog::open(store.clone(), options()).await.unwrap();
+    second
+        .commit(|tx| tx.create_schema("from_second").map(|_| ()))
         .await
         .unwrap();
     first
-        .commit(|tx| tx.create_schema("before").map(|_| ()))
+        .commit(|tx| tx.create_schema("first_again").map(|_| ()))
         .await
         .unwrap();
 
-    // The second read-write open fences the first (newest writer wins).
-    let second = Catalog::open(store.clone(), CatalogOptions::default())
-        .await
-        .unwrap();
-
-    let err = first
-        .commit(|tx| tx.create_schema("after").map(|_| ()))
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::Fenced(_)), "got {err:?}");
-    let text = err.to_string();
-    for substring in ["conflict", "concurrent", "unique", "primary key"] {
-        assert!(
-            !text.contains(substring),
-            "{text:?} contains DuckLake's retry substring {substring:?}"
-        );
+    // Each attach replays the log and sees every committed schema.
+    for catalog in [&first, &second] {
+        let view = catalog.snapshot().await.unwrap();
+        assert!(view.schema_by_name("from_first").is_some());
+        assert!(view.schema_by_name("from_second").is_some());
+        assert!(view.schema_by_name("first_again").is_some());
     }
-
-    // The winner is unaffected.
-    second
-        .commit(|tx| tx.create_schema("after").map(|_| ()))
-        .await
-        .unwrap();
     second.close().await.unwrap();
 }
 

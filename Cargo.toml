@@ -14,10 +14,15 @@ anyhow = "1"
 arrow = { version = "59.2.0", default-features = false }
 async-trait = "0.1"
 bytes = "1"
+constant_time_eq = "0.4"
+fastrand = "2"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 parquet = { version = "59.2.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
 moraine = { path = "crates/moraine", version = "0.6.0" }
+moraine-remote = { path = "crates/moraine-remote", version = "0.6.0" }
+moraine-wal = { path = "crates/moraine-wal", version = "0.6.0" }
 foyer = { version = "0.22", features = ["serde"] }
+# object_store must stay on the same minor as slatedb's
 object_store = "0.14"
 prost = "0.14"
 prost-build = "0.14"
@@ -26,9 +31,9 @@ proptest = "1"
 proptest-derive = "0.8"
 roaring = "0.11"
 serde = { version = "1", features = ["derive"] }
-slatedb = "0.15.0"
+slatedb = { git = "https://github.com/slatedb/slatedb", rev = "2a2fdd146", version = "0.15.0", features = ["wal_disable"] }
 # must move in lockstep with slatedb: it is where the metrics traits live
-slatedb-common = "0.15.0"
+slatedb-common = { git = "https://github.com/slatedb/slatedb", rev = "2a2fdd146", version = "0.15.0" }
 storekey = "0.11"
 thiserror = "2"
 tokio = "1"

@@ -43,10 +43,6 @@ use parquet::{
 };
 
 pub use crate::data_file::data_store::DataStore;
-#[cfg(test)]
-pub(crate) use crate::data_file::inline_batch::{
-    inline_batch_decode_count, inline_schema_decode_count,
-};
 pub(crate) use crate::data_file::{
     auxiliary_cache::{
         install as install_auxiliary, occupancy as auxiliary_occupancy, row_summary_occupancy,

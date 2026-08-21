@@ -1455,6 +1455,44 @@ int32_t moraine_maintain(struct MoraineCatalogHandle *handle,
                          void *probe_ctx,
                          struct MoraineError *err);
 
+// Runs one bounded fold pass: applies up to `limit` unfolded slots into
+// the store, advancing the durable fold cursor, and writes the count
+// applied to `*out_slots_folded` and the slots still unfolded to
+// `*out_tail_remaining`. `limit` of 0 folds nothing and only reports the
+// tail.
+//
+// Folding is invisible to readers — the served state is byte-identical
+// before and after — so a pass may run whenever. A read-only attach is
+// refused with [`codes::CONSTRAINT`]; a concurrent folder fencing this
+// session surfaces as [`codes::FENCED`], which the caller treats as
+// wasted work rather than an error.
+//
+// # Safety
+//
+// `handle` must be a live handle from [`moraine_attach`]. The
+// out-parameters, if non-null, must be writable, and `err`, if non-null,
+// must be writable. All for the duration of this call.
+int32_t moraine_fold_sprint(struct MoraineCatalogHandle *handle,
+                            uint64_t limit,
+                            uint64_t *out_slots_folded,
+                            uint64_t *out_tail_remaining,
+                            struct MoraineError *err);
+
+// Deletes slots durably folded into the store, oldest first, and writes
+// the count removed to `*out_slots_removed`. The horizon is bounded by
+// both the durable fold cursor and what live readers still need, so a
+// pass may remove nothing when readers lag. A read-only attach is refused
+// with [`codes::CONSTRAINT`].
+//
+// # Safety
+//
+// `handle` must be a live handle from [`moraine_attach`].
+// `out_slots_removed`, if non-null, must be writable, and `err`, if
+// non-null, must be writable. All for the duration of this call.
+int32_t moraine_truncate_slots(struct MoraineCatalogHandle *handle,
+                               uint64_t *out_slots_removed,
+                               struct MoraineError *err);
+
 // Durably records one completed maintenance pass.
 //
 // # Safety
@@ -1469,6 +1507,32 @@ int32_t moraine_maintenance_status_record(struct MoraineCatalogHandle *handle,
                                           const struct MoraineMaintenanceStatusStepInput *steps,
                                           size_t steps_len,
                                           struct MoraineError *err);
+
+// Opens the leader role on this attached catalog: binds `bind_address`,
+// advertises `advertise_address` (its own bind when null), mints or reads the
+// forwarding token, announces through the log, and serves forwarded sessions
+// on the handle's runtime until [`moraine_leader_stop`]. A read-only catalog
+// cannot lead. Starting a second leader on a handle already leading fails.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; `err`, if non-null, must
+// be writable.
+int32_t moraine_leader_start(struct MoraineCatalogHandle *handle,
+                             const char *bind_address,
+                             const char *advertise_address,
+                             uint64_t max_sessions,
+                             struct MoraineError *err);
+
+// Stands the leader down: signals a clean withdrawal and waits a bounded grace
+// for the drain and the withdrawal PUT. A handle not leading is a no-op. The
+// runtime the detach that follows drops would abort the task anyway, so this
+// never blocks past the grace.
+//
+// # Safety
+//
+// `handle`, if non-null, must be a live [`moraine_attach`] pointer.
+void moraine_leader_stop(struct MoraineCatalogHandle *handle);
 
 // Lists durable maintenance status, newest pass first and step order within
 // each pass.
@@ -1518,6 +1582,20 @@ int32_t moraine_store_census(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written by a
 // matching [`moraine_store_census`] call, not yet freed.
 void moraine_store_census_free(struct MoraineSubspaceCensus *items, size_t len);
+
+// Reports the leader role: whether this catalog holds it right now, the
+// forwarded sessions open, and the commits landed through the funnel since it
+// bound. A handle not leading reports `false`/`0`/`0`.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; `err`, if non-null, must
+// be writable.
+int32_t moraine_leader_status(struct MoraineCatalogHandle *handle,
+                              bool *out_role_held,
+                              uint64_t *out_sessions,
+                              uint64_t *out_forwarded,
+                              struct MoraineError *err);
 
 // Merges each targeted subspace's sorted runs into one.
 //

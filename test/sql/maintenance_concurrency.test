@@ -75,18 +75,18 @@ SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],false);
 statement ok
 SELECT * FROM moraine_index_drop('lake','main','t','by_a');
 
-# The baseline: an autocommit trigger with nothing else in flight. Nine
+# The baseline: an autocommit trigger with nothing else in flight. Eleven
 # steps report, whatever their individual statuses — the pass ran.
 query I con2
 SELECT count(*) FROM moraine_maintenance('lake');
 ----
-9
+11
 
 # And it did real work rather than skipping past everything.
 query I con2
 SELECT count(*) FROM moraine_maintenance('lake') WHERE status = 'ran';
 ----
-4
+6
 
 # The case the refusal leaves open. `con1` holds an *uncommitted* write
 # transaction against the same lake, so a DuckLake transaction is open on
@@ -112,7 +112,7 @@ SELECT * FROM moraine_index_drop('lake','main','t','by_a2');
 query I con2
 SELECT count(*) FROM moraine_maintenance('lake');
 ----
-9
+11
 
 # And again from the connection that itself just wrote in autocommit, so the
 # caller's implicit transaction is the most recent writer.
@@ -122,7 +122,7 @@ INSERT INTO lake.main.t VALUES (999);
 query I con3
 SELECT count(*) FROM moraine_maintenance('lake');
 ----
-9
+11
 
 # What con1 gets is a *conflict*, not a hang and not corruption: the pass
 # expired snapshots and so altered the table con1 was inserting into, and
@@ -147,4 +147,4 @@ SELECT count(*) FROM lake.main.t;
 query I con2
 SELECT count(*) FROM moraine_maintenance('lake');
 ----
-9
+11

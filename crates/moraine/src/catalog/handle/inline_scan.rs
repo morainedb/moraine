@@ -1,5 +1,7 @@
 //! Inline row scans: materialized from the chunk-range directory when it
 //! is known complete, with only the referenced chunk bodies point-read.
+//! Otherwise from one walk of the chunks per head, which every schema
+//! version's ask of the same statement shares.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -17,10 +19,7 @@ use crate::{
     },
     error::{Error, Result},
     store::{
-        handle::{ReadHandle, ReadSession},
-        inline as store_inline,
-        key::InlineOperation,
-        proto::InlineChunkValue,
+        handle::ReadHandle, inline as store_inline, key::InlineOperation, proto::InlineChunkValue,
     },
     transaction::commit,
 };
@@ -32,7 +31,7 @@ const CHUNK_READ_CONCURRENCY: usize = 8;
 /// without bodies — or the full chunk scan, bodies in hand.
 pub(super) enum InlineRowSource {
     Locators(Vec<store_inline::InlineChunkLocator>),
-    Chunks(Vec<(InlineOperation, InlineChunkValue)>),
+    Chunks(projection::InlineChunks),
 }
 
 impl InlineRowSource {
@@ -58,6 +57,7 @@ impl InlineRowSource {
     async fn resolve_chunks(
         self,
         handle: ReadHandle<'_>,
+        overlay: Option<&moraine_wal::Overlay>,
         table: TableId,
         mut selected: Vec<InlineRow>,
     ) -> Result<(Vec<InlineRow>, Vec<(InlineOperation, InlineChunkValue)>)> {
@@ -76,19 +76,24 @@ impl InlineRowSource {
                 stream::iter(referenced.into_iter().map(|index| {
                     let locator = locators[index];
                     async move {
-                        store_inline::read_inline_chunk_locator(handle, table.get(), locator).await
+                        store_inline::read_inline_chunk_locator(
+                            handle,
+                            overlay,
+                            table.get(),
+                            locator,
+                        )
+                        .await
                     }
                 }))
                 .buffered(CHUNK_READ_CONCURRENCY)
                 .try_collect()
                 .await?
             }
-            Self::Chunks(mut chunks) => referenced
+            // Cloned rather than moved out: the walk is shared, and a
+            // chunk body is a refcounted buffer either way.
+            Self::Chunks(chunks) => referenced
                 .into_iter()
-                .map(|index| {
-                    let (operation, chunk) = &mut chunks[index];
-                    (*operation, std::mem::take(chunk))
-                })
+                .map(|index| chunks[index].clone())
                 .collect(),
         };
 
@@ -97,6 +102,34 @@ impl InlineRowSource {
 }
 
 impl ReadOnlyCatalog {
+    /// `table`'s inline tombstones, served from the projection when they
+    /// stand at this read's head. Every per-version scan of a base table asks
+    /// for the same whole set, and the set cannot be scoped by version: a
+    /// tombstone names a row id, not the version that wrote it.
+    async fn inline_tombstones(
+        &self,
+        handle: ReadHandle<'_>,
+        overlay: Option<&moraine_wal::Overlay>,
+        table: TableId,
+        head: &crate::store::proto::HeadValue,
+    ) -> Result<projection::InlineTombstones> {
+        if let Some(rows) = projection::inline_tombstones_at(&self.projections, table.get(), head) {
+            return Ok(rows);
+        }
+
+        let rows = std::sync::Arc::new(
+            store_inline::scan_inline_deletes(handle, overlay, table.get()).await?,
+        );
+        projection::install_inline_tombstones(
+            &self.projections,
+            table.get(),
+            *head,
+            std::sync::Arc::clone(&rows),
+        );
+
+        Ok(rows)
+    }
+
     /// Every inline row of `table` — tombstoned included, for the caller's
     /// scan kind to select over — from the chunk-range directory when it
     /// is known complete, else from the chunk scan, verifying the
@@ -104,23 +137,42 @@ impl ReadOnlyCatalog {
     async fn inline_row_source(
         &self,
         handle: ReadHandle<'_>,
+        overlay: Option<&moraine_wal::Overlay>,
         table: TableId,
+        head: &crate::store::proto::HeadValue,
     ) -> Result<(InlineRowSource, Vec<InlineRow>)> {
+        // A base-table scan asks once per registered schema version and every
+        // ask walks the same chunks, so the walk is paid once per head and the
+        // asks after it select out of it.
+        if let Some(chunks) = projection::inline_chunks_at(&self.projections, table.get(), head) {
+            let tombstones = self.inline_tombstones(handle, overlay, table, head).await?;
+            let rows = materialize_inline_rows(&chunks, &tombstones);
+            return Ok((InlineRowSource::Chunks(chunks), rows));
+        }
+
         if projection::inline_directory_complete(&self.projections, table.get()) {
             let (locators, tombstones) = futures::try_join!(
-                store_inline::scan_inline_chunk_locators(handle, table.get()),
-                store_inline::scan_inline_deletes(handle, table.get()),
+                store_inline::scan_inline_chunk_locators(handle, overlay, table.get()),
+                self.inline_tombstones(handle, overlay, table, head),
             )?;
             let rows = materialize_locator_rows(&locators, &tombstones);
             return Ok((InlineRowSource::Locators(locators), rows));
         }
 
         let (chunks, tombstones) = futures::try_join!(
-            store_inline::scan_inline_chunks(handle, table.get()),
-            store_inline::scan_inline_deletes(handle, table.get()),
+            store_inline::scan_inline_chunks(handle, overlay, table.get()),
+            self.inline_tombstones(handle, overlay, table, head),
         )?;
-        self.verify_inline_directory(handle, table, &chunks).await?;
+        self.verify_inline_directory(handle, overlay, table, &chunks)
+            .await?;
+        let chunks = Arc::new(chunks);
         let rows = materialize_inline_rows(&chunks, &tombstones);
+        projection::install_inline_chunks(
+            &self.projections,
+            table.get(),
+            *head,
+            Arc::clone(&chunks),
+        );
 
         Ok((InlineRowSource::Chunks(chunks), rows))
     }
@@ -139,50 +191,56 @@ impl ReadOnlyCatalog {
         schema_version: Option<u64>,
     ) -> Result<(Vec<InlineRow>, Vec<(InlineOperation, InlineChunkValue)>)> {
         let table = TableId::new(table_id);
-        let session = self.begin_read().await?;
+        let read = self.begin_probe().await?;
+        let head = read.head_value();
         let outcome = async {
-            let (source, rows) = self.inline_row_source(session.handle(), table).await?;
+            let (source, rows) = self
+                .inline_row_source(read.handle(), read.tail(), table, &head)
+                .await?;
             let mut selected = kind.select(&rows, snapshot, start);
             if let Some(version) = schema_version {
                 selected.retain(|row| source.chunk_is_version(row.chunk, version));
             }
             source
-                .resolve_chunks(session.handle(), table, selected)
+                .resolve_chunks(read.handle(), read.tail(), table, selected)
                 .await
         }
         .await;
-        session.finish();
+        read.finish().await;
 
         outcome
     }
 
-    /// The inline rows of `table` live at `at` (head, when `None`), read
-    /// through an open session.
+    /// The inline rows of `table` live at `at` (the probe's head, when
+    /// `None`), read through the probe's view of store plus unfolded tail.
     pub(super) async fn scan_recent_rows(
         &self,
-        session: &ReadSession,
+        read: &super::ProbeRead,
         table: TableId,
         at: Option<u64>,
     ) -> Result<Vec<RecentRow>> {
-        let handle = session.handle();
-        let read_at = async {
-            match at {
-                Some(_) => Ok(commit::resolve_read_snapshot(handle, at).await?.0),
-                None => commit::read_head_id(handle).await,
-            }
+        let handle = read.handle();
+        let overlay = read.tail();
+        let head_value = read.head_value();
+        // The probe already resolved the head across store and tail, so only
+        // time travel owes a store read.
+        let read_at = match at {
+            Some(_) => commit::resolve_read_snapshot(handle, at).await?.0,
+            None => read.view().snapshot.snapshot_id,
         };
-        let (read_at, (source, rows)) =
-            futures::try_join!(read_at, self.inline_row_source(handle, table))?;
+        let (source, rows) = self
+            .inline_row_source(handle, overlay, table, &head_value)
+            .await?;
 
         let live = InlineScanKind::Table.select(&rows, read_at, 0);
-        let (live, chunks) = source.resolve_chunks(handle, table, live).await?;
+        let (live, chunks) = source.resolve_chunks(handle, overlay, table, live).await?;
 
         let schema_versions = live.iter().filter_map(|row| match &chunks[row.chunk].0 {
             InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
             _ => None,
         });
         let schemas: HashMap<u64, Arc<Vec<u8>>> =
-            backfill::read_inline_schemas(handle, table, schema_versions)
+            backfill::read_inline_schemas(handle, overlay, table, schema_versions)
                 .await?
                 .into_iter()
                 .map(|(version, record)| (version, Arc::new(record.to_vec())))
@@ -224,14 +282,14 @@ impl ReadOnlyCatalog {
 
     pub(super) async fn scan_live_inline_row_ids(
         &self,
-        session: &ReadSession,
+        read: &super::ProbeRead,
         table: TableId,
     ) -> Result<Vec<u64>> {
-        let handle = session.handle();
-        let (head, (_, rows)) = futures::try_join!(
-            commit::read_head_id(handle),
-            self.inline_row_source(handle, table),
-        )?;
+        let head = read.view().snapshot.snapshot_id;
+        let head_value = read.head_value();
+        let (_, rows) = self
+            .inline_row_source(read.handle(), read.tail(), table, &head_value)
+            .await?;
 
         Ok(InlineScanKind::Table
             .select(&rows, head, 0)
@@ -241,27 +299,41 @@ impl ReadOnlyCatalog {
     }
 
     /// Compares the walked chunks against the directory and remembers a
-    /// complete one. Only an isolated session may judge — a
-    /// manifest-following pass can straddle a commit — and only under a
-    /// format that locks out writers that predate the directory. This path
-    /// never writes, so a gap is simply left for a flush to heal.
+    /// complete one, under a format that locks out writers predating the
+    /// directory.
+    ///
+    /// The two scans must describe one store state. A transaction gives that
+    /// outright; a manifest-following reader does not, so the head is read
+    /// again afterwards and a judgement is only recorded when it has not
+    /// moved — a commit landing between the scans leaves the directory
+    /// unjudged rather than wrongly complete. This path never writes, so a
+    /// gap is simply left for a flush to heal.
     async fn verify_inline_directory(
         &self,
         handle: ReadHandle<'_>,
+        overlay: Option<&moraine_wal::Overlay>,
         table: TableId,
         chunks: &[(InlineOperation, InlineChunkValue)],
     ) -> Result<()> {
-        if !handle.is_isolated()
-            || projection::format_floor(&self.projections)
-                < commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY
+        if projection::format_floor(&self.projections) < commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY
         {
             return Ok(());
         }
 
-        let directory: BTreeSet<u64> = store_inline::scan_inline_chunk_ranges(handle, table.get())
-            .await?
-            .into_iter()
-            .collect();
+        // Read before the directory scan, compared after it: the walked
+        // chunks were taken at this head too, so an unmoved head means all
+        // of it described one state.
+        let before = if handle.is_isolated() {
+            None
+        } else {
+            Some(commit::read_head_value(handle).await?)
+        };
+
+        let directory: BTreeSet<u64> =
+            store_inline::scan_inline_chunk_ranges(handle, overlay, table.get())
+                .await?
+                .into_iter()
+                .collect();
         let ends: Option<BTreeSet<u64>> = chunks
             .iter()
             .map(|(_, chunk)| {
@@ -271,7 +343,14 @@ impl ReadOnlyCatalog {
                     .and_then(|count| chunk.row_id_start.checked_add(count))
             })
             .collect();
-        if ends == Some(directory) {
+        let steady = match &before {
+            None => true,
+            Some(before) => {
+                let after = commit::read_head_value(handle).await?;
+                after.snapshot_id == before.snapshot_id && after.batch_seq == before.batch_seq
+            }
+        };
+        if steady && ends == Some(directory) {
             projection::note_inline_directory_complete(&self.projections, table.get());
         }
 

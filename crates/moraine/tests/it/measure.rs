@@ -68,7 +68,7 @@ async fn open_reader(store: Arc<InMemory>) -> moraine::ReadOnlyCatalog {
 #[allow(clippy::unwrap_used)]
 async fn open_with(store: Arc<InMemory>, flush_ms: u64) -> Catalog {
     let mut options = CatalogOptions::default();
-    options.flush_interval = Duration::from_millis(flush_ms);
+    options.commit_batch_window = Duration::from_millis(flush_ms);
     Catalog::open(store, options).await.unwrap()
 }
 
@@ -650,7 +650,7 @@ async fn measure_commit_throughput_by_concurrency() {
     for &concurrency in &ladder {
         let store = Arc::new(FreezingStore::thawed(Arc::new(InMemory::new())));
         let mut options = CatalogOptions::default();
-        options.flush_interval = Duration::from_millis(DEFAULT_FLUSH_MS);
+        options.commit_batch_window = Duration::from_millis(DEFAULT_FLUSH_MS);
         let catalog = Catalog::open(store.clone(), options).await.unwrap();
 
         // One table per caller, created up front so the timed burst is
@@ -750,7 +750,7 @@ async fn measure_commit_latency_by_write_rtt() {
             };
             let store = Arc::new(ThrottledStore::new(InMemory::new(), config));
             let mut options = CatalogOptions::default();
-            options.flush_interval = Duration::from_millis(flush_ms);
+            options.commit_batch_window = Duration::from_millis(flush_ms);
             let catalog = Catalog::open(store, options).await.unwrap();
 
             let mut samples = Vec::with_capacity(COMMITS);
@@ -921,7 +921,7 @@ async fn measure_read_concurrency_under_io_latency() {
     // copies), so the throttled handle sees the seeded data.
     let throttled = Arc::new(ThrottledStore::new((*raw).clone(), config));
     let mut options = CatalogOptions::default();
-    options.flush_interval = Duration::from_millis(DEFAULT_FLUSH_MS);
+    options.commit_batch_window = Duration::from_millis(DEFAULT_FLUSH_MS);
     let catalog = Catalog::open(throttled, options).await.unwrap();
 
     println!("\n# 0010 read concurrency under {READ_LATENCY_MS} ms IO latency");
@@ -1489,11 +1489,7 @@ async fn measure_probe_cost_by_index_size() {
         )));
         let catalog = Catalog::open(
             Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
-            {
-                let mut options = CatalogOptions::default();
-                options.flush_interval = Duration::from_millis(SEED_FLUSH_MS);
-                options
-            },
+            CatalogOptions::default(),
         )
         .await
         .unwrap();

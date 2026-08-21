@@ -33,8 +33,6 @@ message TableValue {
   string table_name = 6;
   string path = 7;
   bool path_is_relative = 8;
-  // moraine-side per-table field-id counter: the next column_id to
-  // allocate. Persisted so allocation never depends on scanning history.
   uint64 next_column_id = 9;
 }
 
@@ -340,6 +338,7 @@ message SnapshotValue {
   // it checks at file grain. Empty on a DuckLake-authored snapshot, which
   // is read back as "deletes from the whole table".
   repeated uint64 deleted_data_file_ids = 12;
+  optional bytes transaction_id = 13;
 }
 
 // changelog/<snapshot_id>: the `current` keys one commit's batch wrote,
@@ -382,6 +381,18 @@ message FormatValue {
 message HeadValue {
   uint64 snapshot_id = 1;
   uint64 batch_seq = 2;
+}
+
+// sys/secret: the forwarding token a leader authenticates sessions against.
+message SecretValue {
+  bytes token = 1;
+}
+
+// sys/leader: the freshest folded leader advert. An absent `endpoint`
+// records a withdrawal.
+message LeaderValue {
+  bytes instance = 1;
+  optional string endpoint = 2;
 }
 
 // sys/migration: structural-migration marker. Present only

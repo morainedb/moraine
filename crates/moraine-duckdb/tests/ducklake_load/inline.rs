@@ -759,13 +759,13 @@ fn a_flushed_duplicate_schema_collapses_and_still_binds() {
         "the two superseded versions must leave the registry, got {after:?}"
     );
 
-    // The collapse is what carries the store's format, so a move here is
-    // the proof one happened — nothing else in this test writes a shape
-    // that needs the newer format.
+    // A slot-backed store is stamped past the reference format at bootstrap,
+    // so a collapse carries it nowhere: the registry above is what says one
+    // happened, and the binds below are what say it stayed readable.
     let after_format = format("after the flush");
-    assert!(
-        after_format > before_format,
-        "a collapsed schema must carry the store's format, which stayed at {before_format}"
+    assert_eq!(
+        after_format, before_format,
+        "a collapse owes no format a bootstrapped store does not already carry"
     );
 
     // Both deregistered versions still bind and scan empty: the first

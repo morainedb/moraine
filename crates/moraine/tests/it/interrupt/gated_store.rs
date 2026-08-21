@@ -3,11 +3,11 @@
 //!
 //! Cancellation coverage has to place an interrupt with the commit's
 //! durable write already in the air, and no amount of sleeping promises
-//! that. This store makes the point observable instead: the WAL write
+//! that. This store makes the point observable instead: the slot write
 //! parks, announces that it arrived, and stays parked until the test
 //! opens the gate, so the interrupt lands at a known moment rather than a
-//! hoped-for one. A parked write also holds the store — one batch is
-//! admitted at a time — which is how the *pre*-write window is staged.
+//! hoped-for one. A parked write also holds the leader — one batch drives
+//! the slot at a time — which is how the *pre*-write window is staged.
 
 use std::sync::{
     Arc,
@@ -25,7 +25,7 @@ use tokio::sync::{Semaphore, watch};
 #[derive(Debug)]
 pub struct GatedStore {
     inner: Arc<InMemory>,
-    gate_wal_writes: AtomicBool,
+    gate_slot_writes: AtomicBool,
     /// How many operations have parked, ever. A test waits on this to
     /// learn that the operation it gated has reached the gate.
     arrivals: watch::Sender<u64>,
@@ -33,9 +33,9 @@ pub struct GatedStore {
     /// once, which releases everyone parked and lets everyone after them
     /// straight through.
     release: Semaphore,
-    /// WAL objects written, counted on completion — so a put still parked
+    /// Slot objects written, counted on completion — so a put still parked
     /// at the gate has not been counted.
-    wal_writes: AtomicU64,
+    slot_writes: AtomicU64,
 }
 
 impl GatedStore {
@@ -43,29 +43,29 @@ impl GatedStore {
     pub fn open(inner: Arc<InMemory>) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            gate_wal_writes: AtomicBool::new(false),
+            gate_slot_writes: AtomicBool::new(false),
             arrivals: watch::Sender::new(0),
             release: Semaphore::new(0),
-            wal_writes: AtomicU64::new(0),
+            slot_writes: AtomicU64::new(0),
         })
     }
 
-    /// Parks every WAL object write from here on — SlateDB's durable-commit
-    /// unit, so this is the commit's point of no return.
-    pub fn gate_wal_writes(&self) {
-        self.gate_wal_writes.store(true, Ordering::SeqCst);
+    /// Parks every slot object write from here on — the leader's conditional
+    /// put into the commit log, so this is the commit's point of no return.
+    pub fn gate_slot_writes(&self) {
+        self.gate_slot_writes.store(true, Ordering::SeqCst);
     }
 
     /// Lets everyone through, now and afterwards. Not reversible: a test
     /// opens the gate once, at the end of the window it was staging.
     pub fn open_gate(&self) {
-        self.gate_wal_writes.store(false, Ordering::SeqCst);
+        self.gate_slot_writes.store(false, Ordering::SeqCst);
         self.release.close();
     }
 
-    /// WAL objects written to completion.
-    pub fn wal_writes(&self) -> u64 {
-        self.wal_writes.load(Ordering::SeqCst)
+    /// Slot objects written to completion.
+    pub fn slot_writes(&self) -> u64 {
+        self.slot_writes.load(Ordering::SeqCst)
     }
 
     /// Resolves once at least one operation has parked at the gate.
@@ -85,10 +85,11 @@ impl GatedStore {
         let _ = self.release.acquire().await;
     }
 
-    /// SlateDB keeps WAL objects under a `wal/` directory of the store
-    /// root; every durable commit lands as one of them.
-    fn is_wal(location: &Path) -> bool {
-        location.parts().any(|part| part.as_ref() == "wal")
+    /// Slot objects live under a `commits/` directory of the store root;
+    /// every durable commit lands as one of them, written once with a
+    /// create-if-absent conditional put.
+    fn is_slot(location: &Path) -> bool {
+        location.parts().any(|part| part.as_ref() == "commits")
     }
 }
 
@@ -106,13 +107,13 @@ impl ObjectStore for GatedStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        let wal = Self::is_wal(location);
-        if wal && self.gate_wal_writes.load(Ordering::SeqCst) {
+        let slot = Self::is_slot(location);
+        if slot && self.gate_slot_writes.load(Ordering::SeqCst) {
             self.park().await;
         }
         let result = self.inner.put_opts(location, payload, opts).await;
-        if wal && result.is_ok() {
-            self.wal_writes.fetch_add(1, Ordering::SeqCst);
+        if slot && result.is_ok() {
+            self.slot_writes.fetch_add(1, Ordering::SeqCst);
         }
         result
     }

@@ -64,12 +64,13 @@ impl ReadOnlyCatalog {
     ///
     /// Returns a store error if the head view cannot be read.
     pub async fn warm_tables(&self, tables: &[TableId]) -> Result<()> {
-        let session = self.begin_read().await?;
-        let handle = session.handle();
-        let view = self.head_view(handle).await?;
+        let read = self.begin_probe().await?;
+        let handle = read.handle();
+        // Warming fills the block cache from the folded store; the unfolded
+        // tail is not cacheable this way, and a warm miss is only slower.
         let prefixes = tables
             .iter()
-            .flat_map(|table| probe_prefixes(&view, *table))
+            .flat_map(|table| probe_prefixes(read.view(), *table))
             .collect::<Vec<_>>();
         let ranges = prefixes.len();
 
@@ -84,7 +85,7 @@ impl ReadOnlyCatalog {
             ranges, failed, "warmed table probe ranges"
         );
 
-        session.finish();
+        read.finish().await;
 
         Ok(())
     }

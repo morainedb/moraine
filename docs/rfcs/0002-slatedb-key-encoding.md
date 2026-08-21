@@ -147,8 +147,8 @@ Other subspaces:
 
 | Subspace/kind | Key components | Contents |
 |---|---|---|
-| `sys/format` | — | Layout format version (this RFC = 1), moraine version that wrote it |
-| `sys/head` | — | Latest committed `snapshot_id`, plus the count of batches that have landed. Every batch writes this record and increments the count — a maintenance batch that reuses the snapshot id included (RFC 0004) — so the pair moves whenever any committed state does. That is what makes it both the single write-write conflict anchor and the stamp a read-only reader validates a consistent cut against (RFC 0009) |
+| `sys/format` | — | Layout format version (this RFC = 1; the commit log bumps it to 4 — RFC 0022), moraine version that wrote it |
+| `sys/head` | — | Latest committed `snapshot_id`, as folded (RFC 0022: the true head is this plus replay of any commit-log slots past the store's own replay point) |
 | `sys/migration` | — | Structural-migration marker (RFC 0015): `{from_format, to_format, cursor}`, present only mid-migration. **Reserved from format v1**: every materialization checks it and refuses a mid-migration store (RFC 0009) — the check must predate the first migration ever run. |
 | `sys/maintenance_status` | — | The last 16 completed maintenance passes, oldest-to-newest, with each pass's start time, trigger, and step outcomes (RFC 0021). Unversioned and overwritten atomically outside the DuckLake snapshot protocol; its first write lazily stamps additive format 5. |
 | `snapshot` | `snapshot_id` | `ducklake_snapshot` + `ducklake_snapshot_changes` merged into one record (1:1, always written together), plus one moraine-internal field the DuckLake grammar has no room for: the data files this commit's delete files target, so a later commit classifies a delete against it at file grain. Absent on a DuckLake-authored row, which reads back as "deletes from the whole table" |
@@ -156,6 +156,17 @@ Other subspaces:
 | `current/gcfile` | `data_file_id` | `ducklake_files_scheduled_for_deletion` — keyed by the scheduled file's id, the row's identity in DuckLake's own schema (inserts carry it, cleanup deletes by it); unique because a file's catalog rows are removed in the same transaction that schedules it, so no moraine-allocated id or counter exists (RFC 0007) |
 | `inline/*` | `table_id, schema_version, …` | Inlined data — RFC 0005 owns seven kinds (`schema`, `insert`, `inline_delete`, `file_delete`, the `file_delete_table` existence marker, the per-chunk `chunk_range` directory, and the `schema_dropped` deregistration marker). |
 | `schema_version` | `table_id, begin_snapshot` | The catalog `schema_version` that snapshot minted — the third column of a `ducklake_schema_versions` row. Its own subspace rather than a field of the snapshot record, because expiry (RFC 0007) deletes snapshot records and these rows must outlive them: a data file resolves the schema version it was written under by joining its `begin_snapshot` against them, long after that snapshot is gone. Removed only by the dead-table cleanup, exactly as DuckLake's own catalogs remove them |
+
+**The commit log is not a subspace.** RFC 0022's log lives at the bucket
+prefix `commits/<seq>` — plain objects addressed directly by the object
+store, written once each with a conditional put. It shares the bucket with
+this keyspace but not the keyspace itself: `commits/<seq>` is never a `Key`
+variant and never touches the segment extractor above. SlateDB does read
+it — the store takes the log as its own write-ahead log — but as opaque
+log files, never as keys of this keyspace. A reader looking for the log's
+home in the `Key` enum will not find one, and neither does the keyspace
+record how far it has been folded: that cursor is the replay point in the
+store's manifest.
 
 Two mapping conventions apply throughout: **1:1 side tables merge** into
 their parent record, and **pure child tables with no independent lifecycle
@@ -216,12 +227,13 @@ correct rows.
 ### Atomicity invariant
 
 One DuckLake catalog commit — snapshot record, head-pointer update, every
-entity insert/end it implies — is **exactly one SlateDB `WriteBatch`**. No
-commit spans batches or depends on read-modify-write across them. Batches
-are atomic, so a crash leaves the whole commit or none; one commit ≈ one
-durable WAL flush. RFC 0004 builds on this invariant; the layout
-guarantees it is *possible* — every mutation a commit needs is puts and
-deletes at statically computable keys.
+entity insert/end it implies — is **exactly one atomic unit**: no commit
+spans units or depends on read-modify-write across them. RFC 0022 realizes
+that unit as one commit-log slot at commit time and, later, one SlateDB
+`WriteBatch` when the folder applies it — atomic either way, so a crash
+leaves the whole commit or none. RFC 0004 builds on this invariant; the
+layout guarantees it is *possible* — every mutation a commit needs is puts
+and deletes at statically computable keys.
 
 ### Property-test obligations
 

@@ -13,12 +13,12 @@ use futures::{
 use tokio::sync::OnceCell;
 
 use super::{
-    Arc, CatalogSnapshot, Cell, ColumnInfo, DataStore, DbTransaction, Error, HashMap, HashSet,
-    IndexInfo, InlineOperation, ReadHandle, Result, RowOperation, StagedEntries, StagedIndexEntry,
-    TableId, TableKind, commit, data_file,
+    Arc, CatalogSnapshot, Cell, ColumnInfo, DataStore, Error, HashMap, HashSet, IndexInfo,
+    InlineOperation, ProbeHandle, Result, RowOperation, StagedEntries, StagedIndexEntry, TableId,
+    TableKind, commit, data_file,
     decode::{Cursor, decode_data_file, decode_delete_file},
     inline::inline_chunk_range_write,
-    proto, stage_index_entry_stream, store_inline,
+    plan_index_entry_stream, proto, store_inline,
 };
 use crate::transaction::operations::ChangeSet;
 
@@ -54,7 +54,7 @@ impl<'a> InlineSchemaCache<'a> {
     /// chunk ends up decoding must not fail the commit.
     async fn prefetch(
         &self,
-        db_tx: &DbTransaction,
+        reader: ProbeHandle<'_>,
         versions: impl IntoIterator<Item = (u64, u64)>,
     ) {
         let distinct: HashSet<(u64, u64)> = versions.into_iter().collect();
@@ -62,7 +62,7 @@ impl<'a> InlineSchemaCache<'a> {
             .for_each_concurrent(
                 INLINE_READ_CONCURRENCY,
                 |(table_id, schema_version)| async move {
-                    let _ = self.get(db_tx, table_id, schema_version).await;
+                    let _ = self.get(reader, table_id, schema_version).await;
                 },
             )
             .await;
@@ -70,7 +70,7 @@ impl<'a> InlineSchemaCache<'a> {
 
     async fn get(
         &self,
-        db_tx: &DbTransaction,
+        reader: ProbeHandle<'_>,
         table_id: u64,
         schema_version: u64,
     ) -> Result<SchemaRef> {
@@ -86,7 +86,8 @@ impl<'a> InlineSchemaCache<'a> {
                     Bytes::copy_from_slice(bytes)
                 } else {
                     store_inline::read_inline_schema(
-                        ReadHandle::Tx(db_tx),
+                        reader.store(),
+                        Some(reader.overlay()),
                         table_id,
                         schema_version,
                     )
@@ -303,7 +304,7 @@ fn staged_scoped_entry(
 /// put on the batch.
 #[allow(clippy::too_many_lines)]
 pub(super) async fn stage_index_maintenance(
-    db_tx: &DbTransaction,
+    reader: ProbeHandle<'_>,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     data_store: Option<&DataStore>,
@@ -346,7 +347,7 @@ pub(super) async fn stage_index_maintenance(
             staged_versions.extend(chunks.iter().map(|chunk| (*table_id, chunk.schema_version)));
         }
     }
-    inline_schemas.prefetch(db_tx, staged_versions).await;
+    inline_schemas.prefetch(reader, staged_versions).await;
     let inline_schemas_ref = &inline_schemas;
     let context_ref = &context;
     let inline_deletions = stream::iter(inline_deletes)
@@ -355,7 +356,7 @@ pub(super) async fn stage_index_maintenance(
             let staged_chunks = staged_chunks.remove(&table_id).unwrap_or_default();
             async move {
                 let (entries, writes) = stage_inline_delete_entries(
-                    db_tx,
+                    reader,
                     base,
                     inline_schemas_ref,
                     context_ref,
@@ -390,11 +391,11 @@ pub(super) async fn stage_index_maintenance(
     let inline_schemas_ref = &inline_schemas;
     let context_ref = &context;
     let additions = stream::iter(adds)
-        .map(move |add| produce_addition(db_tx, base, inline_schemas_ref, context_ref, add))
+        .map(move |add| produce_addition(reader, base, inline_schemas_ref, context_ref, add))
         .buffer_unordered(FILE_READ_CONCURRENCY)
         .try_flatten_unordered(None);
 
-    let mut staged = stage_index_entry_stream(db_tx, deletions, additions, 0).await?;
+    let mut staged = plan_index_entry_stream(reader, deletions, additions, 0).await?;
     staged.metrics.scoped_read = metrics.tally();
     // Handed back unstaged: this phase may run beside the inline
     // translation, which reads the directory these would write.
@@ -405,7 +406,7 @@ pub(super) async fn stage_index_maintenance(
 }
 
 async fn produce_addition(
-    db_tx: &DbTransaction,
+    reader: ProbeHandle<'_>,
     base: &CatalogSnapshot,
     inline_schemas: &InlineSchemaCache<'_>,
     context: &FileContext<'_>,
@@ -417,7 +418,7 @@ async fn produce_addition(
         }
         Add::Inline { table_id, chunk } => {
             let entries = inline_chunk_index_entries(
-                db_tx,
+                reader,
                 base,
                 inline_schemas,
                 context,
@@ -667,7 +668,7 @@ pub(super) fn pending_inline_schemas(ops: &[RowOperation]) -> HashMap<(u64, u64)
 /// The index entries for one inline chunk's rows: every row when `held` is
 /// `None` (an insert), or removals for just those rows when it is `Some`.
 async fn inline_chunk_index_entries(
-    db_tx: &DbTransaction,
+    reader: ProbeHandle<'_>,
     base: &CatalogSnapshot,
     inline_schemas: &InlineSchemaCache<'_>,
     context: &FileContext<'_>,
@@ -686,7 +687,7 @@ async fn inline_chunk_index_entries(
     }
 
     let schema = inline_schemas
-        .get(db_tx, table_id, chunk.schema_version)
+        .get(reader, table_id, chunk.schema_version)
         .await?;
     let plan = InlineDecodePlan {
         schema,
@@ -769,7 +770,7 @@ impl InlineBody<'_> {
 /// `locators` name; the locators arrive in ascending, non-overlapping row
 /// order, so one forward walk assigns each its held run.
 async fn derive_located_inline_removals(
-    db_tx: &DbTransaction,
+    reader: ProbeHandle<'_>,
     base: &CatalogSnapshot,
     inline_schemas: &InlineSchemaCache<'_>,
     context: &FileContext<'_>,
@@ -788,7 +789,8 @@ async fn derive_located_inline_removals(
 
             async move {
                 let (operation, value) = store_inline::read_inline_chunk_locator(
-                    ReadHandle::Tx(db_tx),
+                    reader.store(),
+                    Some(reader.overlay()),
                     table_id,
                     locator,
                 )
@@ -805,7 +807,7 @@ async fn derive_located_inline_removals(
                     body: InlineBody::Owned(value.body),
                 };
                 let entries = inline_chunk_index_entries(
-                    db_tx,
+                    reader,
                     base,
                     inline_schemas,
                     context,
@@ -829,7 +831,7 @@ async fn derive_located_inline_removals(
 }
 
 async fn derive_inline_chunk_removals(
-    db_tx: &DbTransaction,
+    reader: ProbeHandle<'_>,
     base: &CatalogSnapshot,
     inline_schemas: &InlineSchemaCache<'_>,
     context: &FileContext<'_>,
@@ -845,7 +847,7 @@ async fn derive_inline_chunk_removals(
         })
         .map(|(chunk, held)| async move {
             let entries = inline_chunk_index_entries(
-                db_tx,
+                reader,
                 base,
                 inline_schemas,
                 context,
@@ -899,7 +901,7 @@ fn legacy_inline_locator_writes(
 /// Derives the entry removals for rows tombstoned out of inline chunks,
 /// reading each row's indexed values from the chunk holding it.
 async fn stage_inline_delete_entries(
-    db_tx: &DbTransaction,
+    reader: ProbeHandle<'_>,
     base: &CatalogSnapshot,
     inline_schemas: &InlineSchemaCache<'_>,
     context: &FileContext<'_>,
@@ -922,7 +924,8 @@ async fn stage_inline_delete_entries(
 
     let committed = async {
         let locators = store_inline::find_inline_chunk_locators_for_rows(
-            ReadHandle::Tx(db_tx),
+            reader.store(),
+            Some(reader.overlay()),
             table_id,
             row_ids,
         )
@@ -930,14 +933,14 @@ async fn stage_inline_delete_entries(
         if let Some(locators) = locators {
             inline_schemas
                 .prefetch(
-                    db_tx,
+                    reader,
                     locators
                         .iter()
                         .filter_map(|locator| Some((table_id, locator.schema_version()?))),
                 )
                 .await;
             let (entries, covered) = derive_located_inline_removals(
-                db_tx,
+                reader,
                 base,
                 inline_schemas,
                 context,
@@ -950,7 +953,9 @@ async fn stage_inline_delete_entries(
             return Ok((entries, covered, Vec::new()));
         }
 
-        let committed = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
+        let committed =
+            store_inline::scan_inline_chunks(reader.store(), Some(reader.overlay()), table_id)
+                .await?;
         let locator_writes = legacy_inline_locator_writes(table_id, &committed)?;
         let chunks: Vec<_> = committed
             .into_iter()
@@ -966,12 +971,12 @@ async fn stage_inline_delete_entries(
             .collect();
         inline_schemas
             .prefetch(
-                db_tx,
+                reader,
                 chunks.iter().map(|chunk| (table_id, chunk.schema_version)),
             )
             .await;
         let (entries, covered) = derive_inline_chunk_removals(
-            db_tx,
+            reader,
             base,
             inline_schemas,
             context,
@@ -987,7 +992,7 @@ async fn stage_inline_delete_entries(
     // A row inserted and deleted inside one commit lives in a chunk that is
     // still only staged.
     let staged = derive_inline_chunk_removals(
-        db_tx,
+        reader,
         base,
         inline_schemas,
         context,
@@ -1348,7 +1353,7 @@ mod tests {
             arrow::datatypes::DataType::Int64,
             false,
         )]);
-        let schema_ipc = super::super::tests::inline_schema_ipc(&schema);
+        let schema_ipc = crate::transaction::staged::tests::inline_schema_ipc(&schema);
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         tx.put(
             Key::Inline(InlineKey::Schema {
@@ -1367,12 +1372,17 @@ mod tests {
         let pending = HashMap::new();
         let cache = InlineSchemaCache::new(&pending);
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        cache.prefetch(&tx, [(7, 1), (7, 2)]).await;
+        let overlay = moraine_wal::Overlay::default();
+        let probe = ProbeHandle::Overlaid {
+            store: crate::store::handle::ReadHandle::Tx(&tx),
+            overlay: &overlay,
+        };
+        cache.prefetch(probe, [(7, 1), (7, 2)]).await;
 
-        let decoded = cache.get(&tx, 7, 1).await.unwrap();
+        let decoded = cache.get(probe, 7, 1).await.unwrap();
         assert_eq!(decoded.fields().len(), 1);
         assert!(matches!(
-            cache.get(&tx, 7, 2).await,
+            cache.get(probe, 7, 2).await,
             Err(Error::Corruption(_))
         ));
 

@@ -97,6 +97,10 @@ pub(crate) enum SysKey {
     Migration,
     /// Bounded history of completed maintenance passes.
     MaintenanceStatus,
+    /// The freshest leader advert, folded here so it survives truncation.
+    Leader,
+    /// The 32-byte forwarding token a leader authenticates sessions against.
+    Secret,
 }
 
 /// A live record: a temporally versioned entity, or the `current`-only
@@ -254,6 +258,11 @@ impl EntityKey {
 /// One [`EntityKey`] variant, without the fields identifying a record.
 /// Used to derive a prefix that selects one catalog kind without scanning
 /// every entity in `current` or `history`.
+///
+/// The set names every kind the keyspace holds, not the subset some scan
+/// currently selects on, so variants stay whether or not a caller builds a
+/// prefix for them.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum EntityKind {
     /// `ducklake_schema`.
@@ -336,11 +345,6 @@ impl EntityKind {
                 mapping_id: 0,
             },
         }
-    }
-
-    /// Whether this kind has ended versions in `history`.
-    pub(crate) const fn is_versioned(self) -> bool {
-        self.sample().is_versioned()
     }
 }
 
@@ -1007,11 +1011,6 @@ pub(crate) fn history_entity_kind_prefix(kind: EntityKind) -> Vec<u8> {
     prefix_of(&Key::history(kind.sample(), 0), HISTORY_KIND_PREFIX_LEN)
 }
 
-/// Byte prefix of every scheduled-file record in `current`.
-pub(crate) fn current_gc_file_prefix() -> Vec<u8> {
-    prefix_of(&Key::Current(CurrentKey::GcFile { data_file_id: 0 }), 2)
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -1037,6 +1036,8 @@ mod tests {
             Key::Sys(SysKey::MaintenanceStatus).encode(),
             vec![0x02, 0x05]
         );
+        assert_eq!(Key::Sys(SysKey::Leader).encode(), vec![0x02, 0x06]);
+        assert_eq!(Key::Sys(SysKey::Secret).encode(), vec![0x02, 0x07]);
     }
 
     #[test]
@@ -1832,6 +1833,8 @@ mod tests {
             Just(Key::Sys(SysKey::Head)),
             Just(Key::Sys(SysKey::Migration)),
             Just(Key::Sys(SysKey::MaintenanceStatus)),
+            Just(Key::Sys(SysKey::Leader)),
+            Just(Key::Sys(SysKey::Secret)),
             any::<u64>().prop_map(|snapshot_id| Key::Snapshot { snapshot_id }),
             arb_entity().prop_map(Key::current),
             (arb_entity(), any::<u64>()).prop_map(|(entity, end)| Key::history(entity, end)),

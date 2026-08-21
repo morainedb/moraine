@@ -696,7 +696,17 @@ pub(crate) fn conflicts(ours: &ChangeSet, theirs: &ChangeSet) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use object_store::{ObjectStore, memory::InMemory};
+    use proptest::prelude::*;
+
     use super::*;
+    use crate::{
+        catalog::{Catalog, CatalogOptions, CatalogSnapshot, ColumnDef, SchemaId, TableId},
+        error::Error,
+        transaction::verbs::Transaction,
+    };
 
     fn create_schema(schema_id: u64, name: &str) -> Operation {
         Operation::CreateSchema {
@@ -1212,6 +1222,241 @@ mod tests {
         assert!(!Operation::ExpireDataFile { table_id: 0 }.is_schema_changing());
         assert!(!Operation::ExpireDeleteFile { table_id: 0 }.is_schema_changing());
         assert!(!Operation::UpdateStats { table_id: 0 }.is_schema_changing());
+    }
+
+    fn any_change_set() -> impl Strategy<Value = ChangeSet> {
+        let names = || proptest::collection::btree_set("[a-c]", 0..3);
+        let ids = || proptest::collection::btree_set(0u64..4, 0..3);
+        (
+            names(),
+            ids(),
+            ids(),
+            ids(),
+            ids(),
+            ids(),
+            ids(),
+            ids(),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(
+                    created_schemas,
+                    dropped_schemas,
+                    altered,
+                    dropped,
+                    inserted,
+                    deleted,
+                    merged,
+                    created_in,
+                    unknown,
+                )| {
+                    ChangeSet {
+                        created_schemas,
+                        dropped_schemas,
+                        altered_tables: altered,
+                        dropped_tables: dropped,
+                        inserted_tables: inserted,
+                        deleted_from_tables: deleted,
+                        merge_adjacent_tables: merged,
+                        created_table_schema_ids: created_in,
+                        has_unknown: unknown,
+                        ..ChangeSet::default()
+                    }
+                },
+            )
+    }
+
+    proptest! {
+        /// The conflict relation is symmetric: an asymmetric classifier would
+        /// make a race's outcome depend on who lost it.
+        #[test]
+        fn conflicts_is_symmetric(a in any_change_set(), b in any_change_set()) {
+            prop_assert_eq!(conflicts(&a, &b), conflicts(&b, &a));
+        }
+    }
+
+    /// One catalog action, applied inside a commit closure and checked for its
+    /// effect afterwards. Names carry a side tag so the two commits of a pair
+    /// never collide on a name — a same-name collision is closure-re-validated,
+    /// not a classifier concern.
+    #[derive(Debug, Clone)]
+    enum Action {
+        NewSchema(u16),
+        NewTable(u16),
+        AddColumnA(u16),
+        AddColumnB(u16),
+        DropTableA,
+        DropTableB,
+    }
+
+    struct Ids {
+        schema: SchemaId,
+        a: TableId,
+        b: TableId,
+    }
+
+    fn a_column(name: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            column_type: "BIGINT".into(),
+            nulls_allowed: true,
+            default_value: None,
+            children: Vec::new(),
+        }
+    }
+
+    impl Action {
+        fn apply(&self, tx: &mut Transaction, ids: &Ids, side: &str) -> crate::error::Result<()> {
+            match self {
+                Action::NewSchema(k) => tx.create_schema(&format!("{side}s{k}")).map(|_| ()),
+                Action::NewTable(k) => tx
+                    .create_table(ids.schema, &format!("{side}t{k}"), &[a_column("x")])
+                    .map(|_| ()),
+                Action::AddColumnA(k) => tx
+                    .add_column(ids.a, &a_column(&format!("{side}ac{k}")))
+                    .map(|_| ()),
+                Action::AddColumnB(k) => tx
+                    .add_column(ids.b, &a_column(&format!("{side}bc{k}")))
+                    .map(|_| ()),
+                Action::DropTableA => tx.drop_table(ids.a),
+                Action::DropTableB => tx.drop_table(ids.b),
+            }
+        }
+
+        fn effect_present(&self, head: &CatalogSnapshot, ids: &Ids, side: &str) -> bool {
+            let table_live = |id: TableId| head.tables_in(ids.schema).iter().any(|t| t.id == id);
+            match self {
+                Action::NewSchema(k) => head.schema_by_name(&format!("{side}s{k}")).is_some(),
+                Action::NewTable(k) => head
+                    .table_by_name(ids.schema, &format!("{side}t{k}"))
+                    .is_some(),
+                Action::AddColumnA(k) => {
+                    table_live(ids.a)
+                        && head
+                            .columns_of(ids.a)
+                            .iter()
+                            .any(|c| c.name == format!("{side}ac{k}"))
+                }
+                Action::AddColumnB(k) => {
+                    table_live(ids.b)
+                        && head
+                            .columns_of(ids.b)
+                            .iter()
+                            .any(|c| c.name == format!("{side}bc{k}"))
+                }
+                Action::DropTableA => !table_live(ids.a),
+                Action::DropTableB => !table_live(ids.b),
+            }
+        }
+    }
+
+    fn any_action() -> impl Strategy<Value = Action> {
+        prop_oneof![
+            (0u16..3).prop_map(Action::NewSchema),
+            (0u16..3).prop_map(Action::NewTable),
+            (0u16..3).prop_map(Action::AddColumnA),
+            (0u16..3).prop_map(Action::AddColumnB),
+            Just(Action::DropTableA),
+            Just(Action::DropTableB),
+        ]
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn seeded() -> (Catalog, Ids) {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let options = CatalogOptions::default();
+        let catalog = Catalog::open(store, options).await.unwrap();
+        catalog
+            .commit(|tx| {
+                let schema = tx.create_schema("s")?;
+                tx.create_table(schema, "a", &[a_column("x")])?;
+                tx.create_table(schema, "b", &[a_column("x")])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let snapshot = catalog.snapshot().await.unwrap();
+        let schema = snapshot.schema_by_name("s").unwrap().id;
+        let a = snapshot.table_by_name(schema, "a").unwrap().id;
+        let b = snapshot.table_by_name(schema, "b").unwrap().id;
+        (catalog, Ids { schema, a, b })
+    }
+
+    /// The change set an action stages against the seeded head, read from the
+    /// operations it records in a throwaway transaction.
+    #[allow(clippy::unwrap_used)]
+    async fn change_set_of(catalog: &Catalog, action: &Action, ids: &Ids) -> ChangeSet {
+        let base = catalog.snapshot().await.unwrap();
+        let next = base.snapshot.snapshot_id + 1;
+        let mut tx = Transaction::new((*base).clone(), next);
+        let _ = action.apply(&mut tx, ids, "probe");
+        ChangeSet::from_operations(&tx.into_parts().operations)
+    }
+
+    /// The judgment the protocol defers to moraine, proven where its violation
+    /// silently loses writes: a pair the classifier calls benign must commute
+    /// through two real slot commits — the second re-assembles against a head
+    /// already holding the first, and no committed effect is ever lost. A
+    /// wrongly *permissive* classifier that waves through an interfering pair
+    /// (say alter-then-drop of one table) makes the winner's effect vanish
+    /// while both commits report success — which this assertion catches, and no
+    /// racing test can.
+    #[allow(clippy::unwrap_used)]
+    async fn benign_pair_commutes(x: &Action, y: &Action) -> Result<(), TestCaseError> {
+        let (catalog, ids) = seeded().await;
+        let cs_x = change_set_of(&catalog, x, &ids).await;
+        let cs_y = change_set_of(&catalog, y, &ids).await;
+
+        prop_assert_eq!(conflicts(&cs_x, &cs_y), conflicts(&cs_y, &cs_x));
+        prop_assume!(!conflicts(&cs_x, &cs_y));
+
+        // The first commit always lands against the seeded head.
+        let landed = catalog.commit(|tx| x.apply(tx, &ids, "x")).await;
+        prop_assert!(landed.is_ok(), "first commit failed: {:?}", landed);
+
+        // The second re-assembles against a head that already contains the
+        // first, and rebases if it lost the slot.
+        let rebased = catalog.commit(|tx| y.apply(tx, &ids, "y")).await;
+
+        let head = catalog.snapshot().await.unwrap();
+        prop_assert!(
+            x.effect_present(&head, &ids, "x"),
+            "the first commit's effect was silently lost: x={:?} y={:?}",
+            x,
+            y
+        );
+        match rebased {
+            Ok(_) => prop_assert!(
+                y.effect_present(&head, &ids, "y"),
+                "the second commit reported success but its effect is absent: x={:?} y={:?}",
+                x,
+                y
+            ),
+            // A benign loser may still fail its own re-validation typed (a drop
+            // of an entity the winner already removed surfaces NotFound).
+            Err(
+                Error::CommitConflict(_)
+                | Error::NotFound(_)
+                | Error::AlreadyExists(_)
+                | Error::Constraint(_),
+            ) => {}
+            Err(other) => prop_assert!(false, "loser failed untyped: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn benign_pairs_commute_through_two_slot_commits() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        proptest!(
+            ProptestConfig::with_cases(48),
+            |(x in any_action(), y in any_action())| {
+                runtime.block_on(benign_pair_commutes(&x, &y))?;
+            }
+        );
     }
 
     /// A sort change is the one table alter that is not schema-changing,

@@ -12,6 +12,16 @@ this file is the operational summary.
   protocol) bridges them. `data_file` is the only module that reads Parquet:
   scoped reads of registered files, knowing nothing about the catalog
   keyspace. `lib.rs` is docs + re-exports only.
+- `crates/moraine-wal` — the commit-slot log protocol: sequence naming, the
+  envelope wire format, the conditional-put race, tail enumeration and
+  truncation, plus the protocol's loops behind embedder traits (retry-and-
+  rebase commit, resumable fold, and the folder appointment rule), and
+  `engine`, which presents the log as SlateDB's own write-ahead log.
+  Sits below `moraine` and knows nothing of DuckLake or moraine's key
+  layout — payload keys, values, and the classification string are opaque
+  bytes here, `engine` included. The boundary is shape versus meaning; if a
+  change wants to teach this crate what a payload means, it belongs in
+  `moraine`.
 - `crates/moraine-duckdb` — DuckDB extension: a thin C++ shim registering a
   `StorageExtension` over a C ABI to the Rust core (RFC 0006). Thin by policy:
   if logic accumulates here, move it to the core.
@@ -41,17 +51,25 @@ this file is the operational summary.
   split the module instead.
 - Comments are direct and succinct: state what the item does and any hard
   constraint, no rationale essays. One or two sentences is the norm; a third
-  needs a caller who would otherwise get it wrong. Never restate the design
-  above a function — that is the RFC's job — and never argue for the code in
-  its own doc comment. Test docs name the property, not the case for it. A
-  doc comment longer than the item it documents is the signal to cut.
+  needs a caller who would otherwise get it wrong. A well-named declaration
+  earns no comment at all — write one only for a constraint a reader cannot
+  infer from the name and type: a permanent tag or discriminant, an invariant
+  the code enforces, a compatibility rule. Never restate the design above a
+  function — that is the RFC's job — and never argue for the code in its own
+  doc comment. Test docs name the property, not the case for it. A doc comment
+  longer than the item it documents is the signal to cut. This binds `.proto`
+  comments as much as Rust doc comments, and where `missing_docs` demands one,
+  a single clause discharges it.
 - Use blank lines to group code into readable stanzas.
 - Names prefer full words, for every symbol; abbreviate only when the word
   is long and the abbreviation is conventional (`tx`, not `tbl`).
 - Code and code comments never cite RFCs by number or name. State the
   constraint itself in the comment; RFCs reference code, not the reverse.
 - Features are additive-only and documented in the crate root.
-- Conventional commits; PRs squash-merge into `main`.
+- Conventional commits; PRs squash-merge into `main`. Stage explicit paths
+  (`git add <path>`) — never `git add -A`, `git add .`, or `git commit -a`:
+  concurrent agents and hand edits share the working tree, and a broad stage
+  swallows them. On `index.lock`, wait and retry; never delete the lock.
 
 ## Design docs
 
@@ -60,6 +78,11 @@ this file is the operational summary.
   binding design; update or replace, never re-label).
   **Do not** create `docs/superpowers/specs/` — the RFC directory overrides
   that default.
+- An RFC never narrates its own revision history: state the present
+  arrangement, not how it changed. No "previously", "no longer", "now
+  settled", "used to", "moved to" — a cold reader must not be able to tell
+  which sentences were amended. Statements about which RFC governs a design
+  are fine, as are runtime uses of old/new about store state.
 - Implementation plans go to `docs/plans/` (not-committed).
 - RFCs are required for: KV key layout, commit protocol, public API shape.
 

@@ -1,0 +1,45 @@
+// Wire messages for the commit-slot log: one object per sequence, each
+// written exactly once with a create-if-absent conditional put.
+//
+// Payload keys, payload values, and the classification string are opaque
+// here — their meaning belongs to the embedder, never to this schema.
+//
+// Evolution: add or deprecate fields only — field numbers are permanent.
+
+syntax = "proto3";
+
+package moraine.wal;
+
+// One commit-slot object: the envelope of the commits that won one slot.
+message EnvelopeValue {
+  repeated CommitValue commits = 1;
+  optional LeaderAdvertValue leader = 2;
+}
+
+// A leader announcement riding a slot. An absent `endpoint` withdraws the
+// role — distinct from an absent advert, which says nothing about leadership.
+message LeaderAdvertValue {
+  bytes instance = 1;
+  optional string endpoint = 2;
+}
+
+// One committed unit inside a slot.
+message CommitValue {
+  // Committer-minted 16-byte id; resolves an ambiguous commit outcome.
+  bytes transaction_id = 1;
+  SlotPayloadValue payload = 2;
+}
+
+// A commit's content: a batch of writes plus what it validated against.
+// Keys, values, and the classification string are embedder-opaque.
+message SlotPayloadValue {
+  uint64 validated_head = 1;
+  string changes_made = 2;
+  repeated SlotWriteValue writes = 3;
+}
+
+// One staged write: an absent value is a delete.
+message SlotWriteValue {
+  bytes key = 1;
+  optional bytes value = 2;
+}

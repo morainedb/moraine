@@ -174,7 +174,7 @@ impl Catalog {
         data_prefix: &str,
         step: Option<BuildStep>,
     ) -> Result<IndexId> {
-        self.create_index_staged_with_maintenance(
+        Box::pin(self.create_index_staged_with_maintenance(
             table,
             def,
             orders,
@@ -182,7 +182,7 @@ impl Catalog {
             data_store,
             data_prefix,
             step,
-        )
+        ))
         .await
     }
 
@@ -214,9 +214,9 @@ impl Catalog {
         let index = self
             .begin_staged_index(table, def, orders, maintenance)
             .await?;
-        let outcome = self
-            .drive_staged_build(table, def, index, data_store, data_prefix, step)
-            .await;
+        let outcome =
+            Box::pin(self.drive_staged_build(table, def, index, data_store, data_prefix, step))
+                .await;
 
         // A build that cannot finish leaves no half-covered index behind.
         // A cleanup that itself fails is logged, never substituted for the
@@ -279,14 +279,14 @@ impl Catalog {
                 columns: index.columns.clone(),
                 unique: index.unique,
             };
-            self.drive_staged_build(
+            Box::pin(self.drive_staged_build(
                 index.table_id,
                 &def,
                 index.id,
                 data_store.clone(),
                 data_prefix,
                 step,
-            )
+            ))
             .await?;
             repaired = repaired.saturating_add(1);
         }
@@ -417,7 +417,7 @@ impl Catalog {
             }
 
             if let Some(store) = &data_store {
-                self.stream_backfill_files(
+                Box::pin(self.stream_backfill_files(
                     store.clone(),
                     data_prefix,
                     table,
@@ -426,7 +426,7 @@ impl Catalog {
                     initial_position_cursor,
                     legacy_row_cursor,
                     &mut buffer,
-                )
+                ))
                 .await?;
             }
             let pass = buffer.flush(true).await;
@@ -484,87 +484,94 @@ impl Catalog {
         legacy_row_cursor: Option<u64>,
         buffer: &mut BuildStepBuffer<'_>,
     ) -> Result<()> {
-        let session = self.begin_read().await?;
-        let snapshot = self.head_view(session.handle()).await?;
-        let positions = snapshot.column_positions(table, columns)?;
+        let read = self.begin_probe().await?;
+        let outcome = async {
+            let snapshot = read.view();
+            let positions = snapshot.column_positions(table, columns)?;
 
-        let table_prefix = snapshot.table_data_prefix(table)?;
-        let resolve = |path: &str, is_relative: bool| {
-            let relative = match (is_relative, data_prefix.is_empty()) {
-                (false, _) => path.to_owned(),
-                (true, true) => format!("{table_prefix}{path}"),
-                (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
+            let table_prefix = snapshot.table_data_prefix(table)?;
+            let resolve = |path: &str, is_relative: bool| {
+                let relative = match (is_relative, data_prefix.is_empty()) {
+                    (false, _) => path.to_owned(),
+                    (true, true) => format!("{table_prefix}{path}"),
+                    (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
+                };
+                Path::from(relative.as_str())
             };
-            Path::from(relative.as_str())
-        };
 
-        let inline_deletes =
-            backfill::collect_inline_delete_positions(session.handle(), table.get());
-        let metrics = self.data_read_metrics();
-        let delete_files = backfill::collect_delete_positions(
-            snapshot.delete_files_of(table).into_iter(),
-            object_store.clone(),
-            Arc::clone(&metrics),
-            &resolve,
-        );
-        let (killed_row_ids, killed_positions) = futures::try_join!(inline_deletes, delete_files)?;
+            let inline_deletes =
+                backfill::collect_inline_delete_positions(read.handle(), read.tail(), table.get());
+            let metrics = self.data_read_metrics();
+            let delete_files = backfill::collect_delete_positions(
+                snapshot.delete_files_of(table).into_iter(),
+                object_store.clone(),
+                Arc::clone(&metrics),
+                &resolve,
+            );
+            let (killed_row_ids, killed_positions) =
+                futures::try_join!(inline_deletes, delete_files)?;
 
-        for file in snapshot.data_files_of(table) {
-            if file_cursor.is_some_and(|cursor| file.id.get() < cursor) {
-                continue;
-            }
-            let start = if file_cursor == Some(file.id.get()) {
-                position_cursor.map_or(0, |position| position.saturating_add(1))
-            } else {
-                0
-            };
-            if start >= file.record_count {
-                continue;
-            }
-            let path = resolve(&file.path, file.path_is_relative);
-            let file_id = file.id.get();
-            let dead_positions = killed_positions.get(&file_id);
-            let dead_row_ids = killed_row_ids.get(&file_id);
-            let mut batches = data_file::scoped_read_entry_batches(
-                data_file::ParquetFile::new(
-                    object_store.clone(),
-                    path,
-                    file.file_size_bytes,
-                    file.footer_size,
+            for file in snapshot.data_files_of(table) {
+                if file_cursor.is_some_and(|cursor| file.id.get() < cursor) {
+                    continue;
+                }
+                let start = if file_cursor == Some(file.id.get()) {
+                    position_cursor.map_or(0, |position| position.saturating_add(1))
+                } else {
+                    0
+                };
+                if start >= file.record_count {
+                    continue;
+                }
+                let path = resolve(&file.path, file.path_is_relative);
+                let file_id = file.id.get();
+                let dead_positions = killed_positions.get(&file_id);
+                let dead_row_ids = killed_row_ids.get(&file_id);
+                let mut batches = data_file::scoped_read_entry_batches(
+                    data_file::ParquetFile::new(
+                        object_store.clone(),
+                        path,
+                        file.file_size_bytes,
+                        file.footer_size,
+                    )
+                    .with_metrics(Arc::clone(&metrics)),
+                    &positions,
+                    data_file::ScopedRows::From(start),
+                    data_file::RowIdSource::Resolve {
+                        row_id_start: file.row_id_start,
+                    },
                 )
-                .with_metrics(Arc::clone(&metrics)),
-                &positions,
-                data_file::ScopedRows::From(start),
-                data_file::RowIdSource::Resolve {
-                    row_id_start: file.row_id_start,
-                },
-            )
-            .await?;
-            while let Some(batch) = batches.try_next().await? {
-                for entry in batch {
-                    let ordinal = entry.ordinal;
-                    let dead = dead_positions.is_some_and(|positions| positions.contains(&ordinal))
-                        || dead_row_ids.is_some_and(|rows| rows.contains(&entry.row_id));
-                    let covered = legacy_row_cursor.is_some_and(|cursor| entry.row_id <= cursor);
-                    if !dead && !covered {
-                        buffer
-                            .push(
-                                IndexEntry {
-                                    row_id: entry.row_id,
-                                    values: entry.values,
-                                },
-                                Some((file_id, ordinal)),
-                            )
-                            .await?;
-                    } else {
-                        buffer.cover_source(file_id, ordinal);
+                .await?;
+                while let Some(batch) = batches.try_next().await? {
+                    for entry in batch {
+                        let ordinal = entry.ordinal;
+                        let dead = dead_positions
+                            .is_some_and(|positions| positions.contains(&ordinal))
+                            || dead_row_ids.is_some_and(|rows| rows.contains(&entry.row_id));
+                        let covered =
+                            legacy_row_cursor.is_some_and(|cursor| entry.row_id <= cursor);
+                        if !dead && !covered {
+                            buffer
+                                .push(
+                                    IndexEntry {
+                                        row_id: entry.row_id,
+                                        values: entry.values,
+                                    },
+                                    Some((file_id, ordinal)),
+                                )
+                                .await?;
+                        } else {
+                            buffer.cover_source(file_id, ordinal);
+                        }
                     }
                 }
             }
+
+            Ok(())
         }
+        .await;
+        read.finish().await;
 
-        session.finish();
-
-        Ok(())
+        outcome
     }
 }

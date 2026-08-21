@@ -604,11 +604,14 @@ async fn a_scan_does_not_evict_what_probes_need() {
         .await
         .unwrap();
 
+    // This attach's own tally, not the process-wide one: the cache is shared
+    // by every attach in the process, so a concurrent test would otherwise
+    // land its misses between these two samples.
     // Warm: whatever this costs, it is what a repeat should cost.
     let _ = reader.snapshot().await.unwrap();
-    let before_repeat = moraine::cache_tally();
+    let before_repeat = reader.cache_tally();
     let _ = reader.snapshot().await.unwrap();
-    let warm_misses = moraine::cache_tally().metadata_misses - before_repeat.metadata_misses;
+    let warm_misses = reader.cache_tally().metadata_misses - before_repeat.metadata_misses;
 
     // A full scan of every subspace, then the same read again.
     let census = reader
@@ -621,10 +624,10 @@ async fn a_scan_does_not_evict_what_probes_need() {
         .unwrap();
     assert!(!census.subspaces.is_empty());
 
-    let before_after_scan = moraine::cache_tally();
+    let before_after_scan = reader.cache_tally();
     let _ = reader.snapshot().await.unwrap();
     let after_scan_misses =
-        moraine::cache_tally().metadata_misses - before_after_scan.metadata_misses;
+        reader.cache_tally().metadata_misses - before_after_scan.metadata_misses;
     reader.close().await.unwrap();
 
     assert!(

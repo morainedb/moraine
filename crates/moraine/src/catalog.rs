@@ -16,11 +16,9 @@ pub use census::{
     CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
     MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
 };
-#[cfg(test)]
-pub(crate) use handle::BACKFILL_FILE_READ_CONCURRENCY;
-pub(crate) use handle::Store;
+pub(crate) use handle::SlotStore;
 pub use handle::{
-    CachePreload, Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest,
+    CachePreload, Catalog, CatalogOptions, Contention, MaintenanceReport, MaintenanceRequest,
     MaintenanceStatusPass, MaintenanceStatusStep, MigrationRequest, ReadOnlyCatalog,
     RowSummaryWarmth,
 };

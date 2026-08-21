@@ -660,6 +660,12 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientConte
 	// destructor never runs — so the handle would leak with no
 	// `moraine_detach`. Release it by hand and re-throw instead.
 	try {
+		// The leader host rides the folder role, so it is captured before the
+		// config moves into the scheduler and started only on a writable attach.
+		bool lead = maintenance.leader && !db.IsReadOnly();
+		std::string leader_bind = maintenance.leader_address;
+		std::string leader_advertise = maintenance.leader_advertise;
+		uint64_t leader_sessions = maintenance.leader_max_sessions;
 		scheduler_ = duckdb::make_shared_ptr<MaintenanceScheduler>(db.GetDatabase(), db.GetName(), path_, handle_,
 		                                                           std::move(maintenance));
 		// A read-only attach never schedules — maintenance mutates, and
@@ -667,6 +673,15 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientConte
 		if (!db.IsReadOnly()) {
 			BindMaintenanceScheduler(context, scheduler_);
 			scheduler_->Start();
+		}
+		if (lead) {
+			MoraineError err {};
+			auto code = moraine_leader_start(handle_, leader_bind.c_str(),
+			                                 leader_advertise.empty() ? nullptr : leader_advertise.c_str(),
+			                                 leader_sessions, &err);
+			if (code != MORAINE_OK) {
+				ThrowMoraineError(err);
+			}
 		}
 		// While this catalog lives, the handle's events push straight
 		// through the database-scoped logger as they fire — a watcher on
@@ -678,6 +693,7 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientConte
 	} catch (...) {
 		if (handle_ != nullptr) {
 			moraine_unregister_log_sink(handle_);
+			moraine_leader_stop(handle_);
 		}
 		if (scheduler_) {
 			scheduler_->Stop();
@@ -697,6 +713,9 @@ MoraineCatalog::~MoraineCatalog() {
 	// will follow.
 	if (handle_ != nullptr) {
 		moraine_unregister_log_sink(handle_);
+		// Stand the leader down cleanly (a withdrawal advert, a session drain)
+		// before the detach below drops the runtime and aborts it.
+		moraine_leader_stop(handle_);
 	}
 	// The thread issues SQL against this database and calls through
 	// `handle_`, so it must be stopped before either goes away.

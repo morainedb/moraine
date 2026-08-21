@@ -1,0 +1,34 @@
+[package]
+name = "moraine-wal"
+description = "The commit-slot log protocol behind moraine's multi-writer catalog"
+readme = "../../README.md"
+keywords = ["commit-log", "object-store", "concurrency", "protocol"]
+categories = ["database-implementations"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+fastrand = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+prost = { workspace = true }
+slatedb = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protox = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

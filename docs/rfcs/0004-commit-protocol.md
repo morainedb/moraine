@@ -6,59 +6,67 @@
 
 Defines how a DuckLake catalog mutation becomes a durable, atomic commit in
 moraine: how a committer reads the head snapshot, allocates ids, detects
-conflicts against concurrent commits, and lands everything in a single
-atomic SlateDB write. Builds directly on RFC 0002's atomicity invariant
-(one commit = one batch) and treats RFC 0005 inlined writes as first-class
-commit participants. The design is optimistic and single-writer-oriented:
-commits race on the head pointer under SlateDB's transactional write-write
-conflict detection, disjoint concurrent commits retry internally, and
-genuine conflicts surface as a typed error for the caller — DuckLake or the
-application — to re-drive. The protocol has **two front doors** over one
-commit core: the verb/closure API of RFC 0003 (retryable internally,
-because moraine authors the mutations) and the staged-row path of RFC 0006
-(never retried internally, because DuckLake authors the rows — a lost race
-surfaces to DuckLake). The two paths have different retry rights, and
-keeping them distinct is load-bearing; this RFC specifies both.
+conflicts against concurrent commits, and lands everything as a single
+atomic unit. Builds directly on RFC 0002's atomicity invariant (one commit
+= one batch) and treats RFC 0005 inlined writes as first-class commit
+participants. The design is optimistic: a commit stages against a head read
+once, races to land, and a lost race is classified benign or true exactly as
+below — disjoint concurrent commits retry internally, and genuine conflicts
+surface as a typed error for the caller — DuckLake or the application — to
+re-drive. **Arbitration itself lives in RFC 0022**: head arbitration is the
+commit log's conditional put, not SlateDB's transactional write-write
+conflict detection on `sys/head` — one process's slot PUT wins a round,
+every other contender re-validates and retries or conflicts. This RFC is
+authoritative for everything arbitration does not decide: the conflict
+grammar, the benign/true matrix, retry rights per front door, id
+allocation, and schema-version tracking are independent of where the race
+runs. The protocol has **two front doors** over one commit core: the
+verb/closure API of RFC 0003 (retryable internally, because moraine authors
+the mutations) and the staged-row path of RFC 0006 (never retried
+internally, because DuckLake authors the rows — a lost race surfaces to
+DuckLake). The two paths have different retry rights, and keeping them
+distinct is load-bearing; this RFC specifies both.
 
-**Implemented.** Both front doors land commits as one atomic SlateDB batch
-over the shared core. Multi-statement, cross-table ACID transactions work
-end to end through DuckLake: a `BEGIN … COMMIT` spanning tables stages every
+**Implemented.** Both front doors land commits as one atomic unit over the
+shared core. Multi-statement, cross-table ACID transactions work end to end
+through DuckLake: a `BEGIN … COMMIT` spanning tables stages every
 statement's writes into one moraine staged tx (opened lazily on the first
 write, reused across the transaction) and commits them as one snapshot;
-`ROLLBACK` discards them and mints none. A lost write-write race aborts
-without internal retry on the staged-row path, the loser's error carrying
-the `conflict` substring DuckLake's retry loop scans for. Verified live
+`ROLLBACK` discards them and mints none. A lost race aborts without
+internal retry on the staged-row path, the loser's error carrying the
+`conflict` substring DuckLake's retry loop scans for. Verified live
 (`ducklake_load.rs`'s `ducklake_multi_statement_transaction_commits_atomically`,
 which pins that two writes across two tables advance the head by exactly one
 snapshot) and at the core (`staged.rs`'s
 `lost_race_is_not_retried_and_carries_conflict_text`). A genuine concurrent
-race is not reachable through DuckLake's single serialized metadata
-connection — a second read-write attach fences rather than races (the
-single-writer topology below) — so that path is pinned at the core, not live.
+race is not reachable through a single embedded DuckDB process's one
+serialized metadata connection, so that path is pinned at the core, not live.
 
 ## Goals
 
-- Every commit is exactly one SlateDB `WriteBatch` (RFC 0002). Snapshot
+- Every commit is exactly one atomic unit (RFC 0002): a slot object at
+  commit time, folded later as one SlateDB `WriteBatch`. Snapshot
   allocation, id allocation, conflict detection, and the write itself all
-  fit inside that envelope — no read-modify-write spanning batches.
-- Inlined inserts/deletes (RFC 0005) ride the same batch as their catalog
+  fit inside it — no read-modify-write spanning units.
+- Inlined inserts/deletes (RFC 0005) ride the same payload as their catalog
   metadata. Inlining adds no round trips to the commit path.
 - On the verb path (RFC 0003), concurrent commits touching disjoint tables
   — and concurrent pure appends to the *same* table — both succeed without
   caller involvement; incompatible commits resolve to a typed conflict. On
   the staged-row path (RFC 0006), every lost race surfaces to DuckLake.
-- Commit latency floor is one durable WAL flush; the protocol enables group
-  commit so throughput under a funnel of concurrent transactions is not
-  one-flush-per-commit.
+- Commit latency floor is one durable slot PUT (RFC 0022); the protocol
+  enables group commit — chaining, in-process or via the leader role — so
+  throughput under concurrent transactions is not one-PUT-per-commit.
 - Faithful to DuckLake's own concurrency semantics — moraine implements
   DuckLake's conflict model, it does not invent a stricter or looser one.
 
 Non-goals:
 
-- **Multi-writer coordination.** The supported topology is single-writer,
-  many-readers (see Topology). Concurrent *commit coordination* across
-  processes is out of scope; the escape hatch is funneling commits through
-  one process.
+- **Arbitrating who wins a commit.** RFC 0022 owns that: the commit log's
+  conditional put decides, and every committer — including a solo one with
+  no fleet around it — goes through the same slot race. This RFC picks up
+  once a winner is known: conflict classification, retry rights, id
+  allocation.
 - **Key layout and value codec** — RFC 0002.
 - **Inlined data record formats** — RFC 0005. This RFC covers only how
   inlined writes participate in a commit.
@@ -67,41 +75,66 @@ Non-goals:
 ## Background
 
 RFC 0002 established the keyspace: `sys/head` holds the latest committed
-`snapshot_id`; the `snapshot` subspace is append-only snapshot records; `current`
-and `history` split live from ended entity versions; commits are atomic
-`WriteBatch` writes under a single fenced SlateDB writer.
+`snapshot_id` (as folded; RFC 0022 adds a tail past the store's replay point);
+the `snapshot` subspace is append-only snapshot records; `current` and
+`history` split live from ended entity versions.
 
-SlateDB (pinned at 0.14.x) provides the concrete primitives this protocol
-uses, verified against its source rather than assumed from prose:
-`Db::begin(IsolationLevel::Snapshot)` opens a transaction whose commit
-performs **write-write conflict detection** on the keys it writes and fails
-with a typed `TransactionConflict`; `Db::snapshot()` gives a pinned
-consistent read handle (RFC 0009); `DbReader` opens a store **read-only**
-without becoming a writer; and writer fencing is a monotonic
-`writer_epoch` bumped by manifest CAS on `Db::open`. There is no bespoke
-key-level compare-and-swap API, and none is needed — the "head CAS" in
-this RFC is realized as conflict detection on `sys/head` (see the commit
-sequence).
+SlateDB (pinned at 0.14.x) provides the concrete primitives the **folder**
+(RFC 0022) uses to apply a won commit, verified against its source rather
+than assumed from prose: `Db::begin(IsolationLevel::Snapshot)` opens a
+transaction whose commit performs **write-write conflict detection** on the
+keys it writes; `Db::snapshot()` gives a pinned consistent read handle
+(RFC 0009); `DbReader` opens a store **read-only** without becoming a
+writer; and writer fencing is a monotonic `writer_epoch` bumped by manifest
+CAS on `Db::open`. Arbitration comes from none of them: the object store's
+conditional put (RFC 0022) is the primitive that serializes committers, and
+it is the only one an arbitrary number of independent processes share.
+SlateDB's transaction conflict detection serves a narrower purpose — it
+gives the folder one atomic write per folded slot, with no concurrent
+writer to contend against, because direct store writes are the folder's
+monopoly. SlateDB exposes no bespoke key-level compare-and-swap API, and
+none is needed at either layer: the slot's conditional put arbitrates
+across processes; the folder's one-writer invariant makes its own
+transaction's conflict detection a formality.
 
-DuckLake allocates
-ids from counters: `next_catalog_id` and `next_file_id` live in the
-`ducklake_snapshot` record; `next_row_id` is **per-table** in
+DuckLake allocates ids from counters: `next_catalog_id` and `next_file_id`
+live in the `ducklake_snapshot` record; `next_row_id` is **per-table** in
 `ducklake_table_stats` (`next_row_id += record_count` on insert), preserved
 across UPDATE and compaction for row lineage. The `ducklake_snapshot` record
 also carries `schema_version` — a counter DuckLake advances only when a
 commit changes the catalog *schema*, and that DuckDB uses as its
 schema-cache key. This RFC defines the protocol that maintains all of these
-under optimistic concurrency.
+under optimistic concurrency, regardless of where the race that decides a
+winner is run.
 
 ## Design
 
 ### Topology
 
-**Single writer, many readers.** Readers open the store through SlateDB's
-`DbReader` — a handle that follows the manifest, never becomes a writer,
-and never participates in fencing (only `Db::open` and the compactor bump
-manifest epochs); there is no bound on their number. Writers are expected
-to be a single logical committer holding the one read-write `Db`.
+**Commits do not require the read-write `Db` at all.** The commit point is
+the bucket's commit log (RFC 0022): any process can author a commit by
+racing a conditional put against the log, whether or not it holds SlateDB's
+read-write handle. Fleet multi-writer — N independent DuckDB processes
+committing concurrently with nothing beyond the bucket — is therefore the
+one supported commit topology.
+
+**The one fenced writer is the folder role, and it is not the commit
+path.** SlateDB's read-write `Db` has exactly one holder at a time, guarded
+by the `writer_epoch` fencing described below, and its job is to *fold*:
+tail the commit log and apply each won slot as one atomic `WriteBatch`, so
+SlateDB stays a faithful, queryable derived index of the log (RFC 0022). A
+dead folder cannot lose a commit — folding happens strictly after a slot is
+durable — its only symptom is a growing unfolded tail that lengthens
+materialization. Opening the folder (`Db::open` read-write) is also how
+genesis and RFC 0015's structural migrations happen, for the same reason:
+they are the other operations that must write the store directly.
+
+Readers open the store through SlateDB's `DbReader` — a handle that
+follows the manifest, never becomes a writer, and never participates in
+fencing (only `Db::open` and the compactor bump manifest epochs) — plus a
+tail replay past the store's replay point for slots no fold has applied
+(RFC 0022). There is no bound on their number, and unlike commits, reading
+never required a single owner.
 
 One source-verified caveat keeps "read-only" from being oversimplified:
 `DbReader::open` in latest mode **writes a checkpoint into the manifest**
@@ -109,8 +142,9 @@ One source-verified caveat keeps "read-only" from being oversimplified:
 reader's lifetime. So a reader does not fence and does not write data,
 but it *does* need write access to the manifest object and generates
 manifest traffic, and its checkpoint pins SSTs against SlateDB's own GC
-for the checkpoint lifetime. The default "follow latest" mode trades that
-small manifest write for consistent WAL-inclusive reads.
+for the checkpoint lifetime — the same checkpoint RFC 0022's truncation
+bound relies on to find live readers. The default "follow latest" mode
+trades that small manifest write for consistent WAL-inclusive reads.
 
 Deployments whose reader credentials cannot write at all open against an
 existing checkpoint instead. A checkpoint id given at open selects a
@@ -126,47 +160,41 @@ SlateDB's garbage collection for as long as it exists.
 
 Be precise about what fencing does, because its direction is the opposite
 of a lock: SlateDB's `writer_epoch` means **the newest writer wins**. A
-second process opening the store read-write bumps the epoch and **fences
-the incumbent** — the first writer's next durable write fails, not the
+second process opening the folder read-write bumps the epoch and **fences
+the incumbent** — the first folder's next durable write fails, not the
 second's. Safety is absolute (a fenced writer writes nothing, never
-corrupts — RFC 0011's `FencedWriterResumes`), but availability is not: two processes attaching
-read-write do not degrade to "second one fails," they take turns killing
-each other's committer. The operational rule follows: **exactly one
-process attaches read-write; every other process attaches read-only**
-(`DbReader`), and RFC 0006 exposes a read-only attach option so a DuckDB
-process can opt into the reader role explicitly.
-
-This is a real product limitation relative to the multi-client SQL
-catalogs DuckLake otherwise uses — many DuckDB processes writing through
-one PostgreSQL catalog is the common lakehouse shape, and moraine does not
-support it: there is no funnel component in the DuckLake deployment model,
-so "run one long-lived committer process and route commits through it" is
-an escape hatch for embedding hosts, not something a fleet of independent
-DuckDB clients gets for free. This constraint is stated here once,
-surfaced in README-level documentation, and holds for the default
-topology. RFC 0022 takes up the multi-writer coordination design as an
-opt-in topology layered above this protocol; the semantics specified
-here are unchanged by it.
+corrupts — RFC 0011's `FencedWriterResumes`), but availability is not: two
+processes attaching read-write to fold do not degrade to "second one
+fails," they take turns killing each other's writer. RFC 0022's appointment
+rule (observe the unfolded tail, delay, re-check, then open) is what keeps
+this from thrashing in the steady state; nothing about commit liveness
+depends on it — a commit lands at its slot whether or not a folder is
+running at all.
 
 ### Bootstrap — the commit that creates the store
 
 Opening a store that has never been written is itself a commit-shaped
 operation and rides the same machinery. On open, the catalog reads
-`sys/format` through a transaction:
+`sys/format`:
 
 - **Present** → validate: an unknown format version is refused
   (`Corruption` today; `Migration` once RFC 0015's variant exists), and a
   present `sys/migration` marker is refused outright (RFC 0002 reserves
   that check from format v1).
 - **Absent (empty store)** → bootstrap: stage one atomic batch writing
-  `sys/format` (format version 1 plus the writing moraine version),
-  snapshot `0` (empty catalog: no entities, counters at their initial
-  values so the first allocation yields id 0, `schema_version` 0, empty
-  `changes_made`), and `sys/head` → `0` at batch count `0`, then commit it under the same
-  head conflict detection as any commit. A same-process race between two
-  bootstrapping opens arbitrates on the head write like any other commit
-  — the loser re-reads and finds the initialized store; across processes
-  the single-writer topology and fencing already exclude a second writer.
+  `sys/format` (format version 4 plus the writing moraine version),
+  snapshot `0` (empty catalog: no entities, counters at
+  their initial values so the first allocation yields id 0, `schema_version`
+  0, empty `changes_made`), and `sys/head` → `0`, then write it directly as
+  one atomic batch. Genesis is folder-role work (RFC 0022): it precedes the
+  log's own existence — there is no `sys/format` yet to say a `commits/`
+  prefix means anything — so it is guarded the same way RFC 0022's format-4
+  migration stamp is, by the fenced writer rather than a slot race. A
+  same-process race between two bootstrapping opens serializes on the same
+  in-process writer handle — the loser observes the store already
+  initialized and adopts it; across processes, SlateDB's writer-epoch
+  fencing (see Topology) excludes a second writer from landing a second
+  genesis.
 
 Bootstrap mints the default `main` schema in the same batch, matching
 the initial catalog state a fresh DuckLake metadata store carries: a
@@ -180,17 +208,17 @@ counter, so the first user allocation follows it.
 A commit takes a set of staged catalog mutations (entity inserts, entity
 ends, inlined writes) and lands them atomically:
 
-1. **Load head.** Open the SlateDB transaction, then read `sys/head` →
-   snapshot id `N`, the snapshot `N` record for the global counters, and
-   the `tstat` records for any tables this commit inserts rows into — all
-   **through the transaction handle**, so the premise view and the
-   conflict-detection window share one start sequence and no commit can
-   land unseen between them (RFC 0009, "Commit attempts materialize
-   through the transaction").
+1. **Materialize the head.** The current view is `DbReader` state plus tail
+   replay past the store's replay point (RFC 0022) — reading through it gives snapshot id
+   `N`, the snapshot `N` record for the global counters, and the `tstat`
+   records for any tables this commit inserts rows into. This is a read,
+   not a lock; RFC 0022's continuity check is what later proves the view
+   was still current when the commit landed.
 2. **Allocate ids** locally by bumping in-memory copies of the counters:
    `next_catalog_id`/`next_file_id` from the snapshot record, `next_row_id`
    from each touched table's `tstat`. No store writes yet.
-3. **Stage the batch.** Assemble one atomic write set:
+3. **Stage the write set.** Assemble the same atomic write set the commit
+   has always staged:
    - new entity records into `current` (and, for ended versions, delete the
      `current` key + write the `history` key — RFC 0002);
    - inlined `inline/insert` chunks and `inline/inline_delete`/`inline/file_delete` records
@@ -198,37 +226,32 @@ ends, inlined writes) and lands them atomically:
    - updated `tstat` records carrying advanced `next_row_id`;
    - the new `snapshot` record `N+1` with advanced global counters,
      `schema_version` (bumped or carried forward per the rule below), and
-     merged `snapshot_changes`;
-   - the `sys/head` update `N → N+1`, with the batch count incremented.
-4. **Commit under head conflict detection.** The staged writes commit as
-   one SlateDB transaction (`begin(IsolationLevel::Snapshot)`) opened at
-   step 1. **Every batch writes `sys/head`** — including a maintenance
-   batch, which mints no snapshot and so reuses the standing id while still
-   moving the batch count (RFC 0002) — so SlateDB's write-write
-   conflict detection on that one key *is* the head CAS: if a concurrent
-   commit advanced the head since this transaction began, `commit()`
-   returns `TransactionConflict` and nothing was written — go to conflict
-   handling. If it lands, the commit is durable once the WAL flush lands —
-   done. (This is deliberately not a bespoke compare-and-swap: SlateDB
-   exposes no key-level CAS API, and the transaction primitive it does
-   expose is exactly the required shape. A transaction's write set is
-   applied as one atomic batch, so RFC 0002's one-commit-one-batch
-   invariant is preserved verbatim. Two source-verified mechanics worth
-   knowing: the conflict check runs inside SlateDB's single batch-writer
-   event loop immediately before the write is sequenced, so check and
-   apply cannot interleave; and the detection state is **in-process** —
-   which is sufficient precisely because the topology admits one writer
-   process, with cross-process safety carried by fencing, not by conflict
-   detection. Plain non-transactional writes are tracked too, modeled as
-   single-op transactions, so a stray direct write cannot slip past a
-   concurrent commit's conflict check.)
+     merged `snapshot_changes`.
 
-The read in step 1 is "load head," not a lock; the write in step 4 is the
-whole commit. Nothing spans two batches. Within one process, concurrent
-commit attempts (multiple connections) may run steps 1–3 optimistically in
-parallel — the transaction conflict at step 4 arbitrates — or the
-committer may serialize them (see Group commit); across processes, the
-topology above guarantees there is no second writer to race.
+   The set travels as one commit's payload inside a commit-log envelope
+   (RFC 0022), not directly into a SlateDB `WriteBatch`. Payload objects
+   the writes reference (Parquet files, inline chunks) are durable before
+   this step is attempted. `sys/head`'s advance to `N+1` is not staged here
+   at all: it is a consequence the folder derives when it later applies
+   this slot, not something the committer writes.
+4. **Race the slot.** Head arbitration is a conditional put against the
+   bucket, not a SlateDB transaction: RFC 0022 conditional-puts the
+   envelope at the next log sequence. A win is committed and durable at
+   the ack — the commit is exactly one atomic unit (RFC 0002), realized as
+   the slot object rather than a `WriteBatch`; folding that
+   payload into SlateDB as one atomic batch happens later, off this path,
+   under the folder. A loss (`AlreadyExists`) means a concurrent commit
+   took the sequence first: read the winning slot's payload (needed anyway
+   to advance the local head), and go to conflict handling below.
+
+The read in step 1 is "materialize head," not a lock; step 4 is the whole
+commit, whether it is the only committer in the fleet or one of many.
+Nothing spans two atomic units. Within one process, concurrent commit
+attempts (multiple connections) may run steps 1–3 optimistically in
+parallel — the slot race at step 4 arbitrates — or the committer may
+serialize them (see Group commit); across processes, that same step-4 slot
+race is what arbitrates, because RFC 0022's topology assumes many
+concurrent committer processes, not one.
 
 ### Conflict detection — table-level
 
@@ -259,9 +282,11 @@ true against concurrent deletes, drops, and compaction of the table,
 benign against appends and alters). Statistics-only mutations emit no
 entry: stats are re-derived on retry and conflict with nothing.
 
-When the head conflict fires, the committer compares the set of
+When the slot race is lost, the committer compares the set of
 `table_id`s it touched against those touched by the intervening commits
-`N+1 … N+k` (recoverable from their `snapshot_changes`):
+`N+1 … N+k` (recoverable by reading the intervening winning slots
+directly — RFC 0022 — each carrying its `changes_made` classification
+string):
 
 - **Disjoint table sets → benign race.** The concurrent commits do not
   invalidate this commit's premise. Retry from step 1 against the new head
@@ -377,8 +402,8 @@ benign. That is correct as classification (neither commit's staged state is
 invalidated), but uniqueness must still be enforced: on the verb path it is
 the **closure re-run** on retry that catches it — the re-run resolves names
 against the new head, sees the winner's table, and returns `AlreadyExists`;
-on the staged-row path every lost head surfaces to DuckLake (below), which
-re-drives with full knowledge of the new catalog state. Set comparison
+on the staged-row path every lost slot race surfaces to DuckLake (below),
+which re-drives with full knowledge of the new catalog state. Set comparison
 alone never establishes name uniqueness; re-validation against the new head
 does. This is stated explicitly because it is the tempting shortcut: a
 purely mechanical re-stage-and-retry, with no re-validation, would commit
@@ -546,15 +571,16 @@ verb path:
   ids, counters, and `schema_version` are DuckLake's values, stored
   verbatim.
 - **Same commit core.** The translated records land through steps 3–4
-  above: one transaction, one atomic batch, head conflict detection.
-  Nothing about atomicity or durability differs between the paths.
+  above: one payload, one slot race arbitrating who wins. Nothing about
+  atomicity or durability differs between the paths — durability arrives at
+  the slot's ack, and a commit is exactly one atomic unit, on either path.
 - **No internal benign-race retry.** A retry on the verb path re-runs the
   closure and re-stamps ids moraine allocated. On this path there is
   nothing moraine can safely re-run: the snapshot id, `begin_snapshot`,
   counter values, and `schema_version` are DuckLake-authored and embedded
   in row values moraine must carry faithfully — re-stamping them would be
   semantic surgery on another system's data, the exact re-modeling RFC
-  0006 forbids. Therefore **every lost head on the staged-row path
+  0006 forbids. Therefore **every lost slot race on the staged-row path
   surfaces as a typed `CommitConflict`** to DuckLake — benign-shaped or
   not — and this is exactly the composition DuckLake expects of its
   catalog, verified in its source: DuckLake's `RunCommitLoop` wraps every
@@ -590,7 +616,7 @@ batch's own inline writes, so a flush draining a repaired chunk still
 deletes the locator the repair added.
 
 The two front doors share the commit core (staging, one-batch atomicity,
-head conflict detection, durability) and differ only in who authors the
+slot arbitration, durability) and differ only in who authors the
 mutations and therefore who may retry. Keeping that split explicit is what
 lets the verb path be aggressive (closure re-run, append-append benign)
 without ever risking a silent rewrite of DuckLake-authored state.
@@ -598,30 +624,41 @@ without ever risking a silent rewrite of DuckLake-authored state.
 ### Inlined writes as commit participants
 
 Per RFC 0005, an inlined insert/delete is not a separate path: its
-`inline/*` records are added to the same `WriteBatch` in step 3, allocating
+`inline/*` records are added to the same payload in step 3, allocating
 row ids from the same per-table `next_row_id` bump as a Parquet write
 would. An inline flush is itself a commit — Parquet PUTs first, then one
-batch that creates the `file`/`delfile` records and deletes the consumed
+slot that creates the `file`/`delfile` records and deletes the consumed
 `inline/*` records outright (no `history`; `inline/*` is append-then-delete,
 not begin/end-versioned). Nothing about inlining changes the commit
-sequence or the conflict rules; it only adds record kinds to the batch.
+sequence or the conflict rules; it only adds record kinds to the payload.
 
 ### Group commit
 
-Because the topology funnels concurrent transactions through one committer,
-the committer may batch several pending catalog commits into one WAL flush:
-allocate ids for each, stage their records into one `WriteBatch`, one CAS,
-one durable flush. Per-commit latency stays one-PUT-bound (RFC 0002 /
-README); throughput under load stops being one-flush-per-commit and PUT
-costs amortize. Group commit is an optimization the protocol permits, not a
-correctness requirement — a batch of one is the normal path. Ordering
-within a group is the committer's choice; conflicts *within* a group are
-impossible because a single committer serializes them before staging.
+Group commit is specified in full by RFC 0022's "Group commit and
+chaining": commits share a slot exactly when their author can chain them —
+each authored against its predecessor's result, so ids never collide.
+That is achievable in exactly two places: **in-process coalescing** (a
+process holding several pending commits runs each against the accumulating
+head and emits a chain — the direct descendant of this section's old
+one-committer batching) and **the leader role**, which serializes and
+chains commits forwarded to it. Per-commit latency stays one-PUT-bound
+(RFC 0002 / README); throughput under load stops being one-PUT-per-commit
+and slot costs amortize across a chain. Group commit is an optimization
+the protocol permits, not a correctness requirement — a chain of one is the
+normal path. Ordering within a chain is the author's choice; conflicts
+*within* a chain are impossible because its author validates and serializes
+each member locally before racing the slot.
 
-**Implemented** two ways over one core — a lone commit is a group of one,
-so there is one commit path, not two. `Catalog::commit_group` batches what
-one caller hands it; concurrent callers of the ordinary `Catalog::commit`
-are batched without asking. A commit that finds the store free opens a
+**In-process coalescing implemented.** A process holding several pending
+commits chains them into one slot, bounded by
+`CatalogOptions::commit_batch_window`. Verified live over real SlateDB on
+in-memory `object_store` (`concurrent_commits_coalesce_into_few_slots`);
+the leader role that chains commits forwarded across processes is RFC
+0022's to build.
+
+**Implemented** over one core — a lone commit is a group of one, so there
+is one commit path, not two. Concurrent callers of `Catalog::commit` are
+batched without asking. A commit that finds the store free opens a
 batch, one that finds a batch forming joins it, one that finds a batch in
 flight waits for the next, and a batch seals as soon as no caller is on its
 way into it — so the flush already in the air is the batching window and an
@@ -707,35 +744,27 @@ their guard, and a data-only re-drive lands a second time (RFC 0011,
 
 ### Reader visibility after commit
 
-Step 4 makes a commit **durable**; a *separate* reader observing it is a
-second, distinct property. Readers are uncoordinated (Topology) and resolve
-snapshots by following the manifest from object storage. A reader that
-opened before the commit — or a fresh reader whose manifest view is a poll
-interval stale — therefore does not see snapshot `N+1` the instant `commit`
-returns.
-For moraine's own committer this is a non-issue: it holds the advanced
-`sys/head` in memory and reads its own writes. It matters at the boundary
-where another process must observe a just-returned commit —
-read-your-writes across processes, and writer takeover, where a new writer
-must publish the last committed state before it serves.
+Step 4 makes a commit **durable** the instant the slot PUT is acked
+(RFC 0022), and durability and visibility are the same event: nothing
+mediates between them. Every reader resolves the head as `DbReader` state
+plus tail replay past the store's replay point (RFC 0022), and the tail is read fresh
+from the bucket on every materialization: there is no manifest poll
+interval standing between an acked slot and a reader observing it, because
+no process's flush timer sits in the freshness path. A reader that opened
+before the commit, or is mid-materialization, simply performs its next tail
+LIST and sees the new slot.
 
-The contract: `commit` does not return success until the new snapshot is
-both durable and reflected in the manifest that readers follow, so a reader
-opened *after* `commit` returns resolves `N+1`. (A reader opened *before*
-may still lag by its manifest poll interval — that is ordinary snapshot
-isolation, not a violation.)
+Manifest staleness matters only narrowly: it decides how many slots have
+already been *folded* into SlateDB versus how many a reader must replay
+from the tail itself, not whether the commit is visible at all. A reader on
+a stale manifest checkpoint pays a longer replay, never a stale answer.
 
-No extra flush call is needed to hold that contract; step 4's own
-durability does it. A commit with `await_durable: true` blocks on a
-durability watcher that fires only once the WAL object has been PUT to
-object storage (`WalBufferManager::do_flush_one_wal` → `notify_durable`),
-and both fresh-open paths — `Db::open` and `DbReader::open` in latest
-mode — replay WALs from object storage past the manifest state. So a
-handle opened after `commit` returns resolves `N+1` by construction.
-
-A validation test in the store harness (open `object_store`, commit, open a
-*fresh* reader, assert `N+1` is visible) pins that behavior against real
-SlateDB and measures its per-backend latency.
+For moraine's own committer this is a non-issue — it holds the advanced
+head in memory and reads its own writes. It matters most at the boundary
+where another process must observe a
+just-returned commit: read-your-writes across processes, and folder
+takeover, where a successor folder resumes tailing from exactly the
+predecessor's fold cursor.
 
 ### Test obligations
 
@@ -756,14 +785,12 @@ SlateDB on in-memory `object_store` — no mocks of the store:
   name.
 - Incompatible overlapping concurrent commits: one wins, the other returns
   `CommitConflict`.
-- Staged-row commits never retry internally: a lost head on the extension
-  path returns `CommitConflict` with the store unchanged by the loser.
-- Crash-shaped sequences: owned by RFC 0011 rather than restated here.
-  `CommitNotDurable` covers the batch whose flush never landed — the head
-  does not move and no record of it is visible — and
-  `CommitDurableNotAcknowledged` the flush that landed before the process
-  died, where the head and snapshot resolve consistently on reopen and a
-  re-drive surfaces its guard.
+- Staged-row commits never retry internally: a lost slot race on the
+  extension path returns `CommitConflict` with the store unchanged by the
+  loser.
+- Crash-shaped sequences: partial batch never observable (atomicity);
+  commit, reopen, verify head and snapshot resolve consistently. Crash
+  recovery is owned by RFC 0011 rather than restated here.
 - Counter monotonicity: `next_catalog_id`/`next_file_id`/per-table
   `next_row_id` never regress or collide across concurrent commits.
 - Bounded retry terminates: a forced write storm returns `CommitConflict`
@@ -777,9 +804,11 @@ SlateDB on in-memory `object_store` — no mocks of the store:
   snapshot 0, and head in one batch; a second open (concurrent or later)
   finds the initialized store rather than re-initializing; an
   unknown-format or mid-migration store is refused.
-- Fresh-reader visibility: after `commit` returns, a newly opened reader
-  resolves the new snapshot (the store-harness validation above, run
-  against real SlateDB on in-memory `object_store`).
+- Fold visibility: after a fold batch returns, a newly opened reader
+  resolves the folded snapshot without replay (the store-harness
+  validation above, run against real SlateDB on in-memory `object_store`);
+  ordinary commit visibility — before folding — is a tail replay,
+  specified and tested under RFC 0022.
 - Checkpoint readers: a reader pinned to a checkpoint serves the state at
   it and never a later commit; it opens, reads, and closes against a store
   that refuses every write, attempting none, where a latest-following
@@ -839,9 +868,9 @@ E2E testing validates the protocol against real DuckLake SQL.
   only thing retried internally.
 - **Snapshot-level conflict detection (any concurrent commit conflicts).**
   Rejected: serializes all commits and defeats the benign-race retry —
-  disjoint-table writers would falsely conflict. The single-`WriteBatch`
-  CAS already serializes the physical write; there is no reason to also
-  serialize logically-disjoint commits.
+  disjoint-table writers would falsely conflict. The slot's conditional
+  put (RFC 0022) already serializes the physical write; there is no reason
+  to also serialize logically-disjoint commits.
 - **Entity-level conflict detection (per-file/column) everywhere.**
   Rejected, but with one exception now built. DuckLake's matrix is
   operation-grained over tables everywhere except delete-vs-delete on one
@@ -859,5 +888,6 @@ E2E testing validates the protocol against real DuckLake SQL.
   allocation with conflict granularity.
 - **Pessimistic locking (a lease/lock record in `system` a writer must hold).**
   Rejected: reintroduces coordination state and a liveness problem (crashed
-  lock-holder) that the optimistic head-CAS avoids. SlateDB fencing already
-  provides the safety a lock would; optimism provides the concurrency.
+  lock-holder) that the optimistic slot CAS (RFC 0022) avoids. Fencing
+  (folder takeover) already provides the safety a lock would for direct
+  store writes; optimism provides the concurrency for commits.

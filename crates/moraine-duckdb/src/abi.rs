@@ -26,15 +26,15 @@ use std::{
 };
 
 pub use checkpoints::*;
-use moraine::CatalogOptions;
+use moraine::{CatalogOptions, Leader, LeaderConfig};
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 use tracing::warn;
 
 use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
     runtime::{
-        AttachedCatalog, CANCELLED_ATTACH_SHUTDOWN, MoraineCatalogHandle, MoraineInterruptProbe,
-        MoraineSnapshotHandle, block_on_cancellable_in, new_runtime,
+        AttachedCatalog, CANCELLED_ATTACH_SHUTDOWN, LeaderHost, MoraineCatalogHandle,
+        MoraineInterruptProbe, MoraineSnapshotHandle, block_on_cancellable_in, new_runtime,
     },
 };
 
@@ -729,12 +729,16 @@ pub unsafe extern "C" fn moraine_attach(
         let mut options = CatalogOptions::default();
         options.path = prefix;
         options.encrypted = encrypted;
-        // 0 means "not given"; `u64::MAX` is the shim's sentinel for an
-        // explicit zero interval.
+        // `flush_interval_ms` is a deprecated alias for the commit batch
+        // window: no commit touches SlateDB's WAL flush timer any more, but an
+        // operator's existing value still expresses "how long a commit may wait
+        // to be batched". 0 means "not given" (the default window); `u64::MAX`
+        // is the shim's sentinel for an explicit zero; any other value is that
+        // many milliseconds.
         match flush_interval_ms {
             0 => {}
-            u64::MAX => options.flush_interval = std::time::Duration::ZERO,
-            ms => options.flush_interval = std::time::Duration::from_millis(ms),
+            u64::MAX => options.commit_batch_window = std::time::Duration::ZERO,
+            ms => options.commit_batch_window = std::time::Duration::from_millis(ms),
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
         options.cache_size = cache_size_option(cache_size_bytes);
@@ -939,12 +943,13 @@ pub unsafe extern "C" fn moraine_migrate(
 
         let mut options = moraine::CatalogOptions::default();
         options.path = prefix;
-        // 0 means "not given"; `u64::MAX` is the shim's sentinel for an
-        // explicit zero interval.
+        // 0 means "not given": the default cadence stands. `u64::MAX` is the
+        // shim's sentinel for an explicit zero interval. `flush_interval_ms`
+        // is a deprecated alias for the commit batch window.
         match flush_interval_ms {
             0 => {}
-            u64::MAX => options.flush_interval = std::time::Duration::ZERO,
-            ms => options.flush_interval = std::time::Duration::from_millis(ms),
+            u64::MAX => options.commit_batch_window = std::time::Duration::ZERO,
+            ms => options.commit_batch_window = std::time::Duration::from_millis(ms),
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
         options.cache_size = cache_size_option(cache_size_bytes);
@@ -2049,6 +2054,114 @@ pub unsafe extern "C" fn moraine_maintain(
     }
 }
 
+/// Runs one bounded fold pass: applies up to `limit` unfolded slots into
+/// the store, advancing the durable fold cursor, and writes the count
+/// applied to `*out_slots_folded` and the slots still unfolded to
+/// `*out_tail_remaining`. `limit` of 0 folds nothing and only reports the
+/// tail.
+///
+/// Folding is invisible to readers — the served state is byte-identical
+/// before and after — so a pass may run whenever. A read-only attach is
+/// refused with [`codes::CONSTRAINT`]; a concurrent folder fencing this
+/// session surfaces as [`codes::FENCED`], which the caller treats as
+/// wasted work rather than an error.
+///
+/// # Safety
+///
+/// `handle` must be a live handle from [`moraine_attach`]. The
+/// out-parameters, if non-null, must be writable, and `err`, if non-null,
+/// must be writable. All for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_fold_sprint(
+    handle: *mut MoraineCatalogHandle,
+    limit: u64,
+    out_slots_folded: *mut u64,
+    out_tail_remaining: *mut u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+
+        // The scheduler drives this on its own thread, which stops through
+        // the stop flag rather than a query interrupt, so no probe.
+        // SAFETY: a `None` probe polls nothing.
+        let report = unsafe {
+            handle_ref.block_on_cancellable(
+                None,
+                ptr::null_mut(),
+                handle_ref.catalog.writer()?.fold_sprint(limit),
+            )
+        }?;
+
+        if !out_slots_folded.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_slots_folded = report.slots_folded };
+        }
+        if !out_tail_remaining.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_tail_remaining = report.tail_remaining };
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Deletes slots durably folded into the store, oldest first, and writes
+/// the count removed to `*out_slots_removed`. The horizon is bounded by
+/// both the durable fold cursor and what live readers still need, so a
+/// pass may remove nothing when readers lag. A read-only attach is refused
+/// with [`codes::CONSTRAINT`].
+///
+/// # Safety
+///
+/// `handle` must be a live handle from [`moraine_attach`].
+/// `out_slots_removed`, if non-null, must be writable, and `err`, if
+/// non-null, must be writable. All for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_truncate_slots(
+    handle: *mut MoraineCatalogHandle,
+    out_slots_removed: *mut u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+
+        // SAFETY: a `None` probe polls nothing.
+        let removed = unsafe {
+            handle_ref.block_on_cancellable(
+                None,
+                ptr::null_mut(),
+                handle_ref.catalog.writer()?.truncate_folded_slots(),
+            )
+        }?;
+
+        if !out_slots_removed.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_slots_removed = removed };
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
 /// One borrowed step supplied to [`moraine_maintenance_status_record`].
 #[repr(C)]
 pub struct MoraineMaintenanceStatusStepInput {
@@ -2134,6 +2247,144 @@ pub unsafe extern "C" fn moraine_maintenance_status_record(
         Ok(()) => codes::OK,
         Err(code) => code,
     }
+}
+
+/// The bound a leader stop waits for a clean stand-down — the drain plus the
+/// withdrawal PUT — before the detach that follows drops the runtime and
+/// aborts the task.
+const LEADER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Opens the leader role on this attached catalog: binds `bind_address`,
+/// advertises `advertise_address` (its own bind when null), mints or reads the
+/// forwarding token, announces through the log, and serves forwarded sessions
+/// on the handle's runtime until [`moraine_leader_stop`]. A read-only catalog
+/// cannot lead. Starting a second leader on a handle already leading fails.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `err`, if non-null, must
+/// be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_leader_start(
+    handle: *mut MoraineCatalogHandle,
+    bind_address: *const c_char,
+    advertise_address: *const c_char,
+    max_sessions: u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+
+        // SAFETY: caller contract for the string arguments.
+        let bind = unsafe { borrow_str(bind_address, "bind_address") }?;
+        // SAFETY: caller contract; a null or empty advertise means "same as bind".
+        let advertise = unsafe { opt_borrow_str(advertise_address, "advertise_address") }?;
+        let advertise = advertise.unwrap_or(bind).to_string();
+
+        let mut slot = handle_ref
+            .leader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(LeaderHost::is_running) {
+            return Err(AbiError::new(
+                codes::CONSTRAINT,
+                "this catalog is already leading; stop it before starting again",
+            ));
+        }
+
+        let sessions = usize::try_from(max_sessions).unwrap_or(usize::MAX).max(1);
+        let mut config = LeaderConfig::new(bind, sessions);
+        config.advertise_address = advertise;
+
+        let catalog = Arc::new(handle_ref.catalog.writer()?.clone());
+        let leader = handle_ref
+            .block_on(Leader::bind(catalog, config))
+            .map_err(AbiError::from)?;
+        let stats = leader.stats();
+
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // A thread of its own, with a current-thread runtime: the leader's
+        // sessions are `!Send`, so they cannot live on the shared pool.
+        let thread = std::thread::Builder::new()
+            .name("moraine-leader".to_owned())
+            .spawn({
+                let shutdown = Arc::clone(&shutdown);
+                let running = Arc::clone(&running);
+                move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => {
+                            if let Err(err) = runtime.block_on(leader.serve(shutdown)) {
+                                tracing::warn!(error = %err, "leader stopped serving");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "leader runtime could not be built");
+                        }
+                    }
+                    running.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .map_err(|err| AbiError::new(codes::INTERNAL, format!("leader thread: {err}")))?;
+
+        *slot = Some(LeaderHost {
+            thread: Some(thread),
+            running,
+            shutdown,
+            stats,
+        });
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Stands the leader down: signals a clean withdrawal and waits a bounded grace
+/// for the drain and the withdrawal PUT. A handle not leading is a no-op. The
+/// runtime the detach that follows drops would abort the task anyway, so this
+/// never blocks past the grace.
+///
+/// # Safety
+///
+/// `handle`, if non-null, must be a live [`moraine_attach`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_leader_stop(handle: *mut MoraineCatalogHandle) {
+    if handle.is_null() {
+        return;
+    }
+    let attempt = || {
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        let host = handle_ref
+            .leader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut host) = host {
+            host.shutdown.notify_one();
+            // The leader owns its thread, so the grace budget is spent waiting
+            // for the flag rather than on a joinable future.
+            if let Some(thread) = host.thread.take() {
+                let deadline = std::time::Instant::now() + LEADER_STOP_GRACE;
+                while host.is_running() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let _ = thread.join();
+            }
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
 /// Lists durable maintenance status, newest pass first and step order within
@@ -2466,6 +2717,64 @@ pub unsafe extern "C" fn moraine_store_census_free(items: *mut MoraineSubspaceCe
         }
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// Reports the leader role: whether this catalog holds it right now, the
+/// forwarded sessions open, and the commits landed through the funnel since it
+/// bound. A handle not leading reports `false`/`0`/`0`.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `err`, if non-null, must
+/// be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_leader_status(
+    handle: *mut MoraineCatalogHandle,
+    out_role_held: *mut bool,
+    out_sessions: *mut u64,
+    out_forwarded: *mut u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+
+        let slot = handle_ref
+            .leader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (held, sessions, forwarded) = match slot.as_ref() {
+            Some(host) if host.is_running() => (
+                true,
+                host.stats.active_sessions(),
+                host.stats.forwarded_commits(),
+            ),
+            _ => (false, 0, 0),
+        };
+
+        if !out_role_held.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_role_held = held };
+        }
+        if !out_sessions.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_sessions = sessions };
+        }
+        if !out_forwarded.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_forwarded = forwarded };
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
 }
 
 /// One subspace's merge, as returned by [`moraine_compact_store`].

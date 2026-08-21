@@ -1,0 +1,178 @@
+// Wire messages for one forwarded catalog session on a leader: the staged-row
+// ABI carried over a connection, one connection per session.
+//
+// The row-operation and cell messages mirror moraine's staged-row shape;
+// this schema names none of moraine's types, and table kinds ride as their
+// opaque ABI discriminants.
+//
+// Evolution: add or deprecate fields only — field numbers are permanent.
+
+syntax = "proto3";
+
+package moraine.remote;
+
+// One request in a session. An empty variant is a Unit-typed oneof arm.
+message RequestMessage {
+  oneof request {
+    HelloValue hello = 1;
+    Unit begin = 2;
+    Unit snapshot = 3;
+    Unit visible_snapshots = 4;
+    Unit scheduled_deletions = 5;
+    RowOperationValue stage = 6;
+    CommitValue commit = 7;
+    Unit rollback = 8;
+  }
+}
+
+// One response in a session.
+message ResponseMessage {
+  oneof response {
+    Unit ok = 1;
+    SnapshotRowsValue snapshot = 2;
+    CommittedValue committed = 3;
+    ErrorValue error = 4;
+  }
+}
+
+// A variant carrying no fields.
+message Unit {}
+
+// The session handshake: a shared bucket secret and the protocol version the
+// client speaks.
+message HelloValue {
+  bytes token = 1;
+  uint32 protocol_version = 2;
+}
+
+// A read's result: opaque per-row bytes the client decodes into its own row
+// type.
+message SnapshotRowsValue {
+  repeated bytes rows = 1;
+}
+
+// A commit request. The client stamps the transaction with an id it can later
+// resolve through the log, so an ambiguous outcome (the slot landed, the ack
+// was lost) is settled by id rather than re-driven blind. An empty id lets the
+// leader mint one.
+message CommitValue {
+  bytes transaction_id = 1;
+}
+
+// A committed transaction's minted snapshot.
+message CommittedValue {
+  uint64 snapshot_id = 1;
+}
+
+// A typed failure; the client renders it to text the retry loop dispatches on.
+message ErrorValue {
+  ErrorKindValue kind = 1;
+  string message = 2;
+}
+
+// The failure classes a forwarded session surfaces. CONFLICT renders text
+// carrying the retry substring; RETRY_BUDGET_EXHAUSTED and SLOT_LOG carry none.
+enum ErrorKindValue {
+  ERROR_KIND_VALUE_UNSPECIFIED = 0;
+  ERROR_KIND_VALUE_CONFLICT = 1;
+  ERROR_KIND_VALUE_RETRY_BUDGET_EXHAUSTED = 2;
+  ERROR_KIND_VALUE_CORRUPTION = 3;
+  ERROR_KIND_VALUE_NOT_FOUND = 4;
+  ERROR_KIND_VALUE_ALREADY_EXISTS = 5;
+  ERROR_KIND_VALUE_CONSTRAINT = 6;
+  ERROR_KIND_VALUE_INDEX_BUILDING = 7;
+  ERROR_KIND_VALUE_CONFIGURATION = 8;
+  ERROR_KIND_VALUE_FENCED = 9;
+  ERROR_KIND_VALUE_SLOT_LOG = 10;
+  ERROR_KIND_VALUE_STORE = 11;
+  ERROR_KIND_VALUE_UNSUPPORTED = 12;
+  ERROR_KIND_VALUE_SNAPSHOT_EXPIRED = 13;
+  ERROR_KIND_VALUE_INTERRUPTED = 14;
+  ERROR_KIND_VALUE_MIGRATION = 15;
+  ERROR_KIND_VALUE_OPEN_RACED = 16;
+}
+
+// One staged row mutation, mirroring moraine's RowOperation.
+message RowOperationValue {
+  oneof operation {
+    RowCellsValue insert = 1;
+    RowCellsValue delete = 2;
+    RowCellsValue update_set_end = 3;
+    RowCellsValue update_set_begin = 4;
+    InlineSchemaValue inline_schema = 5;
+    InlineInsertValue inline_insert = 6;
+    InlineInlineDeleteValue inline_inline_delete = 7;
+    InlineFileDeleteValue inline_file_delete = 8;
+    InlineFlushDeleteValue inline_flush_delete = 9;
+    InlineDropValue inline_drop = 10;
+    InlineSchemaDropValue inline_schema_drop = 11;
+    InlineFileDeleteRemoveValue inline_file_delete_remove = 12;
+  }
+}
+
+// A table-targeting row: the ABI table-kind discriminant and its positional
+// cells.
+message RowCellsValue {
+  uint32 table = 1;
+  repeated CellValue cells = 2;
+}
+
+message InlineSchemaValue {
+  uint64 table_id = 1;
+  uint64 schema_version = 2;
+  bytes arrow_schema = 3;
+}
+
+message InlineInsertValue {
+  uint64 table_id = 1;
+  uint64 schema_version = 2;
+  uint64 begin_snapshot = 3;
+  uint64 row_id_start = 4;
+  uint64 row_count = 5;
+  bytes arrow_body = 6;
+}
+
+message InlineInlineDeleteValue {
+  uint64 table_id = 1;
+  uint64 row_id = 2;
+  uint64 end_snapshot = 3;
+}
+
+message InlineFileDeleteValue {
+  uint64 table_id = 1;
+  uint64 data_file_id = 2;
+  uint64 row_id = 3;
+  uint64 begin_snapshot = 4;
+}
+
+message InlineFileDeleteRemoveValue {
+  uint64 table_id = 1;
+  uint64 data_file_id = 2;
+  uint64 row_id = 3;
+}
+
+message InlineFlushDeleteValue {
+  uint64 table_id = 1;
+  uint64 schema_version = 2;
+  uint64 flush_snapshot = 3;
+}
+
+message InlineDropValue {
+  uint64 table_id = 1;
+}
+
+message InlineSchemaDropValue {
+  uint64 table_id = 1;
+  uint64 schema_version = 2;
+}
+
+// One positional column value in a staged row.
+message CellValue {
+  oneof cell {
+    Unit null = 1;
+    uint64 unsigned = 2;
+    sint64 signed = 3;
+    bool boolean = 4;
+    string text = 5;
+  }
+}

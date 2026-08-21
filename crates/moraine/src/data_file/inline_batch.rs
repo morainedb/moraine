@@ -125,16 +125,6 @@ fn record_inline_batch_decode(row_id_start: u64) {
 }
 
 #[cfg(test)]
-pub(crate) fn inline_batch_decode_count(row_id_start: u64) -> usize {
-    inline_batch_decodes()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&row_id_start)
-        .copied()
-        .unwrap_or_default()
-}
-
-#[cfg(test)]
 fn inline_schema_decodes() -> &'static std::sync::Mutex<std::collections::HashMap<u64, usize>> {
     static COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, usize>>> =
         std::sync::OnceLock::new();
@@ -158,15 +148,4 @@ fn record_inline_schema_decode(schema_ipc: &[u8]) {
     *counts
         .entry(inline_schema_fingerprint(schema_ipc))
         .or_default() += 1;
-}
-
-/// How often the named schema IPC bytes were decoded in this test process.
-#[cfg(test)]
-pub(crate) fn inline_schema_decode_count(schema_ipc: &[u8]) -> usize {
-    inline_schema_decodes()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&inline_schema_fingerprint(schema_ipc))
-        .copied()
-        .unwrap_or_default()
 }

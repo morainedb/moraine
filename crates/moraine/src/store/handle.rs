@@ -265,8 +265,6 @@ impl ReadHandle<'_> {
 /// An owned read session backing one materialization. Borrow a
 /// [`ReadHandle`] from it, then [`finish`](Self::finish) it.
 pub(crate) enum ReadSession {
-    /// A read-write transaction, rolled back on `finish`.
-    Tx(DbTransaction),
     /// A read-only reader, shared with the catalog.
     Reader(Arc<DbReader>),
 }
@@ -275,16 +273,13 @@ impl ReadSession {
     /// Borrows a read handle over this session.
     pub(crate) fn handle(&self) -> ReadHandle<'_> {
         match self {
-            Self::Tx(tx) => ReadHandle::Tx(tx),
             Self::Reader(reader) => ReadHandle::Reader(reader),
         }
     }
 
-    /// Releases the session, rolling back a read-write transaction.
+    /// Releases the session.
     pub(crate) fn finish(self) {
-        if let Self::Tx(tx) = self {
-            tx.rollback();
-        }
+        let Self::Reader(_) = self;
     }
 }
 
@@ -350,12 +345,9 @@ mod tests {
             b"d",
         )
         .unwrap();
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        tx.commit_with_options(&WriteOptions::default())
+            .await
+            .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let handle = ReadHandle::Tx(&tx);

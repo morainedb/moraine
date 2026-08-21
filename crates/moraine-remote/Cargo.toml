@@ -1,0 +1,27 @@
+[package]
+name = "moraine-remote"
+description = "The forwarded-session wire protocol behind moraine's leader role"
+readme = "../../README.md"
+keywords = ["wire-protocol", "rpc", "protobuf", "catalog"]
+categories = ["database-implementations", "network-programming"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protox = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

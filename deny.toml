@@ -35,3 +35,9 @@ ignore = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+# SlateDB is taken from git while the pluggable-WAL interface the slot log
+# plugs into is unreleased; the pin moves back to a crates.io version once it
+# ships.
+[sources.allow-org]
+github = ["slatedb"]

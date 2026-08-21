@@ -107,10 +107,29 @@ pub async fn scan_inline(
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_schemas(catalog: &ReadOnlyCatalog, table_id: u64) -> Result<Vec<(u64, Bytes)>> {
-    let session = catalog.begin_read().await?;
-    let schemas = store_inline::scan_inline_schemas_resolved(session.handle(), table_id).await;
-    session.finish();
-    schemas
+    let read = catalog.begin_catalog_read().await?;
+    let head = read.head_value();
+    // A base-table scan asks once per registered schema version and every ask
+    // returns the same whole list, so the scan is paid once per head.
+    if let Some(schemas) =
+        crate::catalog::projection::inline_schemas_at(catalog.projections(), table_id, &head)
+    {
+        read.finish().await;
+        return Ok(schemas.as_ref().clone());
+    }
+
+    let schemas =
+        store_inline::scan_inline_schemas_resolved(read.handle(), read.overlay(), table_id).await;
+    read.finish().await;
+    let schemas = schemas?;
+    crate::catalog::projection::install_inline_schemas(
+        catalog.projections(),
+        table_id,
+        head,
+        std::sync::Arc::new(schemas.clone()),
+    );
+
+    Ok(schemas)
 }
 
 /// Every `(table_id, schema_version)` still registered, across every
@@ -125,12 +144,12 @@ pub async fn inline_schemas(catalog: &ReadOnlyCatalog, table_id: u64) -> Result<
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_registered_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<(u64, u64)>> {
-    let session = catalog.begin_read().await?;
+    let read = catalog.begin_catalog_read().await?;
     let scans = futures::try_join!(
-        store_inline::scan_all_inline_schema_keys(session.handle()),
-        store_inline::scan_all_inline_dropped_schemas(session.handle()),
+        store_inline::scan_all_inline_schema_keys(read.handle(), read.overlay()),
+        store_inline::scan_all_inline_dropped_schemas(read.handle(), read.overlay()),
     );
-    session.finish();
+    read.finish().await;
     let (registered, dropped) = scans?;
     let dropped: HashSet<(u64, u64)> = dropped.into_iter().collect();
     Ok(registered
@@ -153,16 +172,19 @@ pub async fn inline_file_delete_table_exists(
     catalog: &ReadOnlyCatalog,
     table_id: u64,
 ) -> Result<bool> {
-    let session = catalog.begin_read().await?;
-    let marked = store_inline::read_inline_file_delete_table(session.handle(), table_id).await;
+    let read = catalog.begin_catalog_read().await?;
+    let marked =
+        store_inline::read_inline_file_delete_table(read.handle(), read.overlay(), table_id).await;
     let exists = match marked {
         Ok(true) => Ok(true),
-        Ok(false) => store_inline::scan_inline_file_deletes(session.handle(), table_id)
-            .await
-            .map(|records| !records.is_empty()),
+        Ok(false) => {
+            store_inline::scan_inline_file_deletes(read.handle(), read.overlay(), table_id)
+                .await
+                .map(|records| !records.is_empty())
+        }
         Err(error) => Err(error),
     };
-    session.finish();
+    read.finish().await;
     exists
 }
 
@@ -179,9 +201,10 @@ pub async fn inline_file_deletes(
     catalog: &ReadOnlyCatalog,
     table_id: u64,
 ) -> Result<Vec<(u64, u64, u64)>> {
-    let session = catalog.begin_read().await?;
-    let file_deletes = store_inline::scan_inline_file_deletes(session.handle(), table_id).await;
-    session.finish();
+    let read = catalog.begin_catalog_read().await?;
+    let file_deletes =
+        store_inline::scan_inline_file_deletes(read.handle(), read.overlay(), table_id).await;
+    read.finish().await;
     Ok(file_deletes?
         .into_iter()
         .map(|(data_file_id, row_id, value)| (data_file_id, row_id, value.begin_snapshot))
@@ -197,7 +220,7 @@ mod tests {
     use super::*;
     use crate::{
         catalog::CatalogOptions,
-        transaction::staged::{Cell, RowOperation, StagedTransaction, TableKind},
+        transaction::staged::{Cell, RowOperation, TableKind},
     };
 
     fn snapshot_row(id: u64) -> Vec<Cell> {
@@ -226,6 +249,116 @@ mod tests {
             .unwrap()
     }
 
+    /// Inline rows committed to a slot with no folder running are served by
+    /// the inline dump through the tail overlay. Against a folded-only read
+    /// the tail is invisible and this scan returns nothing.
+    #[tokio::test]
+    async fn scan_inline_serves_unfolded_rows_on_a_slot_backed_attach() {
+        let catalog = open().await;
+
+        let mut tx = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        tx.stage(RowOperation::InlineSchema {
+            table_id: 1,
+            schema_version: 0,
+            arrow_schema: b"schema".to_vec(),
+        });
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk-a".to_vec(),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        // No folder has run: the rows live only in the unfolded tail.
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0, None)
+            .await
+            .unwrap();
+        let mut ids: Vec<u64> = record.rows.iter().map(|r| r.row_id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![0, 1],
+            "unfolded inline rows are served through the overlay"
+        );
+        assert_eq!(record.chunk_bodies, vec![Bytes::from_static(b"chunk-a")]);
+
+        let schemas = inline_schemas(&catalog, 1).await.unwrap();
+        assert_eq!(schemas, vec![(0, Bytes::from_static(b"schema"))]);
+    }
+
+    /// A base-table scan asks once per registered schema version; the walk
+    /// those asks share is paid once.
+    #[tokio::test]
+    async fn per_version_scans_share_one_walk_of_the_chunks() {
+        let catalog = open().await;
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
+        for version in 0..3u64 {
+            tx.stage(RowOperation::InlineSchema {
+                table_id: 1,
+                schema_version: version,
+                arrow_schema: b"schema".to_vec(),
+            });
+        }
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 1,
+            arrow_body: b"chunk-a".to_vec(),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        let read = catalog.begin_dump().await.unwrap();
+        let head = read.head_value();
+        read.finish().await;
+        assert!(
+            crate::catalog::projection::inline_chunks_at(catalog.projections(), 1, &head).is_none(),
+            "nothing is remembered before the first ask"
+        );
+
+        for version in 0..3u64 {
+            scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0, Some(version))
+                .await
+                .unwrap();
+        }
+
+        let read = catalog.begin_dump().await.unwrap();
+        let later_head = read.head_value();
+        read.finish().await;
+        assert_eq!(
+            (later_head.snapshot_id, later_head.batch_seq),
+            (head.snapshot_id, head.batch_seq),
+            "a read moves no head, so every ask of one statement shares one"
+        );
+        assert!(
+            crate::catalog::projection::inline_chunks_at(catalog.projections(), 1, &later_head)
+                .is_some(),
+            "the walk the first ask paid for is there for the rest"
+        );
+    }
+
     /// Two chunks (rows 0-1, row 2) staged in one commit, one tombstone
     /// on row 1: `scan_inline` with `Table` at the tombstone's snapshot
     /// returns rows 0 and 2 with their chunk bodies attached, and
@@ -234,8 +367,7 @@ mod tests {
     #[tokio::test]
     async fn scan_inline_materializes_rows_with_chunk_bodies() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
 
         tx.stage(RowOperation::InlineSchema {
             table_id: 1,
@@ -268,8 +400,7 @@ mod tests {
         });
         tx.commit().await.unwrap();
 
-        let db_tx2 = catalog.begin_write_tx().await.unwrap();
-        let mut inline_delete = StagedTransaction::begin_detached(db_tx2);
+        let mut inline_delete = catalog.begin_staged(None, String::new()).await.unwrap();
         inline_delete.stage(RowOperation::InlineInlineDelete {
             table_id: 1,
             row_id: 1,
@@ -326,8 +457,7 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_schema_version_deregisters_but_stays_resolvable() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
 
         for (schema_version, schema) in [(0u64, b"schema-v0"), (1, b"schema-v1")] {
             tx.stage(RowOperation::InlineSchema {
@@ -359,8 +489,7 @@ mod tests {
             vec![(1, 0), (1, 1)]
         );
 
-        let db_tx2 = catalog.begin_write_tx().await.unwrap();
-        let mut flush = StagedTransaction::begin_detached(db_tx2);
+        let mut flush = catalog.begin_staged(None, String::new()).await.unwrap();
         flush.stage(RowOperation::InlineFlushDelete {
             table_id: 1,
             schema_version: 0,
@@ -415,8 +544,7 @@ mod tests {
         };
 
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
         tx.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
@@ -445,24 +573,35 @@ mod tests {
         );
 
         // The divergence: a chunk with no locator, behind the memo's back.
-        let tx = catalog.begin_write_tx().await.unwrap();
-        tx.put(
-            Key::Inline(InlineKey::Live(InlineOperation::Insert {
-                table_id: 1,
-                schema_version: 0,
-                begin_snapshot: 1,
-                chunk_seq: 5,
-            }))
-            .encode(),
-            value::encode_value(&proto::InlineChunkValue {
-                body: b"rogue".to_vec().into(),
-                row_id_start: 10,
-                row_count: 2,
-                data_file_id: None,
-            }),
-        )
-        .unwrap();
-        tx.commit().await.unwrap();
+        catalog
+            .with_folder_writer(async |db| {
+                let tx = db
+                    .begin(slatedb::IsolationLevel::Snapshot)
+                    .await
+                    .map_err(crate::error::Error::from)?;
+                tx.put(
+                    Key::Inline(InlineKey::Live(InlineOperation::Insert {
+                        table_id: 1,
+                        schema_version: 0,
+                        begin_snapshot: 1,
+                        chunk_seq: 5,
+                    }))
+                    .encode(),
+                    value::encode_value(&proto::InlineChunkValue {
+                        body: b"rogue".to_vec().into(),
+                        row_id_start: 10,
+                        row_count: 2,
+                        data_file_id: None,
+                    }),
+                )
+                .unwrap();
+                crate::transaction::commit::commit_durably(db, tx)
+                    .await
+                    .unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
 
         let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0, None)
             .await
@@ -483,8 +622,7 @@ mod tests {
     #[tokio::test]
     async fn scan_inline_filtered_to_a_version_hauls_only_its_bodies() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
 
         tx.stage(RowOperation::InlineInsert {
             table_id: 1,
@@ -538,8 +676,7 @@ mod tests {
     #[tokio::test]
     async fn inline_file_deletes_read_back_in_key_order() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
 
         tx.stage(RowOperation::InlineFileDelete {
             table_id: 1,

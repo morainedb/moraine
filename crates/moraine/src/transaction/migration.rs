@@ -71,104 +71,31 @@ pub struct FormatRaise {
 }
 
 /// The highest format `current` can reach without a structural rewrite:
-/// this binary's newest, stopped below the first format some migration
-/// unit reads. Past that one the keys have moved, and only that unit puts
-/// them where the new format says they are.
+/// the newest a stamp alone describes, stopped below the first format some
+/// migration unit reads. Past that one the keys have moved, and only that
+/// unit puts them where the new format says they are.
 fn additive_ceiling(current: u64) -> u64 {
     registry()
         .into_iter()
         .map(|unit| unit.from_format)
         .filter(|from| *from >= current)
         .min()
-        .map_or(commit::MAX_FORMAT_VERSION, |rewrite_at| {
-            rewrite_at.min(commit::MAX_FORMAT_VERSION)
+        .map_or(commit::MAX_ADDITIVE_FORMAT, |rewrite_at| {
+            rewrite_at.min(commit::MAX_ADDITIVE_FORMAT)
         })
 }
 
-/// Raises the store's `sys/format` to the newest purely additive format
-/// this binary writes, and reports what moved.
+/// What a raise would do to a store whose commits ride the slot log.
 ///
-/// The formats it reaches add record shapes that an older binary would
-/// misread rather than refuse — an inline schema reference decoding as a
-/// no-column schema, say — so this is **one-way**: a store that takes one
-/// can no longer be opened by a binary that predates it. Commits reach
-/// these formats on their own, when they first write such a shape; this
-/// is for an operator who would rather take the step deliberately than
-/// have the first such commit take it.
-///
-/// A reader that is *already attached* on an older binary is not refused
-/// by anything here; it keeps running and may misread what later commits
-/// write. Raise the format only once every reader of the store is on a
-/// binary that understands it.
-///
-/// Refuses a store mid-migration, whose keyspace is in motion, and stops
-/// below any format reached by a structural rewrite instead of stamping
-/// past it. `dry_run` reports the move it would make and stamps nothing,
-/// which is the only way to read a store's format without changing it.
-pub(crate) async fn raise_format(db: &Db, dry_run: bool) -> Result<FormatRaise> {
-    let tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
-
-    let read = async {
-        let format = read::read_format(ReadHandle::Tx(&tx))
-            .await?
-            .map_or(commit::FORMAT_VERSION, |stamp| stamp.format_version);
-        let marker = read::read_migration(ReadHandle::Tx(&tx)).await?;
-        Ok::<_, Error>((format, marker))
-    }
-    .await;
-    let (from_format, marker) = match read {
-        Ok(read) => read,
-        Err(error) => {
-            tx.rollback();
-            return Err(error);
-        }
-    };
-
-    if let Some(marker) = marker {
-        tx.rollback();
-        return Err(Error::Migration(format!(
-            "store is mid-migration from format {} to {}; finish that before raising the format",
-            marker.from_format, marker.to_format
-        )));
-    }
-
-    let to_format = additive_ceiling(from_format);
-    if dry_run {
-        tx.rollback();
-        return Ok(FormatRaise {
-            from_format,
-            to_format: to_format.max(from_format),
-        });
-    }
-    if to_format <= from_format {
-        tx.rollback();
-        return Ok(FormatRaise {
-            from_format,
-            to_format: from_format,
-        });
-    }
-
-    let key = Key::Sys(SysKey::Format).encode();
-    let value = value::encode_value(&proto::FormatValue {
-        format_version: to_format,
-        writer_version: env!("CARGO_PKG_VERSION").to_string(),
-    });
-    let mut staged = StagedBytes::default();
-    staged.add(key.len(), value.len());
-    if let Err(error) = tx.put(key, value) {
-        tx.rollback();
-        return Err(Error::from(error));
-    }
-    commit_durable(tx, "format raise", staged).await?;
-
-    info!(from_format, to_format, "raised the store format");
-    Ok(FormatRaise {
+/// Nothing: bootstrap stamps such a store at [`commit::FORMAT_MULTI_WRITER`],
+/// which is above every format a stamp alone reaches, so the ceiling is always
+/// below it and there is no move to make. The report says so rather than the
+/// call being absent, since an operator asking a store its format asks here.
+pub(crate) fn raise_format_stamped(from_format: u64) -> FormatRaise {
+    FormatRaise {
         from_format,
-        to_format,
-    })
+        to_format: additive_ceiling(from_format).max(from_format),
+    }
 }
 
 /// The units a call plans over: everything this binary ships, plus whatever
@@ -293,7 +220,7 @@ async fn start(db: &Db, unit: &MigrationUnit) -> Result<()> {
             }
         };
 
-        match commit_durable(tx, "migration start", staged).await {
+        match commit_durable(db, tx, "migration start", staged).await {
             Ok(_) => return Ok(()),
             Err(error) if error.kind() == slatedb::ErrorKind::Transaction => {
                 info!(attempt, "migration start lost the head race; retrying");
@@ -344,7 +271,7 @@ async fn finish(db: &Db, unit: &MigrationUnit) -> Result<()> {
         return Err(Error::from(error));
     }
 
-    commit_durable(tx, "migration finish", staged)
+    commit_durable(db, tx, "migration finish", staged)
         .await
         .map_err(Error::from)?;
     Ok(())
@@ -393,7 +320,7 @@ async fn run_unit(db: &Db, unit: &MigrationUnit, resume: Option<Vec<u8>>) -> Res
             }
         };
         staged.0 = staged.0.saturating_add(rewritten.0);
-        commit_durable(tx, "migration step", staged)
+        commit_durable(db, tx, "migration step", staged)
             .await
             .map_err(Error::from)?;
         crash_seam(CrashPoint::AfterStep)?;

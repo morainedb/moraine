@@ -670,6 +670,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
     assert_eq!(
         order,
         vec![
+            "fold_slots",
             "expire_snapshots",
             "flush_inlined_data",
             "merge_adjacent_files",
@@ -679,6 +680,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
             "sweep_indexes",
             "sweep_file_stats",
             "compact_store",
+            "truncate_slots",
         ],
         "steps must report in sequence order"
     );
@@ -1210,14 +1212,19 @@ fn scheduler_runs_a_pass_unattended() {
          SELECT * FROM moraine_index_drop('lake','main','t','by_a');",
     );
 
-    let scheduled = format!("{meta}, META_MAINTENANCE_INTERVAL INTERVAL '200 milliseconds'");
+    let scheduled = format!("{meta}, META_MAINTENANCE_INTERVAL INTERVAL '500 milliseconds'");
+    // The window must outlast a slow attach — under the full suite's load,
+    // installing and loading the extensions can eat over a second before the
+    // timer's first tick — yet stay under the 16 passes the status retains,
+    // or the claiming pass is evicted. A 500ms interval over 5s tops out near
+    // ten passes, leaving room on both sides.
     let output = run_ducklake_sql_with_pause(
         store.path(),
         data.path(),
         &scheduled,
         // Nothing but the attach; the timer is the only actor.
         "SELECT 1;\n",
-        std::time::Duration::from_millis(1_500),
+        std::time::Duration::from_secs(5),
         "SELECT 'PASS' AS marker, trigger, detail FROM moraine_maintenance_status('lake') \
            WHERE step = 'sweep_indexes' ORDER BY started_at;\n",
     );
@@ -1295,12 +1302,13 @@ fn scheduler_ticks_skip_a_pass_already_running() {
     orphaned_range(&store, &data, ENTRIES);
 
     // The pass takes 1 500 commits — about a second, several ticks — so
-    // ticks land while it is still running. The window holds 14 ticks,
-    // fewer than the report retains passes, so the pass that claims the
-    // range cannot be pushed out of the report by the empty ones after
-    // it however fast the machine is.
+    // ticks land while it is still running. The window holds at most twelve
+    // ticks, fewer than the report retains passes, so the pass that claims
+    // the range cannot be pushed out of the report by the empty ones after
+    // it however fast the machine is; and it outlasts a slow attach under
+    // the full suite's load, where the first tick can be over a second late.
     let options = format!(
-        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '300 milliseconds', \
+        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '700 milliseconds', \
          META_MAINTENANCE_BATCH_SIZE 1",
         data.path().display()
     );
@@ -1309,7 +1317,7 @@ fn scheduler_ticks_skip_a_pass_already_running() {
         data.path(),
         &options,
         "SELECT 1;\n",
-        std::time::Duration::from_millis(4_200),
+        std::time::Duration::from_secs(9),
         "SELECT 'PASS' AS marker, detail FROM moraine_maintenance_status('lake') \
            WHERE step = 'sweep_indexes' ORDER BY started_at;\n",
     );
@@ -1828,12 +1836,11 @@ fn expiring_a_dropped_table_reclaims_its_file_column_stats_like_stock() {
     assert_eq!(swept, vec![vec!["reclaimed 0 file column statistics"]]);
 }
 
-/// `moraine_raise_format` takes the newest additive format deliberately,
-/// ahead of the commit that would otherwise take it. It reports the move
-/// and is idempotent, and `dry_run` reads a store's format without
-/// moving it. The store here writes no shape needing the newest format —
-/// its inserts inline, but nothing deregisters a duplicate schema — so
-/// it sits below one until the verb runs.
+/// `moraine_raise_format` is how an operator asks a store its format, and
+/// it answers the same however often it is asked and whichever way. A
+/// slot-backed store is stamped past every format a stamp alone reaches
+/// when it is bootstrapped, so the answer is always that there is no move
+/// to make — the verb reports it rather than being absent.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn raising_the_store_format_is_explicit_and_idempotent() {
@@ -1859,12 +1866,10 @@ fn raising_the_store_format_is_explicit_and_idempotent() {
         (read(&row[0]), read(&row[1]))
     };
 
-    // A dry run answers what a raise would do, twice over, without doing
-    // it — the pre-flight a one-way door needs.
     let probed = raise_with("the dry run", ", dry_run := true");
-    assert!(
-        probed.0 < probed.1,
-        "a fresh store must sit below this binary's newest additive format, got {probed:?}"
+    assert_eq!(
+        probed.0, probed.1,
+        "a bootstrapped store sits past every format a stamp reaches, got {probed:?}"
     );
     assert_eq!(
         raise_with("the second dry run", ", dry_run := true"),
@@ -1872,19 +1877,15 @@ fn raising_the_store_format_is_explicit_and_idempotent() {
         "a dry run must leave the store where it found it"
     );
 
-    let (from_format, to_format) = raise_with("the first raise", "");
-    assert_eq!((from_format, to_format), probed);
-    assert!(
-        from_format < to_format,
-        "a store writing no shape that needs the newest format must sit below it, \
-         got {from_format} -> {to_format}"
-    );
-
-    let (again_from, again_to) = raise_with("the second raise", "");
     assert_eq!(
-        (again_from, again_to),
-        (to_format, to_format),
-        "raising an already-raised store must be a no-op"
+        raise_with("the first raise", ""),
+        probed,
+        "asking to raise must read the same as asking what a raise would do"
+    );
+    assert_eq!(
+        raise_with("the second raise", ""),
+        probed,
+        "and asking again must change nothing"
     );
 
     // The lake still reads, and reads the same rows.

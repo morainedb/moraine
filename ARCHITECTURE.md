@@ -132,32 +132,35 @@ most expensive-to-reverse decision in the project; it is
 ## Commit protocol
 
 Turning a catalog mutation into a durable, atomic commit is
-[RFC 0004](docs/rfcs/0004-commit-protocol.md), built on RFC 0002's invariant
-that **one commit = exactly one SlateDB `WriteBatch`**.
+[RFC 0004](docs/rfcs/0004-commit-protocol.md) over the topology
+[RFC 0022](docs/rfcs/0022-commit-log-and-leader-role.md) fixes, built on RFC
+0002's invariant that **one commit is exactly one atomic unit**: a commit-log
+slot at commit time, and one SlateDB `WriteBatch` later, when the folder
+applies it.
 
-- **Topology: single writer, many readers.** Uncoordinated readers resolve
-  snapshots from object storage; a deployment needing commit concurrency
-  funnels commits through one long-lived committer process. A reader
-  following the latest state still writes a manifest checkpoint of its own;
-  one opened against an existing checkpoint id writes nothing at all, and
-  sees the cut that checkpoint named.
-- **Optimistic, head-CAS.** A commit loads the head snapshot, allocates ids
-  locally, stages one batch, and writes it conditional on `sys/head` being
-  unchanged. Nothing spans two batches; the write floor is one durable WAL
-  flush.
-- **Table-level conflict detection**, with one file-grain exception. On a
-  failed CAS, the committer compares the `table_id`s it touched against the
-  intervening commits' — except delete-versus-delete, which compares the
-  data files each targeted, matching the one place DuckLake goes finer.
-  Disjoint sets are
-  a benign race, retried internally; overlapping sets are a true `Conflict`
-  aborted with a typed error — the core is DuckLake-agnostic and cannot replay
-  the originating SQL, so re-driving belongs to whoever authored the operation.
-- **Group commit** batches several pending commits into one flush, each still
-  minting its own snapshot. `commit_group` batches what one caller hands it;
-  concurrent `commit` callers are batched without asking, using the flush
-  already in the air as the window. A batch of one stays the normal path and
-  waits for nobody.
+- **Topology: fleet multi-writer over a commit log.** Every commit races a
+  conditional put against an object-storage commit log; any number of
+  processes may commit concurrently, with nothing beyond the bucket
+  coordinating them. SlateDB's one fenced writer still exists, but it belongs
+  to the **folder** role — tailing the log into SlateDB as a derived index —
+  not the commit path, so a dead folder cannot lose a commit, only lengthen
+  the tail a reader replays.
+- **Optimistic, log-arbitrated.** A commit materializes the head (store state
+  plus tail replay past the fold cursor), allocates ids locally, stages one
+  payload, and races it into the next log slot. A win is durable at the ack;
+  nothing spans two atomic units.
+- **Table-level conflict detection**, with one file-grain exception. On a lost
+  race, the committer compares the `table_id`s it touched against the
+  intervening commits' — except delete-versus-delete, which compares the data
+  files each targeted, matching the one place DuckLake goes finer. Disjoint
+  sets are a benign race, retried internally; overlapping sets are a true
+  `Conflict` aborted with a typed error — the core is DuckLake-agnostic and
+  cannot replay the originating SQL, so re-driving belongs to whoever authored
+  the operation.
+- **Group commit** is permitted — a process with several pending commits can
+  chain them into one slot, and concurrent committers in one process are
+  coalesced into a single slot without asking — but never required; a chain of
+  one is the normal path.
 
 ## Extension surface
 

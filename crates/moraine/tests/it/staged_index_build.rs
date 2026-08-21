@@ -1,6 +1,10 @@
 //! `Catalog::create_index_staged`: driving a multi-commit index build to
 //! `ready` over a table whose rows live in registered Parquet files.
 
+// Test bodies await whole catalog operations in sequence; boxing each
+// call would say nothing about the code under test.
+#![allow(clippy::large_futures)]
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, OnceLock},

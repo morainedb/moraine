@@ -54,8 +54,10 @@ fn migrate_reaches_a_store_without_attaching_it() {
     assert_eq!(
         rows,
         vec![vec![
-            "1".to_string(),
-            "1".to_string(),
+            // The newest format this binary reads: a bootstrapped store
+            // already carries it, so the migration rewrites nothing.
+            moraine::MAX_FORMAT_VERSION.to_string(),
+            moraine::MAX_FORMAT_VERSION.to_string(),
             "false".to_string(),
             String::new(),
         ]],

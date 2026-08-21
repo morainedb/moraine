@@ -3,6 +3,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use futures::{StreamExt, TryStreamExt, stream};
+use slatedb::{Db, IsolationLevel};
 
 use super::{Catalog, ReadOnlyCatalog};
 use crate::{
@@ -25,7 +26,7 @@ use crate::{
             index_index_prefix, index_kind_prefix, subspace_prefix,
         },
     },
-    transaction::{commit, index_maintenance, maintenance_status},
+    transaction::{commit, folder, index_maintenance, maintenance_status},
 };
 
 /// One subspace's row, zeroed when the manifest carries no segment for it.
@@ -314,8 +315,12 @@ impl ReadOnlyCatalog {
         // `scan_prefix` takes its bounds as a suffix of the prefix.
         let suffix = start[kind_prefix.len()..].to_vec();
 
-        let session = self.begin_read().await?;
-        let first = session
+        // Through the dump read for its fresh reader: the sweep folds the tail
+        // first and then reads the store, and the shared reader only refreshes
+        // on its poll interval, so it can still be behind that fold. The
+        // overlay is deliberately unused — what the fold left is the subject.
+        let read = self.begin_dump().await?;
+        let first = read
             .handle()
             .scan_prefix(kind_prefix, suffix.., ScanShape::Probe)
             .await
@@ -323,7 +328,7 @@ impl ReadOnlyCatalog {
             .next()
             .await
             .map_err(Error::from)?;
-        session.finish();
+        read.finish().await;
 
         let Some(entry) = first else {
             return Ok(None);
@@ -372,15 +377,27 @@ impl Catalog {
             )));
         }
 
-        let tx = self.begin_write_tx().await?;
-        let mut staged = StagedBytes::default();
-        let deleted =
-            index_maintenance::reclaim_entries(&tx, index.get(), limit, &mut staged).await?;
-        commit::commit_durable(tx, "entry reclamation", staged)
-            .await
-            .map_err(Error::from)?;
+        // Dead entries live in the unfolded tail until a fold applies them,
+        // and the sweep reads and deletes them through the folded store, so
+        // the tail folds in first.
+        let store = self.folder_store()?;
+        folder::fold_sprint(store, u64::MAX).await?;
 
-        Ok(deleted)
+        self.with_writer(async |db| {
+            let tx = db
+                .begin(IsolationLevel::Snapshot)
+                .await
+                .map_err(Error::from)?;
+            let mut staged = StagedBytes::default();
+            let deleted =
+                index_maintenance::reclaim_entries(&tx, index.get(), limit, &mut staged).await?;
+            commit::commit_durable(db, tx, "entry reclamation", staged)
+                .await
+                .map_err(Error::from)?;
+
+            Ok(deleted)
+        })
+        .await
     }
 
     /// Runs one maintenance pass, reclaiming what only moraine knows is
@@ -407,7 +424,7 @@ impl Catalog {
     /// ```
     pub async fn maintain(&self, request: MaintenanceRequest) -> Result<MaintenanceReport> {
         // Refused before the nothing-to-do shortcut too.
-        self.writer()?;
+        self.ensure_writable()?;
         if request.batch_size == 0 {
             return Err(Error::Configuration(
                 "batch_size must be nonzero; zero would reclaim nothing and never terminate"
@@ -435,25 +452,42 @@ impl Catalog {
             .flat_map(|per_table| per_table.keys().copied())
             .collect();
 
-        for kind in [IndexKind::Unique, IndexKind::Multi] {
-            let mut from = 0u64;
-            while let Some(index_id) = self.first_index_id_from(kind, from).await? {
-                if !live.contains(&index_id) {
-                    let reclaimed = self
-                        .reclaim_dead_range(kind, index_id, request.batch_size)
-                        .await?;
-                    if reclaimed > 0 {
-                        report.indexes_swept += 1;
-                        report.index_entries_reclaimed += reclaimed;
+        // Dead entries live in the unfolded tail until a fold applies them,
+        // and the sweep reads and deletes them through the folded store, so
+        // the tail folds in first. Every read below is then store-only.
+        let store = self.folder_store()?;
+        folder::fold_sprint(store, u64::MAX).await?;
+
+        // The entry deletions are derived-state upkeep in the index subspace,
+        // never replayed into a view, so they run under the folder role: the
+        // single direct writer of a slot-backed store.
+        let swept = self
+            .with_writer(async |db| {
+                let mut swept = MaintenanceReport::default();
+                for kind in [IndexKind::Unique, IndexKind::Multi] {
+                    let mut from = 0u64;
+                    while let Some(index_id) = self.first_index_id_from(kind, from).await? {
+                        if !live.contains(&index_id) {
+                            let reclaimed = self
+                                .reclaim_dead_range(db, kind, index_id, request.batch_size)
+                                .await?;
+                            if reclaimed > 0 {
+                                swept.indexes_swept += 1;
+                                swept.index_entries_reclaimed += reclaimed;
+                            }
+                        }
+                        // Seek past this index rather than walking its entries.
+                        match index_id.checked_add(1) {
+                            Some(next) => from = next,
+                            None => break,
+                        }
                     }
                 }
-                // Seek past this index rather than walking its entries.
-                match index_id.checked_add(1) {
-                    Some(next) => from = next,
-                    None => break,
-                }
-            }
-        }
+                Ok(swept)
+            })
+            .await?;
+        report.indexes_swept += swept.indexes_swept;
+        report.index_entries_reclaimed += swept.index_entries_reclaimed;
 
         Ok(report)
     }
@@ -478,7 +512,7 @@ impl Catalog {
         reason = "the method keeps one ordered submit, await, classify, and measure protocol"
     )]
     pub async fn compact_store(&self, request: CompactStoreRequest) -> Result<CompactStoreReport> {
-        self.writer()?;
+        self.ensure_writable()?;
         if request.require_completed && request.wait.is_none() {
             return Err(Error::Configuration(
                 "require_completed needs a nonzero wait budget".to_owned(),
@@ -600,21 +634,22 @@ impl Catalog {
     /// which is what a time-travelling read resolves a dropped or replaced
     /// file through.
     async fn historical_data_files(&self) -> Result<HashSet<(u64, u64)>> {
-        let session = self.begin_read().await?;
+        // Through the dump read, not a plain session: the shared reader only
+        // refreshes on its poll interval, and a file ended by a commit this
+        // handle just made lives in the unfolded tail until then. Reading the
+        // store alone would call it unresolvable and reclaim its statistics.
+        let dump = self.begin_dump().await?;
+        let prefix = history_entity_kind_prefix(EntityKind::File);
         // One kind's prefix, not the whole subspace: every other kind's
         // history would be read and decoded only to be discarded below.
-        let mut iter = session
+        let mut iter = dump
             .handle()
-            .scan_prefix(
-                history_entity_kind_prefix(EntityKind::File),
-                ..,
-                ScanShape::Bulk,
-            )
+            .scan_prefix(prefix.clone(), .., ScanShape::Bulk)
             .await?;
 
         let mut seen = HashSet::new();
-        while let Some(entry) = iter.next().await? {
-            if let Ok(Key::History(history)) = Key::decode(&entry.key)
+        let note = |key: &[u8], seen: &mut HashSet<(u64, u64)>| {
+            if let Ok(Key::History(history)) = Key::decode(key)
                 && let EntityKey::File {
                     table_id,
                     data_file_id,
@@ -622,8 +657,21 @@ impl Catalog {
             {
                 seen.insert((table_id, data_file_id));
             }
+        };
+        while let Some(entry) = iter.next().await? {
+            note(&entry.key, &mut seen);
         }
-        session.finish();
+        for (key, value) in dump
+            .overlay()
+            .into_iter()
+            .flat_map(|tail| tail.prefixed(&prefix))
+        {
+            if value.is_some() {
+                note(key, &mut seen);
+            }
+        }
+        dump.finish().await;
+
         Ok(seen)
     }
 
@@ -650,31 +698,38 @@ impl Catalog {
             }
         }
 
-        let mut total = 0u64;
-        for batch in victims.chunks(batch_size) {
-            let tx = self.begin_write_tx().await?;
-            for entity in batch {
-                tx.delete(Key::current(*entity).encode())
+        self.with_writer(async |db| {
+            let mut total = 0u64;
+            for batch in victims.chunks(batch_size) {
+                let tx = db
+                    .begin(IsolationLevel::Snapshot)
+                    .await
                     .map_err(Error::from)?;
+                for entity in batch {
+                    tx.delete(Key::current(*entity).encode())
+                        .map_err(Error::from)?;
+                }
+                // Non-durable: the deletes are idempotent, so a batch lost to
+                // a crash leaves records a later pass rediscovers.
+                tx.commit_with_options(&commit::non_durable())
+                    .await
+                    .map_err(Error::from)?;
+                // This batch bypassed the commit protocol, so nothing folded
+                // it into the maintained projections and the head stamp they
+                // key on did not move. Unless they are dropped here, the
+                // handle keeps serving the records the batch removed — and
+                // every later pass rediscovers the same victims.
+                invalidate_current_state(&self.projections);
+                total += batch.len() as u64;
             }
-            // Non-durable: the deletes are idempotent, so a batch lost to a
-            // crash leaves records a later pass rediscovers.
-            tx.commit_with_options(&commit::non_durable())
-                .await
-                .map_err(Error::from)?;
-            // This batch bypassed the commit protocol, so nothing folded it
-            // into the maintained projections and the head stamp they key on
-            // did not move. Unless they are dropped here, the writer keeps
-            // serving the records the batch removed — and every later pass
-            // rediscovers the same victims.
-            invalidate_current_state(&self.projections);
-            total += batch.len() as u64;
-        }
-        Ok(total)
+            Ok(total)
+        })
+        .await
     }
 
     async fn reclaim_dead_range(
         &self,
+        db: &Db,
         kind: IndexKind,
         index_id: u64,
         batch_size: usize,
@@ -683,7 +738,10 @@ impl Catalog {
         // Each batch resumes past the tombstones the last one left.
         let mut cursor: Option<Vec<u8>> = None;
         loop {
-            let tx = self.begin_write_tx().await?;
+            let tx = db
+                .begin(IsolationLevel::Snapshot)
+                .await
+                .map_err(Error::from)?;
             // Non-durable below, so nothing reads the staged size.
             let mut staged = StagedBytes::default();
             let (deleted, last) = index_maintenance::reclaim_entries_from(

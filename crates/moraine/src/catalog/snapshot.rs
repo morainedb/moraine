@@ -215,31 +215,6 @@ impl CatalogSnapshot {
         view
     }
 
-    /// How many `current` records this view holds.
-    pub(crate) fn live_entity_count(&self) -> usize {
-        fn nested<K, V>(map: &BTreeMap<u64, BTreeMap<K, V>>) -> usize {
-            map.values().map(BTreeMap::len).sum()
-        }
-
-        self.schemas.len()
-            + self.tables.len()
-            + self.views.len()
-            + self.macros.len()
-            + nested(&self.columns)
-            + nested(&self.data_files)
-            + nested(&self.delete_files)
-            + nested(&self.partitions)
-            + nested(&self.sorts)
-            + nested(&self.mappings)
-            + nested(&self.indexes)
-            + self.table_stats.len()
-            + nested(&self.table_column_stats)
-            + nested(&self.file_column_stats)
-            + self.options.len()
-            + self.tags.len()
-            + self.gc_files.len()
-    }
-
     /// Inserts one decoded record into the maps it belongs to, keeping the
     /// name indexes coherent.
     pub(crate) fn put_record(&mut self, record: EntityRecord) {
@@ -835,6 +810,12 @@ impl CatalogSnapshot {
         );
     }
 
+    /// Drops one column mapping. A mapping is immutable while its table
+    /// lives; reclaiming a dropped table's mappings is what removes one.
+    pub(crate) fn remove_mapping(&mut self, table_id: u64, mapping_id: u64) {
+        remove_nested(&mut self.mappings, table_id, &mapping_id);
+    }
+
     pub(crate) fn remove_tag(&mut self, object_id: u64) {
         self.tags.remove(&object_id);
     }
@@ -1087,6 +1068,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            transaction_id: None,
             deleted_data_file_ids: Vec::new(),
         }
     }

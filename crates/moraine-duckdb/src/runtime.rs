@@ -9,9 +9,10 @@ use std::{
 };
 
 use futures::future::join_all;
-use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog, TableId};
+use moraine::{Catalog, CatalogSnapshot, LeaderStats, ReadOnlyCatalog, TableId};
 use tokio::{
     runtime::{Builder, Runtime},
+    sync::Notify,
     task::JoinHandle,
 };
 use tracing::warn;
@@ -50,10 +51,39 @@ pub struct MoraineCatalogHandle {
     /// The bucket-relative key prefix of `DATA_PATH` (empty for a local or
     /// bare-bucket store), prepended to a data file's stored path.
     pub(crate) data_prefix: String,
+    /// The leader role, once `moraine_leader_start` has opened it — the
+    /// serving task, its shutdown signal, and the live counters the status
+    /// surface reads. Absent until started, and after a stop.
+    pub(crate) leader: Mutex<Option<LeaderHost>>,
     /// In-flight row-summary warming passes; ended by
     /// [`finish_warming`](MoraineCatalogHandle::finish_warming) before the
     /// catalog closes.
     warming: Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// A serving leader owned by an attached catalog: the thread running it, the
+/// signal that stands it down, the counters it publishes, and the address it
+/// advertises.
+///
+/// The leader runs on a thread of its own, not the shared runtime: its
+/// sessions are `!Send` (they assemble commits through borrowed staged
+/// operations), so they need a current-thread runtime to live on.
+pub(crate) struct LeaderHost {
+    pub(crate) shutdown: Arc<Notify>,
+    /// Joined on stop. Taken so `stop` can consume it while `is_running`
+    /// only observes the flag.
+    pub(crate) thread: Option<std::thread::JoinHandle<()>>,
+    /// Cleared when the leader's `serve` returns, so a stale host reads as
+    /// finished without joining.
+    pub(crate) running: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) stats: Arc<LeaderStats>,
+}
+
+impl LeaderHost {
+    /// Whether the leader is still serving.
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Which mode the attach opened in. A write on a read-only attach is
@@ -91,6 +121,7 @@ impl MoraineCatalogHandle {
             log_id,
             data_store: None,
             data_prefix: String::new(),
+            leader: Mutex::new(None),
             warming: Mutex::new(Vec::new()),
         }
     }

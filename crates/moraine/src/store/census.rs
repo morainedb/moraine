@@ -215,7 +215,7 @@ fn census_of_manifest(manifest: &VersionedManifest) -> ManifestCensus {
 fn tree_size(prefix: Vec<u8>, l0: &VecDeque<SsTableView>, compacted: &[SortedRun]) -> SegmentSize {
     let views = || {
         l0.iter()
-            .chain(compacted.iter().flat_map(|run| run.sst_views.iter()))
+            .chain(compacted.iter().flat_map(|run| run.sst_views().iter()))
     };
 
     SegmentSize {
@@ -230,7 +230,7 @@ fn tree_size(prefix: Vec<u8>, l0: &VecDeque<SsTableView>, compacted: &[SortedRun
         stats_bytes: total_bytes(views().map(|view| view.sst.info.stats_len)),
         l0_ssts: count(l0.len()),
         sorted_runs: count(compacted.len()),
-        sorted_run_ssts: count(compacted.iter().map(|run| run.sst_views.len()).sum()),
+        sorted_run_ssts: count(compacted.iter().map(|run| run.sst_views().len()).sum()),
     }
 }
 
@@ -380,7 +380,10 @@ mod tests {
         assert!(counted > 0, "{census:?}");
     }
 
-    /// A write still in the write-ahead log is not in the manifest census.
+    /// The census reads the manifest, so a write the store has accepted but
+    /// not yet flushed is not in it. Anyone reading a census against a busy
+    /// writer is reading what has been written out, not what has been
+    /// accepted.
     #[tokio::test]
     async fn manifest_census_omits_unflushed_writes() {
         let store = memory_store();
@@ -395,7 +398,6 @@ mod tests {
             b"schema".as_slice(),
         );
         db.write(batch).await.unwrap();
-        db.flush().await.unwrap();
 
         let census = read_manifest_census("census/unflushed", store)
             .await

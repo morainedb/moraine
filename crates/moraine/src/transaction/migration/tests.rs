@@ -14,8 +14,14 @@ use crate::{
         open::StoreBuilder,
         read::{EntityRecord, scan_current_entities},
     },
-    transaction::commit::{FORMAT_VERSION, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION, durable},
+    transaction::commit::{
+        FORMAT_VERSION, MAX_ADDITIVE_FORMAT, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION, commit_durably,
+    },
 };
+
+/// A store is bootstrapped past every format a stamp alone reaches, so a
+/// raise never has one to make.
+const _: () = assert!(MAX_ADDITIVE_FORMAT < MAX_FORMAT_VERSION);
 
 /// The format the rewriting synthetic unit lands on: the newest this binary
 /// reads, so a store it migrated still attaches.
@@ -39,6 +45,16 @@ async fn seeded_store() -> Arc<InMemory> {
 
     let db = open_migrator(&object_store).await;
     let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    // Bootstrap stamps the newest format; restamp the base so the synthetic
+    // units below have an old store to carry forward.
+    tx.put(
+        Key::Sys(SysKey::Format).encode(),
+        value::encode_value(&proto::FormatValue {
+            format_version: FORMAT_VERSION,
+            writer_version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+    )
+    .unwrap();
     for scope_id in 1..=SEEDED_RECORDS {
         tx.put(
             Key::current(EntityKey::Option {
@@ -55,7 +71,7 @@ async fn seeded_store() -> Arc<InMemory> {
         )
         .unwrap();
     }
-    tx.commit_with_options(&durable()).await.unwrap();
+    commit_durably(&db, tx).await.unwrap();
     db.close().await.unwrap();
 
     object_store
@@ -290,7 +306,6 @@ async fn a_migrated_store_still_time_travels() {
     names.sort();
     assert_eq!(names, vec!["main".to_string(), "sales".to_string()]);
 }
-
 /// A marker the format stamp contradicts cannot be produced by any step of
 /// the protocol, so meeting one is corruption, not a resume.
 #[test]
@@ -348,8 +363,8 @@ async fn the_migrate_verb_is_a_noop_against_a_current_store() {
     .await
     .unwrap();
 
-    assert_eq!(report.from_format, FORMAT_VERSION);
-    assert_eq!(report.to_format, FORMAT_VERSION);
+    assert_eq!(report.from_format, MAX_FORMAT_VERSION);
+    assert_eq!(report.to_format, MAX_FORMAT_VERSION);
     assert!(report.units_run.is_empty());
     assert!(!report.resumed);
 }
@@ -438,12 +453,13 @@ fn the_registry_and_the_readable_floor_agree() {
     );
 }
 
-/// The ceiling is this binary's newest format, stopped below the first
-/// one a unit reads: past that the keys have moved, and only that unit's
-/// rewrite puts them where the format says they are.
+/// The ceiling is the newest format a stamp alone describes, stopped below
+/// the first one a unit reads: past that the keys have moved, and only that
+/// unit's rewrite puts them where the format says they are. It stops below
+/// the topology formats too — nothing drifts into one.
 #[test]
 fn the_additive_ceiling_stops_below_the_first_rewrite() {
-    assert_eq!(additive_ceiling(FORMAT_VERSION), MAX_FORMAT_VERSION);
+    assert_eq!(additive_ceiling(FORMAT_VERSION), MAX_ADDITIVE_FORMAT);
 
     install_migration(SyntheticMigration::MoveOptionScope);
     let units = registry();
@@ -456,9 +472,10 @@ fn the_additive_ceiling_stops_below_the_first_rewrite() {
     );
 }
 
-/// Raising moves the store to the newest additive format, is idempotent,
-/// and is the only thing that does: an ordinary open leaves the store
-/// where it was.
+/// A raise reports a slot-backed store settled, whatever it is asked and
+/// however often: bootstrap stamps such a store past every format a stamp
+/// alone reaches, so there is never a move to make and a dry run reads the
+/// same as a live one.
 #[tokio::test]
 async fn raising_the_format_is_idempotent_and_never_implicit() {
     let object_store = Arc::new(InMemory::new());
@@ -466,44 +483,39 @@ async fn raising_the_format_is_idempotent_and_never_implicit() {
         .await
         .unwrap();
 
-    // A dry run answers "what format is this, and where would a raise
-    // take it" without taking it.
     let probed = catalog.raise_format(true).await.unwrap();
-    assert!(probed.from_format < probed.to_format);
-    let still = catalog.raise_format(true).await.unwrap();
     assert_eq!(
-        still, probed,
-        "a dry run must leave the store where it found it"
+        probed.from_format, MAX_FORMAT_VERSION,
+        "bootstrap stamps the topology format"
     );
-
-    let before = catalog.raise_format(false).await.unwrap();
-    assert!(
-        before.from_format < before.to_format,
-        "a fresh store starts below this binary's newest additive format"
+    assert_eq!(
+        probed.from_format, probed.to_format,
+        "a store already past the additive ceiling has nowhere to go"
     );
-    assert_eq!(before.to_format, MAX_FORMAT_VERSION);
-
-    let again = catalog.raise_format(false).await.unwrap();
-    assert_eq!(again.from_format, MAX_FORMAT_VERSION);
-    assert_eq!(again.to_format, MAX_FORMAT_VERSION);
-    let probed_after = catalog.raise_format(true).await.unwrap();
-    assert_eq!(probed_after, again, "a raised store reports itself settled");
+    assert_eq!(
+        catalog.raise_format(false).await.unwrap(),
+        probed,
+        "asking to raise reads the same as asking what a raise would do"
+    );
+    assert_eq!(
+        catalog.raise_format(true).await.unwrap(),
+        probed,
+        "and asking again changes nothing"
+    );
     catalog.close().await.unwrap();
 
-    // Reopening reads the raised stamp back rather than resetting it, and
-    // opening a store never raises one on its own.
+    // Reopening reads the stamp back rather than resetting it.
     let reopened = Catalog::open(object_store, CatalogOptions::default())
         .await
         .unwrap();
-    let observed = reopened.raise_format(false).await.unwrap();
-    assert_eq!(observed.from_format, MAX_FORMAT_VERSION);
+    assert_eq!(reopened.raise_format(false).await.unwrap(), probed);
     reopened.close().await.unwrap();
 }
 
 /// A store whose keyspace is mid-migration never reaches the raise at
 /// all: the marker refuses the open, which is what keeps readers off a
-/// keyspace in motion. The guard inside the raise is the belt to that
-/// brace, not the thing doing the work.
+/// keyspace in motion — and a raise is asked for through a catalog, which
+/// there is no way to obtain on a marked store.
 #[tokio::test]
 async fn a_mid_migration_store_never_reaches_the_raise() {
     let object_store = Arc::new(InMemory::new());
@@ -526,15 +538,7 @@ async fn a_mid_migration_store_never_reaches_the_raise() {
         }),
     )
     .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
-
-    // The raise refuses the marked store reached directly, before the
-    // open below fences this writer.
-    let error = raise_format(&db, false).await.unwrap_err();
-    assert!(
-        matches!(error, Error::Migration(_)),
-        "expected a migration refusal, got {error:?}"
-    );
+    tx.commit().await.unwrap();
     db.close().await.unwrap();
 
     let refused = Catalog::open(object_store, CatalogOptions::default())

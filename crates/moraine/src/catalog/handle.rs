@@ -19,23 +19,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::StreamExt;
 pub use maintenance::{
     MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep,
 };
-use object_store::ObjectStore;
+use moraine_wal::FoldReport;
+use object_store::{ObjectStore, path::Path};
 pub use row_location::RowSummaryWarmth;
-use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
-use tokio::sync::watch;
+use slatedb::{Db, DbReader};
 use tracing::{info, warn};
 
 use crate::{
-    catalog::{
-        CatalogSnapshot, RecentRow, SnapshotId, TableId,
-        projection::{
-            ProjectionCache, cache_epoch, cached_head_view, held_head_view, install_head_view_at,
-            install_shared_current_entities, shared_current_entities,
-        },
-    },
+    catalog::{CatalogSnapshot, RecentRow, SnapshotId, TableId, projection::ProjectionCache},
     data_file,
     error::{Error, Result},
     store::{
@@ -43,9 +38,8 @@ use crate::{
         census,
         handle::{ReadHandle, ReadSession},
         open::{self, StoreBuilder},
-        proto::HeadValue,
     },
-    transaction::{MigrationReport, Transaction, commit, migration},
+    transaction::{MigrationReport, Transaction, commit, folder, migration, slot_commit},
 };
 
 /// Tables warmed concurrently, sized for a remote object store.
@@ -107,26 +101,58 @@ struct StoreLocation {
     object_store: Arc<dyn ObjectStore>,
 }
 
-/// The open store behind a catalog: the read-write `Db` writer, or a
-/// read-only `DbReader`. A read-only catalog never opens a `Db`, so it never
-/// fences a live writer.
+/// The open store behind a catalog.
 pub(crate) enum Store {
-    /// The single read-write writer.
-    Writer(Db),
-    /// A read-only reader following the manifest, shared into read sessions.
-    Reader(Arc<DbReader>),
+    /// The slot-log-backed store: a reader following the folded store plus the
+    /// slot log its commits ride. Boxed to keep the enum's footprint down.
+    Slots(Box<SlotStore>),
 }
 
-impl Store {
-    /// The writer behind this store, for a caller that needs to read after
-    /// its own transaction is spent — a lost staged commit, deciding what
-    /// it lost to.
-    pub(crate) fn writer_db(&self) -> Option<&Db> {
-        match self {
-            Self::Writer(db) => Some(db),
-            Self::Reader(_) => None,
-        }
-    }
+/// A slot-backed store: the folded state a reader follows, plus the slot log
+/// commits ride and the per-attach state shared by every clone of the handle.
+pub(crate) struct SlotStore {
+    pub(crate) reader: Arc<DbReader>,
+    pub(crate) slots: moraine_wal::SlotLog,
+    /// Retained for reopening the fenced writer (folder role) and fresh
+    /// readers (past a truncation).
+    pub(crate) object_store: Arc<dyn ObjectStore>,
+    pub(crate) options: CatalogOptions,
+    /// Whether this attach may write: `false` refuses commits and folder-role
+    /// work, so a read-only attach never opens the writer.
+    pub(crate) read_only: bool,
+    /// Whether this attach is pinned to a checkpoint: a fixed cut that reads
+    /// the folded store the checkpoint captured and never replays the tail
+    /// committed after it.
+    pub(crate) pinned: bool,
+    /// Serializes and coalesces this process's slot commits. Shared by every
+    /// clone of the handle.
+    pub(crate) coalescer: slot_commit::CommitCoalescer,
+    /// The materialized head cached across reads, so a repeated read need not
+    /// re-materialize from the folded store. Shared by every clone of the
+    /// handle; a successful commit updates it in place.
+    pub(crate) head_cache: slot_commit::HeadCache,
+    /// The handle's projection cache, shared so the commit path can consult
+    /// the format floor without a handle to hand.
+    pub(crate) projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    /// When this handle last read the migration marker absent, so a run of
+    /// reads inside one poll interval pays for one look rather than one each.
+    pub(crate) migration_clear: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// The head the store carried before it adopted the log, read once
+    /// through a reader that replays no slot. It is what the log's first slot
+    /// must have been validated against, and nothing but a fold can move it —
+    /// past the first fold the log itself supplies the anchor instead.
+    pub(crate) pre_log_head: Arc<tokio::sync::OnceCell<Option<u64>>>,
+    /// Slot-race and retry counters accumulated across commits, shared by every
+    /// clone of the handle through the store's `Arc` and by the staged
+    /// transactions it opens, which arm forwarding by counting their lost
+    /// races.
+    pub(crate) contention: Arc<slot_commit::ContentionCounters>,
+    /// The endpoints this process has given up forwarding to, shared by every
+    /// clone of the handle. A lost race arms forwarding; an unreachable
+    /// endpoint ages here so the client stops retrying it and commits
+    /// directly.
+    #[cfg(feature = "leader")]
+    pub(crate) forwarding: Arc<slot_commit::Forwarding>,
 }
 
 /// Options for opening a catalog.
@@ -136,8 +162,8 @@ impl Store {
 /// ```
 /// let options = moraine::CatalogOptions::default();
 /// assert_eq!(
-///     options.flush_interval,
-///     std::time::Duration::from_millis(100)
+///     options.reader_poll_interval,
+///     std::time::Duration::from_secs(10)
 /// );
 /// ```
 #[derive(Debug, Clone)]
@@ -152,13 +178,12 @@ pub struct CatalogOptions {
     /// store bootstraps, and ignored on an already-initialized store,
     /// where the stored value is authoritative.
     pub encrypted: bool,
-    /// How often the store's write-ahead log is flushed to object
-    /// storage. Durable commits wait for the next flush, so this bounds
-    /// per-commit latency; smaller values mean more frequent (on S3,
-    /// costlier) object-store PUTs. Zero flushes continuously (no timer),
-    /// so a durable commit waits only on the object-store PUT — the lowest
-    /// latency, at the cost of a busy flush loop. Defaults to 100ms.
-    pub flush_interval: Duration,
+    /// How long a commit may wait to be batched with others of this process
+    /// before racing the log. Zero (the default) still coalesces whatever is
+    /// already queued into one envelope — it only declines to *wait* — so an
+    /// uncontended commit adds no latency. A non-zero window trades latency
+    /// for fewer object-store PUTs under load, the write-side cost axis.
+    pub commit_batch_window: Duration,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -204,15 +229,11 @@ pub struct CatalogOptions {
     /// ([`CatalogSnapshot::data_path`](crate::CatalogSnapshot::data_path)).
     /// `None` records nothing.
     pub data_path: Option<String>,
-    /// How often a **read-only** catalog polls object storage for state a
-    /// writer has committed since it last looked.
-    ///
-    /// This is a reader's freshness bound: nothing pushes a commit to it,
-    /// so a read-only catalog can be one poll interval behind the writer,
-    /// and its cached view is served for exactly that long. Shorter means
-    /// fresher reads and more (on S3, billed) manifest and WAL listings.
-    /// Defaults to 10 seconds. Ignored by [`Catalog::open`], which reads
-    /// its own writes, and by a catalog pinned to a
+    /// How often a reader polls the object store for a fresher folded view.
+    /// A reader lags the head by up to this interval, replaying that many
+    /// more slots per materialization; a shorter interval trades more
+    /// manifest reads for less fold lag, the read-side cost axis. Defaults
+    /// to 10 seconds. Ignored by a catalog pinned to a
     /// [`checkpoint`](Self::checkpoint), which polls for nothing.
     pub reader_poll_interval: Duration,
     /// An existing checkpoint id (a UUID) to pin a **read-only** catalog to,
@@ -232,7 +253,7 @@ impl Default for CatalogOptions {
         Self {
             path: String::new(),
             encrypted: false,
-            flush_interval: Duration::from_millis(100),
+            commit_batch_window: Duration::ZERO,
             cache_dir: None,
             cache_size: None,
             cache_memory: None,
@@ -315,9 +336,189 @@ fn parse_checkpoint(checkpoint: Option<&str>) -> Result<Option<uuid::Uuid>> {
         .transpose()
 }
 
-/// One member of a [`Catalog::commit_group`] batch: a closure authoring
-/// one logical commit.
-pub type CommitMember<'a> = &'a (dyn Fn(&mut Transaction) -> Result<()> + Sync);
+/// How many times a read-write open re-probes after a racing migration fences
+/// its own migration write. Each retry re-reads a store one competitor has by
+/// then converted, so a small bound suffices.
+const MIGRATION_ATTEMPTS: usize = 8;
+
+/// A probe reader's stored structural format, as a read-write open classifies
+/// it.
+enum FormatClass {
+    /// No format stamp: an empty or unfinished store, to bootstrap.
+    Empty,
+    /// The slot-log format this binary attaches directly.
+    SlotLog,
+    /// A legacy format 1–3 store, to migrate to the slot-log format.
+    Legacy,
+    /// A format newer than this binary understands, to refuse.
+    TooNew(u64),
+}
+
+/// What `path` holds when an open could not read a store there: nothing to
+/// destroy (a fresh prefix to bootstrap), a SlateDB manifest (a store a peer
+/// created or is still creating — a benign race), or other objects (a damaged
+/// or foreign prefix a bootstrap must refuse to stamp over). A listing that
+/// fails answers `Foreign`: anything short of proof the prefix is empty denies
+/// creation.
+enum PrefixState {
+    Empty,
+    HasManifest,
+    Foreign,
+}
+
+async fn prefix_state(object_store: &Arc<dyn ObjectStore>, path: &str) -> PrefixState {
+    let prefix: Path = path.split('/').filter(|part| !part.is_empty()).collect();
+    let mut listing = object_store.list(Some(&prefix));
+    let mut foreign = false;
+    while let Some(entry) = listing.next().await {
+        match entry {
+            Ok(object) if object.location.as_ref().contains("manifest") => {
+                return PrefixState::HasManifest;
+            }
+            Ok(object) => {
+                warn!(
+                    path,
+                    found = %object.location,
+                    "refusing to create a store: the prefix already holds objects"
+                );
+                foreign = true;
+            }
+            Err(err) => {
+                warn!(
+                    path,
+                    error = %err,
+                    "refusing to create a store: the prefix could not be listed"
+                );
+                foreign = true;
+            }
+        }
+    }
+
+    if foreign {
+        PrefixState::Foreign
+    } else {
+        PrefixState::Empty
+    }
+}
+
+/// The outcome of probing a store before opening it read-write: a reader over
+/// an existing store, an empty prefix to bootstrap, or a peer mid-creation
+/// whose half-written manifest reads no consistent version yet — a race the
+/// caller waits out rather than a store to bootstrap or refuse.
+enum ProbeOutcome {
+    Reader(Box<(DbReader, Arc<CacheCounters>)>),
+    Empty,
+    Racing,
+}
+
+/// One materialized head, with what a slot-backed attach adds.
+struct HeadRead {
+    view: CatalogSnapshot,
+    /// The unfolded tail's writes; `None` on a single-topology store.
+    tail: Option<moraine_wal::Overlay>,
+    /// Set when the view came from a reader the materialization opened for
+    /// itself rather than the session's.
+    reader: Option<DbReader>,
+}
+
+/// A probe's read: the session it scans through and the head it resolves
+/// against.
+struct ProbeRead {
+    session: ReadSession,
+    head: HeadRead,
+}
+
+impl ProbeRead {
+    /// The handle to scan entries through: the reader the head's view came
+    /// from, which after a hole retry is not the session's.
+    fn handle(&self) -> ReadHandle<'_> {
+        match &self.head.reader {
+            Some(reader) => ReadHandle::Reader(reader),
+            None => self.session.handle(),
+        }
+    }
+
+    fn view(&self) -> &CatalogSnapshot {
+        &self.head.view
+    }
+
+    /// The stamp this probe reads at, both halves.
+    fn head_value(&self) -> crate::store::proto::HeadValue {
+        crate::store::proto::HeadValue {
+            snapshot_id: self.head.view.snapshot.snapshot_id,
+            batch_seq: self.head.view.batch_seq,
+        }
+    }
+
+    fn tail(&self) -> Option<&moraine_wal::Overlay> {
+        self.head.tail.as_ref()
+    }
+
+    /// Releases both the session and any reader the head opened.
+    async fn finish(self) {
+        slot_commit::release_reader(self.head.reader.as_ref()).await;
+        self.session.finish();
+    }
+}
+
+/// A raw dump's read: the scan handle it reads through and, on a slot-backed
+/// attach, the unfolded tail to overlay so a winner no folder has applied yet
+/// is not missed. Released by [`finish`](DumpRead::finish).
+pub(crate) enum DumpRead {
+    /// A pinned slot-log head: scans read through `reader` (or the one the
+    /// head opened past a truncation) overlaid with the tail.
+    Slots {
+        reader: Arc<DbReader>,
+        head: Box<crate::transaction::slot_commit::SlotHead>,
+    },
+}
+
+impl DumpRead {
+    /// The handle raw scans read through.
+    pub(crate) fn handle(&self) -> ReadHandle<'_> {
+        let Self::Slots { reader, head } = self;
+        head.handle(ReadHandle::Reader(reader))
+    }
+
+    /// The unfolded tail to overlay, `Some` for the overlay-accepting scan
+    /// functions this feeds.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn overlay(&self) -> Option<&moraine_wal::Overlay> {
+        let Self::Slots { head, .. } = self;
+        Some(&head.overlay)
+    }
+
+    /// The stamp this dump reads at, both halves: a maintenance batch reuses
+    /// the snapshot id, so the batch count is what says the store moved.
+    pub(crate) fn head_value(&self) -> crate::store::proto::HeadValue {
+        let Self::Slots { head, .. } = self;
+        crate::store::proto::HeadValue {
+            snapshot_id: head.view.snapshot.snapshot_id,
+            batch_seq: head.view.batch_seq,
+        }
+    }
+
+    /// Releases the reader a hole retry opened.
+    pub(crate) async fn finish(self) {
+        let Self::Slots { head, .. } = self;
+        slot_commit::release_reader(head.reader.as_ref()).await;
+    }
+}
+
+/// A point-in-time read of a slot-backed store's contention counters,
+/// accumulated across every commit through a handle and its clones. They
+/// measure slot-race pressure; a nonzero `races_lost` is the signal
+/// contention-triggered forwarding reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Contention {
+    /// Commits that won a slot.
+    pub commits: u64,
+    /// Slot races lost on the way to those wins.
+    pub races_lost: u64,
+    /// Commits that spent their retry budget without winning.
+    pub exhaustions: u64,
+}
 
 /// The read surface of a moraine catalog: cheap to clone, drives every
 /// read. This is what a read-only attach hands back, and what a
@@ -363,9 +564,6 @@ pub struct ReadOnlyCatalog {
     data_reads: Arc<data_file::DataStoreCounters>,
     location: Arc<StoreLocation>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
-    commits: Arc<commit::Coalescer>,
-    // `None` on a read-only handle.
-    writer_status: Option<watch::Receiver<DbStatus>>,
 }
 
 impl std::fmt::Debug for ReadOnlyCatalog {
@@ -447,10 +645,14 @@ impl ReadOnlyCatalog {
     /// this as a floor.
     #[must_use]
     pub fn projection_bytes(&self) -> u64 {
+        let Store::Slots(store) = self.store.as_ref();
+        // The decoded head lives in the head cache, the served projections
+        // beside it; both are this handle's decoded catalog.
         self.projections
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .estimated_bytes()
+            .saturating_add(store.head_cache.estimated_bytes())
     }
 
     /// Physical object-store requests this catalog has issued since it
@@ -510,39 +712,6 @@ impl ReadOnlyCatalog {
     #[cfg(test)]
     pub(crate) fn head_reads(&self) -> u64 {
         self.reads.head_reads.load(Ordering::Relaxed)
-    }
-
-    /// Refuses if this handle has lost the writer epoch, or its `Db` has
-    /// closed for any other reason. Reads the status channel only: no
-    /// store read and no session.
-    pub(crate) fn refuse_if_closed(&self) -> Result<()> {
-        let Some(status) = &self.writer_status else {
-            return Ok(());
-        };
-        match status.borrow().close_reason {
-            None => Ok(()),
-            Some(CloseReason::Fenced) => Err(crate::error::fenced()),
-            Some(reason) => Err(Error::Interrupted(format!(
-                "this catalog's store handle has closed ({reason:?}); re-attach to use it"
-            ))),
-        }
-    }
-
-    /// The held view a read-write handle may serve without resolving the
-    /// head from the store; `None` on a read-only handle, which always
-    /// reads. Callers must pair it with
-    /// [`refuse_if_closed`](Self::refuse_if_closed).
-    pub(crate) fn writer_head_view(&self) -> Option<Arc<CatalogSnapshot>> {
-        if !self.holds_the_writer() {
-            return None;
-        }
-        held_head_view(&self.projections)
-    }
-
-    /// Whether this handle is the store's writer, and so the only thing
-    /// that can move `sys/head`.
-    pub(crate) fn holds_the_writer(&self) -> bool {
-        matches!(self.store.as_ref(), Store::Writer(_))
     }
 
     /// An immutable view of the catalog at the latest committed snapshot.
@@ -631,9 +800,9 @@ impl ReadOnlyCatalog {
     /// # fn record_batch_bytes() -> Vec<u8> { b"body".to_vec() }
     /// ```
     pub async fn recent_rows(&self, table: TableId) -> Result<Vec<RecentRow>> {
-        let session = self.begin_read().await?;
-        let outcome = self.scan_recent_rows(&session, table, None).await;
-        session.finish();
+        let read = self.begin_probe().await?;
+        let outcome = self.scan_recent_rows(&read, table, None).await;
+        read.finish().await;
 
         outcome
     }
@@ -655,11 +824,11 @@ impl ReadOnlyCatalog {
         table: TableId,
         snapshot: SnapshotId,
     ) -> Result<Vec<RecentRow>> {
-        let session = self.begin_read().await?;
+        let read = self.begin_probe().await?;
         let outcome = self
-            .scan_recent_rows(&session, table, Some(snapshot.get()))
+            .scan_recent_rows(&read, table, Some(snapshot.get()))
             .await;
-        session.finish();
+        read.finish().await;
 
         outcome
     }
@@ -684,124 +853,104 @@ impl ReadOnlyCatalog {
     /// verifies it against the chunk scan and remembers the answer when
     /// the store format shuts out writers that predate the directory.
     pub(crate) async fn live_inline_row_ids(&self, table: TableId) -> Result<Vec<u64>> {
-        let session = self.begin_read().await?;
-        let outcome = self.scan_live_inline_row_ids(&session, table).await;
-        session.finish();
+        let read = self.begin_probe().await?;
+        let outcome = self.scan_live_inline_row_ids(&read, table).await;
+        read.finish().await;
 
         outcome
     }
 
     /// The view at `at`, or at head when `None`. Time travel always
     /// materializes: the cache holds head views only.
+    ///
+    /// A migration rewrites the keyspace under any reader already attached, so
+    /// this refuses one in progress the same way opening a session does — a
+    /// cached head is no reason to serve a view of a store being rewritten.
     async fn view(&self, at: Option<u64>) -> Result<Arc<CatalogSnapshot>> {
-        if at.is_some() {
-            let session = self.begin_read().await?;
-            let started = Instant::now();
-            let view = commit::materialize(session.handle(), at).await;
-            session.finish();
-            if view.is_ok() {
-                self.reads.materialized(started.elapsed());
+        let Store::Slots(store) = self.store.as_ref();
+        commit::refuse_mid_migration(ReadHandle::Reader(&store.reader)).await?;
+        match at {
+            None => {
+                self.note_head_read();
+                let head = slot_commit::cached_slot_head(store).await?;
+                slot_commit::release_reader(head.reader.as_ref()).await;
+                Ok(Arc::new(head.view))
             }
-
-            return view.map(Arc::new);
+            Some(snapshot) => {
+                let started = Instant::now();
+                let view = slot_commit::materialize_slot_view_at(store, snapshot).await?;
+                self.reads.materialized(started.elapsed());
+                Ok(Arc::new(view))
+            }
         }
-
-        // Captured before the first store read, so an invalidation racing
-        // this read cannot be overwritten by what it invalidated.
-        if let Some(view) = self.writer_head_view() {
-            self.refuse_if_closed()?;
-            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(view);
-        }
-
-        let epoch = cache_epoch(&self.projections);
-        let session = self.begin_read().await?;
-        let view = self.head_view(session.handle()).await;
-        session.finish();
-
-        let view = view?;
-        install_head_view_at(&self.projections, epoch, Arc::clone(&view));
-
-        Ok(view)
     }
 
-    /// The cached view when it already stands at head, a view refreshed
-    /// across the gap when it has fallen behind and the gap is replayable,
-    /// else a fresh materialization.
-    async fn head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
+    /// One head read: the view, and the byte-level overlay of the slots no
+    /// folder has applied — what a probe the projection does not model must
+    /// read over the store.
+    async fn head_view(&self) -> Result<HeadRead> {
+        let Store::Slots(store) = self.store.as_ref();
         self.note_head_read();
-        let head = commit::read_head_value(handle).await?;
-        if let Some(cached) = cached_head_view(&self.projections, &head) {
-            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(cached);
-        }
-
-        if let Some(behind) = held_head_view(&self.projections)
-            && let Some(refreshed) = commit::refresh(handle, &behind).await?
-        {
-            self.reads.refreshes.fetch_add(1, Ordering::Relaxed);
-            return Ok(Arc::new(refreshed));
-        }
-
-        // Derive from the shared `current` half before paying a scan. The
-        // stamp is re-verified under the same consistent cut the build
-        // reads through, so a derived view equals a scanned one; a store
-        // that moved in between reports `None` and falls through.
-        if let Some(current) = shared_current_entities(&self.projections, &head)
-            && let Some(view) = commit::materialize_from(handle, &head, &current).await?
-        {
-            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(Arc::new(view));
-        }
-
-        let started = Instant::now();
-        let (view, records) = commit::materialize_capturing(handle).await?;
-        self.reads.materialized(started.elapsed());
-        self.tally_current_scan();
-        // Stamped with the state the *view* settled at — the consistent
-        // cut may be newer than the head read above, never mismatched
-        // with the records.
-        install_shared_current_entities(
-            &self.projections,
-            HeadValue {
-                snapshot_id: view.snapshot.snapshot_id,
-                batch_seq: view.batch_seq,
-            },
-            records,
-        );
-
-        Ok(Arc::new(view))
+        // A fresh reader: entry scans read folder-written entries — index
+        // backfills above all — straight from the store, not the tail.
+        let head = slot_commit::materialize_slot_head_fresh(store).await?;
+        Ok(HeadRead {
+            view: head.view,
+            tail: Some(head.overlay),
+            reader: head.reader,
+        })
     }
 
-    /// Opens a read session at the current head — a read-write transaction or
-    /// the read-only reader — the same isolation
+    /// Opens a read session at the current head — the read-only reader shared
+    /// with the catalog — the same isolation
     /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
-    /// Every read of the store opens its session here, so this is where a
-    /// store mid-structural-migration is refused. The check is keyed on
-    /// the head: a migration start moves it, so a head already observed
-    /// clear opens without re-reading the marker — the head is rewritten
-    /// every batch and stays hot, where the absent marker is the store's
-    /// most expensive possible read.
+    ///
+    /// Every read in the crate opens its session here, so this is where a
+    /// store mid-structural-migration is refused. The check costs one point
+    /// read per session and belongs here rather than at each call site: a
+    /// reader that skips it scans a keyspace being rewritten under it and
+    /// returns a catalog with a hole in it, and an open-time check cannot
+    /// catch a migration that starts after the handle attached.
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
-        let session = match self.store.as_ref() {
-            Store::Writer(db) => ReadSession::Tx(
-                db.begin(IsolationLevel::Snapshot)
-                    .await
-                    .map_err(Error::from)?,
-            ),
-            Store::Reader(reader) => ReadSession::Reader(reader.clone()),
-        };
+        let Store::Slots(store) = self.store.as_ref();
+        let session = ReadSession::Reader(store.reader.clone());
 
-        let refused = async {
-            let head = commit::read_head_value(session.handle()).await?;
-            commit::refuse_mid_migration_at(session.handle(), &self.projections, &head).await
-        };
-        if let Err(error) = refused.await {
+        if let Err(error) = self.refuse_mid_migration_bounded(session.handle()).await {
             session.finish();
             return Err(error);
         }
 
         Ok(session)
+    }
+
+    /// [`commit::refuse_mid_migration`], looked up at most once per
+    /// `reader_poll_interval`.
+    ///
+    /// The marker is read through the session's own reader, whose view of the
+    /// store only advances on that interval, so asking again inside one window
+    /// returns the bytes already read. A marker planted by a migrator is met on
+    /// the first read past the window either way, and a marker found is never
+    /// memoized.
+    async fn refuse_mid_migration_bounded(&self, handle: ReadHandle<'_>) -> Result<()> {
+        let Store::Slots(store) = self.store.as_ref();
+        let window = store.options.reader_poll_interval;
+        {
+            let clear = store
+                .migration_clear
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if clear.is_some_and(|at| at.elapsed() < window) {
+                return Ok(());
+            }
+        }
+
+        commit::refuse_mid_migration(handle).await?;
+
+        *store
+            .migration_clear
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+        Ok(())
     }
 
     /// Closes the catalog, flushing background work.
@@ -815,60 +964,197 @@ impl ReadOnlyCatalog {
     ///
     /// Returns an error if the underlying store fails to close cleanly.
     pub async fn close(&self) -> Result<()> {
-        match self.store.as_ref() {
-            Store::Writer(db) => db.close().await.map_err(Error::from),
-            Store::Reader(reader) => reader.close().await.map_err(Error::from),
+        let Store::Slots(store) = self.store.as_ref();
+        store.reader.close().await.map_err(Error::from)
+    }
+
+    /// The slot-log-backed store behind this handle — the leader role
+    /// materializes heads, mints the secret, and races slots through it.
+    #[cfg(feature = "leader")]
+    pub(crate) fn slot_store(&self) -> &SlotStore {
+        let Store::Slots(store) = self.store.as_ref();
+        store
+    }
+
+    /// Opens a read session and materializes the head through it, so a probe's
+    /// entry scans and the catalog they resolve against are one cut. Released
+    /// by [`ProbeRead::finish`].
+    async fn begin_probe(&self) -> Result<ProbeRead> {
+        let session = self.begin_read().await?;
+        match self.head_view().await {
+            Ok(head) => Ok(ProbeRead { session, head }),
+            Err(err) => {
+                session.finish();
+                Err(err)
+            }
         }
+    }
+
+    /// Opens a read for the raw current+history dumps: a single read session
+    /// on a single-topology store, or the pinned slot-log head (reader plus
+    /// unfolded tail) on a slot-backed attach, so a dump taken mid-transaction
+    /// reflects a winner no folder has applied yet.
+    pub(crate) async fn begin_dump(&self) -> Result<DumpRead> {
+        let Store::Slots(store) = self.store.as_ref();
+        // A read-write attach reads through a reader opened for this dump, so a
+        // folder-role write — a mid-migration marker above all — is seen and a
+        // dump scanning a keyspace being rewritten refuses rather than serve a
+        // catalog with a hole. A read-only attach cannot be mid-migration (its
+        // open refuses one) and reads through the shared reader, whose warm
+        // block cache keeps a run of dumps from rescanning the store.
+        let head = if store.read_only {
+            slot_commit::cached_slot_head(store).await?
+        } else {
+            slot_commit::materialize_slot_head_fresh(store).await?
+        };
+        if let Err(err) =
+            commit::refuse_mid_migration(head.handle(ReadHandle::Reader(&store.reader))).await
+        {
+            slot_commit::release_reader(head.reader.as_ref()).await;
+            return Err(err);
+        }
+        Ok(DumpRead::Slots {
+            reader: store.reader.clone(),
+            head: Box::new(head),
+        })
+    }
+
+    /// Opens a read of commit-written catalog state: the cached slot head with
+    /// its unfolded tail.
+    ///
+    /// A slot-committed record reaches a reader through the overlay, so
+    /// serving one needs no reader of its own — where
+    /// [`begin_dump`](Self::begin_dump) opens one per call because a
+    /// folder-role write appears in neither the cached head nor the tail. A
+    /// caller reading records this handle's own commits produce belongs here;
+    /// one reading what a folder wrote does not.
+    pub(crate) async fn begin_catalog_read(&self) -> Result<DumpRead> {
+        let Store::Slots(store) = self.store.as_ref();
+        let head = slot_commit::cached_slot_head(store).await?;
+        if let Err(err) =
+            commit::refuse_mid_migration(head.handle(ReadHandle::Reader(&store.reader))).await
+        {
+            slot_commit::release_reader(head.reader.as_ref()).await;
+            return Err(err);
+        }
+        Ok(DumpRead::Slots {
+            reader: store.reader.clone(),
+            head: Box::new(head),
+        })
+    }
+
+    /// Test-only: every stored `(key, value)` under `prefix`, read through a
+    /// fresh slot head — the folded store overlaid with the unfolded tail — so
+    /// both folder-written entries and slot-committed ones are seen.
+    #[cfg(test)]
+    pub(crate) async fn scan_prefix_overlaid(&self, prefix: Vec<u8>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Store::Slots(store) = self.store.as_ref();
+        let head = slot_commit::materialize_slot_head_fresh(store)
+            .await
+            .unwrap();
+        let handle = head.handle(ReadHandle::Reader(&store.reader));
+        let mut merged: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut iter = handle
+            .scan_prefix(prefix.clone(), .., crate::store::handle::ScanShape::Bulk)
+            .await
+            .unwrap();
+        while let Some(entry) = iter.next().await.unwrap() {
+            merged.insert(entry.key.to_vec(), entry.value.to_vec());
+        }
+        for (key, value) in head.overlay.prefixed(&prefix) {
+            match value {
+                Some(bytes) => {
+                    merged.insert(key.to_vec(), bytes.to_vec());
+                }
+                None => {
+                    merged.remove(key);
+                }
+            }
+        }
+        slot_commit::release_reader(head.reader.as_ref()).await;
+        merged.into_iter().collect()
+    }
+
+    /// A snapshot of this store's contention counters — commits, slot races
+    /// lost, and budget exhaustions — accumulated across every commit through
+    /// this handle and its clones. A nonzero `races_lost` is the signal
+    /// contention-triggered forwarding reads; the counts measure slot-race
+    /// pressure over the handle's life. Reads atomics only, never the store.
+    #[must_use]
+    pub fn contention(&self) -> Contention {
+        let Store::Slots(store) = self.store.as_ref();
+        store.contention.snapshot()
+    }
+
+    /// Resolves whether `transaction_id` committed, and at which snapshot: the
+    /// exactly-once recovery surface for a committer that crashed mid-commit
+    /// and must not double-apply. Scans the unfolded slot tail and the folded
+    /// snapshot records above `floor`.
+    ///
+    /// `Some(snapshot)` is the snapshot the transaction committed at. `None`
+    /// means the commit never landed and a retry is safe — but only when
+    /// `floor` is at or below the head the original attempt validated against
+    /// and no truncation has passed it; a `floor` above the truncation horizon
+    /// could yield a false `None`. Both scans are bounded by truncation
+    /// retention and slot expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Corruption`] if the scanned tail has a hole below the
+    /// transaction — a possibly-committed transaction cannot be ruled out past
+    /// a destroyed slot — or a store error if a scan fails.
+    pub async fn transaction_outcome(
+        &self,
+        transaction_id: uuid::Uuid,
+        floor: SnapshotId,
+    ) -> Result<Option<SnapshotId>> {
+        let Store::Slots(store) = self.store.as_ref();
+        Ok(
+            slot_commit::transaction_outcome(store, transaction_id.into_bytes(), floor.get())
+                .await?
+                .map(SnapshotId::new),
+        )
     }
 }
 
 impl Catalog {
-    /// The underlying writer `Db`; a `Catalog` is only ever built around
-    /// one, so the reader arm is unreachable by construction.
-    fn writer(&self) -> Result<&Db> {
-        match self.store.as_ref() {
-            Store::Writer(db) => Ok(db),
-            Store::Reader(_) => Err(Error::Constraint(
-                "catalog opened read-only; writes are unavailable".to_string(),
-            )),
-        }
-    }
-
-    /// Raises the store's format to the newest purely additive one this
-    /// binary writes, ahead of the commit that would otherwise take it.
+    /// Reports the store's format and the highest a stamp alone could raise
+    /// it to.
     ///
-    /// One-way: a store that has taken the format can no longer be opened
-    /// by a binary that predates it, and a reader already attached on one
-    /// is not refused — it keeps running and may misread later commits.
-    /// Raise it only once every reader is on a binary that understands
-    /// it.
-    ///
-    /// `dry_run` reports the move it would make and stamps nothing — the
-    /// only way to read a store's format without moving it.
+    /// A store whose commits ride the slot log is stamped at bootstrap with a
+    /// format above every one a stamp reaches, so there is never a move to
+    /// make and `dry_run` reads the same either way. It is still how an
+    /// operator asks a store what format it carries.
     ///
     /// # Errors
     ///
-    /// Returns an error if the store is mid-migration, or if the stamp
-    /// cannot be committed durably.
+    /// Returns an error if the store cannot be read, or is mid-migration.
     pub async fn raise_format(
         &self,
         dry_run: bool,
     ) -> Result<crate::transaction::migration::FormatRaise> {
-        let raised = crate::transaction::migration::raise_format(self.writer()?, dry_run).await?;
-        if !dry_run {
-            crate::catalog::projection::raise_format_floor(self.projections(), raised.to_format);
-        }
-        Ok(raised)
+        let _ = dry_run;
+        let Store::Slots(store) = self.store.as_ref();
+        let handle = ReadHandle::Reader(&store.reader);
+        // The unmemoized look: an operator asking about a migration is owed a
+        // current answer, not one a read window may still be standing on.
+        commit::refuse_mid_migration(handle).await?;
+        let from_format = crate::store::read::read_format(handle)
+            .await?
+            .map_or(commit::FORMAT_VERSION, |stamp| stamp.format_version);
+
+        Ok(crate::transaction::migration::raise_format_stamped(
+            from_format,
+        ))
     }
 
     /// Opens (creating and initializing if empty) the catalog in
     /// `object_store` at `options.path`.
     ///
-    /// Exactly one process may hold a read-write catalog per store —
-    /// opening a second fences the first. An open that is fenced while
-    /// *creating* the catalog re-attempts a few times before reporting it:
-    /// nothing of the fenced attempt reached the store, so the re-attempt
-    /// either adopts the catalog the other process created or creates it.
+    /// Several processes may hold a read-write catalog per store: commits
+    /// arbitrate through the slot log rather than a single writer epoch. A
+    /// legacy store is migrated to the slot-log format on the way in.
     ///
     /// # Errors
     ///
@@ -903,44 +1189,226 @@ impl Catalog {
             .await
             .ok();
         warn_if_preload_cannot_fit(&options, manifest);
-        let store = StoreBuilder::new(&options.path, object_store)
-            .flush_interval(options.flush_interval)
-            .cache_dir(options.cache_dir.clone())
-            .cache_size(options.cache_size)
-            .cache_memory(options.cache_memory)
-            .cache_preload(options.cache_preload)
-            .cache_puts(options.cache_puts);
-        let (db, cache, format) =
-            commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
-                .await?;
+        let (reader, cache) =
+            Box::pin(Self::open_read_write_reader(&object_store, &options)).await?;
         warn_if_metadata_cache_cannot_hold(
             &options.path,
             manifest.map(|manifest| manifest.metadata_bytes),
         );
         info!(
             path = options.path,
-            flush_interval_ms = options.flush_interval.as_millis(),
+            poll_interval_ms = options.reader_poll_interval.as_millis(),
             "opened catalog read-write"
         );
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
-        // The open already validated the stamp; commits below this floor
-        // owe no format read.
-        crate::catalog::projection::raise_format_floor(&projections, format);
+        // A read-write attach always lands at the slot-log format: the open
+        // bootstraps or migrates until it does.
+        crate::catalog::projection::raise_format_floor(&projections, commit::FORMAT_MULTI_WRITER);
+        let location = Arc::new(StoreLocation {
+            path: options.path.clone(),
+            object_store: located,
+        });
+        let slots = moraine_wal::SlotLog::new(Arc::clone(&object_store), &options.path);
+        let coalescer = slot_commit::CommitCoalescer::new(options.commit_batch_window);
         Ok(Self {
             inner: ReadOnlyCatalog {
-                writer_status: Some(db.subscribe()),
-                store: Arc::new(Store::Writer(db)),
-                location: Arc::new(StoreLocation {
-                    path: options.path,
-                    object_store: located,
-                }),
+                store: Arc::new(Store::Slots(Box::new(SlotStore {
+                    reader: Arc::new(reader),
+                    slots,
+                    object_store,
+                    options,
+                    read_only: false,
+                    pinned: false,
+                    coalescer,
+                    projections: Arc::clone(&projections),
+                    migration_clear: Arc::new(std::sync::Mutex::new(None)),
+                    pre_log_head: Arc::new(tokio::sync::OnceCell::new()),
+                    head_cache: slot_commit::HeadCache::default(),
+                    contention: Arc::new(slot_commit::ContentionCounters::default()),
+                    #[cfg(feature = "leader")]
+                    forwarding: Arc::new(slot_commit::Forwarding::default()),
+                }))),
+                location,
                 reads: Arc::new(ReadTally::default()),
                 cache,
                 data_reads: Arc::default(),
-                commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
                 projections,
             },
         })
+    }
+
+    /// Resolves a read-write attach to the reader it follows: bootstraps an
+    /// empty store at [`commit::FORMAT_MULTI_WRITER`], attaches a store already
+    /// there, migrates a legacy format 1–3 store in one atomic batch, and
+    /// refuses a format newer than this binary understands. A migration whose
+    /// write a racing migration fenced re-probes and finds the store converted.
+    async fn open_read_write_reader(
+        object_store: &Arc<dyn ObjectStore>,
+        options: &CatalogOptions,
+    ) -> Result<(DbReader, Arc<CacheCounters>)> {
+        for attempt in 0..MIGRATION_ATTEMPTS {
+            let (reader, cache) = match Self::open_probe_reader(object_store, options).await? {
+                ProbeOutcome::Reader(reader) => *reader,
+                // Empty, or a peer mid-creation: route to the writer path, which
+                // SlateDB serializes by fencing. A concurrent creator can still
+                // leave the store half-formed, so a failed bootstrap backs off
+                // and re-probes — one racer wins and the rest adopt it.
+                ProbeOutcome::Empty | ProbeOutcome::Racing => {
+                    match Self::bootstrap_slot_reader(object_store, options).await {
+                        Ok(opened) => return Ok(opened),
+                        // A definitively lost race — a peer already created the
+                        // store — names itself; surface it rather than retry.
+                        Err(err @ Error::OpenRaced(_)) => return Err(err),
+                        Err(_) if attempt + 1 < MIGRATION_ATTEMPTS => {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                1u64 << attempt.min(6),
+                            ))
+                            .await;
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            };
+            match Self::classify_format(&reader).await?.0 {
+                FormatClass::SlotLog => return Ok((reader, cache)),
+                FormatClass::Empty => {
+                    reader.close().await.map_err(Error::from)?;
+                    match Self::bootstrap_slot_reader(object_store, options).await {
+                        Ok(opened) => return Ok(opened),
+                        // A definitively lost race — a peer already created the
+                        // store — names itself; surface it rather than retry.
+                        Err(err @ Error::OpenRaced(_)) => return Err(err),
+                        Err(_) if attempt + 1 < MIGRATION_ATTEMPTS => {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                1u64 << attempt.min(6),
+                            ))
+                            .await;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                FormatClass::TooNew(version) => {
+                    reader.close().await.map_err(Error::from)?;
+                    return Err(Error::Configuration(format!(
+                        "store format {version} is newer than this binary understands \
+                         (up to {}); upgrade moraine to attach it",
+                        commit::MAX_FORMAT_VERSION
+                    )));
+                }
+                FormatClass::Legacy => {
+                    reader.close().await.map_err(Error::from)?;
+                    let writer_store = StoreBuilder::new(&options.path, object_store.clone())
+                        .cache_dir(options.cache_dir.clone())
+                        .cache_size(options.cache_size)
+                        .cache_memory(options.cache_memory)
+                        .cache_preload(options.cache_preload)
+                        .cache_puts(options.cache_puts);
+                    match commit::migrate_to_slot_log(writer_store).await {
+                        // Converted, or a racing migration converted it first:
+                        // fall through to re-probe, which finds the slot format.
+                        Ok(()) | Err(Error::Fenced(_)) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        }
+        Err(Error::Fenced(
+            "a legacy store's migration was fenced repeatedly and never converged; \
+             retry the attach"
+                .to_string(),
+        ))
+    }
+
+    /// Opens a probe reader over the store: a reader when the prefix is
+    /// readable, otherwise what the prefix holds — a known-empty prefix that
+    /// licenses a bootstrap, or a peer mid-creation to wait out. A prefix
+    /// holding objects whose manifest will not open is a damaged store, and
+    /// the error propagates rather than stamping over it.
+    async fn open_probe_reader(
+        object_store: &Arc<dyn ObjectStore>,
+        options: &CatalogOptions,
+    ) -> Result<ProbeOutcome> {
+        let reader_store = StoreBuilder::new(&options.path, object_store.clone())
+            .poll_interval(options.reader_poll_interval)
+            .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_memory(options.cache_memory)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts);
+        match reader_store.open_reader().await {
+            Ok(opened) => Ok(ProbeOutcome::Reader(Box::new(opened))),
+            Err(err) => match prefix_state(object_store, &options.path).await {
+                PrefixState::Empty => Ok(ProbeOutcome::Empty),
+                PrefixState::HasManifest => Ok(ProbeOutcome::Racing),
+                PrefixState::Foreign => Err(err),
+            },
+        }
+    }
+
+    /// Classifies a probe reader's stored structural format, with the version
+    /// it read (zero when the store carries no stamp).
+    async fn classify_format(reader: &DbReader) -> Result<(FormatClass, u64)> {
+        let handle = ReadHandle::Reader(reader);
+        if crate::store::read::read_migration(handle).await?.is_some() {
+            return Err(Error::Migration(
+                "store is mid-migration; refusing to open — Catalog::migrate resumes it from \
+                 the durable cursor, and takes a store path rather than an open catalog, so it \
+                 runs against a store no attach will touch"
+                    .to_string(),
+            ));
+        }
+        match crate::store::read::read_format(handle).await? {
+            None => Ok((FormatClass::Empty, 0)),
+            Some(format) if format.format_version == commit::FORMAT_MULTI_WRITER => {
+                Ok((FormatClass::SlotLog, format.format_version))
+            }
+            Some(format) if format.format_version > commit::MAX_FORMAT_VERSION => Ok((
+                FormatClass::TooNew(format.format_version),
+                format.format_version,
+            )),
+            Some(format) if format.format_version < commit::MIN_FORMAT_VERSION => {
+                Err(Error::Configuration(format!(
+                    "store format {} predates this binary's minimum ({}); it cannot be attached",
+                    format.format_version,
+                    commit::MIN_FORMAT_VERSION
+                )))
+            }
+            Some(format) => Ok((FormatClass::Legacy, format.format_version)),
+        }
+    }
+
+    /// Bootstraps an empty store at the slot-log format through the writer,
+    /// fencing any incumbent old-binary writer, then closes it and reopens
+    /// read-only.
+    async fn bootstrap_slot_reader(
+        object_store: &Arc<dyn ObjectStore>,
+        options: &CatalogOptions,
+    ) -> Result<(DbReader, Arc<CacheCounters>)> {
+        let writer_store = StoreBuilder::new(&options.path, object_store.clone())
+            .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_memory(options.cache_memory)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts);
+        let (db, _, _) = commit::open_initialized(
+            writer_store,
+            options.encrypted,
+            options.data_path.as_deref(),
+        )
+        .await?;
+        db.close().await.map_err(Error::from)?;
+
+        let reader_store = StoreBuilder::new(&options.path, object_store.clone())
+            .poll_interval(options.reader_poll_interval)
+            .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_memory(options.cache_memory)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts);
+        let (reader, cache, _) = commit::open_reader_initialized(reader_store).await?;
+
+        Ok((reader, cache))
     }
 
     /// Opens the catalog **read-only** in `object_store` at `options.path`,
@@ -996,7 +1464,7 @@ impl Catalog {
             .await
             .ok();
         warn_if_preload_cannot_fit(&options, manifest);
-        let store = StoreBuilder::new(&options.path, object_store)
+        let store = StoreBuilder::new(&options.path, Arc::clone(&object_store))
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
             .cache_memory(options.cache_memory)
@@ -1005,7 +1473,35 @@ impl Catalog {
             .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
 
-        let (reader, cache, format) = commit::open_reader_initialized(store).await?;
+        // A store with no manifest fails to open at all; the failure propagates
+        // (a read-only attach never bootstraps).
+        let (reader, cache) = store.open_reader().await?;
+        let format = match Self::classify_format(&reader).await {
+            // Format 1–7 all serve read-only.
+            Ok((FormatClass::SlotLog | FormatClass::Legacy, version)) => version,
+            Ok((FormatClass::Empty, _)) => {
+                slot_commit::release_reader(Some(&reader)).await;
+                return Err(Error::Corruption(
+                    "store is not an initialized moraine catalog; a read-only attach \
+                     needs a writer to have created it first"
+                        .to_string(),
+                ));
+            }
+            // A too-new format is a compatibility problem, not corruption — the
+            // same kind the read-write path refuses it with.
+            Ok((FormatClass::TooNew(version), _)) => {
+                slot_commit::release_reader(Some(&reader)).await;
+                return Err(Error::Configuration(format!(
+                    "store format {version} is newer than this binary understands \
+                     (up to {}); upgrade moraine to attach it",
+                    commit::MAX_FORMAT_VERSION
+                )));
+            }
+            Err(err) => {
+                slot_commit::release_reader(Some(&reader)).await;
+                return Err(err);
+            }
+        };
         warn_if_metadata_cache_cannot_hold(
             &options.path,
             manifest.map(|manifest| manifest.metadata_bytes),
@@ -1017,17 +1513,39 @@ impl Catalog {
         );
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         crate::catalog::projection::raise_format_floor(&projections, format);
+
+        // Every readable store serves read-only through the slot topology: a
+        // legacy format 1–3 store never migrates (a read-only attach writes
+        // nothing), and its absent fold cursor reads as 0 with an empty tail,
+        // so it is a slot store with no slots.
+        let location = Arc::new(StoreLocation {
+            path: options.path.clone(),
+            object_store: located,
+        });
+        let slots = moraine_wal::SlotLog::new(Arc::clone(&object_store), &options.path);
+        let coalescer = slot_commit::CommitCoalescer::new(options.commit_batch_window);
+        let pinned = options.checkpoint.is_some();
         Ok(ReadOnlyCatalog {
-            writer_status: None,
-            store: Arc::new(Store::Reader(Arc::new(reader))),
-            location: Arc::new(StoreLocation {
-                path: options.path,
-                object_store: located,
-            }),
+            store: Arc::new(Store::Slots(Box::new(SlotStore {
+                reader: Arc::new(reader),
+                slots,
+                object_store,
+                options,
+                read_only: true,
+                pinned,
+                coalescer,
+                projections: Arc::clone(&projections),
+                migration_clear: Arc::new(std::sync::Mutex::new(None)),
+                pre_log_head: Arc::new(tokio::sync::OnceCell::new()),
+                head_cache: slot_commit::HeadCache::default(),
+                contention: Arc::new(slot_commit::ContentionCounters::default()),
+                #[cfg(feature = "leader")]
+                forwarding: Arc::new(slot_commit::Forwarding::default()),
+            }))),
+            location,
             reads: Arc::new(ReadTally::default()),
             cache,
             data_reads: Arc::default(),
-            commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
             projections,
         })
     }
@@ -1078,7 +1596,6 @@ impl Catalog {
         request: MigrationRequest,
     ) -> Result<MigrationReport> {
         let (db, _cache) = StoreBuilder::new(&options.path, object_store.clone())
-            .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
             .cache_memory(options.cache_memory)
@@ -1124,7 +1641,16 @@ impl Catalog {
     /// creating a checkpoint is a manifest write — or a store error if the
     /// write fails.
     pub async fn create_checkpoint(&self, lifetime: Option<Duration>) -> Result<String> {
-        let id = open::create_checkpoint(self.writer()?, lifetime).await?;
+        // A checkpoint captures the folded store and a pinned reader never
+        // replays the tail, so every committed slot is folded in before the cut
+        // is taken.
+        let Store::Slots(store) = self.store.as_ref();
+        if !store.read_only {
+            folder::fold_sprint(store, u64::MAX).await?;
+        }
+        let id = self
+            .with_writer(async |db| open::create_checkpoint(db, lifetime).await)
+            .await?;
         info!(checkpoint = %id, "created a checkpoint");
         Ok(id.to_string())
     }
@@ -1170,20 +1696,6 @@ impl Catalog {
             .list_checkpoints()
             .await?;
         Ok(ids.iter().map(uuid::Uuid::to_string).collect())
-    }
-
-    /// Opens a read-write transaction for the staged-row commit path. Fails
-    /// with [`Error::Constraint`] on a read-only catalog.
-    /// The open store, shared so a spent transaction can still read.
-    pub(crate) fn store(&self) -> Arc<Store> {
-        Arc::clone(&self.store)
-    }
-
-    pub(crate) async fn begin_write_tx(&self) -> Result<DbTransaction> {
-        self.writer()?
-            .begin(IsolationLevel::Snapshot)
-            .await
-            .map_err(Error::from)
     }
 
     /// Commits catalog mutations atomically, producing one new snapshot.
@@ -1239,57 +1751,184 @@ impl Catalog {
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
-        let ids =
-            commit::commit_cycle(self.writer()?, std::slice::from_ref(&f), &self.commits).await?;
-        ids.first().copied().ok_or_else(|| {
-            Error::Corruption("a commit of one member reported no snapshot".to_string())
-        })
+        let Store::Slots(store) = self.store.as_ref();
+        store.coalescer.commit(store, &f).await
     }
 
-    /// Commits several mutations as one batch, made durable by one flush.
-    ///
-    /// Each closure is its own logical commit with its own snapshot — a
-    /// group batches commits, it does not merge them — so the returned ids
-    /// are one per member, in member order, and time travel resolves each
-    /// separately. Members run in the order given, and each stages against
-    /// the state the members before it left, so a group never conflicts
-    /// with itself. Where [`Catalog::commit`] costs one durable flush per
-    /// mutation, a group costs one for all of them.
-    ///
-    /// The batch is the unit of durability: a crash leaves every member
-    /// committed or none of them, and a member that fails aborts the whole
-    /// group, including members that already staged. Closures may be re-run
-    /// as a group after a lost race with a concurrent commit, so the purity
-    /// requirement of [`Catalog::commit`] applies to every member.
+    /// Whether direct-store writes are available: a read-write slot-backed
+    /// attach (through the folder role). A read-only attach refuses.
+    fn ensure_writable(&self) -> Result<()> {
+        match self.store.as_ref() {
+            Store::Slots(store) if !store.read_only => Ok(()),
+            Store::Slots(_) => Err(Error::Constraint(
+                "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+        }
+    }
+
+    /// Runs `body` against a writable `Db` for a direct-store maintenance
+    /// write: a read-write attach opens a fenced folder session for it — the
+    /// one process allowed to write the store directly — and a read-only attach
+    /// refuses.
+    pub(crate) async fn with_writer<T, F>(&self, body: F) -> Result<T>
+    where
+        F: AsyncFnOnce(&Db) -> Result<T>,
+    {
+        match self.store.as_ref() {
+            Store::Slots(store) if !store.read_only => folder::with_folder(store, body).await,
+            Store::Slots(_) => Err(Error::Constraint(
+                "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+        }
+    }
+
+    /// Runs `body` against the writable folder `Db`, for tests that plant
+    /// direct-store keys under a live handle.
+    #[cfg(test)]
+    pub(crate) async fn with_folder_writer<T, F>(&self, body: F) -> Result<T>
+    where
+        F: AsyncFnOnce(&Db) -> Result<T>,
+    {
+        self.with_writer(body).await
+    }
+
+    /// Test-only: writes `entries` straight into the folded store under the
+    /// folder role — the state a completed fold would leave, so the folder-role
+    /// sweep can be exercised before a fold implementation lands.
+    #[cfg(test)]
+    pub(crate) async fn seed_folded_writes(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) {
+        self.with_writer(async |db| {
+            let tx = db
+                .begin(slatedb::IsolationLevel::Snapshot)
+                .await
+                .map_err(Error::from)?;
+            for (key, value) in &entries {
+                tx.put(key.clone(), value.clone()).map_err(Error::from)?;
+            }
+            commit::commit_durably(db, tx).await.map_err(Error::from)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Opens a staged-row transaction: materializes the head and pins it, so
+    /// the staged batch races one slot at commit. A read-only attach returns
+    /// [`Error::Constraint`].
+    pub(crate) async fn begin_staged(
+        &self,
+        data_store: Option<data_file::DataStore>,
+        data_prefix: String,
+    ) -> Result<crate::transaction::staged::StagedTransaction> {
+        use crate::transaction::staged::StagedTransaction;
+
+        let Store::Slots(store) = self.store.as_ref();
+        if store.read_only {
+            return Err(Error::Constraint(
+                "catalog attached read-only; writes are unavailable".to_string(),
+            ));
+        }
+        // The commit premise: the frontier is settled by a LIST either way, and
+        // a cached view the new slots chain onto spares the folded-store scan.
+        let head = slot_commit::revalidated_slot_head(store).await?;
+        let transaction = StagedTransaction::begin_slots(
+            head,
+            store.reader.clone(),
+            store.slots.clone(),
+            data_store,
+            data_prefix,
+            store.head_cache.clone(),
+            Arc::clone(&store.contention),
+            self.data_reads(),
+            Arc::clone(self.projections()),
+        );
+
+        // A lost race arms forwarding: this fresh re-drive opens forwarded when a
+        // leader is reachable, direct otherwise. An uncontended transaction never
+        // reaches this and never connects.
+        #[cfg(feature = "leader")]
+        let transaction = match slot_commit::forward_target(store).await? {
+            Some(target) => transaction.forwarded(slot_commit::forward_context(store, target)),
+            None => transaction,
+        };
+
+        Ok(transaction)
+    }
+
+    /// One bounded fold pass: opens the fenced writer, applies up to `limit`
+    /// unfolded slots — each as one atomic batch advancing the fold cursor —
+    /// and closes, leaving the store an accurate index of the log that far.
+    /// Folding is invisible to readers: the served state is byte-identical
+    /// before and after. Resuming after a crash re-reads the durable cursor and
+    /// never re-applies a folded slot.
     ///
     /// # Errors
     ///
-    /// Returns whatever error any member returns (the whole group is
-    /// aborted), or the errors [`Catalog::commit`] documents — a conflict
-    /// or an exhausted retry budget applies to the group as a whole.
+    /// Returns [`Error::Constraint`] on a read-only attach, [`Error::Fenced`]
+    /// if a concurrent folder fenced this session, [`Error::Corruption`] if the
+    /// tail has a hole or a slot does not chain, or a store error.
+    pub async fn fold_sprint(&self, limit: u64) -> Result<FoldReport> {
+        let store = self.folder_store()?;
+        folder::fold_sprint(store, limit).await
+    }
+
+    /// Slots committed but not yet folded — the clock-free staleness signal.
+    /// One tail-length probe from the fold cursor: existence checks, no slot
+    /// bodies fetched.
     ///
-    /// # Examples
+    /// # Errors
     ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use moraine::{Catalog, CatalogOptions, Transaction};
-    /// # use object_store::memory::InMemory;
-    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
-    /// let ids = catalog
-    ///     .commit_group(&[
-    ///         &|tx: &mut Transaction| tx.create_schema("sales").map(|_| ()),
-    ///         &|tx: &mut Transaction| tx.create_schema("ops").map(|_| ()),
-    ///     ])
-    ///     .await?;
+    /// Returns [`Error::Constraint`] on a read-only attach, or a store error.
+    pub async fn unfolded_tail(&self) -> Result<u64> {
+        let store = self.folder_store()?;
+        folder::unfolded_tail(store).await
+    }
+
+    /// The self-appointment rule: if the unfolded tail exceeds `threshold`,
+    /// wait `delay` plus jitter, re-check fold progress, and sprint only if no
+    /// other folder advanced the cursor. `Ok(None)` means this handle stood
+    /// down — the tail was short, or a peer folded during the wait.
     ///
-    /// // Two snapshots, one flush.
-    /// assert_eq!(ids.len(), 2);
-    /// assert_eq!(ids[1].get(), ids[0].get() + 1);
-    /// assert!(catalog.snapshot_at(ids[0]).await?.schema_by_name("ops").is_none());
-    /// # Ok::<(), moraine::Error>(()) }).unwrap();
-    /// ```
-    pub async fn commit_group(&self, members: &[CommitMember<'_>]) -> Result<Vec<SnapshotId>> {
-        commit::commit_cycle(self.writer()?, members, &self.commits).await
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] on a read-only attach, [`Error::Fenced`]
+    /// if a concurrent folder fenced this session, or a store error.
+    pub async fn fold_if_stalled(
+        &self,
+        threshold: u64,
+        delay: Duration,
+        limit: u64,
+    ) -> Result<Option<FoldReport>> {
+        let store = self.folder_store()?;
+        folder::fold_if_stalled(store, threshold, delay, limit).await
+    }
+
+    /// Deletes slots durably folded into the store, oldest first, and returns
+    /// how many were removed. The horizon is the lower of two bounds: the fold
+    /// cursor as seen by the attach's reader (durable by construction — a
+    /// reader cannot see a memtable), and the fold cursor the oldest live
+    /// reader still sits at, held back by a retention margin. Truncation is
+    /// conservative garbage collection: it never deletes a slot a reader
+    /// still needs to resolve state, so it may remove nothing when readers
+    /// lag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] on a read-only attach, or a store error.
+    pub async fn truncate_folded_slots(&self) -> Result<u64> {
+        let store = self.folder_store()?;
+        folder::truncate_folded_slots(store).await
+    }
+
+    /// The slot store a folder surface runs against, refusing a read-only
+    /// attach: folding and the staleness signal are the writer's monopoly.
+    fn folder_store(&self) -> Result<&SlotStore> {
+        let Store::Slots(store) = self.store.as_ref();
+        if store.read_only {
+            return Err(Error::Constraint(
+                "catalog attached read-only; folding is unavailable".to_string(),
+            ));
+        }
+        Ok(store)
     }
 }

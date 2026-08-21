@@ -9,11 +9,11 @@
 //! kinds yield only their single current row since they are never mirrored
 //! to history. DuckLake filters lifecycles in SQL over these rows.
 //!
-//! Every function opens one fresh read session, and most are served from a
+//! Every function opens one fresh dump read, and most are served from a
 //! maintained projection when its head matches rather than by rescanning.
 //! Views spanning several `dump_*` calls are not snapshot-consistent: each
 //! call reads at whatever the current head is when it runs. Opening that
-//! session refuses a store undergoing a structural migration, so every
+//! read refuses a store undergoing a structural migration, so every
 //! function here can return [`crate::Error::Migration`] however it would
 //! otherwise have succeeded.
 //!
@@ -35,34 +35,11 @@ use crate::{
             TableValue, TagValue, ViewValue,
         },
         read::{
-            EntityRecord, read_head, scan_current_entities, scan_history_entities,
-            scan_schema_versions, scan_snapshots,
+            EntityRecord, scan_current_entities_overlaid, scan_history_entities_overlaid,
+            scan_schema_versions_overlaid, scan_snapshots_overlaid,
         },
     },
 };
-
-/// The head snapshot id inside an open read session, or `None` on a
-/// store that has no head yet (mid-bootstrap).
-async fn session_head(
-    catalog: &ReadOnlyCatalog,
-    session: &crate::store::handle::ReadSession,
-) -> Result<Option<HeadValue>> {
-    catalog.note_head_read();
-    read_head(session.handle()).await
-}
-
-/// The stamp of the view a read-write handle already holds, usable as a
-/// projection lookup key without a head read. `None` on a read-only handle
-/// or a writer whose view is not held. Only a lookup key: a miss falls
-/// through to the session path.
-fn writer_head(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> {
-    let Some(view) = catalog.writer_head_view() else {
-        return Ok(None);
-    };
-    catalog.refuse_if_closed()?;
-
-    Ok(Some(crate::catalog::projection::view_head(&view)))
-}
 
 /// Locks the shared projection state for reading, recovering a poisoned
 /// lock.
@@ -110,14 +87,12 @@ pub use crate::store::proto::{
 /// snapshot id.
 #[doc(hidden)]
 pub async fn head_stamp(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> {
-    if let Some(head) = writer_head(catalog)? {
-        return Ok(Some(head));
-    }
+    let dump = catalog.begin_dump().await?;
+    catalog.note_head_read();
+    let head = dump.head_value();
+    dump.finish().await;
 
-    let session = catalog.begin_read().await?;
-    let head = session_head(catalog, &session).await;
-    session.finish();
-    head
+    Ok(Some(head))
 }
 
 /// Whether a caller needs the ended half, and if it depends on the head,
@@ -150,7 +125,7 @@ impl HistoryNeed {
     }
 }
 
-/// The shared record set's two halves at the session head, each served
+/// The shared record set's two halves at the dump's head, each served
 /// from the projection cache when its stamp matches and scanned at most
 /// once otherwise.
 ///
@@ -166,24 +141,9 @@ async fn entity_halves(
     Arc<Vec<EntityRecord>>,
     Arc<Vec<EntityRecord>>,
 )> {
-    // A read-write handle's held view is at head, so a read served wholly
-    // from the cache needs neither a session nor a head read.
-    if let Some(head) = writer_head(catalog)? {
-        let want_history = history.wants_history(Some(&head));
-        let projections = projections_read(catalog);
-        if let Some(current) = projections.current_entities_at(&head) {
-            let held_history = projections.history_entities_at(&head);
-            if !want_history {
-                return Ok((Some(head), current, Arc::new(Vec::new())));
-            }
-            if let Some(history) = held_history {
-                return Ok((Some(head), current, history));
-            }
-        }
-    }
-
-    let session = catalog.begin_read().await?;
-    let head = session_head(catalog, &session).await?;
+    let dump = catalog.begin_dump().await?;
+    let head = Some(dump.head_value());
+    catalog.note_head_read();
     let want_history = history.wants_history(head.as_ref());
 
     let (held_current, held_history) = match &head {
@@ -200,42 +160,41 @@ async fn entity_halves(
     if let Some(current) = &held_current
         && history_settled
     {
-        session.finish();
+        dump.finish().await;
         let history = held_history.unwrap_or_default();
         return Ok((head, Arc::clone(current), history));
     }
 
-    // Scan only the missing halves, under one consistent cut. The closure
-    // may re-run on a read-only handle, so it clones what it captures.
-    let handle = session.handle();
-    let current_held = held_current.clone();
-    let history_held = held_history.clone();
-    let scanned = crate::store::read::consistent(handle, || {
-        let current_held = current_held.clone();
-        let history_held = history_held.clone();
-        async move {
-            let current = async {
-                if let Some(records) = current_held {
-                    return Ok(records);
+    // Scan only the missing halves. The dump pins one head across store and
+    // unfolded tail, so the halves already agree without a stable-read retry.
+    let handle = dump.handle();
+    let overlay = dump.overlay();
+    let scanned = async {
+        let current = async {
+            if let Some(records) = held_current.clone() {
+                return Ok(records);
+            }
+            catalog.tally_current_scan();
+            Ok::<_, Error>(Arc::new(
+                scan_current_entities_overlaid(handle, overlay).await?,
+            ))
+        };
+        let history = async {
+            match (&held_history, want_history) {
+                (Some(records), _) => Ok(Arc::clone(records)),
+                (None, true) => {
+                    catalog.tally_history_scan();
+                    Ok::<_, Error>(Arc::new(
+                        scan_history_entities_overlaid(handle, overlay).await?,
+                    ))
                 }
-                catalog.tally_current_scan();
-                Ok::<_, Error>(Arc::new(scan_current_entities(handle).await?))
-            };
-            let history = async {
-                match (&history_held, want_history) {
-                    (Some(records), _) => Ok(Arc::clone(records)),
-                    (None, true) => {
-                        catalog.tally_history_scan();
-                        Ok::<_, Error>(Arc::new(scan_history_entities(handle).await?))
-                    }
-                    (None, false) => Ok(Arc::new(Vec::new())),
-                }
-            };
-            futures::try_join!(current, history)
-        }
-    })
+                (None, false) => Ok(Arc::new(Vec::new())),
+            }
+        };
+        futures::try_join!(current, history)
+    }
     .await;
-    session.finish();
+    dump.finish().await;
     let (current, history) = scanned?;
 
     if let Some(head) = &head {
@@ -419,25 +378,17 @@ async fn dump_projected_current<K: Ord, T: Clone>(
     install: impl Fn(&mut ProjectionCache, HeadValue, Vec<T>),
     extract: impl Fn(&EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
-    // Each serve is bound in a statement of its own so the cache lock is
-    // released before the rows are copied out of it.
-    if let Some(head) = writer_head(catalog)? {
-        let served = read(&projections_read(catalog), &head);
-        if let Some(rows) = served {
-            return Ok(projection::materialize(&rows));
-        }
-    }
-
-    let session = catalog.begin_read().await?;
-    let head = session_head(catalog, &session).await?;
+    let dump = catalog.begin_dump().await?;
+    catalog.note_head_read();
+    let head = Some(dump.head_value());
     if let Some(head) = &head {
         let served = read(&projections_read(catalog), head);
         if let Some(rows) = served {
-            session.finish();
+            dump.finish().await;
             return Ok(projection::materialize(&rows));
         }
     }
-    session.finish();
+    dump.finish().await;
 
     // Installed at the stamp the halves were served at, which may be newer
     // than the head read above but never mismatched with the rows.
@@ -514,31 +465,23 @@ pub async fn dump_file_column_stats_of(
 /// Snapshots are append-only, so this is the full history.
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &ReadOnlyCatalog) -> Result<Vec<SnapshotValue>> {
-    // Bound in a statement of its own so the cache lock is released before
-    // the rows are copied out of it.
-    if let Some(head) = writer_head(catalog)? {
-        let served = projections_read(catalog).snapshots_at(&head);
-        if let Some(rows) = served {
-            return Ok(projection::materialize(&rows));
-        }
-    }
-
-    let session = catalog.begin_read().await?;
-    let head = session_head(catalog, &session).await?;
+    let dump = catalog.begin_dump().await?;
+    catalog.note_head_read();
+    let head = Some(dump.head_value());
     if let Some(head) = head {
         let served = projections_read(catalog).snapshots_at(&head);
         if let Some(rows) = served {
-            session.finish();
+            dump.finish().await;
             return Ok(projection::materialize(&rows));
         }
-        let result = scan_snapshots(session.handle()).await;
-        session.finish();
+        let result = scan_snapshots_overlaid(dump.handle(), dump.overlay()).await;
+        dump.finish().await;
         let rows = result?;
         projections_write(catalog).install_snapshots(head, rows.clone());
         return Ok(rows);
     }
-    let result = scan_snapshots(session.handle()).await;
-    session.finish();
+    let result = scan_snapshots_overlaid(dump.handle(), dump.overlay()).await;
+    dump.finish().await;
     result
 }
 
@@ -565,9 +508,9 @@ pub struct SchemaVersionRow {
 #[doc(hidden)]
 pub async fn dump_schema_versions(catalog: &ReadOnlyCatalog) -> Result<Vec<SchemaVersionRow>> {
     let records = async {
-        let session = catalog.begin_read().await?;
-        let records = scan_schema_versions(session.handle()).await;
-        session.finish();
+        let dump = catalog.begin_dump().await?;
+        let records = scan_schema_versions_overlaid(dump.handle(), dump.overlay()).await;
+        dump.finish().await;
         records
     };
     let file_snapshots = dump_entities(catalog, |r| match r {
@@ -1167,6 +1110,9 @@ pub async fn dump_sort_expression_rows(
     Ok(sort_expression_rows_from(dump_sort_info(catalog).await?))
 }
 
+// Test bodies await whole catalog operations in sequence; boxing each
+// call would say nothing about the code under test.
+#[allow(clippy::large_futures)]
 #[cfg(test)]
 mod tests {
     use object_store::memory::InMemory;
@@ -1402,20 +1348,29 @@ mod tests {
             transaction::commit,
         };
 
-        let tx = catalog.begin_write_tx().await.unwrap();
-        let head = read::read_head(ReadHandle::Tx(&tx)).await.unwrap().unwrap();
-        tx.put(
-            Key::Sys(SysKey::Migration).encode(),
-            encode_value(&MigrationValue {
-                from_format: 1,
-                to_format: 2,
-                cursor: Vec::new(),
-            }),
-        )
-        .unwrap();
-        let (key, stamp) = commit::head_stamp(head.snapshot_id, head.batch_seq);
-        tx.put(key, stamp.unwrap()).unwrap();
-        tx.commit_with_options(&commit::durable()).await.unwrap();
+        catalog
+            .with_folder_writer(async |db| {
+                let tx = db
+                    .begin(slatedb::IsolationLevel::Snapshot)
+                    .await
+                    .map_err(crate::error::Error::from)?;
+                let head = read::read_head(ReadHandle::Tx(&tx)).await?.unwrap();
+                tx.put(
+                    Key::Sys(SysKey::Migration).encode(),
+                    encode_value(&MigrationValue {
+                        from_format: 1,
+                        to_format: 2,
+                        cursor: Vec::new(),
+                    }),
+                )
+                .unwrap();
+                let (key, stamp) = commit::head_stamp(head.snapshot_id, head.batch_seq);
+                tx.put(key, stamp.unwrap()).unwrap();
+                commit::commit_durably(db, tx).await.unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     fn refuses<T>(outcome: &Result<T>) -> bool {
@@ -1620,13 +1575,12 @@ mod tests {
     /// row-faithfully, embedded rows in `column_id` order.
     #[tokio::test]
     async fn dump_mappings_serves_embedded_rows() {
-        use crate::transaction::staged::{Cell, RowOperation, StagedTransaction, TableKind};
+        use crate::transaction::staged::{Cell, RowOperation, TableKind};
 
         let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
             .await
             .unwrap();
-        let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
         tx.stage(RowOperation::Insert {
             table: TableKind::ColumnMapping,
             cells: vec![Cell::U64(21), Cell::U64(1), Cell::Str("map_by_name".into())],
@@ -1887,5 +1841,335 @@ mod tests {
         assert_eq!(rows[0].changes_made, "created_schema:\"main\"");
         assert!(!rows[1].changes_made.is_empty());
         assert!(!rows[2].changes_made.is_empty());
+    }
+
+    /// Opens a slot-backed (multi-writer) catalog: its commits land in the
+    /// log and are served through the unfolded tail until a folder applies
+    /// them.
+    async fn open_slots() -> Catalog {
+        let options = CatalogOptions::default();
+        Catalog::open(Arc::new(InMemory::new()), options)
+            .await
+            .unwrap()
+    }
+
+    /// On a slot-backed attach, a staged commit lands only in the log until a
+    /// folder applies it. The raw dumps must read it through the tail overlay,
+    /// or DuckLake's conflict matrix would miss a committed winner.
+    #[tokio::test]
+    async fn dumps_reflect_an_unfolded_tail_on_a_slot_backed_attach() {
+        use crate::transaction::staged::{Cell, RowOperation, TableKind};
+
+        let options = CatalogOptions::default();
+        let catalog = Catalog::open(Arc::new(InMemory::new()), options)
+            .await
+            .unwrap();
+
+        let mut tx = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: vec![
+                Cell::U64(1),
+                Cell::I64(1),
+                Cell::U64(1),
+                Cell::U64(2),
+                Cell::U64(0),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str(r#"created_schema:"sales""#.into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Schema,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str("uuid-1".into()),
+                Cell::U64(1),
+                Cell::Null,
+                Cell::Str("sales".into()),
+                Cell::Str("sales/".into()),
+                Cell::Bool(true),
+            ],
+        });
+        tx.commit().await.unwrap();
+
+        let snapshots = dump_snapshots(&catalog).await.unwrap();
+        assert_eq!(
+            snapshots.iter().map(|s| s.snapshot_id).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let schemas = dump_schemas(&catalog).await.unwrap();
+        assert!(schemas.iter().any(|s| s.schema_name == "sales"));
+        let deletions = dump_scheduled_deletions(&catalog).await.unwrap();
+        assert!(deletions.is_empty());
+    }
+
+    /// A tail tombstone hides a folded record: a maintenance commit that
+    /// expires the bootstrap snapshot 0 — already folded into the store —
+    /// removes it from the dump, exercising the overlay's delete (`None`)
+    /// branch that no other slot-backed test covers.
+    #[tokio::test]
+    async fn a_tail_tombstone_hides_a_folded_snapshot_on_a_slot_backed_attach() {
+        use crate::transaction::staged::{Cell, RowOperation, TableKind};
+
+        let catalog = open_slots().await;
+
+        // Advance head off the folded bootstrap snapshot 0 by minting 1.
+        let mut mint = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        mint.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: vec![
+                Cell::U64(1),
+                Cell::I64(1),
+                Cell::U64(1),
+                Cell::U64(2),
+                Cell::U64(0),
+            ],
+        });
+        mint.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str(r#"created_schema:"sales""#.into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        mint.stage(RowOperation::Insert {
+            table: TableKind::Schema,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str("uuid-1".into()),
+                Cell::U64(1),
+                Cell::Null,
+                Cell::Str("sales".into()),
+                Cell::Str("sales/".into()),
+                Cell::Bool(true),
+            ],
+        });
+        mint.commit().await.unwrap();
+
+        // Head-preserving maintenance: expire the now-non-head snapshot 0.
+        let mut expire = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        expire.stage(RowOperation::Delete {
+            table: TableKind::Snapshot,
+            cells: vec![Cell::U64(0)],
+        });
+        expire.stage(RowOperation::Delete {
+            table: TableKind::SnapshotChanges,
+            cells: vec![Cell::U64(0)],
+        });
+        expire.commit().await.unwrap();
+
+        let snapshots = dump_snapshots(&catalog).await.unwrap();
+        assert_eq!(
+            snapshots.iter().map(|s| s.snapshot_id).collect::<Vec<_>>(),
+            vec![1],
+            "the tail tombstone hides the folded snapshot 0"
+        );
+    }
+
+    /// A rename committed through a slot ends the old table version and writes
+    /// a new one. The overlaid history scan must surface the ended version —
+    /// real content for `scan_history_entities_overlaid`, which the prior
+    /// slot-backed dump test left empty.
+    #[tokio::test]
+    async fn history_scan_reflects_an_ended_table_version_on_a_slot_backed_attach() {
+        use crate::transaction::staged::{Cell, RowOperation, TableKind};
+
+        let catalog = open_slots().await;
+
+        // Create table t_old (id 1) in the bootstrap schema `main` (id 0).
+        let mut create = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        create.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str("uuid-t1".into()),
+                Cell::U64(1),
+                Cell::Null,
+                Cell::U64(0),
+                Cell::Str("t_old".into()),
+                Cell::Str("t_old/".into()),
+                Cell::Bool(true),
+            ],
+        });
+        create.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: vec![
+                Cell::U64(1),
+                Cell::I64(1),
+                Cell::U64(1),
+                Cell::U64(2),
+                Cell::U64(0),
+            ],
+        });
+        create.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str(r#"created_table:"main"."t_old""#.into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        create.commit().await.unwrap();
+
+        // Rename: end the old version at snapshot 2, insert t_new.
+        let mut rename = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        rename.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::Table,
+            cells: vec![Cell::U64(1), Cell::U64(2)],
+        });
+        rename.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str("uuid-t1".into()),
+                Cell::U64(2),
+                Cell::Null,
+                Cell::U64(0),
+                Cell::Str("t_new".into()),
+                Cell::Str("t_new/".into()),
+                Cell::Bool(true),
+            ],
+        });
+        rename.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: vec![
+                Cell::U64(2),
+                Cell::I64(1),
+                Cell::U64(1),
+                Cell::U64(2),
+                Cell::U64(0),
+            ],
+        });
+        rename.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: vec![
+                Cell::U64(2),
+                Cell::Str("altered_table:1".into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        rename.commit().await.unwrap();
+
+        let tables = dump_tables(&catalog).await.unwrap();
+        let ended: Vec<_> = tables
+            .iter()
+            .filter(|t| t.end_snapshot == Some(2))
+            .collect();
+        assert_eq!(
+            ended.len(),
+            1,
+            "the ended old version is in overlaid history: {tables:?}"
+        );
+        assert_eq!(ended[0].table_name, "t_old");
+        assert!(
+            tables
+                .iter()
+                .any(|t| t.table_name == "t_new" && t.end_snapshot.is_none()),
+            "the renamed live version is in overlaid current: {tables:?}"
+        );
+    }
+
+    /// `dump_projected_current` (behind `dump_table_stats`) must reflect the
+    /// unfolded tail on a slot-backed attach, where no projection cache is
+    /// maintained and the read falls to an overlaid `current` scan.
+    #[tokio::test]
+    async fn dump_projected_current_reflects_unfolded_stats_on_a_slot_backed_attach() {
+        use crate::transaction::staged::{Cell, RowOperation, TableKind};
+
+        let catalog = open_slots().await;
+
+        let mut tx = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str("uuid-t1".into()),
+                Cell::U64(1),
+                Cell::Null,
+                Cell::U64(0),
+                Cell::Str("t".into()),
+                Cell::Str("t/".into()),
+                Cell::Bool(true),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: vec![
+                Cell::U64(1),
+                Cell::U64(0),
+                Cell::Null,
+                Cell::U64(1),
+                Cell::U64(0),
+                Cell::Str("a".into()),
+                Cell::Str("BIGINT".into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Bool(true),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::TableStats,
+            cells: vec![Cell::U64(1), Cell::U64(20), Cell::U64(20), Cell::U64(2048)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: vec![
+                Cell::U64(1),
+                Cell::I64(1),
+                Cell::U64(1),
+                Cell::U64(2),
+                Cell::U64(0),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str(r#"created_table:"main"."t""#.into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        tx.commit().await.unwrap();
+
+        let stats = dump_table_stats(&catalog).await.unwrap();
+        assert_eq!(
+            stats.len(),
+            1,
+            "the unfolded table-stats row is served: {stats:?}"
+        );
+        assert_eq!(stats[0].table_id, 1);
+        assert_eq!(stats[0].record_count, 20);
     }
 }

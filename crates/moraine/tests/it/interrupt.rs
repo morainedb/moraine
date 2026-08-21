@@ -5,15 +5,18 @@
 //! drops the caller's future at a chosen point and asserts what the
 //! catalog is left holding. The point is a parked durable write rather
 //! than a hopeful sleep — see [`gated_store`], and note that a parked
-//! write also holds the store, which is what puts a *second* commit
+//! write also holds the leader, which is what puts a *second* commit
 //! squarely before a write of its own.
 //!
-//! The commit is split at its point of no return. Everything before the
-//! durable write is staged in memory, so dropping it changes nothing;
-//! the write itself runs on a task of its own, so dropping the caller
-//! cannot abort it mid-batch. That split is what makes the middle case
-//! below *ambiguous but never torn*: the interrupt returns promptly and
-//! the write still lands or fails whole.
+//! A commit's durable write is the leader's inline conditional put into
+//! the commit-slot log; there is no task of its own between the caller
+//! and that put. A caller dropped during the put returns promptly and
+//! never wedges the handle, and the put is atomic — it lands the whole
+//! commit or none of it, never a torn slot. What it does *not* buy is a
+//! deterministic landing: when the drop coincides with the put, whether
+//! the commit lands is ambiguous. The guarantee under interrupt is the
+//! shape of the outcome — never torn, never wedged — not which of the
+//! two coherent outcomes it is.
 
 pub mod gated_store;
 
@@ -23,10 +26,6 @@ use moraine::{Catalog, CatalogOptions, SnapshotId};
 use object_store::memory::InMemory;
 
 use crate::interrupt::gated_store::GatedStore;
-
-/// How long a test waits for a shielded write to finish once the gate is
-/// open. Generous: it bounds a hang, it does not time anything.
-const SETTLE: Duration = Duration::from_secs(10);
 
 /// A catalog over a gated store, seeded with one schema so head is past
 /// bootstrap and the commit under test is not the store's first.
@@ -65,65 +64,46 @@ async fn head(catalog: &Catalog) -> u64 {
         .get()
 }
 
-/// Waits for head to reach `target`, failing rather than hanging if the
-/// shielded write never lands.
-#[allow(clippy::unwrap_used)]
-async fn await_head(catalog: &Catalog, target: u64) {
-    let reached = tokio::time::timeout(SETTLE, async {
-        loop {
-            if head(catalog).await == target {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await;
-    assert!(
-        reached.is_ok(),
-        "the shielded write never landed: head never reached {target}"
-    );
-}
-
-/// Interrupted before its durable write, a commit contributes nothing.
+/// Interrupted before its slot put, a commit contributes nothing.
 ///
-/// The window is staged with a real one rather than a timer: a store
-/// admits one batch at a time, so a batch parked at the gate keeps the
-/// commit under test waiting its turn — it has read nothing, staged
-/// nothing, and issued nothing. Dropping it there must leave the catalog
-/// holding exactly what the batch in flight put there.
+/// The window is staged with a real leader rather than a timer: one batch
+/// drives the slot at a time, so a leader parked at the gate keeps the
+/// commit under test waiting its turn behind it — it has read nothing,
+/// staged nothing, and issued no slot put. Dropping it there must leave
+/// the catalog holding exactly what the batch in flight put there, and
+/// the handle must still commit afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::unwrap_used)]
 async fn an_interrupt_before_the_write_leaves_the_catalog_untouched() {
     let (catalog, store) = gated().await;
     let head_before = head(&catalog).await;
 
-    store.gate_wal_writes();
-    // One batch in flight, parked at the gate. Its own caller is dropped;
-    // the write survives that (the case below is about exactly this), and
-    // the store stays busy while it does.
-    {
-        let holder = catalog.commit(|tx| tx.create_schema("holder").map(|_| ()));
-        tokio::pin!(holder);
-        tokio::select! {
-            () = store.arrival() => {}
-            _ = &mut holder => panic!("the holding commit finished before its write parked"),
-        }
+    store.gate_slot_writes();
+    // One batch leading, parked mid slot put; kept alive so its put lands
+    // once the gate opens. It holds the slot while a second commit queues
+    // behind it, which is what puts that second commit before a put of its
+    // own.
+    let holder = catalog.commit(|tx| tx.create_schema("holder").map(|_| ()));
+    tokio::pin!(holder);
+    tokio::select! {
+        () = store.arrival() => {}
+        _ = &mut holder => panic!("the holding commit finished before its write parked"),
     }
 
-    // The commit under test cannot get past the store's door while that
-    // batch is in flight, so it can only be here — before its write.
+    // The commit under test cannot reach the slot while the leader holds it,
+    // so it can only be here — queued behind the leader, before its put.
     {
         let cancelled = catalog.commit(|tx| tx.create_schema("cancelled").map(|_| ()));
         tokio::pin!(cancelled);
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(100)) => {}
-            _ = &mut cancelled => panic!("a second batch landed while one was in flight"),
+            _ = &mut cancelled => panic!("a second batch landed while one held the slot"),
         }
         // `cancelled` is dropped here — the interrupt.
     }
 
     store.open_gate();
-    await_head(&catalog, head_before + 1).await;
+    holder.await.unwrap();
     // The cancelled commit could only ever land after the holder's, so a
     // settle past that is what makes its absence meaningful.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -131,7 +111,7 @@ async fn an_interrupt_before_the_write_leaves_the_catalog_untouched() {
     assert_eq!(
         head(&catalog).await,
         head_before + 1,
-        "a commit cancelled before its write must not advance head past the batch in flight"
+        "a commit cancelled before its put must not advance head past the batch in flight"
     );
     let view = catalog.snapshot().await.unwrap();
     assert!(
@@ -149,23 +129,40 @@ async fn an_interrupt_before_the_write_leaves_the_catalog_untouched() {
             .is_err(),
         "a cancelled commit minted a snapshot"
     );
+
+    // No wedge: the handle commits again and that commit lands whole.
+    catalog
+        .commit(|tx| tx.create_schema("after").map(|_| ()))
+        .await
+        .unwrap();
+    let after = catalog.snapshot().await.unwrap();
+    assert!(
+        after.schema_by_name("after").is_some(),
+        "the handle was left unusable by a cancelled commit"
+    );
+    assert_eq!(
+        after.current_snapshot().id.get(),
+        head_before + 2,
+        "the next commit advances the coherent head by exactly one"
+    );
 }
 
-/// Interrupted *during* the durable write, a commit returns promptly and
-/// the write still lands — whole.
+/// Interrupted *during* its slot put, a commit returns promptly and never
+/// tears — its landing is ambiguous, its shape is not.
 ///
-/// This is the ambiguous case the split buys: the caller is told nothing
-/// about which side of the write it landed on, but the write is never
-/// abandoned mid-batch, so head ends at exactly `N` or exactly `N + 1`
-/// and the catalog is coherent either way.
+/// Cancelling the leader on the one await where the put's fate is unknown
+/// treats the batch as abandoned. The put is atomic, so the outcome is one
+/// of exactly two coherent states — the commit landed whole at `N + 1`, or
+/// it did not land and head is still `N` — never a slot torn between them,
+/// and never a wedged handle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::unwrap_used)]
-async fn an_interrupt_during_the_write_returns_at_once_and_the_write_still_lands() {
+async fn an_interrupt_during_the_write_returns_at_once_and_never_tears() {
     let (catalog, store) = gated().await;
     let head_before = head(&catalog).await;
-    let wal_before = store.wal_writes();
+    let slot_before = store.slot_writes();
 
-    store.gate_wal_writes();
+    store.gate_slot_writes();
     let interrupted = {
         let commit = catalog.commit(|tx| tx.create_schema("shielded").map(|_| ()));
         tokio::pin!(commit);
@@ -173,41 +170,65 @@ async fn an_interrupt_during_the_write_returns_at_once_and_the_write_still_lands
             () = store.arrival() => true,
             _ = &mut commit => false,
         }
-        // `commit` is dropped with its batch already in the air.
+        // `commit` is dropped with its slot put already parked at the gate.
     };
     assert!(
         interrupted,
         "the commit finished before its write reached the gate"
     );
     assert_eq!(
-        store.wal_writes(),
-        wal_before,
-        "the interrupt was supposed to return while the write was still parked"
+        store.slot_writes(),
+        slot_before,
+        "the interrupt was supposed to return while the put was still parked"
     );
 
+    // Let the abandoned put settle out either way.
     store.open_gate();
-    await_head(&catalog, head_before + 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let view = catalog.snapshot().await.unwrap();
-    assert!(
-        view.schema_by_name("shielded").is_some(),
-        "the shielded write landed without its schema"
-    );
-    let minted = catalog
-        .snapshot_at(SnapshotId::new(head_before + 1))
+    let head_now = view.current_snapshot().id.get();
+    if view.schema_by_name("shielded").is_some() {
+        assert_eq!(
+            head_now,
+            head_before + 1,
+            "a landed shielded commit advances head by exactly its own commit"
+        );
+        let minted = catalog
+            .snapshot_at(SnapshotId::new(head_before + 1))
+            .await
+            .unwrap();
+        assert!(
+            minted.schema_by_name("shielded").is_some(),
+            "a landed commit's own snapshot carries its own writes"
+        );
+    } else {
+        assert_eq!(
+            head_now, head_before,
+            "an abandoned commit left head where it was, never advanced without its writes"
+        );
+    }
+
+    // No wedge, either way: the handle commits again and lands whole one
+    // step past whichever coherent head the interrupt left.
+    catalog
+        .commit(|tx| tx.create_schema("after").map(|_| ()))
         .await
         .unwrap();
-    assert!(
-        minted.schema_by_name("shielded").is_some(),
-        "the minted snapshot is torn: it advanced head without its own writes"
+    let after = catalog.snapshot().await.unwrap();
+    assert!(after.schema_by_name("after").is_some());
+    assert_eq!(
+        after.current_snapshot().id.get(),
+        head_now + 1,
+        "the next commit advances the coherent head by exactly one"
     );
 }
 
-/// The same shield on the staged-row path, which lands its batch without
-/// the group coalescer the verb path rides.
+/// The same never-torn shape on the staged-row path, whose slot put is the
+/// leader's just as the verb path's is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::unwrap_used)]
-async fn a_staged_commit_interrupted_during_its_write_still_lands() {
+async fn a_staged_commit_interrupted_during_its_write_never_tears() {
     use moraine::ffi_support::staged::{Cell, RowOperation, TableKind, staged_begin};
 
     let (catalog, store) = gated().await;
@@ -250,7 +271,7 @@ async fn a_staged_commit_interrupted_during_its_write_still_lands() {
         ],
     });
 
-    store.gate_wal_writes();
+    store.gate_slot_writes();
     let interrupted = {
         let commit = tx.commit();
         tokio::pin!(commit);
@@ -264,47 +285,54 @@ async fn a_staged_commit_interrupted_during_its_write_still_lands() {
         "the staged commit finished before its write reached the gate"
     );
 
+    // Let the abandoned put settle out either way.
     store.open_gate();
-    await_head(&catalog, next).await;
-    assert!(
-        catalog
-            .snapshot()
-            .await
-            .unwrap()
-            .schema_by_name("staged")
-            .is_some(),
-        "the staged path's shielded write landed without its schema"
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let view = catalog.snapshot().await.unwrap();
+    let head_now = view.current_snapshot().id.get();
+    if view.schema_by_name("staged").is_some() {
+        assert_eq!(
+            head_now, next,
+            "a landed staged commit advances head by exactly its own commit"
+        );
+    } else {
+        assert_eq!(
+            head_now, head_before,
+            "an abandoned staged commit left head where it was, never advanced without its writes"
+        );
+    }
+
+    // No wedge: the handle commits again and lands whole one step on.
+    catalog
+        .commit(|tx| tx.create_schema("after").map(|_| ()))
+        .await
+        .unwrap();
+    let after = catalog.snapshot().await.unwrap();
+    assert!(after.schema_by_name("after").is_some());
+    assert_eq!(
+        after.current_snapshot().id.get(),
+        head_now + 1,
+        "the next commit advances the coherent head by exactly one"
     );
 }
 
 /// An interrupted read leaves nothing behind and nothing broken.
 ///
-/// A read holds only a read point, so cancelling it is the trivial case —
-/// but "trivial" is the claim under test: the handle must still serve the
-/// next read and the next commit, and the store must be untouched. The
-/// read is caught mid-flight the same way as above, parked behind the
-/// batch holding the store.
+/// A read is a pure materialization — it takes no part in the slot log, so
+/// it never reaches the put gate; dropping its future is the whole
+/// interrupt. "Trivial" is the claim under test: the read writes nothing,
+/// and the handle must still serve the next read and the next commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::unwrap_used)]
 async fn an_interrupted_read_releases_its_snapshot_and_writes_nothing() {
     let (catalog, store) = gated().await;
     let head_before = head(&catalog).await;
-    let wal_before = store.wal_writes();
+    let slot_before = store.slot_writes();
 
-    store.gate_wal_writes();
-    {
-        let holder = catalog.commit(|tx| tx.create_schema("holder").map(|_| ()));
-        tokio::pin!(holder);
-        tokio::select! {
-            () = store.arrival() => {}
-            _ = &mut holder => panic!("the holding commit finished before its write parked"),
-        }
-    }
-
-    // Dropped without ever being awaited to completion: reads take no
-    // part in the batch holding the store, so this one is cancelled
-    // mid-materialization or not at all — either way it must leave no
-    // trace.
+    // Dropped without ever being awaited to completion: a read never puts a
+    // slot, so it is cancelled mid-materialization or not at all — either
+    // way it must leave no trace.
     {
         let read = catalog.snapshot_at(SnapshotId::new(head_before));
         tokio::pin!(read);
@@ -317,13 +345,10 @@ async fn an_interrupted_read_releases_its_snapshot_and_writes_nothing() {
     }
 
     assert_eq!(
-        store.wal_writes(),
-        wal_before,
-        "a cancelled read must write nothing"
+        store.slot_writes(),
+        slot_before,
+        "a cancelled read must write nothing to the log"
     );
-
-    store.open_gate();
-    await_head(&catalog, head_before + 1).await;
 
     catalog
         .commit(|tx| tx.create_schema("after").map(|_| ()))
@@ -336,7 +361,7 @@ async fn an_interrupted_read_releases_its_snapshot_and_writes_nothing() {
     );
     assert_eq!(
         view.current_snapshot().id.get(),
-        head_before + 2,
+        head_before + 1,
         "a cancelled read cost the catalog a snapshot"
     );
 }

@@ -19,10 +19,11 @@ A Cargo workspace with a virtual root (no root crate):
 | Crate | Type | Role |
 |---|---|---|
 | `moraine` | lib | Core: DuckLake catalog semantics on SlateDB. The flagship crate. |
+| `moraine-wal` | lib | The bucket-resident commit log's protocol, below `moraine` in the dependency graph (`moraine` depends on it, never the reverse). Owns sequence naming, the envelope and payload schema, the conditional-put race, tail replay, truncation, and the generic commit/fold loops the log's clients plug into — the *shape* of a slot. Knows nothing about DuckLake, SlateDB, or moraine's key layout: payload keys, values, and the DuckLake `changes_made` classification string are opaque bytes to it, which is what lets the protocol be simulation-tested on its own (see [RFC 0022](0022-commit-log-and-leader-role.md)). |
 | `moraine-duckdb` | cdylib (+ linked C++ shim) | DuckDB extension wrapping the core. Thin by policy — *language-agnostic*: no domain logic, only `StorageExtension` registration, C-ABI marshalling, and the sync↔async bridge. Composition and the DuckLake catalog contract are specified by [RFC 0006](0006-extension-surface.md). If logic accumulates here, it belongs in the core. |
 | `xtask` | bin (unpublished) | Automation: build/package the extension, orchestrate the e2e suite. Rust instead of shell scripts/Makefiles — cross-platform and type-checked. |
 
-Library-first: the catalog logic lives in `moraine`, free of the FFI/build tax and embeddable in any Rust host. The extension is one consumer of it.
+Library-first: the catalog logic lives in `moraine`, free of the FFI/build tax and embeddable in any Rust host, with `moraine-wal` as its one internal dependency. The extension is one consumer of `moraine`.
 
 ## Repository layout
 
@@ -55,6 +56,10 @@ moraine/
 │   │   ├── src/
 │   │   ├── examples/             # runnable usage examples, compiled by CI
 │   │   └── tests/                # Integration tests
+│   ├── moraine-wal/
+│   │   ├── Cargo.toml
+│   │   ├── src/
+│   │   └── tests/                # protocol-level tests, incl. deterministic simulation
 │   └── moraine-duckdb/
 │       ├── Cargo.toml
 │       ├── src/
@@ -150,7 +155,7 @@ Toolchain pinned via `rust-toolchain.toml`. `rust-version` declared in workspace
 
 - **Conventional commits** (`feat:`, `fix:`, `docs:`, `refactor:`, …). Load-bearing, not cosmetic: `release-plz` derives changelogs and version bumps from them.
 - **release-plz** on `release.yml`: opens a release PR with version bumps + CHANGELOG; merging publishes to crates.io. Configured from the start, dormant until the first release.
-- Both published crates share a workspace version (`[workspace.package] version`) and release in lockstep. Decoupling is a post-1.0 problem.
+- Published crates share a workspace version (`[workspace.package] version`) and release in lockstep. `moraine-wal` is `moraine`'s path dependency and therefore publishes first in every release — crates.io requires a path dependency of a published crate to itself be published — mirroring `moraine`'s release settings exactly. Decoupling is a post-1.0 problem.
 - Pre-1.0 semver: breaking changes bump the minor version. Stated in the README. From the first release onward, `release-plz` runs `cargo-semver-checks`, catching accidental breaking changes mechanically, not by reviewer vigilance.
 - PRs into `main`; squash-merge so `main` stays a clean conventional-commit history.
 

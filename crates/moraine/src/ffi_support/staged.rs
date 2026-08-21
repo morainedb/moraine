@@ -23,15 +23,7 @@ pub async fn staged_begin(
     data_store: Option<DataStore>,
     data_prefix: String,
 ) -> Result<StagedTransaction> {
-    let db_tx = catalog.begin_write_tx().await?;
-    Ok(StagedTransaction::begin(
-        db_tx,
-        catalog.projections().clone(),
-        Some(catalog.store()),
-        data_store,
-        data_prefix,
-        catalog.data_reads(),
-    ))
+    catalog.begin_staged(data_store, data_prefix).await
 }
 
 // Each child projection below is its parents' rows plus the rows the

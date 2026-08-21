@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
-use slatedb::DbTransaction;
+use moraine_wal::Overlay;
 
 use crate::{
     catalog::projection::ProjectionCache,
@@ -65,7 +65,8 @@ const FLUSH_SCAN_CONCURRENCY: usize = 8;
 /// for, keyed by `(table_id, schema_version)`; read concurrently since the
 /// key set is known up front.
 async fn recorded_schemas(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     ops: &[InlineStage],
 ) -> Result<HashMap<(u64, u64), Option<Bytes>>> {
     let mut versions = Vec::new();
@@ -85,8 +86,7 @@ async fn recorded_schemas(
     stream::iter(versions)
         .map(|(table_id, schema_version)| async move {
             let recorded =
-                store_inline::read_inline_schema(ReadHandle::Tx(db_tx), table_id, schema_version)
-                    .await?;
+                store_inline::read_inline_schema(handle, overlay, table_id, schema_version).await?;
             Ok::<_, Error>(((table_id, schema_version), recorded))
         })
         .buffered(SCHEMA_READ_CONCURRENCY)
@@ -95,10 +95,11 @@ async fn recorded_schemas(
 }
 
 /// Every flush in `ops`, in op order, translated to its writes and the row
-/// ids it drains. Flushes only read `db_tx`, so their table scans run
+/// ids it drains. Flushes only read, so their table scans run
 /// concurrently.
 async fn translated_flushes(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     projections: &std::sync::RwLock<ProjectionCache>,
     ops: &[InlineStage],
 ) -> Result<Vec<(Vec<StagedWrite>, HashSet<u64>)>> {
@@ -118,7 +119,8 @@ async fn translated_flushes(
         .map(|(table_id, schema_version, flush_snapshot)| async move {
             let mut writes = Vec::new();
             let drained = translate_inline_flush_delete(
-                db_tx,
+                handle,
+                overlay,
                 projections,
                 table_id,
                 schema_version,
@@ -181,7 +183,8 @@ fn refuse_tombstones_of_drained_rows(
 /// read at its pre-commit state, so a drain sees the store as it stood
 /// before this commit.
 pub(crate) async fn stage_inline_writes(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     projections: &std::sync::RwLock<ProjectionCache>,
     ops: &[InlineStage],
 ) -> Result<Vec<StagedWrite>> {
@@ -196,8 +199,8 @@ pub(crate) async fn stage_inline_writes(
         })
         .collect();
     let (recorded, flushes) = futures::try_join!(
-        recorded_schemas(db_tx, ops),
-        translated_flushes(db_tx, projections, ops)
+        recorded_schemas(handle, overlay, ops),
+        translated_flushes(handle, overlay, projections, ops)
     )?;
     let mut flushes = flushes.into_iter();
     // Versions whose schema record this batch has already settled.
@@ -324,7 +327,9 @@ mod tests {
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let projections = std::sync::RwLock::new(ProjectionCache::empty());
-        let writes = stage_inline_writes(&tx, &projections, &ops).await.unwrap();
+        let writes = stage_inline_writes(ReadHandle::Tx(&tx), None, &projections, &ops)
+            .await
+            .unwrap();
         assert_eq!(
             writes,
             vec![
@@ -333,7 +338,13 @@ mod tests {
             ]
         );
 
-        let conflicting = stage_inline_writes(&tx, &projections, &[schema(1, b"other")]).await;
+        let conflicting = stage_inline_writes(
+            ReadHandle::Tx(&tx),
+            None,
+            &projections,
+            &[schema(1, b"other")],
+        )
+        .await;
         assert!(matches!(conflicting, Err(Error::Constraint(_))));
 
         tx.rollback();

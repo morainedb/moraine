@@ -32,6 +32,31 @@ clients configure nothing.
 
 Safety never depends on clocks, leases, leadership, or any node's disk.
 
+**Implemented.** The log, the folder, and truncation are live: every
+commit races a conditional put against `commits/<seq>`; the log is the
+store's own write-ahead log, so a fenced folder folds it by opening the
+store — the replay past its cursor *is* the fold — and flushing; slots
+truncate oldest-first, bounded by the durable flush horizon and by
+live-reader checkpoints past a retention margin. Old-format stores
+migrate on their first read-write attach (`sys/format = 4`), fencing any
+incumbent old-binary writer; a too-new format refuses. Group commit runs through in-process
+coalescing (`CatalogOptions::commit_batch_window`); a committer that
+crashes with an ambiguous PUT resolves its outcome by scanning for its
+transaction id (`Catalog::transaction_outcome`). The leader role is live
+behind the `leader` feature and the extension's `MAINTENANCE_LEADER`
+attach option: the designated folder binds a listener, mints or reads the
+store-held forwarding token, and announces through the log; a client that
+loses a race forwards its transaction, and the funnel coalesces forwarded
+commits into shared slots and races them hot (near-zero backoff base).
+Verified live over real SlateDB on in-memory `object_store`:
+prefix-consistent truncation past the retention margin
+(`truncation_holds_the_live_reader_bound_past_the_margin`), a stale
+reader surviving a peer's fold and truncation
+(`a_stale_reader_survives_a_peer_fold_and_truncation`), migration
+(`a_legacy_store_migrates_on_first_write_attach_and_serves_its_data`),
+and a contended fleet converging onto the leader
+(`two_contending_handles_converge_onto_the_leader`).
+
 ## Goals
 
 - **Fleet multi-writer.** N independent DuckDB processes commit
@@ -77,13 +102,18 @@ Non-goals:
    `PutMode::Create`. Any process may attempt slot N+1; the object store
    guarantees one winner.
 2. **The SlateDB store** — unchanged on-disk format, maintained by the one
-   fenced **folder** (RFC 0004's writer). It tails the log and applies
-   each slot as one atomic `WriteBatch` that also advances the fold cursor
-   `sys/fold`, so a successor resumes exactly.
+   fenced **folder** (RFC 0004's writer). The store takes the log as its
+   own write-ahead log, so the folder folds by opening it: SlateDB replays
+   every slot past the store's replay point into the memtable, and the
+   flush that follows lands them in an L0 SST and moves that point. The
+   cursor is the store's own manifest, so a successor resumes exactly and
+   the fold advances state and cursor as one act.
 
-Every other process is a `DbReader` (RFC 0017) plus a log tail; the head
-is store state as of `sys/fold` plus replay of the slots past it. This
-mirrors SlateDB's own WAL-to-L0 relationship.
+Every other process is a `DbReader` (RFC 0017) reading the same log the
+same way: it replays the slots past the store's cursor for itself, so the
+head is store state plus the unfolded tail without either side folding by
+hand. This is not *like* SlateDB's WAL-to-L0 relationship — it is that
+relationship, with the commit log in the WAL's place.
 
 The layering exists to change the liveness model. SlateDB ties write
 liveness to its one writer — right for an embedded store owned by one
@@ -132,7 +162,7 @@ simulation-tested without SlateDB.
 ### Commit protocol
 
 1. **Materialize the head**: `DbReader` state plus tail replay past
-   `sys/fold`.
+   the store's replay point.
 2. **Validate**: RFC 0004's conflict detection against that head; a
    genuine conflict is the same typed error as before.
 3. **Payload first**: objects the change set references are written to
@@ -174,9 +204,15 @@ checks, both free:
 - **Continuity.** Each commit records the head it validated against.
   Before applying, replay compares it with the view's snapshot id:
   **greater** → slots are missing, refuse; **equal** → apply; **less** →
-  already folded, skip. This catches a substituted or reordered slot, and
-  it walks multi-commit envelopes commit by commit, so an envelope whose
-  commits do not chain fails its own replay.
+  already folded, skip. The **greater** case catches a substituted or
+  reordered slot. The **less** case is sound only ahead of the first apply:
+  folding advances in log order under a prefix cursor, so a legitimately
+  already-folded commit is a leading prefix of the tail. A latch enforces
+  that — once any commit in the replay has applied, a following **less** is
+  a broken chain and refuses, not a lagging cursor. This is what makes a
+  multi-commit envelope safe: its commits must chain (each staged against
+  the previous one's result), and one that does not fails replay rather
+  than applying a prefix and dropping the rest.
 
 Both are detection. Prevention stays with bucket guard rails (versioning
 on `commits/`, lifecycle exclusions).
@@ -184,7 +220,7 @@ on `commits/`, lifecycle exclusions).
 ### The folder
 
 RFC 0004's single writer with a new job: tail the log, fold each slot as
-one atomic batch, advance `sys/fold`. Folding is deterministic and
+one atomic act, advance the store's replay point. Folding is deterministic and
 idempotent; a successor resumes from the cursor.
 
 The folder is **availability-optional**. Down, commits continue; the only
@@ -201,7 +237,7 @@ maintenance, like compaction.
 incumbent; the only question is when to open. The failure detector is the
 tail itself — a growing unfolded tail is the clock-free signal that no
 folder is live. The rule: observe tail beyond a threshold; after a
-jittered delay, re-check fold progress; if `sys/fold` advanced, stand
+jittered delay, re-check fold progress; if the cursor advanced, stand
 down; otherwise open and fold, staying (long-lived host) or folding to
 drained and closing (a **fold sprint**). If fenced, stand down. The
 progress check turns a stampede into one opener; fencing plus idempotent
@@ -214,15 +250,39 @@ the leader role; otherwise **opportunistic** fold sprints, where "whoever
 last bothered" is a legitimate steady state. With no long-lived posture,
 no leader ever exists.
 
-**The folder runs with the store's WAL disabled.** The commit log is the
-WAL; journaling folds again through SlateDB's WAL would double every
-logged byte for nothing — commits are durable at the slot PUT and fold
-state is re-derivable. So `wal_enabled = false`: folds go to the
-memtable, durability arrives at the L0 flush, which the sprint forces
-explicitly (the default L0 size threshold is far above a catalog fold).
-Consequences, neither safety-relevant: truncation lags to the flush
-horizon, and a fenced zombie notices its demotion at its next flush
-rather than its next WAL write.
+**The store journals nothing of its own.** The commit log is its
+write-ahead log, so journaling a fold again would double every logged
+byte for nothing — commits are durable at the slot PUT and fold state is
+re-derivable. Folds go to the memtable, durability arrives at the L0
+flush, which the sprint forces explicitly (the default L0 size threshold
+is far above a catalog fold). Consequences, neither safety-relevant:
+truncation lags to the flush horizon, and a fenced zombie notices its
+demotion at its next flush rather than its next WAL write.
+
+**Sequence numbers are shared, so slots take every millionth one.** A
+store numbers its rows from one space, and the rows a replay produces are
+numbered from it too: a slot's rows all carry the number its ordinal
+fixes. Two rules keep the two kinds of writer out of each other's way.
+The log's first slot starts at 2^32, above anything a store wrote before
+it adopted the log, so a migrated store's history stays ordered before
+every slot rather than shadowing it — a store already past that is
+refused rather than folded underneath. And each slot reserves 2^20
+numbers, so the writes a store still makes for itself — the derived state
+its maintenance keeps — take the numbers between the slot last folded and
+the next one: they order after everything folded and before everything
+still to fold, which is where they belong. A store write that reaches the
+next slot's own number is refused, because the fold would then skip that
+slot as already covered; the interval is a million writes wide, so
+reaching it means a session wrote without ever folding.
+
+**The chain is checked in the log, not against the view.** A reader
+replays the tail for itself, so its view already reflects the slots a
+replay would apply and cannot reveal a substituted one. Each commit
+instead declares the head it was validated against, and the head it
+leaves is its own `sys/head` write (or the one it found, for a commit
+that mints no snapshot); consecutive slots must agree. A slot whose
+commit was validated against anything else was substituted or reordered,
+and replay refuses.
 
 ### Truncation and GC
 
@@ -233,10 +293,23 @@ copy of a commit, so it has **two** bounds:
 > durably flushed** — the flush horizon, not the memtable — **and** no
 > live reader still needs tail replay across it.
 
-The second bound is not optional. Readers lag by their manifest poll
-interval, so a truncator with a fresh view can delete slots a peer at an
-older fold cursor still needs — and the only other copy is the slot just
-deleted.
+The first bound alone already makes deletion safe: a slot folds into the
+store, durably, strictly before it becomes eligible for deletion, so the
+store holds every truncated slot's content at the flush horizon. A reader
+whose tail replay lags behind a truncation and lands on a
+truncated-but-folded hole recovers by the mechanism the Integrity section
+above specifies for a benign hole: re-reading the fold cursor through a
+fresh reader finds it has advanced past the hole, and the reader
+re-materializes from the fresher folded state.
+
+The second bound is a cost and consistency guarantee layered on top, not
+a correctness requirement. Without it, every reader whose replay crosses
+a truncated range pays that re-materialization on its own, independently,
+each time it happens — safe, but a repeated, per-reader cost that
+compounds across a fleet. Respecting live readers instead keeps tail
+replay prefix-consistent (stale-but-consistent) for every reader at once,
+turning the re-materialization from a recurring cost into one that need
+never happen.
 
 Live readers are discoverable because SlateDB already keeps the registry:
 a latest-mode `DbReader` writes a checkpoint into the manifest, which is
@@ -245,11 +318,18 @@ of the oldest live checkpoint. Checkpoints expire, so a crashed reader's
 pin lapses. Add a retention margin on top (mirroring the minimum age
 SlateDB's WAL GC applies), so the common case never depends on timing.
 Envelopes are small: over-retention costs storage, under-retention costs
-correctness.
+consistency.
 
 Slot GC and orphaned-payload GC ride RFC 0007's expiry machinery; an
 orphaned payload — a data file whose commit never won a slot — is the
 multi-writer face of DuckLake's aborted-transaction cleanup.
+
+Maintenance truncates by the two bounds above, which are ordinal and so
+need no clock. The store's own collector can reclaim slots instead, since
+the log is its write-ahead log and the ranges its live manifests
+reference are the same two bounds computed upstream; that path is
+temporal (a minimum age) rather than ordinal, and a host that runs it
+gets the collector from the log rather than reimplementing the policy.
 
 ### Group commit and chaining
 
@@ -388,10 +468,37 @@ willingness-to-wait knob, the same bargain SlateDB's flush and poll
 intervals make: a coalescing window on the write side, a refresh interval
 on the read side.
 
+Measured over the coalescing bench (50 single-statement commits, real
+SlateDB on in-memory `object_store`): the slot path costs 1.00 PUT/commit
+serial (LIST 1.02/commit, GET 25.60/commit before the head-materialization
+cache) and 0.02 PUT/commit concurrent, identical at a zero and a 5ms
+coalescing window. The head cache holds serial GET at 0.12/commit instead
+of 25.60/commit. Folding amortizes further: many slots land in one L0
+SST. These figures sit inside the accepted band.
+
+The leader's relief is measured over the adaptive bench (`adaptive_leader_bench`:
+a fleet of contending committers on one bucket, real SlateDB on in-memory
+`object_store`, PUTs counted per store). Direct racing amplifies with the
+fleet: PUT/commit rises from 1.9 at two committers to 4.2 at sixteen, the
+write amplification the leader exists to relieve. With a leader present the
+fleet forwards and coalesces: at eight committers PUT/commit falls to 0.26
+at a zero coalescing window and 0.13 at a 2 ms window, with a 100% win
+share — every commit lands through the leader, so no committer races a slot
+of its own. Killed mid-run, the survivors degrade to direct racing: a
+bounded spike back toward the direct figure, never a stall, every commit
+still landing. The no-leader figure is the pre-leader path unchanged — with
+no advert on the log a client never forwards — so the role costs nothing
+when absent. The bias strength follows from these numbers: a near-zero
+backoff base converges the whole fleet at eight contenders, so the tip needs
+no strengthening; and widening the coalescing window (zero to 2 ms) halves
+the leader's own slot PUTs, which is the convergence lever the design reaches
+for before any harder backoff asymmetry — it absorbs more per win without
+changing what a client that cannot reach the leader experiences.
+
 ### Format and compatibility
 
 The log stamps a new structural format version (RFC 0002's mechanism):
-the store gains a `commits/` prefix, a `sys/fold` cursor, and log-derived
+the store gains a `commits/` prefix, a fold cursor in its own manifest, and log-derived
 id allocation, and an older binary — which would commit through the RFC
 0004 path and bypass the log — must refuse it.
 
@@ -446,12 +553,14 @@ decorator alongside drop-and-reopen.
 - **Mandatory leader (no leaderless base).** Hangs commit liveness on one
   process, and a partitioned client could only seize the writer role,
   inviting ping-pong. The contention-triggered role dissolves both.
-- **Cooperative multi-writer inside SlateDB.** Its WAL SSTs are already
+- **Cooperative multi-writer inside SlateDB.** Its WAL files are already
   `PutMode::Create`; treating a lost race as contention rather than
-  fencing would make the WAL itself the commit log. The preferred
-  endgame, and it belongs upstream. This design is shaped so it lands as
-  a deletion: `moraine-wal` retires; the folder, coalescing, and the
-  leader role survive, since none depend on how commits are serialized.
+  fencing would let many writers share one WAL, and the fenced folder
+  would go too. The log already *is* the store's write-ahead log, so what
+  remains is upstream: contention where fencing is today. That change
+  lands as a deletion here — the folder role retires and coalescing and
+  the leader role survive, since neither depends on how commits are
+  serialized.
 - **External object-storage queue (e.g. OpenData Buffer).** Its consumer
   contracts (deterministic commit identity, ack after durable sink
   commit) validate the folder design and are borrowed. The queue itself

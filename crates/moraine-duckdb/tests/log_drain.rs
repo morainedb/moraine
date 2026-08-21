@@ -63,7 +63,7 @@ async fn catalog_open_reaches_the_sink_through_the_abi() {
     );
     // Structured fields ride along, not just the message.
     assert!(
-        opened.1.contains("flush_interval_ms="),
+        opened.1.contains("poll_interval_ms="),
         "record should carry the event's fields: {}",
         opened.1
     );

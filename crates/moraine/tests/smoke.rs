@@ -34,6 +34,45 @@ fn commit_conflict_keeps_the_retry_substring() {
     );
 }
 
+/// The commit-slot log's failures cross into moraine's error type: an
+/// unreachable log is terminal — not a conflict — so its text carries none
+/// of the four substrings either; a corrupt slot is corruption.
+///
+/// The message stands in for what `moraine_wal` actually builds: the object
+/// store's own Display, embedded verbatim except for the four substrings,
+/// which `moraine_wal` redacts at construction (proven in that crate, which
+/// can make a store fail). What this asserts is that the mapping adds none of
+/// its own and passes a real store's diagnostic through intact.
+#[test]
+fn slot_log_errors_map_and_avoid_ducklake_retry_substrings() {
+    let store_text = "slot 4: Generic S3 error: Error after 2 retries in 1.4s, \
+                      max_retries: 3 ... HTTP status server error \
+                      (503 Service Unavailable) for url (https://bucket.s3.amazonaws.com/\
+                      cat/commits/00000000000000000004)";
+    let transport = Error::from(moraine_wal::Error::Transport(store_text.to_string()));
+
+    assert_eq!(
+        transport.to_string(),
+        format!("commit-slot log unavailable: {store_text}")
+    );
+    for substring in ["conflict", "concurrent", "unique", "primary key"] {
+        assert!(
+            !transport
+                .to_string()
+                .to_ascii_lowercase()
+                .contains(substring),
+            "{transport} contains DuckLake's retry substring {substring:?}"
+        );
+    }
+
+    assert!(matches!(
+        Error::from(moraine_wal::Error::Corruption(
+            "slot: bad magic".to_string()
+        )),
+        Error::Corruption(_)
+    ));
+}
+
 #[test]
 fn logical_errors_display_context() {
     assert_eq!(

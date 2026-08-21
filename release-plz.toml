@@ -7,11 +7,23 @@ name = "moraine"
 # The extension release references the released commit; the crate tag is fixed.
 git_tag_name = "v{{ version }}"
 # Single workspace changelog: moraine owns the one CHANGELOG.md at the repo root
-# (changelog_path is relative to the root Cargo.toml) and folds moraine-duckdb's
-# commits into it. The root file is not part of any crate's package tarball;
+# (changelog_path is relative to the root Cargo.toml) and folds the crates listed
+# below into it. The root file is not part of any crate's package tarball;
 # crates.io renders the README, not the changelog, so nothing is lost there.
 changelog_path = "CHANGELOG.md"
-changelog_include = ["moraine-duckdb"]
+changelog_include = ["moraine-wal", "moraine-duckdb"]
+
+[[package]]
+name = "moraine-wal"
+# Published, and before moraine: a path dependency of a published crate must
+# itself be published. release-plz orders that from the dependency graph, so
+# `publish` and `git_only` stay at their defaults — unlike moraine-duckdb, this
+# crate goes to crates.io. moraine owns the one `v<version>` tag, GitHub
+# release, and root changelog for the workspace.
+git_tag_name = "v{{ version }}"
+git_tag_enable = false
+git_release_enable = false
+changelog_update = false
 
 [[package]]
 name = "moraine-duckdb"

@@ -34,6 +34,7 @@ mod index;
 mod inline;
 mod maintenance;
 mod migrate;
+mod multi_writer;
 mod partitioning;
 mod time_travel;
 mod types;

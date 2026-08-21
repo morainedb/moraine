@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use futures::{StreamExt, TryStreamExt, stream};
 
 use super::{
-    DbTransaction, EntityKey, Error, HashMap, InlineKey, InlineOperation, InlineScanKind, Key,
+    EntityKey, Error, HashMap, InlineKey, InlineOperation, InlineScanKind, Key, Overlay,
     ReadHandle, Result, RowOperation, TableKind, commit, decode::decode_hard_delete,
     materialize_inline_rows, proto, store_inline, value,
 };
@@ -39,7 +39,7 @@ impl ChunkSeqAllocator {
 
 /// Removes every `inline/insert` chunk begun at or before `flush_snapshot`
 /// for `(table_id, schema_version)`, plus the `inline/inline_delete`
-/// tombstones on those chunks' rows, reading `db_tx`'s pre-commit inline
+/// tombstones on those chunks' rows, reading the store's pre-commit inline
 /// records. Returns the row ids drained.
 ///
 /// A directory known complete serves the walk from its locators alone;
@@ -47,7 +47,8 @@ impl ChunkSeqAllocator {
 /// them (remembered when the store format locks out writers that predate
 /// it), and any gaps healed onto this batch.
 pub(crate) async fn translate_inline_flush_delete(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     projections: &std::sync::RwLock<ProjectionCache>,
     table_id: u64,
     schema_version: u64,
@@ -56,8 +57,8 @@ pub(crate) async fn translate_inline_flush_delete(
 ) -> Result<HashSet<u64>> {
     let rows = if projection::inline_directory_complete(projections, table_id) {
         let (locators, inline_deletes) = futures::try_join!(
-            store_inline::scan_inline_chunk_locators(ReadHandle::Tx(db_tx), table_id),
-            store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
+            store_inline::scan_inline_chunk_locators(handle, overlay, table_id),
+            store_inline::scan_inline_deletes(handle, overlay, table_id),
         )?;
 
         let scoped: Vec<store_inline::InlineChunkLocator> = locators
@@ -86,9 +87,9 @@ pub(crate) async fn translate_inline_flush_delete(
         materialize_locator_rows(&scoped, &inline_deletes)
     } else {
         let (chunks, range_ends, inline_deletes) = futures::try_join!(
-            store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id),
-            store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id),
-            store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
+            store_inline::scan_inline_chunks(handle, overlay, table_id),
+            store_inline::scan_inline_chunk_ranges(handle, overlay, table_id),
+            store_inline::scan_inline_deletes(handle, overlay, table_id),
         )?;
 
         let scoped: Vec<(InlineOperation, proto::InlineChunkValue)> = chunks
@@ -224,12 +225,13 @@ fn reconcile_chunk_directory(
 /// table does not carry. Takes a table's whole batch so the liveness
 /// check costs one prefix scan.
 pub(super) async fn translate_inline_file_delete_removals(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
     removals: &[(u64, u64)],
 ) -> Result<Vec<commit::StagedWrite>> {
     let live: HashSet<(u64, u64)> =
-        store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id)
+        store_inline::scan_inline_file_deletes(handle, overlay, table_id)
             .await?
             .into_iter()
             .map(|(data_file_id, row_id, _)| (data_file_id, row_id))
@@ -282,14 +284,15 @@ fn gather_pruned_data_files(ops: &[RowOperation]) -> Result<BTreeSet<(u64, u64)>
 /// this commit prunes. A pruned file carrying no inlined deletion is the
 /// ordinary case, not an error.
 async fn translate_pruned_file_delete_cascade(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     pruned: &BTreeSet<(u64, u64)>,
 ) -> Result<Vec<commit::StagedWrite>> {
     let tables: BTreeSet<u64> = pruned.iter().map(|(table_id, _)| *table_id).collect();
     stream::iter(tables.into_iter().map(|table_id| async move {
         let mut writes = Vec::new();
         for (data_file_id, row_id, _) in
-            store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id).await?
+            store_inline::scan_inline_file_deletes(handle, overlay, table_id).await?
         {
             if pruned.contains(&(table_id, data_file_id)) {
                 writes.push((
@@ -314,19 +317,20 @@ async fn translate_pruned_file_delete_cascade(
 }
 
 /// Removes every `inline/*` record for `table_id`: schema, chunks, and
-/// tombstones, read from `db_tx`'s current (pre-commit) state.
+/// tombstones, read at the current (pre-commit) state.
 pub(super) async fn translate_inline_drop(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
     let (chunks, ranges, inline_deletes, file_deletes, schemas, dropped_schemas) = futures::try_join!(
-        store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id),
-        store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id),
-        store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
-        store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id),
-        store_inline::scan_inline_schemas(ReadHandle::Tx(db_tx), table_id),
-        store_inline::scan_inline_dropped_schemas(ReadHandle::Tx(db_tx), table_id),
+        store_inline::scan_inline_chunks(handle, overlay, table_id),
+        store_inline::scan_inline_chunk_ranges(handle, overlay, table_id),
+        store_inline::scan_inline_deletes(handle, overlay, table_id),
+        store_inline::scan_inline_file_deletes(handle, overlay, table_id),
+        store_inline::scan_inline_schemas(handle, overlay, table_id),
+        store_inline::scan_inline_dropped_schemas(handle, overlay, table_id),
     )?;
 
     for (op, _) in chunks {
@@ -587,14 +591,15 @@ pub(super) fn inline_schema_collapse_target(
 /// inline chunk locator carries it to theirs. Reports whether it wrote
 /// one, which is what owes that stamp.
 async fn translate_inline_schema_drop(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
     schema_version: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<bool> {
     writes.push(inline_schema_drop_write(table_id, schema_version));
 
-    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(db_tx), table_id).await?;
+    let schemas = store_inline::scan_inline_schemas(handle, overlay, table_id).await?;
     let Some(target) = inline_schema_collapse_target(&schemas, schema_version) else {
         return Ok(false);
     };
@@ -670,14 +675,33 @@ fn gather_file_delete_removals(ops: &[RowOperation]) -> BTreeMap<u64, Vec<(u64, 
 
 /// Translates every staged inline op into direct `inline/*` key writes, a
 /// separate pass from `translate` since inline records are never diffed.
-/// `db_tx` is read at its pre-commit state, before any of this commit's
+/// The store is read at its pre-commit state, before any of this commit's
 /// own writes are staged onto it.
 #[allow(clippy::too_many_lines)]
 pub(super) async fn translate_inline(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     projections: &std::sync::RwLock<ProjectionCache>,
     ops: &[RowOperation],
 ) -> Result<(Vec<commit::StagedWrite>, bool)> {
+    /// One table-scoped translation, resolved to owned inputs so each future
+    /// borrows nothing from `ops`: a borrowed operand here makes the whole
+    /// translation non-`Send`, which the leader's spawned session needs.
+    enum TableScoped {
+        FlushDelete {
+            table_id: u64,
+            schema_version: u64,
+            flush_snapshot: u64,
+        },
+        Drop {
+            table_id: u64,
+        },
+        SchemaDrop {
+            table_id: u64,
+            schema_version: u64,
+        },
+    }
+
     let mut writes = Vec::new();
     let mut chunk_seqs = ChunkSeqAllocator::default();
     // One existence marker per table per commit.
@@ -686,7 +710,7 @@ pub(super) async fn translate_inline(
     let removals = async {
         stream::iter(gather_file_delete_removals(ops).into_iter().map(
             |(table_id, removals)| async move {
-                translate_inline_file_delete_removals(db_tx, table_id, &removals).await
+                translate_inline_file_delete_removals(handle, overlay, table_id, &removals).await
             },
         ))
         .buffer_unordered(INLINE_TRANSLATION_CONCURRENCY)
@@ -698,53 +722,73 @@ pub(super) async fn translate_inline(
         if pruned.is_empty() {
             Ok(Vec::new())
         } else {
-            translate_pruned_file_delete_cascade(db_tx, &pruned).await
+            translate_pruned_file_delete_cascade(handle, overlay, &pruned).await
         }
     };
-    // Flushes and drops name a table and scan `db_tx` for the keys to
+    // Flushes and drops name a table and scan the store for the keys to
     // remove; they run together and land last.
-    let table_scoped: Vec<&RowOperation> = ops
+
+    let table_scoped: Vec<TableScoped> = ops
         .iter()
-        .filter(|op| {
-            matches!(
-                op,
-                RowOperation::InlineFlushDelete { .. }
-                    | RowOperation::InlineDrop { .. }
-                    | RowOperation::InlineSchemaDrop { .. }
-            )
+        .filter_map(|op| match op {
+            RowOperation::InlineFlushDelete {
+                table_id,
+                schema_version,
+                flush_snapshot,
+            } => Some(TableScoped::FlushDelete {
+                table_id: *table_id,
+                schema_version: *schema_version,
+                flush_snapshot: *flush_snapshot,
+            }),
+            RowOperation::InlineDrop { table_id } => Some(TableScoped::Drop {
+                table_id: *table_id,
+            }),
+            RowOperation::InlineSchemaDrop {
+                table_id,
+                schema_version,
+            } => Some(TableScoped::SchemaDrop {
+                table_id: *table_id,
+                schema_version: *schema_version,
+            }),
+            _ => None,
         })
         .collect();
     let scoped = stream::iter(table_scoped.into_iter().map(|op| async move {
         let mut writes = Vec::new();
         let mut referenced = false;
         match op {
-            RowOperation::InlineFlushDelete {
+            TableScoped::FlushDelete {
                 table_id,
                 schema_version,
                 flush_snapshot,
             } => {
                 translate_inline_flush_delete(
-                    db_tx,
+                    handle,
+                    overlay,
                     projections,
-                    *table_id,
-                    *schema_version,
-                    *flush_snapshot,
+                    table_id,
+                    schema_version,
+                    flush_snapshot,
                     &mut writes,
                 )
                 .await?;
             }
-            RowOperation::InlineDrop { table_id } => {
-                translate_inline_drop(db_tx, *table_id, &mut writes).await?;
+            TableScoped::Drop { table_id } => {
+                translate_inline_drop(handle, overlay, table_id, &mut writes).await?;
             }
-            RowOperation::InlineSchemaDrop {
+            TableScoped::SchemaDrop {
                 table_id,
                 schema_version,
             } => {
-                referenced =
-                    translate_inline_schema_drop(db_tx, *table_id, *schema_version, &mut writes)
-                        .await?;
+                referenced = translate_inline_schema_drop(
+                    handle,
+                    overlay,
+                    table_id,
+                    schema_version,
+                    &mut writes,
+                )
+                .await?;
             }
-            _ => {}
         }
         Ok::<_, Error>((writes, referenced))
     }))

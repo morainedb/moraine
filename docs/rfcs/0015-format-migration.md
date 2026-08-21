@@ -37,7 +37,9 @@ any of this machinery.
   and resumes from a durable cursor, never losing catalog state and never
   exposing a half-migrated store to a reader.
 - A structural rewrite is **operator-triggered**, not a silent side effect of
-  opening a store in production.
+  opening a store in production — except a bounded `system`-only migration
+  (Trigger policy), which auto-runs on read-write attach as a deliberate,
+  narrow exception.
 
 Non-goals:
 
@@ -143,14 +145,16 @@ that makes it fire.
 ### Single-writer migration
 
 A structural migration is a sequence of writes, so it runs under the **one
-fenced writer** (RFC 0004). This is not new machinery: SlateDB's
-`writer_epoch` CAS-on-open means a second process attempting to migrate the
-same store is fenced — it loses the epoch and writes nothing (RFC 0011, the
-takeover cases).
-So **exactly one migrator runs**, by the same guarantee that makes an
-accidental second catalog writer safe. Readers, meanwhile, must never observe
-a half-migrated store; the resume protocol below is structured so the only
-externally visible flip of `sys/format` is atomic and last.
+fenced writer** (RFC 0004; under RFC 0022's commit log, the fenced writer
+performing it is the folder role — migration is folder-role work, like
+fold and genesis, because all three write the store directly). This is not
+new machinery: SlateDB's `writer_epoch` CAS-on-open means a second process
+attempting to migrate the same store is fenced — it loses the epoch and
+writes nothing (RFC 0011, the takeover cases). So **exactly one migrator
+runs**, by the same guarantee that makes an accidental second catalog
+writer safe. Readers, meanwhile, must never observe a half-migrated store;
+the resume protocol below is structured so the only externally visible flip
+of `sys/format` is atomic and last.
 
 The start batch is additionally the **only writer of the marker key**:
 `migration::start` is the one code path that puts `sys/migration`, and any
@@ -302,10 +306,16 @@ rewrite.
 
 ### Trigger policy
 
-A structural rewrite is heavyweight — it rewrites the keyspace and takes the
-single writer for its duration. It is therefore gated behind **explicit
-operator opt-in**: a dedicated verb/flag (e.g. a `migrate` operation, distinct
-from ordinary attach), **not** a silent auto-run on open. The reasoning:
+Migrations split into two classes by whether they carry the rolling-fleet
+surprise the previous section warns about, and each class has its own
+trigger.
+
+**Keyspace-walking migrations stay operator-triggered.** A rewrite that
+touches entity keys is heavyweight, unbounded in the size of the catalog,
+and takes the fenced writer for its duration. It is gated behind **explicit
+operator opt-in**: a dedicated verb/flag (e.g. a `migrate` operation,
+distinct from ordinary attach), **not** a silent auto-run on open. The
+reasoning:
 
 - An unbounded rewrite triggered implicitly by "someone opened the store with
   a newer binary" can surprise a rolling fleet — the first upgraded node to
@@ -320,14 +330,25 @@ the floor, or carrying a marker. It opens the writer itself — taking the
 same epoch `open` takes, so it fences a running catalog and is fenced by
 one — runs the plan the durable state implies, and closes.
 
-That is also what makes the refusal actionable, and the refusal says so: the
-verb never runs the format check, so the binary that refuses to *open* a
-below-the-floor store is the same binary that migrates it. An operator
-reading "refused" as "wrong binary" would go looking for one that does not
-exist. The refusal names the verb — the core names `Catalog::migrate`, and
-the DuckDB shim, which is the layer that holds the store path and the only
-one that may name a SQL function, turns the same error into one naming
-`moraine_migrate('<path>')`.
+**Bounded `system`-only migrations auto-run on read-write attach.** A
+migration qualifies when it is a single atomic `WriteBatch` touching only
+`system` records, with no keyspace walk and no cursor — the whole
+start/step/finish machinery above collapses to one step, so there is no
+half-migrated intermediate a rolling reader could ever observe. RFC 0022's
+format 4 migration is the exemplar, and so far the only member: converting
+a format 1–3 store writes `sys/format = 4`
+— the existing store already *is* the folded state and the commit log
+starts empty, so there is nothing else to rewrite. It auto-runs the moment
+any process attaches read-write, exactly as bootstrap (RFC 0004) auto-runs
+on first open: opening the writer to migrate fences any incumbent
+old-binary writer, safe by RFC 0004's fencing and called out in release
+notes. Read-only attaches never trigger it and need not: an absent
+The store's replay point reads as 0 with an empty tail, so a format 1–3 store served
+read-only is already a valid (empty) slot store. A future bounded
+`system`-only migration gets the same trigger for the same reason; a
+migration that walks the keyspace does not, no matter how small it looks
+in the moment — the rolling-fleet hazard above is what gates it, not row
+count.
 
 Every migration is triggered by the explicit verb; nothing auto-runs on open.
 This includes bounded metadata-only rewrites: one trigger rule is easier to
@@ -382,6 +403,27 @@ the post-migration assertions go through an ordinary attach.
   pre-migration snapshot (RFC 0002 `history`/`snapshot`) still returns the correct
   historical state — the rewrite preserves temporal semantics, it does not
   flatten history.
+
+## Open questions
+
+- **Rollback strategy.** Migrations are one-way. Is a pre-migration snapshot
+  the sanctioned recovery, or should paired `v_{n+1} → v_n` inverse
+  migrations be written and tested? The latter doubles the test surface and
+  is not always expressible (a lossy structural change has no inverse).
+- **Online / mixed-binary migration for rolling deploys.** Can a structural
+  bump ever be served across two binary versions simultaneously — e.g. a
+  reader that understands both layouts for a window — or is a drain/brief
+  unavailability the permanent answer? This RFC assumes the latter and flags
+  the former as unsolved.
+- **Whole-store pre-migration snapshot.** Should the `migrate` verb snapshot
+  the entire store before starting, for guaranteed manual rollback? SlateDB
+  (pinned 0.14.x) provides the mechanism nearly for free:
+  `Db::create_checkpoint()` produces a durable, named manifest-level
+  checkpoint that pins the store's current objects without copying them —
+  no transient size doubling, no bulk traffic; the cost is retained objects
+  for the checkpoint's lifetime. The open part is policy, not mechanism:
+  checkpoint by default or behind an operator flag, and when the checkpoint
+  is released after a successful migration.
 
 ## Alternatives considered
 
