@@ -715,18 +715,18 @@ async fn replay(reader: &DbReader, store: &SlotStore, until: Option<u64>) -> Res
 /// The head the slot after `folded` must have been validated against: the one
 /// the last folded slot leaves, read from the log itself.
 ///
-/// `None` when the log cannot supply it — nothing folded yet, or the folded
-/// slot already truncated away. Only the store records the head in those
-/// cases, and a reader replaying the log as its write-ahead log holds the
-/// tail folded into that view, so it cannot read the two apart. An unanchored
-/// tail is still checked slot against slot; it is the first slot that goes
-/// unchecked.
+/// With nothing folded there is no such slot, and the head the store carried
+/// before it adopted the log stands in — read once through a reader that
+/// replays no slot, so the rows answering it and the cursor bounding them come
+/// from one manifest.
+///
+/// `None` when neither can supply it: a folded slot already truncated away, or
+/// a fold that landed since, which leaves the folded-only view describing more
+/// than the pre-log store. An unanchored tail is still checked slot against
+/// slot; it is the first slot that goes unchecked.
 async fn tail_anchor(store: &SlotStore, folded: u64) -> Result<Option<u64>> {
-    // Nothing folded leaves the store the only record of the head, and the
-    // fold cursor and a folded-only reader answer from different manifests,
-    // which can disagree — so there is nothing here to anchor on safely.
     if folded == 0 {
-        return Ok(None);
+        return pre_log_head(store).await;
     }
 
     let Some(envelope) = store.slots.read_slot(folded).await? else {
@@ -739,6 +739,41 @@ async fn tail_anchor(store: &SlotStore, folded: u64) -> Result<Option<u64>> {
     }
 
     Ok(head)
+}
+
+/// The head the store carried before its first slot, memoized: nothing but a
+/// fold can move it, and past the first fold the log supplies the anchor
+/// instead.
+///
+/// `None` when the folded-only open reports a cursor of its own above zero —
+/// a fold landed since, so what it serves is no longer the pre-log store and
+/// the caller's `folded` belongs to a different manifest than these rows.
+async fn pre_log_head(store: &SlotStore) -> Result<Option<u64>> {
+    store
+        .pre_log_head
+        .get_or_try_init(|| async {
+            let reader = CacheOptions::of(&store.options)
+                .apply(StoreBuilder::new(
+                    &store.options.path,
+                    Arc::clone(&store.object_store),
+                ))
+                .open_folded_reader()
+                .await?;
+            let cursor = crate::transaction::folder::reader_cursor(&reader);
+            let head = if cursor == 0 {
+                commit::read_head_value(ReadHandle::Reader(&reader))
+                    .await
+                    .map(|head| Some(head.snapshot_id))
+            } else {
+                Ok(None)
+            };
+            // Closed on both paths: this reader is opened for the one read and
+            // never handed to a caller.
+            release_reader(Some(&reader)).await;
+            head
+        })
+        .await
+        .copied()
 }
 
 /// The head a commit leaves behind, read from its own `sys/head` write.
@@ -961,6 +996,7 @@ mod tests {
                 crate::catalog::projection::ProjectionCache::empty(),
             )),
             migration_clear: Arc::new(std::sync::Mutex::new(None)),
+            pre_log_head: Arc::new(tokio::sync::OnceCell::new()),
             head_cache: HeadCache::default(),
             contention: Arc::new(ContentionCounters::default()),
             #[cfg(feature = "leader")]
@@ -1159,8 +1195,9 @@ mod tests {
     }
 
     /// The anchor the first unfolded slot is held to is the head the last
-    /// folded slot leaves, taken from the log. It is absent exactly when the
-    /// log cannot supply it: nothing folded, or that slot truncated away.
+    /// folded slot leaves, taken from the log — or, with nothing folded, the
+    /// head the store carried before the log. It is absent only when neither
+    /// can supply it, as a truncated folded slot cannot.
     #[tokio::test]
     async fn the_tail_anchors_on_the_head_the_folded_slot_leaves() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1173,27 +1210,21 @@ mod tests {
 
         // Slot 1 leaves head 1, so a slot following it owes exactly that.
         assert_eq!(tail_anchor(&store, 1).await.unwrap(), Some(1));
-        // Nothing folded, and a truncated slot, leave nothing to anchor on.
-        assert_eq!(tail_anchor(&store, 0).await.unwrap(), None);
+        // Bootstrap leaves head 0, and the log's first slot owes that — read
+        // through a reader replaying no slot, so the tail cannot answer for it.
+        assert_eq!(tail_anchor(&store, 0).await.unwrap(), Some(0));
+        // A folded slot truncated away leaves nothing to anchor on.
         assert_eq!(tail_anchor(&store, 9).await.unwrap(), None);
     }
 
     /// A commit validated above the replayed head means the slots between them
     /// are missing, so its writes never apply.
     ///
-    /// Detection here races the reader. A reader serves the unfolded tail by
-    /// replaying it, so once it has taken slot 1 its view already holds that
-    /// commit's writes and `admit` reads the slot as one the view reflects
-    /// rather than one above it; before it has, the view stands at the
-    /// bootstrap head and the slot is refused. The fold cursor says nothing
-    /// either way — it reads 0 under both.
-    ///
-    /// The chain check covers every later slot, seeded from the head the one
-    /// before it leaves. Only the first slot of an unfolded log goes
-    /// unchecked, and anchoring it needs the pre-tail head, which no reader
-    /// that replays the log can be asked for. Telling the folded state from
-    /// the tail under one manifest is what this needs.
-    #[ignore = "detection races the reader's own replay of the tail"]
+    /// The view cannot answer this on its own: a reader serves the unfolded
+    /// tail by replaying it, so once it has taken slot 1 its view already
+    /// holds that commit and reads it as one the view reflects. The anchor is
+    /// what settles it — the head the store carried before the log, which the
+    /// first slot must have been validated against.
     #[tokio::test]
     async fn a_commit_validated_above_the_view_refuses() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

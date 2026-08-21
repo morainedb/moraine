@@ -137,6 +137,11 @@ pub(crate) struct SlotStore {
     /// When this handle last read the migration marker absent, so a run of
     /// reads inside one poll interval pays for one look rather than one each.
     pub(crate) migration_clear: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// The head the store carried before it adopted the log, read once
+    /// through a reader that replays no slot. It is what the log's first slot
+    /// must have been validated against, and nothing but a fold can move it —
+    /// past the first fold the log itself supplies the anchor instead.
+    pub(crate) pre_log_head: Arc<tokio::sync::OnceCell<Option<u64>>>,
     /// Slot-race and retry counters accumulated across commits, shared by every
     /// clone of the handle through the store's `Arc` and by the staged
     /// transactions it opens, which arm forwarding by counting their lost
@@ -1187,6 +1192,7 @@ impl Catalog {
                     coalescer,
                     projections: Arc::clone(&projections),
                     migration_clear: Arc::new(std::sync::Mutex::new(None)),
+                    pre_log_head: Arc::new(tokio::sync::OnceCell::new()),
                     head_cache: slot_commit::HeadCache::default(),
                     contention: Arc::new(slot_commit::ContentionCounters::default()),
                     #[cfg(feature = "leader")]
@@ -1500,6 +1506,7 @@ impl Catalog {
                 coalescer,
                 projections: Arc::clone(&projections),
                 migration_clear: Arc::new(std::sync::Mutex::new(None)),
+                pre_log_head: Arc::new(tokio::sync::OnceCell::new()),
                 head_cache: slot_commit::HeadCache::default(),
                 contention: Arc::new(slot_commit::ContentionCounters::default()),
                 #[cfg(feature = "leader")]

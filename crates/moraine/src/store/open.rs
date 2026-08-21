@@ -253,6 +253,26 @@ impl<'a> StoreBuilder<'a> {
         Ok((reader, counters))
     }
 
+    /// Opens the store read-only over a WAL that replays nothing, so the
+    /// reader serves what the fold has applied and no part of the tail.
+    ///
+    /// The cursor this reader reports and the rows it serves come from one
+    /// manifest, which is what telling folded state from a replayed tail
+    /// needs. Nothing else may read through it: a caller after the current
+    /// catalog wants [`open_reader`](Self::open_reader).
+    pub(crate) async fn open_folded_reader(&self) -> Result<DbReader> {
+        let mut builder = DbReader::builder(self.path, Arc::clone(&self.object_store))
+            .with_segment_extractor(Arc::new(TagSegmentExtractor))
+            .with_wal_reader(moraine_wal::SlotWal::folded_only_reader())
+            .with_options(self.reader_options());
+
+        if let Some(cache) = cache::shared(&self.cache_config(), self.location()).await {
+            builder = builder.with_db_cache(cache);
+        }
+
+        builder.build().await.map_err(Error::from)
+    }
+
     /// Deletes the checkpoint `checkpoint`, unpinning whatever it held
     /// against garbage collection.
     pub(crate) async fn delete_checkpoint(&self, checkpoint: Uuid) -> Result<()> {

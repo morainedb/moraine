@@ -164,6 +164,15 @@ impl SlotWal {
         Arc::new(self.clone())
     }
 
+    /// A reader-side WAL that replays no slot, so the store it opens serves
+    /// what the fold has applied and nothing else. Pair it with the
+    /// `replay_after_wal_id` that same open reports and the two describe one
+    /// state, which is what separating folded rows from replayed ones needs.
+    #[must_use]
+    pub fn folded_only_reader() -> Arc<dyn WalReader> {
+        Arc::new(FoldedOnly)
+    }
+
     /// The collector SlateDB's garbage collector hands referenced ranges to:
     /// `GarbageCollectorBuilder::with_wal_gc(wal.garbage_collector())`.
     #[must_use]
@@ -450,6 +459,39 @@ impl WalReader for SlotWal {
 
     async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError> {
         self.tail_end(replay_after_wal_id).await
+    }
+}
+
+/// A reader-side WAL that replays nothing, so the store it opens serves the
+/// folded state alone.
+///
+/// Every ordinary reader replays the tail, which is what makes it current —
+/// and what leaves it unable to say which of its rows the fold put there and
+/// which the replay did. Reading the two apart takes a view with no replay in
+/// it, at the cursor that same open reports.
+struct FoldedOnly;
+
+#[async_trait]
+impl WalReader for FoldedOnly {
+    async fn iterator(
+        &self,
+        _wal_file_id_range: WalFileRange,
+    ) -> Result<Box<dyn WalIterator>, WalError> {
+        Ok(Box::new(EmptyWalIterator))
+    }
+
+    /// The cursor itself: nothing follows what the fold already applied.
+    async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError> {
+        Ok(replay_after_wal_id)
+    }
+}
+
+struct EmptyWalIterator;
+
+#[async_trait]
+impl WalIterator for EmptyWalIterator {
+    async fn next(&mut self) -> Result<Option<WalRows>, WalError> {
+        Ok(None)
     }
 }
 
