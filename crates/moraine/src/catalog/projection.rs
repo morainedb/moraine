@@ -33,6 +33,9 @@ pub(crate) fn materialize<K: Ord, V: Clone>(rows: &BTreeMap<K, V>) -> Vec<V> {
 /// One table's recorded inline schemas, shared so a serve is a refcount bump.
 pub(crate) type InlineSchemas = Arc<Vec<(u64, bytes::Bytes)>>;
 
+/// One table's inline row tombstones, shared the same way.
+pub(crate) type InlineTombstones = Arc<Vec<(u64, crate::store::proto::InlineInlineDeleteValue)>>;
+
 /// Whether two head records name the same store state.
 fn same_head(a: &HeadValue, b: &HeadValue) -> bool {
     a.snapshot_id == b.snapshot_id && a.batch_seq == b.batch_seq
@@ -101,6 +104,31 @@ pub(crate) fn inline_schemas_at(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .inline_schemas_at(table_id, expected)
+}
+
+/// `table_id`'s inline tombstones iff they stand at exactly `expected`.
+pub(crate) fn inline_tombstones_at(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+    expected: &HeadValue,
+) -> Option<InlineTombstones> {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inline_tombstones_at(table_id, expected)
+}
+
+/// Records `table_id`'s inline tombstones as scanned at `head`.
+pub(crate) fn install_inline_tombstones(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+    head: HeadValue,
+    rows: InlineTombstones,
+) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .install_inline_tombstones(table_id, head, rows);
 }
 
 /// Records `table_id`'s inline schemas as scanned at `head`.
@@ -176,6 +204,9 @@ pub(crate) struct ProjectionCache {
     /// scanned at. A base-table scan asks for them once per registered
     /// schema version, and every ask returns the same whole list.
     inline_schemas: BTreeMap<u64, (HeadValue, InlineSchemas)>,
+    /// One table's inline tombstones, stamped with the head they were scanned
+    /// at. Every per-version scan of a base table asks for the same set.
+    inline_tombstones: BTreeMap<u64, (HeadValue, InlineTombstones)>,
 }
 
 impl ProjectionCache {
@@ -206,6 +237,7 @@ impl ProjectionCache {
             format_floor: 0,
             inline_directory_complete: BTreeSet::new(),
             inline_schemas: BTreeMap::new(),
+            inline_tombstones: BTreeMap::new(),
         }
     }
 
@@ -219,6 +251,28 @@ impl ProjectionCache {
             .get(&table_id)
             .filter(|(head, _)| same_head(head, expected))
             .map(|(_, schemas)| Arc::clone(schemas))
+    }
+
+    /// `table_id`'s inline tombstones iff they stand at exactly `expected`.
+    pub(crate) fn inline_tombstones_at(
+        &self,
+        table_id: u64,
+        expected: &HeadValue,
+    ) -> Option<InlineTombstones> {
+        self.inline_tombstones
+            .get(&table_id)
+            .filter(|(head, _)| same_head(head, expected))
+            .map(|(_, rows)| Arc::clone(rows))
+    }
+
+    /// Records `table_id`'s inline tombstones as scanned at `head`.
+    pub(crate) fn install_inline_tombstones(
+        &mut self,
+        table_id: u64,
+        head: HeadValue,
+        rows: InlineTombstones,
+    ) {
+        self.inline_tombstones.insert(table_id, (head, rows));
     }
 
     /// Records `table_id`'s inline schemas as scanned at `head`.

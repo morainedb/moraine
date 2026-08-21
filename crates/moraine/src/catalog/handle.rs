@@ -434,6 +434,14 @@ impl ProbeRead {
         &self.head.view
     }
 
+    /// The stamp this probe reads at, both halves.
+    fn head_value(&self) -> crate::store::proto::HeadValue {
+        crate::store::proto::HeadValue {
+            snapshot_id: self.head.view.snapshot.snapshot_id,
+            batch_seq: self.head.view.batch_seq,
+        }
+    }
+
     fn tail(&self) -> Option<&moraine_wal::Overlay> {
         self.head.tail.as_ref()
     }

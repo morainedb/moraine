@@ -101,6 +101,34 @@ impl InlineRowSource {
 }
 
 impl ReadOnlyCatalog {
+    /// `table`'s inline tombstones, served from the projection when they
+    /// stand at this read's head. Every per-version scan of a base table asks
+    /// for the same whole set, and the set cannot be scoped by version: a
+    /// tombstone names a row id, not the version that wrote it.
+    async fn inline_tombstones(
+        &self,
+        handle: ReadHandle<'_>,
+        overlay: Option<&moraine_wal::Overlay>,
+        table: TableId,
+        head: &crate::store::proto::HeadValue,
+    ) -> Result<projection::InlineTombstones> {
+        if let Some(rows) = projection::inline_tombstones_at(&self.projections, table.get(), head) {
+            return Ok(rows);
+        }
+
+        let rows = std::sync::Arc::new(
+            store_inline::scan_inline_deletes(handle, overlay, table.get()).await?,
+        );
+        projection::install_inline_tombstones(
+            &self.projections,
+            table.get(),
+            *head,
+            std::sync::Arc::clone(&rows),
+        );
+
+        Ok(rows)
+    }
+
     /// Every inline row of `table` — tombstoned included, for the caller's
     /// scan kind to select over — from the chunk-range directory when it
     /// is known complete, else from the chunk scan, verifying the
@@ -111,6 +139,7 @@ impl ReadOnlyCatalog {
         overlay: Option<&moraine_wal::Overlay>,
         table: TableId,
         schema_version: Option<u64>,
+        head: &crate::store::proto::HeadValue,
     ) -> Result<(InlineRowSource, Vec<InlineRow>)> {
         // A caller after one version's rows takes only that version's chunks:
         // the others are dropped before their bodies resolve anyway, and a
@@ -121,7 +150,7 @@ impl ReadOnlyCatalog {
         {
             let (chunks, tombstones) = futures::try_join!(
                 store_inline::scan_inline_chunks_of_version(handle, overlay, table.get(), version),
-                store_inline::scan_inline_deletes(handle, overlay, table.get()),
+                self.inline_tombstones(handle, overlay, table, head),
             )?;
             let rows = materialize_inline_rows(&chunks, &tombstones);
             return Ok((InlineRowSource::Chunks(chunks), rows));
@@ -130,7 +159,7 @@ impl ReadOnlyCatalog {
         if projection::inline_directory_complete(&self.projections, table.get()) {
             let (locators, tombstones) = futures::try_join!(
                 store_inline::scan_inline_chunk_locators(handle, overlay, table.get()),
-                store_inline::scan_inline_deletes(handle, overlay, table.get()),
+                self.inline_tombstones(handle, overlay, table, head),
             )?;
             let rows = materialize_locator_rows(&locators, &tombstones);
             return Ok((InlineRowSource::Locators(locators), rows));
@@ -138,7 +167,7 @@ impl ReadOnlyCatalog {
 
         let (chunks, tombstones) = futures::try_join!(
             store_inline::scan_inline_chunks(handle, overlay, table.get()),
-            store_inline::scan_inline_deletes(handle, overlay, table.get()),
+            self.inline_tombstones(handle, overlay, table, head),
         )?;
         self.verify_inline_directory(handle, overlay, table, &chunks)
             .await?;
@@ -162,9 +191,10 @@ impl ReadOnlyCatalog {
     ) -> Result<(Vec<InlineRow>, Vec<(InlineOperation, InlineChunkValue)>)> {
         let table = TableId::new(table_id);
         let read = self.begin_probe().await?;
+        let head = read.head_value();
         let outcome = async {
             let (source, rows) = self
-                .inline_row_source(read.handle(), read.tail(), table, schema_version)
+                .inline_row_source(read.handle(), read.tail(), table, schema_version, &head)
                 .await?;
             let mut selected = kind.select(&rows, snapshot, start);
             if let Some(version) = schema_version {
@@ -190,13 +220,16 @@ impl ReadOnlyCatalog {
     ) -> Result<Vec<RecentRow>> {
         let handle = read.handle();
         let overlay = read.tail();
+        let head_value = read.head_value();
         // The probe already resolved the head across store and tail, so only
         // time travel owes a store read.
         let read_at = match at {
             Some(_) => commit::resolve_read_snapshot(handle, at).await?.0,
             None => read.view().snapshot.snapshot_id,
         };
-        let (source, rows) = self.inline_row_source(handle, overlay, table, None).await?;
+        let (source, rows) = self
+            .inline_row_source(handle, overlay, table, None, &head_value)
+            .await?;
 
         let live = InlineScanKind::Table.select(&rows, read_at, 0);
         let (live, chunks) = source.resolve_chunks(handle, overlay, table, live).await?;
@@ -252,8 +285,9 @@ impl ReadOnlyCatalog {
         table: TableId,
     ) -> Result<Vec<u64>> {
         let head = read.view().snapshot.snapshot_id;
+        let head_value = read.head_value();
         let (_, rows) = self
-            .inline_row_source(read.handle(), read.tail(), table, None)
+            .inline_row_source(read.handle(), read.tail(), table, None, &head_value)
             .await?;
 
         Ok(InlineScanKind::Table
