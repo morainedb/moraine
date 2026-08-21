@@ -172,7 +172,8 @@ std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &conte
 }
 
 MoraineArrowBytes EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::DataChunk &chunk,
-                                        duckdb::idx_t user_col_start) {
+                                        duckdb::idx_t user_col_start, duckdb::idx_t row_offset,
+                                        duckdb::idx_t row_count) {
 	auto user_count = chunk.ColumnCount() - user_col_start;
 	duckdb::vector<duckdb::LogicalType> types;
 	duckdb::vector<std::string> names;
@@ -185,14 +186,15 @@ MoraineArrowBytes EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::
 		names.push_back("c" + std::to_string(i));
 	}
 
-	// Export just the user columns: `ToArrowArray` serializes every column of
-	// the chunk it is handed, so reference the tail into a standalone view.
+	// Export just the user columns of just this row range: `ToArrowArray`
+	// serializes every column and every row of the chunk it is handed, so
+	// slice the tail into a standalone view.
 	duckdb::DataChunk user_chunk;
 	user_chunk.InitializeEmpty(types);
 	for (duckdb::idx_t i = 0; i < user_count; i++) {
-		user_chunk.data[i].Reference(chunk.data[user_col_start + i]);
+		user_chunk.data[i].Slice(chunk.data[user_col_start + i], row_offset, row_offset + row_count);
 	}
-	user_chunk.SetCardinality(chunk.size());
+	user_chunk.SetCardinality(row_count);
 
 	// Lossless, matching the inline schema registration: a UUID encodes as a
 	// 16-byte blob (as in Parquet), not a string, so index maintenance sees
@@ -889,14 +891,37 @@ public:
 		auto *tx = StagedTx(context.client);
 		// Columns 0/1 are `row_id`/`begin_snapshot`; every row of one chunk
 		// shares one `begin_snapshot`, so the first row's value is enough.
-		auto row_id_start = CellAsU64(chunk.GetValue(0, 0));
+		// A chunk records only its first row id and a count, so its rows must
+		// be contiguous — which an UPDATE's preserved row ids are not, since
+		// DuckLake emits each row's own id and mints fresh ones only for the
+		// rest. Stage one chunk per contiguous run.
 		auto begin_snapshot = CellAsU64(chunk.GetValue(1, 0));
-		auto body = EncodeInlineChunkRows(context.client, chunk, /* user_col_start */ 3);
-		MoraineError err {};
-		auto code = moraine_tx_stage_inline_insert_owned(tx, table_id_, schema_version_, begin_snapshot, row_id_start,
-		                                                 chunk.size(), body, &err);
-		if (code != MORAINE_OK) {
-			ThrowMoraineError(err);
+
+		// Flattened once: the run scan reads every row, and a `Value` apiece
+		// would price an ordinary insert by its chunk size.
+		duckdb::UnifiedVectorFormat row_ids;
+		chunk.data[0].ToUnifiedFormat(chunk.size(), row_ids);
+		auto ids = duckdb::UnifiedVectorFormat::GetData<int64_t>(row_ids);
+		auto id_at = [&](duckdb::idx_t row) {
+			return static_cast<uint64_t>(ids[row_ids.sel->get_index(row)]);
+		};
+
+		duckdb::idx_t run_start = 0;
+		while (run_start < chunk.size()) {
+			auto run_first_id = id_at(run_start);
+			duckdb::idx_t run_end = run_start + 1;
+			while (run_end < chunk.size() && id_at(run_end) == run_first_id + (run_end - run_start)) {
+				run_end++;
+			}
+			auto run_count = run_end - run_start;
+			auto body = EncodeInlineChunkRows(context.client, chunk, /* user_col_start */ 3, run_start, run_count);
+			MoraineError err {};
+			auto code = moraine_tx_stage_inline_insert_owned(tx, table_id_, schema_version_, begin_snapshot,
+			                                                 run_first_id, run_count, body, &err);
+			if (code != MORAINE_OK) {
+				ThrowMoraineError(err);
+			}
+			run_start = run_end;
 		}
 		state.affected_count += chunk.size();
 		return duckdb::SinkResultType::NEED_MORE_INPUT;

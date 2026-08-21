@@ -26,7 +26,6 @@ async fn collect_immediate_backfill<'a>(
     positions: &[usize],
     resolve: impl Fn(&str, bool) -> Path,
     killed_positions: &'a HashMap<u64, HashSet<u64>>,
-    killed_row_ids: &'a HashMap<u64, HashSet<u64>>,
 ) -> Result<Vec<IndexEntry>> {
     // Each future drains its file completely, so the one buffer below is the
     // whole read window; a second stage would hold a window of its own.
@@ -36,7 +35,6 @@ async fn collect_immediate_backfill<'a>(
             let metrics = Arc::clone(&metrics);
             let path = resolve(&file.path, file.path_is_relative);
             let dead_positions = killed_positions.get(&file.id.get());
-            let dead_row_ids = killed_row_ids.get(&file.id.get());
             async move {
                 data_file::scoped_read_entry_batches(
                     data_file::ParquetFile::new(
@@ -56,8 +54,7 @@ async fn collect_immediate_backfill<'a>(
                 .try_fold(Vec::new(), move |mut entries, batch| async move {
                     entries.extend(batch.into_iter().filter_map(|entry| {
                         let dead = dead_positions
-                            .is_some_and(|positions| positions.contains(&entry.ordinal))
-                            || dead_row_ids.is_some_and(|rows| rows.contains(&entry.row_id));
+                            .is_some_and(|positions| positions.contains(&entry.ordinal));
                         (!dead).then_some(IndexEntry {
                             row_id: entry.row_id,
                             values: entry.values,
@@ -92,6 +89,21 @@ pub(super) async fn collect_inline_delete_positions(
         );
 
     Ok(killed)
+}
+
+/// Folds inline file-deletes into the delete-file positions of the same
+/// target. Both name a physical position within their file, so one map
+/// serves both.
+pub(super) fn merge_killed_positions(
+    killed_positions: &mut HashMap<u64, HashSet<u64>>,
+    inline_killed: HashMap<u64, HashSet<u64>>,
+) {
+    for (data_file_id, positions) in inline_killed {
+        killed_positions
+            .entry(data_file_id)
+            .or_default()
+            .extend(positions);
+    }
 }
 
 /// The recorded inline schema of each distinct version in `schema_versions`,
@@ -212,8 +224,9 @@ impl ReadOnlyCatalog {
     ///
     /// Row ids resolve per file: the embedded row-id column when the file
     /// carries one (rewrite and flush output), else `row_id_start +
-    /// ordinal`. Rows already dead — named by a delete file's positions or an
-    /// inline file-delete's row ids — are excluded, so entries stay live-only.
+    /// ordinal`. Rows already dead — named by a delete file's positions or
+    /// by an inline file-delete, both physical — are excluded, so entries
+    /// stay live-only.
     ///
     /// # Errors
     ///
@@ -243,8 +256,8 @@ impl ReadOnlyCatalog {
             object_store::path::Path::from(relative.as_str())
         };
 
-        // Entries are live-only: delete files name positions within their
-        // target, inline file-deletes name row ids.
+        // Entries are live-only. Both kinds of deletion name a physical
+        // position within their target file, so they fold into one map.
         let inline_deletes = collect_inline_delete_positions(session.handle(), table.get());
         let metrics = self.data_read_metrics();
         let delete_files = collect_delete_positions(
@@ -253,7 +266,9 @@ impl ReadOnlyCatalog {
             Arc::clone(&metrics),
             &resolve,
         );
-        let (killed_row_ids, killed_positions) = futures::try_join!(inline_deletes, delete_files)?;
+        let (inline_killed, mut killed_positions) =
+            futures::try_join!(inline_deletes, delete_files)?;
+        merge_killed_positions(&mut killed_positions, inline_killed);
 
         let outcome = collect_immediate_backfill(
             snapshot.data_files_of(table).into_iter(),
@@ -262,7 +277,6 @@ impl ReadOnlyCatalog {
             &positions,
             resolve,
             &killed_positions,
-            &killed_row_ids,
         )
         .await;
         session.finish();

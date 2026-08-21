@@ -786,3 +786,56 @@ fn a_flushed_duplicate_schema_collapses_and_still_binds() {
     ));
     assert_eq!(rows, vec![vec!["1"], vec!["2"], vec!["3"]]);
 }
+
+/// DuckLake preserves a row's own id through an UPDATE and mints fresh ids
+/// only for the rest, so one re-inlined chunk can carry non-contiguous ids.
+/// A chunk records just its first id and a count, so its rows must be split
+/// into contiguous runs — otherwise every row after the first is relabelled
+/// with an id another row already owns. Regression.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn an_update_re_inlining_scattered_rows_keeps_each_rows_own_id() {
+    let dir = TempDir::new("inline-scattered-store");
+    let data_dir = TempDir::new("inline-scattered-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CREATE TABLE lake.main.t (a BIGINT, b VARCHAR);",
+    );
+    run_ducklake_sql(
+        store,
+        data_path,
+        "INSERT INTO lake.main.t SELECT i, 'v0' FROM range(10) t(i);",
+    );
+    // Flush first, so the UPDATE below re-inlines rows that already own
+    // file-assigned ids rather than minting a dense run of fresh ones.
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CALL ducklake_flush_inlined_data('lake');",
+    );
+    // One statement, so all three land in one chunk with scattered ids.
+    run_ducklake_sql(
+        store,
+        data_path,
+        "UPDATE lake.main.t SET b = 'v1' WHERE a IN (1, 4, 7);",
+    );
+
+    let rows = run_ducklake_sql(
+        store,
+        data_path,
+        "SELECT a, rowid FROM lake.main.t WHERE b = 'v1' ORDER BY a;",
+    );
+    assert_eq!(
+        csv_rows(&rows),
+        vec![
+            vec!["1".to_string(), "1".to_string()],
+            vec!["4".to_string(), "4".to_string()],
+            vec!["7".to_string(), "7".to_string()],
+        ],
+        "a re-inlined row was relabelled by its chunk's dense range"
+    );
+}

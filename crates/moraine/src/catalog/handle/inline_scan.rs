@@ -251,6 +251,17 @@ impl ReadOnlyCatalog {
         table: TableId,
         chunks: &[(InlineOperation, InlineChunkValue)],
     ) -> Result<()> {
+        // The walk saw every chunk, so it knows the widest exactly. Raised
+        // rather than replaced: a bound that could fall would silently skip
+        // a chunk, and the looseness costs only a few extra entries.
+        if let Some(widest) = chunks
+            .iter()
+            .filter_map(|(_, chunk)| chunk.row_count.checked_sub(1))
+            .max()
+        {
+            projection::note_inline_chunk_width(&self.projections, table.get(), widest);
+        }
+
         if !handle.is_isolated()
             || projection::format_floor(&self.projections)
                 < commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY
@@ -258,20 +269,16 @@ impl ReadOnlyCatalog {
             return Ok(());
         }
 
-        let directory: BTreeSet<u64> = store_inline::scan_inline_chunk_ranges(handle, table.get())
-            .await?
-            .into_iter()
-            .collect();
-        let ends: Option<BTreeSet<u64>> = chunks
-            .iter()
-            .map(|(_, chunk)| {
-                chunk
-                    .row_count
-                    .checked_sub(1)
-                    .and_then(|count| chunk.row_id_start.checked_add(count))
-            })
-            .collect();
-        if ends == Some(directory) {
+        // Compared by chunk identity, not by range end: two live chunks can
+        // end at one row id, and each owns its own locator.
+        let directory: BTreeSet<InlineOperation> =
+            store_inline::scan_inline_chunk_ranges(handle, table.get())
+                .await?
+                .into_iter()
+                .map(|(_, operation)| operation)
+                .collect();
+        let walked: BTreeSet<InlineOperation> = chunks.iter().map(|(op, _)| *op).collect();
+        if walked == directory {
             projection::note_inline_directory_complete(&self.projections, table.get());
         }
 

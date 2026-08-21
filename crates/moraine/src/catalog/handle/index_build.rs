@@ -507,7 +507,9 @@ impl Catalog {
             Arc::clone(&metrics),
             &resolve,
         );
-        let (killed_row_ids, killed_positions) = futures::try_join!(inline_deletes, delete_files)?;
+        let (inline_killed, mut killed_positions) =
+            futures::try_join!(inline_deletes, delete_files)?;
+        backfill::merge_killed_positions(&mut killed_positions, inline_killed);
 
         for file in snapshot.data_files_of(table) {
             if file_cursor.is_some_and(|cursor| file.id.get() < cursor) {
@@ -524,7 +526,6 @@ impl Catalog {
             let path = resolve(&file.path, file.path_is_relative);
             let file_id = file.id.get();
             let dead_positions = killed_positions.get(&file_id);
-            let dead_row_ids = killed_row_ids.get(&file_id);
             let mut batches = data_file::scoped_read_entry_batches(
                 data_file::ParquetFile::new(
                     object_store.clone(),
@@ -543,8 +544,7 @@ impl Catalog {
             while let Some(batch) = batches.try_next().await? {
                 for entry in batch {
                     let ordinal = entry.ordinal;
-                    let dead = dead_positions.is_some_and(|positions| positions.contains(&ordinal))
-                        || dead_row_ids.is_some_and(|rows| rows.contains(&entry.row_id));
+                    let dead = dead_positions.is_some_and(|positions| positions.contains(&ordinal));
                     let covered = legacy_row_cursor.is_some_and(|cursor| entry.row_id <= cursor);
                     if !dead && !covered {
                         buffer

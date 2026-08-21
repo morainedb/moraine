@@ -125,6 +125,90 @@ async fn recent_rows_serves_from_a_directory_verified_complete() {
     catalog.close().await.unwrap();
 }
 
+/// Two live chunks of one table can end at the same row id: an UPDATE
+/// re-inlines a row that another chunk's range still ends on. A locator is
+/// keyed by its range end alone, so the second chunk overwrites the first's
+/// locator and takes the first's other rows out of every directory-served
+/// read — and both completeness checks compare *sets* of ends, so the
+/// truncated directory is declared complete and never healed. Regression.
+#[tokio::test]
+async fn two_chunks_ending_at_one_row_id_keep_both_locators() {
+    let catalog = open().await;
+
+    commit_staged(
+        &catalog,
+        1,
+        "inlined_insert:1",
+        vec![
+            RowOperation::InlineSchema {
+                table_id: 1,
+                schema_version: 0,
+                arrow_schema: b"schema".to_vec(),
+            },
+            RowOperation::InlineInsert {
+                table_id: 1,
+                schema_version: 0,
+                begin_snapshot: 1,
+                row_id_start: 5,
+                row_count: 3,
+                arrow_body: b"chunk-a".to_vec(),
+            },
+        ],
+    )
+    .await;
+
+    // The re-inlined row 7: its own chunk, ending where chunk A ends.
+    commit_staged(
+        &catalog,
+        2,
+        "inlined_insert:1",
+        vec![RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 2,
+            row_id_start: 7,
+            row_count: 1,
+            arrow_body: b"chunk-b".to_vec(),
+        }],
+    )
+    .await;
+
+    // The first walk verifies the directory and remembers it; the next
+    // serves from it, so the two must agree.
+    let walked: Vec<u64> = catalog
+        .recent_rows(TableId::new(1))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.row_id)
+        .collect();
+    let served: Vec<u64> = catalog
+        .recent_rows(TableId::new(1))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.row_id)
+        .collect();
+
+    assert_eq!(
+        walked, served,
+        "a directory-served read lost rows the body scan found"
+    );
+    assert!(
+        served.contains(&5) && served.contains(&6),
+        "a colliding locator took chunk A's other rows out: {served:?}"
+    );
+    // The point of keying a locator by chunk identity: both chunks are
+    // named, so the directory is complete rather than merely declining to
+    // claim completeness.
+    assert!(
+        projection::inline_directory_complete(catalog.projections(), 1),
+        "both chunks must keep their own locator"
+    );
+
+    catalog.close().await.unwrap();
+}
+
 /// A directory-served `recent_rows` point-reads only the chunks its live
 /// rows reference: a chunk whose rows are all tombstoned is never fetched.
 /// The proof deletes that chunk's body out from under its locator — a

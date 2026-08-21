@@ -73,11 +73,7 @@ pub(crate) async fn translate_inline_flush_delete(
                     None,
                 ));
                 writes.push((
-                    Key::Inline(InlineKey::ChunkRange {
-                        table_id,
-                        row_id_end: locator.row_id_end(),
-                    })
-                    .encode(),
+                    chunk_range_key(table_id, locator.row_id_end(), locator.operation())?,
                     None,
                 ));
             }
@@ -85,9 +81,10 @@ pub(crate) async fn translate_inline_flush_delete(
 
         materialize_locator_rows(&scoped, &inline_deletes)
     } else {
-        let (chunks, range_ends, inline_deletes) = futures::try_join!(
+        let (chunks, range_ends, legacy_ranges, inline_deletes) = futures::try_join!(
             store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id),
             store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id),
+            store_inline::scan_legacy_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id),
             store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
         )?;
 
@@ -99,16 +96,29 @@ pub(crate) async fn translate_inline_flush_delete(
             .cloned()
             .collect();
 
-        let mut deleted_ends = HashSet::new();
+        let mut deleted = BTreeSet::new();
         for (op, chunk) in &scoped {
             if let InlineOperation::Insert { begin_snapshot, .. } = op
                 && *begin_snapshot <= flush_snapshot
             {
                 writes.push((Key::Inline(InlineKey::Live(*op)).encode(), None));
-                let (range_key, _) = inline_chunk_range_delete(table_id, chunk)?;
+                let (range_key, _) = inline_chunk_range_delete(table_id, *op, chunk)?;
                 writes.push((range_key, None));
-                deleted_ends.insert(inline_chunk_row_id_end(chunk.row_id_start, chunk.row_count));
+                deleted.insert(*op);
             }
+        }
+
+        // A store carried across the locator-key change still holds the
+        // superseded keys; nothing reads them, so the repair sweeps them.
+        for row_id_end in legacy_ranges {
+            writes.push((
+                Key::Inline(InlineKey::ChunkRange {
+                    table_id,
+                    row_id_end,
+                })
+                .encode(),
+                None,
+            ));
         }
 
         reconcile_chunk_directory(
@@ -116,7 +126,7 @@ pub(crate) async fn translate_inline_flush_delete(
             table_id,
             &chunks,
             &range_ends,
-            &deleted_ends,
+            &deleted,
             writes,
         )?;
 
@@ -153,33 +163,26 @@ fn reconcile_chunk_directory(
     projections: &std::sync::RwLock<ProjectionCache>,
     table_id: u64,
     chunks: &[(InlineOperation, proto::InlineChunkValue)],
-    range_ends: &[u64],
-    deleted_ends: &HashSet<Option<u64>>,
+    range_ends: &[(u64, InlineOperation)],
+    deleted: &BTreeSet<InlineOperation>,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
     if projection::format_floor(projections) < commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY {
         return Ok(());
     }
 
-    let chunk_ends: HashMap<Option<u64>, &(InlineOperation, proto::InlineChunkValue)> = chunks
-        .iter()
-        .map(|entry| {
-            (
-                inline_chunk_row_id_end(entry.1.row_id_start, entry.1.row_count),
-                entry,
-            )
-        })
-        .collect();
-    let directory: HashSet<u64> = range_ends.iter().copied().collect();
+    // Coverage is judged by chunk identity, not by range end: two live
+    // chunks can end at one row id, and each still owns its own locator.
+    let chunk_identities: BTreeSet<InlineOperation> = chunks.iter().map(|(op, _)| *op).collect();
+    let directory: BTreeSet<InlineOperation> = range_ends.iter().map(|(_, op)| *op).collect();
 
     let mut complete = true;
-    for (end, (op, chunk)) in &chunk_ends {
-        let covered = end.is_some_and(|end| directory.contains(&end));
-        if covered {
+    for (op, chunk) in chunks {
+        if directory.contains(op) {
             continue;
         }
         complete = false;
-        if deleted_ends.contains(end) {
+        if deleted.contains(op) {
             continue;
         }
         if let InlineOperation::Insert {
@@ -199,17 +202,10 @@ fn reconcile_chunk_directory(
             )?);
         }
     }
-    for end in &directory {
-        if !chunk_ends.contains_key(&Some(*end)) {
+    for (end, op) in range_ends {
+        if !chunk_identities.contains(op) {
             complete = false;
-            writes.push((
-                Key::Inline(InlineKey::ChunkRange {
-                    table_id,
-                    row_id_end: *end,
-                })
-                .encode(),
-                None,
-            ));
+            writes.push((chunk_range_key(table_id, *end, *op)?, None));
         }
     }
 
@@ -332,15 +328,8 @@ pub(super) async fn translate_inline_drop(
     for (op, _) in chunks {
         writes.push((Key::Inline(InlineKey::Live(op)).encode(), None));
     }
-    for row_id_end in ranges {
-        writes.push((
-            Key::Inline(InlineKey::ChunkRange {
-                table_id,
-                row_id_end,
-            })
-            .encode(),
-            None,
-        ));
+    for (row_id_end, operation) in ranges {
+        writes.push((chunk_range_key(table_id, row_id_end, operation)?, None));
     }
     for (row_id, _) in inline_deletes {
         writes.push((
@@ -456,9 +445,12 @@ pub(crate) fn inline_chunk_range_write(
     })?;
 
     Ok((
-        Key::Inline(InlineKey::ChunkRange {
+        Key::Inline(InlineKey::ChunkLocator {
             table_id,
             row_id_end,
+            schema_version,
+            begin_snapshot,
+            chunk_seq,
         })
         .encode(),
         Some(value::encode_value(&proto::InlineChunkRangeValue {
@@ -470,8 +462,39 @@ pub(crate) fn inline_chunk_range_write(
     ))
 }
 
+/// The directory key naming one chunk: the range end leads so a scan still
+/// seeks by row id, and the chunk's identity follows so two chunks ending
+/// at one row id stay distinct.
+pub(crate) fn chunk_range_key(
+    table_id: u64,
+    row_id_end: u64,
+    operation: InlineOperation,
+) -> Result<Vec<u8>> {
+    let InlineOperation::Insert {
+        schema_version,
+        begin_snapshot,
+        chunk_seq,
+        ..
+    } = operation
+    else {
+        return Err(Error::Corruption(
+            "inline chunk directory names a non-insert operation".to_owned(),
+        ));
+    };
+
+    Ok(Key::Inline(InlineKey::ChunkLocator {
+        table_id,
+        row_id_end,
+        schema_version,
+        begin_snapshot,
+        chunk_seq,
+    })
+    .encode())
+}
+
 fn inline_chunk_range_delete(
     table_id: u64,
+    operation: InlineOperation,
     chunk: &proto::InlineChunkValue,
 ) -> Result<commit::StagedWrite> {
     let row_id_end =
@@ -481,14 +504,7 @@ fn inline_chunk_range_delete(
             ))
         })?;
 
-    Ok((
-        Key::Inline(InlineKey::ChunkRange {
-            table_id,
-            row_id_end,
-        })
-        .encode(),
-        None,
-    ))
+    Ok((chunk_range_key(table_id, row_id_end, operation)?, None))
 }
 
 pub(crate) fn inline_inline_delete_write(
@@ -779,6 +795,14 @@ pub(super) async fn translate_inline(
                 arrow_body,
             } => {
                 let chunk_seq = chunk_seqs.next(*table_id, *schema_version, *begin_snapshot);
+                // The locator scan bounds itself by the widest chunk a table
+                // holds; raising it here keeps that bound sound for the
+                // chunk this commit is about to add.
+                projection::note_inline_chunk_width(
+                    projections,
+                    *table_id,
+                    row_count.saturating_sub(1),
+                );
                 writes.push(inline_insert_write(
                     *table_id,
                     *schema_version,

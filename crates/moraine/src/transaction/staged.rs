@@ -1198,9 +1198,16 @@ impl StagedTransaction {
         };
         let maintenance = async {
             let phase_started = Instant::now();
-            let entries =
-                stage_index_maintenance(&db_tx, base_ref, &ops, store, &data_prefix, read_metrics)
-                    .await?;
+            let entries = stage_index_maintenance(
+                &db_tx,
+                base_ref,
+                &ops,
+                store,
+                &data_prefix,
+                read_metrics,
+                &projections,
+            )
+            .await?;
             Ok::<_, Error>((entries, phase_started.elapsed()))
         };
         let (inline_writes, uses_inline_schema_reference, entries) =

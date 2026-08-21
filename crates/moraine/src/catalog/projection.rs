@@ -284,6 +284,31 @@ pub(crate) fn inline_directory_complete(
         .inline_directory_complete(table_id)
 }
 
+/// The widest inline chunk `table_id` is known to hold, as an upper bound
+/// on `row_id_end - row_id_start`. `None` means unknown, which bounds
+/// nothing.
+pub(crate) fn inline_chunk_width(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+) -> Option<u64> {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inline_chunk_width(table_id)
+}
+
+/// Raises `table_id`'s known widest chunk to at least `width`.
+pub(crate) fn note_inline_chunk_width(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+    width: u64,
+) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .note_inline_chunk_width(table_id, width);
+}
+
 /// Records `table_id`'s inline chunk-range directory as verified complete.
 pub(crate) fn note_inline_directory_complete(
     cache: &std::sync::RwLock<ProjectionCache>,
@@ -378,6 +403,10 @@ pub(crate) struct ProjectionCache {
     /// Invalidation leaves it standing: it describes the store, not a view
     /// of it.
     inline_directory_complete: BTreeSet<u64>,
+    /// Per table, an upper bound on the widest live inline chunk. Only ever
+    /// raised, so it always bounds the true width from above however stale
+    /// it is — a bound that could fall would silently skip a chunk.
+    inline_chunk_width: BTreeMap<u64, u64>,
     /// Bumped by every invalidation.
     epoch: u64,
 }
@@ -417,6 +446,7 @@ impl ProjectionCache {
             format_floor: 0,
             migration_clear: None,
             inline_directory_complete: BTreeSet::new(),
+            inline_chunk_width: BTreeMap::new(),
             epoch: 0,
         }
     }
@@ -430,6 +460,18 @@ impl ProjectionCache {
     /// Records `table_id`'s directory as verified complete.
     pub(crate) fn note_inline_directory_complete(&mut self, table_id: u64) {
         self.inline_directory_complete.insert(table_id);
+    }
+
+    /// An upper bound on `table_id`'s widest live inline chunk, or `None`
+    /// when nothing has been observed.
+    pub(crate) fn inline_chunk_width(&self, table_id: u64) -> Option<u64> {
+        self.inline_chunk_width.get(&table_id).copied()
+    }
+
+    /// Raises the bound for `table_id`; never lowers it.
+    pub(crate) fn note_inline_chunk_width(&mut self, table_id: u64, width: u64) {
+        let slot = self.inline_chunk_width.entry(table_id).or_default();
+        *slot = (*slot).max(width);
     }
 
     /// The highest format version observed, 0 before any has been.

@@ -78,10 +78,12 @@ MoraineArrowBytes EncodeInlineSchema(duckdb::ClientContext &context,
 // an Arrow type DuckDB cannot map back.
 std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &context, const uint8_t *data, size_t len);
 
-// Serializes columns `[user_col_start, chunk.ColumnCount())` of every row
-// `0..chunk.size()` as one Arrow IPC record-batch body (no schema message).
+// Serializes columns `[user_col_start, chunk.ColumnCount())` of rows
+// `[row_offset, row_offset + row_count)` as one Arrow IPC record-batch body
+// (no schema message).
 MoraineArrowBytes EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::DataChunk &chunk,
-                                        duckdb::idx_t user_col_start);
+                                        duckdb::idx_t user_col_start, duckdb::idx_t row_offset,
+                                        duckdb::idx_t row_count);
 
 // A version's schema-only stream (`inline/schema`) parsed once by the Rust
 // side, reused for every chunk of that version. Throws on malformed bytes.

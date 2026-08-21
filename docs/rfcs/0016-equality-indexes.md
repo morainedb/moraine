@@ -1104,9 +1104,10 @@ delete file names positions within its target; converting them to row ids
 before reading the target bakes in the dense assumption. Instead the
 killed positions ride verbatim to the target's scoped read, which returns
 entries in file order — an entry is removed when its ordinal is named by
-a delete file, or its resolved row id is named by an inline file-delete
-(those carry row ids directly). One rule serves dense and per-row-id
-targets alike.
+a delete file or by an inline file-delete. DuckLake writes a physical
+`file_row_number` into `ducklake_inlined_delete_<t>.row_id` despite the
+column's name, so both kinds name a position and one rule serves dense and
+per-row-id targets alike.
 
 **Maintenance stays derivation, never removal.** Registering a rewrite
 file only re-derives entries that exist (the idempotent puts and the
