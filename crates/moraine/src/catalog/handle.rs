@@ -1791,7 +1791,9 @@ impl Catalog {
                 "catalog attached read-only; writes are unavailable".to_string(),
             ));
         }
-        let head = slot_commit::materialize_slot_head(store).await?;
+        // The commit premise: the frontier is settled by a LIST either way, and
+        // a cached view the new slots chain onto spares the folded-store scan.
+        let head = slot_commit::revalidated_slot_head(store).await?;
         let transaction = StagedTransaction::begin_slots(
             head,
             store.reader.clone(),
