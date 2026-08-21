@@ -154,6 +154,7 @@ impl ObjectStore for SlotMeter {
 struct RunningLeader {
     store: Arc<SlotMeter>,
     shutdown: Arc<Notify>,
+    crash: Arc<Notify>,
     join: JoinHandle<Result<()>>,
 }
 
@@ -165,21 +166,31 @@ impl RunningLeader {
             .await
             .unwrap();
         let shutdown = Arc::new(Notify::new());
+        let crash = Arc::new(Notify::new());
         // The leader's sessions are `!Send`, so `serve` needs a runtime of its
-        // own rather than a slot on the shared pool.
+        // own rather than a slot on the shared pool. A blocking task runs to
+        // completion however early it is cancelled, so the crash is a signal
+        // rather than an abort.
         let join = tokio::task::spawn_blocking({
             let shutdown = Arc::clone(&shutdown);
+            let crash = Arc::clone(&crash);
             move || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("leader test runtime")
-                    .block_on(leader.serve(shutdown))
+                    .block_on(async move {
+                        tokio::select! {
+                            served = leader.serve(shutdown) => served,
+                            () = crash.notified() => Ok(()),
+                        }
+                    })
             }
         });
         Self {
             store,
             shutdown,
+            crash,
             join,
         }
     }
@@ -189,8 +200,11 @@ impl RunningLeader {
         let _ = self.join.await;
     }
 
+    /// A crash: the serve future drops with its listener. `abort` cannot do
+    /// this — a blocking task runs to completion however early it is
+    /// cancelled.
     fn kill(&self) {
-        self.join.abort();
+        self.crash.notify_one();
     }
 }
 

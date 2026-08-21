@@ -128,6 +128,7 @@ impl ObjectStore for CountingStore {
 /// A leader serving on a background task.
 struct RunningLeader {
     shutdown: Arc<Notify>,
+    crash: Arc<Notify>,
     join: JoinHandle<Result<()>>,
 }
 
@@ -135,19 +136,32 @@ impl RunningLeader {
     async fn spawn(catalog: Arc<Catalog>, config: LeaderConfig) -> Self {
         let leader = Leader::bind(catalog, config).await.unwrap();
         let shutdown = Arc::new(Notify::new());
+        let crash = Arc::new(Notify::new());
         // The leader's sessions are `!Send`, so `serve` needs a runtime of its
-        // own rather than a slot on the shared pool.
+        // own rather than a slot on the shared pool. A blocking task runs to
+        // completion however early it is cancelled, so the crash is a signal
+        // rather than an abort.
         let join = tokio::task::spawn_blocking({
             let shutdown = Arc::clone(&shutdown);
+            let crash = Arc::clone(&crash);
             move || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("leader test runtime")
-                    .block_on(leader.serve(shutdown))
+                    .block_on(async move {
+                        tokio::select! {
+                            served = leader.serve(shutdown) => served,
+                            () = crash.notified() => Ok(()),
+                        }
+                    })
             }
         });
-        Self { shutdown, join }
+        Self {
+            shutdown,
+            crash,
+            join,
+        }
     }
 
     /// A clean stand-down: withdraws the advert.
@@ -156,10 +170,12 @@ impl RunningLeader {
         let _ = self.join.await;
     }
 
-    /// A crash: the task drops with its listener, leaving a stale advert and a
-    /// dead port — no withdrawal.
-    fn kill(self) {
-        self.join.abort();
+    /// A crash: the serve future drops with its listener, leaving a stale
+    /// advert and a dead port — no withdrawal. Awaited, so the port is shut
+    /// before the caller observes the crash.
+    async fn kill(self) {
+        self.crash.notify_one();
+        let _ = self.join.await;
     }
 }
 
@@ -588,7 +604,7 @@ async fn a_dead_leader_rolls_back_and_the_re_drive_lands_direct() {
     arm(&client, 1, 2).await;
 
     // The leader crashes without withdrawing: its advert is stale, its port dead.
-    leader.kill();
+    leader.kill().await;
 
     let before = client_store.slot_puts();
     // The armed re-drive attempts the dead leader, retreats, and lands direct.
@@ -627,7 +643,7 @@ async fn a_forwarded_then_direct_re_drive_uses_a_fresh_id() {
 
     // Kill the leader; the next armed re-drive retreats to a fresh direct
     // transaction with a fresh id.
-    leader.kill();
+    leader.kill().await;
     drive_staged(&client, gc_insert(3)).await.unwrap();
 
     let ids = all_transaction_ids(&client).await;

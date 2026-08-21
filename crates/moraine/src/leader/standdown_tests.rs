@@ -133,6 +133,7 @@ struct StandDownLeader {
     endpoint: String,
     instance: [u8; 16],
     shutdown: Arc<Notify>,
+    crash: Arc<Notify>,
     join: JoinHandle<Result<()>>,
 }
 
@@ -150,22 +151,32 @@ impl StandDownLeader {
         let leader = Leader::bind(catalog, config).await.unwrap();
         let instance = leader.instance();
         let shutdown = Arc::new(Notify::new());
+        let crash = Arc::new(Notify::new());
         // The leader's sessions are `!Send`, so `serve` needs a runtime of its
-        // own rather than a slot on the shared pool.
+        // own rather than a slot on the shared pool. A blocking task runs to
+        // completion however early it is cancelled, so the crash is a signal
+        // rather than an abort.
         let join = tokio::task::spawn_blocking({
             let shutdown = Arc::clone(&shutdown);
+            let crash = Arc::clone(&crash);
             move || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("leader test runtime")
-                    .block_on(leader.serve(shutdown))
+                    .block_on(async move {
+                        tokio::select! {
+                            served = leader.serve(shutdown) => served,
+                            () = crash.notified() => Ok(()),
+                        }
+                    })
             }
         });
         Self {
             endpoint,
             instance,
             shutdown,
+            crash,
             join,
         }
     }
@@ -177,10 +188,12 @@ impl StandDownLeader {
         let _ = self.join.await;
     }
 
-    /// A crash: the task drops with its listener, leaving a stale advert and a
-    /// dead port — no withdrawal.
-    fn kill(self) {
-        self.join.abort();
+    /// A crash: the serve future drops with its listener, leaving a stale
+    /// advert and a dead port — no withdrawal. Awaited, so the port is shut
+    /// before the caller observes the crash.
+    async fn kill(self) {
+        self.crash.notify_one();
+        let _ = self.join.await;
     }
 }
 
@@ -363,7 +376,7 @@ async fn a_stale_advert_is_superseded_and_the_client_readopts_the_successor() {
     let cat_a = Arc::new(open_over(&store_a).await);
     let leader_a = StandDownLeader::spawn(Arc::clone(&cat_a), FAST_POLL).await;
     let endpoint_a = leader_a.endpoint.clone();
-    leader_a.kill();
+    leader_a.kill().await;
 
     // An armed client pays one failed connect against the stale advert, ages it,
     // and commits direct.
