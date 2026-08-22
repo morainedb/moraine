@@ -4802,3 +4802,54 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
     db_tx.rollback();
     catalog.close().await.unwrap();
 }
+
+/// The format floor is the highest term that applies, never the first.
+#[test]
+fn the_format_floor_takes_the_highest_term_that_applies() {
+    let index_at = |value: proto::IndexValue| {
+        let mut state = CatalogSnapshot::default();
+        state.indexes.insert(1, BTreeMap::from([(1, value)]));
+        state
+    };
+
+    let building = index_at(proto::IndexValue {
+        build_state: Some("maintaining".to_owned()),
+        ..proto::IndexValue::default()
+    });
+    let deferred = index_at(proto::IndexValue {
+        deferred_maintenance: Some(true),
+        ..proto::IndexValue::default()
+    });
+
+    assert_eq!(index_format(&CatalogSnapshot::default()), FORMAT_VERSION);
+    assert_eq!(index_format(&building), FORMAT_WITH_STAGED_INDEX);
+    assert_eq!(index_format(&deferred), FORMAT_WITH_DEFERRED_INDEX);
+
+    let both = InlineShapes {
+        chunk_directory: true,
+        schema_reference: true,
+    };
+    assert_eq!(inline_format(InlineShapes::default()), FORMAT_VERSION);
+    assert_eq!(
+        inline_format(InlineShapes {
+            schema_reference: true,
+            ..InlineShapes::default()
+        }),
+        FORMAT_WITH_INLINE_SCHEMA_REFERENCE
+    );
+    assert_eq!(
+        inline_format(both),
+        FORMAT_WITH_INLINE_CHUNK_IDENTITY,
+        "a locator outranks a schema reference written beside it"
+    );
+
+    assert_eq!(
+        target_format(&deferred, both),
+        FORMAT_WITH_INLINE_CHUNK_IDENTITY,
+        "an inline shape outranks the index state it commits beside"
+    );
+    assert_eq!(
+        target_format(&deferred, InlineShapes::default()),
+        FORMAT_WITH_DEFERRED_INDEX
+    );
+}

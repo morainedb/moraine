@@ -925,7 +925,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
     );
     assert_eq!(
         format.format_version,
-        commit::FORMAT_WITH_INLINE_CHUNK_DIRECTORY
+        commit::FORMAT_WITH_INLINE_CHUNK_IDENTITY
     );
     tx.rollback();
 }
@@ -4747,6 +4747,57 @@ async fn a_collapsing_deregistration_stamps_the_reference_format() {
             "only the batch that writes a reference owes the stamp"
         );
     }
+}
+
+/// A locator carries its chunk's identity, so the batch that writes one
+/// owes the identity stamp — not the directory's older floor, and not the
+/// schema reference's, which no longer subsumes it. A store left below it
+/// would be read by a binary that looks for the superseded key and finds
+/// no directory at all. Regression.
+#[tokio::test]
+async fn an_inline_insert_stamps_the_chunk_identity_format() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::InlineSchema {
+        table_id: 1,
+        schema_version: 0,
+        arrow_schema: b"schema".to_vec(),
+    });
+    tx.stage(RowOperation::InlineInsert {
+        table_id: 1,
+        schema_version: 0,
+        begin_snapshot: 1,
+        row_id_start: 0,
+        row_count: 2,
+        arrow_body: b"chunk".to_vec(),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 0, 1),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "inlined_insert:1"),
+    });
+    tx.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let format = crate::store::read::read_format(ReadHandle::Tx(&tx))
+        .await
+        .unwrap()
+        .map_or(crate::transaction::commit::FORMAT_VERSION, |stamp| {
+            stamp.format_version
+        });
+    tx.rollback();
+
+    assert!(
+        format >= crate::transaction::commit::FORMAT_WITH_INLINE_CHUNK_IDENTITY,
+        "a batch that writes a locator must stamp the identity format, got {format}"
+    );
+
+    catalog.close().await.unwrap();
 }
 
 /// A collapsed version still resolves to the bytes it was registered
