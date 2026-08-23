@@ -1518,3 +1518,60 @@ async fn null_embedded_row_id_fails_corruption() {
     .unwrap_err();
     assert!(matches!(err, Error::Corruption(_)), "{err}");
 }
+
+/// A delete file's positions are decoded once per object. The byte-range
+/// cache already spares the second pass its fetches; the decode is what
+/// is left, and it is the whole cost of a warm read.
+#[tokio::test]
+async fn a_delete_files_positions_are_decoded_once() {
+    let store = Arc::new(CountingStore::new());
+    let data = DataStore::new(store.clone());
+    let path = Path::from("decoded-once-delete.parquet");
+    let (object_len, footer_size) =
+        write_wide_named_fixture_with_footer(store.as_ref(), &path, 4_000, "pos").await;
+
+    let metrics = Arc::new(ScopedReadMetrics::default());
+    let file = || {
+        ParquetFile::new(data.clone(), path.clone(), object_len, footer_size)
+            .with_metrics(Arc::clone(&metrics))
+    };
+
+    let first = delete_file_positions(file()).await.unwrap();
+    assert_eq!(first.len(), 4_000);
+    assert_eq!(metrics.tally().parquet_files, 1);
+
+    let second = delete_file_positions(file()).await.unwrap();
+    assert_eq!(second, first);
+    assert_eq!(
+        metrics.tally().parquet_files,
+        1,
+        "the second pass answers from the memoized positions"
+    );
+    assert_eq!(store.fetch_requests(), 2, "footer and the position column");
+}
+
+/// A memoized position set is keyed by the object, so a delete file at
+/// another path decodes on its own.
+#[tokio::test]
+async fn each_delete_file_memoizes_its_own_positions() {
+    let store = Arc::new(CountingStore::new());
+    let data = DataStore::new(store.clone());
+    let metrics = Arc::new(ScopedReadMetrics::default());
+
+    let mut lengths = Vec::new();
+    for (index, rows) in [(0usize, 100usize), (1, 200)] {
+        let path = Path::from(format!("per-object-delete-{index}.parquet"));
+        let (object_len, footer_size) =
+            write_wide_named_fixture_with_footer(store.as_ref(), &path, rows, "pos").await;
+        let positions = delete_file_positions(
+            ParquetFile::new(data.clone(), path, object_len, footer_size)
+                .with_metrics(Arc::clone(&metrics)),
+        )
+        .await
+        .unwrap();
+        lengths.push(positions.len());
+    }
+
+    assert_eq!(lengths, [100, 200]);
+    assert_eq!(metrics.tally().parquet_files, 2);
+}

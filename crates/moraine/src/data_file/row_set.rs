@@ -118,6 +118,16 @@ impl FileRowSet {
             .collect()
     }
 
+    /// Every member, ascending. Materializes whatever the representation
+    /// compressed, so a caller wanting the set itself pays for it once.
+    pub(super) fn to_sorted_vec(&self) -> Vec<u64> {
+        match self {
+            Self::Range { start, end } => (*start..*end).collect(),
+            Self::Roaring(rows) => rows.iter().collect(),
+            Self::Sorted(rows) => rows.clone(),
+        }
+    }
+
     /// Estimated resident bytes charged to the cache.
     pub(super) fn estimated_bytes(&self) -> u64 {
         match self {

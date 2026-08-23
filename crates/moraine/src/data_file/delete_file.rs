@@ -1,6 +1,8 @@
 //! The row positions a DuckLake delete file marks dead, read from its
 //! `pos` column alone.
 
+use std::sync::Arc;
+
 use arrow::{array::RecordBatch, datatypes::Schema};
 use futures::{StreamExt, TryStreamExt};
 use parquet::{
@@ -12,7 +14,10 @@ use parquet::{
 };
 
 use crate::{
-    data_file::{ParquetFile, corrupt, reader::ObjectStoreReader, values::row_id_value},
+    data_file::{
+        ParquetFile, auxiliary_cache, corrupt, reader::ObjectStoreReader, row_set::FileRowSet,
+        values::row_id_value,
+    },
     error::{Error, Result},
 };
 
@@ -41,9 +46,29 @@ fn delete_positions(batch: &RecordBatch) -> Result<Vec<u64>> {
         .collect::<Result<Vec<_>>>()
 }
 
-/// The row positions a DuckLake delete file marks dead, read from its
-/// `pos` column alone.
+/// The row positions a DuckLake delete file marks dead, ascending and
+/// duplicate-free.
+///
+/// Decoded once per object: a delete file is immutable, and every later
+/// delete against its target reads it again to subtract what was already
+/// dead.
 pub(crate) async fn delete_file_positions(file: ParquetFile) -> Result<Vec<u64>> {
+    let positions = auxiliary_cache::shared()
+        .delete_positions(&file, || decode_delete_file_positions(file.clone()))
+        .await?;
+    Ok(positions.to_sorted_vec())
+}
+
+/// Reads and sorts one delete file's `pos` column.
+async fn decode_delete_file_positions(file: ParquetFile) -> Result<Arc<FileRowSet>> {
+    file.metrics.parquet_file();
+    let mut positions = read_delete_file_positions(file).await?;
+    positions.sort_unstable();
+    positions.dedup();
+    FileRowSet::from_sorted(positions).map(Arc::new)
+}
+
+async fn read_delete_file_positions(file: ParquetFile) -> Result<Vec<u64>> {
     let reader = ObjectStoreReader::new(&file, PageIndexPolicy::Skip);
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
