@@ -1,0 +1,222 @@
+diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/storage/ducklake_metadata_manager.hpp
+index 2c9d3b91..211622d2 100644
+--- a/src/include/storage/ducklake_metadata_manager.hpp
++++ b/src/include/storage/ducklake_metadata_manager.hpp
+@@ -420,0 +421,4 @@ protected:
++	//! Writes one table's inlined rows through the Appender API instead of an INSERT ... VALUES list.
++	//! False means the caller must emit that SQL: the backend has no appender, or there are no rows.
++	bool TryAppendInlinedData(DuckLakeSnapshot &commit_snapshot, const string &inlined_table_name,
++	                          const DuckLakeInlinedDataInfo &entry, bool has_preserved_row_ids);
+diff --git a/src/storage/ducklake_metadata_manager.cpp b/src/storage/ducklake_metadata_manager.cpp
+index 168b989d..6890c152 100644
+--- a/src/storage/ducklake_metadata_manager.cpp
++++ b/src/storage/ducklake_metadata_manager.cpp
+@@ -2802,0 +2803,56 @@ string DuckLakeMetadataManager::WriteNewViews(const vector<DuckLakeViewInfo> &ne
++bool DuckLakeMetadataManager::TryAppendInlinedData(DuckLakeSnapshot &commit_snapshot,
++                                                  const string &inlined_table_name,
++                                                  const DuckLakeInlinedDataInfo &entry, bool has_preserved_row_ids) {
++	if (!SupportsAppender() || !entry.data || !entry.data->data || entry.data->data->Count() == 0) {
++		return false;
++	}
++	auto &catalog = transaction.GetCatalog();
++	auto &connection = transaction.GetConnection();
++	auto schema_name = catalog.MetadataSchemaName();
++	if (schema_name.empty()) {
++		schema_name = "main";
++	}
++
++	auto &collection = *entry.data->data;
++	vector<LogicalType> append_types {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};
++	for (auto &type : collection.Types()) {
++		append_types.push_back(type);
++	}
++
++	Appender appender(connection, catalog.MetadataDatabaseName(), schema_name, inlined_table_name);
++	DataChunk append_chunk;
++	append_chunk.Initialize(Allocator::DefaultAllocator(), append_types);
++
++	auto row_id = entry.row_id_start;
++	auto snapshot_id = static_cast<int64_t>(commit_snapshot.snapshot_id);
++	idx_t position = 0;
++	for (auto &chunk : collection.Chunks()) {
++		auto count = chunk.size();
++		append_chunk.Reset();
++		auto row_ids = FlatVector::GetData<int64_t>(append_chunk.data[0]);
++		auto snapshots = FlatVector::GetData<int64_t>(append_chunk.data[1]);
++		for (idx_t r = 0; r < count; r++) {
++			int64_t emit_rid;
++			if (has_preserved_row_ids) {
++				int64_t staged_rid = entry.data->row_ids[position];
++				emit_rid = DuckLakeConstants::IsTransactionLocalRowId(staged_rid) ? static_cast<int64_t>(row_id++)
++				                                                                  : staged_rid;
++			} else {
++				emit_rid = static_cast<int64_t>(row_id++);
++			}
++			row_ids[r] = emit_rid;
++			snapshots[r] = snapshot_id;
++			position++;
++		}
++		append_chunk.data[2].SetVectorType(VectorType::CONSTANT_VECTOR);
++		ConstantVector::SetNull(append_chunk.data[2], true);
++		for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
++			append_chunk.data[3 + c].Reference(chunk.data[c]);
++		}
++		append_chunk.SetCardinality(count);
++		appender.AppendDataChunk(append_chunk);
++	}
++	appender.Close();
++	return true;
++}
++
+@@ -2813,0 +2870,3 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
++	// Appends run now; the batch this builds runs later. A table the batch still has to CREATE is
++	// therefore not appendable yet, and those rows keep taking the SQL path.
++	set<string> created_in_batch;
+@@ -2818,0 +2878 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
++				created_in_batch.insert(inlined_table_name);
+@@ -2867,0 +2928 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
++			created_in_batch.insert(inlined_table_name);
+@@ -2870,2 +2930,0 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
+-		// Build one cell list per row, then defer formatting to the shared helper.
+-		// FIXME: we can do a much faster append than this
+@@ -2872,0 +2932,6 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
++		if (!created_in_batch.count(inlined_table_name) &&
++		    TryAppendInlinedData(commit_snapshot, inlined_table_name, entry, has_preserved_row_ids)) {
++			continue;
++		}
++
++		// Build one cell list per row, then defer formatting to the shared helper.
+diff --git a/test/sql/data_inlining/data_inlining_appender.test b/test/sql/data_inlining/data_inlining_appender.test
+new file mode 100644
+index 00000000..b60df64d
+--- /dev/null
++++ b/test/sql/data_inlining/data_inlining_appender.test
+@@ -0,0 +1,66 @@
++# name: test/sql/data_inlining/data_inlining_appender.test
++# description: inlined rows written through the Appender API match the SQL path they replace
++# group: [data_inlining]
++
++require ducklake
++
++require parquet
++
++test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
++
++test-env DATA_PATH __TEST_DIR__
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/data_inlining_appender', METADATA_CATALOG 'inlining_appender_meta', DATA_INLINING_ROW_LIMIT 5000)
++
++statement ok
++CREATE TABLE ducklake.t(a INTEGER, b VARCHAR, c DOUBLE, d INTEGER[])
++
++# The first insert creates the inlined table, so it still takes the SQL path.
++statement ok
++INSERT INTO ducklake.t SELECT i, 'x' || i, i * 1.5, [i, i + 1] FROM range(1000) t(i)
++
++# Every later insert appends into the table the first one created.
++statement ok
++INSERT INTO ducklake.t SELECT i, 'y' || i, i * 2.5, [i, i + 2] FROM range(1000, 3000) t(i)
++
++statement ok
++INSERT INTO ducklake.t VALUES (NULL, NULL, NULL, NULL)
++
++query IIII
++SELECT count(*), count(a), sum(a), max(d[2]) FROM ducklake.t
++----
++3001	3000	4498500	3001
++
++# Rows from both paths read back with their own values.
++query IIII
++SELECT a, b, c, d FROM ducklake.t WHERE a IN (0, 999, 1000, 2999) ORDER BY a
++----
++0	x0	0.0	[0, 1]
++999	x999	1498.5	[999, 1000]
++1000	y1000	2500.0	[1000, 1002]
++2999	y2999	7497.5	[2999, 3001]
++
++# Nothing was flushed to Parquet - all of it is still inlined.
++query I
++SELECT count(*) FROM ducklake_list_files('ducklake', 't')
++----
++0
++
++# Updating inlined rows preserves row ids through the appended data.
++statement ok
++UPDATE ducklake.t SET b = 'updated' WHERE a < 5
++
++statement ok
++DELETE FROM ducklake.t WHERE a BETWEEN 100 AND 199
++
++query II
++SELECT count(*), count(*) FILTER (WHERE b = 'updated') FROM ducklake.t
++----
++2901	5
++
++# Time travel still sees the pre-DML state.
++query I
++SELECT count(*) FROM ducklake.t AT (VERSION => 3)
++----
++3000
+diff --git a/test/sql/data_inlining/inlining_append_retry.test b/test/sql/data_inlining/inlining_append_retry.test
+new file mode 100644
+index 00000000..8ea0f2e3
+--- /dev/null
++++ b/test/sql/data_inlining/inlining_append_retry.test
+@@ -0,0 +1,56 @@
++# name: test/sql/data_inlining/inlining_append_retry.test
++# description: a losing concurrent inlined insert retries without losing or duplicating appended rows
++# group: [data_inlining]
++
++require ducklake
++
++require parquet
++
++test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
++
++test-env DATA_PATH __TEST_DIR__
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/inlining_append_retry', METADATA_CATALOG 'append_retry_meta', DATA_INLINING_ROW_LIMIT 5000)
++
++statement ok
++CREATE TABLE ducklake.t(a INTEGER, b VARCHAR)
++
++# Seed so the inlined table exists and both writers below take the appender path.
++statement ok
++INSERT INTO ducklake.t VALUES (-1, 'seed')
++
++statement ok con1
++BEGIN
++
++statement ok con2
++BEGIN
++
++statement ok con1
++INSERT INTO ducklake.t SELECT i, 'one' FROM range(1000) t(i)
++
++statement ok con2
++INSERT INTO ducklake.t SELECT i, 'two' FROM range(1000, 2000) t(i)
++
++statement ok con1
++COMMIT
++
++# con2 lost the race, so this commit retries; its appended rows must survive exactly once.
++statement ok con2
++COMMIT
++
++query III
++SELECT count(*), count(*) FILTER (WHERE b = 'one'), count(*) FILTER (WHERE b = 'two') FROM ducklake.t
++----
++2001	1000	1000
++
++# No row id was reused across the two writers.
++query I
++SELECT count(DISTINCT rowid) FROM ducklake.t
++----
++2001
++
++query I
++SELECT count(*) FROM ducklake_list_files('ducklake', 't')
++----
++0

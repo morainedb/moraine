@@ -1,4 +1,4 @@
-# Patched DuckLake row-ID statistics and pruning
+# Patched DuckLake row-ID statistics, pruning, and inlined writes
 
 This directory carries a downstream DuckLake patch series for DuckDB v1.5.5,
 applied in file-name order:
@@ -19,6 +19,15 @@ applied in file-name order:
    statistics, so a located index result restricts the file list as well as
    the rows read within it. A filter shape the translation does not cover
    adds no predicate, which keeps every file rather than guessing.
+4. `0004-perf-append-DuckLake-inlined-data-rows.patch` writes a commit's
+   inlined rows through the DuckDB Appender API instead of formatting them
+   into an `INSERT ... VALUES` list, whose cost is per row and dominated by
+   binding it. Backends without an appender keep the SQL branch, as does the
+   server-side commit path. Appends run while the commit's SQL batch is still
+   being assembled, so rows bound for a table that batch has yet to `CREATE`
+   keep the SQL branch too; DuckLake registers a table's inlined table when
+   the table itself is created or altered, so this covers same-transaction
+   `CREATE`-then-`INSERT` and tables that predate inlining being enabled.
 
 Later patches address the lines earlier ones produce, so the series is applied
 in one `git apply` invocation rather than one per file.
@@ -57,8 +66,8 @@ cargo xtask ducklake-patch
 ```
 
 On Linux, the command selects GCC 14 to match DuckLake's extension pipeline.
-This keeps the downstream source patch limited to row-ID statistics and
-pruning; it does not carry compiler-compatibility edits.
+This keeps the downstream source patch limited to the behaviour above; it
+does not carry compiler-compatibility edits.
 
 The command:
 
@@ -69,8 +78,8 @@ The command:
 3. builds only `ducklake_loadable_extension` against moraine's exact DuckDB
    submodule and prebuilt static library; and
 4. downloads the pinned DuckDB CLI if needed and verifies that the artifact
-   loads; then runs the series' row-ID write, backfill, and pruning
-   sqllogictest against that artifact.
+   loads; then runs the series' row-ID write, backfill, pruning, and
+   inlined-append sqllogictests against that artifact.
 
 The resulting extension is:
 
