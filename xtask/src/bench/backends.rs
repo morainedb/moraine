@@ -53,6 +53,10 @@ pub struct SessionPaths {
 
 /// The backend's `ATTACH` statement. `postgres_dsn` must be provided for
 /// (and only for) the Postgres backend.
+///
+/// moraine attaches with `META_DATA_PATH` so equality-index workloads can
+/// scoped-read their data files. It is inert without an index: the delete
+/// workloads time the same with and without it.
 pub fn attach_sql(
     kind: BackendKind,
     paths: &SessionPaths,
@@ -61,7 +65,7 @@ pub fn attach_sql(
     let data = paths.data_dir.display();
     Ok(match kind {
         BackendKind::Moraine => format!(
-            "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{data}', META_FLUSH_INTERVAL_MS 1);",
+            "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{data}', META_DATA_PATH '{data}', META_FLUSH_INTERVAL_MS 1);",
             paths.catalog_dir.display()
         ),
         BackendKind::DuckdbFile => format!(
@@ -284,7 +288,7 @@ mod tests {
         assert_eq!(
             attach_sql(BackendKind::Moraine, &paths(), None).unwrap(),
             "ATTACH 'ducklake:moraine:/tmp/cat' AS lake \
-             (DATA_PATH '/tmp/data', META_FLUSH_INTERVAL_MS 1);"
+             (DATA_PATH '/tmp/data', META_DATA_PATH '/tmp/data', META_FLUSH_INTERVAL_MS 1);"
         );
     }
 

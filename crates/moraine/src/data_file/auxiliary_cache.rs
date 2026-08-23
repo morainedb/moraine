@@ -92,6 +92,14 @@ enum AuxiliaryKey {
         start: u64,
         end: u64,
     },
+    /// One delete file's decoded `pos` column. Keyed by the object alone:
+    /// the positions are a function of its bytes, not of the catalog
+    /// record naming it.
+    DeletePositions {
+        store: StoreIdentity,
+        path: String,
+        file_size: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +107,7 @@ pub(super) enum AuxiliaryValue {
     Metadata(Arc<ParquetMetaData>),
     Summary(Arc<FileRowSet>),
     Block(Bytes),
+    DeletePositions(Arc<FileRowSet>),
 }
 
 /// A value with its charge measured once, at insertion.
@@ -112,7 +121,7 @@ impl From<AuxiliaryValue> for Weighed {
     fn from(value: AuxiliaryValue) -> Self {
         let bytes = match &value {
             AuxiliaryValue::Metadata(metadata) => metadata.memory_size(),
-            AuxiliaryValue::Summary(rows) => {
+            AuxiliaryValue::Summary(rows) | AuxiliaryValue::DeletePositions(rows) => {
                 usize::try_from(rows.estimated_bytes()).unwrap_or(usize::MAX)
             }
             AuxiliaryValue::Block(bytes) => bytes.len(),
@@ -123,14 +132,83 @@ impl From<AuxiliaryValue> for Weighed {
 }
 
 /// The disk form of a value: a tag byte, then a footer as the Parquet
-/// metadata writer lays it out (page index included) or a summary in its
-/// own shape.
+/// metadata writer lays it out (page index included) or a row set in its
+/// own shape. Row summaries and delete positions are both row sets and
+/// share those three shapes, under a tag triple each so one tag byte
+/// still names both the kind and the shape.
 mod tag {
     pub(super) const METADATA: u8 = 0;
     pub(super) const RANGE: u8 = 1;
     pub(super) const ROARING: u8 = 2;
     pub(super) const SORTED: u8 = 3;
     pub(super) const BLOCK: u8 = 4;
+    pub(super) const DELETE_RANGE: u8 = 5;
+    pub(super) const DELETE_ROARING: u8 = 6;
+    pub(super) const DELETE_SORTED: u8 = 7;
+
+    /// The `(range, roaring, sorted)` tags one row-set kind writes.
+    pub(super) const SUMMARY_SHAPES: [u8; 3] = [RANGE, ROARING, SORTED];
+    pub(super) const DELETE_SHAPES: [u8; 3] = [DELETE_RANGE, DELETE_ROARING, DELETE_SORTED];
+}
+
+/// Writes `rows` as one of `shapes`, whichever representation it took.
+fn encode_row_set(
+    rows: &FileRowSet,
+    shapes: [u8; 3],
+    writer: &mut impl Write,
+) -> foyer::Result<()> {
+    let io = foyer::Error::io_error;
+    let [range, roaring, sorted] = shapes;
+    match rows {
+        FileRowSet::Range { start, end } => {
+            writer.write_all(&[range]).map_err(io)?;
+            writer.write_all(&start.to_le_bytes()).map_err(io)?;
+            writer.write_all(&end.to_le_bytes()).map_err(io)
+        }
+        FileRowSet::Roaring(bitmap) => {
+            writer.write_all(&[roaring]).map_err(io)?;
+            bitmap.serialize_into(writer).map_err(io)
+        }
+        FileRowSet::Sorted(row_ids) => {
+            writer.write_all(&[sorted]).map_err(io)?;
+            writer
+                .write_all(&usize_as_u64(row_ids.len()).to_le_bytes())
+                .map_err(io)?;
+            row_ids
+                .iter()
+                .try_for_each(|row_id| writer.write_all(&row_id.to_le_bytes()))
+                .map_err(io)
+        }
+    }
+}
+
+/// Reads back the body [`encode_row_set`] wrote, given which shape the
+/// consumed tag named.
+fn decode_row_set(shape: RowSetShape, reader: &mut impl Read) -> foyer::Result<FileRowSet> {
+    Ok(match shape {
+        RowSetShape::Range => FileRowSet::Range {
+            start: read_u64(reader)?,
+            end: read_u64(reader)?,
+        },
+        RowSetShape::Roaring => FileRowSet::Roaring(
+            RoaringTreemap::deserialize_from(reader).map_err(foyer::Error::io_error)?,
+        ),
+        RowSetShape::Sorted => {
+            let count = usize::try_from(read_u64(reader)?).unwrap_or(usize::MAX);
+            FileRowSet::Sorted(
+                (0..count)
+                    .map(|_| read_u64(reader))
+                    .collect::<foyer::Result<Vec<u64>>>()?,
+            )
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+enum RowSetShape {
+    Range,
+    Roaring,
+    Sorted,
 }
 
 fn parse_failed(error: impl std::error::Error + Send + Sync + 'static) -> foyer::Error {
@@ -157,27 +235,10 @@ impl foyer::Code for Weighed {
                     .map_err(parse_failed)?;
                 writer.write_all(&buffer).map_err(io)
             }
-            AuxiliaryValue::Summary(rows) => match rows.as_ref() {
-                FileRowSet::Range { start, end } => {
-                    writer.write_all(&[tag::RANGE]).map_err(io)?;
-                    writer.write_all(&start.to_le_bytes()).map_err(io)?;
-                    writer.write_all(&end.to_le_bytes()).map_err(io)
-                }
-                FileRowSet::Roaring(bitmap) => {
-                    writer.write_all(&[tag::ROARING]).map_err(io)?;
-                    bitmap.serialize_into(writer).map_err(io)
-                }
-                FileRowSet::Sorted(row_ids) => {
-                    writer.write_all(&[tag::SORTED]).map_err(io)?;
-                    writer
-                        .write_all(&usize_as_u64(row_ids.len()).to_le_bytes())
-                        .map_err(io)?;
-                    row_ids
-                        .iter()
-                        .try_for_each(|row_id| writer.write_all(&row_id.to_le_bytes()))
-                        .map_err(io)
-                }
-            },
+            AuxiliaryValue::Summary(rows) => encode_row_set(rows, tag::SUMMARY_SHAPES, writer),
+            AuxiliaryValue::DeletePositions(positions) => {
+                encode_row_set(positions, tag::DELETE_SHAPES, writer)
+            }
             AuxiliaryValue::Block(bytes) => {
                 writer.write_all(&[tag::BLOCK]).map_err(io)?;
                 writer.write_all(bytes).map_err(io)
@@ -201,21 +262,26 @@ impl foyer::Code for Weighed {
                 AuxiliaryValue::Metadata(Arc::new(metadata))
             }
             tag::RANGE => {
-                let start = read_u64(reader)?;
-                let end = read_u64(reader)?;
-                AuxiliaryValue::Summary(Arc::new(FileRowSet::Range { start, end }))
+                AuxiliaryValue::Summary(Arc::new(decode_row_set(RowSetShape::Range, reader)?))
             }
             tag::ROARING => {
-                let bitmap = RoaringTreemap::deserialize_from(reader).map_err(io)?;
-                AuxiliaryValue::Summary(Arc::new(FileRowSet::Roaring(bitmap)))
+                AuxiliaryValue::Summary(Arc::new(decode_row_set(RowSetShape::Roaring, reader)?))
             }
             tag::SORTED => {
-                let count = usize::try_from(read_u64(reader)?).unwrap_or(usize::MAX);
-                let row_ids = (0..count)
-                    .map(|_| read_u64(reader))
-                    .collect::<foyer::Result<Vec<u64>>>()?;
-                AuxiliaryValue::Summary(Arc::new(FileRowSet::Sorted(row_ids)))
+                AuxiliaryValue::Summary(Arc::new(decode_row_set(RowSetShape::Sorted, reader)?))
             }
+            tag::DELETE_RANGE => AuxiliaryValue::DeletePositions(Arc::new(decode_row_set(
+                RowSetShape::Range,
+                reader,
+            )?)),
+            tag::DELETE_ROARING => AuxiliaryValue::DeletePositions(Arc::new(decode_row_set(
+                RowSetShape::Roaring,
+                reader,
+            )?)),
+            tag::DELETE_SORTED => AuxiliaryValue::DeletePositions(Arc::new(decode_row_set(
+                RowSetShape::Sorted,
+                reader,
+            )?)),
             tag::BLOCK => {
                 let mut buffer = Vec::new();
                 reader.read_to_end(&mut buffer).map_err(io)?;
@@ -552,6 +618,46 @@ impl AuxiliaryCache {
         })
     }
 
+    /// One delete file's positions, decoding them through `decode` on a
+    /// miss. Concurrent misses on one object share the single decode.
+    ///
+    /// A delete file is immutable and the commit path reads the same one
+    /// again on every later delete against its target, so the decode is
+    /// worth keeping even though the bytes it decodes are cached already.
+    pub(super) async fn delete_positions<F, Fut>(
+        &self,
+        file: &ParquetFile,
+        decode: F,
+    ) -> Result<Arc<FileRowSet>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Arc<FileRowSet>>> + Send + 'static,
+    {
+        let pending = decode();
+        let fetch = || async move {
+            pending
+                .await
+                .map(|positions| Weighed::from(AuxiliaryValue::DeletePositions(positions)))
+        };
+
+        let entry = self
+            .tier
+            .get_or_fetch(&Self::delete_positions_key(file), fetch)
+            .await
+            .map_err(|error| {
+                let cause = std::error::Error::source(&error)
+                    .map_or_else(|| error.to_string(), ToString::to_string);
+                Error::Corruption(format!("delete-file positions: {cause}"))
+            })?;
+
+        match &entry.value {
+            AuxiliaryValue::DeletePositions(positions) => Ok(Arc::clone(positions)),
+            _ => Err(Error::Corruption(
+                "another value was cached under a delete-position key".to_owned(),
+            )),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn insert_summary(
         &self,
@@ -678,6 +784,14 @@ impl AuxiliaryCache {
         }
     }
 
+    fn delete_positions_key(file: &ParquetFile) -> AuxiliaryKey {
+        AuxiliaryKey::DeletePositions {
+            store: file.store.identity,
+            path: file.path.to_string(),
+            file_size: file.file_size,
+        }
+    }
+
     fn file_summary_key(store: &DataStore, key: &FileSummaryKey<'_>) -> AuxiliaryKey {
         AuxiliaryKey::Summary {
             store: store.identity,
@@ -721,15 +835,19 @@ impl AuxiliaryCache {
 fn summary_of(value: &AuxiliaryValue) -> Option<Arc<FileRowSet>> {
     match value {
         AuxiliaryValue::Summary(rows) => Some(Arc::clone(rows)),
-        AuxiliaryValue::Metadata(_) | AuxiliaryValue::Block(_) => None,
+        AuxiliaryValue::Metadata(_)
+        | AuxiliaryValue::Block(_)
+        | AuxiliaryValue::DeletePositions(_) => None,
     }
 }
 
 fn metadata_of(value: &AuxiliaryValue) -> ParquetResult<Arc<ParquetMetaData>> {
     match value {
         AuxiliaryValue::Metadata(metadata) => Ok(Arc::clone(metadata)),
-        AuxiliaryValue::Summary(_) | AuxiliaryValue::Block(_) => Err(ParquetError::General(
-            "a row summary or block was cached under a metadata key".to_owned(),
+        AuxiliaryValue::Summary(_)
+        | AuxiliaryValue::Block(_)
+        | AuxiliaryValue::DeletePositions(_) => Err(ParquetError::General(
+            "a row set or block was cached under a metadata key".to_owned(),
         )),
     }
 }

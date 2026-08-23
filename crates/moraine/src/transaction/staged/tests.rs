@@ -3827,6 +3827,92 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
     );
 }
 
+/// A delete covering a data file entirely drops the file instead of
+/// writing a delete file, so the rows die with no `pos` list naming them.
+/// Every row the file still held loses its entry.
+#[tokio::test]
+async fn dropping_a_data_file_removes_its_live_rows_index_entries() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+    assert_eq!(index_entry_count(&catalog, true, index_id).await, 3);
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store));
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(1), Cell::U64(4)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        0,
+        "the dropped file held every indexed row"
+    );
+}
+
+/// A dropped file's already-dead positions lost their entries when their
+/// delete file was registered. The drop derives removals for the
+/// survivors alone, so a value re-inserted between the two commits keeps
+/// the entry it owns.
+#[tokio::test]
+async fn dropping_a_partly_deleted_data_file_removes_only_the_surviving_entries() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+
+    let delete_size = write_delete_file(&store, "deletes.parquet", "data.parquet", &[0, 2]).await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store.clone()));
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: delete_file_row_at(2, "deletes.parquet", 1, 2, delete_size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+    assert_eq!(index_entry_count(&catalog, true, index_id).await, 1);
+
+    // Row 0's value, live again under a row the dropped file never held.
+    inline_insert(&catalog, 5, 100, &[10], true).await;
+    assert_eq!(index_entry_count(&catalog, true, index_id).await, 2);
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, DataStore::new(store));
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(1), Cell::U64(6)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(6, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(6, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        1,
+        "the survivor's entry goes; the re-inserted value's stays"
+    );
+}
+
 /// A delete file may target a data file its own commit registers, which
 /// is the shape a flush of partly-tombstoned inlined rows takes: DuckLake
 /// writes every inlined row — live and tombstoned alike — into one Parquet

@@ -116,6 +116,10 @@ pub(super) struct FileContext<'a> {
     prefix: &'a str,
     /// Tables this commit compacts and does nothing else to.
     compacted: BTreeSet<u64>,
+    /// Tables this commit kills rows in, which is what separates a data
+    /// file dropped because its rows died from one ended because
+    /// compaction re-homed them under their own ids.
+    deleted_from: BTreeSet<u64>,
     delete_file_permits: Arc<tokio::sync::Semaphore>,
     metrics: Arc<data_file::ScopedReadMetrics>,
     /// Per-table index metadata and compiled projections, built on first use.
@@ -319,10 +323,12 @@ pub(super) async fn stage_index_maintenance(
 ) -> Result<StagedEntries> {
     let pending_schemas = pending_inline_schemas(ops);
     let inline_schemas = InlineSchemaCache::new(&pending_schemas);
+    let scope = change_scope(ops)?;
     let context = FileContext {
         store: data_store,
         prefix: data_prefix,
-        compacted: compaction_only_tables(ops)?,
+        compacted: scope.compacted,
+        deleted_from: scope.deleted_from,
         delete_file_permits: Arc::new(tokio::sync::Semaphore::new(FILE_READ_CONCURRENCY)),
         metrics: Arc::clone(&metrics),
         indexing: std::sync::Mutex::new(HashMap::new()),
@@ -495,11 +501,46 @@ fn plan_deletes(
             } if !context.compacted.contains(table_id) => {
                 plan.inline.entry(*table_id).or_default().push(*row_id);
             }
+            RowOperation::UpdateSetEnd {
+                table: TableKind::DataFile,
+                cells,
+            } => {
+                // A delete covering a file drops it rather than writing a
+                // delete file, so nothing names the dead positions: the
+                // whole live remainder of the file died. Gated on the
+                // commit having killed rows in this table, since ending a
+                // data file also expresses compaction and a rewrite, which
+                // re-home rows under their own ids and must keep every
+                // entry.
+                let (table_id, data_file_id) = ended_data_file(cells)?;
+                if context.deleted_from.contains(&table_id)
+                    && !context.compacted.contains(&table_id)
+                    && !context
+                        .indexing(base, TableId::new(table_id))?
+                        .all
+                        .indexes
+                        .is_empty()
+                {
+                    plan.files
+                        .entry((table_id, data_file_id))
+                        .or_default()
+                        .dropped = true;
+                }
+            }
             _ => {}
         }
     }
 
     Ok(plan)
+}
+
+/// The `(table, data file)` an `UpdateSetEnd` over `ducklake_data_file`
+/// names.
+fn ended_data_file(cells: &[Cell]) -> Result<(u64, u64)> {
+    let mut cursor = Cursor::new(TableKind::DataFile, cells);
+    let table_id = cursor.u64()?;
+    let data_file_id = cursor.u64()?;
+    Ok((table_id, data_file_id))
 }
 
 /// Plans entry additions without reading their bytes.
@@ -590,6 +631,9 @@ struct DeletePlan {
 struct TargetDeletes {
     positions: Vec<u64>,
     files: Vec<proto::DeleteFileValue>,
+    /// The commit drops the file outright, which names every position it
+    /// still held rather than any list of them.
+    dropped: bool,
 }
 
 /// Addition reads and the metadata needed to exclude same-commit targets
@@ -614,9 +658,17 @@ enum Add<'a> {
     },
 }
 
-/// The tables this commit compacts and otherwise leaves alone, read from
-/// the `ducklake_snapshot_changes` row it stages; empty without one.
-fn compaction_only_tables(ops: &[RowOperation]) -> Result<BTreeSet<u64>> {
+/// What this commit's `ducklake_snapshot_changes` row says about the
+/// tables it touches; both sets empty without one.
+#[derive(Default)]
+struct ChangeScope {
+    /// Tables this commit compacts and otherwise leaves alone.
+    compacted: BTreeSet<u64>,
+    /// Tables this commit kills rows in.
+    deleted_from: BTreeSet<u64>,
+}
+
+fn change_scope(ops: &[RowOperation]) -> Result<ChangeScope> {
     let Some(cells) = ops.iter().find_map(|op| match op {
         RowOperation::Insert {
             table: TableKind::SnapshotChanges,
@@ -624,13 +676,17 @@ fn compaction_only_tables(ops: &[RowOperation]) -> Result<BTreeSet<u64>> {
         } => Some(cells.as_slice()),
         _ => None,
     }) else {
-        return Ok(BTreeSet::new());
+        return Ok(ChangeScope::default());
     };
 
     // The row's full shape is validated when the snapshot record is built.
     let mut cursor = Cursor::new(TableKind::SnapshotChanges, cells);
     cursor.u64()?;
-    Ok(ChangeSet::parse(&cursor.string()?).compaction_only_tables())
+    let changes = ChangeSet::parse(&cursor.string()?);
+    Ok(ChangeScope {
+        compacted: changes.compaction_only_tables(),
+        deleted_from: changes.deleted_from_tables,
+    })
 }
 
 /// The inline chunks this commit stages, grouped by table.
@@ -1117,6 +1173,10 @@ async fn newly_killed_rows(
         committed_dead_positions(base, table_id, data_file_id, context)
     )?;
 
+    if deletes.dropped {
+        positions.extend(0..live_data_file(base, table_id, data_file_id)?.record_count);
+    }
+
     if !already_dead.is_empty() {
         let already_dead: HashSet<u64> = already_dead.into_iter().collect();
         positions.retain(|position| !already_dead.contains(position));
@@ -1189,6 +1249,17 @@ pub(super) async fn stream_file_delete_index_entries(
 
     refuse_out_of_range(killed, &file)?;
 
+    // Positions are unique and in range, so covering the record count is
+    // covering the file: read it whole rather than page-skipping past
+    // nothing.
+    let covers_file = usize::try_from(file.record_count)
+        .is_ok_and(|count| count == killed.positions.as_slice().len());
+    let rows = if covers_file {
+        data_file::ScopedRows::All
+    } else {
+        data_file::ScopedRows::At(&killed.positions)
+    };
+
     let path = data_file_object_path(base, &file, context.prefix)?;
     let entries = data_file::scoped_read_index_entry_batches(
         data_file::ParquetFile::new(
@@ -1199,7 +1270,7 @@ pub(super) async fn stream_file_delete_index_entries(
         )
         .with_metrics(Arc::clone(&context.metrics)),
         indexes.projections.clone(),
-        data_file::ScopedRows::At(&killed.positions),
+        rows,
         data_file::RowIdSource::Resolve {
             row_id_start: file.row_id_start,
         },

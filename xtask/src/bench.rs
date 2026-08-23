@@ -280,6 +280,9 @@ pub fn bench(arguments: &[String]) -> anyhow::Result<()> {
     let mut rows: Vec<Row> = Vec::new();
     for workload in &selected {
         for &backend in &backends {
+            if workload.moraine_only && backend != BackendKind::Moraine {
+                continue;
+            }
             for repeat in 0..options.repeat {
                 let phases = run_once(
                     &context,
