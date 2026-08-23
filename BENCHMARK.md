@@ -34,8 +34,8 @@ rather than the flush wait. Tune it on any attach with
 
 ## Workloads
 
-`small` / `medium` / `large` scale (bulk rows, small commits, tables) as
-(100k, 20, 10) / (1M, 50, 25) / (10M, 200, 100).
+`small` / `medium` / `large` scale (bulk rows, small commits, tables,
+deletes) as (100k, 20, 10, 20) / (1M, 50, 25, 50) / (10M, 200, 100, 200).
 
 | workload | measures |
 |---|---|
@@ -44,6 +44,40 @@ rather than the flush wait. Tune it on any attach with
 | `many_tables` | T × `CREATE TABLE` — the DDL commit path |
 | `scan` | full/filtered scans, time travel, snapshot listing over a seeded table |
 | `maintenance` | `merge_adjacent_files`, `expire_snapshots`, `cleanup_old_files` |
+| `deletes_repeated` | D × single-key `DELETE` — one commit each |
+| `deletes_bulk` | the same rows as `deletes_repeated`, in one statement |
+| `deletes_covering` | a partition-aligned `DELETE`, which drops the file |
+| `deletes_partial` | `deletes_covering`'s control — same file, not covered |
+| `deletes_indexed_repeated` | `deletes_repeated` against an equality index |
+| `deletes_indexed_covering` | `deletes_covering` against an equality index |
+
+The four delete workloads bracket what statement shape costs. Delete cost
+rises with how many tables the lake holds, whether or not they hold rows or
+are the target — seeding one extra empty table alongside these moved a
+`DELETE` against an untouched table from 14ms to 26ms — so each path gets a
+lake of its own, holding one table and nothing else to charge against the
+statement being timed.
+
+That buys two comparisons, each between workloads seeded identically:
+
+- `deletes_repeated` against `deletes_bulk` — the same rows removed either
+  way, one key per statement versus all of them at once, so the gap is what
+  N commits cost over one. `deletes_repeated` also rewrites a delete file
+  that the previous statement grew, so its Parquet work rises across the
+  run while `deletes_bulk`'s does not; the gap is an upper bound on
+  per-commit cost, not a clean reading of it.
+- `deletes_covering` against `deletes_partial` — the same partitioned seed
+  and the same target partition, one row short of covering it, so the file
+  survives and takes a delete file instead of being dropped. The drop is
+  the only difference.
+
+Do not read across those pairs: `covering` needs a partitioned table to be
+partition-aligned, so it is not comparable to `bulk`.
+
+The two `indexed` workloads are their twins' seeds plus one
+`moraine_index_create`, so subtracting the twin gives what maintaining
+index entries costs a delete. They call a moraine-only function, so the
+other backends sit them out and the report leaves their cells empty.
 
 Every backend runs the byte-identical SQL through the same DuckDB binary, one
 statement timed at a time via `.timer on`, so differences come only from the
