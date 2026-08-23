@@ -111,8 +111,9 @@ struct StoreLocation {
 /// read-only `DbReader`. A read-only catalog never opens a `Db`, so it never
 /// fences a live writer.
 pub(crate) enum Store {
-    /// The single read-write writer.
-    Writer(Db),
+    /// The single read-write writer, and whether its commits force the
+    /// write-ahead log out rather than waiting for the flush timer.
+    Writer { db: Db, flush_on_commit: bool },
     /// A read-only reader following the manifest, shared into read sessions.
     Reader(Arc<DbReader>),
 }
@@ -123,8 +124,20 @@ impl Store {
     /// it lost to.
     pub(crate) fn writer_db(&self) -> Option<&Db> {
         match self {
-            Self::Writer(db) => Some(db),
+            Self::Writer { db, .. } => Some(db),
             Self::Reader(_) => None,
+        }
+    }
+
+    /// How a commit through this store reaches object storage. A reader
+    /// commits nothing, so it names the waiting route.
+    pub(crate) fn commit_durability(&self) -> commit::CommitDurability {
+        match self {
+            Self::Writer {
+                db,
+                flush_on_commit,
+            } => commit::writer_durability(db, *flush_on_commit),
+            Self::Reader(_) => commit::CommitDurability::OnFlushInterval,
         }
     }
 }
@@ -159,6 +172,14 @@ pub struct CatalogOptions {
     /// so a durable commit waits only on the object-store PUT — the lowest
     /// latency, at the cost of a busy flush loop. Defaults to 100ms.
     pub flush_interval: Duration,
+    /// Whether a commit forces the write-ahead log out to object storage
+    /// rather than waiting for the next flush. It trades one object-store
+    /// PUT per commit for a commit latency that no longer includes up to a
+    /// whole [`flush_interval`](Self::flush_interval) of waiting — worth it
+    /// for a low commit rate, wasteful for a high one, where the interval
+    /// is what batches many commits into one PUT. Defaults to `false`,
+    /// leaving the interval in charge.
+    pub flush_on_commit: bool,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -233,6 +254,7 @@ impl Default for CatalogOptions {
             path: String::new(),
             encrypted: false,
             flush_interval: Duration::from_millis(100),
+            flush_on_commit: false,
             cache_dir: None,
             cache_size: None,
             cache_memory: None,
@@ -542,7 +564,7 @@ impl ReadOnlyCatalog {
     /// Whether this handle is the store's writer, and so the only thing
     /// that can move `sys/head`.
     pub(crate) fn holds_the_writer(&self) -> bool {
-        matches!(self.store.as_ref(), Store::Writer(_))
+        matches!(self.store.as_ref(), Store::Writer { .. })
     }
 
     /// An immutable view of the catalog at the latest committed snapshot.
@@ -784,7 +806,7 @@ impl ReadOnlyCatalog {
     /// most expensive possible read.
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
         let session = match self.store.as_ref() {
-            Store::Writer(db) => ReadSession::Tx(
+            Store::Writer { db, .. } => ReadSession::Tx(
                 db.begin(IsolationLevel::Snapshot)
                     .await
                     .map_err(Error::from)?,
@@ -816,7 +838,7 @@ impl ReadOnlyCatalog {
     /// Returns an error if the underlying store fails to close cleanly.
     pub async fn close(&self) -> Result<()> {
         match self.store.as_ref() {
-            Store::Writer(db) => db.close().await.map_err(Error::from),
+            Store::Writer { db, .. } => db.close().await.map_err(Error::from),
             Store::Reader(reader) => reader.close().await.map_err(Error::from),
         }
     }
@@ -827,7 +849,7 @@ impl Catalog {
     /// one, so the reader arm is unreachable by construction.
     fn writer(&self) -> Result<&Db> {
         match self.store.as_ref() {
-            Store::Writer(db) => Ok(db),
+            Store::Writer { db, .. } => Ok(db),
             Store::Reader(_) => Err(Error::Constraint(
                 "catalog opened read-only; writes are unavailable".to_string(),
             )),
@@ -910,9 +932,13 @@ impl Catalog {
             .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts);
-        let (db, cache, format) =
-            commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
-                .await?;
+        let (db, cache, format) = commit::open_initialized(
+            store,
+            options.encrypted,
+            options.data_path.as_deref(),
+            options.flush_on_commit,
+        )
+        .await?;
         warn_if_metadata_cache_cannot_hold(
             &options.path,
             manifest.map(|manifest| manifest.metadata_bytes),
@@ -920,16 +946,21 @@ impl Catalog {
         info!(
             path = options.path,
             flush_interval_ms = options.flush_interval.as_millis(),
+            flush_on_commit = options.flush_on_commit,
             "opened catalog read-write"
         );
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         // The open already validated the stamp; commits below this floor
         // owe no format read.
         crate::catalog::projection::raise_format_floor(&projections, format);
+        let durability = commit::writer_durability(&db, options.flush_on_commit);
         Ok(Self {
             inner: ReadOnlyCatalog {
                 writer_status: Some(db.subscribe()),
-                store: Arc::new(Store::Writer(db)),
+                store: Arc::new(Store::Writer {
+                    db,
+                    flush_on_commit: options.flush_on_commit,
+                }),
                 location: Arc::new(StoreLocation {
                     path: options.path,
                     object_store: located,
@@ -937,7 +968,7 @@ impl Catalog {
                 reads: Arc::new(ReadTally::default()),
                 cache,
                 data_reads: Arc::default(),
-                commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
+                commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections), durability)),
                 projections,
             },
         })
@@ -1027,7 +1058,10 @@ impl Catalog {
             reads: Arc::new(ReadTally::default()),
             cache,
             data_reads: Arc::default(),
-            commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
+            commits: Arc::new(commit::Coalescer::new(
+                Arc::clone(&projections),
+                commit::CommitDurability::OnFlushInterval,
+            )),
             projections,
         })
     }

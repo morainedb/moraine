@@ -14,8 +14,8 @@ use slatedb::{Db, DbTransaction, IsolationLevel};
 use tokio::sync::{Mutex, MutexGuard, watch};
 
 use super::{
-    HeadViewUpdate, Landed, Prepared, StagedWrite, commit_batch, fold, head_view_for,
-    prepare_and_stage,
+    CommitDurability, HeadTransition, HeadViewUpdate, Landed, Prepared, StagedWrite, commit_batch,
+    fold, head_view_for, prepare_and_stage,
 };
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
@@ -178,10 +178,15 @@ pub(crate) struct Coalescer {
     /// Bumped under `shared` whenever a batch leaves flight.
     flights: watch::Sender<u64>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    /// How a sealed batch reaches object storage.
+    durability: CommitDurability,
 }
 
 impl Coalescer {
-    pub(crate) fn new(projections: Arc<std::sync::RwLock<ProjectionCache>>) -> Self {
+    pub(crate) fn new(
+        projections: Arc<std::sync::RwLock<ProjectionCache>>,
+        durability: CommitDurability,
+    ) -> Self {
         Self {
             shared: Mutex::new(Shared {
                 forming: None,
@@ -190,6 +195,7 @@ impl Coalescer {
             arriving: AtomicUsize::new(0),
             flights: watch::Sender::new(0),
             projections,
+            durability,
         }
     }
 
@@ -291,12 +297,15 @@ impl Coalescer {
 
         let landed = match commit_batch(
             db_tx,
-            head_before,
-            head,
+            HeadTransition {
+                before: head_before,
+                after: head,
+            },
             &writes,
             staged_bytes,
             HeadViewUpdate::Rebuild(base),
             &self.projections,
+            &self.durability,
         )
         .await
         {

@@ -106,6 +106,33 @@ Local and `memory://` stores default to read-write and need no flag. A
 read-only attach of an uninitialized store fails with an error that names this
 fix.
 
+**`FLUSH_INTERVAL_MS` and `FLUSH_ON_COMMIT` — what a commit waits for.** A
+commit is durable once its batch reaches object storage, and by default the
+store's flush timer is what carries it there. Commit latency is therefore up
+to one whole interval (100 ms unset), and the interval is also what batches
+concurrent commits into a single PUT. `META_FLUSH_INTERVAL_MS <n>` shortens
+the wait at the cost of more frequent PUTs:
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE, META_FLUSH_INTERVAL_MS 5);
+```
+
+`META_FLUSH_ON_COMMIT true` takes the timer out of the commit path instead:
+each commit forces the write-ahead log out itself and waits only on that PUT,
+whatever the interval is. It trades one PUT per commit for a latency that no
+longer includes waiting, so it suits a low commit rate — a lake written in
+occasional batches — and works against a high one, where the interval is
+exactly what merges many commits into one request:
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE, META_FLUSH_ON_COMMIT true);
+```
+
+Off by default. The two compose: the interval still bounds how long an
+*uncommitted* write sits in memory, and a commit no longer waits for it.
+
 **`CACHE_DIR` — on-disk object cache for S3 catalogs.** Each query reads the
 catalog metadata from the store; on S3 that is network latency every time, and
 the in-memory caches start empty in each new process. Point SlateDB's disk

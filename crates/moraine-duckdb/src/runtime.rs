@@ -388,6 +388,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,

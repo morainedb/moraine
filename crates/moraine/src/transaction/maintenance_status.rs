@@ -34,6 +34,7 @@ pub(crate) async fn read(catalog: &ReadOnlyCatalog) -> Result<Vec<MaintenanceSta
 /// Appends one pass and durably retains the newest bounded window.
 pub(crate) async fn record(catalog: &Catalog, pass: MaintenanceStatusPass) -> Result<()> {
     let encoded = encode_pass(pass);
+    let durability = catalog.store().commit_durability();
 
     for attempt in 0..MAX_COMMIT_ATTEMPTS {
         if attempt > 0 {
@@ -59,7 +60,7 @@ pub(crate) async fn record(catalog: &Catalog, pass: MaintenanceStatusPass) -> Re
         writes.extend(stamp);
         let staged = commit::stage_writes(&tx, &writes)?;
 
-        match commit::commit_durable(tx, "maintenance status", staged).await {
+        match commit::commit_durable(tx, "maintenance status", staged, &durability).await {
             Ok(_) => return Ok(()),
             Err(error) if error.kind() == ErrorKind::Transaction => {}
             Err(error) => return Err(Error::from(error)),

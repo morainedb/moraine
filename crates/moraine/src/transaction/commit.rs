@@ -118,20 +118,64 @@ pub(crate) fn durable() -> WriteOptions {
 /// and how often it is reported thereafter.
 const STALL_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Commits `tx` and waits for the batch to reach object storage, naming
-/// `operation` and the batch's `staged` size in the log if the wait runs
-/// long. The wait is unbounded: the store retries the write indefinitely,
-/// and a deadline could not retract a batch that still lands.
+/// How a durable commit's bytes reach object storage.
+#[derive(Clone, Default)]
+pub(crate) enum CommitDurability {
+    /// Hand the batch to the store and wait for the flush timer to carry
+    /// it out, so the commit costs up to one flush interval.
+    #[default]
+    OnFlushInterval,
+    /// Force the write-ahead log out as part of the commit, so the commit
+    /// costs one object-store PUT whatever the flush interval is.
+    Immediate(Db),
+}
+
+/// The route commits through `db` take, given whether the catalog was
+/// opened to flush on commit.
+pub(crate) fn writer_durability(db: &Db, flush_on_commit: bool) -> CommitDurability {
+    if flush_on_commit {
+        CommitDurability::Immediate(db.clone())
+    } else {
+        CommitDurability::OnFlushInterval
+    }
+}
+
+/// Commits `tx` and waits for the batch to reach object storage, by the
+/// route `durability` names. The wait is unbounded: the store retries the
+/// write indefinitely, and a deadline could not retract a batch that still
+/// lands.
 pub(crate) async fn commit_durable(
     tx: DbTransaction,
     operation: &'static str,
     staged: StagedBytes,
+    durability: &CommitDurability,
 ) -> std::result::Result<Option<slatedb::WriteHandle>, slatedb::Error> {
-    let options = durable();
-    let mut commit = Box::pin(tx.commit_with_options(&options));
+    match durability {
+        CommitDurability::OnFlushInterval => {
+            reporting_stalls(operation, staged, tx.commit_with_options(&durable())).await
+        }
+        // The commit returns as soon as the batch is visible; the flush
+        // that follows is what puts it in object storage, so both are
+        // waited on before this reports the write durable.
+        CommitDurability::Immediate(db) => {
+            let handle = tx.commit_with_options(&non_durable()).await?;
+            reporting_stalls(operation, staged, db.flush()).await?;
+            Ok(handle)
+        }
+    }
+}
+
+/// Awaits `write`, naming `operation` and the batch's `staged` size in the
+/// log every [`STALL_INTERVAL`] the wait runs long.
+async fn reporting_stalls<T>(
+    operation: &'static str,
+    staged: StagedBytes,
+    write: impl Future<Output = std::result::Result<T, slatedb::Error>>,
+) -> std::result::Result<T, slatedb::Error> {
+    let mut write = Box::pin(write);
     let mut waited = Duration::ZERO;
     loop {
-        if let Ok(outcome) = tokio::time::timeout(STALL_INTERVAL, &mut commit).await {
+        if let Ok(outcome) = tokio::time::timeout(STALL_INTERVAL, &mut write).await {
             return outcome;
         }
         waited = waited.saturating_add(STALL_INTERVAL);
@@ -287,10 +331,11 @@ pub(crate) async fn open_initialized(
     store: StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
+    flush_on_commit: bool,
 ) -> Result<(Db, Arc<CacheCounters>, u64)> {
     let mut attempt = 1;
     loop {
-        match open_attempt(&store, encrypted, data_path).await {
+        match open_attempt(&store, encrypted, data_path, flush_on_commit).await {
             Ok(opened) => return Ok(opened),
             Err(OpenFailure::Fatal(err)) => return Err(err),
             Err(OpenFailure::FencedAtGenesis(err)) => {
@@ -314,6 +359,7 @@ async fn open_attempt(
     store: &StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
+    flush_on_commit: bool,
 ) -> std::result::Result<(Db, Arc<CacheCounters>, u64), OpenFailure> {
     let started = Instant::now();
     let (db, counters) = store.open_writer().await.map_err(OpenFailure::Fatal)?;
@@ -343,7 +389,8 @@ async fn open_attempt(
         }
     };
 
-    match commit_durable(tx, "bootstrap", staged).await {
+    let durability = writer_durability(&db, flush_on_commit);
+    match commit_durable(tx, "bootstrap", staged, &durability).await {
         Ok(_) => {
             info!(encrypted, data_path, "bootstrapped a fresh catalog store");
             Ok((db, counters, FORMAT_VERSION))
@@ -1170,26 +1217,34 @@ fn staged_sys_value<M: prost::Message + Default>(writes: &[StagedWrite], key: Sy
         .and_then(|bytes| value::decode_value::<M>(bytes).ok())
 }
 
+/// The head pointer a batch moves: the id it commits against, and the id
+/// it leaves standing. A head-preserving commit repeats the same id.
+#[derive(Clone, Copy)]
+pub(crate) struct HeadTransition {
+    pub(crate) before: u64,
+    pub(crate) after: u64,
+}
+
 /// Commits one staged batch and folds the result into the maintained
-/// projections. `head` is the id the batch leaves at the head pointer. The
-/// one place a catalog batch reaches the store.
+/// projections. The one place a catalog batch reaches the store.
 pub(crate) async fn commit_batch(
     db_tx: DbTransaction,
-    head_before: u64,
-    head: u64,
+    heads: HeadTransition,
     writes: &[StagedWrite],
     staged_bytes: StagedBytes,
     head_view_update: HeadViewUpdate,
     projections: &std::sync::RwLock<ProjectionCache>,
+    durability: &CommitDurability,
 ) -> Result<Landed> {
+    let head = heads.after;
     // A head-preserving commit reuses the head id with new content, so the
     // cache is dropped before the write is visible.
-    let head_advanced = head > head_before;
+    let head_advanced = head > heads.before;
     if !head_advanced {
         invalidate_head_view(projections);
     }
     let durable_started = Instant::now();
-    match commit_durable(db_tx, "commit", staged_bytes).await {
+    match commit_durable(db_tx, "commit", staged_bytes, durability).await {
         Ok(_) => {
             let durable = durable_started.elapsed();
             let projection_started = Instant::now();
@@ -1237,24 +1292,24 @@ pub(crate) async fn commit_batch(
 /// re-drive.
 pub(crate) async fn commit_batch_off_task(
     db_tx: DbTransaction,
-    head_before: u64,
-    head: u64,
+    heads: HeadTransition,
     writes: Vec<StagedWrite>,
     staged_bytes: StagedBytes,
     head_view_update: HeadViewUpdate,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    durability: CommitDurability,
 ) -> Result<Landed> {
     let task = {
         let projections = Arc::clone(&projections);
         tokio::spawn(async move {
             commit_batch(
                 db_tx,
-                head_before,
-                head,
+                heads,
                 &writes,
                 staged_bytes,
                 head_view_update,
                 &projections,
+                &durability,
             )
             .await
         })

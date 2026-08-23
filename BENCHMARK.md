@@ -30,7 +30,9 @@ fails because a backend is unavailable.
 moraine's per-commit latency is bounded by its WAL flush cadence (100ms by
 default); the bench pins it low so `small_commits` measures catalog work
 rather than the flush wait. Tune it on any attach with
-`META_FLUSH_INTERVAL_MS <n>`, at the cost of more frequent object-store PUTs.
+`META_FLUSH_INTERVAL_MS <n>`, at the cost of more frequent object-store PUTs,
+or take the cadence out of the commit path entirely with
+`META_FLUSH_ON_COMMIT true`, which flushes per commit instead of per interval.
 
 ## Workloads
 

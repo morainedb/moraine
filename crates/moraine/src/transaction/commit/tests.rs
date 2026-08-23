@@ -44,9 +44,14 @@ async fn a_durable_commit_returns_its_own_outcome() {
     let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
     tx.put(Key::Sys(SysKey::Head).encode(), b"head").unwrap();
     assert!(
-        commit_durable(tx, "test", StagedBytes::default())
-            .await
-            .is_ok()
+        commit_durable(
+            tx,
+            "test",
+            StagedBytes::default(),
+            &CommitDurability::OnFlushInterval,
+        )
+        .await
+        .is_ok()
     );
     assert_eq!(
         db.get(&Key::Sys(SysKey::Head).encode())
@@ -90,7 +95,7 @@ async fn a_store_with_an_unreadable_manifest_refuses_to_open() {
             .unwrap();
     }
 
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
         .await
         .err()
         .unwrap();
@@ -119,7 +124,7 @@ async fn unknown_format_is_refused() {
 
     // `Result::unwrap_err` needs `T: Debug`, and `slatedb::Db` has no
     // `Debug` impl; `err().unwrap()` only needs it on the error side.
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
         .await
         .err()
         .unwrap();
@@ -146,7 +151,7 @@ async fn migration_marker_is_refused() {
     .unwrap();
     db.close().await.unwrap();
 
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
         .await
         .err()
         .unwrap();
@@ -187,7 +192,7 @@ async fn older_format_refuses_toward_migrate() {
     .unwrap();
     db.close().await.unwrap();
 
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
         .await
         .err()
         .unwrap();
@@ -442,6 +447,62 @@ async fn fresh_reader_sees_committed_head() {
     assert_eq!(head.snapshot_id, 1);
     reader.close().await.unwrap();
     catalog.close().await.unwrap();
+}
+
+/// With `flush_on_commit`, a durable commit forces the WAL out instead of
+/// waiting out the store's flush cadence: it returns well inside a ten
+/// second interval, and the bytes are in object storage by the time it does.
+#[tokio::test]
+async fn flush_on_commit_lands_the_write_without_waiting_for_the_interval() {
+    use std::time::{Duration, Instant};
+
+    use crate::catalog::{Catalog, CatalogOptions};
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = Catalog::open(
+        Arc::clone(&object_store),
+        CatalogOptions {
+            flush_interval: Duration::from_secs(10),
+            flush_on_commit: true,
+            ..CatalogOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let wal_objects = || {
+        let object_store = Arc::clone(&object_store);
+        async move {
+            object_store
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|object| object.location.as_ref().starts_with("wal/"))
+                .count()
+        }
+    };
+    let before = wal_objects().await;
+
+    let started = Instant::now();
+    catalog
+        .commit(|tx| {
+            tx.create_schema("s")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let waited = started.elapsed();
+
+    assert!(
+        waited < Duration::from_secs(5),
+        "commit waited {waited:?}, so it sat on the flush interval"
+    );
+    assert!(
+        wal_objects().await > before,
+        "the commit returned before its write reached object storage"
+    );
 }
 
 /// Verb-path DDL records the shape-changed table ids on its snapshot,
@@ -4370,12 +4431,15 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
     let staged_bytes = stage_writes(&attempt, &staged).unwrap();
     let landed = commit_batch(
         attempt,
-        head_before,
-        head_before + 1,
+        HeadTransition {
+            before: head_before,
+            after: head_before + 1,
+        },
         &staged,
         staged_bytes,
         HeadViewUpdate::Rebuild(Arc::clone(&base)),
         catalog.projections(),
+        &CommitDurability::OnFlushInterval,
     )
     .await
     .unwrap();
@@ -4563,11 +4627,14 @@ async fn a_read_only_pass_that_straddles_a_commit_is_discarded_and_re_run() {
 async fn catalog_with_a_reclaimed_snapshot()
 -> (Db, Arc<std::sync::RwLock<ProjectionCache>>, Arc<Coalescer>) {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let (db, _, _) = open_initialized(StoreBuilder::new("", object_store), false, None)
+    let (db, _, _) = open_initialized(StoreBuilder::new("", object_store), false, None, false)
         .await
         .unwrap();
     let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
-    let coalescer = Arc::new(Coalescer::new(Arc::clone(&projections)));
+    let coalescer = Arc::new(Coalescer::new(
+        Arc::clone(&projections),
+        CommitDurability::OnFlushInterval,
+    ));
 
     for name in ["a", "b", "c"] {
         commit_cycle(
