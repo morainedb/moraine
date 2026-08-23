@@ -1106,7 +1106,7 @@ extern "C" {
 // valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 // `checkpoint`, if non-null, must be valid NUL-terminated C strings.
 // `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
-// and `host_threads` are unconstrained.
+// `flush_on_commit`, and `host_threads` are unconstrained.
 // `probe`, if non-null, must be safe to call with `probe_ctx` from any
 // thread. `out` must be a valid, writable `*mut *mut
 // MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
@@ -1116,6 +1116,7 @@ int32_t moraine_attach(const char *path,
                        bool read_only,
                        bool encrypted,
                        uint64_t flush_interval_ms,
+                       bool flush_on_commit,
                        const char *cache_dir,
                        uint64_t cache_size_bytes,
                        uint64_t cache_memory_bytes,

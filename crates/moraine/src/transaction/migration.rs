@@ -21,7 +21,7 @@ use crate::{
         key::{Key, SysKey},
         proto, read, value,
     },
-    transaction::commit::{self, MAX_COMMIT_ATTEMPTS, commit_durable},
+    transaction::commit::{self, CommitDurability, MAX_COMMIT_ATTEMPTS, commit_durable},
 };
 
 /// Where a step left off: the cursor the next step resumes at and what it
@@ -162,7 +162,13 @@ pub(crate) async fn raise_format(db: &Db, dry_run: bool) -> Result<FormatRaise> 
         tx.rollback();
         return Err(Error::from(error));
     }
-    commit_durable(tx, "format raise", staged).await?;
+    commit_durable(
+        tx,
+        "format raise",
+        staged,
+        &CommitDurability::OnFlushInterval,
+    )
+    .await?;
 
     info!(from_format, to_format, "raised the store format");
     Ok(FormatRaise {
@@ -293,7 +299,14 @@ async fn start(db: &Db, unit: &MigrationUnit) -> Result<()> {
             }
         };
 
-        match commit_durable(tx, "migration start", staged).await {
+        match commit_durable(
+            tx,
+            "migration start",
+            staged,
+            &CommitDurability::OnFlushInterval,
+        )
+        .await
+        {
             Ok(_) => return Ok(()),
             Err(error) if error.kind() == slatedb::ErrorKind::Transaction => {
                 info!(attempt, "migration start lost the head race; retrying");
@@ -344,9 +357,14 @@ async fn finish(db: &Db, unit: &MigrationUnit) -> Result<()> {
         return Err(Error::from(error));
     }
 
-    commit_durable(tx, "migration finish", staged)
-        .await
-        .map_err(Error::from)?;
+    commit_durable(
+        tx,
+        "migration finish",
+        staged,
+        &CommitDurability::OnFlushInterval,
+    )
+    .await
+    .map_err(Error::from)?;
     Ok(())
 }
 
@@ -393,9 +411,14 @@ async fn run_unit(db: &Db, unit: &MigrationUnit, resume: Option<Vec<u8>>) -> Res
             }
         };
         staged.0 = staged.0.saturating_add(rewritten.0);
-        commit_durable(tx, "migration step", staged)
-            .await
-            .map_err(Error::from)?;
+        commit_durable(
+            tx,
+            "migration step",
+            staged,
+            &CommitDurability::OnFlushInterval,
+        )
+        .await
+        .map_err(Error::from)?;
         crash_seam(CrashPoint::AfterStep)?;
 
         cursor = next;

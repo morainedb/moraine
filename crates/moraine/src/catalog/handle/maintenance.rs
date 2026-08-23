@@ -376,9 +376,14 @@ impl Catalog {
         let mut staged = StagedBytes::default();
         let deleted =
             index_maintenance::reclaim_entries(&tx, index.get(), limit, &mut staged).await?;
-        commit::commit_durable(tx, "entry reclamation", staged)
-            .await
-            .map_err(Error::from)?;
+        commit::commit_durable(
+            tx,
+            "entry reclamation",
+            staged,
+            &self.store().commit_durability(),
+        )
+        .await
+        .map_err(Error::from)?;
 
         Ok(deleted)
     }

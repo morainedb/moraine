@@ -579,6 +579,17 @@ fn cache_size_option(cache_size_bytes: u64) -> Option<u64> {
     (cache_size_bytes != 0).then_some(cache_size_bytes)
 }
 
+/// The WAL flush cadence an ABI millisecond count names. Zero means "not
+/// given"; `u64::MAX` is the shim's sentinel for an explicit zero interval,
+/// which flushes continuously.
+fn flush_interval_option(flush_interval_ms: u64) -> Option<std::time::Duration> {
+    match flush_interval_ms {
+        0 => None,
+        u64::MAX => Some(std::time::Duration::ZERO),
+        ms => Some(std::time::Duration::from_millis(ms)),
+    }
+}
+
 /// The preload level an ABI code names: `0` loads nothing, `1` the
 /// newest objects, `2` every object the manifest references. Any other
 /// value is an error.
@@ -653,7 +664,7 @@ fn cache_preload_option(cache_preload: u8) -> Result<Option<moraine::CachePreloa
 /// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 /// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
 /// `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
-/// and `host_threads` are unconstrained.
+/// `flush_on_commit`, and `host_threads` are unconstrained.
 /// `probe`, if non-null, must be safe to call with `probe_ctx` from any
 /// thread. `out` must be a valid, writable `*mut *mut
 /// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
@@ -665,6 +676,7 @@ pub unsafe extern "C" fn moraine_attach(
     read_only: bool,
     encrypted: bool,
     flush_interval_ms: u64,
+    flush_on_commit: bool,
     cache_dir: *const c_char,
     cache_size_bytes: u64,
     cache_memory_bytes: u64,
@@ -729,13 +741,10 @@ pub unsafe extern "C" fn moraine_attach(
         let mut options = CatalogOptions::default();
         options.path = prefix;
         options.encrypted = encrypted;
-        // 0 means "not given"; `u64::MAX` is the shim's sentinel for an
-        // explicit zero interval.
-        match flush_interval_ms {
-            0 => {}
-            u64::MAX => options.flush_interval = std::time::Duration::ZERO,
-            ms => options.flush_interval = std::time::Duration::from_millis(ms),
+        if let Some(interval) = flush_interval_option(flush_interval_ms) {
+            options.flush_interval = interval;
         }
+        options.flush_on_commit = flush_on_commit;
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
         options.cache_size = cache_size_option(cache_size_bytes);
         options.cache_memory = cache_size_option(cache_memory_bytes);
@@ -939,12 +948,8 @@ pub unsafe extern "C" fn moraine_migrate(
 
         let mut options = moraine::CatalogOptions::default();
         options.path = prefix;
-        // 0 means "not given"; `u64::MAX` is the shim's sentinel for an
-        // explicit zero interval.
-        match flush_interval_ms {
-            0 => {}
-            u64::MAX => options.flush_interval = std::time::Duration::ZERO,
-            ms => options.flush_interval = std::time::Duration::from_millis(ms),
+        if let Some(interval) = flush_interval_option(flush_interval_ms) {
+            options.flush_interval = interval;
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
         options.cache_size = cache_size_option(cache_size_bytes);
@@ -4167,6 +4172,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -4207,6 +4213,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -4250,6 +4257,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -4390,6 +4398,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -4488,6 +4497,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -4638,6 +4648,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -4680,6 +4691,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -4724,6 +4736,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -4760,6 +4773,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -4805,6 +4819,7 @@ mod tests {
                 true,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -4856,6 +4871,7 @@ mod tests {
                 false,
                 true,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -5203,6 +5219,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -5246,6 +5263,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -5308,6 +5326,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -5703,6 +5722,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 ptr::null(),
                 0,
                 0,
@@ -5854,6 +5874,7 @@ mod tests {
                     false,
                     false,
                     0,
+                    false,
                     c_cache.as_ptr(),
                     0,
                     0,
@@ -5896,6 +5917,7 @@ mod tests {
                 false,
                 false,
                 0,
+                false,
                 c_cache.as_ptr(),
                 64 * 1024 * 1024,
                 0,
@@ -5938,6 +5960,7 @@ mod tests {
                     false,
                     false,
                     0,
+                    false,
                     c_cache.as_ptr(),
                     0,
                     0,

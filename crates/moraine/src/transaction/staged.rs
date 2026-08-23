@@ -1161,6 +1161,10 @@ impl StagedTransaction {
             data_prefix,
             data_reads,
         } = self;
+        let durability = catalog_store
+            .as_deref()
+            .map(Store::commit_durability)
+            .unwrap_or_default();
         let staged_rows = ops.len();
         let mut uses_inline_chunk_directory = ops
             .iter()
@@ -1294,12 +1298,15 @@ impl StagedTransaction {
                 let phase_started = Instant::now();
                 let landed = commit::commit_batch_off_task(
                     db_tx,
-                    head_before.snapshot_id,
-                    result_id,
+                    commit::HeadTransition {
+                        before: head_before.snapshot_id,
+                        after: result_id,
+                    },
                     writes,
                     staged_bytes,
                     head_view_update,
                     projections,
+                    durability,
                 )
                 .await?;
                 phases.land = phase_started.elapsed();

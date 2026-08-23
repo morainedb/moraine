@@ -726,6 +726,9 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// ignores it afterward. `FLUSH_INTERVAL_MS` sets the WAL flush cadence; 0 on
 	// the ABI means "not given", so an explicit zero (flush continuously, no
 	// timer) is mapped to the ABI's continuous-flush sentinel (UINT64_MAX).
+	// `FLUSH_ON_COMMIT` takes the cadence out of the commit path instead:
+	// each commit forces the WAL out itself, trading a PUT per commit for a
+	// latency that no longer includes waiting on the timer.
 	// `CACHE_DIR` is a local directory for the block cache's disk tier; it
 	// must outlive the moraine_attach call, so it lives in this scope.
 	// `CACHE_SIZE` bounds that directory and `CACHE_MEMORY` bounds the
@@ -741,6 +744,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// read-write attach.
 	bool encrypted = false;
 	uint64_t flush_interval_ms = 0;
+	bool flush_on_commit = false;
 	std::string cache_dir;
 	uint64_t cache_size_bytes = 0;
 	uint64_t cache_memory_bytes = 0;
@@ -774,6 +778,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			// The ABI reads 0 as "not given"; map an explicit zero (flush
 			// continuously) to its continuous-flush sentinel so it is applied.
 			flush_interval_ms = requested == 0 ? UINT64_MAX : requested;
+		} else if (name == "flush_on_commit") {
+			flush_on_commit = option.second.GetValue<bool>();
 		} else if (name == "cache_dir") {
 			cache_dir = option.second.GetValue<std::string>();
 		} else if (name == "cache_size") {
@@ -811,6 +817,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
+	                           flush_on_commit,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_memory_bytes,
 	                           cache_preload, cache_puts,
 	                           data_path.empty() ? nullptr : data_path.c_str(),

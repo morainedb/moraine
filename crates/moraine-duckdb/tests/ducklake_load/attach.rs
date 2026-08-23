@@ -256,6 +256,36 @@ fn ducklake_attach_flush_interval_option_is_applied() {
     );
 }
 
+/// `FLUSH_ON_COMMIT` end to end: `ATTACH (META_FLUSH_ON_COMMIT true)` →
+/// DuckLake's `META_` passthrough → this shim's inner attach → the commit
+/// path forcing the WAL out itself. Paired with a flush cadence of a minute,
+/// which a working flush-on-commit never waits on and a broken one always
+/// does, so the option regressing shows up as a minute per commit rather
+/// than as a wrong answer.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn ducklake_attach_flush_on_commit_option_is_applied() {
+    let dir = TempDir::new("flush-on-commit-store");
+    let data_dir = TempDir::new("flush-on-commit-data");
+
+    run_ducklake_sql_with_options(
+        dir.path(),
+        data_dir.path(),
+        ", META_FLUSH_INTERVAL_MS 60000, META_FLUSH_ON_COMMIT true",
+        "CREATE TABLE lake.main.t(id BIGINT); \
+         INSERT INTO lake.main.t VALUES (1), (2);",
+    );
+
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            dir.path(),
+            data_dir.path(),
+            "SELECT count(*) FROM lake.main.t;",
+        )),
+        vec![vec!["2".to_string()]]
+    );
+}
+
 /// The cache options end to end: `ATTACH (META_CACHE_DIR '…',
 /// META_CACHE_SIZE 67108864, META_CACHE_PUTS true, META_CACHE_PRELOAD
 /// 'all')` → DuckLake's `META_` passthrough → this shim's inner attach →
