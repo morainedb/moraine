@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/morainedb/moraine/compare/v0.6.1...v0.6.2) - 2026-08-25
+
+### Added
+
+- flush the write-ahead log on commit, as an attach option ([#176](https://github.com/morainedb/moraine/pull/176))
+
+### Fixed
+
+- remove index entries for a data file dropped by a covering delete ([#175](https://github.com/morainedb/moraine/pull/175))
+- stamp the chunk-identity format from the staged commit path ([#173](https://github.com/morainedb/moraine/pull/173))
+
 ## [0.6.1](https://github.com/morainedb/moraine/compare/v0.6.0...v0.6.1) - 2026-08-21
 
 ### Added
