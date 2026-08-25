@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Companion release tag, e.g. ducklake-rowid-v0.1.0"
+        description: "Companion release tag, e.g. ducklake-patch-v0.1.0"
         required: true
 
 concurrency:
@@ -23,8 +23,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          if [[ ! "$RELEASE_TAG" =~ ^ducklake-rowid-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "tag must match ducklake-rowid-vMAJOR.MINOR.PATCH" >&2
+          if [[ ! "$RELEASE_TAG" =~ ^ducklake-patch-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag must match ducklake-patch-vMAJOR.MINOR.PATCH" >&2
             exit 1
           fi
       - id: read
