@@ -595,6 +595,13 @@ The extension surfaces two columns, `row_id BIGINT` and
 A consumer joins with null-safe equality on file id and ordinary equality on
 row id; a caller selecting only `row_id` is unaffected.
 
+A tuple comparison — `(rowid, data_file_id) IN (SELECT row_id, data_file_id
+…)` — is **unsafe** against these columns: tuple `IN` compares with plain
+equality, under which a NULL file id matches nothing, so every inlined or
+unlocated row silently drops out of the result. As a DELETE or UPDATE
+predicate that strands the row with no error. The join with null-safe
+equality on file id is the supported shape.
+
 ### File-row sets
 
 One immutable summary describes the physical row ids of one immutable data
@@ -678,14 +685,26 @@ is every update the table has taken.
 An extension optimizer rule closes that gap. An index read resolves its rows
 while binding, so a join against one is a join against a list of constants
 already visible to the planner; the rule restates that list as an `IN` filter
-on the other side of an inner join, where the ordinary pushdown carries it
-into the scan. The filter only repeats what the join enforces, so it is added
-beside the join rather than replacing it: whatever the query projects from
-either side is unaffected, and an outer join — which keeps rows meeting no
-condition — is left alone. A file id resolved as NULL contributes an
-`IS NULL` disjunct under null-safe equality and nothing under plain equality,
-matching what each comparison would have accepted. Past a bounded list length
-the rule declines, a lookup that wide being a scan in disguise.
+on the other side of an inner or semi join. The filter only repeats what the
+join enforces, so it is added beside the join rather than replacing it:
+whatever the query projects from either side is unaffected, and an outer
+join — which keeps rows meeting no condition — is left alone. A file id
+resolved as NULL contributes an `IS NULL` disjunct under null-safe equality
+and nothing under plain equality, matching what each comparison would have
+accepted. Past a bounded list length the rule declines, a lookup that wide
+being a scan in disguise.
+
+The rule runs after DuckDB's own optimizers, because that is when every
+qualifying join exists: a `SELECT` writes its join directly, but `DELETE …
+USING` and `UPDATE … FROM` bind theirs through the WHERE clause as a filter
+over a cross product, and an `EXISTS` probe as a dependent join — both formed
+into comparison joins only during optimization, the latter flattened to a
+semi join over a projection of the lookup that the rule looks through. The
+built-in filter pushdown has already run by then, so the rule pushes the
+derived filter down its own subtree, landing it in the scan as table filters.
+A semi join is also the shape that most needs it: DuckDB generates no runtime
+join filters for one, so the derived filter is the only pruning an `EXISTS`
+probe gets, and only within the bounded list length.
 
 The current DuckLake catalog view stays authoritative for file lifetime.
 Ended compaction inputs are simply absent, new outputs are cache misses, and

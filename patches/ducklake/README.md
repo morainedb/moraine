@@ -163,8 +163,11 @@ function.
 
 ## Index-assisted read
 
-Every lookup function returns a single `row_id` column. Join the lookup
-directly to the DuckLake table in one relational query:
+Every lookup function returns a `row_id` column and a nullable
+`data_file_id` — NULL for a row living in inlined data rather than a
+Parquet file. Join the lookup directly to the DuckLake table in one
+relational query: ordinary equality on the row id, null-safe equality on
+the file id.
 
 ```sql
 SELECT data.*
@@ -173,13 +176,36 @@ JOIN moraine_index_in(
     'lake', 'main', 'items', 'by_external_key',
     ['key-a', 'key-b']
 ) AS hits
-  ON data.rowid = hits.row_id;
+  ON data.rowid = hits.row_id
+ AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
 ```
 
 The same shape works with `moraine_index_lookup`, `moraine_index_range`, and
-`moraine_index_nulls`. DuckDB turns the join key into a dynamic row-ID filter.
-The patched DuckLake maps it to the reserved internal row-ID field and applies
-its existing zone-map pruning while constructing the physical-file list.
+`moraine_index_nulls`; a query that selects only `row_id` can join on it
+alone. The Moraine extension restates the resolved rows as static row-id and
+file-id filters on the scan, and DuckDB adds a dynamic row-ID filter from the
+join key; the patched DuckLake applies both while constructing the
+physical-file list, so the read touches only the files holding the rows.
+
+The same conditions locate rows for DML — `DELETE … USING` and
+`UPDATE … FROM` — and inside an `EXISTS` probe:
+
+```sql
+DELETE FROM lake.main.items
+USING moraine_index_lookup(
+    'lake', 'main', 'items', 'by_external_key', 'key-a'
+) AS hits
+WHERE items.rowid = hits.row_id
+  AND items.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+```
+
+**Do not** compare the two columns as a tuple —
+`(rowid, data_file_id) IN (SELECT row_id, data_file_id …)`. Tuple `IN`
+compares with plain equality, under which a NULL file id matches nothing, so
+every inlined row silently drops out of the result; as a DELETE or UPDATE
+predicate that strands the row with no error. The file-id condition is an
+optimization, not a correctness requirement — when in doubt, join on
+`row_id` alone and let DuckLake pick the visible copy.
 
 ## Release
 
