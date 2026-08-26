@@ -944,26 +944,7 @@ fn a_located_join_reads_only_the_file_holding_the_row() {
         data.path().display()
     );
     let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
-
-    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
-    for start in [0, 100, 200] {
-        run(&format!(
-            "INSERT INTO lake.main.t SELECT i, 'x' FROM range({start}, {}) t(i);",
-            start + 100
-        ));
-    }
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
-
-    // Each UPDATE writes a file under preserved row ids drawn from across the
-    // table, so its row-id range spans everything and statistics can no
-    // longer exclude it.
-    for key in [10, 11, 12] {
-        run(&format!(
-            "UPDATE lake.main.t SET b = 'updated' WHERE a IN ({key}, {}, {});",
-            key + 100,
-            key + 200
-        ));
-    }
+    populate_files_spanning_row_ids(&run);
 
     let located_join = "SELECT data.b FROM lake.main.t data \
          JOIN moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
@@ -1116,6 +1097,127 @@ fn a_prepared_located_join_resolves_each_key_it_is_executed_with() {
         total_files_read(&plan),
         1,
         "a prepared located join read more than the holding file"
+    );
+}
+
+/// Three 100-row files, an index over `a`, then three UPDATE files written
+/// under preserved row ids drawn from across the table, so every file's
+/// row-id range spans everything and statistics alone exclude none of them.
+fn populate_files_spanning_row_ids(run: &dyn Fn(&str) -> String) {
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    for start in [0, 100, 200] {
+        run(&format!(
+            "INSERT INTO lake.main.t SELECT i, 'x' FROM range({start}, {}) t(i);",
+            start + 100
+        ));
+    }
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    for key in [10, 11, 12] {
+        run(&format!(
+            "UPDATE lake.main.t SET b = 'updated' WHERE a IN ({key}, {}, {});",
+            key + 100,
+            key + 200
+        ));
+    }
+}
+
+/// A DELETE binds its USING join as a filter over a cross product rather
+/// than a comparison join, so the located restriction must reach that shape
+/// too: without it the delete reads every file the row-id statistics admit.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn a_located_delete_reads_only_the_file_holding_the_row() {
+    let store = TempDir::new("index-locate-delete-store");
+    let data = TempDir::new("index-locate-delete-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    populate_files_spanning_row_ids(&run);
+
+    let plan = run("EXPLAIN ANALYZE DELETE FROM lake.main.t \
+         USING moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
+         WHERE t.rowid = hits.row_id \
+           AND t.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
+    assert_eq!(
+        total_files_read(&plan),
+        1,
+        "the located delete read more than the holding file"
+    );
+
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FILTER (WHERE a = 150), count(*) FROM lake.main.t;"
+        )),
+        vec![vec!["0".to_string(), "299".to_string()]],
+        "the located delete removed its row and only its row"
+    );
+}
+
+/// An UPDATE binds its FROM join the same way a DELETE binds USING, and
+/// needs the same restriction.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn a_located_update_reads_only_the_file_holding_the_row() {
+    let store = TempDir::new("index-locate-update-store");
+    let data = TempDir::new("index-locate-update-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    populate_files_spanning_row_ids(&run);
+
+    let plan = run("EXPLAIN ANALYZE UPDATE lake.main.t \
+         SET b = 'relocated' \
+         FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
+         WHERE t.rowid = hits.row_id \
+           AND t.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
+    assert_eq!(
+        total_files_read(&plan),
+        1,
+        "the located update read more than the holding file"
+    );
+
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FILTER (WHERE b = 'relocated'), count(*) FROM lake.main.t;"
+        )),
+        vec![vec!["1".to_string(), "300".to_string()]],
+        "the located update rewrote its row and only its row"
+    );
+}
+
+/// An EXISTS probe flattens to a semi join, which a hash join's runtime
+/// filters never reach; the located restriction is all the pruning it gets.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn a_located_exists_probe_reads_only_the_file_holding_the_row() {
+    let store = TempDir::new("index-locate-exists-store");
+    let data = TempDir::new("index-locate-exists-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    populate_files_spanning_row_ids(&run);
+
+    let probe = "SELECT data.b FROM lake.main.t data \
+         WHERE EXISTS (SELECT 1 \
+             FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits \
+            WHERE data.rowid = hits.row_id \
+              AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id)";
+
+    assert_eq!(
+        csv_rows(&run(&format!("{probe};"))),
+        vec![vec!["x".to_string()]],
+        "the exists probe still returns the row it pruned to"
+    );
+    assert_eq!(
+        total_files_read(&run(&format!("EXPLAIN ANALYZE {probe};"))),
+        1,
+        "the exists probe read more than the holding file"
     );
 }
 
