@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use crate::helpers::*;
 
 /// The equality-index SQL surface end to end: `moraine_index_create`
@@ -1218,6 +1220,58 @@ fn a_located_exists_probe_reads_only_the_file_holding_the_row() {
         total_files_read(&run(&format!("EXPLAIN ANALYZE {probe};"))),
         1,
         "the exists probe read more than the holding file"
+    );
+}
+
+/// A probe wider than the derived row-id filter admits still restricts the
+/// file list. The file-id list dedups to the files holding the rows and is
+/// checked against each file's constant id rather than per row, so it stays
+/// worthwhile at widths where a row-id list would be a scan in disguise.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn a_wide_located_probe_still_prunes_by_file_id() {
+    let store = TempDir::new("index-locate-wide-store");
+    let data = TempDir::new("index-locate-wide-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    // One file per row: more distinct holding files than a row-id filter
+    // will list, so only the file-id filter can restrict the read.
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    let mut inserts = String::new();
+    for i in 0..300 {
+        write!(inserts, "INSERT INTO lake.main.t VALUES ({i}, 'x');").unwrap();
+    }
+    run(&inserts);
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+
+    // The keys span the whole table with a gap in the middle, so a min/max
+    // row-id filter admits every file and only file identity can exclude
+    // the twenty files holding the gap.
+    let keys = (0..270)
+        .chain(290..300)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let probe = format!(
+        "SELECT count(data.b) FROM lake.main.t data \
+         JOIN moraine_index_in('lake', 'main', 't', 'by_a', [{keys}]) hits \
+           ON data.rowid = hits.row_id \
+          AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id"
+    );
+
+    assert_eq!(
+        csv_rows(&run(&format!("{probe};"))),
+        vec![vec!["280".to_string()]],
+        "the wide probe still returns every probed row"
+    );
+    assert_eq!(
+        total_files_read(&run(&format!("EXPLAIN ANALYZE {probe};"))),
+        280,
+        "the wide probe read files holding none of its rows"
     );
 }
 
