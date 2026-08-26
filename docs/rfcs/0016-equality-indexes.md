@@ -691,8 +691,18 @@ whatever the query projects from either side is unaffected, and an outer
 join — which keeps rows meeting no condition — is left alone. A file id
 resolved as NULL contributes an `IS NULL` disjunct under null-safe equality
 and nothing under plain equality, matching what each comparison would have
-accepted. Past a bounded list length the rule declines, a lookup that wide
-being a scan in disguise.
+accepted.
+
+Each derived list is bounded, and the bounds differ by what evaluating the
+list costs. The row-id list is checked against every row, so past a few
+hundred distinct ids the lookup is a scan in disguise and the rule declines —
+the dynamic row-id filter still covers that side. The file-id list dedups to
+the files holding the rows and is checked against each file's constant id,
+not against every row, so it stays worthwhile far wider — its much larger
+bound only keeps a pathological plan bounded. A wide probe over a churned
+table is exactly the case that needs this: near one row per rewrite file,
+the distinct file ids grow with the probe, and the file-id list is the only
+filter that names files exactly rather than testing row-id spans.
 
 The rule runs after DuckDB's own optimizers, because that is when every
 qualifying join exists: a `SELECT` writes its join directly, but `DELETE …

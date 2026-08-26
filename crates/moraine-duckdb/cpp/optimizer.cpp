@@ -55,10 +55,16 @@ void ReplaceEmptyIndexReads(duckdb::ClientContext &context, duckdb::unique_ptr<d
 // beside the join rather than replacing it, and holds whatever the query
 // projects from either side.
 
-// Most distinct values one derived filter will list. Past this a lookup is a
-// scan in disguise, and evaluating the list costs more than the files it could
-// still exclude are worth.
-constexpr duckdb::idx_t MAX_DERIVED_FILTER_VALUES = 256;
+// Most distinct row ids one derived filter will list. Past this a lookup is a
+// scan in disguise, and evaluating the list against every row costs more than
+// the files it could still exclude are worth.
+constexpr duckdb::idx_t MAX_DERIVED_ROW_ID_VALUES = 256;
+
+// Most distinct file ids one derived filter will list. The list dedups to the
+// files holding the rows and is checked against each file's constant id, not
+// against every row, so it stays worthwhile far past the row-id bound; this
+// only keeps a pathological plan bounded.
+constexpr duckdb::idx_t MAX_DERIVED_FILE_ID_VALUES = 16384;
 
 duckdb::LogicalGet *IndexReadGet(duckdb::LogicalOperator &op) {
 	if (op.type != duckdb::LogicalOperatorType::LOGICAL_GET) {
@@ -127,6 +133,8 @@ bool ResolvedValues(const std::vector<MoraineRowId> &rows, duckdb::idx_t column,
                     bool &any_null) {
 	std::set<uint64_t> seen;
 	any_null = false;
+	auto most_values =
+	    column == INDEX_READ_ROW_ID_COLUMN ? MAX_DERIVED_ROW_ID_VALUES : MAX_DERIVED_FILE_ID_VALUES;
 	for (auto &row : rows) {
 		if (column == INDEX_READ_ROW_ID_COLUMN) {
 			if (seen.insert(row.value).second) {
@@ -141,7 +149,7 @@ bool ResolvedValues(const std::vector<MoraineRowId> &rows, duckdb::idx_t column,
 		} else {
 			return false;
 		}
-		if (values.size() > MAX_DERIVED_FILTER_VALUES) {
+		if (values.size() > most_values) {
 			return false;
 		}
 	}
