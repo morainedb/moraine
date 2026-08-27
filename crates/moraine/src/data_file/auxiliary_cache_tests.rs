@@ -6,16 +6,19 @@ use super::auxiliary_cache::{AuxiliaryCache, FileSummaryKey};
 use crate::data_file::{
     DataStore,
     data_store::StoreIdentity,
-    row_set::{FileRowSet, FileRowSetKind},
+    row_set::{FileRowSet, FileRowSetKind, PositionedRowSet, RowOrder},
 };
 
-fn summary(row_ids: Vec<u64>) -> Arc<FileRowSet> {
-    Arc::new(FileRowSet::from_sorted(row_ids).unwrap())
+fn summary(row_ids: Vec<u64>) -> Arc<PositionedRowSet> {
+    Arc::new(PositionedRowSet {
+        rows: FileRowSet::from_sorted(row_ids).unwrap(),
+        order: RowOrder::Ascending,
+    })
 }
 
 /// A summary large enough to matter against a small allowance, built
 /// fragmented so it takes the sorted form rather than collapsing to a range.
-fn fragmented(count: u64) -> Arc<FileRowSet> {
+fn fragmented(count: u64) -> Arc<PositionedRowSet> {
     summary((0..count).map(|row| row * 2).collect())
 }
 
@@ -111,9 +114,9 @@ fn row_summary_occupancy_counts_each_shape_and_its_bytes() {
         .map(|index| Path::from(format!("sorted-{index}.parquet")))
         .collect();
 
-    assert_eq!(range.kind(), FileRowSetKind::Range);
-    assert_eq!(roaring.kind(), FileRowSetKind::Roaring);
-    assert_eq!(sorted.kind(), FileRowSetKind::Sorted);
+    assert_eq!(range.rows.kind(), FileRowSetKind::Range);
+    assert_eq!(roaring.rows.kind(), FileRowSetKind::Roaring);
+    assert_eq!(sorted.rows.kind(), FileRowSetKind::Sorted);
 
     cache.insert_summary(&store, &key(&range_path), &range);
     cache.insert_summary(&store, &key(&roaring_path), &roaring);
@@ -205,9 +208,239 @@ fn values_round_trip_through_their_disk_form() {
         let AuxiliaryValue::Summary(decoded) = &decoded.value else {
             panic!("a summary decoded as a footer");
         };
-        assert_eq!(decoded.kind(), rows.kind());
+        assert_eq!(decoded.rows.kind(), rows.rows.kind());
         let requested: Vec<u64> = (0..6_000).collect();
-        assert_eq!(decoded.matching(&requested), rows.matching(&requested));
+        assert_eq!(
+            decoded.rows.matching(&requested),
+            rows.rows.matching(&requested)
+        );
+    }
+}
+
+/// A permuted summary — the shape an UPDATE's rewritten rows take — round
+/// trips through its disk form with the same set and the same answers to
+/// every requested position.
+#[test]
+fn a_permuted_summary_round_trips_through_its_disk_form() {
+    use foyer::Code;
+
+    use super::auxiliary_cache::{AuxiliaryValue, Weighed};
+
+    for file_order in [
+        // Sorted-shaped: fragmented ids out of file order.
+        vec![30 << 16, 10 << 16, 20 << 16],
+        // Roaring-shaped: sparse ids out of file order.
+        {
+            let mut ids: Vec<u64> = (0..10_000).map(|row| row * 10).collect();
+            ids.swap(0, 1);
+            ids
+        },
+    ] {
+        let positioned = PositionedRowSet::from_file_order(file_order.clone()).unwrap();
+        assert!(matches!(positioned.order, RowOrder::Permuted(_)));
+        let expected_positions = positioned.positions_of(&file_order);
+
+        let weighed = Weighed::from(AuxiliaryValue::Summary(Arc::new(positioned)));
+        let mut encoded = Vec::new();
+        weighed.encode(&mut encoded).unwrap();
+        let decoded = Weighed::decode(&mut encoded.as_slice()).unwrap();
+        let AuxiliaryValue::Summary(decoded) = &decoded.value else {
+            panic!("a summary decoded as something else");
+        };
+
+        assert!(matches!(decoded.order, RowOrder::Permuted(_)));
+        assert_eq!(decoded.positions_of(&file_order), expected_positions);
+    }
+}
+
+/// A permuted set whose sorted ids happen to be contiguous must not
+/// collapse to a bare range on disk: a range tag carries no permutation,
+/// so decoding it would answer positions by arithmetic — silently wrong
+/// for a file that rewrote a contiguous id range out of order.
+#[test]
+fn a_contiguous_permuted_summary_keeps_its_permutation_across_a_round_trip() {
+    use foyer::Code;
+
+    use super::auxiliary_cache::{AuxiliaryValue, Weighed};
+
+    // ids 100..110, filed as two ascending runs: [105..110, 100..105].
+    let file_order: Vec<u64> = (105..110).chain(100..105).collect();
+    let positioned = PositionedRowSet::from_file_order(file_order.clone()).unwrap();
+    assert!(matches!(positioned.order, RowOrder::Permuted(_)));
+    let expected_positions = positioned.positions_of(&[100, 105]);
+
+    let weighed = Weighed::from(AuxiliaryValue::Summary(Arc::new(positioned)));
+    let mut encoded = Vec::new();
+    weighed.encode(&mut encoded).unwrap();
+    let decoded = Weighed::decode(&mut encoded.as_slice()).unwrap();
+    let AuxiliaryValue::Summary(decoded) = &decoded.value else {
+        panic!("a summary decoded as something else");
+    };
+
+    assert_eq!(decoded.positions_of(&[100, 105]), expected_positions);
+}
+
+/// A cached summary from before positions existed carries no order verdict:
+/// decoding it is a parse failure, not a guessed position. Tag 1 is included
+/// because pre-upgrade encoders wrote it for a contiguous-but-permuted file,
+/// discarding the order a decoder would otherwise have to invent.
+#[test]
+fn a_legacy_summary_tag_fails_to_decode() {
+    use foyer::Code;
+
+    use super::auxiliary_cache::Weighed;
+
+    for legacy_tag in [2_u8, 3_u8] {
+        let encoded = vec![legacy_tag];
+        assert!(
+            Weighed::decode(&mut encoded.as_slice()).is_err(),
+            "tag {legacy_tag} should not decode"
+        );
+    }
+
+    // Tag 1 carries a body (a start/end pair), unlike 2 and 3 above: a
+    // pre-upgrade encoder wrote it for a contiguous-but-permuted file,
+    // discarding the permutation, so it must fail even with a well-formed
+    // body rather than silently answer as an ascending range.
+    let mut range_bodied = vec![1_u8];
+    range_bodied.extend_from_slice(&0_u64.to_le_bytes());
+    range_bodied.extend_from_slice(&99_u64.to_le_bytes());
+    assert!(
+        Weighed::decode(&mut range_bodied.as_slice()).is_err(),
+        "tag 1 with a range body should not decode"
+    );
+}
+
+/// The tag the current encoder writes for an ascending range round-trips,
+/// distinct from the retired tag 1 above.
+#[test]
+fn a_range_ascending_summary_round_trips_through_its_disk_form() {
+    use foyer::Code;
+
+    use super::auxiliary_cache::{AuxiliaryValue, Weighed};
+
+    let positioned = summary((0..1_000).collect());
+    assert_eq!(positioned.rows.kind(), FileRowSetKind::Range);
+
+    let weighed = Weighed::from(AuxiliaryValue::Summary(Arc::clone(&positioned)));
+    let mut encoded = Vec::new();
+    weighed.encode(&mut encoded).unwrap();
+    assert_eq!(
+        encoded.first().copied(),
+        Some(12_u8),
+        "expected tag 12 (RANGE_ASCENDING)"
+    );
+
+    let decoded = Weighed::decode(&mut encoded.as_slice()).unwrap();
+    let AuxiliaryValue::Summary(decoded) = &decoded.value else {
+        panic!("a summary decoded as something else");
+    };
+    assert_eq!(decoded.rows.kind(), FileRowSetKind::Range);
+    assert!(matches!(decoded.order, RowOrder::Ascending));
+}
+
+/// A delete file's positions are a different kind from a summary: their
+/// tags stay valid even though a summary predating positions cannot decode.
+#[test]
+fn delete_position_tags_still_decode() {
+    use foyer::Code;
+
+    use super::auxiliary_cache::{AuxiliaryValue, Weighed};
+
+    for (positions, expected_kind) in [
+        (
+            FileRowSet::from_sorted((0..10_000).collect()).unwrap(),
+            FileRowSetKind::Range,
+        ),
+        (
+            FileRowSet::from_sorted((0..10_000).map(|row| row * 10).collect()).unwrap(),
+            FileRowSetKind::Roaring,
+        ),
+        (
+            FileRowSet::from_sorted((0..1_000).map(|row| row << 16).collect()).unwrap(),
+            FileRowSetKind::Sorted,
+        ),
+    ] {
+        assert_eq!(positions.kind(), expected_kind);
+        let requested: Vec<u64> = (0..20_000).collect();
+        let expected = positions.matching(&requested);
+
+        let weighed = Weighed::from(AuxiliaryValue::DeletePositions(Arc::new(positions)));
+        let mut encoded = Vec::new();
+        weighed.encode(&mut encoded).unwrap();
+        let decoded = Weighed::decode(&mut encoded.as_slice()).unwrap();
+        let AuxiliaryValue::DeletePositions(decoded) = &decoded.value else {
+            panic!("delete positions decoded as something else");
+        };
+
+        assert_eq!(decoded.matching(&requested), expected);
+    }
+}
+
+mod proptests {
+    use std::collections::HashSet;
+
+    use foyer::Code;
+    use proptest::prelude::*;
+
+    use super::{Arc, PositionedRowSet, RowOrder};
+    use crate::data_file::auxiliary_cache::{AuxiliaryValue, Weighed};
+
+    /// Deduplicates while keeping each id's first-seen position, so the
+    /// result is a valid (possibly unsorted) file order.
+    fn unique_preserving_order(ids: Vec<u16>) -> Vec<u64> {
+        let mut seen = HashSet::new();
+        ids.into_iter()
+            .map(u64::from)
+            .filter(|id| seen.insert(*id))
+            .collect()
+    }
+
+    /// A contiguous id range rotated by a generated offset — the shape
+    /// that collapses to `FileRowSet::Range` when sorted, exercising the
+    /// range/permutation interaction directly rather than leaving it to
+    /// chance.
+    fn contiguous_permuted_file_order() -> impl Strategy<Value = Vec<u64>> {
+        (any::<u16>(), 2_u16..64).prop_flat_map(|(start, len)| {
+            (0..len).prop_map(move |offset| {
+                let mut ids: Vec<u64> = (0..len).map(|i| u64::from(start) + u64::from(i)).collect();
+                ids.rotate_left(usize::from(offset));
+                ids
+            })
+        })
+    }
+
+    fn file_order_strategy() -> impl Strategy<Value = Vec<u64>> {
+        prop_oneof![
+            proptest::collection::vec(any::<u16>(), 1..64).prop_map(unique_preserving_order),
+            contiguous_permuted_file_order(),
+        ]
+    }
+
+    proptest! {
+        /// Encoding then decoding a summary built from an arbitrary file
+        /// order preserves its order kind, membership, and every position.
+        #[test]
+        fn positioned_row_set_round_trips_through_its_disk_form(
+            file_order in file_order_strategy(),
+        ) {
+            prop_assume!(!file_order.is_empty());
+
+            let positioned = PositionedRowSet::from_file_order(file_order.clone()).unwrap();
+            let was_ascending = matches!(positioned.order, RowOrder::Ascending);
+            let expected_positions = positioned.positions_of(&file_order);
+
+            let weighed = Weighed::from(AuxiliaryValue::Summary(Arc::new(positioned)));
+            let mut encoded = Vec::new();
+            weighed.encode(&mut encoded).unwrap();
+            let decoded = Weighed::decode(&mut encoded.as_slice()).unwrap();
+            let AuxiliaryValue::Summary(decoded) = &decoded.value else {
+                panic!("a summary decoded as something else");
+            };
+
+            prop_assert_eq!(matches!(decoded.order, RowOrder::Ascending), was_ascending);
+            prop_assert_eq!(decoded.positions_of(&file_order), expected_positions);
+        }
     }
 }
 

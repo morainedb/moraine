@@ -1363,11 +1363,8 @@ pub(super) fn table_object_path(
             }
             other => other,
         })?;
-    let relative = match (path_is_relative, data_prefix.is_empty()) {
-        (false, _) => path.to_owned(),
-        (true, true) => format!("{table_prefix}{path}"),
-        (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
-    };
+    let relative =
+        crate::catalog::resolve_data_path(data_prefix, &table_prefix, path, path_is_relative);
 
     Ok(object_store::path::Path::from(relative.as_str()))
 }

@@ -13,6 +13,7 @@ use super::{BACKFILL_FILE_READ_CONCURRENCY, ReadOnlyCatalog};
 use crate::{
     catalog::{
         ColumnId, DataFileInfo, DeleteFileInfo, FileIndexEntry, IndexEntry, IndexId, TableId,
+        resolve_data_path,
     },
     data_file::{self, DataStore},
     error::{Error, Result},
@@ -248,11 +249,7 @@ impl ReadOnlyCatalog {
 
         let table_prefix = snapshot.table_data_prefix(table)?;
         let resolve = |path: &str, is_relative: bool| {
-            let relative = match (is_relative, data_prefix.is_empty()) {
-                (false, _) => path.to_owned(),
-                (true, true) => format!("{table_prefix}{path}"),
-                (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
-            };
+            let relative = resolve_data_path(data_prefix, &table_prefix, path, is_relative);
             object_store::path::Path::from(relative.as_str())
         };
 

@@ -10,7 +10,7 @@ use super::{Catalog, backfill};
 use crate::{
     catalog::{
         BuildStep, ColumnId, ColumnOrder, DataFileId, IndexDef, IndexEntry, IndexId,
-        IndexMaintenance, IndexState, TableId, snapshot,
+        IndexMaintenance, IndexState, TableId, resolve_data_path, snapshot,
     },
     data_file::{self, DataStore},
     error::{Error, Result},
@@ -490,11 +490,7 @@ impl Catalog {
 
         let table_prefix = snapshot.table_data_prefix(table)?;
         let resolve = |path: &str, is_relative: bool| {
-            let relative = match (is_relative, data_prefix.is_empty()) {
-                (false, _) => path.to_owned(),
-                (true, true) => format!("{table_prefix}{path}"),
-                (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
-            };
+            let relative = resolve_data_path(data_prefix, &table_prefix, path, is_relative);
             Path::from(relative.as_str())
         };
 

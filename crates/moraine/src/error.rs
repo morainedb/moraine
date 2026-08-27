@@ -1,6 +1,8 @@
 //! Crate error types: one enum, variants per failure domain.
 use tracing::warn;
 
+use crate::catalog::DataFileId;
+
 /// Errors returned by moraine operations.
 ///
 /// DuckLake's commit loop retries any error whose message contains
@@ -89,6 +91,20 @@ pub enum Error {
     /// Concurrent modification detected during index maintenance.
     #[error("concurrent modification")]
     ConcurrentModification,
+
+    /// A row could not be positioned exactly against the named file:
+    /// position resolution is exact-or-failed, never a guess. `data_file_id`
+    /// is `None` for a NULL-file pair whose row turned out not to be a live
+    /// inlined row.
+    #[error("row {row_id} could not be positioned against data file {data_file_id:?}: {reason}")]
+    RowPosition {
+        /// The row id that could not be positioned.
+        row_id: u64,
+        /// The file the pair named, if any.
+        data_file_id: Option<DataFileId>,
+        /// Why positioning failed.
+        reason: String,
+    },
 }
 
 /// What SlateDB reports when a manifest compare-and-swap loses to a version
@@ -158,6 +174,11 @@ mod tests {
             Error::SnapshotExpired(sample.into()),
             Error::Interrupted(sample.into()),
             Error::Migration(sample.into()),
+            Error::RowPosition {
+                row_id: 1,
+                data_file_id: None,
+                reason: sample.into(),
+            },
         ];
 
         // Payload wording is the caller's responsibility; only the prefix

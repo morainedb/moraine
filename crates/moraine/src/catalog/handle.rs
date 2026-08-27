@@ -23,7 +23,9 @@ pub use maintenance::{
     MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep,
 };
 use object_store::ObjectStore;
-pub use row_location::RowSummaryWarmth;
+pub use row_location::{
+    DeleteFileRegistration, ExistingDeleteFile, LocatedDeletion, LocatedPositions, RowSummaryWarmth,
+};
 use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
 use tokio::sync::watch;
 use tracing::{info, warn};

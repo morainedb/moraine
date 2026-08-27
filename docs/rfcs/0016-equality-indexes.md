@@ -612,6 +612,26 @@ file, in whichever representation is smallest for that file:
 - a run-optimized 64-bit Roaring set, when it beats the raw ids;
 - a sorted `u64` vector, when fragmentation makes Roaring larger.
 
+A summary also answers a row id's **position** — the row's ordinal within
+its file, which a delete file names. Positions are permanent facts of an
+immutable file, so caching them can never go stale; they are also implicit
+in the build, which reads the reserved row-id column front to back.
+Position is order information, and order rides beside the set rather than
+replacing it — membership keeps whichever representation is smallest,
+untouched. A dense range answers by arithmetic. For the sparse shapes the
+set's rank is the position whenever the file's ids ascend in file order,
+which the build verifies while it holds the column; an UPDATE that rewrote
+rows from several source files emits concatenated ascending runs rather
+than one ascending sequence, and such a file carries a rank-indexed
+permutation beside the set — `u32` file positions in ascending-id order —
+so position remains one rank plus one array read. A cached summary from
+before positions existed carries no order verdict and cannot be trusted
+with one; decoding treats it as absent, and the next lookup rebuilds it
+from the file — a one-time cold start, never a guessed position. A
+permutation over contiguous ids answers no question a dense range could
+not answer more cheaply, so construction demotes that case to the plain
+Roaring set instead of pairing a permutation with a range.
+
 A recorded `row_id_start` does not by itself imply the range: a flushed file
 carries both a dense start and the reserved column, and that column's ids may
 hold gaps a range would invent rows across and, worse, end before — excluding
@@ -719,6 +739,58 @@ probe gets, and only within the bounded list length.
 The current DuckLake catalog view stays authoritative for file lifetime.
 Ended compaction inputs are simply absent, new outputs are cache misses, and
 nothing pairs sources with outputs or hooks catalog changes.
+
+### File-located deletion
+
+A caller holding located rows — `(row_id, data_file_id)` pairs from a
+lookup — can delete them without a scan: a DuckLake delete file is
+`(file_path, pos)` rows, and positions are what file-row summaries answer.
+The path exists for bulk deletion by key from the embedding surface, where
+per-statement SQL machinery is the cost being avoided; the extension path
+surfaces it as `moraine_delete_located` (SQL surface below). SQL callers
+keep the located `DELETE … USING` join, whose scan reads only holding
+files.
+
+The split follows the repository's Parquet charter: the core never writes
+Parquet. `ReadOnlyCatalog::locate_row_positions` resolves located rows to
+`(data_file_id, position)` through the summaries, building on miss exactly
+as locating does; the caller — the extension shim, which already holds a
+Parquet writer — writes the delete file's content and lands it through the
+verbs that already exist: `register_delete_file` for the new file,
+`expire_delete_file` for the one it replaces, `inline_delete` for rows whose
+file id is NULL. No new keys, no commit-protocol change, no new verb. The
+directory the caller writes the delete file into comes from
+`CatalogSnapshot::table_write_directory`, which types a refusal rather than
+guess a path for a table an operator has relocated to an absolute-path
+schema or table directory.
+
+Position resolution inverts the locating contract, and the inversion is the
+design's load-bearing clause. Locating may broaden — a degraded summary
+leaves every row a candidate, and the scan adjudicates. A position may not:
+a wrong position deletes a different row. `locate_row_positions` is
+therefore exact-or-failed. A summary miss rebuilds from the file's row-id
+column; a row the file does not hold, a file absent from the head view, or
+an unreadable column is a typed error naming the row, never a guess. The
+caller falls back to the SQL path or surfaces the failure.
+
+A data file may already carry a delete file. The writer reads the existing
+file's positions, unions them with the new deletions, writes one file
+holding both, and registers it while expiring the old — the same
+replace-not-amend shape DuckLake's own DELETE produces. Two transactions
+deleting from the same data file conflict on that expiry: the commit fails
+closed with a typed conflict rather than retrying, and it is the caller's
+re-issued call that re-locates and re-unions; a row deleted twice this way
+folds silently into the union. The written shape matches what DuckLake's
+DELETE writes, source-verified: `file_path VARCHAR` and `pos BIGINT` under
+DuckLake's reserved field ids. A lake configured for deletion vectors
+rather than Parquet delete files declines this path and keeps the SQL
+fallback.
+
+Deletion is head-only, exactly as locating is, and carries the same
+authority boundary: the summaries locate and position rows, but visibility
+— which physical copy of a row id is current — remains DuckLake's delete
+and snapshot processing, which is precisely what the registered delete file
+feeds.
 
 ### Range and comparison queries
 
@@ -948,6 +1020,7 @@ written `…` below for brevity.
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
 | `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
 | `moraine_indexes(catalog, schema, table)` | table function: index introspection |
+| `moraine_delete_located(catalog, schema, table, rows)` | table function: delete the located rows without a scan (File-located deletion). `rows` is a list of `row(row_id, data_file_id)` pairs as a lookup returned them, a NULL file id naming an inlined row. Returns one row of counts: file rows deleted, inline rows deleted, delete files written |
 
 `moraine_index_in` binds `keys` as one constant list value (including a
 prepared-statement parameter), like the arguments of the other explicit
@@ -966,6 +1039,16 @@ The DDL functions commit autonomously — their own moraine commit, outside any
 enclosing DuckDB transaction — and race concurrent DuckLake commits through
 the ordinary `altered_table` conflict. Non-native syntax, explicit reads
 (below), but real without a DuckLake change.
+
+`moraine_delete_located` binds `rows` as one constant list, exactly as
+`moraine_index_in` binds `keys`, and commits autonomously like the DDL
+functions — one DuckLake snapshot of its own, not part of any enclosing
+DuckDB transaction. The call is atomic and fail-closed as File-located
+deletion requires: every pair positions exactly or the whole call errors
+with no commit — a row the named file does not hold, a file absent from
+the head, or a deletion-vector-configured lake each refuse rather than
+guess. Duplicate pairs collapse, and a row already deleted folds silently
+into the union its delete file replaces.
 
 **Coverage: intercept inline, read bulk.** Small inserts DuckLake stages
 inline; their values cross the ABI as an Arrow body (RFC 0005), and moraine

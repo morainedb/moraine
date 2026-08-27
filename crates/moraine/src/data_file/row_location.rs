@@ -10,14 +10,15 @@ use futures::TryStreamExt;
 use crate::{
     data_file::{
         ParquetFile, RowIdSource, ScopedRows, auxiliary_cache, carries_embedded_row_ids,
-        row_set::FileRowSet, scoped_read_entry_batches,
+        row_set::{FileRowSet, PositionedRowSet, RowOrder},
+        scoped_read_entry_batches,
     },
     error::Result,
 };
 
 /// One file's row-id membership, and what it cost to obtain.
 pub(crate) struct FileSummary {
-    rows: Arc<FileRowSet>,
+    rows: Arc<PositionedRowSet>,
     /// Whether this call read the file's row-id column and cached the
     /// result.
     pub(crate) built: bool,
@@ -26,7 +27,13 @@ pub(crate) struct FileSummary {
 impl FileSummary {
     /// Which of `requested` this file holds, in request order.
     pub(crate) fn matching(&self, requested: &[u64]) -> Vec<u64> {
-        self.rows.matching(requested)
+        self.rows.rows.matching(requested)
+    }
+
+    /// File positions of `requested` rows within this file; `None` for rows
+    /// this file does not hold.
+    pub(crate) fn positions_of(&self, requested: &[u64]) -> Vec<Option<u64>> {
+        self.rows.positions_of(requested)
     }
 }
 
@@ -58,7 +65,10 @@ pub(crate) async fn file_summary(
         && !carries_embedded_row_ids(file.clone()).await?
     {
         Ok(FileSummary {
-            rows: Arc::new(FileRowSet::range(start, record_count)?),
+            rows: Arc::new(PositionedRowSet {
+                rows: FileRowSet::range(start, record_count)?,
+                order: RowOrder::Ascending,
+            }),
             built: false,
         })
     } else {
@@ -82,8 +92,11 @@ pub(crate) async fn file_summary(
     }
 }
 
-async fn read_row_ids(file: ParquetFile, row_id_start: Option<u64>) -> Result<Arc<FileRowSet>> {
-    let mut row_ids = scoped_read_entry_batches(
+async fn read_row_ids(
+    file: ParquetFile,
+    row_id_start: Option<u64>,
+) -> Result<Arc<PositionedRowSet>> {
+    let row_ids_in_file_order = scoped_read_entry_batches(
         file,
         &[],
         ScopedRows::All,
@@ -95,8 +108,8 @@ async fn read_row_ids(file: ParquetFile, row_id_start: Option<u64>) -> Result<Ar
         Ok(row_ids)
     })
     .await?;
-    row_ids.sort_unstable();
-    row_ids.dedup();
 
-    Ok(Arc::new(FileRowSet::from_sorted(row_ids)?))
+    Ok(Arc::new(PositionedRowSet::from_file_order(
+        row_ids_in_file_order,
+    )?))
 }
