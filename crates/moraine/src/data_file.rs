@@ -25,6 +25,8 @@ mod values;
 #[cfg(test)]
 mod auxiliary_cache_tests;
 #[cfg(test)]
+mod row_location_tests;
+#[cfg(test)]
 mod row_set_tests;
 #[cfg(test)]
 mod tests;

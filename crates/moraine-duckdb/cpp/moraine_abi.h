@@ -416,6 +416,77 @@ typedef struct MoraineLookupKey {
   size_t values_len;
 } MoraineLookupKey;
 
+// One `(row_id, data_file_id)` pair to resolve to an exact file position,
+// as [`moraine_locate_row_positions`] takes them. `has_data_file_id` false
+// means the row's file id is NULL — a lookup's report of a live inlined
+// row.
+typedef struct MorainePositionPair {
+  // The row id to position.
+  uint64_t row_id;
+  // The data file it was located in; meaningful only when
+  // `has_data_file_id`.
+  uint64_t data_file_id;
+  // Whether `data_file_id` names a file.
+  bool has_data_file_id;
+} MorainePositionPair;
+
+// One data file carrying located positions, as
+// [`moraine_locate_row_positions`] groups its answer. Free with
+// [`moraine_locate_row_positions_free_files`].
+typedef struct MoraineLocatedFile {
+  // The data file these positions are within.
+  uint64_t data_file_id;
+  // The file's recorded path, owned.
+  char *file_path;
+  // Newly requested positions within this file, ascending and
+  // duplicate-free, owned.
+  uint64_t *positions;
+  // Length of `positions`.
+  size_t positions_len;
+  // Whether a delete file is currently registered against this data
+  // file; `existing_delete_file_id` and `existing_positions` are
+  // meaningful only when set.
+  bool has_existing_delete;
+  // The registered delete file's id — the `expires` a later
+  // [`moraine_commit_located_deletion`] call names to replace it.
+  uint64_t existing_delete_file_id;
+  // Positions the registered delete file already carries, ascending
+  // and duplicate-free, owned.
+  uint64_t *existing_positions;
+  // Length of `existing_positions`.
+  size_t existing_positions_len;
+} MoraineLocatedFile;
+
+// One delete file to land through [`moraine_commit_located_deletion`], as
+// [`moraine::DeleteFileRegistration`] takes it.
+typedef struct MorainePositionedDeleteFile {
+  // The data file this delete file's positions apply to.
+  uint64_t data_file_id;
+  // The delete file's bare file name (no path components) within the
+  // table's own data directory, where the caller already wrote it.
+  // Borrowed for the duration of the call.
+  const char *path;
+  // Total file size in bytes.
+  uint64_t file_size;
+  // Parquet footer size in bytes.
+  uint64_t footer_size;
+  // Number of positions the file records.
+  uint64_t delete_count;
+  // The delete file this one replaces; meaningful only when
+  // `has_expires`.
+  uint64_t expires;
+  // Whether `expires` names a delete file to expire in the same commit.
+  bool has_expires;
+  // Physical positions within the data file that this registration
+  // newly marks dead, borrowed for the duration of the call — the
+  // positions a `moraine_locate_row_positions` call resolved for this
+  // file, used only to derive index entry removals for the table's
+  // live equality indexes.
+  const uint64_t *new_positions;
+  // Length of `new_positions`.
+  size_t new_positions_len;
+} MorainePositionedDeleteFile;
+
 // One checkpoint the store's manifest carries.
 typedef struct MoraineCheckpoint {
   // The checkpoint's id, in the form `moraine_attach`'s `checkpoint`
@@ -1793,6 +1864,93 @@ int32_t moraine_index_nulls(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written by a matching
 // [`moraine_index_nulls`] call, not yet freed.
 void moraine_index_nulls_free(struct MoraineRowId *items, size_t len);
+
+// Resolves located rows to exact file positions for deletion without a
+// scan. `pairs` are `(row_id, data_file_id)` as a lookup reports them,
+// `has_data_file_id` false naming a live inlined row.
+//
+// Writes `out_files` (one entry per data file carrying a requested
+// position, each with its own positions and whatever delete file is
+// already registered against it) and `out_inlined` (row ids resolved as
+// live inlined rows, from `pairs` entries naming no file). Both arrays are
+// written even when empty, and each must be freed with its own matching
+// `_free` function exactly once.
+//
+// Also writes `out_write_directory`: the absolute directory a new delete
+// file for this table belongs in (see
+// [`moraine::CatalogSnapshot::table_write_directory`]), owned — free with
+// [`moraine_string_free`]. Resolved from the same snapshot `out_files` was
+// positioned against, so a concurrent table relocation cannot name a
+// directory a moved table no longer writes under. Written only when
+// `out_files` is non-empty, since only then does a caller need to write
+// anything; null otherwise. A caller that does need to write a file and
+// receives null has a typed error instead: an absent `DATA_PATH`, or a
+// table relocated to an absolute path, both fail the whole call.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; `pairs` points to
+// `pairs_len` pairs; every `out_*` pointer must be non-null and writable;
+// `probe`/`probe_ctx` must satisfy the interrupt-probe contract; `err`, if
+// non-null, must be writable.
+int32_t moraine_locate_row_positions(struct MoraineCatalogHandle *handle,
+                                     const char *schema_name,
+                                     const char *table_name,
+                                     const struct MorainePositionPair *pairs,
+                                     size_t pairs_len,
+                                     struct MoraineLocatedFile **out_files,
+                                     size_t *out_files_len,
+                                     uint64_t **out_inlined,
+                                     size_t *out_inlined_len,
+                                     char **out_write_directory,
+                                     MoraineInterruptProbe probe,
+                                     void *probe_ctx,
+                                     struct MoraineError *err);
+
+// Frees the array [`moraine_locate_row_positions`] wrote to
+// `out_files`/`out_files_len`, including each file's nested positions
+// arrays.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written there by a
+// matching call, not yet freed.
+void moraine_locate_row_positions_free_files(struct MoraineLocatedFile *items, size_t len);
+
+// Frees the array [`moraine_locate_row_positions`] wrote to
+// `out_inlined`/`out_inlined_len`.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written there by a
+// matching call, not yet freed.
+void moraine_locate_row_positions_free_inlined(uint64_t *items, size_t len);
+
+// Lands located deletions through the register/expire/inline-delete
+// verbs in one autonomous commit — see
+// [`moraine::Catalog::commit_located_deletion`]. `registrations` are the
+// delete files the caller already wrote; `inlined_rows` are row ids to
+// tombstone directly. Writes the minted snapshot id to `out_snapshot_id`.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; `registrations`
+// points to `registrations_len` descriptors, each with a valid `path` and
+// a `new_positions` valid for `new_positions_len` entries; `inlined_rows`
+// points to `inlined_rows_len` row ids; `out_snapshot_id` must be
+// writable; `probe`/`probe_ctx` must satisfy the interrupt-probe
+// contract; `err`, if non-null, must be writable.
+int32_t moraine_commit_located_deletion(struct MoraineCatalogHandle *handle,
+                                        const char *schema_name,
+                                        const char *table_name,
+                                        const struct MorainePositionedDeleteFile *registrations,
+                                        size_t registrations_len,
+                                        const uint64_t *inlined_rows,
+                                        size_t inlined_rows_len,
+                                        uint64_t *out_snapshot_id,
+                                        MoraineInterruptProbe probe,
+                                        void *probe_ctx,
+                                        struct MoraineError *err);
 
 // Mints a checkpoint over `handle`'s current durable state and writes its
 // id to `*out_id` (free with `moraine_string_free`).

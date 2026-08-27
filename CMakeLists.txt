@@ -26,6 +26,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/catalog.cpp
     ${CPP_DIR}/checkpoints.cpp
     ${CPP_DIR}/census.cpp
+    ${CPP_DIR}/delete_located.cpp
     ${CPP_DIR}/index_functions.cpp
     ${CPP_DIR}/inline_tables.cpp
     ${CPP_DIR}/maintenance.cpp

@@ -1682,3 +1682,408 @@ fn moraine_index_deferred_maintenance_catches_up_after_sql_insert() {
         "deferred uniqueness cannot be sound: {stderr}"
     );
 }
+
+/// `moraine_delete_located` resolves already-located `(row_id,
+/// data_file_id)` pairs — as an index lookup reports them — to exact file
+/// positions and deletes them without a scan, landing the delete through a
+/// shim-written delete file. The returned counts row, the row count drop,
+/// and a prior-snapshot read together are this feature's basic contract.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn moraine_delete_located_removes_rows_without_a_scan() {
+    let store = TempDir::new("delete-located-store");
+    let data = TempDir::new("delete-located-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    populate_files_spanning_row_ids(&run);
+
+    let before_snapshot = csv_rows(&run(
+        "USE lake; SELECT CAST(max(snapshot_id) AS VARCHAR) FROM snapshots();",
+    ))[0][0]
+        .clone();
+
+    // a = 50 and a = 150 sit in their original (unrewritten) files, one
+    // each — the lookup's own answer becomes the `rows` list literal.
+    let located = csv_rows(&run(
+        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 50) \
+         UNION ALL \
+         SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 150) \
+         ORDER BY row_id;",
+    ));
+    assert_eq!(
+        located.len(),
+        2,
+        "expected exactly one location each for a=50 and a=150: {located:?}"
+    );
+    let rows_literal = located
+        .iter()
+        .map(|row| format!("{{row_id: {}, data_file_id: {}}}", row[0], row[1]))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let counts = csv_rows(&run(&format!(
+        "SELECT * FROM moraine_delete_located('lake', 'main', 't', [{rows_literal}]);"
+    )));
+    assert_eq!(
+        counts,
+        vec![vec!["2".to_string(), "0".to_string(), "2".to_string()]],
+        "two file-backed rows deleted, no inline rows, one delete file per data file"
+    );
+
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FILTER (WHERE a IN (50, 150)), count(*) FROM lake.main.t;"
+        )),
+        vec![vec!["0".to_string(), "298".to_string()]],
+        "the located delete removed exactly its two rows"
+    );
+
+    assert_eq!(
+        csv_rows(&run(&format!(
+            "SELECT count(*) FILTER (WHERE a IN (50, 150)) FROM lake.main.t AT (VERSION => {before_snapshot});"
+        ))),
+        vec![vec!["2".to_string()]],
+        "a read at the snapshot before the delete still sees both rows"
+    );
+}
+
+/// A second `moraine_delete_located` call against a data file that already
+/// carries a live delete file merges into it rather than adding a second
+/// one, and the first call's deletion is still respected — the union
+/// property a naive overwrite would violate.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn moraine_delete_located_merges_an_existing_delete_file() {
+    let store = TempDir::new("delete-located-merge-store");
+    let data = TempDir::new("delete-located-merge-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    populate_files_spanning_row_ids(&run);
+
+    // a = 60 and a = 61 both sit in the first original (unrewritten) file:
+    // neither key was among the UPDATEs that relocated rows elsewhere.
+    let locate = |value: i64| {
+        let located = csv_rows(&run(&format!(
+            "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', {value});"
+        )));
+        assert_eq!(located.len(), 1, "expected one location for a = {value}");
+        format!(
+            "{{row_id: {}, data_file_id: {}}}",
+            located[0][0], located[0][1]
+        )
+    };
+    let data_file_id: i64 = csv_rows(&run(
+        "SELECT data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 60);",
+    ))[0][0]
+        .parse()
+        .expect("a data file id");
+
+    let first_pair = locate(60);
+    let first_counts = csv_rows(&run(&format!(
+        "SELECT * FROM moraine_delete_located('lake', 'main', 't', [{first_pair}]);"
+    )));
+    assert_eq!(
+        first_counts,
+        vec![vec!["1".to_string(), "0".to_string(), "1".to_string()]],
+        "the first call writes one delete file for the one row it deleted"
+    );
+
+    let second_pair = locate(61);
+    let second_counts = csv_rows(&run(&format!(
+        "SELECT * FROM moraine_delete_located('lake', 'main', 't', [{second_pair}]);"
+    )));
+    assert_eq!(
+        second_counts,
+        vec![vec!["1".to_string(), "0".to_string(), "1".to_string()]],
+        "the second call also writes exactly one delete file, merged into the same file's slot"
+    );
+
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FILTER (WHERE a IN (60, 61)), count(*) FROM lake.main.t;"
+        )),
+        vec![vec!["0".to_string(), "298".to_string()]],
+        "both rows stay deleted after the second call — the union property"
+    );
+
+    let live_delete_files = csv_rows(&run_standalone_sql(
+        store.path(),
+        &format!(
+            "SELECT count(*) FROM m.ducklake_delete_file \
+             WHERE end_snapshot IS NULL AND data_file_id = {data_file_id};"
+        ),
+    ));
+    assert_eq!(
+        live_delete_files,
+        vec![vec!["1".to_string()]],
+        "the merge leaves exactly one live delete file for the data file, not two"
+    );
+}
+
+/// Default inlining leaves a small insert as an inlined row (a NULL
+/// `data_file_id` from the lookup), and `moraine_delete_located` deletes it
+/// through the inline path rather than the file path.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn moraine_delete_located_deletes_an_inlined_row() {
+    let store = TempDir::new("delete-located-inline-store");
+    let data = TempDir::new("delete-located-inline-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    // Under the compiled default inline limit, so this insert stays
+    // inlined rather than landing as a Parquet file.
+    run("INSERT INTO lake.main.t VALUES (500, 'z');");
+
+    let located = csv_rows(&run(
+        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 500);",
+    ));
+    assert_eq!(
+        located.len(),
+        1,
+        "expected exactly one location for the inlined row: {located:?}"
+    );
+    assert_eq!(
+        located[0][1], "NULL",
+        "the inlined row's lookup names no data file"
+    );
+    let row_id = &located[0][0];
+
+    let counts = csv_rows(&run(&format!(
+        "SELECT * FROM moraine_delete_located('lake', 'main', 't', \
+         [{{row_id: {row_id}, data_file_id: NULL}}]);"
+    )));
+    assert_eq!(
+        counts,
+        vec![vec!["0".to_string(), "1".to_string(), "0".to_string()]],
+        "the inlined row is deleted through the inline path, not the file path"
+    );
+
+    assert_eq!(
+        csv_rows(&run("SELECT count(*) FROM lake.main.t;")),
+        vec![vec!["0".to_string()]],
+        "the inlined row is gone"
+    );
+}
+
+/// A pair naming a data file that does not hold the row it names is
+/// exact-or-failed: the call errors, deletes nothing, and mints no
+/// snapshot.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn moraine_delete_located_refuses_a_wrong_location() {
+    let store = TempDir::new("delete-located-wrong-store");
+    let data = TempDir::new("delete-located-wrong-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    populate_files_spanning_row_ids(&run);
+
+    let location_a = csv_rows(&run(
+        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 50);",
+    ));
+    let location_b = csv_rows(&run(
+        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 150);",
+    ));
+    assert_eq!(location_a.len(), 1, "expected one location for a = 50");
+    assert_eq!(location_b.len(), 1, "expected one location for a = 150");
+    assert_ne!(
+        location_a[0][1], location_b[0][1],
+        "the two rows must live in different files for this pair to be wrong"
+    );
+
+    let before_snapshots = csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');"));
+
+    let stderr = run_ducklake_sql_expect_err_with_options(
+        store.path(),
+        data.path(),
+        &meta,
+        &format!(
+            "USE lake; SELECT * FROM moraine_delete_located('lake', 'main', 't', \
+             [{{row_id: {}, data_file_id: {}}}]);",
+            location_a[0][0], location_b[0][1]
+        ),
+    );
+    assert!(
+        stderr
+            .to_lowercase()
+            .contains("could not be positioned against data file"),
+        "expected the exact-or-failed positioning error, got: {stderr}"
+    );
+
+    assert_eq!(
+        csv_rows(&run("SELECT count(*) FROM lake.main.t;")),
+        vec![vec!["300".to_string()]],
+        "the refused call deleted nothing"
+    );
+    assert_eq!(
+        csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');")),
+        before_snapshots,
+        "the refused call minted no snapshot"
+    );
+}
+
+/// A `rows` entry's fields, named in the opposite order from the struct
+/// literal's usual `(row_id, data_file_id)`, must still resolve by name:
+/// mapping positionally would delete a different row than the one named.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn moraine_delete_located_accepts_swapped_field_order() {
+    let store = TempDir::new("delete-located-swapped-store");
+    let data = TempDir::new("delete-located-swapped-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    populate_files_spanning_row_ids(&run);
+
+    let located = csv_rows(&run(
+        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 50);",
+    ));
+    assert_eq!(located.len(), 1, "expected one location for a = 50");
+    let row_id = &located[0][0];
+    let data_file_id = &located[0][1];
+
+    let counts = csv_rows(&run(&format!(
+        "SELECT * FROM moraine_delete_located('lake', 'main', 't', \
+         [{{data_file_id: {data_file_id}, row_id: {row_id}}}]);"
+    )));
+    assert_eq!(
+        counts,
+        vec![vec!["1".to_string(), "0".to_string(), "1".to_string()]],
+        "the swapped-order fields still resolved to exactly one deleted row"
+    );
+
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FILTER (WHERE a = 50), count(*) FROM lake.main.t;"
+        )),
+        vec![vec!["0".to_string(), "299".to_string()]],
+        "the swapped-field call deleted row a=50 and only that row"
+    );
+}
+
+/// A NULL `row_id` field is a clean rejection, mirroring the existing NULL
+/// `data_file_id` guard.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn moraine_delete_located_refuses_a_null_row_id() {
+    let store = TempDir::new("delete-located-nullrow-store");
+    let data = TempDir::new("delete-located-nullrow-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &meta,
+        "CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);",
+    );
+    run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &meta,
+        "INSERT INTO lake.main.t VALUES (1, 'x');",
+    );
+
+    let stderr = run_ducklake_sql_expect_err_with_options(
+        store.path(),
+        data.path(),
+        &meta,
+        "SELECT * FROM moraine_delete_located('lake', 'main', 't', \
+         [{row_id: NULL, data_file_id: NULL}]);",
+    );
+    assert!(
+        stderr.to_lowercase().contains("row_id"),
+        "expected a clean row_id rejection, got: {stderr}"
+    );
+}
+
+/// A `rows` list whose entries are all already dead (already carried by the
+/// data file's registered delete file) reports zero for every count and
+/// mints no snapshot — the diff against the existing delete file's
+/// positions must leave nothing newly dead.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn moraine_delete_located_of_only_already_dead_pairs_mints_no_snapshot() {
+    let store = TempDir::new("delete-located-stale-store");
+    let data = TempDir::new("delete-located-stale-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    populate_files_spanning_row_ids(&run);
+
+    let located = csv_rows(&run(
+        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 60);",
+    ));
+    assert_eq!(located.len(), 1, "expected one location for a = 60");
+    let pair = format!(
+        "{{row_id: {}, data_file_id: {}}}",
+        located[0][0], located[0][1]
+    );
+
+    let first_counts = csv_rows(&run(&format!(
+        "SELECT * FROM moraine_delete_located('lake', 'main', 't', [{pair}]);"
+    )));
+    assert_eq!(
+        first_counts,
+        vec![vec!["1".to_string(), "0".to_string(), "1".to_string()]],
+        "the first call deletes the row"
+    );
+
+    let before_snapshots = csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');"));
+    let repeat_counts = csv_rows(&run(&format!(
+        "SELECT * FROM moraine_delete_located('lake', 'main', 't', [{pair}]);"
+    )));
+    assert_eq!(
+        repeat_counts,
+        vec![vec!["0".to_string(), "0".to_string(), "0".to_string()]],
+        "repeating an already-dead pair reports zero for every count"
+    );
+    assert_eq!(
+        csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');")),
+        before_snapshots,
+        "a call whose pairs are all already dead mints no snapshot"
+    );
+}
+
+/// An empty `rows` list mints no snapshot: there is nothing to write or
+/// commit, so the call must not pay for either.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn moraine_delete_located_of_an_empty_list_mints_no_snapshot() {
+    let store = TempDir::new("delete-located-empty-store");
+    let data = TempDir::new("delete-located-empty-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t VALUES (1, 'x');");
+
+    let before_snapshots = csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');"));
+    let counts = csv_rows(&run(
+        "SELECT * FROM moraine_delete_located('lake', 'main', 't', \
+         []::STRUCT(row_id BIGINT, data_file_id UBIGINT)[]);",
+    ));
+    assert_eq!(
+        counts,
+        vec![vec!["0".to_string(), "0".to_string(), "0".to_string()]],
+        "an empty rows list reports zero for every count"
+    );
+    assert_eq!(
+        csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');")),
+        before_snapshots,
+        "an empty rows list mints no snapshot"
+    );
+}

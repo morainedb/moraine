@@ -126,6 +126,12 @@ fn index_identity(value: &IndexValue) -> (u64, u64, &str) {
     (value.index_id, value.table_id, &value.index_name)
 }
 
+/// Ensures exactly one trailing `/`, so directory components concatenate
+/// without doubling or losing a separator.
+fn normalize_directory(path: &str) -> String {
+    format!("{}/", path.trim_end_matches('/'))
+}
+
 /// Inserts into a table-scoped nested map.
 fn put_nested<K: Ord, V>(map: &mut BTreeMap<u64, BTreeMap<K, V>>, table_id: u64, key: K, value: V) {
     map.entry(table_id).or_default().insert(key, value);
@@ -480,6 +486,49 @@ impl CatalogSnapshot {
             Error::Corruption(format!("table {table} references a missing schema"))
         })?;
         Ok(format!("{}{}", schema_value.path, table_value.path))
+    }
+
+    /// The absolute directory a table's files resolve under: `DATA_PATH`
+    /// joined with the schema and table path components, as DuckLake's own
+    /// reader resolves a `path_is_relative` file.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for a missing table, [`Error::Constraint`] for
+    /// a lake without a recorded `DATA_PATH`, [`Error::Unsupported`] for
+    /// an absolute (operator-relocated) schema or table path.
+    pub fn table_write_directory(&self, table: TableId) -> Result<String> {
+        let table_value = self
+            .tables
+            .get(&table.get())
+            .ok_or_else(|| Error::NotFound(format!("table {table}")))?;
+        let schema_value = self.schemas.get(&table_value.schema_id).ok_or_else(|| {
+            Error::Corruption(format!("table {table} references a missing schema"))
+        })?;
+        if !schema_value.path_is_relative {
+            return Err(Error::Unsupported(format!(
+                "schema \"{}\" has an absolute path, which a table write directory does not \
+                 support",
+                schema_value.schema_name
+            )));
+        }
+        if !table_value.path_is_relative {
+            return Err(Error::Unsupported(format!(
+                "table \"{}\" has an absolute path, which a table write directory does not \
+                 support",
+                table_value.table_name
+            )));
+        }
+        let data_path = self
+            .data_path()
+            .ok_or_else(|| Error::Constraint("the lake has no recorded DATA_PATH".to_owned()))?;
+
+        Ok(normalize_directory(&format!(
+            "{}{}{}",
+            normalize_directory(&data_path),
+            normalize_directory(&schema_value.path),
+            normalize_directory(&table_value.path),
+        )))
     }
 
     /// One equality index by id within a table.
@@ -1624,5 +1673,69 @@ mod tests {
             !view.options.contains_key(&(2, 1)),
             "table options die with the table"
         );
+    }
+
+    #[test]
+    fn table_write_directory_joins_data_path_with_schema_and_table_paths() {
+        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
+        view.put_schema(schema_rec(0, "s", 1, None));
+        view.put_table(table_rec(1, 0, "t", 1));
+        view.set_option_record(
+            (0, 0),
+            OptionScopeValue {
+                options: [("data_path".to_owned(), "/lake/data".to_owned())].into(),
+            },
+        );
+
+        let directory = view.table_write_directory(TableId::new(1)).unwrap();
+
+        assert_eq!(directory, "/lake/data/s/t/");
+    }
+
+    #[test]
+    fn table_write_directory_rejects_a_missing_data_path() {
+        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
+        view.put_schema(schema_rec(0, "s", 1, None));
+        view.put_table(table_rec(1, 0, "t", 1));
+
+        let error = view.table_write_directory(TableId::new(1)).unwrap_err();
+
+        assert!(matches!(error, Error::Constraint(_)), "{error:?}");
+    }
+
+    #[test]
+    fn table_write_directory_rejects_an_absolute_schema_or_table_path() {
+        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
+        view.put_schema(SchemaValue {
+            path_is_relative: false,
+            ..schema_rec(0, "s", 1, None)
+        });
+        view.put_table(table_rec(1, 0, "t", 1));
+        view.set_option_record(
+            (0, 0),
+            OptionScopeValue {
+                options: [("data_path".to_owned(), "/lake/data".to_owned())].into(),
+            },
+        );
+
+        let error = view.table_write_directory(TableId::new(1)).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+
+        view.put_schema(schema_rec(0, "s", 1, None));
+        view.put_table(TableValue {
+            path_is_relative: false,
+            ..table_rec(1, 0, "t", 1)
+        });
+        let error = view.table_write_directory(TableId::new(1)).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+    }
+
+    #[test]
+    fn table_write_directory_rejects_an_unknown_table() {
+        let view = CatalogSnapshot::build(snap(1), &[], &[], None);
+
+        let error = view.table_write_directory(TableId::new(99)).unwrap_err();
+
+        assert!(matches!(error, Error::NotFound(_)), "{error:?}");
     }
 }

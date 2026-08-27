@@ -6,9 +6,12 @@
 //! fetched to do it. Counting is how a test tells those apart without
 //! timing anything, so the assertion is exact rather than flaky.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use futures::stream::BoxStream;
@@ -24,6 +27,7 @@ pub struct CountingStore {
     gets: AtomicU64,
     ranged_gets: AtomicU64,
     bytes: AtomicU64,
+    touched: Mutex<HashSet<String>>,
 }
 
 impl CountingStore {
@@ -33,6 +37,7 @@ impl CountingStore {
             gets: AtomicU64::new(0),
             ranged_gets: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            touched: Mutex::new(HashSet::new()),
         }
     }
 
@@ -43,6 +48,22 @@ impl CountingStore {
         let gets = self.gets.swap(0, Ordering::SeqCst);
         let ranged = self.ranged_gets.swap(0, Ordering::SeqCst);
         gets + ranged
+    }
+
+    /// The distinct object paths read since the last call, sorted, and
+    /// resets the set — which files a read actually touched, when a count
+    /// alone cannot tell a scoped read from a wider one that happens to
+    /// cost the same.
+    pub fn take_touched_paths(&self) -> Vec<String> {
+        let mut touched = self.touched.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut paths: Vec<String> = touched.drain().collect();
+        paths.sort();
+        paths
+    }
+
+    fn record_touch(&self, location: &Path) {
+        let mut touched = self.touched.lock().unwrap_or_else(PoisonError::into_inner);
+        touched.insert(location.to_string());
     }
 
     /// Bytes those reads carried since the last call, and resets the
@@ -86,6 +107,7 @@ impl ObjectStore for CountingStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         self.gets.fetch_add(1, Ordering::SeqCst);
+        self.record_touch(location);
         let result = self.inner.get_opts(location, options).await?;
         self.bytes
             .fetch_add(result.range.end - result.range.start, Ordering::SeqCst);
@@ -99,6 +121,7 @@ impl ObjectStore for CountingStore {
     ) -> object_store::Result<Vec<bytes::Bytes>> {
         self.ranged_gets
             .fetch_add(ranges.len() as u64, Ordering::SeqCst);
+        self.record_touch(location);
         self.bytes.fetch_add(
             ranges.iter().map(|range| range.end - range.start).sum(),
             Ordering::SeqCst,

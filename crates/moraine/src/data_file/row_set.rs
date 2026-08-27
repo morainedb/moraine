@@ -146,6 +146,126 @@ impl FileRowSet {
     }
 }
 
+/// How a summary's ascending-id rank maps to a row's physical file
+/// position.
+#[derive(Debug, Clone)]
+pub(super) enum RowOrder {
+    /// File order is ascending id order: position = rank - 1.
+    Ascending,
+    /// `positions[k]` is the file position of the k-th smallest id.
+    ///
+    /// Never pairs with `FileRowSet::Range`: a range answers positions by
+    /// arithmetic alone, which is only correct when file order is
+    /// ascending order, so a permutation over a contiguous id set is kept
+    /// as `Roaring` rather than collapsed to a range.
+    Permuted(Vec<u32>),
+}
+
+/// A membership set plus how to read file positions off it.
+#[derive(Debug, Clone)]
+pub(super) struct PositionedRowSet {
+    pub(super) rows: FileRowSet,
+    pub(super) order: RowOrder,
+}
+
+impl PositionedRowSet {
+    /// Estimated resident bytes charged to the cache: the set itself plus
+    /// any permutation riding beside it.
+    pub(super) fn estimated_bytes(&self) -> u64 {
+        let permutation_bytes = match &self.order {
+            RowOrder::Ascending => 0,
+            RowOrder::Permuted(positions) => {
+                usize_as_u64(positions.len()).saturating_mul(size_of::<u32>() as u64)
+            }
+        };
+        self.rows
+            .estimated_bytes()
+            .saturating_add(permutation_bytes)
+    }
+
+    /// File positions of `requested` rows; `None` for absent rows.
+    pub(super) fn positions_of(&self, requested: &[u64]) -> Vec<Option<u64>> {
+        requested
+            .iter()
+            .map(|&row_id| {
+                self.rank_of(row_id)
+                    .and_then(|rank| self.order.position_of(rank))
+            })
+            .collect()
+    }
+
+    /// This row id's ascending-id rank among the set's members, if present.
+    fn rank_of(&self, row_id: u64) -> Option<u64> {
+        if !self.rows.contains(row_id) {
+            return None;
+        }
+
+        match &self.rows {
+            FileRowSet::Range { start, .. } => Some(row_id - start),
+            FileRowSet::Roaring(rows) => rows.rank(row_id).checked_sub(1),
+            FileRowSet::Sorted(rows) => rows.binary_search(&row_id).ok().map(usize_as_u64),
+        }
+    }
+
+    /// Constructs from row ids in file order; duplicate ids are
+    /// [`Error::Constraint`].
+    pub(super) fn from_file_order(row_ids: Vec<u64>) -> Result<Self> {
+        if is_strictly_ascending(&row_ids) {
+            return Ok(Self {
+                rows: FileRowSet::from_sorted(row_ids)?,
+                order: RowOrder::Ascending,
+            });
+        }
+
+        let mut ascending: Vec<u64> = row_ids.clone();
+        ascending.sort_unstable();
+        if ascending.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::Constraint("file row ids must be unique".to_owned()));
+        }
+
+        let mut permutation = vec![0_u32; ascending.len()];
+        for (position, row_id) in row_ids.iter().enumerate() {
+            let rank = ascending
+                .binary_search(row_id)
+                .map_err(|_| Error::Corruption("row id vanished while sorting".to_owned()))?;
+            permutation[rank] = u32::try_from(position).map_err(|_| {
+                Error::Constraint("file position exceeds the u32 domain".to_owned())
+            })?;
+        }
+
+        let rows = FileRowSet::from_sorted(ascending)?;
+        // A permutation never pairs with Range: demote a contiguous
+        // permuted set to Roaring so position resolution still consults
+        // the permutation instead of arithmetic.
+        let rows = match rows {
+            FileRowSet::Range { start, end } => {
+                let mut treemap = RoaringTreemap::new();
+                treemap.insert_range(start..end);
+                FileRowSet::Roaring(treemap)
+            }
+            other => other,
+        };
+
+        Ok(Self {
+            rows,
+            order: RowOrder::Permuted(permutation),
+        })
+    }
+}
+
+impl RowOrder {
+    /// The file position for a set member's ascending-id rank.
+    fn position_of(&self, rank: u64) -> Option<u64> {
+        match self {
+            Self::Ascending => Some(rank),
+            Self::Permuted(positions) => usize::try_from(rank)
+                .ok()
+                .and_then(|rank| positions.get(rank))
+                .map(|&position| u64::from(position)),
+        }
+    }
+}
+
 #[allow(clippy::cast_possible_truncation)]
 const fn high_word(row_id: u64) -> u32 {
     (row_id >> 32) as u32
@@ -154,6 +274,11 @@ const fn high_word(row_id: u64) -> u32 {
 #[allow(clippy::cast_possible_truncation)]
 const fn low_word(row_id: u64) -> u32 {
     row_id as u32
+}
+
+/// Whether `row_ids` is strictly increasing (and therefore also unique).
+fn is_strictly_ascending(row_ids: &[u64]) -> bool {
+    row_ids.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 /// Approximates the heap retained by the Rust Roaring implementation from its

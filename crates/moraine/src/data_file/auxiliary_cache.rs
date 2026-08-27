@@ -32,7 +32,7 @@ use crate::{
         DataStore, ParquetFile,
         data_store::StoreIdentity,
         reader::ObjectStoreReader,
-        row_set::{FileRowSet, FileRowSetKind},
+        row_set::{FileRowSet, FileRowSetKind, PositionedRowSet, RowOrder},
         usize_as_u64,
     },
     error::{Error, Result},
@@ -105,7 +105,7 @@ enum AuxiliaryKey {
 #[derive(Debug, Clone)]
 pub(super) enum AuxiliaryValue {
     Metadata(Arc<ParquetMetaData>),
-    Summary(Arc<FileRowSet>),
+    Summary(Arc<PositionedRowSet>),
     Block(Bytes),
     DeletePositions(Arc<FileRowSet>),
 }
@@ -121,7 +121,10 @@ impl From<AuxiliaryValue> for Weighed {
     fn from(value: AuxiliaryValue) -> Self {
         let bytes = match &value {
             AuxiliaryValue::Metadata(metadata) => metadata.memory_size(),
-            AuxiliaryValue::Summary(rows) | AuxiliaryValue::DeletePositions(rows) => {
+            AuxiliaryValue::Summary(positioned) => {
+                usize::try_from(positioned.estimated_bytes()).unwrap_or(usize::MAX)
+            }
+            AuxiliaryValue::DeletePositions(rows) => {
                 usize::try_from(rows.estimated_bytes()).unwrap_or(usize::MAX)
             }
             AuxiliaryValue::Block(bytes) => bytes.len(),
@@ -133,21 +136,37 @@ impl From<AuxiliaryValue> for Weighed {
 
 /// The disk form of a value: a tag byte, then a footer as the Parquet
 /// metadata writer lays it out (page index included) or a row set in its
-/// own shape. Row summaries and delete positions are both row sets and
-/// share those three shapes, under a tag triple each so one tag byte
-/// still names both the kind and the shape.
+/// own shape. Delete positions carry no order and use one tag per shape;
+/// a summary's tag also names its [`RowOrder`], since a cached summary from
+/// before positions existed cannot answer them.
 mod tag {
     pub(super) const METADATA: u8 = 0;
+    /// Retired for summaries: a pre-upgrade encoder wrote this for any
+    /// dense range, discarding whether the file order was ascending or a
+    /// contiguous-but-permuted run. Still decoded as a parse failure so it
+    /// misses and rebuilds rather than lying about order. Never written
+    /// again; superseded for ascending ranges by [`RANGE_ASCENDING`].
     pub(super) const RANGE: u8 = 1;
-    pub(super) const ROARING: u8 = 2;
-    pub(super) const SORTED: u8 = 3;
+    /// Retired for summaries: an entry predating positions. Still decoded
+    /// as a parse failure so it misses and rebuilds rather than lying
+    /// about order. Never written again.
+    pub(super) const LEGACY_ROARING: u8 = 2;
+    /// See [`LEGACY_ROARING`].
+    pub(super) const LEGACY_SORTED: u8 = 3;
     pub(super) const BLOCK: u8 = 4;
     pub(super) const DELETE_RANGE: u8 = 5;
     pub(super) const DELETE_ROARING: u8 = 6;
     pub(super) const DELETE_SORTED: u8 = 7;
+    pub(super) const ROARING_ASCENDING: u8 = 8;
+    pub(super) const SORTED_ASCENDING: u8 = 9;
+    pub(super) const ROARING_PERMUTED: u8 = 10;
+    pub(super) const SORTED_PERMUTED: u8 = 11;
+    /// A dense ascending range: positional by arithmetic. Distinct from the
+    /// retired [`RANGE`], which could also have been written for a
+    /// contiguous-but-permuted file.
+    pub(super) const RANGE_ASCENDING: u8 = 12;
 
-    /// The `(range, roaring, sorted)` tags one row-set kind writes.
-    pub(super) const SUMMARY_SHAPES: [u8; 3] = [RANGE, ROARING, SORTED];
+    /// The `(range, roaring, sorted)` tags a delete-position set writes.
     pub(super) const DELETE_SHAPES: [u8; 3] = [DELETE_RANGE, DELETE_ROARING, DELETE_SORTED];
 }
 
@@ -190,18 +209,20 @@ fn decode_row_set(shape: RowSetShape, reader: &mut impl Read) -> foyer::Result<F
             start: read_u64(reader)?,
             end: read_u64(reader)?,
         },
-        RowSetShape::Roaring => FileRowSet::Roaring(
-            RoaringTreemap::deserialize_from(reader).map_err(foyer::Error::io_error)?,
-        ),
-        RowSetShape::Sorted => {
-            let count = usize::try_from(read_u64(reader)?).unwrap_or(usize::MAX);
-            FileRowSet::Sorted(
-                (0..count)
-                    .map(|_| read_u64(reader))
-                    .collect::<foyer::Result<Vec<u64>>>()?,
-            )
-        }
+        RowSetShape::Roaring => FileRowSet::Roaring(read_roaring_body(reader)?),
+        RowSetShape::Sorted => FileRowSet::Sorted(read_sorted_body(reader)?),
     })
+}
+
+fn read_roaring_body(reader: &mut impl Read) -> foyer::Result<RoaringTreemap> {
+    RoaringTreemap::deserialize_from(reader).map_err(foyer::Error::io_error)
+}
+
+fn read_sorted_body(reader: &mut impl Read) -> foyer::Result<Vec<u64>> {
+    let count = usize::try_from(read_u64(reader)?).unwrap_or(usize::MAX);
+    (0..count)
+        .map(|_| read_u64(reader))
+        .collect::<foyer::Result<Vec<u64>>>()
 }
 
 #[derive(Clone, Copy)]
@@ -209,6 +230,130 @@ enum RowSetShape {
     Range,
     Roaring,
     Sorted,
+}
+
+/// Writes `positioned`'s set with [`encode_row_set`], then — for a permuted
+/// order — its rank-to-position permutation, count-prefixed.
+fn encode_positioned_row_set(
+    positioned: &PositionedRowSet,
+    writer: &mut impl Write,
+) -> foyer::Result<()> {
+    // Unreachable by construction: `PositionedRowSet::from_file_order` never
+    // pairs a permutation with a range. A bare range tag carries no
+    // permutation, so writing one here would silently answer positions by
+    // arithmetic on decode.
+    if matches!(
+        (&positioned.rows, &positioned.order),
+        (FileRowSet::Range { .. }, RowOrder::Permuted(_))
+    ) {
+        return Err(foyer::Error::new(
+            foyer::ErrorKind::Parse,
+            "a permuted row set cannot encode as a range",
+        ));
+    }
+
+    let shapes = match positioned.order {
+        RowOrder::Ascending => [
+            tag::RANGE_ASCENDING,
+            tag::ROARING_ASCENDING,
+            tag::SORTED_ASCENDING,
+        ],
+        // The range slot is unused here: a permuted range was already
+        // rejected above.
+        RowOrder::Permuted(_) => [
+            tag::RANGE_ASCENDING,
+            tag::ROARING_PERMUTED,
+            tag::SORTED_PERMUTED,
+        ],
+    };
+    encode_row_set(&positioned.rows, shapes, writer)?;
+
+    if let RowOrder::Permuted(permutation) = &positioned.order {
+        write_permutation(permutation, writer)?;
+    }
+
+    Ok(())
+}
+
+fn write_permutation(permutation: &[u32], writer: &mut impl Write) -> foyer::Result<()> {
+    let io = foyer::Error::io_error;
+    writer
+        .write_all(&usize_as_u64(permutation.len()).to_le_bytes())
+        .map_err(io)?;
+    permutation
+        .iter()
+        .try_for_each(|position| writer.write_all(&position.to_le_bytes()))
+        .map_err(io)
+}
+
+/// Reads back a permutation [`write_permutation`] wrote, failing unless its
+/// count matches `expected_len` — the set's own cardinality.
+fn read_permutation(expected_len: usize, reader: &mut impl Read) -> foyer::Result<Vec<u32>> {
+    let count = usize::try_from(read_u64(reader)?).unwrap_or(usize::MAX);
+    if count != expected_len {
+        return Err(foyer::Error::new(
+            foyer::ErrorKind::Parse,
+            format!("permutation length {count} does not match set cardinality {expected_len}"),
+        ));
+    }
+
+    let mut buffer = [0; 4];
+    (0..count)
+        .map(|_| {
+            reader
+                .read_exact(&mut buffer)
+                .map_err(foyer::Error::io_error)?;
+            Ok(u32::from_le_bytes(buffer))
+        })
+        .collect()
+}
+
+/// Reads back the body [`encode_positioned_row_set`] wrote, given the
+/// consumed tag.
+fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<PositionedRowSet> {
+    match tag {
+        tag::RANGE_ASCENDING => Ok(PositionedRowSet {
+            rows: decode_row_set(RowSetShape::Range, reader)?,
+            order: RowOrder::Ascending,
+        }),
+        tag::ROARING_ASCENDING => Ok(PositionedRowSet {
+            rows: decode_row_set(RowSetShape::Roaring, reader)?,
+            order: RowOrder::Ascending,
+        }),
+        tag::SORTED_ASCENDING => Ok(PositionedRowSet {
+            rows: decode_row_set(RowSetShape::Sorted, reader)?,
+            order: RowOrder::Ascending,
+        }),
+        tag::ROARING_PERMUTED => {
+            let bitmap = read_roaring_body(reader)?;
+            // On a 32-bit target a cardinality that overflows `usize`
+            // clamps to `usize::MAX`, which can never equal a real
+            // permutation length: `read_permutation`'s length check fails
+            // closed rather than wrapping or truncating.
+            let expected_len = usize::try_from(bitmap.len()).unwrap_or(usize::MAX);
+            let permutation = read_permutation(expected_len, reader)?;
+            Ok(PositionedRowSet {
+                rows: FileRowSet::Roaring(bitmap),
+                order: RowOrder::Permuted(permutation),
+            })
+        }
+        tag::SORTED_PERMUTED => {
+            let row_ids = read_sorted_body(reader)?;
+            let permutation = read_permutation(row_ids.len(), reader)?;
+            Ok(PositionedRowSet {
+                rows: FileRowSet::Sorted(row_ids),
+                order: RowOrder::Permuted(permutation),
+            })
+        }
+        tag::RANGE | tag::LEGACY_ROARING | tag::LEGACY_SORTED => Err(foyer::Error::new(
+            foyer::ErrorKind::Parse,
+            "a row summary predates positions and cannot answer them",
+        )),
+        other => Err(foyer::Error::new(
+            foyer::ErrorKind::Parse,
+            format!("unknown row-summary tag {other}"),
+        )),
+    }
 }
 
 fn parse_failed(error: impl std::error::Error + Send + Sync + 'static) -> foyer::Error {
@@ -235,7 +380,7 @@ impl foyer::Code for Weighed {
                     .map_err(parse_failed)?;
                 writer.write_all(&buffer).map_err(io)
             }
-            AuxiliaryValue::Summary(rows) => encode_row_set(rows, tag::SUMMARY_SHAPES, writer),
+            AuxiliaryValue::Summary(positioned) => encode_positioned_row_set(positioned, writer),
             AuxiliaryValue::DeletePositions(positions) => {
                 encode_row_set(positions, tag::DELETE_SHAPES, writer)
             }
@@ -261,14 +406,15 @@ impl foyer::Code for Weighed {
                     .map_err(parse_failed)?;
                 AuxiliaryValue::Metadata(Arc::new(metadata))
             }
-            tag::RANGE => {
-                AuxiliaryValue::Summary(Arc::new(decode_row_set(RowSetShape::Range, reader)?))
-            }
-            tag::ROARING => {
-                AuxiliaryValue::Summary(Arc::new(decode_row_set(RowSetShape::Roaring, reader)?))
-            }
-            tag::SORTED => {
-                AuxiliaryValue::Summary(Arc::new(decode_row_set(RowSetShape::Sorted, reader)?))
+            tag::RANGE
+            | tag::LEGACY_ROARING
+            | tag::LEGACY_SORTED
+            | tag::ROARING_ASCENDING
+            | tag::SORTED_ASCENDING
+            | tag::ROARING_PERMUTED
+            | tag::SORTED_PERMUTED
+            | tag::RANGE_ASCENDING => {
+                AuxiliaryValue::Summary(Arc::new(decode_positioned_row_set(tag[0], reader)?))
             }
             tag::DELETE_RANGE => AuxiliaryValue::DeletePositions(Arc::new(decode_row_set(
                 RowSetShape::Range,
@@ -323,16 +469,17 @@ impl RowSummaryCounters {
     }
 
     fn entered(&self, weighed: &Weighed) {
-        if let AuxiliaryValue::Summary(rows) = &weighed.value {
-            self.of(rows.kind()).fetch_add(1, Ordering::Relaxed);
+        if let AuxiliaryValue::Summary(positioned) = &weighed.value {
+            self.of(positioned.rows.kind())
+                .fetch_add(1, Ordering::Relaxed);
             self.bytes
                 .fetch_add(usize_as_u64(weighed.bytes), Ordering::Relaxed);
         }
     }
 
     fn left(&self, weighed: &Weighed) {
-        if let AuxiliaryValue::Summary(rows) = &weighed.value {
-            saturating_decrement(self.of(rows.kind()), 1);
+        if let AuxiliaryValue::Summary(positioned) = &weighed.value {
+            saturating_decrement(self.of(positioned.rows.kind()), 1);
             saturating_decrement(&self.bytes, usize_as_u64(weighed.bytes));
         }
     }
@@ -571,7 +718,7 @@ impl AuxiliaryCache {
         &self,
         store: &DataStore,
         key: &FileSummaryKey<'_>,
-    ) -> Option<Arc<FileRowSet>> {
+    ) -> Option<Arc<PositionedRowSet>> {
         summary_of(
             &self
                 .tier
@@ -588,16 +735,16 @@ impl AuxiliaryCache {
         store: &DataStore,
         key: &FileSummaryKey<'_>,
         fill: F,
-    ) -> Result<Arc<FileRowSet>>
+    ) -> Result<Arc<PositionedRowSet>>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Arc<FileRowSet>>> + Send + 'static,
+        Fut: Future<Output = Result<Arc<PositionedRowSet>>> + Send + 'static,
     {
         let fill = fill();
         let summaries = Arc::clone(&self.summaries);
         let fill = || async move {
-            fill.await.map(|rows| {
-                let weighed = Weighed::from(AuxiliaryValue::Summary(rows));
+            fill.await.map(|positioned| {
+                let weighed = Weighed::from(AuxiliaryValue::Summary(positioned));
                 summaries.entered(&weighed);
                 weighed
             })
@@ -663,9 +810,9 @@ impl AuxiliaryCache {
         &self,
         store: &DataStore,
         key: &FileSummaryKey<'_>,
-        rows: &Arc<FileRowSet>,
+        positioned: &Arc<PositionedRowSet>,
     ) {
-        let weighed = Weighed::from(AuxiliaryValue::Summary(Arc::clone(rows)));
+        let weighed = Weighed::from(AuxiliaryValue::Summary(Arc::clone(positioned)));
         self.summaries.entered(&weighed);
         self.tier
             .insert(Self::file_summary_key(store, key), weighed);
@@ -832,9 +979,9 @@ impl AuxiliaryCache {
     }
 }
 
-fn summary_of(value: &AuxiliaryValue) -> Option<Arc<FileRowSet>> {
+fn summary_of(value: &AuxiliaryValue) -> Option<Arc<PositionedRowSet>> {
     match value {
-        AuxiliaryValue::Summary(rows) => Some(Arc::clone(rows)),
+        AuxiliaryValue::Summary(positioned) => Some(Arc::clone(positioned)),
         AuxiliaryValue::Metadata(_)
         | AuxiliaryValue::Block(_)
         | AuxiliaryValue::DeletePositions(_) => None,

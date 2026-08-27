@@ -20,12 +20,30 @@ pub use census::{
 pub(crate) use handle::BACKFILL_FILE_READ_CONCURRENCY;
 pub(crate) use handle::Store;
 pub use handle::{
-    CachePreload, Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest,
+    CachePreload, Catalog, CatalogOptions, CommitMember, DeleteFileRegistration,
+    ExistingDeleteFile, LocatedDeletion, LocatedPositions, MaintenanceReport, MaintenanceRequest,
     MaintenanceStatusPass, MaintenanceStatusStep, MigrationRequest, ReadOnlyCatalog,
     RowSummaryWarmth,
 };
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;
+
+/// Resolves a data-file or delete-file path recorded relative to its table
+/// (or, when `path_is_relative` is false, already store-absolute) to the
+/// store key it lives under: `table_prefix` first, then `data_prefix` ahead
+/// of that when the store keeps data under a prefix of its own.
+pub(crate) fn resolve_data_path(
+    data_prefix: &str,
+    table_prefix: &str,
+    path: &str,
+    path_is_relative: bool,
+) -> String {
+    match (path_is_relative, data_prefix.is_empty()) {
+        (false, _) => path.to_owned(),
+        (true, true) => format!("{table_prefix}{path}"),
+        (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
+    }
+}
 pub use types::{
     BuildStep, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats,
     DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats,

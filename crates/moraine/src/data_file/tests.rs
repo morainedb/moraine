@@ -714,14 +714,21 @@ async fn simulated_remote_store_bench() {
     }
 }
 
-async fn write_fixture(object_store: &InMemory, path: &Path, batch: &RecordBatch) {
+/// Writes `batch` to `path` as a Parquet object, returning its byte size.
+pub(super) async fn write_fixture(
+    object_store: &InMemory,
+    path: &Path,
+    batch: &RecordBatch,
+) -> u64 {
     let mut buffer = Vec::new();
     {
         let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
         writer.write(batch).unwrap();
         writer.close().unwrap();
     }
+    let file_size = buffer.len() as u64;
     object_store.put(path, buffer.into()).await.unwrap();
+    file_size
 }
 
 fn fixture_batch() -> RecordBatch {
@@ -999,7 +1006,7 @@ fn fused_arrow_encoding_normalizes_signed_zero_identically() {
 
 /// The row-id column DuckLake's rewrite and flush writers append:
 /// BIGINT, tagged with the reserved field id — at any position.
-fn tagged_row_id_field(nullable: bool) -> Field {
+pub(super) fn tagged_row_id_field(nullable: bool) -> Field {
     Field::new("_ducklake_internal_row_id", DataType::Int64, nullable).with_metadata(
         std::collections::HashMap::from([(
             parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
