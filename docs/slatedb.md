@@ -30,6 +30,27 @@ does not reduce the underlying lookup amplification.
 
 Owner: [RFC 0016](rfcs/0016-equality-indexes.md).
 
+## Transaction commit memory
+
+### Move the write batch and accept explicit conflict keys
+
+SlateDB 0.15 clones `DbTransaction`'s complete `WriteBatch` at commit, then
+materializes every batch key into a `HashSet` for conflict tracking. Large
+equality-index commits therefore hold another complete batch plus one conflict
+node per index key at their peak. Recent committed transactions can retain the
+conflict set while an older transaction remains active.
+
+Commit should move the batch out of the consumed transaction. The transaction
+API should also accept an explicit write-conflict key set without first
+materializing every batch key. Moraine serializes every catalog batch through
+`sys/head`, so tracking index keys adds no conflict information.
+
+Until upstream provides both operations, Moraine accepts SlateDB's default
+all-write-key behavior and bounds commit peaks with equality-index entry and
+encoded-byte limits.
+
+Owner: [RFC 0016](rfcs/0016-equality-indexes.md).
+
 ## Cache identity
 
 ### Accept a caller-supplied stable cache scope

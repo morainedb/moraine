@@ -377,6 +377,20 @@ usage. `moraine_store_census` adds `filter_bytes`, `index_bytes`, and
 `stats_bytes` per subspace from the manifest, which is the store-side demand
 to compare with metadata capacity.
 
+`CACHE_MEMORY` is only the shared cache budget. It is not a process-memory
+limit and excludes SlateDB's WAL and memtables, decoded catalog projections,
+commit staging, DuckDB allocations, and allocator retention.
+
+**`moraine_memory_tally('lake')` — what live memory can be attributed.** One
+row reports this catalog's SlateDB WAL-plus-memtable gauge, its decoded
+projection estimate, and its last staged-row commit's equality-entry count
+and encoded batch bytes. The same row includes process-wide occupancy for
+SlateDB metadata, data blocks, and parsed Parquet metadata. The scopes are
+spelled out in the column meanings: cache residents are shared, while write
+buffers and projections belong to the named attach. This is logical
+accounting rather than RSS; the gap includes allocator overhead and retention,
+DuckDB, extension glue, and any dependency memory with no exported gauge.
+
 **`moraine_object_store_tally('lake')` — what SlateDB sent to storage.**
 One cumulative row per attach reports `main_gets`, `main_puts`, and
 `main_deletes`, the same three counts for a separately configured WAL store,

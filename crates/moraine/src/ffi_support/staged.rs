@@ -31,6 +31,7 @@ pub async fn staged_begin(
         data_store,
         data_prefix,
         catalog.data_reads(),
+        catalog.cache_counters(),
     ))
 }
 

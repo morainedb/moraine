@@ -225,6 +225,27 @@ pub struct CacheStatus {
     pub row_summaries: RowSummaryOccupancy,
 }
 
+/// Logical memory Moraine can attribute without sampling process RSS.
+/// Cache occupancy is process-wide; the other fields belong to one catalog.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MemoryTally {
+    /// SlateDB's current WAL-plus-memtable bytes for this catalog.
+    pub slatedb_unflushed_bytes: u64,
+    /// Estimated bytes in this handle's decoded catalog projections.
+    pub projection_bytes: u64,
+    /// Process-wide decoded SlateDB metadata cache occupancy.
+    pub cache_metadata_bytes: u64,
+    /// Process-wide SlateDB data-block cache occupancy.
+    pub cache_block_bytes: u64,
+    /// Process-wide parsed Parquet metadata occupancy.
+    pub auxiliary_metadata_bytes: u64,
+    /// Equality-index entries derived by the last staged-row commit.
+    pub last_commit_index_entries: u64,
+    /// Encoded key and value bytes in the last staged-row commit batch.
+    pub last_commit_staged_bytes: u64,
+}
+
 /// Resident file row-id summaries by shape, and their bytes together; the
 /// summary share of `auxiliary_metadata_occupancy_bytes`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +390,8 @@ fn rate(hits: u64, misses: u64) -> Option<f64> {
 /// and one for the process.
 #[derive(Debug, Default)]
 pub(crate) struct CacheCounters {
+    slatedb_unflushed_bytes: AtomicU64,
+    last_commit_memory: std::sync::RwLock<(u64, u64)>,
     metadata_hits: AtomicU64,
     metadata_misses: AtomicU64,
     block_hits: AtomicU64,
@@ -395,6 +418,24 @@ pub(crate) struct CacheCounters {
 }
 
 impl CacheCounters {
+    pub(crate) fn slatedb_unflushed_bytes(&self) -> u64 {
+        self.slatedb_unflushed_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_commit(&self, index_entries: u64, staged_bytes: u64) {
+        *self
+            .last_commit_memory
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (index_entries, staged_bytes);
+    }
+
+    pub(crate) fn last_commit_memory(&self) -> (u64, u64) {
+        *self
+            .last_commit_memory
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn tally(&self) -> CacheTally {
         CacheTally {
             metadata_hits: self.metadata_hits.load(Ordering::Relaxed),
@@ -610,8 +651,14 @@ impl MetricsRecorder for CacheRecorder {
         })
     }
 
-    fn register_gauge(&self, _: &str, _: &str, _: &[(&str, &str)]) -> Arc<dyn GaugeFn> {
-        Arc::new(Sink)
+    fn register_gauge(&self, name: &str, _: &str, _: &[(&str, &str)]) -> Arc<dyn GaugeFn> {
+        if name == slatedb::db_stats::TOTAL_MEM_SIZE_BYTES {
+            Arc::new(MemoryGauge {
+                store: Arc::clone(&self.store),
+            })
+        } else {
+            Arc::new(Sink)
+        }
     }
 
     fn register_up_down_counter(
@@ -642,6 +689,18 @@ impl MetricsRecorder for CacheRecorder {
 
 /// Every instrument this crate does not read.
 struct Sink;
+
+struct MemoryGauge {
+    store: Arc<CacheCounters>,
+}
+
+impl GaugeFn for MemoryGauge {
+    fn set(&self, value: i64) {
+        self.store
+            .slatedb_unflushed_bytes
+            .store(u64::try_from(value).unwrap_or_default(), Ordering::Relaxed);
+    }
+}
 
 impl GaugeFn for Sink {
     fn set(&self, _: i64) {}
@@ -1490,6 +1549,35 @@ mod tests {
         assert_eq!(tally.block_hits, 4);
         assert_eq!(tally.block_misses, 5);
         assert_eq!(tally.errors, 6);
+    }
+
+    /// SlateDB's logical WAL-plus-memtable gauge is retained per store;
+    /// unrelated gauges remain ignored.
+    #[test]
+    fn the_recorder_retains_slatedb_unflushed_bytes() {
+        let counters = Arc::new(CacheCounters::default());
+        let recorder = CacheRecorder {
+            store: Arc::clone(&counters),
+        };
+
+        recorder
+            .register_gauge(slatedb::db_stats::TOTAL_MEM_SIZE_BYTES, "", &[])
+            .set(42_000);
+        recorder.register_gauge("unknown", "", &[]).set(99_000);
+
+        assert_eq!(counters.slatedb_unflushed_bytes(), 42_000);
+    }
+
+    /// The last landed staged-row commit replaces both memory dimensions
+    /// together; failed attempts never call this recorder.
+    #[test]
+    fn the_last_commit_memory_is_a_single_snapshot() {
+        let counters = CacheCounters::default();
+        counters.record_commit(12, 34_000);
+        assert_eq!(counters.last_commit_memory(), (12, 34_000));
+
+        counters.record_commit(56, 78_000);
+        assert_eq!(counters.last_commit_memory(), (56, 78_000));
     }
 
     /// The same recorder retains SlateDB's physical object-store metrics,

@@ -411,6 +411,7 @@ pub struct StagedTransaction {
     data_store: Option<DataStore>,
     data_prefix: String,
     data_reads: Arc<data_file::DataStoreCounters>,
+    memory: Arc<crate::store::cache::CacheCounters>,
 }
 
 impl StagedTransaction {
@@ -425,6 +426,7 @@ impl StagedTransaction {
         data_store: Option<DataStore>,
         data_prefix: String,
         data_reads: Arc<data_file::DataStoreCounters>,
+        memory: Arc<crate::store::cache::CacheCounters>,
     ) -> Self {
         Self {
             diagnostic_id: next_diagnostic_id(),
@@ -438,6 +440,7 @@ impl StagedTransaction {
             data_store,
             data_prefix,
             data_reads,
+            memory,
         }
     }
 
@@ -452,6 +455,7 @@ impl StagedTransaction {
             None,
             None,
             String::new(),
+            Arc::default(),
             Arc::default(),
         )
     }
@@ -468,6 +472,7 @@ impl StagedTransaction {
             None,
             String::new(),
             Arc::default(),
+            catalog.cache_counters(),
         )
     }
 
@@ -481,6 +486,7 @@ impl StagedTransaction {
             None,
             Some(data_store),
             String::new(),
+            Arc::default(),
             Arc::default(),
         )
     }
@@ -1160,6 +1166,7 @@ impl StagedTransaction {
             data_store,
             data_prefix,
             data_reads,
+            memory,
         } = self;
         let durability = catalog_store
             .as_deref()
@@ -1312,6 +1319,11 @@ impl StagedTransaction {
                 phases.land = phase_started.elapsed();
                 match landed {
                     commit::Landed::Committed(commit_timings) => {
+                        let index_entries = phases
+                            .index_metrics
+                            .additions
+                            .saturating_add(phases.index_metrics.deletions);
+                        memory.record_commit(index_entries, staged_bytes.0);
                         staged_landed(
                             diagnostic_id,
                             result_id,
@@ -1324,6 +1336,8 @@ impl StagedTransaction {
                         Ok(CommitReport {
                             snapshot_id: SnapshotId::new(result_id),
                             deferred_indexes,
+                            index_entries,
+                            staged_bytes: staged_bytes.0,
                         })
                     }
                     commit::Landed::LostRace => {
@@ -1357,6 +1371,10 @@ pub struct CommitReport {
     pub snapshot_id: SnapshotId,
     /// Deferred-maintenance indexes this commit left `Maintaining`.
     pub deferred_indexes: Vec<IndexId>,
+    /// Equality-index entries derived by this commit.
+    pub index_entries: u64,
+    /// Encoded key and value bytes in the committed store batch.
+    pub staged_bytes: u64,
 }
 
 /// The writes a batch carries, the snapshot id it results in, and the

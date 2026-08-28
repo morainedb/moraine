@@ -272,7 +272,8 @@ pub use fault::{CrashCase, CrashPoint, SyntheticMigration, inject_crash, install
 pub mod fuzz;
 pub use store::{
     cache::{
-        CacheStatus, CacheTally, ObjectStoreTally, RowSummaryOccupancy, cache_status, cache_tally,
+        CacheStatus, CacheTally, MemoryTally, ObjectStoreTally, RowSummaryOccupancy, cache_status,
+        cache_tally,
     },
     index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder},
 };

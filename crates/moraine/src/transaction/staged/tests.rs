@@ -1754,6 +1754,7 @@ async fn commit_reports_the_deferred_indexes_it_leaves_maintaining() {
         Some(DataStore::new(store)),
         String::new(),
         Arc::default(),
+        catalog.cache_counters(),
     );
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,

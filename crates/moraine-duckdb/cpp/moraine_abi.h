@@ -329,6 +329,24 @@ typedef struct MoraineCacheStatus {
   uint64_t auxiliary_metadata_evictions;
 } MoraineCacheStatus;
 
+// Logical memory attributed to one catalog and the process-shared caches.
+typedef struct MoraineMemoryTally {
+  // SlateDB WAL-plus-memtable bytes for this catalog.
+  uint64_t slatedb_unflushed_bytes;
+  // Estimated decoded catalog projection bytes for this handle.
+  uint64_t projection_bytes;
+  // Process-wide decoded SlateDB metadata cache occupancy.
+  uint64_t cache_metadata_bytes;
+  // Process-wide SlateDB data-block cache occupancy.
+  uint64_t cache_block_bytes;
+  // Process-wide parsed Parquet metadata occupancy.
+  uint64_t auxiliary_metadata_bytes;
+  // Equality-index entries derived by the last staged-row commit.
+  uint64_t last_commit_index_entries;
+  // Encoded bytes in the last staged-row commit batch.
+  uint64_t last_commit_staged_bytes;
+} MoraineMemoryTally;
+
 // Physical object-store requests one catalog has issued, as returned by
 // [`moraine_catalog_object_store_tally`].
 typedef struct MoraineObjectStoreTally {
@@ -1138,9 +1156,11 @@ extern "C" {
 // process-wide, and the three differ on that: `cache_dir` is where each
 // store's disk tier lives and is recovered from (null keeps the caches in
 // memory); `cache_size_bytes` caps **each store's** device, so peak disk is
-// that figure times the attached stores; `cache_memory_bytes` is the one
-// true process total, bounding memory across every store's cache and the
-// parsed-footer cache. `0` means "not given" for either byte count.
+// that figure times the attached stores; `cache_memory_bytes` is the
+// process-shared cache budget across every store's cache and the
+// parsed-footer cache. It is not a process RSS limit: SlateDB write buffers,
+// catalog projections, commit staging, DuckDB, and allocator retention are
+// outside it. `0` means "not given" for either byte count.
 //
 // `cache_preload` warms this store into that cache before the attach
 // returns: `0` loads nothing, `1` each subspace's SST metadata, `2` the
@@ -1673,6 +1693,15 @@ int32_t moraine_catalog_cache_tally(struct MoraineCatalogHandle *handle,
 //
 // `out_status` must be valid and writable for the duration of the call.
 int32_t moraine_cache_status(struct MoraineCacheStatus *out_status);
+
+// Returns logical memory attributed to one attached catalog.
+//
+// # Safety
+//
+// `handle` must be a live handle from [`moraine_attach`] and `out_tally`
+// must be valid and writable for the duration of the call.
+int32_t moraine_catalog_memory_tally(struct MoraineCatalogHandle *handle,
+                                     struct MoraineMemoryTally *out_tally);
 
 // Physical object-store requests one attached catalog has issued.
 //
