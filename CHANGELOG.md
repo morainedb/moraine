@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/morainedb/moraine/compare/v0.6.1...v0.6.2) - 2026-08-28
+
+### Added
+
+- delete located rows without a scan ([#182](https://github.com/morainedb/moraine/pull/182))
+- flush the write-ahead log on commit, as an attach option ([#176](https://github.com/morainedb/moraine/pull/176))
+- prune located DELETE, UPDATE, and EXISTS scans by resolved rows ([#180](https://github.com/morainedb/moraine/pull/180))
+
+### Fixed
+
+- bound equality index commit memory ([#185](https://github.com/morainedb/moraine/pull/185))
+- take a read again when its body dies mid-stream ([#184](https://github.com/morainedb/moraine/pull/184))
+- remove index entries for a data file dropped by a covering delete ([#175](https://github.com/morainedb/moraine/pull/175))
+- stamp the chunk-identity format from the staged commit path ([#173](https://github.com/morainedb/moraine/pull/173))
+
+### Other
+
+- bound derived file-id filters by files rather than rows ([#181](https://github.com/morainedb/moraine/pull/181))
+
 ## [0.6.1](https://github.com/morainedb/moraine/compare/v0.6.0...v0.6.1) - 2026-08-21
 
 ### Added
