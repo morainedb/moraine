@@ -24,7 +24,7 @@ use crate::{
     store::{
         cache,
         handle::{ReadHandle, ScanShape},
-        key,
+        key, retry,
         segment::TagSegmentExtractor,
     },
 };
@@ -86,11 +86,13 @@ pub(crate) struct StoreBuilder<'a> {
 
 impl<'a> StoreBuilder<'a> {
     /// A builder for the store at `path` on `object_store`, with the default
-    /// flush cadence and no on-disk object cache.
+    /// flush cadence and no on-disk object cache. Every store SlateDB is
+    /// opened on reads through retries, since SlateDB drains some of its
+    /// reads outside its own.
     pub(crate) fn new(path: &'a str, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             path,
-            object_store,
+            object_store: retry::Store::wrap(object_store),
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
