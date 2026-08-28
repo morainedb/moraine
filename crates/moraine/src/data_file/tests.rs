@@ -1582,3 +1582,166 @@ async fn each_delete_file_memoizes_its_own_positions() {
     assert_eq!(lengths, [100, 200]);
     assert_eq!(metrics.tally().parquet_files, 2);
 }
+
+/// A store that answers its first `failures` reads with a body that
+/// yields one chunk and then dies, the shape a dropped connection takes
+/// mid-read.
+#[derive(Debug)]
+struct DroppedBodies {
+    inner: InMemory,
+    failures: AtomicUsize,
+    reads: AtomicU64,
+}
+
+impl DroppedBodies {
+    fn new(failures: usize) -> Self {
+        Self {
+            inner: InMemory::new(),
+            failures: AtomicUsize::new(failures),
+            reads: AtomicU64::new(0),
+        }
+    }
+
+    fn reads(&self) -> u64 {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+impl std::fmt::Display for DroppedBodies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DroppedBodies({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for DroppedBodies {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.get_opts(location, options).await?;
+        let dropping = self
+            .failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if !dropping {
+            return Ok(result);
+        }
+
+        let body = futures::stream::iter([
+            Ok(bytes::Bytes::from_static(b"h")),
+            Err(object_store::Error::Generic {
+                store: "DroppedBodies",
+                source: "connection closed before the body ended".into(),
+            }),
+        ]);
+        Ok(GetResult {
+            payload: object_store::GetResultPayload::Stream(Box::pin(body)),
+            ..result
+        })
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A data-file read whose body dies partway is taken again, whole: the
+/// transport under a Parquet read fails without failing the read.
+#[tokio::test(start_paused = true)]
+async fn a_data_file_read_whose_body_dies_partway_is_taken_again() {
+    let flaky = Arc::new(DroppedBodies::new(2));
+    let path = Path::from("dropped.parquet");
+    flaky
+        .inner
+        .put(&path, PutPayload::from_static(b"parquet bytes"))
+        .await
+        .unwrap();
+    let data = DataStore::new(Arc::clone(&flaky) as Arc<dyn ObjectStore>);
+
+    let bytes = data.read_range(&path, 0..7).await.unwrap();
+
+    assert_eq!(bytes, bytes::Bytes::from_static(b"parquet"));
+    assert_eq!(flaky.reads(), 3, "two dropped bodies, then the whole range");
+}
+
+/// A body that never settles surfaces its own error, once the read's
+/// budget is spent.
+#[tokio::test(start_paused = true)]
+async fn a_data_file_body_that_never_settles_surfaces_its_error() {
+    let flaky = Arc::new(DroppedBodies::new(usize::MAX));
+    let path = Path::from("never-settles.parquet");
+    flaky
+        .inner
+        .put(&path, PutPayload::from_static(b"parquet bytes"))
+        .await
+        .unwrap();
+    let data = DataStore::new(Arc::clone(&flaky) as Arc<dyn ObjectStore>);
+
+    let error = data.read_range(&path, 0..7).await.unwrap_err();
+
+    assert!(
+        error.to_string().contains("connection closed"),
+        "the store's own error must survive the retries: {error}"
+    );
+    assert_eq!(flaky.reads(), 6, "the read spends its whole budget");
+}
+
+/// A missing data file is an answer, not a failure: it is not retried.
+#[tokio::test(start_paused = true)]
+async fn a_missing_data_file_is_reported_without_a_retry() {
+    let flaky = Arc::new(DroppedBodies::new(0));
+    let data = DataStore::new(Arc::clone(&flaky) as Arc<dyn ObjectStore>);
+
+    let error = data
+        .read_range(&Path::from("absent.parquet"), 0..7)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, object_store::Error::NotFound { .. }),
+        "a missing file must surface as such: {error}"
+    );
+    assert_eq!(flaky.reads(), 1, "a terminal answer is not retried");
+}

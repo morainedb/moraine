@@ -16,7 +16,7 @@ use std::{
 
 use bytes::Bytes;
 use foyer::{Cache, HybridCache};
-use object_store::{ObjectStoreExt, path::Path};
+use object_store::path::Path;
 use parquet::{
     errors::{ParquetError, Result as ParquetResult},
     file::metadata::{
@@ -837,8 +837,7 @@ impl AuxiliaryCache {
         let started = Instant::now();
         let fetched = file
             .store
-            .object_store()
-            .get_range(&file.path, range.clone())
+            .read_range(&file.path, range.clone())
             .await
             .map_err(|error| ParquetError::External(Box::new(error)))?;
         file.metrics
@@ -868,8 +867,7 @@ impl AuxiliaryCache {
             let started = Instant::now();
             let fetched = file
                 .store
-                .object_store()
-                .get_ranges(&file.path, &missing)
+                .read_ranges(&file.path, &missing)
                 .await
                 .map_err(|error| ParquetError::External(Box::new(error)))?;
             let total = fetched.iter().fold(0_u64, |sum, bytes| {
@@ -914,7 +912,14 @@ impl AuxiliaryCache {
         }
     }
 
+    /// Memoizes `bytes` as the file's content over `range`, unless they
+    /// fall short of filling it: a read that stopped early would otherwise
+    /// be served to every later reader of that range.
     fn admit_range(&self, file: &ParquetFile, range: &std::ops::Range<u64>, bytes: &Bytes) {
+        if usize_as_u64(bytes.len()) != range.end.saturating_sub(range.start) {
+            return;
+        }
+
         self.tier.insert_block(
             Self::range_key(file, range),
             Weighed::from(AuxiliaryValue::Block(bytes.clone())),
