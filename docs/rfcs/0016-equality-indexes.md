@@ -318,18 +318,22 @@ fits in memory at all. Three properties are load-bearing:
 - **Entries stage onto the transaction directly.** They never enter the
   write list the committer retains for the maintained projections. No
   projection reflects an index entry, so retaining them would hold a second
-  copy of the batch's largest part — plus the clone staging makes of it —
-  in memory for nothing.
+  copy of the batch's largest part in memory for nothing.
+
+Every catalog batch rewrites `sys/head`, including head-preserving maintenance,
+and the store admits only one writer process. Tracking every index key cannot
+reject a commit the head collision would admit, but SlateDB 0.15 nevertheless
+materializes the batch's complete key set for conflict detection. It also
+clones the transaction's write batch at commit. Moraine accepts that upstream
+behavior and bounds the resulting peak with count and encoded-byte limits.
 
 ### Commit size is bounded, and why it must be
 
-Heap profiling of a staging commit attributes roughly **a kilobyte of peak
-memory to every staged entry**, and almost none of it to moraine: the write
-batch, the WAL buffer's copy of it, the memtable's skiplist node, and the
-transaction's write-key set each hold their own copy or node. Removing
-moraine's own retained copy (above) accounted for about 8% of the total;
-after that there is nothing material left to win on this side. The cost is
-inherent to putting a key into a batch.
+Direct measurement with 49-byte keys attributed about 250 bytes per entry
+while staging and about 1.2 KiB per entry at commit peak. The latter included
+SlateDB's write-batch clone and conflict-key materialization as well as WAL and
+memtable work; it was not the encoded key size and was not all retained after
+the commit.
 
 A commit's footprint is therefore set by how many entries it stages, and a
 bulk load stages one per indexed row per index — memory proportional to the
@@ -337,17 +341,26 @@ whole table. Tens of millions of rows ask for tens of gigabytes, and the
 failure mode is not an error but a thrash: swapping, no progress, nothing
 logged. So `stage_index_entries` refuses a commit above
 `MAX_INDEX_ENTRIES_PER_COMMIT` before doing any work, with a message naming
-the count, the limit, the memory it would have needed, and the remedy —
-split the load. The limit admits commits needing about 8 GiB.
+the count, the limit, and the remedy — split the load. The limit is one
+million entries. A second 64 MiB ceiling over encoded index key and value
+bytes protects the same path from fewer unusually wide keys and is checked
+before each write enters SlateDB's batch.
 
 The refusal's text avoids DuckLake's four retry substrings, as the
 uniqueness rejection does: it is terminal, and re-running it reaches the
 same answer more slowly.
 
-The limit is a fixed safety invariant, not a `CatalogOptions` field. A caller
+Both limits are fixed safety invariants, not `CatalogOptions` fields. A caller
 cannot raise it and turn a bounded commit back into memory thrash; workloads
 above it must split the load or use a staged build. Changing the limit or
 making it configurable requires new measurements and a new design decision.
+
+The extension asks DuckDB to flush its allocators after a successful staged
+commit with at least 100,000 equality entries or 64 MiB of encoded batch data,
+and after a failed staged commit. DuckDB's flush also trims the system
+allocator used by the Rust static library. This does not change live-memory
+accounting; it returns free arenas that a large commit would otherwise leave
+in process RSS. Ordinary small successful commits avoid the global flush.
 
 The remedy the refusal names — split the load — is only available to a
 writer that chooses its own batch boundaries. A DuckLake maintenance call

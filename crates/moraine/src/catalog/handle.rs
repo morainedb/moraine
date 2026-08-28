@@ -41,7 +41,10 @@ use crate::{
     data_file,
     error::{Error, Result},
     store::{
-        cache::{CacheCounters, CacheTally, ObjectStoreTally, cache_status, metadata_shortfall},
+        cache::{
+            CacheCounters, CacheTally, MemoryTally, ObjectStoreTally, cache_status,
+            metadata_shortfall,
+        },
         census,
         handle::{ReadHandle, ReadSession},
         open::{self, StoreBuilder},
@@ -202,8 +205,9 @@ pub struct CatalogOptions {
     /// Process-wide, like [`cache_size`](Self::cache_size).
     /// `None` (the default) takes what SlateDB gives a single store, now
     /// for the whole process. Never inert: the memory slots exist with or
-    /// without a `cache_dir`, and this is the number to weigh against
-    /// DuckDB's own `memory_limit` when sizing a host.
+    /// without a `cache_dir`. This bounds cache residents, not process RSS;
+    /// SlateDB write buffers, catalog projections, commit staging, DuckDB,
+    /// and allocator retention are additional when sizing a host.
     pub cache_memory: Option<u64>,
     /// What to warm into the cache while the catalog opens, so the first
     /// query pays no first touch. Warming is reading, so it is bounded by
@@ -475,6 +479,26 @@ impl ReadOnlyCatalog {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .estimated_bytes()
+    }
+
+    /// Logical memory attributed to this catalog and the process-shared caches.
+    #[must_use]
+    pub fn memory_tally(&self) -> MemoryTally {
+        let status = cache_status();
+        let (last_commit_index_entries, last_commit_staged_bytes) = self.cache.last_commit_memory();
+        MemoryTally {
+            slatedb_unflushed_bytes: self.cache.slatedb_unflushed_bytes(),
+            projection_bytes: self.projection_bytes(),
+            cache_metadata_bytes: status.metadata_occupancy_bytes,
+            cache_block_bytes: status.block_occupancy_bytes,
+            auxiliary_metadata_bytes: status.auxiliary_metadata_occupancy_bytes,
+            last_commit_index_entries,
+            last_commit_staged_bytes,
+        }
+    }
+
+    pub(crate) fn cache_counters(&self) -> Arc<CacheCounters> {
+        Arc::clone(&self.cache)
     }
 
     /// Physical object-store requests this catalog has issued since it

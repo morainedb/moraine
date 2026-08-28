@@ -625,9 +625,11 @@ fn cache_preload_option(cache_preload: u8) -> Result<Option<moraine::CachePreloa
 /// process-wide, and the three differ on that: `cache_dir` is where each
 /// store's disk tier lives and is recovered from (null keeps the caches in
 /// memory); `cache_size_bytes` caps **each store's** device, so peak disk is
-/// that figure times the attached stores; `cache_memory_bytes` is the one
-/// true process total, bounding memory across every store's cache and the
-/// parsed-footer cache. `0` means "not given" for either byte count.
+/// that figure times the attached stores; `cache_memory_bytes` is the
+/// process-shared cache budget across every store's cache and the
+/// parsed-footer cache. It is not a process RSS limit: SlateDB write buffers,
+/// catalog projections, commit staging, DuckDB, and allocator retention are
+/// outside it. `0` means "not given" for either byte count.
 ///
 /// `cache_preload` warms this store into that cache before the attach
 /// returns: `0` loads nothing, `1` each subspace's SST metadata, `2` the
@@ -2339,6 +2341,26 @@ pub struct MoraineCacheStatus {
     pub auxiliary_metadata_evictions: u64,
 }
 
+/// Logical memory attributed to one catalog and the process-shared caches.
+#[repr(C)]
+#[derive(Default)]
+pub struct MoraineMemoryTally {
+    /// SlateDB WAL-plus-memtable bytes for this catalog.
+    pub slatedb_unflushed_bytes: u64,
+    /// Estimated decoded catalog projection bytes for this handle.
+    pub projection_bytes: u64,
+    /// Process-wide decoded SlateDB metadata cache occupancy.
+    pub cache_metadata_bytes: u64,
+    /// Process-wide SlateDB data-block cache occupancy.
+    pub cache_block_bytes: u64,
+    /// Process-wide parsed Parquet metadata occupancy.
+    pub auxiliary_metadata_bytes: u64,
+    /// Equality-index entries derived by the last staged-row commit.
+    pub last_commit_index_entries: u64,
+    /// Encoded bytes in the last staged-row commit batch.
+    pub last_commit_staged_bytes: u64,
+}
+
 fn duration_nanoseconds(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
@@ -2753,6 +2775,40 @@ pub unsafe extern "C" fn moraine_cache_status(out_status: *mut MoraineCacheStatu
                 auxiliary_metadata_capacity_bytes: status.auxiliary_metadata_capacity_bytes,
                 auxiliary_metadata_occupancy_bytes: status.auxiliary_metadata_occupancy_bytes,
                 auxiliary_metadata_evictions: status.auxiliary_metadata_evictions,
+            };
+        }
+        codes::OK
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(codes::INTERNAL)
+}
+
+/// Returns logical memory attributed to one attached catalog.
+///
+/// # Safety
+///
+/// `handle` must be a live handle from [`moraine_attach`] and `out_tally`
+/// must be valid and writable for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_catalog_memory_tally(
+    handle: *mut MoraineCatalogHandle,
+    out_tally: *mut MoraineMemoryTally,
+) -> i32 {
+    let attempt = || {
+        if handle.is_null() || out_tally.is_null() {
+            return codes::INVALID_ARGUMENT;
+        }
+        // SAFETY: caller contract for `handle`.
+        let tally = unsafe { &*handle }.catalog.reads().memory_tally();
+        // SAFETY: checked non-null above; caller contract for validity.
+        unsafe {
+            *out_tally = MoraineMemoryTally {
+                slatedb_unflushed_bytes: tally.slatedb_unflushed_bytes,
+                projection_bytes: tally.projection_bytes,
+                cache_metadata_bytes: tally.cache_metadata_bytes,
+                cache_block_bytes: tally.cache_block_bytes,
+                auxiliary_metadata_bytes: tally.auxiliary_metadata_bytes,
+                last_commit_index_entries: tally.last_commit_index_entries,
+                last_commit_staged_bytes: tally.last_commit_staged_bytes,
             };
         }
         codes::OK

@@ -1,5 +1,7 @@
 #include "transaction_manager.hpp"
 
+#include "duckdb/common/allocator.hpp"
+
 #include "catalog.hpp"
 
 #include <mutex>
@@ -248,6 +250,16 @@ duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientCon
 	// flight returns promptly while the write still lands or fails whole
 	// — the ambiguity documented on moraine_tx_commit.
 	auto code = moraine_tx_commit(staged, &new_snapshot_id, moraine_shim_is_interrupted, &context, &err);
+	MoraineMemoryTally memory {};
+	auto measured = code == MORAINE_OK &&
+	                moraine_catalog_memory_tally(catalog_.Handle(), &memory) == MORAINE_OK;
+	constexpr uint64_t ALLOCATOR_FLUSH_INDEX_ENTRIES = 100'000;
+	constexpr uint64_t ALLOCATOR_FLUSH_STAGED_BYTES = 64ULL * 1024ULL * 1024ULL;
+	if (code != MORAINE_OK ||
+	    (measured && (memory.last_commit_index_entries >= ALLOCATOR_FLUSH_INDEX_ENTRIES ||
+	                  memory.last_commit_staged_bytes >= ALLOCATOR_FLUSH_STAGED_BYTES))) {
+		duckdb::Allocator::FlushAll();
+	}
 	drain();
 	if (code != MORAINE_OK) {
 		try {

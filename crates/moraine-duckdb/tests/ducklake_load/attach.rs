@@ -365,6 +365,26 @@ fn ducklake_attach_cache_preload_warms_indexed_tables() {
     );
 }
 
+/// The memory tally separates per-catalog write buffers and projections
+/// from process-shared cache occupancy, and remembers the landed commit.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn ducklake_attach_reports_attributed_memory() {
+    let dir = TempDir::new("memory-tally-store");
+    let data_dir = TempDir::new("memory-tally-data");
+    let rows = csv_rows(&run_ducklake_sql(
+        dir.path(),
+        data_dir.path(),
+        "CREATE TABLE lake.main.t(id BIGINT); \
+         SELECT last_commit_staged_bytes > 0, last_commit_index_entries = 0, \
+                slatedb_unflushed_bytes >= 0, projection_bytes >= 0, \
+                cache_metadata_bytes >= 0, cache_block_bytes >= 0, \
+                auxiliary_metadata_bytes >= 0 \
+         FROM moraine_memory_tally('lake');",
+    ));
+    assert_eq!(rows.last(), Some(&vec!["true".to_string(); 7]));
+}
+
 /// An attach naming no `META_CACHE_PRELOAD` preloads at the `'l0'` level:
 /// the open-time warm reads through the cache, and its counters are settled
 /// by the time ATTACH returns.

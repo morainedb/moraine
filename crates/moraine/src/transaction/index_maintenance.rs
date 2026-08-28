@@ -65,10 +65,42 @@ const UNIQUENESS_PROBE_CONCURRENCY: usize = 1024;
 /// backpressure pauses addition sources without holding up deletion staging.
 const ADDITION_PREFETCH: usize = 512;
 
-/// The most entries one commit may stage. Each staged key costs roughly a
-/// kilobyte in the store's write path, so this admits commits needing
-/// about 8 GiB.
-const MAX_INDEX_ENTRIES_PER_COMMIT: usize = 8_000_000;
+/// The most equality-index entries one commit may derive.
+const MAX_INDEX_ENTRIES_PER_COMMIT: usize = 1_000_000;
+
+/// The most encoded equality-index key and value bytes one commit may stage.
+const MAX_INDEX_STAGED_BYTES_PER_COMMIT: u64 = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct IndexCommitBudget {
+    entries: usize,
+    staged_bytes: u64,
+}
+
+impl IndexCommitBudget {
+    fn with_entries(entries: usize) -> Result<Self> {
+        let mut budget = Self::default();
+        budget.observe_entry(entries)?;
+        Ok(budget)
+    }
+
+    fn observe_entry(&mut self, additional: usize) -> Result<()> {
+        self.entries = self.entries.saturating_add(additional);
+        if self.entries > MAX_INDEX_ENTRIES_PER_COMMIT {
+            return Err(oversized_commit(self.entries));
+        }
+        Ok(())
+    }
+
+    fn stage_bytes(&mut self, additional: u64) -> Result<()> {
+        let staged = self.staged_bytes.saturating_add(additional);
+        if staged > MAX_INDEX_STAGED_BYTES_PER_COMMIT {
+            return Err(oversized_staged_bytes(staged));
+        }
+        self.staged_bytes = staged;
+        Ok(())
+    }
+}
 
 /// What staging a batch's entries produced: the indexes a collision
 /// poisoned, and the bytes the entries put on the batch.
@@ -151,14 +183,23 @@ struct ProbePlanner {
 }
 
 impl ProbePlanner {
-    fn plan(&mut self, entry: Result<StagedIndexEntry>, entry_count: &mut usize) -> ProbePlan {
+    fn plan(
+        &mut self,
+        entry: Result<StagedIndexEntry>,
+        budget: &mut IndexCommitBudget,
+    ) -> ProbePlan {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => return ProbePlan::Failure(error),
         };
-        *entry_count = entry_count.saturating_add(1);
-        if *entry_count > MAX_INDEX_ENTRIES_PER_COMMIT {
-            return ProbePlan::Failure(oversized_commit(*entry_count));
+        if let Err(error) = budget.observe_entry(1) {
+            return ProbePlan::Failure(error);
+        }
+        let value_bytes = usize::from(entry.unique) * size_of::<u64>();
+        if let Err(error) = budget.stage_bytes(
+            u64::try_from(entry.key.len().saturating_add(value_bytes)).unwrap_or(u64::MAX),
+        ) {
+            return ProbePlan::Failure(error);
         }
         if entry.delete {
             return ProbePlan::Failure(Error::Corruption(
@@ -302,6 +343,15 @@ pub(crate) async fn stage_index_entries(
         );
         return Err(oversized_commit(entry_count));
     }
+    let encoded_bytes = entries.iter().fold(0_u64, |total, entry| {
+        let value_bytes = usize::from(entry.unique && !entry.delete) * size_of::<u64>();
+        total.saturating_add(
+            u64::try_from(entry.key.len().saturating_add(value_bytes)).unwrap_or(u64::MAX),
+        )
+    });
+    if encoded_bytes > MAX_INDEX_STAGED_BYTES_PER_COMMIT {
+        return Err(oversized_staged_bytes(encoded_bytes));
+    }
 
     let (deletes, puts): (Vec<_>, Vec<_>) = entries.into_iter().partition(|entry| entry.delete);
     let deletes = stream::iter(deletes.into_iter().map(Ok));
@@ -326,7 +376,7 @@ where
     let started = Instant::now();
     let mut staged = StagedBytes::default();
     let mut deleted_unique = HashSet::new();
-    let mut entry_count = prior_entry_count;
+    let mut budget = IndexCommitBudget::with_entries(prior_entry_count)?;
     let reader = ReadHandle::Tx(db_tx);
     let mut deletes = std::pin::pin!(guarded_deletions(reader, deletes));
     let mut entries = std::pin::pin!(entries);
@@ -361,7 +411,7 @@ where
                 },
                 addition = entries.next(), if !additions_done => if let Some(addition) = addition {
                     metrics.additions = metrics.additions.saturating_add(1);
-                    let plan = planner.plan(addition, &mut entry_count);
+                    let plan = planner.plan(addition, &mut budget);
                     schedule_probe_plan(
                         plan,
                         reader,
@@ -382,10 +432,8 @@ where
             break;
         };
         let entry = entry?;
-        entry_count = entry_count.saturating_add(1);
-        if entry_count > MAX_INDEX_ENTRIES_PER_COMMIT {
-            return Err(oversized_commit(entry_count));
-        }
+        budget.observe_entry(1)?;
+        budget.stage_bytes(u64::try_from(entry.key.len()).unwrap_or(u64::MAX))?;
         if !entry.delete {
             return Err(Error::Corruption(
                 "index deletion stream contains a put".to_owned(),
@@ -416,7 +464,7 @@ where
                 },
                 addition = entries.next() => if let Some(addition) = addition {
                     metrics.additions = metrics.additions.saturating_add(1);
-                    let plan = planner.plan(addition, &mut entry_count);
+                    let plan = planner.plan(addition, &mut budget);
                     schedule_probe_plan(
                         plan,
                         reader,
@@ -545,17 +593,22 @@ pub(crate) fn apply_deferred_maintenance(
     }
 }
 
-/// The refusal for a commit staging more entries than
-/// [`MAX_INDEX_ENTRIES_PER_COMMIT`]. The text must avoid DuckLake's retry
+/// The refusal for a commit deriving too many equality-index entries. The
+/// text must avoid DuckLake's retry
 /// substrings (`conflict`, `concurrent`, `unique`, `primary key`).
 fn oversized_commit(staged: usize) -> Error {
-    // A kilobyte apiece, rounded to the nearest GiB.
-    let gib = (staged + 512 * 1024) / (1024 * 1024);
     Error::Constraint(format!(
         "commit stages {staged} equality-index entries, above the \
-         {MAX_INDEX_ENTRIES_PER_COMMIT} a single commit allows; at about a kilobyte \
-         apiece in the store's write path it would need roughly {gib} GiB of \
-         memory. Split the work into several smaller commits."
+         {MAX_INDEX_ENTRIES_PER_COMMIT} a single commit allows. Split the work into \
+         several smaller commits."
+    ))
+}
+
+fn oversized_staged_bytes(staged: u64) -> Error {
+    Error::Constraint(format!(
+        "commit stages {staged} encoded equality-index bytes, above the \
+         {MAX_INDEX_STAGED_BYTES_PER_COMMIT} a single commit allows. Split the work into \
+         several smaller commits."
     ))
 }
 
@@ -942,12 +995,16 @@ mod tests {
     /// re-running this one only reaches the same answer more slowly.
     #[test]
     fn oversized_commit_refusal_avoids_ducklake_retry_substrings() {
-        let text = oversized_commit(13_400_000).to_string();
-        for substring in ["conflict", "concurrent", "unique", "primary key"] {
-            assert!(
-                !text.contains(substring),
-                "{text:?} contains DuckLake's retry substring {substring:?}"
-            );
+        for text in [
+            oversized_commit(1_000_001).to_string(),
+            oversized_staged_bytes(64 * 1024 * 1024 + 1).to_string(),
+        ] {
+            for substring in ["conflict", "concurrent", "unique", "primary key"] {
+                assert!(
+                    !text.contains(substring),
+                    "{text:?} contains DuckLake's retry substring {substring:?}"
+                );
+            }
         }
     }
 
@@ -955,10 +1012,31 @@ mod tests {
     /// the one thing the caller can do about it.
     #[test]
     fn oversized_commit_refusal_is_actionable() {
-        let text = oversized_commit(13_400_000).to_string();
-        assert!(text.contains("13400000"), "names the count: {text}");
-        assert!(text.contains("8000000"), "names the limit: {text}");
-        assert!(text.contains("13 GiB"), "names the memory: {text}");
+        let text = oversized_commit(1_000_001).to_string();
+        assert!(text.contains("1000001"), "names the count: {text}");
+        assert!(text.contains("1000000"), "names the limit: {text}");
         assert!(text.contains("smaller commits"), "names the remedy: {text}");
+    }
+
+    /// The entry ceiling bounds ordinary narrow keys, while the byte
+    /// ceiling stops a smaller number of unusually wide keys.
+    #[test]
+    fn index_commit_budget_enforces_both_dimensions() {
+        let mut budget = IndexCommitBudget::default();
+        assert!(budget.observe_entry(MAX_INDEX_ENTRIES_PER_COMMIT).is_ok());
+        assert!(budget.observe_entry(1).is_err());
+
+        let mut budget = IndexCommitBudget::default();
+        assert!(
+            budget
+                .stage_bytes(MAX_INDEX_STAGED_BYTES_PER_COMMIT)
+                .is_ok()
+        );
+        let error = budget.stage_bytes(1).unwrap_err().to_string();
+        assert!(error.contains("67108864"), "names the byte limit: {error}");
+        assert!(
+            error.contains("smaller commits"),
+            "names the remedy: {error}"
+        );
     }
 }

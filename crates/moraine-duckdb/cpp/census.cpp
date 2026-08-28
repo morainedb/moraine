@@ -305,6 +305,46 @@ void CacheStatusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, 
 	output.SetCardinality(1);
 }
 
+duckdb::unique_ptr<duckdb::FunctionData> MemoryTallyBind(duckdb::ClientContext &,
+                                                         duckdb::TableFunctionBindInput &input,
+                                                         duckdb::vector<duckdb::LogicalType> &return_types,
+                                                         duckdb::vector<duckdb::string> &names) {
+	if (input.inputs[0].IsNull()) {
+		throw duckdb::BinderException("moraine_memory_tally: the lake name must not be NULL");
+	}
+	auto bind_data = duckdb::make_uniq<TallyBindData>();
+	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
+	names = {"slatedb_unflushed_bytes", "projection_bytes", "cache_metadata_bytes", "cache_block_bytes",
+	         "auxiliary_metadata_bytes", "last_commit_index_entries", "last_commit_staged_bytes"};
+	return_types.assign(names.size(), duckdb::LogicalType::UBIGINT);
+	return bind_data;
+}
+
+void MemoryTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
+                     duckdb::DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<TallyBindData>();
+	auto &state = data.global_state->Cast<TallyGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+
+	MoraineMemoryTally tally {};
+	auto code = moraine_catalog_memory_tally(ResolveMoraineCatalog(context, bind_data.catalog_name).Handle(), &tally);
+	if (code != MORAINE_OK) {
+		throw duckdb::InternalException("moraine_memory_tally: could not read memory accounting");
+	}
+	output.SetValue(0, 0, duckdb::Value::UBIGINT(tally.slatedb_unflushed_bytes));
+	output.SetValue(1, 0, duckdb::Value::UBIGINT(tally.projection_bytes));
+	output.SetValue(2, 0, duckdb::Value::UBIGINT(tally.cache_metadata_bytes));
+	output.SetValue(3, 0, duckdb::Value::UBIGINT(tally.cache_block_bytes));
+	output.SetValue(4, 0, duckdb::Value::UBIGINT(tally.auxiliary_metadata_bytes));
+	output.SetValue(5, 0, duckdb::Value::UBIGINT(tally.last_commit_index_entries));
+	output.SetValue(6, 0, duckdb::Value::UBIGINT(tally.last_commit_staged_bytes));
+	output.SetCardinality(1);
+}
+
 duckdb::unique_ptr<duckdb::FunctionData> ObjectStoreTallyBind(duckdb::ClientContext &,
                                                               duckdb::TableFunctionBindInput &input,
                                                               duckdb::vector<duckdb::LogicalType> &return_types,
@@ -380,6 +420,10 @@ void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader) {
 	duckdb::TableFunction cache_status("moraine_cache_status", {}, CacheStatusImpl, CacheStatusBind,
 	                                  TallyInitGlobal);
 	loader.RegisterFunction(cache_status);
+
+	duckdb::TableFunction memory_tally("moraine_memory_tally", {duckdb::LogicalType::VARCHAR}, MemoryTallyImpl,
+	                                  MemoryTallyBind, TallyInitGlobal);
+	loader.RegisterFunction(memory_tally);
 
 	duckdb::TableFunction object_store_tally("moraine_object_store_tally", {duckdb::LogicalType::VARCHAR},
 	                                         ObjectStoreTallyImpl, ObjectStoreTallyBind, TallyInitGlobal);
