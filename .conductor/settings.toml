@@ -14,6 +14,18 @@ if [ "$(uname -s)" = "Linux" ] && command -v dnf >/dev/null 2>&1; then
   if ! command -v gcc14-gcc >/dev/null 2>&1 || ! command -v gcc14-g++ >/dev/null 2>&1; then
     sudo dnf install -y gcc14 gcc14-c++
   fi
+
+  # `cargo xtask e2e` drives DuckDB's own cmake build, which generates
+  # Ninja. Amazon Linux ships neither.
+  if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+    sudo dnf install -y cmake ninja-build
+  fi
+
+  # The patched DuckLake resolves its dependencies through vcpkg, whose
+  # compiler probe configures with no explicit compiler set. GCC 14 under
+  # its prefixed name does not answer to `c++`, so without an unprefixed
+  # one that probe fails and takes the whole e2e build with it.
+  command -v c++ >/dev/null 2>&1 || sudo dnf install -y gcc-c++
 fi
 
 # Cloud workspaces start bare; a developer machine already has a toolchain,
@@ -75,4 +87,11 @@ if ! command -v ccache >/dev/null 2>&1 && ! command -v sccache >/dev/null 2>&1; 
 fi
 
 git config core.hooksPath .githooks
+
+# `cargo xtask check-pins` and `cargo xtask e2e` both read the `duckdb` and
+# `extension-ci-tools` submodules, which a fresh clone leaves empty.
+# Shallow, because nothing reads their history — only the pinned commits.
+# Not fatal: a workspace that cannot yet run e2e still beats one that
+# refused to be created, and check-pins names the checkout that repairs it.
+git submodule update --init --depth 1 || git submodule update --init || true
 '''
