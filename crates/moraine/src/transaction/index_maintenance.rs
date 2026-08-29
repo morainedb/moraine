@@ -157,7 +157,12 @@ enum ProbePlan {
     /// A repeated claim by the same row needs no write.
     Noop,
     /// Two rows in this batch claim one unique value.
-    Collision { index_id: u64, building: bool },
+    Collision {
+        index_id: u64,
+        building: bool,
+        claimant: u64,
+        holder: u64,
+    },
     /// Input, limit, or derivation failure at this stream position.
     Failure(Error),
 }
@@ -217,6 +222,8 @@ impl ProbePlanner {
                 ProbePlan::Collision {
                     index_id: entry.index_id,
                     building: entry.building,
+                    claimant: entry.row_id,
+                    holder,
                 }
             };
         }
@@ -231,12 +238,26 @@ impl ProbePlanner {
     }
 }
 
+/// Which state a rejected claim collided with: the commit's own additions,
+/// or a row the index already held.
+#[derive(Clone, Copy)]
+enum Collided {
+    InBatch,
+    Committed,
+}
+
 /// A collision's verdict: fail the commit, or poison the building index.
-fn collision(probe_index_id: u64, building: bool) -> Result<Option<u64>> {
+fn collision(
+    index_id: u64,
+    building: bool,
+    claimant: u64,
+    holder: u64,
+    collided: Collided,
+) -> Result<Option<u64>> {
     if building {
-        Ok(Some(probe_index_id))
+        Ok(Some(index_id))
     } else {
-        Err(unique_violation(probe_index_id))
+        Err(unique_violation(index_id, claimant, holder, collided))
     }
 }
 
@@ -271,8 +292,15 @@ fn schedule_probe_plan<'a>(
                 .max(u64::try_from(probes.len()).unwrap_or(u64::MAX));
         }
         ProbePlan::Noop => {}
-        ProbePlan::Collision { index_id, building } => {
-            if let Some(index_id) = collision(index_id, building)? {
+        ProbePlan::Collision {
+            index_id,
+            building,
+            claimant,
+            holder,
+        } => {
+            if let Some(index_id) =
+                collision(index_id, building, claimant, holder, Collided::InBatch)?
+            {
                 ready.push_back(ReadyAddition::Poison(index_id));
             }
         }
@@ -511,8 +539,14 @@ where
                 } else if let Some(bytes) = present {
                     match decode_row_id(&bytes) {
                         Ok(holder) if holder == probe.row_id => {}
-                        Ok(_) => {
-                            if let Some(index_id) = collision(probe.index_id, probe.building)? {
+                        Ok(holder) => {
+                            if let Some(index_id) = collision(
+                                probe.index_id,
+                                probe.building,
+                                probe.row_id,
+                                holder,
+                                Collided::Committed,
+                            )? {
                                 poisoned.push(index_id);
                             }
                         }
@@ -612,12 +646,21 @@ fn oversized_staged_bytes(staged: u64) -> Error {
     ))
 }
 
-/// A uniqueness error. The text must avoid DuckLake's retry substrings
-/// (`conflict`, `concurrent`, `unique`, `primary key`).
-fn unique_violation(index_id: u64) -> Error {
-    Error::Constraint(format!(
-        "duplicate value violates equality index {index_id}"
-    ))
+/// A uniqueness error, naming both rows and which state the claim collided
+/// with. The text must avoid DuckLake's retry substrings (`conflict`,
+/// `concurrent`, `unique`, `primary key`), and names row ids rather than the
+/// value, which no error on this path carries.
+fn unique_violation(index_id: u64, claimant: u64, holder: u64, collided: Collided) -> Error {
+    Error::Constraint(match collided {
+        Collided::InBatch => format!(
+            "duplicate value violates equality index {index_id}: rows {claimant} and {holder} in \
+             one commit claim the same value"
+        ),
+        Collided::Committed => format!(
+            "duplicate value violates equality index {index_id}: row {claimant} claims a value \
+             held by committed row {holder}"
+        ),
+    })
 }
 
 /// Deletes up to `limit` orphaned entries of one dropped index inside an
@@ -998,6 +1041,8 @@ mod tests {
         for text in [
             oversized_commit(1_000_001).to_string(),
             oversized_staged_bytes(64 * 1024 * 1024 + 1).to_string(),
+            unique_violation(24, 900, 17, Collided::Committed).to_string(),
+            unique_violation(24, 900, 901, Collided::InBatch).to_string(),
         ] {
             for substring in ["conflict", "concurrent", "unique", "primary key"] {
                 assert!(
@@ -1006,6 +1051,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A rejection names both rows and the state it collided with, so an
+    /// entry naming a row that is no longer live is one query away.
+    #[test]
+    fn unique_violation_names_both_rows_and_the_state_it_collided_with() {
+        let committed = unique_violation(24, 900, 17, Collided::Committed).to_string();
+        assert!(
+            committed.contains("index 24"),
+            "names the index: {committed}"
+        );
+        assert!(
+            committed.contains("row 900"),
+            "names the claimant: {committed}"
+        );
+        assert!(
+            committed.contains("row 17"),
+            "names the holder: {committed}"
+        );
+        assert!(
+            committed.contains("committed"),
+            "names the state: {committed}"
+        );
+
+        let in_batch = unique_violation(24, 900, 901, Collided::InBatch).to_string();
+        assert!(in_batch.contains("900"), "names the claimant: {in_batch}");
+        assert!(in_batch.contains("901"), "names the holder: {in_batch}");
+        assert!(
+            in_batch.contains("one commit"),
+            "names the state: {in_batch}"
+        );
     }
 
     /// It names the count, the limit, the memory it would have needed, and
