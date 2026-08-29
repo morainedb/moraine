@@ -40,6 +40,31 @@ enum {
 };
 
 
+// An index's build lifecycle, as [`moraine_indexes`] reports it. `building`
+// collapses everything but `Ready`, so a terminally poisoned index is
+// distinguishable only here.
+enum MoraineIndexState
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint8_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  // Serving lookups and enforcing uniqueness.
+  MoraineIndexState_Ready = 0,
+  // A staged backfill is in progress; lookups refuse.
+  MoraineIndexState_Building = 1,
+  // Awaiting bounded repair after deferred additions; lookups refuse.
+  MoraineIndexState_Maintaining = 2,
+  // A duplicate ended the build. Terminal: no progress resumes it.
+  MoraineIndexState_Poisoned = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum MoraineIndexState MoraineIndexState;
+#else
+typedef uint8_t MoraineIndexState;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
 // A parsed inline schema, opaque to C: the schema-only IPC stream of one
 // version decoded once and reused across every chunk of a scan.
 typedef struct MoraineArrowSchema MoraineArrowSchema;
@@ -384,8 +409,11 @@ typedef struct MoraineIndexDesc {
   uint64_t index_id;
   // Whether the index enforces uniqueness.
   bool unique;
-  // Whether a staged build is still in progress.
+  // Whether the index is anything but ready. True for a poisoned index,
+  // which no build is advancing — read `state` to tell them apart.
   bool building;
+  // The index's build lifecycle.
+  MoraineIndexState state;
   // The index name, owned — free via [`moraine_indexes_free`].
   char *name;
 } MoraineIndexDesc;

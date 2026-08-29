@@ -1347,9 +1347,9 @@ fn moraine_index_create_staged_builds_over_existing_data() {
     // The build finished: not building, and the backfilled rows resolve.
     assert_eq!(
         csv_rows(&run(
-            "SELECT is_building FROM moraine_indexes('lake','main','t');"
+            "SELECT is_building, state FROM moraine_indexes('lake','main','t');"
         )),
-        vec![vec!["false".to_string()]],
+        vec![vec!["false".to_string(), "ready".to_string()]],
         "the staged build flipped ready"
     );
     for value in ["0", "250", "499"] {

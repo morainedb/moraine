@@ -30,6 +30,23 @@ MoraineCatalogHandle *ResolveHandle(duckdb::ClientContext &context, const std::s
 
 // moraine_indexes: lists a table's live equality indexes.
 
+// `is_building` is true for every state but ready, so a poisoned index —
+// which no build is advancing — reads the same as one mid-build. This names
+// the state itself.
+const char *IndexStateName(MoraineIndexState state) {
+	switch (state) {
+	case MoraineIndexState_Ready:
+		return "ready";
+	case MoraineIndexState_Building:
+		return "building";
+	case MoraineIndexState_Maintaining:
+		return "maintaining";
+	case MoraineIndexState_Poisoned:
+		return "poisoned";
+	}
+	throw duckdb::InternalException("moraine_indexes: unknown index state %d", static_cast<int>(state));
+}
+
 struct IndexesBindData : public duckdb::FunctionData {
 	std::string catalog_name;
 	std::string schema_name;
@@ -39,6 +56,7 @@ struct IndexesBindData : public duckdb::FunctionData {
 		std::string name;
 		bool unique;
 		bool building;
+		std::string state;
 	};
 	std::vector<Row> rows;
 
@@ -75,13 +93,13 @@ duckdb::unique_ptr<duckdb::FunctionData> IndexesBind(duckdb::ClientContext &cont
 		ThrowMoraineError(err);
 	}
 	for (auto &desc : descs) {
-		bind_data->rows.push_back(
-		    {static_cast<int64_t>(desc.index_id), std::string(desc.name), desc.unique, desc.building});
+		bind_data->rows.push_back({static_cast<int64_t>(desc.index_id), std::string(desc.name), desc.unique,
+		                           desc.building, IndexStateName(desc.state)});
 	}
 
 	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN,
-	                duckdb::LogicalType::BOOLEAN};
-	names = {"index_id", "index_name", "is_unique", "is_building"};
+	                duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::VARCHAR};
+	names = {"index_id", "index_name", "is_unique", "is_building", "state"};
 	return bind_data;
 }
 
@@ -111,6 +129,7 @@ void IndexesImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 		output.SetValue(1, i, duckdb::Value(row.name));
 		output.SetValue(2, i, duckdb::Value::BOOLEAN(row.unique));
 		output.SetValue(3, i, duckdb::Value::BOOLEAN(row.building));
+		output.SetValue(4, i, duckdb::Value(row.state));
 	}
 	state.offset += count;
 	output.SetCardinality(count);
