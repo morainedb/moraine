@@ -82,6 +82,12 @@ exclude = [
     "ERROR",
 ]
 
+# Variants land in the global namespace of a header DuckDB's C++ includes,
+# where a bare `Ready` or `Building` is the same collision the export
+# exclusions above exist to avoid.
+[enum]
+prefix_with_name = true
+
 [export.rename]
 "FFI_ArrowSchema" = "ArrowSchema"
 "FFI_ArrowArray" = "ArrowArray"

@@ -290,6 +290,13 @@ value": deletes remove entries in the same batch that kills the row, so
 delete-then-reinsert behaves as SQL expects, within one commit or across
 commits.
 
+The rejection names the index, the claiming row, the holding row, and which
+state it collided with — the commit's own additions or a row already
+indexed. Those two branches otherwise produce the same message from
+different causes, and a holder that is not live says the index holds a stale
+entry rather than the table holding a duplicate. It names no indexed value:
+errors on this path carry shapes and counts, never key data.
+
 The `Constraint` here is a verb-path error (embedding API) — no DuckLake
 wire contract applies to its text. It is nonetheless worded free of the four
 substrings DuckLake's commit loop retries on, so a rejected bulk INSERT
@@ -985,7 +992,11 @@ internally in the same autonomous-commit style as the other DDL functions,
 returning once the index is `ready` or the build has failed. A cancelled
 or crashed call leaves the definition `building`: re-issuing the same call
 resumes from the cursor, and `moraine_index_drop` abandons the build.
-`moraine_indexes` exposes the state (`is_building`) for progress.
+`moraine_indexes` exposes the state for progress: `is_building` for the
+binary question, and `state` for which of `ready`, `building`,
+`maintaining`, or `poisoned` it is. A caller gating writes on readiness
+needs the latter — `is_building` is true for a poisoned definition, which no
+build is advancing, so it reads identically to one mid-build.
 `drop_index` on a building index is an ordinary drop: the builder's next
 step re-runs against the ended definition and stops.
 
@@ -1032,7 +1043,7 @@ written `…` below for brevity.
 | `moraine_index_in(…, keys)` | table function: row ids for the union of complete equality keys in `keys`. A single-column index takes a list of scalar values; a composite index takes a list of `row(...)` values in index-column order. Duplicate keys are one predicate, a key containing NULL matches no row, and an empty list returns no rows |
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
 | `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
-| `moraine_indexes(catalog, schema, table)` | table function: index introspection |
+| `moraine_indexes(catalog, schema, table)` | table function: index introspection — `index_id`, `index_name`, `is_unique`, `is_building`, and `state` (`ready`\|`building`\|`maintaining`\|`poisoned`) |
 | `moraine_delete_located(catalog, schema, table, rows)` | table function: delete the located rows without a scan (File-located deletion). `rows` is a list of `row(row_id, data_file_id)` pairs as a lookup returned them, a NULL file id naming an inlined row. Returns one row of counts: file rows deleted, inline rows deleted, delete files written |
 
 `moraine_index_in` binds `keys` as one constant list value (including a

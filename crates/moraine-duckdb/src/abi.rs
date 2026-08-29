@@ -1610,6 +1610,22 @@ pub unsafe extern "C" fn moraine_snapshot_data_files_of_free(
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
+/// An index's build lifecycle, as [`moraine_indexes`] reports it. `building`
+/// collapses everything but `Ready`, so a terminally poisoned index is
+/// distinguishable only here.
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum MoraineIndexState {
+    /// Serving lookups and enforcing uniqueness.
+    Ready = 0,
+    /// A staged backfill is in progress; lookups refuse.
+    Building = 1,
+    /// Awaiting bounded repair after deferred additions; lookups refuse.
+    Maintaining = 2,
+    /// A duplicate ended the build. Terminal: no progress resumes it.
+    Poisoned = 3,
+}
+
 /// One index, as returned by [`moraine_indexes`].
 #[repr(C)]
 pub struct MoraineIndexDesc {
@@ -1617,10 +1633,24 @@ pub struct MoraineIndexDesc {
     pub index_id: u64,
     /// Whether the index enforces uniqueness.
     pub unique: bool,
-    /// Whether a staged build is still in progress.
+    /// Whether the index is anything but ready. True for a poisoned index,
+    /// which no build is advancing — read `state` to tell them apart.
     pub building: bool,
+    /// The index's build lifecycle.
+    pub state: MoraineIndexState,
     /// The index name, owned — free via [`moraine_indexes_free`].
     pub name: *mut c_char,
+}
+
+impl From<moraine::IndexState> for MoraineIndexState {
+    fn from(state: moraine::IndexState) -> Self {
+        match state {
+            moraine::IndexState::Ready => Self::Ready,
+            moraine::IndexState::Building => Self::Building,
+            moraine::IndexState::Maintaining => Self::Maintaining,
+            moraine::IndexState::Poisoned => Self::Poisoned,
+        }
+    }
 }
 
 fn resolve_table(
@@ -2975,24 +3005,25 @@ pub unsafe extern "C" fn moraine_indexes(
             handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
-        let owned: Vec<(u64, bool, bool, CString)> = snapshot
+        let owned: Vec<(u64, bool, moraine::IndexState, CString)> = snapshot
             .indexes_of(table_id)
             .into_iter()
             .map(|index| {
                 Ok((
                     index.id.get(),
                     index.unique,
-                    index.state != moraine::IndexState::Ready,
+                    index.state,
                     to_c_string(index.name)?,
                 ))
             })
             .collect::<Result<_, AbiError>>()?;
         Ok(owned
             .into_iter()
-            .map(|(index_id, unique, building, name)| MoraineIndexDesc {
+            .map(|(index_id, unique, state, name)| MoraineIndexDesc {
                 index_id,
                 unique,
-                building,
+                building: state != moraine::IndexState::Ready,
+                state: state.into(),
                 name: name.into_raw(),
             })
             .collect())
@@ -4117,6 +4148,30 @@ mod tests {
         staged::moraine_tx_commit,
         test_support::{TempDir, attach_ok, begin},
     };
+
+    /// Every state maps to its own wire value, and only `Ready` clears
+    /// `is_building` — the distinction a caller gating on `is_building`
+    /// alone cannot make.
+    #[test]
+    fn every_index_state_maps_to_its_own_wire_value() {
+        for (state, expected) in [
+            (moraine::IndexState::Ready, MoraineIndexState::Ready),
+            (moraine::IndexState::Building, MoraineIndexState::Building),
+            (
+                moraine::IndexState::Maintaining,
+                MoraineIndexState::Maintaining,
+            ),
+            (moraine::IndexState::Poisoned, MoraineIndexState::Poisoned),
+        ] {
+            let mapped = MoraineIndexState::from(state);
+            assert_eq!(mapped as u8, expected as u8, "{state:?} maps to itself");
+            assert_eq!(
+                state == moraine::IndexState::Ready,
+                mapped as u8 == MoraineIndexState::Ready as u8,
+                "{state:?} agrees with the ready test `is_building` inverts"
+            );
+        }
+    }
 
     /// Seeds a catalog directly through the `moraine` API with one
     /// schema, one table with two columns and one data file, and one
