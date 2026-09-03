@@ -26,7 +26,7 @@ proptest = "1"
 proptest-derive = "0.8"
 roaring = "0.11"
 serde = { version = "1", features = ["derive"] }
-slatedb = "0.15.0"
+slatedb = "0.16.0"
 # must move in lockstep with slatedb: it is where the metrics traits live
 slatedb-common = "0.15.0"
 storekey = "0.11"
