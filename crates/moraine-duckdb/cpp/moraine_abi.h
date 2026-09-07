@@ -1989,6 +1989,10 @@ void moraine_locate_row_positions_free_inlined(uint64_t *items, size_t len);
 // delete files the caller already wrote; `inlined_rows` are row ids to
 // tombstone directly. Writes the minted snapshot id to `out_snapshot_id`.
 //
+// An interrupted call can leave its commit running in the background.
+// On failure, retain the supplied files for orphan cleanup: the error
+// does not establish that no catalog references were committed.
+//
 // # Safety
 //
 // Every pointer must be valid per the ABI contract; `registrations`
