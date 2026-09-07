@@ -6,9 +6,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "input=$(cat); cmd=$(printf '%s' \"$input\" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"tool_input\",{}).get(\"command\",\"\"))'); cwd=$(printf '%s' \"$input\" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"cwd\",\"\"))'); case \"$cmd\" in *\"git commit\"*) ;; *) exit 0;; esac; [ -n \"$cwd\" ] || cwd=\"$CLAUDE_PROJECT_DIR\"; top=$(git -C \"$cwd\" rev-parse --show-toplevel 2>/dev/null) || top=\"$cwd\"; { cd \"$top\" && cargo +nightly fmt --check && cargo clippy --workspace --all-targets -- -D warnings; } >&2 || { echo \"Blocked: cargo fmt --check or clippy failed in $top; fix before committing.\" >&2; exit 2; }",
+            "command": "input=$(cat); cmd=$(printf '%s' \"$input\" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"tool_input\",{}).get(\"command\",\"\"))'); cwd=$(printf '%s' \"$input\" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"cwd\",\"\"))'); case \"$cmd\" in *\"git commit\"*) ;; *) exit 0;; esac; [ -n \"$cwd\" ] || cwd=\"$CLAUDE_PROJECT_DIR\"; top=$(git -C \"$cwd\" rev-parse --show-toplevel 2>/dev/null) || top=\"$cwd\"; { cd \"$top\" && cargo +nightly-2026-08-29 fmt --check && cargo clippy --workspace --all-targets -- -D warnings; } >&2 || { echo \"Blocked: cargo fmt --check or clippy failed in $top; fix before committing.\" >&2; exit 2; }",
             "timeout": 600,
-            "statusMessage": "Pre-commit gate: cargo +nightly fmt --check && cargo clippy on the committed tree"
+            "statusMessage": "Pre-commit gate: cargo +nightly-2026-08-29 fmt --check && cargo clippy on the committed tree"
           }
         ]
       }

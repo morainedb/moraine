@@ -66,7 +66,7 @@ this file is the operational summary.
 ## The local gate
 
 ```bash
-cargo +nightly fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
+cargo +nightly-2026-08-29 fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
   && cargo test --workspace --locked \
   && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
   && cargo deny check -D advisory-not-detected \

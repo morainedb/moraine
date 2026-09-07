@@ -433,22 +433,24 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DeleteLocatedInitGlobal(duc
 			registration.new_positions_len = work.new_positions.size();
 			registrations.push_back(registration);
 		}
-
-		uint64_t snapshot_id = 0;
-		MoraineError commit_err {};
-		auto commit_code = moraine_commit_located_deletion(
-		    handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
-		    registrations.empty() ? nullptr : registrations.data(), registrations.size(),
-		    inlined.size() == 0 ? nullptr : inlined.begin(), inlined.size(), &snapshot_id, probe, probe_ctx,
-		    &commit_err);
-		if (commit_code != MORAINE_OK) {
-			ThrowMoraineError(commit_err);
-		}
 	} catch (...) {
 		for (auto &path : written_paths) {
 			fs.TryRemoveFile(path);
 		}
 		throw;
+	}
+
+	// A commit can outlive an interrupted call. Once it starts, retain its
+	// files on any error; orphan cleanup can reclaim files it never registered.
+	uint64_t snapshot_id = 0;
+	MoraineError commit_err {};
+	auto commit_code = moraine_commit_located_deletion(
+	    handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
+	    registrations.empty() ? nullptr : registrations.data(), registrations.size(),
+	    inlined.size() == 0 ? nullptr : inlined.begin(), inlined.size(), &snapshot_id, probe, probe_ctx,
+	    &commit_err);
+	if (commit_code != MORAINE_OK) {
+		ThrowMoraineError(commit_err);
 	}
 
 	auto result = duckdb::make_uniq<DeleteLocatedGlobalState>();

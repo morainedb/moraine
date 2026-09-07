@@ -28,13 +28,9 @@ if [ "$(uname -s)" = "Linux" ] && command -v dnf >/dev/null 2>&1; then
   command -v c++ >/dev/null 2>&1 || sudo dnf install -y gcc-c++
 fi
 
-# Cloud workspaces start bare; a developer machine already has a toolchain,
-# so this whole block is skipped there. The pinned channel installs itself
-# on first use from rust-toolchain.toml, but the gate's `cargo +nightly fmt`
-# needs a nightly rustfmt alongside it, and linking needs a C compiler.
+# Install Rust and a C compiler when the workspace starts without them.
 if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-  "$HOME/.cargo/bin/rustup" toolchain install nightly --profile minimal --component rustfmt
   command -v cc >/dev/null 2>&1 || sudo dnf install -y gcc
 fi
 
@@ -46,8 +42,8 @@ if ! command -v cargo >/dev/null 2>&1 && [ -d "$HOME/.cargo/bin" ]; then
   done
 fi
 
-# Materialize the pinned toolchain now rather than during someone's first
-# commit, when it would look like the hook hanging.
+# Install both pinned toolchains before the first commit invokes the hooks.
+rustup toolchain install nightly-2026-08-29 --profile minimal --component rustfmt
 cargo --version >/dev/null
 
 # `cargo xtask e2e` compiles DuckDB itself, and every workspace builds it

@@ -1,5 +1,5 @@
 # These options below are unstable: they take effect under
-# `cargo +nightly fmt` and are silently ignored by stable rustfmt.
+# `cargo +nightly-2026-08-29 fmt` and are silently ignored by stable rustfmt.
 style_edition = "2024"
 imports_granularity = "Crate"
 group_imports = "StdExternalCrate"
