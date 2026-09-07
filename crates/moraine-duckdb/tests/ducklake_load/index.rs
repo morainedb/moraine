@@ -2,6 +2,7 @@ use std::fmt::Write;
 
 use crate::helpers::*;
 
+mod prepared;
 mod schema_evolution;
 
 /// The equality-index SQL surface end to end: `moraine_index_create`
