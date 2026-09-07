@@ -28,9 +28,9 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::{
+    CacheIdentity,
     data_file::{
         DataStore, ParquetFile,
-        data_store::StoreIdentity,
         reader::ObjectStoreReader,
         row_set::{FileRowSet, FileRowSetKind, PositionedRowSet, RowOrder},
         usize_as_u64,
@@ -70,13 +70,13 @@ pub(super) struct FileSummaryKey<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum AuxiliaryKey {
     Metadata {
-        store: StoreIdentity,
+        store: CacheIdentity,
         path: String,
         file_size: u64,
         page_index: PageIndex,
     },
     Summary {
-        store: StoreIdentity,
+        store: CacheIdentity,
         table_id: u64,
         data_file_id: u64,
         path: String,
@@ -86,7 +86,7 @@ enum AuxiliaryKey {
     /// recorded size guards against a path reused at another length, as it
     /// does for the other two.
     Range {
-        store: StoreIdentity,
+        store: CacheIdentity,
         path: String,
         file_size: u64,
         start: u64,
@@ -96,7 +96,7 @@ enum AuxiliaryKey {
     /// the positions are a function of its bytes, not of the catalog
     /// record naming it.
     DeletePositions {
-        store: StoreIdentity,
+        store: CacheIdentity,
         path: String,
         file_size: u64,
     },
@@ -1060,3 +1060,6 @@ pub(crate) async fn install(capacity: usize, dir: Option<PathBuf>, disk: u64) {
         shared().resize(capacity);
     }
 }
+
+#[cfg(test)]
+mod identity_tests;

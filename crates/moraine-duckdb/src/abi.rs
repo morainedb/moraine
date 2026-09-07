@@ -363,7 +363,7 @@ impl StoreKind {
         &self,
         path: &str,
         s3: Option<&S3Creds>,
-    ) -> Result<Arc<dyn ObjectStore>, AbiError> {
+    ) -> Result<(Arc<dyn ObjectStore>, moraine::CacheIdentity), AbiError> {
         match self {
             Self::LocalFile => {
                 std::fs::create_dir_all(path).map_err(|e| {
@@ -376,9 +376,12 @@ impl StoreKind {
                         "moraine_attach: cannot open `{path}` as a store root: {e}"
                     ))
                 })?;
-                Ok(Arc::new(fs))
+                let identity = moraine::CacheIdentity::local(&fs).map_err(|error| {
+                    AbiError::invalid_argument(format!("cannot identify local store: {error}"))
+                })?;
+                Ok((Arc::new(fs), identity))
             }
-            Self::Memory => Ok(Arc::new(InMemory::new())),
+            Self::Memory => Ok((Arc::new(InMemory::new()), moraine::CacheIdentity::default())),
             Self::S3 { bucket } => {
                 // With a secret, only the secret's values apply; without one,
                 // the environment credential chain does.
@@ -416,16 +419,33 @@ impl StoreKind {
                         builder = builder.with_allow_http(true);
                     }
                 }
+                let identity = s3_cache_identity(&builder);
                 let store = builder.build().map_err(|e| {
                     AbiError::invalid_argument(format!(
                         "moraine_attach: cannot open s3 bucket `{bucket}`: {e} \
                          (check the s3 secret or the AWS_* environment)"
                     ))
                 })?;
-                Ok(Arc::new(store))
+                Ok((Arc::new(store), identity))
             }
         }
     }
+}
+
+/// Identifies the configured S3 object namespace without retaining credentials.
+fn s3_cache_identity(builder: &AmazonS3Builder) -> moraine::CacheIdentity {
+    use object_store::aws::AmazonS3ConfigKey;
+
+    let namespace = [
+        AmazonS3ConfigKey::Endpoint,
+        AmazonS3ConfigKey::S3Endpoint,
+        AmazonS3ConfigKey::Region,
+        AmazonS3ConfigKey::Bucket,
+        AmazonS3ConfigKey::VirtualHostedStyleRequest,
+        AmazonS3ConfigKey::S3Express,
+    ]
+    .map(|key| builder.get_config_value(&key));
+    moraine::CacheIdentity::new(&format!("s3:{namespace:?}"))
 }
 
 /// Borrows a raw pointer argument as a `&str`, checking it for null and
@@ -519,7 +539,7 @@ fn resolve_data_store(
     data_path_arg: Option<String>,
     read_only: bool,
     s3_creds: Option<&S3Creds>,
-) -> Result<(Option<Arc<dyn ObjectStore>>, String), AbiError> {
+) -> Result<(Option<moraine::DataStore>, String), AbiError> {
     let recorded = runtime
         .block_on(catalog.reads().snapshot())
         .map_err(AbiError::from)?
@@ -574,9 +594,23 @@ fn resolve_data_store(
                         ))
                     })?;
                 // A foreign file can carry an absolute path outside DATA_PATH.
-                return Ok((Some(Arc::new(LocalFileSystem::new())), prefix.to_string()));
+                let store = LocalFileSystem::new();
+                let identity = moraine::CacheIdentity::local(&store).map_err(|error| {
+                    AbiError::invalid_argument(format!("cannot identify local data store: {error}"))
+                })?;
+                return Ok((
+                    Some(moraine::DataStore::with_cache_identity(
+                        Arc::new(store),
+                        identity,
+                    )),
+                    prefix.to_string(),
+                ));
             }
-            Ok((Some(kind.open(&path, s3_creds)?), prefix))
+            let (store, identity) = kind.open(&path, s3_creds)?;
+            Ok((
+                Some(moraine::DataStore::with_cache_identity(store, identity)),
+                prefix,
+            ))
         }
         None => Ok((None, String::new())),
     }
@@ -732,7 +766,7 @@ pub unsafe extern "C" fn moraine_attach(
         // SAFETY: `s3` validity is this function's own safety contract.
         let s3_creds = unsafe { borrow_s3_creds(s3) };
 
-        let object_store = store_kind.open(path_str, s3_creds.as_ref())?;
+        let (object_store, cache_identity) = store_kind.open(path_str, s3_creds.as_ref())?;
         // Allocated before the runtime so its worker threads are tagged
         // from their first instant.
         let log_id = crate::logging::allocate_handle_id();
@@ -757,6 +791,7 @@ pub unsafe extern "C" fn moraine_attach(
 
         let mut options = CatalogOptions::default();
         options.path = prefix;
+        options.cache_identity = Some(cache_identity);
         options.encrypted = encrypted;
         if let Some(interval) = flush_interval_option(flush_interval_ms) {
             options.flush_interval = interval;
@@ -818,7 +853,7 @@ pub unsafe extern "C" fn moraine_attach(
         };
 
         let mut handle = MoraineCatalogHandle::new(runtime, catalog, log_id);
-        handle.data_store = data_store.map(moraine::DataStore::new);
+        handle.data_store = data_store;
         handle.data_prefix = data_prefix;
         handle.spawn_warm_at_attach(preload);
         Ok(Box::new(handle))
@@ -953,7 +988,7 @@ pub unsafe extern "C" fn moraine_migrate(
         // SAFETY: `s3` validity is this function's own safety contract.
         let s3_creds = unsafe { borrow_s3_creds(s3) };
 
-        let object_store = store_kind.open(path_str, s3_creds.as_ref())?;
+        let (object_store, cache_identity) = store_kind.open(path_str, s3_creds.as_ref())?;
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
         let runtime = new_runtime(log_id, 0).map_err(|e| {
@@ -965,6 +1000,7 @@ pub unsafe extern "C" fn moraine_migrate(
 
         let mut options = moraine::CatalogOptions::default();
         options.path = prefix;
+        options.cache_identity = Some(cache_identity);
         if let Some(interval) = flush_interval_option(flush_interval_ms) {
             options.flush_interval = interval;
         }
@@ -4167,6 +4203,54 @@ mod tests {
         staged::moraine_tx_commit,
         test_support::{TempDir, attach_ok, begin},
     };
+
+    #[test]
+    fn s3_cache_identities_include_endpoint_and_bucket_but_not_credentials() {
+        let builder = AmazonS3Builder::new()
+            .with_bucket_name("shared-bucket")
+            .with_region("us-east-1")
+            .with_access_key_id("test")
+            .with_secret_access_key("test");
+        let first = builder.clone().with_endpoint("https://one.example");
+        let second = builder.clone().with_endpoint("https://two.example");
+        assert_eq!(
+            first.clone().build().unwrap().to_string(),
+            second.clone().build().unwrap().to_string()
+        );
+        assert_ne!(s3_cache_identity(&first), s3_cache_identity(&second));
+        assert_ne!(
+            s3_cache_identity(&first),
+            s3_cache_identity(&first.clone().with_bucket_name("other"))
+        );
+        assert_eq!(
+            s3_cache_identity(&first),
+            s3_cache_identity(
+                &first
+                    .clone()
+                    .with_access_key_id("rotated")
+                    .with_secret_access_key("rotated")
+            )
+        );
+        assert_ne!(
+            s3_cache_identity(&builder),
+            s3_cache_identity(&builder.clone().with_config(
+                object_store::aws::AmazonS3ConfigKey::S3Endpoint,
+                "https://override.example"
+            ))
+        );
+    }
+
+    #[test]
+    fn local_attaches_share_cache_identity_and_memory_attaches_do_not() {
+        let root = TempDir::new("cache-identity");
+        let path = root.path().to_str().unwrap();
+        let (_, first) = StoreKind::LocalFile.open(path, None).unwrap();
+        let (_, second) = StoreKind::LocalFile.open(path, None).unwrap();
+        assert_eq!(first, second);
+        let (_, first) = StoreKind::Memory.open("memory://", None).unwrap();
+        let (_, second) = StoreKind::Memory.open("memory://", None).unwrap();
+        assert_ne!(first, second);
+    }
 
     /// Every state maps to its own wire value, and only `Ready` clears
     /// `is_building` — the distinction a caller gating on `is_building`

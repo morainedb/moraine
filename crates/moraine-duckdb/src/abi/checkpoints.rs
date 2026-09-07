@@ -43,9 +43,10 @@ fn resolve(
     // SAFETY: `s3` validity is the caller's contract, forwarded from the
     // entry point that took it.
     let s3_creds = unsafe { borrow_s3_creds(s3) };
-    let object_store = store_kind.open(path, s3_creds.as_ref())?;
+    let (object_store, cache_identity) = store_kind.open(path, s3_creds.as_ref())?;
     let mut options = CatalogOptions::default();
     options.path = prefix;
+    options.cache_identity = Some(cache_identity);
     Ok((object_store, options))
 }
 

@@ -317,8 +317,19 @@ The public surface is hand-written domain types, decoupled from the
   (`locate_row_ids`, `warm_row_summaries`, backfill, index build, staged
   transactions), wrapping the `Arc<dyn ObjectStore>` with the identity the
   footer and row-summary caches key on. Built once per store and cloned:
-  a durable store is named by its location, so cached footers outlive the
-  process; an in-memory store is named at random per `DataStore::new`.
+  `DataStore::new` assigns an isolated random identity, regardless of the
+  store's `Display`. `DataStore::with_cache_identity` accepts a caller-supplied
+  `CacheIdentity` to share entries across handles and restarts.
+- **`CacheIdentity`:** an opaque object-namespace identity. `Default` generates
+  an isolated identity; `new(namespace)` deterministically hashes an explicit
+  namespace; `local(&LocalFileSystem)` names the resolved filesystem root.
+  Equal identities assert that equal object paths name the same immutable
+  contents. Custom stores must include backend, endpoint, bucket/root,
+  wrapper prefixes, and any other routing context in their namespace.
+  Credentials and human-readable display names do not establish equivalence.
+  Replacing a store's contents requires a new namespace or clearing its cache.
+  `CatalogOptions::cache_identity` applies the same contract to catalog block
+  caches; the catalog path is included separately. `None` isolates each open.
 
 Keeping these separate from the wire types is what lets RFC 0002's protobuf
 field evolution stay an internal change instead of a public breaking one.

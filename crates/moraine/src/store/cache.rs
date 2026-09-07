@@ -823,20 +823,19 @@ fn caches() -> std::sync::MutexGuard<'static, Caches> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Where a store lives: its object store's name and its path within it.
+/// Where a store lives: its explicit object namespace and its path within it.
 /// Names the store's cache directory, so it must be stable across processes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct StoreLocation {
-    pub(crate) object_store: String,
+    pub(crate) identity: crate::CacheIdentity,
     pub(crate) path: String,
 }
 
 impl StoreLocation {
     /// The directory this store's cache takes under the configured one.
     fn directory(&self) -> String {
-        stable_name(&format!("{}/{}", self.object_store, self.path))
-            .simple()
-            .to_string()
+        let name = stable_name(&format!("{}/{}", self.identity.directory(), self.path));
+        format!("v2-{}", name.simple())
     }
 }
 
@@ -1174,7 +1173,7 @@ async fn open_store_cache(settled: &CacheConfig, location: StoreLocation) -> Arc
     };
     let tier = hybrid.map_or_else(|| Tier::Memory(memory_cache(shared_bytes)), Tier::Hybrid);
     info!(
-        object_store = %location.object_store,
+        identity = ?location.identity,
         path = %location.path,
         disk = matches!(tier, Tier::Hybrid(_)),
         "opened a store's block cache"
@@ -1197,7 +1196,7 @@ async fn settle(config: &CacheConfig) {
         config.disk_size.unwrap_or(DEFAULT_CACHE_DISK) / AUXILIARY_METADATA_SHARE_DIVISOR;
     data_file::install_auxiliary(
         usize::try_from(auxiliary_metadata_bytes).unwrap_or(usize::MAX),
-        config.dir.as_deref().map(|dir| dir.join("auxiliary")),
+        config.dir.as_deref().map(|dir| dir.join("auxiliary-v2")),
         auxiliary_disk.max(MIN_AUXILIARY_DISK),
     )
     .await;
@@ -1299,6 +1298,26 @@ async fn hybrid(dir: &Path, memory: u64, disk: u64) -> Option<HybridCache> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cache_directories_separate_namespace_and_path_components() {
+        let location = |namespace: &str, path: &str| StoreLocation {
+            identity: crate::CacheIdentity::new(namespace),
+            path: path.to_owned(),
+        };
+        assert_eq!(
+            location("endpoint-a/bucket", "catalog").directory(),
+            location("endpoint-a/bucket", "catalog").directory()
+        );
+        assert_ne!(
+            location("endpoint-a/bucket", "catalog").directory(),
+            location("endpoint-b/bucket", "catalog").directory()
+        );
+        assert_ne!(
+            location("namespace/a", "b").directory(),
+            location("namespace", "a/b").directory()
+        );
+    }
+
     const RESTART_PHASE: &str = "MORAINE_CACHE_RESTART_PHASE";
     const RESTART_ROOT: &str = "MORAINE_CACHE_RESTART_ROOT";
 
@@ -1368,7 +1387,7 @@ mod tests {
 
         for (path, expected) in order {
             let location = StoreLocation {
-                object_store: object_store.to_string(),
+                identity: crate::CacheIdentity::local(object_store.as_ref()).unwrap(),
                 path: path.to_owned(),
             };
             let cache = shared(&config, location).await.unwrap();
@@ -1494,7 +1513,7 @@ mod tests {
             ..CacheConfig::default()
         };
         let location = |path: &str| StoreLocation {
-            object_store: "InMemory".to_owned(),
+            identity: crate::CacheIdentity::default(),
             path: path.to_owned(),
         };
         let built = shared(&first, location("first")).await;
@@ -1721,7 +1740,7 @@ mod tests {
     #[tokio::test]
     async fn cache_status_reports_live_memory_dimensions() {
         let location = StoreLocation {
-            object_store: "InMemory".to_owned(),
+            identity: crate::CacheIdentity::default(),
             path: "status".to_owned(),
         };
         let _ = shared(&CacheConfig::default(), location).await;

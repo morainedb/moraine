@@ -77,6 +77,7 @@ pub(crate) struct StoreBuilder<'a> {
     flush_interval: Duration,
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
+    cache_identity: crate::CacheIdentity,
     cache_size: Option<u64>,
     cache_memory: Option<u64>,
     cache_preload: Option<CachePreload>,
@@ -96,6 +97,7 @@ impl<'a> StoreBuilder<'a> {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
+            cache_identity: crate::CacheIdentity::default(),
             cache_size: None,
             cache_memory: None,
             cache_preload: None,
@@ -125,6 +127,14 @@ impl<'a> StoreBuilder<'a> {
     /// disk tier, and where. `None` (the default) keeps the caches in memory.
     pub(crate) fn cache_dir(mut self, cache_dir: Option<PathBuf>) -> Self {
         self.cache_dir = cache_dir;
+        self
+    }
+
+    /// Shares a cache only with opens declaring the same object namespace.
+    pub(crate) fn cache_identity(mut self, identity: Option<crate::CacheIdentity>) -> Self {
+        if let Some(identity) = identity {
+            self.cache_identity = identity;
+        }
         self
     }
 
@@ -260,7 +270,7 @@ impl<'a> StoreBuilder<'a> {
 
     fn location(&self) -> cache::StoreLocation {
         cache::StoreLocation {
-            object_store: self.object_store.to_string(),
+            identity: self.cache_identity,
             path: self.path.to_owned(),
         }
     }
@@ -372,6 +382,29 @@ mod tests {
 
     fn memory_store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
+    }
+
+    #[test]
+    fn identical_display_names_do_not_share_catalog_cache_locations() {
+        let first = StoreBuilder::new("catalog", memory_store());
+        let second = StoreBuilder::new("catalog", memory_store());
+        assert_ne!(first.location(), second.location());
+    }
+
+    #[test]
+    fn explicit_catalog_cache_identities_share_only_the_same_namespace_and_path() {
+        let identity = crate::CacheIdentity::new("https://endpoint/bucket");
+        let location = |path, identity| {
+            StoreBuilder::new(path, memory_store())
+                .cache_identity(Some(identity))
+                .location()
+        };
+        assert_eq!(location("catalog", identity), location("catalog", identity));
+        assert_ne!(location("catalog", identity), location("other", identity));
+        assert_ne!(
+            location("catalog", identity),
+            location("catalog", crate::CacheIdentity::new("https://other/bucket"))
+        );
     }
 
     /// The format grain is a moraine choice rather than an upstream default
