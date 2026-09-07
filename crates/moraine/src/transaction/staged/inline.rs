@@ -6,12 +6,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use futures::{StreamExt, TryStreamExt, stream};
 
 use super::{
-    DbTransaction, EntityKey, Error, HashMap, InlineKey, InlineOperation, InlineScanKind, Key,
-    ReadHandle, Result, RowOperation, TableKind, commit, decode::decode_hard_delete,
-    materialize_inline_rows, proto, store_inline, value,
+    DbTransaction, EntityKey, Error, HashMap, InlineKey, InlineOperation, Key, ReadHandle, Result,
+    RowOperation, TableKind, commit, decode::decode_hard_delete, materialize_inline_rows, proto,
+    store_inline, value,
 };
 use crate::catalog::{
-    inline::materialize_locator_rows,
+    inline::{InlineRow, materialize_locator_rows},
     projection::{self, ProjectionCache},
 };
 
@@ -38,9 +38,8 @@ impl ChunkSeqAllocator {
 }
 
 /// Removes every `inline/insert` chunk begun at or before `flush_snapshot`
-/// for `(table_id, schema_version)`, plus the `inline/inline_delete`
-/// tombstones on those chunks' rows, reading `db_tx`'s pre-commit inline
-/// records. Returns the row ids drained.
+/// for `(table_id, schema_version)` and the tombstones no surviving version
+/// needs, reading `db_tx`'s pre-commit records. Returns the row ids drained.
 ///
 /// A directory known complete serves the walk from its locators alone;
 /// otherwise the chunk bodies are scanned, the directory verified against
@@ -54,103 +53,138 @@ pub(crate) async fn translate_inline_flush_delete(
     flush_snapshot: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<HashSet<u64>> {
-    let rows = if projection::inline_directory_complete(projections, table_id) {
-        let (locators, inline_deletes) = futures::try_join!(
-            store_inline::scan_inline_chunk_locators(ReadHandle::Tx(db_tx), table_id),
-            store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
-        )?;
-
-        let scoped: Vec<store_inline::InlineChunkLocator> = locators
-            .into_iter()
-            .filter(|locator| locator.schema_version() == Some(schema_version))
-            .collect();
-        for locator in &scoped {
-            if let InlineOperation::Insert { begin_snapshot, .. } = locator.operation()
-                && begin_snapshot <= flush_snapshot
-            {
-                writes.push((
-                    Key::Inline(InlineKey::Live(locator.operation())).encode(),
-                    None,
-                ));
-                writes.push((
-                    chunk_range_key(table_id, locator.row_id_end(), locator.operation())?,
-                    None,
-                ));
-            }
-        }
-
-        materialize_locator_rows(&scoped, &inline_deletes)
-    } else {
-        let (chunks, range_ends, legacy_ranges, inline_deletes) = futures::try_join!(
-            store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id),
-            store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id),
-            store_inline::scan_legacy_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id),
-            store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
-        )?;
-
-        let scoped: Vec<(InlineOperation, proto::InlineChunkValue)> = chunks
-            .iter()
-            .filter(
-                |(op, _)| matches!(op, InlineOperation::Insert { schema_version: v, .. } if *v == schema_version),
-            )
-            .cloned()
-            .collect();
-
-        let mut deleted = BTreeSet::new();
-        for (op, chunk) in &scoped {
-            if let InlineOperation::Insert { begin_snapshot, .. } = op
-                && *begin_snapshot <= flush_snapshot
-            {
-                writes.push((Key::Inline(InlineKey::Live(*op)).encode(), None));
-                let (range_key, _) = inline_chunk_range_delete(table_id, *op, chunk)?;
-                writes.push((range_key, None));
-                deleted.insert(*op);
-            }
-        }
-
-        // A store carried across the locator-key change still holds the
-        // superseded keys; nothing reads them, so the repair sweeps them.
-        for row_id_end in legacy_ranges {
-            writes.push((
-                Key::Inline(InlineKey::ChunkRange {
-                    table_id,
-                    row_id_end,
-                })
-                .encode(),
-                None,
-            ));
-        }
-
-        reconcile_chunk_directory(
-            projections,
-            table_id,
-            &chunks,
-            &range_ends,
-            &deleted,
-            writes,
-        )?;
-
-        materialize_inline_rows(&scoped, &inline_deletes)
+    let is_flushed = |operation: InlineOperation| {
+        matches!(operation, InlineOperation::Insert { schema_version: version, begin_snapshot, .. }
+            if version == schema_version && begin_snapshot <= flush_snapshot)
     };
+    let (rows, tombstones, flushed) =
+        if projection::inline_directory_complete(projections, table_id) {
+            let (locators, tombstones) = futures::try_join!(
+                store_inline::scan_inline_chunk_locators(ReadHandle::Tx(db_tx), table_id),
+                store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
+            )?;
 
-    // Tombstones on the flushed chunks' rows (`ForFlush` includes them)
-    // go with their chunk.
+            let flushed: Vec<bool> = locators
+                .iter()
+                .map(|locator| is_flushed(locator.operation()))
+                .collect();
+            for locator in &locators {
+                if is_flushed(locator.operation()) {
+                    writes.push((
+                        Key::Inline(InlineKey::Live(locator.operation())).encode(),
+                        None,
+                    ));
+                    writes.push((
+                        chunk_range_key(table_id, locator.row_id_end(), locator.operation())?,
+                        None,
+                    ));
+                }
+            }
+
+            (
+                materialize_locator_rows(&locators, &tombstones),
+                tombstones,
+                flushed,
+            )
+        } else {
+            let (chunks, range_ends, legacy_ranges, tombstones) = futures::try_join!(
+                store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id),
+                store_inline::scan_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id),
+                store_inline::scan_legacy_inline_chunk_ranges(ReadHandle::Tx(db_tx), table_id),
+                store_inline::scan_inline_deletes(ReadHandle::Tx(db_tx), table_id),
+            )?;
+
+            let flushed: Vec<bool> = chunks
+                .iter()
+                .map(|(operation, _)| is_flushed(*operation))
+                .collect();
+            let mut deleted = BTreeSet::new();
+            for (op, chunk) in &chunks {
+                if is_flushed(*op) {
+                    writes.push((Key::Inline(InlineKey::Live(*op)).encode(), None));
+                    let (range_key, _) = inline_chunk_range_delete(table_id, *op, chunk)?;
+                    writes.push((range_key, None));
+                    deleted.insert(*op);
+                }
+            }
+
+            // A store carried across the locator-key change still holds the
+            // superseded keys; nothing reads them, so the repair sweeps them.
+            for row_id_end in legacy_ranges {
+                writes.push((
+                    Key::Inline(InlineKey::ChunkRange {
+                        table_id,
+                        row_id_end,
+                    })
+                    .encode(),
+                    None,
+                ));
+            }
+
+            reconcile_chunk_directory(
+                projections,
+                table_id,
+                &chunks,
+                &range_ends,
+                &deleted,
+                writes,
+            )?;
+
+            (
+                materialize_inline_rows(&chunks, &tombstones),
+                tombstones,
+                flushed,
+            )
+        };
+
+    Ok(prune_flushed_tombstones(
+        table_id,
+        &rows,
+        &flushed,
+        &tombstones,
+        writes,
+    ))
+}
+
+/// Removes consumed deletion events that no surviving version needs and
+/// returns the drained row ids.
+fn prune_flushed_tombstones(
+    table_id: u64,
+    rows: &[InlineRow],
+    flushed: &[bool],
+    tombstones: &[(u64, proto::InlineInlineDeleteValue)],
+    writes: &mut Vec<commit::StagedWrite>,
+) -> HashSet<u64> {
     let mut drained = HashSet::new();
-    for row in InlineScanKind::ForFlush.select(&rows, flush_snapshot, 0) {
-        drained.insert(row.row_id);
-        if row.end_snapshot.is_some() {
+    let mut consumed = HashSet::new();
+    let mut retained = HashSet::new();
+    for row in rows {
+        if flushed[row.chunk] {
+            drained.insert(row.row_id);
+            if let Some(end) = row.end_snapshot {
+                consumed.insert((row.row_id, end));
+            }
+        } else if let Some(end) = row.end_snapshot {
+            retained.insert((row.row_id, end));
+        }
+    }
+    // Another schema version or a newer chunk can still need the event.
+    for &(row_id, record) in tombstones {
+        let event = (row_id, record.end_snapshot);
+        if consumed.contains(&event) && !retained.contains(&event) {
             writes.push((
-                Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
+                Key::Inline(InlineKey::RowTombstone {
                     table_id,
-                    row_id: row.row_id,
-                }))
+                    row_id,
+                    end_snapshot: record.end_snapshot,
+                })
                 .encode(),
                 None,
             ));
         }
     }
 
-    Ok(drained)
+    drained
 }
 
 /// Compares the walked chunks against the directory. Equality is
@@ -331,12 +365,13 @@ pub(super) async fn translate_inline_drop(
     for (row_id_end, operation) in ranges {
         writes.push((chunk_range_key(table_id, row_id_end, operation)?, None));
     }
-    for (row_id, _) in inline_deletes {
+    for (row_id, record) in inline_deletes {
         writes.push((
-            Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
+            Key::Inline(InlineKey::RowTombstone {
                 table_id,
                 row_id,
-            }))
+                end_snapshot: record.end_snapshot,
+            })
             .encode(),
             None,
         ));
@@ -513,10 +548,11 @@ pub(crate) fn inline_inline_delete_write(
     end_snapshot: u64,
 ) -> commit::StagedWrite {
     (
-        Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
+        Key::Inline(InlineKey::RowTombstone {
             table_id,
             row_id,
-        }))
+            end_snapshot,
+        })
         .encode(),
         Some(value::encode_value(&proto::InlineInlineDeleteValue {
             end_snapshot,

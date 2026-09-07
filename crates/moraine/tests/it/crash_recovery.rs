@@ -683,6 +683,21 @@ async fn catalog_with_planted_options(backing: &Arc<InMemory>) -> Vec<SchemaId> 
     created.into_inner()
 }
 
+#[derive(Debug)]
+struct HistoricalSegments;
+impl slatedb::PrefixExtractor for HistoricalSegments {
+    fn name(&self) -> &'static str {
+        "moraine-tag-v1"
+    }
+
+    fn prefix_len(&self, target: &slatedb::PrefixTarget) -> Option<usize> {
+        let bytes = match target {
+            slatedb::PrefixTarget::Point(bytes) | slatedb::PrefixTarget::Prefix(bytes) => bytes,
+        };
+        (!bytes.is_empty()).then_some(1)
+    }
+}
+
 /// `MigrationInterrupted` — a structural format migration runs as a start
 /// batch planting the marker, one batch per bounded piece of the rewrite,
 /// and a finish batch flipping the format and clearing the marker together.
@@ -690,10 +705,7 @@ async fn catalog_with_planted_options(backing: &Arc<InMemory>) -> Vec<SchemaId> 
 ///
 /// The one case crashed from *inside* a library call: the boundaries are
 /// internal to `Catalog::migrate`, so [`CrashPoint`] is the only way in.
-/// The unit is installed rather than shipped — every format to date is
-/// additive, so the registry is empty and no store in the world needs a
-/// rewrite — but it runs through the shipped planner, and the verb driving
-/// it is the public one.
+/// The synthetic unit runs through the shipped planner and public verb.
 ///
 /// What must hold, at every seam: while the marker is down no attach may
 /// open the store at all, and a re-run resumes from what is durable and
@@ -703,6 +715,16 @@ async fn interrupted_migration_refuses_readers_and_resumes_exactly_once() {
     for point in CrashCase::MigrationInterrupted.seams() {
         let backing: Arc<InMemory> = Arc::new(InMemory::new());
         let schemas = catalog_with_planted_options(&backing).await;
+
+        // The synthetic rewrite starts at format 1; fresh catalogs now
+        // bootstrap above it. Seed its historical format stamp explicitly.
+        let db = slatedb::Db::builder("", backing.clone())
+            .with_segment_extractor(Arc::new(HistoricalSegments))
+            .build()
+            .await
+            .unwrap();
+        db.put([0x02_u8, 0x02], b"MRNE\x00\x08\x01").await.unwrap();
+        db.close().await.unwrap();
 
         install_migration(SyntheticMigration::MoveOptionScope);
         inject_crash(Some(*point));
@@ -808,7 +830,7 @@ async fn a_live_reader_refuses_once_another_writer_plants_a_marker() {
 
     // A second handle starts a migration and dies at its first seam, leaving
     // the marker down and the store stamped old.
-    install_migration(SyntheticMigration::MoveOptionScope);
+    install_migration(SyntheticMigration::MoveOptionScopeThenLink);
     inject_crash(Some(CrashPoint::AfterStart));
     Catalog::migrate(
         backing.clone(),

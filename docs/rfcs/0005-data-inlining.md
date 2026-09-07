@@ -78,7 +78,8 @@ inherit that limitation.
 |---|---|---|
 | `inline/schema` | `table_id, schema_version` | Arrow IPC schema-only stream (written once per schema version), or — once deregistered — a reference to the version of the same table whose bytes are identical |
 | `inline/insert` | `table_id, schema_version, begin_snapshot, chunk_seq` | Arrow IPC record-batch **body** (the batch message + buffers, no schema) over the user columns + `row_id_start`, `row_count`. Decoded against the version's `inline/schema` stream, so the schema is not re-serialized per chunk |
-| `inline/inline_delete` | `table_id, row_id` | `end_snapshot` (tombstone for an inlined insert row) |
+| `inline/inline_delete` | `table_id, row_id` | Legacy `end_snapshot`; read and removed only by the format-9 migration |
+| `inline/row_tombstone` | `table_id, row_id, end_snapshot` | `end_snapshot`, matching the key; one immutable deletion event per row and snapshot |
 | `inline/file_delete` | `table_id, data_file_id, row_id` | `begin_snapshot` (inlined delete against a Parquet file) |
 | `inline/file_delete_table` | `table_id` | Empty — the key is the fact. Marks that `ducklake_inlined_delete_<table_id>` exists |
 | `inline/schema_dropped` | `table_id, schema_version` | Empty — the key is the fact. Marks that `ducklake_inlined_data_<t>_<v>` has been deregistered by a flush |
@@ -111,14 +112,41 @@ this key layout exists to prevent; an unknown `W` bounds nothing and the
 walk runs in full.
 
 The identity-carrying locator takes its own key kind rather than widening
-the old one, so a store written before the change needs no migration to be
-read: its superseded keys decode as `inline/chunk_range`, sit outside the
+the old one. The format-9 tombstone migration leaves those directory keys
+for the existing repair path: its superseded keys decode as `inline/chunk_range`, sit outside the
 directory's prefix, and the repair that already heals a missing locator
 rebuilds the directory and sweeps them. Writing a locator stamps
 `FORMAT_WITH_INLINE_CHUNK_IDENTITY`, which shuts out a binary that would
 look for the superseded key and conclude the table has no directory.
 
-The insert and tombstone records are append-only on the commit path. The
+Each inline row version ends at the earliest tombstone snapshot strictly
+greater than its `begin_snapshot`. An update's deletion ends the old version
+while its same-snapshot insertion remains live; later updates append events
+instead of moving the old version's end. Readers resolve events across
+schema versions. This also preserves gaps when a
+row moves through Parquet between two inline versions: the next inline
+insertion is not sufficient evidence of when the preceding version ended.
+
+`inline/row_tombstone` appends discriminant 7 to `InlineKey` without changing
+the encoding of any existing key. Structural format 9
+(`FORMAT_WITH_INLINE_TOMBSTONE_HISTORY`) rewrites every old row-level
+tombstone into its corresponding event key, preserving the value bytes and
+removing the source key atomically. Normal readers use only the event keys.
+The readable floor and fresh-store bootstrap both start at 9; older catalogs
+must run `Catalog::migrate` or the unattached `moraine_migrate` SQL function
+before opening. Formats 1 through 7 first advance additively to 8, then the
+`version-inline-tombstones` unit performs the 8-to-9 rewrite using RFC 0015's
+bounded batches, durable cursor, migration marker, and atomic finish.
+
+Deletion snapshots already overwritten by an older writer are not recoverable from
+the remaining tombstone record; the new format does not reconstruct that
+lost history or repair Parquet files flushed with incorrect lifetimes.
+
+Flush removes a tombstone only when the versions it ends have been drained;
+a surviving chunk or another schema version retains its required event.
+Drop removes all deletion events with the table.
+
+The insert and versioned tombstone records are append-only on the commit path. The
 file-delete-table record is a marker, and exists because existence cannot be
 derived from the file-delete records: a flush
 materializes a table's inlined deletions into a real delete file and
@@ -243,7 +271,7 @@ evolution never rewrites existing chunks.
 
 Deletes:
 
-- Against an inlined insert row → `inline/inline_delete` tombstone carrying
+- Against an inlined insert row → `inline/row_tombstone` tombstone carrying
   `end_snapshot`. DuckLake's SQL form updates the row in place; a
   tombstone is the append-only equivalent and keeps chunks immutable.
 - Against a Parquet-file row, when small enough to inline →
@@ -292,13 +320,13 @@ encryption to the object store, which encrypts post-compression.)
 
 Live inlined rows of table T at snapshot S: range-scan
 `inline/insert/{table_id}` (all schema versions), keep chunks with
-`begin_snapshot <= S`, subtract row ids from `inline/inline_delete` tombstones with
-`end_snapshot <= S`. Inlined file-deletes overlay Parquet scans the same
+`begin_snapshot <= S`, resolve each version's end from the first later
+`inline/row_tombstone` event, and retain versions with no end or `S < end_snapshot`. Inlined file-deletes overlay Parquet scans the same
 way delete files do. The tombstone set for a table is scanned once and
 held in memory — inlined data is bounded by the row limit and flush
 cadence, so these sets are small by construction.
 
-Equality-index maintenance for an `inline/inline_delete` needs the deleted
+Equality-index maintenance for an `inline/row_tombstone` needs the deleted
 row's indexed values. It seeks the `inline/chunk_range` directory from that
 row id, reads only the owning immutable chunk, and decodes that body. A
 partially populated directory means an older chunk is still live, so the
@@ -358,15 +386,15 @@ that order — data before metadata, like any DuckLake write):
    row-by-row materialization would undo the transcode-free property the
    format was chosen for, one `Value` per cell, twice.
 
-   A rowid the scan emits stays its index into that scan's row list, since
-   the UPDATE and DELETE paths resolve one back by re-materializing the
-   list. They need only `row_id` and `begin_snapshot`, so that
-   re-materialization decodes no Arrow body at all.
+   A physical rowid is the index into the scan's row list, so versions
+   sharing a logical `row_id` remain distinct. UPDATE and DELETE resolve
+   it against the statement's shared scan materialization, with no second
+   store scan or Arrow decode.
 2. In the commit batch: create the `file` (and `delfile`) records — the
    file record backdated to the minimum per-row snapshot, row-faithfully,
    as DuckLake writes it — and **delete** the flushed `inline/insert` chunks,
    their `inline/chunk_range` locators, and consumed
-   `inline/inline_delete`/`inline/file_delete` records, matching DuckLake's
+   `inline/row_tombstone`/`inline/file_delete` records, matching DuckLake's
    delete-at-flush semantics. Pre-flush time travel is served by the
    flushed Parquet (per-row snapshot columns), not by retained chunks —
    retained chunks visible to any catalog scan would double-count rows.
@@ -413,12 +441,12 @@ The operation → keyspace mapping (source-verified against DuckLake
 | DuckLake SQL | moraine record |
 |---|---|
 | `CREATE TABLE ducklake_inlined_data_<t>_<v>(...)` (batched with the `INSERT INTO ducklake_inlined_data_tables` registration) | `inline/schema` at `(t, v)` holding the user columns as an Arrow IPC schema-only stream (DuckDB's `ArrowConverter::ToArrowSchema` transcodes the column list; the Rust bridge serializes it); the table appears in the now-live `ducklake_inlined_data_tables` projection |
-| `INSERT INTO ducklake_inlined_data_<t>_<v> VALUES (row_id, {snap}, NULL, <cols>), …` (one multi-row `VALUES` per commit) | one `inline/insert` chunk at `(t, v, begin_snapshot={snap}, chunk_seq)`: the user-column cells as one Arrow IPC record-batch body (no schema message; decoded against the version's `inline/schema`), plus `row_id_start` (first row's `row_id`) and `row_count`; and one `inline/chunk_range` locator keyed by its inclusive row-id end. The `row_id`/`begin_snapshot`/`end_snapshot` columns are moraine-derived on read (`row_id = row_id_start + offset`, `begin_snapshot` from the key, `end_snapshot` from `inline/inline_delete`), never stored in the body |
-| `UPDATE ducklake_inlined_data_<t>_<v> SET end_snapshot={snap} WHERE row_id=r …` | `inline/inline_delete` at `(t, r)` holding `end_snapshot={snap}` |
-| `SELECT <cols> FROM ducklake_inlined_data_<t>_<v> WHERE {snap} >= begin_snapshot AND ({snap} < end_snapshot OR end_snapshot IS NULL) ORDER BY row_id` (and the `SCAN_INSERTIONS`/`SCAN_DELETIONS`/`SCAN_FOR_FLUSH` filter variants) | range-scan `inline/insert` for `t` at `v`, decode Arrow, reconstruct the three virtual columns, apply the snapshot predicate, subtract `inline/inline_delete` tombstones, project and order by `row_id` |
+| `INSERT INTO ducklake_inlined_data_<t>_<v> VALUES (row_id, {snap}, NULL, <cols>), …` (one multi-row `VALUES` per commit) | one `inline/insert` chunk at `(t, v, begin_snapshot={snap}, chunk_seq)`: the user-column cells as one Arrow IPC record-batch body (no schema message; decoded against the version's `inline/schema`), plus `row_id_start` (first row's `row_id`) and `row_count`; and one `inline/chunk_range` locator keyed by its inclusive row-id end. The `row_id`/`begin_snapshot`/`end_snapshot` columns are moraine-derived on read (`row_id = row_id_start + offset`, `begin_snapshot` from the key, `end_snapshot` from `inline/row_tombstone`), never stored in the body |
+| `UPDATE ducklake_inlined_data_<t>_<v> SET end_snapshot={snap} WHERE row_id=r …` | `inline/row_tombstone` at `(t, r, snap)` holding `end_snapshot={snap}` |
+| `SELECT <cols> FROM ducklake_inlined_data_<t>_<v> WHERE {snap} >= begin_snapshot AND ({snap} < end_snapshot OR end_snapshot IS NULL) ORDER BY row_id` (and the `SCAN_INSERTIONS`/`SCAN_DELETIONS`/`SCAN_FOR_FLUSH` filter variants) | range-scan `inline/insert` for `t` at `v`, decode Arrow, reconstruct the three virtual columns, apply the snapshot predicate, apply the version-specific `inline/row_tombstone` ends, project and order by `row_id` |
 | `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id, {snap}), …` | `inline/file_delete` at `(t, file_id, row_id)` holding `begin_snapshot={snap}`, plus the `inline/file_delete_table` marker for `t` |
 | `DELETE FROM ducklake_inlined_delete_<t>` (the flush's clean-up, once those deletions are written out as a real delete file) | remove the `inline/file_delete` record behind each matched row, keeping the `inline/file_delete_table` marker. Translated per row rather than as a table-wide clear: DuckLake's flush happens to delete every row, but what it issues is an ordinary SQL `DELETE`, so a filtered one removes exactly what it matched. Naming a record the table does not carry is a typed error, not a silent no-op |
-| `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <= {flush_snap}` then `DROP TABLE …` + `DELETE FROM ducklake_inlined_data_tables …` (flush / superseded-table cleanup) | remove the flushed `inline/insert` chunks, their `inline/chunk_range` locators, and consumed `inline/inline_delete`; write the version's `inline/schema_dropped` marker, retaining its `inline/schema`. The flushed data lives on as the backdated `ducklake_data_file` DuckLake registers through the ordinary file path |
+| `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <= {flush_snap}` then `DROP TABLE …` + `DELETE FROM ducklake_inlined_data_tables …` (flush / superseded-table cleanup) | remove the flushed `inline/insert` chunks, their `inline/chunk_range` locators, and consumed `inline/row_tombstone`; write the version's `inline/schema_dropped` marker, retaining its `inline/schema`. The flushed data lives on as the backdated `ducklake_data_file` DuckLake registers through the ordinary file path |
 | hard `DELETE FROM ducklake_data_file` naming `(t, file_id)` (a merge pruning its sources, cleanup draining the schedule) | remove every `inline/file_delete` record targeting that file, keeping the marker. Silent on a miss, unlike the removal above: this cascade names a file rather than records, and a pruned file carrying no inlined deletion is the ordinary case |
 | `UPDATE ducklake_data_file SET end_snapshot` (a rewrite ending its source) | nothing — see below |
 | `DROP TABLE lake.<schema>.<t>` cascade | drop every `inline/*` record for `t` |

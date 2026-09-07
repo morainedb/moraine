@@ -15,7 +15,9 @@ use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{layer::Context, prelude::*};
 
 use super::{inline::inline_schema_collapse_target, *};
-use crate::catalog::{Catalog, CatalogOptions};
+use crate::catalog::{Catalog, CatalogOptions, inline::InlineScanKind};
+
+mod inline_history;
 
 fn schema_row(id: u64, name: &str, begin: u64) -> Vec<Cell> {
     vec![
@@ -925,7 +927,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
     );
     assert_eq!(
         format.format_version,
-        commit::FORMAT_WITH_INLINE_CHUNK_IDENTITY
+        commit::MIN_FORMAT_VERSION.max(commit::FORMAT_WITH_INLINE_CHUNK_IDENTITY)
     );
     tx.rollback();
 }
@@ -4767,13 +4769,9 @@ fn a_schema_version_collapses_only_onto_an_unreferenced_twin() {
     assert_eq!(inline_schema_collapse_target(&twins, 9), None);
 }
 
-/// A deregistration that collapses a duplicate carries the store to the
-/// format that shuts out readers which would misdecode a reference, in
-/// the batch that writes one — as a live index or an inline chunk
-/// locator carries it to theirs. One that collapses nothing moves
-/// nothing.
+/// Collapsing a duplicate schema keeps the format at its existing floor.
 #[tokio::test]
-async fn a_collapsing_deregistration_stamps_the_reference_format() {
+async fn a_collapsing_deregistration_preserves_the_format_floor() {
     for (versions, collapses) in [
         ([(0u64, b"same".as_slice()), (1, b"same".as_slice())], true),
         ([(0, b"first".as_slice()), (1, b"second".as_slice())], false),
@@ -4829,18 +4827,14 @@ async fn a_collapsing_deregistration_stamps_the_reference_format() {
 
         assert_eq!(schemas[0].1.same_as_version.is_some(), collapses);
         assert_eq!(
-            format >= crate::transaction::commit::FORMAT_WITH_INLINE_SCHEMA_REFERENCE,
-            collapses,
-            "only the batch that writes a reference owes the stamp"
+            format,
+            crate::transaction::commit::MIN_FORMAT_VERSION,
+            "a schema reference must not lower the current format"
         );
     }
 }
 
-/// A locator carries its chunk's identity, so the batch that writes one
-/// owes the identity stamp — not the directory's older floor, and not the
-/// schema reference's, which no longer subsumes it. A store left below it
-/// would be read by a binary that looks for the superseded key and finds
-/// no directory at all. Regression.
+/// An inline insert leaves the store at or above the chunk-identity format.
 #[tokio::test]
 async fn an_inline_insert_stamps_the_chunk_identity_format() {
     let catalog = open().await;
