@@ -21,10 +21,10 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
-struct BackfillSource<'a> {
-    snapshot: &'a crate::catalog::CatalogSnapshot,
-    table: TableId,
-    handle: ReadHandle<'a>,
+pub(super) struct BackfillSource<'a> {
+    pub(super) snapshot: &'a crate::catalog::CatalogSnapshot,
+    pub(super) table: TableId,
+    pub(super) handle: ReadHandle<'a>,
 }
 
 async fn collect_immediate_backfill<'a>(
@@ -323,78 +323,100 @@ impl ReadOnlyCatalog {
         let session = self.begin_read().await?;
 
         let snapshot = self.head_view(session.handle()).await?;
-        let positions = snapshot.column_positions(table, columns)?;
-
-        // A tombstone ends only versions begun before it. UPDATE can
-        // reinsert the same row id in the tombstone's snapshot, and that
-        // newer value is live and must be indexed.
-        let (dead, chunks) = futures::try_join!(
-            async {
-                Ok::<_, Error>(
-                    store_inline::scan_inline_deletes(session.handle(), table.get())
-                        .await?
-                        .into_iter()
-                        .map(|(row_id, deletion)| (row_id, deletion.end_snapshot))
-                        .collect::<HashMap<u64, u64>>(),
-                )
+        let entries = inline_backfill_entries_at(
+            BackfillSource {
+                snapshot: &snapshot,
+                table,
+                handle: session.handle(),
             },
-            store_inline::scan_inline_chunks(session.handle(), table.get()),
-        )?;
-        let schema_versions = chunks.iter().filter_map(|(operation, _)| match operation {
-            InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
-            _ => None,
-        });
-        let schemas = read_inline_schemas(session.handle(), table, schema_versions)
-            .await?
-            .into_iter()
-            .map(|(schema_version, record)| {
-                let schema = data_file::decode_inline_schema(record)?;
-                Ok::<_, Error>((schema_version, schema))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-
-        let mut entries = Vec::new();
-        for (op, chunk) in chunks {
-            let InlineOperation::Insert {
-                schema_version,
-                begin_snapshot,
-                ..
-            } = op
-            else {
-                continue;
-            };
-            let schema = schemas.get(&schema_version).cloned().ok_or_else(|| {
-                Error::Corruption(format!(
-                    "no inline schema for table {table} version {schema_version}"
-                ))
-            })?;
-
-            let scoped = data_file::inline_batch_entries(
-                schema,
-                &chunk.body,
-                &positions,
-                chunk.row_id_start,
-                Some(
-                    &snapshot
-                        .inline_read_columns(session.handle(), table, begin_snapshot)
-                        .await?,
-                ),
-            )?;
-            entries.extend(
-                scoped
-                    .into_iter()
-                    .filter(|entry| {
-                        dead.get(&entry.row_id)
-                            .is_none_or(|end_snapshot| begin_snapshot >= *end_snapshot)
-                    })
-                    .map(|entry| IndexEntry {
-                        row_id: entry.row_id,
-                        values: entry.values,
-                    }),
-            );
-        }
+            columns,
+        )
+        .await?;
         session.finish();
 
         Ok(entries)
     }
+}
+
+/// Derives inline entries from the same read point as a build's file sources.
+pub(super) async fn inline_backfill_entries_at(
+    source: BackfillSource<'_>,
+    columns: &[ColumnId],
+) -> Result<Vec<IndexEntry>> {
+    let BackfillSource {
+        snapshot,
+        table,
+        handle,
+    } = source;
+    let positions = snapshot.column_positions(table, columns)?;
+
+    // A tombstone ends only versions begun before it. UPDATE can
+    // reinsert the same row id in the tombstone's snapshot, and that
+    // newer value is live and must be indexed.
+    let (dead, chunks) = futures::try_join!(
+        async {
+            Ok::<_, Error>(
+                store_inline::scan_inline_deletes(handle, table.get())
+                    .await?
+                    .into_iter()
+                    .map(|(row_id, deletion)| (row_id, deletion.end_snapshot))
+                    .collect::<HashMap<u64, u64>>(),
+            )
+        },
+        store_inline::scan_inline_chunks(handle, table.get()),
+    )?;
+    let schema_versions = chunks.iter().filter_map(|(operation, _)| match operation {
+        InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
+        _ => None,
+    });
+    let schemas = read_inline_schemas(handle, table, schema_versions)
+        .await?
+        .into_iter()
+        .map(|(schema_version, record)| {
+            let schema = data_file::decode_inline_schema(record)?;
+            Ok::<_, Error>((schema_version, schema))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+
+    let mut entries = Vec::new();
+    for (op, chunk) in chunks {
+        let InlineOperation::Insert {
+            schema_version,
+            begin_snapshot,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let schema = schemas.get(&schema_version).cloned().ok_or_else(|| {
+            Error::Corruption(format!(
+                "no inline schema for table {table} version {schema_version}"
+            ))
+        })?;
+
+        let scoped = data_file::inline_batch_entries(
+            schema,
+            &chunk.body,
+            &positions,
+            chunk.row_id_start,
+            Some(
+                &snapshot
+                    .inline_read_columns(handle, table, begin_snapshot)
+                    .await?,
+            ),
+        )?;
+        entries.extend(
+            scoped
+                .into_iter()
+                .filter(|entry| {
+                    dead.get(&entry.row_id)
+                        .is_none_or(|end_snapshot| begin_snapshot >= *end_snapshot)
+                })
+                .map(|entry| IndexEntry {
+                    row_id: entry.row_id,
+                    values: entry.values,
+                }),
+        );
+    }
+    Ok(entries)
 }

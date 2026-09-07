@@ -8,8 +8,8 @@ use tracing::{info, warn};
 use super::{Catalog, backfill};
 use crate::{
     catalog::{
-        BuildStep, ColumnId, ColumnOrder, DataFileId, IndexDef, IndexEntry, IndexId,
-        IndexMaintenance, IndexState, TableId, resolve_data_path, snapshot,
+        BuildStep, CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, IndexDef, IndexEntry,
+        IndexId, IndexMaintenance, IndexState, SnapshotId, TableId, resolve_data_path, snapshot,
     },
     data_file::{self, DataStore},
     error::{Error, Result},
@@ -54,6 +54,8 @@ struct BuildStepBuffer<'a> {
     index_name: &'a str,
     bound: BuildStep,
     derivation_attempt: usize,
+    /// Derivation snapshot advanced only by this driver's committed steps.
+    expected_snapshot: SnapshotId,
     total_entries: usize,
     entries: Vec<IndexEntry>,
     nominal_bytes: u64,
@@ -93,12 +95,19 @@ impl BuildStepBuffer<'_> {
         let source = self.pending_source;
         let commit_started = Instant::now();
 
-        self.catalog
+        let committed = self
+            .catalog
             .commit(|tx| {
+                if tx.current_snapshot().id != self.expected_snapshot {
+                    return Err(Error::CommitConflict(
+                        "catalog changed after staged index derivation".to_owned(),
+                    ));
+                }
                 tx.build_index_source_step(self.index, &entries, is_final, source)
                     .map(|_| ())
             })
             .await?;
+        self.expected_snapshot = committed;
 
         let state = self
             .catalog
@@ -162,8 +171,9 @@ impl Catalog {
     ///
     /// Returns [`Error::AlreadyExists`] if the table already holds a ready
     /// index of this name, or [`Error::Constraint`] if either `step` bound
-    /// is zero, the resumed definition differs from `def`, or the rows
-    /// duplicate a unique value. A failed build drops its definition.
+    /// is zero, the resumed definition differs from `def`, registered files
+    /// require an absent data store, or the rows duplicate a unique value. A
+    /// failed build drops its definition.
     pub async fn create_index_staged(
         &self,
         table: TableId,
@@ -211,7 +221,7 @@ impl Catalog {
         }
 
         let index = self
-            .begin_staged_index(table, def, orders, maintenance)
+            .begin_staged_index(table, def, orders, maintenance, data_store.is_some())
             .await?;
         let outcome = self
             .drive_staged_build(table, def, index, data_store, data_prefix, step)
@@ -300,8 +310,11 @@ impl Catalog {
         def: &IndexDef,
         orders: &[ColumnOrder],
         maintenance: IndexMaintenance,
+        has_data_store: bool,
     ) -> Result<IndexId> {
-        if let Some(existing) = self.snapshot().await?.index_by_name(table, &def.name) {
+        let snapshot = self.snapshot().await?;
+        require_data_store(&snapshot, table, has_data_store)?;
+        if let Some(existing) = snapshot.index_by_name(table, &def.name) {
             return match existing.state {
                 IndexState::Ready => Err(Error::AlreadyExists(format!(
                     "index {} on table {table}",
@@ -334,6 +347,7 @@ impl Catalog {
 
         let index = std::cell::Cell::new(None);
         self.commit(|tx| {
+            require_data_store(tx, table, has_data_store)?;
             let id =
                 tx.create_index_staged_ordered_with_maintenance(table, def, orders, maintenance)?;
             index.set(Some(id));
@@ -367,12 +381,22 @@ impl Catalog {
                 "staged index backfill derivation started"
             );
             let derivation_started = Instant::now();
-            let snapshot = self.snapshot().await?;
+            let session = self.begin_read().await?;
+            let snapshot = self.head_view(session.handle()).await?;
+            require_data_store(&snapshot, table, data_store.is_some())?;
+            let source = backfill::BackfillSource {
+                snapshot: &snapshot,
+                table,
+                handle: session.handle(),
+            };
             let info = snapshot
                 .indexes_of(table)
                 .into_iter()
                 .find(|info| info.id == index)
                 .ok_or_else(|| Error::NotFound(format!("index {index}")))?;
+            if info.state == IndexState::Ready {
+                return Ok(());
+            }
             let total_entries = snapshot
                 .table_stats(table)
                 .and_then(|stats| usize::try_from(stats.record_count).ok())
@@ -396,6 +420,7 @@ impl Catalog {
                 index_name: &def.name,
                 bound: step,
                 derivation_attempt: attempt,
+                expected_snapshot: snapshot.current_snapshot().id,
                 total_entries,
                 entries: Vec::new(),
                 nominal_bytes: 0,
@@ -404,31 +429,35 @@ impl Catalog {
                 peak_buffered_entries: 0,
             };
 
-            // Inline rows precede file sources. Older builds that carry
-            // only a row-id cursor resume this leg by that watermark.
-            let mut inline = self.inline_backfill_entries(table, &def.columns).await?;
-            inline.sort_unstable_by_key(|entry| entry.row_id);
-            for entry in inline
-                .into_iter()
-                .filter(|entry| inline_row_cursor.is_none_or(|row| entry.row_id > row))
-            {
-                buffer.push(entry, None).await?;
-            }
+            let pass = async {
+                // Inline rows precede file sources. Older builds that carry
+                // only a row-id cursor resume this leg by that watermark.
+                let mut inline = backfill::inline_backfill_entries_at(source, &def.columns).await?;
+                inline.sort_unstable_by_key(|entry| entry.row_id);
+                for entry in inline
+                    .into_iter()
+                    .filter(|entry| inline_row_cursor.is_none_or(|row| entry.row_id > row))
+                {
+                    buffer.push(entry, None).await?;
+                }
 
-            if let Some(store) = &data_store {
-                self.stream_backfill_files(
-                    store.clone(),
-                    data_prefix,
-                    table,
-                    &def.columns,
-                    initial_file_cursor,
-                    initial_position_cursor,
-                    legacy_row_cursor,
-                    &mut buffer,
-                )
-                .await?;
+                if let Some(store) = &data_store {
+                    self.stream_backfill_files(
+                        store.clone(),
+                        data_prefix,
+                        source,
+                        &def.columns,
+                        initial_file_cursor,
+                        initial_position_cursor,
+                        legacy_row_cursor,
+                        &mut buffer,
+                    )
+                    .await?;
+                }
+                buffer.flush(true).await
             }
-            let pass = buffer.flush(true).await;
+            .await;
+            session.finish();
 
             match pass {
                 Ok(()) => {
@@ -476,15 +505,18 @@ impl Catalog {
         &self,
         object_store: DataStore,
         data_prefix: &str,
-        table: TableId,
+        source: backfill::BackfillSource<'_>,
         columns: &[ColumnId],
         file_cursor: Option<u64>,
         position_cursor: Option<u64>,
         legacy_row_cursor: Option<u64>,
         buffer: &mut BuildStepBuffer<'_>,
     ) -> Result<()> {
-        let session = self.begin_read().await?;
-        let snapshot = self.head_view(session.handle()).await?;
+        let backfill::BackfillSource {
+            snapshot,
+            table,
+            handle,
+        } = source;
         let positions = snapshot.column_positions(table, columns)?;
 
         let table_prefix = snapshot.table_data_prefix(table)?;
@@ -492,8 +524,7 @@ impl Catalog {
             resolve_data_path(data_prefix, &table_prefix, path, is_relative)
         };
 
-        let inline_deletes =
-            backfill::collect_inline_delete_positions(session.handle(), table.get());
+        let inline_deletes = backfill::collect_inline_delete_positions(handle, table.get());
         let metrics = self.data_read_metrics();
         let delete_files = backfill::collect_delete_positions(
             snapshot.delete_files_of(table).into_iter(),
@@ -530,7 +561,7 @@ impl Catalog {
                 .with_columns(
                     snapshot
                         .file_read_columns_at(
-                            session.handle(),
+                            handle,
                             table,
                             snapshot
                                 .data_files
@@ -570,8 +601,25 @@ impl Catalog {
             }
         }
 
-        session.finish();
-
         Ok(())
     }
+}
+
+/// A build must be able to read every registered file before it can publish.
+fn require_data_store(
+    snapshot: &CatalogSnapshot,
+    table: TableId,
+    has_data_store: bool,
+) -> Result<()> {
+    if !has_data_store
+        && snapshot
+            .data_files
+            .get(&table.get())
+            .is_some_and(|files| !files.is_empty())
+    {
+        return Err(Error::Constraint(format!(
+            "staged index build for table {table} requires a data-path store",
+        )));
+    }
+    Ok(())
 }
