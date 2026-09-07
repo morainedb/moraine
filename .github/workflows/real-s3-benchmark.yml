@@ -41,7 +41,7 @@ jobs:
 
       # The AWS trust policy independently restricts this token to main.
       - name: Exchange GitHub OIDC token for the launcher role
-        uses: aws-actions/configure-aws-credentials@v6.2.3
+        uses: aws-actions/configure-aws-credentials@v6.2.4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ vars.MORAINE_BENCHMARK_ROLE_ARN }}
