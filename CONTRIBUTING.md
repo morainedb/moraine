@@ -4,8 +4,13 @@
 
 ```bash
 rustup toolchain install  # respects rust-toolchain.toml
+rustup toolchain install nightly-2026-08-29 --profile minimal --component rustfmt
 cargo install cargo-deny
 ```
+
+Formatting uses a dated nightly so CI and local hooks produce the same output.
+Update the formatter pin in CI, workspace setup, both commit hooks, and these
+instructions together.
 
 `cargo xtask e2e` compiles DuckDB itself. Install `ccache` (or `sccache`)
 and DuckDB's cmake finds it on `PATH` by itself, which turns the
@@ -17,7 +22,7 @@ There is nothing else to configure.
 Everything CI enforces, runnable locally:
 
 ```bash
-cargo +nightly fmt --check
+cargo +nightly-2026-08-29 fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
