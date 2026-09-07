@@ -25,6 +25,27 @@ use crate::{
     transaction::operations::ChangeSet,
 };
 
+/// Mapping parents and children authored by this commit, before publication.
+fn pending_mappings(ops: &[RowOperation]) -> Result<HashMap<(u64, u64), proto::MappingValue>> {
+    let mut children = super::apply::collect_child_rows(ops)?;
+    let mut mappings = HashMap::new();
+    for operation in ops {
+        if let RowOperation::Insert {
+            table: TableKind::ColumnMapping,
+            cells,
+        } = operation
+        {
+            let mut mapping = super::decode::decode_column_mapping(cells)?;
+            mapping.name_mappings = children
+                .name_mappings
+                .remove(&mapping.mapping_id)
+                .unwrap_or_default();
+            mappings.insert((mapping.table_id, mapping.mapping_id), mapping);
+        }
+    }
+    Ok(mappings)
+}
+
 /// How many files one upkeep phase reads at once.
 const FILE_READ_CONCURRENCY: usize = 64;
 
@@ -112,6 +133,7 @@ impl<'a> InlineSchemaCache<'a> {
 pub(super) struct FileContext<'a> {
     /// The `DATA_PATH` store, absent when the caller supplied none.
     store: Option<&'a DataStore>,
+    handle: ReadHandle<'a>,
     /// The store-relative prefix data files resolve against.
     prefix: &'a str,
     /// Tables this commit compacts and does nothing else to.
@@ -124,12 +146,43 @@ pub(super) struct FileContext<'a> {
     metrics: Arc<data_file::ScopedReadMetrics>,
     /// Per-table index metadata and compiled projections, built on first use.
     indexing: std::sync::Mutex<HashMap<u64, Arc<TableIndexing>>>,
+    mappings: HashMap<(u64, u64), proto::MappingValue>,
+    pending_columns: HashMap<(u64, u64), proto::ColumnValue>,
     /// The handle's projection cache, for the inline locator scan's width
     /// bound.
     projections: &'a std::sync::RwLock<ProjectionCache>,
 }
 
 impl FileContext<'_> {
+    async fn file_columns(
+        &self,
+        base: &CatalogSnapshot,
+        file: &proto::DataFileValue,
+    ) -> Result<Vec<data_file::ReadColumn>> {
+        let table = TableId::new(file.table_id);
+        let mut columns = if let Some(mapping) = file
+            .mapping_id
+            .and_then(|id| self.mappings.get(&(file.table_id, id)))
+        {
+            base.mapped_read_columns(table, Some(file), Some(mapping))?
+        } else {
+            base.file_read_columns_at(self.handle, table, file).await?
+        };
+        if file.mapping_id.is_none() && file.begin_snapshot > base.snapshot.snapshot_id {
+            self.apply_pending_column_names(file.table_id, &mut columns);
+        }
+        Ok(columns)
+    }
+
+    fn apply_pending_column_names(&self, table: u64, columns: &mut [data_file::ReadColumn]) {
+        for column in columns {
+            if let Some(pending) = self.pending_columns.get(&(table, column.field_id)) {
+                column.source_name = Some(pending.column_name.clone());
+                column.name_is_known = true;
+            }
+        }
+    }
+
     fn indexing(&self, base: &CatalogSnapshot, table: TableId) -> Result<Arc<TableIndexing>> {
         let mut cache = self.indexing.lock().map_err(|_| {
             Error::Interrupted("index metadata cache poisoned by a failed upkeep task".to_owned())
@@ -239,6 +292,7 @@ async fn stream_data_file_index_entries(
             file.file_size_bytes,
             file.footer_size,
         )
+        .with_columns(context.file_columns(base, &file).await?)
         .with_metrics(Arc::clone(&context.metrics)),
         indexes.projections.clone(),
         data_file::ScopedRows::All,
@@ -326,12 +380,27 @@ pub(super) async fn stage_index_maintenance(
     let scope = change_scope(ops)?;
     let context = FileContext {
         store: data_store,
+        handle: ReadHandle::Tx(db_tx),
         prefix: data_prefix,
         compacted: scope.compacted,
         deleted_from: scope.deleted_from,
         delete_file_permits: Arc::new(tokio::sync::Semaphore::new(FILE_READ_CONCURRENCY)),
         metrics: Arc::clone(&metrics),
         indexing: std::sync::Mutex::new(HashMap::new()),
+        mappings: pending_mappings(ops)?,
+        pending_columns: ops
+            .iter()
+            .filter_map(|operation| match operation {
+                RowOperation::Insert {
+                    table: TableKind::Column,
+                    cells,
+                } => Some(
+                    super::decode::decode_column(cells)
+                        .map(|column| ((column.table_id, column.column_id), column)),
+                ),
+                _ => None,
+            })
+            .collect::<Result<_>>()?,
         projections,
     };
 
@@ -586,6 +655,7 @@ fn plan_adds<'a>(
             RowOperation::InlineInsert {
                 table_id,
                 schema_version,
+                begin_snapshot,
                 row_id_start,
                 row_count,
                 arrow_body,
@@ -602,6 +672,7 @@ fn plan_adds<'a>(
                     table_id: *table_id,
                     chunk: InlineChunk {
                         schema_version: *schema_version,
+                        begin_snapshot: *begin_snapshot,
                         row_id_start: *row_id_start,
                         row_count: *row_count,
                         body: InlineBody::Borrowed(arrow_body),
@@ -696,6 +767,7 @@ fn staged_inline_chunks(ops: &[RowOperation]) -> HashMap<u64, Vec<InlineChunk<'_
         if let RowOperation::InlineInsert {
             table_id,
             schema_version,
+            begin_snapshot,
             row_id_start,
             row_count,
             arrow_body,
@@ -704,6 +776,7 @@ fn staged_inline_chunks(ops: &[RowOperation]) -> HashMap<u64, Vec<InlineChunk<'_
         {
             chunks.entry(*table_id).or_default().push(InlineChunk {
                 schema_version: *schema_version,
+                begin_snapshot: *begin_snapshot,
                 row_id_start: *row_id_start,
                 row_count: *row_count,
                 body: InlineBody::Borrowed(arrow_body),
@@ -752,7 +825,18 @@ async fn inline_chunk_index_entries(
     let schema = inline_schemas
         .get(db_tx, table_id, chunk.schema_version)
         .await?;
+    let mut columns = base
+        .inline_read_columns(
+            ReadHandle::Tx(db_tx),
+            TableId::new(table_id),
+            chunk.begin_snapshot,
+        )
+        .await?;
+    if chunk.begin_snapshot > base.snapshot.snapshot_id {
+        context.apply_pending_column_names(table_id, &mut columns);
+    }
     let plan = InlineDecodePlan {
+        columns,
         schema,
         body: chunk.body.into_bytes(),
         indexes,
@@ -773,6 +857,7 @@ async fn inline_chunk_index_entries(
 
 /// Owned input for one blocking Arrow decode.
 struct InlineDecodePlan {
+    columns: Vec<data_file::ReadColumn>,
     schema: SchemaRef,
     body: Bytes,
     indexes: Arc<IndexSet>,
@@ -789,6 +874,7 @@ impl InlineDecodePlan {
             &self.indexes.projections,
             self.row_id_start,
             self.held.as_ref(),
+            Some(&self.columns),
         )?;
         let delete = self.held.is_some();
         staged_scoped_entries(&self.indexes.indexes, scoped, delete)
@@ -799,6 +885,7 @@ impl InlineDecodePlan {
 /// the commit itself.
 pub(super) struct InlineChunk<'a> {
     schema_version: u64,
+    begin_snapshot: u64,
     row_id_start: u64,
     row_count: u64,
     body: InlineBody<'a>,
@@ -858,13 +945,19 @@ async fn derive_located_inline_removals(
                     locator,
                 )
                 .await?;
-                let InlineOperation::Insert { schema_version, .. } = operation else {
+                let InlineOperation::Insert {
+                    schema_version,
+                    begin_snapshot,
+                    ..
+                } = operation
+                else {
                     return Err(Error::Corruption(
                         "inline chunk locator names a non-insert operation".to_owned(),
                     ));
                 };
                 let chunk = InlineChunk {
                     schema_version,
+                    begin_snapshot,
                     row_id_start: value.row_id_start,
                     row_count: value.row_count,
                     body: InlineBody::Owned(value.body),
@@ -1021,8 +1114,13 @@ async fn stage_inline_delete_entries(
         let chunks: Vec<_> = committed
             .into_iter()
             .filter_map(|(operation, value)| match operation {
-                InlineOperation::Insert { schema_version, .. } => Some(InlineChunk {
+                InlineOperation::Insert {
                     schema_version,
+                    begin_snapshot,
+                    ..
+                } => Some(InlineChunk {
+                    schema_version,
+                    begin_snapshot,
                     row_id_start: value.row_id_start,
                     row_count: value.row_count,
                     body: InlineBody::Owned(value.body),
@@ -1268,6 +1366,7 @@ pub(super) async fn stream_file_delete_index_entries(
             file.file_size_bytes,
             file.footer_size,
         )
+        .with_columns(context.file_columns(base, &file).await?)
         .with_metrics(Arc::clone(&context.metrics)),
         indexes.projections.clone(),
         rows,
@@ -1363,15 +1462,11 @@ pub(super) fn table_object_path(
             }
             other => other,
         })?;
-    let relative =
-        crate::catalog::resolve_data_path(data_prefix, &table_prefix, path, path_is_relative);
-
-    Ok(object_store::path::Path::from(relative.as_str()))
+    crate::catalog::resolve_data_path(data_prefix, &table_prefix, path, path_is_relative)
 }
 
-/// The physical positions of an index's columns in a file or chunk written
-/// under the current schema: each column's 0-based rank among the table's
-/// columns (the order `columns_of` returns).
+/// Logical column positions shared by the index plans; each source schema
+/// maps them to physical columns before reading.
 pub(super) fn index_positions(
     live_columns: &[ColumnInfo],
     index: &IndexInfo,

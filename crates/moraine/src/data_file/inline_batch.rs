@@ -76,11 +76,29 @@ pub(crate) fn inline_batch_entries(
     body: &Bytes,
     positions: &[usize],
     row_id_start: u64,
+    columns: Option<&[crate::data_file::ReadColumn]>,
 ) -> Result<Vec<ScopedReadEntry>> {
     #[cfg(test)]
     record_inline_batch_decode(row_id_start);
 
     let batch = decode_inline_batch(schema, body)?;
+    if let Some(columns) = columns {
+        let (projection, _) = super::schema::BatchProjection::resolve(
+            batch.schema().as_ref(),
+            columns,
+            positions,
+            None,
+        )?;
+        let batch = projection.apply(&batch)?;
+        return record_batch_entries(
+            &batch,
+            &(0..positions.len()).collect::<Vec<_>>(),
+            None,
+            row_id_start,
+            Ordinals::Dense,
+            0,
+        );
+    }
     record_batch_entries(&batch, positions, None, row_id_start, Ordinals::Dense, 0)
 }
 
@@ -92,14 +110,31 @@ pub(crate) fn inline_batch_index_entries(
     projections: &[IndexProjection],
     row_id_start: u64,
     included_row_ids: Option<&HashSet<u64>>,
+    columns: Option<&[crate::data_file::ReadColumn]>,
 ) -> Result<Vec<ScopedIndexEntry>> {
     #[cfg(test)]
     record_inline_batch_decode(row_id_start);
 
     let batch = decode_inline_batch(schema, body)?;
+    let (batch, plans) = if let Some(columns) = columns {
+        let positions = super::columns::index_positions(projections);
+        let (projection, _) = super::schema::BatchProjection::resolve(
+            batch.schema().as_ref(),
+            columns,
+            &positions,
+            None,
+        )?;
+        let output = (0..positions.len()).collect::<Vec<_>>();
+        (
+            projection.apply(&batch)?,
+            super::columns::remap_index_projections(projections.to_vec(), &positions, &output)?,
+        )
+    } else {
+        (batch, projections.to_vec())
+    };
     record_batch_index_entries(
         &batch,
-        projections,
+        &plans,
         None,
         row_id_start,
         Ordinals::Dense,

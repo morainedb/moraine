@@ -353,8 +353,8 @@ impl CatalogSnapshot {
         infos
     }
 
-    /// The physical position of each of `columns` in a file written under
-    /// `table`'s current column order.
+    /// Positions in the table's logical column list. Each stored schema
+    /// resolves those columns separately by identity.
     ///
     /// # Errors
     ///

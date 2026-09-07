@@ -20,12 +20,20 @@ use crate::{
     store::{handle::ReadHandle, inline as store_inline, key::InlineOperation},
 };
 
+#[derive(Clone, Copy)]
+pub(super) struct BackfillSource<'a> {
+    pub(super) snapshot: &'a crate::catalog::CatalogSnapshot,
+    pub(super) table: TableId,
+    pub(super) handle: ReadHandle<'a>,
+}
+
 async fn collect_immediate_backfill<'a>(
     files: impl Iterator<Item = DataFileInfo> + 'a,
     object_store: DataStore,
     metrics: Arc<data_file::ScopedReadMetrics>,
     positions: &[usize],
-    resolve: impl Fn(&str, bool) -> Path,
+    source: BackfillSource<'a>,
+    resolve: impl Fn(&str, bool) -> Result<Path>,
     killed_positions: &'a HashMap<u64, HashSet<u64>>,
 ) -> Result<Vec<IndexEntry>> {
     // Each future drains its file completely, so the one buffer below is the
@@ -37,13 +45,24 @@ async fn collect_immediate_backfill<'a>(
             let path = resolve(&file.path, file.path_is_relative);
             let dead_positions = killed_positions.get(&file.id.get());
             async move {
+                let recorded = source
+                    .snapshot
+                    .data_files
+                    .get(&source.table.get())
+                    .and_then(|files| files.get(&file.id.get()))
+                    .ok_or_else(|| Error::NotFound(format!("data file {}", file.id)))?;
+                let columns = source
+                    .snapshot
+                    .file_read_columns_at(source.handle, source.table, recorded)
+                    .await?;
                 data_file::scoped_read_entry_batches(
                     data_file::ParquetFile::new(
                         object_store,
-                        path,
+                        path?,
                         file.file_size_bytes,
                         file.footer_size,
                     )
+                    .with_columns(columns)
                     .with_metrics(metrics),
                     positions,
                     data_file::ScopedRows::All,
@@ -140,7 +159,7 @@ pub(super) async fn collect_delete_positions<'a>(
     files: impl Iterator<Item = DeleteFileInfo> + 'a,
     object_store: DataStore,
     metrics: Arc<data_file::ScopedReadMetrics>,
-    resolve: &'a impl Fn(&str, bool) -> Path,
+    resolve: &'a impl Fn(&str, bool) -> Result<Path>,
 ) -> Result<HashMap<u64, HashSet<u64>>> {
     stream::iter(files.map(|file| {
         let path = resolve(&file.path, file.path_is_relative);
@@ -150,7 +169,7 @@ pub(super) async fn collect_delete_positions<'a>(
             let positions = data_file::delete_file_positions(
                 data_file::ParquetFile::new(
                     object_store,
-                    path,
+                    path?,
                     file.file_size_bytes,
                     file.footer_size,
                 )
@@ -220,8 +239,8 @@ impl ReadOnlyCatalog {
     /// live file from `object_store` (the `DATA_PATH` store) and deriving one
     /// entry per row — the extension-path build for a table that already
     /// holds data. The returned entries feed `create_index`'s backfill.
-    /// Indexed columns are located by resolving each field id to its physical
-    /// position (the file's columns follow the table's column order).
+    /// Each file resolves indexed field ids through its recorded mapping;
+    /// missing columns use their initial defaults.
     ///
     /// Row ids resolve per file: the embedded row-id column when the file
     /// carries one (rewrite and flush output), else `row_id_start +
@@ -249,8 +268,7 @@ impl ReadOnlyCatalog {
 
         let table_prefix = snapshot.table_data_prefix(table)?;
         let resolve = |path: &str, is_relative: bool| {
-            let relative = resolve_data_path(data_prefix, &table_prefix, path, is_relative);
-            object_store::path::Path::from(relative.as_str())
+            resolve_data_path(data_prefix, &table_prefix, path, is_relative)
         };
 
         // Entries are live-only. Both kinds of deletion name a physical
@@ -272,6 +290,11 @@ impl ReadOnlyCatalog {
             object_store,
             metrics,
             &positions,
+            BackfillSource {
+                snapshot: &snapshot,
+                table,
+                handle: session.handle(),
+            },
             resolve,
             &killed_positions,
         )
@@ -300,73 +323,100 @@ impl ReadOnlyCatalog {
         let session = self.begin_read().await?;
 
         let snapshot = self.head_view(session.handle()).await?;
-        let positions = snapshot.column_positions(table, columns)?;
-
-        // A tombstone ends only versions begun before it. UPDATE can
-        // reinsert the same row id in the tombstone's snapshot, and that
-        // newer value is live and must be indexed.
-        let (dead, chunks) = futures::try_join!(
-            async {
-                Ok::<_, Error>(
-                    store_inline::scan_inline_deletes(session.handle(), table.get())
-                        .await?
-                        .into_iter()
-                        .map(|(row_id, deletion)| (row_id, deletion.end_snapshot))
-                        .collect::<HashMap<u64, u64>>(),
-                )
+        let entries = inline_backfill_entries_at(
+            BackfillSource {
+                snapshot: &snapshot,
+                table,
+                handle: session.handle(),
             },
-            store_inline::scan_inline_chunks(session.handle(), table.get()),
-        )?;
-        let schema_versions = chunks.iter().filter_map(|(operation, _)| match operation {
-            InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
-            _ => None,
-        });
-        let schemas = read_inline_schemas(session.handle(), table, schema_versions)
-            .await?
-            .into_iter()
-            .map(|(schema_version, record)| {
-                let schema = data_file::decode_inline_schema(record)?;
-                Ok::<_, Error>((schema_version, schema))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-
-        let mut entries = Vec::new();
-        for (op, chunk) in chunks {
-            let InlineOperation::Insert {
-                schema_version,
-                begin_snapshot,
-                ..
-            } = op
-            else {
-                continue;
-            };
-            let schema = schemas.get(&schema_version).cloned().ok_or_else(|| {
-                Error::Corruption(format!(
-                    "no inline schema for table {table} version {schema_version}"
-                ))
-            })?;
-
-            let scoped = data_file::inline_batch_entries(
-                schema,
-                &chunk.body,
-                &positions,
-                chunk.row_id_start,
-            )?;
-            entries.extend(
-                scoped
-                    .into_iter()
-                    .filter(|entry| {
-                        dead.get(&entry.row_id)
-                            .is_none_or(|end_snapshot| begin_snapshot >= *end_snapshot)
-                    })
-                    .map(|entry| IndexEntry {
-                        row_id: entry.row_id,
-                        values: entry.values,
-                    }),
-            );
-        }
+            columns,
+        )
+        .await?;
         session.finish();
 
         Ok(entries)
     }
+}
+
+/// Derives inline entries from the same read point as a build's file sources.
+pub(super) async fn inline_backfill_entries_at(
+    source: BackfillSource<'_>,
+    columns: &[ColumnId],
+) -> Result<Vec<IndexEntry>> {
+    let BackfillSource {
+        snapshot,
+        table,
+        handle,
+    } = source;
+    let positions = snapshot.column_positions(table, columns)?;
+
+    // A tombstone ends only versions begun before it. UPDATE can
+    // reinsert the same row id in the tombstone's snapshot, and that
+    // newer value is live and must be indexed.
+    let (dead, chunks) = futures::try_join!(
+        async {
+            Ok::<_, Error>(
+                store_inline::scan_inline_deletes(handle, table.get())
+                    .await?
+                    .into_iter()
+                    .map(|(row_id, deletion)| (row_id, deletion.end_snapshot))
+                    .collect::<HashMap<u64, u64>>(),
+            )
+        },
+        store_inline::scan_inline_chunks(handle, table.get()),
+    )?;
+    let schema_versions = chunks.iter().filter_map(|(operation, _)| match operation {
+        InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
+        _ => None,
+    });
+    let schemas = read_inline_schemas(handle, table, schema_versions)
+        .await?
+        .into_iter()
+        .map(|(schema_version, record)| {
+            let schema = data_file::decode_inline_schema(record)?;
+            Ok::<_, Error>((schema_version, schema))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+
+    let mut entries = Vec::new();
+    for (op, chunk) in chunks {
+        let InlineOperation::Insert {
+            schema_version,
+            begin_snapshot,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let schema = schemas.get(&schema_version).cloned().ok_or_else(|| {
+            Error::Corruption(format!(
+                "no inline schema for table {table} version {schema_version}"
+            ))
+        })?;
+
+        let scoped = data_file::inline_batch_entries(
+            schema,
+            &chunk.body,
+            &positions,
+            chunk.row_id_start,
+            Some(
+                &snapshot
+                    .inline_read_columns(handle, table, begin_snapshot)
+                    .await?,
+            ),
+        )?;
+        entries.extend(
+            scoped
+                .into_iter()
+                .filter(|entry| {
+                    dead.get(&entry.row_id)
+                        .is_none_or(|end_snapshot| begin_snapshot >= *end_snapshot)
+                })
+                .map(|entry| IndexEntry {
+                    row_id: entry.row_id,
+                    values: entry.values,
+                }),
+        );
+    }
+    Ok(entries)
 }

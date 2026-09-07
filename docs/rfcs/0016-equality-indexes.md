@@ -933,10 +933,11 @@ its entry memory is bounded by `BuildStep` rather than table size.
 Two builders racing the same build both write the definition key and collide
 write-write. Re-running either batch is idempotent, and the persisted source
 cursor advances monotonically, so a stale retry cannot move it backward.
-Intermediate steps classify `inserted_into_table:<table_id>`: a concurrent
-append is benign and re-runs whichever commit loses the head race, while the
-ordinary conflict matrix still rejects a concurrent delete, schema alter, or
-drop. An intermediate cursor advance does **not** change the table schema: it
+Intermediate steps classify `inserted_into_table:<table_id>`: the commit
+layer treats an append as benign and rejects a concurrent delete, schema
+alter, or drop. A replayed closure still checks the driver's derivation
+snapshot before staging its entries. An intermediate cursor advance does
+**not** change the table schema: it
 mints its ordinary snapshot while retaining the current global schema version
 and writes no `ducklake_schema_versions` row. Only the initial definition
 publication and final `ready` flip advance schema history.
@@ -944,18 +945,30 @@ publication and final `ready` flip advance schema history.
 **The delete race.** A row live at one derivation pass can die before its
 step lands, and a stale entry for a dead row is corruption — for a unique
 index it manufactures false `Constraint`s. Both tenses resolve into one
-mechanism: derivation from a fresh snapshot.
+mechanism: derivation from a fresh snapshot. Each pass reads its definition,
+inline rows, file registrations, schemas, and delete bookkeeping through one
+snapshot-isolated read session. Every step checks that snapshot inside its
+commit closure before staging entries; after a successful step, only its
+returned commit snapshot advances the expected value. Reading a newer head
+after acknowledgement must not adopt intervening writes into the premise.
+The driver conservatively re-derives after any other snapshot advance,
+including an unrelated append, rather than trying to prove it harmless.
 
 - *Past deletes* (committed before the pass's snapshot): excluded by
   construction — the scoped read applies the table's delete bookkeeping,
   so a dead row produces no entry.
-- *Concurrent deletes* (racing a step): the killing commit writes
+- *Deletes after derivation but before the step opens*: the in-closure
+  snapshot check returns `CommitConflict`, so an already-committed deletion
+  cannot become part of a stale batch's premise.
+- *Concurrent deletes* (racing an open step): the killing commit writes
   `deleted_from_table`, which conflicts with the step's
   `inserted_into_table` classification, so the
   loser surfaces `CommitConflict` — never an internal closure re-run that
   would re-stage a stale batch. The driver answers a surfaced conflict by
   re-deriving at a fresh snapshot (which excludes the newly dead rows) and
-  re-committing from the cursor.
+  re-committing from the durable cursor. The retry boundary covers the entire
+  pass, including flushes triggered by a full entry or byte buffer and the
+  final ready flip.
 
 **Duplicates poison the build, not the writer.** During `building` the
 entry set is incomplete, so an absent probe proves nothing and enforcement
@@ -1006,6 +1019,12 @@ needs the latter — `is_building` is true for a poisoned definition, which no
 build is advancing, so it reads identically to one mid-build.
 `drop_index` on a building index is an ordinary drop: the builder's next
 step re-runs against the ended definition and stops.
+
+The core driver requires a data-path store whenever the table has live
+registered files. It checks before creating or adopting a definition, again
+inside the definition's commit closure, and at the start of every derivation
+pass. Missing-store refusal leaves an existing resumable build intact;
+empty tables and tables containing only inline rows need no data-path store.
 
 The driver emits progress at `info`. A derivation-started event makes the
 otherwise quiet Parquet-read phase explicit; the matching derived event names
@@ -1097,6 +1116,25 @@ entries to remove. Indexed columns are located in the file by field id
 through the column-mapping rules (RFC 0018). The prohibition on reading
 Parquet guards the *scan* path — merge-on-read, lineage, pushdown — not this
 raw-value projection.
+
+Scoped reads resolve each immutable input independently: native Parquet field
+ids take precedence, externally registered files use their recorded name
+mapping, and inline chunks use the column identities and names at the chunk's
+begin snapshot. Current catalog positions select logical columns only; they
+never select a physical column in an older schema. Unindexed nested children
+do not shift an indexed top-level field's physical position.
+Files without field ids use historical names when no explicit mapping exists;
+if expired history prevents resolving an identity, the read fails. Hive
+partition mappings materialize their virtual columns from the file's directory
+values, including percent decoding and partition-null rules.
+
+Missing fields use `initial_default`, not the current insertion default.
+Before deriving keys, old physical values are converted to the indexed
+column's current type with checked casts; an unsupported default or failed
+conversion returns a typed error. The same projection serves immediate and
+staged backfills, deferred repair, file registration, SQL deletes and updates,
+and located-delete removals. Projection bounds are checked before calling
+Arrow or Parquet APIs that assume valid positions.
 
 A value is indexable only if its Parquet form and its inline Arrow form
 derive the *same* canonical bytes, so the two write paths collide as they

@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet};
 
 use futures::{StreamExt, TryStreamExt, stream};
-use object_store::path::Path;
 use tracing::{debug, warn};
 
 use super::{Catalog, ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
@@ -217,11 +216,14 @@ impl ReadOnlyCatalog {
         stream::iter(files.into_iter().map(|file| {
             let relative =
                 resolve_data_path(data_prefix, table_prefix, &file.path, file.path_is_relative);
-            let path = Path::from(relative.as_str());
             let store = store.clone();
             let metrics = self.data_read_metrics();
 
             async move {
+                let path = match relative {
+                    Ok(path) => path,
+                    Err(error) => return (file.id, Err(error)),
+                };
                 let summary = data_file::file_summary(
                     data_file::ParquetFile::new(
                         store,
@@ -538,7 +540,7 @@ impl ReadOnlyCatalog {
         );
         let file = data_file::ParquetFile::new(
             scope.store.clone(),
-            Path::from(relative.as_str()),
+            relative?,
             delete_file.file_size_bytes,
             delete_file.footer_size,
         )
@@ -769,6 +771,8 @@ fn split_index_removals(
 /// table's registrations to keep a per-registration call under the
 /// argument-count lint.
 struct DeleteIndexScope<'a> {
+    snapshot: &'a CatalogSnapshot,
+    handle: crate::store::handle::ReadHandle<'a>,
     data_store: Option<&'a DataStore>,
     data_prefix: &'a str,
     table_prefix: &'a str,
@@ -809,7 +813,10 @@ impl ReadOnlyCatalog {
             snapshot.column_positions(table, &index.columns)
         })?;
 
+        let session = self.begin_read().await?;
         let scope = DeleteIndexScope {
+            snapshot,
+            handle: session.handle(),
             data_store,
             data_prefix,
             table_prefix: &table_prefix,
@@ -862,13 +869,28 @@ impl ReadOnlyCatalog {
             &file.path,
             file.path_is_relative,
         );
-        let path = Path::from(relative.as_str());
+        let path = relative?;
         let positions = data_file::RowPositions::from_unsorted(registration.new_positions.clone());
         let parquet = data_file::ParquetFile::new(
             store.clone(),
             path,
             file.file_size_bytes,
             file.footer_size,
+        )
+        .with_columns(
+            scope
+                .snapshot
+                .file_read_columns_at(
+                    scope.handle,
+                    scope.table,
+                    scope
+                        .snapshot
+                        .data_files
+                        .get(&scope.table.get())
+                        .and_then(|files| files.get(&file.id.get()))
+                        .ok_or_else(|| Error::NotFound(format!("data file {}", file.id)))?,
+                )
+                .await?,
         )
         .with_metrics(self.data_read_metrics());
 

@@ -561,6 +561,21 @@ fn resolve_data_store(
     match data_root {
         Some(path) => {
             let (kind, prefix) = StoreKind::from_path(&path)?;
+            if matches!(kind, StoreKind::LocalFile) {
+                std::fs::create_dir_all(&path).map_err(|error| {
+                    AbiError::invalid_argument(format!(
+                        "cannot create data directory `{path}`: {error}"
+                    ))
+                })?;
+                let prefix =
+                    object_store::path::Path::from_filesystem_path(&path).map_err(|error| {
+                        AbiError::invalid_argument(format!(
+                            "cannot resolve data directory `{path}`: {error}"
+                        ))
+                    })?;
+                // A foreign file can carry an absolute path outside DATA_PATH.
+                return Ok((Some(Arc::new(LocalFileSystem::new())), prefix.to_string()));
+            }
             Ok((Some(kind.open(&path, s3_creds)?), prefix))
         }
         None => Ok((None, String::new())),

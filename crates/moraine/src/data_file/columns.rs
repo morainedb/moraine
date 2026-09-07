@@ -60,6 +60,14 @@ pub(super) fn projection(
     }
     projected.sort_unstable();
     projected.dedup();
+    if projected
+        .iter()
+        .any(|&position| position >= schema.root_schema().get_fields().len())
+    {
+        return Err(Error::Corruption(
+            "scoped read: projected column is out of bounds".to_owned(),
+        ));
+    }
     let mask = ProjectionMask::roots(schema, projected.iter().copied());
     // Output-batch column index for an original file position.
     let output_index = |position: usize| {

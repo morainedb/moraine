@@ -9,6 +9,7 @@ pub(crate) mod index_policy;
 pub(crate) mod inline;
 pub(crate) mod inline_policy;
 pub(crate) mod projection;
+mod schema_projection;
 mod snapshot;
 mod types;
 
@@ -37,12 +38,14 @@ pub(crate) fn resolve_data_path(
     table_prefix: &str,
     path: &str,
     path_is_relative: bool,
-) -> String {
-    match (path_is_relative, data_prefix.is_empty()) {
+) -> crate::error::Result<object_store::path::Path> {
+    let resolved = match (path_is_relative, data_prefix.is_empty()) {
         (false, _) => path.to_owned(),
         (true, true) => format!("{table_prefix}{path}"),
         (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
-    }
+    };
+    object_store::path::Path::parse(resolved)
+        .map_err(|error| crate::error::Error::Corruption(format!("invalid data path: {error}")))
 }
 pub use types::{
     BuildStep, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats,

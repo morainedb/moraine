@@ -2,6 +2,8 @@ use std::fmt::Write;
 
 use crate::helpers::*;
 
+mod schema_evolution;
+
 /// The equality-index SQL surface end to end: `moraine_index_create`
 /// backfills an index over existing data by scoped-reading the table's
 /// Parquet from `DATA_PATH` (autonomous commit), `moraine_indexes` lists it,

@@ -1,6 +1,9 @@
 //! `Catalog::create_index_staged`: driving a multi-commit index build to
 //! `ready` over a table whose rows live in registered Parquet files.
 
+mod gated_store;
+mod races;
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, OnceLock},
