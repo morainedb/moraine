@@ -33,8 +33,7 @@ use tracing::debug;
 use crate::{
     catalog::{
         CatalogSnapshot, ColumnInfo, IndexId, IndexInfo, SnapshotId, Store, TableId,
-        inline::{InlineScanKind, materialize_inline_rows},
-        projection::ProjectionCache,
+        inline::materialize_inline_rows, projection::ProjectionCache,
     },
     data_file::{self, DataStore},
     error::{Error, Result},

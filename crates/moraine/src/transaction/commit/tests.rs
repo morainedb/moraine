@@ -164,16 +164,7 @@ async fn migration_marker_is_refused() {
     }
 }
 
-/// A format below this binary's floor refuses toward the migrate path,
-/// distinct from the newer-than-binary message. The floor sits at the base
-/// format while every format is additive, so only a synthetic store reaches
-/// this arm; the test holds it correct for the first format that raises it.
-///
-/// The message must name the verb, and name it as something this binary
-/// runs: `Catalog::migrate` takes a store path and never goes through the
-/// format check, so the store an attach refuses is still migratable by the
-/// binary that refused it. That is the non-obvious half, and the half an
-/// operator gets wrong.
+/// A format below the readable floor refuses with the migration verb.
 #[tokio::test]
 async fn older_format_refuses_toward_migrate() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
@@ -679,7 +670,10 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
         store::key::{IndexKind, index_index_prefix},
     };
     let (catalog, table) = catalog_with_two_column_table().await;
-    assert_eq!(read_format_version(&catalog).await, FORMAT_VERSION);
+    assert_eq!(
+        read_format_version(&catalog).await,
+        FORMAT_VERSION.max(MIN_FORMAT_VERSION)
+    );
 
     let index = std::cell::Cell::new(None);
     catalog
@@ -707,7 +701,10 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
     assert_eq!(infos[0].columns, vec![ColumnId::new(1)]);
     assert!(infos[0].unique);
     assert_eq!(infos[0].state, IndexState::Ready);
-    assert_eq!(read_format_version(&catalog).await, FORMAT_WITH_INDEX);
+    assert_eq!(
+        read_format_version(&catalog).await,
+        FORMAT_WITH_INDEX.max(MIN_FORMAT_VERSION)
+    );
 
     // Both backfill rows produced a stored entry.
     let tx = catalog.begin_write_tx().await.unwrap();
@@ -758,7 +755,7 @@ async fn deferred_index_is_non_unique_and_stamps_its_format() {
     );
     assert_eq!(
         read_format_version(&catalog).await,
-        FORMAT_WITH_DEFERRED_INDEX
+        FORMAT_WITH_DEFERRED_INDEX.max(MIN_FORMAT_VERSION)
     );
 
     let error = catalog
@@ -812,7 +809,10 @@ async fn duplicate_unique_value_in_backfill_aborts_create() {
             .indexes_of(table)
             .is_empty()
     );
-    assert_eq!(read_format_version(&catalog).await, FORMAT_VERSION);
+    assert_eq!(
+        read_format_version(&catalog).await,
+        FORMAT_VERSION.max(MIN_FORMAT_VERSION)
+    );
     catalog.close().await.unwrap();
 }
 
@@ -2602,7 +2602,10 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     assert_eq!(single_index, staged_index);
 
     // While building: format 3, lookups fail typed.
-    assert_eq!(read_format_version(&staged).await, FORMAT_WITH_STAGED_INDEX);
+    assert_eq!(
+        read_format_version(&staged).await,
+        FORMAT_WITH_STAGED_INDEX.max(MIN_FORMAT_VERSION)
+    );
     assert!(matches!(
         staged
             .index_lookup(table_staged, staged_index, &[int_value(20)])
@@ -3412,7 +3415,10 @@ async fn drop_index_ends_definition_and_keeps_format() {
             .is_empty()
     );
     // Dropping the last index does not downgrade the stamp.
-    assert_eq!(read_format_version(&catalog).await, FORMAT_WITH_INDEX);
+    assert_eq!(
+        read_format_version(&catalog).await,
+        FORMAT_WITH_INDEX.max(MIN_FORMAT_VERSION)
+    );
     catalog.close().await.unwrap();
 }
 
@@ -3631,10 +3637,10 @@ async fn the_migration_marker_refuses_a_commit_with_a_warm_cache() {
 async fn a_format_target_under_the_observed_floor_costs_no_read() {
     let (catalog, _) = seeded_catalog(1).await;
     let projections = catalog.projections();
-    raise_format_floor(projections, MAX_FORMAT_VERSION);
+    raise_format_floor(projections, MAX_FORMAT_VERSION + 1);
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let stamp = format_stamp_to(&db_tx, projections, FORMAT_WITH_INDEX)
+    let stamp = format_stamp_to(&db_tx, projections, MAX_FORMAT_VERSION + 1)
         .await
         .unwrap();
 
@@ -3651,12 +3657,12 @@ async fn a_format_target_above_the_floor_reads_and_raises_it() {
     let projections = catalog.projections();
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let stamp = format_stamp_to(&db_tx, projections, FORMAT_WITH_INDEX)
+    let stamp = format_stamp_to(&db_tx, projections, MIN_FORMAT_VERSION + 1)
         .await
         .unwrap();
 
-    assert!(stamp.is_some(), "a fresh store owes the index stamp");
-    assert_eq!(format_floor(projections), FORMAT_VERSION);
+    assert!(stamp.is_some(), "a higher target requires a stamp");
+    assert_eq!(format_floor(projections), MIN_FORMAT_VERSION);
     db_tx.rollback();
     catalog.close().await.unwrap();
 }

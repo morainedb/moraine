@@ -1,9 +1,9 @@
 //! Pure materialization of live inlined rows from already-scanned
-//! `inline/insert` chunks and `inline/inline_delete` tombstones (see
+//! `inline/insert` chunks and `inline/row_tombstone` deletion events (see
 //! [`crate::store::inline`] for the scans). No store I/O here; the read
 //! model DuckLake's four inline scan variants select over.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::store::{
     key::InlineOperation,
@@ -11,8 +11,8 @@ use crate::store::{
 };
 
 /// One inlined row, addressed by dense `row_id` and located in its chunk
-/// by index + offset. `end_snapshot` is `None` until a matching
-/// `inline/inline_delete` tombstones the row.
+/// by index + offset. The first deletion event after `begin_snapshot`
+/// determines `end_snapshot`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InlineRow {
     /// The row's dense id (`chunk.row_id_start + offset_in_chunk`).
@@ -68,10 +68,13 @@ fn materialize_spans(
     spans: impl Iterator<Item = (InlineOperation, u64, u64)>,
     inline_deletes: &[(u64, InlineInlineDeleteValue)],
 ) -> Vec<InlineRow> {
-    let tombstones: HashMap<u64, u64> = inline_deletes
-        .iter()
-        .map(|(row_id, inline_delete)| (*row_id, inline_delete.end_snapshot))
-        .collect();
+    let mut tombstones: HashMap<u64, BTreeSet<u64>> = HashMap::new();
+    for (row_id, deletion) in inline_deletes {
+        tombstones
+            .entry(*row_id)
+            .or_default()
+            .insert(deletion.end_snapshot);
+    }
 
     let mut rows = Vec::new();
     for (chunk_index, (op, row_id_start, row_count)) in spans.enumerate() {
@@ -81,14 +84,16 @@ fn materialize_spans(
 
         for offset in 0..row_count {
             let row_id = row_id_start + offset;
-            // A tombstone ends only a version begun before it: an `UPDATE`
-            // tombstones a row and re-inserts its `row_id` in one commit,
-            // and the re-inserted version must stay live (DuckLake's own
-            // writer guards `begin_snapshot != {SNAPSHOT_ID}`).
-            let end_snapshot = tombstones
-                .get(&row_id)
+            // An UPDATE ends the preceding version, not its same-commit
+            // replacement. Later deletions must not extend that lifetime.
+            let end_snapshot = tombstones.get(&row_id).and_then(|ends| {
+                ends.range((
+                    std::ops::Bound::Excluded(begin_snapshot),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
                 .copied()
-                .filter(|&end| begin_snapshot < end);
+            });
             rows.push(InlineRow {
                 row_id,
                 begin_snapshot,
@@ -120,8 +125,8 @@ pub enum InlineScanKind {
 
 impl InlineScanKind {
     /// Filters `rows` per this scan's predicate at snapshot `S`, ordered
-    /// by `(row_id, begin_snapshot)` — only `ForFlush` can return more
-    /// than one row per `row_id`, so only it observes the tiebreak.
+    /// by `(row_id, begin_snapshot)`. History scans can return several
+    /// versions of one row id.
     /// `start` is only read by `Insertions`/`Deletions`.
     #[must_use]
     pub fn select(self, rows: &[InlineRow], snapshot: u64, start: u64) -> Vec<InlineRow> {
@@ -274,6 +279,28 @@ mod tests {
         let deleted = InlineScanKind::Deletions.select(&rows, 5, 5);
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0].begin_snapshot, 2);
+    }
+
+    #[test]
+    fn each_version_ends_at_its_first_later_tombstone() {
+        let chunks = vec![
+            (insert(6), chunk(0, 1)),
+            (insert(1), chunk(0, 2)),
+            (insert(4), chunk(0, 1)),
+        ];
+        let deletes = vec![
+            (0, InlineInlineDeleteValue { end_snapshot: 7 }),
+            (0, InlineInlineDeleteValue { end_snapshot: 2 }),
+            (0, InlineInlineDeleteValue { end_snapshot: 6 }),
+        ];
+        let rows = materialize_inline_rows(&chunks, &deletes);
+
+        assert_eq!(rows[0].end_snapshot, Some(7));
+        assert_eq!(rows[1].end_snapshot, Some(2));
+        assert_eq!(rows[2].end_snapshot, None);
+        assert_eq!(rows[3].end_snapshot, Some(6));
+        assert_eq!(row_ids(&InlineScanKind::Table.select(&rows, 3, 0)), [1]);
+        assert_eq!(InlineScanKind::Deletions.select(&rows, 6, 6), [rows[3]]);
     }
 
     #[test]

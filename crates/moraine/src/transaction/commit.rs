@@ -39,7 +39,7 @@ use crate::{
     },
 };
 
-/// Structural layout version a fresh store bootstraps at.
+/// The original structural layout; later rewrites raise the readable floor.
 pub(crate) const FORMAT_VERSION: u64 = 1;
 /// Format stamped the first time an equality index exists: adds the
 /// `index` subspace and kind.
@@ -63,12 +63,14 @@ pub(crate) const FORMAT_WITH_INLINE_SCHEMA_REFERENCE: u64 = 7;
 /// no directory at all, so it must be locked out rather than left to serve
 /// reads from a directory it cannot see.
 pub(crate) const FORMAT_WITH_INLINE_CHUNK_IDENTITY: u64 = 8;
+/// Inline tombstones retain each deletion snapshot under its own key.
+pub(crate) const FORMAT_WITH_INLINE_TOMBSTONE_HISTORY: u64 = 9;
 /// The highest format this binary understands. It opens any store in
 /// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
-pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_CHUNK_IDENTITY;
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_TOMBSTONE_HISTORY;
 /// The lowest format this binary reads directly; a store below it must be
 /// migrated up first. Rises only when a format rewrites the keyspace.
-pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_VERSION;
+pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_TOMBSTONE_HISTORY;
 /// Bounded internal retries before a benign race is reported as a
 /// conflict.
 pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 10;
@@ -248,7 +250,7 @@ fn stage_bootstrap(
     stage(
         Key::Sys(SysKey::Format),
         value::encode_value(&proto::FormatValue {
-            format_version: FORMAT_VERSION,
+            format_version: MIN_FORMAT_VERSION,
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
         }),
     );
@@ -393,7 +395,7 @@ async fn open_attempt(
     match commit_durable(tx, "bootstrap", staged, &durability).await {
         Ok(_) => {
             info!(encrypted, data_path, "bootstrapped a fresh catalog store");
-            Ok((db, counters, FORMAT_VERSION))
+            Ok((db, counters, MIN_FORMAT_VERSION))
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.

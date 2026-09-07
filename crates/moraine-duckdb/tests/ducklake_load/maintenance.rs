@@ -1828,15 +1828,11 @@ fn expiring_a_dropped_table_reclaims_its_file_column_stats_like_stock() {
     assert_eq!(swept, vec![vec!["reclaimed 0 file column statistics"]]);
 }
 
-/// `moraine_raise_format` takes the newest additive format deliberately,
-/// ahead of the commit that would otherwise take it. It reports the move
-/// and is idempotent, and `dry_run` reads a store's format without
-/// moving it. The store here writes no shape needing the newest format —
-/// its inserts inline, but nothing deregisters a duplicate schema — so
-/// it sits below one until the verb runs.
+/// Fresh catalogs already use the newest format; raising it and probing
+/// with `dry_run` are idempotent.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
-fn raising_the_store_format_is_explicit_and_idempotent() {
+fn raising_a_fresh_stores_format_is_idempotent() {
     let dir = TempDir::new("raise-format-store");
     let data_dir = TempDir::new("raise-format-data");
     let store = dir.path();
@@ -1845,8 +1841,6 @@ fn raising_the_store_format_is_explicit_and_idempotent() {
     run_ducklake_sql(
         store,
         data_path,
-        // Inlining is off: a locator carries the newest format, and this
-        // test needs a store that sits below it.
         "SET ducklake_default_data_inlining_row_limit = 0;\n\
          CREATE TABLE lake.main.t (i BIGINT);\n\
          INSERT INTO lake.main.t VALUES (1);",
@@ -1866,10 +1860,7 @@ fn raising_the_store_format_is_explicit_and_idempotent() {
     // A dry run answers what a raise would do, twice over, without doing
     // it — the pre-flight a one-way door needs.
     let probed = raise_with("the dry run", ", dry_run := true");
-    assert!(
-        probed.0 < probed.1,
-        "a fresh store must sit below this binary's newest additive format, got {probed:?}"
-    );
+    assert_eq!(probed, (9, 9));
     assert_eq!(
         raise_with("the second dry run", ", dry_run := true"),
         probed,
@@ -1878,11 +1869,6 @@ fn raising_the_store_format_is_explicit_and_idempotent() {
 
     let (from_format, to_format) = raise_with("the first raise", "");
     assert_eq!((from_format, to_format), probed);
-    assert!(
-        from_format < to_format,
-        "a store writing no shape that needs the newest format must sit below it, \
-         got {from_format} -> {to_format}"
-    );
 
     let (again_from, again_to) = raise_with("the second raise", "");
     assert_eq!(

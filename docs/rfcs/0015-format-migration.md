@@ -134,11 +134,11 @@ cannot name every subspace tag it might encounter cannot safely read, so it
 stops. This is the same discipline the framing header applies to an unknown
 value encoding, lifted to the structural level.
 
-Until the first rewriting migration exists, the floor sits at the base format
-and the below-the-floor arm is **dormant** — no store in the world is below
-it. It is specified and implemented now anyway, for the same reason the
-reader gate is: the arm has to be in the fielded binaries *before* the format
-that makes it fire.
+The first rewriting migration, `version-inline-tombstones` (8 → 9), moves
+single inline tombstones to immutable deletion-event keys (RFC 0005).
+The readable floor and fresh-store bootstrap are both 9. Opening an older
+catalog refuses until the operator invokes `Catalog::migrate` or the
+unattached `moraine_migrate` SQL function.
 
 ### Single-writer migration
 
@@ -158,10 +158,7 @@ future writer must keep its rule — the marker lands in the same batch as a
 head move. Handles cache the marker's absence keyed on the head they
 observed it at (RFC 0009), so a marker written without moving the head
 would be invisible to every warm handle. The invariant is what that caching
-is sound against, not an incidental property of today's code — and it holds
-for every store in the field, not only future ones, because the unit
-registry has been empty since the marker key was reserved: no released
-binary has ever written it.
+is sound against, not an incidental property of today's code — and every registered migration uses that start path.
 
 ### Crash-safe resumable migration
 
@@ -278,11 +275,21 @@ v1→v2 then v2→v3, run in sequence, each with its own start/step/finish and i
 own cursor. There is no bespoke v1→v3 path to write or test; correctness of
 the composition follows from correctness of each link.
 
-The unit registry is intentionally empty while every shipped format change is
-additive. It is complete for the formats that exist, not a missing
-implementation. The change that first moves an existing key must add its
-`v_n → v_{n+1}` unit, raise `MIN_FORMAT_VERSION`, pin the registry chain, and
-drive that released unit through the SQL surface in the same change.
+The shipped registry contains `version-inline-tombstones` (8 → 9). For a
+catalog at format 1 through 7 without an in-progress marker, the migration
+verb first advances the additive stamp to 8, then runs the rewrite. An
+interrupted unit resumes at its recorded format and cursor. The report keeps
+the original format as `from_format`, including when an additive advance
+preceded the rewrite.
+
+The unit processes at most 256 old tombstones per step in encoded-key order.
+Each step preserves the framed value at the new `(table_id, row_id,
+end_snapshot)` key, deletes the old key, and advances a full source-key
+cursor atomically. It leaves Arrow bodies and catalog snapshots unchanged.
+Deletion snapshots an older writer already overwrote cannot be recovered;
+migration preserves the surviving events, not history already lost.
+Future rewrites add a named unit, raise the readable floor, and pin the
+registry chain in tests.
 
 There is **no automatic rollback**, by decision. Recovery from a failed
 migration is manual, resting on two mitigations already load-bearing elsewhere
@@ -340,12 +347,10 @@ These extend [RFC 0011](0011-crash-recovery.md)'s cases; they
 run against real SlateDB on in-memory `object_store`, no store mocks
 (RFC 0001), and are naturally expressed as new `CrashCase`-style cases.
 
-They need a unit to run, and no shipped format has one — every format to
-date is additive. A fault-injection build therefore installs a synthetic
-rewriting unit into the driver's own registry, so the obligations below are
-driven through the public verb against the planner that ships. The unit
-lands the store on the newest format this binary reads, which is what lets
-the post-migration assertions go through an ordinary attach.
+The shipped inline-tombstone migration is tested with enough records to span
+multiple steps and interrupted at every seam. Synthetic rewriting units
+also exercise option-record preservation and multi-unit chains through the
+public migration verb.
 
 - **Crash at every migration seam.** Inject a crash after the start batch,
   after each step batch, before the finish flip, and after it. Each reopen

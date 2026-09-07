@@ -410,6 +410,15 @@ pub(crate) enum InlineKey {
         /// The chunk's sequence within its schema version and snapshot.
         chunk_seq: u64,
     },
+    /// One deletion event for an inline row; later updates append events.
+    RowTombstone {
+        /// Owning table.
+        table_id: u64,
+        /// Deleted row.
+        row_id: u64,
+        /// Snapshot that ended the row's preceding version.
+        end_snapshot: u64,
+    },
 }
 
 /// An inlined-data record that exists in both live and archived form.
@@ -426,7 +435,7 @@ pub(crate) enum InlineOperation {
         /// Disambiguates multiple chunks in one commit.
         chunk_seq: u64,
     },
-    /// Tombstone for an inlined insert row.
+    /// Legacy row-level tombstone, read only by the format migration.
     InlineDelete {
         /// Owning table.
         table_id: u64,
@@ -698,6 +707,26 @@ pub(crate) fn inline_live_table_prefix(kind: InlineOperationKind, table_id: u64)
     prefix_of(
         &Key::Inline(InlineKey::Live(kind.sample(table_id))),
         INLINE_LIVE_KIND_PREFIX_LEN + size_of::<u64>(),
+    )
+}
+
+/// Byte prefix of one legacy inline operation kind across all tables.
+pub(crate) fn inline_live_kind_prefix(kind: InlineOperationKind) -> Vec<u8> {
+    prefix_of(
+        &Key::Inline(InlineKey::Live(kind.sample(0))),
+        INLINE_LIVE_KIND_PREFIX_LEN,
+    )
+}
+
+/// Byte prefix of every versioned inline tombstone for `table_id`.
+pub(crate) fn inline_row_tombstone_table_prefix(table_id: u64) -> Vec<u8> {
+    prefix_of(
+        &Key::Inline(InlineKey::RowTombstone {
+            table_id,
+            row_id: 0,
+            end_snapshot: 0,
+        }),
+        2 + size_of::<u64>(),
     )
 }
 
@@ -1950,11 +1979,29 @@ mod tests {
                 },
             ),
             arb_index().prop_map(Key::Index),
+            any::<(u64, u64, u64)>().prop_map(|(table_id, row_id, end_snapshot)| {
+                Key::Inline(InlineKey::RowTombstone {
+                    table_id,
+                    row_id,
+                    end_snapshot,
+                })
+            }),
             any::<u64>().prop_map(|snapshot_id| Key::Changelog { snapshot_id }),
         ]
     }
 
     proptest! {
+        #[test]
+        fn inline_tombstone_roundtrip_and_table_prefix(
+            table_id in any::<u64>(), row_id in any::<u64>(), end_snapshot in any::<u64>(),
+        ) {
+            let key = Key::Inline(InlineKey::RowTombstone { table_id, row_id, end_snapshot });
+            let encoded = key.encode();
+            prop_assert_eq!(Key::decode(&encoded).unwrap(), key);
+            prop_assert!(encoded.starts_with(&inline_row_tombstone_table_prefix(table_id)));
+            prop_assert!(!encoded.starts_with(&inline_live_table_prefix(InlineOperationKind::InlineDelete, table_id)));
+        }
+
         #[test]
         fn borrowed_index_entry_encoding_matches_owned(
             index_id in any::<u64>(),

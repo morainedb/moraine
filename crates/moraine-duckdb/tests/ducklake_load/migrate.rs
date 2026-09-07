@@ -28,10 +28,7 @@ fn run_unattached(sql: &str) -> std::process::Output {
 }
 
 /// The verb reaches a store no session has attached, reports what it did,
-/// and re-runs as a no-op. Every format to date is additive, so there is
-/// nothing to rewrite and the store reports the version it already
-/// carries — the dormant case, which is the one an operator hits until the
-/// first rewriting format exists.
+/// and re-runs as a no-op for a freshly created store.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI and packaged extension"]
 fn migrate_reaches_a_store_without_attaching_it() {
@@ -54,8 +51,8 @@ fn migrate_reaches_a_store_without_attaching_it() {
     assert_eq!(
         rows,
         vec![vec![
-            "1".to_string(),
-            "1".to_string(),
+            "9".to_string(),
+            "9".to_string(),
             "false".to_string(),
             String::new(),
         ]],

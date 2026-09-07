@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+mod tombstone_rewrite;
+
 use object_store::memory::InMemory;
 
 use super::{
@@ -39,6 +41,14 @@ async fn seeded_store() -> Arc<InMemory> {
 
     let db = open_migrator(&object_store).await;
     let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Format).encode(),
+        value::encode_value(&proto::FormatValue {
+            format_version: FORMAT_VERSION,
+            writer_version: "synthetic-source".to_owned(),
+        }),
+    )
+    .unwrap();
     for scope_id in 1..=SEEDED_RECORDS {
         tx.put(
             Key::current(EntityKey::Option {
@@ -329,8 +339,7 @@ fn an_unknown_migration_in_flight_is_refused() {
     assert!(matches!(error, Error::Migration(_)), "{error:?}");
 }
 
-/// The shipped registry is empty — every format so far is additive — so the
-/// verb reports a no-op rather than pretending it rewrote anything.
+/// A current store needs no rewrite.
 #[tokio::test]
 async fn the_migrate_verb_is_a_noop_against_a_current_store() {
     install_migration(SyntheticMigration::None);
@@ -348,8 +357,8 @@ async fn the_migrate_verb_is_a_noop_against_a_current_store() {
     .await
     .unwrap();
 
-    assert_eq!(report.from_format, FORMAT_VERSION);
-    assert_eq!(report.to_format, FORMAT_VERSION);
+    assert_eq!(report.from_format, MIN_FORMAT_VERSION);
+    assert_eq!(report.to_format, MIN_FORMAT_VERSION);
     assert!(report.units_run.is_empty());
     assert!(!report.resumed);
 }
@@ -381,20 +390,8 @@ async fn the_checkpoint_flag_takes_and_releases_one() {
     catalog.close().await.unwrap();
 }
 
-/// The registry and the readable floor have to agree, and nothing but this
-/// test makes them.
-///
-/// `MIGRATIONS` is empty today, so the floor sits at the base format and
-/// every arm of the version check that depends on it is dormant. The moment
-/// a real unit is added that stops being true: its `to_format` is where the
-/// keys now live, so a store below that is one this binary cannot read
-/// directly and must migrate first. Adding a unit without raising
-/// `MIN_FORMAT_VERSION` with it would leave the below-floor arm silently
-/// unreachable and let an ordinary attach scan for keys the rewrite moved.
-///
-/// The chain shape matters for the same reason: `chain_from` walks by
-/// matching `from_format`, so a gap strands every later unit and a repeat
-/// makes which one runs depend on registry order.
+/// The readable floor matches the last rewrite, and the registry forms an
+/// unambiguous chain with no gaps or repeated source versions.
 #[test]
 fn the_registry_and_the_readable_floor_agree() {
     for pair in MIGRATIONS.windows(2) {
@@ -443,7 +440,7 @@ fn the_registry_and_the_readable_floor_agree() {
 /// rewrite puts them where the format says they are.
 #[test]
 fn the_additive_ceiling_stops_below_the_first_rewrite() {
-    assert_eq!(additive_ceiling(FORMAT_VERSION), MAX_FORMAT_VERSION);
+    assert_eq!(additive_ceiling(FORMAT_VERSION), MIGRATIONS[0].from_format);
 
     install_migration(SyntheticMigration::MoveOptionScope);
     let units = registry();
@@ -469,7 +466,8 @@ async fn raising_the_format_is_idempotent_and_never_implicit() {
     // A dry run answers "what format is this, and where would a raise
     // take it" without taking it.
     let probed = catalog.raise_format(true).await.unwrap();
-    assert!(probed.from_format < probed.to_format);
+    assert_eq!(probed.from_format, MIN_FORMAT_VERSION);
+    assert_eq!(probed.to_format, additive_ceiling(MIN_FORMAT_VERSION));
     let still = catalog.raise_format(true).await.unwrap();
     assert_eq!(
         still, probed,
@@ -477,10 +475,7 @@ async fn raising_the_format_is_idempotent_and_never_implicit() {
     );
 
     let before = catalog.raise_format(false).await.unwrap();
-    assert!(
-        before.from_format < before.to_format,
-        "a fresh store starts below this binary's newest additive format"
-    );
+    assert_eq!(before, probed);
     assert_eq!(before.to_format, MAX_FORMAT_VERSION);
 
     let again = catalog.raise_format(false).await.unwrap();

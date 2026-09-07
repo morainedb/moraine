@@ -12,6 +12,8 @@ use futures::future::BoxFuture;
 use slatedb::{Db, DbTransaction, IsolationLevel};
 use tracing::info;
 
+mod inline_tombstones;
+
 use crate::{
     error::{Error, Result},
     fault::{CrashPoint, crash_seam},
@@ -56,8 +58,7 @@ pub(crate) struct MigrationUnit {
 }
 
 /// Every structural migration this binary ships, in ascending order.
-/// Empty: every format to date is additive, so no keyspace is rewritten.
-pub(crate) const MIGRATIONS: &[MigrationUnit] = &[];
+pub(crate) const MIGRATIONS: &[MigrationUnit] = &[inline_tombstones::MIGRATION];
 
 /// What one raise call did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,20 +455,27 @@ pub(crate) async fn run(db: &Db) -> Result<MigrationReport> {
     let from_format = format.format_version;
     let marker = marker?;
 
-    let Plan { units, mut resume } = plan(from_format, marker.as_ref())?;
+    // Older additive stamps can reach the first rewrite's source without
+    // moving keys. An interrupted rewrite must resume at its recorded stamp.
+    let planning_format = if marker.is_none() && from_format < commit::MIN_FORMAT_VERSION {
+        raise_format(db, false).await?.to_format
+    } else {
+        from_format
+    };
+    let Plan { units, mut resume } = plan(planning_format, marker.as_ref())?;
     let resumed = resume.is_some();
 
     if units.is_empty() {
         return Ok(MigrationReport {
             from_format,
-            to_format: from_format,
+            to_format: planning_format,
             units_run: Vec::new(),
             resumed,
         });
     }
 
     let mut units_run = Vec::with_capacity(units.len());
-    let mut to_format = from_format;
+    let mut to_format = planning_format;
 
     for unit in units {
         info!(

@@ -85,8 +85,7 @@ impl CrashCase {
 }
 
 /// Which synthetic migration units a fault-injection build installs into the
-/// driver's registry. The shipped registry is empty (every shipped format is
-/// additive), so a unit is what gives the driver something to run.
+/// driver's registry to exercise rewrites and multi-unit chains.
 #[cfg(any(test, feature = "fault-injection"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyntheticMigration {

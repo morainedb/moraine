@@ -13,8 +13,9 @@ use crate::{
         key::{
             InlineKey, InlineOperation, InlineOperationKind, Key, inline_chunk_locator_suffix,
             inline_chunk_locator_table_prefix, inline_chunk_range_table_prefix,
-            inline_live_table_prefix, inline_schema_dropped_prefix,
-            inline_schema_dropped_table_prefix, inline_schema_prefix, inline_schema_table_prefix,
+            inline_live_table_prefix, inline_row_tombstone_table_prefix,
+            inline_schema_dropped_prefix, inline_schema_dropped_table_prefix, inline_schema_prefix,
+            inline_schema_table_prefix,
         },
         proto::{
             InlineChunkRangeValue, InlineChunkValue, InlineFileDeleteTableValue,
@@ -312,21 +313,31 @@ pub(crate) async fn scan_inline_chunks(
     .await
 }
 
-/// Every inlined-insert-row tombstone for `table_id`, keyed by row id.
+/// Every inlined-insert-row tombstone, ordered by row id and end snapshot.
 pub(crate) async fn scan_inline_deletes(
     handle: ReadHandle<'_>,
     table_id: u64,
 ) -> Result<Vec<(u64, InlineInlineDeleteValue)>> {
     scan_decode(
         handle,
-        inline_live_table_prefix(InlineOperationKind::InlineDelete, table_id),
+        inline_row_tombstone_table_prefix(table_id),
         ScanShape::Probe,
         |key, bytes| match key {
-            Key::Inline(InlineKey::Live(InlineOperation::InlineDelete { row_id, .. })) => {
-                Ok((row_id, value::decode_owned(bytes)?))
+            Key::Inline(InlineKey::RowTombstone {
+                row_id,
+                end_snapshot,
+                ..
+            }) => {
+                let value: InlineInlineDeleteValue = value::decode_owned(bytes)?;
+                if value.end_snapshot != end_snapshot {
+                    return Err(Error::Corruption(
+                        "inline tombstone key and value disagree".to_owned(),
+                    ));
+                }
+                Ok((row_id, value))
             }
             other => Err(Error::Corruption(format!(
-                "non-inline_delete key in inline inline_delete scan: {other:?}"
+                "non-tombstone key in inline tombstone scan: {other:?}"
             ))),
         },
     )
@@ -864,10 +875,11 @@ mod tests {
         )
         .unwrap();
         tx.put(
-            Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
+            Key::Inline(InlineKey::RowTombstone {
                 table_id: 7,
                 row_id: 3,
-            }))
+                end_snapshot: 9,
+            })
             .encode(),
             value::encode_value(&inline_delete),
         )
