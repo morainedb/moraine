@@ -98,15 +98,57 @@ async fn index_encoding_workers_share_one_process_bound() {
 #[derive(Debug)]
 struct CountingStore {
     inner: InMemory,
+    display_name: &'static str,
     fetched_bytes: AtomicU64,
     fetch_requests: AtomicU64,
     fetch_delay: Option<Duration>,
+}
+
+#[tokio::test]
+async fn identical_display_names_do_not_share_parquet_cache_entries() {
+    let path = Path::from("same-name.parquet");
+    let mut sizes = Vec::new();
+    for value in [10_i64, 20] {
+        let store = Arc::new(CountingStore {
+            display_name: "AmazonS3(shared-bucket)",
+            ..CountingStore::new()
+        });
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let size = bytes.len() as u64;
+        sizes.push(size);
+        store.put(&path, bytes.into()).await.unwrap();
+        let entries = scoped_read_entries(
+            store,
+            &path,
+            &[0],
+            ScopedRows::All,
+            RowIdSource::Ordinal,
+            Some(size),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            entries[0].values,
+            vec![Some(IndexKeyValue::Int {
+                value: value.into(),
+                width: IntWidth::I64
+            })]
+        );
+    }
+    assert_eq!(sizes[0], sizes[1]);
 }
 
 impl CountingStore {
     fn new() -> Self {
         Self {
             inner: InMemory::new(),
+            display_name: "CountingStore(InMemory)",
             fetched_bytes: AtomicU64::new(0),
             fetch_requests: AtomicU64::new(0),
             fetch_delay: None,
@@ -131,7 +173,7 @@ impl CountingStore {
 
 impl std::fmt::Display for CountingStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CountingStore({})", self.inner)
+        f.write_str(self.display_name)
     }
 }
 

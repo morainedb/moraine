@@ -5,7 +5,6 @@ use object_store::{ObjectStore, memory::InMemory, path::Path};
 use super::auxiliary_cache::{AuxiliaryCache, FileSummaryKey};
 use crate::data_file::{
     DataStore,
-    data_store::StoreIdentity,
     row_set::{FileRowSet, FileRowSetKind, PositionedRowSet, RowOrder},
 };
 
@@ -555,24 +554,17 @@ mod blocks {
     }
 }
 
-/// A durable store's identity is its location, the same in every process;
-/// an in-memory store's is its own.
+/// Local roots share explicitly; unnamed handles remain isolated.
 #[test]
 fn durable_stores_are_named_by_location() {
     let root = std::env::temp_dir();
-    let local = || -> Arc<dyn ObjectStore> {
-        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&root).unwrap())
-    };
-    assert_eq!(StoreIdentity::of(&local()), StoreIdentity::of(&local()));
-    assert!(matches!(
-        StoreIdentity::of(&local()),
-        StoreIdentity::Durable(_)
-    ));
-
+    let local = || object_store::local::LocalFileSystem::new_with_prefix(&root).unwrap();
+    assert_eq!(
+        crate::CacheIdentity::local(&local()).unwrap(),
+        crate::CacheIdentity::local(&local()).unwrap()
+    );
     let memory: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    assert!(matches!(
-        StoreIdentity::of(&memory),
-        StoreIdentity::Ephemeral(_)
-    ));
-    assert_ne!(StoreIdentity::of(&memory), StoreIdentity::of(&memory));
+    let first = DataStore::new(memory.clone());
+    assert_eq!(first.identity, first.clone().identity);
+    assert_ne!(first.identity, DataStore::new(memory).identity);
 }

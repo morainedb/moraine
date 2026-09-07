@@ -611,7 +611,7 @@ The caches a moraine-backed query crosses, top to bottom:
 | DuckLake catalog cache | schema/catalog entries; the per-transaction snapshot | snapshot id + `schema_version` | live-catalog-sized | `schema_version` move; transaction end |
 | shim `MetadataRows` | decoded rows per synthesized table | head stamp at first scan | per transaction | transaction end |
 | core logical caches | `CatalogSnapshot`, entity record set, maintained projections | head stamp + install epoch | one catalog's decoded size, reported by `projection_bytes` | replaced on stamp move |
-| core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep, and file row-id summaries | object-store location + path + file size + page-index policy | process-wide share of `CACHE_MEMORY`, to a ceiling, over `CACHE_DIR/auxiliary` | byte-bounded LRU (foyer), recovered on restart |
+| core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep, and file row-id summaries | object-store location + path + file size + page-index policy | process-wide share of `CACHE_MEMORY`, to a ceiling, over `CACHE_DIR/auxiliary-v2` | byte-bounded LRU (foyer), recovered on restart |
 | SlateDB block + meta cache | decoded SST blocks, indexes, filters | scoped SST id + offset | one cache per attached store: an even share of the process budget in memory over `CACHE_DIR/<store>/blocks` | LRU-ish (foyer), recovered on restart |
 
 Two findings drove this section. Before consolidation, one catalog byte could
@@ -917,8 +917,9 @@ counter resets with the process and follows attach order. One disk device
 shared by every store would therefore, after a restart in a different attach
 order, serve one store's recovered WAL block for another. So the block cache
 is **one foyer instance per store**, its device at `CACHE_DIR/<store>/blocks`
-where `<store>` hashes the object store's name and the store's path. Inside
-one store's directory the keys can only be that store's, so recovery is
+where `<store>` is `v2-` followed by a hash of the explicit cache identity
+and the store's path, with unambiguous component boundaries. Inside one store's
+directory the keys can only be that store's, so recovery is
 enabled: entries are written to disk on insertion (a shutdown is not needed
 to persist them) and read back on the next open. A store re-attached in the
 same order gets the same scopes and is served from disk; a different order
@@ -928,11 +929,25 @@ whose WAL ids restart: its cache directory must be removed with it. Once
 SlateDB accepts a caller-supplied stable scope
 ([`../slatedb.md`](../slatedb.md)) the order condition goes away.
 
-The auxiliary cache is one foyer hybrid at `CACHE_DIR/auxiliary`, its keys
+The auxiliary cache is one foyer hybrid at `CACHE_DIR/auxiliary-v2`, its keys
 moraine's own, carrying the identity the caller's `DataStore` was built
-with: a durable object store is named by its location, so a footer or
-summary is served across restarts; an in-memory store is named at random,
-so nothing recovered can match it. Footers go to disk in the
+with. `DataStore::new` and catalog opens without a cache identity use fresh
+random namespaces, including for custom stores whose display names happen to
+match. Explicit `CacheIdentity` values allow safe sharing across handles and
+restarts. Equal identities assert that equal object paths name the same
+immutable contents; custom wrappers must include their routing context and
+prefixes. Display strings never determine storage equivalence.
+
+DuckDB attachments supply stable identities: local stores use the resolved
+filesystem root; S3 stores include the configured endpoint (including the
+S3-specific override), region, bucket, addressing style, and Express setting.
+These values come from the fully configured builder, including environment
+configuration when no secret is supplied. Credentials are excluded so rotation
+preserves reuse. In-memory attachments retain random identities.
+
+Identity hashes and block-cache directories use a new versioned namespace;
+the auxiliary disk tier uses `auxiliary-v2`. Old display-based cache entries are not recovered and
+may be removed; catalog data needs no migration. Footers go to disk in the
 Parquet metadata writer's form, page index included; summaries in their own
 shape.
 

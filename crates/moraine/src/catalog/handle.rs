@@ -194,6 +194,11 @@ pub struct CatalogOptions {
     /// whether there is a disk tier at all, and where. `None` (the
     /// default) keeps the caches in memory.
     pub cache_dir: Option<std::path::PathBuf>,
+    /// The object store's cache namespace; the catalog path is added
+    /// separately. `None` isolates each open. Supply the same identity only
+    /// for equivalent object stores to share cached blocks across opens and
+    /// process restarts.
+    pub cache_identity: Option<crate::CacheIdentity>,
     /// How many bytes of disk each store's cache device may hold. The
     /// first catalog to open settles it for the process. `None` (the
     /// default) leaves a cap of 16 GiB in force, and without a
@@ -262,6 +267,7 @@ impl Default for CatalogOptions {
             flush_interval: Duration::from_millis(100),
             flush_on_commit: false,
             cache_dir: None,
+            cache_identity: None,
             cache_size: None,
             cache_memory: None,
             cache_preload: None,
@@ -954,6 +960,7 @@ impl Catalog {
         let store = StoreBuilder::new(&options.path, object_store)
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
+            .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
             .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
@@ -1055,6 +1062,7 @@ impl Catalog {
         warn_if_preload_cannot_fit(&options, manifest);
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())
+            .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
             .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
@@ -1140,6 +1148,7 @@ impl Catalog {
         let (db, _cache) = StoreBuilder::new(&options.path, object_store.clone())
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
+            .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
             .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)

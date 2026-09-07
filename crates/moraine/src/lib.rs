@@ -265,6 +265,7 @@ pub use error::{Error, Result};
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use fault::{CrashCase, CrashPoint, SyntheticMigration, inject_crash, install_migration};
+pub use store::cache_identity::CacheIdentity;
 /// Decode entry points for the out-of-crate fuzz targets. Unstable and not
 /// part of the semver contract.
 #[cfg(feature = "fuzzing")]
