@@ -352,7 +352,14 @@ void SetRowId(duckdb::DataChunk &output, duckdb::idx_t row_index, const MoraineR
 	                                        : duckdb::Value(duckdb::LogicalType::UBIGINT));
 }
 
-struct LookupBindData : public duckdb::FunctionData {
+struct IndexReadBindData : public duckdb::FunctionData {
+	// Resolved rows, exact cardinalities, and derived filters belong to one execution.
+	bool SupportStatementCache() const override {
+		return false;
+	}
+};
+
+struct LookupBindData : public IndexReadBindData {
 	std::string catalog_name;
 	std::string schema_name;
 	std::string table_name;
@@ -604,7 +611,7 @@ void LookupImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 	output.SetCardinality(count);
 }
 
-struct RangeBindData : public duckdb::FunctionData {
+struct RangeBindData : public IndexReadBindData {
 	std::string catalog_name;
 	std::string schema_name;
 	std::string table_name;
@@ -725,7 +732,7 @@ void RangeImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 	output.SetCardinality(count);
 }
 
-struct NullsBindData : public duckdb::FunctionData {
+struct NullsBindData : public IndexReadBindData {
 	std::string catalog_name;
 	std::string schema_name;
 	std::string table_name;

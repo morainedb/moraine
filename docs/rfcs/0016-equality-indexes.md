@@ -733,6 +733,12 @@ resolved as NULL contributes an `IS NULL` disjunct under null-safe equality
 and nothing under plain equality, matching what each comparison would have
 accepted.
 
+Point, IN, range, and NULL-prefix lookup bind data disable DuckDB's statement
+cache. Every execution of a prepared statement binds and optimizes again,
+including statements with literal arguments or unchanged parameter values.
+This refreshes resolved rows, exact cardinalities, empty-result rewrites, and
+derived row/file filters together while retaining pruning within an execution.
+
 Each derived list is bounded, and the bounds differ by what evaluating the
 list costs. The row-id list is checked against every row, so past a few
 hundred distinct ids the lookup is a scan in disguise and the rule declines —
