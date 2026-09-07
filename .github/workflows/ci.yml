@@ -24,10 +24,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # The runner installs nightly with rustup's minimal profile, which
-      # omits rustfmt; add it explicitly.
-      - run: rustup toolchain install nightly --profile minimal --component rustfmt
-      - run: cargo +nightly fmt --check
+      # Match the dated formatter used by workspace setup and local hooks.
+      - run: rustup toolchain install nightly-2026-08-29 --profile minimal --component rustfmt
+      - run: cargo +nightly-2026-08-29 fmt --check
 
   # moraine-duckdb is a pure Rust static library (the C++ shim and DuckDB
   # link are owned by the extension toolchain, exercised only by the e2e

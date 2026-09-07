@@ -806,6 +806,13 @@ DuckLake's reserved field ids. A lake configured for deletion vectors
 rather than Parquet delete files declines this path and keeps the SQL
 fallback.
 
+The shim removes newly written delete files only if preparation fails before
+the commit call starts. Once that call starts, it retains the files on every
+error, including interruption: the commit can finish in the background after
+the caller receives an error (RFC 0010). Unregistered files are left for
+ordinary orphan cleanup under its grace window; a potentially committed
+file must never be removed as immediate error cleanup.
+
 Deletion is head-only, exactly as locating is, and carries the same
 authority boundary: the summaries locate and position rows, but visibility
 — which physical copy of a row id is current — remains DuckLake's delete
