@@ -3,7 +3,6 @@
 use std::{sync::Arc, time::Instant};
 
 use futures::TryStreamExt;
-use object_store::path::Path;
 use tracing::{info, warn};
 
 use super::{Catalog, backfill};
@@ -490,8 +489,7 @@ impl Catalog {
 
         let table_prefix = snapshot.table_data_prefix(table)?;
         let resolve = |path: &str, is_relative: bool| {
-            let relative = resolve_data_path(data_prefix, &table_prefix, path, is_relative);
-            Path::from(relative.as_str())
+            resolve_data_path(data_prefix, &table_prefix, path, is_relative)
         };
 
         let inline_deletes =
@@ -519,7 +517,7 @@ impl Catalog {
             if start >= file.record_count {
                 continue;
             }
-            let path = resolve(&file.path, file.path_is_relative);
+            let path = resolve(&file.path, file.path_is_relative)?;
             let file_id = file.id.get();
             let dead_positions = killed_positions.get(&file_id);
             let mut batches = data_file::scoped_read_entry_batches(
@@ -528,6 +526,19 @@ impl Catalog {
                     path,
                     file.file_size_bytes,
                     file.footer_size,
+                )
+                .with_columns(
+                    snapshot
+                        .file_read_columns_at(
+                            session.handle(),
+                            table,
+                            snapshot
+                                .data_files
+                                .get(&table.get())
+                                .and_then(|files| files.get(&file.id.get()))
+                                .ok_or_else(|| Error::NotFound(format!("data file {}", file.id)))?,
+                        )
+                        .await?,
                 )
                 .with_metrics(Arc::clone(&metrics)),
                 &positions,

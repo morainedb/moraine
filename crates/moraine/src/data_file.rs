@@ -19,6 +19,7 @@ mod metrics;
 mod reader;
 mod row_location;
 mod row_set;
+mod schema;
 mod selection;
 mod values;
 
@@ -57,6 +58,7 @@ pub(crate) use crate::data_file::{
     inline_batch::{decode_inline_schema, inline_batch_entries, inline_batch_index_entries},
     metrics::{DataStoreCounters, ScopedReadMetrics, ScopedReadTally, run_bounded_index_encoding},
     row_location::{FileSummary, file_summary},
+    schema::ReadColumn,
     selection::{RowPositions, ScopedRows},
 };
 use crate::{
@@ -168,6 +170,7 @@ pub(crate) struct ParquetFile {
     file_size: u64,
     footer_size: u64,
     metrics: Arc<ScopedReadMetrics>,
+    columns: Option<Arc<Vec<ReadColumn>>>,
 }
 
 impl ParquetFile {
@@ -179,7 +182,14 @@ impl ParquetFile {
             file_size,
             footer_size,
             metrics: Arc::new(ScopedReadMetrics::default()),
+            columns: None,
         }
+    }
+
+    /// Resolves logical column positions against this file's physical schema.
+    pub(crate) fn with_columns(mut self, columns: Vec<ReadColumn>) -> Self {
+        self.columns = Some(Arc::new(columns));
+        self
     }
 
     /// Records this file's reads in the supplied commit-wide tally.
@@ -234,8 +244,12 @@ pub(crate) async fn scoped_read_index_entry_batches(
         .map_err(corrupt("scoped read"))?;
     let (row_id_position, row_id_start) =
         resolve_row_id_source(builder.parquet_schema(), row_id_source, &file.path)?;
-    let (mask, indexed_output, row_id_output) =
-        projection(builder.parquet_schema(), &source_positions, row_id_position)?;
+    let (mask, indexed_output, row_id_output, normalization) = read_projection(
+        &builder,
+        file.columns.as_deref(),
+        &source_positions,
+        row_id_position,
+    )?;
     let projections = Arc::new(remap_index_projections(
         projections,
         &source_positions,
@@ -257,6 +271,7 @@ pub(crate) async fn scoped_read_index_entry_batches(
     Ok(arrow_reader
         .map(move |batch| {
             let batch = batch.map_err(corrupt("scoped read"))?;
+            let batch = normalize_batch(batch, normalization.as_ref())?;
             file.metrics.arrow_batch();
             let batch_start = emitted;
             emitted = emitted.saturating_add(batch.num_rows());
@@ -312,8 +327,12 @@ pub(crate) async fn scoped_read_entry_batches(
 
     let (row_id_position, row_id_start) =
         resolve_row_id_source(builder.parquet_schema(), row_id_source, &file.path)?;
-    let (mask, indexed_output, row_id_output) =
-        projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
+    let (mask, indexed_output, row_id_output, normalization) = read_projection(
+        &builder,
+        file.columns.as_deref(),
+        indexed_positions,
+        row_id_position,
+    )?;
     let mut builder = builder
         .with_projection(mask)
         .with_batch_size(BUILD_READ_BATCH_ROWS);
@@ -325,6 +344,7 @@ pub(crate) async fn scoped_read_entry_batches(
     let mut emitted = 0usize;
     let selection_stream = arrow_reader.map(move |batch| {
         let batch = batch.map_err(corrupt("scoped read"))?;
+        let batch = normalize_batch(batch, normalization.as_ref())?;
         let batch_start = emitted;
         emitted = emitted.saturating_add(batch.num_rows());
 
@@ -339,4 +359,42 @@ pub(crate) async fn scoped_read_entry_batches(
     });
 
     Ok(selection_stream.boxed())
+}
+
+fn normalize_batch(
+    batch: arrow::array::RecordBatch,
+    projection: Option<&schema::BatchProjection>,
+) -> Result<arrow::array::RecordBatch> {
+    match projection {
+        Some(projection) => projection.apply(&batch),
+        None => Ok(batch),
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn read_projection(
+    builder: &ParquetRecordBatchStreamBuilder<ObjectStoreReader>,
+    columns: Option<&Vec<ReadColumn>>,
+    requested: &[usize],
+    row_id: Option<usize>,
+) -> Result<(
+    parquet::arrow::ProjectionMask,
+    Vec<usize>,
+    Option<usize>,
+    Option<schema::BatchProjection>,
+)> {
+    let Some(columns) = columns else {
+        let (mask, output, row_id) = projection(builder.parquet_schema(), requested, row_id)?;
+        return Ok((mask, output, row_id, None));
+    };
+    let (mut normalization, positions) =
+        schema::BatchProjection::resolve(builder.schema(), columns, requested, row_id)?;
+    let (mask, _, _) = projection(builder.parquet_schema(), &positions, None)?;
+    normalization.remap(&positions)?;
+    Ok((
+        mask,
+        (0..requested.len()).collect(),
+        row_id.map(|_| requested.len()),
+        Some(normalization),
+    ))
 }

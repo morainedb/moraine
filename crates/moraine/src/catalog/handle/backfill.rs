@@ -20,12 +20,20 @@ use crate::{
     store::{handle::ReadHandle, inline as store_inline, key::InlineOperation},
 };
 
+#[derive(Clone, Copy)]
+struct BackfillSource<'a> {
+    snapshot: &'a crate::catalog::CatalogSnapshot,
+    table: TableId,
+    handle: ReadHandle<'a>,
+}
+
 async fn collect_immediate_backfill<'a>(
     files: impl Iterator<Item = DataFileInfo> + 'a,
     object_store: DataStore,
     metrics: Arc<data_file::ScopedReadMetrics>,
     positions: &[usize],
-    resolve: impl Fn(&str, bool) -> Path,
+    source: BackfillSource<'a>,
+    resolve: impl Fn(&str, bool) -> Result<Path>,
     killed_positions: &'a HashMap<u64, HashSet<u64>>,
 ) -> Result<Vec<IndexEntry>> {
     // Each future drains its file completely, so the one buffer below is the
@@ -37,13 +45,24 @@ async fn collect_immediate_backfill<'a>(
             let path = resolve(&file.path, file.path_is_relative);
             let dead_positions = killed_positions.get(&file.id.get());
             async move {
+                let recorded = source
+                    .snapshot
+                    .data_files
+                    .get(&source.table.get())
+                    .and_then(|files| files.get(&file.id.get()))
+                    .ok_or_else(|| Error::NotFound(format!("data file {}", file.id)))?;
+                let columns = source
+                    .snapshot
+                    .file_read_columns_at(source.handle, source.table, recorded)
+                    .await?;
                 data_file::scoped_read_entry_batches(
                     data_file::ParquetFile::new(
                         object_store,
-                        path,
+                        path?,
                         file.file_size_bytes,
                         file.footer_size,
                     )
+                    .with_columns(columns)
                     .with_metrics(metrics),
                     positions,
                     data_file::ScopedRows::All,
@@ -140,7 +159,7 @@ pub(super) async fn collect_delete_positions<'a>(
     files: impl Iterator<Item = DeleteFileInfo> + 'a,
     object_store: DataStore,
     metrics: Arc<data_file::ScopedReadMetrics>,
-    resolve: &'a impl Fn(&str, bool) -> Path,
+    resolve: &'a impl Fn(&str, bool) -> Result<Path>,
 ) -> Result<HashMap<u64, HashSet<u64>>> {
     stream::iter(files.map(|file| {
         let path = resolve(&file.path, file.path_is_relative);
@@ -150,7 +169,7 @@ pub(super) async fn collect_delete_positions<'a>(
             let positions = data_file::delete_file_positions(
                 data_file::ParquetFile::new(
                     object_store,
-                    path,
+                    path?,
                     file.file_size_bytes,
                     file.footer_size,
                 )
@@ -220,8 +239,8 @@ impl ReadOnlyCatalog {
     /// live file from `object_store` (the `DATA_PATH` store) and deriving one
     /// entry per row — the extension-path build for a table that already
     /// holds data. The returned entries feed `create_index`'s backfill.
-    /// Indexed columns are located by resolving each field id to its physical
-    /// position (the file's columns follow the table's column order).
+    /// Each file resolves indexed field ids through its recorded mapping;
+    /// missing columns use their initial defaults.
     ///
     /// Row ids resolve per file: the embedded row-id column when the file
     /// carries one (rewrite and flush output), else `row_id_start +
@@ -249,8 +268,7 @@ impl ReadOnlyCatalog {
 
         let table_prefix = snapshot.table_data_prefix(table)?;
         let resolve = |path: &str, is_relative: bool| {
-            let relative = resolve_data_path(data_prefix, &table_prefix, path, is_relative);
-            object_store::path::Path::from(relative.as_str())
+            resolve_data_path(data_prefix, &table_prefix, path, is_relative)
         };
 
         // Entries are live-only. Both kinds of deletion name a physical
@@ -272,6 +290,11 @@ impl ReadOnlyCatalog {
             object_store,
             metrics,
             &positions,
+            BackfillSource {
+                snapshot: &snapshot,
+                table,
+                handle: session.handle(),
+            },
             resolve,
             &killed_positions,
         )
@@ -351,6 +374,11 @@ impl ReadOnlyCatalog {
                 &chunk.body,
                 &positions,
                 chunk.row_id_start,
+                Some(
+                    &snapshot
+                        .inline_read_columns(session.handle(), table, begin_snapshot)
+                        .await?,
+                ),
             )?;
             entries.extend(
                 scoped

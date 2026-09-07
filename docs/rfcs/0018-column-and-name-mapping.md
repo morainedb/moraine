@@ -42,9 +42,9 @@ Non-goals:
   needs no mapping to resolve. The staged path serves the one writer that
   does create them, for a user who issues `ducklake_add_data_files` through
   the extension, and that is what the rest of this RFC specifies.
-- **Using mappings.** moraine never reads Parquet; resolving a file's
-  columns through its mapping is DuckLake's scanner's job. moraine stores
-  and serves.
+- **General table scans.** DuckLake resolves mappings for its scanner.
+  Moraine also uses them for the scoped index reads defined in RFC 0016:
+  index backfills and entry maintenance, including located deletion.
 - **Physical deletion.** DuckLake deletes mapping rows only during snapshot
   expiry, by `table_id` for dropped tables and then a referential orphan
   sweep over `ducklake_name_mapping`. moraine honors both. The record's

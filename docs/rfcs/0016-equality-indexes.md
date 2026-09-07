@@ -1098,6 +1098,25 @@ through the column-mapping rules (RFC 0018). The prohibition on reading
 Parquet guards the *scan* path — merge-on-read, lineage, pushdown — not this
 raw-value projection.
 
+Scoped reads resolve each immutable input independently: native Parquet field
+ids take precedence, externally registered files use their recorded name
+mapping, and inline chunks use the column identities and names at the chunk's
+begin snapshot. Current catalog positions select logical columns only; they
+never select a physical column in an older schema. Unindexed nested children
+do not shift an indexed top-level field's physical position.
+Files without field ids use historical names when no explicit mapping exists;
+if expired history prevents resolving an identity, the read fails. Hive
+partition mappings materialize their virtual columns from the file's directory
+values, including percent decoding and partition-null rules.
+
+Missing fields use `initial_default`, not the current insertion default.
+Before deriving keys, old physical values are converted to the indexed
+column's current type with checked casts; an unsupported default or failed
+conversion returns a typed error. The same projection serves immediate and
+staged backfills, deferred repair, file registration, SQL deletes and updates,
+and located-delete removals. Projection bounds are checked before calling
+Arrow or Parquet APIs that assume valid positions.
+
 A value is indexable only if its Parquet form and its inline Arrow form
 derive the *same* canonical bytes, so the two write paths collide as they
 must. That holds for the scalar types, strings, blobs, `UUID` (a 16-byte
