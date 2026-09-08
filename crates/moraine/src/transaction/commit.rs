@@ -807,8 +807,8 @@ enum CommitOutcome {
         ours: Vec<ChangeSet>,
         head_before: u64,
     },
-    /// Nothing landed, for a reason the attempt cannot classify.
-    Nothing,
+    /// The batch was abandoned before submission.
+    Abandoned,
 }
 
 /// Runs one attempt: stages every member onto whichever batch the store is
@@ -836,7 +836,9 @@ where
             ours: staged.ours,
             head_before: staged.head_before,
         }),
-        Outcome::Nothing => Ok(CommitOutcome::Nothing),
+        Outcome::Abandoned => Ok(CommitOutcome::Abandoned),
+        Outcome::Unknown(reason) => Err(Error::CommitOutcomeUnknown(reason)),
+        Outcome::Fenced(reason) => Err(Error::Fenced(reason)),
     }
 }
 
@@ -1285,10 +1287,14 @@ pub(crate) async fn commit_batch(
             }))
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(Landed::LostRace),
+        Err(err) if err.kind() == slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced) => {
+            invalidate_head_view(projections);
+            Err(err.into())
+        }
         Err(err) => {
             // The write's fate is unknown, so the held view may be stale.
             invalidate_head_view(projections);
-            Err(err.into())
+            Err(Error::CommitOutcomeUnknown(err.to_string()))
         }
     }
 }
@@ -1296,8 +1302,8 @@ pub(crate) async fn commit_batch(
 /// Runs [`commit_batch`] on a task of its own and waits for it, putting
 /// the durable write out of reach of the caller's cancellation. A task
 /// that never reports leaves the write's fate unknown and surfaces as
-/// [`Error::Interrupted`]; the caller must re-resolve head rather than
-/// re-drive.
+/// [`Error::CommitOutcomeUnknown`]; the caller must reconcile the operation
+/// before resubmitting.
 pub(crate) async fn commit_batch_off_task(
     db_tx: DbTransaction,
     heads: HeadTransition,
@@ -1329,9 +1335,9 @@ pub(crate) async fn commit_batch_off_task(
             // The task may have died between the durable write and the fold.
             invalidate_head_view(&projections);
             warn!(error = %err, "the durable write did not report back; its outcome is unknown");
-            Err(Error::Interrupted(format!(
+            Err(Error::CommitOutcomeUnknown(format!(
                 "the durable write did not report back ({err}); it may or may not have \
-                 landed — re-resolve head before re-driving"
+                 landed — reconcile the operation before resubmitting"
             )))
         }
     }
@@ -1361,7 +1367,7 @@ where
             tokio::time::sleep(retry_backoff(attempt)).await;
         }
         match attempt_group(db, members, coalescer).await? {
-            CommitOutcome::Nothing => {
+            CommitOutcome::Abandoned => {
                 tracing::debug!(attempt, "commit's batch wrote nothing; retrying");
             }
             CommitOutcome::Committed(ids) => {

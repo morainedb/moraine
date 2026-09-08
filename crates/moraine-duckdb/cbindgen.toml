@@ -44,6 +44,7 @@ enum {
 	MORAINE_SNAPSHOT_EXPIRED = 13,
 	MORAINE_UNSUPPORTED = 14,
 	MORAINE_OPEN_RACED = 15,
+	MORAINE_COMMIT_OUTCOME_UNKNOWN = 16,
 };
 """
 
@@ -70,6 +71,7 @@ exclude = [
     "SNAPSHOT_EXPIRED",
     "UNSUPPORTED",
     "OPEN_RACED",
+    "COMMIT_OUTCOME_UNKNOWN",
     # `logging::levels` mirrors DuckDB's own `LogLevel` values for the sink
     # to forward. Exported, these become `#define ERROR 50` and friends in a
     # header DuckDB's C++ includes — the very collision DuckDB's own logging

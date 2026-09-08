@@ -243,12 +243,8 @@ duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientCon
 	}
 	uint64_t new_snapshot_id = 0;
 	MoraineError err {};
-	// Cancellable, like every other call that can wait on the store: a
-	// durable write against an unreachable endpoint is retried beneath
-	// moraine indefinitely, so without a probe a Ctrl-C here would have
-	// nothing to act on. An interrupt that arrives once the write is in
-	// flight returns promptly while the write still lands or fails whole
-	// — the ambiguity documented on moraine_tx_commit.
+	// Cancellation before polling submits nothing. Once the call starts,
+	// cancellation reports COMMIT_OUTCOME_UNKNOWN and the write may still land.
 	auto code = moraine_tx_commit(staged, &new_snapshot_id, moraine_shim_is_interrupted, &context, &err);
 	MoraineMemoryTally memory {};
 	auto measured = code == MORAINE_OK &&

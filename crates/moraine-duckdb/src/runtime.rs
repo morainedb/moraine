@@ -209,6 +209,40 @@ impl MoraineCatalogHandle {
         // SAFETY: forwarded caller contract.
         unsafe { block_on_cancellable_in(&self.runtime, probe, probe_ctx, future) }
     }
+
+    /// Cancels before polling with certainty; after polling, the commit may
+    /// have landed.
+    ///
+    /// # Safety
+    ///
+    /// `probe` must be safe to call with `probe_ctx` for this call's duration.
+    pub(crate) unsafe fn block_on_commit<T, E>(
+        &self,
+        probe: MoraineInterruptProbe,
+        probe_ctx: *mut c_void,
+        future: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, AbiError>
+    where
+        AbiError: From<E>,
+    {
+        let started = std::cell::Cell::new(false);
+        // SAFETY: forwarded caller contract.
+        let result = unsafe {
+            self.block_on_cancellable(probe, probe_ctx, async {
+                started.set(true);
+                future.await
+            })
+        };
+        result.map_err(|error| {
+            if started.get() && error.code == crate::error::codes::INTERRUPTED {
+                <AbiError as From<moraine::Error>>::from(moraine::Error::CommitOutcomeUnknown(
+                    "the caller stopped waiting".into(),
+                ))
+            } else {
+                error
+            }
+        })
+    }
 }
 
 /// Warms the probe ranges of every table in the head view; failures are

@@ -290,7 +290,8 @@ is a verb-path property.
 | `Corruption` | value decode failure or unknown `sys/format` version (RFC 0002) | no |
 | `Unsupported` | a DuckLake feature moraine does not yet implement (e.g. VARIANT inlining, RFC 0005) | no |
 | `SnapshotExpired` | a held/requested snapshot fell below the RFC 0007 retention horizon (RFC 0009) — re-resolve from head | no |
-| `Interrupted` | operation cancelled by a host interrupt before its point of no return, or a durable write past that point whose outcome went unreported (RFC 0010) — re-resolve head | no |
+| `Interrupted` | operation cancelled or interrupted before it could report a result | no |
+| `CommitOutcomeUnknown` | a submitted commit was not acknowledged; retain external files and reconcile the operation before resubmitting (RFC 0010) | no |
 | `Migration` | store requires, is undergoing, or is newer than a structural format the binary supports (RFC 0015) | no |
 
 The conflict split follows from closure-with-retry: transient races

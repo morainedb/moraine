@@ -10,6 +10,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use futures::FutureExt;
 use slatedb::{Db, DbTransaction, IsolationLevel};
 use tokio::sync::{Mutex, MutexGuard, watch};
 
@@ -28,18 +29,28 @@ use crate::{
 /// callers are still arriving.
 const MAX_BATCH_MEMBERS: usize = 64;
 
-/// What a sealed batch did, told to every member that rode it. A write
-/// failure arrives as [`Outcome::Nothing`], not as the error itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a batch did, told to every member that rode it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// Committed. Every member's allocated ids stand.
     Committed,
     /// Lost the head race. Every member re-runs, classifying its own
     /// change set against the commits that won.
     LostRace,
-    /// Nothing was written: the write failed, or the batch was abandoned
-    /// before it sealed. Every member re-attempts.
-    Nothing,
+    /// Abandoned before submission; every member may re-attempt.
+    Abandoned,
+    /// Submitted, but durability was not acknowledged. Never re-attempt.
+    Unknown(String),
+    /// The writer lost its epoch and cannot submit further work.
+    Fenced(String),
+}
+
+/// Submission distinguishes an abandoned batch from a lost acknowledgement.
+#[derive(Clone)]
+pub(crate) enum BatchState {
+    Forming,
+    Submitted,
+    Finished(Outcome),
 }
 
 /// What one caller staged onto a batch.
@@ -54,7 +65,7 @@ pub(crate) struct Staged {
     /// Whether this caller put anything in the batch.
     pub(crate) contributed: bool,
     /// The batch's outcome, once it lands.
-    pub(crate) outcome: watch::Receiver<Option<Outcome>>,
+    pub(crate) outcome: watch::Receiver<BatchState>,
 }
 
 /// A batch being formed: one open transaction carrying every member's
@@ -77,7 +88,7 @@ struct Batch {
     writes: Vec<StagedWrite>,
     /// What the members have staged onto `db_tx`, index entries included.
     staged_bytes: StagedBytes,
-    outcome: watch::Sender<Option<Outcome>>,
+    outcome: watch::Sender<BatchState>,
 }
 
 impl Batch {
@@ -105,7 +116,7 @@ impl Batch {
             members: 0,
             writes: Vec::new(),
             staged_bytes: StagedBytes::default(),
-            outcome: watch::Sender::new(None),
+            outcome: watch::Sender::new(BatchState::Forming),
         })
     }
 
@@ -297,7 +308,8 @@ impl Coalescer {
             ..
         } = batch;
 
-        let landed = match commit_batch(
+        outcome.send_replace(BatchState::Submitted);
+        let landed = match std::panic::AssertUnwindSafe(commit_batch(
             db_tx,
             HeadTransition {
                 before: head_before,
@@ -308,18 +320,24 @@ impl Coalescer {
             HeadViewUpdate::Rebuild(base),
             &self.projections,
             &self.durability,
-        )
+        ))
+        .catch_unwind()
         .await
         {
-            Ok(Landed::Committed(_)) => Outcome::Committed,
-            Ok(Landed::LostRace) => Outcome::LostRace,
-            Err(err) => {
-                tracing::warn!(error = %err, "commit batch failed to write; its members retry");
-                Outcome::Nothing
+            Ok(Ok(Landed::Committed(_))) => Outcome::Committed,
+            Ok(Ok(Landed::LostRace)) => Outcome::LostRace,
+            Ok(Err(Error::Fenced(reason))) => Outcome::Fenced(reason),
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "commit batch outcome is unknown; its members must not retry");
+                Outcome::Unknown(err.to_string())
+            }
+            Err(_) => {
+                super::invalidate_head_view(&self.projections);
+                Outcome::Unknown("the submitted batch panicked before acknowledgement".into())
             }
         };
         // Every member may already have gone; the batch landed regardless.
-        let _ = outcome.send(Some(landed));
+        let _ = outcome.send(BatchState::Finished(landed));
 
         let mut shared = self.shared.lock().await;
         shared.in_flight = false;
@@ -347,16 +365,21 @@ impl Coalescer {
     }
 }
 
-/// Waits for the batch a caller staged onto to land. A sender dropped with
-/// nothing published means the batch was abandoned before it sealed.
-pub(crate) async fn await_outcome(mut outcome: watch::Receiver<Option<Outcome>>) -> Outcome {
+/// Waits for acknowledgement, retaining the submission boundary if the task
+/// exits.
+pub(crate) async fn await_outcome(mut outcome: watch::Receiver<BatchState>) -> Outcome {
     loop {
-        if let Some(landed) = *outcome.borrow_and_update() {
-            return landed;
+        if let BatchState::Finished(landed) = &*outcome.borrow_and_update() {
+            return landed.clone();
         }
         if outcome.changed().await.is_err() {
-            // The sender may have published and dropped since the borrow.
-            return outcome.borrow().unwrap_or(Outcome::Nothing);
+            return match &*outcome.borrow() {
+                BatchState::Forming => Outcome::Abandoned,
+                BatchState::Submitted => {
+                    Outcome::Unknown("the submitted batch stopped reporting".into())
+                }
+                BatchState::Finished(landed) => landed.clone(),
+            };
         }
     }
 }
@@ -391,5 +414,57 @@ impl Drop for Arrival {
             let coalescer = Arc::clone(&self.coalescer);
             drop(runtime.spawn(async move { coalescer.seal_abandoned().await }));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use object_store::memory::InMemory;
+
+    use super::*;
+    use crate::{Catalog, CatalogOptions};
+
+    #[tokio::test]
+    async fn a_lost_sender_preserves_the_submission_boundary() {
+        for (state, expected) in [
+            (BatchState::Forming, Outcome::Abandoned),
+            (
+                BatchState::Submitted,
+                Outcome::Unknown("the submitted batch stopped reporting".into()),
+            ),
+            (BatchState::Finished(Outcome::Committed), Outcome::Committed),
+        ] {
+            let (sender, receiver) = watch::channel(state);
+            drop(sender);
+            assert_eq!(await_outcome(receiver).await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_error_is_not_reported_as_safe_to_retry() {
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        let store = catalog.store();
+        let db = store.writer_db().unwrap();
+        let mut batch = Batch::open(db, catalog.projections()).await.unwrap();
+        batch
+            .stage(
+                &[|tx: &mut Transaction| {
+                    tx.create_schema("pending")?;
+                    Ok(())
+                }],
+                catalog.projections(),
+            )
+            .await
+            .unwrap();
+        let outcome = batch.outcome.subscribe();
+        catalog.close().await.unwrap();
+        let coalescer = Arc::new(Coalescer::new(
+            Arc::clone(catalog.projections()),
+            CommitDurability::OnFlushInterval,
+        ));
+        coalescer.land(batch).await;
+        assert!(matches!(await_outcome(outcome).await, Outcome::Unknown(_)));
     }
 }

@@ -96,6 +96,20 @@ duration. This RFC honors that contract on the reader side.
 
 ## Design
 
+### Consistency of lookup and inline operations
+
+Equality, IN, range, and NULL index lookups, full inline scans, and requested
+inline-row lookups guard the entire operation, including definition checks,
+tombstones, chunk bodies, and schema reads. Manifest readers compare the full
+head stamp before and after the operation. An error is returned only after
+that comparison: a missing chunk during a refresh may be a torn pass rather
+than stored corruption. An unchanged pass preserves its original error.
+
+A changed pass is retried at most eight times. If every pass changes, the
+operation returns `RetryBudgetExhausted`; it must not fall back to an
+unguarded scan. Writer-backed isolated transactions run the operation once.
+This boundary covers a single call, not several independent API calls.
+
 ### Materialization rests on one read point
 
 The correctness foundation: building a `CatalogSnapshot` issues *many* store

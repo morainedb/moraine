@@ -52,9 +52,12 @@ pub enum Error {
     #[error("snapshot expired: {0}")]
     SnapshotExpired(String),
 
-    /// A host interrupt cancelled the operation before its point of no
-    /// return, or a durable write past that point never reported its
-    /// outcome; after the latter the caller must re-resolve head.
+    /// A submitted commit was not acknowledged. It may have landed; retain
+    /// its external files and reconcile catalog state before resubmitting.
+    #[error("commit outcome unknown: {0}")]
+    CommitOutcomeUnknown(String),
+
+    /// A host interrupt cancelled an operation.
     #[error("interrupted: {0}")]
     Interrupted(String),
 
@@ -173,6 +176,7 @@ mod tests {
             Error::Unsupported(sample.into()),
             Error::SnapshotExpired(sample.into()),
             Error::Interrupted(sample.into()),
+            Error::CommitOutcomeUnknown(sample.into()),
             Error::Migration(sample.into()),
             Error::RowPosition {
                 row_id: 1,

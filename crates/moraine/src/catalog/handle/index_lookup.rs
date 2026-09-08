@@ -255,26 +255,27 @@ impl ReadOnlyCatalog {
         upper: Bound<Vec<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
-        let epoch = cache_epoch(&self.projections);
         let session = self.begin_read().await?;
         let handle = session.handle();
 
-        let view = self.head_view(handle, epoch).await?;
-        let info = ready_index(&view, table, index)?;
+        let range_row_ids = self
+            .with_ready_index(handle, table, index, async |info| {
+                let (byte_lower, byte_upper) =
+                    encode_range_bounds(&info, index, lower.clone(), upper.clone())?;
+                let leading_nulls = info.nulls.first().copied().unwrap_or(NullOrder::Last);
 
-        let (byte_lower, byte_upper) = encode_range_bounds(&info, index, lower, upper)?;
-        let leading_nulls = info.nulls.first().copied().unwrap_or(NullOrder::Last);
-
-        let range_row_ids = index_maintenance::range_row_ids(
-            handle,
-            index.get(),
-            info.unique,
-            leading_nulls,
-            byte_lower,
-            byte_upper,
-            ScanOrder::from_reverse(reverse),
-        )
-        .await;
+                index_maintenance::range_row_ids(
+                    handle,
+                    index.get(),
+                    info.unique,
+                    leading_nulls,
+                    byte_lower,
+                    byte_upper,
+                    ScanOrder::from_reverse(reverse),
+                )
+                .await
+            })
+            .await;
         session.finish();
 
         range_row_ids
@@ -301,41 +302,57 @@ impl ReadOnlyCatalog {
         prefix: Vec<Option<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
-        let epoch = cache_epoch(&self.projections);
         let session = self.begin_read().await?;
         let handle = session.handle();
 
-        let view = self.head_view(handle, epoch).await?;
-        let info = ready_index(&view, table, index)?;
-
-        if prefix.is_empty() || prefix.len() > info.columns.len() {
-            return Err(Error::Constraint(format!(
-                "index_nulls: a prefix of {} predicates does not fit the {}-column index \
+        let null_prefix_row_ids = self
+            .with_ready_index(handle, table, index, async |info| {
+                if prefix.is_empty() || prefix.len() > info.columns.len() {
+                    return Err(Error::Constraint(format!(
+                        "index_nulls: a prefix of {} predicates does not fit the {}-column index \
                      {index}",
-                prefix.len(),
-                info.columns.len()
-            )));
-        }
-        if prefix.iter().all(Option::is_some) {
-            return Err(Error::Constraint(
-                "index_nulls: the prefix names no IS NULL; use index_lookup for pure equality"
-                    .to_owned(),
-            ));
-        }
+                        prefix.len(),
+                        info.columns.len()
+                    )));
+                }
+                if prefix.iter().all(Option::is_some) {
+                    return Err(Error::Constraint(
+                    "index_nulls: the prefix names no IS NULL; use index_lookup for pure equality"
+                        .to_owned(),
+                ));
+                }
 
-        let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
+                let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
 
-        let null_prefix_row_ids = index_maintenance::null_prefix_row_ids(
-            handle,
-            index.get(),
-            &key,
-            ScanOrder::from_reverse(reverse),
-        )
-        .await;
+                index_maintenance::null_prefix_row_ids(
+                    handle,
+                    index.get(),
+                    &key,
+                    ScanOrder::from_reverse(reverse),
+                )
+                .await
+            })
+            .await;
 
         session.finish();
 
         null_prefix_row_ids
+    }
+
+    /// Resolves the definition and its entries under the same read guard.
+    async fn with_ready_index<T>(
+        &self,
+        handle: ReadHandle<'_>,
+        table: TableId,
+        index: IndexId,
+        lookup: impl AsyncFn(IndexInfo) -> Result<T>,
+    ) -> Result<T> {
+        let epoch = cache_epoch(&self.projections);
+        read::consistent(handle, || async {
+            let view = self.head_view(handle, epoch).await?;
+            lookup(ready_index(&view, table, index)?).await
+        })
+        .await
     }
 }
 
@@ -424,3 +441,6 @@ fn encode_range_bounds(
     };
     Ok((encode_bound(byte_lower)?, encode_bound(byte_upper)?))
 }
+
+#[cfg(test)]
+mod tests;

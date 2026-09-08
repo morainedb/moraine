@@ -1,12 +1,18 @@
 # Roadmap
 
-One release target: **v0.1 — DuckLake consistency**. moraine ships v0.1
-when it is a consistent DuckLake catalog: parity with the complete DuckLake
-spec v1.0 catalog feature set, every feature a SQL-backed DuckLake catalog
-offers served from SlateDB instead. Each of the 28 `ducklake_*` catalog
-tables gets a home in the keyspace (RFC 0002) and is validated against real
-DuckLake SQL in the e2e suite before it is checked off. Everything below is
-on that path.
+Moraine is in the **v0.6 release series**. This checklist records implemented
+DuckLake catalog coverage and remaining work; v0.1 is no longer a release
+target. Catalog features are validated against real DuckLake SQL in the e2e
+suite. Unchecked items are implementation gaps, not supported attach modes.
+
+## Next capabilities
+
+- [ ] Independent multi-process writers. The current topology is one fenced
+  SlateDB writer with many readers. A conditional-PUT log, replay/folder,
+  leader forwarding, durable operation-id resolution, and a topology migration
+  are not implemented. RFC 0022 specifies that replacement topology.
+- [ ] `VARIANT` inlining and variant statistics.
+- [ ] Signed community-extension distribution.
 
 ## Foundations
 
@@ -24,7 +30,7 @@ on that path.
 - [x] Extension entry points and loading into a real DuckDB
 - [x] Read-write and read-only attach; read-only never fences the live writer (RFC 0017)
 - [x] Full DuckLake SQL against moraine as the catalog: `ATTACH`, `CREATE`/`INSERT`/`UPDATE`/`DELETE`/rename/`DROP`, `SELECT`/`COUNT`/time travel
-- [x] Query interruption: Ctrl-C aborts a blocked read; `COMMIT` runs to completion (RFC 0006)
+- [x] Query interruption: Ctrl-C aborts a blocked read; submitted commits survive cancellation, which reports an unknown outcome (RFC 0006)
 
 ## Catalog & schema
 - [x] Schemas, tables, and views
@@ -55,11 +61,21 @@ on that path.
 
 ## Performance
 - [x] Commit-served projections: `snapshot`, `table_stats`, and `table_column_stats` are folded forward from each commit and served from an in-memory cache when current, removing per-commit latency growth with snapshot history. Attach-tunable WAL flush cadence bounds the per-commit durable wait.
-- [ ] Per-commit latency is now dominated by DuckDB/DuckLake executing moraine's table-function-backed metadata (~72% of a single-row commit is outside moraine), not by moraine's own code. Closing that gap would mean presenting metadata as native tables rather than table functions — a large, off-axis storage rewrite — so the remaining difference is architectural.
+- [x] Catalog commit preparation shares unchanged maps and derives writes from
+  changed entities; allocation and CPU benchmarks separate preparation from WAL latency.
+- [x] Staged index derivation streams inline sources with resumable cursors and
+  whole-operation peak-memory measurement.
+- [x] Small row lookups select requested inline ranges and use cached file
+  intervals, retaining conservative handling for arbitrary row-ID files.
+- [ ] Reduce metadata-query overhead in DuckDB/DuckLake. Earlier profiling
+  attributed much of single-row commit latency to metadata table functions;
+  native metadata tables would require a separate storage design and fresh
+  end-to-end measurements.
+
 
 ## Hardening & release
 - [x] Real object storage tests (MinIO)
 - [x] Arbitrary-bytes decode proptests for store codecs (never panic on garbage)
-- [x] Release pipeline armed for v0.1 (crates.io publish on tag); not yet published
+- [x] Release pipeline: versioned tags drive crate publishing and extension artifacts
 - [x] Extension distribution: per-DuckDB-version, per-platform builds attached to GitHub releases (unsigned)
 - [ ] Signed distribution via a duckdb/community-extensions submission

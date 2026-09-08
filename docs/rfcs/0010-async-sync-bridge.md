@@ -287,30 +287,32 @@ to share, so it spawns its own write and waits on the join handle.
 
 A spawned write that never reports back — its runtime shut down, or the task
 lost to a panic — leaves the outcome unknown, which is the one answer a
-caller must not read as "nothing landed". The core raises `Interrupted` for
-it, so the caller re-resolves head rather than re-driving a commit that may
-already be durable.
+caller must not read as "nothing landed". The core raises `CommitOutcomeUnknown` for
+it. The caller retains external files and reconciles the operation before
+resubmitting; a newer head alone does not resolve its fate.
+
+The bridge observes whether it has polled the commit future, not the exact
+submission instant inside the core. It reports `INTERRUPTED` only before that
+first poll; later cancellation conservatively reports `COMMIT_OUTCOME_UNKNOWN`.
+The physical cases below explain why preparation may safely stop while a
+submitted write must survive.
 
 **Cancel-safety, relative to RFC 0004**, then has three cases instead of a
 clean two:
 
-- **Cancelled before the write is spawned**: the staged batch is dropped.
-  No catalog state changed — RFC 0002/0004 guarantee a commit is
-  all-or-nothing, and nothing was written. Clean abort, `Interrupted`.
+- **Cancelled before the write is spawned**: dropping preparation discards
+  its staged state. The ABI reports `INTERRUPTED` only if the commit future
+  was never polled; once polling starts it conservatively reports
+  `COMMIT_OUTCOME_UNKNOWN` because it does not observe the core's exact
+  submission boundary.
 - **Cancelled while the spawned write is in flight**: the bridge returns
-  `Interrupted` promptly (DuckDB expects interrupts to be honored, not
-  ridden out against a stalled object-store PUT), and the spawned write
-  **runs to completion in the background** — it either lands durably or
-  fails, but is never torn. The caller-visible outcome is therefore
-  **ambiguous**: `Interrupted` was returned, yet the commit may have
-  landed. This is not a new hazard — it is byte-for-byte the semantics of
-  RFC 0011's `CommitDurableNotAcknowledged`: a caller that must know
-  re-resolves head and re-drives, observing either the landed commit or
-  clean pre-commit state. The ambiguity is documented on the FFI commit
-  entry point rather than papered over.
-- **Interrupt arrives after the write completed but before return**: the
-  result is already known; the entry point reports the committed snapshot
-  normally (there is nothing left to cancel).
+  `COMMIT_OUTCOME_UNKNOWN` promptly and the spawned write continues. It may
+  land durably or fail, but is never torn. The caller retains external files
+  and reconciles the operation before resubmitting. A newer head by itself
+  does not establish whether this operation landed.
+- **The core future reports its result**: the bridge returns the committed
+  snapshot normally. If cancellation stops the wait before that result is
+  received, the outcome remains unknown even if the write is already durable.
 
 Read operations (materialization, RFC 0009) are trivially cancel-safe —
 they are pure `select!`, dropping them frees the read-snapshot and touches
@@ -346,11 +348,12 @@ paths are exercised by the `cargo xtask e2e` DuckDB harness (RFC 0006):
 - **Concurrency progresses.** Multiple threads each `block_on` a catalog call
   concurrently and all complete; SlateDB background flush advances while a
   thread is blocked (no `current_thread` stall).
-- **Cancel before write.** An operation interrupted before its commit write
-  returns `Interrupted` and leaves catalog state exactly as before (head
-  unchanged, no partial records).
+- **Cancel before polling.** An operation interrupted before its commit future
+  is polled returns `INTERRUPTED` and leaves catalog state exactly as before.
+  Cancellation after polling begins reports `COMMIT_OUTCOME_UNKNOWN` even
+  when the future was still preparing.
 - **Cancel during the shielded write.** An interrupt delivered while the
-  spawned batch write is in flight returns `Interrupted` promptly; the
+  spawned batch write is in flight returns `COMMIT_OUTCOME_UNKNOWN` promptly; the
   write still completes (or fails) in the background, never torn — a
   subsequent read observes head at exactly `N` or exactly `N+1`, and a
   re-drive behaves per RFC 0011's `CommitDurableNotAcknowledged`.
