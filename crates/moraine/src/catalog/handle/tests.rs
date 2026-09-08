@@ -407,3 +407,181 @@ async fn a_late_read_view_cannot_replace_a_committed_view() {
     assert!(Arc::ptr_eq(&committed, &catalog.snapshot().await.unwrap()));
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn recent_row_does_not_fetch_unrequested_live_chunks() {
+    let catalog = open().await;
+    commit_staged(
+        &catalog,
+        1,
+        "inlined_insert:1",
+        vec![
+            RowOperation::InlineSchema {
+                table_id: 1,
+                schema_version: 0,
+                arrow_schema: b"schema".to_vec(),
+            },
+            RowOperation::InlineInsert {
+                table_id: 1,
+                schema_version: 0,
+                begin_snapshot: 1,
+                row_id_start: 0,
+                row_count: 128,
+                arrow_body: b"wanted".to_vec(),
+            },
+            RowOperation::InlineInsert {
+                table_id: 1,
+                schema_version: 0,
+                begin_snapshot: 1,
+                row_id_start: 128,
+                row_count: 128,
+                arrow_body: b"unrelated".to_vec(),
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        catalog
+            .recent_row(TableId::new(1), 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .offset_in_chunk,
+        1
+    );
+    let tx = catalog.begin_write_tx().await.unwrap();
+    tx.delete(
+        Key::Inline(InlineKey::Live(InlineOperation::Insert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            chunk_seq: 1,
+        }))
+        .encode(),
+    )
+    .unwrap();
+    tx.commit().await.unwrap();
+    let row = catalog
+        .recent_row(TableId::new(1), 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.chunk_body.as_slice(), b"wanted");
+    assert!(
+        catalog
+            .recent_row(TableId::new(1), 999)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn requested_inline_rows_follow_updates_and_wider_chunks() {
+    let catalog = open().await;
+    commit_staged(
+        &catalog,
+        1,
+        "inlined_insert:1",
+        vec![
+            RowOperation::InlineSchema {
+                table_id: 1,
+                schema_version: 0,
+                arrow_schema: b"schema".to_vec(),
+            },
+            RowOperation::InlineInsert {
+                table_id: 1,
+                schema_version: 0,
+                begin_snapshot: 1,
+                row_id_start: 10,
+                row_count: 2,
+                arrow_body: b"old".to_vec(),
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        catalog
+            .recent_row(TableId::new(1), 10)
+            .await
+            .unwrap()
+            .unwrap()
+            .chunk_body
+            .as_slice(),
+        b"old"
+    );
+    commit_staged(
+        &catalog,
+        2,
+        "inlined_insert:1,inlined_delete:1",
+        vec![
+            RowOperation::InlineInlineDelete {
+                table_id: 1,
+                row_id: 10,
+                end_snapshot: 2,
+            },
+            RowOperation::InlineInlineDelete {
+                table_id: 1,
+                row_id: 11,
+                end_snapshot: 2,
+            },
+            RowOperation::InlineInsert {
+                table_id: 1,
+                schema_version: 0,
+                begin_snapshot: 2,
+                row_id_start: 0,
+                row_count: 1024,
+                arrow_body: b"replacement".to_vec(),
+            },
+        ],
+    )
+    .await;
+    let requested = catalog
+        .requested_inline_row_ids(TableId::new(1), &[10, 1000, 10, u64::MAX])
+        .await
+        .unwrap();
+    assert_eq!(requested, [10, 1000].into_iter().collect());
+    let row = catalog
+        .recent_row(TableId::new(1), 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.begin_snapshot.get(), 2);
+    assert_eq!(row.chunk_body.as_slice(), b"replacement");
+    commit_staged(
+        &catalog,
+        3,
+        "inlined_delete:1",
+        vec![RowOperation::InlineInlineDelete {
+            table_id: 1,
+            row_id: 10,
+            end_snapshot: 3,
+        }],
+    )
+    .await;
+    assert!(
+        catalog
+            .recent_row(TableId::new(1), 10)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !catalog
+            .requested_inline_row_ids(TableId::new(1), &[10])
+            .await
+            .unwrap()
+            .contains(&10)
+    );
+    assert_eq!(
+        catalog
+            .recent_rows_at(TableId::new(1), crate::SnapshotId::new(1))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    catalog.close().await.unwrap();
+}

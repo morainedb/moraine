@@ -645,6 +645,44 @@ unlocated row silently drops out of the result. As a DELETE or UPDATE
 predicate that strands the row with no error. The join with null-safe
 equality on file id is the supported shape.
 
+### Selective row lookup
+
+`locate_row_ids` uses a per-table interval directory for verified dense file
+summaries. A cold directory resolves every current file once: `row_id_start`
+alone cannot exclude an embedded-ID file. Warm requests visit matching dense
+intervals and probe only the remaining arbitrary-ID or failed files. Failed
+summaries still broaden every requested ID to that file and are retried on the
+next request. Results preserve request order, deduplicate repeated requests,
+and retain overlapping physical and inline candidates.
+
+The directory is valid only for its exact shared file map, data-store cache
+identity, data prefix, and table prefix. A replacement, expiry, namespace change,
+or path change rebuilds it; unrelated catalog changes can reuse it. No file
+summary is inferred from a catalog range before the footer establishes which
+row-ID source applies.
+
+Inline point lookups build a chunk interval directory, then materialize only
+requested offsets, scan tombstones only for those IDs, and fetch only chunks
+holding selected live versions. This path serves both `recent_row` and inline
+membership checks used by row location and position validation. A first lookup
+verifies the persistent directory against the chunk scan; an incomplete directory
+falls back to metadata from that scan. Further directory builds can read locators
+without bodies once completeness is established. Cached intervals require the
+read session's full head stamp, including the maintenance batch sequence, so
+updates, flushes, and changes to chunk widths cannot reuse stale ownership.
+Manifest-following read-only sessions check the full head stamp before and
+after selection, body/schema reads, and failures. A changed stamp retries from
+the new head. Only a stable pass installs its directory. After three retries,
+the reader falls back to scanned bodies without caching, so sustained changes
+cannot make it re-fetch a body already removed by a concurrent flush.
+
+Each catalog handle retains at most 64 table directories of each kind. Directory
+space follows source counts, not expanded row counts, and is included in the
+catalog projection-memory estimate. File directories share immutable file maps;
+the estimate can count those maps again beside the current catalog projection.
+Eviction or a cold attach pays directory construction again. This is an in-memory
+read optimization with no key-layout or format-version change.
+
 ### File-row sets
 
 One immutable summary describes the physical row ids of one immutable data
@@ -947,21 +985,39 @@ additions and removals retain their bounded producer windows; nested
 delete-file reads share one commit-wide allowance rather than multiplying
 that bound per target.
 
-Each step atomically advances a **source cursor** persisted in the definition
-value: the completed inline row watermark, then the data-file id and physical
-position most recently covered. Files are immutable and ids are monotonic, so
-the cursor survives a crash without depending on embedded row-id order. A
-replacement file receives a later id and is safe to re-derive; entries name
-stable row ids, so the put is idempotent whether the source row was already
-covered. A crash within one file resumes after its last durable physical
-position. Deferred repair seeds the file cursor at the preceding snapshot's
-tail, so it consumes only later files. It re-derives the policy-bounded inline
-live set because UPDATE may preserve a row id while changing its value. The
-driver retains at most one step of derived entries plus one Arrow batch, so
-its entry memory is bounded by `BuildStep` rather than table size.
-Two builders racing the same build both write the definition key and collide
-write-write. Re-running either batch is idempotent, and the persisted source
-cursor advances monotonically, so a stale retry cannot move it backward.
+Each step atomically advances a **source cursor** persisted in the definition.
+Inline progress identifies `(schema_version, begin_snapshot, chunk_seq)` and
+its next row offset, plus flags for a completed chunk and inline leg. The
+covered snapshot identifies the last committed step. The driver streams these
+immutable sources in key order, holding one body and projected Arrow batch,
+resolving tombstones through a bounded range iterator, and deriving one entry
+at a time into the step buffer. It caches only the current decoded schema.
+
+Inline source order need not match row-id order. Streamed inline steps therefore
+leave the older row-id watermark unchanged: an older binary ignores the new
+protobuf field and safely replays the inline leg in its own row order. A build
+written by an older binary can resume using its row watermark until the first
+source checkpoint. The new cursor is optional, so old values remain readable
+and this extension does not require a format-version change.
+
+The external leg retains its data-file id and physical-position cursor. Files
+are immutable and ids are monotonic, so resume does not depend on embedded
+row-id order. A replacement file receives a later id and is safe to re-derive;
+entries name stable row ids, so repeated puts are idempotent. Deferred repair
+seeds its file cursor at the preceding snapshot's tail. Inline repair resumes
+its source checkpoint only if the current head is that checkpoint's covered
+snapshot; otherwise it replays live inline sources, including updates that
+preserved a row id. Every cursor update is guarded by the derivation snapshot,
+so another builder or writer cannot move progress under a stale premise.
+
+`BuildStep` bounds the committed entry buffer, not all process memory. Derivation
+also retains one source chunk or Parquet batch, schema projection, store iterator
+buffers, and source-local deletion state. An individual stored Arrow chunk can
+be larger than a step; no path retains all inline chunks or all derived inline
+entries. Entry-buffer and inline body/decoded-array high-water telemetry are
+reported separately; array buffers can share body memory, so those byte counts
+must not be added as a heap estimate. Whole-operation allocator peak measurements
+include store caches and commit/WAL work as well as derivation.
 Intermediate steps classify `inserted_into_table:<table_id>`: the commit
 layer treats an append as benign and rejects a concurrent delete, schema
 alter, or drop. A replayed closure still checks the driver's derivation

@@ -7,6 +7,7 @@ mod index_lookup;
 mod inline_scan;
 mod maintenance;
 mod row_location;
+mod row_lookup;
 mod table_warm;
 #[cfg(test)]
 mod tests;
@@ -395,6 +396,7 @@ pub struct ReadOnlyCatalog {
     reads: Arc<ReadTally>,
     cache: Arc<CacheCounters>,
     data_reads: Arc<data_file::DataStoreCounters>,
+    row_lookups: Arc<row_lookup::RowLookupCache>,
     location: Arc<StoreLocation>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     commits: Arc<commit::Coalescer>,
@@ -477,14 +479,16 @@ impl ReadOnlyCatalog {
     ///
     /// An estimate over the decoded record sets, the maintained
     /// projections, and the head view derived from them. Encoded record
-    /// lengths stand in for what those records occupy in memory, so treat
-    /// this as a floor.
+    /// lengths stand in for what those records occupy in memory. Row lookup
+    /// directories include retained file metadata and can share it with the
+    /// view, so treat this as an approximation.
     #[must_use]
     pub fn projection_bytes(&self) -> u64 {
         self.projections
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .estimated_bytes()
+            .saturating_add(self.row_lookups.estimated_bytes())
     }
 
     /// Logical memory attributed to this catalog and the process-shared caches.
@@ -725,23 +729,9 @@ impl ReadOnlyCatalog {
     ///
     /// As [`Self::recent_rows`].
     pub async fn recent_row(&self, table: TableId, row_id: u64) -> Result<Option<RecentRow>> {
-        Ok(self
-            .recent_rows(table)
-            .await?
-            .into_iter()
-            .find(|row| row.row_id == row_id))
-    }
-
-    /// The row ids of `table`'s live inlined rows at head, without their
-    /// bodies — what a row-location probe needs. Served from the
-    /// chunk-range directory once it is known complete; the first walk
-    /// verifies it against the chunk scan and remembers the answer when
-    /// the store format shuts out writers that predate the directory.
-    pub(crate) async fn live_inline_row_ids(&self, table: TableId) -> Result<Vec<u64>> {
         let session = self.begin_read().await?;
-        let outcome = self.scan_live_inline_row_ids(&session, table).await;
+        let outcome = self.scan_recent_row(&session, table, row_id).await;
         session.finish();
-
         outcome
     }
 
@@ -1005,6 +995,7 @@ impl Catalog {
                 reads: Arc::new(ReadTally::default()),
                 cache,
                 data_reads: Arc::default(),
+                row_lookups: Arc::default(),
                 commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections), durability)),
                 projections,
             },
@@ -1096,6 +1087,7 @@ impl Catalog {
             reads: Arc::new(ReadTally::default()),
             cache,
             data_reads: Arc::default(),
+            row_lookups: Arc::default(),
             commits: Arc::new(commit::Coalescer::new(
                 Arc::clone(&projections),
                 commit::CommitDurability::OnFlushInterval,

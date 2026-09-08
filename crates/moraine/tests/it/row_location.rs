@@ -1479,3 +1479,106 @@ mod commit_located_deletion {
         catalog.close().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn warm_dense_directory_tracks_file_replacement() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
+    let (file_size_bytes, footer_size) = write(
+        &data,
+        "main/orders/data-3.parquet",
+        &dense_batch(&[1, 2, 3]),
+    )
+    .await;
+    let table = table_with(
+        &catalog,
+        vec![DataFile {
+            file_size_bytes,
+            footer_size,
+            ..datafile(3)
+        }],
+    )
+    .await;
+    let initial = catalog
+        .locate_row_ids(Some(store.clone()), "", table, vec![1])
+        .await
+        .unwrap();
+    let old_file = initial[0].data_file_id.unwrap();
+    let (file_size_bytes, footer_size) = write(
+        &data,
+        "main/orders/replacement.parquet",
+        &batch_with_row_ids(&[4, 5], &[1, 999]),
+    )
+    .await;
+    catalog
+        .commit(|tx| {
+            tx.expire_data_file(table, old_file)?;
+            tx.register_data_file(
+                table,
+                DataFile {
+                    path: "replacement.parquet".into(),
+                    file_size_bytes,
+                    footer_size,
+                    ..datafile(2)
+                },
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let found = catalog
+            .locate_row_ids(Some(store.clone()), "", table, vec![999, 1, 2, 999])
+            .await
+            .unwrap();
+        assert_eq!(
+            found.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+            [999, 1, 2]
+        );
+        assert!(found[0].data_file_id.is_some());
+        assert_ne!(found[0].data_file_id, Some(old_file));
+        assert_eq!(found[1].data_file_id, found[0].data_file_id);
+        assert_eq!(found[2].data_file_id, None);
+    }
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn warm_dense_directory_does_not_alias_data_stores() {
+    let catalog = open_memory().await;
+    let first = Arc::new(InMemory::new());
+    let second = Arc::new(InMemory::new());
+    let path = "main/orders/data-3.parquet";
+    let (file_size_bytes, footer_size) = write(&first, path, &dense_batch(&[1, 2, 3])).await;
+    let table = table_with(
+        &catalog,
+        vec![DataFile {
+            file_size_bytes,
+            footer_size,
+            ..datafile(3)
+        }],
+    )
+    .await;
+    let first = DataStore::new(first);
+    let found = catalog
+        .locate_row_ids(Some(first.clone()), "", table, vec![999])
+        .await
+        .unwrap();
+    assert_eq!(found[0].data_file_id, None);
+    // The second namespace has no object: it must broaden instead of reusing the
+    // first range.
+    let second = DataStore::new(second);
+    let found = catalog
+        .locate_row_ids(Some(second), "", table, vec![999])
+        .await
+        .unwrap();
+    assert!(found[0].data_file_id.is_some());
+    let found = catalog
+        .locate_row_ids(Some(first), "", table, vec![999])
+        .await
+        .unwrap();
+    assert_eq!(found[0].data_file_id, None);
+    catalog.close().await.unwrap();
+}

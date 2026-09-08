@@ -15,6 +15,7 @@ mod data_store;
 mod delete_file;
 mod entries;
 mod inline_batch;
+mod inline_rows;
 mod metrics;
 mod reader;
 mod row_location;
@@ -56,6 +57,7 @@ pub(crate) use crate::data_file::{
     },
     delete_file::delete_file_positions,
     inline_batch::{decode_inline_schema, inline_batch_entries, inline_batch_index_entries},
+    inline_rows::InlineRows,
     metrics::{DataStoreCounters, ScopedReadMetrics, ScopedReadTally, run_bounded_index_encoding},
     row_location::{FileSummary, file_summary},
     schema::ReadColumn,
@@ -171,6 +173,7 @@ pub(crate) struct ParquetFile {
     footer_size: u64,
     metrics: Arc<ScopedReadMetrics>,
     columns: Option<Arc<Vec<ReadColumn>>>,
+    entry_batch_rows: usize,
 }
 
 impl ParquetFile {
@@ -183,12 +186,19 @@ impl ParquetFile {
             footer_size,
             metrics: Arc::new(ScopedReadMetrics::default()),
             columns: None,
+            entry_batch_rows: BUILD_READ_BATCH_ROWS,
         }
     }
 
     /// Resolves logical column positions against this file's physical schema.
     pub(crate) fn with_columns(mut self, columns: Vec<ReadColumn>) -> Self {
         self.columns = Some(Arc::new(columns));
+        self
+    }
+
+    /// Caps the projected entry vector independently of Parquet page sizes.
+    pub(crate) fn with_entry_batch_rows(mut self, rows: usize) -> Self {
+        self.entry_batch_rows = rows.clamp(1, BUILD_READ_BATCH_ROWS);
         self
     }
 
@@ -335,7 +345,7 @@ pub(crate) async fn scoped_read_entry_batches(
     )?;
     let mut builder = builder
         .with_projection(mask)
-        .with_batch_size(BUILD_READ_BATCH_ROWS);
+        .with_batch_size(file.entry_batch_rows);
     if let Some(selection) = selection {
         builder = builder.with_row_selection(selection);
     }

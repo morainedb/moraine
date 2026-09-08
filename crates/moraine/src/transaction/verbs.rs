@@ -979,6 +979,7 @@ impl Transaction {
             build_cursor_file: None,
             build_cursor_row_id: None,
             build_cursor_position: None,
+            build_inline_cursor: None,
             build_deletes_scanned: None,
             poisoned: None,
             ducklake_index_id: None,
@@ -1091,7 +1092,7 @@ impl Transaction {
         batch: &[IndexEntry],
         is_final: bool,
     ) -> Result<IndexState> {
-        self.build_index_step_at(index, batch, is_final, None)
+        self.build_index_step_at(index, batch, is_final, None, None)
     }
 
     /// Advances a staged build and persists the file position covered by
@@ -1102,8 +1103,9 @@ impl Transaction {
         batch: &[IndexEntry],
         is_final: bool,
         source: Option<(u64, u64)>,
+        inline: Option<&crate::store::proto::InlineBuildCursorValue>,
     ) -> Result<IndexState> {
-        self.build_index_step_at(index, batch, is_final, source)
+        self.build_index_step_at(index, batch, is_final, source, inline)
     }
 
     fn build_index_step_at(
@@ -1112,6 +1114,7 @@ impl Transaction {
         batch: &[IndexEntry],
         is_final: bool,
         source: Option<(u64, u64)>,
+        inline: Option<&crate::store::proto::InlineBuildCursorValue>,
     ) -> Result<IndexState> {
         let (table_id, mut value) = self.live_index(index)?;
         if !matches!(
@@ -1130,8 +1133,15 @@ impl Transaction {
         }
 
         value.begin_snapshot = self.new_snapshot_id;
-        if !batch.is_empty() {
+        // Unordered inline sources must not advance the older row watermark.
+        if !batch.is_empty() && inline.is_none_or(|cursor| cursor.complete) {
             value.build_cursor_row_id = Some(cursor);
+        }
+        if let Some(inline) = inline {
+            value.build_inline_cursor = Some(crate::store::proto::InlineBuildCursorValue {
+                covered_snapshot: self.new_snapshot_id,
+                ..*inline
+            });
         }
         if let Some((file_id, position)) = source {
             let covered = value.build_cursor_file.zip(value.build_cursor_position);
@@ -2459,10 +2469,10 @@ mod tests {
             .unwrap();
 
         transaction
-            .build_index_source_step(index, &[], false, Some((9, 90)))
+            .build_index_source_step(index, &[], false, Some((9, 90)), None)
             .unwrap();
         transaction
-            .build_index_source_step(index, &[], false, Some((9, 20)))
+            .build_index_source_step(index, &[], false, Some((9, 20)), None)
             .unwrap();
 
         let value = &transaction.state.indexes[&table.get()][&index.get()];
@@ -2496,7 +2506,7 @@ mod tests {
         transaction.ops.clear();
 
         transaction
-            .build_index_source_step(index, &[], true, Some((9, 90)))
+            .build_index_source_step(index, &[], true, Some((9, 90)), None)
             .unwrap();
 
         assert_eq!(

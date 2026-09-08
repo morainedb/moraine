@@ -603,8 +603,9 @@ pub struct IndexInfo {
     pub maintenance: IndexMaintenance,
     /// The build lifecycle state.
     pub state: IndexState,
-    /// A staged build's watermark: the highest row id covered so far, or
-    /// `None` before its first step. Always `None` on a single-commit index.
+    /// Row-id watermark for manual steps and older builds. Streamed inline
+    /// steps leave it unchanged until the inline leg completes, using a
+    /// separate source checkpoint. Always `None` on a single-commit index.
     pub build_cursor: Option<u64>,
     /// The data file currently covered through [`Self::build_position_cursor`].
     /// `None` while the build is still covering inline rows or was written by
@@ -651,8 +652,9 @@ impl IndexEntry {
 
 /// How much one step of a staged index build may commit. A step ends at
 /// whichever bound it reaches first, and always carries at least one
-/// entry. `entries` bounds memory; `bytes` bounds the single object-store
-/// request a batch becomes.
+/// entry. `entries` bounds the committed entry buffer; derivation also holds
+/// one source chunk or batch and source-local deletion state. `bytes` bounds
+/// the single object-store request a batch becomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildStep {
     /// Entries per step.

@@ -39,6 +39,10 @@ impl DataStore {
         &self.store
     }
 
+    pub(crate) fn cache_identity(&self) -> CacheIdentity {
+        self.identity
+    }
+
     /// Reads `range` of the file at `path`, taking the whole read again
     /// when the transport under it fails partway.
     pub(crate) async fn read_range(

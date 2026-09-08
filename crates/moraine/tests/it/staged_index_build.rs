@@ -414,7 +414,7 @@ async fn staged_build_reports_explicit_progress() {
     assert_eq!(
         derived[0].get("peak_buffered_entries"),
         Some(&"2".to_owned()),
-        "derivation retains no more entries than one build step"
+        "the commit entry buffer retains no more than one build step"
     );
     assert!(derived[0].contains_key("derive_ms"));
     assert!(derived[0].contains_key("sort_ms"));

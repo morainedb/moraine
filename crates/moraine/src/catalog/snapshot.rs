@@ -1149,7 +1149,7 @@ fn macro_info(value: &MacroValue) -> MacroInfo {
     }
 }
 
-fn data_file_info(value: &DataFileValue) -> DataFileInfo {
+pub(crate) fn data_file_info(value: &DataFileValue) -> DataFileInfo {
     DataFileInfo {
         id: DataFileId::new(value.data_file_id),
         path: value.path.clone(),
@@ -1685,6 +1685,7 @@ mod tests {
             build_cursor_file: None,
             build_cursor_row_id: None,
             build_cursor_position: None,
+            build_inline_cursor: None,
             build_deletes_scanned: None,
             poisoned: None,
             ducklake_index_id: None,

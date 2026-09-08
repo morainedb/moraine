@@ -13,7 +13,10 @@ use crate::{
     },
     data_file::{self, DataStore},
     error::{Error, Result},
-    store::index_encoding::{Direction, NullOrder},
+    store::{
+        index_encoding::{Direction, NullOrder},
+        proto::InlineBuildCursorValue,
+    },
 };
 
 /// How many times a staged build re-derives after losing a race before
@@ -62,9 +65,19 @@ struct BuildStepBuffer<'a> {
     pending_source: Option<(u64, u64)>,
     completed_entries: usize,
     peak_buffered_entries: usize,
+    inline_cursor: Option<InlineBuildCursorValue>,
+    peak_inline_body_bytes: usize,
+    peak_inline_decoded_bytes: usize,
+    peak_derived_entries: usize,
 }
 
 impl BuildStepBuffer<'_> {
+    fn observe_source_entries(&mut self, count: usize) {
+        self.peak_derived_entries = self
+            .peak_derived_entries
+            .max(self.entries.len().saturating_add(count));
+    }
+
     fn cover_source(&mut self, file_id: u64, position: u64) {
         self.pending_source = Some((file_id, position));
     }
@@ -103,8 +116,14 @@ impl BuildStepBuffer<'_> {
                         "catalog changed after staged index derivation".to_owned(),
                     ));
                 }
-                tx.build_index_source_step(self.index, &entries, is_final, source)
-                    .map(|_| ())
+                tx.build_index_source_step(
+                    self.index,
+                    &entries,
+                    is_final,
+                    source,
+                    self.inline_cursor.as_ref(),
+                )
+                .map(|_| ())
             })
             .await?;
         self.expected_snapshot = committed;
@@ -408,12 +427,19 @@ impl Catalog {
                 .is_none()
                 .then_some(info.build_cursor)
                 .flatten();
-            // Deferred UPDATE may reinsert an inline row under its preserved
-            // id, so a repair re-derives the inline live set rather than
-            // resuming by row-id watermark.
-            let inline_row_cursor = (info.state != IndexState::Maintaining)
-                .then_some(info.build_cursor)
-                .flatten();
+            let saved_inline = snapshot
+                .indexes
+                .get(&table.get())
+                .and_then(|indexes| indexes.get(&index.get()))
+                .and_then(|index| index.build_inline_cursor);
+            let inline_cursor = saved_inline.filter(|cursor| {
+                info.state != IndexState::Maintaining
+                    || cursor.covered_snapshot == snapshot.current_snapshot().id.get()
+            });
+            let inline_row_cursor = (info.state != IndexState::Maintaining
+                && inline_cursor.is_none())
+            .then_some(info.build_cursor)
+            .flatten();
             let mut buffer = BuildStepBuffer {
                 catalog: self,
                 table,
@@ -428,19 +454,23 @@ impl Catalog {
                 pending_source: initial_file_cursor.zip(initial_position_cursor),
                 completed_entries: 0,
                 peak_buffered_entries: 0,
+                inline_cursor,
+                peak_inline_body_bytes: 0,
+                peak_inline_decoded_bytes: 0,
+                peak_derived_entries: 0,
             };
 
             let pass = async {
-                // Inline rows precede file sources. Older builds that carry
-                // only a row-id cursor resume this leg by that watermark.
-                let mut inline = backfill::inline_backfill_entries_at(source, &def.columns).await?;
-                inline.sort_unstable_by_key(|entry| entry.row_id);
-                for entry in inline
-                    .into_iter()
-                    .filter(|entry| inline_row_cursor.is_none_or(|row| entry.row_id > row))
-                {
-                    buffer.push(entry, None).await?;
+                let inline_done = buffer
+                    .inline_cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.complete)
+                    || (info.state != IndexState::Maintaining && initial_file_cursor.is_some());
+                if !inline_done {
+                    stream_inline_sources(source, &def.columns, inline_row_cursor, &mut buffer)
+                        .await?;
                 }
+                buffer.inline_cursor.get_or_insert_default().complete = true;
 
                 if let Some(store) = &data_store {
                     self.stream_backfill_files(
@@ -469,6 +499,9 @@ impl Catalog {
                         derivation_attempt = attempt,
                         total_entries = buffer.completed_entries,
                         peak_buffered_entries = buffer.peak_buffered_entries,
+                        peak_derived_entries = buffer.peak_derived_entries,
+                        peak_inline_body_bytes = buffer.peak_inline_body_bytes,
+                        peak_inline_decoded_bytes = buffer.peak_inline_decoded_bytes,
                         derive_ms = crate::telemetry::milliseconds(derivation_started.elapsed()),
                         sort_ms = 0_u64,
                         "staged index backfill derived"
@@ -525,23 +558,17 @@ impl Catalog {
             resolve_data_path(data_prefix, &table_prefix, path, is_relative)
         };
 
-        let inline_deletes = backfill::collect_inline_delete_positions(handle, table.get());
         let metrics = self.data_read_metrics();
-        let delete_files = backfill::collect_delete_positions(
-            snapshot.delete_files_of(table).into_iter(),
-            object_store.clone(),
-            Arc::clone(&metrics),
-            &resolve,
-        );
-        let (inline_killed, mut killed_positions) =
-            futures::try_join!(inline_deletes, delete_files)?;
-        backfill::merge_killed_positions(&mut killed_positions, inline_killed);
-
-        for file in snapshot.data_files_of(table) {
-            if file_cursor.is_some_and(|cursor| file.id.get() < cursor) {
+        for file in snapshot
+            .data_files
+            .get(&table.get())
+            .into_iter()
+            .flat_map(|files| files.values())
+        {
+            if file_cursor.is_some_and(|cursor| file.data_file_id < cursor) {
                 continue;
             }
-            let start = if file_cursor == Some(file.id.get()) {
+            let start = if file_cursor == Some(file.data_file_id) {
                 position_cursor.map_or(0, |position| position.saturating_add(1))
             } else {
                 0
@@ -550,8 +577,30 @@ impl Catalog {
                 continue;
             }
             let path = resolve(&file.path, file.path_is_relative)?;
-            let file_id = file.id.get();
-            let dead_positions = killed_positions.get(&file_id);
+            let file_id = file.data_file_id;
+            let mut dead_positions =
+                crate::store::inline::stream::file_delete_positions(handle, table.get(), file_id)
+                    .await?;
+            for deletion in snapshot
+                .delete_files
+                .get(&table.get())
+                .into_iter()
+                .flat_map(|files| files.values())
+                .filter(|deletion| deletion.data_file_id == file_id)
+            {
+                dead_positions.extend(
+                    data_file::delete_file_positions(
+                        data_file::ParquetFile::new(
+                            object_store.clone(),
+                            resolve(&deletion.path, deletion.path_is_relative)?,
+                            deletion.file_size_bytes,
+                            deletion.footer_size,
+                        )
+                        .with_metrics(Arc::clone(&metrics)),
+                    )
+                    .await?,
+                );
+            }
             let mut batches = data_file::scoped_read_entry_batches(
                 data_file::ParquetFile::new(
                     object_store.clone(),
@@ -559,19 +608,8 @@ impl Catalog {
                     file.file_size_bytes,
                     file.footer_size,
                 )
-                .with_columns(
-                    snapshot
-                        .file_read_columns_at(
-                            handle,
-                            table,
-                            snapshot
-                                .data_files
-                                .get(&table.get())
-                                .and_then(|files| files.get(&file.id.get()))
-                                .ok_or_else(|| Error::NotFound(format!("data file {}", file.id)))?,
-                        )
-                        .await?,
-                )
+                .with_columns(snapshot.file_read_columns_at(handle, table, file).await?)
+                .with_entry_batch_rows(buffer.bound.entries)
                 .with_metrics(Arc::clone(&metrics)),
                 &positions,
                 data_file::ScopedRows::From(start),
@@ -581,9 +619,11 @@ impl Catalog {
             )
             .await?;
             while let Some(batch) = batches.try_next().await? {
-                for entry in batch {
+                let mut entries = batch.into_iter();
+                while let Some(entry) = entries.next() {
+                    buffer.observe_source_entries(entries.len() + 1);
                     let ordinal = entry.ordinal;
-                    let dead = dead_positions.is_some_and(|positions| positions.contains(&ordinal));
+                    let dead = dead_positions.contains(&ordinal);
                     let covered = legacy_row_cursor.is_some_and(|cursor| entry.row_id <= cursor);
                     if !dead && !covered {
                         buffer
@@ -624,3 +664,9 @@ fn require_data_store(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
+
+mod inline_sources;
+use inline_sources::stream_inline_sources;
