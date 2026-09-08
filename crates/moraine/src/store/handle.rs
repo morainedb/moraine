@@ -35,6 +35,8 @@ const SCAN_SPLIT_BYTES: usize = SCAN_READ_AHEAD_BYTES;
 pub(crate) enum ScanShape {
     /// A whole-subspace walk; its blocks are not admitted.
     Bulk,
+    /// One-block read-ahead without cache admission for sequential derivation.
+    Streaming,
     /// A targeted lookup; its blocks are admitted.
     Probe,
 }
@@ -71,8 +73,16 @@ impl ScanShape {
     /// admits its blocks.
     fn options(self, order: ScanOrder) -> ScanOptions {
         ScanOptions {
-            read_ahead_bytes: SCAN_READ_AHEAD_BYTES,
-            max_fetch_tasks: SCAN_FETCH_TASKS,
+            read_ahead_bytes: if self == Self::Streaming {
+                1
+            } else {
+                SCAN_READ_AHEAD_BYTES
+            },
+            max_fetch_tasks: if self == Self::Streaming {
+                1
+            } else {
+                SCAN_FETCH_TASKS
+            },
             cache_blocks: matches!(self, Self::Probe),
             order: order.iteration_order(),
             ..ScanOptions::default()

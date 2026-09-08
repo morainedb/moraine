@@ -2,6 +2,8 @@
 //! per-schema-version schema records. Mirrors `store::read`'s decode-only
 //! contract — no DuckLake interpretation here.
 
+pub(crate) mod stream;
+
 use std::collections::{BTreeSet, HashMap};
 
 use bytes::Bytes;

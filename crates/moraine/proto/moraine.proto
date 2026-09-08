@@ -176,6 +176,18 @@ message IndexValue {
   optional uint64 ducklake_index_id = 13;
   // SQL additions may land before this non-unique index is repaired.
   optional bool deferred_maintenance = 17;
+  // Inline source checkpoint; independent of the row-id watermark.
+  optional InlineBuildCursorValue build_inline_cursor = 18;
+}
+
+message InlineBuildCursorValue {
+  uint64 schema_version = 1;
+  uint64 begin_snapshot = 2;
+  uint64 chunk_seq = 3;
+  uint64 next_position = 4;
+  bool chunk_finished = 5;
+  bool complete = 6;
+  uint64 covered_snapshot = 7;
 }
 
 // ducklake_file_partition_value — embedded in DataFileValue.

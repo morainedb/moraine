@@ -1685,6 +1685,7 @@ mod tests {
             build_cursor_file: None,
             build_cursor_row_id: None,
             build_cursor_position: None,
+            build_inline_cursor: None,
             build_deletes_scanned: None,
             poisoned: None,
             ducklake_index_id: None,

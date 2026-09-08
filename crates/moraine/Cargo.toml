@@ -41,6 +41,7 @@ prost-build = { workspace = true }
 protox = { workspace = true }
 
 [dev-dependencies]
+dhat = { workspace = true }
 cpu-time = { workspace = true }
 stats_alloc = { workspace = true }
 moraine = { path = ".", features = ["fault-injection"] }

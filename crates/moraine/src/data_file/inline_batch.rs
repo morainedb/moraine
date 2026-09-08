@@ -39,7 +39,7 @@ pub(crate) fn decode_inline_schema(schema_ipc: Bytes) -> Result<SchemaRef> {
 /// Decodes an inline-insert Arrow body — `[u32-le message length][record-
 /// batch message][arrow data buffers]` — against its already-decoded table
 /// schema without copying the data region.
-fn decode_inline_batch(schema: SchemaRef, body: &Bytes) -> Result<RecordBatch> {
+pub(super) fn decode_inline_batch(schema: SchemaRef, body: &Bytes) -> Result<RecordBatch> {
     if body.len() < 4 {
         return Err(Error::Corruption("inline body truncated".to_owned()));
     }
