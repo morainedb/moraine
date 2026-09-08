@@ -11,7 +11,7 @@ integration coverage.
 
 ### Batch exact-key reads through one read plan
 
-SlateDB 0.15 exposes single-key `get` operations and range scans, but no
+SlateDB 0.16 exposes single-key `get` operations and range scans, but no
 multi-get operation. A caller resolving hundreds of unrelated exact keys must
 issue concurrent `get` calls, each of which independently enters the read path.
 The caller cannot ask SlateDB to group those keys by level, SST, or block and
@@ -34,7 +34,7 @@ Owner: [RFC 0016](rfcs/0016-equality-indexes.md).
 
 ### Move the write batch and accept explicit conflict keys
 
-SlateDB 0.15 clones `DbTransaction`'s complete `WriteBatch` at commit, then
+SlateDB 0.16 clones `DbTransaction`'s complete `WriteBatch` at commit, then
 materializes every batch key into a `HashSet` for conflict tracking. Large
 equality-index commits therefore hold another complete batch plus one conflict
 node per index key at their peak. Recent committed transactions can retain the

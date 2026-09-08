@@ -352,7 +352,7 @@ compatibility oracle.
 
 Every catalog batch rewrites `sys/head`, including head-preserving maintenance,
 and the store admits only one writer process. Tracking every index key cannot
-reject a commit the head collision would admit, but SlateDB 0.15 nevertheless
+reject a commit the head collision would admit, but SlateDB 0.16 nevertheless
 materializes the batch's complete key set for conflict detection. It also
 clones the transaction's write batch at commit. Moraine accepts that upstream
 behavior and bounds the resulting peak with count and encoded-byte limits.

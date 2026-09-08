@@ -6,6 +6,7 @@ use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
 use super::*;
 
 mod allocation;
+mod durability;
 
 /// A prepared head view is installed by allocation rather than rebuilt.
 #[test]
@@ -231,7 +232,13 @@ async fn materialize_gate_refuses_on_marker() {
         }),
     )
     .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
+    tx.commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .await_durable()
+        .await
+        .unwrap();
 
     let read = db.begin(IsolationLevel::Snapshot).await.unwrap();
     let err = materialize(ReadHandle::Tx(&read), None)
@@ -614,7 +621,13 @@ async fn plant_migration_marker(catalog: &crate::catalog::Catalog) {
     .unwrap();
     let (key, stamp) = head_stamp(head.snapshot_id, head.batch_seq);
     tx.put(key, stamp.unwrap()).unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
+    tx.commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .await_durable()
+        .await
+        .unwrap();
 }
 
 fn int_value(value: i128) -> crate::store::index_encoding::IndexKeyValue {
@@ -3696,7 +3709,13 @@ async fn the_migration_check_is_skipped_at_a_head_already_found_clear() {
         }),
     )
     .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
+    tx.commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .await_durable()
+        .await
+        .unwrap();
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let served = refuse_mid_migration_at(ReadHandle::Tx(&db_tx), projections, &head).await;
@@ -3741,7 +3760,13 @@ async fn a_read_session_skips_the_migration_check_at_a_stamped_head() {
         }),
     )
     .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
+    tx.commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .await_durable()
+        .await
+        .unwrap();
     let session = catalog.begin_read().await.unwrap();
     session.finish();
 
@@ -4777,7 +4802,13 @@ async fn a_marker_from_the_writer_that_fenced_us_never_reads_as_a_migration() {
         }),
     )
     .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
+    tx.commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .await_durable()
+        .await
+        .unwrap();
 
     // Fencing is reported by a background task, so the displaced handle
     // does not learn of it in the same breath. Whatever it answers in that

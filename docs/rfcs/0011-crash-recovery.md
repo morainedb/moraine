@@ -295,10 +295,10 @@ cannot produce a false negative, and it turns an invisible hang into a
 diagnosable one.
 
 This replaces an earlier design that reached for SlateDB's
-`Settings { flush_interval: None }` and `WriteOptions { await_durable: false }`
-to freeze the pre-flush instant from inside. That would have needed two
+`Settings { flush_interval: None }` and a commit without awaiting its durability
+handle to freeze the pre-flush instant from inside. That would have needed two
 knobs plumbed through `CatalogOptions` and the commit path purely for tests
-— and `await_durable: true` against a store that cannot flush is precisely
+— and awaiting durability against a store that cannot flush is precisely
 the hang described above. Freezing the store needs no production surface at
 all: `Catalog::open` already takes any `ObjectStore`.
 

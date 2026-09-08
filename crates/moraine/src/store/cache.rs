@@ -1349,10 +1349,7 @@ mod tests {
                     b"key",
                     value,
                     &PutOptions::default(),
-                    &WriteOptions {
-                        await_durable: false,
-                        ..WriteOptions::default()
-                    },
+                    &WriteOptions::default(),
                 )
                 .await
                 .unwrap();

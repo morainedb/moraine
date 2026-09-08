@@ -782,13 +782,17 @@ opened *after* `commit` returns resolves `N+1`. (A reader opened *before*
 may still lag by its manifest poll interval — that is ordinary snapshot
 isolation, not a violation.)
 
-No extra flush call is needed to hold that contract; step 4's own
-durability does it. A commit with `await_durable: true` blocks on a
-durability watcher that fires only once the WAL object has been PUT to
-object storage (`WalBufferManager::do_flush_one_wal` → `notify_durable`),
-and both fresh-open paths — `Db::open` and `DbReader::open` in latest
-mode — replay WALs from object storage past the manifest state. So a
-handle opened after `commit` returns resolves `N+1` by construction.
+SlateDB 0.16 returns a `WriteHandle` once the transaction is visible in
+memory. Moraine's timer-driven commit path then awaits
+`WriteHandle::await_durable()` before reporting success; an empty transaction
+returns no handle and needs no wait. The immediate path explicitly flushes
+the WAL after submitting the transaction. Both paths retain shutdown and
+fencing errors and report stalls without abandoning the durability wait.
+
+The durability watcher advances only after the WAL reaches object storage.
+Both fresh-open paths — `Db::open` and `DbReader::open` in latest mode —
+replay WALs from object storage past the manifest state. So a handle opened
+after Moraine's `commit` returns resolves `N+1` by construction.
 
 A validation test in the store harness (open `object_store`, commit, open a
 *fresh* reader, assert `N+1` is visible) pins that behavior against real

@@ -16,7 +16,7 @@ use crate::{
         open::StoreBuilder,
         read::{EntityRecord, scan_current_entities},
     },
-    transaction::commit::{FORMAT_VERSION, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION, durable},
+    transaction::commit::{FORMAT_VERSION, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION},
 };
 
 /// The format the rewriting synthetic unit lands on: the newest this binary
@@ -65,7 +65,13 @@ async fn seeded_store() -> Arc<InMemory> {
         )
         .unwrap();
     }
-    tx.commit_with_options(&durable()).await.unwrap();
+    tx.commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .await_durable()
+        .await
+        .unwrap();
     db.close().await.unwrap();
 
     object_store
@@ -521,7 +527,13 @@ async fn a_mid_migration_store_never_reaches_the_raise() {
         }),
     )
     .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
+    tx.commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .await_durable()
+        .await
+        .unwrap();
 
     // The raise refuses the marked store reached directly, before the
     // open below fences this writer.

@@ -303,7 +303,7 @@ impl ReadSession {
 #[cfg(test)]
 mod tests {
     use object_store::memory::InMemory;
-    use slatedb::{IsolationLevel, config::WriteOptions};
+    use slatedb::IsolationLevel;
 
     use super::*;
     use crate::store::{
@@ -362,12 +362,8 @@ mod tests {
             b"d",
         )
         .unwrap();
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        let write = tx.commit().await.unwrap().unwrap();
+        write.await_durable().await.unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let handle = ReadHandle::Tx(&tx);

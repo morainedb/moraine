@@ -1415,7 +1415,13 @@ mod tests {
         .unwrap();
         let (key, stamp) = commit::head_stamp(head.snapshot_id, head.batch_seq);
         tx.put(key, stamp.unwrap()).unwrap();
-        tx.commit_with_options(&commit::durable()).await.unwrap();
+        tx.commit()
+            .await
+            .unwrap()
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
     }
 
     fn refuses<T>(outcome: &Result<T>) -> bool {
