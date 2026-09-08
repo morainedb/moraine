@@ -1,5 +1,8 @@
 //! Repo automation. Invoked as `cargo xtask <command>`.
 //!
+//! `session-bench` compares the pinned pre-review, post-review, and SlateDB
+//! upgrade revisions with shared core and SQL workloads.
+//!
 //! - `e2e` packages the extension and drives it through a real DuckDB CLI (see
 //!   `e2e.rs`).
 //! - `bench` compares DuckLake metadata catalogs — moraine's SlateDB store, a
@@ -35,6 +38,7 @@ mod locate_bench;
 mod pins;
 mod release;
 mod s3;
+mod session_bench;
 
 fn main() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(2).collect();
@@ -44,6 +48,7 @@ fn main() -> anyhow::Result<()> {
         Some("bench") => bench::bench(&arguments),
         Some("commit-bench") => commit_bench::run(&arguments),
         Some("locate-bench") => locate_bench::run(&arguments),
+        Some("session-bench") => session_bench::run(&arguments),
         Some("s3") => s3::s3(),
         Some("ducklake-patch") => ducklake_patch::build(&arguments),
         Some("check-pins") => pins::check_pins(),
@@ -59,14 +64,14 @@ fn main() -> anyhow::Result<()> {
         }
         Some(other) => {
             bail!(
-                "unknown task `{other}`; available: e2e, bench, commit-bench, locate-bench, s3, check-pins, \
+                "unknown task `{other}`; available: e2e, bench, commit-bench, locate-bench, session-bench, s3, check-pins, \
                  check-release-assets, check-ducklake-release-assets, \
                  validate-ducklake-release-artifact, version-matrix, bump-duckdb, \
                  ducklake-patch"
             )
         }
         None => bail!(
-            "usage: cargo xtask <task>; available: e2e, bench, commit-bench, locate-bench, s3, check-pins, \
+            "usage: cargo xtask <task>; available: e2e, bench, commit-bench, locate-bench, session-bench, s3, check-pins, \
              check-release-assets, check-ducklake-release-assets, \
              validate-ducklake-release-artifact, version-matrix, bump-duckdb, \
              ducklake-patch"

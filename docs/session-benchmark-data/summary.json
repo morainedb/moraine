@@ -1,0 +1,102 @@
+{
+  "Build:16384 rows normal wall": {
+    "before": 349612.0,
+    "review": 299895.0,
+    "slatedb16": 303352.0
+  },
+  "Build:16384 rows normal CPU": {
+    "before": 263360.0,
+    "review": 211775.0,
+    "slatedb16": 215823.0
+  },
+  "Commit:4096 tables wall": {
+    "before": 46289.969,
+    "review": 1170.71,
+    "slatedb16": 1177.442
+  },
+  "Commit:4096 tables CPU": {
+    "before": 46332.304,
+    "review": 159.265,
+    "slatedb16": 155.292
+  },
+  "Commit:4096 tables bytes": {
+    "before": 54610481.2,
+    "review": 139925.0,
+    "slatedb16": 140924.0
+  },
+  "Commit:4096 tables 10ms wall": {
+    "before": 52872.251,
+    "review": 11109.645,
+    "slatedb16": 11110.728
+  },
+  "File:1024 warm wall": {
+    "before": 3450.334,
+    "review": 25.419,
+    "slatedb16": 28.054
+  },
+  "File:1024 cold wall": {
+    "before": 12276.368,
+    "review": 12605.598,
+    "slatedb16": 13100.579
+  },
+  "Inline:1024 warm wall": {
+    "before": 9071.43,
+    "review": 30.613,
+    "slatedb16": 30.63
+  },
+  "Recent:1024 warm wall": {
+    "before": 33748.034,
+    "review": 63.593,
+    "slatedb16": 65.106
+  },
+  "Reader recent:1024 warm wall": {
+    "before": 20628.581,
+    "review": 77.95,
+    "slatedb16": 79.477
+  },
+  "Index:65536 batch1024 wall": {
+    "before": 7763.966,
+    "review": 2385.716,
+    "slatedb16": 2357.274
+  },
+  "Index:65536 batch1024 bytes": {
+    "before": 5913004.8,
+    "review": 2904146.8,
+    "slatedb16": 2910507.6
+  },
+  "Index:65536 batch1 bytes": {
+    "before": 162053.6,
+    "review": 178998.8,
+    "slatedb16": 180784.0
+  },
+  "Build:16384 rows peak": {
+    "before": 38872351.0,
+    "review": 22586603.0,
+    "slatedb16": 22585899.0
+  },
+  "SQL mixed tables0 flush0 seconds": {
+    "before": 8.167182,
+    "review": 8.125542,
+    "slatedb16": 8.047516
+  },
+  "SQL mixed tables128 flush0 seconds": {
+    "before": 9.702996,
+    "review": 9.477943,
+    "slatedb16": 9.388734
+  },
+  "SQL mixed tables128 flush10 seconds": {
+    "before": 11.370481,
+    "review": 11.189341,
+    "slatedb16": 11.102757
+  },
+  "SQL bulk tables0 flush0 seconds": {
+    "before": 0.164657,
+    "review": 0.166845,
+    "slatedb16": 0.163406
+  },
+  "SQL mixed_256_files tables0 flush0 seconds": {
+    "before": 12.375607,
+    "review": 10.393987,
+    "slatedb16": 10.242219
+  }
+}

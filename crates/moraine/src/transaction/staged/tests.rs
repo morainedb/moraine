@@ -17,6 +17,7 @@ use tracing_subscriber::{layer::Context, prelude::*};
 use super::{inline::inline_schema_collapse_target, *};
 use crate::catalog::{Catalog, CatalogOptions, inline::InlineScanKind};
 
+mod data_path;
 mod inline_history;
 
 fn schema_row(id: u64, name: &str, begin: u64) -> Vec<Cell> {
