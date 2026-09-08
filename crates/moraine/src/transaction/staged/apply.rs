@@ -1142,9 +1142,7 @@ pub(super) fn apply_stats_delete(
                 table_id,
                 column_id,
             });
-            if let Some(cols) = state.table_column_stats.get_mut(&table_id) {
-                cols.remove(&column_id);
-            }
+            state.remove_table_column_stats(table_id, column_id);
         }
         StatsKey::FileColumn(table_id, data_file_id, column_id) => {
             touched.touch(EntityKey::FileColumnStats {
@@ -1152,9 +1150,7 @@ pub(super) fn apply_stats_delete(
                 data_file_id,
                 column_id,
             });
-            if let Some(cols) = state.file_column_stats.get_mut(&table_id) {
-                cols.remove(&(data_file_id, column_id));
-            }
+            state.remove_file_column_stats(table_id, data_file_id, column_id);
         }
     }
     Ok(())

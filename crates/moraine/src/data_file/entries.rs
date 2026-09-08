@@ -57,7 +57,7 @@ fn build_canonical_keys(
     row: usize,
     row_id: u64,
 ) -> Result<(Bytes, bool)> {
-    let mut builder = CanonicalKeyBuilder::new();
+    let mut builder = CanonicalKeyBuilder::for_index_entry(projection.unique);
     projection
         .positions
         .iter()

@@ -320,10 +320,20 @@ rescanning `current`:
    applied by the same fold the committer uses on its own batch. Stamp the
    view with head's snapshot record and batch count.
 
-Cost is churn across the gap plus one copy of the base view, not a function
-of catalog size beyond that copy — a view is immutable and shared, so
-advancing one copies it first. No step restates any entity kind's rules:
-the changelog is encoded keys and the application is the existing fold.
+Entity maps use structurally shared ordered trees (`imbl::OrdMap`), including
+both levels of table-scoped maps. Name and index-owner lookups use persistent
+hash maps. `imbl` 5 brings the unmaintained transitive `bitmaps` crate
+([RUSTSEC-2026-0247](https://rustsec.org/advisories/RUSTSEC-2026-0247));
+`deny.toml` records a narrow exception for this maintenance advisory, to revisit
+on dependency upgrades. Cloning a view shares these trees; applying a change copies only
+the affected paths, preserving held readers. The snapshot record itself is
+copied. Replay work scales with changed records and tree height. The churn
+heuristic reads the base entity count in constant time: flat maps retain their
+lengths, and snapshot mutators maintain one total for nested records. Replacements
+leave that total unchanged; removals and cascades subtract only records actually
+removed, including staged statistics deletions. Historical mappings and file
+statistics retained by a table cascade remain counted. No step restates entity rules: the changelog is encoded
+keys and application uses the existing fold.
 
 The changelog lives in a subspace of its own rather than in the snapshot
 record. Measured in the record it grew snapshot rows 6.8× and slowed their
@@ -484,6 +494,12 @@ store read and installs only if the epoch still matches; any interleaved
 invalidation makes the install a no-op and the reader simply keeps the view
 it computed. Installation is thus compare-and-set, and no path needs to
 discard a view it has already paid for.
+
+All head-view consumers, including equality, batched equality, range, and NULL
+index lookups, install their computed catalog view under this rule. Capture the
+epoch before opening the read session. Index entries are still resolved anew
+inside that session against the same head as the cached metadata; only the
+catalog view is reused.
 
 **Read-only handles cache too.** A reader folds no batch of its own — it
 has none — so the changelog replay above is the only way it advances, and

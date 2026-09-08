@@ -2,7 +2,7 @@
 //! itself builds on these.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -955,7 +955,7 @@ pub(crate) struct InlineShapes {
 /// [`FORMAT_WITH_STAGED_INDEX`], and any other index [`FORMAT_WITH_INDEX`].
 /// The floor is the highest term that applies, never the first.
 pub(crate) fn index_format(state: &CatalogSnapshot) -> u64 {
-    let indexes = || state.indexes.values().flat_map(BTreeMap::values);
+    let indexes = || state.indexes.values().flat_map(imbl::OrdMap::values);
 
     [
         indexes()
@@ -1005,6 +1005,9 @@ async fn format_stamp(
     state: &CatalogSnapshot,
     wrote: InlineShapes,
 ) -> Result<Option<StagedWrite>> {
+    if format_floor(projections) >= MAX_FORMAT_VERSION {
+        return Ok(None);
+    }
     format_stamp_to(db_tx, projections, target_format(state, wrote)).await
 }
 
@@ -1070,6 +1073,7 @@ async fn prepare_and_stage<F>(
     projections: &std::sync::RwLock<ProjectionCache>,
     f: &F,
     base: &CatalogSnapshot,
+    first_member: bool,
 ) -> Result<Prepared>
 where
     F: Fn(&mut Transaction) -> Result<()>,
@@ -1089,7 +1093,7 @@ where
 
     if operations.is_empty() {
         let mut writes = Vec::new();
-        diff_options(&mut writes, diff::Scope::All, base, &state);
+        diff_options(&mut writes, diff::Scope::Changed, base, &state);
         if writes.is_empty() {
             return Ok(Prepared::Nothing { head });
         }
@@ -1117,7 +1121,7 @@ where
         schema_reference: false,
     };
     let (entries, inline_writes, format_write) = futures::try_join!(
-        index_maintenance::stage_index_entries(db_tx, index_entries),
+        index_maintenance::stage_index_entries(db_tx, index_entries, first_member),
         inline::stage_inline_writes(db_tx, projections, &inline_ops),
         format_stamp(db_tx, projections, &state, wrote_inline),
     )?;
@@ -1271,6 +1275,8 @@ pub(crate) async fn commit_batch(
                 staged_bytes = staged_bytes.0,
                 elapsed_ms = crate::telemetry::milliseconds(durable),
                 projection_ms = crate::telemetry::milliseconds(projection),
+                elapsed_ns = crate::telemetry::nanoseconds(durable),
+                projection_ns = crate::telemetry::nanoseconds(projection),
                 "durable commit landed"
             );
             Ok(Landed::Committed(CommitTimings {

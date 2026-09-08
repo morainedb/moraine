@@ -8,7 +8,7 @@ use std::{
 use futures::{StreamExt, stream::FuturesUnordered};
 use tracing::debug;
 
-use super::ReadOnlyCatalog;
+use super::{ReadOnlyCatalog, cache_epoch};
 use crate::{
     catalog::{CatalogSnapshot, IndexId, IndexInfo, IndexState, TableId},
     error::{Error, Result},
@@ -180,12 +180,13 @@ impl ReadOnlyCatalog {
         let started = Instant::now();
         let cache_before = self.cache_tally();
         let store_before = self.object_store_tally();
+        let epoch = cache_epoch(&self.projections);
         let session = self.begin_read().await?;
         let handle = session.handle();
 
         let index_row_ids = read::consistent(handle, || async {
             let head_started = Instant::now();
-            let view = self.head_view(handle).await?;
+            let view = self.head_view(handle, epoch).await?;
             let head = head_started.elapsed();
             let info = ready_index(&view, table, index)?;
 
@@ -254,10 +255,11 @@ impl ReadOnlyCatalog {
         upper: Bound<Vec<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
+        let epoch = cache_epoch(&self.projections);
         let session = self.begin_read().await?;
         let handle = session.handle();
 
-        let view = self.head_view(handle).await?;
+        let view = self.head_view(handle, epoch).await?;
         let info = ready_index(&view, table, index)?;
 
         let (byte_lower, byte_upper) = encode_range_bounds(&info, index, lower, upper)?;
@@ -299,10 +301,11 @@ impl ReadOnlyCatalog {
         prefix: Vec<Option<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
+        let epoch = cache_epoch(&self.projections);
         let session = self.begin_read().await?;
         let handle = session.handle();
 
-        let view = self.head_view(handle).await?;
+        let view = self.head_view(handle, epoch).await?;
         let info = ready_index(&view, table, index)?;
 
         if prefix.is_empty() || prefix.len() > info.columns.len() {

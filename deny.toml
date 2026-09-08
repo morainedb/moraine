@@ -15,7 +15,7 @@ allow = [
     "CDLA-Permissive-2.0",
     # arrow's transitive graph (tiny-keccak) — public-domain dedication:
     "CC0-1.0",
-    # cbindgen (build-dependency generating cpp/moraine_abi.h):
+    # cbindgen (ABI generation) and imbl (persistent catalog maps):
     "MPL-2.0",
 ]
 
@@ -30,6 +30,8 @@ ignore = [
     # Revisit on slatedb bumps.
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; transitive via slatedb->foyer" },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive via slatedb->foyer" },
+    # imbl and imbl-sized-chunks require bitmaps; revisit on imbl upgrades.
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained; transitive via imbl, no patched version or reported vulnerability" },
 ]
 
 [sources]

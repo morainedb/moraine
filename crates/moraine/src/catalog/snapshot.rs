@@ -1,8 +1,7 @@
 //! An immutable, materialized catalog view. Built once from a consistent
 //! store scan; every accessor is an in-memory lookup afterwards.
 
-use std::collections::{BTreeMap, HashMap};
-
+use imbl::{HashMap, OrdMap};
 use prost::Message as _;
 
 use crate::{
@@ -30,35 +29,39 @@ use crate::{
 ///
 /// Reads issue no store I/O after the view is built — a `CatalogSnapshot`
 /// is a value, not a cursor. The default value is an empty view at
-/// snapshot 0.
+/// snapshot 0. Clones share entity maps; mutations copy only affected tree
+/// nodes.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogSnapshot {
     pub(crate) snapshot: SnapshotValue,
     /// The head record's batch count when this view was built, zero for a
     /// time-travel view.
     pub(crate) batch_seq: u64,
-    pub(crate) schemas: BTreeMap<u64, SchemaValue>,
-    pub(crate) tables: BTreeMap<u64, TableValue>,
-    pub(crate) views: BTreeMap<u64, ViewValue>,
-    pub(crate) macros: BTreeMap<u64, MacroValue>,
-    pub(crate) columns: BTreeMap<u64, BTreeMap<u64, ColumnValue>>,
+    /// Records in nested entity maps; flat maps already maintain their lengths.
+    pub(crate) nested_entity_count: usize,
+    pub(crate) schemas: OrdMap<u64, SchemaValue>,
+    pub(crate) tables: OrdMap<u64, TableValue>,
+    pub(crate) views: OrdMap<u64, ViewValue>,
+    pub(crate) macros: OrdMap<u64, MacroValue>,
+    pub(crate) columns: OrdMap<u64, OrdMap<u64, ColumnValue>>,
     pub(crate) schema_names: HashMap<String, u64>,
     pub(crate) table_names: ScopedNames,
     pub(crate) view_names: ScopedNames,
     pub(crate) macro_names: ScopedNames,
-    pub(crate) data_files: BTreeMap<u64, BTreeMap<u64, DataFileValue>>,
-    pub(crate) delete_files: BTreeMap<u64, BTreeMap<u64, DeleteFileValue>>,
-    pub(crate) partitions: BTreeMap<u64, BTreeMap<u64, PartitionValue>>,
-    pub(crate) sorts: BTreeMap<u64, BTreeMap<u64, SortValue>>,
-    pub(crate) mappings: BTreeMap<u64, BTreeMap<u64, MappingValue>>,
-    pub(crate) indexes: BTreeMap<u64, BTreeMap<u64, IndexValue>>,
+    pub(crate) data_files: OrdMap<u64, OrdMap<u64, DataFileValue>>,
+    pub(crate) delete_files: OrdMap<u64, OrdMap<u64, DeleteFileValue>>,
+    pub(crate) partitions: OrdMap<u64, OrdMap<u64, PartitionValue>>,
+    pub(crate) sorts: OrdMap<u64, OrdMap<u64, SortValue>>,
+    pub(crate) mappings: OrdMap<u64, OrdMap<u64, MappingValue>>,
+    pub(crate) indexes: OrdMap<u64, OrdMap<u64, IndexValue>>,
     pub(crate) index_names: ScopedNames,
-    pub(crate) table_stats: BTreeMap<u64, TableStatsValue>,
-    pub(crate) table_column_stats: BTreeMap<u64, BTreeMap<u64, TableColumnStatsValue>>,
-    pub(crate) file_column_stats: BTreeMap<u64, BTreeMap<(u64, u64), FileColumnStatsValue>>,
-    pub(crate) options: BTreeMap<(u64, u64), OptionScopeValue>,
-    pub(crate) tags: BTreeMap<u64, TagValue>,
-    pub(crate) gc_files: BTreeMap<u64, GcFileValue>,
+    pub(crate) index_tables: HashMap<u64, u64>,
+    pub(crate) table_stats: OrdMap<u64, TableStatsValue>,
+    pub(crate) table_column_stats: OrdMap<u64, OrdMap<u64, TableColumnStatsValue>>,
+    pub(crate) file_column_stats: OrdMap<u64, OrdMap<(u64, u64), FileColumnStatsValue>>,
+    pub(crate) options: OrdMap<(u64, u64), OptionScopeValue>,
+    pub(crate) tags: OrdMap<u64, TagValue>,
+    pub(crate) gc_files: OrdMap<u64, GcFileValue>,
 }
 
 /// A per-scope name index: schema or table id, then name, to entity id.
@@ -80,8 +83,8 @@ fn remove_scoped_name(names: &mut ScopedNames, scope: u64, name: &str) {
 
 /// Inserts a name-scoped entity, first unlinking the replaced version's
 /// name so a rename never leaves a stale name entry.
-fn put_named<V>(
-    values: &mut BTreeMap<u64, V>,
+fn put_named<V: Clone>(
+    values: &mut OrdMap<u64, V>,
     names: &mut ScopedNames,
     value: V,
     identity: impl for<'v> Fn(&'v V) -> (u64, u64, &'v str),
@@ -98,8 +101,8 @@ fn put_named<V>(
 }
 
 /// Removes a name-scoped entity and its name entry, if present.
-fn delete_named<V>(
-    values: &mut BTreeMap<u64, V>,
+fn delete_named<V: Clone>(
+    values: &mut OrdMap<u64, V>,
     names: &mut ScopedNames,
     id: u64,
     identity: impl for<'v> Fn(&'v V) -> (u64, u64, &'v str),
@@ -133,19 +136,35 @@ fn normalize_directory(path: &str) -> String {
 }
 
 /// Inserts into a table-scoped nested map.
-fn put_nested<K: Ord, V>(map: &mut BTreeMap<u64, BTreeMap<K, V>>, table_id: u64, key: K, value: V) {
-    map.entry(table_id).or_default().insert(key, value);
+fn put_nested<K: Ord + Clone, V: Clone>(
+    map: &mut OrdMap<u64, OrdMap<K, V>>,
+    count: &mut usize,
+    table_id: u64,
+    key: K,
+    value: V,
+) {
+    *count += usize::from(
+        map.entry(table_id)
+            .or_default()
+            .insert(key, value)
+            .is_none(),
+    );
 }
 
 /// Removes from a table-scoped nested map, if present.
-fn remove_nested<K: Ord, V>(map: &mut BTreeMap<u64, BTreeMap<K, V>>, table_id: u64, key: &K) {
+fn remove_nested<K: Ord + Clone, V: Clone>(
+    map: &mut OrdMap<u64, OrdMap<K, V>>,
+    count: &mut usize,
+    table_id: u64,
+    key: &K,
+) {
     if let Some(per_table) = map.get_mut(&table_id) {
-        per_table.remove(key);
+        *count -= usize::from(per_table.remove(key).is_some());
     }
 }
 
 /// Encoded bytes of one map's values, keys included.
-fn flat_bytes<K, V: prost::Message>(map: &BTreeMap<K, V>) -> u64 {
+fn flat_bytes<K: Ord, V: prost::Message>(map: &OrdMap<K, V>) -> u64 {
     map.values()
         .map(|value| u64::try_from(value.encoded_len()).unwrap_or(u64::MAX))
         .sum::<u64>()
@@ -153,7 +172,7 @@ fn flat_bytes<K, V: prost::Message>(map: &BTreeMap<K, V>) -> u64 {
 }
 
 /// As [`flat_bytes`], for a map of maps.
-fn nested_bytes<K1, K2, V: prost::Message>(map: &BTreeMap<K1, BTreeMap<K2, V>>) -> u64 {
+fn nested_bytes<K1: Ord, K2: Ord, V: prost::Message>(map: &OrdMap<K1, OrdMap<K2, V>>) -> u64 {
     map.values().map(flat_bytes).sum::<u64>()
         + u64::try_from(map.len() * std::mem::size_of::<K1>()).unwrap_or(0)
 }
@@ -223,24 +242,12 @@ impl CatalogSnapshot {
 
     /// How many `current` records this view holds.
     pub(crate) fn live_entity_count(&self) -> usize {
-        fn nested<K, V>(map: &BTreeMap<u64, BTreeMap<K, V>>) -> usize {
-            map.values().map(BTreeMap::len).sum()
-        }
-
-        self.schemas.len()
+        self.nested_entity_count
+            + self.schemas.len()
             + self.tables.len()
             + self.views.len()
             + self.macros.len()
-            + nested(&self.columns)
-            + nested(&self.data_files)
-            + nested(&self.delete_files)
-            + nested(&self.partitions)
-            + nested(&self.sorts)
-            + nested(&self.mappings)
-            + nested(&self.indexes)
             + self.table_stats.len()
-            + nested(&self.table_column_stats)
-            + nested(&self.file_column_stats)
             + self.options.len()
             + self.tags.len()
             + self.gc_files.len()
@@ -541,7 +548,9 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn put_index(&mut self, value: IndexValue) {
+        self.index_tables.insert(value.index_id, value.table_id);
         let per_table = self.indexes.entry(value.table_id).or_default();
+        self.nested_entity_count += usize::from(!per_table.contains_key(&value.index_id));
         put_named(per_table, &mut self.index_names, value, index_identity);
     }
 
@@ -549,6 +558,8 @@ impl CatalogSnapshot {
         if let Some(per_table) = self.indexes.get_mut(&table_id)
             && let Some(old) = per_table.remove(&index_id)
         {
+            self.nested_entity_count -= 1;
+            self.index_tables.remove(&index_id);
             let (_, scope, name) = index_identity(&old);
             remove_scoped_name(&mut self.index_names, scope, name);
         }
@@ -663,15 +674,32 @@ impl CatalogSnapshot {
             table_id,
             table_identity,
         );
-        self.columns.remove(&table_id);
-        self.data_files.remove(&table_id);
-        self.delete_files.remove(&table_id);
-        self.partitions.remove(&table_id);
-        self.sorts.remove(&table_id);
-        self.indexes.remove(&table_id);
+        self.nested_entity_count -= self.columns.remove(&table_id).map_or(0, |rows| rows.len());
+        self.nested_entity_count -= self
+            .data_files
+            .remove(&table_id)
+            .map_or(0, |rows| rows.len());
+        self.nested_entity_count -= self
+            .delete_files
+            .remove(&table_id)
+            .map_or(0, |rows| rows.len());
+        self.nested_entity_count -= self
+            .partitions
+            .remove(&table_id)
+            .map_or(0, |rows| rows.len());
+        self.nested_entity_count -= self.sorts.remove(&table_id).map_or(0, |rows| rows.len());
+        if let Some(indexes) = self.indexes.remove(&table_id) {
+            self.nested_entity_count -= indexes.len();
+            for index_id in indexes.keys() {
+                self.index_tables.remove(index_id);
+            }
+        }
         self.index_names.remove(&table_id);
         self.table_stats.remove(&table_id);
-        self.table_column_stats.remove(&table_id);
+        self.nested_entity_count -= self
+            .table_column_stats
+            .remove(&table_id)
+            .map_or(0, |rows| rows.len());
         self.remove_option_record(OptionScope::Table(TableId::new(table_id)).key_components());
         // file_column_stats and mappings are kept: historical file reads
         // still resolve through them.
@@ -691,7 +719,13 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn put_mapping(&mut self, value: MappingValue) {
-        put_nested(&mut self.mappings, value.table_id, value.mapping_id, value);
+        put_nested(
+            &mut self.mappings,
+            &mut self.nested_entity_count,
+            value.table_id,
+            value.mapping_id,
+            value,
+        );
     }
 
     pub(crate) fn put_macro(&mut self, value: MacroValue) {
@@ -713,13 +747,29 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn put_column(&mut self, value: ColumnValue) {
-        put_nested(&mut self.columns, value.table_id, value.column_id, value);
+        put_nested(
+            &mut self.columns,
+            &mut self.nested_entity_count,
+            value.table_id,
+            value.column_id,
+            value,
+        );
     }
 
     pub(crate) fn delete_column(&mut self, table_id: u64, column_id: u64) {
-        remove_nested(&mut self.columns, table_id, &column_id);
+        remove_nested(
+            &mut self.columns,
+            &mut self.nested_entity_count,
+            table_id,
+            &column_id,
+        );
         // Column stats describe current state and die with the column.
-        remove_nested(&mut self.table_column_stats, table_id, &column_id);
+        remove_nested(
+            &mut self.table_column_stats,
+            &mut self.nested_entity_count,
+            table_id,
+            &column_id,
+        );
     }
 
     /// The table's data files live at this view's snapshot, ordered by id.
@@ -764,6 +814,7 @@ impl CatalogSnapshot {
     pub(crate) fn put_data_file(&mut self, value: DataFileValue) {
         put_nested(
             &mut self.data_files,
+            &mut self.nested_entity_count,
             value.table_id,
             value.data_file_id,
             value,
@@ -771,12 +822,18 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn delete_data_file(&mut self, table_id: u64, data_file_id: u64) {
-        remove_nested(&mut self.data_files, table_id, &data_file_id);
+        remove_nested(
+            &mut self.data_files,
+            &mut self.nested_entity_count,
+            table_id,
+            &data_file_id,
+        );
     }
 
     pub(crate) fn put_partition(&mut self, value: PartitionValue) {
         put_nested(
             &mut self.partitions,
+            &mut self.nested_entity_count,
             value.table_id,
             value.partition_id,
             value,
@@ -784,20 +841,37 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn delete_partition(&mut self, table_id: u64, partition_id: u64) {
-        remove_nested(&mut self.partitions, table_id, &partition_id);
+        remove_nested(
+            &mut self.partitions,
+            &mut self.nested_entity_count,
+            table_id,
+            &partition_id,
+        );
     }
 
     pub(crate) fn put_sort(&mut self, value: SortValue) {
-        put_nested(&mut self.sorts, value.table_id, value.sort_id, value);
+        put_nested(
+            &mut self.sorts,
+            &mut self.nested_entity_count,
+            value.table_id,
+            value.sort_id,
+            value,
+        );
     }
 
     pub(crate) fn delete_sort(&mut self, table_id: u64, sort_id: u64) {
-        remove_nested(&mut self.sorts, table_id, &sort_id);
+        remove_nested(
+            &mut self.sorts,
+            &mut self.nested_entity_count,
+            table_id,
+            &sort_id,
+        );
     }
 
     pub(crate) fn put_delete_file(&mut self, value: DeleteFileValue) {
         put_nested(
             &mut self.delete_files,
+            &mut self.nested_entity_count,
             value.table_id,
             value.delete_file_id,
             value,
@@ -805,7 +879,12 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn delete_delete_file(&mut self, table_id: u64, delete_file_id: u64) {
-        remove_nested(&mut self.delete_files, table_id, &delete_file_id);
+        remove_nested(
+            &mut self.delete_files,
+            &mut self.nested_entity_count,
+            table_id,
+            &delete_file_id,
+        );
     }
 
     pub(crate) fn put_table_stats(&mut self, value: TableStatsValue) {
@@ -815,6 +894,7 @@ impl CatalogSnapshot {
     pub(crate) fn put_table_column_stats(&mut self, value: TableColumnStatsValue) {
         put_nested(
             &mut self.table_column_stats,
+            &mut self.nested_entity_count,
             value.table_id,
             value.column_id,
             value,
@@ -824,6 +904,7 @@ impl CatalogSnapshot {
     pub(crate) fn put_file_column_stats(&mut self, value: FileColumnStatsValue) {
         put_nested(
             &mut self.file_column_stats,
+            &mut self.nested_entity_count,
             value.table_id,
             (value.data_file_id, value.column_id),
             value,
@@ -860,7 +941,12 @@ impl CatalogSnapshot {
     /// Removes one column, without the column-stats cascade
     /// [`delete_column`](Self::delete_column) applies.
     pub(crate) fn remove_column_only(&mut self, table_id: u64, column_id: u64) {
-        remove_nested(&mut self.columns, table_id, &column_id);
+        remove_nested(
+            &mut self.columns,
+            &mut self.nested_entity_count,
+            table_id,
+            &column_id,
+        );
     }
 
     pub(crate) fn remove_table_stats(&mut self, table_id: u64) {
@@ -868,7 +954,12 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn remove_table_column_stats(&mut self, table_id: u64, column_id: u64) {
-        remove_nested(&mut self.table_column_stats, table_id, &column_id);
+        remove_nested(
+            &mut self.table_column_stats,
+            &mut self.nested_entity_count,
+            table_id,
+            &column_id,
+        );
     }
 
     pub(crate) fn remove_file_column_stats(
@@ -879,6 +970,7 @@ impl CatalogSnapshot {
     ) {
         remove_nested(
             &mut self.file_column_stats,
+            &mut self.nested_entity_count,
             table_id,
             &(data_file_id, column_id),
         );
@@ -1121,8 +1213,71 @@ fn column_stats_from_proto(value: &TableColumnStatsValue) -> ColumnStats {
 
 #[cfg(test)]
 mod tests {
+    mod counts;
+
     use super::*;
     use crate::catalog::types::DataFileId;
+
+    #[test]
+    fn cloning_a_view_shares_untouched_records_and_isolates_mutations() {
+        let mut base = super::CatalogSnapshot::default();
+        for table_id in 0..100 {
+            base.put_data_file(super::DataFileValue {
+                table_id,
+                data_file_id: table_id,
+                path: format!("file-{table_id}"),
+                ..Default::default()
+            });
+        }
+        let mut next = base.clone();
+        assert!(
+            std::ptr::eq(
+                std::ptr::from_ref(&base.data_files[&99][&99]),
+                std::ptr::from_ref(&next.data_files[&99][&99])
+            ),
+            "cloning a snapshot copied an unrelated file"
+        );
+        next.put_data_file(super::DataFileValue {
+            table_id: 0,
+            data_file_id: 0,
+            path: "changed".into(),
+            ..Default::default()
+        });
+        assert_eq!(base.data_files[&0][&0].path, "file-0");
+        assert_eq!(next.data_files[&0][&0].path, "changed");
+        assert!(
+            std::ptr::eq(
+                std::ptr::from_ref(&base.data_files[&99][&99]),
+                std::ptr::from_ref(&next.data_files[&99][&99])
+            ),
+            "mutating a snapshot copied another table's files"
+        );
+    }
+
+    #[test]
+    fn index_owners_follow_replacement_and_cascading_deletion() {
+        let mut state = CatalogSnapshot::default();
+        let index = IndexValue {
+            table_id: 1,
+            index_id: 2,
+            index_name: "old".into(),
+            ..Default::default()
+        };
+        state.put_index(index.clone());
+        let held = state.clone();
+        state.put_index(IndexValue {
+            index_name: "new".into(),
+            ..index.clone()
+        });
+        assert_eq!(state.index_tables.get(&2), Some(&1));
+        state.delete_index(1, 2);
+        assert!(!state.index_tables.contains_key(&2));
+        state.put_index(index);
+        state.delete_table(1);
+        assert!(!state.index_tables.contains_key(&2));
+        assert_eq!(held.index_tables.get(&2), Some(&1));
+        assert_eq!(held.indexes[&1][&2].index_name, "old");
+    }
 
     fn snap(id: u64) -> SnapshotValue {
         SnapshotValue {

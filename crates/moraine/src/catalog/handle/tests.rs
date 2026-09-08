@@ -300,3 +300,110 @@ async fn recent_rows_reads_only_the_chunks_live_rows_reference() {
 
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn index_queries_reuse_views_and_observe_later_commits() {
+    use std::{cell::Cell, ops::Bound};
+
+    use crate::{ColumnDef, IndexDef};
+
+    let catalog = open().await;
+    let ids = Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.create_schema("s")?;
+            let table = tx.create_table(
+                schema,
+                "t",
+                &[ColumnDef {
+                    name: "value".into(),
+                    column_type: "BIGINT".into(),
+                    nulls_allowed: true,
+                    default_value: None,
+                    children: Vec::new(),
+                }],
+            )?;
+            let column = tx.columns_of(table)[0].id;
+            let index = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_value".into(),
+                    columns: vec![column],
+                    unique: true,
+                },
+                &[],
+            )?;
+            ids.set(Some((table, index)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (table, index) = ids.get().unwrap();
+
+    for operation in 0..4 {
+        projection::invalidate_current_state(catalog.projections());
+        assert!(catalog.writer_head_view().is_none());
+        for repeated in [false, true] {
+            let before = catalog.writer_head_view();
+            let rows = match operation {
+                0 => catalog
+                    .index_lookup(
+                        table,
+                        index,
+                        &[crate::IndexKeyValue::Int {
+                            value: 1,
+                            width: crate::IntWidth::I64,
+                        }],
+                    )
+                    .await
+                    .unwrap(),
+                1 => catalog.index_lookup_many(table, index, &[]).await.unwrap(),
+                2 => catalog
+                    .index_range(table, index, Bound::Unbounded, Bound::Unbounded, false)
+                    .await
+                    .unwrap(),
+                _ => catalog
+                    .index_nulls(table, index, vec![None], false)
+                    .await
+                    .unwrap(),
+            };
+            assert!(rows.is_empty());
+            let cached = catalog
+                .writer_head_view()
+                .expect("index query must retain its catalog view");
+            if repeated {
+                assert!(Arc::ptr_eq(&before.unwrap(), &cached));
+            }
+        }
+    }
+    let held = catalog.writer_head_view().unwrap();
+    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+    assert!(held.index_by_id(table, index).is_some());
+    assert!(matches!(
+        catalog.index_lookup_many(table, index, &[]).await,
+        Err(crate::Error::NotFound(_))
+    ));
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_late_read_view_cannot_replace_a_committed_view() {
+    let catalog = open().await;
+    let epoch = projection::cache_epoch(catalog.projections());
+    let session = catalog.begin_read().await.unwrap();
+    let old = catalog.load_head_view(session.handle()).await.unwrap();
+
+    catalog
+        .commit(|tx| tx.create_schema("new").map(|_| ()))
+        .await
+        .unwrap();
+    let committed = catalog.writer_head_view().unwrap();
+    let late = catalog.head_view(session.handle(), epoch).await.unwrap();
+    session.finish();
+
+    assert_eq!(late.current_snapshot().id, old.current_snapshot().id);
+    assert!(late.schema_by_name("new").is_none());
+    assert!(committed.schema_by_name("new").is_some());
+    assert!(Arc::ptr_eq(&committed, &catalog.snapshot().await.unwrap()));
+    catalog.close().await.unwrap();
+}

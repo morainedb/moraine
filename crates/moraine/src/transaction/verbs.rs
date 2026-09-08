@@ -1,7 +1,7 @@
 //! The mutation handle passed to a commit closure.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     ops::Deref,
 };
 
@@ -1253,7 +1253,7 @@ impl Transaction {
             .state
             .indexes
             .get(&table.get())
-            .map_or(0, BTreeMap::len);
+            .map_or(0, imbl::OrdMap::len);
         if live_index_count > 0 && file.record_count > 0 && index_entries.is_empty() {
             return Err(Error::Constraint(format!(
                 "register_data_file on indexed table {table} must supply index entries"
@@ -1371,7 +1371,7 @@ impl Transaction {
             .delete_files
             .get(&table.get())
             .into_iter()
-            .flat_map(BTreeMap::values)
+            .flat_map(imbl::OrdMap::values)
             .filter(|d| d.data_file_id == file.get())
             .map(|d| d.delete_file_id)
             .collect();
@@ -1450,7 +1450,7 @@ impl Transaction {
             .state
             .indexes
             .get(&table.get())
-            .map_or(0, BTreeMap::len);
+            .map_or(0, imbl::OrdMap::len);
         if live_index_count > 0 && file.delete_count > 0 && index_entries.is_empty() {
             return Err(Error::Constraint(format!(
                 "register_delete_file on indexed table {table} must supply index entries"
@@ -2028,7 +2028,7 @@ impl Transaction {
             .state
             .indexes
             .get(&table.get())
-            .map_or(0, BTreeMap::len);
+            .map_or(0, imbl::OrdMap::len);
         if live_index_count > 0 && index_entries.is_empty() {
             return Err(Error::Constraint(format!(
                 "inline_insert on indexed table {table} must supply index entries"
@@ -2106,7 +2106,7 @@ impl Transaction {
             .state
             .indexes
             .get(&table.get())
-            .map_or(0, BTreeMap::len);
+            .map_or(0, imbl::OrdMap::len);
         if live_index_count > 0 && index_entries.is_empty() {
             return Err(Error::Constraint(format!(
                 "inline_delete on indexed table {table} must supply index entries"

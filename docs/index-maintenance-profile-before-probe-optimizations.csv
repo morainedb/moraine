@@ -1,0 +1,99 @@
+group,allocation_site,blocks,blocks_per_entry,dhat_allocated_bytes
+Uniqueness point read,<slatedb::db_iter::GetIterator as slatedb::iter::RowEntryIterator>::next::{{closure}} > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},122880,6.00000,3932160
+Uniqueness point read,slatedb::db_iter::DbIterator::new::{{closure}} > slatedb::reader::Reader::get_key_value_with_options::{{closure}},102400,5.00000,5242880
+Canonical key buffer growth,<alloc::raw_vec::RawVecInner>::finish_grow > <alloc::raw_vec::RawVec<u8>>::grow_one,61440,3.00000,1270240
+Uniqueness point read,bytes::bytes::Bytes::copy_from_slice > moraine::store::handle::ReadHandle::get::{{closure}},40960,2.00000,1557440
+Uniqueness point read,bytes::bytes::Bytes::copy_from_slice > slatedb::reader::Reader::get_key_value_with_options::{{closure}},40960,2.00000,1557440
+Uniqueness point read,bytes::bytes::shallow_clone_vec > bytes::bytes::promotable_even_clone,40960,2.00000,983040
+Uniqueness point read,"<alloc::vec::into_iter::IntoIter<T,A> as core::iter::traits::iterator::Iterator>::try_fold > alloc::vec::in_place_collect::<impl alloc::vec::spec_from_iter::SpecFromIter<T,I> for alloc::vec::Vec<T>>::from_iter",40960,2.00000,819200
+Uniqueness point read,<slatedb::db_iter::GetIterator as slatedb::iter::RowEntryIterator>::init > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init::{{closure}},40960,2.00000,655360
+Uniqueness point read,<slatedb::db_iter::GetIterator as slatedb::iter::RowEntryIterator>::next > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},40960,2.00000,1638400
+Uniqueness point read,<slatedb::filter_iterator::FilterIterator<T> as slatedb::iter::RowEntryIterator>::init > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init::{{closure}},40960,2.00000,1310720
+Uniqueness point read,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init > <slatedb::filter_iterator::FilterIterator<T> as slatedb::iter::RowEntryIterator>::init::{{closure}},40960,2.00000,1310720
+Uniqueness point read,<slatedb::filter_iterator::FilterIterator<T> as slatedb::iter::RowEntryIterator>::next > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},40960,2.00000,1638400
+Uniqueness point read,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next > <slatedb::filter_iterator::FilterIterator<T> as slatedb::iter::RowEntryIterator>::next::{{closure}},40960,2.00000,1310720
+Transaction write batch,bytes::bytes::Bytes::copy_from_slice > slatedb::batch::WriteBatch::put_with_options,40960,2.00000,942560
+In-batch duplicate tracking,bytes::bytes::shallow_clone_vec > bytes::bytes::promotable_even_clone,20480,1.00000,491520
+Probe scheduling,moraine::transaction::index_maintenance::schedule_probe_plan > <futures_util::future::maybe_done::MaybeDone<Fut> as core::future::future::Future>::poll,20480,1.00000,29491200
+Probe scheduling,futures_util::stream::futures_unordered::FuturesUnordered<Fut>::push > moraine::transaction::index_maintenance::schedule_probe_plan,20480,1.00000,1638400
+Uniqueness point read,slatedb::batch::WriteBatchIterator::new > moraine::store::handle::ReadHandle::get::{{closure}},20480,1.00000,655360
+Uniqueness point read,"alloc::raw_vec::RawVecInner<A>::finish_grow > alloc::raw_vec::RawVec<T,A>::grow_one",20480,1.00000,655360
+Uniqueness point read,"<alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter > slatedb::reader::Reader::build_iterator_sources::{{closure}}",20480,1.00000,327680
+Uniqueness point read,slatedb::mem_table::ouroboros_impl_mem_table_iterator_inner::MemTableIteratorInner<T>::new > slatedb::mem_table::KVTable::range,20480,1.00000,163840
+Uniqueness point read,"core::ops::function::impls::<impl core::ops::function::FnMut<A> for &mut F>::call_mut > <alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter",20480,1.00000,5898240
+Uniqueness point read,slatedb::segment_iterator::build_segment_iter > slatedb::reader::Reader::build_iterator_sources::{{closure}},20480,1.00000,1310720
+Uniqueness point read,slatedb::db_iter::GetIterator::new > slatedb::db_iter::DbIterator::new::{{closure}},20480,1.00000,327680
+Uniqueness point read,"<alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter > slatedb::db_iter::GetIterator::new",20480,1.00000,983040
+Uniqueness point read,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init > slatedb::db_iter::DbIterator::new::{{closure}},20480,1.00000,655360
+Uniqueness point read,<slatedb::merge_operator::MergeOperatorRequiredIterator<T> as slatedb::iter::RowEntryIterator>::init > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init::{{closure}},20480,1.00000,655360
+Uniqueness point read,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init > <slatedb::merge_operator::MergeOperatorRequiredIterator<T> as slatedb::iter::RowEntryIterator>::init::{{closure}},20480,1.00000,655360
+Uniqueness point read,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next > slatedb::db_iter::DbIterator::next_entry::{{closure}},20480,1.00000,655360
+Uniqueness point read,<slatedb::merge_operator::MergeOperatorRequiredIterator<T> as slatedb::iter::RowEntryIterator>::next > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},20480,1.00000,655360
+Uniqueness point read,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next > <slatedb::merge_operator::MergeOperatorRequiredIterator<T> as slatedb::iter::RowEntryIterator>::next::{{closure}},20480,1.00000,655360
+Uniqueness point read,<slatedb::batch::WriteBatchIterator as slatedb::iter::RowEntryIterator>::init > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init::{{closure}},20480,1.00000,327680
+Uniqueness point read,<slatedb::batch::WriteBatchIterator as slatedb::iter::RowEntryIterator>::next > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},20480,1.00000,327680
+Uniqueness point read,slatedb::mem_table::<impl slatedb::iter::RowEntryIterator for slatedb::mem_table::ouroboros_impl_mem_table_iterator_inner::MemTableIteratorInner<slatedb::mem_table::KVTableInternalKeyRange>>::init > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init::{{closure}},20480,1.00000,327680
+Uniqueness point read,slatedb::mem_table::<impl slatedb::iter::RowEntryIterator for slatedb::mem_table::ouroboros_impl_mem_table_iterator_inner::MemTableIteratorInner<slatedb::mem_table::KVTableInternalKeyRange>>::next > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},20480,1.00000,327680
+Transaction write batch,"alloc::collections::btree::map::entry::VacantEntry<K,V,A>::insert_entry > alloc::collections::btree::map::BTreeMap<K,V,A>::insert",3420,0.16699,4015200
+Other preparation,"alloc::raw_vec::RawVecInner<A>::finish_grow > alloc::raw_vec::RawVec<T,A>::grow_one",460,0.02246,4640640
+Other preparation,<alloc::string::String as core::clone::Clone>::clone > <moraine::store::proto::generated::DataFileValue as core::clone::Clone>::clone,420,0.02051,3305
+Other preparation,alloc::raw_vec::RawVecInner<A>::finish_grow > alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle,260,0.01270,9600
+In-batch duplicate tracking,"hashbrown::raw::RawTableInner::fallible_with_capacity > hashbrown::raw::RawTable<T,A>::reserve_rehash",200,0.00977,3358640
+Other preparation,bytes::bytes::Bytes::copy_from_slice > slatedb::db_transaction::DbTransaction::put_with_options,200,0.00977,4107
+Other preparation,moraine::transaction::commit::diff::diff_scoped > moraine::transaction::commit::attempt_group::{{closure}},160,0.00781,2560
+Other preparation,"imbl::ord::map::GenericOrdMap<K,V,P>::diff > <core::iter::adapters::flatten::FlatMap<I,U,F> as core::iter::traits::iterator::Iterator>::next",146,0.00713,18368
+Other preparation,slatedb::db_iter::DbIterator::new::{{closure}} > slatedb::reader::Reader::get_key_value_with_options::{{closure}},100,0.00488,5120
+Other preparation,<futures_util::future::maybe_done::MaybeDone<Fut> as core::future::future::Future>::poll > <futures_util::future::poll_fn::PollFn<F> as core::future::future::Future>::poll,100,0.00488,1413760
+Other preparation,moraine::store::frame::header_buf > moraine::store::value::encode_value,100,0.00488,3107
+Other preparation,<slatedb::db_iter::GetIterator as slatedb::iter::RowEntryIterator>::next::{{closure}} > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},80,0.00391,2560
+Other preparation,"imbl::ord::map::GenericOrdMap<K,V,P>::diff > moraine::transaction::commit::diff::diff_scoped",80,0.00391,1280
+Other preparation,<alloc::string::String as core::clone::Clone>::clone > moraine::transaction::verbs::Transaction::live_table,60,0.00293,1020
+Other preparation,"<alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter > moraine::transaction::commit::diff::diff_scoped",60,0.00293,2560
+Other preparation,bytes::bytes::Bytes::copy_from_slice > slatedb::db_transaction::DbTransaction::get::{{closure}},40,0.00195,80
+Other preparation,bytes::bytes::Bytes::copy_from_slice > slatedb::reader::Reader::get_key_value_with_options::{{closure}},40,0.00195,80
+Other preparation,bytes::bytes::shallow_clone_vec > bytes::bytes::promotable_even_clone,40,0.00195,960
+Other preparation,"<alloc::vec::into_iter::IntoIter<T,A> as core::iter::traits::iterator::Iterator>::try_fold > alloc::vec::in_place_collect::<impl alloc::vec::spec_from_iter::SpecFromIter<T,I> for alloc::vec::Vec<T>>::from_iter",40,0.00195,800
+Other preparation,moraine::transaction::commit::attempt_group::{{closure}} > moraine::catalog::handle::Catalog::commit::{{closure}},40,0.00195,10880
+Other preparation,<alloc::string::String as core::clone::Clone>::clone > moraine::transaction::commit::attempt_group::{{closure}},40,0.00195,330
+Other preparation,"hashbrown::raw::RawTableInner::fallible_with_capacity > hashbrown::raw::RawTable<T,A>::reserve_rehash",40,0.00195,7840
+Other preparation,futures_util::stream::stream::buffer_unordered::BufferUnordered<St>::new > <futures_util::future::maybe_done::MaybeDone<Fut> as core::future::future::Future>::poll,40,0.00195,30880
+Other preparation,futures_util::stream::futures_unordered::FuturesUnordered<Fut>::new > <futures_util::future::maybe_done::MaybeDone<Fut> as core::future::future::Future>::poll,40,0.00195,2880
+Other preparation,moraine::transaction::commit::diff::diff_options > moraine::transaction::commit::diff::diff_scoped,40,0.00195,640
+Other preparation,moraine::transaction::commit::refresh_keys_of > moraine::transaction::commit::changelog_writes,40,0.00195,600
+Other preparation,<alloc::raw_vec::RawVecInner>::finish_grow > <alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>,40,0.00195,1140
+Other preparation,slatedb::batch::WriteBatchIterator::new > slatedb::db_transaction::DbTransaction::get::{{closure}},20,0.00098,640
+Other preparation,"<alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter > slatedb::reader::Reader::build_iterator_sources::{{closure}}",20,0.00098,320
+Other preparation,slatedb::mem_table::ouroboros_impl_mem_table_iterator_inner::MemTableIteratorInner<T>::new > slatedb::mem_table::KVTable::range,20,0.00098,160
+Other preparation,"core::ops::function::impls::<impl core::ops::function::FnMut<A> for &mut F>::call_mut > <alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter",20,0.00098,5760
+Other preparation,slatedb::segment_iterator::build_segment_iter > slatedb::reader::Reader::build_iterator_sources::{{closure}},20,0.00098,1280
+Other preparation,slatedb::db_iter::GetIterator::new > slatedb::db_iter::DbIterator::new::{{closure}},20,0.00098,320
+Other preparation,"<alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter > slatedb::db_iter::GetIterator::new",20,0.00098,960
+Other preparation,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init > slatedb::db_iter::DbIterator::new::{{closure}},20,0.00098,640
+Other preparation,<slatedb::merge_operator::MergeOperatorRequiredIterator<T> as slatedb::iter::RowEntryIterator>::init > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init::{{closure}},20,0.00098,640
+Other preparation,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init > <slatedb::merge_operator::MergeOperatorRequiredIterator<T> as slatedb::iter::RowEntryIterator>::init::{{closure}},20,0.00098,640
+Other preparation,<slatedb::db_iter::GetIterator as slatedb::iter::RowEntryIterator>::init > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init::{{closure}},20,0.00098,320
+Other preparation,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next > slatedb::db_iter::DbIterator::next_entry::{{closure}},20,0.00098,640
+Other preparation,<slatedb::merge_operator::MergeOperatorRequiredIterator<T> as slatedb::iter::RowEntryIterator>::next > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},20,0.00098,640
+Other preparation,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next > <slatedb::merge_operator::MergeOperatorRequiredIterator<T> as slatedb::iter::RowEntryIterator>::next::{{closure}},20,0.00098,640
+Other preparation,<slatedb::db_iter::GetIterator as slatedb::iter::RowEntryIterator>::next > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},20,0.00098,800
+Other preparation,<slatedb::batch::WriteBatchIterator as slatedb::iter::RowEntryIterator>::init > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init::{{closure}},20,0.00098,320
+Other preparation,<slatedb::batch::WriteBatchIterator as slatedb::iter::RowEntryIterator>::next > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},20,0.00098,320
+Other preparation,<slatedb::filter_iterator::FilterIterator<T> as slatedb::iter::RowEntryIterator>::init > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init::{{closure}},20,0.00098,640
+Other preparation,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init > <slatedb::filter_iterator::FilterIterator<T> as slatedb::iter::RowEntryIterator>::init::{{closure}},20,0.00098,640
+Other preparation,slatedb::mem_table::<impl slatedb::iter::RowEntryIterator for slatedb::mem_table::ouroboros_impl_mem_table_iterator_inner::MemTableIteratorInner<slatedb::mem_table::KVTableInternalKeyRange>>::init > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::init::{{closure}},20,0.00098,320
+Other preparation,<slatedb::filter_iterator::FilterIterator<T> as slatedb::iter::RowEntryIterator>::next > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},20,0.00098,800
+Other preparation,<alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next > <slatedb::filter_iterator::FilterIterator<T> as slatedb::iter::RowEntryIterator>::next::{{closure}},20,0.00098,640
+Other preparation,slatedb::mem_table::<impl slatedb::iter::RowEntryIterator for slatedb::mem_table::ouroboros_impl_mem_table_iterator_inner::MemTableIteratorInner<slatedb::mem_table::KVTableInternalKeyRange>>::next > <alloc::boxed::Box<dyn slatedb::iter::RowEntryIterator> as slatedb::iter::RowEntryIterator>::next::{{closure}},20,0.00098,320
+Other preparation,tokio::sync::watch::Sender<T>::new > moraine::transaction::commit::group::Batch::open::{{closure}},20,0.00098,6880
+Other preparation,<alloc::string::String as core::clone::Clone>::clone > <moraine::catalog::snapshot::CatalogSnapshot as core::clone::Clone>::clone,20,0.00098,483
+Other preparation,"alloc::sync::Arc<T,A>::clone_from_ref_in > moraine::catalog::snapshot::CatalogSnapshot::put_table_stats",20,0.00098,72960
+Other preparation,"alloc::sync::Arc<T,A>::clone_from_ref_in > <archery::shared_pointer::kind::arc::ArcK as archery::shared_pointer::kind::SharedPointerKind>::make_mut::{{closure}}",20,0.00098,52480
+Other preparation,"alloc::sync::Arc<T,A>::clone_from_ref_in > moraine::catalog::snapshot::CatalogSnapshot::put_data_file",20,0.00098,349440
+Other preparation,"<core::iter::adapters::flatten::FlatMap<I,U,F> as core::iter::traits::iterator::Iterator>::next > <alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter",20,0.00098,640
+Other preparation,"alloc::collections::btree::map::entry::VacantEntry<K,V,A>::insert_entry > moraine::transaction::operations::ChangeSet::from_operations",20,0.00098,2080
+Other preparation,"alloc::collections::btree::map::entry::VacantEntry<K,V,A>::insert_entry > alloc::collections::btree::map::BTreeMap<K,V,A>::insert",20,0.00098,5600
+Other preparation,"<alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter > moraine::transaction::commit::refresh_keys_of",20,0.00098,960
+Other preparation,moraine::transaction::commit::changelog_writes > moraine::transaction::commit::attempt_group::{{closure}},20,0.00098,1920
+Other preparation,alloc::str::join_generic_copy > moraine::transaction::operations::ChangeSet::to_changes_made,20,0.00098,420
+Other preparation,"tokio::runtime::task::core::Cell<T,S>::new > tokio::runtime::scheduler::multi_thread::handle::Handle::bind_new_task",20,0.00098,110080
+Other preparation,<moraine::catalog::snapshot::CatalogSnapshot as core::clone::Clone>::clone > moraine::transaction::commit::attempt_group::{{closure}},1,0.00005,8

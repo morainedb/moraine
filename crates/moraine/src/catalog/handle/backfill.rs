@@ -261,9 +261,10 @@ impl ReadOnlyCatalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
+        let epoch = super::cache_epoch(&self.projections);
         let session = self.begin_read().await?;
 
-        let snapshot = self.head_view(session.handle()).await?;
+        let snapshot = self.head_view(session.handle(), epoch).await?;
         let positions = snapshot.column_positions(table, columns)?;
 
         let table_prefix = snapshot.table_data_prefix(table)?;
@@ -320,9 +321,10 @@ impl ReadOnlyCatalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
+        let epoch = super::cache_epoch(&self.projections);
         let session = self.begin_read().await?;
 
-        let snapshot = self.head_view(session.handle()).await?;
+        let snapshot = self.head_view(session.handle(), epoch).await?;
         let entries = inline_backfill_entries_at(
             BackfillSource {
                 snapshot: &snapshot,

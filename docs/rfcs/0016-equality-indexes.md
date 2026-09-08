@@ -304,28 +304,51 @@ surfaces at once rather than being re-run (RFC 0006's wire contract).
 
 **How the probes run.** A bulk load stages one entry per indexed row, so
 this step decides whether a large commit is minutes or hours, and whether it
-fits in memory at all. Three properties are load-bearing:
+fits in memory at all. These properties govern the implementation:
 
 - **One probe per distinct key, not per entry.** Repeats within a batch
   collapse in memory; two entries claiming one value for different rows
   collide there, before any read.
-- **Bounded concurrency, in bounded groups, at every batch size.** Probes
-  are independent point reads, so serializing them makes a batch cost one
-  store round-trip of latency *per entry*. They run with a bounded fan-out,
-  resolved a group at a time — peak memory is one group of keys, not the
-  batch's, whatever the batch size. Results are applied in batch order, so
-  which entry a rejection names does not depend on which probe finished
-  first. A bulk load probes nearly every key it stages, but each probe is a
-  bloom-filtered point read whose cost does not grow with the index, and the
-  bounded fan-out overlaps the object store's per-read latency — so the batch
-  stays linear in rows without a second resolution mode. A sorted range scan
-  would be worse for the common case: a bulk load's indexed values are not
-  store-ordered, so one scan sweeps the whole index serially where the
-  concurrent point reads touch only the blocks they need, in parallel.
+- **Bounded concurrency with opportunistic read batches.** Ready additions
+  form chunks of at most 128; a pending source flushes a partial chunk rather
+  than delaying it. At most 1,024 logical uniqueness probes are in flight.
+  Probe futures have concrete types, with no per-probe `BoxFuture`.
+  A chunk outside the span of earlier planned claims may share one SlateDB
+  transactional range iterator. Keys are sorted for reading and results are
+  returned to their original positions. The reader takes at most one extra
+  row before a gap switches the remaining keys to concurrent point reads.
+  Sparse keys therefore cause neither a sequential index sweep nor a chain
+  of remote seeks. Read-ahead stays at one block and fetched blocks are
+  admitted to cache.
+- **Local writes bound scan eligibility.** SlateDB materializes the local
+  writes covered by a scan when opening it. A batch whose span overlaps
+  earlier claims or completed unique deletions therefore uses concurrent
+  point reads. Prefetch while deletions are still pending also uses point
+  reads, as does a pass with pre-existing staged entries or a later member
+  of a grouped commit. This conservative
+  fallback prevents repeated scans from copying a growing local index batch;
+  ascending and descending append streams retain scan sharing.
+  Single-key batches remain point reads. Both modes use the original
+  transaction, preserving its snapshot, local writes, tombstones, and merge
+  semantics. Outcomes are applied as batches complete; the first surfaced
+  error aborts the commit.
 - **Entries stage onto the transaction directly.** They never enter the
   write list the committer retains for the maintained projections. No
   projection reflects an index entry, so retaining them would hold a second
   copy of the batch's largest part in memory for nothing.
+
+The deletion phase still completes before any addition is staged. While it
+runs, the bounded prefetch holds at most 512 additions or logical probes.
+Telemetry continues to count logical probes, hits, misses, and peak logical
+concurrency; summed probe service counts a shared read batch's interval once
+(including any sparse-key fallback), while batches planned as point reads
+retain their individual service intervals.
+
+Physical key builders reserve the exact outer-framed size as each component
+arrives, including the row-id suffix only when required. Canonical and physical
+bytes stay unchanged, including escaping, direction, NULL placement, and the
+unique-to-multi transition on NULL. Existing encoding property tests remain the
+compatibility oracle.
 
 Every catalog batch rewrites `sys/head`, including head-preserving maintenance,
 and the store admits only one writer process. Tracking every index key cannot
@@ -551,7 +574,7 @@ cut:
   under the same pinned read as one logical lookup, and return the union of
   their row ids. An empty key set returns no rows after validating the
   index. The probes run through a continuously refilled bounded window of
-  512 futures, matching uniqueness enforcement: completion frees one slot
+  512 point-read futures: completion frees one slot
   immediately rather than waiting for a fixed chunk's slowest read. The
   extension path surfaces this accessor as `moraine_index_in`.
 - `index_range(table, index, lower, upper) -> Vec<u64>` — the

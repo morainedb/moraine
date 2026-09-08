@@ -301,6 +301,8 @@ pub(crate) struct CanonicalKeyBuilder {
     bytes: Vec<u8>,
     raw_bytes: usize,
     has_null: bool,
+    entry_bytes: Option<usize>,
+    entry_unique: bool,
 }
 
 impl CanonicalKeyBuilder {
@@ -310,6 +312,32 @@ impl CanonicalKeyBuilder {
             bytes: Vec::new(),
             raw_bytes: 0,
             has_null: false,
+            entry_bytes: None,
+            entry_unique: false,
+        }
+    }
+
+    /// Reserves for physical framing as columns arrive, including a possible
+    /// row-id suffix.
+    pub(crate) const fn for_index_entry(unique: bool) -> Self {
+        Self {
+            bytes: Vec::new(),
+            raw_bytes: 0,
+            has_null: false,
+            entry_bytes: Some(
+                INDEX_ENTRY_PREFIX_LEN + 1 + if unique { 0 } else { size_of::<u64>() },
+            ),
+            entry_unique: unique,
+        }
+    }
+
+    fn reserve_component(&mut self, canonical_bytes: usize, outer_escapes: usize) {
+        if let Some(entry_bytes) = &mut self.entry_bytes {
+            *entry_bytes += canonical_bytes + outer_escapes;
+            self.bytes
+                .reserve_exact(entry_bytes.saturating_sub(self.bytes.len()));
+        } else {
+            self.bytes.reserve(canonical_bytes);
         }
     }
 
@@ -323,6 +351,13 @@ impl CanonicalKeyBuilder {
     ) -> Result<()> {
         let (null_flag, non_null_flag) = null_flags(nulls);
         let Some(value) = value else {
+            if self.entry_unique {
+                if let Some(entry_bytes) = &mut self.entry_bytes {
+                    *entry_bytes += size_of::<u64>();
+                }
+                self.entry_unique = false;
+            }
+            self.reserve_component(1, 1);
             self.bytes.push(null_flag);
             self.has_null = true;
             return Ok(());
@@ -338,17 +373,16 @@ impl CanonicalKeyBuilder {
         value.validate_width()?;
 
         self.raw_bytes = total;
-        self.bytes.push(non_null_flag);
         match value {
             BorrowedIndexKeyValue::Int { value, width } => {
                 let mut raw = value.to_be_bytes();
                 let start = raw.len() - width.bytes();
                 raw[start] ^= 0x80;
-                self.append_framed(&raw[start..], direction);
+                self.append_framed(&raw[start..], direction, non_null_flag);
             }
             BorrowedIndexKeyValue::UInt { value, width } => {
                 let raw = value.to_be_bytes();
-                self.append_framed(&raw[raw.len() - width.bytes()..], direction);
+                self.append_framed(&raw[raw.len() - width.bytes()..], direction, non_null_flag);
             }
             BorrowedIndexKeyValue::F32(value) => {
                 let bits = if value.is_nan() {
@@ -357,7 +391,7 @@ impl CanonicalKeyBuilder {
                     (value + 0.0).to_bits()
                 };
                 let mask = 0x8000_0000_u32 | 0_u32.wrapping_sub(bits >> 31);
-                self.append_framed(&(bits ^ mask).to_be_bytes(), direction);
+                self.append_framed(&(bits ^ mask).to_be_bytes(), direction, non_null_flag);
             }
             BorrowedIndexKeyValue::F64(value) => {
                 let bits = if value.is_nan() {
@@ -366,15 +400,17 @@ impl CanonicalKeyBuilder {
                     (value + 0.0).to_bits()
                 };
                 let mask = 0x8000_0000_0000_0000_u64 | 0_u64.wrapping_sub(bits >> 63);
-                self.append_framed(&(bits ^ mask).to_be_bytes(), direction);
+                self.append_framed(&(bits ^ mask).to_be_bytes(), direction, non_null_flag);
             }
             BorrowedIndexKeyValue::Bool(value) => {
-                self.append_framed(&[u8::from(value)], direction);
+                self.append_framed(&[u8::from(value)], direction, non_null_flag);
             }
             BorrowedIndexKeyValue::Str(value) => {
-                self.append_framed(value.as_bytes(), direction);
+                self.append_framed(value.as_bytes(), direction, non_null_flag);
             }
-            BorrowedIndexKeyValue::Bytes(value) => self.append_framed(value, direction),
+            BorrowedIndexKeyValue::Bytes(value) => {
+                self.append_framed(value, direction, non_null_flag);
+            }
         }
         Ok(())
     }
@@ -422,9 +458,15 @@ impl CanonicalKeyBuilder {
         (Bytes::from(self.bytes), unique)
     }
 
-    fn append_framed(&mut self, raw: &[u8], direction: Direction) {
+    fn append_framed(&mut self, raw: &[u8], direction: Direction, flag: u8) {
+        let low_bytes = raw.iter().filter(|byte| **byte <= 1).count();
+        let outer_escapes = 1 + match direction {
+            Direction::Ascending => low_bytes * 2 + 1,
+            Direction::Descending => raw.iter().filter(|byte| **byte >= 254).count(),
+        };
+        self.reserve_component(raw.len() + low_bytes + 2, outer_escapes);
+        self.bytes.push(flag);
         let start = self.bytes.len();
-        self.bytes.reserve(raw.len().saturating_add(1));
         for &byte in raw {
             if byte <= 1 {
                 self.bytes.push(1);
@@ -551,8 +593,8 @@ fn build(
     values: &[Option<IndexKeyValue>],
     directions: &[Direction],
     nulls: &[NullOrder],
+    mut builder: CanonicalKeyBuilder,
 ) -> Result<CanonicalKeyBuilder> {
-    let mut builder = CanonicalKeyBuilder::new();
     for (index, value) in values.iter().enumerate() {
         builder.append(
             value.as_ref().map(BorrowedIndexKeyValue::from),
@@ -574,7 +616,11 @@ pub(crate) fn encode_ordered_values(
     directions: &[Direction],
     nulls: &[NullOrder],
 ) -> Result<CanonicalKey> {
-    Ok(build(values, directions, nulls)?.finish().0)
+    Ok(
+        build(values, directions, nulls, CanonicalKeyBuilder::new())?
+            .finish()
+            .0,
+    )
 }
 
 /// Encodes ordered values straight into their physical SlateDB entry key.
@@ -588,7 +634,13 @@ pub(crate) fn encode_ordered_index_entry(
     requested_unique: bool,
     row_id: u64,
 ) -> Result<(Bytes, bool)> {
-    Ok(build(values, directions, nulls)?.finish_index_entry(index_id, requested_unique, row_id))
+    Ok(build(
+        values,
+        directions,
+        nulls,
+        CanonicalKeyBuilder::for_index_entry(requested_unique),
+    )?
+    .finish_index_entry(index_id, requested_unique, row_id))
 }
 
 /// A single slice framed as a storekey byte string: low bytes escaped behind
@@ -1180,7 +1232,7 @@ mod tests {
                     &canonical,
                     row_id,
                 );
-                let mut builder = CanonicalKeyBuilder::new();
+                let mut builder = CanonicalKeyBuilder::for_index_entry(requested_unique);
                 for column in &columns {
                     builder.append(
                         column.value.as_ref().map(BorrowedIndexKeyValue::from),

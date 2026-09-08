@@ -5181,11 +5181,7 @@ async fn partition_spec_rows_land_fold_and_time_travel() {
     tx.commit().await.unwrap();
 
     let head = catalog.snapshot().await.unwrap();
-    assert!(
-        head.partitions
-            .get(&1)
-            .is_none_or(std::collections::BTreeMap::is_empty)
-    );
+    assert!(head.partitions.get(&1).is_none_or(imbl::OrdMap::is_empty));
 
     catalog.close().await.unwrap();
 }
@@ -5733,7 +5729,7 @@ async fn the_file_stats_sweep_reclaims_each_orphan_once() {
             .unwrap()
             .file_column_stats
             .get(&1)
-            .is_none_or(BTreeMap::is_empty),
+            .is_none_or(imbl::OrdMap::is_empty),
         "the reclaimed row must be gone from the view the writer serves"
     );
 
@@ -8019,4 +8015,42 @@ async fn a_commit_registering_no_data_files_names_no_tables() {
     assert!(tx.tables_with_staged_data_files().is_empty());
     tx.rollback();
     catalog.close().await.unwrap();
+}
+
+#[test]
+fn staged_statistics_deletes_update_entity_counts_once() {
+    let mut state = CatalogSnapshot::default();
+    state.put_table_column_stats(crate::store::proto::TableColumnStatsValue {
+        table_id: 1,
+        column_id: 2,
+        ..Default::default()
+    });
+    state.put_file_column_stats(crate::store::proto::FileColumnStatsValue {
+        table_id: 1,
+        data_file_id: 3,
+        column_id: 2,
+        ..Default::default()
+    });
+    let mut touched = crate::transaction::commit::Touched::default();
+    assert_eq!(state.live_entity_count(), 2);
+    for expected in [1, 1] {
+        apply::apply_stats_delete(
+            &mut state,
+            TableKind::TableColumnStats,
+            &[Cell::U64(1), Cell::U64(2)],
+            &mut touched,
+        )
+        .unwrap();
+        assert_eq!(state.live_entity_count(), expected);
+    }
+    for _ in 0..2 {
+        apply::apply_stats_delete(
+            &mut state,
+            TableKind::FileColumnStats,
+            &[Cell::U64(3), Cell::U64(1), Cell::U64(2)],
+            &mut touched,
+        )
+        .unwrap();
+        assert_eq!(state.live_entity_count(), 0);
+    }
 }

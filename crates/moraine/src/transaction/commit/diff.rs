@@ -3,11 +3,12 @@
 //! unversioned kinds are overwritten in place.
 //!
 //! The diff walks a [`Scope`] of entity ids rather than the catalog: a
-//! caller that recorded what it touched pays for its own commit, one that
-//! did not pays for the whole catalog. Both share the staging below, so
-//! the two scopes differ only in which ids they visit.
+//! staged caller supplies touched ids; a verb caller discovers changes by
+//! skipping shared tree nodes. Both use the same versioning and write staging.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
+
+use imbl::{OrdMap, ordmap::DiffItem};
 
 use super::StagedWrite;
 use crate::{
@@ -135,21 +136,24 @@ impl Touched {
 /// Which entity ids a diff visits.
 #[derive(Clone, Copy)]
 pub(crate) enum Scope<'a> {
-    /// Every id either side holds, for a caller that did not record.
+    /// Only branches changed since the base snapshot, skipping shared nodes.
+    Changed,
+    /// Every id either side holds, for the debug and test oracle.
     All,
     /// Only what a translation recorded touching.
     Touched(&'a Touched),
 }
 
 /// The ids to visit in one flat map pair.
-fn flat_ids<K: Copy + Ord, M, N>(
+fn flat_ids<K: Copy + Ord, M: PartialEq>(
     scope: Scope<'_>,
-    base: &BTreeMap<K, M>,
-    state: &BTreeMap<K, N>,
+    base: &OrdMap<K, M>,
+    state: &OrdMap<K, M>,
     select: impl Fn(&Touched) -> &BTreeSet<K>,
 ) -> Vec<K> {
     match scope {
         Scope::Touched(touched) => select(touched).iter().copied().collect(),
+        Scope::Changed => changed_ids(base, state),
         Scope::All => base
             .keys()
             .chain(state.keys())
@@ -162,14 +166,25 @@ fn flat_ids<K: Copy + Ord, M, N>(
 
 /// The `(table_id, id)` pairs to visit in one nested map pair. Table-major
 /// then id, the order a whole-catalog walk visits them in.
-fn nested_ids<K: Copy + Ord, M, N>(
+fn nested_ids<K: Copy + Ord, M: PartialEq>(
     scope: Scope<'_>,
-    base: &BTreeMap<u64, BTreeMap<K, M>>,
-    state: &BTreeMap<u64, BTreeMap<K, N>>,
+    base: &OrdMap<u64, OrdMap<K, M>>,
+    state: &OrdMap<u64, OrdMap<K, M>>,
     select: impl Fn(&Touched) -> &BTreeSet<(u64, K)>,
 ) -> Vec<(u64, K)> {
     match scope {
         Scope::Touched(touched) => select(touched).iter().copied().collect(),
+        Scope::Changed => changed_ids(base, state)
+            .into_iter()
+            .flat_map(|table_id| {
+                let ids = match (base.get(&table_id), state.get(&table_id)) {
+                    (Some(base), Some(state)) => changed_ids(base, state),
+                    (Some(only), None) | (None, Some(only)) => only.keys().copied().collect(),
+                    (None, None) => Vec::new(),
+                };
+                ids.into_iter().map(move |id| (table_id, id))
+            })
+            .collect(),
         Scope::All => {
             let mut ids = BTreeSet::new();
             for (&table_id, inner) in base {
@@ -181,6 +196,17 @@ fn nested_ids<K: Copy + Ord, M, N>(
             ids.into_iter().collect()
         }
     }
+}
+
+/// The changed keys in catalog order; shared tree nodes are not visited.
+fn changed_ids<K: Ord + Copy, V: PartialEq>(base: &OrdMap<K, V>, state: &OrdMap<K, V>) -> Vec<K> {
+    base.diff(state)
+        .map(|change| match change {
+            DiffItem::Add(key, _)
+            | DiffItem::Remove(key, _)
+            | DiffItem::Update { new: (key, _), .. } => *key,
+        })
+        .collect()
 }
 
 fn stage_transition<M: prost::Message + Clone + PartialEq>(
@@ -243,8 +269,8 @@ fn stage_overwrite<M: prost::Message + PartialEq>(
 fn diff_versioned_map<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
     writes: &mut Vec<StagedWrite>,
     ids: Vec<K>,
-    base: &BTreeMap<K, M>,
-    state: &BTreeMap<K, M>,
+    base: &OrdMap<K, M>,
+    state: &OrdMap<K, M>,
     make_key: impl Fn(K) -> EntityKey,
     new_snapshot: u64,
     set_end: impl Fn(&M) -> M,
@@ -266,8 +292,8 @@ fn diff_versioned_map<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
 fn diff_nested_versioned<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
     writes: &mut Vec<StagedWrite>,
     ids: Vec<(u64, K)>,
-    base: &BTreeMap<u64, BTreeMap<K, M>>,
-    state: &BTreeMap<u64, BTreeMap<K, M>>,
+    base: &OrdMap<u64, OrdMap<K, M>>,
+    state: &OrdMap<u64, OrdMap<K, M>>,
     make_key: impl Fn(u64, K) -> EntityKey,
     new_snapshot: u64,
     set_end: impl Fn(&M) -> M,
@@ -289,8 +315,8 @@ fn diff_nested_versioned<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
 fn diff_overwrite_map<K: Copy + Ord, M: prost::Message + PartialEq>(
     writes: &mut Vec<StagedWrite>,
     ids: Vec<K>,
-    base: &BTreeMap<K, M>,
-    state: &BTreeMap<K, M>,
+    base: &OrdMap<K, M>,
+    state: &OrdMap<K, M>,
     make_key: impl Fn(K) -> EntityKey,
 ) {
     for id in ids {
@@ -484,6 +510,7 @@ fn diff_mappings(
 ) {
     let ids = match scope {
         Scope::Touched(touched) => touched.mappings.iter().copied().collect(),
+        Scope::Changed => nested_ids(scope, &base.mappings, &state.mappings, |t| &t.mappings),
         Scope::All => {
             let mut ids = Vec::new();
             for (&table_id, per_table) in &state.mappings {
@@ -532,18 +559,20 @@ fn diff_columns(
         }
     }
 
-    let empty = BTreeMap::new();
     for (table_id, column_id) in nested_ids(scope, &base.columns, &state.columns, |t| &t.columns) {
-        let base_cols = base.columns.get(&table_id).unwrap_or(&empty);
-        let state_cols = state.columns.get(&table_id).unwrap_or(&empty);
         stage_transition_with_internal(
             writes,
             EntityKey::Column {
                 table_id,
                 column_id,
             },
-            base_cols.get(&column_id),
-            state_cols.get(&column_id),
+            base.columns
+                .get(&table_id)
+                .and_then(|columns| columns.get(&column_id)),
+            state
+                .columns
+                .get(&table_id)
+                .and_then(|columns| columns.get(&column_id)),
             new_snapshot,
             |prior| proto::ColumnValue {
                 end_snapshot: Some(new_snapshot),
@@ -697,7 +726,6 @@ fn diff_table_column_stats(
     base: &CatalogSnapshot,
     state: &CatalogSnapshot,
 ) {
-    let empty = BTreeMap::new();
     for (table_id, column_id) in nested_ids(
         scope,
         &base.table_column_stats,
@@ -712,13 +740,11 @@ fn diff_table_column_stats(
             },
             base.table_column_stats
                 .get(&table_id)
-                .unwrap_or(&empty)
-                .get(&column_id),
+                .and_then(|columns| columns.get(&column_id)),
             state
                 .table_column_stats
                 .get(&table_id)
-                .unwrap_or(&empty)
-                .get(&column_id),
+                .and_then(|columns| columns.get(&column_id)),
         );
     }
 }
@@ -729,8 +755,6 @@ fn diff_file_column_stats(
     base: &CatalogSnapshot,
     state: &CatalogSnapshot,
 ) {
-    let empty_stats = BTreeMap::new();
-    let empty_files = BTreeMap::new();
     for (table_id, (data_file_id, column_id)) in nested_ids(
         scope,
         &base.file_column_stats,
@@ -738,20 +762,22 @@ fn diff_file_column_stats(
         |t| &t.file_column_stats,
     ) {
         {
-            let base_cols = base
+            let base_stats = base
                 .file_column_stats
                 .get(&table_id)
-                .unwrap_or(&empty_stats);
-            let state_cols = state
+                .and_then(|columns| columns.get(&(data_file_id, column_id)));
+            let state_stats = state
                 .file_column_stats
                 .get(&table_id)
-                .unwrap_or(&empty_stats);
-            let base_files = base.data_files.get(&table_id).unwrap_or(&empty_files);
-            let state_files = state.data_files.get(&table_id).unwrap_or(&empty_files);
-            let base_stats = base_cols.get(&(data_file_id, column_id));
-            let state_stats = state_cols.get(&(data_file_id, column_id));
-            let file_is_known =
-                base_files.contains_key(&data_file_id) || state_files.contains_key(&data_file_id);
+                .and_then(|columns| columns.get(&(data_file_id, column_id)));
+            let file_is_known = base
+                .data_files
+                .get(&table_id)
+                .is_some_and(|files| files.contains_key(&data_file_id))
+                || state
+                    .data_files
+                    .get(&table_id)
+                    .is_some_and(|files| files.contains_key(&data_file_id));
             let retiring = base_stats.is_some() && state_stats.is_none();
             // A file in neither side's data files may not *gain*
             // statistics — it was registered and expired within this
@@ -785,7 +811,9 @@ pub(crate) fn diff_writes(
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) -> Vec<StagedWrite> {
-    diff_scoped(base, state, new_snapshot, Scope::All)
+    let writes = diff_scoped(base, state, new_snapshot, Scope::Changed);
+    debug_assert_eq!(writes, diff_scoped(base, state, new_snapshot, Scope::All));
+    writes
 }
 
 /// As [`diff_writes`], over only what a translation recorded touching.
@@ -802,7 +830,7 @@ pub(crate) fn diff_touched(
     let writes = diff_scoped(base, state, new_snapshot, Scope::Touched(touched));
     debug_assert_eq!(
         writes,
-        diff_writes(base, state, new_snapshot),
+        diff_scoped(base, state, new_snapshot, Scope::All),
         "a translation mutated an entity it did not record touching"
     );
     writes
@@ -842,6 +870,67 @@ fn diff_scoped(
 mod tests {
     use super::*;
 
+    proptest::proptest! {
+        #[test]
+        fn changed_branches_match_full_diff_after_chained_mutations(
+            edits in proptest::collection::vec((0u64..8, 0u64..80, 0u8..4), 0..100)
+        ) {
+            let mut base = CatalogSnapshot::default();
+            for table_id in 0..8 {
+                for file_id in 0..64 {
+                    base.put_data_file(file(table_id, file_id, "original"));
+                }
+            }
+            let mut state = base.clone();
+            for (table_id, file_id, operation) in edits {
+                match operation {
+                    0 => state.put_data_file(file(table_id, file_id, "changed")),
+                    1 => state.delete_data_file(table_id, file_id),
+                    2 => {
+                        let ids: Vec<_> = state.data_files.get(&table_id)
+                            .into_iter().flat_map(|files| files.keys().copied()).collect();
+                        for id in ids { state.delete_data_file(table_id, id); }
+                    }
+                    _ => state.put_data_file(file(table_id, file_id, "original")),
+                }
+                proptest::prop_assert_eq!(
+                    diff_scoped(&base, &state, 9, Scope::Changed),
+                    diff_scoped(&base, &state, 9, Scope::All)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changed_ids_skip_shared_branches() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        #[derive(Clone)]
+        struct Counted(u64, Arc<AtomicUsize>);
+
+        impl PartialEq for Counted {
+            fn eq(&self, other: &Self) -> bool {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0 == other.0
+            }
+        }
+
+        let comparisons = Arc::new(AtomicUsize::new(0));
+        let base: OrdMap<u64, Counted> = (0u64..32768)
+            .map(|id| (id, Counted(id, Arc::clone(&comparisons))))
+            .collect();
+        for id in [0, 1, 23, 24, 63, 64, 512, 1023, 16384, 32767] {
+            let mut state = base.clone();
+            state.insert(id, Counted(id + 1, Arc::clone(&comparisons)));
+            comparisons.store(0, Ordering::Relaxed);
+            assert_eq!(changed_ids(&base, &state), [id]);
+            assert!(comparisons.load(Ordering::Relaxed) < 512);
+        }
+    }
+
     fn file(table_id: u64, data_file_id: u64, path: &str) -> proto::DataFileValue {
         proto::DataFileValue {
             table_id,
@@ -857,15 +946,8 @@ mod tests {
     #[test]
     fn a_touched_scope_walks_only_what_it_records() {
         let mut base = CatalogSnapshot::default();
-        base.data_files.insert(
-            7,
-            [
-                (1, file(7, 1, "one.parquet")),
-                (2, file(7, 2, "two.parquet")),
-            ]
-            .into_iter()
-            .collect(),
-        );
+        base.put_data_file(file(7, 1, "one.parquet"));
+        base.put_data_file(file(7, 2, "two.parquet"));
 
         let mut state = base.clone();
         for (id, path) in [
