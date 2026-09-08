@@ -11,6 +11,8 @@ pub(crate) mod inline_policy;
 pub(crate) mod projection;
 mod schema_projection;
 mod snapshot;
+#[cfg(test)]
+mod tests;
 mod types;
 
 pub use census::{
@@ -39,6 +41,7 @@ pub(crate) fn resolve_data_path(
     path: &str,
     path_is_relative: bool,
 ) -> crate::error::Result<object_store::path::Path> {
+    let data_prefix = data_prefix.trim_end_matches('/');
     let resolved = match (path_is_relative, data_prefix.is_empty()) {
         (false, _) => path.to_owned(),
         (true, true) => format!("{table_prefix}{path}"),
