@@ -48,7 +48,13 @@ async fn old_store(format: u64, rows: u64) -> Arc<InMemory> {
         }),
     )
     .unwrap();
-    tx.commit_with_options(&durable()).await.unwrap();
+    tx.commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .await_durable()
+        .await
+        .unwrap();
     db.close().await.unwrap();
     store
 }

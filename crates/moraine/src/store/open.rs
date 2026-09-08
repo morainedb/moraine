@@ -375,7 +375,7 @@ async fn warm_subspace(handle: ReadHandle<'_>, subspace: key::Subspace, deep: bo
 #[cfg(test)]
 mod tests {
     use object_store::memory::InMemory;
-    use slatedb::{IsolationLevel, config::WriteOptions};
+    use slatedb::IsolationLevel;
 
     use super::*;
     use crate::store::key::{self, Key, SysKey};
@@ -432,12 +432,13 @@ mod tests {
         tx.put(&head, b"head").unwrap();
         tx.put(&snapshot, b"snap").unwrap();
         tx.put(&table, b"table").unwrap();
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        tx.commit()
+            .await
+            .unwrap()
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
 
         assert_eq!(db.get(&head).await.unwrap().unwrap().as_ref(), b"head");
 
@@ -472,7 +473,12 @@ mod tests {
             .unwrap();
 
         let head = Key::Sys(SysKey::Head).encode();
-        db.put(&head, b"head").await.unwrap();
+        db.put(&head, b"head")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
         assert_eq!(db.get(&head).await.unwrap().unwrap().as_ref(), b"head");
 
         db.close().await.unwrap();
@@ -489,7 +495,12 @@ mod tests {
             .unwrap();
 
         let head = Key::Sys(SysKey::Head).encode();
-        db.put(&head, b"head").await.unwrap();
+        db.put(&head, b"head")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
         assert_eq!(db.get(&head).await.unwrap().unwrap().as_ref(), b"head");
 
         db.close().await.unwrap();

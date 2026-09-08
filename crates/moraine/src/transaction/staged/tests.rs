@@ -1368,7 +1368,13 @@ async fn indexed_delete_lazily_repairs_legacy_inline_chunk_locators() {
         tx.delete(super::inline::chunk_range_key(1, row_id_end, operation).unwrap())
             .unwrap();
     }
-    tx.commit_with_options(&commit::durable()).await.unwrap();
+    tx.commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .await_durable()
+        .await
+        .unwrap();
 
     let tx = catalog.begin_write_tx().await.unwrap();
     assert!(

@@ -561,7 +561,7 @@ mod tests {
     use std::sync::Arc;
 
     use object_store::memory::InMemory;
-    use slatedb::{IsolationLevel, config::WriteOptions};
+    use slatedb::IsolationLevel;
 
     use super::*;
     use crate::store::open::StoreBuilder;
@@ -676,12 +676,13 @@ mod tests {
         )
         .unwrap();
 
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        tx.commit()
+            .await
+            .unwrap()
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         assert_eq!(read_head(ReadHandle::Tx(&tx)).await.unwrap(), Some(head));
@@ -786,12 +787,13 @@ mod tests {
                 .unwrap();
             }
         }
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        tx.commit()
+            .await
+            .unwrap()
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let handle = ReadHandle::Tx(&tx);
@@ -930,12 +932,13 @@ mod tests {
             value::encode_value(&stats),
         )
         .unwrap();
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        tx.commit()
+            .await
+            .unwrap()
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let err = scan_history_entities(ReadHandle::Tx(&tx))
@@ -973,12 +976,13 @@ mod tests {
             value::encode_value(&mapping),
         )
         .unwrap();
-        tx.commit_with_options(&WriteOptions {
-            await_durable: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        tx.commit()
+            .await
+            .unwrap()
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         let err = scan_history_entities(ReadHandle::Tx(&tx))

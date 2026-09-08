@@ -8,7 +8,7 @@ use std::{
 };
 
 use futures::{StreamExt, TryStreamExt, stream};
-use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
+use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -109,13 +109,6 @@ pub(crate) fn now_micros() -> i64 {
     Timestamp::now().as_micros()
 }
 
-pub(crate) fn durable() -> WriteOptions {
-    WriteOptions {
-        await_durable: true,
-        ..Default::default()
-    }
-}
-
 /// How long a durable commit may wait before the wait itself is reported,
 /// and how often it is reported thereafter.
 const STALL_INTERVAL: Duration = Duration::from_secs(10);
@@ -154,13 +147,20 @@ pub(crate) async fn commit_durable(
 ) -> std::result::Result<Option<slatedb::WriteHandle>, slatedb::Error> {
     match durability {
         CommitDurability::OnFlushInterval => {
-            reporting_stalls(operation, staged, tx.commit_with_options(&durable())).await
+            reporting_stalls(operation, staged, async {
+                let handle = tx.commit().await?;
+                if let Some(handle) = &handle {
+                    handle.await_durable().await?;
+                }
+                Ok(handle)
+            })
+            .await
         }
         // The commit returns as soon as the batch is visible; the flush
         // that follows is what puts it in object storage, so both are
         // waited on before this reports the write durable.
         CommitDurability::Immediate(db) => {
-            let handle = tx.commit_with_options(&non_durable()).await?;
+            let handle = tx.commit().await?;
             reporting_stalls(operation, staged, db.flush()).await?;
             Ok(handle)
         }
@@ -188,16 +188,6 @@ async fn reporting_stalls<T>(
             "still waiting for object storage to accept a durable write; the batch goes as one \
              request and is retried indefinitely, so it will not fail on its own"
         );
-    }
-}
-
-/// A commit that returns without waiting for the write to reach object
-/// storage. The write is still atomic and visible to this handle at once.
-/// Only for writes whose loss is self-correcting.
-pub(crate) fn non_durable() -> WriteOptions {
-    WriteOptions {
-        await_durable: false,
-        ..Default::default()
     }
 }
 

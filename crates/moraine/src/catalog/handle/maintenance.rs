@@ -664,9 +664,7 @@ impl Catalog {
             }
             // Non-durable: the deletes are idempotent, so a batch lost to a
             // crash leaves records a later pass rediscovers.
-            tx.commit_with_options(&commit::non_durable())
-                .await
-                .map_err(Error::from)?;
+            tx.commit().await.map_err(Error::from)?;
             // This batch bypassed the commit protocol, so nothing folded it
             // into the maintained projections and the head stamp they key on
             // did not move. Unless they are dropped here, the writer keeps
@@ -706,9 +704,7 @@ impl Catalog {
             }
             // Non-durable: the deletes are idempotent, so a batch lost to a
             // crash leaves entries a later pass rediscovers.
-            tx.commit_with_options(&commit::non_durable())
-                .await
-                .map_err(Error::from)?;
+            tx.commit().await.map_err(Error::from)?;
             total += deleted as u64;
             cursor = last;
         }
