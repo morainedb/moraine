@@ -48,14 +48,10 @@ impl InlineRowSource {
         )
     }
 
-    /// Hands back the chunks `selected` references, remapping each row's
-    /// `chunk` index into the returned set: point reads of exactly the
-    /// referenced chunks in directory mode, a reference-order compaction
-    /// of the scanned set otherwise. Directory mode is reached only
-    /// through isolated sessions (completeness is never remembered
-    /// elsewhere), so a locator naming a missing chunk is corruption, not
-    /// a straddled commit.
-    async fn resolve_chunks(
+    /// Fetches referenced chunks and remaps selected rows into the returned
+    /// set. Directory callers must use an isolated session or retry a
+    /// changed head.
+    pub(super) async fn resolve_chunks(
         self,
         handle: ReadHandle<'_>,
         table: TableId,
@@ -177,6 +173,17 @@ impl ReadOnlyCatalog {
         let live = InlineScanKind::Table.select(&rows, read_at, 0);
         let (live, chunks) = source.resolve_chunks(handle, table, live).await?;
 
+        self.recent_rows_from_chunks(handle, table, live, chunks)
+            .await
+    }
+
+    pub(super) async fn recent_rows_from_chunks(
+        &self,
+        handle: ReadHandle<'_>,
+        table: TableId,
+        live: Vec<InlineRow>,
+        chunks: Vec<(InlineOperation, InlineChunkValue)>,
+    ) -> Result<Vec<RecentRow>> {
         let schema_versions = live.iter().filter_map(|row| match &chunks[row.chunk].0 {
             InlineOperation::Insert { schema_version, .. } => Some(*schema_version),
             _ => None,
@@ -222,30 +229,12 @@ impl ReadOnlyCatalog {
         Ok(rows)
     }
 
-    pub(super) async fn scan_live_inline_row_ids(
-        &self,
-        session: &ReadSession,
-        table: TableId,
-    ) -> Result<Vec<u64>> {
-        let handle = session.handle();
-        let (head, (_, rows)) = futures::try_join!(
-            commit::read_head_id(handle),
-            self.inline_row_source(handle, table),
-        )?;
-
-        Ok(InlineScanKind::Table
-            .select(&rows, head, 0)
-            .into_iter()
-            .map(|row| row.row_id)
-            .collect())
-    }
-
     /// Compares the walked chunks against the directory and remembers a
     /// complete one. Only an isolated session may judge — a
     /// manifest-following pass can straddle a commit — and only under a
     /// format that locks out writers that predate the directory. This path
     /// never writes, so a gap is simply left for a flush to heal.
-    async fn verify_inline_directory(
+    pub(super) async fn verify_inline_directory(
         &self,
         handle: ReadHandle<'_>,
         table: TableId,

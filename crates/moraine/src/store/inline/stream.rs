@@ -124,12 +124,18 @@ impl InlineTombstones {
 
     /// Resolves increasing row ids against the latest deletion event.
     pub(crate) async fn latest(&mut self, row_id: u64) -> Result<Option<u64>> {
+        self.latest_at(row_id, u64::MAX).await
+    }
+
+    /// Resolves the latest event visible at `snapshot` for an increasing row
+    /// id.
+    pub(crate) async fn latest_at(&mut self, row_id: u64, snapshot: u64) -> Result<Option<u64>> {
         let mut latest = None;
         while let Some((row, end)) = self.next {
             if row > row_id {
                 break;
             }
-            if row == row_id {
+            if row == row_id && end <= snapshot {
                 latest = Some(end);
             }
             self.advance().await?;

@@ -25,6 +25,14 @@ pub(crate) struct FileSummary {
 }
 
 impl FileSummary {
+    /// Verified dense membership, irrespective of how the file records row IDs.
+    pub(crate) fn dense_range(&self) -> Option<std::ops::Range<u64>> {
+        match &self.rows.rows {
+            FileRowSet::Range { start, end } => Some(*start..*end),
+            _ => None,
+        }
+    }
+
     /// Which of `requested` this file holds, in request order.
     pub(crate) fn matching(&self, requested: &[u64]) -> Vec<u64> {
         self.rows.rows.matching(requested)

@@ -645,6 +645,44 @@ unlocated row silently drops out of the result. As a DELETE or UPDATE
 predicate that strands the row with no error. The join with null-safe
 equality on file id is the supported shape.
 
+### Selective row lookup
+
+`locate_row_ids` uses a per-table interval directory for verified dense file
+summaries. A cold directory resolves every current file once: `row_id_start`
+alone cannot exclude an embedded-ID file. Warm requests visit matching dense
+intervals and probe only the remaining arbitrary-ID or failed files. Failed
+summaries still broaden every requested ID to that file and are retried on the
+next request. Results preserve request order, deduplicate repeated requests,
+and retain overlapping physical and inline candidates.
+
+The directory is valid only for its exact shared file map, data-store cache
+identity, data prefix, and table prefix. A replacement, expiry, namespace change,
+or path change rebuilds it; unrelated catalog changes can reuse it. No file
+summary is inferred from a catalog range before the footer establishes which
+row-ID source applies.
+
+Inline point lookups build a chunk interval directory, then materialize only
+requested offsets, scan tombstones only for those IDs, and fetch only chunks
+holding selected live versions. This path serves both `recent_row` and inline
+membership checks used by row location and position validation. A first lookup
+verifies the persistent directory against the chunk scan; an incomplete directory
+falls back to metadata from that scan. Further directory builds can read locators
+without bodies once completeness is established. Cached intervals require the
+read session's full head stamp, including the maintenance batch sequence, so
+updates, flushes, and changes to chunk widths cannot reuse stale ownership.
+Manifest-following read-only sessions check the full head stamp before and
+after selection, body/schema reads, and failures. A changed stamp retries from
+the new head. Only a stable pass installs its directory. After three retries,
+the reader falls back to scanned bodies without caching, so sustained changes
+cannot make it re-fetch a body already removed by a concurrent flush.
+
+Each catalog handle retains at most 64 table directories of each kind. Directory
+space follows source counts, not expanded row counts, and is included in the
+catalog projection-memory estimate. File directories share immutable file maps;
+the estimate can count those maps again beside the current catalog projection.
+Eviction or a cold attach pays directory construction again. This is an in-memory
+read optimization with no key-layout or format-version change.
+
 ### File-row sets
 
 One immutable summary describes the physical row ids of one immutable data

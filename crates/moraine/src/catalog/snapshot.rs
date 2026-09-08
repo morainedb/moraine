@@ -1149,7 +1149,7 @@ fn macro_info(value: &MacroValue) -> MacroInfo {
     }
 }
 
-fn data_file_info(value: &DataFileValue) -> DataFileInfo {
+pub(crate) fn data_file_info(value: &DataFileValue) -> DataFileInfo {
     DataFileInfo {
         id: DataFileId::new(value.data_file_id),
         path: value.path.clone(),

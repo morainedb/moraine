@@ -101,25 +101,21 @@ fn current_files_for(
     table: TableId,
     by_file: &HashMap<DataFileId, Vec<u64>>,
 ) -> Result<Vec<DataFileInfo>> {
-    let current: HashMap<DataFileId, DataFileInfo> = snapshot
-        .data_files_of(table)
-        .into_iter()
-        .map(|file| (file.id, file))
-        .collect();
+    let current = snapshot.data_files.get(&table.get());
 
     let mut file_ids: Vec<DataFileId> = by_file.keys().copied().collect();
     file_ids.sort_unstable();
 
     let mut files = Vec::with_capacity(file_ids.len());
     for file_id in file_ids {
-        let Some(info) = current.get(&file_id) else {
+        let Some(info) = current.and_then(|files| files.get(&file_id.get())) else {
             return Err(first_row_error(
                 by_file,
                 file_id,
                 "not a current data file of this table",
             ));
         };
-        files.push(info.clone());
+        files.push(crate::catalog::snapshot::data_file_info(info));
     }
 
     Ok(files)
@@ -205,7 +201,7 @@ pub struct RowSummaryWarmth {
 impl ReadOnlyCatalog {
     /// Resolves each of the table's current data files to its summary,
     /// pairing every result with the file it came from.
-    async fn file_summaries(
+    pub(super) async fn file_summaries(
         &self,
         store: &DataStore,
         data_prefix: &str,
@@ -280,47 +276,14 @@ impl ReadOnlyCatalog {
             let Some(store) = &data_store else {
                 return Ok(HashMap::<u64, Vec<DataFileId>>::new());
             };
-            let table_prefix = snapshot.table_data_prefix(table)?;
-            let files = snapshot.data_files_of(table);
-
-            let mut placements = HashMap::<u64, Vec<DataFileId>>::new();
-            for (data_file_id, summary) in self
-                .file_summaries(store, data_prefix, &table_prefix, table, files)
+            self.locate_files(store, data_prefix, &snapshot, table, &row_ids)
                 .await
-            {
-                let matched = match summary {
-                    Ok(summary) => summary.matching(&row_ids),
-                    Err(error) => {
-                        warn!(
-                            table_id = table.get(),
-                            data_file_id = data_file_id.get(),
-                            %error,
-                            "row location fell back to every requested row for this file"
-                        );
-                        row_ids.clone()
-                    }
-                };
-                for row_id in matched {
-                    placements.entry(row_id).or_default().push(data_file_id);
-                }
-            }
-
-            Ok(placements)
         };
 
         // A row can be inlined and still hold an expired physical copy in a
         // current file, so the inlined copy is its own candidate. Only the
         // ids are needed, so the bodies stay unread.
-        let requested: HashSet<u64> = row_ids.iter().copied().collect();
-        let inlined = async {
-            Ok::<_, crate::Error>(
-                self.live_inline_row_ids(table)
-                    .await?
-                    .into_iter()
-                    .filter(|row_id| requested.contains(row_id))
-                    .collect::<HashSet<u64>>(),
-            )
-        };
+        let inlined = self.requested_inline_row_ids(table, &row_ids);
         let (mut placements, inlined) = futures::try_join!(file_placements, inlined)?;
 
         // Emit in the caller's order; locating must not reorder.
@@ -922,7 +885,7 @@ impl ReadOnlyCatalog {
             return Ok(());
         }
 
-        let live: HashSet<u64> = self.live_inline_row_ids(table).await?.into_iter().collect();
+        let live = self.requested_inline_row_ids(table, inlined_rows).await?;
         for &row_id in inlined_rows {
             if !live.contains(&row_id) {
                 return Err(Error::RowPosition {

@@ -38,6 +38,25 @@ pub(crate) struct InlineChunkLocator {
 }
 
 impl InlineChunkLocator {
+    /// Metadata for a nonempty immutable insert chunk.
+    pub(crate) fn from_chunk(
+        operation: InlineOperation,
+        chunk: &InlineChunkValue,
+    ) -> Result<Option<Self>> {
+        let Some(last) = chunk.row_count.checked_sub(1) else {
+            return Ok(None);
+        };
+        let row_id_end = chunk
+            .row_id_start
+            .checked_add(last)
+            .ok_or_else(|| Error::Corruption("inline chunk row range overflow".into()))?;
+        Ok(Some(Self {
+            operation,
+            row_id_start: chunk.row_id_start,
+            row_id_end,
+        }))
+    }
+
     /// The schema version this chunk decodes against; `None` for a
     /// locator naming a non-insert operation.
     pub(crate) fn schema_version(self) -> Option<u64> {
