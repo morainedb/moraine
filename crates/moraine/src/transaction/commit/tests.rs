@@ -5,6 +5,8 @@ use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
 
 use super::*;
 
+mod allocation;
+
 /// A prepared head view is installed by allocation rather than rebuilt.
 #[test]
 fn a_prepared_head_view_is_installed_without_rebuilding() {
@@ -4835,6 +4837,7 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
         catalog.projections(),
         &|tx: &mut Transaction| tx.create_index(table, &def, &entries).map(|_| ()),
         &base,
+        true,
     )
     .await
     .unwrap();
@@ -4881,7 +4884,7 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
 fn the_format_floor_takes_the_highest_term_that_applies() {
     let index_at = |value: proto::IndexValue| {
         let mut state = CatalogSnapshot::default();
-        state.indexes.insert(1, BTreeMap::from([(1, value)]));
+        state.put_index(value);
         state
     };
 

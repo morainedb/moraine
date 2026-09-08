@@ -770,19 +770,23 @@ impl ReadOnlyCatalog {
 
         let epoch = cache_epoch(&self.projections);
         let session = self.begin_read().await?;
-        let view = self.head_view(session.handle()).await;
+        let view = self.head_view(session.handle(), epoch).await;
         session.finish();
 
-        let view = view?;
-        install_head_view_at(&self.projections, epoch, Arc::clone(&view));
-
-        Ok(view)
+        view
     }
 
     /// The cached view when it already stands at head, a view refreshed
     /// across the gap when it has fallen behind and the gap is replayable,
-    /// else a fresh materialization.
-    async fn head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
+    /// else a fresh materialization. Capture `epoch` before opening the
+    /// read session so an intervening invalidation prevents installation.
+    async fn head_view(&self, handle: ReadHandle<'_>, epoch: u64) -> Result<Arc<CatalogSnapshot>> {
+        let view = self.load_head_view(handle).await?;
+        install_head_view_at(&self.projections, epoch, Arc::clone(&view));
+        Ok(view)
+    }
+
+    async fn load_head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
         self.note_head_read();
         let head = commit::read_head_value(handle).await?;
         if let Some(cached) = cached_head_view(&self.projections, &head) {

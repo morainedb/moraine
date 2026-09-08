@@ -381,8 +381,9 @@ impl Catalog {
                 "staged index backfill derivation started"
             );
             let derivation_started = Instant::now();
+            let epoch = super::cache_epoch(&self.projections);
             let session = self.begin_read().await?;
-            let snapshot = self.head_view(session.handle()).await?;
+            let snapshot = self.head_view(session.handle(), epoch).await?;
             require_data_store(&snapshot, table, data_store.is_some())?;
             let source = backfill::BackfillSource {
                 snapshot: &snapshot,

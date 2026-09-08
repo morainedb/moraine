@@ -10,7 +10,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt, future::BoxFuture, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use slatedb::DbTransaction;
 use tracing::warn;
 
@@ -60,6 +60,10 @@ fn decode_row_id(bytes: &[u8]) -> Result<u64> {
 
 /// Uniqueness probes in flight at once; sized for a remote object store.
 const UNIQUENESS_PROBE_CONCURRENCY: usize = 1024;
+
+/// Ready keys sharing one transactional scan; pending sources flush partial
+/// batches.
+const PROBE_BATCH_SIZE: usize = 128;
 
 /// Additions derived while the deletion phase is still draining. Once full,
 /// backpressure pauses addition sources without holding up deletion staging.
@@ -183,8 +187,46 @@ struct CompletedProbe {
 
 /// Sequential planning state. Claims are recorded before probes start, so
 /// concurrent reads cannot admit duplicate values from the same commit.
+#[derive(Default)]
 struct ProbePlanner {
     claimed: HashMap<Bytes, u64>,
+    span: Option<KeySpan>,
+}
+
+#[derive(Clone)]
+struct KeySpan {
+    first: Bytes,
+    last: Bytes,
+}
+
+impl KeySpan {
+    fn include(span: &mut Option<Self>, key: &Bytes) {
+        match span {
+            Some(span) => {
+                if *key < span.first {
+                    span.first = key.clone();
+                }
+                if *key > span.last {
+                    span.last = key.clone();
+                }
+            }
+            None => {
+                *span = Some(Self {
+                    first: key.clone(),
+                    last: key.clone(),
+                });
+            }
+        }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        self.first <= other.last && other.first <= self.last
+    }
+}
+
+struct ProbeBatch {
+    probes: Vec<PendingProbe>,
+    shared_scan: bool,
 }
 
 impl ProbePlanner {
@@ -228,6 +270,7 @@ impl ProbePlanner {
             };
         }
         self.claimed.insert(entry.key.clone(), entry.row_id);
+        KeySpan::include(&mut self.span, &entry.key);
 
         ProbePlan::Probe(PendingProbe {
             key: entry.key,
@@ -261,10 +304,9 @@ fn collision(
     }
 }
 
-async fn resolve_probe(reader: ReadHandle<'_>, probe: PendingProbe) -> Result<CompletedProbe> {
+async fn resolve_probe(transaction: &DbTransaction, probe: PendingProbe) -> Result<CompletedProbe> {
     let started = Instant::now();
-    let present = reader.get(probe.key.clone()).await.map_err(Error::from)?;
-
+    let present = transaction.get(&probe.key).await?;
     Ok(CompletedProbe {
         probe,
         present,
@@ -273,40 +315,116 @@ async fn resolve_probe(reader: ReadHandle<'_>, probe: PendingProbe) -> Result<Co
     })
 }
 
-fn schedule_probe_plan<'a>(
-    plan: ProbePlan,
-    reader: ReadHandle<'a>,
-    probes: &mut futures::stream::FuturesUnordered<BoxFuture<'a, Result<CompletedProbe>>>,
+async fn resolve_probes(
+    transaction: &DbTransaction,
+    batch: ProbeBatch,
+) -> Result<Vec<CompletedProbe>> {
+    let mut probes = batch.probes;
+    if probes.len() == 1
+        && let Some(probe) = probes.pop()
+    {
+        return Ok(vec![resolve_probe(transaction, probe).await?]);
+    }
+    if !batch.shared_scan {
+        let reads: Vec<_> = probes
+            .into_iter()
+            .map(|probe| resolve_probe(transaction, probe))
+            .collect();
+        return stream::iter(reads)
+            .buffer_unordered(PROBE_BATCH_SIZE)
+            .try_collect()
+            .await;
+    }
+    let started = Instant::now();
+    let keys: Vec<_> = probes.iter().map(|probe| probe.key.clone()).collect();
+    let values = crate::store::handle::probes::get_many(transaction, &keys).await?;
+    let completed = Instant::now();
+    let mut resolutions: Vec<_> = probes
+        .into_iter()
+        .zip(values)
+        .map(|(probe, present)| CompletedProbe {
+            probe,
+            present,
+            service: Duration::ZERO,
+            completed,
+        })
+        .collect();
+    // Count the shared read interval once rather than once per key.
+    if let Some(first) = resolutions.first_mut() {
+        first.service = completed.saturating_duration_since(started);
+    }
+    Ok(resolutions)
+}
+
+fn plan_probe_batch(
+    additions: Vec<Result<StagedIndexEntry>>,
+    planner: &mut ProbePlanner,
+    budget: &mut IndexCommitBudget,
     ready: &mut VecDeque<ReadyAddition>,
     metrics: &mut IndexMaintenanceMetrics,
+    in_flight: &mut usize,
     first_probe: &mut Option<Instant>,
-) -> Result<()> {
-    match plan {
-        ProbePlan::Put(key) => ready.push_back(ReadyAddition::Put(key)),
-        ProbePlan::Probe(probe) => {
-            first_probe.get_or_insert_with(Instant::now);
-            metrics.unique_probes = metrics.unique_probes.saturating_add(1);
-            probes.push(resolve_probe(reader, probe).boxed());
-            metrics.probe_peak_in_flight = metrics
-                .probe_peak_in_flight
-                .max(u64::try_from(probes.len()).unwrap_or(u64::MAX));
-        }
-        ProbePlan::Noop => {}
-        ProbePlan::Collision {
-            index_id,
-            building,
-            claimant,
-            holder,
-        } => {
-            if let Some(index_id) =
-                collision(index_id, building, claimant, holder, Collided::InBatch)?
-            {
-                ready.push_back(ReadyAddition::Poison(index_id));
+) -> Result<ProbeBatch> {
+    let occupied = planner.span.clone();
+    let capacity = additions.len();
+    let mut span = None;
+    let mut probes = Vec::new();
+    for addition in additions {
+        metrics.additions = metrics.additions.saturating_add(1);
+        match planner.plan(addition, budget) {
+            ProbePlan::Put(key) => ready.push_back(ReadyAddition::Put(key)),
+            ProbePlan::Probe(probe) => {
+                if probes.is_empty() {
+                    probes.reserve_exact(capacity);
+                }
+                KeySpan::include(&mut span, &probe.key);
+                probes.push(probe);
             }
+            ProbePlan::Noop => {}
+            ProbePlan::Collision {
+                index_id,
+                building,
+                claimant,
+                holder,
+            } => {
+                if let Some(index_id) =
+                    collision(index_id, building, claimant, holder, Collided::InBatch)?
+                {
+                    ready.push_back(ReadyAddition::Poison(index_id));
+                }
+            }
+            ProbePlan::Failure(error) => return Err(error),
         }
-        ProbePlan::Failure(error) => return Err(error),
     }
-    Ok(())
+    if !probes.is_empty() {
+        first_probe.get_or_insert_with(Instant::now);
+        let count = u64::try_from(probes.len()).unwrap_or(u64::MAX);
+        metrics.unique_probes = metrics.unique_probes.saturating_add(count);
+        *in_flight += probes.len();
+        metrics.probe_peak_in_flight = metrics
+            .probe_peak_in_flight
+            .max(u64::try_from(*in_flight).unwrap_or(u64::MAX));
+    }
+    let shared_scan = match (&occupied, &span) {
+        (Some(occupied), Some(span)) => !occupied.overlaps(span),
+        _ => true,
+    };
+    Ok(ProbeBatch {
+        probes,
+        shared_scan,
+    })
+}
+
+fn complete_probes(
+    resolutions: Result<Vec<CompletedProbe>>,
+    ready: &mut VecDeque<ReadyAddition>,
+    in_flight: &mut usize,
+) -> Result<usize> {
+    let resolutions = resolutions?;
+    let count = resolutions.len();
+    *in_flight -= count;
+    ready.extend(resolutions.into_iter().map(ReadyAddition::Probed));
+    Ok(count)
 }
 
 /// Drops a unique deletion whose entry is held by some other row.
@@ -361,6 +479,7 @@ fn stage_probe_put(
 pub(crate) async fn stage_index_entries(
     db_tx: &DbTransaction,
     entries: Vec<StagedIndexEntry>,
+    shared_scan: bool,
 ) -> Result<StagedEntries> {
     let entry_count = entries.len();
     if entry_count > MAX_INDEX_ENTRIES_PER_COMMIT {
@@ -384,7 +503,7 @@ pub(crate) async fn stage_index_entries(
     let (deletes, puts): (Vec<_>, Vec<_>) = entries.into_iter().partition(|entry| entry.delete);
     let deletes = stream::iter(deletes.into_iter().map(Ok));
     let puts = stream::iter(puts.into_iter().map(Ok));
-    stage_index_entry_stream(db_tx, deletes, puts, 0).await
+    stage_index_entry_stream(db_tx, deletes, puts, 0, shared_scan).await
 }
 
 /// Consumes deletion entries, then additions, as streams. Unique probes form
@@ -396,6 +515,7 @@ pub(crate) async fn stage_index_entry_stream<D, S>(
     deletes: D,
     entries: S,
     prior_entry_count: usize,
+    shared_scan: bool,
 ) -> Result<StagedEntries>
 where
     D: Stream<Item = Result<StagedIndexEntry>>,
@@ -404,25 +524,24 @@ where
     let started = Instant::now();
     let mut staged = StagedBytes::default();
     let mut deleted_unique = HashSet::new();
+    let mut deleted_span = None;
     let mut budget = IndexCommitBudget::with_entries(prior_entry_count)?;
     let reader = ReadHandle::Tx(db_tx);
     let mut deletes = std::pin::pin!(guarded_deletions(reader, deletes));
-    let mut entries = std::pin::pin!(entries);
+    let mut entries = std::pin::pin!(entries.ready_chunks(PROBE_BATCH_SIZE));
     let mut ready = VecDeque::with_capacity(ADDITION_PREFETCH);
     let mut additions_done = false;
-    let mut planner = ProbePlanner {
-        claimed: HashMap::new(),
-    };
+    let mut planner = ProbePlanner::default();
 
-    let mut probes =
-        futures::stream::FuturesUnordered::<BoxFuture<'_, Result<CompletedProbe>>>::new();
+    let mut probes = futures::stream::FuturesUnordered::new();
+    let mut in_flight = 0;
     let mut metrics = IndexMaintenanceMetrics::default();
     let mut first_probe = None;
     let mut last_probe_completion = None;
 
     loop {
-        let buffered = ready.len().saturating_add(probes.len());
-        let deletion = if buffered >= ADDITION_PREFETCH {
+        let buffered = ready.len().saturating_add(in_flight);
+        let deletion = if buffered > ADDITION_PREFETCH - PROBE_BATCH_SIZE {
             deletes.next().await
         } else {
             tokio::select! {
@@ -430,24 +549,22 @@ where
                 deletion = deletes.next() => deletion,
                 resolution = probes.next(), if !probes.is_empty() => {
                     if let Some(resolution) = resolution {
+                        let count = complete_probes(resolution, &mut ready, &mut in_flight)?;
                         metrics.probes_completed_during_deletions = metrics
                             .probes_completed_during_deletions
-                            .saturating_add(1);
-                        ready.push_back(ReadyAddition::Probed(resolution?));
+                            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
                     }
                     continue;
                 },
                 addition = entries.next(), if !additions_done => if let Some(addition) = addition {
-                    metrics.additions = metrics.additions.saturating_add(1);
-                    let plan = planner.plan(addition, &mut budget);
-                    schedule_probe_plan(
-                        plan,
-                        reader,
-                        &mut probes,
-                        &mut ready,
-                        &mut metrics,
-                        &mut first_probe,
+                    let mut pending = plan_probe_batch(
+                        addition, &mut planner, &mut budget, &mut ready,
+                        &mut metrics, &mut in_flight, &mut first_probe,
                     )?;
+                    pending.shared_scan = false;
+                    if !pending.probes.is_empty() {
+                        probes.push(resolve_probes(db_tx, pending));
+                    }
                     continue;
                 } else {
                     additions_done = true;
@@ -468,6 +585,7 @@ where
             ));
         }
         if entry.unique {
+            KeySpan::include(&mut deleted_span, &entry.key);
             deleted_unique.insert(entry.key.clone());
         }
         metrics.deletions = metrics.deletions.saturating_add(1);
@@ -482,25 +600,39 @@ where
     loop {
         let resolution = if let Some(resolution) = ready.pop_front() {
             Some(resolution)
-        } else if additions_done || probes.len() >= UNIQUENESS_PROBE_CONCURRENCY {
-            probes.next().await.transpose()?.map(ReadyAddition::Probed)
+        } else if additions_done || in_flight > UNIQUENESS_PROBE_CONCURRENCY - PROBE_BATCH_SIZE {
+            if let Some(resolutions) = probes.next().await {
+                complete_probes(resolutions, &mut ready, &mut in_flight)?;
+                continue;
+            }
+            None
         } else {
             tokio::select! {
                 biased;
                 resolution = probes.next(), if !probes.is_empty() => {
-                    resolution.transpose()?.map(ReadyAddition::Probed)
+                    if let Some(resolution) = resolution {
+                        complete_probes(resolution, &mut ready, &mut in_flight)?;
+                    }
+                    continue;
                 },
                 addition = entries.next() => if let Some(addition) = addition {
-                    metrics.additions = metrics.additions.saturating_add(1);
-                    let plan = planner.plan(addition, &mut budget);
-                    schedule_probe_plan(
-                        plan,
-                        reader,
-                        &mut probes,
-                        &mut ready,
-                        &mut metrics,
-                        &mut first_probe,
+                    let mut pending = plan_probe_batch(
+                        addition, &mut planner, &mut budget, &mut ready,
+                        &mut metrics, &mut in_flight, &mut first_probe,
                     )?;
+                    if let Some(deleted) = &deleted_span {
+                        // A batch spanning the deleted interval also overlaps its local writes.
+                        if let (Some(first), Some(last)) = (
+                            pending.probes.iter().map(|probe| &probe.key).min(),
+                            pending.probes.iter().map(|probe| &probe.key).max(),
+                        ) {
+                            pending.shared_scan &= *last < deleted.first || *first > deleted.last;
+                        }
+                    }
+                    pending.shared_scan &= shared_scan && prior_entry_count == 0;
+                    if !pending.probes.is_empty() {
+                        probes.push(resolve_probes(db_tx, pending));
+                    }
                     continue;
                 } else {
                     additions_done = true;
@@ -580,13 +712,15 @@ where
 /// Records `poisoned` on the working state's definitions, so the commit's
 /// ordinary entity diff stages the flag. Poisoning is terminal.
 pub(crate) fn apply_poison(state: &mut crate::catalog::CatalogSnapshot, poisoned: &[u64]) {
-    let poisoned: HashSet<&u64> = poisoned.iter().collect();
-    for value in state
-        .indexes
-        .values_mut()
-        .flat_map(|per_table| per_table.values_mut())
-    {
-        if poisoned.contains(&value.index_id) {
+    for index_id in poisoned {
+        let Some(table_id) = state.index_tables.get(index_id).copied() else {
+            continue;
+        };
+        if let Some(value) = state
+            .indexes
+            .get_mut(&table_id)
+            .and_then(|indexes| indexes.get_mut(index_id))
+        {
             value.poisoned = Some(true);
         }
     }
@@ -601,28 +735,31 @@ pub(crate) fn apply_deferred_maintenance(
     new_snapshot: u64,
 ) {
     for index_id in deferred {
-        for (table_id, per_table) in &mut state.indexes {
-            let Some(value) = per_table.get_mut(index_id) else {
-                continue;
-            };
-
-            if value.build_state.is_none() {
-                value.begin_snapshot = new_snapshot;
-                value.build_state = Some("maintaining".to_owned());
-                value.build_cursor_row_id = base
-                    .table_stats
-                    .get(table_id)
-                    .and_then(|stats| stats.next_row_id.checked_sub(1));
-                let tail = base
-                    .data_files
-                    .get(table_id)
-                    .and_then(|files| files.values().max_by_key(|file| file.data_file_id));
-                // File ids begin above zero: zero means the old snapshot held
-                // no files.
-                value.build_cursor_file = Some(tail.map_or(0, |file| file.data_file_id));
-                value.build_cursor_position =
-                    Some(tail.map_or(0, |file| file.record_count.saturating_sub(1)));
-            }
+        let Some(table_id) = state.index_tables.get(index_id).copied() else {
+            continue;
+        };
+        let Some(value) = state
+            .indexes
+            .get_mut(&table_id)
+            .and_then(|indexes| indexes.get_mut(index_id))
+        else {
+            continue;
+        };
+        if value.build_state.is_none() {
+            value.begin_snapshot = new_snapshot;
+            value.build_state = Some("maintaining".to_owned());
+            value.build_cursor_row_id = base
+                .table_stats
+                .get(&table_id)
+                .and_then(|stats| stats.next_row_id.checked_sub(1));
+            let tail = base
+                .data_files
+                .get(&table_id)
+                .and_then(|files| files.get_max())
+                .map(|(_, file)| file);
+            value.build_cursor_file = Some(tail.map_or(0, |file| file.data_file_id));
+            value.build_cursor_position =
+                Some(tail.map_or(0, |file| file.record_count.saturating_sub(1)));
         }
     }
 }
@@ -859,6 +996,47 @@ mod tests {
     use super::*;
     use crate::store::open::StoreBuilder;
 
+    #[test]
+    fn overlapping_probe_batches_keep_point_reads() {
+        let mut planner = ProbePlanner::default();
+        let mut budget = IndexCommitBudget::default();
+        let mut ready = VecDeque::new();
+        let mut metrics = IndexMaintenanceMetrics::default();
+        let mut in_flight = 0;
+        let mut first = None;
+        for (keys, shared) in [
+            (vec![10u64, 20], true),
+            (vec![0, 5], true),
+            (vec![7, 30], false),
+            (vec![31, 40], true),
+        ] {
+            let additions = keys
+                .into_iter()
+                .map(|key| {
+                    Ok(StagedIndexEntry {
+                        key: Bytes::copy_from_slice(&key.to_be_bytes()),
+                        index_id: 1,
+                        unique: true,
+                        row_id: key,
+                        delete: false,
+                        building: false,
+                    })
+                })
+                .collect();
+            let batch = plan_probe_batch(
+                additions,
+                &mut planner,
+                &mut budget,
+                &mut ready,
+                &mut metrics,
+                &mut in_flight,
+                &mut first,
+            )
+            .unwrap();
+            assert_eq!(batch.shared_scan, shared);
+        }
+    }
+
     /// A normal fact flush carries 250 source keys plus a handful of newly
     /// discovered reference keys. They must all enter the first probe window:
     /// leaving one or two for a second window charges a full remote-read tail
@@ -897,7 +1075,7 @@ mod tests {
             })
         }));
 
-        let staged = stage_index_entry_stream(&tx, stream::empty(), entries, 0)
+        let staged = stage_index_entry_stream(&tx, stream::empty(), entries, 0, true)
             .await
             .unwrap();
 
@@ -938,9 +1116,10 @@ mod tests {
         };
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        let staged = stage_index_entry_stream(&tx, deletion(0, key.clone()), stream::empty(), 0)
-            .await
-            .unwrap();
+        let staged =
+            stage_index_entry_stream(&tx, deletion(0, key.clone()), stream::empty(), 0, true)
+                .await
+                .unwrap();
         assert_eq!(staged.metrics.deletions, 0);
         tx.commit().await.unwrap();
 
@@ -953,9 +1132,10 @@ mod tests {
                 .is_some(),
             "row 3's entry survives a deletion derived for row 0"
         );
-        let staged = stage_index_entry_stream(&tx, deletion(3, key.clone()), stream::empty(), 0)
-            .await
-            .unwrap();
+        let staged =
+            stage_index_entry_stream(&tx, deletion(3, key.clone()), stream::empty(), 0, true)
+                .await
+                .unwrap();
         assert_eq!(staged.metrics.deletions, 1);
         tx.commit().await.unwrap();
 
@@ -1010,7 +1190,7 @@ mod tests {
         });
 
         {
-            let staging = stage_index_entry_stream(&tx, deletions, additions, 0);
+            let staging = stage_index_entry_stream(&tx, deletions, additions, 0, true);
             let mut staging = std::pin::pin!(staging);
             tokio::select! {
                 _ = &mut staging => panic!("staging finished before deletion release"),

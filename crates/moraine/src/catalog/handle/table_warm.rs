@@ -64,9 +64,10 @@ impl ReadOnlyCatalog {
     ///
     /// Returns a store error if the head view cannot be read.
     pub async fn warm_tables(&self, tables: &[TableId]) -> Result<()> {
+        let epoch = super::cache_epoch(&self.projections);
         let session = self.begin_read().await?;
         let handle = session.handle();
-        let view = self.head_view(handle).await?;
+        let view = self.head_view(handle, epoch).await?;
         let prefixes = tables
             .iter()
             .flat_map(|table| probe_prefixes(&view, *table))

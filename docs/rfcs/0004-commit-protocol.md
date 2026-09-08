@@ -175,6 +175,47 @@ bootstrap pass (whose exists-probe always succeeds against moraine — see
 the extension-surface RFC). The `main` row's id comes from the ordinary
 counter, so the first user allocation follows it.
 
+### Mutation-sized verb preparation
+
+Verb transactions clone the structurally shared `CatalogSnapshot` maps.
+Mutations copy affected tree paths; untouched maps and nested subtrees remain
+shared with the premise and held readers. Group formation and folding use the
+same representation, so each member avoids copying unrelated catalog rows.
+
+The verb diff discovers changed ids through ordered-tree differences that
+skip shared nodes, descending into changed table-scoped maps. Those ids use
+the same history/version staging as the staged path's explicit touched ids.
+Debug builds compare both paths against a whole-catalog diff to detect omitted
+writes. Inserts, deletes, cascades, and chained edits retain the existing write
+order and history semantics. No additional mutation journal is required.
+
+Use the `imbl` 5 tree implementation: our tests reproduced a missing update in
+the 7.0.1 diff iterator at a shared-leaf boundary (64 sequential keys, then
+replace key 24). A missed diff would omit the entity write from a successful
+release-mode commit. This is a correctness constraint, not a performance choice.
+A saved property-test seed pins this failure for future dependency upgrades.
+
+Upstream [issue #161](https://github.com/jneem/imbl/issues/161) reports the same
+failure on 7.0.0. Proposed [fix #166](https://github.com/jneem/imbl/pull/166) also
+describes incorrect map equality and deletion results from the same cursor bug.
+As checked on 2026-09-07, the issue and fix are open and the fix is unmerged.
+An upgrade must pass the full-diff equivalence and shared-boundary regressions.
+
+Index maintenance resolves affected definitions through an in-memory
+index-id-to-table lookup. A known current format floor bypasses feature scans.
+These indexes and shared nodes are derived memory state, with no new on-disk
+encoding or migration. Commit conflict detection and WAL durability are unchanged.
+
+For a warm premise, a fixed metadata mutation pays for changed tree paths and
+its own encoded writes, rather than unrelated tables or files. Cold
+materialization, external refresh, explicit whole-table operations, large
+individual records, and projection readers retaining a copy-on-write dump are
+outside this bound. The release benchmark in
+`crates/moraine/examples/verb_commit_bench.rs` varies unrelated tables and files
+while updating one table's statistics. It reports process CPU, allocation calls
+and bytes, total latency, durability-phase latency, and object PUT time separately.
+Debug builds intentionally retain the full-diff correctness oracle.
+
 ### The commit sequence
 
 A commit takes a set of staged catalog mutations (entity inserts, entity
