@@ -1,4 +1,4 @@
-# Patched DuckLake row-ID statistics, pruning, and inlined writes
+# Patched DuckLake row-ID statistics, pruning, inlined writes, and commit cleanup
 
 This directory carries a downstream DuckLake patch series for DuckDB v1.5.5,
 applied in file-name order:
@@ -28,6 +28,15 @@ applied in file-name order:
    keep the SQL branch too; DuckLake registers a table's inlined table when
    the table itself is created or altered, so this covers same-transaction
    `CREATE`-then-`INSERT` and tables that predate inlining being enabled.
+
+5. `0005-fix-retain-files-after-unknown-commit-outcomes.patch` recognizes the
+   metadata backend's structured `commit_outcome=unknown` error field, with
+   Moraine's fixed message as a fallback when DuckDB's COMMIT wrapper drops
+   extra fields. It
+   stops retries and releases the transaction's file-cleanup ownership before
+   rollback, so an unacknowledged commit cannot lose files it registered.
+   Unregistered files remain eligible for orphan cleanup. Ordinary SQL deletion
+   and autonomous located deletion cancellation are tested by `cargo xtask e2e`.
 
 Later patches address the lines earlier ones produce, so the series is applied
 in one `git apply` invocation rather than one per file.

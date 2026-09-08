@@ -1078,14 +1078,13 @@ pub unsafe extern "C" fn moraine_tx_dump_schema_versions(
 /// ~100 ms; a null `probe` disables polling). Where the cancellation lands
 /// decides what it means:
 ///
-/// - Before the durable write is issued: [`codes::INTERRUPTED`], catalog
-///   unchanged, head where it was.
-/// - While the durable write is in flight: the write runs to completion in the
-///   background and this call returns [`codes::INTERRUPTED`] promptly, so the
-///   commit may still land. Head ends at either the old id or the new one; a
-///   caller that needs to know re-resolves head, and must not treat
-///   [`codes::INTERRUPTED`] as "nothing landed".
-/// - After the write completed: the committed snapshot id is reported normally.
+/// - Before the core future is polled: [`codes::INTERRUPTED`], catalog
+///   unchanged.
+/// - After polling starts: cancellation returns
+///   [`codes::COMMIT_OUTCOME_UNKNOWN`]. A submitted write keeps running; retain
+///   its files and reconcile catalog state before resubmitting. Cancellation
+///   during preparation is conservatively reported the same way.
+/// - A completed write reports its snapshot id normally.
 ///
 /// # Safety
 ///
@@ -1136,7 +1135,7 @@ pub unsafe extern "C" fn moraine_tx_commit(
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let report =
-            unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, tx.commit_reporting()) }?;
+            unsafe { catalog_ref.block_on_commit(probe, probe_ctx, tx.commit_reporting()) }?;
         catalog_ref.spawn_warm_tables(warm_tables);
 
         // Repair runs only when this commit deferred entries, after the data

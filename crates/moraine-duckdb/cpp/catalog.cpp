@@ -198,6 +198,9 @@ void ThrowMoraineError(MoraineError &err) {
 		throw duckdb::NotImplementedException(message);
 	case MORAINE_INTERRUPTED:
 		throw duckdb::InterruptException();
+	case MORAINE_COMMIT_OUTCOME_UNKNOWN:
+		throw duckdb::IOException(duckdb::unordered_map<duckdb::string, duckdb::string> {{"commit_outcome", "unknown"}},
+		                          message);
 	case MORAINE_CORRUPTION:
 	case MORAINE_STORE:
 	case MORAINE_FENCED:

@@ -159,7 +159,27 @@ that **one commit = exactly one SlateDB `WriteBatch`**.
   already in the air as the window. A batch of one stays the normal path and
   waits for nobody.
 
+The commit point remains SlateDB's durable WAL. Moraine has no conditional-PUT
+commit log, log folder, leader forwarding, or automatic multi-writer migration.
+[RFC 0022](docs/rfcs/0022-commit-log-and-leader-role.md) specifies the unimplemented
+replacement topology;
+[ROADMAP](ROADMAP.md) tracks independent writers as unimplemented.
+
+Unacknowledged submissions return `CommitOutcomeUnknown` without automatic
+replay. Cancellation after a C commit call starts has the same conservative
+outcome: its external files must be retained until the operation is reconciled.
+Manifest readers guard multi-read operations with the full head stamp, retrying
+changed passes, including errors, within a bounded budget. This prevents mixed
+states within a call; it does not make a manifest reader immediately current
+with the writer's WAL.
+
 ## Extension surface
+
+The Rust ABI groups attachment, snapshot descriptors, index lifecycle, lookups,
+maintenance, and located deletion under `crates/moraine-duckdb/src/abi/`.
+`abi.rs` owns shared error and array helpers and re-exports the C surface.
+Domain validation remains in the core; the modules handle C representation,
+ownership, cancellation, and error translation.
 
 `moraine-duckdb` makes the core reachable from DuckDB
 ([RFC 0006](docs/rfcs/0006-extension-surface.md)).

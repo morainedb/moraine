@@ -57,6 +57,17 @@ fn wait_until(mut ready: impl FnMut() -> bool, description: &str) {
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn an_interrupted_located_deletion_keeps_its_committed_file() {
+    interrupted_deletion_retains_files(true);
+}
+
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn an_interrupted_sql_deletion_keeps_its_committed_file() {
+    interrupted_deletion_retains_files(false);
+}
+
+#[allow(clippy::too_many_lines)]
+fn interrupted_deletion_retains_files(located: bool) {
     let store = TempDir::new("delete-located-interrupted-store");
     let data = TempDir::new("delete-located-interrupted-data");
     let options = format!(
@@ -83,19 +94,26 @@ fn an_interrupted_located_deletion_keeps_its_committed_file() {
             .spawn()
             .unwrap(),
     );
+    let deletion = if located {
+        format!(
+            "CALL moraine_delete_located('lake', 'main', 't', [{{row_id: {}::BIGINT, data_file_id: {}::UBIGINT}}]);",
+            file.row_id_start.unwrap(),
+            file.id.get()
+        )
+    } else {
+        "DELETE FROM lake.main.t WHERE a = 1;".to_owned()
+    };
     let sql = format!(
         "SET threads=1;\n{}\nLOAD '{}';\n\
          ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}'{options}, META_FLUSH_INTERVAL_MS {});\n\
-         CALL moraine_delete_located('lake', 'main', 't', \
-         [{{row_id: {}::BIGINT, data_file_id: {}::UBIGINT}}]);\n",
+         {deletion}\n",
         ducklake_load_statement(&ducklake_ext_path()),
         ext_path().display(),
         store.path().display(),
         data.path().display(),
         FLUSH_INTERVAL.as_millis(),
-        file.row_id_start.unwrap(),
-        file.id.get(),
     );
+    let submitted_at = Instant::now();
     let input = session.0.stdin.as_mut().unwrap();
     input.write_all(sql.as_bytes()).unwrap();
     input.flush().unwrap();
@@ -106,10 +124,9 @@ fn an_interrupted_located_deletion_keeps_its_committed_file() {
     );
     // Allow staging to finish while the long WAL cadence withholds durability.
     std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(
-        snapshot(store.path()).current_snapshot().id,
-        before.current_snapshot().id,
-        "the delete committed before the interrupt window"
+    assert!(
+        submitted_at.elapsed() < FLUSH_INTERVAL / 2,
+        "staging missed the interrupt window"
     );
     assert!(
         Command::new("kill")
@@ -139,6 +156,12 @@ fn an_interrupted_located_deletion_keeps_its_committed_file() {
         || session.0.try_wait().unwrap().is_some(),
         "the interrupted session to close",
     );
+    if located {
+        assert!(
+            !session.0.try_wait().unwrap().unwrap().success(),
+            "the autonomous call must have been interrupted before acknowledgement"
+        );
+    }
     assert_eq!(
         csv_rows(&run_ducklake_sql(
             store.path(),

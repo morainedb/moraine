@@ -634,9 +634,14 @@ an unwind into C++. The shim translates codes to DuckDB exceptions:
 | 6 | `STORE` | `Error::Store` (and, conservatively, any future core variant) | `IOException` |
 | 7 | `INVALID_ARGUMENT` | ABI-layer validation: null pointer, invalid UTF-8, unsupported store scheme | `InvalidInputException` |
 | 8 | `INTERNAL` | a panic caught at the FFI boundary | `InternalException` |
-| 9 | `INTERRUPTED` | cancellation — `moraine_interrupt` or the call's interrupt probe — cancelled the read in flight (or about to start) on the handle | `InterruptException` |
+| 9 | `INTERRUPTED` | a read was cancelled, or a commit was cancelled before its future was polled | `InterruptException` |
 | 10 | `RETRY_EXHAUSTED` | `Error::RetryBudgetExhausted` — the commit spent its whole internal retry budget without settling | `TransactionException` |
 | 11 | `FENCED` | `Error::Fenced` — another process took over as the writer; the handle can no longer commit, and the message says to re-attach | `IOException` |
+| 12 | `MIGRATION` | unsupported or incomplete format migration | `IOException` |
+| 13 | `SNAPSHOT_EXPIRED` | requested snapshot was reclaimed | `CatalogException` |
+| 14 | `UNSUPPORTED` | unsupported feature | `NotImplementedException` |
+| 15 | `OPEN_RACED` | another process created the store first | `IOException` |
+| 16 | `COMMIT_OUTCOME_UNKNOWN` | submitted write was not acknowledged, or a commit call was cancelled after polling began | `IOException` |
 
 Wire contract: the `COMMIT_CONFLICT` message always contains the literal
 substring `conflict` — DuckLake's `RetryOnError` keys its retry decision on
@@ -727,11 +732,11 @@ very warnings the buffer exists to preserve.
 
 ### Read cancellation seam
 
-Pinned by `moraine-duckdb/src/{abi,runtime}.rs`. Every cancellable entry
+Pinned by `moraine-duckdb/src/abi/`, `staged.rs`, and `runtime.rs`. Every cancellable entry
 point `block_on`s a `select!` between the core future and its
 cancellation signal, `biased` toward the signal so a pending interrupt
 always wins a tie and aborts before the core future does any work. A
-cancelled call returns `INTERRUPTED`, which the shim raises as
+cancelled read returns `INTERRUPTED`, which the shim raises as
 `InterruptException`; the handle stays fully usable and the next call is
 unaffected.
 
@@ -767,8 +772,7 @@ core makes cancellation a dropped future. No first-party remote-catalog
 extension (postgres, mysql, iceberg, delta, httpfs — or DuckLake itself)
 cancels a blocked external call; their shipped mitigations are timeouts.
 
-Cancellable entry points are the ones that block on store I/O and mutate
-nothing: `moraine_snapshot`, the `moraine_dump_*` reads, the
+Read-only cancellable entry points include: `moraine_snapshot`, the `moraine_dump_*` reads, the
 `moraine_inline_*` reads, and `moraine_tx_begin` (reads the head
 snapshot; nothing is staged yet, so aborting it leaves no state). The
 snapshot listing calls (`moraine_snapshot_schemas`/`tables_in`/
@@ -787,14 +791,27 @@ than dropped: a plain drop blocks until every background task of the
 half-built store finishes, which is the hang the cancellation existed to
 escape.
 
-Two paths take no probe, both deliberately. **The commit path is
-shielded**: `moraine_tx_commit` lets an interrupt during `COMMIT` finish
-rather than tear the commit mid-protocol, matching upstream DuckDB's own
-direction of suppressing interrupts around commit irreversibility.
-**`moraine_detach` is teardown**: an interrupt part-way through would
-either leak the handle or leave the store half-closed, and detach's wait
-is the flush that makes committed data durable — cancellation exists to
-escape a wait, not that one.
+Commit calls also take a probe. Before the commit future is first polled,
+cancellation returns `INTERRUPTED` and that call submitted nothing. Once
+polling begins, cancellation returns `COMMIT_OUTCOME_UNKNOWN`; a submitted
+write continues on its own task. Preparation that has not yet submitted is
+conservatively classified the same way. An acknowledged result is returned
+normally when the commit future completes.
+
+`COMMIT_OUTCOME_UNKNOWN` is terminal for automatic retry. Its ABI message is
+fixed so backend error text cannot introduce DuckLake's retry substrings.
+The detailed reason is logged. The shim adds the structured DuckDB error
+field `commit_outcome=unknown`. DuckDB's COMMIT wrapper discards extra fields,
+so `moraine: commit outcome unknown;` is also a fixed transport marker. The
+companion DuckLake patch treats either signal as terminal and clears its transaction's file-cleanup ownership before
+rollback. This preserves newly written data and delete files even if rollback
+runs again. Errors without the flag retain DuckLake's usual cleanup behavior. Callers retain external files and reconcile
+catalog state before resubmitting. Located deletion retains supplied delete
+files on every commit-call failure, including unknown outcomes; orphan
+cleanup can reclaim files no successful catalog commit registered.
+
+`moraine_detach` takes no probe: cancellation during teardown could leak the
+handle or leave the store half-closed.
 
 ### Version pinning and distribution
 

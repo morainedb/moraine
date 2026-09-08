@@ -322,9 +322,9 @@ where
     for attempt in 1..=STABLE_READ_ATTEMPTS {
         let pass_started = Instant::now();
         let before = read_head(handle).await?;
-        let value = read().await?;
+        let value = read().await;
         if read_head(handle).await? == before {
-            return Ok(value);
+            return value;
         }
         debug!(
             attempt,

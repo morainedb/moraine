@@ -143,10 +143,26 @@ support it: there is no funnel component in the DuckLake deployment model,
 so "run one long-lived committer process and route commits through it" is
 an escape hatch for embedding hosts, not something a fleet of independent
 DuckDB clients gets for free. This constraint is stated here once,
-surfaced in README-level documentation, and holds for the default
-topology. RFC 0022 takes up the multi-writer coordination design as an
-opt-in topology layered above this protocol; the semantics specified
-here are unchanged by it.
+surfaced in README-level documentation, and holds for the only implemented
+topology. RFC 0022 specifies an unimplemented replacement
+topology; no multi-writer mode exists in the current implementation.
+
+### Submission outcomes
+
+The coalescer distinguishes a forming batch from a submitted one. Dropping a
+forming batch proves that it wrote nothing; its members may retry. A submitted
+batch reports either an acknowledged commit or a rejected head race. A write
+error or a task that exits without acknowledgement returns
+`Error::CommitOutcomeUnknown` to every member, without replaying their
+closures. A fenced writer retains the terminal `Error::Fenced` result and
+must be reattached before it can write. The staged path returns the same error for an unacknowledged write.
+
+The caller must retain external files and reconcile the operation against
+catalog state before resubmitting an unknown outcome. There is no durable
+client operation id that makes arbitrary resubmission idempotent. A changed
+head alone does not resolve a particular operation's fate. Cancellation of
+the waiting caller leaves a submitted batch running; RFC 0006 defines how
+that uncertainty crosses the C ABI.
 
 ### Bootstrap — the commit that creates the store
 

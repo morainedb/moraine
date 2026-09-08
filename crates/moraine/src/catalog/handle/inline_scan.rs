@@ -21,6 +21,7 @@ use crate::{
         inline as store_inline,
         key::InlineOperation,
         proto::InlineChunkValue,
+        read,
     },
     transaction::commit,
 };
@@ -136,17 +137,17 @@ impl ReadOnlyCatalog {
     ) -> Result<(Vec<InlineRow>, Vec<(InlineOperation, InlineChunkValue)>)> {
         let table = TableId::new(table_id);
         let session = self.begin_read().await?;
-        let outcome = async {
-            let (source, rows) = self.inline_row_source(session.handle(), table).await?;
-            let mut selected = kind.select(&rows, snapshot, start);
-            if let Some(version) = schema_version {
-                selected.retain(|row| source.chunk_is_version(row.chunk, version));
-            }
-            source
-                .resolve_chunks(session.handle(), table, selected)
-                .await
-        }
-        .await;
+        let outcome = self
+            .with_inline_rows(session.handle(), table, async |source, rows| {
+                let mut selected = kind.select(&rows, snapshot, start);
+                if let Some(version) = schema_version {
+                    selected.retain(|row| source.chunk_is_version(row.chunk, version));
+                }
+                source
+                    .resolve_chunks(session.handle(), table, selected)
+                    .await
+            })
+            .await;
         session.finish();
 
         outcome
@@ -161,20 +162,36 @@ impl ReadOnlyCatalog {
         at: Option<u64>,
     ) -> Result<Vec<RecentRow>> {
         let handle = session.handle();
-        let read_at = async {
-            match at {
-                Some(_) => Ok(commit::resolve_read_snapshot(handle, at).await?.0),
-                None => commit::read_head_id(handle).await,
-            }
-        };
-        let (read_at, (source, rows)) =
-            futures::try_join!(read_at, self.inline_row_source(handle, table))?;
+        self.with_inline_rows(handle, table, async |source, rows| {
+            let read_at = async {
+                match at {
+                    Some(_) => Ok(commit::resolve_read_snapshot(handle, at).await?.0),
+                    None => commit::read_head_id(handle).await,
+                }
+            };
+            let read_at = read_at.await?;
 
-        let live = InlineScanKind::Table.select(&rows, read_at, 0);
-        let (live, chunks) = source.resolve_chunks(handle, table, live).await?;
+            let live = InlineScanKind::Table.select(&rows, read_at, 0);
+            let (live, chunks) = source.resolve_chunks(handle, table, live).await?;
 
-        self.recent_rows_from_chunks(handle, table, live, chunks)
-            .await
+            self.recent_rows_from_chunks(handle, table, live, chunks)
+                .await
+        })
+        .await
+    }
+
+    /// Keeps selection, body resolution, and schema reads in one stable pass.
+    pub(super) async fn with_inline_rows<T>(
+        &self,
+        handle: ReadHandle<'_>,
+        table: TableId,
+        finish: impl AsyncFn(InlineRowSource, Vec<InlineRow>) -> Result<T>,
+    ) -> Result<T> {
+        read::consistent(handle, || async {
+            let (source, rows) = self.inline_row_source(handle, table).await?;
+            finish(source, rows).await
+        })
+        .await
     }
 
     pub(super) async fn recent_rows_from_chunks(

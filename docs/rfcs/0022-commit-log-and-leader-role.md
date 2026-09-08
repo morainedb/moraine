@@ -1,5 +1,8 @@
 # RFC 0022: The commit log and the leader role
 
+**Implementation status: Unimplemented.** The current implementation uses the
+single fenced SlateDB writer and durable WAL described in RFC 0004.
+
 - **Date:** 2026-07-29
 
 ## Summary

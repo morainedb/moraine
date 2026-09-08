@@ -1,0 +1,17 @@
+diff --git a/src/storage/ducklake_transaction_state.cpp b/src/storage/ducklake_transaction_state.cpp
+index 7b9758d..8d7a581 100644
+--- a/src/storage/ducklake_transaction_state.cpp
++++ b/src/storage/ducklake_transaction_state.cpp
+@@ -1740 +1740,11 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
+-			ErrorData error(ex);
++			ErrorData error(ex);
++			auto outcome = error.ExtraInfo().find("commit_outcome");
++			// COMMIT can discard extra fields while preserving the backend's fixed message.
++			bool outcome_unknown = (outcome != error.ExtraInfo().end() && outcome->second == "unknown") ||
++			                       StringUtil::Contains(error.RawMessage(), "moraine: commit outcome unknown;");
++			if (outcome_unknown) {
++				// The metadata commit may reference these files. Later rollback must retain them too.
++				local_changes.Clear();
++				context.try_rollback();
++				error.Throw("DuckLake commit outcome unknown; files retained for reconciliation. ");
++			}

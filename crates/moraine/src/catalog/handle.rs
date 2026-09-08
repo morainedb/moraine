@@ -1269,7 +1269,9 @@ impl Catalog {
     /// [`Error::RetryBudgetExhausted`] when the bounded internal retry
     /// budget runs out before a benign race resolves; unlike a conflict,
     /// that is terminal, and the caller re-drives the work itself —
-    /// usually as smaller commits.
+    /// usually as smaller commits. An unacknowledged submission returns
+    /// [`Error::CommitOutcomeUnknown`]; retain external files and reconcile
+    /// the operation before resubmitting.
     ///
     /// # Examples
     ///

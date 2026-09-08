@@ -29,9 +29,10 @@ replacement. Full scans and time-travel scans retain their existing behavior.
 
 Manifest-following read-only handles validate the full head stamp before and
 after a lookup, including body/schema reads and failures. A moving manifest
-retries from its new head; after three such retries, the lookup uses scanned
-bodies without caching the directory, preserving the original fallback under
-sustained changes. A stable reader can cache its directory just like a writer.
+retries from its new head. The consistency hardening following these benchmark
+runs uses the common eight-attempt budget and returns `RetryBudgetExhausted`
+under sustained changes, with no unguarded fallback. A stable reader can cache
+its directory just like a writer. The measurements below predate that hardening.
 
 Each handle caches at most 64 table directories per source kind, with arbitrary
 entry eviction on admission at capacity. Directory memory follows file/chunk

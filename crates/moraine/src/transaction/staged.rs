@@ -1137,7 +1137,9 @@ impl StagedTransaction {
     /// `ducklake_snapshot` / `ducklake_snapshot_changes` pair, or expire
     /// the head snapshot. Returns [`Error::CommitConflict`] — **never
     /// retried internally** — if a concurrent commit advanced the head
-    /// first; the store is left unchanged by the loser.
+    /// first; the store is left unchanged by the loser. An unacknowledged
+    /// submission returns [`Error::CommitOutcomeUnknown`]; retain external
+    /// files and reconcile the operation before resubmitting.
     pub async fn commit(self) -> Result<SnapshotId> {
         self.commit_reporting()
             .await
