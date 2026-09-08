@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/morainedb/moraine/compare/v0.6.2...v0.6.3) - 2026-09-08
+
+### Added
+
+- name both rows in a duplicate rejection and expose index state ([#186](https://github.com/morainedb/moraine/pull/186))
+
+### Fixed
+
+- preserve read consistency and uncertain commit outcomes ([#198](https://github.com/morainedb/moraine/pull/198))
+- bound staged index build derivation ([#197](https://github.com/morainedb/moraine/pull/197))
+- isolate caches by explicit object-store identity ([#195](https://github.com/morainedb/moraine/pull/195))
+- preserve index correctness across schema evolution and staged builds ([#193](https://github.com/morainedb/moraine/pull/193))
+- preserve inline row history across repeated updates ([#192](https://github.com/morainedb/moraine/pull/192))
+- refresh prepared index lookups on every execution ([#194](https://github.com/morainedb/moraine/pull/194))
+- preserve delete files after interrupted commits ([#191](https://github.com/morainedb/moraine/pull/191))
+
+### Other
+
+- upgrade SlateDB to 0.16.0 ([#199](https://github.com/morainedb/moraine/pull/199))
+- scale catalog commits with changed entities ([#196](https://github.com/morainedb/moraine/pull/196))
+
 ## [0.6.2](https://github.com/morainedb/moraine/compare/v0.6.1...v0.6.2) - 2026-08-28
 
 ### Added
