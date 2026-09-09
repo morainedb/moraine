@@ -1,4 +1,4 @@
-# Patched DuckLake row-ID statistics, pruning, inlined writes, and commit cleanup
+# Patched DuckLake row-ID statistics, pruning, inlined writes, commit cleanup, and positional deletes
 
 This directory carries a downstream DuckLake patch series for DuckDB v1.5.5,
 applied in file-name order:
@@ -36,7 +36,25 @@ applied in file-name order:
    stops retries and releases the transaction's file-cleanup ownership before
    rollback, so an unacknowledged commit cannot lose files it registered.
    Unregistered files remain eligible for orphan cleanup. Ordinary SQL deletion
-   and autonomous located deletion cancellation are tested by `cargo xtask e2e`.
+   and standalone located deletion cancellation are tested by `cargo xtask e2e`.
+
+6. `0006-feat-delete-DuckLake-rows-by-position.patch` adds
+   `ducklake_delete_positions(catalog, schema, table, files, inlined_rows := [])`,
+   which stages deletes of already-located rows in the current DuckLake
+   transaction without scanning the table. `files` is a list of
+   `STRUCT(data_file_id UBIGINT, positions UBIGINT[])` naming positions
+   within committed data files at the transaction's snapshot; `inlined_rows`
+   lists row ids of committed inlined rows. The function validates every
+   file id and position against that snapshot, subtracts deletions the file
+   already carries, and then stages the rest exactly as `DELETE` would:
+   inlined file deletions below the inlining threshold, otherwise a new
+   delete file that replaces the file's current one. `COMMIT` publishes
+   these together with the transaction's other changes, and `ROLLBACK`
+   discards them and removes any file written. Moraine's
+   `moraine_delete_located` resolves row ids to positions through its
+   file-row summaries and rewrites itself into this call. The function has
+   no Moraine dependency; explicit rollback, failed replacement inserts,
+   repeated calls, and standalone autocommit are covered by `cargo xtask e2e`.
 
 Later patches address the lines earlier ones produce, so the series is applied
 in one `git apply` invocation rather than one per file.

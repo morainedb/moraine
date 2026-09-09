@@ -1,4 +1,6 @@
-//! Delete-file lifetime across an interrupted autonomous commit.
+//! Delete-file lifetime across an interrupted standalone commit.
+
+mod transactions;
 
 use std::{
     io::Write,
@@ -159,7 +161,7 @@ fn interrupted_deletion_retains_files(located: bool) {
     if located {
         assert!(
             !session.0.try_wait().unwrap().unwrap().success(),
-            "the autonomous call must have been interrupted before acknowledgement"
+            "the standalone call must have been interrupted before acknowledgement"
         );
     }
     assert_eq!(
