@@ -1107,6 +1107,7 @@ where
     // that diff. The three reads touch disjoint subspaces, so they run
     // together.
     let index_entry_count = index_entries.len();
+    let probe_scope = ProbeScope::of(&index_entries);
     // This path records every schema whole; only the staged one writes a
     // schema as a reference to another version.
     let wrote_inline = InlineShapes {
@@ -1120,6 +1121,7 @@ where
         inline::stage_inline_writes(db_tx, projections, &inline_ops),
         format_stamp(db_tx, projections, &state, wrote_inline),
     )?;
+    probe_scope.report(&state, &entries.metrics);
     let poisoned = entries.poisoned;
     index_maintenance::apply_poison(&mut state, &poisoned);
 
@@ -1413,6 +1415,72 @@ pub(crate) async fn commit_batch_off_task(
                 "the durable write did not report back ({err}); it may or may not have \
                  landed — reconcile the operation before resubmitting"
             )))
+        }
+    }
+}
+
+/// Which indexes a commit's entries probe, captured before staging
+/// consumes them.
+struct ProbeScope {
+    indexes: BTreeSet<u64>,
+    entries: usize,
+    for_building_index: bool,
+}
+
+impl ProbeScope {
+    fn of(entries: &[index_maintenance::StagedIndexEntry]) -> Self {
+        Self {
+            indexes: entries.iter().map(|entry| entry.index_id).collect(),
+            entries: entries.len(),
+            for_building_index: entries.iter().any(|entry| entry.building),
+        }
+    }
+
+    /// Reports how the entries were probed. A build step reports at
+    /// `info`, since its probes are its whole commit; a writer's entries
+    /// at `debug`.
+    fn report(
+        &self,
+        state: &CatalogSnapshot,
+        metrics: &index_maintenance::IndexMaintenanceMetrics,
+    ) {
+        if self.entries == 0 {
+            return;
+        }
+        let index = (self.indexes.len() == 1)
+            .then(|| self.indexes.iter().next().copied())
+            .flatten();
+        let index_name = index
+            .and_then(|index| {
+                state
+                    .indexes
+                    .values()
+                    .find_map(|per_table| per_table.get(&index))
+            })
+            .map_or("", |value| value.index_name.as_str());
+        macro_rules! event {
+            ($level:ident) => {
+                $level!(
+                    index,
+                    index_name = %index_name,
+                    indexes = self.indexes.len(),
+                    index_entries = self.entries,
+                    unique_probes = metrics.unique_probes,
+                    probe_hits = metrics.probe_hits,
+                    probe_misses = metrics.probe_misses,
+                    shared_scans = metrics.shared_scans,
+                    probe_peak_in_flight = metrics.probe_peak_in_flight,
+                    probe_window_ms = crate::telemetry::milliseconds(metrics.probe_window),
+                    probe_service_ms = crate::telemetry::milliseconds(metrics.probe_service),
+                    stage_ms = crate::telemetry::milliseconds(metrics.staging),
+                    "staged index entries probed"
+                )
+            };
+        }
+        if self.for_building_index {
+            event!(info);
+        } else {
+            event!(debug);
         }
     }
 }

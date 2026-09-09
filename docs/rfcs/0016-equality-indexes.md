@@ -328,6 +328,13 @@ fits in memory at all. These properties govern the implementation:
   of a grouped commit. This conservative
   fallback prevents repeated scans from copying a growing local index batch;
   ascending and descending append streams retain scan sharing.
+- **A building index never shares a scan.** Its probes are misses, which
+  the SST filters answer without touching a data block, whereas a shared
+  scan opens every overlapping L0 SST and sorted run per chunk with no
+  filter to rule any of them out. Every commit staging index entries
+  reports how its probes were served — count, hits, misses, shared scans,
+  peak in flight, window and service time — at `info` when an entry
+  targets a building index and at `debug` otherwise.
   Single-key batches remain point reads. Both modes use the original
   transaction, preserving its snapshot, local writes, tombstones, and merge
   semantics. Outcomes are applied as batches complete; the first surfaced

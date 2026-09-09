@@ -138,6 +138,8 @@ pub(crate) struct IndexMaintenanceMetrics {
     pub(crate) probe_misses: u64,
     pub(crate) probe_peak_in_flight: u64,
     pub(crate) probes_completed_during_deletions: u64,
+    /// Batches resolved by one range scan rather than point reads.
+    pub(crate) shared_scans: u64,
 }
 
 /// One unique put awaiting its committed-state probe.
@@ -405,10 +407,15 @@ fn plan_probe_batch(
             .probe_peak_in_flight
             .max(u64::try_from(*in_flight).unwrap_or(u64::MAX));
     }
-    let shared_scan = match (&occupied, &span) {
-        (Some(occupied), Some(span)) => !occupied.overlaps(span),
-        _ => true,
-    };
+    // A building index's probes are misses, which the filters answer
+    // without touching data; a shared scan would open every overlapping
+    // SST per batch for nothing.
+    let building = probes.iter().any(|probe| probe.building);
+    let shared_scan = !building
+        && match (&occupied, &span) {
+            (Some(occupied), Some(span)) => !occupied.overlaps(span),
+            _ => true,
+        };
     Ok(ProbeBatch {
         probes,
         shared_scan,
@@ -630,6 +637,9 @@ where
                         }
                     }
                     pending.shared_scan &= shared_scan && prior_entry_count == 0;
+                    if pending.shared_scan && pending.probes.len() > 1 {
+                        metrics.shared_scans = metrics.shared_scans.saturating_add(1);
+                    }
                     if !pending.probes.is_empty() {
                         probes.push(resolve_probes(db_tx, pending));
                     }
@@ -1035,6 +1045,73 @@ mod tests {
             .unwrap();
             assert_eq!(batch.shared_scan, shared);
         }
+    }
+
+    /// A build's probes are misses, which bloom filters answer without
+    /// touching data blocks; a shared scan would open every overlapping SST
+    /// per batch instead.
+    #[test]
+    fn a_building_index_s_batches_keep_point_reads() {
+        let mut planner = ProbePlanner::default();
+        let mut budget = IndexCommitBudget::default();
+        let mut ready = VecDeque::new();
+        let mut metrics = IndexMaintenanceMetrics::default();
+        let mut in_flight = 0;
+        let mut first = None;
+        let additions = [10u64, 20]
+            .into_iter()
+            .map(|key| {
+                Ok(StagedIndexEntry {
+                    key: Bytes::copy_from_slice(&key.to_be_bytes()),
+                    index_id: 1,
+                    unique: true,
+                    row_id: key,
+                    delete: false,
+                    building: true,
+                })
+            })
+            .collect();
+        let batch = plan_probe_batch(
+            additions,
+            &mut planner,
+            &mut budget,
+            &mut ready,
+            &mut metrics,
+            &mut in_flight,
+            &mut first,
+        )
+        .unwrap();
+        assert!(!batch.shared_scan);
+    }
+
+    /// Resolving a batch by one scan is counted, so a commit can report how
+    /// its probes were served.
+    #[tokio::test]
+    async fn shared_scans_are_counted() {
+        let (db, _) = StoreBuilder::new("counted-scans", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let entries = stream::iter((0..4u64).map(|row_id| {
+            Ok(StagedIndexEntry {
+                index_id: 1,
+                unique: true,
+                key: Bytes::copy_from_slice(&row_id.to_be_bytes()),
+                row_id,
+                delete: false,
+                building: false,
+            })
+        }));
+
+        let staged = stage_index_entry_stream(&tx, stream::empty(), entries, 0, true)
+            .await
+            .unwrap();
+
+        assert_eq!(staged.metrics.shared_scans, 1);
+        assert_eq!(staged.metrics.unique_probes, 4);
+        tx.rollback();
+        db.close().await.unwrap();
     }
 
     /// A normal fact flush carries 250 source keys plus a handful of newly
