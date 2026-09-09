@@ -17,14 +17,14 @@ use parquet::arrow::{
 };
 
 use super::{
-    ParquetFile, ReadColumn, RowIdSource,
+    BUILD_READ_BATCH_ROWS, ParquetFile, ReadColumn, RowIdSource,
     columns::resolve_row_id_source,
     corrupt,
     inline_batch::decode_inline_batch,
     normalize_batch, read_projection,
     reader::ObjectStoreReader,
     schema::BatchProjection,
-    selection::{ScopedRows, scoped_selection, total_rows},
+    selection::{ScopedRows, scoped_selection},
     usize_as_u64,
 };
 use crate::error::{Error, Result};
@@ -54,8 +54,7 @@ pub(crate) async fn scoped_read_row_batches(
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
         .await
         .map_err(corrupt("located read"))?;
-    let total = total_rows(builder.metadata(), &file.path)?;
-    let (selection, ordinals) = scoped_selection(rows, total)?;
+    let (scope, ordinals) = scoped_selection(rows, builder.metadata(), &file.path)?;
     let (row_id_position, row_id_start) =
         resolve_row_id_source(builder.parquet_schema(), row_id_source, &file.path)?;
     let (mask, output, row_id_output, normalization) = read_projection(
@@ -64,12 +63,11 @@ pub(crate) async fn scoped_read_row_batches(
         requested,
         row_id_position,
     )?;
-    let mut builder = builder
-        .with_projection(mask)
-        .with_batch_size(file.entry_batch_rows);
-    if let Some(selection) = selection {
-        builder = builder.with_row_selection(selection);
-    }
+    let builder = scope.narrow(
+        builder
+            .with_projection(mask)
+            .with_batch_size(BUILD_READ_BATCH_ROWS),
+    );
     let mut stream = builder.build().map_err(corrupt("located read"))?;
 
     let mut batches = Vec::new();

@@ -195,6 +195,7 @@ impl IndexKeyValue {
 
     /// How many canonical bytes [`Self::encode`] would produce, without
     /// producing them.
+    #[cfg(test)]
     const fn encoded_len(&self) -> usize {
         match self {
             Self::Int { width, .. } | Self::UInt { width, .. } => width.bytes(),
@@ -209,6 +210,7 @@ impl IndexKeyValue {
 
 /// What [`encode_ordered_values`] would produce for `values`, assuming no
 /// byte needs escaping. A lower bound: escaping can at worst double a value.
+#[cfg(test)]
 pub(crate) fn nominal_key_bytes(values: &[Option<IndexKeyValue>]) -> usize {
     values
         .iter()

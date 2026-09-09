@@ -645,6 +645,7 @@ impl IndexEntry {
     /// What this entry will weigh on a batch, key and value together,
     /// before escaping; escaping can make the staged entry up to twice
     /// this, never smaller.
+    #[cfg(test)]
     pub(crate) fn nominal_bytes(&self) -> u64 {
         crate::store::key::index_entry_bytes(&self.values)
     }
@@ -652,16 +653,15 @@ impl IndexEntry {
 
 /// How much one step of a staged index build may commit. A step ends at
 /// whichever bound it reaches first, and always carries at least one
-/// entry. `entries` bounds the committed entry buffer; derivation also holds
-/// one source chunk or batch and source-local deletion state. `bytes` bounds
-/// the single object-store request a batch becomes.
+/// entry. `entries` bounds one step's entry buffer; derivation holds the
+/// step being filled and the one committing, plus a fixed window of
+/// decoded source batches read ahead. `bytes` bounds the single
+/// object-store request a batch becomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildStep {
     /// Entries per step.
     pub entries: usize,
-    /// Staged key and value bytes per step, summed over each entry's key
-    /// and value before either is encoded. Framing escapes `0x00` and
-    /// `0x01`, so the committed batch can be up to twice this.
+    /// Encoded key and value bytes per step, as the commit stages them.
     pub bytes: u64,
 }
 

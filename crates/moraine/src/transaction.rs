@@ -11,4 +11,5 @@ pub(crate) mod staged;
 mod verbs;
 
 pub use migration::MigrationReport;
+pub(crate) use verbs::EncodedIndexEntry;
 pub use verbs::Transaction;

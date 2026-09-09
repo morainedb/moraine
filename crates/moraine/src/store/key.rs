@@ -12,7 +12,7 @@ use storekey::{Decode, Encode};
 
 use crate::{
     error::{Error, Result},
-    store::index_encoding::{CanonicalKey, IndexKeyValue, nominal_key_bytes},
+    store::index_encoding::CanonicalKey,
 };
 
 /// Length in bytes of the encoded subspace prefix — one discriminant
@@ -857,8 +857,13 @@ pub(crate) const fn index_kind_tag(unique: bool) -> u8 {
 /// The nominal bytes one index entry stages, key and value together: the
 /// entry prefix, the framed value, and one row id (in the key or as the
 /// value). Escaping can make the real entry larger, never smaller.
-pub(crate) fn index_entry_bytes(values: &[Option<IndexKeyValue>]) -> u64 {
-    let bytes = INDEX_ENTRY_PREFIX_LEN + nominal_key_bytes(values) + size_of::<u64>();
+#[cfg(test)]
+pub(crate) fn index_entry_bytes(
+    values: &[Option<crate::store::index_encoding::IndexKeyValue>],
+) -> u64 {
+    let bytes = INDEX_ENTRY_PREFIX_LEN
+        + crate::store::index_encoding::nominal_key_bytes(values)
+        + size_of::<u64>();
     bytes as u64
 }
 

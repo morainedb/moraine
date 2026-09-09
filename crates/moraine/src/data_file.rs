@@ -74,7 +74,7 @@ use crate::{
         entries::{record_batch_entries, record_batch_index_entries},
         metrics::INDEX_ENCODING_CONCURRENCY,
         reader::ObjectStoreReader,
-        selection::{scoped_selection, total_rows},
+        selection::scoped_selection,
     },
     error::{Error, Result},
     store::index_encoding::{Direction, IndexKeyValue, NullOrder},
@@ -115,6 +115,8 @@ pub(crate) struct IndexProjection {
 pub(crate) struct ScopedIndexEntry {
     /// Position of the owning index in the supplied projection plans.
     pub(crate) index: usize,
+    /// Physical position of the row in its Parquet file.
+    pub(crate) ordinal: u64,
     /// Stable row id carried by the entry.
     pub(crate) row_id: u64,
     /// Fully encoded SlateDB entry key.
@@ -175,7 +177,6 @@ pub(crate) struct ParquetFile {
     footer_size: u64,
     metrics: Arc<ScopedReadMetrics>,
     columns: Option<Arc<Vec<ReadColumn>>>,
-    entry_batch_rows: usize,
 }
 
 impl ParquetFile {
@@ -188,19 +189,12 @@ impl ParquetFile {
             footer_size,
             metrics: Arc::new(ScopedReadMetrics::default()),
             columns: None,
-            entry_batch_rows: BUILD_READ_BATCH_ROWS,
         }
     }
 
     /// Resolves logical column positions against this file's physical schema.
     pub(crate) fn with_columns(mut self, columns: Vec<ReadColumn>) -> Self {
         self.columns = Some(Arc::new(columns));
-        self
-    }
-
-    /// Caps the projected entry vector independently of Parquet page sizes.
-    pub(crate) fn with_entry_batch_rows(mut self, rows: usize) -> Self {
-        self.entry_batch_rows = rows.clamp(1, BUILD_READ_BATCH_ROWS);
         self
     }
 
@@ -217,6 +211,17 @@ impl ParquetFile {
     }
 }
 
+/// Row counts of `file`'s row groups, in file order.
+pub(crate) async fn row_group_row_counts(file: &ParquetFile) -> Result<Vec<u64>> {
+    let reader = ObjectStoreReader::new(file, PageIndexPolicy::Skip);
+    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+        .await
+        .map_err(corrupt("row-group probe"))?;
+
+    selection::row_group_row_counts(builder.metadata(), &file.path)
+}
+
 /// Whether `file` carries the reserved embedded row-id column.
 pub(crate) async fn carries_embedded_row_ids(file: ParquetFile) -> Result<bool> {
     let reader = ObjectStoreReader::new(&file, PageIndexPolicy::Skip);
@@ -228,9 +233,8 @@ pub(crate) async fn carries_embedded_row_ids(file: ParquetFile) -> Result<bool> 
     Ok(embedded_row_id_position(builder.parquet_schema()).is_some())
 }
 
-/// Rows decoded at once by a streamed scoped read. A staged build step may
-/// be smaller; its caller splits this group before staging.
-const BUILD_READ_BATCH_ROWS: usize = 8_192;
+/// Rows decoded at once by a streamed scoped read.
+pub(crate) const BUILD_READ_BATCH_ROWS: usize = 8_192;
 
 /// Streams a file's fused index entries in bounded Arrow batches. Shared
 /// columns are projected once and borrowed directly into their final keys.
@@ -267,15 +271,13 @@ pub(crate) async fn scoped_read_index_entry_batches(
         &source_positions,
         &indexed_output,
     )?);
-    let total = total_rows(builder.metadata(), &file.path)?;
-    let (selection, ordinals) = scoped_selection(rows, total)?;
+    let (scope, ordinals) = scoped_selection(rows, builder.metadata(), &file.path)?;
     let ordinals = Arc::new(ordinals);
-    let mut builder = builder
-        .with_projection(mask)
-        .with_batch_size(BUILD_READ_BATCH_ROWS);
-    if let Some(selection) = selection {
-        builder = builder.with_row_selection(selection);
-    }
+    let builder = scope.narrow(
+        builder
+            .with_projection(mask)
+            .with_batch_size(BUILD_READ_BATCH_ROWS),
+    );
     let arrow_reader = builder.build().map_err(corrupt("scoped read"))?;
     let mut emitted = 0usize;
 
@@ -334,8 +336,7 @@ pub(crate) async fn scoped_read_entry_batches(
     let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
         .await
         .map_err(corrupt("scoped read"))?;
-    let total = total_rows(builder.metadata(), &file.path)?;
-    let (selection, ordinals) = scoped_selection(rows, total)?;
+    let (scope, ordinals) = scoped_selection(rows, builder.metadata(), &file.path)?;
 
     let (row_id_position, row_id_start) =
         resolve_row_id_source(builder.parquet_schema(), row_id_source, &file.path)?;
@@ -345,12 +346,11 @@ pub(crate) async fn scoped_read_entry_batches(
         indexed_positions,
         row_id_position,
     )?;
-    let mut builder = builder
-        .with_projection(mask)
-        .with_batch_size(file.entry_batch_rows);
-    if let Some(selection) = selection {
-        builder = builder.with_row_selection(selection);
-    }
+    let builder = scope.narrow(
+        builder
+            .with_projection(mask)
+            .with_batch_size(BUILD_READ_BATCH_ROWS),
+    );
     let arrow_reader = builder.build().map_err(corrupt("scoped read"))?;
 
     let mut emitted = 0usize;

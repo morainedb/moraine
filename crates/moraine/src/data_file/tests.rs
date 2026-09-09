@@ -1787,3 +1787,120 @@ async fn a_missing_data_file_is_reported_without_a_retry() {
     );
     assert_eq!(flaky.reads(), 1, "a terminal answer is not retried");
 }
+
+/// A file written in bounded row groups: the unit a staged build splits
+/// its reads on.
+async fn write_grouped_fixture(
+    store: &dyn ObjectStore,
+    path: &Path,
+    rows: usize,
+    group_rows: usize,
+) -> (u64, u64) {
+    let properties = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(group_rows))
+        .build();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let ids: Vec<i64> = (0..i64::try_from(rows).unwrap()).collect();
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids))]).unwrap();
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer =
+            ArrowWriter::try_new(&mut buffer, batch.schema(), Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    let object_len = u64::try_from(buffer.len()).unwrap();
+    let footer_offset = buffer.len() - 8;
+    let footer_size = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
+    store.put(path, buffer.into()).await.unwrap();
+    (object_len, footer_size)
+}
+
+#[tokio::test]
+async fn row_group_row_counts_list_every_group_in_file_order() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("grouped.parquet");
+    let (file_size, footer_size) = write_grouped_fixture(store.as_ref(), &path, 2_500, 1_000).await;
+
+    let counts = row_group_row_counts(&ParquetFile::new(
+        DataStore::new(store),
+        path,
+        file_size,
+        footer_size,
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(counts, [1_000, 1_000, 500]);
+}
+
+/// A row-group read emits only that group, at the group's file ordinals,
+/// and resumes from a position inside the group.
+#[tokio::test]
+async fn a_row_group_read_emits_that_group_at_file_ordinals() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("grouped-read.parquet");
+    let (file_size, footer_size) = write_grouped_fixture(store.as_ref(), &path, 2_500, 1_000).await;
+    let projections = vec![IndexProjection {
+        index_id: 7,
+        unique: false,
+        positions: vec![0],
+        directions: vec![Direction::Ascending],
+        nulls: vec![NullOrder::First],
+    }];
+    let file = ParquetFile::new(DataStore::new(store), path, file_size, footer_size);
+
+    let row_ids = |rows: ScopedRows<'static>| {
+        let file = file.clone();
+        let projections = projections.clone();
+        async move {
+            scoped_read_index_entry_batches(
+                file,
+                projections,
+                rows,
+                RowIdSource::Resolve {
+                    row_id_start: Some(100),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.row_id)
+            .collect::<Vec<_>>()
+        }
+    };
+
+    let whole = row_ids(ScopedRows::RowGroup {
+        group: 1,
+        from: 1_000,
+    })
+    .await;
+    assert_eq!(whole.len(), 1_000);
+    assert_eq!(whole.first(), Some(&1_100));
+    assert_eq!(whole.last(), Some(&2_099));
+
+    let resumed = row_ids(ScopedRows::RowGroup {
+        group: 1,
+        from: 1_500,
+    })
+    .await;
+    assert_eq!(resumed.len(), 500);
+    assert_eq!(resumed.first(), Some(&1_600));
+    assert_eq!(resumed.last(), Some(&2_099));
+
+    let tail = row_ids(ScopedRows::RowGroup {
+        group: 2,
+        from: 2_000,
+    })
+    .await;
+    assert_eq!(tail.len(), 500);
+    assert_eq!(tail.last(), Some(&2_599));
+}

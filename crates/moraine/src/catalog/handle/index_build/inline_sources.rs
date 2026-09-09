@@ -2,9 +2,7 @@
 
 use arrow::datatypes::SchemaRef;
 
-use super::{
-    BuildStepBuffer, ColumnId, Error, IndexEntry, InlineBuildCursorValue, Result, backfill,
-};
+use super::{ColumnId, Error, InlineBuildCursorValue, Result, StepBuffer, backfill};
 use crate::{
     catalog::TableId,
     data_file,
@@ -22,7 +20,7 @@ pub(super) async fn stream_inline_sources(
     source: backfill::BackfillSource<'_>,
     columns: &[ColumnId],
     legacy_cursor: Option<u64>,
-    buffer: &mut BuildStepBuffer<'_>,
+    buffer: &mut StepBuffer,
 ) -> Result<()> {
     let backfill::BackfillSource {
         snapshot,
@@ -80,22 +78,13 @@ pub(super) async fn stream_inline_sources(
         let mut tombstones =
             InlineTombstones::open(handle, table.get(), chunk.row_id_start, end).await?;
         while let Some(entry) = rows.next()? {
-            buffer.observe_source_entries(1);
             let next_position = entry.ordinal + 1;
             let dead = tombstones
                 .latest(entry.row_id)
                 .await?
                 .is_some_and(|end| begin_snapshot < end);
             if !dead && legacy_cursor.is_none_or(|cursor| entry.row_id > cursor) {
-                buffer
-                    .push(
-                        IndexEntry {
-                            row_id: entry.row_id,
-                            values: entry.values,
-                        },
-                        None,
-                    )
-                    .await?;
+                buffer.push_values(entry.row_id, &entry.values).await?;
             }
             buffer.inline_cursor = Some(InlineBuildCursorValue {
                 schema_version,
