@@ -11,7 +11,7 @@ use std::{env, process::Command};
 #[path = "ducklake_load/helpers.rs"]
 mod helpers;
 
-use helpers::{TempDir, cli_path, csv_rows, ducklake_ext_path, ext_path};
+use helpers::{TempDir, cli_path, csv_rows, load_statement};
 
 #[test]
 #[ignore = "needs the packaged extensions, DuckDB CLI with httpfs, and an S3 emulator"]
@@ -38,15 +38,14 @@ fn indexed_parquet_mutations_reopen_roots_with_trailing_separators() {
                 .env("AWS_ALLOW_HTTP", "true")
                 .args(["-unsigned", "-csv", "-batch", "-bail", "-c"])
                 .arg(format!(
-                    "LOAD httpfs; LOAD '{}'; LOAD '{}';
+                    "LOAD httpfs; {}
                      CREATE SECRET emulator (TYPE s3, KEY_ID 'minioadmin',
                          SECRET 'minioadmin', REGION 'us-east-1', ENDPOINT '{endpoint}',
                          USE_SSL false, URL_STYLE 'path');
                      ATTACH 'ducklake:moraine:{}' AS lake (META_FLUSH_INTERVAL_MS 1{options});
                      SELECT 'moraine_result_start';
                      {sql}",
-                    ducklake_ext_path().display(),
-                    ext_path().display(),
+                    load_statement(),
                     catalog.path().display(),
                 ))
                 .output()

@@ -53,15 +53,12 @@ pub fn ext_path() -> PathBuf {
     )
 }
 
-pub fn ducklake_ext_path() -> PathBuf {
-    PathBuf::from(
-        env::var("MORAINE_DUCKLAKE_EXT")
-            .expect("MORAINE_DUCKLAKE_EXT must be set (see this module's doc comment)"),
+/// Loads the extension by path; its bundled DuckLake comes with it.
+pub fn load_statement() -> String {
+    format!(
+        "LOAD '{}';",
+        ext_path().display().to_string().replace('\'', "''")
     )
-}
-
-pub fn ducklake_load_statement(path: &Path) -> String {
-    format!("LOAD '{}';", path.display().to_string().replace('\'', "''"))
 }
 
 pub const ROW_COUNT: u64 = 5;
@@ -223,21 +220,13 @@ pub enum Attach<'a> {
 /// moraine's translation, not DuckLake's cache concurrency.
 pub fn run_session(attach: &Attach, sql: &str) -> std::process::Output {
     let mut command = Command::new(cli_path());
-    let loads_moraine = !matches!(attach, Attach::Reference { .. });
     command.arg("-unsigned").arg("-csv");
-    // The standalone attach needs no ducklake extension.
     if !matches!(attach, Attach::Standalone { .. }) {
-        command
-            .arg("-c")
-            .arg("SET threads=1;")
-            .arg("-c")
-            .arg(ducklake_load_statement(&ducklake_ext_path()));
+        command.arg("-c").arg("SET threads=1;");
     }
-    if loads_moraine {
-        command
-            .arg("-c")
-            .arg(format!("LOAD '{}';", ext_path().display()));
-    }
+    // One load serves every shape: the reference attach runs on the bundled
+    // DuckLake with no moraine in its chain.
+    command.arg("-c").arg(load_statement());
     let attach_sql = match attach {
         Attach::Moraine {
             store_dir,
@@ -307,10 +296,8 @@ pub fn kill_ducklake_session_after(
     let preamble = format!(
         "SET threads=1;\n\
          {}\n\
-         LOAD '{}';\n\
          ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}');\n",
-        ducklake_load_statement(&ducklake_ext_path()),
-        ext_path().display(),
+        load_statement(),
         store_dir.display(),
         data_path.display(),
     );
@@ -364,10 +351,8 @@ pub fn run_ducklake_sql_with_pause(
     let preamble = format!(
         "SET threads=1;\n\
          {}\n\
-         LOAD '{}';\n\
          ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}'{attach_options});\n",
-        ducklake_load_statement(&ducklake_ext_path()),
-        ext_path().display(),
+        load_statement(),
         store_dir.display(),
         data_path.display(),
     );
@@ -447,10 +432,8 @@ pub fn run_ducklake_sql_around(
     let preamble = format!(
         "SET threads=1;\n\
          {}\n\
-         LOAD '{}';\n\
          ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}');\n",
-        ducklake_load_statement(&ducklake_ext_path()),
-        ext_path().display(),
+        load_statement(),
         store_dir.display(),
         data_path.display(),
     );
@@ -726,19 +709,4 @@ pub fn parquet_files_under(dir: &Path) -> Vec<PathBuf> {
 /// [`Attach::MoraineBare`]. Returns the raw output.
 pub fn run_ducklake_sql_bare(store_dir: &Path, sql: &str) -> std::process::Output {
     run_session(&Attach::MoraineBare { store_dir }, sql)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::ducklake_load_statement;
-
-    #[test]
-    fn patched_ducklake_is_loaded_by_escaped_artifact_path() {
-        assert_eq!(
-            ducklake_load_statement(Path::new("/tmp/patched'ducklake.duckdb_extension")),
-            "LOAD '/tmp/patched''ducklake.duckdb_extension';"
-        );
-    }
 }

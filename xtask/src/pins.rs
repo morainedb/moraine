@@ -36,7 +36,7 @@ const README: &str = "crates/moraine-duckdb/README.md";
 /// Prose that names the pinned DuckLake commit.
 const DUCKLAKE_PROSE: [&str; 2] = [README, "docs/rfcs/0006-extension-surface.md"];
 
-/// Version-specific DuckLake source pins used by the companion release.
+/// The DuckLake commit each supported DuckDB release bundles.
 const DUCKLAKE_RELEASE_PINS: &str = "patches/ducklake/source-pins";
 
 /// How much of a commit `duckdb_extensions()` reports as
@@ -88,7 +88,6 @@ pub fn check_pins() -> anyhow::Result<()> {
     // is required.
     for file in [
         ".github/workflows/extension.yml",
-        ".github/workflows/ducklake-extension.yml",
         ".github/workflows/release.yml",
     ] {
         let contents = read(file)?;

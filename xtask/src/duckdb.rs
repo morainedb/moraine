@@ -11,6 +11,8 @@ use std::{
 
 use anyhow::{Context, bail, ensure};
 
+use crate::ducklake_patch;
+
 /// The DuckDB versions manifest, read once so every consumer sees one
 /// copy.
 fn duckdb_versions_manifest() -> &'static str {
@@ -246,13 +248,30 @@ pub fn ensure_duckdb_cli_for(pin: &str) -> anyhow::Result<PathBuf> {
 
 /// Builds the extension through DuckDB's extension toolchain (`make
 /// release`) and returns the path to the loadable `.duckdb_extension`. The
-/// toolchain statically links DuckDB, links moraine's Rust core, and writes
-/// the metadata footer; this replaces the old cdylib-plus-hand-written-
-/// footer packaging. Requires `ninja` on PATH (the toolchain generator).
-pub fn build_and_package_extension() -> anyhow::Result<PathBuf> {
+/// toolchain statically links DuckDB, links moraine's Rust core and the
+/// patched DuckLake, and writes the metadata footer. Requires `ninja` on
+/// PATH (the toolchain generator).
+pub fn build_and_package_extension(
+    bundled: &ducklake_patch::PatchedDuckLake,
+) -> anyhow::Result<PathBuf> {
     // Stamp the artifact with the pinned DuckDB version explicitly.
     let override_describe = format!("OVERRIDE_GIT_DESCRIBE={}", duckdb_pin());
+    // The bundled DuckLake: the prepared checkout instead of a fetch, and
+    // its `roaring` dependency through the prepared vcpkg.
+    let vcpkg_toolchain = format!(
+        "VCPKG_TOOLCHAIN_PATH={}",
+        bundled.vcpkg_toolchain().display()
+    );
     let compilers = cpp_compilers()?;
+    let extension_flags = match &compilers {
+        Some(compilers) => format!(
+            "-DDUCKLAKE_PATCH_SOURCE={} -DCMAKE_C_COMPILER={} -DCMAKE_CXX_COMPILER={}",
+            bundled.source.display(),
+            compilers.c,
+            compilers.cxx
+        ),
+        None => format!("-DDUCKLAKE_PATCH_SOURCE={}", bundled.source.display()),
+    };
     // CMake clears its cache and reconfigures when an existing build tree
     // changes compiler. That internal reconfigure drops the extension-config
     // argument, so run the idempotent Make target again to restore it. A fresh
@@ -260,16 +279,11 @@ pub fn build_and_package_extension() -> anyhow::Result<PathBuf> {
     for _ in 0..2 {
         let mut build = Command::new("make");
         build
-            .args(["release", "GEN=ninja", &override_describe])
+            .args(["release", "GEN=ninja", &override_describe, &vcpkg_toolchain])
+            .arg(format!("EXT_FLAGS={extension_flags}"))
             .current_dir(workspace_root());
         if let Some(compilers) = &compilers {
-            build
-                .env("CC", compilers.c)
-                .env("CXX", compilers.cxx)
-                .arg(format!(
-                    "EXT_FLAGS=-DCMAKE_C_COMPILER={} -DCMAKE_CXX_COMPILER={}",
-                    compilers.c, compilers.cxx
-                ));
+            build.env("CC", compilers.c).env("CXX", compilers.cxx);
         }
         run(&mut build)?;
     }

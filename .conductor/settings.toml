@@ -21,8 +21,8 @@ if [ "$(uname -s)" = "Linux" ] && command -v dnf >/dev/null 2>&1; then
     sudo dnf install -y cmake ninja-build
   fi
 
-  # The patched DuckLake resolves its dependencies through vcpkg, whose
-  # compiler probe configures with no explicit compiler set. GCC 14 under
+  # The bundled DuckLake resolves its roaring dependency through vcpkg,
+  # whose compiler probe configures with no explicit compiler set. GCC 14 under
   # its prefixed name does not answer to `c++`, so without an unprefixed
   # one that probe fails and takes the whole e2e build with it.
   command -v c++ >/dev/null 2>&1 || sudo dnf install -y gcc-c++

@@ -122,18 +122,13 @@ impl Drop for TempDir {
 }
 
 /// The preamble every session needs: both extensions, then the lake.
-fn preamble(moraine: &Path, ducklake: &Path, temp: &TempDir) -> String {
+fn preamble(moraine: &Path, temp: &TempDir) -> String {
     let mut script = String::new();
     let _ = writeln!(script, "SET threads=1;");
     let _ = writeln!(
         script,
         "SET extension_directory={};",
         sql_literal(&duckdb::extension_install_directory().display().to_string())
-    );
-    let _ = writeln!(
-        script,
-        "LOAD {};",
-        sql_literal(&ducklake.display().to_string())
     );
     let _ = writeln!(
         script,
@@ -360,11 +355,10 @@ fn files_read(
 pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let options = parse_options(arguments)?;
     let cli = duckdb::ensure_duckdb_cli()?;
-    let moraine = duckdb::build_and_package_extension()?;
-    let ducklake = ducklake_patch::build_artifact(&[])?;
+    let moraine = duckdb::build_and_package_extension(&ducklake_patch::prepare()?)?;
 
     let temp = TempDir::new("lake")?;
-    let preamble = preamble(&moraine, &ducklake, &temp);
+    let preamble = preamble(&moraine, &temp);
 
     println!(
         "building {} files of {} rows",

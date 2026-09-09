@@ -79,8 +79,48 @@ jobs:
       # hook this workflow gives us to set it.
       test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir"}}'
 
-  publish:
+  # The bundled DuckLake carries the patch series: prove a published build
+  # backfills row-ID statistics and prunes a scan by row id, on one Linux
+  # and one macOS build of every version, before anything is released.
+  validate:
+    name: Validate ${{ matrix.duckdb_version }} on ${{ matrix.runner }}
     needs: [should-release, build-extension]
+    if: needs.should-release.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux_amd64
+            duckdb_version: v1.5.5
+          - runner: ubuntu-24.04
+            platform: linux_amd64
+            duckdb_version: v1.5.4
+          - runner: macos-15
+            platform: osx_arm64
+            duckdb_version: v1.5.5
+          - runner: macos-15
+            platform: osx_arm64
+            duckdb_version: v1.5.4
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: moraine-${{ matrix.duckdb_version }}-extension-${{ matrix.platform }}
+          path: artifact
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v6
+        with:
+          path: target/duckdb-cli
+          key: duckdb-cli-${{ matrix.platform }}-${{ matrix.duckdb_version }}
+      - run: >-
+          cargo xtask validate-release-artifact
+          ${{ matrix.duckdb_version }}
+          artifact/moraine.duckdb_extension
+
+  publish:
+    needs: [should-release, build-extension, validate]
     if: needs.should-release.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:

@@ -57,13 +57,13 @@ fn wait_until(mut ready: impl FnMut() -> bool, description: &str) {
 /// An interrupted commit can still land; its registered delete file must
 /// survive.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn an_interrupted_located_deletion_keeps_its_committed_file() {
     interrupted_deletion_retains_files(true);
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn an_interrupted_sql_deletion_keeps_its_committed_file() {
     interrupted_deletion_retains_files(false);
 }
@@ -108,12 +108,11 @@ fn interrupted_deletion_retains_files(located: bool) {
     // The long spacing withholds durability only from a commit inside it,
     // so a first commit opens the window the deletion is then caught in.
     let sql = format!(
-        "SET threads=1;\n{}\nLOAD '{}';\n\
+        "SET threads=1;\n{}\n\
          ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}'{options}, META_FLUSH_INTERVAL_MS {});\n\
          CREATE TABLE lake.main.warm(a INTEGER);\n\
          {deletion}\n",
-        ducklake_load_statement(&ducklake_ext_path()),
-        ext_path().display(),
+        load_statement(),
         store.path().display(),
         data.path().display(),
         FLUSH_INTERVAL.as_millis(),

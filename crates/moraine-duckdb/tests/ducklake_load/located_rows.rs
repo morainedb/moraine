@@ -47,7 +47,7 @@ impl Fixture {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn located_rows_read_back_whole_with_their_locators() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -65,7 +65,7 @@ fn located_rows_read_back_whole_with_their_locators() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn a_partial_update_recipe_commits_as_one_transaction() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -91,7 +91,7 @@ fn a_partial_update_recipe_commits_as_one_transaction() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn a_rolled_back_recipe_leaves_the_rows_untouched() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -111,7 +111,7 @@ fn a_rolled_back_recipe_leaves_the_rows_untouched() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn a_column_added_after_the_rows_were_written_reads_null() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -126,7 +126,7 @@ fn a_column_added_after_the_rows_were_written_reads_null() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn a_located_update_applies_its_assignments_in_one_statement() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -156,7 +156,7 @@ fn a_located_update_applies_its_assignments_in_one_statement() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn a_located_update_rolls_back_with_its_transaction() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -174,7 +174,7 @@ fn a_located_update_rolls_back_with_its_transaction() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn an_assignment_to_an_unknown_column_is_refused() {
     let fixture = Fixture::new(0);
     let output = run_ducklake_sql_output(

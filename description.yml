@@ -18,11 +18,10 @@ docs:
   hello_world: |
     INSTALL moraine FROM community;
     LOAD moraine;
-    INSTALL ducklake;
-    LOAD ducklake;
     ATTACH 'ducklake:moraine:<store>' AS lake (DATA_PATH '<data-path>');
   extended_description: |
-    moraine backs a DuckLake catalog with SlateDB over object storage.
+    moraine backs a DuckLake catalog with SlateDB over object storage, and
+    bundles the DuckLake it is built for: LOAD moraine serves both.
     ATTACH 'ducklake:moraine:<store>' nests moraine as DuckLake's metadata
     connection; every ducklake_* table is served from the store and DuckLake's
     own INSERT/UPDATE/DELETE commit atomically.

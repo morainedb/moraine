@@ -230,8 +230,9 @@ compiler pair automatically. Remove `build/release` before the direct `make`
 command if that tree was configured with a different compiler.
 
 The loadable lands at `build/release/extension/moraine/moraine.duckdb_extension`
-(gitignored). `cargo xtask e2e` builds it that way and drives it through a
-real DuckDB CLI plus a real `INSTALL ducklake`.
+(gitignored). It bundles the patched DuckLake from `patches/ducklake/`, built
+in the same tree and linked in, so one `LOAD` serves both. `cargo xtask e2e`
+builds it that way and drives it through a real DuckDB CLI.
 
 ### The pin, and what a bump touches
 
@@ -249,7 +250,7 @@ submodules, both workflow files, and the table below.
 | C++ standard | C++17 |
 | Linux C++ compiler | GCC 14 |
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/<version>/` (never committed) |
-| DuckLake extension | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
+| DuckLake (bundled) | the commit `INSTALL ducklake` resolves to against the pinned CLI, plus `patches/ducklake/` — see "The bundled DuckLake" below |
 
 **Bumping** is `cargo xtask bump-duckdb v1.5.6`: it moves both submodules
 to that release, rewrites the manifest around it, and carries every derived
@@ -335,61 +336,46 @@ a CLI the new build cannot load into. The CLI is
 downloaded from a release asset; the DuckDB *source* the extension builds
 against comes from the `duckdb` submodule, not this download.
 
-## Obtaining the DuckLake extension
+## The bundled DuckLake
 
-`INSTALL ducklake` against the pinned `v1.5.5` CLI deterministically
-resolves and installs DuckLake — no version pin of our own is needed beyond
-the DuckDB version:
-
-```
-$ target/duckdb-cli/v1.5.5/cli/duckdb \
-    -c "INSTALL ducklake;" -c "LOAD ducklake;" \
-    -c "SELECT extension_name, extension_version, install_mode, installed_from \
-        FROM duckdb_extensions() WHERE extension_name='ducklake';"
-┌────────────────┬────────────────────┬──────────────┬────────────────┐
-│ extension_name │ extension_version  │ install_mode │ installed_from │
-├────────────────┼────────────────────┼──────────────┼────────────────┤
-│ ducklake       │ d8a1881e           │ REPOSITORY   │ core           │
-└────────────────┴────────────────────┴──────────────┴────────────────┘
-```
-
-`extension_version` is DuckLake's own short git commit hash, resolved from
-DuckDB v1.5.5's own build-time pin
-(`.github/config/extensions/ducklake.cmake` in the `duckdb/duckdb` source
-tree names `GIT_URL https://github.com/duckdb/ducklake` at
-`GIT_TAG d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4`) — `INSTALL ducklake`
-against this exact CLI build always resolves to this exact commit,
-deterministically, from DuckDB's `core` extension repository
-(`installed_from: core`, not the community repository).
-
-**Caching under `target/`, not the CLI's default `~/.duckdb/extensions/`.**
-`INSTALL`'s default cache is the user's home directory, outside this
-repo's `target/` convention. Redirect it with a `SET` run before
-`INSTALL`/`LOAD`:
+moraine does not require a separate DuckLake extension: the loadable links
+the patched DuckLake from [`patches/ducklake/`](../../patches/ducklake/README.md)
+and registers it from its own entry point, so `LOAD moraine` is the whole
+setup. The bundle is recorded as the loaded `ducklake` extension, so a
+later `LOAD ducklake` is a no-op and `duckdb_extensions()` reports its
+source revision:
 
 ```
-$ duckdb -c "SET extension_directory='target/duckdb-extensions';" \
-         -c "INSTALL ducklake;" -c "LOAD ducklake;" \
-         -c "SELECT install_path FROM duckdb_extensions() WHERE extension_name='ducklake';"
-┌──────────────────────────────────────────────────────────────────┐
-│                            install_path                          │
-├──────────────────────────────────────────────────────────────────┤
-│ target/duckdb-extensions/v1.5.5/osx_arm64/ducklake.duckdb_extension │
-└──────────────────────────────────────────────────────────────────┘
+$ duckdb -unsigned \
+    -c "LOAD './build/release/extension/moraine/moraine.duckdb_extension';" \
+    -c "SELECT extension_name, loaded, extension_version \
+        FROM duckdb_extensions() WHERE extension_name IN ('ducklake', 'moraine');"
+┌────────────────┬─────────┬───────────────────┐
+│ extension_name │ loaded  │ extension_version │
+├────────────────┼─────────┼───────────────────┤
+│ ducklake       │ true    │ d8a1881           │
+│ moraine        │ true    │ …                 │
+└────────────────┴─────────┴───────────────────┘
 ```
 
-`xtask e2e` runs `SET extension_directory=...` + `INSTALL ducklake` +
-`LOAD ducklake` for real on every invocation, against
-`crates/moraine-duckdb/tests/ducklake_load.rs`.
+Loading stock DuckLake *before* moraine is refused: it lacks the patches
+moraine's located functions rely on, and its log type would collide with
+the bundle's.
 
-For evaluating pre-reader pruning from moraine index row ids, the repository
-also carries a pinned downstream DuckLake patch and an extension-only build
-command. It records file-level row-id min/max statistics and pushes static and
-dynamic `rowid` filters into DuckLake's file-list query. Index-assisted reads
-remain a direct join on the stable row id; DuckLake owns file selection,
-inlined data, snapshots, and deletes. See
-[`patches/ducklake/`](../../patches/ducklake/README.md) for the build, load,
-and query shape.
+The bundled source is the DuckLake commit DuckDB v1.5.5's own build-time pin
+selects (`.github/config/extensions/ducklake.cmake` in the `duckdb/duckdb`
+source tree names `GIT_URL https://github.com/duckdb/ducklake` at
+`GIT_TAG d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4`), so the bundle tracks
+exactly what `INSTALL ducklake` would install against this DuckDB, with the
+patch series on top. `patches/ducklake/source-pins` records that commit per
+supported DuckDB release; `cargo xtask check-pins` keeps it in step.
+
+The patch series records file-level row-id min/max statistics, pushes
+static and dynamic `rowid` filters into DuckLake's file-list query, exposes
+data-file ids to scans, appends inlined rows, keeps files after unknown
+commit outcomes, and adds positional deletes and updates. Index-assisted
+reads remain a direct join on the stable row id; DuckLake owns file
+selection, inlined data, snapshots, and deletes.
 
 ## Serving as DuckLake's metadata catalog
 

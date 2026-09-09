@@ -68,4 +68,9 @@ foreach(EXT_TARGET ${TARGET_NAME}_extension ${TARGET_NAME}_loadable_extension)
     # library as `<lib>-static` (GLOBAL, with the cargo build dependency and
     # forwarded native libs).
     target_link_libraries(${EXT_TARGET} moraine_duckdb-static ${RUST_PLATFORM_LIBS})
+    # The patched DuckLake rides in the same binary: its static extension
+    # library (with its roaring dependency) links in, and the entry point
+    # registers it before moraine.
+    target_include_directories(${EXT_TARGET} PRIVATE ${MORAINE_DUCKLAKE_SOURCE_DIR}/src/include)
+    target_link_libraries(${EXT_TARGET} ducklake_extension)
 endforeach()

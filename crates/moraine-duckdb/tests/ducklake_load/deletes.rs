@@ -76,7 +76,7 @@ fn rows_per_live_file(store: &std::path::Path) -> Vec<Vec<String>> {
 /// This is the expensive path: an object-store write per delete, and a
 /// full rewrite of the delete file on each subsequent one.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_partial_delete_of_flushed_inline_data_writes_a_delete_file() {
     let dir = TempDir::new("delete-partial-store");
     let data_dir = TempDir::new("delete-partial-data");
@@ -119,7 +119,7 @@ fn ducklake_partial_delete_of_flushed_inline_data_writes_a_delete_file() {
 /// independent of how the flush shaped the file — the limit is compared
 /// against the delete, not the file.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_narrow_delete_of_flushed_inline_data_inlines_its_deletions() {
     let dir = TempDir::new("delete-narrow-store");
     let data_dir = TempDir::new("delete-narrow-data");
@@ -163,7 +163,7 @@ fn ducklake_narrow_delete_of_flushed_inline_data_inlines_its_deletions() {
 /// write. The file is *ended* rather than removed, so time travel below
 /// the delete still reads it.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_partition_aligned_delete_drops_the_data_file() {
     let dir = TempDir::new("delete-aligned-store");
     let data_dir = TempDir::new("delete-aligned-data");
@@ -218,7 +218,7 @@ fn ducklake_partition_aligned_delete_drops_the_data_file() {
 /// written after all. Raising `data_inlining_row_limit` to catch small
 /// deletes therefore costs the drop on every file it touches.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_inlined_deletion_blocks_the_data_file_drop() {
     let dir = TempDir::new("delete-blocked-store");
     let data_dir = TempDir::new("delete-blocked-data");
@@ -272,7 +272,7 @@ fn ducklake_inlined_deletion_blocks_the_data_file_drop() {
 /// data file for the identical ones — strictly more than the delete
 /// alone. Skipping unchanged rows has to happen before the statement.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_no_change_update_still_writes_both_files() {
     let dir = TempDir::new("delete-noop-store");
     let data_dir = TempDir::new("delete-noop-data");
@@ -311,7 +311,7 @@ fn ducklake_no_change_update_still_writes_both_files() {
 /// rows are filtered out upstream, the resulting empty DELETE and
 /// INSERT cost nothing rather than costing an empty commit.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_zero_row_statements_mint_no_snapshot() {
     let dir = TempDir::new("delete-empty-store");
     let data_dir = TempDir::new("delete-empty-data");
@@ -347,7 +347,7 @@ fn ducklake_zero_row_statements_mint_no_snapshot() {
 /// and it merges within a partition — the merged file still holds one
 /// partition's rows, so a partition-aligned delete still drops it.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_merge_keeps_partition_files_droppable() {
     let dir = TempDir::new("delete-merged-store");
     let data_dir = TempDir::new("delete-merged-data");
@@ -440,7 +440,7 @@ fn file_column_stats(store: &std::path::Path) -> Vec<Vec<String>> {
 /// the opposite case and is asserted alongside, because it is what makes
 /// the distinction load-bearing: the two paths must not be conflated.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_delete_leaves_file_column_stats_untouched() {
     let dir = TempDir::new("delete-stats-store");
     let data_dir = TempDir::new("delete-stats-data");
@@ -493,7 +493,7 @@ fn ducklake_delete_leaves_file_column_stats_untouched() {
 /// [`ducklake_delete_leaves_file_column_stats_untouched`] — together they
 /// bound which statements stage against the statistics table.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_compaction_writes_file_column_stats() {
     let dir = TempDir::new("compact-stats-store");
     let data_dir = TempDir::new("compact-stats-data");
@@ -542,7 +542,7 @@ fn ducklake_compaction_writes_file_column_stats() {
 /// wrong base would corrupt silently — it resolves rowids back to key cells
 /// against the unscoped list.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_narrowed_file_column_stats_scan_reads_and_writes_the_right_rows() {
     let dir = TempDir::new("scope-stats-store");
     let data_dir = TempDir::new("scope-stats-data");
@@ -639,7 +639,7 @@ fn ducklake_narrowed_file_column_stats_scan_reads_and_writes_the_right_rows() {
 /// not implement. Differential, because a moraine-only assertion would
 /// encode whatever it currently does as correct.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_narrowing_the_statistics_scan_changes_no_answer() {
     let dir = TempDir::new("scope-safe-store");
     let data_dir = TempDir::new("scope-safe-data");

@@ -27,7 +27,7 @@ use backends::{BackendKind, PostgresHandle, SessionPaths, attach_sql};
 use report::{Report, Row};
 use timing::{Statement, phase_seconds};
 
-use crate::duckdb;
+use crate::{duckdb, ducklake_patch};
 
 /// Parsed `cargo xtask bench` arguments.
 struct Options {
@@ -104,8 +104,8 @@ impl SessionContext {
             "SET extension_directory='{}';",
             duckdb::extension_install_directory().display()
         );
-        script.push_str("INSTALL ducklake;\nLOAD ducklake;\n");
         script.push_str("INSTALL postgres;\nLOAD postgres;\n");
+        // moraine bundles DuckLake, which serves every catalog under test.
         let _ = writeln!(script, "LOAD '{}';", self.extension.display());
         script.push_str(".timer on\n");
         for statement in statements {
@@ -248,7 +248,7 @@ pub fn bench(arguments: &[String]) -> anyhow::Result<()> {
 
     let cli = duckdb::ensure_duckdb_cli()?;
     println!("ok: duckdb CLI at {}", cli.display());
-    let extension = duckdb::build_and_package_extension()?;
+    let extension = duckdb::build_and_package_extension(&ducklake_patch::prepare()?)?;
     println!("ok: packaged {}", extension.display());
     let context = SessionContext { cli, extension };
 
