@@ -34,6 +34,7 @@ mod delete_located;
 mod deletes;
 mod index;
 mod inline;
+mod located_rows;
 mod maintenance;
 mod migrate;
 mod partitioning;

@@ -136,7 +136,7 @@ async fn manifest_lookup_retries_a_chunk_removed_by_a_maintenance_batch() {
     let session = reader.begin_read().await.unwrap();
     let attempts = Cell::new(0);
     let rows = reader
-        .lookup_inline(&session, table, &[3], async |source, rows| {
+        .lookup_inline(&session, table, &[3], None, async |source, rows| {
             attempts.set(attempts.get() + 1);
             if attempts.get() == 1 {
                 remove_middle_chunk(&writer, &session, table).await;
@@ -168,7 +168,7 @@ async fn consistent_read_retries_errors_from_a_changed_manifest() {
     let rows = crate::store::read::consistent(session.handle(), || async {
         let head = commit::read_head_value(session.handle()).await?;
         let (source, rows, _) = reader
-            .requested_inline_rows(&session, table, &[3], head)
+            .requested_inline_rows(&session, table, &[3], head, None)
             .await?;
         attempts.set(attempts.get() + 1);
         if attempts.get() == 1 {

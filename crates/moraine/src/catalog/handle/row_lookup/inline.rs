@@ -73,14 +73,18 @@ impl ReadOnlyCatalog {
         Ok((directory, scanned))
     }
 
+    /// Selects the requested rows live at `visible_at` (the head when
+    /// `None`) from the directory built at `head`.
     async fn requested_inline_rows(
         &self,
         session: &ReadSession,
         table: TableId,
         requested: &[u64],
         head: HeadValue,
+        visible_at: Option<u64>,
     ) -> Result<(InlineRowSource, Vec<InlineRow>, Arc<InlineDirectory>)> {
         let (directory, scanned) = self.inline_lookup_directory(session, table, head).await?;
+        let visible_at = visible_at.unwrap_or(directory.head.snapshot_id);
         let mut selected = Vec::new();
         let mut locators = Vec::new();
         let mut chunks = BTreeMap::new();
@@ -92,15 +96,12 @@ impl ReadOnlyCatalog {
             if matches.is_empty() {
                 continue;
             }
-            let deletion =
-                latest_deletion(session.handle(), table, row, directory.head.snapshot_id).await?;
+            let deletion = latest_deletion(session.handle(), table, row, visible_at).await?;
             for locator in matches {
                 let InlineOperation::Insert { begin_snapshot, .. } = locator.operation() else {
                     continue;
                 };
-                if begin_snapshot > directory.head.snapshot_id
-                    || deletion.is_some_and(|end| begin_snapshot < end)
-                {
+                if begin_snapshot > visible_at || deletion.is_some_and(|end| begin_snapshot < end) {
                     continue;
                 }
                 let chunk = *chunks.entry(locator.operation()).or_insert_with(|| {
@@ -135,19 +136,21 @@ impl ReadOnlyCatalog {
         Ok((source, selected, directory))
     }
 
-    /// Selects and resolves rows from one stable manifest state.
+    /// Selects and resolves rows from one stable manifest state, visible at
+    /// `visible_at` (the head when `None`).
     async fn lookup_inline<T>(
         &self,
         session: &ReadSession,
         table: TableId,
         requested: &[u64],
+        visible_at: Option<u64>,
         finish: impl AsyncFn(InlineRowSource, Vec<InlineRow>) -> Result<T>,
     ) -> Result<T> {
         let handle = session.handle();
         let (result, directory) = read::consistent(handle, || async {
             let head = commit::read_head_value(handle).await?;
             let (source, rows, directory) = self
-                .requested_inline_rows(session, table, requested, head)
+                .requested_inline_rows(session, table, requested, head, visible_at)
                 .await?;
             finish(source, rows).await.map(|result| (result, directory))
         })
@@ -156,19 +159,52 @@ impl ReadOnlyCatalog {
         Ok(result)
     }
 
+    /// The ids among `requested` that are live inlined rows at `visible_at`
+    /// (the head when `None`).
     pub(in crate::catalog::handle) async fn requested_inline_row_ids(
         &self,
         table: TableId,
         requested: &[u64],
+        visible_at: Option<u64>,
     ) -> Result<HashSet<u64>> {
         if requested.is_empty() {
             return Ok(HashSet::new());
         }
         let session = self.begin_read().await?;
         let outcome = self
-            .lookup_inline(&session, table, requested, async |_, rows| {
+            .lookup_inline(&session, table, requested, visible_at, async |_, rows| {
                 Ok(rows.into_iter().map(|row| row.row_id).collect())
             })
+            .await;
+        session.finish();
+        outcome
+    }
+
+    /// The requested rows live at `visible_at` (the head when `None`), with
+    /// only their chunks' bodies read.
+    pub(in crate::catalog::handle) async fn requested_inline_recent_rows(
+        &self,
+        table: TableId,
+        requested: &[u64],
+        visible_at: Option<u64>,
+    ) -> Result<Vec<RecentRow>> {
+        if requested.is_empty() {
+            return Ok(Vec::new());
+        }
+        let session = self.begin_read().await?;
+        let outcome = self
+            .lookup_inline(
+                &session,
+                table,
+                requested,
+                visible_at,
+                async |source, rows| {
+                    let (rows, chunks) =
+                        source.resolve_chunks(session.handle(), table, rows).await?;
+                    self.recent_rows_from_chunks(session.handle(), table, rows, chunks)
+                        .await
+                },
+            )
             .await;
         session.finish();
         outcome
@@ -180,7 +216,7 @@ impl ReadOnlyCatalog {
         table: TableId,
         row: u64,
     ) -> Result<Option<RecentRow>> {
-        self.lookup_inline(session, table, &[row], async |source, rows| {
+        self.lookup_inline(session, table, &[row], None, async |source, rows| {
             let (rows, chunks) = source.resolve_chunks(session.handle(), table, rows).await?;
             Ok(self
                 .recent_rows_from_chunks(session.handle(), table, rows, chunks)

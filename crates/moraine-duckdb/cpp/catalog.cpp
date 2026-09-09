@@ -26,8 +26,6 @@
 
 namespace moraine_duckdb {
 
-namespace {
-
 // Reconstructs a column's DuckDB `LogicalType` from a table's flat,
 // position-ordered `ducklake_column` rows, folding nested children (linked
 // by `parent_column`) into `LIST`/`STRUCT`/`MAP`. `by_id` maps each column's
@@ -66,6 +64,8 @@ duckdb::LogicalType BuildColumnType(const MoraineColumnDesc &column,
 	}
 	return MapColumnType(column.sql_type);
 }
+
+namespace {
 
 std::string ToUpperAscii(const std::string &s) {
 	std::string result = s;

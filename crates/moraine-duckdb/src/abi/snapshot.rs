@@ -5,7 +5,9 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
-use super::{free_array, free_c_string, guard, snapshot_list, to_c_string};
+use super::{
+    borrow_str, free_array, free_c_string, guard, resolve_table, snapshot_list, to_c_string,
+};
 use crate::{
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle},
@@ -467,4 +469,83 @@ pub unsafe extern "C" fn moraine_snapshot_data_files_of_free(
         }
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// Resolves `schema_name.table_name` to its table id in `snapshot`, written
+/// to `*out_table_id`.
+///
+/// # Safety
+///
+/// `snapshot` must point to a live [`MoraineSnapshotHandle`]; the names must
+/// be valid NUL-terminated strings; `out_table_id` must be non-null and
+/// writable; `err`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_snapshot_resolve_table(
+    snapshot: *mut MoraineSnapshotHandle,
+    schema_name: *const c_char,
+    table_name: *const c_char,
+    out_table_id: *mut u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<u64, AbiError> {
+        if snapshot.is_null() {
+            return Err(AbiError::invalid_argument("`snapshot` is null"));
+        }
+        if out_table_id.is_null() {
+            return Err(AbiError::invalid_argument("`out_table_id` is null"));
+        }
+        // SAFETY: caller contract for `snapshot`.
+        let snapshot = unsafe { &*snapshot };
+        // SAFETY: caller contract for the string pointers.
+        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+        // SAFETY: caller contract.
+        let table = unsafe { borrow_str(table_name, "table_name") }?;
+        Ok(resolve_table(&snapshot.snapshot, schema, table)?.get())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(table_id) => {
+            // SAFETY: caller contract for `out_table_id`.
+            unsafe { *out_table_id = table_id };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Writes the id of the snapshot `snapshot` views to `*out_snapshot_id`.
+///
+/// # Safety
+///
+/// `snapshot` must point to a live [`MoraineSnapshotHandle`];
+/// `out_snapshot_id` must be non-null and writable; `err`, if non-null,
+/// must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_snapshot_id(
+    snapshot: *mut MoraineSnapshotHandle,
+    out_snapshot_id: *mut u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<u64, AbiError> {
+        if snapshot.is_null() {
+            return Err(AbiError::invalid_argument("`snapshot` is null"));
+        }
+        if out_snapshot_id.is_null() {
+            return Err(AbiError::invalid_argument("`out_snapshot_id` is null"));
+        }
+        // SAFETY: caller contract for `snapshot`.
+        let snapshot = unsafe { &*snapshot };
+        Ok(snapshot.snapshot.current_snapshot().id.get())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(snapshot_id) => {
+            // SAFETY: caller contract for `out_snapshot_id`.
+            unsafe { *out_snapshot_id = snapshot_id };
+            codes::OK
+        }
+        Err(code) => code,
+    }
 }

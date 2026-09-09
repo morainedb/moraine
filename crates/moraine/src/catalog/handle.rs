@@ -25,7 +25,8 @@ pub use maintenance::{
 };
 use object_store::ObjectStore;
 pub use row_location::{
-    DeleteFileRegistration, ExistingDeleteFile, LocatedDeletion, LocatedPositions, RowSummaryWarmth,
+    DeleteFileRegistration, ExistingDeleteFile, LocatedDeletion, LocatedPositions, LocatedRows,
+    RowSummaryWarmth,
 };
 use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
 use tokio::sync::watch;

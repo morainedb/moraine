@@ -17,6 +17,7 @@
 mod attach;
 mod deletion;
 mod indexes;
+mod located_rows;
 mod lookup;
 mod maintenance;
 mod snapshot;
@@ -36,6 +37,7 @@ pub use attach::*;
 pub use checkpoints::*;
 pub use deletion::*;
 pub use indexes::*;
+pub use located_rows::*;
 pub use lookup::*;
 pub use maintenance::*;
 pub use snapshot::*;
@@ -44,6 +46,30 @@ use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineSnapshotHandle},
 };
+
+/// The view a read resolves against: `snapshot`'s when non-null, else the
+/// catalog head read through `handle`.
+///
+/// # Safety
+///
+/// `snapshot`, if non-null, must point to a live [`MoraineSnapshotHandle`];
+/// `probe`/`probe_ctx` must satisfy the interrupt-probe contract.
+pub(crate) unsafe fn pinned_or_head(
+    handle: &MoraineCatalogHandle,
+    snapshot: *mut MoraineSnapshotHandle,
+    probe: crate::runtime::MoraineInterruptProbe,
+    probe_ctx: *mut std::ffi::c_void,
+) -> Result<std::sync::Arc<moraine::CatalogSnapshot>, AbiError> {
+    if snapshot.is_null() {
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        return unsafe {
+            handle.block_on_cancellable(probe, probe_ctx, handle.catalog.reads().snapshot())
+        };
+    }
+    // SAFETY: caller contract for `snapshot`.
+    let snapshot = unsafe { &*snapshot };
+    Ok(std::sync::Arc::clone(&snapshot.snapshot))
+}
 
 /// Runs `body`, containing any panic and turning both panics and `Err`
 /// results into a `(code, message)` pair written to `err`.

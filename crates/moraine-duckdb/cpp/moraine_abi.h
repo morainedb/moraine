@@ -236,6 +236,18 @@ typedef struct MoraineIndexDesc {
   char *name;
 } MoraineIndexDesc;
 
+// One batch of located rows, as [`moraine_rows_at`] returns them: a
+// self-describing Arrow IPC stream holding one record batch. Free the
+// array with [`moraine_rows_at_free`].
+typedef struct MoraineRowBatch {
+  // The IPC bytes, owned.
+  uint8_t *data;
+  // Length of `data` in bytes.
+  size_t len;
+  // Capacity of the allocation behind `data`, retained for freeing.
+  size_t cap;
+} MoraineRowBatch;
+
 // A value passed to [`moraine_index_lookup`], tagged by kind. The shim
 // fills the field matching `kind`; the ABI coerces it to the indexed
 // column's canonical form.
@@ -1378,7 +1390,8 @@ void moraine_detach(struct MoraineCatalogHandle *handle);
 
 // Resolves located rows to exact file positions for deletion without a
 // scan. `pairs` are `(row_id, data_file_id)` as a lookup reports them,
-// `has_data_file_id` false naming a live inlined row.
+// `has_data_file_id` false naming a live inlined row. Resolution is
+// against `snapshot` when non-null, else the catalog head.
 //
 // Writes `out_files` (one entry per data file carrying a requested
 // position, each with its own positions and whatever delete file is
@@ -1400,11 +1413,13 @@ void moraine_detach(struct MoraineCatalogHandle *handle);
 //
 // # Safety
 //
-// Every pointer must be valid per the ABI contract; `pairs` points to
-// `pairs_len` pairs; every `out_*` pointer must be non-null and writable;
-// `probe`/`probe_ctx` must satisfy the interrupt-probe contract; `err`, if
-// non-null, must be writable.
+// Every pointer must be valid per the ABI contract; `snapshot`, if
+// non-null, must be a live snapshot of `handle`'s catalog; `pairs` points
+// to `pairs_len` pairs; every `out_*` pointer must be non-null and
+// writable; `probe`/`probe_ctx` must satisfy the interrupt-probe contract;
+// `err`, if non-null, must be writable.
 int32_t moraine_locate_row_positions(struct MoraineCatalogHandle *handle,
+                                     struct MoraineSnapshotHandle *snapshot,
                                      const char *schema_name,
                                      const char *table_name,
                                      const struct MorainePositionPair *pairs,
@@ -1533,6 +1548,45 @@ int32_t moraine_indexes(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written by a
 // matching [`moraine_indexes`] call, not yet freed.
 void moraine_indexes_free(struct MoraineIndexDesc *items, size_t len);
+
+// Reads located rows back whole at `snapshot` (the catalog head when
+// null), without a scan. `pairs` are `(row_id, data_file_id)` as a lookup
+// reports them, `has_data_file_id` false naming a live inlined row.
+//
+// Writes `out_items`/`out_len`: one [`MoraineRowBatch`] per batch, each an
+// Arrow IPC stream whose columns are the table's top-level columns at the
+// snapshot under their current names, then `row_id` (`UInt64`) and
+// `data_file_id` (`UInt64`, NULL for an inlined row). A row deleted at the
+// snapshot is omitted; a pair that cannot be positioned exactly fails the
+// call. Written even when empty; free exactly once with
+// [`moraine_rows_at_free`].
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; `snapshot`, if
+// non-null, must be a live snapshot of `handle`'s catalog; `pairs` points
+// to `pairs_len` pairs; `out_items`/`out_len` must be non-null and
+// writable; `probe`/`probe_ctx` must satisfy the interrupt-probe contract;
+// `err`, if non-null, must be writable.
+int32_t moraine_rows_at(struct MoraineCatalogHandle *handle,
+                        struct MoraineSnapshotHandle *snapshot,
+                        const char *schema_name,
+                        const char *table_name,
+                        const struct MorainePositionPair *pairs,
+                        size_t pairs_len,
+                        struct MoraineRowBatch **out_items,
+                        size_t *out_len,
+                        MoraineInterruptProbe probe,
+                        void *probe_ctx,
+                        struct MoraineError *err);
+
+// Frees the array [`moraine_rows_at`] wrote, including each batch's bytes.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written there by a
+// matching call, not yet freed.
+void moraine_rows_at_free(struct MoraineRowBatch *items, size_t len);
 
 // Resolves an equality lookup to the rows currently holding `values` — one
 // [`MoraineLookupValue`] per indexed column, in the index's column order,
@@ -2013,6 +2067,31 @@ int32_t moraine_snapshot_data_files_of(struct MoraineSnapshotHandle *snapshot,
 // `items`/`len` must be exactly the pointer and length written by a
 // matching [`moraine_snapshot_data_files_of`] call, not yet freed.
 void moraine_snapshot_data_files_of_free(struct MoraineDataFileDesc *items, size_t len);
+
+// Resolves `schema_name.table_name` to its table id in `snapshot`, written
+// to `*out_table_id`.
+//
+// # Safety
+//
+// `snapshot` must point to a live [`MoraineSnapshotHandle`]; the names must
+// be valid NUL-terminated strings; `out_table_id` must be non-null and
+// writable; `err`, if non-null, must be writable.
+int32_t moraine_snapshot_resolve_table(struct MoraineSnapshotHandle *snapshot,
+                                       const char *schema_name,
+                                       const char *table_name,
+                                       uint64_t *out_table_id,
+                                       struct MoraineError *err);
+
+// Writes the id of the snapshot `snapshot` views to `*out_snapshot_id`.
+//
+// # Safety
+//
+// `snapshot` must point to a live [`MoraineSnapshotHandle`];
+// `out_snapshot_id` must be non-null and writable; `err`, if non-null,
+// must be writable.
+int32_t moraine_snapshot_id(struct MoraineSnapshotHandle *snapshot,
+                            uint64_t *out_snapshot_id,
+                            struct MoraineError *err);
 
 // Mints a checkpoint over `handle`'s current durable state and writes its
 // id to `*out_id` (free with `moraine_string_free`).

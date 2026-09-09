@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     error::{AbiError, MoraineError, codes},
-    runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
+    runtime::{MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle},
 };
 
 /// One `(row_id, data_file_id)` pair to resolve to an exact file position,
@@ -107,7 +107,8 @@ fn into_c_array<T>(items: Vec<T>) -> (*mut T, usize) {
 
 /// Resolves located rows to exact file positions for deletion without a
 /// scan. `pairs` are `(row_id, data_file_id)` as a lookup reports them,
-/// `has_data_file_id` false naming a live inlined row.
+/// `has_data_file_id` false naming a live inlined row. Resolution is
+/// against `snapshot` when non-null, else the catalog head.
 ///
 /// Writes `out_files` (one entry per data file carrying a requested
 /// position, each with its own positions and whatever delete file is
@@ -129,14 +130,16 @@ fn into_c_array<T>(items: Vec<T>) -> (*mut T, usize) {
 ///
 /// # Safety
 ///
-/// Every pointer must be valid per the ABI contract; `pairs` points to
-/// `pairs_len` pairs; every `out_*` pointer must be non-null and writable;
-/// `probe`/`probe_ctx` must satisfy the interrupt-probe contract; `err`, if
-/// non-null, must be writable.
+/// Every pointer must be valid per the ABI contract; `snapshot`, if
+/// non-null, must be a live snapshot of `handle`'s catalog; `pairs` points
+/// to `pairs_len` pairs; every `out_*` pointer must be non-null and
+/// writable; `probe`/`probe_ctx` must satisfy the interrupt-probe contract;
+/// `err`, if non-null, must be writable.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn moraine_locate_row_positions(
     handle: *mut MoraineCatalogHandle,
+    snapshot: *mut MoraineSnapshotHandle,
     schema_name: *const c_char,
     table_name: *const c_char,
     pairs: *const MorainePositionPair,
@@ -194,14 +197,18 @@ pub unsafe extern "C" fn moraine_locate_row_positions(
             .collect();
 
         let reads = handle_ref.catalog.reads();
-        // SAFETY: caller contract for `probe`/`probe_ctx`.
-        let snapshot =
-            unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, reads.snapshot()) }?;
-        let table_id = resolve_table(&snapshot, schema, table)?;
+        // SAFETY: caller contract for `snapshot`, `probe`, and `probe_ctx`.
+        let view = unsafe { super::pinned_or_head(handle_ref, snapshot, probe, probe_ctx) }?;
+        let table_id = resolve_table(&view, schema, table)?;
 
         let data_store = handle_ref.data_store.clone();
-        let locate =
-            reads.locate_row_positions(data_store, &handle_ref.data_prefix, table_id, &pairs);
+        let locate = reads.locate_row_positions_at(
+            &view,
+            data_store,
+            &handle_ref.data_prefix,
+            table_id,
+            &pairs,
+        );
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let located = unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, locate) }?;
 
