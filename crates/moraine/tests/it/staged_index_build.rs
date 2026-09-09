@@ -2,6 +2,7 @@
 //! `ready` over a table whose rows live in registered Parquet files.
 
 mod gated_store;
+mod overlap_store;
 mod races;
 
 use std::{
@@ -18,7 +19,7 @@ use moraine::{
     TableId,
 };
 use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
-use parquet::arrow::ArrowWriter;
+use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{layer::Context, prelude::*};
 
@@ -693,5 +694,243 @@ async fn a_zero_step_bound_is_refused() {
             .unwrap_err();
         assert!(matches!(err, Error::Constraint(_)), "{err}");
     }
+    catalog.close().await.unwrap();
+}
+
+/// Registers one table over `files`, each written in `group_rows`-row
+/// groups so a build has row groups to split.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn table_with_grouped_files(
+    data: Arc<dyn object_store::ObjectStore>,
+    files: &[Vec<i64>],
+    group_rows: usize,
+) -> (Catalog, TableId) {
+    let catalog = open_memory().await;
+    let arrow_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let mut registrations = Vec::new();
+    for (ordinal, values) in files.iter().enumerate() {
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int64Array::from(values.clone()))],
+        )
+        .unwrap();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(group_rows))
+            .build();
+        let mut buffer = Vec::new();
+        {
+            let mut writer =
+                ArrowWriter::try_new(&mut buffer, batch.schema(), Some(properties)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let footer_offset = buffer.len() - 8;
+        let footer_size = u64::from(u32::from_le_bytes(
+            buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+        ));
+        let file_size_bytes = u64::try_from(buffer.len()).unwrap();
+        let path = format!("grouped-{ordinal}.parquet");
+        data.put(&Path::from(format!("main/orders/{path}")), buffer.into())
+            .await
+            .unwrap();
+        registrations.push(moraine::DataFile {
+            path,
+            record_count: u64::try_from(values.len()).unwrap(),
+            file_size_bytes,
+            footer_size,
+            ..datafile(0)
+        });
+    }
+
+    let created = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap schema").id;
+            let table = tx.create_table(schema, "orders", &[col("a")])?;
+            for file in &registrations {
+                tx.register_data_file(table, file.clone(), &[])?;
+            }
+            created.set(Some(table));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    (catalog, created.get().unwrap())
+}
+
+/// The `Some(n)` a debug-formatted cursor field carries.
+#[allow(clippy::unwrap_used)]
+fn cursor_field(event: &BTreeMap<String, String>, name: &str) -> u64 {
+    event[name]
+        .trim_start_matches("Some(")
+        .trim_end_matches(')')
+        .parse()
+        .unwrap()
+}
+
+/// Rows spread over several files and row groups reach the index exactly
+/// once, and the persisted source cursor only ever moves forward.
+#[tokio::test]
+async fn multi_row_group_files_are_covered_once_in_source_order() {
+    const INDEX_NAME: &str = "grouped_by_a";
+    let events = captured_events();
+    let files: Vec<Vec<i64>> = (0..3)
+        .map(|file| (file * 2_500..(file + 1) * 2_500).collect())
+        .collect();
+    let data: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let (catalog, table) = table_with_grouped_files(data.clone(), &files, 1_000).await;
+    let grouped_def = IndexDef {
+        name: INDEX_NAME.to_owned(),
+        ..def(true)
+    };
+
+    let index = catalog
+        .create_index_staged(
+            table,
+            &grouped_def,
+            &[],
+            Some(DataStore::new(data)),
+            "",
+            Some(by_entries(700)),
+        )
+        .await
+        .unwrap();
+
+    let rows = catalog
+        .index_range(
+            table,
+            index,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(
+        rows.into_iter().eq(0..7_500),
+        "every row indexed exactly once"
+    );
+
+    let steps = events.named_for("staged index build step committed", INDEX_NAME);
+    let cursors: Vec<(u64, u64)> = steps
+        .iter()
+        .map(|event| {
+            (
+                cursor_field(event, "source_file"),
+                cursor_field(event, "source_position"),
+            )
+        })
+        .collect();
+    assert!(
+        cursors.windows(2).all(|pair| pair[0] < pair[1]),
+        "source cursors regressed: {cursors:?}"
+    );
+    assert_eq!(steps.last().unwrap()["is_final"], "true");
+    catalog.close().await.unwrap();
+}
+
+/// A build cancelled with its cursor inside a row group resumes from that
+/// position, not the group's start, and still covers each row once.
+#[tokio::test]
+async fn cancelled_build_resumes_inside_a_row_group() {
+    let data: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let (catalog, table) =
+        table_with_grouped_files(data.clone(), &[(0..2_500).collect()], 1_000).await;
+    let unique = def(true);
+    let mut build = Box::pin(catalog.create_index_staged(
+        table,
+        &unique,
+        &[],
+        Some(DataStore::new(data.clone())),
+        "",
+        Some(by_entries(300)),
+    ));
+    let checkpoint = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let snapshot = catalog.snapshot().await.unwrap();
+            if let Some(index) = snapshot.index_by_name(table, "by_a")
+                && index
+                    .build_position_cursor
+                    .is_some_and(|position| position % 1_000 != 999)
+            {
+                assert_eq!(index.state, IndexState::Building);
+                break index.id;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    let index = tokio::select! {
+        result = &mut build => panic!("build finished before cancellation: {result:?}"),
+        index = checkpoint => index.unwrap(),
+    };
+    drop(build);
+
+    let resumed = catalog
+        .create_index_staged(
+            table,
+            &def(true),
+            &[],
+            Some(DataStore::new(data)),
+            "",
+            Some(by_entries(10_000)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed, index);
+    let rows = catalog
+        .index_range(
+            table,
+            index,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(rows.into_iter().eq(0..2_500));
+    catalog.close().await.unwrap();
+}
+
+/// Reads of different files and row groups overlap instead of waiting on
+/// one another.
+#[tokio::test]
+async fn file_reads_overlap_across_files_and_row_groups() {
+    let backing = Arc::new(InMemory::new());
+    let store = Arc::new(overlap_store::OverlapStore::new(backing));
+    let data: Arc<dyn object_store::ObjectStore> = store.clone();
+    let files: Vec<Vec<i64>> = (0..6)
+        .map(|file| (file * 2_000..(file + 1) * 2_000).collect())
+        .collect();
+    let (catalog, table) = table_with_grouped_files(data.clone(), &files, 1_000).await;
+
+    let index = catalog
+        .create_index_staged(
+            table,
+            &def(true),
+            &[],
+            Some(DataStore::new(data)),
+            "",
+            Some(by_entries(5_000)),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store.peak_in_flight() > 1,
+        "reads never overlapped: peak {}",
+        store.peak_in_flight()
+    );
+    let rows = catalog
+        .index_range(
+            table,
+            index,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(rows.into_iter().eq(0..12_000));
     catalog.close().await.unwrap();
 }

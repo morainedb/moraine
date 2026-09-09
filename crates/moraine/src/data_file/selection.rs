@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use object_store::path::Path;
 use parquet::{
-    arrow::arrow_reader::RowSelection,
+    arrow::{
+        ParquetRecordBatchStreamBuilder, arrow_reader::RowSelection, async_reader::AsyncFileReader,
+    },
     file::metadata::{PageIndexPolicy, ParquetMetaData},
 };
 
@@ -22,8 +24,14 @@ pub(crate) enum ScopedRows<'a> {
     /// Only the rows at these physical positions; entries come back in
     /// position order.
     At(&'a RowPositions),
-    /// Every row from this physical position through the end of the file.
-    From(u64),
+    /// One row group, from the physical position `from` (at or after the
+    /// group's first row) through the group's end.
+    RowGroup {
+        /// Index of the row group in file order.
+        group: usize,
+        /// Physical position of the first row to read.
+        from: u64,
+    },
 }
 
 impl ScopedRows<'_> {
@@ -36,8 +44,30 @@ impl ScopedRows<'_> {
     pub(super) fn page_index_policy(self) -> PageIndexPolicy {
         match self {
             Self::All => PageIndexPolicy::Skip,
-            Self::At(_) | Self::From(_) => PageIndexPolicy::Optional,
+            Self::At(_) | Self::RowGroup { .. } => PageIndexPolicy::Optional,
         }
+    }
+}
+
+/// The row groups and rows a scoped read narrows its reader to.
+pub(super) struct RowScope {
+    groups: Option<Vec<usize>>,
+    rows: Option<RowSelection>,
+}
+
+impl RowScope {
+    /// Narrows `builder` to this scope.
+    pub(super) fn narrow<T: AsyncFileReader>(
+        self,
+        mut builder: ParquetRecordBatchStreamBuilder<T>,
+    ) -> ParquetRecordBatchStreamBuilder<T> {
+        if let Some(groups) = self.groups {
+            builder = builder.with_row_groups(groups);
+        }
+        if let Some(rows) = self.rows {
+            builder = builder.with_row_selection(rows);
+        }
+        builder
     }
 }
 
@@ -80,7 +110,7 @@ impl FromIterator<u64> for RowPositions {
 pub(super) enum Ordinals<'a> {
     /// Every row was read, so the nth emitted row is the nth row.
     Dense,
-    /// A full-file read resumed at this physical position.
+    /// A read of consecutive rows starting at this physical position.
     Offset(u64),
     /// Only these positions were read, in this order.
     Selected(&'a [u64]),
@@ -120,32 +150,62 @@ impl OwnedOrdinals {
 
 pub(super) fn scoped_selection(
     rows: ScopedRows<'_>,
-    total: usize,
-) -> Result<(Option<RowSelection>, OwnedOrdinals)> {
+    metadata: &ParquetMetaData,
+    path: &Path,
+) -> Result<(RowScope, OwnedOrdinals)> {
+    let total = total_rows(metadata, path)?;
+    let whole_file = |rows| RowScope { groups: None, rows };
     match rows {
-        ScopedRows::All => Ok((None, OwnedOrdinals::Dense)),
+        ScopedRows::All => Ok((whole_file(None), OwnedOrdinals::Dense)),
         ScopedRows::At(positions) => Ok((
-            Some(row_selection(positions.as_slice(), total)?),
+            whole_file(Some(row_selection(positions.as_slice(), total)?)),
             OwnedOrdinals::Selected(positions.clone()),
         )),
-        ScopedRows::From(start_ordinal) => {
-            let start = usize::try_from(start_ordinal)
-                .ok()
-                .filter(|start| *start <= total)
+        ScopedRows::RowGroup { group, from } => {
+            let counts = row_group_row_counts(metadata, path)?;
+            let group_rows = counts.get(group).copied().ok_or_else(|| {
+                Error::Corruption(format!("scoped read: {path} has no row group {group}"))
+            })?;
+            let group_start: u64 = counts[..group].iter().sum();
+            let offset = from
+                .checked_sub(group_start)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .filter(|offset| usize_as_u64(*offset) <= group_rows)
                 .ok_or_else(|| {
                     Error::Corruption(format!(
-                        "scoped read: resume row {start_ordinal} is past the file's {total} rows"
+                        "scoped read: resume row {from} is outside row group {group} of {path}"
                     ))
                 })?;
+            let group_rows = usize::try_from(group_rows).map_err(|_| {
+                Error::Corruption(format!(
+                    "scoped read: row group {group} of {path} is larger than memory"
+                ))
+            })?;
             Ok((
-                Some(RowSelection::from_consecutive_ranges(
-                    std::iter::once(start..total),
-                    total,
-                )),
-                OwnedOrdinals::Offset(start_ordinal),
+                RowScope {
+                    groups: Some(vec![group]),
+                    rows: Some(RowSelection::from_consecutive_ranges(
+                        std::iter::once(offset..group_rows),
+                        group_rows,
+                    )),
+                },
+                OwnedOrdinals::Offset(from),
             ))
         }
     }
+}
+
+/// Row counts of the file's row groups, in file order.
+pub(super) fn row_group_row_counts(metadata: &ParquetMetaData, path: &Path) -> Result<Vec<u64>> {
+    metadata
+        .row_groups()
+        .iter()
+        .map(|group| {
+            u64::try_from(group.num_rows()).map_err(|_| {
+                Error::Corruption(format!("scoped read: {path} reports a negative row count"))
+            })
+        })
+        .collect()
 }
 
 /// The row selection naming `positions` in a file of `total_rows`.

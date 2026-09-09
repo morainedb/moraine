@@ -89,14 +89,17 @@ async fn expiry_during_build(files: usize, step: usize) {
     ));
     let expire = async {
         gate.arrival().await;
+        // Reads run ahead of commits, so the expiry waits for the first
+        // step to be durable rather than assuming the arrival implies it.
         if files > 1 {
-            let snapshot = catalog.snapshot().await.unwrap();
-            let index = snapshot.index_by_name(table, "by_a").unwrap();
-            assert_eq!(
-                index.build_cursor,
-                Some(0),
-                "the first step must already be durable"
-            );
+            loop {
+                let snapshot = catalog.snapshot().await.unwrap();
+                let index = snapshot.index_by_name(table, "by_a").unwrap();
+                if index.build_cursor == Some(0) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
         }
         catalog
             .commit(|tx| tx.expire_data_file(table, expired))

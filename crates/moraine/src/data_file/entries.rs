@@ -104,6 +104,7 @@ pub(super) fn record_batch_index_entries(
             let (key, unique) = build_canonical_keys(batch, projection, row, row_id)?;
             entries.push(ScopedIndexEntry {
                 index,
+                ordinal,
                 row_id,
                 key,
                 unique,

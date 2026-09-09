@@ -5,6 +5,7 @@ use std::{
     ops::Deref,
 };
 
+use bytes::Bytes;
 use uuid::Uuid;
 
 use crate::{
@@ -31,6 +32,18 @@ use crate::{
 };
 
 /// What staging an entry against an index needs to know about it.
+/// An index entry already encoded to its physical key, as a staged build
+/// derives it off the driving task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EncodedIndexEntry {
+    /// The row the entry points at.
+    pub(crate) row_id: u64,
+    /// The final encoded entry key.
+    pub(crate) key: Bytes,
+    /// Whether the key uses the unique physical shape.
+    pub(crate) unique: bool,
+}
+
 struct IndexShape {
     /// Whether the index enforces uniqueness.
     unique: bool,
@@ -1097,6 +1110,7 @@ impl Transaction {
 
     /// Advances a staged build and persists the file position covered by
     /// this step.
+    #[cfg(test)]
     pub(crate) fn build_index_source_step(
         &mut self,
         index: IndexId,
@@ -1108,6 +1122,42 @@ impl Transaction {
         self.build_index_step_at(index, batch, is_final, source, inline)
     }
 
+    /// Advances a staged build with entries its driver already encoded to
+    /// their physical keys under the definition it derived from.
+    pub(crate) fn build_index_encoded_step(
+        &mut self,
+        index: IndexId,
+        batch: &[EncodedIndexEntry],
+        is_final: bool,
+        source: Option<(u64, u64)>,
+        inline: Option<&crate::store::proto::InlineBuildCursorValue>,
+    ) -> Result<IndexState> {
+        let (table_id, value) = self.building_index(index)?;
+        let building = IndexShape::of_value(&value).building;
+        let mut cursor = value.build_cursor_row_id.unwrap_or(0);
+        for entry in batch {
+            cursor = cursor.max(entry.row_id);
+            self.index_entries.push(StagedIndexEntry {
+                index_id: index.get(),
+                unique: entry.unique,
+                key: entry.key.clone(),
+                row_id: entry.row_id,
+                delete: false,
+                building,
+            });
+        }
+
+        Ok(self.finish_build_step(
+            table_id,
+            value,
+            cursor,
+            batch.is_empty(),
+            is_final,
+            source,
+            inline,
+        ))
+    }
+
     fn build_index_step_at(
         &mut self,
         index: IndexId,
@@ -1116,15 +1166,7 @@ impl Transaction {
         source: Option<(u64, u64)>,
         inline: Option<&crate::store::proto::InlineBuildCursorValue>,
     ) -> Result<IndexState> {
-        let (table_id, mut value) = self.live_index(index)?;
-        if !matches!(
-            value.build_state.as_deref(),
-            Some("building" | "maintaining")
-        ) {
-            return Err(Error::Constraint(format!("index {index} is not building")));
-        }
-
-        let maintenance_repair = value.build_state.as_deref() == Some("maintaining");
+        let (table_id, value) = self.building_index(index)?;
         let shape = IndexShape::of_value(&value);
         let mut cursor = value.build_cursor_row_id.unwrap_or(0);
         for entry in batch {
@@ -1132,9 +1174,46 @@ impl Transaction {
             self.stage_index_entry(index.get(), &shape, entry.row_id, &entry.values, false)?;
         }
 
+        Ok(self.finish_build_step(
+            table_id,
+            value,
+            cursor,
+            batch.is_empty(),
+            is_final,
+            source,
+            inline,
+        ))
+    }
+
+    /// The live definition of an index whose build may still advance.
+    fn building_index(&self, index: IndexId) -> Result<(u64, IndexValue)> {
+        let (table_id, value) = self.live_index(index)?;
+        if !matches!(
+            value.build_state.as_deref(),
+            Some("building" | "maintaining")
+        ) {
+            return Err(Error::Constraint(format!("index {index} is not building")));
+        }
+        Ok((table_id, value))
+    }
+
+    /// Records a step's cursors on the definition and flips it ready when
+    /// the step is final.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_build_step(
+        &mut self,
+        table_id: u64,
+        mut value: IndexValue,
+        cursor: u64,
+        empty: bool,
+        is_final: bool,
+        source: Option<(u64, u64)>,
+        inline: Option<&crate::store::proto::InlineBuildCursorValue>,
+    ) -> IndexState {
+        let maintenance_repair = value.build_state.as_deref() == Some("maintaining");
         value.begin_snapshot = self.new_snapshot_id;
         // Unordered inline sources must not advance the older row watermark.
-        if !batch.is_empty() && inline.is_none_or(|cursor| cursor.complete) {
+        if !empty && inline.is_none_or(|cursor| cursor.complete) {
             value.build_cursor_row_id = Some(cursor);
         }
         if let Some(inline) = inline {
@@ -1169,7 +1248,7 @@ impl Transaction {
         } else {
             self.ops.push(Operation::AdvanceIndexBuild { table_id });
         }
-        Ok(resulting_state)
+        resulting_state
     }
 
     fn live_table_stats(&self, table: TableId) -> Result<TableStatsValue> {

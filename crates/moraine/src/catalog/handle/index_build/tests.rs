@@ -10,7 +10,7 @@ use arrow::{
 use object_store::memory::InMemory;
 
 use super::*;
-use crate::{CatalogOptions, ColumnDef, InlineChunk};
+use crate::{CatalogOptions, ColumnDef, IndexEntry, InlineChunk};
 
 fn chunk(values: Vec<i64>) -> InlineChunk {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));

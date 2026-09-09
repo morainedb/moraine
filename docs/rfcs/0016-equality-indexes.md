@@ -426,6 +426,10 @@ first:
   30-second default at a little over 270 KiB/s, which is slower than any
   link a build has a right to expect.
 
+`entries` bounds one step's buffer, not the process: derivation holds the
+step being filled and the step being committed, plus the fixed read-ahead
+window described under Staged builds.
+
 A step always carries at least one entry: an entry wider than the byte
 bound still has to be committed, and a step that admitted nothing would
 never advance.
@@ -439,11 +443,9 @@ lifts the byte bound to cut commit count is exactly who needs a step still
 capped at a million entries, because at 256 MiB the byte bound alone would
 admit fourteen million and the memory limit above is real.
 
-The byte figure is **nominal** — summed before the keys are encoded, since
-the step boundary has to be chosen first. Framing escapes `0x00` and
-`0x01`, which at worst doubles a value, so the committed batch can be up to
-twice the bound. The margin against the timeout absorbs that; a property
-test pins the bracket.
+The byte figure is **exact**: entries are encoded to their physical keys
+as they are derived, so a step is measured on the key and value bytes its
+commit stages, escaping included.
 
 Both are settable per call, because neither default can know the link. The
 transfer bound is the one an operator on a slow or distant link reaches
@@ -1070,6 +1072,26 @@ entry set. Delete files and inline deletes are applied as each source is
 read. Each step ends at whichever `BuildStep` bound it reaches first (Two
 bounds on a step) and always carries at least one entry.
 
+**Derivation runs beside its commits.** A full step is handed to a
+committer that lands steps in order while derivation fills the next one,
+so a step's durable write overlaps the reads and decoding behind it. The
+committer checks the derivation snapshot inside each closure exactly as
+before; a conflict ends the pass and the next derives afresh. A derivation
+failure is delivered to the committer behind the steps already handed off,
+so those still land before it surfaces.
+
+**The external leg reads ahead.** Files are planned several at a time:
+the footer, the file's read-column mapping, its inline file-deletes, and
+its delete files resolve concurrently, ahead of the position being
+consumed. Each row group of a planned file is a unit read on its own task,
+which decodes the group and encodes its entries to physical keys off the
+driving task, holding a fixed number of encoded batches ahead of the
+consumer. A bounded window of units runs at once. Entries are consumed
+strictly in file-then-position order, so the source cursor is exactly what
+it was under a serial read, and a resume inside a row group reads that
+group from the cursor. A single large file therefore still parallelizes
+across its row groups; a file with one row group does not.
+
 SQL-write upkeep compiles one projection plan per live index, deduplicates
 shared Arrow columns, and decodes each Parquet or inline batch once. A scalar
 stays borrowed from its Arrow array while the store-layer canonical builder
@@ -1097,7 +1119,7 @@ Inline progress identifies `(schema_version, begin_snapshot, chunk_seq)` and
 its next row offset, plus flags for a completed chunk and inline leg. The
 covered snapshot identifies the last committed step. The driver streams these
 immutable sources in key order, holding one body and projected Arrow batch,
-resolving tombstones through a bounded range iterator, and deriving one entry
+resolving tombstones through a bounded range iterator, and encoding one entry
 at a time into the step buffer. It caches only the current decoded schema.
 
 Inline source order need not match row-id order. Streamed inline steps therefore
@@ -1117,11 +1139,12 @@ snapshot; otherwise it replays live inline sources, including updates that
 preserved a row id. Every cursor update is guarded by the derivation snapshot,
 so another builder or writer cannot move progress under a stale premise.
 
-`BuildStep` bounds the committed entry buffer, not all process memory. Derivation
-also retains one source chunk or Parquet batch, schema projection, store iterator
-buffers, and source-local deletion state. An individual stored Arrow chunk can
-be larger than a step; no path retains all inline chunks or all derived inline
-entries. Entry-buffer and inline body/decoded-array high-water telemetry are
+`BuildStep` bounds one step's entry buffer, not all process memory. Derivation
+also retains the step being committed, the read-ahead window of units with
+their buffered encoded batches, one inline source chunk, schema projection,
+store iterator buffers, and per-file deletion state. An individual stored
+Arrow chunk can be larger than a step; no path retains all inline chunks or
+all derived inline entries. Entry-buffer and inline body/decoded-array high-water telemetry are
 reported separately; array buffers can share body memory, so those byte counts
 must not be added as a heap estimate. Whole-operation allocator peak measurements
 include store caches and commit/WAL work as well as derivation.
@@ -1642,7 +1665,13 @@ tests against real SlateDB on in-memory `object_store`:
 - **Staged resume and racing builders.** A builder killed mid-build resumes
   from the persisted cursor with idempotent re-puts; two builders advancing
   one build serialize on the definition key, and a stale retry cannot regress
-  the source cursor.
+  the source cursor. A build cancelled with its cursor inside a row group
+  resumes from that position and covers each row once.
+- **Ordered read-ahead.** Over several multi-row-group files, every row
+  reaches the index exactly once and each committed step's source cursor is
+  strictly greater than the last; reads of different files and row groups
+  are observed in flight at once, and a row-group read emits only its group
+  at the group's file ordinals.
 - **Ready-flip visibility.** A write in flight across the flip re-runs
   (altered-table conflict) and commits under full enforcement — a duplicate
   in that write gets `Constraint`, not poison.
