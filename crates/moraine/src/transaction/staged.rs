@@ -447,11 +447,11 @@ impl StagedTransaction {
     /// projection state and no `DATA_PATH` store — for tests that drive a
     /// `StagedTransaction` directly without a `Catalog`.
     #[cfg(test)]
-    pub(crate) fn begin_detached(db_tx: DbTransaction) -> Self {
+    pub(crate) fn begin_detached(catalog: &crate::Catalog, db_tx: DbTransaction) -> Self {
         Self::begin(
             db_tx,
             Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
-            None,
+            Some(catalog.store()),
             None,
             String::new(),
             Arc::default(),
@@ -478,11 +478,15 @@ impl StagedTransaction {
     /// As [`begin_detached`](Self::begin_detached), but reading registered
     /// files from `data_store` — for tests that exercise the file paths.
     #[cfg(test)]
-    pub(crate) fn begin_detached_with_store(db_tx: DbTransaction, data_store: DataStore) -> Self {
+    pub(crate) fn begin_detached_with_store(
+        catalog: &crate::Catalog,
+        db_tx: DbTransaction,
+        data_store: DataStore,
+    ) -> Self {
         Self::begin(
             db_tx,
             Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
-            None,
+            Some(catalog.store()),
             Some(data_store),
             String::new(),
             Arc::default(),

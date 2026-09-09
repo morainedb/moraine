@@ -11,6 +11,7 @@ async fn indexed_files_and_deletes_resolve_trailing_data_prefixes() {
         let (_, batch) = bigint_batch(&[10, 20, 30]);
         let size = write_parquet(&store, "org-123/main/t/data.parquet", &batch).await;
         let mut tx = StagedTransaction::begin_detached_with_store(
+            &catalog,
             catalog.begin_write_tx().await.unwrap(),
             DataStore::new(store.clone()),
         );
@@ -39,6 +40,7 @@ async fn indexed_files_and_deletes_resolve_trailing_data_prefixes() {
             .await
             .unwrap();
         let mut tx = StagedTransaction::begin_detached_with_store(
+            &catalog,
             catalog.begin_write_tx().await.unwrap(),
             DataStore::new(store.clone()),
         );

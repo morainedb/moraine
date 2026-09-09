@@ -106,7 +106,11 @@ fn additive_ceiling(current: u64) -> u64 {
 /// below any format reached by a structural rewrite instead of stamping
 /// past it. `dry_run` reports the move it would make and stamps nothing,
 /// which is the only way to read a store's format without changing it.
-pub(crate) async fn raise_format(db: &Db, dry_run: bool) -> Result<FormatRaise> {
+pub(crate) async fn raise_format(
+    db: &Db,
+    durability: &CommitDurability,
+    dry_run: bool,
+) -> Result<FormatRaise> {
     let tx = db
         .begin(IsolationLevel::Snapshot)
         .await
@@ -163,13 +167,7 @@ pub(crate) async fn raise_format(db: &Db, dry_run: bool) -> Result<FormatRaise> 
         tx.rollback();
         return Err(Error::from(error));
     }
-    commit_durable(
-        tx,
-        "format raise",
-        staged,
-        &CommitDurability::OnFlushInterval,
-    )
-    .await?;
+    commit_durable(tx, "format raise", staged, durability).await?;
 
     info!(from_format, to_format, "raised the store format");
     Ok(FormatRaise {
@@ -458,7 +456,9 @@ pub(crate) async fn run(db: &Db) -> Result<MigrationReport> {
     // Older additive stamps can reach the first rewrite's source without
     // moving keys. An interrupted rewrite must resume at its recorded stamp.
     let planning_format = if marker.is_none() && from_format < commit::MIN_FORMAT_VERSION {
-        raise_format(db, false).await?.to_format
+        raise_format(db, &CommitDurability::OnFlushInterval, false)
+            .await?
+            .to_format
     } else {
         from_format
     };

@@ -2,8 +2,11 @@
 //!
 //! A store admits one batch at a time. A commit that finds the store free
 //! opens a batch and stages onto it; a commit that finds one forming joins
-//! it; a commit that finds one in flight waits for the next. A batch seals
-//! the moment no caller is on its way into it; nothing waits on a timer.
+//! it; a commit that finds one being submitted waits for the next. A batch
+//! seals the moment no caller is on its way into it; nothing waits on a
+//! timer. A submitted batch is visible and folded before it is durable, so
+//! the next batch forms and submits while it awaits its flush, and the
+//! flush pacer lets the two share one.
 
 use std::sync::{
     Arc,
@@ -15,8 +18,8 @@ use slatedb::{Db, DbTransaction, IsolationLevel};
 use tokio::sync::{Mutex, MutexGuard, watch};
 
 use super::{
-    CommitDurability, HeadTransition, HeadViewUpdate, Landed, Prepared, StagedWrite, commit_batch,
-    fold, head_view_for, prepare_and_stage,
+    CommitDurability, HeadTransition, HeadViewUpdate, Landed, Prepared, StagedWrite, Submission,
+    await_submitted, fold, head_view_for, prepare_and_stage, submit_batch,
 };
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
@@ -309,7 +312,7 @@ impl Coalescer {
         } = batch;
 
         outcome.send_replace(BatchState::Submitted);
-        let landed = match std::panic::AssertUnwindSafe(commit_batch(
+        let submission = std::panic::AssertUnwindSafe(submit_batch(
             db_tx,
             HeadTransition {
                 before: head_before,
@@ -319,13 +322,39 @@ impl Coalescer {
             staged_bytes,
             HeadViewUpdate::Rebuild(base),
             &self.projections,
-            &self.durability,
         ))
         .catch_unwind()
-        .await
-        {
-            Ok(Ok(Landed::Committed(_))) => Outcome::Committed,
-            Ok(Ok(Landed::LostRace)) => Outcome::LostRace,
+        .await;
+        // Visible and folded, or decided: the store admits the next batch
+        // while this one awaits its flush, so the two may share it.
+        self.reopen().await;
+
+        let landed = match submission {
+            Ok(Ok(Submission::Submitted(submitted))) => {
+                match std::panic::AssertUnwindSafe(await_submitted(
+                    submitted,
+                    &self.projections,
+                    &self.durability,
+                ))
+                .catch_unwind()
+                .await
+                {
+                    Ok(Ok(Landed::Committed(_))) => Outcome::Committed,
+                    Ok(Ok(Landed::LostRace)) => Outcome::LostRace,
+                    Ok(Err(Error::Fenced(reason))) => Outcome::Fenced(reason),
+                    Ok(Err(err)) => {
+                        tracing::warn!(error = %err, "commit batch outcome is unknown; its members must not retry");
+                        Outcome::Unknown(err.to_string())
+                    }
+                    Err(_) => {
+                        super::invalidate_head_view(&self.projections);
+                        Outcome::Unknown(
+                            "the submitted batch panicked before acknowledgement".into(),
+                        )
+                    }
+                }
+            }
+            Ok(Ok(Submission::LostRace)) => Outcome::LostRace,
             Ok(Err(Error::Fenced(reason))) => Outcome::Fenced(reason),
             Ok(Err(err)) => {
                 tracing::warn!(error = %err, "commit batch outcome is unknown; its members must not retry");
@@ -338,7 +367,10 @@ impl Coalescer {
         };
         // Every member may already have gone; the batch landed regardless.
         let _ = outcome.send(BatchState::Finished(landed));
+    }
 
+    /// Lets the next batch form and submit.
+    async fn reopen(&self) {
         let mut shared = self.shared.lock().await;
         shared.in_flight = false;
         self.flights

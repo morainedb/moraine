@@ -1415,13 +1415,14 @@ mod tests {
         .unwrap();
         let (key, stamp) = commit::head_stamp(head.snapshot_id, head.batch_seq);
         tx.put(key, stamp.unwrap()).unwrap();
-        tx.commit()
-            .await
-            .unwrap()
-            .unwrap()
-            .await_durable()
-            .await
-            .unwrap();
+        commit::commit_durable(
+            tx,
+            "test",
+            crate::store::StagedBytes::default(),
+            &catalog.store().commit_durability(),
+        )
+        .await
+        .unwrap();
     }
 
     fn refuses<T>(outcome: &Result<T>) -> bool {
@@ -1632,7 +1633,7 @@ mod tests {
             .await
             .unwrap();
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
         tx.stage(RowOperation::Insert {
             table: TableKind::ColumnMapping,
             cells: vec![Cell::U64(21), Cell::U64(1), Cell::Str("map_by_name".into())],

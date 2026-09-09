@@ -27,6 +27,7 @@ pub struct CountingStore {
     gets: AtomicU64,
     ranged_gets: AtomicU64,
     bytes: AtomicU64,
+    wal_puts: AtomicU64,
     touched: Mutex<HashSet<String>>,
 }
 
@@ -37,7 +38,21 @@ impl CountingStore {
             gets: AtomicU64::new(0),
             ranged_gets: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            wal_puts: AtomicU64::new(0),
             touched: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Write-ahead-log objects written since the last call, and resets the
+    /// tally — one per flush, the PUT a commit's durability costs.
+    #[allow(dead_code)]
+    pub fn take_wal_puts(&self) -> u64 {
+        self.wal_puts.swap(0, Ordering::SeqCst)
+    }
+
+    fn record_put(&self, location: &Path) {
+        if location.as_ref().contains("wal/") {
+            self.wal_puts.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -90,6 +105,7 @@ impl ObjectStore for CountingStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
+        self.record_put(location);
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -98,6 +114,7 @@ impl ObjectStore for CountingStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.record_put(location);
         self.inner.put_multipart_opts(location, opts).await
     }
 

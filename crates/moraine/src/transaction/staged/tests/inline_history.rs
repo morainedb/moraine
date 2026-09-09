@@ -3,7 +3,8 @@
 use super::*;
 
 async fn commit_inline(catalog: &Catalog, snapshot: u64, operations: Vec<RowOperation>) {
-    let mut tx = StagedTransaction::begin_detached(catalog.begin_write_tx().await.unwrap());
+    let mut tx =
+        StagedTransaction::begin_detached(catalog, catalog.begin_write_tx().await.unwrap());
     for operation in operations {
         tx.stage(operation);
     }

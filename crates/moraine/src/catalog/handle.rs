@@ -118,9 +118,11 @@ struct StoreLocation {
 /// read-only `DbReader`. A read-only catalog never opens a `Db`, so it never
 /// fences a live writer.
 pub(crate) enum Store {
-    /// The single read-write writer, and whether its commits force the
-    /// write-ahead log out rather than waiting for the flush timer.
-    Writer { db: Db, flush_on_commit: bool },
+    /// The single read-write writer and the pacer its commits flush through.
+    Writer {
+        db: Db,
+        pacer: Arc<commit::FlushPacer>,
+    },
     /// A read-only reader following the manifest, shared into read sessions.
     Reader(Arc<DbReader>),
 }
@@ -140,10 +142,7 @@ impl Store {
     /// commits nothing, so it names the waiting route.
     pub(crate) fn commit_durability(&self) -> commit::CommitDurability {
         match self {
-            Self::Writer {
-                db,
-                flush_on_commit,
-            } => commit::writer_durability(db, *flush_on_commit),
+            Self::Writer { pacer, .. } => commit::CommitDurability::Paced(Arc::clone(pacer)),
             Self::Reader(_) => commit::CommitDurability::OnFlushInterval,
         }
     }
@@ -172,20 +171,18 @@ pub struct CatalogOptions {
     /// store bootstraps, and ignored on an already-initialized store,
     /// where the stored value is authoritative.
     pub encrypted: bool,
-    /// How often the store's write-ahead log is flushed to object
-    /// storage. Durable commits wait for the next flush, so this bounds
-    /// per-commit latency; smaller values mean more frequent (on S3,
-    /// costlier) object-store PUTs. Zero flushes continuously (no timer),
-    /// so a durable commit waits only on the object-store PUT — the lowest
-    /// latency, at the cost of a busy flush loop. Defaults to 100ms.
+    /// The minimum spacing between two flushes of the store's write-ahead
+    /// log to object storage, each one PUT. A commit that finds the spacing
+    /// elapsed flushes at once and waits only on its own PUT; one that
+    /// finds it running joins a single flush deferred to when it elapses,
+    /// so under load PUTs never exceed one per spacing and commits batch
+    /// into them, and no commit waits longer than the spacing plus a PUT.
+    /// Zero flushes every commit that finds no flush in the air. Defaults
+    /// to 100ms.
     pub flush_interval: Duration,
-    /// Whether a commit forces the write-ahead log out to object storage
-    /// rather than waiting for the next flush. It trades one object-store
-    /// PUT per commit for a commit latency that no longer includes up to a
-    /// whole [`flush_interval`](Self::flush_interval) of waiting — worth it
-    /// for a low commit rate, wasteful for a high one, where the interval
-    /// is what batches many commits into one PUT. Defaults to `false`,
-    /// leaving the interval in charge.
+    /// Whether every commit flushes on its own: the same as a zero
+    /// [`flush_interval`](Self::flush_interval), kept for callers that set
+    /// it. Defaults to `false`.
     pub flush_on_commit: bool,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
@@ -903,7 +900,12 @@ impl Catalog {
         &self,
         dry_run: bool,
     ) -> Result<crate::transaction::migration::FormatRaise> {
-        let raised = crate::transaction::migration::raise_format(self.writer()?, dry_run).await?;
+        let raised = crate::transaction::migration::raise_format(
+            self.writer()?,
+            &self.store.commit_durability(),
+            dry_run,
+        )
+        .await?;
         if !dry_run {
             crate::catalog::projection::raise_format_floor(self.projections(), raised.to_format);
         }
@@ -952,19 +954,26 @@ impl Catalog {
             .await
             .ok();
         warn_if_preload_cannot_fit(&options, manifest);
+        // The writer paces its own flushes; the store's timer stays off so
+        // the pacing is exact.
         let store = StoreBuilder::new(&options.path, object_store)
-            .flush_interval(options.flush_interval)
+            .without_flush_timer()
             .cache_dir(options.cache_dir.clone())
             .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
             .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts);
-        let (db, cache, format) = commit::open_initialized(
+        let flush_spacing = if options.flush_on_commit {
+            Duration::ZERO
+        } else {
+            options.flush_interval
+        };
+        let (db, cache, format, pacer) = commit::open_initialized(
             store,
             options.encrypted,
             options.data_path.as_deref(),
-            options.flush_on_commit,
+            flush_spacing,
         )
         .await?;
         warn_if_metadata_cache_cannot_hold(
@@ -981,14 +990,11 @@ impl Catalog {
         // The open already validated the stamp; commits below this floor
         // owe no format read.
         crate::catalog::projection::raise_format_floor(&projections, format);
-        let durability = commit::writer_durability(&db, options.flush_on_commit);
+        let durability = commit::CommitDurability::Paced(Arc::clone(&pacer));
         Ok(Self {
             inner: ReadOnlyCatalog {
                 writer_status: Some(db.subscribe()),
-                store: Arc::new(Store::Writer {
-                    db,
-                    flush_on_commit: options.flush_on_commit,
-                }),
+                store: Arc::new(Store::Writer { db, pacer }),
                 location: Arc::new(StoreLocation {
                     path: options.path,
                     object_store: located,
@@ -1250,6 +1256,22 @@ impl Catalog {
             .begin(IsolationLevel::Snapshot)
             .await
             .map_err(Error::from)
+    }
+
+    /// Commits a raw store transaction through the writer's paced route,
+    /// for tests that stage bytes the verbs do not; the writer runs no
+    /// flush timer, so a bare durability wait would never resolve.
+    #[cfg(test)]
+    pub(crate) async fn commit_write_tx(&self, tx: DbTransaction) -> Result<()> {
+        commit::commit_durable(
+            tx,
+            "test",
+            crate::store::StagedBytes::default(),
+            &self.store.commit_durability(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(Error::from)
     }
 
     /// Commits catalog mutations atomically, producing one new snapshot.

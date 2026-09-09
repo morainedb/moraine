@@ -679,11 +679,16 @@ impossible because a single committer serializes them before staging.
 so there is one commit path, not two. `Catalog::commit_group` batches what
 one caller hands it; concurrent callers of the ordinary `Catalog::commit`
 are batched without asking. A commit that finds the store free opens a
-batch, one that finds a batch forming joins it, one that finds a batch in
-flight waits for the next, and a batch seals as soon as no caller is on its
-way into it — so the flush already in the air is the batching window and an
-uncontended commit waits for nobody. A batch also seals at a bounded member
-count, since under saturation the arrival count never falls to zero.
+batch, one that finds a batch forming joins it, one that finds a batch
+being submitted waits for the next, and a batch seals as soon as no caller
+is on its way into it — so the submission in progress is the batching
+window and an uncontended commit waits for nobody. A batch also seals at a
+bounded member count, since under saturation the arrival count never falls
+to zero. Submission ends when the batch's write is visible and folded into
+the projections, before it is durable: the store then admits the next
+batch, which forms and submits while the first awaits its flush, and the
+two share that flush under the pacing below. Every member still returns
+only once its own batch is durable.
 
 Steps 1–3 run once per member, against a premise folded forward from the
 member before it (the same fold that refreshes the cached head view), so
@@ -697,6 +702,7 @@ durability granularity, not catalog shape.
 
 Measured, the coalescing is exact: a batch carries as many commits as there
 are concurrent committers, so throughput is `concurrency / flush_interval`
+(the flush spacing, under which back-to-back batches each wait one spacing)
 with no overhead visible at any level, up to the member ceiling — where 128
 concurrent commits land as two full batches at the same rate 64 do
 (`BENCHMARK.md`, "Commit throughput vs. concurrency"). The ceiling, not the
@@ -783,11 +789,41 @@ may still lag by its manifest poll interval — that is ordinary snapshot
 isolation, not a violation.)
 
 SlateDB 0.16 returns a `WriteHandle` once the transaction is visible in
-memory. Moraine's timer-driven commit path then awaits
-`WriteHandle::await_durable()` before reporting success; an empty transaction
-returns no handle and needs no wait. The immediate path explicitly flushes
-the WAL after submitting the transaction. Both paths retain shutdown and
+memory. Moraine then either flushes the WAL itself or awaits
+`WriteHandle::await_durable()` on a flush another commit is performing,
+per the pacing below, before reporting success; an empty transaction
+returns no handle and needs no wait. Both routes retain shutdown and
 fencing errors and report stalls without abandoning the durability wait.
+
+### Flush pacing
+
+Every WAL flush is one object-store PUT, so the flush rate is the PUT rate
+a commit stream costs. The writer opens its store with SlateDB's flush
+timer off and paces the flushes itself, under one setting,
+`flush_interval`, read as the minimum spacing between two flushes:
+
+- A commit that finds the spacing elapsed since the last flush flushes at
+  once and waits only on its own PUT.
+- A commit that finds the spacing running joins one flush deferred to the
+  moment it elapses; the first such commit performs it, the rest await
+  their handles on it.
+- A commit that finds a flush in the air, and so not carrying it, schedules
+  the next flush for when the spacing elapses from that flush's start.
+
+So a lone commit costs one PUT of latency, a burst costs at most the
+spacing plus one PUT, and PUTs never exceed one per spacing. The timer is
+off rather than kept as a ceiling because a tick landing inside a spacing
+window would carry the pending commits early, one extra PUT per tick, and
+the cap would only be approximate; it is safe to turn off because every
+Moraine write reaches the WAL through a commit that waits for durability,
+so nothing is left for a timer to sweep up. `flush_on_commit` is the same
+setting at zero. A store opened for a migration keeps the timer, since its
+few commits do not warrant pacing.
+
+Group commit and pacing compose: the coalescer batches concurrent commits
+into one write, a batch submitted while an earlier one awaits its deferred
+flush rides on that flush, and so under a burst every commit that lands
+inside one spacing is durable together at its end, in one PUT.
 
 The durability watcher advances only after the WAL reaches object storage.
 Both fresh-open paths — `Db::open` and `DbReader::open` in latest mode —

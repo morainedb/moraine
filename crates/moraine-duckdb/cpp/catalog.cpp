@@ -726,12 +726,12 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// (`META_ENCRYPTED true`, `META_FLUSH_INTERVAL_MS 5`, `META_CACHE_DIR '…'`),
 	// or directly on a standalone `moraine:` attach. `ENCRYPTED` is
 	// creation-time only: the ABI records it when a fresh store bootstraps and
-	// ignores it afterward. `FLUSH_INTERVAL_MS` sets the WAL flush cadence; 0 on
-	// the ABI means "not given", so an explicit zero (flush continuously, no
-	// timer) is mapped to the ABI's continuous-flush sentinel (UINT64_MAX).
-	// `FLUSH_ON_COMMIT` takes the cadence out of the commit path instead:
-	// each commit forces the WAL out itself, trading a PUT per commit for a
-	// latency that no longer includes waiting on the timer.
+	// ignores it afterward. `FLUSH_INTERVAL_MS` sets the minimum spacing
+	// between WAL flushes: a commit past the spacing flushes at once, one
+	// inside it joins a flush deferred to when it elapses. 0 on the ABI means
+	// "not given", so an explicit zero (flush every commit) is mapped to the
+	// ABI's sentinel (UINT64_MAX). `FLUSH_ON_COMMIT` is the same as a zero
+	// spacing, kept for attach lines that set it.
 	// `CACHE_DIR` is a local directory for the block cache's disk tier; it
 	// must outlive the moraine_attach call, so it lives in this scope.
 	// `CACHE_SIZE` bounds that directory and `CACHE_MEMORY` bounds the

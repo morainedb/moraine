@@ -74,7 +74,7 @@ pub(crate) fn preload_shortfall(store_bytes: u64, cache_size: Option<u64>) -> Op
 pub(crate) struct StoreBuilder<'a> {
     path: &'a str,
     object_store: Arc<dyn ObjectStore>,
-    flush_interval: Duration,
+    flush_interval: Option<Duration>,
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
     cache_identity: crate::CacheIdentity,
@@ -94,7 +94,7 @@ impl<'a> StoreBuilder<'a> {
         Self {
             path,
             object_store: retry::Store::wrap(object_store),
-            flush_interval: DEFAULT_FLUSH_INTERVAL,
+            flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
             cache_identity: crate::CacheIdentity::default(),
@@ -117,7 +117,15 @@ impl<'a> StoreBuilder<'a> {
     /// zero flushes continuously with no timer. Writer only — a reader
     /// never flushes.
     pub(crate) fn flush_interval(mut self, flush_interval: Duration) -> Self {
-        self.flush_interval = flush_interval;
+        self.flush_interval = Some(flush_interval);
+        self
+    }
+
+    /// Opens the writer with no flush timer: nothing flushes the
+    /// write-ahead log but an explicit `Db::flush`, so a durability wait
+    /// must be paired with one.
+    pub(crate) fn without_flush_timer(mut self) -> Self {
+        self.flush_interval = None;
         self
     }
 
@@ -263,7 +271,7 @@ impl<'a> StoreBuilder<'a> {
     /// SlateDB settings for a writer.
     fn settings(&self) -> Settings {
         Settings {
-            flush_interval: Some(self.flush_interval),
+            flush_interval: self.flush_interval,
             ..Default::default()
         }
     }
