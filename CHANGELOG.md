@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4](https://github.com/morainedb/moraine/compare/v0.6.3...v0.6.4) - 2026-09-09
+
+### Added
+
+- pace write-ahead-log flushes instead of ticking a timer ([#204](https://github.com/morainedb/moraine/pull/204))
+- read and update located rows in DuckLake transactions ([#203](https://github.com/morainedb/moraine/pull/203))
+- bundle the patched DuckLake into the moraine extension ([#205](https://github.com/morainedb/moraine/pull/205))
+- stage located deletions in DuckLake transactions ([#202](https://github.com/morainedb/moraine/pull/202))
+
+### Fixed
+
+- normalize S3 data roots and record session benchmarks ([#200](https://github.com/morainedb/moraine/pull/200))
+
+### Other
+
+- read and encode staged index builds ahead of their commits ([#206](https://github.com/morainedb/moraine/pull/206))
+
 ## [0.6.3](https://github.com/morainedb/moraine/compare/v0.6.2...v0.6.3) - 2026-09-08
 
 ### Added
