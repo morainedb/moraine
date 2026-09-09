@@ -27,12 +27,13 @@ The Postgres backend self-provisions an ephemeral cluster (`initdb` +
 Postgres is found, that backend is skipped with a notice — the suite never
 fails because a backend is unavailable.
 
-moraine's per-commit latency is bounded by its WAL flush cadence (100ms by
-default); the bench pins it low so `small_commits` measures catalog work
-rather than the flush wait. Tune it on any attach with
-`META_FLUSH_INTERVAL_MS <n>`, at the cost of more frequent object-store PUTs,
-or take the cadence out of the commit path entirely with
-`META_FLUSH_ON_COMMIT true`, which flushes per commit instead of per interval.
+moraine paces its WAL flushes: a commit past the spacing (100ms by default)
+flushes at once and waits only on its own PUT, one inside it joins a flush
+deferred to when the spacing elapses. Back-to-back commits therefore each
+wait about one spacing; the bench pins it low so `small_commits` measures
+catalog work rather than that wait. Tune it on any attach with
+`META_FLUSH_INTERVAL_MS <n>`, at the cost of more frequent object-store PUTs
+under load; `META_FLUSH_ON_COMMIT true` is a spacing of zero.
 
 ## Workloads
 
@@ -192,10 +193,12 @@ faster commit: K concurrent commits share one flush.
 | 100 ms (default) | 102.7 ms |
 | 250 ms | 252.7 ms |
 
-Commit latency is `flush_interval + ~2 ms`. The ~2 ms is the real compute
-floor; everything above it is the wait for the flush tick. On a real object
-store the tick wait is replaced (or joined) by the WAL PUT round-trip — the
-next two sections measure that term rather than assume it.
+Back-to-back commit latency is `flush_interval + ~2 ms`: each commit lands
+inside the spacing the one before it opened, so it waits for that spacing
+to elapse. The ~2 ms is the real compute floor. A commit that finds the
+spacing clear skips the wait and costs the flush alone — on a real object
+store, the WAL PUT round-trip, which the next two sections measure rather
+than assume.
 
 ### Durable-commit latency vs. write round-trip
 

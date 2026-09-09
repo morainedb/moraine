@@ -98,10 +98,15 @@ async fn a_store_with_an_unreadable_manifest_refuses_to_open() {
             .unwrap();
     }
 
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
-        .await
-        .err()
-        .unwrap();
+    let err = open_initialized(
+        StoreBuilder::new("", object_store),
+        false,
+        None,
+        std::time::Duration::ZERO,
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(matches!(err, Error::Store(_)), "{err:?}");
 }
 
@@ -127,10 +132,15 @@ async fn unknown_format_is_refused() {
 
     // `Result::unwrap_err` needs `T: Debug`, and `slatedb::Db` has no
     // `Debug` impl; `err().unwrap()` only needs it on the error side.
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
-        .await
-        .err()
-        .unwrap();
+    let err = open_initialized(
+        StoreBuilder::new("", object_store),
+        false,
+        None,
+        std::time::Duration::ZERO,
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(matches!(err, Error::Migration(_)), "{err:?}");
 }
 
@@ -154,10 +164,15 @@ async fn migration_marker_is_refused() {
     .unwrap();
     db.close().await.unwrap();
 
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
-        .await
-        .err()
-        .unwrap();
+    let err = open_initialized(
+        StoreBuilder::new("", object_store),
+        false,
+        None,
+        std::time::Duration::ZERO,
+    )
+    .await
+    .err()
+    .unwrap();
     match err {
         Error::Migration(msg) => assert!(
             msg.contains("Catalog::migrate"),
@@ -186,10 +201,15 @@ async fn older_format_refuses_toward_migrate() {
     .unwrap();
     db.close().await.unwrap();
 
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
-        .await
-        .err()
-        .unwrap();
+    let err = open_initialized(
+        StoreBuilder::new("", object_store),
+        false,
+        None,
+        std::time::Duration::ZERO,
+    )
+    .await
+    .err()
+    .unwrap();
     match err {
         Error::Migration(msg) => {
             assert!(
@@ -621,13 +641,7 @@ async fn plant_migration_marker(catalog: &crate::catalog::Catalog) {
     .unwrap();
     let (key, stamp) = head_stamp(head.snapshot_id, head.batch_seq);
     tx.put(key, stamp.unwrap()).unwrap();
-    tx.commit()
-        .await
-        .unwrap()
-        .unwrap()
-        .await_durable()
-        .await
-        .unwrap();
+    catalog.commit_write_tx(tx).await.unwrap();
 }
 
 fn int_value(value: i128) -> crate::store::index_encoding::IndexKeyValue {
@@ -3709,13 +3723,7 @@ async fn the_migration_check_is_skipped_at_a_head_already_found_clear() {
         }),
     )
     .unwrap();
-    tx.commit()
-        .await
-        .unwrap()
-        .unwrap()
-        .await_durable()
-        .await
-        .unwrap();
+    catalog.commit_write_tx(tx).await.unwrap();
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let served = refuse_mid_migration_at(ReadHandle::Tx(&db_tx), projections, &head).await;
@@ -3760,13 +3768,7 @@ async fn a_read_session_skips_the_migration_check_at_a_stamped_head() {
         }),
     )
     .unwrap();
-    tx.commit()
-        .await
-        .unwrap()
-        .unwrap()
-        .await_durable()
-        .await
-        .unwrap();
+    catalog.commit_write_tx(tx).await.unwrap();
     let session = catalog.begin_read().await.unwrap();
     session.finish();
 
@@ -4660,9 +4662,14 @@ async fn a_read_only_pass_that_straddles_a_commit_is_discarded_and_re_run() {
 async fn catalog_with_a_reclaimed_snapshot()
 -> (Db, Arc<std::sync::RwLock<ProjectionCache>>, Arc<Coalescer>) {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let (db, _, _) = open_initialized(StoreBuilder::new("", object_store), false, None, false)
-        .await
-        .unwrap();
+    let (db, _, _, _) = open_initialized(
+        StoreBuilder::new("", object_store),
+        false,
+        None,
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap();
     let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
     let coalescer = Arc::new(Coalescer::new(
         Arc::clone(&projections),
@@ -4802,13 +4809,7 @@ async fn a_marker_from_the_writer_that_fenced_us_never_reads_as_a_migration() {
         }),
     )
     .unwrap();
-    tx.commit()
-        .await
-        .unwrap()
-        .unwrap()
-        .await_durable()
-        .await
-        .unwrap();
+    migrator.commit_write_tx(tx).await.unwrap();
 
     // Fencing is reported by a background task, so the displaced handle
     // does not learn of it in the same breath. Whatever it answers in that

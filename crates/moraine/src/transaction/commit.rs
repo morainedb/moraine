@@ -12,6 +12,10 @@ use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+mod pacer;
+
+pub(crate) use pacer::FlushPacer;
+
 use crate::{
     catalog::{
         CatalogSnapshot, SnapshotId, Timestamp,
@@ -116,23 +120,14 @@ const STALL_INTERVAL: Duration = Duration::from_secs(10);
 /// How a durable commit's bytes reach object storage.
 #[derive(Clone, Default)]
 pub(crate) enum CommitDurability {
-    /// Hand the batch to the store and wait for the flush timer to carry
-    /// it out, so the commit costs up to one flush interval.
+    /// Hand the batch to the store and wait for its flush timer to carry it
+    /// out. Only a store opened with the timer running may take this route;
+    /// a catalog's writer runs without one and paces its flushes instead.
     #[default]
     OnFlushInterval,
-    /// Force the write-ahead log out as part of the commit, so the commit
-    /// costs one object-store PUT whatever the flush interval is.
-    Immediate(Db),
-}
-
-/// The route commits through `db` take, given whether the catalog was
-/// opened to flush on commit.
-pub(crate) fn writer_durability(db: &Db, flush_on_commit: bool) -> CommitDurability {
-    if flush_on_commit {
-        CommitDurability::Immediate(db.clone())
-    } else {
-        CommitDurability::OnFlushInterval
-    }
+    /// Flush through the writer's pacer: at once when the spacing has
+    /// elapsed, else with the one flush deferred to when it does.
+    Paced(Arc<FlushPacer>),
 }
 
 /// Commits `tx` and waits for the batch to reach object storage, by the
@@ -145,24 +140,31 @@ pub(crate) async fn commit_durable(
     staged: StagedBytes,
     durability: &CommitDurability,
 ) -> std::result::Result<Option<slatedb::WriteHandle>, slatedb::Error> {
+    let handle = reporting_stalls(operation, staged, tx.commit()).await?;
+    await_durable(handle.clone(), operation, staged, durability).await?;
+    Ok(handle)
+}
+
+/// Waits for `handle`'s already-visible batch to reach object storage by
+/// the route `durability` names; an empty batch has no handle and nothing
+/// to wait for. The wait is unbounded, as [`commit_durable`]'s is.
+pub(crate) async fn await_durable(
+    handle: Option<slatedb::WriteHandle>,
+    operation: &'static str,
+    staged: StagedBytes,
+    durability: &CommitDurability,
+) -> std::result::Result<(), slatedb::Error> {
+    let Some(handle) = handle else {
+        return Ok(());
+    };
     match durability {
         CommitDurability::OnFlushInterval => {
-            reporting_stalls(operation, staged, async {
-                let handle = tx.commit().await?;
-                if let Some(handle) = &handle {
-                    handle.await_durable().await?;
-                }
-                Ok(handle)
-            })
-            .await
+            reporting_stalls(operation, staged, handle.await_durable()).await
         }
-        // The commit returns as soon as the batch is visible; the flush
-        // that follows is what puts it in object storage, so both are
-        // waited on before this reports the write durable.
-        CommitDurability::Immediate(db) => {
-            let handle = tx.commit().await?;
-            reporting_stalls(operation, staged, db.flush()).await?;
-            Ok(handle)
+        // The flush the pacer performs or waits for is what puts the
+        // batch in object storage.
+        CommitDurability::Paced(pacer) => {
+            reporting_stalls(operation, staged, pacer.await_durable(handle)).await
         }
     }
 }
@@ -323,11 +325,11 @@ pub(crate) async fn open_initialized(
     store: StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
-    flush_on_commit: bool,
-) -> Result<(Db, Arc<CacheCounters>, u64)> {
+    flush_spacing: Duration,
+) -> Result<(Db, Arc<CacheCounters>, u64, Arc<FlushPacer>)> {
     let mut attempt = 1;
     loop {
-        match open_attempt(&store, encrypted, data_path, flush_on_commit).await {
+        match open_attempt(&store, encrypted, data_path, flush_spacing).await {
             Ok(opened) => return Ok(opened),
             Err(OpenFailure::Fatal(err)) => return Err(err),
             Err(OpenFailure::FencedAtGenesis(err)) => {
@@ -351,10 +353,11 @@ async fn open_attempt(
     store: &StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
-    flush_on_commit: bool,
-) -> std::result::Result<(Db, Arc<CacheCounters>, u64), OpenFailure> {
+    flush_spacing: Duration,
+) -> std::result::Result<(Db, Arc<CacheCounters>, u64, Arc<FlushPacer>), OpenFailure> {
     let started = Instant::now();
     let (db, counters) = store.open_writer().await.map_err(OpenFailure::Fatal)?;
+    let pacer = FlushPacer::new(db.clone(), flush_spacing);
     info!(
         writer_open_ms = crate::telemetry::milliseconds(started.elapsed()),
         "opened the store read-write"
@@ -364,7 +367,7 @@ async fn open_attempt(
     match validate_format(ReadHandle::Tx(&tx)).await {
         Ok(Some(format)) => {
             tx.rollback();
-            return Ok((db, counters, format.format_version));
+            return Ok((db, counters, format.format_version, pacer));
         }
         Ok(None) => {}
         Err(err) => {
@@ -381,11 +384,11 @@ async fn open_attempt(
         }
     };
 
-    let durability = writer_durability(&db, flush_on_commit);
+    let durability = CommitDurability::Paced(Arc::clone(&pacer));
     match commit_durable(tx, "bootstrap", staged, &durability).await {
         Ok(_) => {
             info!(encrypted, data_path, "bootstrapped a fresh catalog store");
-            Ok((db, counters, MIN_FORMAT_VERSION))
+            Ok((db, counters, MIN_FORMAT_VERSION, pacer))
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
@@ -393,7 +396,7 @@ async fn open_attempt(
             let validated = validate_format(ReadHandle::Tx(&tx)).await;
             tx.rollback();
             match validated {
-                Ok(Some(format)) => Ok((db, counters, format.format_version)),
+                Ok(Some(format)) => Ok((db, counters, format.format_version, pacer)),
                 Ok(None) => Err(OpenFailure::Fatal(Error::Corruption(
                     "bootstrap race left the store uninitialized".to_string(),
                 ))),
@@ -1223,17 +1226,36 @@ pub(crate) struct HeadTransition {
     pub(crate) after: u64,
 }
 
-/// Commits one staged batch and folds the result into the maintained
-/// projections. The one place a catalog batch reaches the store.
-pub(crate) async fn commit_batch(
+/// A batch whose write is visible and folded into the projections, its
+/// durability still owed.
+pub(crate) struct Submitted {
+    handle: Option<slatedb::WriteHandle>,
+    staged_bytes: StagedBytes,
+    head: u64,
+    durable_started: Instant,
+    projection: Duration,
+}
+
+/// What submitting a batch decided before any flush.
+pub(crate) enum Submission {
+    /// The write is visible; durability is [`await_submitted`]'s.
+    Submitted(Submitted),
+    /// A concurrent commit advanced the head first; nothing was written.
+    LostRace,
+}
+
+/// Commits the batch's write and folds it into the projections, without
+/// waiting for the flush. Winning `sys/head` settles the race, so the
+/// projections may fold before the bytes are durable; a flush that then
+/// fails invalidates them.
+pub(crate) async fn submit_batch(
     db_tx: DbTransaction,
     heads: HeadTransition,
     writes: &[StagedWrite],
     staged_bytes: StagedBytes,
     head_view_update: HeadViewUpdate,
     projections: &std::sync::RwLock<ProjectionCache>,
-    durability: &CommitDurability,
-) -> Result<Landed> {
+) -> Result<Submission> {
     let head = heads.after;
     // A head-preserving commit reuses the head id with new content, so the
     // cache is dropped before the write is visible.
@@ -1242,9 +1264,8 @@ pub(crate) async fn commit_batch(
         invalidate_head_view(projections);
     }
     let durable_started = Instant::now();
-    match commit_durable(db_tx, "commit", staged_bytes, durability).await {
-        Ok(_) => {
-            let durable = durable_started.elapsed();
+    match reporting_stalls("commit", staged_bytes, db_tx.commit()).await {
+        Ok(handle) => {
             let projection_started = Instant::now();
             // `sys/head` is the conflict anchor, so winning it proves no
             // batch landed between the base's migration check and this
@@ -1260,7 +1281,43 @@ pub(crate) async fn commit_batch(
             if head_advanced {
                 install_committed_head_view(projections, head_view_update, writes);
             }
-            let projection = projection_started.elapsed();
+            Ok(Submission::Submitted(Submitted {
+                handle,
+                staged_bytes,
+                head,
+                durable_started,
+                projection: projection_started.elapsed(),
+            }))
+        }
+        Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(Submission::LostRace),
+        Err(err) if err.kind() == slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced) => {
+            invalidate_head_view(projections);
+            Err(err.into())
+        }
+        Err(err) => {
+            // The write's fate is unknown, so the held view may be stale.
+            invalidate_head_view(projections);
+            Err(Error::CommitOutcomeUnknown(err.to_string()))
+        }
+    }
+}
+
+/// Waits for a submitted batch to reach object storage.
+pub(crate) async fn await_submitted(
+    submitted: Submitted,
+    projections: &std::sync::RwLock<ProjectionCache>,
+    durability: &CommitDurability,
+) -> Result<Landed> {
+    let Submitted {
+        handle,
+        staged_bytes,
+        head,
+        durable_started,
+        projection,
+    } = submitted;
+    match await_durable(handle, "commit", staged_bytes, durability).await {
+        Ok(()) => {
+            let durable = durable_started.elapsed();
             debug!(
                 operation = "commit",
                 snapshot = head,
@@ -1276,7 +1333,6 @@ pub(crate) async fn commit_batch(
                 projection,
             }))
         }
-        Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(Landed::LostRace),
         Err(err) if err.kind() == slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced) => {
             invalidate_head_view(projections);
             Err(err.into())
@@ -1285,6 +1341,34 @@ pub(crate) async fn commit_batch(
             // The write's fate is unknown, so the held view may be stale.
             invalidate_head_view(projections);
             Err(Error::CommitOutcomeUnknown(err.to_string()))
+        }
+    }
+}
+
+/// Commits one batch and waits for it to reach object storage:
+/// [`submit_batch`] then [`await_submitted`].
+pub(crate) async fn commit_batch(
+    db_tx: DbTransaction,
+    heads: HeadTransition,
+    writes: &[StagedWrite],
+    staged_bytes: StagedBytes,
+    head_view_update: HeadViewUpdate,
+    projections: &std::sync::RwLock<ProjectionCache>,
+    durability: &CommitDurability,
+) -> Result<Landed> {
+    match submit_batch(
+        db_tx,
+        heads,
+        writes,
+        staged_bytes,
+        head_view_update,
+        projections,
+    )
+    .await?
+    {
+        Submission::LostRace => Ok(Landed::LostRace),
+        Submission::Submitted(submitted) => {
+            await_submitted(submitted, projections, durability).await
         }
     }
 }

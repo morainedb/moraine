@@ -105,9 +105,12 @@ fn interrupted_deletion_retains_files(located: bool) {
     } else {
         "DELETE FROM lake.main.t WHERE a = 1;".to_owned()
     };
+    // The long spacing withholds durability only from a commit inside it,
+    // so a first commit opens the window the deletion is then caught in.
     let sql = format!(
         "SET threads=1;\n{}\nLOAD '{}';\n\
          ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}'{options}, META_FLUSH_INTERVAL_MS {});\n\
+         CREATE TABLE lake.main.warm(a INTEGER);\n\
          {deletion}\n",
         ducklake_load_statement(&ducklake_ext_path()),
         ext_path().display(),
@@ -139,7 +142,7 @@ fn interrupted_deletion_retains_files(located: bool) {
     );
 
     wait_until(
-        || snapshot(store.path()).current_snapshot().id > before.current_snapshot().id,
+        || snapshot(store.path()).delete_files_of(table).len() == 1,
         "the interrupted commit to become durable",
     );
     let deletes = snapshot(store.path()).delete_files_of(table);

@@ -537,7 +537,13 @@ async fn a_mid_migration_store_never_reaches_the_raise() {
 
     // The raise refuses the marked store reached directly, before the
     // open below fences this writer.
-    let error = raise_format(&db, false).await.unwrap_err();
+    let error = raise_format(
+        &db,
+        &crate::transaction::commit::CommitDurability::OnFlushInterval,
+        false,
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(error, Error::Migration(_)),
         "expected a migration refusal, got {error:?}"

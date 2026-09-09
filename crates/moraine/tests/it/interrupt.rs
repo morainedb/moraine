@@ -4,9 +4,9 @@
 //! loser, so an interrupt *is* a dropped future here: every case below
 //! drops the caller's future at a chosen point and asserts what the
 //! catalog is left holding. The point is a parked durable write rather
-//! than a hopeful sleep — see [`gated_store`], and note that a parked
-//! write also holds the store, which is what puts a *second* commit
-//! squarely before a write of its own.
+//! than a hopeful sleep — see [`gated_store`]. A parked write does not
+//! hold the store: the batch behind it submits and awaits a flush of its
+//! own, which is what the first case below pins.
 //!
 //! The commit is split at its point of no return. Everything before the
 //! durable write is staged in memory, so dropping it changes nothing;
@@ -84,23 +84,18 @@ async fn await_head(catalog: &Catalog, target: u64) {
     );
 }
 
-/// Interrupted before its durable write, a commit contributes nothing.
-///
-/// The window is staged with a real one rather than a timer: a store
-/// admits one batch at a time, so a batch parked at the gate keeps the
-/// commit under test waiting its turn — it has read nothing, staged
-/// nothing, and issued nothing. Dropping it there must leave the catalog
-/// holding exactly what the batch in flight put there.
+/// A commit issued while another batch's flush is parked does not wait
+/// behind it: its batch submits and, once its caller is dropped, still
+/// lands whole when the gate opens, after the parked one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::unwrap_used)]
-async fn an_interrupt_before_the_write_leaves_the_catalog_untouched() {
+async fn a_commit_behind_a_parked_flush_submits_and_lands_after_it() {
     let (catalog, store) = gated().await;
     let head_before = head(&catalog).await;
 
     store.gate_wal_writes();
     // One batch in flight, parked at the gate. Its own caller is dropped;
-    // the write survives that (the case below is about exactly this), and
-    // the store stays busy while it does.
+    // the write survives that (the case below is about exactly this).
     {
         let holder = catalog.commit(|tx| tx.create_schema("holder").map(|_| ()));
         tokio::pin!(holder);
@@ -110,44 +105,37 @@ async fn an_interrupt_before_the_write_leaves_the_catalog_untouched() {
         }
     }
 
-    // The commit under test cannot get past the store's door while that
-    // batch is in flight, so it can only be here — before its write.
+    // The commit behind it submits at once and waits only on a flush; its
+    // caller is dropped while that flush is still owed.
     {
-        let cancelled = catalog.commit(|tx| tx.create_schema("cancelled").map(|_| ()));
-        tokio::pin!(cancelled);
+        let behind = catalog.commit(|tx| tx.create_schema("behind").map(|_| ()));
+        tokio::pin!(behind);
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(100)) => {}
-            _ = &mut cancelled => panic!("a second batch landed while one was in flight"),
+            _ = &mut behind => panic!("a commit landed while every flush was parked"),
         }
-        // `cancelled` is dropped here — the interrupt.
+        // `behind` is dropped here — the interrupt.
     }
 
     store.open_gate();
-    await_head(&catalog, head_before + 1).await;
-    // The cancelled commit could only ever land after the holder's, so a
-    // settle past that is what makes its absence meaningful.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    await_head(&catalog, head_before + 2).await;
 
-    assert_eq!(
-        head(&catalog).await,
-        head_before + 1,
-        "a commit cancelled before its write must not advance head past the batch in flight"
-    );
     let view = catalog.snapshot().await.unwrap();
     assert!(
         view.schema_by_name("holder").is_some(),
         "the batch in flight was supposed to land"
     );
     assert!(
-        view.schema_by_name("cancelled").is_none(),
-        "a cancelled commit left a partial record behind"
+        view.schema_by_name("behind").is_some(),
+        "the batch submitted behind it was supposed to land"
     );
+    let first = catalog
+        .snapshot_at(SnapshotId::new(head_before + 1))
+        .await
+        .unwrap();
     assert!(
-        catalog
-            .snapshot_at(SnapshotId::new(head_before + 2))
-            .await
-            .is_err(),
-        "a cancelled commit minted a snapshot"
+        first.schema_by_name("holder").is_some() && first.schema_by_name("behind").is_none(),
+        "the parked batch must land first and whole"
     );
 }
 

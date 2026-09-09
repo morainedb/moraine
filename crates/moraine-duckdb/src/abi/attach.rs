@@ -435,9 +435,10 @@ pub(super) fn cache_size_option(cache_size_bytes: u64) -> Option<u64> {
     (cache_size_bytes != 0).then_some(cache_size_bytes)
 }
 
-/// The WAL flush cadence an ABI millisecond count names. Zero means "not
-/// given"; `u64::MAX` is the shim's sentinel for an explicit zero interval,
-/// which flushes continuously.
+/// The minimum spacing between WAL flushes an ABI millisecond count names.
+/// Zero means "not given"; `u64::MAX` is the shim's sentinel for an
+/// explicit zero, which flushes every commit that finds no flush in the
+/// air.
 fn flush_interval_option(flush_interval_ms: u64) -> Option<std::time::Duration> {
     match flush_interval_ms {
         0 => None,

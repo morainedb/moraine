@@ -235,7 +235,7 @@ mod tests {
     async fn scan_inline_materializes_rows_with_chunk_bodies() {
         let catalog = open().await;
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
 
         tx.stage(RowOperation::InlineSchema {
             table_id: 1,
@@ -269,7 +269,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         let db_tx2 = catalog.begin_write_tx().await.unwrap();
-        let mut inline_delete = StagedTransaction::begin_detached(db_tx2);
+        let mut inline_delete = StagedTransaction::begin_detached(&catalog, db_tx2);
         inline_delete.stage(RowOperation::InlineInlineDelete {
             table_id: 1,
             row_id: 1,
@@ -327,7 +327,7 @@ mod tests {
     async fn a_dropped_schema_version_deregisters_but_stays_resolvable() {
         let catalog = open().await;
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
 
         for (schema_version, schema) in [(0u64, b"schema-v0"), (1, b"schema-v1")] {
             tx.stage(RowOperation::InlineSchema {
@@ -360,7 +360,7 @@ mod tests {
         );
 
         let db_tx2 = catalog.begin_write_tx().await.unwrap();
-        let mut flush = StagedTransaction::begin_detached(db_tx2);
+        let mut flush = StagedTransaction::begin_detached(&catalog, db_tx2);
         flush.stage(RowOperation::InlineFlushDelete {
             table_id: 1,
             schema_version: 0,
@@ -484,7 +484,7 @@ mod tests {
     async fn scan_inline_filtered_to_a_version_hauls_only_its_bodies() {
         let catalog = open().await;
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
 
         tx.stage(RowOperation::InlineInsert {
             table_id: 1,
@@ -539,7 +539,7 @@ mod tests {
     async fn inline_file_deletes_read_back_in_key_order() {
         let catalog = open().await;
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
 
         tx.stage(RowOperation::InlineFileDelete {
             table_id: 1,

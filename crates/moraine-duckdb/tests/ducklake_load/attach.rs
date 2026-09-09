@@ -228,10 +228,10 @@ fn ducklake_forwards_read_only_into_the_metadata_attach() {
 
 /// `FLUSH_INTERVAL_MS` end to end: `ATTACH (META_FLUSH_INTERVAL_MS
 /// 5)` → DuckLake's `META_` passthrough → this shim's inner attach →
-/// the store's WAL flush cadence. The setting is visible only as
-/// commit latency, so the assertion is that the option is accepted,
-/// commits land, and a plain re-attach (default cadence) reads them
-/// back.
+/// the spacing the writer paces its WAL flushes at. The setting is
+/// visible only as commit latency, so the assertion is that the option
+/// is accepted, commits land, and a plain re-attach (default spacing)
+/// reads them back.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
 fn ducklake_attach_flush_interval_option_is_applied() {
@@ -257,10 +257,10 @@ fn ducklake_attach_flush_interval_option_is_applied() {
 }
 
 /// `FLUSH_ON_COMMIT` end to end: `ATTACH (META_FLUSH_ON_COMMIT true)` →
-/// DuckLake's `META_` passthrough → this shim's inner attach → the commit
-/// path forcing the WAL out itself. Paired with a flush cadence of a minute,
-/// which a working flush-on-commit never waits on and a broken one always
-/// does, so the option regressing shows up as a minute per commit rather
+/// DuckLake's `META_` passthrough → this shim's inner attach → a flush
+/// spacing of zero. Paired with a spacing of a minute, which a working
+/// flush-on-commit overrides and a broken one leaves in charge, so the
+/// option regressing shows up as a minute for the second commit rather
 /// than as a wrong answer.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]

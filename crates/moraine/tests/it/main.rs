@@ -12,6 +12,7 @@ mod commit_concurrency;
 mod counting_store;
 mod crash_recovery;
 mod data_files;
+mod flush_pacing;
 mod group_commit;
 mod index_backfill;
 mod index_lookup;
