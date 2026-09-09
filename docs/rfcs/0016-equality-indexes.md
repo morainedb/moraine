@@ -964,11 +964,8 @@ has `UPDATE`'s semantics under concurrency: a row deleted before
 the snapshot is neither read nor reinserted, and a row deleted after it
 conflicts at commit. With inlining on, a small update is metadata-only
 before commit — local reads for the old rows, inlined rows for the new
-ones, inlined deletions for the old ones. The rows do get new ids: every
-variant of the recipe deletes and reinserts, and DuckLake assigns ids at
-commit. Index maintenance does not depend on id stability, but anything
-keying on `rowid` across an update would; preserving ids would need a
-change to DuckLake's id assignment and is not part of this design.
+ones, inlined deletions for the old ones. The spelled-out recipe gives the rows new ids, since a plain `INSERT`
+has DuckLake assign them at commit; `moraine_update` below keeps them.
 
 `moraine_update` fuses the recipe into one statement:
 
@@ -981,15 +978,16 @@ expressions ordinary SQL over the table's columns; unassigned columns keep
 their values. The extension resolves the located rows exactly as the
 deletion does, composes the replacement query — every column in order,
 assigned ones replaced by their expression, read from `moraine_rows_at`
-over the same located rows — and rewrites the call into the companion
+over the same located rows — then the row id, and rewrites the call into the companion
 `ducklake_update_positions(catalog, schema, table, files, replacement,
-inlined_rows, snapshot)`. That function binds `replacement` as an ordinary
-`INSERT` into the table through DuckDB's binder, so the rows take the
-standard insert path with its inlining, sorting, partitioning, encryption,
-and statistics, and plans the positional deletes as an operator that runs
-once the insert has completed, in the same transaction; DuckDB's
-`bind_operator` hook lets a table function return that plan, as DuckLake's
-own inlined-data flush does. It reports the deleted, inlined, and written
+inlined_rows, snapshot)`. That function binds `replacement` through
+DuckDB's binder, casts it to the table's columns, and plans it through the
+operators DuckLake's own `UPDATE` uses, in the mode that writes the row-id
+column back: the rows keep their ids, and inlining, partitioning,
+encryption, and statistics follow the update path. The positional deletes
+run as an operator once the rows have been written, in the same
+transaction; DuckDB's `bind_operator` hook lets a table function return
+that plan, as DuckLake's own inlined-data flush does. It reports the deleted, inlined, and written
 counts of the deletion and the number of rows inserted. Outside an
 explicit transaction DuckDB commits the statement on its own. The
 concurrency rules are the recipe's, since the same snapshot pinning and
@@ -1603,9 +1601,9 @@ tests against real SlateDB on in-memory `object_store`:
   across two connections a read pinned before a concurrent delete still
   sees the row while the commit reports the conflict, and a metadata view
   pinned before DuckLake's own, hence older, is refused by the deletion.
-  `moraine_update` applies its assignments in one statement, rolls back
-  with its transaction, commits on its own outside one, refuses an unknown
-  column, and conflicts at commit like the recipe.
+  `moraine_update` applies its assignments in one statement, keeps the
+  rows' ids, rolls back with its transaction, commits on its own outside
+  one, refuses an unknown column, and conflicts at commit like the recipe.
 - **Delete coverage.** Store-resident delete (self-sufficient) and
   writer-supplied delete both remove entries; delete-then-reinsert of a
   unique value succeeds; a `register_delete_file` omitting entries on an

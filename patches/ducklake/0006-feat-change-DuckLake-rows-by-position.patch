@@ -13,17 +13,21 @@ diff --git a/src/functions/ducklake_delete_positions.cpp b/src/functions/ducklak
 new file mode 100644
 --- /dev/null
 +++ b/src/functions/ducklake_delete_positions.cpp
-@@ -0,0 +1,515 @@
+@@ -0,0 +1,553 @@
 +#include "functions/ducklake_table_functions.hpp"
 +#include "duckdb/common/enums/database_modification_type.hpp"
 +#include "duckdb/execution/physical_operator.hpp"
 +#include "duckdb/execution/physical_plan_generator.hpp"
 +#include "duckdb/parser/parser.hpp"
-+#include "duckdb/parser/statement/insert_statement.hpp"
 +#include "duckdb/parser/statement/select_statement.hpp"
 +#include "duckdb/planner/binder.hpp"
++#include "duckdb/planner/expression/bound_cast_expression.hpp"
++#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 +#include "duckdb/planner/operator/logical_extension_operator.hpp"
++#include "duckdb/planner/operator/logical_projection.hpp"
 +#include "storage/ducklake_catalog.hpp"
++#include "storage/ducklake_inline_data.hpp"
++#include "storage/ducklake_insert.hpp"
 +#include "storage/ducklake_schema_entry.hpp"
 +#include "storage/ducklake_table_entry.hpp"
 +#include "storage/ducklake_transaction.hpp"
@@ -403,7 +407,7 @@ new file mode 100644
 +//===--------------------------------------------------------------------===//
 +// ducklake_update_positions
 +//===--------------------------------------------------------------------===//
-+//! Runs after the replacement rows have been inserted: stages the positional deletes and reports both counts.
++//! Runs after the replacement rows have been written: stages the positional deletes and reports both counts.
 +class DuckLakeUpdatePositions : public PhysicalOperator {
 +public:
 +	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
@@ -455,9 +459,27 @@ new file mode 100644
 +	DuckLakeTableEntry &table;
 +	PositionalDeletes request;
 +
++	//! Plans the replacement rows — the table's columns followed by their row ids — through the same operators an
++	//! UPDATE uses, so the rows keep their ids and inline, copy, and register as an update's would.
 +	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
 +		auto &child = planner.CreatePlan(*children[0]);
-+		return planner.Make<DuckLakeUpdatePositions>(types, catalog, table, request, child);
++		DuckLakeCopyInput copy_input(context, table);
++		copy_input.virtual_columns = InsertVirtualColumns::WRITE_ROW_ID;
++
++		optional_ptr<PhysicalOperator> plan = &child;
++		optional_ptr<DuckLakeInlineData> inline_data;
++		idx_t data_inlining_row_limit = catalog.GetInliningLimit(context, table);
++		if (data_inlining_row_limit > 0) {
++			plan = planner.Make<DuckLakeInlineData>(*plan, data_inlining_row_limit);
++			inline_data = plan->Cast<DuckLakeInlineData>();
++		}
++		auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, plan);
++		auto &insert = DuckLakeInsert::PlanInsert(context, planner, table, std::move(copy_input.encryption_key));
++		if (inline_data) {
++			inline_data->insert = insert.Cast<DuckLakeInsert>();
++		}
++		insert.children.push_back(physical_copy);
++		return planner.Make<DuckLakeUpdatePositions>(types, catalog, table, request, insert);
 +	}
 +
 +	string GetName() const override {
@@ -481,9 +503,8 @@ new file mode 100644
 +	}
 +};
 +
-+//! Binds `replacement` — a SELECT producing the table's columns — as an ordinary INSERT into the table, so
-+//! inlining, sorting, partitioning, encryption, and statistics follow the standard insert path, and plans the
-+//! positional deletes to run once the insert has completed.
++//! Binds `replacement` — a SELECT producing the table's columns followed by each row's id — casts it to the
++//! table's types, and plans it through the update path with the positional deletes staged once it has run.
 +static unique_ptr<LogicalOperator> UpdatePositionsBind(ClientContext &context, TableFunctionBindInput &input,
 +                                                       idx_t bind_index, vector<string> &return_names) {
 +	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]).Cast<DuckLakeCatalog>();
@@ -498,22 +519,39 @@ new file mode 100644
 +	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 +		throw InvalidInputException("ducklake_update_positions: `replacement` must be a single SELECT statement");
 +	}
-+	auto insert = make_uniq<InsertStatement>();
-+	insert->catalog = input.inputs[0].GetValue<string>();
-+	insert->schema = input.inputs[1].GetValue<string>();
-+	insert->table = input.inputs[2].GetValue<string>();
-+	insert->select_statement = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
 +	auto binder = Binder::CreateBinder(context, input.binder.get());
-+	SQLStatement &statement = *insert;
-+	auto bound = binder->Bind(statement);
-+	// Binding the insert marks the statement as returning changed rows; this function returns a result.
-+	input.binder->GetStatementProperties().return_type = StatementReturnType::QUERY_RESULT;
++	auto bound = binder->Bind(*parser.statements[0]);
++
++	// The replacement's columns cast to the table's, with the row id last.
++	vector<LogicalType> target_types;
++	for (auto &column : table.GetColumns().Physical()) {
++		target_types.push_back(column.Type());
++	}
++	target_types.push_back(LogicalType::BIGINT);
++	if (bound.types.size() != target_types.size()) {
++		throw InvalidInputException("ducklake_update_positions: `replacement` must produce the %d columns of table "
++		                            "\"%s\" followed by row_id, got %d columns",
++		                            target_types.size() - 1, table.name, bound.types.size());
++	}
++	auto bindings = bound.plan->GetColumnBindings();
++	vector<unique_ptr<Expression>> casts;
++	for (idx_t i = 0; i < target_types.size(); i++) {
++		unique_ptr<Expression> column = make_uniq<BoundColumnRefExpression>(bound.types[i], bindings[i]);
++		casts.push_back(BoundCastExpression::AddCastToType(context, std::move(column), target_types[i]));
++	}
++	auto projection = make_uniq<LogicalProjection>(input.binder->GenerateTableIndex(), std::move(casts));
++	projection->children.push_back(std::move(bound.plan));
 +
 +	// The staged changes belong to the executing transaction, so a prepared call binds again for each execution.
 +	input.binder->SetAlwaysRequireRebind();
 +	input.binder->GetStatementProperties().RegisterDBModify(catalog, context, DatabaseModificationType::DELETE_DATA);
 +	auto plan = make_uniq<DuckLakeLogicalUpdatePositions>(bind_index, catalog, table, std::move(request));
-+	plan->children.push_back(std::move(bound.plan));
++	// Reference every replacement column, or the unused-column optimizer prunes the projection to a constant.
++	auto projected = projection->GetColumnBindings();
++	for (idx_t i = 0; i < target_types.size(); i++) {
++		plan->expressions.push_back(make_uniq<BoundColumnRefExpression>(target_types[i], projected[i]));
++	}
++	plan->children.push_back(std::move(projection));
 +	return_names = {"file_rows_deleted", "inline_rows_deleted", "delete_files_written", "rows_inserted"};
 +	return std::move(plan);
 +}

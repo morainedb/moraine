@@ -58,10 +58,11 @@ applied in file-name order:
    file-row summaries and rewrites itself into this call. The same patch
    adds `ducklake_update_positions(catalog, schema, table, files,
    replacement, inlined_rows := [], snapshot := NULL)`: `replacement` is a
-   `SELECT` producing the table's columns, bound as an ordinary `INSERT`
-   through DuckDB's binder and planned with the positional deletes staged
-   once the insert completes, all in the current transaction, which
-   `moraine_update` rewrites into. Neither function has a Moraine
+   `SELECT` producing the table's columns followed by each row's id, bound
+   through DuckDB's binder and planned through the operators `UPDATE` uses
+   in their row-id-writing mode, so the rows keep their ids, with the
+   positional deletes staged once the rows are written, all in the current
+   transaction; `moraine_update` rewrites into it. Neither function has a Moraine
    dependency; explicit rollback, failed replacement inserts, repeated
    calls, and standalone autocommit are covered by `cargo xtask e2e`.
 

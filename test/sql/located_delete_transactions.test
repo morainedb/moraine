@@ -279,20 +279,27 @@ SELECT a FROM lake.t ORDER BY a;
 4
 5
 
-# Outside an explicit transaction the update commits on its own.
+# Outside an explicit transaction the update commits on its own, and the
+# updated row keeps its id, as under UPDATE.
 statement ok
 SET VARIABLE located = (SELECT list({row_id:row_id, data_file_id:data_file_id}) FROM moraine_index_lookup('lake','main','t','by_a',4));
+
+query II
+SELECT rowid, a FROM lake.t ORDER BY a;
+----
+3	4
+4	5
 
 query IIII
 SELECT * FROM moraine_update('lake','main','t',getvariable('located'),'a = a * 10');
 ----
 1	0	1	1
 
-query I
-SELECT a FROM lake.t ORDER BY a;
+query II
+SELECT rowid, a FROM lake.t ORDER BY a;
 ----
-5
-40
+4	5
+3	40
 
 query I
 SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a',40);

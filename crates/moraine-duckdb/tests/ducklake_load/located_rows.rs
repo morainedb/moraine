@@ -130,6 +130,7 @@ fn a_column_added_after_the_rows_were_written_reads_null() {
 fn a_located_update_applies_its_assignments_in_one_statement() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
+        let ids_before = csv_rows(&fixture.run("SELECT rowid, a FROM lake.main.t ORDER BY a;"));
         let counts = csv_rows(&fixture.run(&format!(
             "{} SELECT file_rows_deleted + inline_rows_deleted, rows_inserted FROM \
              moraine_update('lake', 'main', 't', getvariable('located'), 'b = b || ''!''');",
@@ -139,6 +140,11 @@ fn a_located_update_applies_its_assignments_in_one_statement() {
         assert_eq!(
             fixture.rows(),
             vec![vec!["1", "x!"], vec!["2", "y"], vec!["3", "z!"]]
+        );
+        // The rows keep their ids, as an UPDATE's would.
+        assert_eq!(
+            csv_rows(&fixture.run("SELECT rowid, a FROM lake.main.t ORDER BY a;")),
+            ids_before
         );
         assert_eq!(
             csv_rows(&fixture.run(

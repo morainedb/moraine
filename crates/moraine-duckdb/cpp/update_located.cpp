@@ -58,7 +58,9 @@ std::unordered_map<std::string, std::string> ParseAssignments(const std::string 
 }
 
 // The replacement query: every column of the table in order, assigned
-// columns replaced by their expression, read from the located rows.
+// columns replaced by their expression, then the row id, read from the
+// located rows. DuckLake writes the id back, so the rows keep their ids as
+// an UPDATE's would.
 std::string ReplacementQuery(duckdb::ClientContext &context, const std::string &catalog_name,
                              const std::string &schema_name, const std::string &table_name,
                              const duckdb::Value &rows, const std::string &assignments) {
@@ -87,7 +89,7 @@ std::string ReplacementQuery(duckdb::ClientContext &context, const std::string &
 		}
 	}
 
-	return duckdb::StringUtil::Format("SELECT %s FROM moraine_rows_at(%s, %s, %s, %s)", projection,
+	return duckdb::StringUtil::Format("SELECT %s, row_id FROM moraine_rows_at(%s, %s, %s, %s)", projection,
 	                                  duckdb::KeywordHelper::WriteQuoted(catalog_name),
 	                                  duckdb::KeywordHelper::WriteQuoted(schema_name),
 	                                  duckdb::KeywordHelper::WriteQuoted(table_name), rows.ToSQLString());
