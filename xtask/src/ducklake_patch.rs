@@ -16,12 +16,13 @@ const DUCKLAKE_REVISION: &str = "d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4";
 const SUPPORTED_DUCKDB_PIN: &str = "v1.5.5";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
-const PATCH_PATHS: [&str; 5] = [
+const PATCH_PATHS: [&str; 6] = [
     "patches/ducklake/0001-perf-prune-DuckLake-files-by-row-id.patch",
     "patches/ducklake/0002-feat-backfill-DuckLake-row-id-file-statistics.patch",
     "patches/ducklake/0003-feat-expose-DuckLake-data-file-ids-to-scans.patch",
     "patches/ducklake/0004-perf-append-DuckLake-inlined-data-rows.patch",
     "patches/ducklake/0005-fix-retain-files-after-unknown-commit-outcomes.patch",
+    "patches/ducklake/0006-feat-delete-DuckLake-rows-by-position.patch",
 ];
 const CONFIG_PATH: &str = "patches/ducklake/extension_config.cmake";
 /// The patched-behaviour sqllogictests, run against the built artifact.

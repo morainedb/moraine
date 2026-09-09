@@ -20,14 +20,14 @@ const DUCKDB_LOAD_TEST_NAME: &str = "attach_lists_and_scans_through_real_duckdb"
 /// `--exact`, since there are many). Adding a test there means bumping this
 /// count, or `e2e` fails — deliberate, so a silently-filtered test can never
 /// pass.
-const DUCKLAKE_LOAD_TEST_COUNT: &str = "155 passed";
+const DUCKLAKE_LOAD_TEST_COUNT: &str = "162 passed";
 
 /// Every file under `test/sql`, run together through DuckDB's own
 /// sqllogictest runner. Adding one means bumping this count, exactly as for
 /// the suites above — and a file that *skips* (its `require-env` unmet, or
 /// an extension download failing) reports no passing case at all, so a
 /// silent skip fails the gate instead of looking like a pass.
-const SQLLOGIC_TEST_COUNT: &str = "5 test cases";
+const SQLLOGIC_TEST_COUNT: &str = "6 test cases";
 
 /// Downloads/caches the pinned DuckDB CLI, builds Moraine and patched
 /// DuckLake, then runs every repository test against those artifacts.

@@ -1,0 +1,152 @@
+# name: test/sql/located_delete_transactions.test
+# group: [moraine]
+
+require-env MORAINE_DUCKDB_EXT
+
+require-env MORAINE_DUCKLAKE_EXT
+
+require-env MORAINE_EXTENSION_DIR
+
+statement ok
+SET threads=1;
+
+statement ok
+SET extension_directory='${MORAINE_EXTENSION_DIR}';
+
+statement ok
+INSTALL parquet;
+
+statement ok
+LOAD parquet;
+
+statement ok
+LOAD '${MORAINE_DUCKLAKE_EXT}';
+
+statement ok
+LOAD '${MORAINE_DUCKDB_EXT}';
+
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/located-store' AS lake (DATA_PATH '__TEST_DIR__/located-data/', META_DATA_PATH '__TEST_DIR__/located-data/', DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE lake.t(a BIGINT);
+
+statement ok
+INSERT INTO lake.t VALUES (1),(2),(3);
+
+statement ok
+CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+
+statement ok con1
+SET VARIABLE located = (SELECT list({row_id:row_id, data_file_id:data_file_id}) FROM moraine_index_lookup('lake','main','t','by_a',1));
+
+# A transaction pinned before a newer commit still deletes from the files its
+# snapshot holds: positions are absolute within an immutable file.
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT count(*) FROM lake.t;
+----
+3
+
+statement ok con2
+INSERT INTO lake.t VALUES (4);
+
+query III con1
+SELECT * FROM moraine_delete_located('lake','main','t',getvariable('located'));
+----
+1	0	1
+
+statement ok con1
+ROLLBACK;
+
+query I con1
+SELECT count(*) FROM lake.t;
+----
+4
+
+# The companion function validates files and positions against the snapshot.
+statement ok con1
+SET VARIABLE located = (SELECT list({row_id:row_id, data_file_id:data_file_id}) FROM moraine_index_lookup('lake','main','t','by_a',1));
+
+statement ok con1
+SET VARIABLE file = (SELECT data_file_id FROM moraine_index_lookup('lake','main','t','by_a',1));
+
+statement error con1
+CALL ducklake_delete_positions('lake','main','t',[{data_file_id: 999999::UBIGINT, positions: [0::UBIGINT]}]);
+----
+<REGEX>:.*data file 999999 is not part of table.*
+
+statement error con1
+CALL ducklake_delete_positions('lake','main','t',[{data_file_id: getvariable('file'), positions: [3::UBIGINT]}]);
+----
+<REGEX>:.*position 3 is beyond the 3 rows.*
+
+statement error con1
+CALL ducklake_delete_positions('lake','main','t',[], inlined_rows := [7]);
+----
+<REGEX>:.*inlined row 7 is not visible.*
+
+statement ok con1
+BEGIN;
+
+query III con1
+SELECT * FROM ducklake_delete_positions('lake','main','t',[{data_file_id: getvariable('file'), positions: [0::UBIGINT]}]);
+----
+1	0	1
+
+query I con1
+SELECT a FROM lake.t ORDER BY a;
+----
+2
+3
+4
+
+statement ok con1
+ROLLBACK;
+
+query I con1
+SELECT count(*) FROM lake.t;
+----
+4
+
+# Pending deletions are visible to their own transaction only.
+statement ok con1
+BEGIN;
+
+query III con1
+SELECT * FROM moraine_delete_located('lake','main','t',getvariable('located'));
+----
+1	0	1
+
+query I con1
+SELECT count(*) FROM lake.t;
+----
+3
+
+query I con2
+SELECT count(*) FROM lake.t;
+----
+4
+
+# A conflicting delete after resolution must still fail at commit.
+statement ok con2
+DELETE FROM lake.t WHERE a=1;
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*(Conflict|conflict|TransactionContext Error).*
+
+query I
+SELECT a FROM lake.t ORDER BY a;
+----
+2
+3
+4
+
+query I
+SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a',1);
+----
+0

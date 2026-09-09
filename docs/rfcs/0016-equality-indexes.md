@@ -834,15 +834,14 @@ lookup — can delete them without a scan: a DuckLake delete file is
 `(file_path, pos)` rows, and positions are what file-row summaries answer.
 The path exists for bulk deletion by key from the embedding surface, where
 per-statement SQL machinery is the cost being avoided; the extension path
-surfaces it as `moraine_delete_located` (SQL surface below). SQL callers
-keep the located `DELETE … USING` join, whose scan reads only holding
-files.
+surfaces it as `moraine_delete_located` (SQL surface below). The SQL function
+retains direct positioning and stages its changes in DuckLake's transaction.
+The located `DELETE … USING` join remains available for ordinary SQL deletion.
 
 The split follows the repository's Parquet charter: the core never writes
 Parquet. `ReadOnlyCatalog::locate_row_positions` resolves located rows to
 `(data_file_id, position)` through the summaries, building on miss exactly
-as locating does; the caller — the extension shim, which already holds a
-Parquet writer — writes the delete file's content and lands it through the
+as locating does; the caller writes the delete file's content and lands it through the
 verbs that already exist: `register_delete_file` for the new file,
 `expire_delete_file` for the one it replaces, `inline_delete` for rows whose
 file id is NULL. No new keys, no commit-protocol change, no new verb. The
@@ -873,18 +872,37 @@ DuckLake's reserved field ids. A lake configured for deletion vectors
 rather than Parquet delete files declines this path and keeps the SQL
 fallback.
 
-The shim removes newly written delete files only if preparation fails before
-the commit call starts. Once that call starts, it retains the files on every
-error, including interruption: the commit can finish in the background after
-the caller receives an error (RFC 0010). Unregistered files are left for
-ordinary orphan cleanup under its grace window; a potentially committed
-file must never be removed as immediate error cleanup.
+Embedding callers of `Catalog::commit_located_deletion` retain files on an
+uncertain commit outcome. SQL calls instead transfer file ownership to
+DuckLake's pending changes: rollback removes uncommitted files, while the
+unknown-outcome handling preserves files that a commit may have registered.
 
-Deletion is head-only, exactly as locating is, and carries the same
-authority boundary: the summaries locate and position rows, but visibility
-— which physical copy of a row id is current — remains DuckLake's delete
-and snapshot processing, which is precisely what the registered delete file
-feeds.
+The SQL surface splits the work along the same line. During binding the
+extension resolves the located rows through `locate_row_positions` at the
+current head and rewrites the call into the companion DuckLake function
+`ducklake_delete_positions(catalog, schema, table, files, inlined_rows)`,
+whose inputs are DuckLake's own identifiers: `(data_file_id, positions)` per
+file and row ids for inlined rows. That function knows nothing about
+Moraine. It validates every file id and position against the transaction's
+snapshot, subtracts deletions the file already carries — its committed or
+pending delete file and inlined file deletions — and stages the remainder
+exactly as `DELETE` would: inlined file deletions below the inlining
+threshold, otherwise a delete file replacing the file's current one. Inlined
+rows are resolved to their backing inlined table by a metadata query and
+staged as pending inline deletions. DuckDB registers the lake as modified,
+so `COMMIT` publishes the deletions with the transaction's other changes and
+`ROLLBACK` discards them and removes any file written; a prepared call binds
+again for each execution. A failure after staging begins aborts the
+enclosing transaction.
+
+Resolving at the head while the transaction may be pinned earlier is safe
+because positions are absolute within an immutable file: a file the head no
+longer holds fails in Moraine, a file the snapshot lacks fails in DuckLake,
+and a row another writer deleted meanwhile surfaces as DuckLake's ordinary
+commit conflict on that file. Rows inserted into transaction-local storage
+are not addressable. Visibility remains DuckLake's delete and snapshot
+processing, and index maintenance uses the normal scoped reads when the
+transaction commits. No user-table scan is introduced.
 
 ### Range and comparison queries
 
@@ -1176,14 +1194,18 @@ the ordinary `altered_table` conflict. Non-native syntax, explicit reads
 (below), but real without a DuckLake change.
 
 `moraine_delete_located` binds `rows` as one constant list, exactly as
-`moraine_index_in` binds `keys`, and commits autonomously like the DDL
-functions — one DuckLake snapshot of its own, not part of any enclosing
-DuckDB transaction. The call is atomic and fail-closed as File-located
-deletion requires: every pair positions exactly or the whole call errors
-with no commit — a row the named file does not hold, a file absent from
-the head, or a deletion-vector-configured lake each refuse rather than
-guess. Duplicate pairs collapse, and a row already deleted folds silently
-into the union its delete file replaces.
+`moraine_index_in` binds `keys`. It participates in the current DuckLake
+transaction: an explicit `COMMIT` publishes its deletions together with other
+writes, and `ROLLBACK` discards them. Outside an explicit transaction, DuckDB
+commits the statement automatically. An empty or already-deleted request
+stages nothing. The SQL function requires the companion extension's
+`ducklake_delete_positions`; it never falls back to an autonomous commit.
+
+Every pair positions exactly or the call fails: a row the named file does not
+hold, a file absent from the head, or a deletion-vector-configured lake each
+refuse. Duplicate pairs collapse, and pending deletions are considered when
+counting new work. A failed replacement insert can therefore roll back the
+preceding direct deletion without losing the original rows.
 
 **Coverage: intercept inline, read bulk.** Small inserts DuckLake stages
 inline; their values cross the ABI as an Arrow body (RFC 0005), and moraine
