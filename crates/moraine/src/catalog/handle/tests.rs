@@ -539,7 +539,7 @@ async fn requested_inline_rows_follow_updates_and_wider_chunks() {
     )
     .await;
     let requested = catalog
-        .requested_inline_row_ids(TableId::new(1), &[10, 1000, 10, u64::MAX])
+        .requested_inline_row_ids(TableId::new(1), &[10, 1000, 10, u64::MAX], None)
         .await
         .unwrap();
     assert_eq!(requested, [10, 1000].into_iter().collect());
@@ -570,7 +570,7 @@ async fn requested_inline_rows_follow_updates_and_wider_chunks() {
     );
     assert!(
         !catalog
-            .requested_inline_row_ids(TableId::new(1), &[10])
+            .requested_inline_row_ids(TableId::new(1), &[10], None)
             .await
             .unwrap()
             .contains(&10)

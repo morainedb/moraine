@@ -5,6 +5,10 @@ use std::collections::{HashMap, HashSet};
 use futures::{StreamExt, TryStreamExt, stream};
 use tracing::{debug, warn};
 
+mod rows_at;
+
+pub use rows_at::LocatedRows;
+
 use super::{Catalog, ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
 use crate::{
     catalog::{
@@ -283,7 +287,7 @@ impl ReadOnlyCatalog {
         // A row can be inlined and still hold an expired physical copy in a
         // current file, so the inlined copy is its own candidate. Only the
         // ids are needed, so the bodies stay unread.
-        let inlined = self.requested_inline_row_ids(table, &row_ids);
+        let inlined = self.requested_inline_row_ids(table, &row_ids, None);
         let (mut placements, inlined) = futures::try_join!(file_placements, inlined)?;
 
         // Emit in the caller's order; locating must not reorder.
@@ -329,8 +333,9 @@ impl ReadOnlyCatalog {
     }
 
     /// Resolves located rows — `(row_id, data_file_id)` pairs, as a lookup
-    /// returns them — to their exact file positions, for deletion without a
-    /// scan.
+    /// returns them — to their exact file positions at the head, for
+    /// deletion without a scan. [`Self::locate_row_positions_at`] pins the
+    /// view instead.
     ///
     /// Position resolution inverts locating's contract: locating may
     /// broaden, but a position may not, since a wrong position deletes a
@@ -354,13 +359,33 @@ impl ReadOnlyCatalog {
         table: TableId,
         pairs: &[(u64, Option<DataFileId>)],
     ) -> Result<LocatedPositions> {
+        let snapshot = self.snapshot().await?;
+        self.locate_row_positions_at(&snapshot, data_store, data_prefix, table, pairs)
+            .await
+    }
+
+    /// [`Self::locate_row_positions`] against `snapshot` rather than the
+    /// head: files, delete files, and inlined rows are those visible there,
+    /// so a caller pinned to an older view positions what it can see.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::locate_row_positions`].
+    pub async fn locate_row_positions_at(
+        &self,
+        snapshot: &CatalogSnapshot,
+        data_store: Option<DataStore>,
+        data_prefix: &str,
+        table: TableId,
+        pairs: &[(u64, Option<DataFileId>)],
+    ) -> Result<LocatedPositions> {
         if pairs.is_empty() {
             return Ok(LocatedPositions::default());
         }
 
-        let snapshot = self.snapshot().await?;
+        let visible_at = snapshot.current_snapshot().id.get();
         let (by_file, null_rows) = group_deduped_pairs(pairs);
-        let inlined_rows = self.resolve_inlined(table, null_rows).await?;
+        let inlined_rows = self.resolve_inlined(table, null_rows, visible_at).await?;
 
         if by_file.is_empty() {
             return Ok(LocatedPositions {
@@ -370,7 +395,7 @@ impl ReadOnlyCatalog {
         }
 
         let table_prefix = snapshot.table_data_prefix(table)?;
-        let requested_files = current_files_for(&snapshot, table, &by_file)?;
+        let requested_files = current_files_for(snapshot, table, &by_file)?;
 
         let Some(store) = data_store else {
             return Err(first_row_error(
@@ -384,7 +409,7 @@ impl ReadOnlyCatalog {
             data_prefix,
             table_prefix: &table_prefix,
             table,
-            snapshot: &snapshot,
+            snapshot,
         };
 
         let deletions = self
@@ -401,10 +426,16 @@ impl ReadOnlyCatalog {
         })
     }
 
-    /// Confirms every row naming no file is a live inlined row, failing
-    /// typed on the first that is neither.
-    async fn resolve_inlined(&self, table: TableId, null_rows: Vec<u64>) -> Result<Vec<u64>> {
-        self.require_live_inlined_rows(table, &null_rows).await?;
+    /// Confirms every row naming no file is an inlined row live at
+    /// `visible_at`, failing typed on the first that is neither.
+    async fn resolve_inlined(
+        &self,
+        table: TableId,
+        null_rows: Vec<u64>,
+        visible_at: u64,
+    ) -> Result<Vec<u64>> {
+        self.require_live_inlined_rows(table, &null_rows, Some(visible_at))
+            .await?;
         Ok(null_rows)
     }
 
@@ -880,12 +911,19 @@ impl ReadOnlyCatalog {
     /// row: a flush settling between locate and commit would otherwise turn
     /// the tombstone into a silent no-op. A flush racing after this check
     /// conflicts at commit.
-    async fn require_live_inlined_rows(&self, table: TableId, inlined_rows: &[u64]) -> Result<()> {
+    async fn require_live_inlined_rows(
+        &self,
+        table: TableId,
+        inlined_rows: &[u64],
+        visible_at: Option<u64>,
+    ) -> Result<()> {
         if inlined_rows.is_empty() {
             return Ok(());
         }
 
-        let live = self.requested_inline_row_ids(table, inlined_rows).await?;
+        let live = self
+            .requested_inline_row_ids(table, inlined_rows, visible_at)
+            .await?;
         for &row_id in inlined_rows {
             if !live.contains(&row_id) {
                 return Err(Error::RowPosition {
@@ -968,7 +1006,8 @@ impl Catalog {
         inlined_rows: &[u64],
     ) -> Result<SnapshotId> {
         let snapshot = self.snapshot().await?;
-        self.require_live_inlined_rows(table, inlined_rows).await?;
+        self.require_live_inlined_rows(table, inlined_rows, None)
+            .await?;
         let file_removals = self
             .delete_file_index_removals(
                 data_store.as_ref(),

@@ -250,7 +250,7 @@ pub use catalog::{
     DeleteFile, DeleteFileId, DeleteFileInfo, DeleteFileRegistration, ExistingDeleteFile,
     FileColumnStats, FileIndexEntry, FileIndexRemoval, FileRowCandidate, FlushedDataFile, IndexDef,
     IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexState, InlineChunk, LiveCount,
-    LocatedDeletion, LocatedPositions, MacroId, MacroImplementationDef, MacroInfo,
+    LocatedDeletion, LocatedPositions, LocatedRows, MacroId, MacroImplementationDef, MacroInfo,
     MacroParameterDef, MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass,
     MaintenanceStatusStep, MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef,
     OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow,

@@ -12,7 +12,7 @@ diff --git a/src/functions/ducklake_delete_positions.cpp b/src/functions/ducklak
 new file mode 100644
 --- /dev/null
 +++ b/src/functions/ducklake_delete_positions.cpp
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,345 @@
 +#include "functions/ducklake_table_functions.hpp"
 +#include "duckdb/planner/binder.hpp"
 +#include "duckdb/common/enums/database_modification_type.hpp"
@@ -36,6 +36,8 @@ new file mode 100644
 +	map<idx_t, set<idx_t>> file_positions;
 +	//! Requested row ids of committed inlined rows
 +	set<idx_t> inlined_rows;
++	//! The snapshot the caller resolved its positions against, if it says
++	optional_idx resolved_snapshot;
 +};
 +
 +struct DeletePositionsState : public GlobalTableFunctionState {
@@ -112,6 +114,10 @@ new file mode 100644
 +			}
 +			result->inlined_rows.insert(row_id.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>());
 +		}
++	}
++	auto resolved = input.named_parameters.find("snapshot");
++	if (resolved != input.named_parameters.end() && !resolved->second.IsNull()) {
++		result->resolved_snapshot = resolved->second.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>();
 +	}
 +	// The staged deletes belong to the executing transaction, so a prepared call binds again for each execution.
 +	input.binder->SetAlwaysRequireRebind();
@@ -223,6 +229,13 @@ new file mode 100644
 +		                            "committed tables have addressable files",
 +		                            data.table.name);
 +	}
++	// Positions resolved against an older snapshot may name rows this transaction already sees deleted; a newer
++	// one only stages what this snapshot still holds, and a deletion in between surfaces as a commit conflict.
++	if (data.resolved_snapshot.IsValid() && data.resolved_snapshot.GetIndex() < snapshot.snapshot_id) {
++		throw TransactionException("ducklake_delete_positions: positions were resolved against snapshot %d, older "
++		                            "than snapshot %d this transaction reads; retry the statement",
++		                            data.resolved_snapshot.GetIndex(), snapshot.snapshot_id);
++	}
 +
 +	map<idx_t, DuckLakeFileListExtendedEntry> files;
 +	if (!data.file_positions.empty()) {
@@ -270,7 +283,10 @@ new file mode 100644
 +				auto scanned = DuckLakeDeleteFilter::ScanDeleteFile(context, pending);
 +				positions.insert(scanned.deleted_rows.begin(), scanned.deleted_rows.end());
 +			} else if (!file.delete_file.path.empty()) {
-+				auto scanned = DuckLakeDeleteFilter::ScanDeleteFile(context, file.delete_file);
++				// A replaced delete file embeds per-position snapshots and keeps the earliest begin; only the
++				// positions deleted at this snapshot count as already gone.
++				auto scanned = DuckLakeDeleteFilter::ScanDeleteFile(context, file.delete_file, optional_idx(),
++				                                                    snapshot.snapshot_id);
 +				positions.insert(scanned.deleted_rows.begin(), scanned.deleted_rows.end());
 +			}
 +			set<idx_t> inlined_positions;
@@ -338,6 +354,7 @@ new file mode 100644
 +                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
 +                    DeletePositionsExecute, DeletePositionsBind, DeletePositionsInit) {
 +	named_parameters["inlined_rows"] = LogicalType::LIST(LogicalType::UBIGINT);
++	named_parameters["snapshot"] = LogicalType::UBIGINT;
 +}
 +
 +} // namespace duckdb

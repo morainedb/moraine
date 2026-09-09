@@ -33,6 +33,13 @@ namespace moraine_duckdb {
 // string verbatim.
 duckdb::LogicalType MapColumnType(const std::string &ducklake_type);
 
+// A column's DuckDB `LogicalType` from a table's flat `ducklake_column`
+// rows: `by_id` maps field ids to rows, `children_of` maps a parent id to
+// its child ids in column order.
+duckdb::LogicalType BuildColumnType(const MoraineColumnDesc &column,
+                                    const std::unordered_map<uint64_t, const MoraineColumnDesc *> &by_id,
+                                    const std::unordered_map<uint64_t, std::vector<uint64_t>> &children_of);
+
 // Translates a MoraineError into the matching DuckDB exception (NotFound/
 // AlreadyExists/Constraint -> CatalogException, CommitConflict ->
 // TransactionException, Corruption/Store/internal -> IOException/

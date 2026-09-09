@@ -39,13 +39,16 @@ applied in file-name order:
    and standalone located deletion cancellation are tested by `cargo xtask e2e`.
 
 6. `0006-feat-delete-DuckLake-rows-by-position.patch` adds
-   `ducklake_delete_positions(catalog, schema, table, files, inlined_rows := [])`,
+   `ducklake_delete_positions(catalog, schema, table, files, inlined_rows := [], snapshot := NULL)`,
    which stages deletes of already-located rows in the current DuckLake
    transaction without scanning the table. `files` is a list of
    `STRUCT(data_file_id UBIGINT, positions UBIGINT[])` naming positions
    within committed data files at the transaction's snapshot; `inlined_rows`
-   lists row ids of committed inlined rows. The function validates every
-   file id and position against that snapshot, subtracts deletions the file
+   lists row ids of committed inlined rows, and `snapshot`, when given, is
+   the snapshot the caller resolved them against, refused with a
+   transaction error if it is older than the one the transaction reads. The
+   function validates every file id and position against that snapshot,
+   subtracts deletions the file
    already carries, and then stages the rest exactly as `DELETE` would:
    inlined file deletions below the inlining threshold, otherwise a new
    delete file that replaces the file's current one. `COMMIT` publishes

@@ -13,61 +13,10 @@
 #include "delete_located.hpp"
 #include "moraine_abi.h"
 #include "owned_array.hpp"
+#include "rows_at.hpp"
 
 namespace moraine_duckdb {
 namespace {
-
-std::vector<MorainePositionPair> ParsePairs(const duckdb::Value &rows) {
-	std::vector<MorainePositionPair> pairs;
-	if (rows.IsNull()) {
-		throw duckdb::InvalidInputException("moraine_delete_located: `rows` cannot be NULL");
-	}
-
-	// The element struct's field names are validated once here, by type,
-	// rather than assumed positional: a caller naming `data_file_id` before
-	// `row_id` must still resolve to the right row.
-	auto element_type = duckdb::ListType::GetChildType(rows.type());
-	if (element_type.id() != duckdb::LogicalTypeId::STRUCT) {
-		throw duckdb::InvalidInputException(
-		    "moraine_delete_located: each `rows` entry must be STRUCT(row_id BIGINT, data_file_id UBIGINT)");
-	}
-	auto &children = duckdb::StructType::GetChildTypes(element_type);
-	duckdb::optional_idx row_id_index;
-	duckdb::optional_idx data_file_id_index;
-	for (duckdb::idx_t i = 0; i < children.size(); i++) {
-		auto name = duckdb::StringUtil::Lower(children[i].first);
-		if (name == "row_id") {
-			row_id_index = i;
-		} else if (name == "data_file_id") {
-			data_file_id_index = i;
-		}
-	}
-	if (children.size() != 2 || !row_id_index.IsValid() || !data_file_id_index.IsValid()) {
-		throw duckdb::InvalidInputException(
-		    "moraine_delete_located: each `rows` entry must be exactly STRUCT(row_id BIGINT, data_file_id UBIGINT)");
-	}
-
-	for (auto &row : duckdb::ListValue::GetChildren(rows)) {
-		if (row.IsNull()) {
-			throw duckdb::InvalidInputException("moraine_delete_located: a `rows` entry cannot be NULL");
-		}
-		auto &fields = duckdb::StructValue::GetChildren(row);
-		auto &row_id_value = fields[row_id_index.GetIndex()];
-		auto &data_file_id_value = fields[data_file_id_index.GetIndex()];
-		if (row_id_value.IsNull()) {
-			throw duckdb::InvalidInputException("moraine_delete_located: `row_id` cannot be NULL");
-		}
-		MorainePositionPair pair {};
-		pair.row_id = row_id_value.DefaultCastAs(duckdb::LogicalType::UBIGINT).GetValue<uint64_t>();
-		if (!data_file_id_value.IsNull()) {
-			pair.has_data_file_id = true;
-			pair.data_file_id = data_file_id_value.DefaultCastAs(duckdb::LogicalType::UBIGINT).GetValue<uint64_t>();
-		}
-		pairs.push_back(pair);
-	}
-
-	return pairs;
-}
 
 duckdb::Value Positions(const uint64_t *positions, size_t length) {
 	duckdb::vector<duckdb::Value> values;
@@ -78,26 +27,27 @@ duckdb::Value Positions(const uint64_t *positions, size_t length) {
 	return duckdb::Value::LIST(duckdb::LogicalType::UBIGINT, std::move(values));
 }
 
-// Resolves the located rows to `(data_file_id, positions)` at the catalog
-// head and rewrites the call into DuckLake's transaction-aware function.
-// A file the head no longer holds, or a row its named file does not hold,
-// fails here; a file the transaction's snapshot lacks fails in DuckLake.
+// Resolves the located rows to `(data_file_id, positions)` at the snapshot
+// the current DuckDB transaction pinned on the metadata catalog, and
+// rewrites the call into DuckLake's transaction-aware function, naming that
+// snapshot so DuckLake can refuse a mismatch. A file the snapshot does not
+// hold, or a row its named file does not hold, fails here.
 duckdb::unique_ptr<duckdb::TableRef> DeleteLocatedReplace(duckdb::ClientContext &context,
                                                           duckdb::TableFunctionBindInput &input) {
 	auto catalog_name = input.inputs[0].GetValue<std::string>();
 	auto schema_name = input.inputs[1].GetValue<std::string>();
 	auto table_name = input.inputs[2].GetValue<std::string>();
-	auto pairs = ParsePairs(input.inputs[3]);
+	auto pairs = ParseLocatedPairs(input.inputs[3], "moraine_delete_located");
 
-	auto handle = ResolveMoraineCatalog(context, catalog_name).Handle();
+	auto pinned = PinTransactionSnapshot(context, catalog_name, schema_name, table_name);
 	OwnedArray<MoraineLocatedFile> files(moraine_locate_row_positions_free_files);
 	OwnedArray<uint64_t> inlined(moraine_locate_row_positions_free_inlined);
 	char *raw_write_directory = nullptr;
 	MoraineError error {};
-	auto code = moraine_locate_row_positions(handle, schema_name.c_str(), table_name.c_str(), pairs.data(),
-	                                         pairs.size(), files.OutItems(), files.OutLen(), inlined.OutItems(),
-	                                         inlined.OutLen(), &raw_write_directory, moraine_shim_is_interrupted,
-	                                         &context, &error);
+	auto code = moraine_locate_row_positions(pinned.catalog->Handle(), pinned.snapshot, schema_name.c_str(),
+	                                         table_name.c_str(), pairs.data(), pairs.size(), files.OutItems(),
+	                                         files.OutLen(), inlined.OutItems(), inlined.OutLen(),
+	                                         &raw_write_directory, moraine_shim_is_interrupted, &context, &error);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(error);
 	}
@@ -132,6 +82,10 @@ duckdb::unique_ptr<duckdb::TableRef> DeleteLocatedReplace(duckdb::ClientContext 
 	    Value::LIST(LogicalType::UBIGINT, std::move(inlined_values)));
 	inlined_rows->SetAlias("inlined_rows");
 	arguments.push_back(std::move(inlined_rows));
+	// DuckLake refuses positions resolved against any snapshot but its own.
+	auto snapshot = duckdb::make_uniq<duckdb::ConstantExpression>(Value::UBIGINT(pinned.snapshot_id));
+	snapshot->SetAlias("snapshot");
+	arguments.push_back(std::move(snapshot));
 
 	auto result = duckdb::make_uniq<duckdb::TableFunctionRef>();
 	result->function = duckdb::make_uniq<duckdb::FunctionExpression>("ducklake_delete_positions", std::move(arguments));

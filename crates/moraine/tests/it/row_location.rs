@@ -1,6 +1,6 @@
 //! `ReadOnlyCatalog::locate_row_ids`: which current files hold a row id.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arrow::{
     array::{Int64Array, RecordBatch},
@@ -10,38 +10,9 @@ use moraine::{
     Catalog, DataFile, DataFileId, DataStore, DeleteFile, DeleteFileRegistration, Error, IndexDef,
     IndexKeyValue, InlineChunk, IntWidth, TableId,
 };
-use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
-use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+use object_store::{ObjectStore, memory::InMemory};
 
-use crate::fixtures::{col, datafile, open_memory};
-
-/// DuckLake's reserved row-id column, tagged so discovery finds it.
-fn row_id_field() -> Field {
-    Field::new("_ducklake_internal_row_id", DataType::Int64, false).with_metadata(HashMap::from([
-        (
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            "2147483540".to_string(),
-        ),
-    ]))
-}
-
-/// Writes `batch` and returns the sizes the catalog records for it.
-#[allow(clippy::unwrap_used)]
-async fn write(store: &InMemory, path: &str, batch: &RecordBatch) -> (u64, u64) {
-    let mut buffer = Vec::new();
-    {
-        let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
-        writer.write(batch).unwrap();
-        writer.close().unwrap();
-    }
-    let footer_offset = buffer.len() - 8;
-    let footer_size = u64::from(u32::from_le_bytes(
-        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
-    ));
-    let file_size = u64::try_from(buffer.len()).unwrap();
-    store.put(&Path::from(path), buffer.into()).await.unwrap();
-    (file_size, footer_size)
-}
+use crate::fixtures::{col, datafile, open_memory, row_id_field, write_parquet as write};
 
 /// A batch of `a` values carrying explicit row ids.
 #[allow(clippy::unwrap_used)]

@@ -24,9 +24,9 @@ pub(crate) use handle::BACKFILL_FILE_READ_CONCURRENCY;
 pub(crate) use handle::Store;
 pub use handle::{
     CachePreload, Catalog, CatalogOptions, CommitMember, DeleteFileRegistration,
-    ExistingDeleteFile, LocatedDeletion, LocatedPositions, MaintenanceReport, MaintenanceRequest,
-    MaintenanceStatusPass, MaintenanceStatusStep, MigrationRequest, ReadOnlyCatalog,
-    RowSummaryWarmth,
+    ExistingDeleteFile, LocatedDeletion, LocatedPositions, LocatedRows, MaintenanceReport,
+    MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep, MigrationRequest,
+    ReadOnlyCatalog, RowSummaryWarmth,
 };
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;

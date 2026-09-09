@@ -15,6 +15,7 @@ void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader);
 void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader);
 // Defined in delete_located.cpp.
 void RegisterMoraineDeleteLocatedFunction(duckdb::ExtensionLoader &loader);
+void RegisterMoraineRowsAtFunction(duckdb::ExtensionLoader &loader);
 // Defined in optimizer.cpp.
 void RegisterMoraineOptimizer(duckdb::DBConfig &config);
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader);
@@ -32,6 +33,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	moraine_duckdb::RegisterMoraineCensusFunctions(loader);
 	moraine_duckdb::RegisterMoraineIndexFunctions(loader);
 	moraine_duckdb::RegisterMoraineDeleteLocatedFunction(loader);
+	moraine_duckdb::RegisterMoraineRowsAtFunction(loader);
 	moraine_duckdb::RegisterMoraineMaintenanceFunctions(loader);
 	moraine_duckdb::RegisterMoraineMigrateFunction(loader);
 	moraine_duckdb::RegisterMoraineCheckpointFunctions(loader);

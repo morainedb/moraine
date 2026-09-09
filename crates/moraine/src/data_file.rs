@@ -16,6 +16,7 @@ mod delete_file;
 mod entries;
 mod inline_batch;
 mod inline_rows;
+mod located_rows;
 mod metrics;
 mod reader;
 mod row_location;
@@ -55,9 +56,10 @@ pub(crate) use crate::data_file::{
     auxiliary_cache::{
         install as install_auxiliary, occupancy as auxiliary_occupancy, row_summary_occupancy,
     },
-    delete_file::delete_file_positions,
+    delete_file::{delete_file_positions, delete_file_positions_at},
     inline_batch::{decode_inline_schema, inline_batch_entries, inline_batch_index_entries},
     inline_rows::InlineRows,
+    located_rows::{encode_located_batch, inline_rows_batch, scoped_read_row_batches},
     metrics::{DataStoreCounters, ScopedReadMetrics, ScopedReadTally, run_bounded_index_encoding},
     row_location::{FileSummary, file_summary},
     schema::ReadColumn,

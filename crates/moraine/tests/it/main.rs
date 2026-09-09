@@ -22,6 +22,7 @@ mod maintenance_status;
 mod measure;
 mod partitioning;
 mod row_location;
+mod rows_at;
 mod runtime;
 mod schema_evolution;
 mod sorting;

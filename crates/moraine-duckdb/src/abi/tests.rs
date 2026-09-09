@@ -2604,6 +2604,7 @@ impl LocateOutcome {
         outcome.code = unsafe {
             moraine_locate_row_positions(
                 handle,
+                ptr::null_mut(),
                 schema.as_ptr(),
                 table.as_ptr(),
                 pairs.as_ptr(),
