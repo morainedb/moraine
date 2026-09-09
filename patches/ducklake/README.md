@@ -38,7 +38,7 @@ applied in file-name order:
    Unregistered files remain eligible for orphan cleanup. Ordinary SQL deletion
    and standalone located deletion cancellation are tested by `cargo xtask e2e`.
 
-6. `0006-feat-delete-DuckLake-rows-by-position.patch` adds
+6. `0006-feat-change-DuckLake-rows-by-position.patch` adds
    `ducklake_delete_positions(catalog, schema, table, files, inlined_rows := [], snapshot := NULL)`,
    which stages deletes of already-located rows in the current DuckLake
    transaction without scanning the table. `files` is a list of
@@ -55,9 +55,15 @@ applied in file-name order:
    these together with the transaction's other changes, and `ROLLBACK`
    discards them and removes any file written. Moraine's
    `moraine_delete_located` resolves row ids to positions through its
-   file-row summaries and rewrites itself into this call. The function has
-   no Moraine dependency; explicit rollback, failed replacement inserts,
-   repeated calls, and standalone autocommit are covered by `cargo xtask e2e`.
+   file-row summaries and rewrites itself into this call. The same patch
+   adds `ducklake_update_positions(catalog, schema, table, files,
+   replacement, inlined_rows := [], snapshot := NULL)`: `replacement` is a
+   `SELECT` producing the table's columns, bound as an ordinary `INSERT`
+   through DuckDB's binder and planned with the positional deletes staged
+   once the insert completes, all in the current transaction, which
+   `moraine_update` rewrites into. Neither function has a Moraine
+   dependency; explicit rollback, failed replacement inserts, repeated
+   calls, and standalone autocommit are covered by `cargo xtask e2e`.
 
 Later patches address the lines earlier ones produce, so the series is applied
 in one `git apply` invocation rather than one per file.

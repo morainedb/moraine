@@ -28,6 +28,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/census.cpp
     ${CPP_DIR}/delete_located.cpp
     ${CPP_DIR}/rows_at.cpp
+    ${CPP_DIR}/update_located.cpp
     ${CPP_DIR}/index_functions.cpp
     ${CPP_DIR}/inline_tables.cpp
     ${CPP_DIR}/maintenance.cpp

@@ -98,12 +98,58 @@ std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, co
 	return pairs;
 }
 
-namespace {
+LocatedArguments ResolveLocatedArguments(duckdb::ClientContext &context, const std::string &catalog_name,
+                                         const std::string &schema_name, const std::string &table_name,
+                                         const duckdb::Value &rows, const char *caller) {
+	auto pairs = ParseLocatedPairs(rows, caller);
+	auto pinned = PinTransactionSnapshot(context, catalog_name, schema_name, table_name);
+	OwnedArray<MoraineLocatedFile> files(moraine_locate_row_positions_free_files);
+	OwnedArray<uint64_t> inlined(moraine_locate_row_positions_free_inlined);
+	char *raw_write_directory = nullptr;
+	MoraineError error {};
+	auto code = moraine_locate_row_positions(pinned.catalog->Handle(), pinned.snapshot, schema_name.c_str(),
+	                                         table_name.c_str(), pairs.data(), pairs.size(), files.OutItems(),
+	                                         files.OutLen(), inlined.OutItems(), inlined.OutLen(),
+	                                         &raw_write_directory, moraine_shim_is_interrupted, &context, &error);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(error);
+	}
+	// DuckLake composes the delete file's directory itself.
+	moraine_string_free(raw_write_directory);
 
-// The table's top-level column types at the transaction's snapshot, in
-// catalog order, as the storage extension would bind them.
-void BindTableColumns(MoraineSnapshotHandle *snapshot, const std::string &schema_name, const std::string &table_name,
-                      duckdb::vector<duckdb::LogicalType> &types, duckdb::vector<std::string> &names) {
+	using duckdb::LogicalType;
+	using duckdb::Value;
+	duckdb::child_list_t<LogicalType> file_fields {{"data_file_id", LogicalType::UBIGINT},
+	                                               {"positions", LogicalType::LIST(LogicalType::UBIGINT)}};
+	auto file_type = LogicalType::STRUCT(file_fields);
+	duckdb::vector<Value> file_values;
+	file_values.reserve(files.size());
+	for (auto &file : files) {
+		duckdb::vector<Value> positions;
+		positions.reserve(file.positions_len);
+		for (size_t i = 0; i < file.positions_len; i++) {
+			positions.push_back(Value::UBIGINT(file.positions[i]));
+		}
+		duckdb::child_list_t<Value> fields {
+		    {"data_file_id", Value::UBIGINT(file.data_file_id)},
+		    {"positions", Value::LIST(LogicalType::UBIGINT, std::move(positions))}};
+		file_values.push_back(Value::STRUCT(std::move(fields)));
+	}
+	duckdb::vector<Value> inlined_values;
+	inlined_values.reserve(inlined.size());
+	for (auto row_id : inlined) {
+		inlined_values.push_back(Value::UBIGINT(row_id));
+	}
+
+	LocatedArguments arguments;
+	arguments.files = Value::LIST(file_type, std::move(file_values));
+	arguments.inlined_rows = Value::LIST(LogicalType::UBIGINT, std::move(inlined_values));
+	arguments.snapshot_id = pinned.snapshot_id;
+	return arguments;
+}
+
+void TableColumns(MoraineSnapshotHandle *snapshot, const std::string &schema_name, const std::string &table_name,
+                  duckdb::vector<duckdb::LogicalType> &types, duckdb::vector<std::string> &names) {
 	uint64_t table_id = 0;
 	MoraineError error {};
 	if (moraine_snapshot_resolve_table(snapshot, schema_name.c_str(), table_name.c_str(), &table_id, &error) !=
@@ -130,6 +176,8 @@ void BindTableColumns(MoraineSnapshotHandle *snapshot, const std::string &schema
 		names.push_back(column.name);
 	}
 }
+
+namespace {
 
 struct RowsAtBindData : public duckdb::FunctionData {
 	std::string catalog_name;
@@ -173,7 +221,7 @@ duckdb::unique_ptr<duckdb::FunctionData> RowsAtBind(duckdb::ClientContext &conte
 	auto pinned =
 	    PinTransactionSnapshot(context, bind_data->catalog_name, bind_data->schema_name, bind_data->table_name);
 	auto snapshot = pinned.snapshot;
-	BindTableColumns(snapshot, bind_data->schema_name, bind_data->table_name, return_types, names);
+	TableColumns(snapshot, bind_data->schema_name, bind_data->table_name, return_types, names);
 	return_types.push_back(duckdb::LogicalType::UBIGINT);
 	names.push_back("row_id");
 	return_types.push_back(duckdb::LogicalType::UBIGINT);

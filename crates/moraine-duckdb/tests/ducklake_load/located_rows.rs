@@ -124,3 +124,67 @@ fn a_column_added_after_the_rows_were_written_reads_null() {
         assert_eq!(rows, vec![vec!["2", "y", "true"]]);
     }
 }
+
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn a_located_update_applies_its_assignments_in_one_statement() {
+    for inline_limit in [0, 1024] {
+        let fixture = Fixture::new(inline_limit);
+        let counts = csv_rows(&fixture.run(&format!(
+            "{} SELECT file_rows_deleted + inline_rows_deleted, rows_inserted FROM \
+             moraine_update('lake', 'main', 't', getvariable('located'), 'b = b || ''!''');",
+            Fixture::locate("1, 3")
+        )));
+        assert_eq!(counts, vec![vec!["2", "2"]]);
+        assert_eq!(
+            fixture.rows(),
+            vec![vec!["1", "x!"], vec!["2", "y"], vec!["3", "z!"]]
+        );
+        assert_eq!(
+            csv_rows(&fixture.run(
+                "SELECT count(DISTINCT row_id) FROM moraine_index_in('lake', 'main', 't', 'by_a', [1, 3]);"
+            )),
+            vec![vec!["2"]],
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn a_located_update_rolls_back_with_its_transaction() {
+    for inline_limit in [0, 1024] {
+        let fixture = Fixture::new(inline_limit);
+        fixture.run(&format!(
+            "{} BEGIN;
+             CALL moraine_update('lake', 'main', 't', getvariable('located'), 'b = b || ''!''');
+             ROLLBACK;",
+            Fixture::locate("1, 3")
+        ));
+        assert_eq!(
+            fixture.rows(),
+            vec![vec!["1", "x"], vec!["2", "y"], vec!["3", "z"]]
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+fn an_assignment_to_an_unknown_column_is_refused() {
+    let fixture = Fixture::new(0);
+    let output = run_ducklake_sql_output(
+        fixture.store.path(),
+        fixture.data.path(),
+        &fixture.options,
+        &format!(
+            "{} CALL moraine_update('lake', 'main', 't', getvariable('located'), 'zz = 1');",
+            Fixture::locate("1")
+        ),
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("has no column \"zz\""), "{error}");
+    assert_eq!(
+        fixture.rows(),
+        vec![vec!["1", "x"], vec!["2", "y"], vec!["3", "z"]]
+    );
+}

@@ -27,7 +27,7 @@ FetchContent_Declare(moraine_patched_ducklake
         ${CMAKE_CURRENT_LIST_DIR}/0003-feat-expose-DuckLake-data-file-ids-to-scans.patch
         ${CMAKE_CURRENT_LIST_DIR}/0004-perf-append-DuckLake-inlined-data-rows.patch
         ${CMAKE_CURRENT_LIST_DIR}/0005-fix-retain-files-after-unknown-commit-outcomes.patch
-        ${CMAKE_CURRENT_LIST_DIR}/0006-feat-delete-DuckLake-rows-by-position.patch
+        ${CMAKE_CURRENT_LIST_DIR}/0006-feat-change-DuckLake-rows-by-position.patch
 )
 FetchContent_GetProperties(moraine_patched_ducklake)
 if(NOT moraine_patched_ducklake_POPULATED)

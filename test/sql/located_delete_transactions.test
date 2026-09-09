@@ -238,3 +238,63 @@ SELECT a FROM lake.t ORDER BY a;
 3
 4
 5
+
+# moraine_update fuses the recipe into one statement, under the same rules:
+# the read and the deletion resolve against the pinned snapshot, and a row
+# another writer deletes meanwhile conflicts at commit.
+statement ok con1
+SET VARIABLE located = (SELECT list({row_id:row_id, data_file_id:data_file_id}) FROM moraine_index_lookup('lake','main','t','by_a',3));
+
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT a FROM moraine_rows_at('lake','main','t',getvariable('located'));
+----
+3
+
+statement ok con2
+DELETE FROM lake.t WHERE a=3;
+
+query IIII con1
+SELECT * FROM moraine_update('lake','main','t',getvariable('located'),'a = a + 100');
+----
+1	0	1	1
+
+query I con1
+SELECT a FROM lake.t ORDER BY a;
+----
+4
+5
+103
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*(Conflict|conflict|TransactionContext Error).*
+
+query I
+SELECT a FROM lake.t ORDER BY a;
+----
+4
+5
+
+# Outside an explicit transaction the update commits on its own.
+statement ok
+SET VARIABLE located = (SELECT list({row_id:row_id, data_file_id:data_file_id}) FROM moraine_index_lookup('lake','main','t','by_a',4));
+
+query IIII
+SELECT * FROM moraine_update('lake','main','t',getvariable('located'),'a = a * 10');
+----
+1	0	1	1
+
+query I
+SELECT a FROM lake.t ORDER BY a;
+----
+5
+40
+
+query I
+SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a',40);
+----
+1

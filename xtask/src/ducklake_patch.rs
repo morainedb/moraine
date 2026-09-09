@@ -22,7 +22,7 @@ const PATCH_PATHS: [&str; 6] = [
     "patches/ducklake/0003-feat-expose-DuckLake-data-file-ids-to-scans.patch",
     "patches/ducklake/0004-perf-append-DuckLake-inlined-data-rows.patch",
     "patches/ducklake/0005-fix-retain-files-after-unknown-commit-outcomes.patch",
-    "patches/ducklake/0006-feat-delete-DuckLake-rows-by-position.patch",
+    "patches/ducklake/0006-feat-change-DuckLake-rows-by-position.patch",
 ];
 const CONFIG_PATH: &str = "patches/ducklake/extension_config.cmake";
 /// The patched-behaviour sqllogictests, run against the built artifact.

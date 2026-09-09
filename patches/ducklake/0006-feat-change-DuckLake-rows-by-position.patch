@@ -1,0 +1,545 @@
+diff --git a/src/ducklake_extension.cpp b/src/ducklake_extension.cpp
+--- a/src/ducklake_extension.cpp
++++ b/src/ducklake_extension.cpp
+@@ -81,0 +82,2 @@ static void LoadInternal(ExtensionLoader &loader) {
++	loader.RegisterFunction(DuckLakeDeletePositionsFunction());
++	loader.RegisterFunction(DuckLakeUpdatePositionsFunction());
+diff --git a/src/functions/CMakeLists.txt b/src/functions/CMakeLists.txt
+--- a/src/functions/CMakeLists.txt
++++ b/src/functions/CMakeLists.txt
+@@ -4,0 +5 @@ add_library(
++  ducklake_delete_positions.cpp
+diff --git a/src/functions/ducklake_delete_positions.cpp b/src/functions/ducklake_delete_positions.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/functions/ducklake_delete_positions.cpp
+@@ -0,0 +1,515 @@
++#include "functions/ducklake_table_functions.hpp"
++#include "duckdb/common/enums/database_modification_type.hpp"
++#include "duckdb/execution/physical_operator.hpp"
++#include "duckdb/execution/physical_plan_generator.hpp"
++#include "duckdb/parser/parser.hpp"
++#include "duckdb/parser/statement/insert_statement.hpp"
++#include "duckdb/parser/statement/select_statement.hpp"
++#include "duckdb/planner/binder.hpp"
++#include "duckdb/planner/operator/logical_extension_operator.hpp"
++#include "storage/ducklake_catalog.hpp"
++#include "storage/ducklake_schema_entry.hpp"
++#include "storage/ducklake_table_entry.hpp"
++#include "storage/ducklake_transaction.hpp"
++#include "storage/ducklake_delete.hpp"
++#include "storage/ducklake_delete_filter.hpp"
++#include "storage/ducklake_metadata_manager.hpp"
++
++namespace duckdb {
++
++//===--------------------------------------------------------------------===//
++// Positional deletes, shared by ducklake_delete_positions and ducklake_update_positions
++//===--------------------------------------------------------------------===//
++struct PositionalDeletes {
++	//! Requested positions per committed data file id
++	map<idx_t, set<idx_t>> file_positions;
++	//! Requested row ids of committed inlined rows
++	set<idx_t> inlined_rows;
++	//! The snapshot the caller resolved its positions against, if it says
++	optional_idx resolved_snapshot;
++};
++
++struct StagedDeletes {
++	idx_t file_rows = 0;
++	idx_t inline_rows = 0;
++	idx_t files_written = 0;
++};
++
++static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &result, const char *function) {
++	if (files.IsNull()) {
++		throw InvalidInputException("%s: `files` cannot be NULL", function);
++	}
++	if (ListValue::GetChildren(files).empty()) {
++		return;
++	}
++	auto &element_type = ListType::GetChildType(files.type());
++	if (element_type.id() != LogicalTypeId::STRUCT) {
++		throw InvalidInputException("%s: each `files` entry must be STRUCT(data_file_id UBIGINT, positions UBIGINT[])",
++		                            function);
++	}
++	optional_idx file_index;
++	optional_idx positions_index;
++	auto &children = StructType::GetChildTypes(element_type);
++	for (idx_t i = 0; i < children.size(); i++) {
++		auto name = StringUtil::Lower(children[i].first);
++		if (name == "data_file_id") {
++			file_index = i;
++		} else if (name == "positions") {
++			positions_index = i;
++		}
++	}
++	if (children.size() != 2 || !file_index.IsValid() || !positions_index.IsValid()) {
++		throw InvalidInputException("%s: each `files` entry must be STRUCT(data_file_id UBIGINT, positions UBIGINT[])",
++		                            function);
++	}
++	for (auto &entry : ListValue::GetChildren(files)) {
++		if (entry.IsNull()) {
++			throw InvalidInputException("%s: a `files` entry cannot be NULL", function);
++		}
++		auto &fields = StructValue::GetChildren(entry);
++		auto &file_value = fields[file_index.GetIndex()];
++		auto &positions_value = fields[positions_index.GetIndex()];
++		if (file_value.IsNull() || positions_value.IsNull()) {
++			throw InvalidInputException("%s: `data_file_id` and `positions` cannot be NULL", function);
++		}
++		if (positions_value.type().id() != LogicalTypeId::LIST) {
++			throw InvalidInputException("%s: `positions` must be a list", function);
++		}
++		auto &positions = result[file_value.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>()];
++		for (auto &position : ListValue::GetChildren(positions_value)) {
++			if (position.IsNull()) {
++				throw InvalidInputException("%s: a position cannot be NULL", function);
++			}
++			positions.insert(position.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>());
++		}
++	}
++}
++
++//! Parses the positional arguments shared by both functions: `files` at `inputs[3]` and the named
++//! `inlined_rows` and `snapshot`.
++static PositionalDeletes ParsePositionalDeletes(TableFunctionBindInput &input, const char *function) {
++	PositionalDeletes result;
++	ParseFilePositions(input.inputs[3], result.file_positions, function);
++	auto inlined = input.named_parameters.find("inlined_rows");
++	if (inlined != input.named_parameters.end() && !inlined->second.IsNull()) {
++		for (auto &row_id : ListValue::GetChildren(inlined->second)) {
++			if (row_id.IsNull()) {
++				throw InvalidInputException("%s: an inlined row id cannot be NULL", function);
++			}
++			result.inlined_rows.insert(row_id.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>());
++		}
++	}
++	auto resolved = input.named_parameters.find("snapshot");
++	if (resolved != input.named_parameters.end() && !resolved->second.IsNull()) {
++		result.resolved_snapshot = resolved->second.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>();
++	}
++	return result;
++}
++
++static DuckLakeTableEntry &LookupTable(ClientContext &context, DuckLakeCatalog &catalog, const Value &schema,
++                                       const Value &table) {
++	return catalog
++	    .GetEntry<TableCatalogEntry>(context, schema.GetValue<string>(), table.GetValue<string>(),
++	                                 OnEntryNotFound::THROW_EXCEPTION)
++	    ->Cast<DuckLakeTableEntry>();
++}
++
++static string RowIdList(const set<idx_t> &rows) {
++	string result;
++	for (auto row_id : rows) {
++		if (!result.empty()) {
++			result += ", ";
++		}
++		result += to_string(row_id);
++	}
++	return result;
++}
++
++//! Stages deletes of committed inlined rows, resolving each row's inlined table from the metadata.
++static idx_t DeleteInlinedRows(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot,
++                               DuckLakeTableEntry &table, set<idx_t> remaining, const char *function) {
++	idx_t deleted = 0;
++	auto table_id = table.GetTableId();
++	for (auto &inlined_table : table.GetInlinedDataTables()) {
++		if (remaining.empty()) {
++			break;
++		}
++		auto result = transaction.Query(
++		    snapshot, StringUtil::Format("SELECT row_id FROM {METADATA_CATALOG}.%s WHERE row_id IN (%s) AND "
++		                                 "{SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < end_snapshot OR "
++		                                 "end_snapshot IS NULL)",
++		                                 inlined_table.table_name, RowIdList(remaining)));
++		if (result->HasError()) {
++			result->GetErrorObject().Throw();
++		}
++		set<idx_t> found;
++		for (auto &row : *result) {
++			found.insert(row.GetValue<idx_t>(0));
++		}
++		if (found.empty()) {
++			continue;
++		}
++		for (auto row_id : found) {
++			remaining.erase(row_id);
++		}
++		auto pending = transaction.GetInlinedDeletes(table_id, inlined_table.table_name);
++		set<idx_t> new_deletes;
++		for (auto row_id : found) {
++			if (!pending || !pending->rows.count(row_id)) {
++				new_deletes.insert(row_id);
++			}
++		}
++		deleted += new_deletes.size();
++		if (!new_deletes.empty()) {
++			transaction.AddNewInlinedDeletes(table_id, inlined_table.table_name, std::move(new_deletes));
++		}
++	}
++	if (!remaining.empty()) {
++		throw InvalidInputException("%s: inlined row %d is not visible in table \"%s\" at this snapshot; only "
++		                            "committed inlined rows can be deleted by row id",
++		                            function, *remaining.begin(), table.name);
++	}
++	return deleted;
++}
++
++//! Positions of `file_id` deleted through inlined file deletions, committed or pending in this transaction.
++static void AddInlinedFileDeletes(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot, TableIndex table,
++                                  idx_t file_id, set<idx_t> &positions) {
++	transaction.GetLocalInlinedFileDeletesForFile(table, file_id, positions);
++	auto name = transaction.GetMetadataManager().GetInlinedDeletionTableName(table, snapshot);
++	if (name.empty()) {
++		return;
++	}
++	auto result = transaction.Query(
++	    snapshot, StringUtil::Format(
++	                  "SELECT row_id FROM {METADATA_CATALOG}.%s WHERE file_id = %d AND begin_snapshot <= {SNAPSHOT_ID}",
++	                  name, file_id));
++	if (result->HasError()) {
++		result->GetErrorObject().Throw();
++	}
++	for (auto &row : *result) {
++		positions.insert(row.GetValue<idx_t>(0));
++	}
++}
++
++//! Stages `request` in the current transaction exactly as DELETE would: inlined file deletions below the inlining
++//! threshold, otherwise a delete file replacing the file's current one, and pending inline deletions for inlined
++//! rows. Positions the snapshot already sees deleted are skipped. A failure after staging begins aborts the
++//! transaction.
++static StagedDeletes StagePositionalDeletes(ClientContext &context, DuckLakeCatalog &catalog,
++                                            DuckLakeTableEntry &table, const PositionalDeletes &request,
++                                            const char *function) {
++	auto &transaction = DuckLakeTransaction::Get(context, catalog);
++	auto snapshot = transaction.GetSnapshot();
++	auto table_id = table.GetTableId();
++	auto &schema = table.ParentSchema().Cast<DuckLakeSchemaEntry>();
++	if (catalog.WriteDeletionVectors(schema.GetSchemaId(), table_id)) {
++		throw InvalidInputException("%s: table \"%s\" is configured to write deletion vectors, which this function "
++		                            "does not support; use DELETE instead",
++		                            function, table.name);
++	}
++	if (table_id.IsTransactionLocal()) {
++		throw InvalidInputException("%s: table \"%s\" was created in this transaction; only committed tables have "
++		                            "addressable files",
++		                            function, table.name);
++	}
++	// Positions resolved against an older snapshot may name rows this transaction already sees deleted; a newer
++	// one only stages what this snapshot still holds, and a deletion in between surfaces as a commit conflict.
++	if (request.resolved_snapshot.IsValid() && request.resolved_snapshot.GetIndex() < snapshot.snapshot_id) {
++		throw TransactionException("%s: positions were resolved against snapshot %d, older than snapshot %d this "
++		                            "transaction reads; retry the statement",
++		                            function, request.resolved_snapshot.GetIndex(), snapshot.snapshot_id);
++	}
++
++	map<idx_t, DuckLakeFileListExtendedEntry> files;
++	if (!request.file_positions.empty()) {
++		for (auto &entry : transaction.GetMetadataManager().GetExtendedFilesForTable(table, snapshot)) {
++			if (entry.file_id.IsValid()) {
++				files.emplace(entry.file_id.index, std::move(entry));
++			}
++		}
++	}
++	idx_t threshold = catalog.DataInliningRowLimit(context, schema.GetSchemaId(), table_id);
++
++	StagedDeletes staged;
++	auto &fs = FileSystem::GetFileSystem(context);
++	try {
++		for (auto &requested : request.file_positions) {
++			if (context.interrupted) {
++				throw InterruptException();
++			}
++			auto file_entry = files.find(requested.first);
++			if (file_entry == files.end()) {
++				throw InvalidInputException("%s: data file %d is not part of table \"%s\" at this snapshot", function,
++				                            requested.first, table.name);
++			}
++			auto &file = file_entry->second;
++			if (transaction.FileIsDropped(file.file.path)) {
++				continue;
++			}
++			for (auto position : requested.second) {
++				if (position >= file.row_count) {
++					throw InvalidInputException("%s: position %d is beyond the %d rows of data file %d", function,
++					                            position, file.row_count, requested.first);
++				}
++			}
++
++			// Positions the file already has deleted: its pending delete file if this transaction wrote one, else
++			// the committed delete file, plus inlined file deletions from both.
++			set<idx_t> positions;
++			if (transaction.HasLocalDeleteForFile(table_id, file.file.path)) {
++				DuckLakeFileData pending;
++				transaction.GetLocalDeleteForFile(table_id, file.file.path, pending);
++				auto scanned = DuckLakeDeleteFilter::ScanDeleteFile(context, pending);
++				positions.insert(scanned.deleted_rows.begin(), scanned.deleted_rows.end());
++			} else if (!file.delete_file.path.empty()) {
++				// A replaced delete file embeds per-position snapshots and keeps the earliest begin; only the
++				// positions deleted at this snapshot count as already gone.
++				auto scanned = DuckLakeDeleteFilter::ScanDeleteFile(context, file.delete_file, optional_idx(),
++				                                                    snapshot.snapshot_id);
++				positions.insert(scanned.deleted_rows.begin(), scanned.deleted_rows.end());
++			}
++			set<idx_t> inlined_positions;
++			AddInlinedFileDeletes(transaction, snapshot, table_id, requested.first, inlined_positions);
++
++			set<idx_t> new_positions;
++			for (auto position : requested.second) {
++				if (!inlined_positions.count(position) && !positions.count(position)) {
++					new_positions.insert(position);
++				}
++			}
++			if (new_positions.empty()) {
++				continue;
++			}
++			staged.file_rows += new_positions.size();
++			if (threshold > 0 && new_positions.size() <= threshold) {
++				transaction.AddNewInlinedFileDeletes(table_id, requested.first, std::move(new_positions));
++				continue;
++			}
++
++			positions.insert(new_positions.begin(), new_positions.end());
++			fs.CreateDirectoriesRecursive(table.DataPath());
++			WriteDeleteFileInput write {context,
++			                            transaction,
++			                            fs,
++			                            table.DataPath(),
++			                            catalog.GenerateEncryptionKey(context),
++			                            file.file.path,
++			                            std::move(positions),
++			                            DeleteFileSource::REGULAR};
++			auto written = DuckLakeDeleteFileWriter::WriteDeleteFile(context, write);
++			auto written_path = written.file_name;
++			try {
++				written.data_file_id = file.file_id;
++				if (file.delete_file_id.IsValid()) {
++					written.overwrites_existing_delete = true;
++					written.overwritten_delete_file.delete_file_id = file.delete_file_id;
++					written.overwritten_delete_file.path = file.delete_file.path;
++				}
++				vector<DuckLakeDeleteFile> delete_files;
++				delete_files.push_back(std::move(written));
++				transaction.AddDeletes(table_id, std::move(delete_files));
++			} catch (...) {
++				fs.TryRemoveFile(written_path);
++				throw;
++			}
++			staged.files_written++;
++		}
++		if (!request.inlined_rows.empty()) {
++			staged.inline_rows = DeleteInlinedRows(transaction, snapshot, table, request.inlined_rows, function);
++		}
++	} catch (std::exception &error) {
++		// A partially staged call must abort the surrounding transaction.
++		throw TransactionException("%s: %s", function, error.what());
++	}
++	return staged;
++}
++
++//===--------------------------------------------------------------------===//
++// ducklake_delete_positions
++//===--------------------------------------------------------------------===//
++struct DeletePositionsBindData : public TableFunctionData {
++	DeletePositionsBindData(DuckLakeCatalog &catalog_p, DuckLakeTableEntry &table_p, PositionalDeletes request_p)
++	    : catalog(catalog_p), table(table_p), request(std::move(request_p)) {
++	}
++	DuckLakeCatalog &catalog;
++	DuckLakeTableEntry &table;
++	PositionalDeletes request;
++};
++
++struct DeletePositionsState : public GlobalTableFunctionState {
++	bool finished = false;
++	idx_t MaxThreads() const override {
++		return 1;
++	}
++};
++
++static unique_ptr<FunctionData> DeletePositionsBind(ClientContext &context, TableFunctionBindInput &input,
++                                                    vector<LogicalType> &types, vector<string> &names) {
++	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]).Cast<DuckLakeCatalog>();
++	auto &table = LookupTable(context, catalog, input.inputs[1], input.inputs[2]);
++	auto result = make_uniq<DeletePositionsBindData>(catalog, table,
++	                                                 ParsePositionalDeletes(input, "ducklake_delete_positions"));
++	// The staged deletes belong to the executing transaction, so a prepared call binds again for each execution.
++	input.binder->SetAlwaysRequireRebind();
++	input.binder->GetStatementProperties().RegisterDBModify(catalog, context, DatabaseModificationType::DELETE_DATA);
++	types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};
++	names = {"file_rows_deleted", "inline_rows_deleted", "delete_files_written"};
++	return std::move(result);
++}
++
++static unique_ptr<GlobalTableFunctionState> DeletePositionsInit(ClientContext &, TableFunctionInitInput &) {
++	return make_uniq<DeletePositionsState>();
++}
++
++static void DeletePositionsExecute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
++	auto &state = input.global_state->Cast<DeletePositionsState>();
++	if (state.finished) {
++		return;
++	}
++	auto &data = input.bind_data->Cast<DeletePositionsBindData>();
++	auto staged = StagePositionalDeletes(context, data.catalog, data.table, data.request, "ducklake_delete_positions");
++	output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(staged.file_rows)));
++	output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(staged.inline_rows)));
++	output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(staged.files_written)));
++	output.SetCardinality(1);
++	state.finished = true;
++}
++
++DuckLakeDeletePositionsFunction::DuckLakeDeletePositionsFunction()
++    : TableFunction("ducklake_delete_positions",
++                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
++                    DeletePositionsExecute, DeletePositionsBind, DeletePositionsInit) {
++	named_parameters["inlined_rows"] = LogicalType::LIST(LogicalType::UBIGINT);
++	named_parameters["snapshot"] = LogicalType::UBIGINT;
++}
++
++//===--------------------------------------------------------------------===//
++// ducklake_update_positions
++//===--------------------------------------------------------------------===//
++//! Runs after the replacement rows have been inserted: stages the positional deletes and reports both counts.
++class DuckLakeUpdatePositions : public PhysicalOperator {
++public:
++	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
++
++	DuckLakeUpdatePositions(PhysicalPlan &physical_plan, vector<LogicalType> types, DuckLakeCatalog &catalog,
++	                        DuckLakeTableEntry &table, PositionalDeletes request, PhysicalOperator &child)
++	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), 1), catalog(catalog),
++	      table(table), request(std::move(request)) {
++		children.push_back(child);
++	}
++
++	DuckLakeCatalog &catalog;
++	DuckLakeTableEntry &table;
++	PositionalDeletes request;
++
++	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk, GlobalOperatorState &,
++	                           OperatorState &) const override {
++		if (input.size() == 0) {
++			return OperatorResultType::NEED_MORE_INPUT;
++		}
++		auto inserted = input.GetValue(0, 0).DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
++		auto staged = StagePositionalDeletes(context.client, catalog, table, request, "ducklake_update_positions");
++		chunk.SetCardinality(1);
++		chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(staged.file_rows)));
++		chunk.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(staged.inline_rows)));
++		chunk.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(staged.files_written)));
++		chunk.SetValue(3, 0, Value::BIGINT(inserted));
++		return OperatorResultType::NEED_MORE_INPUT;
++	}
++
++	bool ParallelOperator() const override {
++		return false;
++	}
++
++	string GetName() const override {
++		return "DUCKLAKE_UPDATE_POSITIONS";
++	}
++};
++
++class DuckLakeLogicalUpdatePositions : public LogicalExtensionOperator {
++public:
++	DuckLakeLogicalUpdatePositions(idx_t table_index, DuckLakeCatalog &catalog, DuckLakeTableEntry &table,
++	                               PositionalDeletes request)
++	    : table_index(table_index), catalog(catalog), table(table), request(std::move(request)) {
++	}
++
++	idx_t table_index;
++	DuckLakeCatalog &catalog;
++	DuckLakeTableEntry &table;
++	PositionalDeletes request;
++
++	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
++		auto &child = planner.CreatePlan(*children[0]);
++		return planner.Make<DuckLakeUpdatePositions>(types, catalog, table, request, child);
++	}
++
++	string GetName() const override {
++		return "DUCKLAKE_UPDATE_POSITIONS";
++	}
++
++	string GetExtensionName() const override {
++		return "ducklake";
++	}
++
++	vector<ColumnBinding> GetColumnBindings() override {
++		vector<ColumnBinding> result;
++		for (idx_t i = 0; i < 4; i++) {
++			result.emplace_back(table_index, i);
++		}
++		return result;
++	}
++
++	void ResolveTypes() override {
++		types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};
++	}
++};
++
++//! Binds `replacement` — a SELECT producing the table's columns — as an ordinary INSERT into the table, so
++//! inlining, sorting, partitioning, encryption, and statistics follow the standard insert path, and plans the
++//! positional deletes to run once the insert has completed.
++static unique_ptr<LogicalOperator> UpdatePositionsBind(ClientContext &context, TableFunctionBindInput &input,
++                                                       idx_t bind_index, vector<string> &return_names) {
++	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]).Cast<DuckLakeCatalog>();
++	auto &table = LookupTable(context, catalog, input.inputs[1], input.inputs[2]);
++	auto request = ParsePositionalDeletes(input, "ducklake_update_positions");
++	if (input.inputs[4].IsNull()) {
++		throw InvalidInputException("ducklake_update_positions: `replacement` cannot be NULL");
++	}
++
++	Parser parser;
++	parser.ParseQuery(input.inputs[4].GetValue<string>());
++	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
++		throw InvalidInputException("ducklake_update_positions: `replacement` must be a single SELECT statement");
++	}
++	auto insert = make_uniq<InsertStatement>();
++	insert->catalog = input.inputs[0].GetValue<string>();
++	insert->schema = input.inputs[1].GetValue<string>();
++	insert->table = input.inputs[2].GetValue<string>();
++	insert->select_statement = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
++	auto binder = Binder::CreateBinder(context, input.binder.get());
++	SQLStatement &statement = *insert;
++	auto bound = binder->Bind(statement);
++	// Binding the insert marks the statement as returning changed rows; this function returns a result.
++	input.binder->GetStatementProperties().return_type = StatementReturnType::QUERY_RESULT;
++
++	// The staged changes belong to the executing transaction, so a prepared call binds again for each execution.
++	input.binder->SetAlwaysRequireRebind();
++	input.binder->GetStatementProperties().RegisterDBModify(catalog, context, DatabaseModificationType::DELETE_DATA);
++	auto plan = make_uniq<DuckLakeLogicalUpdatePositions>(bind_index, catalog, table, std::move(request));
++	plan->children.push_back(std::move(bound.plan));
++	return_names = {"file_rows_deleted", "inline_rows_deleted", "delete_files_written", "rows_inserted"};
++	return std::move(plan);
++}
++
++DuckLakeUpdatePositionsFunction::DuckLakeUpdatePositionsFunction()
++    : TableFunction("ducklake_update_positions",
++                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
++                     LogicalType::LIST(LogicalType::ANY), LogicalType::VARCHAR},
++                    nullptr, nullptr, nullptr) {
++	named_parameters["inlined_rows"] = LogicalType::LIST(LogicalType::UBIGINT);
++	named_parameters["snapshot"] = LogicalType::UBIGINT;
++	bind_operator = UpdatePositionsBind;
++}
++
++} // namespace duckdb
+diff --git a/src/include/functions/ducklake_table_functions.hpp b/src/include/functions/ducklake_table_functions.hpp
+--- a/src/include/functions/ducklake_table_functions.hpp
++++ b/src/include/functions/ducklake_table_functions.hpp
+@@ -102,0 +103,10 @@ public:
++class DuckLakeDeletePositionsFunction : public TableFunction {
++public:
++	DuckLakeDeletePositionsFunction();
++};
++
++class DuckLakeUpdatePositionsFunction : public TableFunction {
++public:
++	DuckLakeUpdatePositionsFunction();
++};
++
