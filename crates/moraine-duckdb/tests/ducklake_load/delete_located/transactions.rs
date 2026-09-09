@@ -70,7 +70,7 @@ impl Fixture {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn located_deletions_roll_back_with_the_outer_transaction() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -85,7 +85,7 @@ fn located_deletions_roll_back_with_the_outer_transaction() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn failed_replacements_preserve_the_located_rows() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -94,10 +94,9 @@ fn failed_replacements_preserve_the_located_rows() {
         let output = Command::new(cli_path())
             .args(["-unsigned", "-csv", "-c"])
             .arg(format!(
-                "{} LOAD '{}'; ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}'{});
+                "{} ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}'{});
                  BEGIN; {deletion}",
-                ducklake_load_statement(&ducklake_ext_path()),
-                ext_path().display(),
+                load_statement(),
                 fixture.store.path().display(),
                 fixture.data.path().display(),
                 fixture.options,
@@ -119,7 +118,7 @@ fn failed_replacements_preserve_the_located_rows() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn located_deletions_and_replacements_commit_together() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -141,7 +140,7 @@ fn located_deletions_and_replacements_commit_together() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn prepared_located_deletions_follow_the_execution_transaction() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -154,7 +153,7 @@ fn prepared_located_deletions_follow_the_execution_transaction() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn located_and_sql_deletions_share_pending_changes() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -174,7 +173,7 @@ fn located_and_sql_deletions_share_pending_changes() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn located_deletions_preserve_committed_deletes_and_inline_schema_versions() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -196,7 +195,7 @@ fn located_deletions_preserve_committed_deletes_and_inline_schema_versions() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn located_file_deletes_do_not_duplicate_inline_deletion_records() {
     for commit_first in [false, true] {
         let mut fixture = Fixture::new(0);

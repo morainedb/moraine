@@ -13,12 +13,10 @@
 # Two connections over one instance are the only way to commit under an
 # open reader, which is what this runner gives and the CLI cannot.
 #
-# Skipped unless the packaged Moraine and patched DuckLake extensions are
-# named in the environment; `cargo xtask e2e` supplies both.
+# Skipped unless the packaged Moraine extension is named in the
+# environment; `cargo xtask e2e` supplies it.
 
 require-env MORAINE_DUCKDB_EXT
-
-require-env MORAINE_DUCKLAKE_EXT
 
 require-env MORAINE_EXTENSION_DIR
 
@@ -39,9 +37,6 @@ LOAD parquet;
 # Moraine must be registered before DuckLake opens the metadata catalog.
 statement ok
 LOAD '${MORAINE_DUCKDB_EXT}';
-
-statement ok
-LOAD '${MORAINE_DUCKLAKE_EXT}';
 
 # Every insert writes a Parquet file, so every insert carries statistics.
 statement ok

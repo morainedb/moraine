@@ -9,8 +9,6 @@
 
 require-env MORAINE_DUCKDB_EXT
 
-require-env MORAINE_DUCKLAKE_EXT
-
 require-env MORAINE_EXTENSION_DIR
 
 statement ok
@@ -28,9 +26,6 @@ LOAD parquet;
 # Moraine must be registered before DuckLake opens the metadata catalog.
 statement ok
 LOAD '${MORAINE_DUCKDB_EXT}';
-
-statement ok
-LOAD '${MORAINE_DUCKLAKE_EXT}';
 
 statement ok
 ATTACH 'ducklake:moraine:__TEST_DIR__/row-id-backfill-store' AS lake (

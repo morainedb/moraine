@@ -766,7 +766,7 @@ consumes neither live-only entries nor this cache.
 
 ### Locating across the DuckLake file list
 
-The companion DuckLake patch exposes `data_file_id` as an internal virtual
+The bundled DuckLake patch exposes `data_file_id` as an internal virtual
 `UBIGINT` column. A physical file emits its persistent catalog id as a
 constant; inlined and transaction-local sources emit NULL.
 
@@ -879,7 +879,7 @@ unknown-outcome handling preserves files that a commit may have registered.
 
 The SQL surface splits the work along the same line. During binding the
 extension resolves the located rows through `locate_row_positions_at`
-against the transaction's snapshot and rewrites the call into the companion
+against the transaction's snapshot and rewrites the call into the bundled
 DuckLake function
 `ducklake_delete_positions(catalog, schema, table, files, inlined_rows, snapshot)`,
 whose inputs are DuckLake's own identifiers: `(data_file_id, positions)` per
@@ -978,7 +978,7 @@ expressions ordinary SQL over the table's columns; unassigned columns keep
 their values. The extension resolves the located rows exactly as the
 deletion does, composes the replacement query — every column in order,
 assigned ones replaced by their expression, read from `moraine_rows_at`
-over the same located rows — then the row id, and rewrites the call into the companion
+over the same located rows — then the row id, and rewrites the call into the bundled
 `ducklake_update_positions(catalog, schema, table, files, replacement,
 inlined_rows, snapshot)`. That function binds `replacement` through
 DuckDB's binder, casts it to the table's columns, and plans it through the
@@ -1291,7 +1291,7 @@ pinned on the metadata catalog. `moraine_delete_located` and
 `moraine_update` participate in the current DuckLake transaction: an explicit `COMMIT` publishes its deletions together with
 other writes, and `ROLLBACK` discards them. Outside an explicit transaction,
 DuckDB commits the statement automatically. An empty or already-deleted
-request stages nothing. The SQL function requires the companion extension's
+request stages nothing. The SQL function requires the bundled DuckLake's
 `ducklake_delete_positions`; it never falls back to an autonomous commit.
 
 Every pair positions exactly or the call fails: a row the named file does not

@@ -35,21 +35,23 @@ pub fn e2e() -> anyhow::Result<()> {
     let cli = duckdb::ensure_duckdb_cli()?;
     println!("ok: duckdb CLI at {}", cli.display());
 
-    let extension = duckdb::build_and_package_extension()?;
+    let patched = ducklake_patch::prepare()?;
+    println!(
+        "ok: patched DuckLake checkout at {}",
+        patched.source.display()
+    );
+
+    let extension = duckdb::build_and_package_extension(&patched)?;
     println!("ok: packaged {}", extension.display());
 
-    let ducklake_extension = ducklake_patch::build_artifact(&[])?;
-    println!(
-        "ok: built and validated patched DuckLake at {}",
-        ducklake_extension.display()
-    );
+    ducklake_patch::run_row_id_regression(&patched, &extension)?;
+    println!("ok: the bundled DuckLake carries the patch series");
 
     duckdb::run(Command::new("cargo").args(["test", "-p", "moraine-duckdb", "--release"]))?;
 
     let envs: &[(&str, &std::ffi::OsStr)] = &[
         ("MORAINE_DUCKDB_CLI", cli.as_os_str()),
         ("MORAINE_DUCKDB_EXT", extension.as_os_str()),
-        ("MORAINE_DUCKLAKE_EXT", ducklake_extension.as_os_str()),
     ];
 
     duckdb::run_ignored_suite(
@@ -74,7 +76,7 @@ pub fn e2e() -> anyhow::Result<()> {
         "ok: real DuckDB + ducklake attached through moraine:'s metadata catalog and read the lake"
     );
 
-    run_sqllogictests(&extension, &ducklake_extension)?;
+    run_sqllogictests(&extension)?;
     println!(
         "ok: over several connections — two DuckLake transactions raced over one lake, a commit \
          landed under an open reader without moving what it reads, and maintenance contended \
@@ -90,9 +92,9 @@ pub fn e2e() -> anyhow::Result<()> {
 /// This is the one harness that gives **several connections over one DuckDB
 /// instance**, which the CLI cannot: two overlapping DuckLake transactions
 /// against one attached lake are the only way to make DuckLake's commit
-/// retry loop run against moraine. The runner loads both extensions by path,
-/// so it exercises the same artifacts the CLI suites do.
-fn run_sqllogictests(extension: &Path, ducklake_extension: &Path) -> anyhow::Result<()> {
+/// retry loop run against moraine. The runner loads the extension by path,
+/// so it exercises the same artifact the CLI suites do.
+fn run_sqllogictests(extension: &Path) -> anyhow::Result<()> {
     let root = duckdb::workspace_root();
     let runner = root.join("build/release/test/unittest");
     ensure!(
@@ -108,7 +110,6 @@ fn run_sqllogictests(extension: &Path, ducklake_extension: &Path) -> anyhow::Res
         .arg(&root)
         .arg("test/sql/*")
         .env("MORAINE_DUCKDB_EXT", extension.as_os_str())
-        .env("MORAINE_DUCKLAKE_EXT", ducklake_extension.as_os_str())
         .env("MORAINE_EXTENSION_DIR", extension_dir.as_os_str())
         .output()
         .with_context(|| format!("spawning {}", runner.display()))?;

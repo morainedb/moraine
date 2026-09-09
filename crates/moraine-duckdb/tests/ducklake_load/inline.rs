@@ -1,7 +1,7 @@
 use crate::helpers::*;
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_inline_data_round_trip_through_flush() {
     let dir = TempDir::new("inline-store");
     let data_dir = TempDir::new("inline-data");
@@ -115,7 +115,7 @@ fn ducklake_inline_data_round_trip_through_flush() {
 /// back through scalar extractors so the comma-splitting `csv_rows`
 /// never sees a nested value's internal commas.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_inline_nested_types_round_trip_through_flush() {
     let dir = TempDir::new("inline-nested-store");
     let data_dir = TempDir::new("inline-nested-data");
@@ -188,7 +188,7 @@ fn ducklake_inline_nested_types_round_trip_through_flush() {
 /// DuckLake issues an unqualified `DELETE FROM
 /// ducklake_inlined_delete_<table_id>` to do it.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_flush_clears_inlined_file_deletions() {
     let dir = TempDir::new("idel-flush-store");
     let data_dir = TempDir::new("idel-flush-data");
@@ -333,7 +333,7 @@ fn data_files_after_inserting(
 /// serves no option row of its own to displace it: a small insert inlines,
 /// a large one writes a file.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_inlining_defaults_to_ten_rows() {
     let small = TempDir::new("limit-small-store");
     let small_data = TempDir::new("limit-small-data");
@@ -360,7 +360,7 @@ fn ducklake_inlining_defaults_to_ten_rows() {
 /// moraine serves for this key silently outranks what the attach asked
 /// for. Serving none is what keeps the option meaningful.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_attach_option_raises_the_inlining_row_limit() {
     let dir = TempDir::new("limit-attach-store");
     let data_dir = TempDir::new("limit-attach-data");
@@ -380,7 +380,7 @@ fn ducklake_attach_option_raises_the_inlining_row_limit() {
 /// same shadowing question, reached through DuckDB's setting rather than
 /// through an ATTACH option.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_session_setting_raises_the_inlining_row_limit() {
     let dir = TempDir::new("limit-setting-store");
     let data_dir = TempDir::new("limit-setting-data");
@@ -408,7 +408,7 @@ fn ducklake_session_setting_raises_the_inlining_row_limit() {
 /// the two knobs above: `set_option` records a `ducklake_metadata` row,
 /// and a stored row is what DuckLake resolves before either of them.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_stored_option_raises_the_inlining_row_limit() {
     let dir = TempDir::new("limit-stored-store");
     let data_dir = TempDir::new("limit-stored-data");
@@ -451,7 +451,7 @@ fn ducklake_stored_option_raises_the_inlining_row_limit() {
 /// emits the row's own id, so the tombstoning sink stages it directly. The
 /// delete therefore costs what the equivalent read costs.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn deleting_one_inlined_row_costs_one_pass_over_the_table() {
     let dir = TempDir::new("inline-delete-cost");
     let data_dir = TempDir::new("inline-delete-cost-data");
@@ -498,7 +498,7 @@ fn deleting_one_inlined_row_costs_one_pass_over_the_table() {
 /// into one whole-list scan per version; the list is only needed to decode
 /// a body, so a version holding no inlined row must not read it at all.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn reading_a_table_costs_no_inlined_schema_it_does_not_decode_against() {
     let lookups_over_versions = |added_columns: usize| -> u64 {
         let dir = TempDir::new("inline-schema-cost");
@@ -557,7 +557,7 @@ fn reading_a_table_costs_no_inlined_schema_it_does_not_decode_against() {
 /// tables live in one lake so commit depth — which prices every lookup —
 /// cancels out of the comparison.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn an_evolved_tables_read_hauls_each_version_once() {
     let dir = TempDir::new("inline-version-cost");
     let data_dir = TempDir::new("inline-version-cost-data");
@@ -616,7 +616,7 @@ fn an_evolved_tables_read_hauls_each_version_once() {
 /// reads the list after the flush never sees the version at all, so the
 /// retained schema costs no scan.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn a_flushed_inline_table_deregisters_but_still_resolves() {
     let dir = TempDir::new("inline-deregistered-store");
     let data_dir = TempDir::new("inline-deregistered-data");
@@ -697,7 +697,7 @@ fn a_flushed_inline_table_deregisters_but_still_resolves() {
 /// store's format is the SQL-visible proof — a collapse stamps it, and
 /// nothing else here does.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn a_flushed_duplicate_schema_collapses_and_still_binds() {
     /// The floor at which a schema recorded as a reference is legible.
     const SCHEMA_REFERENCE_FORMAT: u64 = 7;
@@ -796,7 +796,7 @@ fn a_flushed_duplicate_schema_collapses_and_still_binds() {
 /// into contiguous runs — otherwise every row after the first is relabelled
 /// with an id another row already owns. Regression.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn an_update_re_inlining_scattered_rows_keeps_each_rows_own_id() {
     let dir = TempDir::new("inline-scattered-store");
     let data_dir = TempDir::new("inline-scattered-data");

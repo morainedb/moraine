@@ -3,7 +3,7 @@ use crate::helpers::*;
 /// Repeated updates preserve history and change feeds across schema changes and
 /// flush.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn repeated_inline_updates_preserve_time_travel_and_change_feeds() {
     let store = TempDir::new("inline-history-store");
     let data = TempDir::new("inline-history-data");
@@ -56,7 +56,7 @@ fn repeated_inline_updates_preserve_time_travel_and_change_feeds() {
 
 /// Inline lifetimes preserve versions that moved through Parquet.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn inline_history_survives_a_version_written_to_parquet() {
     let store = TempDir::new("mixed-history-store");
     let data = TempDir::new("mixed-history-data");
@@ -105,7 +105,7 @@ fn inline_history_survives_a_version_written_to_parquet() {
 /// snapshot: 1 = CREATE, 2 = first INSERT, 3 = ADD COLUMN, 4 = second
 /// INSERT.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_time_travel_reads_past_data_and_schema() {
     let dir = TempDir::new("tt-store");
     let data_dir = TempDir::new("tt-data");
@@ -166,7 +166,7 @@ fn ducklake_time_travel_reads_past_data_and_schema() {
 /// so a past-snapshot scan is served the Parquet with a per-row filter —
 /// never double-counted, never lost.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_time_travel_survives_flush() {
     let dir = TempDir::new("ttf-store");
     let data_dir = TempDir::new("ttf-data");

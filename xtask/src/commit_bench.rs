@@ -267,7 +267,6 @@ fn report_sql() -> &'static str {
 struct Artifacts<'a> {
     cli: &'a Path,
     moraine: &'a Path,
-    ducklake: &'a Path,
 }
 
 fn run_once(
@@ -289,11 +288,6 @@ fn run_once(
         sql_literal(&duckdb::extension_install_directory().display().to_string())
     );
     script.push_str("INSTALL httpfs;\nLOAD httpfs;\n");
-    let _ = writeln!(
-        script,
-        "LOAD {};",
-        sql_literal(&artifacts.ducklake.display().to_string())
-    );
     let _ = writeln!(
         script,
         "LOAD {};",
@@ -391,17 +385,15 @@ fn count_per_commit(value: u64, commits: usize) -> f64 {
     per_commit(value as f64, commits)
 }
 
-/// Builds patched DuckLake and measures the S3-backed metadata commit path.
+/// Builds the extension and measures the S3-backed metadata commit path.
 pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let options = parse_options(arguments)?;
     let target = S3Target::from_environment()?;
     let cli = duckdb::ensure_duckdb_cli()?;
-    let moraine = duckdb::build_and_package_extension()?;
-    let ducklake = ducklake_patch::build_artifact(&[])?;
+    let moraine = duckdb::build_and_package_extension(&ducklake_patch::prepare()?)?;
     let artifacts = Artifacts {
         cli: &cli,
         moraine: &moraine,
-        ducklake: &ducklake,
     };
 
     println!(

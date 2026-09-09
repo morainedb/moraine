@@ -27,9 +27,11 @@ pub(super) fn run(options: &Options) -> anyhow::Result<()> {
         cli.to_string_lossy().as_bytes(),
     )?;
     let ducklake = workspace.join("target/patched-ducklake/build-extension-static/extension/ducklake/ducklake.duckdb_extension");
+    // The pinned revisions predate the bundled DuckLake and load the
+    // standalone artifact beside their own extension.
     ensure!(
         ducklake.exists(),
-        "build patched DuckLake with cargo xtask e2e first"
+        "build the standalone patched DuckLake with `cargo xtask ducklake-patch` first"
     );
     fs::copy(&ducklake, options.root.join("ducklake.duckdb_extension"))?;
     let mut manifest = String::from("label,commit\n");

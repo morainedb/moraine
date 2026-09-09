@@ -1,5 +1,6 @@
-//! Builds the repository's DuckLake patch series against moraine's primary
-//! DuckDB pin without compiling DuckDB core.
+//! Prepares the repository's DuckLake patch series for bundling into the
+//! moraine extension, and builds it standalone for the session benchmark's
+//! pre-bundling revisions.
 
 use std::{
     fs,
@@ -24,7 +25,7 @@ const PATCH_PATHS: [&str; 6] = [
     "patches/ducklake/0005-fix-retain-files-after-unknown-commit-outcomes.patch",
     "patches/ducklake/0006-feat-change-DuckLake-rows-by-position.patch",
 ];
-const CONFIG_PATH: &str = "patches/ducklake/extension_config.cmake";
+const CONFIG_PATH: &str = "patches/ducklake/ducklake.cmake";
 /// The patched-behaviour sqllogictests, run against the built artifact.
 const REGRESSION_TEST_PATHS: [&str; 4] = [
     "test/sql/rowid/ducklake_row_id_file_pruning.test",
@@ -39,49 +40,49 @@ struct Options {
     duckdb_static: PathBuf,
 }
 
+/// The patched DuckLake checkout the moraine build bundles, and the vcpkg
+/// it resolves DuckLake's `roaring` dependency through.
 #[derive(Debug)]
-struct BuildPaths {
+pub struct PatchedDuckLake {
     root: PathBuf,
-    source: PathBuf,
+    /// The pinned DuckLake source with the patch series applied.
+    pub source: PathBuf,
     vcpkg: PathBuf,
-    build: PathBuf,
 }
 
-impl BuildPaths {
-    fn new(root: PathBuf) -> Self {
+impl PatchedDuckLake {
+    fn at(root: PathBuf) -> Self {
         Self {
             source: root.join("source"),
             vcpkg: root.join("vcpkg"),
-            build: root.join("build-extension-static"),
             root,
         }
     }
 
-    fn artifact(&self) -> PathBuf {
-        self.build
+    /// The toolchain file the build resolves `roaring` through.
+    pub fn vcpkg_toolchain(&self) -> PathBuf {
+        self.vcpkg.join("scripts/buildsystems/vcpkg.cmake")
+    }
+
+    fn standalone_build(&self) -> PathBuf {
+        self.root.join("build-extension-static")
+    }
+
+    fn standalone_artifact(&self) -> PathBuf {
+        self.standalone_build()
             .join("extension/ducklake/ducklake.duckdb_extension")
     }
 }
 
-/// Fetches the pinned DuckLake source and vcpkg, applies the tracked patch,
-/// and builds only the loadable DuckLake extension.
-pub fn build(arguments: &[String]) -> anyhow::Result<()> {
-    let artifact = build_artifact(arguments)?;
-    println!("ok: patched DuckLake extension at {}", artifact.display());
-    println!(
-        "load it into DuckDB {} with `duckdb -unsigned`, then `LOAD '{}';`",
-        duckdb::duckdb_pin(),
-        artifact.display()
-    );
-    Ok(())
+/// Fetches the pinned DuckLake source and vcpkg under `target/` and applies
+/// the tracked patch series, ready for the moraine build to bundle.
+pub fn prepare() -> anyhow::Result<PatchedDuckLake> {
+    let workspace = duckdb::workspace_root();
+    let root = workspace.join("target/patched-ducklake");
+    prepare_at(&workspace, root)
 }
 
-/// Builds and validates the patched extension and returns its artifact path.
-pub fn build_artifact(arguments: &[String]) -> anyhow::Result<PathBuf> {
-    let workspace = duckdb::workspace_root();
-    let options = parse_arguments(&workspace, arguments)?;
-    let paths = BuildPaths::new(options.root);
-
+fn prepare_at(workspace: &Path, root: PathBuf) -> anyhow::Result<PatchedDuckLake> {
     ensure!(
         duckdb::duckdb_pin() == SUPPORTED_DUCKDB_PIN,
         "the DuckLake patch targets DuckDB {SUPPORTED_DUCKDB_PIN}, but moraine's primary pin is {}",
@@ -95,8 +96,33 @@ pub fn build_artifact(arguments: &[String]) -> anyhow::Result<PathBuf> {
         );
     }
 
-    fs::create_dir_all(&paths.root)
-        .with_context(|| format!("creating {}", paths.root.display()))?;
+    let patched = PatchedDuckLake::at(root);
+    fs::create_dir_all(&patched.root)
+        .with_context(|| format!("creating {}", patched.root.display()))?;
+    prepare_checkout(&patched.source, DUCKLAKE_URL, DUCKLAKE_REVISION, "DuckLake")?;
+    apply_patches(workspace, &patched.source)?;
+    prepare_checkout(&patched.vcpkg, VCPKG_URL, VCPKG_REVISION, "vcpkg")?;
+    bootstrap_vcpkg(&patched.vcpkg)?;
+    Ok(patched)
+}
+
+/// Builds the patch series as a standalone loadable DuckLake, which the
+/// session benchmark's pre-bundling revisions load beside their moraine.
+pub fn build(arguments: &[String]) -> anyhow::Result<()> {
+    let artifact = build_artifact(arguments)?;
+    println!("ok: standalone patched DuckLake at {}", artifact.display());
+    println!(
+        "load it into DuckDB {} with `duckdb -unsigned`, then `LOAD '{}';`",
+        duckdb::duckdb_pin(),
+        artifact.display()
+    );
+    Ok(())
+}
+
+fn build_artifact(arguments: &[String]) -> anyhow::Result<PathBuf> {
+    let workspace = duckdb::workspace_root();
+    let options = parse_arguments(&workspace, arguments)?;
+
     validate_duckdb_checkout(&workspace)?;
     ensure!(
         options.duckdb_static.exists(),
@@ -104,16 +130,14 @@ pub fn build_artifact(arguments: &[String]) -> anyhow::Result<PathBuf> {
          pass `--duckdb-static PATH`",
         options.duckdb_static.display(),
     );
-    prepare_checkout(&paths.source, DUCKLAKE_URL, DUCKLAKE_REVISION, "DuckLake")?;
-    apply_patches(&workspace, &paths.source)?;
-    prepare_checkout(&paths.vcpkg, VCPKG_URL, VCPKG_REVISION, "vcpkg")?;
-    bootstrap_vcpkg(&paths.vcpkg)?;
+    let patched = prepare_at(&workspace, options.root)?;
 
     let compilers = duckdb::cpp_compilers()?;
-    reset_build_for_compiler_change(&paths.build, compilers.as_ref())?;
+    let build = patched.standalone_build();
+    reset_build_for_compiler_change(&build, compilers.as_ref())?;
     let cmake_args = cmake_arguments(
         &workspace,
-        &paths,
+        &patched,
         &options.duckdb_static,
         duckdb::duckdb_pin(),
         compilers.as_ref(),
@@ -122,26 +146,21 @@ pub fn build_artifact(arguments: &[String]) -> anyhow::Result<PathBuf> {
     configure.args(&cmake_args);
     duckdb::run(&mut configure)?;
 
-    duckdb::run(
-        Command::new("cmake")
-            .args(["--build"])
-            .arg(&paths.build)
-            .args([
-                "--target",
-                "ducklake_loadable_extension",
-                "--config",
-                "Release",
-            ]),
-    )?;
+    duckdb::run(Command::new("cmake").args(["--build"]).arg(&build).args([
+        "--target",
+        "ducklake_loadable_extension",
+        "--config",
+        "Release",
+    ]))?;
 
-    let artifact = paths.artifact();
+    let artifact = patched.standalone_artifact();
     ensure!(
         artifact.exists(),
         "DuckLake build completed but {} is missing",
         artifact.display()
     );
     verify_loadable(&artifact)?;
-    run_row_id_regression(&workspace, &paths, &artifact)?;
+    run_row_id_regression(&patched, &artifact)?;
     Ok(artifact)
 }
 
@@ -407,7 +426,7 @@ fn bootstrap_vcpkg(vcpkg: &Path) -> anyhow::Result<()> {
 
 fn cmake_arguments(
     workspace: &Path,
-    paths: &BuildPaths,
+    patched: &PatchedDuckLake,
     duckdb_static: &Path,
     duckdb_pin: &str,
     compilers: Option<&duckdb::CppCompilers>,
@@ -418,7 +437,7 @@ fn cmake_arguments(
         "-S".to_string(),
         workspace.join("duckdb").display().to_string(),
         "-B".to_string(),
-        paths.build.display().to_string(),
+        patched.standalone_build().display().to_string(),
         "-DCMAKE_BUILD_TYPE=Release".to_string(),
         "-DBUILD_EXTENSIONS_ONLY=TRUE".to_string(),
         "-DEXTENSION_STATIC_BUILD=TRUE".to_string(),
@@ -427,15 +446,12 @@ fn cmake_arguments(
             "-DDUCKDB_EXTENSION_CONFIGS={}",
             workspace.join(CONFIG_PATH).display()
         ),
-        format!("-DDUCKLAKE_PATCH_SOURCE={}", paths.source.display()),
+        format!("-DDUCKLAKE_PATCH_SOURCE={}", patched.source.display()),
         format!(
             "-DCMAKE_TOOLCHAIN_FILE={}",
-            paths
-                .vcpkg
-                .join("scripts/buildsystems/vcpkg.cmake")
-                .display()
+            patched.vcpkg_toolchain().display()
         ),
-        format!("-DVCPKG_MANIFEST_DIR={}", paths.source.display()),
+        format!("-DVCPKG_MANIFEST_DIR={}", patched.source.display()),
         format!("-DOVERRIDE_GIT_DESCRIBE={duckdb_pin}"),
     ];
     if let Some(compilers) = compilers {
@@ -513,12 +529,10 @@ fn preload_ducklake_test(test_path: &str, script: &str) -> anyhow::Result<String
     ))
 }
 
-fn run_row_id_regression(
-    workspace: &Path,
-    paths: &BuildPaths,
-    artifact: &Path,
-) -> anyhow::Result<()> {
-    let runner = workspace.join("build/release/test/unittest");
+/// Runs the series' own row-ID write, backfill, pruning, and inlined-append
+/// sqllogictests with `artifact` preloaded in place of `require ducklake`.
+pub fn run_row_id_regression(patched: &PatchedDuckLake, artifact: &Path) -> anyhow::Result<()> {
+    let runner = duckdb::workspace_root().join("build/release/test/unittest");
     ensure!(
         runner.exists(),
         "the sqllogictest runner is missing at {}; `cargo xtask e2e` builds it",
@@ -526,11 +540,11 @@ fn run_row_id_regression(
     );
 
     for test_path in REGRESSION_TEST_PATHS {
-        let source_test = paths.source.join(test_path);
+        let source_test = patched.source.join(test_path);
         let script = fs::read_to_string(&source_test)
             .with_context(|| format!("reading patched test {}", source_test.display()))?;
         let script = preload_ducklake_test(test_path, &script)?;
-        let test_root = TemporaryDirectory::create(&paths.root, "ducklake-regression")?;
+        let test_root = TemporaryDirectory::create(&patched.root, "ducklake-regression")?;
         let copied_test = test_root.path().join(test_path);
         let parent = copied_test
             .parent()
@@ -551,7 +565,8 @@ fn run_row_id_regression(
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         ensure!(
             output.status.success(),
-            "the patched DuckLake sqllogictest {test_path} failed"
+            "the patched DuckLake sqllogictest {test_path} failed against {}",
+            artifact.display()
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         ensure!(
@@ -866,10 +881,10 @@ mod tests {
 
     #[test]
     fn extension_only_configuration_reuses_the_prebuilt_duckdb_core() {
-        let paths = BuildPaths::new(PathBuf::from("/work"));
+        let patched = PatchedDuckLake::at(PathBuf::from("/work"));
         let arguments = cmake_arguments(
             Path::new("/repo"),
-            &paths,
+            &patched,
             Path::new("/repo/build/libduckdb_static.a"),
             "v1.5.5",
             Some(&duckdb::CppCompilers {

@@ -1,7 +1,7 @@
 # Patched DuckLake row-ID statistics, pruning, inlined writes, commit cleanup, and positional deletes
 
-This directory carries a downstream DuckLake patch series for DuckDB v1.5.5,
-applied in file-name order:
+This directory carries the downstream DuckLake patch series moraine bundles,
+for DuckDB v1.5.5, applied in file-name order:
 
 1. `0001-perf-prune-DuckLake-files-by-row-id.patch` stores file-level row-ID
    min/max statistics in DuckLake's existing `ducklake_file_column_stats`
@@ -70,68 +70,48 @@ Later patches address the lines earlier ones produce, so the series is applied
 in one `git apply` invocation rather than one per file.
 
 The series is pinned separately to the DuckLake revisions selected by every
-DuckDB release moraine supports. It is released as an unsigned companion
-extension, not bundled into the moraine extension.
+DuckDB release moraine supports. The patched DuckLake is built alongside
+moraine and linked into its loadable, so `LOAD moraine` registers both and
+no separate DuckLake extension is installed or loaded.
 Most hunks use zero context to satisfy moraine's whitespace gate across both
 source pins. The control-flow-sensitive row-ID statistics hunk replaces and
 re-emits its function's return so it cannot land after that return.
 
 The source mapping lives in `source-pins`. Each entry binds one DuckDB release
 to the upstream DuckLake commit that release selects. A DuckDB bump must add a
-validated mapping before the companion release can build.
+validated mapping before that release's build can fetch its DuckLake.
 
 ## Build
 
-Initialize the DuckDB submodule and build moraine once:
+`ducklake.cmake` is included by the repository's `extension_config.cmake`, so
+every moraine build carries the series. Without `DUCKLAKE_PATCH_SOURCE` it
+fetches the DuckLake commit `source-pins` names for the DuckDB being built
+and applies the patches, which is how the release and community pipelines
+build. `cargo xtask e2e` instead prepares a checkout under
+`target/patched-ducklake/` first: it fetches the pinned DuckLake and vcpkg
+revisions, applies the series and verifies the checkout's complete diff
+byte-for-byte, and passes the checkout in. Either way the CMake configure
+refuses a tree where the row-ID statistics hunk landed after its function's
+return, and DuckLake's `roaring` dependency resolves through vcpkg
+(`vcpkg.json` at the repository root declares it).
 
-```sh
-git submodule update --init duckdb
-CC=gcc-14 CXX=g++-14 make release GEN=ninja OVERRIDE_GIT_DESCRIBE=v1.5.5
-```
+`cargo xtask e2e` then runs the series' row-ID write, backfill, pruning, and
+inlined-append sqllogictests against the built moraine artifact, and the
+release workflow runs the same backfill-and-prune smoke against every
+published build (`cargo xtask validate-release-artifact`).
 
-The compiler names above are for Debian and Ubuntu. Amazon Linux packages
-the same pair as `gcc14-gcc` and `gcc14-g++`. macOS uses Apple Clang. Remove
-`build/release` first if that tree was configured with a different compiler.
-
-The first build supplies `build/release/src/libduckdb_static.a`. DuckDB's CLI
-does not export the C++ symbols required by a thin extension, so the patched
-extension must link that archive. The archive is reused; the following
-command compiles DuckLake, not DuckDB core:
-
-```sh
-cargo xtask ducklake-patch
-```
-
-On Linux, the command selects GCC 14 to match DuckLake's extension pipeline.
-This keeps the downstream source patch limited to the behaviour above; it
-does not carry compiler-compatibility edits.
-
-The command:
-
-1. fetches the pinned DuckLake and vcpkg revisions under
-   `target/patched-ducklake/`;
-2. rejects a dirty DuckDB submodule, then applies the tracked patch series
-   and verifies the cached checkout's complete diff byte-for-byte;
-3. builds only `ducklake_loadable_extension` against moraine's exact DuckDB
-   submodule and prebuilt static library; and
-4. downloads the pinned DuckDB CLI if needed and verifies that the artifact
-   loads; then runs the series' row-ID write, backfill, pruning, and
-   inlined-append sqllogictests against that artifact.
-
-The resulting extension is:
-
-```text
-target/patched-ducklake/build-extension-static/extension/ducklake/ducklake.duckdb_extension
-```
-
-Use `--root DIRECTORY` to move the gitignored build cache, or
+`cargo xtask ducklake-patch` builds the series as a standalone loadable under
+`target/patched-ducklake/build-extension-static/`, against moraine's DuckDB
+submodule and prebuilt static library. Only `cargo xtask session-bench`
+needs it: its pinned revisions predate the bundle and load DuckLake beside
+their own moraine. Use `--root DIRECTORY` to move the gitignored cache, or
 `--duckdb-static FILE` to select another static archive built from moraine's
 exact DuckDB pin.
 
 ## Load in DuckDB
 
-Both local artifacts are unsigned, so start DuckDB with `-unsigned`. Load
-moraine first, then the patched DuckLake extension by path:
+A locally built artifact is unsigned, so start DuckDB with `-unsigned`. One
+load registers DuckLake and moraine:
 
 ```sh
 target/duckdb-cli/v1.5.5/cli/duckdb -unsigned
@@ -139,7 +119,6 @@ target/duckdb-cli/v1.5.5/cli/duckdb -unsigned
 
 ```sql
 LOAD 'build/release/extension/moraine/moraine.duckdb_extension';
-LOAD 'target/patched-ducklake/build-extension-static/extension/ducklake/ducklake.duckdb_extension';
 
 ATTACH 'ducklake:moraine:s3://bucket/catalog' AS lake (
     DATA_PATH 's3://bucket/data/',
@@ -147,9 +126,11 @@ ATTACH 'ducklake:moraine:s3://bucket/catalog' AS lake (
 );
 ```
 
-Do not `INSTALL` or `LOAD ducklake` afterward in the same process: that would
-select the stock extension instead of this artifact. The CLI, moraine, the
-DuckDB static archive, and DuckLake patches must all match DuckDB v1.5.5.
+A `LOAD ducklake` afterward is a no-op: the bundled DuckLake is recorded as
+the loaded `ducklake` extension, reporting its source revision through
+`duckdb_extensions()`. Loading stock DuckLake *before* moraine is refused,
+since it lacks the series and would collide with the bundle. The CLI and the
+artifact must match on DuckDB version.
 
 ## Backfill existing files
 
@@ -246,25 +227,8 @@ optimization, not a correctness requirement — when in doubt, join on
 
 ## Release
 
-Dispatch the `Patched DuckLake extension` workflow with a tag such as
-`ducklake-rowid-v0.1.0`. It calls DuckDB's extension distribution workflow for
-every version in `.github/duckdb-versions` and publishes the same four native
-platforms as moraine:
-
-```text
-ducklake.v1.5.5.linux_amd64.duckdb_extension
-ducklake.v1.5.5.linux_arm64.duckdb_extension
-ducklake.v1.5.5.osx_amd64.duckdb_extension
-ducklake.v1.5.5.osx_arm64.duckdb_extension
-```
-
-The corresponding four v1.5.4 assets are included in the same release. The
-publisher stays in draft mode until all eight assets exist and the Linux amd64
-and macOS arm64 artifacts for both DuckDB versions pass the row-ID backfill
-and one-file-pruning smoke test. A failed or cancelled run leaves no partial
-public release.
-
-Each artifact only loads into the exact DuckDB version and platform in its
-name. Start DuckDB with unsigned extensions enabled, load moraine first, then
-load the matching DuckLake artifact by path. Do not install or load stock
-DuckLake afterward in the same process.
+There is no separate DuckLake release. The moraine release workflow builds
+the bundle for every version in `.github/duckdb-versions` on the four native
+platforms, and before publishing runs the row-ID backfill and one-file
+pruning smoke (`release-smoke.sql`) against the Linux amd64 and macOS arm64
+builds of each version. A failed run leaves no partial public release.

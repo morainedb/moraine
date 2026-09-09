@@ -38,9 +38,7 @@ fn query_log(store: &Path, data_path: &Path, alias: &str, statements: &[&str]) -
         .arg("-c")
         .arg("SET threads=1;")
         .arg("-c")
-        .arg(ducklake_load_statement(&ducklake_ext_path()))
-        .arg("-c")
-        .arg(format!("LOAD '{}';", ext_path().display()))
+        .arg(load_statement())
         .arg("-c")
         .arg("CALL enable_logging('QueryLog', storage => 'memory');")
         .arg("-c")
@@ -77,7 +75,7 @@ fn query_log(store: &Path, data_path: &Path, alias: &str, statements: &[&str]) -
 /// and the `HIDDEN true` that keeps the nested database out of
 /// `duckdb_databases()` while leaving it addressable by name.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn ducklake_nests_a_hidden_moraine_attach_named_for_its_alias() {
     let dir = TempDir::new("nest-store");
     let data_dir = TempDir::new("nest-data");
@@ -112,9 +110,7 @@ fn ducklake_nests_a_hidden_moraine_attach_named_for_its_alias() {
             .arg("-c")
             .arg("SET threads=1;")
             .arg("-c")
-            .arg(ducklake_load_statement(&ducklake_ext_path()))
-            .arg("-c")
-            .arg(format!("LOAD '{}';", ext_path().display()))
+            .arg(load_statement())
             .arg("-c")
             .arg(format!(
                 "ATTACH 'ducklake:moraine:{}' AS warehouse (DATA_PATH '{}');",
@@ -164,7 +160,7 @@ fn ducklake_nests_a_hidden_moraine_attach_named_for_its_alias() {
 /// `DELETE`, and `CREATE`, so a table marked `RW` is both read and
 /// mutated somewhere in the workload.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 #[allow(clippy::too_many_lines)]
 fn ducklakes_catalog_access_set_is_pinned() {
     let dir = TempDir::new("access-store");
@@ -315,7 +311,7 @@ fn ducklake_tables_named_in(statement: &str) -> Vec<String> {
 /// instead of racing it. What moraine owes is that this read works and
 /// reports the truth while a transaction is open, which is what this pins.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn moraine_serves_the_conflict_resolution_read_inside_a_transaction() {
     let dir = TempDir::new("conflict-store");
     let data_dir = TempDir::new("conflict-data");
@@ -383,13 +379,13 @@ fn moraine_serves_the_conflict_resolution_read_inside_a_transaction() {
 /// The DuckDB/DuckLake build pair the loadable is linked against, checked
 /// by running rather than assumed.
 ///
-/// moraine statically links DuckDB v1.5.5, and the patched DuckLake extension
-/// is built against the same release. ABI friction between the two would show
-/// up as a load failure, a crash, or a wrong answer at the boundary where
-/// DuckLake hands moraine C++ objects by pointer — so the pin is: both
-/// extensions load into one process, and the full chain answers correctly.
+/// moraine statically links DuckDB v1.5.5 and bundles the patched DuckLake
+/// built against the same release. ABI friction would show up as a load
+/// failure, a crash, or a wrong answer at the boundary where DuckLake hands
+/// moraine C++ objects by pointer — so the pin is: the bundle loads, reports
+/// DuckLake as the pinned revision, and the full chain answers correctly.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine and patched DuckLake extensions"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn the_pinned_duckdb_and_ducklake_builds_interoperate() {
     let dir = TempDir::new("pin-store");
     let data_dir = TempDir::new("pin-data");
@@ -422,13 +418,13 @@ fn the_pinned_duckdb_and_ducklake_builds_interoperate() {
     assert!(
         extension_version.len() >= MINIMUM_GIT_ABBREVIATION_LENGTH
             && DUCKLAKE_SOURCE_COMMIT.starts_with(extension_version),
-        "the patched DuckLake artifact reports source revision {extension_version}, not an \
+        "the bundled DuckLake reports source revision {extension_version}, not an \
          abbreviation of {DUCKLAKE_SOURCE_COMMIT}; re-verify every pin in this file and RFC \
          0006's version table"
     );
 
-    // Both extensions loaded and the chain answers: the interoperation
-    // itself, not just the version strings.
+    // The chain answers: the interoperation itself, not just the version
+    // strings.
     run_ducklake_sql(
         dir.path(),
         data_dir.path(),
@@ -473,7 +469,7 @@ fn duckdb_pin() -> &'static str {
 /// attempt count makes a false alarm vanishingly unlikely while staying
 /// cheap.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and patched DuckLake extension"]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn the_upstream_ducklake_listing_race_still_needs_threads_1() {
     const ATTEMPTS: usize = 15;
 
@@ -484,7 +480,7 @@ fn the_upstream_ducklake_listing_race_still_needs_threads_1() {
             .arg("-unsigned")
             .arg("-csv")
             .arg("-c")
-            .arg(ducklake_load_statement(&ducklake_ext_path()))
+            .arg(load_statement())
             .arg("-c")
             .arg(format!(
                 "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}');",
