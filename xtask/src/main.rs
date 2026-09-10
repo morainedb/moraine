@@ -29,12 +29,14 @@ use anyhow::bail;
 
 mod bench;
 mod bump;
+mod catalog_target;
 mod commit_bench;
 mod duckdb;
 mod ducklake_patch;
 mod e2e;
 mod locate_bench;
 mod pins;
+mod reader_bench;
 mod release;
 mod s3;
 mod session_bench;
@@ -47,6 +49,7 @@ fn main() -> anyhow::Result<()> {
         Some("bench") => bench::bench(&arguments),
         Some("commit-bench") => commit_bench::run(&arguments),
         Some("locate-bench") => locate_bench::run(&arguments),
+        Some("reader-bench") => reader_bench::run(&arguments),
         Some("session-bench") => session_bench::run(&arguments),
         Some("s3") => s3::s3(),
         Some("ducklake-patch") => ducklake_patch::build(&arguments),
@@ -60,13 +63,13 @@ fn main() -> anyhow::Result<()> {
         }
         Some(other) => {
             bail!(
-                "unknown task `{other}`; available: e2e, bench, commit-bench, locate-bench, session-bench, s3, check-pins, \
+                "unknown task `{other}`; available: e2e, bench, commit-bench, locate-bench, reader-bench, session-bench, s3, check-pins, \
                  check-release-assets, validate-release-artifact, version-matrix, \
                  bump-duckdb, ducklake-patch"
             )
         }
         None => bail!(
-            "usage: cargo xtask <task>; available: e2e, bench, commit-bench, locate-bench, session-bench, s3, check-pins, \
+            "usage: cargo xtask <task>; available: e2e, bench, commit-bench, locate-bench, reader-bench, session-bench, s3, check-pins, \
              check-release-assets, validate-release-artifact, version-matrix, \
              bump-duckdb, ducklake-patch"
         ),

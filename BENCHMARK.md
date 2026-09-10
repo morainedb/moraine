@@ -181,6 +181,28 @@ regardless of backend, and swamping the ~2 ms of compute underneath. Every
 durable-commit-bound cost inherits this. Concurrency is the way out, not a
 faster commit: K concurrent commits share one flush.
 
+## Cold read-only attaches
+
+`cargo xtask reader-bench` measures what a fresh read-only process pays over
+a catalog with thousands of data files: the attach, the first listing of
+every data file, one query planned against the file list and pruned to one
+file, and a warm repeat of that query. Every repeat is a new DuckDB process,
+so only what `--cache-dir` keeps on disk survives between them. Parquet
+stays local, so the object-store counters describe only the metadata path.
+
+```text
+MORAINE_S3_BUCKET=... [MORAINE_S3_ENDPOINT=...] \
+  cargo xtask reader-bench [--files 2000,20000] [--repeat 5] [--cache-dir <dir>]
+```
+
+Without `MORAINE_S3_BUCKET` the catalog is a local directory, which checks
+the task but shows no round trips; the request columns are what matter, and
+they need an endpoint with latency. Each size is seeded by inserts into a
+table partitioned 1 000 ways, one file per partition per insert, then read
+`--repeat` times cold. The report is medians: attach, file listing, cold
+plan, and warm plan in milliseconds, then GET counts and summed GET time
+for the cold statements and for the warm one.
+
 ### Durable-commit latency vs. flush interval
 
 60 sequential `await_durable` commits, per interval:
