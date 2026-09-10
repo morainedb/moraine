@@ -46,8 +46,9 @@ impl FileSummary {
 }
 
 /// This file's row-id membership, from the cache when it is resident. A
-/// file whose ids are the recorded dense range answers without a read; one
-/// carrying the reserved row-id column reads only that column and is cached.
+/// file whose ids are the recorded dense range answers from its footer and
+/// is remembered as that range; one carrying the reserved row-id column
+/// reads only that column and is cached.
 pub(crate) async fn file_summary(
     file: ParquetFile,
     table_id: u64,
@@ -72,13 +73,13 @@ pub(crate) async fn file_summary(
     if let Some(start) = row_id_start
         && !carries_embedded_row_ids(file.clone()).await?
     {
-        Ok(FileSummary {
-            rows: Arc::new(PositionedRowSet {
-                rows: FileRowSet::range(start, record_count)?,
-                order: RowOrder::Ascending,
-            }),
-            built: false,
-        })
+        let rows = Arc::new(PositionedRowSet {
+            rows: FileRowSet::range(start, record_count)?,
+            order: RowOrder::Ascending,
+        });
+        auxiliary_cache::shared().insert_summary(&store, &key, &rows);
+
+        Ok(FileSummary { rows, built: false })
     } else {
         let built = Arc::new(AtomicBool::new(false));
         let read = {
