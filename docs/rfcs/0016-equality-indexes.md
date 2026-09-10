@@ -1100,13 +1100,19 @@ before; a conflict ends the pass and the next derives afresh. A derivation
 failure is delivered to the committer behind the steps already handed off,
 so those still land before it surfaces.
 
-**The external leg reads ahead.** Files are planned several at a time:
+**The external leg reads ahead.** Files are planned thirty-two at a time:
 the footer, the file's read-column mapping, its inline file-deletes, and
 its delete files resolve concurrently, ahead of the position being
-consumed. Each row group of a planned file is a unit read on its own task,
-which decodes the group and encodes its entries to physical keys off the
-driving task, holding a fixed number of encoded batches ahead of the
-consumer. A bounded window of units runs at once. Entries are consumed
+consumed. Planning is wider than reading because it fetches only footers
+and delete files, which are small. Each row group of a planned file is a
+unit read on its own task, which decodes the group and encodes its entries
+to physical keys off the driving task, holding a fixed number of encoded
+batches ahead of the consumer. A window of eight units runs at once; each
+unit holds decoded rows, so the window is what bounds the build's memory,
+and it does not widen with the machine. Encoding runs on blocking workers
+under one process-wide permit count — the machine's core count, clamped to
+between four and thirty-two — which also bounds the encode futures a
+single file's stream keeps in flight. Entries are consumed
 strictly in file-then-position order, so the source cursor is exactly what
 it was under a serial read, and a resume inside a row group reads that
 group from the cursor. A single large file therefore still parallelizes

@@ -72,7 +72,7 @@ use crate::{
             resolve_row_id_source,
         },
         entries::{record_batch_entries, record_batch_index_entries},
-        metrics::INDEX_ENCODING_CONCURRENCY,
+        metrics::index_encoding_concurrency,
         reader::ObjectStoreReader,
         selection::scoped_selection,
     },
@@ -325,7 +325,7 @@ pub(crate) async fn scoped_read_index_entry_batches(
                 .await
             }
         })
-        .buffered(INDEX_ENCODING_CONCURRENCY)
+        .buffered(index_encoding_concurrency())
         .boxed())
 }
 

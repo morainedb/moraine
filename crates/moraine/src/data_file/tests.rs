@@ -59,13 +59,26 @@ async fn scoped_read_entries(
     .await
 }
 
+/// The encoding permit count follows the machine's cores, clamped to
+/// `[4, 32]`.
+#[test]
+fn index_encoding_concurrency_is_the_core_count_clamped() {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+
+    let derived = index_encoding_concurrency();
+
+    assert_eq!(derived, cores.clamp(4, 32));
+    assert!((4..=32).contains(&derived));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn index_encoding_workers_share_one_process_bound() {
-    const TASKS: usize = INDEX_ENCODING_CONCURRENCY * 2;
+    let bound = index_encoding_concurrency();
+    let tasks = bound * 2;
 
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
-    let work = (0..TASKS).map(|position| {
+    let work = (0..tasks).map(|position| {
         let active = Arc::clone(&active);
         let peak = Arc::clone(&peak);
         async move {
@@ -80,14 +93,14 @@ async fn index_encoding_workers_share_one_process_bound() {
         }
     });
     let mut completed = stream::iter(work)
-        .buffer_unordered(TASKS)
+        .buffer_unordered(tasks)
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
     completed.sort_unstable();
 
-    assert_eq!(completed, (0..TASKS).collect::<Vec<_>>());
-    assert!(peak.load(Ordering::Relaxed) <= INDEX_ENCODING_CONCURRENCY);
+    assert_eq!(completed, (0..tasks).collect::<Vec<_>>());
+    assert!(peak.load(Ordering::Relaxed) <= bound);
     assert!(peak.load(Ordering::Relaxed) > 1);
 }
 
