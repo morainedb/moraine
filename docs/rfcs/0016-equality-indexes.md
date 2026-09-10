@@ -622,6 +622,15 @@ Lookups, ranges, and null queries are **head-only**: entries are live-only, so
 it always was — a scan problem. The hot path (current head) gets the index;
 the rare path pays nothing to keep it honest.
 
+Head-only is also what lets a warm read-write handle serve every accessor
+above without opening a read session: the definition comes from the view the
+handle already holds, which on the store's only writer is the head, and the
+probes are plain reads against the writer's `Db`, so no transaction — and no
+transaction-manager lock — stands under a lookup. A pass the held view moved
+under is re-run through a session. A read-only handle probes under a session
+as before. RFC 0009 (*A read-write handle resolves the head without reading
+it*) carries the argument.
+
 ### File-located lookups
 
 A lookup resolves an indexed value to stable row ids as above. It may then

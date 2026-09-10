@@ -14,7 +14,7 @@ use crate::{
     error::{Error, Result},
     store::{
         cache::{CacheTally, ObjectStoreTally},
-        handle::{ReadHandle, ScanOrder},
+        handle::{ReadHandle, ReadSession, ScanOrder},
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
         },
@@ -30,6 +30,7 @@ const INDEX_LOOKUP_CONCURRENCY: usize = 512;
 #[derive(Default)]
 struct LookupMetrics {
     unique_keys: u64,
+    /// Time until a ready definition was in hand.
     head: Duration,
     probe_window: Duration,
     probe_service: Duration,
@@ -135,10 +136,10 @@ fn log_lookup(
 impl ReadOnlyCatalog {
     /// Resolves an equality lookup to the rows currently holding `values`.
     ///
-    /// Head-only: the lookup materializes the current head and scans the
-    /// `index` subspace under one read session, so the entries and the catalog
-    /// they resolve against are one consistent cut. Entries are live-only,
-    /// so there is no time-travel variant. Returns stable row ids; the caller
+    /// Head-only: the lookup resolves the current head and probes the
+    /// `index` subspace against it, so the entries and the catalog they
+    /// resolve against are one consistent cut. Entries are live-only, so
+    /// there is no time-travel variant. Returns stable row ids; the caller
     /// applies delete files as any DuckLake scan does.
     ///
     /// # Errors
@@ -162,8 +163,8 @@ impl ReadOnlyCatalog {
     ///
     /// Duplicate keys are probed once and duplicate row ids are returned
     /// once. An empty key set returns no rows after validating that the index
-    /// exists and is ready. The whole batch uses one read session and one head
-    /// view, so every result belongs to the same consistent cut.
+    /// exists and is ready. The whole batch resolves against one head view,
+    /// so every result belongs to the same consistent cut.
     ///
     /// # Errors
     ///
@@ -180,40 +181,19 @@ impl ReadOnlyCatalog {
         let started = Instant::now();
         let cache_before = self.cache_tally();
         let store_before = self.object_store_tally();
-        let epoch = cache_epoch(&self.projections);
-        let session = self.begin_read().await?;
-        let handle = session.handle();
 
-        let index_row_ids = read::consistent(handle, || async {
-            let head_started = Instant::now();
-            let view = self.head_view(handle, epoch).await?;
-            let head = head_started.elapsed();
-            let info = ready_index(&view, table, index)?;
-
-            let mut encoded = keys.iter().map(|key| {
-                if key.len() != info.columns.len() {
-                    return Err(Error::Constraint(format!(
-                        "index lookup: {} values do not address the {}-column index {index}; an \
-                         equality lookup names every column",
-                        key.len(),
-                        info.columns.len()
-                    )));
-                }
-                encode_ordered_values(
-                    &key.iter().cloned().map(Some).collect::<Vec<_>>(),
-                    &info.directions,
-                    &info.nulls,
-                )
-            }).collect::<Result<Vec<_>>>()?;
-            encoded.sort_unstable();
-            encoded.dedup();
-
-            let mut resolution = resolve_encoded(handle, index.get(), info.unique, encoded).await?;
-            resolution.metrics.head = head;
-            Ok(resolution)
-        })
-        .await;
-        session.finish();
+        let mut session = None;
+        let index_row_ids = self
+            .lookup_at_head(&mut session, table, index, async |handle, info| {
+                let head = started.elapsed();
+                let encoded = encode_lookup_keys(keys, &info, index)?;
+                let mut resolution =
+                    resolve_encoded(handle, index.get(), info.unique, encoded).await?;
+                resolution.metrics.head = head;
+                Ok(resolution)
+            })
+            .await;
+        finish_session(session);
 
         match index_row_ids {
             Ok(resolution) => {
@@ -255,11 +235,9 @@ impl ReadOnlyCatalog {
         upper: Bound<Vec<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
-        let session = self.begin_read().await?;
-        let handle = session.handle();
-
+        let mut session = None;
         let range_row_ids = self
-            .with_ready_index(handle, table, index, async |info| {
+            .lookup_at_head(&mut session, table, index, async |handle, info| {
                 let (byte_lower, byte_upper) =
                     encode_range_bounds(&info, index, lower.clone(), upper.clone())?;
                 let leading_nulls = info.nulls.first().copied().unwrap_or(NullOrder::Last);
@@ -276,7 +254,7 @@ impl ReadOnlyCatalog {
                 .await
             })
             .await;
-        session.finish();
+        finish_session(session);
 
         range_row_ids
     }
@@ -302,24 +280,23 @@ impl ReadOnlyCatalog {
         prefix: Vec<Option<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<u64>> {
-        let session = self.begin_read().await?;
-        let handle = session.handle();
-
+        let mut session = None;
         let null_prefix_row_ids = self
-            .with_ready_index(handle, table, index, async |info| {
+            .lookup_at_head(&mut session, table, index, async |handle, info| {
                 if prefix.is_empty() || prefix.len() > info.columns.len() {
                     return Err(Error::Constraint(format!(
                         "index_nulls: a prefix of {} predicates does not fit the {}-column index \
-                     {index}",
+                         {index}",
                         prefix.len(),
                         info.columns.len()
                     )));
                 }
                 if prefix.iter().all(Option::is_some) {
                     return Err(Error::Constraint(
-                    "index_nulls: the prefix names no IS NULL; use index_lookup for pure equality"
-                        .to_owned(),
-                ));
+                        "index_nulls: the prefix names no IS NULL; use index_lookup for pure \
+                         equality"
+                            .to_owned(),
+                    ));
                 }
 
                 let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
@@ -333,27 +310,78 @@ impl ReadOnlyCatalog {
                 .await
             })
             .await;
-
-        session.finish();
+        finish_session(session);
 
         null_prefix_row_ids
     }
 
-    /// Resolves the definition and its entries under the same read guard.
-    async fn with_ready_index<T>(
-        &self,
-        handle: ReadHandle<'_>,
+    /// Resolves `index` at the head and runs `lookup` over its entries. A
+    /// warm read-write handle serves the definition from its held view and
+    /// probes without a transaction; a pass the view moved under, and every
+    /// other handle, runs under a read session opened into `session`, which
+    /// the caller finishes.
+    async fn lookup_at_head<'s, T>(
+        &'s self,
+        session: &'s mut Option<ReadSession>,
         table: TableId,
         index: IndexId,
-        lookup: impl AsyncFn(IndexInfo) -> Result<T>,
+        lookup: impl AsyncFn(ReadHandle<'s>, IndexInfo) -> Result<T>,
     ) -> Result<T> {
+        if let Some((view, handle)) = self.warm_writer_read()? {
+            let outcome = match ready_index(&view, table, index) {
+                Ok(info) => lookup(handle, info).await,
+                Err(error) => Err(error),
+            };
+            if self.still_holds(&view) {
+                return outcome;
+            }
+        }
+
         let epoch = cache_epoch(&self.projections);
+        let handle = Option::insert(session, self.begin_read().await?).handle();
         read::consistent(handle, || async {
             let view = self.head_view(handle, epoch).await?;
-            lookup(ready_index(&view, table, index)?).await
+            lookup(handle, ready_index(&view, table, index)?).await
         })
         .await
     }
+}
+
+/// Releases the session a lookup opened, if it opened one.
+fn finish_session(session: Option<ReadSession>) {
+    if let Some(session) = session {
+        session.finish();
+    }
+}
+
+/// The distinct canonical keys `keys` name; each must name every column.
+fn encode_lookup_keys(
+    keys: &[Vec<IndexKeyValue>],
+    info: &IndexInfo,
+    index: IndexId,
+) -> Result<Vec<CanonicalKey>> {
+    let mut encoded = keys
+        .iter()
+        .map(|key| {
+            if key.len() != info.columns.len() {
+                return Err(Error::Constraint(format!(
+                    "index lookup: {} values do not address the {}-column index {index}; an \
+                     equality lookup names every column",
+                    key.len(),
+                    info.columns.len()
+                )));
+            }
+            encode_ordered_values(
+                &key.iter().cloned().map(Some).collect::<Vec<_>>(),
+                &info.directions,
+                &info.nulls,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    encoded.sort_unstable();
+    encoded.dedup();
+
+    Ok(encoded)
 }
 
 /// The index `index` of `table` in `view`, once it is ready to serve.

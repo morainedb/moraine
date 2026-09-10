@@ -8,7 +8,7 @@ use std::{ops::Bound, sync::Arc};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use slatedb::{
-    ByteRangeBounds, DbIterator, DbReader, DbTransaction, IterationOrder, KeyValue,
+    ByteRangeBounds, Db, DbIterator, DbReader, DbTransaction, IterationOrder, KeyValue,
     config::ScanOptions,
 };
 
@@ -99,13 +99,17 @@ impl ScanShape {
     }
 }
 
-/// A borrowed read over a read-write transaction or a read-only reader.
+/// A borrowed read over a read-write transaction, a read-only reader, or
+/// the writer's latest state.
 #[derive(Clone, Copy)]
 pub(crate) enum ReadHandle<'a> {
     /// A snapshot-isolated read-write transaction (`Db::begin`).
     Tx(&'a DbTransaction),
     /// A read-only reader following the manifest.
     Reader(&'a DbReader),
+    /// The writer itself, read without a transaction; each read is atomic
+    /// on its own.
+    Writer(&'a Db),
 }
 
 impl ReadHandle<'_> {
@@ -117,11 +121,13 @@ impl ReadHandle<'_> {
         match self {
             Self::Tx(tx) => tx.get(key).await,
             Self::Reader(reader) => reader.get(key).await,
+            Self::Writer(db) => db.get(key).await,
         }
     }
 
     /// Whether several reads through this handle observe a single store
-    /// state: true for a transaction, false for a manifest-following reader.
+    /// state: true for a transaction, false for a manifest-following reader
+    /// and for the writer's latest state.
     pub(crate) fn is_isolated(&self) -> bool {
         matches!(self, Self::Tx(_))
     }
@@ -163,6 +169,10 @@ impl ReadHandle<'_> {
             Self::Reader(reader) => {
                 reader
                     .scan_prefix_with_options(prefix, subrange, &options)
+                    .await
+            }
+            Self::Writer(db) => {
+                db.scan_prefix_with_options(prefix, subrange, &options)
                     .await
             }
         }

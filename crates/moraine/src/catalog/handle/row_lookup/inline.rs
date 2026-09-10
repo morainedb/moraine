@@ -28,11 +28,10 @@ type ScannedChunks = Vec<(InlineOperation, InlineChunkValue)>;
 impl ReadOnlyCatalog {
     async fn inline_lookup_directory(
         &self,
-        session: &ReadSession,
+        handle: ReadHandle<'_>,
         table: TableId,
         head: HeadValue,
     ) -> Result<(Arc<InlineDirectory>, Option<ScannedChunks>)> {
-        let handle = session.handle();
         let cached = super::lookup(&self.row_lookups.inline, table)
             .filter(|directory| directory.head == head);
         if let Some(directory) = cached {
@@ -71,13 +70,13 @@ impl ReadOnlyCatalog {
     /// `None`) from the directory built at `head`.
     async fn requested_inline_rows(
         &self,
-        session: &ReadSession,
+        handle: ReadHandle<'_>,
         table: TableId,
         requested: &[u64],
         head: HeadValue,
         visible_at: Option<u64>,
     ) -> Result<(InlineRowSource, Vec<InlineRow>, Arc<InlineDirectory>)> {
-        let (directory, scanned) = self.inline_lookup_directory(session, table, head).await?;
+        let (directory, scanned) = self.inline_lookup_directory(handle, table, head).await?;
         let visible_at = visible_at.unwrap_or(directory.head.snapshot_id);
         let mut selected = Vec::new();
         let mut locators = Vec::new();
@@ -90,7 +89,7 @@ impl ReadOnlyCatalog {
             if matches.is_empty() {
                 continue;
             }
-            let deletion = latest_deletion(session.handle(), table, row, visible_at).await?;
+            let deletion = latest_deletion(handle, table, row, visible_at).await?;
             for locator in matches {
                 let InlineOperation::Insert { begin_snapshot, .. } = locator.operation() else {
                     continue;
@@ -131,24 +130,35 @@ impl ReadOnlyCatalog {
     }
 
     /// Selects and resolves rows from one stable manifest state, visible at
-    /// `visible_at` (the head when `None`).
+    /// `visible_at` (the head when `None`). `held_head` is the writer's
+    /// held stamp; without one the head is read under the session's guard.
     async fn lookup_inline<T>(
         &self,
-        session: &ReadSession,
+        handle: ReadHandle<'_>,
+        held_head: Option<HeadValue>,
         table: TableId,
         requested: &[u64],
         visible_at: Option<u64>,
         finish: impl AsyncFn(InlineRowSource, Vec<InlineRow>) -> Result<T>,
     ) -> Result<T> {
-        let handle = session.handle();
-        let (result, directory) = read::consistent(handle, || async {
-            let head = commit::read_head_value(handle).await?;
-            let (source, rows, directory) = self
-                .requested_inline_rows(session, table, requested, head, visible_at)
-                .await?;
-            finish(source, rows).await.map(|result| (result, directory))
-        })
-        .await?;
+        let (result, directory) = match held_head {
+            Some(head) => {
+                let (source, rows, directory) = self
+                    .requested_inline_rows(handle, table, requested, head, visible_at)
+                    .await?;
+                (finish(source, rows).await?, directory)
+            }
+            None => {
+                read::consistent(handle, || async {
+                    let head = commit::read_head_value(handle).await?;
+                    let (source, rows, directory) = self
+                        .requested_inline_rows(handle, table, requested, head, visible_at)
+                        .await?;
+                    finish(source, rows).await.map(|result| (result, directory))
+                })
+                .await?
+            }
+        };
         super::install(&self.row_lookups.inline, table, directory);
         Ok(result)
     }
@@ -164,11 +174,40 @@ impl ReadOnlyCatalog {
         if requested.is_empty() {
             return Ok(HashSet::new());
         }
+        // The warm pass walks locators only, which needs the directory
+        // verified complete; the verification itself needs a session.
+        if projection::inline_directory_complete(&self.projections, table.get())
+            && let Some((view, handle)) = self.warm_writer_read()?
+        {
+            let head = HeadValue {
+                snapshot_id: view.snapshot.snapshot_id,
+                batch_seq: view.batch_seq,
+            };
+            let outcome = self
+                .lookup_inline(
+                    handle,
+                    Some(head),
+                    table,
+                    requested,
+                    visible_at,
+                    live_row_ids,
+                )
+                .await;
+            if self.still_holds(&view) {
+                return outcome;
+            }
+        }
+
         let session = self.begin_read().await?;
         let outcome = self
-            .lookup_inline(&session, table, requested, visible_at, async |_, rows| {
-                Ok(rows.into_iter().map(|row| row.row_id).collect())
-            })
+            .lookup_inline(
+                session.handle(),
+                None,
+                table,
+                requested,
+                visible_at,
+                live_row_ids,
+            )
             .await;
         session.finish();
         outcome
@@ -188,7 +227,8 @@ impl ReadOnlyCatalog {
         let session = self.begin_read().await?;
         let outcome = self
             .lookup_inline(
-                &session,
+                session.handle(),
+                None,
                 table,
                 requested,
                 visible_at,
@@ -210,16 +250,28 @@ impl ReadOnlyCatalog {
         table: TableId,
         row: u64,
     ) -> Result<Option<RecentRow>> {
-        self.lookup_inline(session, table, &[row], None, async |source, rows| {
-            let (rows, chunks) = source.resolve_chunks(session.handle(), table, rows).await?;
-            Ok(self
-                .recent_rows_from_chunks(session.handle(), table, rows, chunks)
-                .await?
-                .into_iter()
-                .next())
-        })
+        self.lookup_inline(
+            session.handle(),
+            None,
+            table,
+            &[row],
+            None,
+            async |source, rows| {
+                let (rows, chunks) = source.resolve_chunks(session.handle(), table, rows).await?;
+                Ok(self
+                    .recent_rows_from_chunks(session.handle(), table, rows, chunks)
+                    .await?
+                    .into_iter()
+                    .next())
+            },
+        )
         .await
     }
+}
+
+/// The ids of the selected rows, their chunks left unread.
+async fn live_row_ids(_: InlineRowSource, rows: Vec<InlineRow>) -> Result<HashSet<u64>> {
+    Ok(rows.into_iter().map(|row| row.row_id).collect())
 }
 
 async fn latest_deletion(

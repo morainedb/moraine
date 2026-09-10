@@ -84,6 +84,8 @@ struct ReadTally {
     refreshes: AtomicU64,
     cache_hits: AtomicU64,
     head_reads: AtomicU64,
+    /// Read transactions opened on the writer.
+    read_transactions: AtomicU64,
     materialize_micros: AtomicU64,
     current_scans: AtomicU64,
     history_scans: AtomicU64,
@@ -569,6 +571,12 @@ impl ReadOnlyCatalog {
         self.reads.head_reads.load(Ordering::Relaxed)
     }
 
+    /// How many read transactions this handle has opened on the writer.
+    #[cfg(test)]
+    pub(crate) fn read_transactions(&self) -> u64 {
+        self.reads.read_transactions.load(Ordering::Relaxed)
+    }
+
     /// Refuses if this handle has lost the writer epoch, or its `Db` has
     /// closed for any other reason. Reads the status channel only: no
     /// store read and no session.
@@ -600,6 +608,29 @@ impl ReadOnlyCatalog {
     /// that can move `sys/head`.
     pub(crate) fn holds_the_writer(&self) -> bool {
         matches!(self.store.as_ref(), Store::Writer { .. })
+    }
+
+    /// The held view and a transaction-free read over the writer, on a
+    /// warm read-write handle; `None` on a read-only handle or a cold
+    /// writer. The view stands at head: this handle is the store's only
+    /// writer. Pair a pass over it with [`still_holds`](Self::still_holds).
+    pub(crate) fn warm_writer_read(
+        &self,
+    ) -> Result<Option<(Arc<CatalogSnapshot>, ReadHandle<'_>)>> {
+        let (Some(view), Some(db)) = (self.writer_head_view(), self.store.writer_db()) else {
+            return Ok(None);
+        };
+        self.refuse_if_closed()?;
+        self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
+
+        Ok(Some((view, ReadHandle::Writer(db))))
+    }
+
+    /// Whether `view` is still the view this handle holds, so a pass over
+    /// it saw no commit land.
+    pub(crate) fn still_holds(&self, view: &Arc<CatalogSnapshot>) -> bool {
+        self.writer_head_view()
+            .is_some_and(|held| Arc::ptr_eq(&held, view))
     }
 
     /// An immutable view of the catalog at the latest committed snapshot.
@@ -837,11 +868,14 @@ impl ReadOnlyCatalog {
     /// most expensive possible read.
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
         let session = match self.store.as_ref() {
-            Store::Writer { db, .. } => ReadSession::Tx(
-                db.begin(IsolationLevel::Snapshot)
-                    .await
-                    .map_err(Error::from)?,
-            ),
+            Store::Writer { db, .. } => {
+                self.reads.read_transactions.fetch_add(1, Ordering::Relaxed);
+                ReadSession::Tx(
+                    db.begin(IsolationLevel::Snapshot)
+                        .await
+                        .map_err(Error::from)?,
+                )
+            }
             Store::Reader(reader) => ReadSession::Reader(reader.clone()),
         };
 

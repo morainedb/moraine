@@ -223,6 +223,25 @@ place of one. A dump whose projection does not stand at that stamp falls
 through to the ordinary session path and reads the head there, so rows are
 never installed under a stamp the store did not supply.
 
+An index lookup, and the inline membership check under a row location, go
+one step further on a warm read-write handle: they open **no session**. The
+definition each needs is in the held view, and what each then reads is a
+set of live-only keys, so the probes run as plain reads against the
+writer's `Db` rather than through a `DbTransaction`. Opening a transaction
+takes SlateDB's transaction manager lock — a global write lock, measured
+in `BENCHMARK.md` as the ceiling on concurrent lookups — and on this
+handle it bought nothing: the store's only writer is the handle itself, so
+the only commit that can land during a probe is its own, and a lookup is
+head-only by contract. The pass re-reads the held view after its probes;
+if a commit replaced it in between, the pass is discarded and re-run
+under a session, so a result served warm is one a session at that view
+would have returned. The inline check takes this path only for a table
+whose chunk directory has already been verified complete — the
+verification needs an isolated session, and the locator-only walk the
+warm pass uses rests on it. A read-only handle keeps the session path for
+both: it follows another process's commits, and only a session gives it a
+cut.
+
 What a warm read does not skip is the fence check, because a handle that
 served its cache past its own displacement would answer from a catalog the
 store has moved on from, and quietly. It does not open a session to perform
@@ -1347,6 +1366,10 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   dumps regardless.
 - **A warm probe costs no store read.** An index lookup repeated against
   a resident working set issues no GET and fetches no bytes.
+- **A warm writer probes without a session.** Index lookups and row
+  locations repeated on a warm read-write handle read `sys/head` no
+  further and open no read transaction, and return what the session path
+  returns.
 - **One budget across attaches.** Several attached stores share one cache
   and one tally; a later attach's differing options are reported as
   ignored rather than silently applied.
