@@ -33,14 +33,8 @@ impl ReadOnlyCatalog {
         head: HeadValue,
     ) -> Result<(Arc<InlineDirectory>, Option<ScannedChunks>)> {
         let handle = session.handle();
-        let cached = self
-            .row_lookups
-            .inline
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&table)
-            .filter(|directory| directory.head == head)
-            .cloned();
+        let cached = super::lookup(&self.row_lookups.inline, table)
+            .filter(|directory| directory.head == head);
         if let Some(directory) = cached {
             return Ok((directory, None));
         }

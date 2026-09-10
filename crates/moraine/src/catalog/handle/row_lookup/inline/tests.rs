@@ -69,14 +69,7 @@ async fn manifest_reader_caches_only_a_stable_inline_directory() {
         assert!(reader.recent_row(table, 2).await.unwrap().is_none());
         assert!(reader.recent_row(table, 999).await.unwrap().is_none());
     }
-    assert!(
-        reader
-            .row_lookups
-            .inline
-            .read()
-            .unwrap()
-            .contains_key(&table)
-    );
+    assert!(super::super::lookup(&reader.row_lookups.inline, table).is_some());
     reader.close().await.unwrap();
 }
 async fn remove_middle_chunk(

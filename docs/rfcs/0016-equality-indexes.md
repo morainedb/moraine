@@ -672,16 +672,22 @@ equality on file id is the supported shape.
 `locate_row_ids` uses a per-table interval directory for verified dense file
 summaries. A cold directory resolves every current file once: `row_id_start`
 alone cannot exclude an embedded-ID file. Warm requests visit matching dense
-intervals and probe only the remaining arbitrary-ID or failed files. Failed
-summaries still broaden every requested ID to that file and are retried on the
-next request. Results preserve request order, deduplicate repeated requests,
-and retain overlapping physical and inline candidates.
+intervals and consult the arbitrary-ID summaries the directory retains, so a
+lookup re-resolves nothing it has already summarized. Failed summaries still
+broaden every requested ID to that file and are retried on the next request;
+a retry that succeeds moves the file into the directory. Results preserve
+request order, deduplicate repeated requests, and retain overlapping physical
+and inline candidates.
 
-The directory is valid only for its exact shared file map, data-store cache
-identity, data prefix, and table prefix. A replacement, expiry, namespace change,
-or path change rebuilds it; unrelated catalog changes can reuse it. No file
-summary is inferred from a catalog range before the footer establishes which
-row-ID source applies.
+The directory is keyed on the data-store cache identity, data prefix, and
+table prefix; a change to any of those rebuilds it. A change to the table's
+file map refreshes the directory in place: the map it was built from is
+diffed against the current one, files that left are dropped, and only files
+that arrived or changed are summarized. A flush, replacement, or expiry
+therefore costs one summary per new file rather than one per current file,
+and unrelated catalog changes cost nothing. The directory's size estimate is
+carried across refreshes the same way. No file summary is inferred from a
+catalog range before the footer establishes which row-ID source applies.
 
 Inline point lookups build a chunk interval directory, then materialize only
 requested offsets, scan tombstones only for those IDs, and fetch only chunks
@@ -698,12 +704,15 @@ the new head. Only a stable pass installs its directory. After three retries,
 the reader falls back to scanned bodies without caching, so sustained changes
 cannot make it re-fetch a body already removed by a concurrent flush.
 
-Each catalog handle retains at most 64 table directories of each kind. Directory
-space follows source counts, not expanded row counts, and is included in the
-catalog projection-memory estimate. File directories share immutable file maps;
-the estimate can count those maps again beside the current catalog projection.
-Eviction or a cold attach pays directory construction again. This is an in-memory
-read optimization with no key-layout or format-version change.
+Each catalog handle retains at most 256 table directories of each kind and
+evicts the least recently used one when a further table needs a slot, so a
+working set within the cap never rebuilds. Directory space follows source
+counts, not expanded row counts, and is included in the catalog
+projection-memory estimate. File directories share immutable file maps and
+the arbitrary-ID summaries they retain with the auxiliary cache; the estimate
+can count both again beside the current catalog projection. Eviction or a
+cold attach pays directory construction again. This is an in-memory read
+optimization with no key-layout or format-version change.
 
 ### File-row sets
 
