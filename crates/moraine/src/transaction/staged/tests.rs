@@ -313,6 +313,103 @@ async fn repeated_snapshot_projections_scan_once_per_transaction() {
     catalog.close().await.unwrap();
 }
 
+/// Every versioned kind narrows the same way as data files: bounded at
+/// the read point it is served from the head view without a scan, and
+/// bounded behind it the ended version is read and found.
+#[tokio::test]
+async fn every_versioned_kind_bounded_at_the_read_point_scans_nothing() {
+    let events = captured_commit_events();
+
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 0),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+    });
+    tx.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::Table,
+        cells: vec![Cell::U64(1), Cell::U64(2)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, r#"dropped_table:"main"."t""#),
+    });
+    tx.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    let at_head = tx.diagnostic_id.to_string();
+    assert!(tx.visible_tables_live_at(Some(2)).await.unwrap().is_empty());
+    assert_eq!(tx.visible_columns_live_at(Some(2)).await.unwrap().len(), 1);
+    assert!(
+        tx.visible_delete_files_live_at(Some(2))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(tx.visible_views_live_at(Some(2)).await.unwrap().is_empty());
+    assert!(
+        tx.visible_partition_info_live_at(Some(2))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        tx.visible_sort_info_live_at(Some(2))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        events.count(
+            "scanned committed entities for staged transaction",
+            &at_head
+        ),
+        0,
+        "a read bounded at the read point scanned the store"
+    );
+    assert_eq!(
+        events.count("served committed entities from the head view", &at_head),
+        6
+    );
+    tx.rollback();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    let behind = tx.diagnostic_id.to_string();
+    let tables = tx.visible_tables_live_at(Some(1)).await.unwrap();
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].end_snapshot, Some(2));
+    let scan = events.one("scanned committed entities for staged transaction", &behind);
+    assert_eq!(
+        scan.get("versions").map(String::as_str),
+        Some("LiveAndEnded")
+    );
+    tx.rollback();
+    catalog.close().await.unwrap();
+}
+
 /// The bound decides which halves a data-file projection reads: at the
 /// transaction's read point nothing ended can match, so the ended half is
 /// left unread; behind it, and with no bound, it is read. Either way the

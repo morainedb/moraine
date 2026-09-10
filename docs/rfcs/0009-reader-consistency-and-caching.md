@@ -818,16 +818,17 @@ every statement a transaction, and each rebuild pays the full ABI
 crossing for rows that are byte-identical whenever no commit landed in
 between. So the head stamp crosses the ABI: the attach holds one dumped
 row set per synthesized table under the stamp it was dumped at, and a
-transaction's first scan asks the store where it stands before paying to
-re-dump. The pin becomes what it logically was — capture the stamp at
-first scan, serve the transaction at it — and steady-state reads cross
-the ABI once per table per *commit*, not per transaction.
+transaction compares held rows against the stamp its own snapshot stands
+at before paying to re-dump. The pin becomes what it logically was —
+the transaction's snapshot names the stamp, every table is served at it
+— and steady-state reads cross the ABI once per table per *commit*, not
+per transaction.
 
-Asking costs a read-write handle nothing: its held view is at head by
-construction, so the stamp comes from the view rather than the store, and
-the write path's saving is the whole ABI crossing with no read added to
-buy it. A read-only handle pays the one point read it would have paid
-anyway.
+The stamp costs nothing to obtain: the transaction already took its
+snapshot at start, and the view carries the head id and batch count it
+was materialized at, so no table read asks the store where it stands.
+On a read-only handle that removes one point read per table per
+statement; on a read-write handle it removes the crossing.
 
 Rows that straddled a commit are not held. The stamp is read before and
 after the dump and they must agree, because rows spanning two states

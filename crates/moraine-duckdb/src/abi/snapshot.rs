@@ -514,6 +514,49 @@ pub unsafe extern "C" fn moraine_snapshot_resolve_table(
     }
 }
 
+/// Writes the store stamp `snapshot` stands at: the head snapshot id and
+/// batch count, as `moraine_head_stamp` would report them at the moment
+/// the snapshot was taken.
+///
+/// # Safety
+///
+/// `snapshot` must point to a live [`MoraineSnapshotHandle`]; both output
+/// pointers must be non-null and writable; `err`, if non-null, must be
+/// writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_snapshot_stamp(
+    snapshot: *mut MoraineSnapshotHandle,
+    out_snapshot_id: *mut u64,
+    out_batch_seq: *mut u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(u64, u64), AbiError> {
+        if snapshot.is_null() {
+            return Err(AbiError::invalid_argument("`snapshot` is null"));
+        }
+        if out_snapshot_id.is_null() || out_batch_seq.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `snapshot`.
+        let snapshot = unsafe { &*snapshot };
+        let stamp = moraine::ffi_support::snapshot_stamp(&snapshot.snapshot);
+        Ok((stamp.snapshot_id, stamp.batch_seq))
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok((snapshot_id, batch_seq)) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe {
+                *out_snapshot_id = snapshot_id;
+                *out_batch_seq = batch_seq;
+            }
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
 /// Writes the id of the snapshot `snapshot` views to `*out_snapshot_id`.
 ///
 /// # Safety

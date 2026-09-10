@@ -942,6 +942,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end key: table_id */ {0},
 	        /* end_snapshot col */ 3,
 	        /* delete key: table_id, end_snapshot */ {0, 3},
+	        /* overlay_updatable */ false,
+	        /* scope_column */ -1,
+	        /* live_narrowable */ true,
 	    },
 	    {
 	        "ducklake_view",
@@ -961,6 +964,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end key: view_id */ {0},
 	        /* end_snapshot col */ 3,
 	        /* delete key: view_id, end_snapshot */ {0, 3},
+	        /* overlay_updatable */ false,
+	        /* scope_column */ -1,
+	        /* live_narrowable */ true,
 	    },
 	    {
 	        "ducklake_column",
@@ -984,6 +990,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end key: table_id, column_id (decoder order) */ {3, 0},
 	        /* end_snapshot col */ 2,
 	        /* delete key: table_id, column_id, end_snapshot */ {3, 0, 2},
+	        /* overlay_updatable */ false,
+	        /* scope_column */ -1,
+	        /* live_narrowable */ true,
 	    },
 	    {
 	        "ducklake_data_file",
@@ -1036,6 +1045,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end key: table_id, delete_file_id (decoder order) */ {1, 0},
 	        /* end_snapshot col */ 3,
 	        /* delete key: table_id, delete_file_id, end_snapshot */ {1, 0, 3},
+	        /* overlay_updatable */ false,
+	        /* scope_column */ -1,
+	        /* live_narrowable */ true,
 	    },
 	    {
 	        "ducklake_table_stats",
@@ -1207,6 +1219,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end key: table_id, partition_id (decoder order) */ {1, 0},
 	        /* end_snapshot col */ 3,
 	        /* delete key: table_id, partition_id, end_snapshot */ {1, 0, 3},
+	        /* overlay_updatable */ false,
+	        /* scope_column */ -1,
+	        /* live_narrowable */ true,
 	    },
 	    {
 	        "ducklake_partition_column",
@@ -1313,6 +1328,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end key: table_id, sort_id (decoder order) */ {1, 0},
 	        /* end_snapshot col */ 3,
 	        /* delete key: table_id, sort_id, end_snapshot */ {1, 0, 3},
+	        /* overlay_updatable */ false,
+	        /* scope_column */ -1,
+	        /* live_narrowable */ true,
 	    },
 	    {
 	        "ducklake_sort_expression",
@@ -1790,10 +1808,33 @@ std::optional<std::vector<std::vector<duckdb::Value>>> TxAwareRows(MoraineTxHand
                                                                    duckdb::ClientContext &context,
                                                                    int32_t write_table_kind,
                                                                    duckdb::optional_idx live_bound) {
-	if (write_table_kind == 6 && live_bound.IsValid()) {
-		return TxDumpRowsLiveAt<MoraineDataFileRow>(tx, static_cast<uint64_t>(live_bound.GetIndex()),
-		                                            moraine_tx_dump_data_files_live_at, moraine_dump_data_files_free,
-		                                            DataFileShape);
+	if (live_bound.IsValid()) {
+		auto bound = static_cast<uint64_t>(live_bound.GetIndex());
+		switch (write_table_kind) {
+		case 3:
+			return TxDumpRowsLiveAt<MoraineTableRow>(tx, bound, moraine_tx_dump_tables_live_at,
+			                                         moraine_dump_tables_free, TableShape);
+		case 4:
+			return TxDumpRowsLiveAt<MoraineViewRow>(tx, bound, moraine_tx_dump_views_live_at, moraine_dump_views_free,
+			                                        ViewShape);
+		case 5:
+			return TxDumpRowsLiveAt<MoraineColumnRow>(tx, bound, moraine_tx_dump_columns_live_at,
+			                                          moraine_dump_columns_free, ColumnShape);
+		case 6:
+			return TxDumpRowsLiveAt<MoraineDataFileRow>(tx, bound, moraine_tx_dump_data_files_live_at,
+			                                            moraine_dump_data_files_free, DataFileShape);
+		case 7:
+			return TxDumpRowsLiveAt<MoraineDeleteFileRow>(tx, bound, moraine_tx_dump_delete_files_live_at,
+			                                              moraine_dump_delete_files_free, DeleteFileShape);
+		case 12:
+			return TxDumpRowsLiveAt<MorainePartitionInfoRow>(tx, bound, moraine_tx_dump_partition_info_live_at,
+			                                                 moraine_dump_partition_info_free, PartitionInfoShape);
+		case 15:
+			return TxDumpRowsLiveAt<MoraineSortInfoRow>(tx, bound, moraine_tx_dump_sort_info_live_at,
+			                                            moraine_dump_sort_info_free, SortInfoShape);
+		default:
+			break;
+		}
 	}
 	switch (write_table_kind) {
 	case 0:
@@ -1932,12 +1973,12 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 	auto epoch = transaction.MetadataRowsEpoch();
 
 	// The rows this attach dumped last time are byte-identical to a fresh
-	// dump whenever no batch landed since, so ask the store where it
-	// stands (one point read) before paying the ABI crossing again. A
-	// store with no head yet, or a stamp read that fails, simply dumps.
+	// dump whenever no batch landed since, so compare against the stamp
+	// the transaction's snapshot stands at before paying the ABI crossing
+	// again. A store with no head yet simply dumps.
 	auto &moraine_catalog = catalog.Cast<MoraineCatalog>();
 	MoraineHeadStamp before;
-	const bool stamped = ReadHeadStamp(handle, context, before);
+	const bool stamped = transaction.SnapshotStamp(before.snapshot_id, before.batch_seq);
 	if (stamped) {
 		if (auto held = moraine_catalog.HeldMetadataRows(spec, before.snapshot_id, before.batch_seq)) {
 			transaction.PutMetadataRows(spec, held, false, epoch);

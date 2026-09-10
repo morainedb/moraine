@@ -95,9 +95,8 @@ struct MetadataTableSpec {
 	//
 	int32_t scope_column = -1;
 	// Whether a scan of this kind may be narrowed to the versions live at
-	// a filter's snapshot, skipping the ended half. Set only where the
-	// ended half grows without bound and the core exposes a live-bounded
-	// dump for it — `ducklake_data_file` alone.
+	// a filter's snapshot, skipping the ended half. Set on every versioned
+	// kind the core exposes a live-bounded transactional dump for.
 	//
 	// Last, and it must stay last: these specs are initialized positionally,
 	// so a field added anywhere earlier silently shifts every entry that

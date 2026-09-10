@@ -120,6 +120,15 @@ pub async fn head_stamp(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> 
     head
 }
 
+/// The store state `view` stands at, as [`head_stamp`] reports it: the
+/// stamp a transaction holding `view` compares held rows against without
+/// asking the store again.
+#[doc(hidden)]
+#[must_use]
+pub fn snapshot_stamp(view: &crate::catalog::CatalogSnapshot) -> HeadValue {
+    crate::catalog::projection::view_head(view)
+}
+
 /// Whether a caller needs the ended half, and if it depends on the head,
 /// what decides it.
 #[derive(Debug, Clone, Copy)]
