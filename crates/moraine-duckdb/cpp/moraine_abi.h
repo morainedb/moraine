@@ -2082,6 +2082,20 @@ int32_t moraine_snapshot_resolve_table(struct MoraineSnapshotHandle *snapshot,
                                        uint64_t *out_table_id,
                                        struct MoraineError *err);
 
+// Writes the store stamp `snapshot` stands at: the head snapshot id and
+// batch count, as `moraine_head_stamp` would report them at the moment
+// the snapshot was taken.
+//
+// # Safety
+//
+// `snapshot` must point to a live [`MoraineSnapshotHandle`]; both output
+// pointers must be non-null and writable; `err`, if non-null, must be
+// writable.
+int32_t moraine_snapshot_stamp(struct MoraineSnapshotHandle *snapshot,
+                               uint64_t *out_snapshot_id,
+                               uint64_t *out_batch_seq,
+                               struct MoraineError *err);
+
 // Writes the id of the snapshot `snapshot` views to `*out_snapshot_id`.
 //
 // # Safety
@@ -3242,6 +3256,21 @@ int32_t moraine_tx_dump_delete_files(struct MoraineTxHandle *tx,
                                      size_t *out_len,
                                      struct MoraineError *err);
 
+// As [`moraine_tx_dump_delete_files`], for a caller that keeps a row only
+// while `filter_snapshot < end_snapshot` (or it is null). Once
+// `filter_snapshot` reaches the transaction's read point the ended half is not
+// read; the rows are the same ones either way. Freed with
+// `moraine_dump_delete_files_free`.
+//
+// # Safety
+//
+// As [`moraine_tx_dump_delete_files`].
+int32_t moraine_tx_dump_delete_files_live_at(struct MoraineTxHandle *tx,
+                                             uint64_t filter_snapshot,
+                                             struct MoraineDeleteFileRow **out_items,
+                                             size_t *out_len,
+                                             struct MoraineError *err);
+
 // Dumps every `ducklake_file_column_stats` row as this transaction sees
 // it: committed rows at the transaction's read point with its own staged
 // rows over them. Freed with `moraine_dump_file_column_stats_free`.
@@ -3291,6 +3320,20 @@ int32_t moraine_tx_dump_columns(struct MoraineTxHandle *tx,
                                 size_t *out_len,
                                 struct MoraineError *err);
 
+// As [`moraine_tx_dump_columns`], for a caller that keeps a row only while
+// `filter_snapshot < end_snapshot` (or it is null). Once `filter_snapshot`
+// reaches the transaction's read point the ended half is not read; the
+// rows are the same ones either way. Freed with `moraine_dump_columns_free`.
+//
+// # Safety
+//
+// As [`moraine_tx_dump_columns`].
+int32_t moraine_tx_dump_columns_live_at(struct MoraineTxHandle *tx,
+                                        uint64_t filter_snapshot,
+                                        struct MoraineColumnRow **out_items,
+                                        size_t *out_len,
+                                        struct MoraineError *err);
+
 // Dumps every `ducklake_table` row as this transaction sees it: committed
 // rows at the transaction's read point with its own staged rows over them.
 // Freed with `moraine_dump_tables_free`.
@@ -3306,6 +3349,20 @@ int32_t moraine_tx_dump_tables(struct MoraineTxHandle *tx,
                                struct MoraineTableRow **out_items,
                                size_t *out_len,
                                struct MoraineError *err);
+
+// As [`moraine_tx_dump_tables`], for a caller that keeps a row only while
+// `filter_snapshot < end_snapshot` (or it is null). Once `filter_snapshot`
+// reaches the transaction's read point the ended half is not read; the
+// rows are the same ones either way. Freed with `moraine_dump_tables_free`.
+//
+// # Safety
+//
+// As [`moraine_tx_dump_tables`].
+int32_t moraine_tx_dump_tables_live_at(struct MoraineTxHandle *tx,
+                                       uint64_t filter_snapshot,
+                                       struct MoraineTableRow **out_items,
+                                       size_t *out_len,
+                                       struct MoraineError *err);
 
 // Dumps every `ducklake_schema` row as this transaction sees it: committed
 // rows at the transaction's read point with its own staged rows over them.
@@ -3338,6 +3395,20 @@ int32_t moraine_tx_dump_views(struct MoraineTxHandle *tx,
                               struct MoraineViewRow **out_items,
                               size_t *out_len,
                               struct MoraineError *err);
+
+// As [`moraine_tx_dump_views`], for a caller that keeps a row only while
+// `filter_snapshot < end_snapshot` (or it is null). Once `filter_snapshot`
+// reaches the transaction's read point the ended half is not read; the
+// rows are the same ones either way. Freed with `moraine_dump_views_free`.
+//
+// # Safety
+//
+// As [`moraine_tx_dump_views`].
+int32_t moraine_tx_dump_views_live_at(struct MoraineTxHandle *tx,
+                                      uint64_t filter_snapshot,
+                                      struct MoraineViewRow **out_items,
+                                      size_t *out_len,
+                                      struct MoraineError *err);
 
 // Dumps every `ducklake_table_stats` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
@@ -3387,6 +3458,21 @@ int32_t moraine_tx_dump_partition_info(struct MoraineTxHandle *tx,
                                        size_t *out_len,
                                        struct MoraineError *err);
 
+// As [`moraine_tx_dump_partition_info`], for a caller that keeps a row only
+// while `filter_snapshot < end_snapshot` (or it is null). Once
+// `filter_snapshot` reaches the transaction's read point the ended half is not
+// read; the rows are the same ones either way. Freed with
+// `moraine_dump_partition_info_free`.
+//
+// # Safety
+//
+// As [`moraine_tx_dump_partition_info`].
+int32_t moraine_tx_dump_partition_info_live_at(struct MoraineTxHandle *tx,
+                                               uint64_t filter_snapshot,
+                                               struct MorainePartitionInfoRow **out_items,
+                                               size_t *out_len,
+                                               struct MoraineError *err);
+
 // Dumps every `ducklake_sort_info` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_sort_info_free`.
@@ -3402,6 +3488,20 @@ int32_t moraine_tx_dump_sort_info(struct MoraineTxHandle *tx,
                                   struct MoraineSortInfoRow **out_items,
                                   size_t *out_len,
                                   struct MoraineError *err);
+
+// As [`moraine_tx_dump_sort_info`], for a caller that keeps a row only while
+// `filter_snapshot < end_snapshot` (or it is null). Once `filter_snapshot`
+// reaches the transaction's read point the ended half is not read; the
+// rows are the same ones either way. Freed with `moraine_dump_sort_info_free`.
+//
+// # Safety
+//
+// As [`moraine_tx_dump_sort_info`].
+int32_t moraine_tx_dump_sort_info_live_at(struct MoraineTxHandle *tx,
+                                          uint64_t filter_snapshot,
+                                          struct MoraineSortInfoRow **out_items,
+                                          size_t *out_len,
+                                          struct MoraineError *err);
 
 // Dumps every `ducklake_macro` row as this transaction sees it: committed
 // rows at the transaction's read point with its own staged rows over them.

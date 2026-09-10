@@ -290,6 +290,16 @@ value": deletes remove entries in the same batch that kills the row, so
 delete-then-reinsert behaves as SQL expects, within one commit or across
 commits.
 
+A unique entry's key is the value alone, so a delete by key removes
+whichever row holds the value. A deletion supplied by a writer through the
+verb API is therefore guarded: the committer reads the entry and drops the
+deletion unless the stored row id is the row being removed. A deletion the
+committer derives itself — from a scoped read of a delete file's target or
+a dropped file, or from an inlined row — names a row live at the base
+snapshot, and while the index is ready no other row can hold that row's
+value, so it is staged without the read. A building or poisoned index may
+hold the value for another row, so its derived deletions keep the guard.
+
 The rejection names the index, the claiming row, the holding row, and which
 state it collided with — the commit's own additions or a row already
 indexed. Those two branches otherwise produce the same message from
@@ -612,6 +622,15 @@ Lookups, ranges, and null queries are **head-only**: entries are live-only, so
 it always was — a scan problem. The hot path (current head) gets the index;
 the rare path pays nothing to keep it honest.
 
+Head-only is also what lets a warm read-write handle serve every accessor
+above without opening a read session: the definition comes from the view the
+handle already holds, which on the store's only writer is the head, and the
+probes are plain reads against the writer's `Db`, so no transaction — and no
+transaction-manager lock — stands under a lookup. A pass the held view moved
+under is re-run through a session. A read-only handle probes under a session
+as before. RFC 0009 (*A read-write handle resolves the head without reading
+it*) carries the argument.
+
 ### File-located lookups
 
 A lookup resolves an indexed value to stable row ids as above. It may then
@@ -662,16 +681,22 @@ equality on file id is the supported shape.
 `locate_row_ids` uses a per-table interval directory for verified dense file
 summaries. A cold directory resolves every current file once: `row_id_start`
 alone cannot exclude an embedded-ID file. Warm requests visit matching dense
-intervals and probe only the remaining arbitrary-ID or failed files. Failed
-summaries still broaden every requested ID to that file and are retried on the
-next request. Results preserve request order, deduplicate repeated requests,
-and retain overlapping physical and inline candidates.
+intervals and consult the arbitrary-ID summaries the directory retains, so a
+lookup re-resolves nothing it has already summarized. Failed summaries still
+broaden every requested ID to that file and are retried on the next request;
+a retry that succeeds moves the file into the directory. Results preserve
+request order, deduplicate repeated requests, and retain overlapping physical
+and inline candidates.
 
-The directory is valid only for its exact shared file map, data-store cache
-identity, data prefix, and table prefix. A replacement, expiry, namespace change,
-or path change rebuilds it; unrelated catalog changes can reuse it. No file
-summary is inferred from a catalog range before the footer establishes which
-row-ID source applies.
+The directory is keyed on the data-store cache identity, data prefix, and
+table prefix; a change to any of those rebuilds it. A change to the table's
+file map refreshes the directory in place: the map it was built from is
+diffed against the current one, files that left are dropped, and only files
+that arrived or changed are summarized. A flush, replacement, or expiry
+therefore costs one summary per new file rather than one per current file,
+and unrelated catalog changes cost nothing. The directory's size estimate is
+carried across refreshes the same way. No file summary is inferred from a
+catalog range before the footer establishes which row-ID source applies.
 
 Inline point lookups build a chunk interval directory, then materialize only
 requested offsets, scan tombstones only for those IDs, and fetch only chunks
@@ -688,12 +713,15 @@ the new head. Only a stable pass installs its directory. After three retries,
 the reader falls back to scanned bodies without caching, so sustained changes
 cannot make it re-fetch a body already removed by a concurrent flush.
 
-Each catalog handle retains at most 64 table directories of each kind. Directory
-space follows source counts, not expanded row counts, and is included in the
-catalog projection-memory estimate. File directories share immutable file maps;
-the estimate can count those maps again beside the current catalog projection.
-Eviction or a cold attach pays directory construction again. This is an in-memory
-read optimization with no key-layout or format-version change.
+Each catalog handle retains at most 256 table directories of each kind and
+evicts the least recently used one when a further table needs a slot, so a
+working set within the cap never rebuilds. Directory space follows source
+counts, not expanded row counts, and is included in the catalog
+projection-memory estimate. File directories share immutable file maps and
+the arbitrary-ID summaries they retain with the auxiliary cache; the estimate
+can count both again beside the current catalog projection. Eviction or a
+cold attach pays directory construction again. This is an in-memory read
+optimization with no key-layout or format-version change.
 
 ### File-row sets
 
@@ -1100,13 +1128,19 @@ before; a conflict ends the pass and the next derives afresh. A derivation
 failure is delivered to the committer behind the steps already handed off,
 so those still land before it surfaces.
 
-**The external leg reads ahead.** Files are planned several at a time:
+**The external leg reads ahead.** Files are planned thirty-two at a time:
 the footer, the file's read-column mapping, its inline file-deletes, and
 its delete files resolve concurrently, ahead of the position being
-consumed. Each row group of a planned file is a unit read on its own task,
-which decodes the group and encodes its entries to physical keys off the
-driving task, holding a fixed number of encoded batches ahead of the
-consumer. A bounded window of units runs at once. Entries are consumed
+consumed. Planning is wider than reading because it fetches only footers
+and delete files, which are small. Each row group of a planned file is a
+unit read on its own task, which decodes the group and encodes its entries
+to physical keys off the driving task, holding a fixed number of encoded
+batches ahead of the consumer. A window of eight units runs at once; each
+unit holds decoded rows, so the window is what bounds the build's memory,
+and it does not widen with the machine. Encoding runs on blocking workers
+under one process-wide permit count — the machine's core count, clamped to
+between four and thirty-two — which also bounds the encode futures a
+single file's stream keeps in flight. Entries are consumed
 strictly in file-then-position order, so the source cursor is exactly what
 it was under a serial read, and a resume inside a row group reads that
 group from the cursor. A single large file therefore still parallelizes
@@ -1128,8 +1162,11 @@ second copy of the body after it moves to a blocking decode worker.
 
 Delete sources are grouped by physical target from their staged metadata
 before any object is opened. Each target resolves its own delete files, so
-independent additions and inline removals start beside delete discovery; only
-the target whose positions are still being discovered waits. Data-file
+independent additions and inline removals start beside delete discovery. A
+target's footer and page index, and its read-column mapping, depend on
+nothing but the snapshot, so they load beside its delete files; only its row
+selection waits for the positions. A registered file's footer likewise loads
+beside its column mapping and any same-commit deletes against it. Data-file
 additions and removals retain their bounded producer windows; nested
 delete-file reads share one commit-wide allowance rather than multiplying
 that bound per target.
@@ -1162,7 +1199,9 @@ so another builder or writer cannot move progress under a stale premise.
 `BuildStep` bounds one step's entry buffer, not all process memory. Derivation
 also retains the step being committed, the read-ahead window of units with
 their buffered encoded batches, one inline source chunk, schema projection,
-store iterator buffers, and per-file deletion state. An individual stored
+store iterator buffers (256 KiB of read-ahead with two fetches in flight per
+inline source iterator, per SST it is positioned in), and per-file deletion
+state. An individual stored
 Arrow chunk can be larger than a step; no path retains all inline chunks or
 all derived inline entries. Entry-buffer and inline body/decoded-array high-water telemetry are
 reported separately; array buffers can share body memory, so those byte counts

@@ -28,7 +28,9 @@ use crate::{
 const BUILD_DERIVATION_ATTEMPTS: usize = 8;
 
 /// Files whose metadata and deletion state resolve ahead of their rows.
-const FILE_PLAN_CONCURRENCY: usize = BACKFILL_FILE_READ_CONCURRENCY;
+/// Planning reads only footers and delete files, so it runs wider than
+/// the unit window, which holds decoded rows.
+const FILE_PLAN_CONCURRENCY: usize = 32;
 
 /// Row-group reads decoding and encoding at once, ahead of the one whose
 /// entries the driver is consuming.
@@ -986,7 +988,8 @@ async fn plan_file(
         file.file_size_bytes,
         file.footer_size,
     )
-    .with_metrics(Arc::clone(&metrics));
+    .with_metrics(Arc::clone(&metrics))
+    .single_touch();
 
     let columns = snapshot.file_read_columns_at(handle, table, file);
     let inline_dead =

@@ -22,8 +22,8 @@ use crate::{
     catalog::CachePreload,
     error::{Error, Result},
     store::{
-        cache,
-        handle::{ReadHandle, ScanShape},
+        cache, census,
+        handle::{ReadHandle, SCAN_READ_AHEAD_BYTES, ScanShape},
         key, retry,
         segment::TagSegmentExtractor,
     },
@@ -35,6 +35,14 @@ const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// How often a read-only handle polls for new state when none is
 /// configured (SlateDB's own default).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often a writer polls the manifest for fencing and compacted state;
+/// each poll is one object-store read.
+const WRITER_MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The key count from which an SST carries a bloom filter: every SST, so an
+/// absent-key probe clears a filter instead of reading data blocks.
+const MIN_FILTER_KEYS: u32 = 0;
 
 /// The stored block grain for every writer and reader.
 const SST_BLOCK_SIZE: SstBlockSize = SstBlockSize::Block4Kib;
@@ -83,6 +91,9 @@ pub(crate) struct StoreBuilder<'a> {
     cache_preload: Option<CachePreload>,
     cache_puts: bool,
     checkpoint: Option<Uuid>,
+    /// The manifest's per-segment sizes, when the attach read them; they
+    /// decide how a preload reaches each subspace's first entry.
+    warm_segments: Vec<census::SegmentSize>,
 }
 
 impl<'a> StoreBuilder<'a> {
@@ -103,6 +114,7 @@ impl<'a> StoreBuilder<'a> {
             cache_preload: None,
             cache_puts: false,
             checkpoint: None,
+            warm_segments: Vec::new(),
         }
     }
 
@@ -172,6 +184,12 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
+    /// The manifest's per-segment sizes, for sizing the preload's reads.
+    pub(crate) fn warm_segments(mut self, segments: Vec<census::SegmentSize>) -> Self {
+        self.warm_segments = segments;
+        self
+    }
+
     /// Sets whether the SST index and filters this store flushes or
     /// compacts enter the cache as they are written (default: off). Data
     /// blocks are never admitted on the write path.
@@ -209,7 +227,7 @@ impl<'a> StoreBuilder<'a> {
                 .begin(slatedb::IsolationLevel::Snapshot)
                 .await
                 .map_err(Error::from)?;
-            warm(preload, ReadHandle::Tx(&tx), &counters).await;
+            warm(preload, ReadHandle::Tx(&tx), &counters, &self.warm_segments).await;
             tx.rollback();
         }
 
@@ -240,7 +258,13 @@ impl<'a> StoreBuilder<'a> {
 
         let reader = builder.build().await.map_err(Error::from)?;
         if let Some(preload) = self.cache_preload {
-            warm(preload, ReadHandle::Reader(&reader), &counters).await;
+            warm(
+                preload,
+                ReadHandle::Reader(&reader),
+                &counters,
+                &self.warm_segments,
+            )
+            .await;
         }
 
         Ok((reader, counters))
@@ -268,10 +292,13 @@ impl<'a> StoreBuilder<'a> {
         Ok(checkpoints.into_iter().map(|c| c.id).collect())
     }
 
-    /// SlateDB settings for a writer.
+    /// SlateDB settings for a writer. The in-process compactor writes its
+    /// SSTs with these too, so the filter threshold holds across a merge.
     fn settings(&self) -> Settings {
         Settings {
             flush_interval: self.flush_interval,
+            manifest_poll_interval: WRITER_MANIFEST_POLL_INTERVAL,
+            min_filter_keys: MIN_FILTER_KEYS,
             ..Default::default()
         }
     }
@@ -306,11 +333,28 @@ impl<'a> StoreBuilder<'a> {
     }
 }
 
+/// The shape that reaches one entry of a subspace whose segment holds
+/// `bytes`: probe when the whole segment fits one read-ahead, so the one
+/// request each SST costs anyway brings the segment in and admits it; seek
+/// otherwise, and when the size is unknown.
+pub(crate) fn warm_shape(bytes: Option<u64>) -> ScanShape {
+    let read_ahead = u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap_or(u64::MAX);
+    match bytes {
+        Some(bytes) if bytes <= read_ahead => ScanShape::Probe,
+        _ => ScanShape::Seek,
+    }
+}
+
 /// Warms the cache by reading, best-effort. `L0` reads one entry of every
 /// subspace so its SST metadata is resident; `All` additionally walks the
 /// scan-shaped subspaces whole. Neither reads the `index` subspace's data
 /// blocks.
-async fn warm(preload: CachePreload, handle: ReadHandle<'_>, counters: &cache::CacheCounters) {
+async fn warm(
+    preload: CachePreload,
+    handle: ReadHandle<'_>,
+    counters: &cache::CacheCounters,
+    segments: &[census::SegmentSize],
+) {
     let metadata_only = [
         key::Subspace::System,
         key::Subspace::Current,
@@ -331,7 +375,14 @@ async fn warm(preload: CachePreload, handle: ReadHandle<'_>, counters: &cache::C
     let before = counters.tally();
     let (warmed, failed) = stream::iter(metadata_only.into_iter().map(|subspace| {
         let deep = matches!(preload, CachePreload::All) && whole.contains(&subspace);
-        warm_subspace(handle, subspace, deep)
+        let prefix = key::subspace_prefix(subspace);
+        let shape = warm_shape(
+            segments
+                .iter()
+                .find(|segment| segment.prefix == prefix)
+                .map(|segment| segment.bytes),
+        );
+        warm_subspace(handle, subspace, deep, shape)
     }))
     .buffer_unordered(metadata_only.len())
     .fold((0_usize, 0_usize), |(warmed, failed), result| async move {
@@ -353,13 +404,19 @@ async fn warm(preload: CachePreload, handle: ReadHandle<'_>, counters: &cache::C
     );
 }
 
-/// Reads one entry of `subspace`, or the whole range when `deep`, in probe
-/// shape so the touched blocks are admitted. A deep walk of `current` or
-/// `history` runs its data-scaled kinds as concurrent sub-ranges.
-async fn warm_subspace(handle: ReadHandle<'_>, subspace: key::Subspace, deep: bool) -> Result<()> {
+/// Reads one entry of `subspace` in `shape`, or the whole range in probe
+/// shape when `deep`, so the touched blocks are admitted. A deep walk of
+/// `current` or `history` runs its data-scaled kinds as concurrent
+/// sub-ranges.
+async fn warm_subspace(
+    handle: ReadHandle<'_>,
+    subspace: key::Subspace,
+    deep: bool,
+    shape: ScanShape,
+) -> Result<()> {
     let prefix = key::subspace_prefix(subspace);
     if !deep {
-        let mut iterator = handle.scan_prefix(&prefix, .., ScanShape::Probe).await?;
+        let mut iterator = handle.scan_prefix(&prefix, .., shape).await?;
         iterator.next().await?;
         return Ok(());
     }
@@ -392,6 +449,23 @@ mod tests {
         Arc::new(InMemory::new())
     }
 
+    /// A subspace whose segment fits one read-ahead warms in probe shape,
+    /// which brings the segment in for one request; a larger or unknown
+    /// segment warms in seek shape.
+    #[test]
+    fn the_warm_shape_follows_the_segments_size() {
+        assert_eq!(warm_shape(Some(4 * 1024)), ScanShape::Probe);
+        assert_eq!(
+            warm_shape(Some(u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap())),
+            ScanShape::Probe
+        );
+        assert_eq!(
+            warm_shape(Some(u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap() + 1)),
+            ScanShape::Seek
+        );
+        assert_eq!(warm_shape(None), ScanShape::Seek);
+    }
+
     #[test]
     fn identical_display_names_do_not_share_catalog_cache_locations() {
         let first = StoreBuilder::new("catalog", memory_store());
@@ -420,6 +494,29 @@ mod tests {
     #[test]
     fn the_sst_block_size_is_fixed_at_four_kibibytes() {
         assert_eq!(SST_BLOCK_SIZE.as_bytes(), 4 * 1024);
+    }
+
+    /// Every SST a writer flushes or compacts carries a bloom filter, however
+    /// few keys it holds.
+    #[test]
+    fn every_sst_carries_a_bloom_filter() {
+        let settings = StoreBuilder::new("s", memory_store()).settings();
+        assert_eq!(settings.min_filter_keys, 0);
+    }
+
+    /// A writer polls the manifest every five seconds, not SlateDB's default
+    /// one.
+    #[test]
+    fn writers_poll_the_manifest_every_five_seconds() {
+        let settings = StoreBuilder::new("s", memory_store()).settings();
+        assert_eq!(settings.manifest_poll_interval, Duration::from_secs(5));
+    }
+
+    /// The writer settings are ones SlateDB accepts at open.
+    #[test]
+    fn writer_settings_pass_slatedb_validation() {
+        let settings = StoreBuilder::new("s", memory_store()).settings();
+        settings.validate().unwrap();
     }
 
     /// A commit-shaped transaction spanning several subspaces lands

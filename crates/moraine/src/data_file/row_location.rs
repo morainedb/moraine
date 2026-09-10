@@ -17,6 +17,7 @@ use crate::{
 };
 
 /// One file's row-id membership, and what it cost to obtain.
+#[derive(Clone)]
 pub(crate) struct FileSummary {
     rows: Arc<PositionedRowSet>,
     /// Whether this call read the file's row-id column and cached the
@@ -25,6 +26,11 @@ pub(crate) struct FileSummary {
 }
 
 impl FileSummary {
+    /// Estimated resident bytes of the membership set.
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        self.rows.estimated_bytes()
+    }
+
     /// Verified dense membership, irrespective of how the file records row IDs.
     pub(crate) fn dense_range(&self) -> Option<std::ops::Range<u64>> {
         match &self.rows.rows {

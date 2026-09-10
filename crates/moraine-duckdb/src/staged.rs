@@ -447,6 +447,34 @@ pub unsafe extern "C" fn moraine_tx_dump_delete_files(
     )
 }
 
+/// As [`moraine_tx_dump_delete_files`], for a caller that keeps a row only
+/// while `filter_snapshot < end_snapshot` (or it is null). Once
+/// `filter_snapshot` reaches the transaction's read point the ended half is not
+/// read; the rows are the same ones either way. Freed with
+/// `moraine_dump_delete_files_free`.
+///
+/// # Safety
+///
+/// As [`moraine_tx_dump_delete_files`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_delete_files_live_at(
+    tx: *mut MoraineTxHandle,
+    filter_snapshot: u64,
+    out_items: *mut *mut MoraineDeleteFileRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        StagedTransaction::visible_delete_files_live_at,
+        delete_file_rows,
+        Some(filter_snapshot)
+    )
+}
+
 /// Dumps every `ducklake_file_column_stats` row as this transaction sees
 /// it: committed rows at the transaction's read point with its own staged
 /// rows over them. Freed with `moraine_dump_file_column_stats_free`.
@@ -532,6 +560,33 @@ pub unsafe extern "C" fn moraine_tx_dump_columns(
     )
 }
 
+/// As [`moraine_tx_dump_columns`], for a caller that keeps a row only while
+/// `filter_snapshot < end_snapshot` (or it is null). Once `filter_snapshot`
+/// reaches the transaction's read point the ended half is not read; the
+/// rows are the same ones either way. Freed with `moraine_dump_columns_free`.
+///
+/// # Safety
+///
+/// As [`moraine_tx_dump_columns`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_columns_live_at(
+    tx: *mut MoraineTxHandle,
+    filter_snapshot: u64,
+    out_items: *mut *mut MoraineColumnRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        StagedTransaction::visible_columns_live_at,
+        column_rows,
+        Some(filter_snapshot)
+    )
+}
+
 /// Dumps every `ducklake_table` row as this transaction sees it: committed
 /// rows at the transaction's read point with its own staged rows over them.
 /// Freed with `moraine_dump_tables_free`.
@@ -557,6 +612,33 @@ pub unsafe extern "C" fn moraine_tx_dump_tables(
         err,
         StagedTransaction::visible_tables,
         table_rows
+    )
+}
+
+/// As [`moraine_tx_dump_tables`], for a caller that keeps a row only while
+/// `filter_snapshot < end_snapshot` (or it is null). Once `filter_snapshot`
+/// reaches the transaction's read point the ended half is not read; the
+/// rows are the same ones either way. Freed with `moraine_dump_tables_free`.
+///
+/// # Safety
+///
+/// As [`moraine_tx_dump_tables`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_tables_live_at(
+    tx: *mut MoraineTxHandle,
+    filter_snapshot: u64,
+    out_items: *mut *mut MoraineTableRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        StagedTransaction::visible_tables_live_at,
+        table_rows,
+        Some(filter_snapshot)
     )
 }
 
@@ -613,6 +695,33 @@ pub unsafe extern "C" fn moraine_tx_dump_views(
         err,
         StagedTransaction::visible_views,
         view_rows
+    )
+}
+
+/// As [`moraine_tx_dump_views`], for a caller that keeps a row only while
+/// `filter_snapshot < end_snapshot` (or it is null). Once `filter_snapshot`
+/// reaches the transaction's read point the ended half is not read; the
+/// rows are the same ones either way. Freed with `moraine_dump_views_free`.
+///
+/// # Safety
+///
+/// As [`moraine_tx_dump_views`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_views_live_at(
+    tx: *mut MoraineTxHandle,
+    filter_snapshot: u64,
+    out_items: *mut *mut MoraineViewRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        StagedTransaction::visible_views_live_at,
+        view_rows,
+        Some(filter_snapshot)
     )
 }
 
@@ -700,6 +809,34 @@ pub unsafe extern "C" fn moraine_tx_dump_partition_info(
     )
 }
 
+/// As [`moraine_tx_dump_partition_info`], for a caller that keeps a row only
+/// while `filter_snapshot < end_snapshot` (or it is null). Once
+/// `filter_snapshot` reaches the transaction's read point the ended half is not
+/// read; the rows are the same ones either way. Freed with
+/// `moraine_dump_partition_info_free`.
+///
+/// # Safety
+///
+/// As [`moraine_tx_dump_partition_info`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_partition_info_live_at(
+    tx: *mut MoraineTxHandle,
+    filter_snapshot: u64,
+    out_items: *mut *mut MorainePartitionInfoRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        StagedTransaction::visible_partition_info_live_at,
+        partition_info_rows,
+        Some(filter_snapshot)
+    )
+}
+
 /// Dumps every `ducklake_sort_info` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_sort_info_free`.
@@ -725,6 +862,33 @@ pub unsafe extern "C" fn moraine_tx_dump_sort_info(
         err,
         StagedTransaction::visible_sort_info,
         sort_info_rows
+    )
+}
+
+/// As [`moraine_tx_dump_sort_info`], for a caller that keeps a row only while
+/// `filter_snapshot < end_snapshot` (or it is null). Once `filter_snapshot`
+/// reaches the transaction's read point the ended half is not read; the
+/// rows are the same ones either way. Freed with `moraine_dump_sort_info_free`.
+///
+/// # Safety
+///
+/// As [`moraine_tx_dump_sort_info`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_sort_info_live_at(
+    tx: *mut MoraineTxHandle,
+    filter_snapshot: u64,
+    out_items: *mut *mut MoraineSortInfoRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        StagedTransaction::visible_sort_info_live_at,
+        sort_info_rows,
+        Some(filter_snapshot)
     )
 }
 

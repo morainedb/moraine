@@ -45,10 +45,10 @@ fn probe_prefixes(view: &CatalogSnapshot, table: TableId) -> Vec<Vec<u8>> {
     prefixes
 }
 
-/// Reads the first entry under `prefix` in probe shape, admitting the SST
+/// Reads the first entry under `prefix` in seek shape, admitting the SST
 /// metadata and first block a probe there would fetch.
 async fn warm_prefix(handle: ReadHandle<'_>, prefix: Vec<u8>) -> Result<()> {
-    let mut iterator = handle.scan_prefix(prefix, .., ScanShape::Probe).await?;
+    let mut iterator = handle.scan_prefix(prefix, .., ScanShape::Seek).await?;
     iterator.next().await?;
     Ok(())
 }

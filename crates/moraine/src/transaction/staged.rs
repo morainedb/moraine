@@ -390,9 +390,12 @@ pub struct StagedTransaction {
     diagnostic_id: u64,
     db_tx: DbTransaction,
     ops: Vec<RowOperation>,
-    /// The committed records at this transaction's read point, scanned once
+    /// The committed records at this transaction's read point, read once
     /// per requested kind and shared by later reads of that kind.
     committed: CommittedRecordCache,
+    /// The head view at this transaction's read point, resolved once for
+    /// the live-only reads it answers without a scan.
+    head_view: tokio::sync::OnceCell<Arc<CatalogSnapshot>>,
     /// The committed snapshot records at this transaction's read point.
     /// Scanned once; the staged deletes over them are re-applied per call.
     committed_snapshots: CommittedSnapshots,
@@ -432,6 +435,7 @@ impl StagedTransaction {
             db_tx,
             ops: Vec::new(),
             committed: tokio::sync::Mutex::new(HashMap::new()),
+            head_view: tokio::sync::OnceCell::new(),
             committed_snapshots: tokio::sync::OnceCell::new(),
             committed_schema_versions: tokio::sync::OnceCell::new(),
             projections,
@@ -577,10 +581,21 @@ impl StagedTransaction {
             .cloned()
     }
 
-    /// The committed records of one kind at this transaction's read point,
-    /// read through `db_tx` so current and history are one consistent cut.
+    /// The head view at this transaction's read point, from the projection
+    /// cache when it stands there.
+    async fn head_view(&self) -> Result<Arc<CatalogSnapshot>> {
+        self.head_view
+            .get_or_try_init(|| commit::head_view_for(&self.db_tx, &self.projections))
+            .await
+            .cloned()
+    }
+
+    /// The committed records of one kind at this transaction's read point.
+    /// A live-only read comes from the head view, which holds every live
+    /// record; one that needs ended versions scans both subspaces through
+    /// `db_tx` as one consistent cut.
     ///
-    /// Memoized per `(kind, versions)`: a live-only scan is a different set
+    /// Memoized per `(kind, versions)`: a live-only set is a different set
     /// from a full one and never stands in for it.
     async fn committed_entities(
         &self,
@@ -597,6 +612,17 @@ impl StagedTransaction {
         };
         let records = cell
             .get_or_try_init(|| async {
+                if versions == read::Versions::Live || !kind.is_versioned() {
+                    let records = self.head_view().await?.live_records(kind);
+                    debug!(
+                        transaction_id = self.diagnostic_id,
+                        ?kind,
+                        records = records.len(),
+                        "served committed entities from the head view"
+                    );
+                    return Ok::<_, Error>(Arc::new(records));
+                }
+
                 let started = Instant::now();
                 let records =
                     read::scan_entity_kind(ReadHandle::Tx(&self.db_tx), kind, versions).await?;
@@ -696,15 +722,28 @@ impl StagedTransaction {
     ///
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_delete_files(&self) -> Result<Vec<proto::DeleteFileValue>> {
+        self.visible_delete_files_live_at(None).await
+    }
+
+    /// As [`visible_delete_files`](Self::visible_delete_files), for a caller
+    /// that keeps a row only while `filter_snapshot < end_snapshot` (or it
+    /// is null). Once `filter_snapshot` reaches this transaction's read
+    /// point the ended half is not read; the rows are the same ones either
+    /// way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_delete_files_live_at(
+        &self,
+        filter_snapshot: Option<u64>,
+    ) -> Result<Vec<proto::DeleteFileValue>> {
+        let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(
-                read::EntityRecordKind::DeleteFile,
-                read::Versions::LiveAndEnded,
-                |r| match r {
-                    read::EntityRecord::DeleteFile(v) => Some(v.clone()),
-                    _ => None,
-                },
-            )
+            .committed_rows(read::EntityRecordKind::DeleteFile, versions, |r| match r {
+                read::EntityRecord::DeleteFile(v) => Some(v.clone()),
+                _ => None,
+            })
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -715,15 +754,27 @@ impl StagedTransaction {
     ///
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_columns(&self) -> Result<Vec<proto::ColumnValue>> {
+        self.visible_columns_live_at(None).await
+    }
+
+    /// As [`visible_columns`](Self::visible_columns), for a caller that keeps a
+    /// row only while `filter_snapshot < end_snapshot` (or it is null).
+    /// Once `filter_snapshot` reaches this transaction's read point the
+    /// ended half is not read; the rows are the same ones either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_columns_live_at(
+        &self,
+        filter_snapshot: Option<u64>,
+    ) -> Result<Vec<proto::ColumnValue>> {
+        let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(
-                read::EntityRecordKind::Column,
-                read::Versions::LiveAndEnded,
-                |r| match r {
-                    read::EntityRecord::Column(v) => Some(v.clone()),
-                    _ => None,
-                },
-            )
+            .committed_rows(read::EntityRecordKind::Column, versions, |r| match r {
+                read::EntityRecord::Column(v) => Some(v.clone()),
+                _ => None,
+            })
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -734,15 +785,27 @@ impl StagedTransaction {
     ///
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_tables(&self) -> Result<Vec<proto::TableValue>> {
+        self.visible_tables_live_at(None).await
+    }
+
+    /// As [`visible_tables`](Self::visible_tables), for a caller that keeps a
+    /// row only while `filter_snapshot < end_snapshot` (or it is null).
+    /// Once `filter_snapshot` reaches this transaction's read point the
+    /// ended half is not read; the rows are the same ones either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_tables_live_at(
+        &self,
+        filter_snapshot: Option<u64>,
+    ) -> Result<Vec<proto::TableValue>> {
+        let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(
-                read::EntityRecordKind::Table,
-                read::Versions::LiveAndEnded,
-                |r| match r {
-                    read::EntityRecord::Table(v) => Some(v.clone()),
-                    _ => None,
-                },
-            )
+            .committed_rows(read::EntityRecordKind::Table, versions, |r| match r {
+                read::EntityRecord::Table(v) => Some(v.clone()),
+                _ => None,
+            })
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -791,15 +854,27 @@ impl StagedTransaction {
     ///
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_views(&self) -> Result<Vec<proto::ViewValue>> {
+        self.visible_views_live_at(None).await
+    }
+
+    /// As [`visible_views`](Self::visible_views), for a caller that keeps a
+    /// row only while `filter_snapshot < end_snapshot` (or it is null).
+    /// Once `filter_snapshot` reaches this transaction's read point the
+    /// ended half is not read; the rows are the same ones either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_views_live_at(
+        &self,
+        filter_snapshot: Option<u64>,
+    ) -> Result<Vec<proto::ViewValue>> {
+        let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(
-                read::EntityRecordKind::View,
-                read::Versions::LiveAndEnded,
-                |r| match r {
-                    read::EntityRecord::View(v) => Some(v.clone()),
-                    _ => None,
-                },
-            )
+            .committed_rows(read::EntityRecordKind::View, versions, |r| match r {
+                read::EntityRecord::View(v) => Some(v.clone()),
+                _ => None,
+            })
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -810,15 +885,28 @@ impl StagedTransaction {
     ///
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_partition_info(&self) -> Result<Vec<proto::PartitionValue>> {
+        self.visible_partition_info_live_at(None).await
+    }
+
+    /// As [`visible_partition_info`](Self::visible_partition_info), for a
+    /// caller that keeps a row only while `filter_snapshot < end_snapshot`
+    /// (or it is null). Once `filter_snapshot` reaches this transaction's
+    /// read point the ended half is not read; the rows are the same ones
+    /// either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_partition_info_live_at(
+        &self,
+        filter_snapshot: Option<u64>,
+    ) -> Result<Vec<proto::PartitionValue>> {
+        let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(
-                read::EntityRecordKind::Partition,
-                read::Versions::LiveAndEnded,
-                |r| match r {
-                    read::EntityRecord::Partition(v) => Some(v.clone()),
-                    _ => None,
-                },
-            )
+            .committed_rows(read::EntityRecordKind::Partition, versions, |r| match r {
+                read::EntityRecord::Partition(v) => Some(v.clone()),
+                _ => None,
+            })
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -829,15 +917,27 @@ impl StagedTransaction {
     ///
     /// Returns an error if the scan fails or a staged row is malformed.
     pub async fn visible_sort_info(&self) -> Result<Vec<proto::SortValue>> {
+        self.visible_sort_info_live_at(None).await
+    }
+
+    /// As [`visible_sort_info`](Self::visible_sort_info), for a caller that
+    /// keeps a row only while `filter_snapshot < end_snapshot` (or it is
+    /// null). Once `filter_snapshot` reaches this transaction's read point
+    /// the ended half is not read; the rows are the same ones either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_sort_info_live_at(
+        &self,
+        filter_snapshot: Option<u64>,
+    ) -> Result<Vec<proto::SortValue>> {
+        let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(
-                read::EntityRecordKind::Sort,
-                read::Versions::LiveAndEnded,
-                |r| match r {
-                    read::EntityRecord::Sort(v) => Some(v.clone()),
-                    _ => None,
-                },
-            )
+            .committed_rows(read::EntityRecordKind::Sort, versions, |r| match r {
+                read::EntityRecord::Sort(v) => Some(v.clone()),
+                _ => None,
+            })
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -1164,6 +1264,7 @@ impl StagedTransaction {
             db_tx,
             ops,
             committed: _,
+            head_view,
             committed_snapshots: _,
             committed_schema_versions: _,
             projections,
@@ -1183,10 +1284,15 @@ impl StagedTransaction {
             .any(|operation| matches!(operation, RowOperation::InlineInsert { .. }));
         let mut phases = CommitPhases::default();
 
-        // The premise everything below stages against; a warm cache
-        // answers from memory, so this rarely waits on the store.
+        // The premise everything below stages against: the view a read
+        // already resolved at this read point, else the cache, which
+        // answers from memory when warm.
         let phase_started = Instant::now();
-        let base = match commit::head_view_for(&db_tx, &projections).await {
+        let base = match head_view.into_inner() {
+            Some(base) => Ok(base),
+            None => commit::head_view_for(&db_tx, &projections).await,
+        };
+        let base = match base {
             Ok(base) => base,
             Err(err) => {
                 db_tx.rollback();
@@ -1479,6 +1585,7 @@ fn staged_landed(
         index_parquet_read_ms = milliseconds(phases.index_metrics.scoped_read.range_duration),
         index_additions = phases.index_metrics.additions,
         index_deletions = phases.index_metrics.deletions,
+        index_guard_reads = phases.index_metrics.guard_reads,
         index_unique_probes = phases.index_metrics.unique_probes,
         index_probe_hits = phases.index_metrics.probe_hits,
         index_probe_misses = phases.index_metrics.probe_misses,

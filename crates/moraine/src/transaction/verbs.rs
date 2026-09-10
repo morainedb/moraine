@@ -845,6 +845,7 @@ impl Transaction {
             delete,
             building: shape.building,
             known_absent: false,
+            known_held: false,
         });
         Ok(())
     }
@@ -1149,6 +1150,7 @@ impl Transaction {
                 delete: false,
                 building,
                 known_absent: entry.known_absent,
+                known_held: false,
             });
         }
 

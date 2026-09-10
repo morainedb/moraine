@@ -135,6 +135,7 @@ where
         event.record(&mut fields);
         if fields.0.get("message").is_some_and(|message| {
             message == "scanned committed entities for staged transaction"
+                || message == "served committed entities from the head view"
                 || message == "scanned committed snapshots for staged transaction"
                 || message == "scanned committed schema versions for staged transaction"
                 || message == "staged commit landed"
@@ -164,6 +165,20 @@ impl CapturedCommitEvents {
             .collect::<Vec<_>>();
         assert_eq!(matching.len(), 1, "events for {message}: {matching:?}");
         matching.into_iter().next().unwrap()
+    }
+
+    fn count(&self, message: &str, transaction_id: &str) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|fields| {
+                fields.get("message").is_some_and(|value| value == message)
+                    && fields
+                        .get("transaction_id")
+                        .is_some_and(|value| value == transaction_id)
+            })
+            .count()
     }
 
     fn phase_milliseconds(&self, transaction_id: u64, phase: &str) -> u64 {
@@ -298,6 +313,103 @@ async fn repeated_snapshot_projections_scan_once_per_transaction() {
     catalog.close().await.unwrap();
 }
 
+/// Every versioned kind narrows the same way as data files: bounded at
+/// the read point it is served from the head view without a scan, and
+/// bounded behind it the ended version is read and found.
+#[tokio::test]
+async fn every_versioned_kind_bounded_at_the_read_point_scans_nothing() {
+    let events = captured_commit_events();
+
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 0),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+    });
+    tx.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::Table,
+        cells: vec![Cell::U64(1), Cell::U64(2)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, r#"dropped_table:"main"."t""#),
+    });
+    tx.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    let at_head = tx.diagnostic_id.to_string();
+    assert!(tx.visible_tables_live_at(Some(2)).await.unwrap().is_empty());
+    assert_eq!(tx.visible_columns_live_at(Some(2)).await.unwrap().len(), 1);
+    assert!(
+        tx.visible_delete_files_live_at(Some(2))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(tx.visible_views_live_at(Some(2)).await.unwrap().is_empty());
+    assert!(
+        tx.visible_partition_info_live_at(Some(2))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        tx.visible_sort_info_live_at(Some(2))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        events.count(
+            "scanned committed entities for staged transaction",
+            &at_head
+        ),
+        0,
+        "a read bounded at the read point scanned the store"
+    );
+    assert_eq!(
+        events.count("served committed entities from the head view", &at_head),
+        6
+    );
+    tx.rollback();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    let behind = tx.diagnostic_id.to_string();
+    let tables = tx.visible_tables_live_at(Some(1)).await.unwrap();
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].end_snapshot, Some(2));
+    let scan = events.one("scanned committed entities for staged transaction", &behind);
+    assert_eq!(
+        scan.get("versions").map(String::as_str),
+        Some("LiveAndEnded")
+    );
+    tx.rollback();
+    catalog.close().await.unwrap();
+}
+
 /// The bound decides which halves a data-file projection reads: at the
 /// transaction's read point nothing ended can match, so the ended half is
 /// left unread; behind it, and with no bound, it is read. Either way the
@@ -356,11 +468,16 @@ async fn a_data_file_bound_at_the_read_point_leaves_the_ended_half_unread() {
     let at_head = tx.diagnostic_id.to_string();
     let live = tx.visible_data_files_live_at(Some(2)).await.unwrap();
     assert!(live.is_empty(), "the only file ended at the read point");
-    let scan = events.one(
-        "scanned committed entities for staged transaction",
-        &at_head,
+    assert_eq!(
+        events.count(
+            "scanned committed entities for staged transaction",
+            &at_head
+        ),
+        0,
+        "a read bounded at the read point scanned the store"
     );
-    assert_eq!(scan.get("versions").map(String::as_str), Some("Live"));
+    let served = events.one("served committed entities from the head view", &at_head);
+    assert_eq!(served.get("kind").map(String::as_str), Some("File"));
     tx.rollback();
 
     // Bounded behind it — a time-travel read — keeps the full scan, and
@@ -2125,8 +2242,8 @@ async fn registering_many_data_files_reads_them_concurrently() {
 /// collecting the positions they kill is one independent fetch apiece.
 ///
 /// Every delete file targets the same data file, so resolving the killed
-/// positions to their values costs a single scoped read — leaving the
-/// delete files' own reads as the only ones that can overlap.
+/// positions to their values costs a single scoped read, whose object is
+/// fetched beside the delete files rather than after them.
 #[tokio::test]
 async fn registering_many_delete_files_reads_them_concurrently() {
     const DELETES: usize = 8;
@@ -2167,8 +2284,8 @@ async fn registering_many_delete_files_reads_them_concurrently() {
     );
     assert_eq!(
         store.peak_in_flight(),
-        DELETES,
-        "every delete file's read is in flight at once"
+        DELETES + 1,
+        "every delete file's read and the target's own are in flight at once"
     );
 }
 
@@ -2270,10 +2387,10 @@ async fn target_removal_does_not_wait_for_unrelated_delete_discovery() {
     assert_eq!(index_entry_count(&catalog, true, index_id).await, 0);
 }
 
-/// An append reads the registered file's footer and projected columns. The
-/// fixed-latency store makes those two serial range-read waves visible.
+/// An append of a small file fetches it whole: its footer and projected
+/// columns come out of one read.
 #[tokio::test]
-async fn append_only_index_maintenance_is_two_range_read_waves() {
+async fn append_only_index_maintenance_is_one_whole_object_read() {
     let events = captured_commit_events();
     let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
     let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
@@ -2281,17 +2398,17 @@ async fn append_only_index_maintenance_is_two_range_read_waves() {
     let transaction_id = register_indexed_data_files(&catalog, &store, 1, 3).await;
     let milliseconds = events.phase_milliseconds(transaction_id, "index_maintenance_ms");
 
-    assert_eq!(store.reads(), 2, "footer and projected columns are read");
-    assert_index_phase_covers_read_waves(milliseconds, 2);
+    assert_eq!(store.reads(), 1, "the small file is fetched whole");
+    assert_index_phase_covers_read_waves(milliseconds, 1);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
-    eprintln!("append-only: reads=2 index_maintenance_ms={milliseconds}");
+    eprintln!("append-only: reads=1 index_maintenance_ms={milliseconds}");
     catalog.close().await.unwrap();
 }
 
-/// A delete file costs two metadata/column reads for its positions, followed
-/// by metadata, page-index, and projected-column reads from its target.
+/// A delete file and its small target are each fetched whole, and the
+/// target's read does not wait for the delete file's positions.
 #[tokio::test]
-async fn delete_only_index_maintenance_is_five_range_read_waves() {
+async fn delete_only_index_maintenance_reads_both_small_objects_at_once() {
     let events = captured_commit_events();
     let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
     let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
@@ -2323,12 +2440,61 @@ async fn delete_only_index_maintenance_is_five_range_read_waves() {
 
     assert_eq!(
         store.reads(),
-        5,
-        "the delete file uses two ranges and its selected target uses three"
+        2,
+        "the delete file and its target are each fetched whole"
     );
-    assert_index_phase_covers_read_waves(milliseconds, 5);
+    assert!(
+        store.paths_overlapped("main/t/f0.parquet", "main/t/delete.parquet"),
+        "the target's read starts before its delete file's positions resolve"
+    );
+    assert_index_phase_covers_read_waves(milliseconds, 1);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 2);
-    eprintln!("delete-only: reads=5 index_maintenance_ms={milliseconds}");
+    eprintln!("delete-only: reads=2 index_maintenance_ms={milliseconds}");
+    catalog.close().await.unwrap();
+}
+
+/// A delete against a target too large to fetch whole reads the target's
+/// footer and page index beside its delete file, then the selected pages.
+#[tokio::test]
+async fn a_delete_reads_a_large_targets_footer_beside_its_delete_file() {
+    const ROWS: usize = 160_000;
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+    let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
+    register_indexed_data_files(&catalog, &store, 1, ROWS).await;
+    store.reset();
+
+    let size = write_delete_file(&store.inner, "delete.parquet", "f0.parquet", &[0]).await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(
+        &catalog,
+        db_tx,
+        DataStore::new(store.clone()),
+    );
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: delete_file_row_at(2, "delete.parquet", 1, 1, size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        store.reads(),
+        4,
+        "the delete file whole; the target's footer, page index, and selected pages"
+    );
+    assert!(
+        store.paths_overlapped("main/t/f0.parquet", "main/t/delete.parquet"),
+        "the target's footer read starts before its delete file's positions resolve"
+    );
+    assert_eq!(index_entry_count(&catalog, false, index_id).await, ROWS - 1);
     catalog.close().await.unwrap();
 }
 
@@ -2530,9 +2696,9 @@ async fn a_cumulative_delete_file_derives_only_the_positions_it_newly_kills() {
     catalog.close().await.unwrap();
 }
 
-/// A file-backed replacement starts its independent new-file read beside
-/// delete discovery. The old target still waits for the positions, leaving
-/// two dependent waves without putting the addition behind both of them.
+/// A file-backed replacement reads the new file, the delete file, and the
+/// old target's object together: only the target's row selection waits
+/// for the positions, and its bytes are resident by then.
 #[tokio::test]
 async fn replace_index_maintenance_overlaps_adds_and_removals() {
     let events = captured_commit_events();
@@ -2577,21 +2743,21 @@ async fn replace_index_maintenance_overlaps_adds_and_removals() {
 
     assert_eq!(
         store.reads(),
-        7,
-        "the two full reads use two ranges each and the selected target uses three"
+        3,
+        "the replacement, the delete file, and the target are each fetched whole"
     );
     assert_eq!(
         store.peak_in_flight(),
-        2,
-        "two independent paths are read together"
+        3,
+        "three independent paths are read together"
     );
     assert!(
         store.paths_overlapped("main/t/delete.parquet", "main/t/replacement.parquet"),
         "the replacement read starts without waiting for delete discovery"
     );
-    assert_index_phase_covers_read_waves(milliseconds, 5);
+    assert_index_phase_covers_read_waves(milliseconds, 1);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
-    eprintln!("replace: reads=7 index_maintenance_ms={milliseconds}");
+    eprintln!("replace: reads=3 index_maintenance_ms={milliseconds}");
     catalog.close().await.unwrap();
 }
 
@@ -3869,9 +4035,11 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
     .unwrap();
     let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
+    let events = captured_commit_events();
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx =
         StagedTransaction::begin_detached_with_store(&catalog, db_tx, DataStore::new(store));
+    let transaction_id = tx.diagnostic_id.to_string();
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
         cells: vec![
@@ -3904,6 +4072,14 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
         index_entry_count(&catalog, true, index_id).await,
         1,
         "positions 0 and 2 are unindexed; only row 1 survives"
+    );
+    // Derived deletions name rows live at the base, so the unique entries
+    // are removed without a guard read each.
+    let landed = events.one("staged commit landed", &transaction_id);
+    assert_eq!(landed.get("index_deletions").map(String::as_str), Some("2"));
+    assert_eq!(
+        landed.get("index_guard_reads").map(String::as_str),
+        Some("0")
     );
 }
 

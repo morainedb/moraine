@@ -8,17 +8,25 @@ use std::{ops::Bound, sync::Arc};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use slatedb::{
-    ByteRangeBounds, DbIterator, DbReader, DbTransaction, IterationOrder, KeyValue,
+    ByteRangeBounds, Db, DbIterator, DbReader, DbTransaction, IterationOrder, KeyValue,
     config::ScanOptions,
 };
 
 use crate::store::key;
 
 /// Read-ahead for a scan, in bytes, rounded up to a block by SlateDB
-const SCAN_READ_AHEAD_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const SCAN_READ_AHEAD_BYTES: usize = 8 * 1024 * 1024;
 
 /// How many block fetches a scan may have in flight
 const SCAN_FETCH_TASKS: usize = 32;
+
+/// Read-ahead for a streaming scan, in bytes: one round trip's worth of
+/// blocks ahead of a sequential consumer, bounded so an SST's iterator
+/// holds at most a few hundred kibibytes in flight.
+const STREAM_READ_AHEAD_BYTES: usize = 256 * 1024;
+
+/// How many read-ahead fetches a streaming scan keeps in flight.
+const STREAM_FETCH_TASKS: usize = 2;
 
 /// Sub-ranges a split bulk scan keeps in flight; sized for a remote object
 /// store, where each iterator's seek is a round trip.
@@ -33,10 +41,15 @@ const SCAN_SPLIT_BYTES: usize = SCAN_READ_AHEAD_BYTES;
 pub(crate) enum ScanShape {
     /// A whole-subspace walk; its blocks are not admitted.
     Bulk,
-    /// One-block read-ahead without cache admission for sequential derivation.
+    /// A sequential walk with bounded read-ahead and no cache admission, for
+    /// a consumer that derives as it goes.
     Streaming,
     /// A targeted lookup; its blocks are admitted.
     Probe,
+    /// One or a few entries from a wide range: one block fetched at a time,
+    /// admitted. A read-ahead shape here keeps fetching after the iterator
+    /// is dropped.
+    Seek,
 }
 
 /// The direction SlateDB traverses a scan range.
@@ -67,34 +80,36 @@ impl ScanOrder {
 }
 
 impl ScanShape {
-    /// Scan options for this shape: a bulk walk admits no blocks, a probe
-    /// admits its blocks.
+    /// Scan options for this shape: how far it reads ahead, how many
+    /// fetches it keeps in flight, and whether its blocks are admitted.
     fn options(self, order: ScanOrder) -> ScanOptions {
+        let (read_ahead_bytes, max_fetch_tasks) = match self {
+            Self::Bulk | Self::Probe => (SCAN_READ_AHEAD_BYTES, SCAN_FETCH_TASKS),
+            Self::Streaming => (STREAM_READ_AHEAD_BYTES, STREAM_FETCH_TASKS),
+            // SlateDB rounds the read-ahead up to one block.
+            Self::Seek => (1, 1),
+        };
         ScanOptions {
-            read_ahead_bytes: if self == Self::Streaming {
-                1
-            } else {
-                SCAN_READ_AHEAD_BYTES
-            },
-            max_fetch_tasks: if self == Self::Streaming {
-                1
-            } else {
-                SCAN_FETCH_TASKS
-            },
-            cache_blocks: matches!(self, Self::Probe),
+            read_ahead_bytes,
+            max_fetch_tasks,
+            cache_blocks: matches!(self, Self::Probe | Self::Seek),
             order: order.iteration_order(),
             ..ScanOptions::default()
         }
     }
 }
 
-/// A borrowed read over a read-write transaction or a read-only reader.
+/// A borrowed read over a read-write transaction, a read-only reader, or
+/// the writer's latest state.
 #[derive(Clone, Copy)]
 pub(crate) enum ReadHandle<'a> {
     /// A snapshot-isolated read-write transaction (`Db::begin`).
     Tx(&'a DbTransaction),
     /// A read-only reader following the manifest.
     Reader(&'a DbReader),
+    /// The writer itself, read without a transaction; each read is atomic
+    /// on its own.
+    Writer(&'a Db),
 }
 
 impl ReadHandle<'_> {
@@ -106,11 +121,13 @@ impl ReadHandle<'_> {
         match self {
             Self::Tx(tx) => tx.get(key).await,
             Self::Reader(reader) => reader.get(key).await,
+            Self::Writer(db) => db.get(key).await,
         }
     }
 
     /// Whether several reads through this handle observe a single store
-    /// state: true for a transaction, false for a manifest-following reader.
+    /// state: true for a transaction, false for a manifest-following reader
+    /// and for the writer's latest state.
     pub(crate) fn is_isolated(&self) -> bool {
         matches!(self, Self::Tx(_))
     }
@@ -154,18 +171,18 @@ impl ReadHandle<'_> {
                     .scan_prefix_with_options(prefix, subrange, &options)
                     .await
             }
+            Self::Writer(db) => {
+                db.scan_prefix_with_options(prefix, subrange, &options)
+                    .await
+            }
         }
     }
 
     /// The highest key suffix under `prefix`, or `None` when it holds no
     /// key: one seek from the end.
-    async fn highest_suffix(
-        &self,
-        prefix: &[u8],
-        shape: ScanShape,
-    ) -> Result<Option<Vec<u8>>, slatedb::Error> {
+    async fn highest_suffix(&self, prefix: &[u8]) -> Result<Option<Vec<u8>>, slatedb::Error> {
         let mut descending = self
-            .scan_prefix_ordered(prefix, .., shape, ScanOrder::Descending)
+            .scan_prefix_ordered(prefix, .., ScanShape::Seek, ScanOrder::Descending)
             .await?;
         Ok(descending
             .next()
@@ -227,7 +244,7 @@ impl ReadHandle<'_> {
                 let split_suffix = suffix_of(split);
                 let end = key::increment_prefix(split_suffix.clone());
                 let upper = end.clone().map_or(Bound::Unbounded, Bound::Excluded);
-                let points = match self.highest_suffix(split, shape).await? {
+                let points = match self.highest_suffix(split).await? {
                     Some(high) => {
                         let low = last.get(split_suffix.len()..).unwrap_or(&[]);
                         key::even_points_between(low, &high, SCAN_SPLIT)
@@ -433,6 +450,25 @@ mod tests {
         let options = ScanShape::Probe.options(ScanOrder::Ascending);
         assert_eq!(options.read_ahead_bytes, SCAN_READ_AHEAD_BYTES);
         assert_eq!(options.max_fetch_tasks, SCAN_FETCH_TASKS);
+        assert!(options.cache_blocks);
+    }
+
+    /// A streaming scan reads ahead a bounded window, two fetches at a time,
+    /// and admits nothing.
+    #[test]
+    fn streaming_scans_read_ahead_a_bounded_window_and_admit_nothing() {
+        let options = ScanShape::Streaming.options(ScanOrder::Ascending);
+        assert_eq!(options.read_ahead_bytes, 256 * 1024);
+        assert_eq!(options.max_fetch_tasks, 2);
+        assert!(!options.cache_blocks);
+    }
+
+    /// A seek fetches one block, one fetch at a time, and admits it.
+    #[test]
+    fn seeks_fetch_one_block_and_admit_it() {
+        let options = ScanShape::Seek.options(ScanOrder::Ascending);
+        assert_eq!(options.read_ahead_bytes, 1);
+        assert_eq!(options.max_fetch_tasks, 1);
         assert!(options.cache_blocks);
     }
 

@@ -44,6 +44,10 @@ use crate::{
     store::cache::{self, RowSummaryOccupancy},
 };
 
+/// Objects at or below this recorded size are fetched whole on their first
+/// touch; every range of one is cut from that single block.
+const WHOLE_OBJECT_READ_BYTES: u64 = 1 << 20;
+
 /// One file's identity within its store. The path and recorded size guard
 /// against a reused catalog file id: a mismatch misses.
 pub(super) struct FileSummaryKey<'a> {
@@ -910,7 +914,8 @@ impl AuxiliaryCache {
     }
 
     /// The file's bytes over `range`, from the cache when that exact range
-    /// is resident and from the store otherwise.
+    /// is resident and from the store otherwise. A small file is fetched
+    /// whole instead, and the range cut from it.
     ///
     /// Keyed by the range as asked for, not by a fixed window: a selective
     /// read fetches the pages it selected and no more, which is the
@@ -921,10 +926,24 @@ impl AuxiliaryCache {
         file: &ParquetFile,
         range: std::ops::Range<u64>,
     ) -> ParquetResult<Bytes> {
+        if reads_whole_object(file) {
+            let whole = self.whole_object(file).await?;
+            return slice_of(file, &whole, &range);
+        }
+
         if let Some(bytes) = self.cached_range(file, &range).await {
             return Ok(bytes);
         }
 
+        self.fetch_range(file, range).await
+    }
+
+    /// One store read of `range`, admitted for the readers after this one.
+    async fn fetch_range(
+        &self,
+        file: &ParquetFile,
+        range: std::ops::Range<u64>,
+    ) -> ParquetResult<Bytes> {
         let started = Instant::now();
         let fetched = file
             .store
@@ -937,6 +956,16 @@ impl AuxiliaryCache {
         Ok(fetched)
     }
 
+    /// A small file's whole content: fetched once, resident after.
+    async fn whole_object(&self, file: &ParquetFile) -> ParquetResult<Bytes> {
+        let whole = 0..file.file_size;
+        if let Some(bytes) = self.cached_range(file, &whole).await {
+            return Ok(bytes);
+        }
+
+        self.fetch_range(file, whole).await
+    }
+
     /// [`Self::range`] over several ranges, fetching those that miss in one
     /// request so the store can still coalesce adjacent chunks.
     pub(super) async fn ranges(
@@ -944,6 +973,14 @@ impl AuxiliaryCache {
         file: &ParquetFile,
         ranges: Vec<std::ops::Range<u64>>,
     ) -> ParquetResult<Vec<Bytes>> {
+        if reads_whole_object(file) {
+            let whole = self.whole_object(file).await?;
+            return ranges
+                .iter()
+                .map(|range| slice_of(file, &whole, range))
+                .collect();
+        }
+
         let mut out: Vec<Option<Bytes>> = Vec::with_capacity(ranges.len());
         let mut missing = Vec::new();
         for range in &ranges {
@@ -1003,11 +1040,12 @@ impl AuxiliaryCache {
         }
     }
 
-    /// Memoizes `bytes` as the file's content over `range`, unless they
-    /// fall short of filling it: a read that stopped early would otherwise
-    /// be served to every later reader of that range.
+    /// Memoizes `bytes` as the file's content over `range`, unless the read
+    /// is single-touch or they fall short of filling it: a read that
+    /// stopped early would otherwise be served to every later reader of
+    /// that range.
     fn admit_range(&self, file: &ParquetFile, range: &std::ops::Range<u64>, bytes: &Bytes) {
-        if usize_as_u64(bytes.len()) != range.end.saturating_sub(range.start) {
+        if file.single_touch || usize_as_u64(bytes.len()) != range.end.saturating_sub(range.start) {
             return;
         }
 
@@ -1072,6 +1110,34 @@ impl AuxiliaryCache {
 
     pub(super) fn row_summaries(&self) -> RowSummaryOccupancy {
         self.summaries.occupancy()
+    }
+}
+
+/// Whether every read of `file` goes through one resident copy of the
+/// object: a small file, unless the read declares it will not come back
+/// for the bytes.
+fn reads_whole_object(file: &ParquetFile) -> bool {
+    file.file_size <= WHOLE_OBJECT_READ_BYTES && !file.single_touch
+}
+
+/// `range` cut from `whole`, refused when it reaches past the recorded
+/// size rather than answered short.
+fn slice_of(
+    file: &ParquetFile,
+    whole: &Bytes,
+    range: &std::ops::Range<u64>,
+) -> ParquetResult<Bytes> {
+    let bounds = usize::try_from(range.start)
+        .ok()
+        .zip(usize::try_from(range.end).ok())
+        .filter(|(start, end)| start <= end && *end <= whole.len());
+
+    match bounds {
+        Some((start, end)) => Ok(whole.slice(start..end)),
+        None => Err(ParquetError::General(format!(
+            "range {}..{} of {} reaches past its recorded {} bytes",
+            range.start, range.end, file.path, file.file_size
+        ))),
     }
 }
 

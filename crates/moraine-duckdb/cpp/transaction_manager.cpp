@@ -15,6 +15,23 @@ MoraineTransaction::MoraineTransaction(duckdb::TransactionManager &manager, duck
     : duckdb::Transaction(manager, context), snapshot_(snapshot), catalog_handle_(catalog_handle) {
 }
 
+bool MoraineTransaction::SnapshotStamp(uint64_t &snapshot_id, uint64_t &batch_seq) {
+	if (!stamp_resolved_) {
+		stamp_resolved_ = true;
+		if (snapshot_ != nullptr) {
+			MoraineError err {};
+			stamp_present_ = moraine_snapshot_stamp(snapshot_, &stamp_snapshot_id_, &stamp_batch_seq_, &err) ==
+			                 MORAINE_OK;
+			if (!stamp_present_ && err.message != nullptr) {
+				moraine_error_free(err.message);
+			}
+		}
+	}
+	snapshot_id = stamp_snapshot_id_;
+	batch_seq = stamp_batch_seq_;
+	return stamp_present_;
+}
+
 MoraineTransaction::~MoraineTransaction() {
 	// Defensive fallback: normal teardown releases the snapshot via
 	// CommitTransaction/RollbackTransaction's call to ReleaseSnapshot, and

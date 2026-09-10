@@ -108,9 +108,14 @@ pub(crate) async fn find_inline_chunk_locators_for_rows(
 
     let prefix = inline_chunk_locator_table_prefix(table_id);
     let start = inline_chunk_locator_suffix(table_id, first);
-    let mut iter = handle
-        .scan_prefix(prefix, start.., ScanShape::Probe)
-        .await?;
+    // A bounded walk ends within a few entries of the last target; an
+    // unbounded one runs to the end of the directory.
+    let shape = if width_bound.is_some() {
+        ScanShape::Seek
+    } else {
+        ScanShape::Probe
+    };
+    let mut iter = handle.scan_prefix(prefix, start.., shape).await?;
     let mut locators = Vec::new();
     let mut found = 0usize;
 

@@ -3,8 +3,9 @@
 //! are process-wide.
 
 use std::{
+    num::NonZero,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -16,11 +17,25 @@ use crate::{
     telemetry::nanoseconds,
 };
 
-/// Process-wide limit for Arrow-to-index encoding on blocking workers.
-pub(super) const INDEX_ENCODING_CONCURRENCY: usize = 8;
+/// The fewest and most blocking workers Arrow-to-index encoding may hold
+/// at once, whatever the machine's core count.
+const INDEX_ENCODING_CONCURRENCY_BOUNDS: (usize, usize) = (4, 32);
+
+/// Process-wide limit for Arrow-to-index encoding on blocking workers: the
+/// machine's core count within the bounds above, settled once per process.
+pub(super) fn index_encoding_concurrency() -> usize {
+    static CONCURRENCY: OnceLock<usize> = OnceLock::new();
+
+    *CONCURRENCY.get_or_init(|| {
+        let (floor, ceiling) = INDEX_ENCODING_CONCURRENCY_BOUNDS;
+        std::thread::available_parallelism()
+            .map_or(floor, NonZero::get)
+            .clamp(floor, ceiling)
+    })
+}
 
 static INDEX_ENCODING_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
-    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(INDEX_ENCODING_CONCURRENCY)));
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(index_encoding_concurrency())));
 
 /// Data-store reads issued on behalf of one catalog handle, across every
 /// scoped read that reports to it.

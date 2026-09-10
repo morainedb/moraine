@@ -12,13 +12,13 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail, ensure};
 
 use crate::{
     bench::timing::{median, parse_run_times, spread},
+    catalog_target::{CatalogTarget, sql_literal},
     duckdb, ducklake_patch,
 };
 
@@ -67,73 +67,6 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
         commits,
         flush_milliseconds,
     })
-}
-
-struct S3Target {
-    bucket: String,
-    prefix: String,
-    endpoint: Option<String>,
-    region: String,
-}
-
-impl S3Target {
-    fn from_environment() -> anyhow::Result<Self> {
-        Ok(Self {
-            bucket: env::var("MORAINE_S3_BUCKET").context("MORAINE_S3_BUCKET must be set")?,
-            prefix: env::var("MORAINE_S3_PREFIX").unwrap_or_default(),
-            endpoint: env::var("MORAINE_S3_ENDPOINT").ok(),
-            region: env::var("AWS_REGION")
-                .or_else(|_| env::var("AWS_DEFAULT_REGION"))
-                .unwrap_or_else(|_| "us-east-1".to_owned()),
-        })
-    }
-
-    fn description(&self) -> String {
-        self.endpoint
-            .clone()
-            .unwrap_or_else(|| format!("AWS S3 in {}", self.region))
-    }
-
-    fn secret_sql(&self) -> anyhow::Result<String> {
-        let region = sql_literal(&self.region);
-        let Some(endpoint) = &self.endpoint else {
-            return Ok(format!(
-                "CREATE SECRET moraine_commit_bench (TYPE s3, PROVIDER credential_chain, REGION {region});"
-            ));
-        };
-
-        let key = env::var("AWS_ACCESS_KEY_ID")
-            .context("AWS_ACCESS_KEY_ID must be set for an explicit S3 endpoint")?;
-        let secret = env::var("AWS_SECRET_ACCESS_KEY")
-            .context("AWS_SECRET_ACCESS_KEY must be set for an explicit S3 endpoint")?;
-        let use_ssl = endpoint.starts_with("https://");
-        let token = env::var("AWS_SESSION_TOKEN")
-            .ok()
-            .map(|token| format!(", SESSION_TOKEN {}", sql_literal(&token)))
-            .unwrap_or_default();
-        Ok(format!(
-            "CREATE SECRET moraine_commit_bench (TYPE s3, KEY_ID {}, SECRET {}, REGION {region}, \
-             ENDPOINT {}, URL_STYLE 'path', USE_SSL {use_ssl}{token});",
-            sql_literal(&key),
-            sql_literal(&secret),
-            sql_literal(endpoint),
-        ))
-    }
-
-    fn catalog_uri(&self, files: usize) -> anyhow::Result<String> {
-        let epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before the Unix epoch")?
-            .as_millis();
-        let leaf = format!("commit-breakdown-{files}-{}-{epoch}", std::process::id());
-        let prefix = self.prefix.trim_matches('/');
-        let path = if prefix.is_empty() {
-            leaf
-        } else {
-            format!("{prefix}/{leaf}")
-        };
-        Ok(format!("s3://{}/{path}", self.bucket))
-    }
 }
 
 struct TempDir(PathBuf);
@@ -226,10 +159,6 @@ fn parse_breakdown(stdout: &str) -> anyhow::Result<Breakdown> {
     })
 }
 
-fn sql_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 fn report_sql() -> &'static str {
     "WITH metadata AS (\n\
          SELECT count(*) AS statements, coalesce(sum(elapsed_ms), 0) AS elapsed_ms\n\
@@ -271,14 +200,14 @@ struct Artifacts<'a> {
 
 fn run_once(
     artifacts: &Artifacts<'_>,
-    target: &S3Target,
+    target: &CatalogTarget,
     files: usize,
     commits: usize,
     flush_milliseconds: u64,
 ) -> anyhow::Result<(Vec<f64>, Breakdown)> {
     let temp = TempDir::new(files)?;
     let data_path = temp.0.join("data");
-    let catalog_uri = target.catalog_uri(files)?;
+    let catalog_uri = target.catalog_uri(&format!("commit-breakdown-{files}"))?;
 
     let mut script = String::new();
     let _ = writeln!(script, "SET threads=1;");
@@ -293,7 +222,9 @@ fn run_once(
         "LOAD {};",
         sql_literal(&artifacts.moraine.display().to_string())
     );
-    let _ = writeln!(script, "{}", target.secret_sql()?);
+    if let Some(secret) = target.secret_sql()? {
+        let _ = writeln!(script, "{secret}");
+    }
     let _ = writeln!(
         script,
         "ATTACH {} AS lake (DATA_PATH {}, META_DATA_PATH {}, META_FLUSH_INTERVAL_MS {flush_milliseconds}, READ_WRITE);",
@@ -388,7 +319,7 @@ fn count_per_commit(value: u64, commits: usize) -> f64 {
 /// Builds the extension and measures the S3-backed metadata commit path.
 pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let options = parse_options(arguments)?;
-    let target = S3Target::from_environment()?;
+    let target = CatalogTarget::from_environment_s3_only()?;
     let cli = duckdb::ensure_duckdb_cli()?;
     let moraine = duckdb::build_and_package_extension(&ducklake_patch::prepare()?)?;
     let artifacts = Artifacts {

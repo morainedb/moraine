@@ -23,6 +23,18 @@ wait, and physical GET/PUT counts and latency. AWS credentials resolve through
 the normal credential chain. For MinIO, also set `MORAINE_S3_ENDPOINT`,
 `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`.
 
+For the read-only side, the same environment drives a cold-attach sweep:
+
+```bash
+MORAINE_S3_BUCKET=... MORAINE_S3_PREFIX=... AWS_REGION=us-west-2 \
+  cargo xtask reader-bench --files 2000,20000 --repeat 5
+```
+
+Each repeat is a fresh process attaching `READ_ONLY`, so the report shows what
+a reader fleet pays per cold start and per warm statement: attach, the first
+data-file listing, a pruned query plan, a warm repeat, and the GET counts and
+time behind each.
+
 Pull requests continue to run `cargo xtask s3` against pinned MinIO. The AWS
 run uses the same ignored `object_storage` suite with CodeBuild's temporary
 service-role credentials and a unique prefix: the bootstrap and read-only

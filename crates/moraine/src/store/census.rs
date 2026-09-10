@@ -110,12 +110,13 @@ pub(crate) async fn read_manifest_census(
     Ok(census)
 }
 
-/// Bytes the manifest accounts for: SST bytes, and the SST metadata
-/// (filters, indexes, statistics) among them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Bytes the manifest accounts for: SST bytes, the SST metadata (filters,
+/// indexes, statistics) among them, and the per-segment sizes they sum.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManifestBytes {
     pub(crate) store_bytes: u64,
     pub(crate) metadata_bytes: u64,
+    pub(crate) segments: Vec<SegmentSize>,
 }
 
 /// The manifest's byte totals, from one manifest read.
@@ -129,20 +130,25 @@ pub(crate) async fn manifest_bytes(
         .await
         .map_err(Error::from)?;
 
-    Ok(census_of_manifest(view.manifest()).segments.iter().fold(
-        ManifestBytes {
-            store_bytes: 0,
-            metadata_bytes: 0,
-        },
-        |total, segment| ManifestBytes {
-            store_bytes: total.store_bytes.saturating_add(segment.bytes),
-            metadata_bytes: total
-                .metadata_bytes
-                .saturating_add(segment.filter_bytes)
-                .saturating_add(segment.index_bytes)
-                .saturating_add(segment.stats_bytes),
-        },
-    ))
+    let segments = census_of_manifest(view.manifest()).segments;
+    let (store_bytes, metadata_bytes) =
+        segments
+            .iter()
+            .fold((0_u64, 0_u64), |(store, metadata), segment| {
+                (
+                    u64::saturating_add(store, segment.bytes),
+                    metadata
+                        .saturating_add(segment.filter_bytes)
+                        .saturating_add(segment.index_bytes)
+                        .saturating_add(segment.stats_bytes),
+                )
+            });
+
+    Ok(ManifestBytes {
+        store_bytes,
+        metadata_bytes,
+        segments,
+    })
 }
 
 /// Totals every object under the store's prefix, by kind, in one listing.

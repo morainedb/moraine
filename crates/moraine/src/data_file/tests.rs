@@ -59,13 +59,26 @@ async fn scoped_read_entries(
     .await
 }
 
+/// The encoding permit count follows the machine's cores, clamped to
+/// `[4, 32]`.
+#[test]
+fn index_encoding_concurrency_is_the_core_count_clamped() {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+
+    let derived = index_encoding_concurrency();
+
+    assert_eq!(derived, cores.clamp(4, 32));
+    assert!((4..=32).contains(&derived));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn index_encoding_workers_share_one_process_bound() {
-    const TASKS: usize = INDEX_ENCODING_CONCURRENCY * 2;
+    let bound = index_encoding_concurrency();
+    let tasks = bound * 2;
 
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
-    let work = (0..TASKS).map(|position| {
+    let work = (0..tasks).map(|position| {
         let active = Arc::clone(&active);
         let peak = Arc::clone(&peak);
         async move {
@@ -80,14 +93,14 @@ async fn index_encoding_workers_share_one_process_bound() {
         }
     });
     let mut completed = stream::iter(work)
-        .buffer_unordered(TASKS)
+        .buffer_unordered(tasks)
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
     completed.sort_unstable();
 
-    assert_eq!(completed, (0..TASKS).collect::<Vec<_>>());
-    assert!(peak.load(Ordering::Relaxed) <= INDEX_ENCODING_CONCURRENCY);
+    assert_eq!(completed, (0..tasks).collect::<Vec<_>>());
+    assert!(peak.load(Ordering::Relaxed) <= bound);
     assert!(peak.load(Ordering::Relaxed) > 1);
 }
 
@@ -346,6 +359,37 @@ async fn recorded_footer_and_metadata_cache_remove_metadata_round_trips() {
     assert_eq!(
         second_requests, 0,
         "the second read repeats the first's ranges, which are cached"
+    );
+}
+
+/// A single-touch read fetches its column ranges but leaves them out of the
+/// cache: repeating it fetches the columns again, while its footer stays
+/// resident.
+#[tokio::test]
+async fn a_single_touch_read_fetches_its_ranges_again() {
+    let store = Arc::new(CountingStore::new());
+    let data = DataStore::new(store.clone());
+    let path = Path::from("single-touch-wide.parquet");
+    let (object_len, footer_size) =
+        write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
+    let file =
+        || ParquetFile::new(data.clone(), path.clone(), object_len, footer_size).single_touch();
+
+    let first = scoped_read_recorded_entries(file(), &[0], ScopedRows::All, RowIdSource::Ordinal)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 20_000);
+    let first_requests = store.fetch_requests();
+    assert_eq!(first_requests, 2, "footer and the projected column");
+
+    let second = scoped_read_recorded_entries(file(), &[0], ScopedRows::All, RowIdSource::Ordinal)
+        .await
+        .unwrap();
+    assert_eq!(second, first);
+    assert_eq!(
+        store.fetch_requests() - first_requests,
+        1,
+        "the footer is resident; the column is fetched again"
     );
 }
 
@@ -1737,6 +1781,40 @@ async fn a_delete_files_positions_are_decoded_once() {
         "the second pass answers from the memoized positions"
     );
     assert_eq!(store.fetch_requests(), 2, "footer and the position column");
+}
+
+/// A small delete file costs one fetch for its footer and positions
+/// together, and a later read of the same object fetches nothing.
+#[tokio::test]
+async fn a_small_delete_file_is_one_fetch_and_a_second_read_none() {
+    let store = Arc::new(CountingStore::new());
+    let data = DataStore::new(store.clone());
+    let path = Path::from("small-delete.parquet");
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["target.parquet"; 3])),
+            Arc::new(Int64Array::from(vec![4, 1, 7])),
+        ],
+    )
+    .unwrap();
+    let object_len = write_fixture(&store.inner, &path, &batch).await;
+    let file = || ParquetFile::new(data.clone(), path.clone(), object_len, 0);
+
+    let positions = delete_file_positions(file()).await.unwrap();
+    assert_eq!(positions, vec![1, 4, 7]);
+    assert_eq!(store.fetch_requests(), 1, "the object is fetched whole");
+
+    let again = delete_file_positions_at(file(), u64::MAX).await.unwrap();
+    assert_eq!(again, positions);
+    assert_eq!(
+        store.fetch_requests(),
+        1,
+        "the resident object serves the read"
+    );
 }
 
 /// A memoized position set is keyed by the object, so a delete file at

@@ -21,7 +21,7 @@ use crate::{
             SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
             ViewValue,
         },
-        read::EntityRecord,
+        read::{EntityRecord, EntityRecordKind},
     },
 };
 
@@ -248,6 +248,57 @@ impl CatalogSnapshot {
             view.put_record(record.clone());
         }
         view
+    }
+
+    /// The live records of `kind`, in store key order: what a live scan of
+    /// the kind returns at this view's head.
+    pub(crate) fn live_records(&self, kind: EntityRecordKind) -> Vec<EntityRecord> {
+        fn flat<V: Clone>(
+            rows: &OrdMap<u64, V>,
+            wrap: impl Fn(V) -> EntityRecord,
+        ) -> Vec<EntityRecord> {
+            rows.values().cloned().map(wrap).collect()
+        }
+        fn nested<K: Ord + Clone, V: Clone>(
+            rows: &OrdMap<u64, OrdMap<K, V>>,
+            wrap: impl Fn(V) -> EntityRecord,
+        ) -> Vec<EntityRecord> {
+            rows.values()
+                .flat_map(|inner| inner.values().cloned())
+                .map(wrap)
+                .collect()
+        }
+
+        match kind {
+            EntityRecordKind::Schema => flat(&self.schemas, EntityRecord::Schema),
+            EntityRecordKind::Table => flat(&self.tables, EntityRecord::Table),
+            EntityRecordKind::View => flat(&self.views, EntityRecord::View),
+            EntityRecordKind::Column => nested(&self.columns, EntityRecord::Column),
+            EntityRecordKind::File => nested(&self.data_files, EntityRecord::File),
+            EntityRecordKind::DeleteFile => nested(&self.delete_files, EntityRecord::DeleteFile),
+            EntityRecordKind::Partition => nested(&self.partitions, EntityRecord::Partition),
+            EntityRecordKind::Sort => nested(&self.sorts, EntityRecord::Sort),
+            EntityRecordKind::Macro => flat(&self.macros, EntityRecord::Macro),
+            EntityRecordKind::Mapping => nested(&self.mappings, EntityRecord::Mapping),
+            EntityRecordKind::FileColumnStats => {
+                nested(&self.file_column_stats, EntityRecord::FileColumnStats)
+            }
+            EntityRecordKind::TableStats => flat(&self.table_stats, EntityRecord::TableStats),
+            EntityRecordKind::TableColumnStats => {
+                nested(&self.table_column_stats, EntityRecord::TableColumnStats)
+            }
+            EntityRecordKind::Option => self
+                .options
+                .iter()
+                .map(|(&(scope_kind, scope_id), value)| EntityRecord::Option {
+                    scope_kind,
+                    scope_id,
+                    value: value.clone(),
+                })
+                .collect(),
+            EntityRecordKind::Tag => flat(&self.tags, EntityRecord::Tag),
+            EntityRecordKind::GcFile => flat(&self.gc_files, EntityRecord::GcFile),
+        }
     }
 
     /// How many `current` records this view holds.

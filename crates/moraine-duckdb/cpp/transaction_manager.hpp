@@ -51,6 +51,11 @@ public:
 	// defensive free becomes a no-op.
 	void ReleaseSnapshot();
 
+	// The store stamp this transaction's snapshot stands at, resolved once
+	// from the snapshot rather than read from the store per table. False
+	// when the snapshot is gone or reports no stamp.
+	bool SnapshotStamp(uint64_t &snapshot_id, uint64_t &batch_seq);
+
 	// Lazily opens (on the first call) the one staged-row transaction this
 	// DuckDB transaction stages every write into, and returns it. Every
 	// subsequent INSERT/UPDATE/DELETE within the same DuckDB transaction
@@ -123,6 +128,10 @@ private:
 	MoraineSnapshotHandle *snapshot_;
 	MoraineCatalogHandle *catalog_handle_;
 	bool schemas_loaded_ = false;
+	bool stamp_resolved_ = false;
+	bool stamp_present_ = false;
+	uint64_t stamp_snapshot_id_ = 0;
+	uint64_t stamp_batch_seq_ = 0;
 	std::unordered_map<uint64_t, duckdb::unique_ptr<duckdb::SchemaCatalogEntry>> schema_cache_;
 	MoraineTxHandle *staged_tx_ = nullptr;
 	std::map<std::pair<const MetadataTableSpec *, bool>, std::shared_ptr<const MetadataRows>> metadata_rows_;

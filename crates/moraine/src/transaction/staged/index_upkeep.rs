@@ -273,27 +273,39 @@ async fn stream_data_file_index_entries(
         ))
     })?;
 
-    let killed = match killed {
-        Some(deletes) => {
-            let killed = resolve_target_deletes(base, context, deletes).await?;
-            refuse_out_of_range(&killed, &file)?;
-            Some(killed)
-        }
-        None => None,
-    };
     let path = data_file_object_path(base, &file, context.prefix)?;
+    let parquet = data_file::ParquetFile::new(
+        data_store.clone(),
+        path,
+        file.file_size_bytes,
+        file.footer_size,
+    )
+    .with_metrics(Arc::clone(&context.metrics));
+
+    // The killed positions, the read columns, and the footer depend only
+    // on the snapshot, so their reads overlap.
+    let killed = async {
+        match killed {
+            Some(deletes) => resolve_target_deletes(base, context, deletes)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    };
+    let (killed, columns, ()) = futures::try_join!(
+        killed,
+        context.file_columns(base, &file),
+        data_file::load_metadata(&parquet, false)
+    )?;
+    if let Some(killed) = &killed {
+        refuse_out_of_range(killed, &file)?;
+    }
+
     // A row this same commit deletes out of the file it also registers is
     // never indexed: an entry's key carries no file, so a removal beside an
     // add would be indistinguishable from an UPDATE's.
     let entries = data_file::scoped_read_index_entry_batches(
-        data_file::ParquetFile::new(
-            data_store.clone(),
-            path,
-            file.file_size_bytes,
-            file.footer_size,
-        )
-        .with_columns(context.file_columns(base, &file).await?)
-        .with_metrics(Arc::clone(&context.metrics)),
+        parquet.with_columns(columns),
         indexes.projections.clone(),
         data_file::ScopedRows::All,
         data_file::RowIdSource::Resolve {
@@ -343,7 +355,11 @@ fn staged_scoped_entries(
         .collect()
 }
 
-fn staged_scoped_entry(
+/// A derived deletion names a row live at the base snapshot, whose unique
+/// entry can be held by no other row while the index is ready; it is
+/// staged without the guard read. A building or poisoned index may still
+/// hold the value for another row, so its deletions keep the guard.
+pub(super) fn staged_scoped_entry(
     indexes: &[IndexInfo],
     entry: data_file::ScopedIndexEntry,
     delete: bool,
@@ -351,6 +367,7 @@ fn staged_scoped_entry(
     let index = indexes.get(entry.index).ok_or_else(|| {
         Error::Corruption("scoped read returned an unknown index projection".to_owned())
     })?;
+    let building = index.state != crate::catalog::IndexState::Ready;
 
     Ok(StagedIndexEntry {
         index_id: index.id.get(),
@@ -358,8 +375,9 @@ fn staged_scoped_entry(
         key: entry.key,
         row_id: entry.row_id,
         delete,
-        building: index.state != crate::catalog::IndexState::Ready,
+        building,
         known_absent: false,
+        known_held: delete && !building,
     })
 }
 
@@ -460,11 +478,8 @@ pub(super) async fn stage_index_maintenance(
         stream::iter(file_deletes.iter().filter(|((table_id, data_file_id), _)| {
             !registered.contains(&(*table_id, *data_file_id))
         }))
-        .map(|((table_id, data_file_id), deletes)| async move {
-            let killed =
-                newly_killed_rows(base, *table_id, *data_file_id, context_ref, deletes).await?;
-            stream_file_delete_index_entries(base, *table_id, *data_file_id, &killed, context_ref)
-                .await
+        .map(|((table_id, data_file_id), deletes)| {
+            stream_file_delete_index_entries(base, *table_id, *data_file_id, deletes, context_ref)
         })
         .buffer_unordered(FILE_READ_CONCURRENCY)
         .try_flatten_unordered(None);
@@ -1325,16 +1340,16 @@ async fn read_delete_file_positions(
 /// file, by scoped-reading the killed positions. A delete against a file
 /// this same commit registers never reaches here; those rows are left
 /// unindexed at the add.
-pub(super) async fn stream_file_delete_index_entries(
+async fn stream_file_delete_index_entries(
     base: &CatalogSnapshot,
     table_id: u64,
     data_file_id: u64,
-    killed: &KilledRows,
+    deletes: &TargetDeletes,
     context: &FileContext<'_>,
 ) -> Result<IndexEntryStream<'static>> {
     let table = TableId::new(table_id);
     let indexes = Arc::clone(&context.indexing(base, table)?.all);
-    if indexes.indexes.is_empty() || killed.is_empty() {
+    if indexes.indexes.is_empty() {
         return Ok(stream::empty().boxed());
     }
 
@@ -1345,8 +1360,26 @@ pub(super) async fn stream_file_delete_index_entries(
              equality index: no data-path store is available"
         ))
     })?;
+    let path = data_file_object_path(base, &file, context.prefix)?;
+    let parquet = data_file::ParquetFile::new(
+        data_store.clone(),
+        path,
+        file.file_size_bytes,
+        file.footer_size,
+    )
+    .with_metrics(Arc::clone(&context.metrics));
 
-    refuse_out_of_range(killed, &file)?;
+    // The newly killed positions, the read columns, and the footer with
+    // its page index depend only on the snapshot, so their reads overlap.
+    let (killed, columns, ()) = futures::try_join!(
+        newly_killed_rows(base, table_id, data_file_id, context, deletes),
+        context.file_columns(base, &file),
+        data_file::load_metadata(&parquet, true)
+    )?;
+    if killed.is_empty() {
+        return Ok(stream::empty().boxed());
+    }
+    refuse_out_of_range(&killed, &file)?;
 
     // Positions are unique and in range, so covering the record count is
     // covering the file: read it whole rather than page-skipping past
@@ -1359,16 +1392,8 @@ pub(super) async fn stream_file_delete_index_entries(
         data_file::ScopedRows::At(&killed.positions)
     };
 
-    let path = data_file_object_path(base, &file, context.prefix)?;
     let entries = data_file::scoped_read_index_entry_batches(
-        data_file::ParquetFile::new(
-            data_store.clone(),
-            path,
-            file.file_size_bytes,
-            file.footer_size,
-        )
-        .with_columns(context.file_columns(base, &file).await?)
-        .with_metrics(Arc::clone(&context.metrics)),
+        parquet.with_columns(columns),
         indexes.projections.clone(),
         rows,
         data_file::RowIdSource::Resolve {

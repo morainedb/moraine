@@ -223,6 +223,25 @@ place of one. A dump whose projection does not stand at that stamp falls
 through to the ordinary session path and reads the head there, so rows are
 never installed under a stamp the store did not supply.
 
+An index lookup, and the inline membership check under a row location, go
+one step further on a warm read-write handle: they open **no session**. The
+definition each needs is in the held view, and what each then reads is a
+set of live-only keys, so the probes run as plain reads against the
+writer's `Db` rather than through a `DbTransaction`. Opening a transaction
+takes SlateDB's transaction manager lock — a global write lock, measured
+in `BENCHMARK.md` as the ceiling on concurrent lookups — and on this
+handle it bought nothing: the store's only writer is the handle itself, so
+the only commit that can land during a probe is its own, and a lookup is
+head-only by contract. The pass re-reads the held view after its probes;
+if a commit replaced it in between, the pass is discarded and re-run
+under a session, so a result served warm is one a session at that view
+would have returned. The inline check takes this path only for a table
+whose chunk directory has already been verified complete — the
+verification needs an isolated session, and the locator-only walk the
+warm pass uses rests on it. A read-only handle keeps the session path for
+both: it follows another process's commits, and only a session gives it a
+cut.
+
 What a warm read does not skip is the fence check, because a handle that
 served its cache past its own displacement would answer from a catalog the
 store has moved on from, and quietly. It does not open a session to perform
@@ -801,6 +820,12 @@ an unnarrowed read of one table could stand at two heads — the tear
 transaction the read point is pinned for the transaction's life, so no such
 tear exists, and that is where the flush path lives.
 
+A live-only read inside a staged transaction — one bounded at the read
+point, or of an unversioned kind — is served from the head view the
+transaction resolved at that read point, which holds every live record in
+store key order, and scans nothing. Only a read that needs ended versions
+scans, and it scans both subspaces through the transaction as one cut.
+
 The narrowed materialization is cached beside the full one, never in place
 of it, and staging into the table drops both.
 
@@ -812,16 +837,17 @@ every statement a transaction, and each rebuild pays the full ABI
 crossing for rows that are byte-identical whenever no commit landed in
 between. So the head stamp crosses the ABI: the attach holds one dumped
 row set per synthesized table under the stamp it was dumped at, and a
-transaction's first scan asks the store where it stands before paying to
-re-dump. The pin becomes what it logically was — capture the stamp at
-first scan, serve the transaction at it — and steady-state reads cross
-the ABI once per table per *commit*, not per transaction.
+transaction compares held rows against the stamp its own snapshot stands
+at before paying to re-dump. The pin becomes what it logically was —
+the transaction's snapshot names the stamp, every table is served at it
+— and steady-state reads cross the ABI once per table per *commit*, not
+per transaction.
 
-Asking costs a read-write handle nothing: its held view is at head by
-construction, so the stamp comes from the view rather than the store, and
-the write path's saving is the whole ABI crossing with no read added to
-buy it. A read-only handle pays the one point read it would have paid
-anyway.
+The stamp costs nothing to obtain: the transaction already took its
+snapshot at start, and the view carries the head id and batch count it
+was materialized at, so no table read asks the store where it stands.
+On a read-only handle that removes one point read per table per
+statement; on a read-write handle it removes the crossing.
 
 Rows that straddled a commit are not held. The stamp is read before and
 after the dump and they must agree, because rows spanning two states
@@ -1003,14 +1029,38 @@ shape.
 
 **Admission follows read shape.** SlateDB's defaults already split it —
 point reads cache their blocks, scans do not — and moraine makes the
-split deliberate: two scan-option constructors, bulk (admits nothing; the
+split deliberate: scan-option constructors, bulk (admits nothing; the
 row caches absorb scan reuse) and probe (admits; the reuse is real and
 block-grained), with every read path naming one. Foyer's admission picker
 repeats the rule at the disk device, so scan and compaction churn cannot
 wear it or evict the probe set.
 
+A read that takes one entry — or a handful — from a wide range names a
+fourth shape, seek: one block fetched at a time, admitted. The probe shape
+would be wrong there, not merely wasteful: SlateDB spawns its read-ahead
+fetches eagerly when the iterator opens, up to 32 of 8 MiB each per SST,
+and a fetch task has no cancellation on drop, so an iterator dropped after
+one `next` leaves them running to completion. The seek sites are the first
+entry of a subspace or of a table's probe range (the cache warms), the
+highest key of a split kind (the adaptive split's one seek from the end),
+the first index id at or past a cursor (the dead-index sweep), and a
+chunk-directory walk that a known chunk width ends within a few entries of
+its last target. A directory walk with no width bound runs to the end of
+the directory and stays a probe. The preload's first-entry read of a
+subspace is the one seek site that consults the manifest: a segment whose
+recorded size fits one read-ahead warms in probe shape, since each SST
+costs one request either way and the probe's request brings the whole
+segment in and admits it, where a seek would fetch one block per subspace
+per SST and leave the rest cold; a larger or unrecorded segment seeks.
+
 Bulk and probe scans use fixed 8 MiB read-ahead with 32 fetches in flight,
-sized for a remote object store.
+sized for a remote object store. A third shape, streaming, serves a
+sequential consumer that derives as it goes — the staged index build's
+inline sources — and reads ahead 256 KiB with two fetches in flight: a
+round trip's worth of blocks ahead of the cursor, admitting nothing, and
+holding at most about half a mebibyte per SST the iterator is positioned in
+rather than the bulk shape's window. Its previous setting of one block was
+one object-store round trip per 4 KiB.
 These are implementation constants, not attach policy: they remove the
 measured sequential-round-trip failure, while no local/S3 ladder demonstrates
 that per-attach tuning improves a supported workload. A different value needs
@@ -1065,7 +1115,7 @@ The attach options keep their surface (RFC 0006) and change machinery:
   is warned with both numbers, a failure is skipped rather than fatal.
 - **Per-table warm, explicit.** The `index` and `inline` subspaces
   scale with the data, so their warm is per table and never implicit: no
-  read triggers it. `ReadOnlyCatalog::warm_tables` reads, in probe shape,
+  read triggers it. `ReadOnlyCatalog::warm_tables` reads, in seek shape,
   the first entry of each named table's index ranges
   (`index/<kind>/<index id>`) and inline ranges (`inline/<table id>` per
   operation kind, its schemas and chunk-range locators), admitting the SST
@@ -1128,6 +1178,29 @@ attach option. A future profile that puts material weight on block grain must
 change this binding choice and add the option and the scan/probe benchmark
 together.
 
+Two more writer settings leave SlateDB's defaults, for the same reason the
+block size is fixed: they are what the remote-store read profile needs, not
+per-attach policy.
+
+- **Every SST carries a bloom filter** (`min_filter_keys` is 0, not 1000).
+  SlateDB skips the filter on an SST under the threshold, and moraine's
+  SSTs are routinely that small — a commit's L0 flush, a merge of a
+  sparsely written subspace — so an absent-key probe, the read the filters
+  exist for, was reading such an SST's data blocks to learn "not here". The
+  in-process compactor writes with the writer's settings, so a merge keeps
+  the filters; a standalone compaction worker, which moraine does not run,
+  would have to be configured to match.
+- **A writer polls the manifest every 5 s** (not every 1 s). The poll is
+  one object-store GET per open writer, and it exists to notice fencing and
+  compacted state, neither of which a catalog writer needs within a second.
+  A reader's cadence is its own attach option and is unchanged.
+
+Not changed: the WAL-flush bound on a memtable's life
+(`max_wal_flushes_before_l0_flush`) stays at SlateDB's 4096, its floor —
+SlateDB refuses a lower value at open — and SST compression stays off, since
+turning it on is a format change with cross-version consequences that this
+profile does not weigh.
+
 Two losses, taken knowingly. Part-grain prefetch: replaced by the scan
 path's own read-ahead (the measured fix for the 277 s materialization in
 `BENCHMARK.md`), with admission per the shape rule. And a `CACHE_DIR`
@@ -1158,8 +1231,14 @@ file descriptor; metadata discovery is not a production state. For a large
 object, the footer size lets the first read
 prefetch the serialized footer and its trailing length in one request; data
 files then fetch only indexed values and row ids, while delete files fetch only
-their position column. Objects below the measured crossover remain one
-whole-object request. A process-wide byte-bounded cache retains the parsed
+their position column. An object recorded at or below 1 MiB — every delete
+file, and DuckLake's small per-insert data files — is instead fetched whole on
+its first touch and held as one block, from which its footer, page index, and
+column ranges are all cut: a delete file's positions cost one request rather
+than a footer request and a dependent column request, and a small target's
+selected pages are resident by the time its selection is known. A
+single-touch read of a small object takes only its ranges, since it would keep
+nothing. A process-wide byte-bounded cache retains the parsed
 footer and page indexes for repeated touches of the same immutable file; it is
 keyed by object-store identity, path, and file size, adds the page index to a
 resident footer on demand rather than parsing the footer again under a second
@@ -1168,9 +1247,17 @@ range is remembered as a summary once its footer has proved that, so a repeat
 location of it needs neither. Its allowance is one sixteenth of
 `CACHE_MEMORY`'s metadata share, capped at 8 MiB, with the remainder of that
 share continuing to hold SlateDB metadata — one Moraine memory budget, not a
-third invisible one. Projected data-column ranges are never retained. This
-cache exists because DuckDB's metadata cache cannot be reached from the direct
-Rust reader, not as a second copy of metadata DuckDB served to it.
+third invisible one. Projected data-column ranges are retained under the same
+allowance, keyed by the exact range a read asked for and admitted at low
+priority so they leave before any footer or summary. A read declared
+**single-touch** — an index build or a backfill, which touches each column
+chunk once — fetches its ranges without admitting them: a build otherwise
+writes roughly every byte it streams into the disk tier and churns the
+footers and summaries sharing the allowance out of it. Commit-time upkeep is
+not single-touch, because repeated deletes against one file re-read its
+chunks. The footer and the summary are cached whatever the read declares.
+This cache exists because DuckDB's metadata cache cannot be reached from the
+direct Rust reader, not as a second copy of metadata DuckDB served to it.
 
 **Data-block caching rides on the Parquet reader's prefetch, taken only
 for files that are not on local disk** — without it the reader issues a
@@ -1284,6 +1371,10 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   dumps regardless.
 - **A warm probe costs no store read.** An index lookup repeated against
   a resident working set issues no GET and fetches no bytes.
+- **A warm writer probes without a session.** Index lookups and row
+  locations repeated on a warm read-write handle read `sys/head` no
+  further and open no read transaction, and return what the session path
+  returns.
 - **One budget across attaches.** Several attached stores share one cache
   and one tally; a later attach's differing options are reported as
   ignored rather than silently applied.
@@ -1319,8 +1410,9 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   cold against the same file issue one footer/page-index fill and retain one
   parsed value, while each continues to read its own projected data ranges.
 - **Delete-file reads preserve the crossover.** A small delete file is fetched
-  once in full. A large one uses its recorded file and footer sizes, fetches
-  only `pos`, and reuses parsed metadata on a later read.
+  once in full, and a later read of the same object fetches nothing. A large
+  one uses its recorded file and footer sizes, fetches only `pos`, and reuses
+  parsed metadata on a later read.
 
 ## Alternatives considered
 

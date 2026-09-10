@@ -127,6 +127,12 @@ pub(crate) enum EntityRecordKind {
 }
 
 impl EntityRecordKind {
+    /// Whether records of this kind carry a lifecycle and so mirror ended
+    /// versions to `history`.
+    pub(crate) fn is_versioned(self) -> bool {
+        self.entity_kind().is_some_and(EntityKind::is_versioned)
+    }
+
     fn entity_kind(self) -> Option<EntityKind> {
         match self {
             Self::Schema => Some(EntityKind::Schema),
