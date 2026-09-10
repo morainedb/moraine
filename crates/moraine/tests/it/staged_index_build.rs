@@ -439,9 +439,14 @@ async fn staged_build_reports_explicit_progress() {
     assert_eq!(
         probed
             .iter()
-            .map(|event| event["unique_probes"].as_str())
+            .map(|event| event["known_absent"].as_str())
             .collect::<Vec<_>>(),
-        ["2", "2", "2", "1"]
+        ["2", "2", "2", "1"],
+        "a build's fresh keys stage without a read"
+    );
+    assert!(
+        probed.iter().all(|event| event["unique_probes"] == "0"),
+        "nothing to probe while every key is new"
     );
     assert!(
         probed.iter().all(|event| event["shared_scans"] == "0"),

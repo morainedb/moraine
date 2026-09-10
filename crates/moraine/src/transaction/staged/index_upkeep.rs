@@ -359,6 +359,7 @@ fn staged_scoped_entry(
         row_id: entry.row_id,
         delete,
         building: index.state != crate::catalog::IndexState::Ready,
+        known_absent: false,
     })
 }
 

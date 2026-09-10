@@ -31,6 +31,10 @@ use crate::{
 /// One index-entry mutation accumulated during a commit closure, resolved
 /// against the store when the batch is staged.
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent property of one staged entry"
+)]
 pub(crate) struct StagedIndexEntry {
     /// The index this entry belongs to.
     pub(crate) index_id: u64,
@@ -45,6 +49,9 @@ pub(crate) struct StagedIndexEntry {
     /// Whether the index is still building; a collision then poisons it
     /// instead of failing the commit.
     pub(crate) building: bool,
+    /// The caller established the key is absent from committed state, so
+    /// a unique put needs no read before it.
+    pub(crate) known_absent: bool,
 }
 
 /// A unique entry's value is the holding row id, big-endian.
@@ -140,6 +147,8 @@ pub(crate) struct IndexMaintenanceMetrics {
     pub(crate) probes_completed_during_deletions: u64,
     /// Batches resolved by one range scan rather than point reads.
     pub(crate) shared_scans: u64,
+    /// Unique puts staged without a read, their keys known absent.
+    pub(crate) known_absent: u64,
 }
 
 /// One unique put awaiting its committed-state probe.
@@ -158,6 +167,8 @@ struct PendingProbe {
 enum ProbePlan {
     /// Stage a non-unique put without a read.
     Put(Bytes),
+    /// Stage a unique put whose key is known absent, without a read.
+    Claim { key: Bytes, row_id: u64 },
     /// Read committed state before deciding whether to stage the put.
     Probe(PendingProbe),
     /// A repeated claim by the same row needs no write.
@@ -175,7 +186,7 @@ enum ProbePlan {
 
 /// A completed plan, carrying a probe's value when it needed a read.
 enum ReadyAddition {
-    Put(Bytes),
+    Put { key: Bytes, row_id: Option<u64> },
     Probed(CompletedProbe),
     Poison(u64),
 }
@@ -273,6 +284,12 @@ impl ProbePlanner {
         }
         self.claimed.insert(entry.key.clone(), entry.row_id);
         KeySpan::include(&mut self.span, &entry.key);
+        if entry.known_absent {
+            return ProbePlan::Claim {
+                key: entry.key,
+                row_id: entry.row_id,
+            };
+        }
 
         ProbePlan::Probe(PendingProbe {
             key: entry.key,
@@ -374,7 +391,14 @@ fn plan_probe_batch(
     for addition in additions {
         metrics.additions = metrics.additions.saturating_add(1);
         match planner.plan(addition, budget) {
-            ProbePlan::Put(key) => ready.push_back(ReadyAddition::Put(key)),
+            ProbePlan::Put(key) => ready.push_back(ReadyAddition::Put { key, row_id: None }),
+            ProbePlan::Claim { key, row_id } => {
+                metrics.known_absent = metrics.known_absent.saturating_add(1);
+                ready.push_back(ReadyAddition::Put {
+                    key,
+                    row_id: Some(row_id),
+                });
+            }
             ProbePlan::Probe(probe) => {
                 if probes.is_empty() {
                     probes.reserve_exact(capacity);
@@ -656,9 +680,9 @@ where
             break;
         };
         match resolution {
-            ReadyAddition::Put(key) => {
+            ReadyAddition::Put { key, row_id } => {
                 let stage_started = Instant::now();
-                stage_probe_put(db_tx, &mut staged, key, None)?;
+                stage_probe_put(db_tx, &mut staged, key, row_id)?;
                 metrics.staging = metrics.staging.saturating_add(stage_started.elapsed());
             }
             ReadyAddition::Probed(CompletedProbe {
@@ -1030,6 +1054,7 @@ mod tests {
                         row_id: key,
                         delete: false,
                         building: false,
+                        known_absent: false,
                     })
                 })
                 .collect();
@@ -1068,6 +1093,7 @@ mod tests {
                     row_id: key,
                     delete: false,
                     building: true,
+                    known_absent: false,
                 })
             })
             .collect();
@@ -1101,6 +1127,7 @@ mod tests {
                 row_id,
                 delete: false,
                 building: false,
+                known_absent: false,
             })
         }));
 
@@ -1110,6 +1137,72 @@ mod tests {
 
         assert_eq!(staged.metrics.shared_scans, 1);
         assert_eq!(staged.metrics.unique_probes, 4);
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// A unique put whose key the caller established absent is staged with
+    /// its row id and no read.
+    #[tokio::test]
+    async fn a_known_absent_entry_stages_without_a_probe() {
+        let (db, _) = StoreBuilder::new("known-absent", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let key = Bytes::from_static(b"absent value");
+        let entries = stream::once(async {
+            Ok(StagedIndexEntry {
+                index_id: 1,
+                unique: true,
+                key: Bytes::from_static(b"absent value"),
+                row_id: 7,
+                delete: false,
+                building: true,
+                known_absent: true,
+            })
+        });
+
+        let staged = stage_index_entry_stream(&tx, stream::empty(), entries, 0, true)
+            .await
+            .unwrap();
+
+        assert_eq!(staged.metrics.unique_probes, 0);
+        assert_eq!(staged.metrics.known_absent, 1);
+        assert_eq!(
+            tx.get(&key).await.unwrap().as_deref(),
+            Some(&7u64.to_be_bytes()[..])
+        );
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// Two known-absent claims of one value in a batch still collide.
+    #[tokio::test]
+    async fn known_absent_claims_still_collide_in_batch() {
+        let (db, _) = StoreBuilder::new("known-absent-collision", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let entries = stream::iter([3u64, 4].map(|row_id| {
+            Ok(StagedIndexEntry {
+                index_id: 9,
+                unique: true,
+                key: Bytes::from_static(b"shared value"),
+                row_id,
+                delete: false,
+                building: true,
+                known_absent: true,
+            })
+        }));
+
+        let staged = stage_index_entry_stream(&tx, stream::empty(), entries, 0, true)
+            .await
+            .unwrap();
+
+        assert_eq!(staged.poisoned, [9]);
+        assert_eq!(staged.metrics.unique_probes, 0);
         tx.rollback();
         db.close().await.unwrap();
     }
@@ -1149,6 +1242,7 @@ mod tests {
                 row_id,
                 delete: false,
                 building: false,
+                known_absent: false,
             })
         }));
 
@@ -1188,6 +1282,7 @@ mod tests {
                     row_id,
                     delete: true,
                     building: false,
+                    known_absent: false,
                 })
             })
         };
@@ -1250,6 +1345,7 @@ mod tests {
                 row_id: 7,
                 delete: true,
                 building: false,
+                known_absent: false,
             })
         });
         let (addition_polled, observed_addition) = tokio::sync::oneshot::channel();
@@ -1263,6 +1359,7 @@ mod tests {
                 row_id: 7,
                 delete: false,
                 building: false,
+                known_absent: false,
             })
         });
 

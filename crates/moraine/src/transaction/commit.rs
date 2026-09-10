@@ -1469,6 +1469,7 @@ impl ProbeScope {
                     probe_hits = metrics.probe_hits,
                     probe_misses = metrics.probe_misses,
                     shared_scans = metrics.shared_scans,
+                    known_absent = metrics.known_absent,
                     probe_peak_in_flight = metrics.probe_peak_in_flight,
                     probe_window_ms = crate::telemetry::milliseconds(metrics.probe_window),
                     probe_service_ms = crate::telemetry::milliseconds(metrics.probe_service),

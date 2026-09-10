@@ -15,7 +15,9 @@ use crate::{
     data_file::{self, DataStore, RowPositions, ScopedIndexEntry},
     error::{Error, Result},
     store::{
+        handle::ScanShape,
         index_encoding::{Direction, IndexKeyValue, NullOrder, encode_ordered_index_entry},
+        key::{IndexKind, index_index_prefix},
         proto::{DataFileValue, DeleteFileValue, InlineBuildCursorValue},
     },
     transaction::EncodedIndexEntry,
@@ -93,6 +95,7 @@ impl IndexEncoder {
             row_id,
             key,
             unique,
+            known_absent: false,
         })
     }
 
@@ -125,8 +128,11 @@ struct PendingStep {
 
 /// The derivation side of one pass: fills one bounded step at a time and
 /// hands each full step to the committer.
-struct StepBuffer {
+struct StepBuffer<'a> {
     encoder: IndexEncoder,
+    /// Every key this build has staged; a unique key it has not seen is
+    /// staged without a probe.
+    filter: &'a mut BuildFilter,
     bound: BuildStep,
     entries: Vec<EncodedIndexEntry>,
     staged_bytes: u64,
@@ -139,7 +145,7 @@ struct StepBuffer {
     peak_inline_decoded_bytes: usize,
 }
 
-impl StepBuffer {
+impl StepBuffer<'_> {
     fn cover_source(&mut self, file_id: u64, position: u64) {
         self.pending_source = Some((file_id, position));
     }
@@ -150,7 +156,13 @@ impl StepBuffer {
         self.push(entry, None).await
     }
 
-    async fn push(&mut self, entry: EncodedIndexEntry, source: Option<(u64, u64)>) -> Result<()> {
+    async fn push(
+        &mut self,
+        mut entry: EncodedIndexEntry,
+        source: Option<(u64, u64)>,
+    ) -> Result<()> {
+        entry.known_absent = entry.unique && !self.filter.may_contain(&entry.key);
+        self.filter.insert(&entry.key);
         let entry_bytes = staged_entry_bytes(&entry);
         let full = !self.entries.is_empty()
             && (self.entries.len() >= self.bound.entries
@@ -614,6 +626,14 @@ impl Catalog {
         data_prefix: &str,
         step: BuildStep,
     ) -> Result<()> {
+        let expected_keys = self
+            .snapshot()
+            .await?
+            .table_stats(table)
+            .map_or(0, |stats| stats.record_count);
+        let mut filter = BuildFilter::for_entries(expected_keys);
+        let mut filter_established = false;
+
         for attempt in 1..=BUILD_DERIVATION_ATTEMPTS {
             info!(
                 table = table.get(),
@@ -639,6 +659,10 @@ impl Catalog {
                 .ok_or_else(|| Error::NotFound(format!("index {index}")))?;
             if info.state == IndexState::Ready {
                 return Ok(());
+            }
+            if !filter_established {
+                establish_filter(session.handle(), index, &def.name, &mut filter).await?;
+                filter_established = true;
             }
             let total_entries = snapshot
                 .table_stats(table)
@@ -667,6 +691,7 @@ impl Catalog {
             let (steps, pending_steps) = mpsc::channel(1);
             let mut buffer = StepBuffer {
                 encoder: IndexEncoder::of(&info),
+                filter: &mut filter,
                 bound: step,
                 entries: Vec::new(),
                 staged_bytes: 0,
@@ -789,7 +814,7 @@ impl Catalog {
         file_cursor: Option<u64>,
         position_cursor: Option<u64>,
         legacy_row_cursor: Option<u64>,
-        buffer: &mut StepBuffer,
+        buffer: &mut StepBuffer<'_>,
     ) -> Result<()> {
         let backfill::BackfillSource {
             snapshot,
@@ -871,6 +896,7 @@ impl Catalog {
                                     row_id: entry.row_id,
                                     key: entry.key,
                                     unique: entry.unique,
+                                    known_absent: false,
                                 },
                                 Some((unit.file_id, entry.ordinal)),
                             )
@@ -886,6 +912,38 @@ impl Catalog {
             .await
             .map(|((), ())| ())
     }
+}
+
+/// Fills `filter` with every key the index already holds, so a resumed or
+/// repairing build probes only what an earlier pass or a writer committed.
+async fn establish_filter(
+    handle: crate::store::handle::ReadHandle<'_>,
+    index: IndexId,
+    index_name: &str,
+    filter: &mut BuildFilter,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut keys = handle
+        .scan_prefix(
+            index_index_prefix(IndexKind::Unique, index.get()),
+            ..,
+            ScanShape::Bulk,
+        )
+        .await?;
+    let mut scanned = 0u64;
+    while let Some(entry) = keys.next().await? {
+        filter.insert(&entry.key);
+        scanned = scanned.saturating_add(1);
+    }
+    info!(
+        index = index.get(),
+        index_name = %index_name,
+        scanned_keys = scanned,
+        filter_bits = filter.bits(),
+        scan_ms = crate::telemetry::milliseconds(started.elapsed()),
+        "staged index build filter established"
+    );
+    Ok(())
 }
 
 /// A table's delete files, grouped by the data file each one targets.
@@ -991,5 +1049,7 @@ fn require_data_store(
 #[cfg(test)]
 mod tests;
 
+mod filter;
 mod inline_sources;
+use filter::BuildFilter;
 use inline_sources::stream_inline_sources;
