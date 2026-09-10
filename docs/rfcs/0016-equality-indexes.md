@@ -290,6 +290,16 @@ value": deletes remove entries in the same batch that kills the row, so
 delete-then-reinsert behaves as SQL expects, within one commit or across
 commits.
 
+A unique entry's key is the value alone, so a delete by key removes
+whichever row holds the value. A deletion supplied by a writer through the
+verb API is therefore guarded: the committer reads the entry and drops the
+deletion unless the stored row id is the row being removed. A deletion the
+committer derives itself — from a scoped read of a delete file's target or
+a dropped file, or from an inlined row — names a row live at the base
+snapshot, and while the index is ready no other row can hold that row's
+value, so it is staged without the read. A building or poisoned index may
+hold the value for another row, so its derived deletions keep the guard.
+
 The rejection names the index, the claiming row, the holding row, and which
 state it collided with — the commit's own additions or a row already
 indexed. Those two branches otherwise produce the same message from

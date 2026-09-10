@@ -1585,6 +1585,7 @@ fn staged_landed(
         index_parquet_read_ms = milliseconds(phases.index_metrics.scoped_read.range_duration),
         index_additions = phases.index_metrics.additions,
         index_deletions = phases.index_metrics.deletions,
+        index_guard_reads = phases.index_metrics.guard_reads,
         index_unique_probes = phases.index_metrics.unique_probes,
         index_probe_hits = phases.index_metrics.probe_hits,
         index_probe_misses = phases.index_metrics.probe_misses,

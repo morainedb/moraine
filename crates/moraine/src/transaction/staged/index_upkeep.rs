@@ -355,7 +355,11 @@ fn staged_scoped_entries(
         .collect()
 }
 
-fn staged_scoped_entry(
+/// A derived deletion names a row live at the base snapshot, whose unique
+/// entry can be held by no other row while the index is ready; it is
+/// staged without the guard read. A building or poisoned index may still
+/// hold the value for another row, so its deletions keep the guard.
+pub(super) fn staged_scoped_entry(
     indexes: &[IndexInfo],
     entry: data_file::ScopedIndexEntry,
     delete: bool,
@@ -363,6 +367,7 @@ fn staged_scoped_entry(
     let index = indexes.get(entry.index).ok_or_else(|| {
         Error::Corruption("scoped read returned an unknown index projection".to_owned())
     })?;
+    let building = index.state != crate::catalog::IndexState::Ready;
 
     Ok(StagedIndexEntry {
         index_id: index.id.get(),
@@ -370,8 +375,9 @@ fn staged_scoped_entry(
         key: entry.key,
         row_id: entry.row_id,
         delete,
-        building: index.state != crate::catalog::IndexState::Ready,
+        building,
         known_absent: false,
+        known_held: delete && !building,
     })
 }
 

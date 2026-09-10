@@ -6,6 +6,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ops::Bound,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -52,6 +53,9 @@ pub(crate) struct StagedIndexEntry {
     /// The caller established the key is absent from committed state, so
     /// a unique put needs no read before it.
     pub(crate) known_absent: bool,
+    /// The caller established the entry names this row in committed state,
+    /// so a unique delete needs no read before it.
+    pub(crate) known_held: bool,
 }
 
 /// A unique entry's value is the holding row id, big-endian.
@@ -147,6 +151,8 @@ pub(crate) struct IndexMaintenanceMetrics {
     pub(crate) probes_completed_during_deletions: u64,
     /// Unique puts staged without a read, their keys known absent.
     pub(crate) known_absent: u64,
+    /// Unique deletes that read their entry to check which row holds it.
+    pub(crate) guard_reads: u64,
 }
 
 /// One unique put awaiting its committed-state probe.
@@ -379,16 +385,19 @@ fn complete_probes(
     Ok(count)
 }
 
-/// Drops a unique deletion whose entry is held by some other row.
+/// Drops a unique deletion whose entry is held by some other row, counting
+/// each read in `guard_reads`.
 ///
 /// A unique entry's key is the value alone, so deleting it by key removes
 /// whichever row holds that value — not necessarily the row being removed.
 /// The stored row id is what says the two are the same, and a derivation
 /// that names an already-removed row must not take the entry a later
-/// insert of the same value put there.
+/// insert of the same value put there. A deletion the caller established
+/// names its own row is staged without the read.
 fn guarded_deletions<'a, D>(
     reader: ReadHandle<'a>,
     deletes: D,
+    guard_reads: &'a AtomicU64,
 ) -> impl Stream<Item = Result<StagedIndexEntry>> + 'a
 where
     D: Stream<Item = Result<StagedIndexEntry>> + 'a,
@@ -396,9 +405,10 @@ where
     deletes
         .map(move |entry| async move {
             let entry = entry?;
-            if !entry.unique {
+            if !entry.unique || entry.known_held {
                 return Ok(Some(entry));
             }
+            guard_reads.fetch_add(1, Ordering::Relaxed);
             let Some(bytes) = reader.get(entry.key.clone()).await.map_err(Error::from)? else {
                 return Ok(None);
             };
@@ -476,7 +486,8 @@ where
     let mut deleted_unique = HashSet::new();
     let mut budget = IndexCommitBudget::with_entries(prior_entry_count)?;
     let reader = ReadHandle::Tx(db_tx);
-    let mut deletes = std::pin::pin!(guarded_deletions(reader, deletes));
+    let guard_reads = AtomicU64::new(0);
+    let mut deletes = std::pin::pin!(guarded_deletions(reader, deletes, &guard_reads));
     let mut entries = std::pin::pin!(entries.ready_chunks(PROBE_BATCH_SIZE));
     let mut ready = VecDeque::with_capacity(ADDITION_PREFETCH);
     let mut additions_done = false;
@@ -542,6 +553,7 @@ where
         metrics.staging = metrics.staging.saturating_add(stage_started.elapsed());
     }
     metrics.deletion_derivation = started.elapsed();
+    metrics.guard_reads = guard_reads.load(Ordering::Relaxed);
 
     let mut poisoned = Vec::new();
     loop {
@@ -952,6 +964,7 @@ mod tests {
                 delete: false,
                 building: true,
                 known_absent: true,
+                known_held: false,
             })
         });
 
@@ -986,6 +999,7 @@ mod tests {
                 delete: false,
                 building: true,
                 known_absent: true,
+                known_held: false,
             })
         }));
 
@@ -1035,6 +1049,7 @@ mod tests {
                 delete: false,
                 building: false,
                 known_absent: false,
+                known_held: false,
             })
         }));
 
@@ -1075,6 +1090,7 @@ mod tests {
                     delete: true,
                     building: false,
                     known_absent: false,
+                    known_held: false,
                 })
             })
         };
@@ -1084,6 +1100,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(staged.metrics.deletions, 0);
+        assert_eq!(staged.metrics.guard_reads, 1);
         tx.commit().await.unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
@@ -1103,6 +1120,45 @@ mod tests {
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         assert!(ReadHandle::Tx(&tx).get(key).await.unwrap().is_none());
+        tx.rollback();
+
+        db.close().await.unwrap();
+    }
+
+    /// A unique deletion the caller established names its own row is staged
+    /// without reading the entry.
+    #[tokio::test]
+    async fn a_known_held_deletion_stages_without_a_guard_read() {
+        let (db, _) = StoreBuilder::new("known-held", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let key = Bytes::from_static(b"held value");
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(key.clone(), 3u64.to_be_bytes()).unwrap();
+        tx.commit().await.unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let deletion_key = key.clone();
+        let deletion = stream::once(async move {
+            Ok(StagedIndexEntry {
+                index_id: 1,
+                unique: true,
+                key: deletion_key,
+                row_id: 3,
+                delete: true,
+                building: false,
+                known_absent: false,
+                known_held: true,
+            })
+        });
+        let staged = stage_index_entry_stream(&tx, deletion, stream::empty(), 0)
+            .await
+            .unwrap();
+        assert_eq!(staged.metrics.deletions, 1);
+        assert_eq!(staged.metrics.guard_reads, 0);
+        assert!(tx.get(&key).await.unwrap().is_none());
         tx.rollback();
 
         db.close().await.unwrap();
@@ -1136,6 +1192,7 @@ mod tests {
                 delete: true,
                 building: false,
                 known_absent: false,
+                known_held: false,
             })
         });
         let (addition_polled, observed_addition) = tokio::sync::oneshot::channel();
@@ -1150,6 +1207,7 @@ mod tests {
                 delete: false,
                 building: false,
                 known_absent: false,
+                known_held: false,
             })
         });
 

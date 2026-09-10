@@ -4035,9 +4035,11 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
     .unwrap();
     let delete_size = write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
+    let events = captured_commit_events();
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx =
         StagedTransaction::begin_detached_with_store(&catalog, db_tx, DataStore::new(store));
+    let transaction_id = tx.diagnostic_id.to_string();
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
         cells: vec![
@@ -4070,6 +4072,14 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
         index_entry_count(&catalog, true, index_id).await,
         1,
         "positions 0 and 2 are unindexed; only row 1 survives"
+    );
+    // Derived deletions name rows live at the base, so the unique entries
+    // are removed without a guard read each.
+    let landed = events.one("staged commit landed", &transaction_id);
+    assert_eq!(landed.get("index_deletions").map(String::as_str), Some("2"));
+    assert_eq!(
+        landed.get("index_guard_reads").map(String::as_str),
+        Some("0")
     );
 }
 
