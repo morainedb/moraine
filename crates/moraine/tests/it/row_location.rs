@@ -554,9 +554,9 @@ async fn an_inlined_row_with_a_file_copy_keeps_both_candidates_in_any_request_or
     catalog.close().await.unwrap();
 }
 
-/// A cold lookup pays one footer read and one row-id column read per file
-/// with embedded ids, and the handle's tally shows it; a warm repeat reads
-/// nothing.
+/// A cold lookup pays one read per file with embedded ids — a small file
+/// is fetched whole, footer and row-id column together — and the handle's
+/// tally shows it; a warm repeat reads nothing.
 #[tokio::test]
 async fn data_store_reads_land_in_the_handles_tally() {
     let catalog = open_memory().await;
@@ -588,8 +588,8 @@ async fn data_store_reads_land_in_the_handles_tally() {
     let cold = catalog.object_store_tally();
     assert_eq!(
         cold.data_gets - before.data_gets,
-        6,
-        "one footer and one column read per file"
+        3,
+        "one whole-object read per small file"
     );
     assert!(cold.data_bytes > before.data_bytes);
 
