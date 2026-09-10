@@ -35,7 +35,7 @@ use crate::{
             TableValue, TagValue, ViewValue,
         },
         read::{
-            EntityRecord, read_head, scan_current_entities, scan_history_entities,
+            EntityRecord, RecordSet, read_head, scan_current_records, scan_history_records,
             scan_schema_versions, scan_snapshots,
         },
     },
@@ -161,11 +161,7 @@ impl HistoryNeed {
 async fn entity_halves(
     catalog: &ReadOnlyCatalog,
     history: HistoryNeed,
-) -> Result<(
-    Option<HeadValue>,
-    Arc<Vec<EntityRecord>>,
-    Arc<Vec<EntityRecord>>,
-)> {
+) -> Result<(Option<HeadValue>, Arc<RecordSet>, Arc<RecordSet>)> {
     // A read-write handle's held view is at head, so a read served wholly
     // from the cache needs neither a session nor a head read.
     if let Some(head) = writer_head(catalog)? {
@@ -174,7 +170,7 @@ async fn entity_halves(
         if let Some(current) = projections.current_entities_at(&head) {
             let held_history = projections.history_entities_at(&head);
             if !want_history {
-                return Ok((Some(head), current, Arc::new(Vec::new())));
+                return Ok((Some(head), current, Arc::default()));
             }
             if let Some(history) = held_history {
                 return Ok((Some(head), current, history));
@@ -219,16 +215,16 @@ async fn entity_halves(
                     return Ok(records);
                 }
                 catalog.tally_current_scan();
-                Ok::<_, Error>(Arc::new(scan_current_entities(handle).await?))
+                Ok::<_, Error>(Arc::new(scan_current_records(handle).await?))
             };
             let history = async {
                 match (&history_held, want_history) {
                     (Some(records), _) => Ok(Arc::clone(records)),
                     (None, true) => {
                         catalog.tally_history_scan();
-                        Ok::<_, Error>(Arc::new(scan_history_entities(handle).await?))
+                        Ok::<_, Error>(Arc::new(scan_history_records(handle).await?))
                     }
-                    (None, false) => Ok(Arc::new(Vec::new())),
+                    (None, false) => Ok(Arc::default()),
                 }
             };
             futures::try_join!(current, history)
@@ -260,8 +256,9 @@ async fn dump_entities<T>(
 ) -> Result<Vec<T>> {
     let (_, current, history) = entity_halves(catalog, HistoryNeed::Always).await?;
     Ok(current
-        .iter()
-        .chain(history.iter())
+        .values()
+        .chain(history.values())
+        .map(Arc::as_ref)
         .filter_map(extract)
         .collect())
 }
@@ -273,7 +270,11 @@ async fn dump_current_entities<T>(
     extract: impl Fn(&EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
     let (_, current, _) = entity_halves(catalog, HistoryNeed::Never).await?;
-    Ok(current.iter().filter_map(extract).collect())
+    Ok(current
+        .values()
+        .map(Arc::as_ref)
+        .filter_map(extract)
+        .collect())
 }
 
 /// Every `ducklake_schema` row, current and history.
@@ -369,9 +370,9 @@ pub async fn dump_data_files_live_at(
     let (_, current, history) =
         entity_halves(catalog, HistoryNeed::UnlessLiveAt(filter_snapshot)).await?;
     Ok(current
-        .iter()
-        .chain(history.iter())
-        .filter_map(|r| match r {
+        .values()
+        .chain(history.values())
+        .filter_map(|r| match r.as_ref() {
             EntityRecord::File(v) => Some(v.clone()),
             _ => None,
         })
@@ -442,7 +443,11 @@ async fn dump_projected_current<K: Ord, T: Clone>(
     // Installed at the stamp the halves were served at, which may be newer
     // than the head read above but never mismatched with the rows.
     let (served_at, current, _) = entity_halves(catalog, HistoryNeed::Never).await?;
-    let rows: Vec<T> = current.iter().filter_map(extract).collect();
+    let rows: Vec<T> = current
+        .values()
+        .map(Arc::as_ref)
+        .filter_map(extract)
+        .collect();
     if let Some(head) = served_at {
         install(&mut projections_write(catalog), head, rows.clone());
     }
@@ -1349,6 +1354,100 @@ mod tests {
         dump_table_stats(&catalog).await.unwrap();
         let again = catalog.entity_scan_tallies();
         assert_eq!(again, after, "a warm pass re-scanned");
+    }
+
+    /// A commit folds both halves of the shared record set forward, so the
+    /// dumps after it scan nothing and still show what it wrote and ended.
+    #[tokio::test]
+    async fn a_commit_folds_the_record_set_instead_of_dropping_it() {
+        let catalog = seed().await;
+        let tables = dump_tables(&catalog).await.unwrap();
+        let orders = tables
+            .iter()
+            .find(|table| table.end_snapshot.is_none())
+            .unwrap()
+            .table_id;
+        dump_schemas(&catalog).await.unwrap();
+        let warmed = catalog.entity_scan_tallies();
+
+        let ended_at = catalog
+            .commit(|tx| {
+                tx.create_schema("more")?;
+                tx.drop_table(crate::catalog::TableId::new(orders))
+            })
+            .await
+            .unwrap();
+
+        let schemas = dump_schemas(&catalog).await.unwrap();
+        assert!(
+            schemas.iter().any(|schema| schema.schema_name == "more"),
+            "the dump missed the schema the commit created"
+        );
+        let tables = dump_tables(&catalog).await.unwrap();
+        assert!(
+            tables.iter().all(|table| table.end_snapshot.is_some()),
+            "the dump still served the dropped table as live"
+        );
+        assert!(
+            tables
+                .iter()
+                .any(|table| table.table_id == orders && table.end_snapshot == Some(ended_at.get())),
+            "the dump missed the version the commit ended"
+        );
+        assert_eq!(
+            catalog.entity_scan_tallies(),
+            warmed,
+            "a dump after a commit rescanned the store"
+        );
+    }
+
+    /// A read-only handle that replays another writer's commit folds the
+    /// `current` half forward with the view, so its next current-only dump
+    /// scans nothing.
+    #[tokio::test]
+    async fn a_reader_folds_a_replayed_gap_into_its_record_set() {
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let writer = seed_on(Arc::clone(&store)).await;
+        let options = CatalogOptions {
+            reader_poll_interval: std::time::Duration::from_millis(20),
+            ..CatalogOptions::default()
+        };
+        let reader = Catalog::open_read_only(store, options).await.unwrap();
+        reader.snapshot().await.unwrap();
+        dump_table_stats(&reader).await.unwrap();
+        let warmed = reader.entity_scan_tallies();
+
+        let minted = writer
+            .commit(|tx| tx.create_schema("more").map(|_| ()))
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if reader.snapshot().await.unwrap().snapshot.snapshot_id >= minted.get() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let view = reader.snapshot().await.unwrap();
+        assert_eq!(
+            view.snapshot.snapshot_id,
+            minted.get(),
+            "the reader never caught up"
+        );
+
+        dump_table_stats(&reader).await.unwrap();
+        assert_eq!(
+            reader.entity_scan_tallies().0,
+            warmed.0,
+            "a reader dump after a replayed gap rescanned `current`"
+        );
+        assert!(
+            dump_schemas(&reader)
+                .await
+                .unwrap()
+                .iter()
+                .any(|schema| schema.schema_name == "more"),
+            "the reader's dump missed the replayed schema"
+        );
     }
 
     /// A head-view materialization alone never scans `history` — the view

@@ -36,8 +36,9 @@ use crate::{
     catalog::{
         CatalogSnapshot, RecentRow, SnapshotId, TableId,
         projection::{
-            ProjectionCache, cache_epoch, cached_head_view, held_head_view, install_head_view_at,
-            install_shared_current_entities, shared_current_entities,
+            ProjectionCache, cache_epoch, cached_head_view, fold_replayed_writes, held_head_view,
+            install_head_view_at, install_shared_current_entities, shared_current_entities,
+            view_head,
         },
     },
     data_file,
@@ -783,9 +784,15 @@ impl ReadOnlyCatalog {
         }
 
         if let Some(behind) = held_head_view(&self.projections)
-            && let Some(refreshed) = commit::refresh(handle, &behind).await?
+            && let Some((refreshed, writes)) = commit::refresh_with_writes(handle, &behind).await?
         {
             self.reads.refreshes.fetch_add(1, Ordering::Relaxed);
+            fold_replayed_writes(
+                &self.projections,
+                &view_head(&behind),
+                view_head(&refreshed),
+                &writes,
+            );
             return Ok(Arc::new(refreshed));
         }
 
