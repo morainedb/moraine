@@ -4,11 +4,12 @@
 //! misses on one footer share a single fill.
 
 use std::{
+    collections::HashMap,
     future::Future,
     io::{Read, Write},
     path::{Path as FilePath, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock, PoisonError,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
@@ -16,6 +17,10 @@ use std::{
 
 use bytes::Bytes;
 use foyer::{Cache, HybridCache};
+use futures::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use object_store::path::Path;
 use parquet::{
     errors::{ParquetError, Result as ParquetResult},
@@ -602,11 +607,18 @@ impl Tier {
     }
 }
 
+/// A page-index load in flight for one resident footer, shared by every
+/// reader that finds the footer without one. The error is a string so the
+/// outcome clones.
+type PageIndexUpgrade =
+    Shared<BoxFuture<'static, std::result::Result<Arc<ParquetMetaData>, String>>>;
+
 /// One weighted cache over both footers and summaries.
 pub(super) struct AuxiliaryCache {
     tier: Tier,
     capacity: Arc<AtomicUsize>,
     summaries: Arc<RowSummaryCounters>,
+    upgrades: Mutex<HashMap<AuxiliaryKey, PageIndexUpgrade>>,
 }
 
 /// The parts of a build both tiers share.
@@ -658,6 +670,7 @@ impl AuxiliaryCache {
             tier: Tier::Memory(cache),
             capacity: parts.admitted,
             summaries: parts.summaries,
+            upgrades: Mutex::new(HashMap::new()),
         }
     }
 
@@ -678,6 +691,7 @@ impl AuxiliaryCache {
             tier: Tier::Hybrid(cache::disk_tier(memory, dir, disk).await?),
             capacity: parts.admitted,
             summaries: parts.summaries,
+            upgrades: Mutex::new(HashMap::new()),
         })
     }
 
@@ -730,10 +744,56 @@ impl AuxiliaryCache {
             return Ok(metadata);
         }
 
-        let mut loader = ParquetMetaDataReader::new_with_metadata((*metadata).clone())
-            .with_page_index_policy(policy);
-        loader.load_page_index(&mut reader.clone()).await?;
-        let metadata = Arc::new(loader.finish()?);
+        self.upgrade_page_index(key, metadata, reader, policy).await
+    }
+
+    /// Adds the page index to a resident footer, sharing one fetch among
+    /// concurrent readers of the same file. Every awaiter admits the
+    /// result, so a cancelled leader leaves nothing stuck.
+    async fn upgrade_page_index(
+        &self,
+        key: AuxiliaryKey,
+        metadata: Arc<ParquetMetaData>,
+        reader: &ObjectStoreReader,
+        policy: PageIndexPolicy,
+    ) -> ParquetResult<Arc<ParquetMetaData>> {
+        let upgrade = {
+            let mut upgrades = self.upgrades.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(upgrade) = upgrades.get(&key) {
+                upgrade.clone()
+            } else {
+                let mut loader = reader.clone();
+                let upgrade = async move {
+                    let mut loading = ParquetMetaDataReader::new_with_metadata((*metadata).clone())
+                        .with_page_index_policy(policy);
+                    loading
+                        .load_page_index(&mut loader)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    loading
+                        .finish()
+                        .map(Arc::new)
+                        .map_err(|error| error.to_string())
+                }
+                .boxed()
+                .shared();
+                upgrades.insert(key.clone(), upgrade.clone());
+                upgrade
+            }
+        };
+
+        let outcome = upgrade.clone().await;
+
+        let mut upgrades = self.upgrades.lock().unwrap_or_else(PoisonError::into_inner);
+        if upgrades
+            .get(&key)
+            .is_some_and(|in_flight| in_flight.ptr_eq(&upgrade))
+        {
+            upgrades.remove(&key);
+        }
+        drop(upgrades);
+
+        let metadata = outcome.map_err(ParquetError::General)?;
         self.tier.insert(
             key,
             Weighed::from(AuxiliaryValue::Metadata {

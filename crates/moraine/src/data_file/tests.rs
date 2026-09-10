@@ -399,6 +399,50 @@ async fn a_selective_read_after_a_whole_file_read_adds_only_the_page_index() {
     );
 }
 
+/// Selective readers that find a footer without its page index share one
+/// page-index fetch between them.
+#[tokio::test]
+async fn concurrent_page_index_upgrades_share_one_in_flight_fetch() {
+    let store = Arc::new(CountingStore::with_fetch_delay(Duration::from_millis(10)));
+    let data = DataStore::new(store.clone());
+    let path = Path::from("shared-page-index-upgrade.parquet");
+    let (object_len, footer_size) =
+        write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
+    let wanted: RowPositions = [7, 19_000].into_iter().collect();
+
+    scoped_read_recorded_entries(
+        ParquetFile::new(data.clone(), path.clone(), object_len, footer_size),
+        &[0],
+        ScopedRows::All,
+        RowIdSource::Ordinal,
+    )
+    .await
+    .unwrap();
+    let whole_requests = store.fetch_requests();
+    assert_eq!(whole_requests, 2, "footer and the whole projected column");
+
+    let first = scoped_read_recorded_entries(
+        ParquetFile::new(data.clone(), path.clone(), object_len, footer_size),
+        &[0],
+        ScopedRows::At(&wanted),
+        RowIdSource::Ordinal,
+    );
+    let second = scoped_read_recorded_entries(
+        ParquetFile::new(data.clone(), path.clone(), object_len, footer_size),
+        &[0],
+        ScopedRows::At(&wanted),
+        RowIdSource::Ordinal,
+    );
+    let (first, second) = tokio::join!(first, second);
+
+    assert_eq!(first.unwrap(), second.unwrap());
+    assert_eq!(
+        store.fetch_requests() - whole_requests,
+        3,
+        "one page index and two selected-page reads"
+    );
+}
+
 /// A selective read leaves its footer, page index included, for a later
 /// whole-file read, which then fetches only its column.
 #[tokio::test]
