@@ -186,10 +186,18 @@ fn values_round_trip_through_their_disk_form() {
         Weighed::decode(&mut encoded.as_slice()).unwrap()
     };
 
-    let footer = round_trip(AuxiliaryValue::Metadata(Arc::new(metadata.clone())));
-    let AuxiliaryValue::Metadata(decoded) = &footer.value else {
+    let footer = round_trip(AuxiliaryValue::Metadata {
+        metadata: Arc::new(metadata.clone()),
+        page_index: true,
+    });
+    let AuxiliaryValue::Metadata {
+        metadata: decoded,
+        page_index,
+    } = &footer.value
+    else {
         panic!("a footer decoded as a summary");
     };
+    assert!(page_index, "a footer holding its page index says so");
     assert_eq!(decoded.num_row_groups(), 10);
     assert_eq!(decoded.file_metadata().num_rows(), 1_000);
     assert_eq!(
@@ -214,6 +222,59 @@ fn values_round_trip_through_their_disk_form() {
             rows.rows.matching(&requested)
         );
     }
+}
+
+/// A footer loaded without its page index round trips as exactly that: it
+/// decodes, and still says the page index is not loaded.
+#[test]
+fn a_footer_without_its_page_index_round_trips_through_its_disk_form() {
+    use arrow::array::{Int64Array, RecordBatch};
+    use foyer::Code;
+    use parquet::{
+        arrow::ArrowWriter,
+        file::{
+            metadata::{PageIndexPolicy, ParquetMetaDataReader},
+            properties::WriterProperties,
+        },
+    };
+
+    use super::auxiliary_cache::{AuxiliaryValue, Weighed};
+
+    let batch =
+        RecordBatch::try_from_iter([("id", Arc::new((0..1_000).collect::<Int64Array>()) as _)])
+            .unwrap();
+    let mut file = Vec::new();
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(100))
+        .build();
+    let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let metadata = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Skip)
+        .parse_and_finish(&bytes::Bytes::from(file))
+        .unwrap();
+    assert!(metadata.offset_index().is_none());
+
+    let weighed = Weighed::from(AuxiliaryValue::Metadata {
+        metadata: Arc::new(metadata),
+        page_index: false,
+    });
+    let mut encoded = Vec::new();
+    weighed.encode(&mut encoded).unwrap();
+    let decoded = Weighed::decode(&mut encoded.as_slice()).unwrap();
+
+    let AuxiliaryValue::Metadata {
+        metadata: decoded,
+        page_index,
+    } = &decoded.value
+    else {
+        panic!("a footer decoded as a summary");
+    };
+    assert!(!page_index, "a footer without its page index says so");
+    assert_eq!(decoded.num_row_groups(), 10);
+    assert!(decoded.offset_index().is_none());
+    assert!(decoded.column_index().is_none());
 }
 
 /// A permuted summary — the shape an UPDATE's rewritten rows take — round

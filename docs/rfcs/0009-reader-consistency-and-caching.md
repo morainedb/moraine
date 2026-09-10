@@ -641,7 +641,7 @@ The caches a moraine-backed query crosses, top to bottom:
 | DuckLake catalog cache | schema/catalog entries; the per-transaction snapshot | snapshot id + `schema_version` | live-catalog-sized | `schema_version` move; transaction end |
 | shim `MetadataRows` | decoded rows per synthesized table | head stamp at first scan | per transaction | transaction end |
 | core logical caches | `CatalogSnapshot`, entity record set, maintained projections | head stamp + install epoch | one catalog's decoded size, reported by `projection_bytes` | replaced on stamp move |
-| core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep, and file row-id summaries | object-store location + path + file size + page-index policy | process-wide share of `CACHE_MEMORY`, to a ceiling, over `CACHE_DIR/auxiliary-v2` | byte-bounded LRU (foyer), recovered on restart |
+| core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep, and file row-id summaries | object-store location + path + file size | process-wide share of `CACHE_MEMORY`, to a ceiling, over `CACHE_DIR/auxiliary-v2` | byte-bounded LRU (foyer), recovered on restart |
 | SlateDB block + meta cache | decoded SST blocks, indexes, filters | scoped SST id + offset | one cache per attached store: an even share of the process budget in memory over `CACHE_DIR/<store>/blocks` | LRU-ish (foyer), recovered on restart |
 
 Two findings drove this section. Before consolidation, one catalog byte could
@@ -686,11 +686,15 @@ identity, value, and tiering contracts:
   filters, indexes, and decoded blocks. Its `DbCache` controls concurrent-fill
   suppression, admission, and the optional Foyer disk tier.
 - The scoped reader owns immutable `Arc<ParquetMetaData>` values keyed by
-  object-store identity, path, recorded file size, and page-index policy. They
-  are useful only inside this process, stay memory-only, and are evicted by
-  parsed byte weight. Concurrent misses for one key share one in-flight fetch
-  and parse; the result enters the cache once, while a failed fill is shared
-  only with its current waiters and remains retryable.
+  object-store identity, path, and recorded file size — one entry per file,
+  whichever page-index policy first loaded it. A reader that needs the page
+  index a resident footer lacks fetches only the index and upgrades the entry
+  in place, so a whole-file read and a selective read of one file parse its
+  footer once between them. They are useful only inside this process, stay
+  memory-only, and are evicted by parsed byte weight. Concurrent misses for
+  one key share one in-flight fetch and parse; the result enters the cache
+  once, while a failed fill is shared only with its current waiters and
+  remains retryable.
 
 Putting either value into the other engine would erase one of those
 contracts: teaching SlateDB's closed entry type about Parquet couples the
@@ -978,7 +982,11 @@ preserves reuse. In-memory attachments retain random identities.
 Identity hashes and block-cache directories use a new versioned namespace;
 the auxiliary disk tier uses `auxiliary-v2`. Old display-based cache entries are not recovered and
 may be removed; catalog data needs no migration. Footers go to disk in the
-Parquet metadata writer's form, page index included; summaries in their own
+Parquet metadata writer's form under one of two tags: with the page index
+when it was loaded, else without, decoded without one since the writer keeps
+the original file's index offsets, which the disk form does not carry. Footer
+entries written while the key still named a page-index policy are unreachable
+under the policy-free key and age out. Summaries go in their own
 shape.
 
 **Admission follows read shape.** SlateDB's defaults already split it —
@@ -1141,8 +1149,11 @@ files then fetch only indexed values and row ids, while delete files fetch only
 their position column. Objects below the measured crossover remain one
 whole-object request. A process-wide byte-bounded cache retains the parsed
 footer and page indexes for repeated touches of the same immutable file; it is
-keyed by object-store identity, path, file size, and page-index policy, and
-holds only metadata. Its allowance is one sixteenth of
+keyed by object-store identity, path, and file size, adds the page index to a
+resident footer on demand rather than parsing the footer again under a second
+policy, and holds only metadata. A file whose row ids are its recorded dense
+range is remembered as a summary once its footer has proved that, so a repeat
+location of it needs neither. Its allowance is one sixteenth of
 `CACHE_MEMORY`'s metadata share, capped at 8 MiB, with the remainder of that
 share continuing to hold SlateDB metadata — one Moraine memory budget, not a
 third invisible one. Projected data-column ranges are never retained. This

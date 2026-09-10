@@ -4,11 +4,12 @@
 //! misses on one footer share a single fill.
 
 use std::{
+    collections::HashMap,
     future::Future,
     io::{Read, Write},
     path::{Path as FilePath, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock, PoisonError,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
@@ -16,6 +17,10 @@ use std::{
 
 use bytes::Bytes;
 use foyer::{Cache, HybridCache};
+use futures::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use object_store::path::Path;
 use parquet::{
     errors::{ParquetError, Result as ParquetResult},
@@ -39,25 +44,6 @@ use crate::{
     store::cache::{self, RowSummaryOccupancy},
 };
 
-/// Whether a cached footer carries the page index. Mirrors
-/// [`PageIndexPolicy`], which is not hashable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(super) enum PageIndex {
-    Skip,
-    Optional,
-    Required,
-}
-
-impl From<PageIndexPolicy> for PageIndex {
-    fn from(policy: PageIndexPolicy) -> Self {
-        match policy {
-            PageIndexPolicy::Skip => Self::Skip,
-            PageIndexPolicy::Optional => Self::Optional,
-            PageIndexPolicy::Required => Self::Required,
-        }
-    }
-}
-
 /// One file's identity within its store. The path and recorded size guard
 /// against a reused catalog file id: a mismatch misses.
 pub(super) struct FileSummaryKey<'a> {
@@ -69,11 +55,12 @@ pub(super) struct FileSummaryKey<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum AuxiliaryKey {
+    /// One file's footer, whatever page-index policy first loaded it: a
+    /// reader needing the page index adds it to the entry in place.
     Metadata {
         store: CacheIdentity,
         path: String,
         file_size: u64,
-        page_index: PageIndex,
     },
     Summary {
         store: CacheIdentity,
@@ -104,7 +91,12 @@ enum AuxiliaryKey {
 
 #[derive(Debug, Clone)]
 pub(super) enum AuxiliaryValue {
-    Metadata(Arc<ParquetMetaData>),
+    /// A parsed footer; `page_index` says whether its page index was
+    /// loaded, which a file without one also satisfies.
+    Metadata {
+        metadata: Arc<ParquetMetaData>,
+        page_index: bool,
+    },
     Summary(Arc<PositionedRowSet>),
     Block(Bytes),
     DeletePositions(Arc<FileRowSet>),
@@ -120,7 +112,7 @@ pub(super) struct Weighed {
 impl From<AuxiliaryValue> for Weighed {
     fn from(value: AuxiliaryValue) -> Self {
         let bytes = match &value {
-            AuxiliaryValue::Metadata(metadata) => metadata.memory_size(),
+            AuxiliaryValue::Metadata { metadata, .. } => metadata.memory_size(),
             AuxiliaryValue::Summary(positioned) => {
                 usize::try_from(positioned.estimated_bytes()).unwrap_or(usize::MAX)
             }
@@ -135,11 +127,14 @@ impl From<AuxiliaryValue> for Weighed {
 }
 
 /// The disk form of a value: a tag byte, then a footer as the Parquet
-/// metadata writer lays it out (page index included) or a row set in its
-/// own shape. Delete positions carry no order and use one tag per shape;
-/// a summary's tag also names its [`RowOrder`], since a cached summary from
-/// before positions existed cannot answer them.
+/// metadata writer lays it out (page index included when loaded) or a row
+/// set in its own shape. Delete positions carry no order and use one tag per
+/// shape; a summary's tag also names its [`RowOrder`], since a cached summary
+/// from before positions existed cannot answer them.
 mod tag {
+    /// A footer whose page index was not loaded. Decoded without one: the
+    /// serialized column chunks still point at the original file's index
+    /// bytes, which the disk form does not carry.
     pub(super) const METADATA: u8 = 0;
     /// Retired for summaries: a pre-upgrade encoder wrote this for any
     /// dense range, discarding whether the file order was ascending or a
@@ -165,6 +160,8 @@ mod tag {
     /// retired [`RANGE`], which could also have been written for a
     /// contiguous-but-permuted file.
     pub(super) const RANGE_ASCENDING: u8 = 12;
+    /// A footer with its page index loaded.
+    pub(super) const METADATA_WITH_PAGE_INDEX: u8 = 13;
 
     /// The `(range, roaring, sorted)` tags a delete-position set writes.
     pub(super) const DELETE_SHAPES: [u8; 3] = [DELETE_RANGE, DELETE_ROARING, DELETE_SORTED];
@@ -372,8 +369,16 @@ impl foyer::Code for Weighed {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
         let io = foyer::Error::io_error;
         match &self.value {
-            AuxiliaryValue::Metadata(metadata) => {
-                writer.write_all(&[tag::METADATA]).map_err(io)?;
+            AuxiliaryValue::Metadata {
+                metadata,
+                page_index,
+            } => {
+                let tag = if *page_index {
+                    tag::METADATA_WITH_PAGE_INDEX
+                } else {
+                    tag::METADATA
+                };
+                writer.write_all(&[tag]).map_err(io)?;
                 let mut buffer = Vec::new();
                 ParquetMetaDataWriter::new(&mut buffer, metadata)
                     .finish()
@@ -397,14 +402,23 @@ impl foyer::Code for Weighed {
         reader.read_exact(&mut tag).map_err(io)?;
 
         let value = match tag[0] {
-            tag::METADATA => {
+            tag::METADATA | tag::METADATA_WITH_PAGE_INDEX => {
+                let page_index = tag[0] == tag::METADATA_WITH_PAGE_INDEX;
+                let policy = if page_index {
+                    PageIndexPolicy::Optional
+                } else {
+                    PageIndexPolicy::Skip
+                };
                 let mut buffer = Vec::new();
                 reader.read_to_end(&mut buffer).map_err(io)?;
                 let metadata = ParquetMetaDataReader::new()
-                    .with_page_index_policy(PageIndexPolicy::Optional)
+                    .with_page_index_policy(policy)
                     .parse_and_finish(&Bytes::from(buffer))
                     .map_err(parse_failed)?;
-                AuxiliaryValue::Metadata(Arc::new(metadata))
+                AuxiliaryValue::Metadata {
+                    metadata: Arc::new(metadata),
+                    page_index,
+                }
             }
             tag::RANGE
             | tag::LEGACY_ROARING
@@ -560,7 +574,6 @@ impl Tier {
         }
     }
 
-    #[cfg(test)]
     fn insert(&self, key: AuxiliaryKey, value: Weighed) {
         match self {
             Self::Memory(cache) => {
@@ -594,11 +607,18 @@ impl Tier {
     }
 }
 
+/// A page-index load in flight for one resident footer, shared by every
+/// reader that finds the footer without one. The error is a string so the
+/// outcome clones.
+type PageIndexUpgrade =
+    Shared<BoxFuture<'static, std::result::Result<Arc<ParquetMetaData>, String>>>;
+
 /// One weighted cache over both footers and summaries.
 pub(super) struct AuxiliaryCache {
     tier: Tier,
     capacity: Arc<AtomicUsize>,
     summaries: Arc<RowSummaryCounters>,
+    upgrades: Mutex<HashMap<AuxiliaryKey, PageIndexUpgrade>>,
 }
 
 /// The parts of a build both tiers share.
@@ -650,6 +670,7 @@ impl AuxiliaryCache {
             tier: Tier::Memory(cache),
             capacity: parts.admitted,
             summaries: parts.summaries,
+            upgrades: Mutex::new(HashMap::new()),
         }
     }
 
@@ -670,11 +691,14 @@ impl AuxiliaryCache {
             tier: Tier::Hybrid(cache::disk_tier(memory, dir, disk).await?),
             capacity: parts.admitted,
             summaries: parts.summaries,
+            upgrades: Mutex::new(HashMap::new()),
         })
     }
 
     /// This file's parsed footer, loading it through `reader` on a miss.
-    /// Concurrent misses on one key share the single fill.
+    /// Concurrent misses on one key share the single fill. A resident
+    /// footer missing a page index the reader's policy asks for gains it
+    /// in place, fetching only the index.
     pub(super) async fn metadata(
         &self,
         reader: &ObjectStoreReader,
@@ -684,34 +708,101 @@ impl AuxiliaryCache {
             store: reader.file.store.identity,
             path: reader.file.path.to_string(),
             file_size: reader.file.file_size,
-            page_index: reader.page_index.into(),
         };
+        let policy = reader.page_index;
 
-        if let Some(entry) = self.tier.get(&key).await {
+        let entry = if let Some(entry) = self.tier.get(&key).await {
             reader.file.metrics.metadata_hit();
-            return metadata_of(&entry.value);
-        }
-        reader.file.metrics.metadata_miss();
+            entry
+        } else {
+            reader.file.metrics.metadata_miss();
 
-        let mut loader = reader.clone();
-        let file_size = reader.file.file_size;
-        let page_index = reader.page_index;
-        let fill = move || async move {
-            ParquetMetaDataReader::new()
-                .with_page_index_policy(page_index)
-                .with_prefetch_hint(prefetch)
-                .load_and_finish(&mut loader, file_size)
+            let mut loader = reader.clone();
+            let file_size = reader.file.file_size;
+            let fill = move || async move {
+                ParquetMetaDataReader::new()
+                    .with_page_index_policy(policy)
+                    .with_prefetch_hint(prefetch)
+                    .load_and_finish(&mut loader, file_size)
+                    .await
+                    .map(|metadata| {
+                        Weighed::from(AuxiliaryValue::Metadata {
+                            metadata: Arc::new(metadata),
+                            page_index: policy != PageIndexPolicy::Skip,
+                        })
+                    })
+            };
+
+            self.tier
+                .get_or_fetch(&key, fill)
                 .await
-                .map(|metadata| Weighed::from(AuxiliaryValue::Metadata(Arc::new(metadata))))
+                .map_err(|error| ParquetError::General(error.to_string()))?
         };
 
-        let entry = self
-            .tier
-            .get_or_fetch(&key, fill)
-            .await
-            .map_err(|error| ParquetError::General(error.to_string()))?;
+        let (metadata, page_index) = metadata_of(&entry.value)?;
+        if page_index || policy == PageIndexPolicy::Skip {
+            return Ok(metadata);
+        }
 
-        metadata_of(&entry.value)
+        self.upgrade_page_index(key, metadata, reader, policy).await
+    }
+
+    /// Adds the page index to a resident footer, sharing one fetch among
+    /// concurrent readers of the same file. Every awaiter admits the
+    /// result, so a cancelled leader leaves nothing stuck.
+    async fn upgrade_page_index(
+        &self,
+        key: AuxiliaryKey,
+        metadata: Arc<ParquetMetaData>,
+        reader: &ObjectStoreReader,
+        policy: PageIndexPolicy,
+    ) -> ParquetResult<Arc<ParquetMetaData>> {
+        let upgrade = {
+            let mut upgrades = self.upgrades.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(upgrade) = upgrades.get(&key) {
+                upgrade.clone()
+            } else {
+                let mut loader = reader.clone();
+                let upgrade = async move {
+                    let mut loading = ParquetMetaDataReader::new_with_metadata((*metadata).clone())
+                        .with_page_index_policy(policy);
+                    loading
+                        .load_page_index(&mut loader)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    loading
+                        .finish()
+                        .map(Arc::new)
+                        .map_err(|error| error.to_string())
+                }
+                .boxed()
+                .shared();
+                upgrades.insert(key.clone(), upgrade.clone());
+                upgrade
+            }
+        };
+
+        let outcome = upgrade.clone().await;
+
+        let mut upgrades = self.upgrades.lock().unwrap_or_else(PoisonError::into_inner);
+        if upgrades
+            .get(&key)
+            .is_some_and(|in_flight| in_flight.ptr_eq(&upgrade))
+        {
+            upgrades.remove(&key);
+        }
+        drop(upgrades);
+
+        let metadata = outcome.map_err(ParquetError::General)?;
+        self.tier.insert(
+            key,
+            Weighed::from(AuxiliaryValue::Metadata {
+                metadata: Arc::clone(&metadata),
+                page_index: true,
+            }),
+        );
+
+        Ok(metadata)
     }
 
     pub(super) async fn summary(
@@ -805,7 +896,7 @@ impl AuxiliaryCache {
         }
     }
 
-    #[cfg(test)]
+    /// Admits a summary the caller derived without a read.
     pub(super) fn insert_summary(
         &self,
         store: &DataStore,
@@ -987,15 +1078,18 @@ impl AuxiliaryCache {
 fn summary_of(value: &AuxiliaryValue) -> Option<Arc<PositionedRowSet>> {
     match value {
         AuxiliaryValue::Summary(positioned) => Some(Arc::clone(positioned)),
-        AuxiliaryValue::Metadata(_)
+        AuxiliaryValue::Metadata { .. }
         | AuxiliaryValue::Block(_)
         | AuxiliaryValue::DeletePositions(_) => None,
     }
 }
 
-fn metadata_of(value: &AuxiliaryValue) -> ParquetResult<Arc<ParquetMetaData>> {
+fn metadata_of(value: &AuxiliaryValue) -> ParquetResult<(Arc<ParquetMetaData>, bool)> {
     match value {
-        AuxiliaryValue::Metadata(metadata) => Ok(Arc::clone(metadata)),
+        AuxiliaryValue::Metadata {
+            metadata,
+            page_index,
+        } => Ok((Arc::clone(metadata), *page_index)),
         AuxiliaryValue::Summary(_)
         | AuxiliaryValue::Block(_)
         | AuxiliaryValue::DeletePositions(_) => Err(ParquetError::General(
