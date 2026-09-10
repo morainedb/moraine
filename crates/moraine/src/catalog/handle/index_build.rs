@@ -986,7 +986,8 @@ async fn plan_file(
         file.file_size_bytes,
         file.footer_size,
     )
-    .with_metrics(Arc::clone(&metrics));
+    .with_metrics(Arc::clone(&metrics))
+    .single_touch();
 
     let columns = snapshot.file_read_columns_at(handle, table, file);
     let inline_dead =

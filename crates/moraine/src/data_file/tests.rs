@@ -349,6 +349,37 @@ async fn recorded_footer_and_metadata_cache_remove_metadata_round_trips() {
     );
 }
 
+/// A single-touch read fetches its column ranges but leaves them out of the
+/// cache: repeating it fetches the columns again, while its footer stays
+/// resident.
+#[tokio::test]
+async fn a_single_touch_read_fetches_its_ranges_again() {
+    let store = Arc::new(CountingStore::new());
+    let data = DataStore::new(store.clone());
+    let path = Path::from("single-touch-wide.parquet");
+    let (object_len, footer_size) =
+        write_wide_fixture_with_footer(store.as_ref(), &path, 20_000).await;
+    let file =
+        || ParquetFile::new(data.clone(), path.clone(), object_len, footer_size).single_touch();
+
+    let first = scoped_read_recorded_entries(file(), &[0], ScopedRows::All, RowIdSource::Ordinal)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 20_000);
+    let first_requests = store.fetch_requests();
+    assert_eq!(first_requests, 2, "footer and the projected column");
+
+    let second = scoped_read_recorded_entries(file(), &[0], ScopedRows::All, RowIdSource::Ordinal)
+        .await
+        .unwrap();
+    assert_eq!(second, first);
+    assert_eq!(
+        store.fetch_requests() - first_requests,
+        1,
+        "the footer is resident; the column is fetched again"
+    );
+}
+
 /// A whole-file read and a selective read of one file share one parsed
 /// footer: the selective shape hits it and adds only the page index.
 #[tokio::test]

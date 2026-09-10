@@ -1217,9 +1217,17 @@ range is remembered as a summary once its footer has proved that, so a repeat
 location of it needs neither. Its allowance is one sixteenth of
 `CACHE_MEMORY`'s metadata share, capped at 8 MiB, with the remainder of that
 share continuing to hold SlateDB metadata — one Moraine memory budget, not a
-third invisible one. Projected data-column ranges are never retained. This
-cache exists because DuckDB's metadata cache cannot be reached from the direct
-Rust reader, not as a second copy of metadata DuckDB served to it.
+third invisible one. Projected data-column ranges are retained under the same
+allowance, keyed by the exact range a read asked for and admitted at low
+priority so they leave before any footer or summary. A read declared
+**single-touch** — an index build or a backfill, which touches each column
+chunk once — fetches its ranges without admitting them: a build otherwise
+writes roughly every byte it streams into the disk tier and churns the
+footers and summaries sharing the allowance out of it. Commit-time upkeep is
+not single-touch, because repeated deletes against one file re-read its
+chunks. The footer and the summary are cached whatever the read declares.
+This cache exists because DuckDB's metadata cache cannot be reached from the
+direct Rust reader, not as a second copy of metadata DuckDB served to it.
 
 **Data-block caching rides on the Parquet reader's prefetch, taken only
 for files that are not on local disk** — without it the reader issues a

@@ -177,6 +177,7 @@ pub(crate) struct ParquetFile {
     footer_size: u64,
     metrics: Arc<ScopedReadMetrics>,
     columns: Option<Arc<Vec<ReadColumn>>>,
+    single_touch: bool,
 }
 
 impl ParquetFile {
@@ -189,7 +190,15 @@ impl ParquetFile {
             footer_size,
             metrics: Arc::new(ScopedReadMetrics::default()),
             columns: None,
+            single_touch: false,
         }
+    }
+
+    /// Marks this file's data ranges as read once: they are fetched but not
+    /// retained, while its footer stays cached as for any other read.
+    pub(crate) fn single_touch(mut self) -> Self {
+        self.single_touch = true;
+        self
     }
 
     /// Resolves logical column positions against this file's physical schema.

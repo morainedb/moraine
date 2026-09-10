@@ -1003,11 +1003,12 @@ impl AuxiliaryCache {
         }
     }
 
-    /// Memoizes `bytes` as the file's content over `range`, unless they
-    /// fall short of filling it: a read that stopped early would otherwise
-    /// be served to every later reader of that range.
+    /// Memoizes `bytes` as the file's content over `range`, unless the read
+    /// is single-touch or they fall short of filling it: a read that
+    /// stopped early would otherwise be served to every later reader of
+    /// that range.
     fn admit_range(&self, file: &ParquetFile, range: &std::ops::Range<u64>, bytes: &Bytes) {
-        if usize_as_u64(bytes.len()) != range.end.saturating_sub(range.start) {
+        if file.single_touch || usize_as_u64(bytes.len()) != range.end.saturating_sub(range.start) {
             return;
         }
 

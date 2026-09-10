@@ -63,7 +63,8 @@ async fn collect_immediate_backfill<'a>(
                         file.footer_size,
                     )
                     .with_columns(columns)
-                    .with_metrics(metrics),
+                    .with_metrics(metrics)
+                    .single_touch(),
                     positions,
                     data_file::ScopedRows::All,
                     data_file::RowIdSource::Resolve {
@@ -218,7 +219,8 @@ impl ReadOnlyCatalog {
     ) -> Result<Vec<FileIndexEntry>> {
         let entries = data_file::scoped_read_recorded_entries(
             data_file::ParquetFile::new(object_store, path.clone(), file_size, footer_size)
-                .with_metrics(self.data_read_metrics()),
+                .with_metrics(self.data_read_metrics())
+                .single_touch(),
             indexed_positions,
             data_file::ScopedRows::All,
             data_file::RowIdSource::Ordinal,
