@@ -20,9 +20,10 @@ use crate::{
     catalog::{
         CatalogSnapshot, SnapshotId, Timestamp,
         projection::{
-            ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch, format_floor,
-            held_head_view, install_head_view, install_head_view_at, invalidate_head_view,
-            migration_clear_at, note_migration_clear, raise_format_floor,
+            ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch,
+            fold_replayed_writes, format_floor, held_head_view, install_head_view,
+            install_head_view_at, invalidate_head_view, migration_clear_at, note_migration_clear,
+            raise_format_floor, view_head,
         },
     },
     error::{Error, Result},
@@ -33,7 +34,7 @@ use crate::{
         key::{EntityKey, Key, SysKey},
         open::StoreBuilder,
         proto,
-        read::{self, EntityRecord},
+        read::{self, RecordSet},
         value,
     },
     transaction::{
@@ -568,13 +569,13 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
 /// records from the same consistent cut.
 pub(crate) async fn materialize_capturing(
     tx: ReadHandle<'_>,
-) -> Result<(CatalogSnapshot, Arc<Vec<EntityRecord>>)> {
+) -> Result<(CatalogSnapshot, Arc<RecordSet>)> {
     read::consistent(tx, || async move {
         let ((), head) = futures::try_join!(refuse_mid_migration(tx), read_head_value(tx))?;
         let (_, snapshot) = resolve_below(tx, None, head.snapshot_id).await?;
 
         let started = Instant::now();
-        let current = read::scan_current_entities(tx).await?;
+        let current = read::scan_current_records(tx).await?;
         let scanned = started.elapsed();
         info!(
             records = current.len(),
@@ -582,7 +583,12 @@ pub(crate) async fn materialize_capturing(
             "scanned `current`"
         );
 
-        let mut view = CatalogSnapshot::build(snapshot, &current, &[], None);
+        let mut view = CatalogSnapshot::build_from(
+            snapshot,
+            current.values().map(Arc::as_ref),
+            std::iter::empty(),
+            None,
+        );
         // A head view stands at the store state the head record names.
         view.batch_seq = head.batch_seq;
 
@@ -597,7 +603,7 @@ pub(crate) async fn materialize_capturing(
 pub(crate) async fn materialize_from(
     tx: ReadHandle<'_>,
     expected: &proto::HeadValue,
-    current: &[EntityRecord],
+    current: &RecordSet,
 ) -> Result<Option<CatalogSnapshot>> {
     read::consistent(tx, || async move {
         let ((), head) = futures::try_join!(refuse_mid_migration(tx), read_head_value(tx))?;
@@ -606,7 +612,12 @@ pub(crate) async fn materialize_from(
         }
         let (_, snapshot) = resolve_below(tx, None, head.snapshot_id).await?;
 
-        let mut view = CatalogSnapshot::build(snapshot, current, &[], None);
+        let mut view = CatalogSnapshot::build_from(
+            snapshot,
+            current.values().map(Arc::as_ref),
+            std::iter::empty(),
+            None,
+        );
         view.batch_seq = head.batch_seq;
 
         Ok(Some(view))
@@ -685,10 +696,21 @@ pub(crate) fn changelog_writes(snapshot_id: u64, writes: &[StagedWrite]) -> Vec<
 /// forward, a batch in the gap minted no snapshot, a snapshot record or
 /// changelog in the gap is missing, or the churn exceeds
 /// [`REFRESH_CHURN_SHARE`] of the live catalog.
+#[cfg(test)]
 pub(crate) async fn refresh(
     tx: ReadHandle<'_>,
     base: &CatalogSnapshot,
 ) -> Result<Option<CatalogSnapshot>> {
+    Ok(refresh_with_writes(tx, base).await?.map(|(view, _)| view))
+}
+
+/// As [`refresh`], also handing back the `current` writes it re-read
+/// across the gap, so the shared record set can fold forward with the
+/// view.
+pub(crate) async fn refresh_with_writes(
+    tx: ReadHandle<'_>,
+    base: &CatalogSnapshot,
+) -> Result<Option<(CatalogSnapshot, Vec<StagedWrite>)>> {
     read::consistent(tx, || async move {
         let head = read_head_value(tx).await?;
         let churn_limit = base.live_entity_count() / REFRESH_CHURN_SHARE;
@@ -704,7 +726,7 @@ async fn replay(
     base: &CatalogSnapshot,
     head: &proto::HeadValue,
     churn_limit: usize,
-) -> Result<Option<CatalogSnapshot>> {
+) -> Result<Option<(CatalogSnapshot, Vec<StagedWrite>)>> {
     let from = base.snapshot.snapshot_id;
     let Some(minted) = head.snapshot_id.checked_sub(from).filter(|gap| *gap > 0) else {
         return Ok(None);
@@ -757,7 +779,7 @@ async fn replay(
     view.snapshot = latest;
     view.batch_seq = head.batch_seq;
 
-    Ok(Some(view))
+    Ok(Some((view, writes)))
 }
 
 /// One staged write: `Some` puts, `None` deletes.
@@ -858,7 +880,17 @@ pub(crate) async fn head_view_for(
     }
 
     let view = match held_head_view(projections) {
-        Some(behind) => refresh(handle, &behind).await?,
+        Some(behind) => refresh_with_writes(handle, &behind)
+            .await?
+            .map(|(refreshed, writes)| {
+                fold_replayed_writes(
+                    projections,
+                    &view_head(&behind),
+                    view_head(&refreshed),
+                    &writes,
+                );
+                refreshed
+            }),
         None => None,
     };
     let view = match view {

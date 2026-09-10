@@ -1,7 +1,7 @@
 //! Typed reads over an open transaction: decode keys and values into the
 //! wire types. No interpretation — the domain layer owns meaning.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use prost::Message as _;
@@ -230,23 +230,27 @@ async fn scan_decode_split<T>(
     handle: ReadHandle<'_>,
     prefix: Vec<u8>,
     splits: &[Vec<u8>],
-    mut extract: impl FnMut(Key, Bytes) -> Result<T>,
+    mut extract: impl FnMut(Bytes, Key, Bytes) -> Result<T>,
 ) -> Result<Vec<T>> {
     handle
         .scan_prefix_split(&prefix, splits, ScanShape::Bulk)
         .await?
         .into_iter()
-        .map(|entry| extract(Key::decode(&entry.key)?, entry.value))
+        .map(|entry| {
+            let key = Key::decode(&entry.key)?;
+            extract(entry.key, key, entry.value)
+        })
         .collect()
 }
 
 /// As [`scan_decode`] over a whole subspace, splitting the data-scaled
-/// kinds (`kind_prefix` names each one's prefix).
+/// kinds (`kind_prefix` names each one's prefix). `extract` also receives
+/// the encoded key.
 async fn scan_decode_subspace<T>(
     handle: ReadHandle<'_>,
     subspace: Subspace,
     kind_prefix: fn(EntityKind) -> Vec<u8>,
-    extract: impl FnMut(Key, Bytes) -> Result<T>,
+    extract: impl FnMut(Bytes, Key, Bytes) -> Result<T>,
 ) -> Result<Vec<T>> {
     let splits = SPLIT_SCAN_KINDS.map(kind_prefix);
 
@@ -259,14 +263,14 @@ async fn scan_decode_kind<T>(
     handle: ReadHandle<'_>,
     kind: EntityKind,
     prefix: Vec<u8>,
-    extract: impl FnMut(Key, Bytes) -> Result<T>,
+    mut extract: impl FnMut(Key, Bytes) -> Result<T>,
 ) -> Result<Vec<T>> {
     if !SPLIT_SCAN_KINDS.contains(&kind) {
         return scan_decode(handle, prefix, ScanShape::Bulk, extract).await;
     }
     let splits = [prefix.clone()];
 
-    scan_decode_split(handle, prefix, &splits, extract).await
+    scan_decode_split(handle, prefix, &splits, |_, key, bytes| extract(key, bytes)).await
 }
 
 /// The layout-format stamp, if the store has been initialized.
@@ -432,44 +436,86 @@ pub(crate) async fn scan_schema_versions(handle: ReadHandle<'_>) -> Result<Vec<(
     .await
 }
 
+/// One half of the shared record set: a subspace's records keyed by their
+/// encoded store keys, so iteration follows scan order and a committed
+/// write folds in by key.
+pub(crate) type RecordSet = imbl::OrdMap<Bytes, Arc<EntityRecord>>;
+
+/// Decodes the record at a `current` key.
+pub(crate) fn decode_current_record(key: Key, bytes: &[u8]) -> Result<EntityRecord> {
+    match key {
+        Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
+        Key::Current(CurrentKey::GcFile { .. }) => {
+            Ok(EntityRecord::GcFile(value::decode_value(bytes)?))
+        }
+        other => Err(Error::Corruption(format!(
+            "non-current key in current scan: {other:?}"
+        ))),
+    }
+}
+
+/// Decodes the record at a `history` key. Unversioned kinds
+/// ([`EntityKey::is_versioned`]) are never mirrored to history; finding one
+/// there is store damage and is refused.
+pub(crate) fn decode_history_record(key: Key, bytes: &[u8]) -> Result<EntityRecord> {
+    match key {
+        Key::History(history) if !history.entity.is_versioned() => Err(Error::Corruption(format!(
+            "unversioned key in history scan: {:?}",
+            history.entity
+        ))),
+        Key::History(history) => decode_entity(history.entity, bytes),
+        other => Err(Error::Corruption(format!(
+            "non-history key in history scan: {other:?}"
+        ))),
+    }
+}
+
 /// Every live entity record.
 pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
     scan_decode_subspace(
         handle,
         Subspace::Current,
         current_entity_kind_prefix,
-        |key, bytes| match key {
-            Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, &bytes),
-            Key::Current(CurrentKey::GcFile { .. }) => {
-                Ok(EntityRecord::GcFile(value::decode_value(&bytes)?))
-            }
-            other => Err(Error::Corruption(format!(
-                "non-current key in current scan: {other:?}"
-            ))),
-        },
+        |_, key, bytes| decode_current_record(key, &bytes),
     )
     .await
 }
 
-/// Every ended entity-version record. Unversioned kinds
-/// ([`EntityKey::is_versioned`]) are never mirrored to history; finding one
-/// there is store damage and is refused.
+/// Every ended entity-version record.
 pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
     scan_decode_subspace(
         handle,
         Subspace::History,
         history_entity_kind_prefix,
-        |key, bytes| match key {
-            Key::History(history) if !history.entity.is_versioned() => Err(Error::Corruption(
-                format!("unversioned key in history scan: {:?}", history.entity),
-            )),
-            Key::History(history) => decode_entity(history.entity, &bytes),
-            other => Err(Error::Corruption(format!(
-                "non-history key in history scan: {other:?}"
-            ))),
-        },
+        |_, key, bytes| decode_history_record(key, &bytes),
     )
     .await
+}
+
+/// As [`scan_current_entities`], keyed for the shared record set.
+pub(crate) async fn scan_current_records(handle: ReadHandle<'_>) -> Result<RecordSet> {
+    let records = scan_decode_subspace(
+        handle,
+        Subspace::Current,
+        current_entity_kind_prefix,
+        |encoded, key, bytes| Ok((encoded, Arc::new(decode_current_record(key, &bytes)?))),
+    )
+    .await?;
+
+    Ok(records.into_iter().collect())
+}
+
+/// As [`scan_history_entities`], keyed for the shared record set.
+pub(crate) async fn scan_history_records(handle: ReadHandle<'_>) -> Result<RecordSet> {
+    let records = scan_decode_subspace(
+        handle,
+        Subspace::History,
+        history_entity_kind_prefix,
+        |encoded, key, bytes| Ok((encoded, Arc::new(decode_history_record(key, &bytes)?))),
+    )
+    .await?;
+
+    Ok(records.into_iter().collect())
 }
 
 /// Every current and ended record of one catalog kind. Unversioned kinds

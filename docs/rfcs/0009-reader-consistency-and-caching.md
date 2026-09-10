@@ -745,6 +745,18 @@ fold and the changelog replay advance view and record set together — one
 cache entry with two faces, installed and invalidated under the existing
 install-epoch rule.
 
+Each half is keyed by encoded store key, so it iterates in scan order and
+takes a write the way the store does: a put replaces the record at its key,
+a delete removes it. A committed batch folds its `current` writes into the
+`current` half and its `history` writes into the `history` half, then
+restamps both; a batch that touches neither restamps them untouched. A
+reader's changelog replay folds the `current` keys it re-read into the
+`current` half and drops the `history` half, which the changelog does not
+name. A value the binary cannot decode drops the half it was bound for,
+never the other. Before this rule the halves were dropped by any batch
+into their subspace, so a write-then-read workload rescanned the live
+catalog from the store on every commit.
+
 ### A reader that cannot match an ended version does not read them
 
 `history` grows with every ended version and is pruned only by snapshot

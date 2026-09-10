@@ -216,6 +216,16 @@ impl CatalogSnapshot {
         history: &[EntityRecord],
         at: Option<u64>,
     ) -> Self {
+        Self::build_from(snapshot, current, history, at)
+    }
+
+    /// As [`build`](Self::build), over any record iterators.
+    pub(crate) fn build_from<'a>(
+        snapshot: SnapshotValue,
+        current: impl IntoIterator<Item = &'a EntityRecord>,
+        history: impl IntoIterator<Item = &'a EntityRecord>,
+        at: Option<u64>,
+    ) -> Self {
         let mut view = Self {
             snapshot,
             ..Self::default()
@@ -225,7 +235,7 @@ impl CatalogSnapshot {
             None => end.is_none(),
             Some(s) => begin <= s && end.is_none_or(|e| e > s),
         };
-        for record in current.iter().chain(history) {
+        for record in current.into_iter().chain(history) {
             // Unversioned kinds (no lifecycle) are live at any time-travel
             // target: mappings are immutable, tag entries filter at read,
             // stats/options/gc rows are current-state bookkeeping.

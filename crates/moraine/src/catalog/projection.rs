@@ -9,12 +9,14 @@ use std::{
     sync::Arc,
 };
 
+use bytes::Bytes;
+
 use crate::{
     catalog::CatalogSnapshot,
     store::{
         key::{CurrentKey, EntityKey, Key, SysKey},
         proto::{HeadValue, SnapshotValue, TableColumnStatsValue, TableStatsValue},
-        read::EntityRecord,
+        read::{EntityRecord, RecordSet, decode_current_record, decode_history_record},
         value,
     },
     transaction::commit::StagedWrite,
@@ -52,9 +54,47 @@ pub(crate) fn materialize<K: Ord, V: Clone>(rows: &BTreeMap<K, V>) -> Vec<V> {
 
 /// Restamps a retained record half at the state the batch left behind.
 /// The rows are unchanged, so only the stamp they answer to moves.
-fn advance_half(half: &mut Option<(HeadValue, Arc<Vec<EntityRecord>>)>, new_head: HeadValue) {
-    if let Some((head, _)) = half {
-        *head = new_head;
+/// One half of the shared record set taken out of the cache for a fold:
+/// the stamp it stands at and its records.
+type RecordHalf = Option<(HeadValue, RecordSet)>;
+
+#[derive(Clone, Copy)]
+enum Half {
+    Current,
+    History,
+}
+
+/// Folds one write into `half`: a put replaces the record at its key, a
+/// delete removes it. A value this binary cannot decode drops the half.
+fn fold_record(
+    half: &mut RecordHalf,
+    encoded_key: &[u8],
+    bytes: Option<&[u8]>,
+    decode: impl FnOnce(&[u8]) -> crate::error::Result<EntityRecord>,
+) {
+    let Some((_, records)) = half else {
+        return;
+    };
+    match bytes {
+        None => {
+            records.remove(encoded_key);
+        }
+        Some(bytes) => match decode(bytes) {
+            Ok(record) => {
+                records.insert(Bytes::copy_from_slice(encoded_key), Arc::new(record));
+            }
+            Err(_) => *half = None,
+        },
+    }
+}
+
+/// Folds one `current` write into `half`, or ignores a key outside that
+/// subspace.
+fn fold_current_write(half: &mut RecordHalf, key: &Key, encoded_key: &[u8], bytes: Option<&[u8]>) {
+    if let Key::Current(_) = key {
+        fold_record(half, encoded_key, bytes, |bytes| {
+            decode_current_record(key.clone(), bytes)
+        });
     }
 }
 
@@ -340,7 +380,7 @@ pub(crate) fn invalidate_current_state(cache: &std::sync::RwLock<ProjectionCache
 pub(crate) fn shared_current_entities(
     cache: &std::sync::RwLock<ProjectionCache>,
     head: &HeadValue,
-) -> Option<Arc<Vec<EntityRecord>>> {
+) -> Option<Arc<RecordSet>> {
     cache
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -352,12 +392,26 @@ pub(crate) fn shared_current_entities(
 pub(crate) fn install_shared_current_entities(
     cache: &std::sync::RwLock<ProjectionCache>,
     head: HeadValue,
-    records: Arc<Vec<EntityRecord>>,
+    records: Arc<RecordSet>,
 ) {
     cache
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .install_current_entities(head, records);
+}
+
+/// Advances the shared `current` half from `base` to `head` with the
+/// `current` writes a changelog replay re-read across that gap.
+pub(crate) fn fold_replayed_writes(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    base: &HeadValue,
+    head: HeadValue,
+    writes: &[StagedWrite],
+) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .fold_current_across_gap(base, head, writes);
 }
 
 /// The projections DuckLake re-reads per transaction, maintained on a
@@ -367,11 +421,12 @@ pub(crate) struct ProjectionCache {
     table_stats: Maintained<u64, TableStatsValue>,
     table_column_stats: Maintained<(u64, u64), TableColumnStatsValue>,
     /// The `current` half of the shared decoded record set, stamped with
-    /// the head it was scanned at. Dropped by a batch that writes into
-    /// that subspace; otherwise restamped, since its rows still stand.
-    current_entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
-    /// The `history` half of the shared record set, stamped the same way.
-    history_entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
+    /// the head it stands at. A committed batch folds its `current` writes
+    /// in and restamps it; a value that cannot be folded drops it.
+    current_entities: Option<(HeadValue, Arc<RecordSet>)>,
+    /// The `history` half of the shared record set, folded the same way
+    /// from the batch's `history` writes.
+    history_entities: Option<(HeadValue, Arc<RecordSet>)>,
     /// The materialized head view, folded forward on every commit; a fold
     /// that cannot be applied faithfully clears it.
     head_view: Option<Arc<CatalogSnapshot>>,
@@ -416,9 +471,12 @@ impl ProjectionCache {
     /// shared record sets, the maintained projections, and the folded head
     /// view. Encoded lengths throughout, so it understates the decoded form.
     pub(crate) fn estimated_bytes(&self) -> u64 {
-        let records = |half: &Option<(HeadValue, Arc<Vec<EntityRecord>>)>| {
+        let records = |half: &Option<(HeadValue, Arc<RecordSet>)>| {
             half.as_ref().map_or(0, |(_, records)| {
-                records.iter().map(EntityRecord::estimated_bytes).sum()
+                records
+                    .values()
+                    .map(|record| record.estimated_bytes())
+                    .sum()
             })
         };
 
@@ -539,28 +597,17 @@ impl ProjectionCache {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    pub(crate) fn install_current_entities(
-        &mut self,
-        head: HeadValue,
-        records: Arc<Vec<EntityRecord>>,
-    ) {
+    pub(crate) fn install_current_entities(&mut self, head: HeadValue, records: Arc<RecordSet>) {
         self.current_entities = Some((head, records));
     }
 
-    pub(crate) fn install_history_entities(
-        &mut self,
-        head: HeadValue,
-        records: Arc<Vec<EntityRecord>>,
-    ) {
+    pub(crate) fn install_history_entities(&mut self, head: HeadValue, records: Arc<RecordSet>) {
         self.history_entities = Some((head, records));
     }
 
     /// Serves the `current` half of the shared record set if it stands at
     /// exactly `expected`, both halves of the stamp checked.
-    pub(crate) fn current_entities_at(
-        &self,
-        expected: &HeadValue,
-    ) -> Option<Arc<Vec<EntityRecord>>> {
+    pub(crate) fn current_entities_at(&self, expected: &HeadValue) -> Option<Arc<RecordSet>> {
         self.current_entities
             .as_ref()
             .and_then(|(head, records)| same_head(head, expected).then(|| Arc::clone(records)))
@@ -568,10 +615,7 @@ impl ProjectionCache {
 
     /// As [`current_entities_at`](Self::current_entities_at), for the
     /// `history` half.
-    pub(crate) fn history_entities_at(
-        &self,
-        expected: &HeadValue,
-    ) -> Option<Arc<Vec<EntityRecord>>> {
+    pub(crate) fn history_entities_at(&self, expected: &HeadValue) -> Option<Arc<RecordSet>> {
         self.history_entities
             .as_ref()
             .and_then(|(head, records)| same_head(head, expected).then(|| Arc::clone(records)))
@@ -624,65 +668,95 @@ impl ProjectionCache {
     }
 
     /// Folds one committed batch, stamping every installed projection with
-    /// the head record the batch itself wrote. An undecodable key, or a
-    /// batch with no head write matching `new_head`, clears everything.
+    /// the head record the batch itself wrote. Each record half takes the
+    /// batch's writes into its subspace key by key. An undecodable key, or
+    /// a batch with no head write matching `new_head`, clears everything.
     pub(crate) fn apply_batch(&mut self, writes: &[StagedWrite], new_head: u64) {
-        // A half the batch did not write is still exactly right at the new
-        // head, so it rides the stamp forward instead of being rescanned.
-        // Inline, index-entry, and deletion-schedule batches write neither.
-        let mut wrote_current = false;
-        let mut wrote_history = false;
         self.drop_what_lags_behind();
+        let mut current = self.take_half(Half::Current);
+        let mut history = self.take_half(Half::History);
         for (encoded_key, write) in writes {
             let bytes = write.as_deref();
-            let key = Key::decode(encoded_key);
+            let Ok(key) = Key::decode(encoded_key) else {
+                self.clear_folded();
+                return;
+            };
             match key {
-                Ok(Key::Current(_)) => wrote_current = true,
-                Ok(Key::History(_)) => wrote_history = true,
-                _ => {}
-            }
-            match key {
-                Ok(Key::Snapshot { snapshot_id }) => self.snapshots.fold(snapshot_id, bytes),
-                Ok(Key::Current(CurrentKey::Entity(EntityKey::TableStats { table_id }))) => {
+                Key::Snapshot { snapshot_id } => self.snapshots.fold(snapshot_id, bytes),
+                Key::Current(CurrentKey::Entity(EntityKey::TableStats { table_id })) => {
                     self.table_stats.fold(table_id, bytes);
                 }
-                Ok(Key::Current(CurrentKey::Entity(EntityKey::TableColumnStats {
+                Key::Current(CurrentKey::Entity(EntityKey::TableColumnStats {
                     table_id,
                     column_id,
-                }))) => self.table_column_stats.fold((table_id, column_id), bytes),
-                Ok(_) => {}
-                Err(_) => {
-                    self.current_entities = None;
-                    self.history_entities = None;
-                    self.snapshots.clear();
-                    self.table_stats.clear();
-                    self.table_column_stats.clear();
-                    return;
-                }
+                })) => self.table_column_stats.fold((table_id, column_id), bytes),
+                _ => {}
             }
-        }
-        if wrote_current {
-            self.current_entities = None;
-        }
-        if wrote_history {
-            self.history_entities = None;
+            match &key {
+                Key::Current(_) => fold_current_write(&mut current, &key, encoded_key, bytes),
+                Key::History(_) => fold_record(&mut history, encoded_key, bytes, |bytes| {
+                    decode_history_record(key.clone(), bytes)
+                }),
+                _ => {}
+            }
         }
         // Cleared rather than asserted: this runs under the projection write
         // lock inside a spawned commit, where a panic strands the joiner.
         let Some(stamp) = head_stamp(writes).filter(|stamp| stamp.snapshot_id == new_head) else {
-            self.current_entities = None;
-            self.history_entities = None;
-            self.snapshots.clear();
-            self.table_stats.clear();
-            self.table_column_stats.clear();
+            self.clear_folded();
             return;
         };
         self.snapshots.advance(stamp);
         self.table_stats.advance(stamp);
         self.table_column_stats.advance(stamp);
-        advance_half(&mut self.current_entities, stamp);
-        advance_half(&mut self.history_entities, stamp);
+        self.current_entities = current.map(|(_, records)| (stamp, Arc::new(records)));
+        self.history_entities = history.map(|(_, records)| (stamp, Arc::new(records)));
         self.folded_head = Some(stamp);
+    }
+
+    /// Advances the `current` half from `base` to `head` with the `current`
+    /// writes re-read across a replayed gap. The `history` half is dropped:
+    /// the changelog names no history key.
+    pub(crate) fn fold_current_across_gap(
+        &mut self,
+        base: &HeadValue,
+        head: HeadValue,
+        writes: &[StagedWrite],
+    ) {
+        self.history_entities = None;
+        let mut current = self.take_half(Half::Current);
+        if current
+            .as_ref()
+            .is_none_or(|(stamp, _)| !same_head(stamp, base))
+        {
+            return;
+        }
+        for (encoded_key, write) in writes {
+            match Key::decode(encoded_key) {
+                Ok(key) => fold_current_write(&mut current, &key, encoded_key, write.as_deref()),
+                Err(_) => return,
+            }
+        }
+        self.current_entities = current.map(|(_, records)| (head, Arc::new(records)));
+    }
+
+    /// Takes a record half out for folding; the map clone is constant-time.
+    fn take_half(&mut self, half: Half) -> RecordHalf {
+        let slot = match half {
+            Half::Current => &mut self.current_entities,
+            Half::History => &mut self.history_entities,
+        };
+        slot.take()
+            .map(|(head, records)| (head, RecordSet::clone(&records)))
+    }
+
+    /// Drops everything a batch folds forward.
+    fn clear_folded(&mut self) {
+        self.current_entities = None;
+        self.history_entities = None;
+        self.snapshots.clear();
+        self.table_stats.clear();
+        self.table_column_stats.clear();
     }
 
     /// Drops everything not standing at the state the last batch left, so
@@ -693,7 +767,7 @@ impl ProjectionCache {
         let Some(folded_head) = self.folded_head else {
             return;
         };
-        let lags = |half: &Option<(HeadValue, Arc<Vec<EntityRecord>>)>| {
+        let lags = |half: &Option<(HeadValue, Arc<RecordSet>)>| {
             half.as_ref()
                 .is_some_and(|(head, _)| !same_head(head, &folded_head))
         };
@@ -721,7 +795,7 @@ mod tests {
         ffi_support::{dump_snapshots, dump_table_column_stats, dump_table_stats},
         store::{
             key::{EntityKey, Key},
-            proto::{SnapshotValue, TableColumnStatsValue, TableStatsValue},
+            proto::{SchemaValue, SnapshotValue, TableColumnStatsValue, TableStatsValue},
             value::encode_value,
         },
     };
@@ -1057,6 +1131,36 @@ mod tests {
         )
     }
 
+    fn schema_value(schema_id: u64, end_snapshot: Option<u64>) -> SchemaValue {
+        SchemaValue {
+            schema_id,
+            schema_name: format!("schema-{schema_id}"),
+            begin_snapshot: 1,
+            end_snapshot,
+            ..SchemaValue::default()
+        }
+    }
+
+    /// A record half holding `records` under their keys.
+    fn half_of(records: Vec<(Key, EntityRecord)>) -> Arc<RecordSet> {
+        Arc::new(
+            records
+                .into_iter()
+                .map(|(key, record)| (Bytes::from(key.encode()), Arc::new(record)))
+                .collect(),
+        )
+    }
+
+    fn schema_ids(records: &RecordSet) -> Vec<u64> {
+        records
+            .values()
+            .filter_map(|record| match record.as_ref() {
+                EntityRecord::Schema(schema) => Some(schema.schema_id),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn installed_at_three() -> ProjectionCache {
         let mut cache = ProjectionCache::empty();
         cache.install_snapshots(stamp(3, 3), (0..=3).map(snapshot_value).collect());
@@ -1188,7 +1292,10 @@ mod tests {
         cache.install_snapshots(stamp(1, 1), vec![snapshot_value(0), snapshot_value(1)]);
         cache.install_current_entities(
             stamp(1, 1),
-            Arc::new(vec![EntityRecord::TableStats(stats_value(7, 10))]),
+            half_of(vec![(
+                Key::current(EntityKey::TableStats { table_id: 7 }),
+                EntityRecord::TableStats(stats_value(7, 10)),
+            )]),
         );
         cache.apply_batch(
             &[
@@ -1209,7 +1316,10 @@ mod tests {
         cache.install_snapshots(stamp(1, 1), vec![snapshot_value(0), snapshot_value(1)]);
         cache.install_current_entities(
             stamp(1, 1),
-            Arc::new(vec![EntityRecord::TableStats(stats_value(7, 10))]),
+            half_of(vec![(
+                Key::current(EntityKey::TableStats { table_id: 7 }),
+                EntityRecord::TableStats(stats_value(7, 10)),
+            )]),
         );
 
         // The next batch writes no entity key, so the half would ride
@@ -1231,10 +1341,15 @@ mod tests {
 
     /// A batch writing neither record subspace leaves both halves in
     /// place, restamped — an inline or index-entry commit costs the next
-    /// reader no rescan. A batch that does write one drops that one.
+    /// reader no rescan. A write one half cannot decode drops that half.
     #[test]
     fn untouched_record_halves_ride_the_stamp_forward() {
-        let half = || Arc::new(vec![EntityRecord::TableStats(stats_value(7, 10))]);
+        let half = || {
+            half_of(vec![(
+                Key::current(EntityKey::TableStats { table_id: 7 }),
+                EntityRecord::TableStats(stats_value(7, 10)),
+            )])
+        };
 
         let mut cache = installed_at_three();
         cache.install_current_entities(stamp(3, 3), half());
@@ -1263,7 +1378,8 @@ mod tests {
         assert!(cache.history_entities_at(&stamp(4, 4)).is_some());
         assert!(cache.current_entities_at(&stamp(3, 3)).is_none());
 
-        // A current write drops the current half and spares history.
+        // An undecodable current write drops the current half and spares
+        // history.
         cache.apply_batch(
             &[
                 (
@@ -1276,6 +1392,104 @@ mod tests {
         );
         assert!(cache.current_entities_at(&stamp(5, 5)).is_none());
         assert!(cache.history_entities_at(&stamp(5, 5)).is_some());
+    }
+
+    /// A batch's `current` writes fold into the current half key by key:
+    /// a put lands, a delete removes, and the rest stand.
+    #[test]
+    fn current_writes_fold_into_the_current_half() {
+        let mut cache = installed_at_three();
+        cache.install_current_entities(
+            stamp(3, 3),
+            half_of(vec![
+                (
+                    Key::current(EntityKey::Schema { schema_id: 1 }),
+                    EntityRecord::Schema(schema_value(1, None)),
+                ),
+                (
+                    Key::current(EntityKey::Schema { schema_id: 2 }),
+                    EntityRecord::Schema(schema_value(2, None)),
+                ),
+            ]),
+        );
+
+        cache.apply_batch(
+            &[
+                (
+                    Key::current(EntityKey::Schema { schema_id: 1 }).encode(),
+                    None,
+                ),
+                (
+                    Key::current(EntityKey::Schema { schema_id: 9 }).encode(),
+                    Some(encode_value(&schema_value(9, None))),
+                ),
+                head_write(4, 4),
+            ],
+            4,
+        );
+
+        let current = cache.current_entities_at(&stamp(4, 4)).unwrap();
+        assert_eq!(schema_ids(&current), vec![2, 9]);
+    }
+
+    /// A batch's `history` writes fold into the history half the same way,
+    /// so an ended version is served without a rescan.
+    #[test]
+    fn history_writes_fold_into_the_history_half() {
+        let mut cache = installed_at_three();
+        cache.install_history_entities(stamp(3, 3), Arc::default());
+
+        cache.apply_batch(
+            &[
+                (
+                    Key::current(EntityKey::Schema { schema_id: 1 }).encode(),
+                    None,
+                ),
+                (
+                    Key::history(EntityKey::Schema { schema_id: 1 }, 4).encode(),
+                    Some(encode_value(&schema_value(1, Some(4)))),
+                ),
+                head_write(4, 4),
+            ],
+            4,
+        );
+
+        let history = cache.history_entities_at(&stamp(4, 4)).unwrap();
+        assert_eq!(schema_ids(&history), vec![1]);
+        assert!(cache.current_entities_at(&stamp(4, 4)).is_none());
+    }
+
+    /// A replayed gap advances the current half with the writes re-read
+    /// across it and drops the history half, which the changelog cannot
+    /// carry.
+    #[test]
+    fn a_replayed_gap_folds_the_current_half_and_drops_history() {
+        let mut cache = ProjectionCache::empty();
+        cache.install_current_entities(
+            stamp(3, 3),
+            half_of(vec![(
+                Key::current(EntityKey::Schema { schema_id: 1 }),
+                EntityRecord::Schema(schema_value(1, None)),
+            )]),
+        );
+        cache.install_history_entities(stamp(3, 3), Arc::default());
+
+        cache.fold_current_across_gap(
+            &stamp(3, 3),
+            stamp(5, 5),
+            &[(
+                Key::current(EntityKey::Schema { schema_id: 2 }).encode(),
+                Some(encode_value(&schema_value(2, None))),
+            )],
+        );
+
+        let current = cache.current_entities_at(&stamp(5, 5)).unwrap();
+        assert_eq!(schema_ids(&current), vec![1, 2]);
+        assert!(cache.history_entities_at(&stamp(5, 5)).is_none());
+
+        // A half standing elsewhere than the gap's base is not advanced.
+        cache.fold_current_across_gap(&stamp(4, 4), stamp(6, 6), &[]);
+        assert!(cache.current_entities_at(&stamp(6, 6)).is_none());
     }
 
     #[test]
