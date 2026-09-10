@@ -13,9 +13,14 @@ projected entry batches at the smaller of `BuildStep.entries` and 8,192 rows.
 
 `BuildStep` bounds the commit buffer, not the entire heap. Derivation also holds
 one Arrow chunk/batch, a pending entry or batch, schema projection, source-local
-deletion state, and bounded store read-ahead. An individual chunk, Parquet page,
-or file's deletion set can exceed a step. Store caches, catalog metadata, WAL
-buffers, and the growing index also contribute to whole-operation memory.
+deletion state, and bounded store read-ahead: each inline source iterator
+(chunks, tombstones, file deletes) reads ahead 256 KiB with two fetches in
+flight, so an iterator holds at most about 512 KiB of undelivered blocks per
+SST it is positioned in — a few MiB across the sorted runs of one table's
+inline range, rather than the one 4 KiB block per round trip it fetched before.
+An individual chunk, Parquet page, or file's deletion set can exceed a step.
+Store caches, catalog metadata, WAL buffers, and the growing index also
+contribute to whole-operation memory.
 
 ## Checkpoints and compatibility
 

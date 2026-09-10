@@ -20,6 +20,14 @@ const SCAN_READ_AHEAD_BYTES: usize = 8 * 1024 * 1024;
 /// How many block fetches a scan may have in flight
 const SCAN_FETCH_TASKS: usize = 32;
 
+/// Read-ahead for a streaming scan, in bytes: one round trip's worth of
+/// blocks ahead of a sequential consumer, bounded so an SST's iterator
+/// holds at most a few hundred kibibytes in flight.
+const STREAM_READ_AHEAD_BYTES: usize = 256 * 1024;
+
+/// How many read-ahead fetches a streaming scan keeps in flight.
+const STREAM_FETCH_TASKS: usize = 2;
+
 /// Sub-ranges a split bulk scan keeps in flight; sized for a remote object
 /// store, where each iterator's seek is a round trip.
 pub(crate) const SCAN_SPLIT: usize = 8;
@@ -33,7 +41,8 @@ const SCAN_SPLIT_BYTES: usize = SCAN_READ_AHEAD_BYTES;
 pub(crate) enum ScanShape {
     /// A whole-subspace walk; its blocks are not admitted.
     Bulk,
-    /// One-block read-ahead without cache admission for sequential derivation.
+    /// A sequential walk with bounded read-ahead and no cache admission, for
+    /// a consumer that derives as it goes.
     Streaming,
     /// A targeted lookup; its blocks are admitted.
     Probe,
@@ -67,20 +76,16 @@ impl ScanOrder {
 }
 
 impl ScanShape {
-    /// Scan options for this shape: a bulk walk admits no blocks, a probe
-    /// admits its blocks.
+    /// Scan options for this shape: how far it reads ahead, how many
+    /// fetches it keeps in flight, and whether its blocks are admitted.
     fn options(self, order: ScanOrder) -> ScanOptions {
+        let (read_ahead_bytes, max_fetch_tasks) = match self {
+            Self::Bulk | Self::Probe => (SCAN_READ_AHEAD_BYTES, SCAN_FETCH_TASKS),
+            Self::Streaming => (STREAM_READ_AHEAD_BYTES, STREAM_FETCH_TASKS),
+        };
         ScanOptions {
-            read_ahead_bytes: if self == Self::Streaming {
-                1
-            } else {
-                SCAN_READ_AHEAD_BYTES
-            },
-            max_fetch_tasks: if self == Self::Streaming {
-                1
-            } else {
-                SCAN_FETCH_TASKS
-            },
+            read_ahead_bytes,
+            max_fetch_tasks,
             cache_blocks: matches!(self, Self::Probe),
             order: order.iteration_order(),
             ..ScanOptions::default()
@@ -434,6 +439,16 @@ mod tests {
         assert_eq!(options.read_ahead_bytes, SCAN_READ_AHEAD_BYTES);
         assert_eq!(options.max_fetch_tasks, SCAN_FETCH_TASKS);
         assert!(options.cache_blocks);
+    }
+
+    /// A streaming scan reads ahead a bounded window, two fetches at a time,
+    /// and admits nothing.
+    #[test]
+    fn streaming_scans_read_ahead_a_bounded_window_and_admit_nothing() {
+        let options = ScanShape::Streaming.options(ScanOrder::Ascending);
+        assert_eq!(options.read_ahead_bytes, 256 * 1024);
+        assert_eq!(options.max_fetch_tasks, 2);
+        assert!(!options.cache_blocks);
     }
 
     /// A descending probe asks SlateDB to iterate backwards.

@@ -1162,7 +1162,9 @@ so another builder or writer cannot move progress under a stale premise.
 `BuildStep` bounds one step's entry buffer, not all process memory. Derivation
 also retains the step being committed, the read-ahead window of units with
 their buffered encoded batches, one inline source chunk, schema projection,
-store iterator buffers, and per-file deletion state. An individual stored
+store iterator buffers (256 KiB of read-ahead with two fetches in flight per
+inline source iterator, per SST it is positioned in), and per-file deletion
+state. An individual stored
 Arrow chunk can be larger than a step; no path retains all inline chunks or
 all derived inline entries. Entry-buffer and inline body/decoded-array high-water telemetry are
 reported separately; array buffers can share body memory, so those byte counts

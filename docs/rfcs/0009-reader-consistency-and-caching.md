@@ -1017,7 +1017,13 @@ repeats the rule at the disk device, so scan and compaction churn cannot
 wear it or evict the probe set.
 
 Bulk and probe scans use fixed 8 MiB read-ahead with 32 fetches in flight,
-sized for a remote object store.
+sized for a remote object store. A third shape, streaming, serves a
+sequential consumer that derives as it goes — the staged index build's
+inline sources — and reads ahead 256 KiB with two fetches in flight: a
+round trip's worth of blocks ahead of the cursor, admitting nothing, and
+holding at most about half a mebibyte per SST the iterator is positioned in
+rather than the bulk shape's window. Its previous setting of one block was
+one object-store round trip per 4 KiB.
 These are implementation constants, not attach policy: they remove the
 measured sequential-round-trip failure, while no local/S3 ladder demonstrates
 that per-attach tuning improves a supported workload. A different value needs
