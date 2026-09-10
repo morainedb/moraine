@@ -42,6 +42,9 @@ pub(crate) struct EncodedIndexEntry {
     pub(crate) key: Bytes,
     /// Whether the key uses the unique physical shape.
     pub(crate) unique: bool,
+    /// The key is absent from committed state, so a unique put needs no
+    /// read before it.
+    pub(crate) known_absent: bool,
 }
 
 struct IndexShape {
@@ -841,6 +844,7 @@ impl Transaction {
             row_id,
             delete,
             building: shape.building,
+            known_absent: false,
         });
         Ok(())
     }
@@ -1144,6 +1148,7 @@ impl Transaction {
                 row_id: entry.row_id,
                 delete: false,
                 building,
+                known_absent: entry.known_absent,
             });
         }
 

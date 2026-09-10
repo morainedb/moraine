@@ -20,7 +20,7 @@ pub(super) async fn stream_inline_sources(
     source: backfill::BackfillSource<'_>,
     columns: &[ColumnId],
     legacy_cursor: Option<u64>,
-    buffer: &mut StepBuffer,
+    buffer: &mut StepBuffer<'_>,
 ) -> Result<()> {
     let backfill::BackfillSource {
         snapshot,

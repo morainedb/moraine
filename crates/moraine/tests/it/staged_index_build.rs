@@ -433,6 +433,26 @@ async fn staged_build_reports_explicit_progress() {
     assert_eq!(progress.last().unwrap()["progress_percent"], "100");
     assert_eq!(progress.last().unwrap()["is_final"], "true");
     assert!(progress.iter().all(|event| event.contains_key("commit_ms")));
+
+    let probed = events.named_for("staged index entries probed", INDEX_NAME);
+    assert_eq!(probed.len(), 4, "one probe report per step commit");
+    assert_eq!(
+        probed
+            .iter()
+            .map(|event| event["known_absent"].as_str())
+            .collect::<Vec<_>>(),
+        ["2", "2", "2", "1"],
+        "a build's fresh keys stage without a read"
+    );
+    assert!(
+        probed.iter().all(|event| event["unique_probes"] == "0"),
+        "nothing to probe while every key is new"
+    );
+    assert!(
+        probed
+            .iter()
+            .all(|event| event.contains_key("probe_service_ms"))
+    );
 }
 
 /// A build interrupted partway resumes from its persisted cursor: the

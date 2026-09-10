@@ -309,25 +309,35 @@ fits in memory at all. These properties govern the implementation:
 - **One probe per distinct key, not per entry.** Repeats within a batch
   collapse in memory; two entries claiming one value for different rows
   collide there, before any read.
-- **Bounded concurrency with opportunistic read batches.** Ready additions
-  form chunks of at most 128; a pending source flushes a partial chunk rather
-  than delaying it. At most 1,024 logical uniqueness probes are in flight.
-  Probe futures have concrete types, with no per-probe `BoxFuture`.
-  A chunk outside the span of earlier planned claims may share one SlateDB
-  transactional range iterator. Keys are sorted for reading and results are
-  returned to their original positions. The reader takes at most one extra
-  row before a gap switches the remaining keys to concurrent point reads.
-  Sparse keys therefore cause neither a sequential index sweep nor a chain
-  of remote seeks. Read-ahead stays at one block and fetched blocks are
-  admitted to cache.
-- **Local writes bound scan eligibility.** SlateDB materializes the local
-  writes covered by a scan when opening it. A batch whose span overlaps
-  earlier claims or completed unique deletions therefore uses concurrent
-  point reads. Prefetch while deletions are still pending also uses point
-  reads, as does a pass with pre-existing staged entries or a later member
-  of a grouped commit. This conservative
-  fallback prevents repeated scans from copying a growing local index batch;
-  ascending and descending append streams retain scan sharing.
+- **Bounded concurrency of point reads.** Ready additions form chunks of
+  at most 128; a pending source flushes a partial chunk rather than
+  delaying it. At most 1,024 logical uniqueness probes are in flight, each
+  a transactional point read. Probe futures have concrete types, with no
+  per-probe `BoxFuture`. A point read's cost is bounded by the sources the
+  key could be in: an absent key is answered by each SST's filter, and a
+  data block is fetched only on a hit. A shared range scan over a chunk's
+  key span was tried and withdrawn: it saves CPU on an in-memory store,
+  but it opens every overlapping L0 SST and sorted run per chunk with no
+  filter to rule any out, so its cost is set by the store's shape rather
+  than by the chunk, and on a remote store that turned a sorted build's
+  commits into minutes. A put's expected outcome is a miss under any
+  index — a hit is the same row again or a violation — so the scan
+  optimised the exception at the expense of the common case.
+- **Every commit staging index entries reports how its probes were
+  served** — count, hits, misses, known-absent puts, peak in flight, window
+  and service time — at `info` when an entry targets a building index and
+  at `debug` otherwise.
+- **A build probes only keys its filter has seen.** The driver keeps one
+  bloom filter over the physical keys it has staged (Staged builds), and
+  a unique entry whose key the filter has never seen is staged as
+  *known absent*: the planner records its claim, so two such claims of one
+  value in a commit still collide, and stages the put with no read. A
+  positive probes as before. The filter is sound because every key that
+  can be in the index is either one the build staged, or one a writer put
+  for a row inserted after the definition, and the build derives that row
+  too — its source is newer than the cursor — so the pair collides on the
+  probe when the build reaches it. A key the filter never saw therefore
+  belongs to no live row.
   Single-key batches remain point reads. Both modes use the original
   transaction, preserving its snapshot, local writes, tombstones, and merge
   semantics. Outcomes are applied as batches complete; the first surfaced
@@ -1072,6 +1082,16 @@ entry set. Delete files and inline deletes are applied as each source is
 read. Each step ends at whichever `BuildStep` bound it reaches first (Two
 bounds on a step) and always carries at least one entry.
 
+**The build filter.** Before its first pass, a build fills a bloom filter
+with every key the index already holds, by one ordered scan of the index's
+unique-key range, so a resumed build and a deferred repair know what
+earlier passes and writers committed. Each staged key is added as it is
+derived. The filter is sized from the table's row count at about a 0.1%
+false-positive rate, clamped to 64 MiB, and lives in memory for the
+duration of the call; a false positive costs one probe. Every full step's
+unique entries thus commit at the cost of non-unique ones, plus one probe
+per real duplicate, stale key, or false positive.
+
 **Derivation runs beside its commits.** A full step is handed to a
 committer that lands steps in order while derivation fills the next one,
 so a step's durable write overlaps the reads and decoding behind it. The
@@ -1667,6 +1687,15 @@ tests against real SlateDB on in-memory `object_store`:
   one build serialize on the definition key, and a stale retry cannot regress
   the source cursor. A build cancelled with its cursor inside a row group
   resumes from that position and covers each row once.
+- **Point reads only.** A unique probe is never a range scan; every
+  probe resolution is a transactional point read under the concurrency
+  window.
+- **Known-absent staging.** A unique entry marked known absent stages its
+  row id with no probe; two such claims of one value in a batch still
+  collide. A build over fresh keys reports zero probes per step. A build
+  resumed after a hand-committed step whose remaining rows duplicate a
+  committed value still fails as a duplicate, which pins the filter's
+  rebuild from the index before any probe is skipped.
 - **Ordered read-ahead.** Over several multi-row-group files, every row
   reaches the index exactly once and each committed step's source cursor is
   strictly greater than the last; reads of different files and row groups

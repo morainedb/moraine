@@ -4869,7 +4869,6 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
         catalog.projections(),
         &|tx: &mut Transaction| tx.create_index(table, &def, &entries).map(|_| ()),
         &base,
-        true,
     )
     .await
     .unwrap();

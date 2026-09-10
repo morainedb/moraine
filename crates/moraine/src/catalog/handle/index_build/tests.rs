@@ -368,3 +368,59 @@ async fn cancelled_inline_build_resumes_its_committed_checkpoint() {
     assert!(rows.into_iter().eq(0..128));
     catalog.close().await.unwrap();
 }
+
+/// A resumed build learns the keys its earlier steps committed before it
+/// skips any probe, so a later row duplicating a committed value is caught.
+#[tokio::test]
+async fn resumed_build_still_detects_a_duplicate_of_a_committed_row() {
+    let (catalog, table, def) = fixture(&[chunk(vec![10, 20, 10])]).await;
+    let begin = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .current_snapshot()
+        .id
+        .get();
+    let index = catalog
+        .begin_staged_index(table, &def, &[], IndexMaintenance::Synchronous, false)
+        .await
+        .unwrap();
+    let cursor = InlineBuildCursorValue {
+        begin_snapshot: begin,
+        next_position: 1,
+        ..Default::default()
+    };
+    catalog
+        .commit(|tx| {
+            tx.build_index_source_step(
+                index,
+                &[IndexEntry {
+                    row_id: 0,
+                    values: vec![Some(integer(10))],
+                }],
+                false,
+                None,
+                Some(&cursor),
+            )
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    let result = catalog
+        .create_index_staged(
+            table,
+            &def,
+            &[],
+            None,
+            "",
+            Some(BuildStep {
+                entries: 16,
+                bytes: 4096,
+            }),
+        )
+        .await;
+
+    assert!(matches!(result, Err(Error::Constraint(_))), "{result:?}");
+    catalog.close().await.unwrap();
+}

@@ -14,6 +14,7 @@ rust-version.workspace = true
 arrow = { workspace = true, features = ["ipc"] }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+fastbloom = { workspace = true }
 futures = { workspace = true }
 imbl = { workspace = true }
 object_store = { workspace = true }

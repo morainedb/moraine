@@ -359,6 +359,7 @@ fn staged_scoped_entry(
         row_id: entry.row_id,
         delete,
         building: index.state != crate::catalog::IndexState::Ready,
+        known_absent: false,
     })
 }
 
@@ -477,7 +478,7 @@ pub(super) async fn stage_index_maintenance(
         .buffer_unordered(FILE_READ_CONCURRENCY)
         .try_flatten_unordered(None);
 
-    let mut staged = stage_index_entry_stream(db_tx, deletions, additions, 0, true).await?;
+    let mut staged = stage_index_entry_stream(db_tx, deletions, additions, 0).await?;
     staged.metrics.scoped_read = metrics.tally();
     // Handed back unstaged: this phase may run beside the inline
     // translation, which reads the directory these would write.
