@@ -1135,6 +1135,29 @@ attach option. A future profile that puts material weight on block grain must
 change this binding choice and add the option and the scan/probe benchmark
 together.
 
+Two more writer settings leave SlateDB's defaults, for the same reason the
+block size is fixed: they are what the remote-store read profile needs, not
+per-attach policy.
+
+- **Every SST carries a bloom filter** (`min_filter_keys` is 0, not 1000).
+  SlateDB skips the filter on an SST under the threshold, and moraine's
+  SSTs are routinely that small — a commit's L0 flush, a merge of a
+  sparsely written subspace — so an absent-key probe, the read the filters
+  exist for, was reading such an SST's data blocks to learn "not here". The
+  in-process compactor writes with the writer's settings, so a merge keeps
+  the filters; a standalone compaction worker, which moraine does not run,
+  would have to be configured to match.
+- **A writer polls the manifest every 5 s** (not every 1 s). The poll is
+  one object-store GET per open writer, and it exists to notice fencing and
+  compacted state, neither of which a catalog writer needs within a second.
+  A reader's cadence is its own attach option and is unchanged.
+
+Not changed: the WAL-flush bound on a memtable's life
+(`max_wal_flushes_before_l0_flush`) stays at SlateDB's 4096, its floor —
+SlateDB refuses a lower value at open — and SST compression stays off, since
+turning it on is a format change with cross-version consequences that this
+profile does not weigh.
+
 Two losses, taken knowingly. Part-grain prefetch: replaced by the scan
 path's own read-ahead (the measured fix for the 277 s materialization in
 `BENCHMARK.md`), with admission per the shape rule. And a `CACHE_DIR`

@@ -36,6 +36,14 @@ const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// configured (SlateDB's own default).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How often a writer polls the manifest for fencing and compacted state;
+/// each poll is one object-store read.
+const WRITER_MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The key count from which an SST carries a bloom filter: every SST, so an
+/// absent-key probe clears a filter instead of reading data blocks.
+const MIN_FILTER_KEYS: u32 = 0;
+
 /// The stored block grain for every writer and reader.
 const SST_BLOCK_SIZE: SstBlockSize = SstBlockSize::Block4Kib;
 
@@ -268,10 +276,13 @@ impl<'a> StoreBuilder<'a> {
         Ok(checkpoints.into_iter().map(|c| c.id).collect())
     }
 
-    /// SlateDB settings for a writer.
+    /// SlateDB settings for a writer. The in-process compactor writes its
+    /// SSTs with these too, so the filter threshold holds across a merge.
     fn settings(&self) -> Settings {
         Settings {
             flush_interval: self.flush_interval,
+            manifest_poll_interval: WRITER_MANIFEST_POLL_INTERVAL,
+            min_filter_keys: MIN_FILTER_KEYS,
             ..Default::default()
         }
     }
@@ -420,6 +431,29 @@ mod tests {
     #[test]
     fn the_sst_block_size_is_fixed_at_four_kibibytes() {
         assert_eq!(SST_BLOCK_SIZE.as_bytes(), 4 * 1024);
+    }
+
+    /// Every SST a writer flushes or compacts carries a bloom filter, however
+    /// few keys it holds.
+    #[test]
+    fn every_sst_carries_a_bloom_filter() {
+        let settings = StoreBuilder::new("s", memory_store()).settings();
+        assert_eq!(settings.min_filter_keys, 0);
+    }
+
+    /// A writer polls the manifest every five seconds, not SlateDB's default
+    /// one.
+    #[test]
+    fn writers_poll_the_manifest_every_five_seconds() {
+        let settings = StoreBuilder::new("s", memory_store()).settings();
+        assert_eq!(settings.manifest_poll_interval, Duration::from_secs(5));
+    }
+
+    /// The writer settings are ones SlateDB accepts at open.
+    #[test]
+    fn writer_settings_pass_slatedb_validation() {
+        let settings = StoreBuilder::new("s", memory_store()).settings();
+        settings.validate().unwrap();
     }
 
     /// A commit-shaped transaction spanning several subspaces lands
