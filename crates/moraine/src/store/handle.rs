@@ -15,7 +15,7 @@ use slatedb::{
 use crate::store::key;
 
 /// Read-ahead for a scan, in bytes, rounded up to a block by SlateDB
-const SCAN_READ_AHEAD_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const SCAN_READ_AHEAD_BYTES: usize = 8 * 1024 * 1024;
 
 /// How many block fetches a scan may have in flight
 const SCAN_FETCH_TASKS: usize = 32;

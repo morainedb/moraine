@@ -22,8 +22,8 @@ use crate::{
     catalog::CachePreload,
     error::{Error, Result},
     store::{
-        cache,
-        handle::{ReadHandle, ScanShape},
+        cache, census,
+        handle::{ReadHandle, SCAN_READ_AHEAD_BYTES, ScanShape},
         key, retry,
         segment::TagSegmentExtractor,
     },
@@ -91,6 +91,9 @@ pub(crate) struct StoreBuilder<'a> {
     cache_preload: Option<CachePreload>,
     cache_puts: bool,
     checkpoint: Option<Uuid>,
+    /// The manifest's per-segment sizes, when the attach read them; they
+    /// decide how a preload reaches each subspace's first entry.
+    warm_segments: Vec<census::SegmentSize>,
 }
 
 impl<'a> StoreBuilder<'a> {
@@ -111,6 +114,7 @@ impl<'a> StoreBuilder<'a> {
             cache_preload: None,
             cache_puts: false,
             checkpoint: None,
+            warm_segments: Vec::new(),
         }
     }
 
@@ -180,6 +184,12 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
+    /// The manifest's per-segment sizes, for sizing the preload's reads.
+    pub(crate) fn warm_segments(mut self, segments: Vec<census::SegmentSize>) -> Self {
+        self.warm_segments = segments;
+        self
+    }
+
     /// Sets whether the SST index and filters this store flushes or
     /// compacts enter the cache as they are written (default: off). Data
     /// blocks are never admitted on the write path.
@@ -217,7 +227,7 @@ impl<'a> StoreBuilder<'a> {
                 .begin(slatedb::IsolationLevel::Snapshot)
                 .await
                 .map_err(Error::from)?;
-            warm(preload, ReadHandle::Tx(&tx), &counters).await;
+            warm(preload, ReadHandle::Tx(&tx), &counters, &self.warm_segments).await;
             tx.rollback();
         }
 
@@ -248,7 +258,13 @@ impl<'a> StoreBuilder<'a> {
 
         let reader = builder.build().await.map_err(Error::from)?;
         if let Some(preload) = self.cache_preload {
-            warm(preload, ReadHandle::Reader(&reader), &counters).await;
+            warm(
+                preload,
+                ReadHandle::Reader(&reader),
+                &counters,
+                &self.warm_segments,
+            )
+            .await;
         }
 
         Ok((reader, counters))
@@ -317,11 +333,28 @@ impl<'a> StoreBuilder<'a> {
     }
 }
 
+/// The shape that reaches one entry of a subspace whose segment holds
+/// `bytes`: probe when the whole segment fits one read-ahead, so the one
+/// request each SST costs anyway brings the segment in and admits it; seek
+/// otherwise, and when the size is unknown.
+pub(crate) fn warm_shape(bytes: Option<u64>) -> ScanShape {
+    let read_ahead = u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap_or(u64::MAX);
+    match bytes {
+        Some(bytes) if bytes <= read_ahead => ScanShape::Probe,
+        _ => ScanShape::Seek,
+    }
+}
+
 /// Warms the cache by reading, best-effort. `L0` reads one entry of every
 /// subspace so its SST metadata is resident; `All` additionally walks the
 /// scan-shaped subspaces whole. Neither reads the `index` subspace's data
 /// blocks.
-async fn warm(preload: CachePreload, handle: ReadHandle<'_>, counters: &cache::CacheCounters) {
+async fn warm(
+    preload: CachePreload,
+    handle: ReadHandle<'_>,
+    counters: &cache::CacheCounters,
+    segments: &[census::SegmentSize],
+) {
     let metadata_only = [
         key::Subspace::System,
         key::Subspace::Current,
@@ -342,7 +375,14 @@ async fn warm(preload: CachePreload, handle: ReadHandle<'_>, counters: &cache::C
     let before = counters.tally();
     let (warmed, failed) = stream::iter(metadata_only.into_iter().map(|subspace| {
         let deep = matches!(preload, CachePreload::All) && whole.contains(&subspace);
-        warm_subspace(handle, subspace, deep)
+        let prefix = key::subspace_prefix(subspace);
+        let shape = warm_shape(
+            segments
+                .iter()
+                .find(|segment| segment.prefix == prefix)
+                .map(|segment| segment.bytes),
+        );
+        warm_subspace(handle, subspace, deep, shape)
     }))
     .buffer_unordered(metadata_only.len())
     .fold((0_usize, 0_usize), |(warmed, failed), result| async move {
@@ -364,14 +404,19 @@ async fn warm(preload: CachePreload, handle: ReadHandle<'_>, counters: &cache::C
     );
 }
 
-/// Reads one entry of `subspace` in seek shape, or the whole range in probe
+/// Reads one entry of `subspace` in `shape`, or the whole range in probe
 /// shape when `deep`, so the touched blocks are admitted. A deep walk of
 /// `current` or `history` runs its data-scaled kinds as concurrent
 /// sub-ranges.
-async fn warm_subspace(handle: ReadHandle<'_>, subspace: key::Subspace, deep: bool) -> Result<()> {
+async fn warm_subspace(
+    handle: ReadHandle<'_>,
+    subspace: key::Subspace,
+    deep: bool,
+    shape: ScanShape,
+) -> Result<()> {
     let prefix = key::subspace_prefix(subspace);
     if !deep {
-        let mut iterator = handle.scan_prefix(&prefix, .., ScanShape::Seek).await?;
+        let mut iterator = handle.scan_prefix(&prefix, .., shape).await?;
         iterator.next().await?;
         return Ok(());
     }
@@ -402,6 +447,23 @@ mod tests {
 
     fn memory_store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
+    }
+
+    /// A subspace whose segment fits one read-ahead warms in probe shape,
+    /// which brings the segment in for one request; a larger or unknown
+    /// segment warms in seek shape.
+    #[test]
+    fn the_warm_shape_follows_the_segments_size() {
+        assert_eq!(warm_shape(Some(4 * 1024)), ScanShape::Probe);
+        assert_eq!(
+            warm_shape(Some(u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap())),
+            ScanShape::Probe
+        );
+        assert_eq!(
+            warm_shape(Some(u64::try_from(SCAN_READ_AHEAD_BYTES).unwrap() + 1)),
+            ScanShape::Seek
+        );
+        assert_eq!(warm_shape(None), ScanShape::Seek);
     }
 
     #[test]

@@ -1046,7 +1046,12 @@ highest key of a split kind (the adaptive split's one seek from the end),
 the first index id at or past a cursor (the dead-index sweep), and a
 chunk-directory walk that a known chunk width ends within a few entries of
 its last target. A directory walk with no width bound runs to the end of
-the directory and stays a probe.
+the directory and stays a probe. The preload's first-entry read of a
+subspace is the one seek site that consults the manifest: a segment whose
+recorded size fits one read-ahead warms in probe shape, since each SST
+costs one request either way and the probe's request brings the whole
+segment in and admits it, where a seek would fetch one block per subspace
+per SST and leave the rest cold; a larger or unrecorded segment seeks.
 
 Bulk and probe scans use fixed 8 MiB read-ahead with 32 fetches in flight,
 sized for a remote object store. A third shape, streaming, serves a

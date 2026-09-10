@@ -297,7 +297,7 @@ pub enum CachePreload {
 /// Warns when an `All` preload cannot hold the store it is about to load.
 /// Diagnostics only: a manifest that could not be read is left to the open
 /// itself to report.
-fn warn_if_preload_cannot_fit(options: &CatalogOptions, manifest: Option<census::ManifestBytes>) {
+fn warn_if_preload_cannot_fit(options: &CatalogOptions, manifest: Option<&census::ManifestBytes>) {
     if options.cache_preload != Some(CachePreload::All) || options.cache_dir.is_none() {
         return;
     }
@@ -994,7 +994,7 @@ impl Catalog {
         let manifest = census::manifest_bytes(&options.path, Arc::clone(&located))
             .await
             .ok();
-        warn_if_preload_cannot_fit(&options, manifest);
+        warn_if_preload_cannot_fit(&options, manifest.as_ref());
         // The writer paces its own flushes; the store's timer stays off so
         // the pacing is exact.
         let store = StoreBuilder::new(&options.path, object_store)
@@ -1004,6 +1004,12 @@ impl Catalog {
             .cache_size(options.cache_size)
             .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
+            .warm_segments(
+                manifest
+                    .as_ref()
+                    .map(|manifest| manifest.segments.clone())
+                    .unwrap_or_default(),
+            )
             .cache_puts(options.cache_puts);
         let flush_spacing = if options.flush_on_commit {
             Duration::ZERO
@@ -1019,7 +1025,7 @@ impl Catalog {
         .await?;
         warn_if_metadata_cache_cannot_hold(
             &options.path,
-            manifest.map(|manifest| manifest.metadata_bytes),
+            manifest.as_ref().map(|manifest| manifest.metadata_bytes),
         );
         info!(
             path = options.path,
@@ -1102,13 +1108,19 @@ impl Catalog {
         let manifest = census::manifest_bytes(&options.path, Arc::clone(&located))
             .await
             .ok();
-        warn_if_preload_cannot_fit(&options, manifest);
+        warn_if_preload_cannot_fit(&options, manifest.as_ref());
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())
             .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
             .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
+            .warm_segments(
+                manifest
+                    .as_ref()
+                    .map(|manifest| manifest.segments.clone())
+                    .unwrap_or_default(),
+            )
             .cache_puts(options.cache_puts)
             .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
@@ -1116,7 +1128,7 @@ impl Catalog {
         let (reader, cache, format) = commit::open_reader_initialized(store).await?;
         warn_if_metadata_cache_cannot_hold(
             &options.path,
-            manifest.map(|manifest| manifest.metadata_bytes),
+            manifest.as_ref().map(|manifest| manifest.metadata_bytes),
         );
         info!(
             path = options.path,
