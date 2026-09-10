@@ -135,6 +135,7 @@ where
         event.record(&mut fields);
         if fields.0.get("message").is_some_and(|message| {
             message == "scanned committed entities for staged transaction"
+                || message == "served committed entities from the head view"
                 || message == "scanned committed snapshots for staged transaction"
                 || message == "scanned committed schema versions for staged transaction"
                 || message == "staged commit landed"
@@ -164,6 +165,20 @@ impl CapturedCommitEvents {
             .collect::<Vec<_>>();
         assert_eq!(matching.len(), 1, "events for {message}: {matching:?}");
         matching.into_iter().next().unwrap()
+    }
+
+    fn count(&self, message: &str, transaction_id: &str) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|fields| {
+                fields.get("message").is_some_and(|value| value == message)
+                    && fields
+                        .get("transaction_id")
+                        .is_some_and(|value| value == transaction_id)
+            })
+            .count()
     }
 
     fn phase_milliseconds(&self, transaction_id: u64, phase: &str) -> u64 {
@@ -356,11 +371,16 @@ async fn a_data_file_bound_at_the_read_point_leaves_the_ended_half_unread() {
     let at_head = tx.diagnostic_id.to_string();
     let live = tx.visible_data_files_live_at(Some(2)).await.unwrap();
     assert!(live.is_empty(), "the only file ended at the read point");
-    let scan = events.one(
-        "scanned committed entities for staged transaction",
-        &at_head,
+    assert_eq!(
+        events.count(
+            "scanned committed entities for staged transaction",
+            &at_head
+        ),
+        0,
+        "a read bounded at the read point scanned the store"
     );
-    assert_eq!(scan.get("versions").map(String::as_str), Some("Live"));
+    let served = events.one("served committed entities from the head view", &at_head);
+    assert_eq!(served.get("kind").map(String::as_str), Some("File"));
     tx.rollback();
 
     // Bounded behind it — a time-travel read — keeps the full scan, and

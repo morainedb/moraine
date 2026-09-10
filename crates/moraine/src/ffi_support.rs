@@ -1450,6 +1450,50 @@ mod tests {
         );
     }
 
+    /// The live records a head view yields for a kind are the ones a live
+    /// scan of that kind returns, in the same order.
+    #[tokio::test]
+    async fn live_records_from_the_view_match_a_live_scan_for_every_kind() {
+        use crate::store::read::{EntityRecordKind, Versions, scan_entity_kind};
+
+        let catalog = seed().await;
+        let schema = catalog.snapshot().await.unwrap().schemas()[0].id;
+        catalog
+            .commit(|tx| {
+                tx.set_option(crate::catalog::OptionScope::Global, "answer", "42")?;
+                tx.set_tag(crate::catalog::TagTarget::Schema(schema), "owner", "sales")
+            })
+            .await
+            .unwrap();
+        let view = catalog.snapshot().await.unwrap();
+        let session = catalog.begin_read().await.unwrap();
+
+        for kind in [
+            EntityRecordKind::Schema,
+            EntityRecordKind::Table,
+            EntityRecordKind::View,
+            EntityRecordKind::Column,
+            EntityRecordKind::File,
+            EntityRecordKind::DeleteFile,
+            EntityRecordKind::Partition,
+            EntityRecordKind::Sort,
+            EntityRecordKind::Macro,
+            EntityRecordKind::Mapping,
+            EntityRecordKind::FileColumnStats,
+            EntityRecordKind::TableStats,
+            EntityRecordKind::TableColumnStats,
+            EntityRecordKind::Option,
+            EntityRecordKind::Tag,
+            EntityRecordKind::GcFile,
+        ] {
+            let scanned = scan_entity_kind(session.handle(), kind, Versions::Live)
+                .await
+                .unwrap();
+            assert_eq!(view.live_records(kind), scanned, "{kind:?}");
+        }
+        session.finish();
+    }
+
     /// A head-view materialization alone never scans `history` — the view
     /// needs `current` only, and sharing must not grow it a scan.
     #[tokio::test]

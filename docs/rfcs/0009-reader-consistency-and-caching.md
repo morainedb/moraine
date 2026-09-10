@@ -801,6 +801,12 @@ an unnarrowed read of one table could stand at two heads — the tear
 transaction the read point is pinned for the transaction's life, so no such
 tear exists, and that is where the flush path lives.
 
+A live-only read inside a staged transaction — one bounded at the read
+point, or of an unversioned kind — is served from the head view the
+transaction resolved at that read point, which holds every live record in
+store key order, and scans nothing. Only a read that needs ended versions
+scans, and it scans both subspaces through the transaction as one cut.
+
 The narrowed materialization is cached beside the full one, never in place
 of it, and staging into the table drops both.
 
