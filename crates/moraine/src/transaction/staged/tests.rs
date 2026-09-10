@@ -2242,8 +2242,8 @@ async fn registering_many_data_files_reads_them_concurrently() {
 /// collecting the positions they kill is one independent fetch apiece.
 ///
 /// Every delete file targets the same data file, so resolving the killed
-/// positions to their values costs a single scoped read — leaving the
-/// delete files' own reads as the only ones that can overlap.
+/// positions to their values costs a single scoped read, whose object is
+/// fetched beside the delete files rather than after them.
 #[tokio::test]
 async fn registering_many_delete_files_reads_them_concurrently() {
     const DELETES: usize = 8;
@@ -2284,8 +2284,8 @@ async fn registering_many_delete_files_reads_them_concurrently() {
     );
     assert_eq!(
         store.peak_in_flight(),
-        DELETES,
-        "every delete file's read is in flight at once"
+        DELETES + 1,
+        "every delete file's read and the target's own are in flight at once"
     );
 }
 
@@ -2387,10 +2387,10 @@ async fn target_removal_does_not_wait_for_unrelated_delete_discovery() {
     assert_eq!(index_entry_count(&catalog, true, index_id).await, 0);
 }
 
-/// An append reads the registered file's footer and projected columns. The
-/// fixed-latency store makes those two serial range-read waves visible.
+/// An append of a small file fetches it whole: its footer and projected
+/// columns come out of one read.
 #[tokio::test]
-async fn append_only_index_maintenance_is_two_range_read_waves() {
+async fn append_only_index_maintenance_is_one_whole_object_read() {
     let events = captured_commit_events();
     let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
     let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
@@ -2398,17 +2398,17 @@ async fn append_only_index_maintenance_is_two_range_read_waves() {
     let transaction_id = register_indexed_data_files(&catalog, &store, 1, 3).await;
     let milliseconds = events.phase_milliseconds(transaction_id, "index_maintenance_ms");
 
-    assert_eq!(store.reads(), 2, "footer and projected columns are read");
-    assert_index_phase_covers_read_waves(milliseconds, 2);
+    assert_eq!(store.reads(), 1, "the small file is fetched whole");
+    assert_index_phase_covers_read_waves(milliseconds, 1);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
-    eprintln!("append-only: reads=2 index_maintenance_ms={milliseconds}");
+    eprintln!("append-only: reads=1 index_maintenance_ms={milliseconds}");
     catalog.close().await.unwrap();
 }
 
-/// A delete file costs two metadata/column reads for its positions, followed
-/// by metadata, page-index, and projected-column reads from its target.
+/// A delete file and its small target are each fetched whole, and the
+/// target's read does not wait for the delete file's positions.
 #[tokio::test]
-async fn delete_only_index_maintenance_is_five_range_read_waves() {
+async fn delete_only_index_maintenance_reads_both_small_objects_at_once() {
     let events = captured_commit_events();
     let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
     let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
@@ -2440,12 +2440,61 @@ async fn delete_only_index_maintenance_is_five_range_read_waves() {
 
     assert_eq!(
         store.reads(),
-        5,
-        "the delete file uses two ranges and its selected target uses three"
+        2,
+        "the delete file and its target are each fetched whole"
     );
-    assert_index_phase_covers_read_waves(milliseconds, 5);
+    assert!(
+        store.paths_overlapped("main/t/f0.parquet", "main/t/delete.parquet"),
+        "the target's read starts before its delete file's positions resolve"
+    );
+    assert_index_phase_covers_read_waves(milliseconds, 1);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 2);
-    eprintln!("delete-only: reads=5 index_maintenance_ms={milliseconds}");
+    eprintln!("delete-only: reads=2 index_maintenance_ms={milliseconds}");
+    catalog.close().await.unwrap();
+}
+
+/// A delete against a target too large to fetch whole reads the target's
+/// footer and page index beside its delete file, then the selected pages.
+#[tokio::test]
+async fn a_delete_reads_a_large_targets_footer_beside_its_delete_file() {
+    const ROWS: usize = 160_000;
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+    let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
+    register_indexed_data_files(&catalog, &store, 1, ROWS).await;
+    store.reset();
+
+    let size = write_delete_file(&store.inner, "delete.parquet", "f0.parquet", &[0]).await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(
+        &catalog,
+        db_tx,
+        DataStore::new(store.clone()),
+    );
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: delete_file_row_at(2, "delete.parquet", 1, 1, size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        store.reads(),
+        4,
+        "the delete file whole; the target's footer, page index, and selected pages"
+    );
+    assert!(
+        store.paths_overlapped("main/t/f0.parquet", "main/t/delete.parquet"),
+        "the target's footer read starts before its delete file's positions resolve"
+    );
+    assert_eq!(index_entry_count(&catalog, false, index_id).await, ROWS - 1);
     catalog.close().await.unwrap();
 }
 
@@ -2647,9 +2696,9 @@ async fn a_cumulative_delete_file_derives_only_the_positions_it_newly_kills() {
     catalog.close().await.unwrap();
 }
 
-/// A file-backed replacement starts its independent new-file read beside
-/// delete discovery. The old target still waits for the positions, leaving
-/// two dependent waves without putting the addition behind both of them.
+/// A file-backed replacement reads the new file, the delete file, and the
+/// old target's object together: only the target's row selection waits
+/// for the positions, and its bytes are resident by then.
 #[tokio::test]
 async fn replace_index_maintenance_overlaps_adds_and_removals() {
     let events = captured_commit_events();
@@ -2694,21 +2743,21 @@ async fn replace_index_maintenance_overlaps_adds_and_removals() {
 
     assert_eq!(
         store.reads(),
-        7,
-        "the two full reads use two ranges each and the selected target uses three"
+        3,
+        "the replacement, the delete file, and the target are each fetched whole"
     );
     assert_eq!(
         store.peak_in_flight(),
-        2,
-        "two independent paths are read together"
+        3,
+        "three independent paths are read together"
     );
     assert!(
         store.paths_overlapped("main/t/delete.parquet", "main/t/replacement.parquet"),
         "the replacement read starts without waiting for delete discovery"
     );
-    assert_index_phase_covers_read_waves(milliseconds, 5);
+    assert_index_phase_covers_read_waves(milliseconds, 1);
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 3);
-    eprintln!("replace: reads=7 index_maintenance_ms={milliseconds}");
+    eprintln!("replace: reads=3 index_maintenance_ms={milliseconds}");
     catalog.close().await.unwrap();
 }
 

@@ -552,11 +552,65 @@ mod blocks {
         );
     }
 
+    /// A small file is fetched whole on its first touch, and every later
+    /// range of it, single or batched, is cut from that one block.
+    #[tokio::test]
+    async fn a_small_files_ranges_are_cut_from_one_whole_object_fetch() {
+        let (store, path, bytes) = seeded(300_000).await;
+        let cache = AuxiliaryCache::new(4 << 20);
+        let file = file(&store, &path, bytes.len());
+
+        let first = cache.range(&file, 1_000..5_000).await.unwrap();
+        assert_eq!(first.as_ref(), &bytes[1_000..5_000]);
+        let tally = file.metrics().tally();
+        assert_eq!(tally.range_fetches, 1);
+        assert_eq!(tally.range_bytes, 300_000, "the whole object was fetched");
+
+        let served = cache
+            .ranges(&file, vec![10..20, 299_000..300_000])
+            .await
+            .unwrap();
+        assert_eq!(served[0].as_ref(), &bytes[10..20]);
+        assert_eq!(served[1].as_ref(), &bytes[299_000..300_000]);
+        assert_eq!(
+            file.metrics().tally().range_fetches,
+            1,
+            "later ranges are served from the resident object"
+        );
+    }
+
+    /// A single-touch read of a small file takes only the ranges it asks
+    /// for: fetching the object whole buys it nothing it would keep.
+    #[tokio::test]
+    async fn a_single_touch_read_of_a_small_file_fetches_only_its_ranges() {
+        let (store, path, bytes) = seeded(300_000).await;
+        let cache = AuxiliaryCache::new(4 << 20);
+        let file = file(&store, &path, bytes.len()).single_touch();
+
+        let first = cache.range(&file, 1_000..5_000).await.unwrap();
+        assert_eq!(first.as_ref(), &bytes[1_000..5_000]);
+        assert_eq!(file.metrics().tally().range_bytes, 4_000);
+
+        cache.range(&file, 1_000..5_000).await.unwrap();
+        assert_eq!(file.metrics().tally().range_fetches, 2);
+    }
+
+    /// A range reaching past a small file's recorded size is refused rather
+    /// than answered short.
+    #[tokio::test]
+    async fn a_range_past_a_small_files_recorded_size_is_refused() {
+        let (store, path, bytes) = seeded(300_000).await;
+        let cache = AuxiliaryCache::new(4 << 20);
+        let file = file(&store, &path, bytes.len());
+
+        assert!(cache.range(&file, 299_000..300_100).await.is_err());
+    }
+
     /// A multi-range read fetches only the ranges that missed, and serves
     /// the rest from the cache.
     #[tokio::test]
     async fn a_multi_range_read_fetches_only_what_missed() {
-        let (store, path, bytes) = seeded(300_000).await;
+        let (store, path, bytes) = seeded(2 << 20).await;
         let cache = AuxiliaryCache::new(4 << 20);
         let file = file(&store, &path, bytes.len());
 

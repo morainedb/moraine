@@ -1783,6 +1783,40 @@ async fn a_delete_files_positions_are_decoded_once() {
     assert_eq!(store.fetch_requests(), 2, "footer and the position column");
 }
 
+/// A small delete file costs one fetch for its footer and positions
+/// together, and a later read of the same object fetches nothing.
+#[tokio::test]
+async fn a_small_delete_file_is_one_fetch_and_a_second_read_none() {
+    let store = Arc::new(CountingStore::new());
+    let data = DataStore::new(store.clone());
+    let path = Path::from("small-delete.parquet");
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["target.parquet"; 3])),
+            Arc::new(Int64Array::from(vec![4, 1, 7])),
+        ],
+    )
+    .unwrap();
+    let object_len = write_fixture(&store.inner, &path, &batch).await;
+    let file = || ParquetFile::new(data.clone(), path.clone(), object_len, 0);
+
+    let positions = delete_file_positions(file()).await.unwrap();
+    assert_eq!(positions, vec![1, 4, 7]);
+    assert_eq!(store.fetch_requests(), 1, "the object is fetched whole");
+
+    let again = delete_file_positions_at(file(), u64::MAX).await.unwrap();
+    assert_eq!(again, positions);
+    assert_eq!(
+        store.fetch_requests(),
+        1,
+        "the resident object serves the read"
+    );
+}
+
 /// A memoized position set is keyed by the object, so a delete file at
 /// another path decodes on its own.
 #[tokio::test]

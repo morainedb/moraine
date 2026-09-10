@@ -43,7 +43,10 @@ use futures::{
 };
 use object_store::path::Path;
 use parquet::{
-    arrow::{arrow_reader::ArrowReaderOptions, async_reader::ParquetRecordBatchStreamBuilder},
+    arrow::{
+        arrow_reader::ArrowReaderOptions,
+        async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder},
+    },
     file::metadata::PageIndexPolicy,
 };
 
@@ -240,6 +243,23 @@ pub(crate) async fn carries_embedded_row_ids(file: ParquetFile) -> Result<bool> 
         .map_err(corrupt("row-id probe"))?;
 
     Ok(embedded_row_id_position(builder.parquet_schema()).is_some())
+}
+
+/// Loads `file`'s footer into the process cache, with its page index when
+/// `page_index`, so a reader opened on the file afterwards finds it
+/// resident.
+pub(crate) async fn load_metadata(file: &ParquetFile, page_index: bool) -> Result<()> {
+    let policy = if page_index {
+        PageIndexPolicy::Optional
+    } else {
+        PageIndexPolicy::Skip
+    };
+
+    ObjectStoreReader::new(file, policy)
+        .get_metadata(None)
+        .await
+        .map(drop)
+        .map_err(corrupt("footer read"))
 }
 
 /// Rows decoded at once by a streamed scoped read.

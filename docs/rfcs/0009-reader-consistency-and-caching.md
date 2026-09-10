@@ -1207,8 +1207,14 @@ file descriptor; metadata discovery is not a production state. For a large
 object, the footer size lets the first read
 prefetch the serialized footer and its trailing length in one request; data
 files then fetch only indexed values and row ids, while delete files fetch only
-their position column. Objects below the measured crossover remain one
-whole-object request. A process-wide byte-bounded cache retains the parsed
+their position column. An object recorded at or below 1 MiB — every delete
+file, and DuckLake's small per-insert data files — is instead fetched whole on
+its first touch and held as one block, from which its footer, page index, and
+column ranges are all cut: a delete file's positions cost one request rather
+than a footer request and a dependent column request, and a small target's
+selected pages are resident by the time its selection is known. A
+single-touch read of a small object takes only its ranges, since it would keep
+nothing. A process-wide byte-bounded cache retains the parsed
 footer and page indexes for repeated touches of the same immutable file; it is
 keyed by object-store identity, path, and file size, adds the page index to a
 resident footer on demand rather than parsing the footer again under a second
@@ -1376,8 +1382,9 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   cold against the same file issue one footer/page-index fill and retain one
   parsed value, while each continues to read its own projected data ranges.
 - **Delete-file reads preserve the crossover.** A small delete file is fetched
-  once in full. A large one uses its recorded file and footer sizes, fetches
-  only `pos`, and reuses parsed metadata on a later read.
+  once in full, and a later read of the same object fetches nothing. A large
+  one uses its recorded file and footer sizes, fetches only `pos`, and reuses
+  parsed metadata on a later read.
 
 ## Alternatives considered
 

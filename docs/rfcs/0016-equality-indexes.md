@@ -1134,8 +1134,11 @@ second copy of the body after it moves to a blocking decode worker.
 
 Delete sources are grouped by physical target from their staged metadata
 before any object is opened. Each target resolves its own delete files, so
-independent additions and inline removals start beside delete discovery; only
-the target whose positions are still being discovered waits. Data-file
+independent additions and inline removals start beside delete discovery. A
+target's footer and page index, and its read-column mapping, depend on
+nothing but the snapshot, so they load beside its delete files; only its row
+selection waits for the positions. A registered file's footer likewise loads
+beside its column mapping and any same-commit deletes against it. Data-file
 additions and removals retain their bounded producer windows; nested
 delete-file reads share one commit-wide allowance rather than multiplying
 that bound per target.
