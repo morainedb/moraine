@@ -1,6 +1,7 @@
 #include "metadata_tables.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <optional>
 #include <set>
 #include <string>
@@ -1397,7 +1398,11 @@ duckdb::Catalog &LiveBoundCatalog(duckdb::ClientContext &context, const Metadata
 }
 
 struct MetadataScanGlobalState : public duckdb::GlobalTableFunctionState {
-	duckdb::idx_t offset = 0;
+	// The next row to emit. Threads claim vectors of rows from it, so a
+	// row's id (`row_id_base` plus its index) is the same whichever thread
+	// emits it.
+	std::atomic<duckdb::idx_t> offset {0};
+	duckdb::idx_t row_count = 0;
 	// The columns DuckDB asked for, by index into a materialized row, in
 	// output order. Empty for a zero-column "virtual column" probe (e.g.
 	// `SELECT NULL FROM ducklake_metadata LIMIT 1`), which DuckDB emits only
@@ -1412,7 +1417,7 @@ struct MetadataScanGlobalState : public duckdb::GlobalTableFunctionState {
 	uint64_t row_id_base = 0;
 
 	idx_t MaxThreads() const override {
-		return 1;
+		return std::max<idx_t>(1, row_count / STANDARD_VECTOR_SIZE);
 	}
 };
 
@@ -1450,6 +1455,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
 		state->row_id_base = transaction.RegisterScannedRows(
 		    *bind_data.spec, state->rows != nullptr ? state->rows : bind_data.rows);
 	}
+	auto &materialized = state->rows != nullptr ? state->rows : bind_data.rows;
+	state->row_count = materialized == nullptr ? 0 : materialized->size();
 	return state;
 }
 
@@ -1641,6 +1648,60 @@ void MetadataScanPushdownComplexFilter(duckdb::ClientContext &, duckdb::LogicalG
 	}
 }
 
+// Writes `count` rows of column `col_id`, from `start`, into `target` as
+// typed flat data. A virtual column other than the row id, or an id past
+// the row's width, is NULL: the former has no synthesized value and the
+// latter would be a DuckDB/shim mismatch, never a read out of bounds. A
+// column of a type without a typed path below goes through `SetValue`.
+void EmitMetadataColumn(const MetadataRows &rows, duckdb::idx_t start, duckdb::idx_t count, duckdb::column_t col_id,
+                        duckdb::Vector &target) {
+	auto &validity = duckdb::FlatVector::Validity(target);
+	auto cell = [&](duckdb::idx_t out_row) -> const duckdb::Value * {
+		auto &row = rows[start + out_row];
+		if (duckdb::IsVirtualColumn(col_id) || col_id >= row.size() || row[col_id].IsNull()) {
+			validity.SetInvalid(out_row);
+			return nullptr;
+		}
+		return &row[col_id];
+	};
+	switch (target.GetType().id()) {
+	case duckdb::LogicalTypeId::BIGINT: {
+		auto data = duckdb::FlatVector::GetData<int64_t>(target);
+		for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
+			if (auto *value = cell(out_row)) {
+				data[out_row] = value->GetValue<int64_t>();
+			}
+		}
+		return;
+	}
+	case duckdb::LogicalTypeId::BOOLEAN: {
+		auto data = duckdb::FlatVector::GetData<bool>(target);
+		for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
+			if (auto *value = cell(out_row)) {
+				data[out_row] = value->GetValue<bool>();
+			}
+		}
+		return;
+	}
+	case duckdb::LogicalTypeId::VARCHAR: {
+		auto data = duckdb::FlatVector::GetData<duckdb::string_t>(target);
+		for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
+			if (auto *value = cell(out_row)) {
+				data[out_row] = duckdb::StringVector::AddString(target, duckdb::StringValue::Get(*value));
+			}
+		}
+		return;
+	}
+	default:
+		for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
+			if (auto *value = cell(out_row)) {
+				target.SetValue(out_row, *value);
+			}
+		}
+		return;
+	}
+}
+
 void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<MetadataScanBindData>();
 	auto &state = data.global_state->Cast<MetadataScanGlobalState>();
@@ -1651,38 +1712,29 @@ void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInpu
 		throw duckdb::InternalException("moraine: metadata scan bound without a materialized row set");
 	}
 	auto &rows = *materialized;
-	if (state.offset >= rows.size()) {
+	auto start = state.offset.fetch_add(STANDARD_VECTOR_SIZE);
+	if (start >= rows.size()) {
 		output.SetCardinality(0);
 		return;
 	}
-	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, rows.size() - state.offset);
-	for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
-		auto &row = rows[state.offset + out_row];
-		for (duckdb::idx_t out_col = 0; out_col < state.column_ids.size(); out_col++) {
-			auto col_id = state.column_ids[out_col];
-			if (col_id == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
-				// An id in the transaction's run registry, which the
-				// staged-write Sink (staged_write.cpp) resolves back to this
-				// very row — never to the same position in a second
-				// materialization, which a narrowed scan and a commit
-				// landing under it can each make a different list.
-				output.SetValue(
-				    out_col, out_row,
-				    duckdb::Value::BIGINT(static_cast<int64_t>(state.row_id_base + state.offset + out_row)));
-				continue;
+	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, rows.size() - start);
+	for (duckdb::idx_t out_col = 0; out_col < state.column_ids.size(); out_col++) {
+		auto col_id = state.column_ids[out_col];
+		auto &target = output.data[out_col];
+		if (col_id == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
+			// An id in the transaction's run registry, which the
+			// staged-write Sink (staged_write.cpp) resolves back to this
+			// very row — never to the same position in a second
+			// materialization, which a narrowed scan and a commit
+			// landing under it can each make a different list.
+			auto ids = duckdb::FlatVector::GetData<int64_t>(target);
+			for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
+				ids[out_row] = static_cast<int64_t>(state.row_id_base + start + out_row);
 			}
-			if (duckdb::IsVirtualColumn(col_id) || col_id >= row.size()) {
-				// Any other virtual column has no synthesized value, and an
-				// out-of-range id would be a DuckDB/shim mismatch. Serve an
-				// untyped NULL rather than read out of bounds:
-				// `Vector::SetValue` accepts a null `Value` of any type.
-				output.SetValue(out_col, out_row, duckdb::Value());
-				continue;
-			}
-			output.SetValue(out_col, out_row, row[col_id]);
+			continue;
 		}
+		EmitMetadataColumn(rows, start, count, col_id, target);
 	}
-	state.offset += count;
 	output.SetCardinality(count);
 }
 
