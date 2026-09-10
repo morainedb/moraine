@@ -364,13 +364,14 @@ async fn warm(preload: CachePreload, handle: ReadHandle<'_>, counters: &cache::C
     );
 }
 
-/// Reads one entry of `subspace`, or the whole range when `deep`, in probe
-/// shape so the touched blocks are admitted. A deep walk of `current` or
-/// `history` runs its data-scaled kinds as concurrent sub-ranges.
+/// Reads one entry of `subspace` in seek shape, or the whole range in probe
+/// shape when `deep`, so the touched blocks are admitted. A deep walk of
+/// `current` or `history` runs its data-scaled kinds as concurrent
+/// sub-ranges.
 async fn warm_subspace(handle: ReadHandle<'_>, subspace: key::Subspace, deep: bool) -> Result<()> {
     let prefix = key::subspace_prefix(subspace);
     if !deep {
-        let mut iterator = handle.scan_prefix(&prefix, .., ScanShape::Probe).await?;
+        let mut iterator = handle.scan_prefix(&prefix, .., ScanShape::Seek).await?;
         iterator.next().await?;
         return Ok(());
     }

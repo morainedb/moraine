@@ -46,6 +46,10 @@ pub(crate) enum ScanShape {
     Streaming,
     /// A targeted lookup; its blocks are admitted.
     Probe,
+    /// One or a few entries from a wide range: one block fetched at a time,
+    /// admitted. A read-ahead shape here keeps fetching after the iterator
+    /// is dropped.
+    Seek,
 }
 
 /// The direction SlateDB traverses a scan range.
@@ -82,11 +86,13 @@ impl ScanShape {
         let (read_ahead_bytes, max_fetch_tasks) = match self {
             Self::Bulk | Self::Probe => (SCAN_READ_AHEAD_BYTES, SCAN_FETCH_TASKS),
             Self::Streaming => (STREAM_READ_AHEAD_BYTES, STREAM_FETCH_TASKS),
+            // SlateDB rounds the read-ahead up to one block.
+            Self::Seek => (1, 1),
         };
         ScanOptions {
             read_ahead_bytes,
             max_fetch_tasks,
-            cache_blocks: matches!(self, Self::Probe),
+            cache_blocks: matches!(self, Self::Probe | Self::Seek),
             order: order.iteration_order(),
             ..ScanOptions::default()
         }
@@ -164,13 +170,9 @@ impl ReadHandle<'_> {
 
     /// The highest key suffix under `prefix`, or `None` when it holds no
     /// key: one seek from the end.
-    async fn highest_suffix(
-        &self,
-        prefix: &[u8],
-        shape: ScanShape,
-    ) -> Result<Option<Vec<u8>>, slatedb::Error> {
+    async fn highest_suffix(&self, prefix: &[u8]) -> Result<Option<Vec<u8>>, slatedb::Error> {
         let mut descending = self
-            .scan_prefix_ordered(prefix, .., shape, ScanOrder::Descending)
+            .scan_prefix_ordered(prefix, .., ScanShape::Seek, ScanOrder::Descending)
             .await?;
         Ok(descending
             .next()
@@ -232,7 +234,7 @@ impl ReadHandle<'_> {
                 let split_suffix = suffix_of(split);
                 let end = key::increment_prefix(split_suffix.clone());
                 let upper = end.clone().map_or(Bound::Unbounded, Bound::Excluded);
-                let points = match self.highest_suffix(split, shape).await? {
+                let points = match self.highest_suffix(split).await? {
                     Some(high) => {
                         let low = last.get(split_suffix.len()..).unwrap_or(&[]);
                         key::even_points_between(low, &high, SCAN_SPLIT)
@@ -449,6 +451,15 @@ mod tests {
         assert_eq!(options.read_ahead_bytes, 256 * 1024);
         assert_eq!(options.max_fetch_tasks, 2);
         assert!(!options.cache_blocks);
+    }
+
+    /// A seek fetches one block, one fetch at a time, and admits it.
+    #[test]
+    fn seeks_fetch_one_block_and_admit_it() {
+        let options = ScanShape::Seek.options(ScanOrder::Ascending);
+        assert_eq!(options.read_ahead_bytes, 1);
+        assert_eq!(options.max_fetch_tasks, 1);
+        assert!(options.cache_blocks);
     }
 
     /// A descending probe asks SlateDB to iterate backwards.

@@ -1010,11 +1010,24 @@ shape.
 
 **Admission follows read shape.** SlateDB's defaults already split it —
 point reads cache their blocks, scans do not — and moraine makes the
-split deliberate: two scan-option constructors, bulk (admits nothing; the
+split deliberate: scan-option constructors, bulk (admits nothing; the
 row caches absorb scan reuse) and probe (admits; the reuse is real and
 block-grained), with every read path naming one. Foyer's admission picker
 repeats the rule at the disk device, so scan and compaction churn cannot
 wear it or evict the probe set.
+
+A read that takes one entry — or a handful — from a wide range names a
+fourth shape, seek: one block fetched at a time, admitted. The probe shape
+would be wrong there, not merely wasteful: SlateDB spawns its read-ahead
+fetches eagerly when the iterator opens, up to 32 of 8 MiB each per SST,
+and a fetch task has no cancellation on drop, so an iterator dropped after
+one `next` leaves them running to completion. The seek sites are the first
+entry of a subspace or of a table's probe range (the cache warms), the
+highest key of a split kind (the adaptive split's one seek from the end),
+the first index id at or past a cursor (the dead-index sweep), and a
+chunk-directory walk that a known chunk width ends within a few entries of
+its last target. A directory walk with no width bound runs to the end of
+the directory and stays a probe.
 
 Bulk and probe scans use fixed 8 MiB read-ahead with 32 fetches in flight,
 sized for a remote object store. A third shape, streaming, serves a
@@ -1078,7 +1091,7 @@ The attach options keep their surface (RFC 0006) and change machinery:
   is warned with both numbers, a failure is skipped rather than fatal.
 - **Per-table warm, explicit.** The `index` and `inline` subspaces
   scale with the data, so their warm is per table and never implicit: no
-  read triggers it. `ReadOnlyCatalog::warm_tables` reads, in probe shape,
+  read triggers it. `ReadOnlyCatalog::warm_tables` reads, in seek shape,
   the first entry of each named table's index ranges
   (`index/<kind>/<index id>`) and inline ranges (`inline/<table id>` per
   operation kind, its schemas and chunk-range locators), admitting the SST

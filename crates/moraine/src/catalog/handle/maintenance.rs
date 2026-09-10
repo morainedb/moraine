@@ -317,7 +317,7 @@ impl ReadOnlyCatalog {
         let session = self.begin_read().await?;
         let first = session
             .handle()
-            .scan_prefix(kind_prefix, suffix.., ScanShape::Probe)
+            .scan_prefix(kind_prefix, suffix.., ScanShape::Seek)
             .await
             .map_err(Error::from)?
             .next()
