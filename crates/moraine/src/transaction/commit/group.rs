@@ -153,9 +153,7 @@ impl Batch {
             self.members += 1;
             self.refold()?;
             let premise = self.premise.as_ref().unwrap_or(&self.base);
-            let prepared =
-                prepare_and_stage(&self.db_tx, projections, member, premise, self.members == 1)
-                    .await?;
+            let prepared = prepare_and_stage(&self.db_tx, projections, member, premise).await?;
             match prepared {
                 Prepared::Nothing { head } => ids.push(SnapshotId::new(head)),
                 Prepared::Staged {

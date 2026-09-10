@@ -3,8 +3,6 @@
 //! Every typed read in `store` takes a [`ReadHandle`] and dispatches to a
 //! `DbTransaction` or a `DbReader`; the reader never fences a live writer.
 
-pub(crate) mod probes;
-
 use std::{ops::Bound, sync::Arc};
 
 use bytes::Bytes;

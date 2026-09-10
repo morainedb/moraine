@@ -1068,7 +1068,6 @@ async fn prepare_and_stage<F>(
     projections: &std::sync::RwLock<ProjectionCache>,
     f: &F,
     base: &CatalogSnapshot,
-    first_member: bool,
 ) -> Result<Prepared>
 where
     F: Fn(&mut Transaction) -> Result<()>,
@@ -1117,7 +1116,7 @@ where
         schema_reference: false,
     };
     let (entries, inline_writes, format_write) = futures::try_join!(
-        index_maintenance::stage_index_entries(db_tx, index_entries, first_member),
+        index_maintenance::stage_index_entries(db_tx, index_entries),
         inline::stage_inline_writes(db_tx, projections, &inline_ops),
         format_stamp(db_tx, projections, &state, wrote_inline),
     )?;
@@ -1468,7 +1467,6 @@ impl ProbeScope {
                     unique_probes = metrics.unique_probes,
                     probe_hits = metrics.probe_hits,
                     probe_misses = metrics.probe_misses,
-                    shared_scans = metrics.shared_scans,
                     known_absent = metrics.known_absent,
                     probe_peak_in_flight = metrics.probe_peak_in_flight,
                     probe_window_ms = crate::telemetry::milliseconds(metrics.probe_window),

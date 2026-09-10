@@ -449,10 +449,6 @@ async fn staged_build_reports_explicit_progress() {
         "nothing to probe while every key is new"
     );
     assert!(
-        probed.iter().all(|event| event["shared_scans"] == "0"),
-        "a build's probes are answered by filtered point reads"
-    );
-    assert!(
         probed
             .iter()
             .all(|event| event.contains_key("probe_service_ms"))
