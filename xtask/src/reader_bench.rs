@@ -1,6 +1,8 @@
 //! Cold read-only attach over a large catalog: what a fresh reader process
 //! pays to open the store, list every data file, and plan one query, and
-//! what a warm repeat of that query still pays.
+//! what a warm repeat of that query still pays. The attach is split into
+//! the store open and the first materialization by moraine's own log
+//! events, since the two have different levers.
 //!
 //! Parquet stays local so every measured object-store request belongs to
 //! metadata. Each repeat is a new DuckDB process, so nothing survives from
@@ -26,6 +28,11 @@ use crate::{
 const DEFAULT_FILES: &[usize] = &[2_000, 20_000];
 const DEFAULT_REPEAT: usize = 5;
 
+/// Tables the files are spread over. One by default, so a statement's cost
+/// is the whole catalog's; more says what a many-table lake pays per
+/// statement for a query that addresses one of them.
+const DEFAULT_TABLES: usize = 1;
+
 /// Files one seeding commit registers: one per partition value.
 const FILES_PER_COMMIT: usize = 1_000;
 
@@ -36,6 +43,7 @@ const MARKER: &str = "__MORAINE_READER_BENCH__";
 
 struct Options {
     files: Vec<usize>,
+    tables: usize,
     repeat: usize,
     cache_dir: Option<PathBuf>,
 }
@@ -43,6 +51,7 @@ struct Options {
 fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
     let mut options = Options {
         files: DEFAULT_FILES.to_vec(),
+        tables: DEFAULT_TABLES,
         repeat: DEFAULT_REPEAT,
         cache_dir: None,
     };
@@ -66,8 +75,14 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
                 options.repeat = value.parse().context("parsing --repeat")?;
                 ensure!(options.repeat > 0, "--repeat must be positive");
             }
+            "--tables" => {
+                options.tables = value.parse().context("parsing --tables")?;
+                ensure!(options.tables > 0, "--tables must be positive");
+            }
             "--cache-dir" => options.cache_dir = Some(PathBuf::from(value)),
-            other => bail!("unknown flag `{other}`; valid: --files, --repeat, --cache-dir"),
+            other => {
+                bail!("unknown flag `{other}`; valid: --files, --tables, --repeat, --cache-dir")
+            }
         }
     }
     Ok(options)
@@ -93,6 +108,8 @@ fn seed_plan(files: usize) -> SeedPlan {
 #[derive(Debug, PartialEq)]
 struct Sample {
     attach_ms: f64,
+    open_ms: f64,
+    view_ms: f64,
     files_ms: f64,
     plan_ms: f64,
     warm_ms: f64,
@@ -128,12 +145,14 @@ fn parse_sample(stdout: &str) -> anyhow::Result<Sample> {
         .with_context(|| format!("benchmark result row is missing from CLI output:\n{stdout}"))?;
     let fields: Vec<&str> = row.split(',').collect();
     ensure!(
-        fields.len() == 6,
+        fields.len() == 8,
         "benchmark result has {} fields",
         fields.len()
     );
     Ok(Sample {
         attach_ms: times[0] * 1_000.0,
+        open_ms: parse_field(&fields, 6, "open_ms")?,
+        view_ms: parse_field(&fields, 7, "view_ms")?,
         files_ms: times[1] * 1_000.0,
         plan_ms: times[2] * 1_000.0,
         warm_ms: times[3] * 1_000.0,
@@ -223,16 +242,22 @@ fn run_script(artifacts: &Artifacts<'_>, script: &str, what: &str) -> anyhow::Re
     Ok(stdout)
 }
 
-/// Seeds `files` data files: a partitioned table filled by inserts that
-/// each write one file per partition value.
+/// The table a measured query addresses.
+fn table_name(index: usize) -> String {
+    format!("items{index}")
+}
+
+/// Seeds `files` data files spread evenly over `tables` partitioned
+/// tables, each filled by inserts that write one file per partition value.
 fn seed(
     artifacts: &Artifacts<'_>,
     target: &CatalogTarget,
     data_path: &Path,
     catalog_uri: &str,
     files: usize,
+    tables: usize,
 ) -> anyhow::Result<()> {
-    let plan = seed_plan(files);
+    let plan = seed_plan(files.div_ceil(tables));
     let mut script = preamble(artifacts, target)?;
     let _ = writeln!(
         script,
@@ -241,17 +266,26 @@ fn seed(
         sql_literal(&data_path.display().to_string()),
         sql_literal(&data_path.display().to_string())
     );
-    script.push_str("CREATE TABLE lake.main.items(id BIGINT, k BIGINT);\n");
-    script.push_str("ALTER TABLE lake.main.items SET PARTITIONED BY (k);\n");
     let rows_per_commit = plan.partitions.saturating_mul(ROWS_PER_FILE);
-    for commit in 0..plan.commits {
-        let start = commit.saturating_mul(rows_per_commit);
+    for table in 0..tables {
+        let name = table_name(table);
         let _ = writeln!(
             script,
-            "INSERT INTO lake.main.items SELECT i, i % {} FROM range({start}, {}) t(i);",
-            plan.partitions,
-            start.saturating_add(rows_per_commit)
+            "CREATE TABLE lake.main.{name}(id BIGINT, k BIGINT);"
         );
+        let _ = writeln!(
+            script,
+            "ALTER TABLE lake.main.{name} SET PARTITIONED BY (k);"
+        );
+        for commit in 0..plan.commits {
+            let start = commit.saturating_mul(rows_per_commit);
+            let _ = writeln!(
+                script,
+                "INSERT INTO lake.main.{name} SELECT i, i % {} FROM range({start}, {}) t(i);",
+                plan.partitions,
+                start.saturating_add(rows_per_commit)
+            );
+        }
     }
     let _ = writeln!(
         script,
@@ -265,13 +299,25 @@ fn seed(
         .with_context(|| format!("file count is missing from CLI output:\n{stdout}"))?;
     let fields: Vec<&str> = row.split(',').collect();
     let seeded: usize = parse_field(&fields, 1, "files")?;
-    let expected = plan.partitions.saturating_mul(plan.commits);
+    let expected = plan
+        .partitions
+        .saturating_mul(plan.commits)
+        .saturating_mul(tables);
     ensure!(
         seeded == expected,
         "seeding registered {seeded} files, expected {expected}"
     );
     Ok(())
 }
+
+/// The two halves of an attach, read back from the events moraine logs as
+/// it opens: the store open, and the first materialization of the catalog.
+/// Both are milliseconds, and both are NULL if the event never fired.
+const ATTACH_SPLIT_SQL: &str = "\
+    (SELECT CAST(regexp_extract(message, 'elapsed_ms=([0-9]+)', 1) AS BIGINT) FROM duckdb_logs \
+     WHERE type = 'moraine' AND message LIKE '%opened catalog read-only%' LIMIT 1), \
+    (SELECT CAST(regexp_extract(message, 'elapsed_ms=([0-9]+)', 1) AS BIGINT) FROM duckdb_logs \
+     WHERE type = 'moraine' AND message LIKE '%materializations=1,%' LIMIT 1)";
 
 /// One cold process: attach read-only, list every data file, plan a query
 /// pruned to one file, then plan another with everything warm.
@@ -286,6 +332,7 @@ fn measure(
     let cache = cache_dir
         .map(|dir| format!(", CACHE_DIR {}", sql_literal(&dir.display().to_string())))
         .unwrap_or_default();
+    script.push_str("CALL enable_logging(level => 'info', storage => 'memory');\n");
     script.push_str(".timer on\n");
     let _ = writeln!(
         script,
@@ -297,19 +344,28 @@ fn measure(
     script.push_str(
         "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL;\n",
     );
-    script.push_str("SELECT count(*) FROM lake.main.items WHERE k = 7 AND id = 7;\n");
+    let _ = writeln!(
+        script,
+        "SELECT count(*) FROM lake.main.{} WHERE k = 7 AND id = 7;",
+        table_name(0)
+    );
     script.push_str(".timer off\n");
     script.push_str(
         "CREATE TEMP TABLE io_cold AS SELECT * FROM moraine_object_store_tally('lake');\n",
     );
     script.push_str(".timer on\n");
-    script.push_str("SELECT count(*) FROM lake.main.items WHERE k = 8 AND id = 8;\n");
+    let _ = writeln!(
+        script,
+        "SELECT count(*) FROM lake.main.{} WHERE k = 8 AND id = 8;",
+        table_name(0)
+    );
     script.push_str(".timer off\n");
     let _ = writeln!(
         script,
         "SELECT '{MARKER}', cold.main_gets + cold.wal_gets, cold.main_get_ms + cold.wal_get_ms, \
          after.main_gets + after.wal_gets - cold.main_gets - cold.wal_gets, \
-         after.main_get_ms + after.wal_get_ms - cold.main_get_ms - cold.wal_get_ms, after.errors \
+         after.main_get_ms + after.wal_get_ms - cold.main_get_ms - cold.wal_get_ms, after.errors, \
+         {ATTACH_SPLIT_SQL} \
          FROM moraine_object_store_tally('lake') AS after, io_cold AS cold;"
     );
 
@@ -348,7 +404,8 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
 
     println!("\n# Cold read-only attach against {}", target.description());
     println!(
-        "# local Parquet; {} cold processes per size; cache dir: {}; request durations are summed and may overlap\n",
+        "# local Parquet; {} tables; {} cold processes per size; cache dir: {}; request durations are summed and may overlap\n",
+        options.tables,
         options.repeat,
         options
             .cache_dir
@@ -356,9 +413,11 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
             .map_or_else(|| "none".to_owned(), |dir| dir.display().to_string())
     );
     println!(
-        "{:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>11}  {:>9}  {:>11}",
+        "{:>7}  {:>9}  {:>7}  {:>7}  {:>9}  {:>9}  {:>9}  {:>9}  {:>11}  {:>9}  {:>11}",
         "files",
         "attach_ms",
+        "open_ms",
+        "view_ms",
         "files_ms",
         "plan_ms",
         "warm_ms",
@@ -372,7 +431,14 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
         let temp = TempDir::new(files)?;
         let data_path = temp.0.join("data");
         let catalog_uri = target.catalog_uri(&format!("reader-{files}"))?;
-        seed(&artifacts, &target, &data_path, &catalog_uri, files)?;
+        seed(
+            &artifacts,
+            &target,
+            &data_path,
+            &catalog_uri,
+            files,
+            options.tables,
+        )?;
 
         let mut samples = Vec::with_capacity(options.repeat);
         for _ in 0..options.repeat {
@@ -386,8 +452,11 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
         }
         let errors: u64 = samples.iter().map(|sample| sample.errors).sum();
         println!(
-            "{files:>7}  {:>9.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>11.1}  {:>9.1}  {:>11.1}",
+            "{files:>7}  {:>9.1}  {:>7.1}  {:>7.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>9.1}  {:>11.1}  \
+             {:>9.1}  {:>11.1}",
             median_of(&samples, |sample| sample.attach_ms)?,
+            median_of(&samples, |sample| sample.open_ms)?,
+            median_of(&samples, |sample| sample.view_ms)?,
             median_of(&samples, |sample| sample.files_ms)?,
             median_of(&samples, |sample| sample.plan_ms)?,
             median_of(&samples, |sample| sample.warm_ms)?,
@@ -419,6 +488,8 @@ mod tests {
         let arguments = [
             "--files",
             "2000,20000",
+            "--tables",
+            "4",
             "--repeat",
             "3",
             "--cache-dir",
@@ -428,14 +499,16 @@ mod tests {
         .to_vec();
         let options = parse_options(&arguments).unwrap();
         assert_eq!(options.files, [2_000, 20_000]);
+        assert_eq!(options.tables, 4);
         assert_eq!(options.repeat, 3);
         assert_eq!(options.cache_dir.as_deref(), Some(Path::new("/tmp/c")));
         assert!(parse_options(&["--repeat".to_owned(), "0".to_owned()]).is_err());
         assert!(parse_options(&["--files".to_owned(), "0".to_owned()]).is_err());
+        assert!(parse_options(&["--tables".to_owned(), "0".to_owned()]).is_err());
     }
 
     #[test]
-    fn a_seed_plan_registers_exactly_the_requested_files() {
+    fn a_seed_plan_registers_exactly_the_requested_files_per_table() {
         assert_eq!(
             seed_plan(200),
             SeedPlan {
@@ -462,11 +535,13 @@ mod tests {
                       Run Time (s): real 0.150 user 0 sys 0\n\
                       Run Time (s): real 0.040 user 0 sys 0\n\
                       Run Time (s): real 0.002 user 0 sys 0\n\
-                      __MORAINE_READER_BENCH__,4,86.5,0,0.0,0\n";
+                      __MORAINE_READER_BENCH__,4,86.5,0,0.0,0,90,160\n";
         assert_eq!(
             parse_sample(output).unwrap(),
             Sample {
                 attach_ms: 250.0,
+                open_ms: 90.0,
+                view_ms: 160.0,
                 files_ms: 150.0,
                 plan_ms: 40.0,
                 warm_ms: 2.0,

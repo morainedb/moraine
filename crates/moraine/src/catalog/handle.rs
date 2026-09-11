@@ -989,6 +989,7 @@ impl Catalog {
                     .to_string(),
             ));
         }
+        let started = Instant::now();
         let located = Arc::clone(&object_store);
         // One manifest read serves both diagnostics, before the open.
         let manifest = census::manifest_bytes(&options.path, Arc::clone(&located))
@@ -1031,6 +1032,7 @@ impl Catalog {
             path = options.path,
             flush_interval_ms = options.flush_interval.as_millis(),
             flush_on_commit = options.flush_on_commit,
+            elapsed_ms = crate::telemetry::milliseconds(started.elapsed()),
             "opened catalog read-write"
         );
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
@@ -1103,6 +1105,7 @@ impl Catalog {
         options: CatalogOptions,
     ) -> Result<ReadOnlyCatalog> {
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
+        let started = Instant::now();
         let located = Arc::clone(&object_store);
         // One manifest read serves both diagnostics, before the open.
         let manifest = census::manifest_bytes(&options.path, Arc::clone(&located))
@@ -1133,6 +1136,7 @@ impl Catalog {
         info!(
             path = options.path,
             checkpoint = options.checkpoint,
+            elapsed_ms = crate::telemetry::milliseconds(started.elapsed()),
             "opened catalog read-only"
         );
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
