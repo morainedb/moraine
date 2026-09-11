@@ -434,9 +434,9 @@ schema, and implements:
 
 - **Scan** — given a table and the columns DuckDB asks for, produce rows from
   SlateDB. Row filters are **not** applied by the scan, so it materializes the
-  addressed kind and DuckDB's executor filters over the returned rows. One
-  kind narrows *how much* it materializes without taking on that filtering —
-  see "Scoping the file-statistics scan" below.
+  addressed kind and DuckDB's executor filters over the returned rows. The
+  two data-scaled kinds narrow *how much* they materialize without taking on
+  that filtering — see "Scoping the file and file-statistics scans" below.
   Projection is pushed down, but it selects output columns from an
   already-materialized row set rather than narrowing the read. What narrowing
   exists comes from the address, not from a predicate: the RFC 0002 key layout
@@ -513,16 +513,20 @@ else opaque — and the e2e suite pins it against every lifecycle transition
 real DuckLake SQL produces. The contract is not zero interpretation; it is
 exactly one, tested.
 
-### Scoping the file-statistics scan
+### Scoping the file and file-statistics scans
 
-Materializing the addressed kind whole is affordable for every kind but one.
-`ducklake_file_column_stats` holds a row per file per column — a production
-catalog measured 145,995 of them against 1,013 data files — and each becomes
-ten `duckdb::Value`s, two of them heap strings. DuckLake's planner reads it
-to prune, so a statement pays that once and a writing transaction pays it per
-statement. Every other kind is orders of magnitude smaller; the same catalog's
-`ducklake_data_file` is 1,013 rows. So this one kind narrows, and nothing
-else does.
+Materializing the addressed kind whole is affordable for every kind but the
+two that grow with the data. `ducklake_file_column_stats` holds a row per
+file per column — a production catalog measured 145,995 of them against
+1,013 data files — and each becomes ten `duckdb::Value`s, two of them heap
+strings. `ducklake_data_file` holds one row per file, sixteen values wide.
+DuckLake's planner reads both to prune, so a statement pays them once and a
+writing transaction pays them per statement; on a lake whose files are
+spread across many tables, that is every table's files read to plan a query
+against one. Both name the table in the read — DuckLake's own file list is
+`WHERE data.table_id = ?` — so both narrow to it. Every other kind is
+bounded by the catalog's shape rather than its data, and none of them
+narrows.
 
 **The scan still applies no filters.** It reads the `table_id` equality
 through `pushdown_complex_filter` and **consumes nothing**, so DuckDB keeps
@@ -533,26 +537,41 @@ scan answerable for the whole of `TableFilterType`, which is a standing
 correctness liability — a filter type added upstream would begin silently
 dropping rows on a version bump.
 
-**Row identity is why only a table-major kind may narrow.** These tables have
-no physical row ids: a row's `rowid` is *its index into the materialized row
-set*, and the `UPDATE`/`DELETE` sinks resolve that index back to key cells by
-re-materializing the provider whole. A scan that simply filtered would
-renumber its rows, and a DML statement that narrowed would resolve row ids
-against the wrong rows — silently, and only when it both narrows and writes.
-The keying is the way out: this kind is keyed table-major, so a table's rows
-are a **contiguous run** of the whole dump. The scoped dump returns that run
-with where it starts, the scan emits `base + i`, and both sides keep counting
-rows of the same list. A kind whose rows do not form one run cannot narrow
-this way, which is what `scope_column` records.
+**Row identity is what a narrowed scan has to keep.** These tables have no
+physical row ids: a row's `rowid` is *its index into the materialized row
+set*, so a write resolving one against a second materialization would be
+trusting two lists to agree. Narrowing makes them disagree by construction,
+and a commit landing mid-statement does too — silently, and only when a
+statement both narrows and writes. So a scan that emits row ids **registers
+the list it emitted them for** with the transaction, numbered from a base
+that transaction hands out, and the `UPDATE`/`DELETE` sinks resolve each id
+against that run rather than against a fresh dump.
+
+What the keying buys is the cost of the narrowed read: both kinds are keyed
+table-major, so one table's rows are a **contiguous key range**, and the
+core's scoped dump reads that range out of the shared record set instead of
+walking every record of every kind. That is what `scope_column` records,
+paired with the `scoped_provider` that reads it.
 
 The filter also has to arrive before the work. Materialization otherwise
 happens in `GetScanFunction`, at bind, before a plan exists; a narrowable
 kind therefore builds nothing there and `InitGlobal` materializes instead —
 scoped when an equality reached the bind data, whole otherwise. A scan
 mid-write drops the scope: only the unscoped dump carries the staged overlay
-a read then owes. Scoped materializations are not cached, since the
-per-transaction hold is keyed by spec and a scoped set is small and built
-once per statement.
+a read then owes.
+
+Scoped materializations are not cached: the per-transaction hold and the
+attach-level one are both keyed by spec, and a narrowed set built under
+either would be served to a later unnarrowed read. So a scoped statement
+rebuilds, where an unscoped one at an unmoved head reuses. That is the
+trade, and it has a measured shape. Over 20 000 files behind an endpoint
+costing about 20 ms a request, a lake of eight tables plans a cold statement
+in 311 ms scoped against 333 ms whole, and a warm one in 53 ms against 82 ms.
+On a lake of one table, where narrowing can remove nothing, the rebuild costs
+what the hold used to spare — 386 ms against 339 ms on a local store, and
+nothing measurable behind the same endpoint. Keying the holds by scope as
+well would take both, and is the change to make if a single-table lake ever
+matters more than a many-table one.
 
 ### Composition: C++ shim over the Rust core (forced)
 

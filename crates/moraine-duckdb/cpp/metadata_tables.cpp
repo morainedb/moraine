@@ -442,14 +442,13 @@ std::vector<std::vector<duckdb::Value>> ProvideDataFiles(MoraineCatalogHandle *h
 	                                    DataFileShape);
 }
 
-// The `ducklake_data_file` rows live at `live_bound`. The core compares the
-// bound against the read point it serves this dump from, so a bound that
-// has fallen behind one simply reads every version.
-std::vector<std::vector<duckdb::Value>> ProvideDataFilesLiveAt(MoraineCatalogHandle *handle, uint64_t live_bound,
-                                                               MoraineInterruptProbe probe, void *probe_ctx) {
+// One table's data files. `DumpRows` cannot serve this: the scoped entry
+// point takes a table id.
+std::vector<std::vector<duckdb::Value>> ProvideDataFilesOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                           MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MoraineDataFileRow> rows(moraine_dump_data_files_free);
 	MoraineError err {};
-	if (moraine_dump_data_files_live_at(handle, live_bound, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err) !=
+	if (moraine_dump_data_files_of(handle, table_id, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err) !=
 	    MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
@@ -1021,8 +1020,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end_snapshot col */ 3,
 	        /* delete key: table_id, data_file_id, end_snapshot */ {1, 0, 3},
 	        /* overlay_updatable */ false,
-	        /* scope_column */ -1,
+	        /* scope column: table_id */ 1,
 	        /* live_narrowable */ true,
+	        ProvideDataFilesOf,
 	    },
 	    {
 	        "ducklake_delete_file",
@@ -1104,6 +1104,8 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* delete key: data_file_id, table_id, column_id (decoder order) */ {0, 1, 2},
 	        /* overlay updates */ true,
 	        /* scope column: table_id */ 1,
+	        /* live_narrowable */ false,
+	        ProvideFileColumnStatsOf,
 	    },
 	    {
 	        // Three-column form: (begin_snapshot, schema_version, table_id).
@@ -1436,13 +1438,14 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
 	}
 	auto &catalog = LiveBoundCatalog(context, bind_data);
 	if (bind_data.rows == nullptr) {
+		// A scan emitting row ids has its rows resolved back from them by
+		// the staged-write Sink, so it reads the same materialization
+		// every other writer of this table does — never a live-narrowed one.
+		auto live_bound = EmitsRowIds(state->column_ids) ? duckdb::optional_idx() : bind_data.live_bound;
 		if (bind_data.scope.IsValid()) {
-			state->rows = ScopedMetadataRowsFor(context, catalog, *bind_data.spec, bind_data.scope.GetIndex());
+			state->rows =
+			    ScopedMetadataRowsFor(context, catalog, *bind_data.spec, bind_data.scope.GetIndex(), live_bound);
 		} else {
-			// A scan emitting row ids has its rows resolved back from them by
-			// the staged-write Sink, so it reads the same materialization
-			// every other writer of this table does — never a narrowed one.
-			auto live_bound = EmitsRowIds(state->column_ids) ? duckdb::optional_idx() : bind_data.live_bound;
 			state->rows = MetadataRowsFor(context, catalog, *bind_data.spec, live_bound);
 		}
 	}
@@ -2054,14 +2057,16 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 }
 
 std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
-                                                          const MetadataTableSpec &spec, uint64_t table_id) {
+                                                          const MetadataTableSpec &spec, uint64_t table_id,
+                                                          duckdb::optional_idx live_bound) {
 	auto catalog_transaction = catalog.GetCatalogTransaction(context);
 	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
 	// Mid-write the staged tx's overlay is what a read owes, and only the
 	// unscoped dump carries it, so the scope is dropped rather than served
-	// without it. `MetadataRowsFor` holds that set for the transaction.
-	if (spec.scope_column < 0 || transaction.StagedTxIfOpen() != nullptr) {
-		return MetadataRowsFor(context, catalog, spec);
+	// without it — but never the live bound, which is the staged tx's own
+	// narrowing. `MetadataRowsFor` holds that set for the transaction.
+	if (spec.scope_column < 0 || spec.scoped_provider == nullptr || transaction.StagedTxIfOpen() != nullptr) {
+		return MetadataRowsFor(context, catalog, spec, live_bound);
 	}
 	// A transaction that already materialized this table narrows what it
 	// holds. Reading the store again here would serve one scan of the table
@@ -2079,7 +2084,7 @@ std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext 
 	}
 	auto *handle = catalog.Cast<MoraineCatalog>().Handle();
 	return std::make_shared<const MetadataRows>(
-	    ProvideFileColumnStatsOf(handle, table_id, moraine_shim_is_interrupted, &context));
+	    spec.scoped_provider(handle, table_id, moraine_shim_is_interrupted, &context));
 }
 
 duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientContext &context,

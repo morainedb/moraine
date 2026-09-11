@@ -601,7 +601,6 @@ pub(crate) enum TableScopedKind {
 impl TableScopedKind {
     /// An entity of this kind with its table id set and every other
     /// component zeroed, for prefix derivation.
-    #[allow(dead_code)]
     const fn sample(self, table_id: u64) -> EntityKey {
         match self {
             Self::Column => EntityKey::Column {
@@ -1066,11 +1065,18 @@ pub(crate) fn subspace_prefix(subspace: Subspace) -> Vec<u8> {
 }
 
 /// Byte prefix of every live key of `kind` scoped to `table_id`.
-#[allow(dead_code)]
 pub(crate) fn current_table_prefix(kind: TableScopedKind, table_id: u64) -> Vec<u8> {
     prefix_of(
         &Key::current(kind.sample(table_id)),
         CUR_KIND_PREFIX_LEN + size_of::<u64>(),
+    )
+}
+
+/// Byte prefix of every ended version of `kind` scoped to `table_id`.
+pub(crate) fn history_table_prefix(kind: TableScopedKind, table_id: u64) -> Vec<u8> {
+    prefix_of(
+        &Key::history(kind.sample(table_id), 0),
+        HISTORY_KIND_PREFIX_LEN + size_of::<u64>(),
     )
 }
 
@@ -1745,6 +1751,16 @@ mod tests {
             assert!(
                 !bytes.starts_with(&current_table_prefix(kind, 10)),
                 "{kind:?} prefix must not match another table"
+            );
+
+            let ended = Key::history(kind.sample(9), 4).encode();
+            assert!(
+                ended.starts_with(&history_table_prefix(kind, 9)),
+                "{kind:?} history prefix must match its own ended key"
+            );
+            assert!(
+                !ended.starts_with(&history_table_prefix(kind, 10)),
+                "{kind:?} history prefix must not match another table"
             );
         }
     }

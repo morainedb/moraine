@@ -2,7 +2,7 @@
 # group: [moraine]
 #
 # A metadata DELETE resolves every row id against the rows its own scan
-# emitted them for.
+# emitted them for, for both kinds a scan narrows by `table_id`.
 #
 # A scan narrowed by `table_id` materializes just that table's run. If the
 # write resolving its row ids materializes the table a second time, nothing
@@ -130,3 +130,61 @@ SELECT (SELECT count(*) FROM lake.main.t1),
        (SELECT count(*) FROM lake.main.t3);
 ----
 3	2	2
+
+# The same property for `ducklake_data_file`, the other kind a scan narrows
+# by `table_id`. Its rows carry the file registrations, so a row resolved
+# against the wrong list unregisters another table's data.
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file;
+
+# A commit under con1, adding a file row ahead of t2's run.
+statement ok con2
+INSERT INTO lake.main.t1 VALUES (8, 8);
+
+statement ok
+SET VARIABLE t1_files = (
+  SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file
+  WHERE table_id = 1 AND end_snapshot IS NULL
+);
+
+statement ok
+SET VARIABLE t3_files = (
+  SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file
+  WHERE table_id = 3 AND end_snapshot IS NULL
+);
+
+statement ok con1
+DELETE FROM __ducklake_metadata_lake.ducklake_data_file WHERE table_id = 2;
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file
+WHERE table_id = 2;
+----
+0
+
+# Neither neighbour lost a file row.
+query II
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file
+        WHERE table_id = 1 AND end_snapshot IS NULL) = getvariable('t1_files'),
+       (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file
+        WHERE table_id = 3 AND end_snapshot IS NULL) = getvariable('t3_files');
+----
+true	true
+
+# t2 lost its files and reads empty; its neighbours read every row they
+# were given, which a row id resolved against another table's run would
+# have taken from them. Summed rather than counted, so the answer comes
+# from the files rather than from the record counts in the statistics.
+query III
+SELECT (SELECT coalesce(sum(a), 0) FROM lake.main.t1),
+       (SELECT coalesce(sum(a), 0) FROM lake.main.t2),
+       (SELECT coalesce(sum(a), 0) FROM lake.main.t3);
+----
+18	0	11

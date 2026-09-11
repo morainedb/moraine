@@ -2436,6 +2436,21 @@ int32_t moraine_dump_data_files_live_at(struct MoraineCatalogHandle *handle,
                                         void *probe_ctx,
                                         struct MoraineError *err);
 
+// Dumps one table's `ducklake_data_file` rows into
+// `*out_items`/`*out_len`, in the order [`moraine_dump_data_files`] would
+// emit them. Freed with [`moraine_dump_data_files_free`].
+//
+// # Safety
+//
+// As [`moraine_dump_data_files`].
+int32_t moraine_dump_data_files_of(struct MoraineCatalogHandle *handle,
+                                   uint64_t table_id,
+                                   struct MoraineDataFileRow **out_items,
+                                   size_t *out_len,
+                                   MoraineInterruptProbe probe,
+                                   void *probe_ctx,
+                                   struct MoraineError *err);
+
 // Frees the array returned by [`moraine_dump_data_files`].
 //
 // # Safety
