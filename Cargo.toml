@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "xtask"]
 
 [workspace.package]
-version = "0.6.4"
+version = "0.6.5"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alexpropp/moraine"
@@ -21,7 +21,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 # imbl 7 changed-branch diff can skip leaf boundaries; regression pinned in commit/diff.rs.
 imbl = "5"
 parquet = { version = "59.2.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
-moraine = { path = "crates/moraine", version = "0.6.4" }
+moraine = { path = "crates/moraine", version = "0.6.5" }
 foyer = { version = "0.22", features = ["serde"] }
 object_store = "0.14"
 prost = "0.14"
