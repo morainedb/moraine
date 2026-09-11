@@ -187,13 +187,16 @@ faster commit: K concurrent commits share one flush.
 a catalog with thousands of data files: the attach, the first listing of
 every data file, one query planned against the file list and pruned to one
 file, and a warm repeat of that query. Every repeat is a new DuckDB process,
-so only what `--cache-dir` keeps on disk survives between them. Parquet
+so only what `--cache-dir` keeps on disk survives between them — which is
+most of the store open: over 20 000 files behind an endpoint costing about
+20 ms a request, a restarted reader opens in 451 ms with a populated cache
+directory against 1378 ms without one. Parquet
 stays local, so the object-store counters describe only the metadata path.
 
 ```text
 MORAINE_S3_BUCKET=... [MORAINE_S3_ENDPOINT=...] \
-  cargo xtask reader-bench [--files 2000,20000] [--tables 1] [--repeat 5]
-                           [--cache-dir <dir>]
+  cargo xtask reader-bench [--files 2000,20000] [--tables 1] [--deletes 0]
+                           [--repeat 5] [--cache-dir <dir>]
 ```
 
 Without `MORAINE_S3_BUCKET` the catalog is a local directory, which checks
@@ -202,7 +205,21 @@ they need an endpoint with latency. Each size is seeded by inserts into
 tables partitioned 1 000 ways, one file per partition per insert, then read
 `--repeat` times cold. `--tables` spreads the same file count over that many
 tables and measures a query addressing one of them, which is what a
-many-table lake pays per statement.
+many-table lake pays per statement. `--deletes` gives that percentage of the
+files a delete file, one row out of each — the kind DuckLake joins into
+every file list, and which an append-only lake does not have at all. The
+seed attach turns inlining off, or a deletion that small is recorded in the
+store rather than as a delete file.
+
+Delete files are not free and routine maintenance does not retire them:
+20 000 of them moved a first materialization from 284 ms to 363 ms, since
+they are 20 000 more records in the shared record set.
+`ducklake_merge_adjacent_files` skips any file carrying deletions, and
+`ducklake_rewrite_data_files` only rewrites a file that is 95% deleted
+(`rewrite_delete_threshold`). Clearing them takes an explicit lower
+threshold: `CALL ducklake_rewrite_data_files('lake', delete_threshold =>
+0.01)` took a fixture from 400 data and 400 delete files to 200 and none,
+with the same rows.
 
 The report is medians: attach, the two halves the attach splits into, file
 listing, cold plan, and warm plan in milliseconds, then GET counts and summed
