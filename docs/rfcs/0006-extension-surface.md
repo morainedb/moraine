@@ -568,18 +568,19 @@ scoped when an equality reached the bind data, whole otherwise. A scan
 mid-write drops the scope: only the unscoped dump carries the staged overlay
 a read then owes.
 
-Scoped materializations are not cached: the per-transaction hold and the
-attach-level one are both keyed by spec, and a narrowed set built under
-either would be served to a later unnarrowed read. So a scoped statement
-rebuilds, where an unscoped one at an unmoved head reuses. That is the
-trade, and it has a measured shape. Over 20 000 files behind an endpoint
-costing about 20 ms a request, a lake of eight tables plans a cold statement
-in 311 ms scoped against 333 ms whole, and a warm one in 53 ms against 82 ms.
-On a lake of one table, where narrowing can remove nothing, the rebuild costs
-what the hold used to spare — 386 ms against 339 ms on a local store, and
-nothing measurable behind the same endpoint. Keying the holds by scope as
-well would take both, and is the change to make if a single-table lake ever
-matters more than a many-table one.
+Scoped materializations are cached like unscoped ones, under a key that
+carries the scope: the per-transaction pin and the attach-level hold are
+both keyed by kind **and** scope, so a narrowed set can never answer a read
+of the kind, nor one table's run answer another's. Without that the scope
+would have to rebuild per statement where the whole set reuses, which costs
+more than narrowing saves on a lake whose addressed table is most of it.
+
+Within a transaction the whole set wins where it exists: a scoped read finds
+it pinned and filters it rather than reading the store, which is what keeps
+both standing at one head. Across transactions the attach holds each scope
+under the stamp it was dumped at, and holding at a new stamp drops the
+kind's entries at older ones, so the map tracks the tables read since the
+last commit rather than every table the attach has ever addressed.
 
 ### Composition: C++ shim over the Rust core (forced)
 

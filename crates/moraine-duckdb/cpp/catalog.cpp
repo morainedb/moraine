@@ -1006,10 +1006,10 @@ std::string MoraineCatalog::GetDBPath() {
 }
 
 std::shared_ptr<const MetadataRows> MoraineCatalog::HeldMetadataRows(const MetadataTableSpec &spec,
-                                                                     uint64_t snapshot_id,
-                                                                     uint64_t batch_seq) const {
+                                                                     uint64_t snapshot_id, uint64_t batch_seq,
+                                                                     std::optional<uint64_t> scope) const {
 	std::lock_guard<std::mutex> guard(held_rows_lock_);
-	auto it = held_rows_.find(&spec);
+	auto it = held_rows_.find({&spec, scope});
 	if (it == held_rows_.end()) {
 		return nullptr;
 	}
@@ -1023,9 +1023,17 @@ std::shared_ptr<const MetadataRows> MoraineCatalog::HeldMetadataRows(const Metad
 }
 
 void MoraineCatalog::HoldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id, uint64_t batch_seq,
-                                      std::shared_ptr<const MetadataRows> rows) {
+                                      std::shared_ptr<const MetadataRows> rows, std::optional<uint64_t> scope) {
 	std::lock_guard<std::mutex> guard(held_rows_lock_);
-	held_rows_[&spec] = HeldRows {snapshot_id, batch_seq, std::move(rows)};
+	// The kind's entries at an older stamp can never be hit again, so the
+	// scopes accumulated under it go with the move rather than living as
+	// long as the attach.
+	for (auto it = held_rows_.begin(); it != held_rows_.end();) {
+		const bool stale = it->first.first == &spec &&
+		                   (it->second.snapshot_id != snapshot_id || it->second.batch_seq != batch_seq);
+		it = stale ? held_rows_.erase(it) : std::next(it);
+	}
+	held_rows_[{&spec, scope}] = HeldRows {snapshot_id, batch_seq, std::move(rows)};
 }
 
 void MoraineCatalog::OnDetach(duckdb::ClientContext &context) {

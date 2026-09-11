@@ -2034,7 +2034,7 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 		if (rows == nullptr) {
 			rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
 		}
-		transaction.PutMetadataRows(spec, rows, live_only, epoch);
+		transaction.PutMetadataRows(spec, rows, live_only, epoch, std::nullopt);
 		return rows;
 	}
 
@@ -2054,13 +2054,13 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 	const bool stamped = transaction.SnapshotStamp(before.snapshot_id, before.batch_seq);
 	if (stamped) {
 		if (auto held = moraine_catalog.HeldMetadataRows(spec, before.snapshot_id, before.batch_seq)) {
-			transaction.PutMetadataRows(spec, held, false, epoch);
+			transaction.PutMetadataRows(spec, held, false, epoch, std::nullopt);
 			return held;
 		}
 	}
 
 	auto rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
-	transaction.PutMetadataRows(spec, rows, false, epoch);
+	transaction.PutMetadataRows(spec, rows, false, epoch, std::nullopt);
 
 	// Hold them for the next transaction only if the store did not move
 	// under the dump: rows that straddled a commit stand at no single
@@ -2086,23 +2086,55 @@ std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext 
 	if (spec.scope_column < 0 || spec.scoped_provider == nullptr || transaction.StagedTxIfOpen() != nullptr) {
 		return MetadataRowsFor(context, catalog, spec, live_bound);
 	}
+	const std::optional<uint64_t> scope = table_id;
+	if (auto cached = transaction.GetMetadataRows(spec, false, scope)) {
+		return cached;
+	}
+	// Taken before the materialization it stamps, as the unscoped path
+	// does: a staged tx opened while the set is built invalidates it.
+	auto epoch = transaction.MetadataRowsEpoch();
+
 	// A transaction that already materialized this table narrows what it
 	// holds. Reading the store again here would serve one scan of the table
 	// rows from beyond the point every other scan of it stands at.
 	if (auto held = transaction.GetMetadataRows(spec)) {
-		auto scope = static_cast<duckdb::idx_t>(spec.scope_column);
-		MetadataRows scoped;
+		auto column = static_cast<duckdb::idx_t>(spec.scope_column);
+		MetadataRows narrowed;
 		for (auto &row : *held) {
-			if (scope < row.size() && !row[scope].IsNull() &&
-			    row[scope].GetValue<int64_t>() == static_cast<int64_t>(table_id)) {
-				scoped.push_back(row);
+			if (column < row.size() && !row[column].IsNull() &&
+			    row[column].GetValue<int64_t>() == static_cast<int64_t>(table_id)) {
+				narrowed.push_back(row);
 			}
 		}
-		return std::make_shared<const MetadataRows>(std::move(scoped));
+		auto rows = std::make_shared<const MetadataRows>(std::move(narrowed));
+		transaction.PutMetadataRows(spec, rows, false, epoch, scope);
+		return rows;
 	}
-	auto *handle = catalog.Cast<MoraineCatalog>().Handle();
-	return std::make_shared<const MetadataRows>(
+
+	// As the unscoped path: the rows this attach last narrowed to this
+	// table are byte-identical to a fresh dump whenever no batch landed
+	// since, and are held only if the store did not move under the dump.
+	auto &moraine_catalog = catalog.Cast<MoraineCatalog>();
+	auto *handle = moraine_catalog.Handle();
+	MoraineHeadStamp before;
+	const bool stamped = transaction.SnapshotStamp(before.snapshot_id, before.batch_seq);
+	if (stamped) {
+		if (auto held = moraine_catalog.HeldMetadataRows(spec, before.snapshot_id, before.batch_seq, scope)) {
+			transaction.PutMetadataRows(spec, held, false, epoch, scope);
+			return held;
+		}
+	}
+
+	auto rows = std::make_shared<const MetadataRows>(
 	    spec.scoped_provider(handle, table_id, moraine_shim_is_interrupted, &context));
+	transaction.PutMetadataRows(spec, rows, false, epoch, scope);
+
+	MoraineHeadStamp after;
+	if (stamped && ReadHeadStamp(handle, context, after) && after.snapshot_id == before.snapshot_id &&
+	    after.batch_seq == before.batch_seq) {
+		moraine_catalog.HoldMetadataRows(spec, before.snapshot_id, before.batch_seq, rows, scope);
+	}
+	return rows;
 }
 
 duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientContext &context,

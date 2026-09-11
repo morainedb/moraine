@@ -233,13 +233,15 @@ public:
 	// stands where they were dumped from. A miss (nothing held, or the
 	// stamp moved) returns null and the caller re-dumps.
 	std::shared_ptr<const MetadataRows> HeldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id,
-	                                                     uint64_t batch_seq) const;
+	                                                     uint64_t batch_seq,
+	                                                     std::optional<uint64_t> scope = std::nullopt) const;
 
 	// Holds `rows` as this attach's rows for `spec` at the given stamp,
 	// replacing whatever it held. Shared by every connection on the
 	// attach, so it is guarded.
 	void HoldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id, uint64_t batch_seq,
-	                      std::shared_ptr<const MetadataRows> rows);
+	                      std::shared_ptr<const MetadataRows> rows,
+	                      std::optional<uint64_t> scope = std::nullopt);
 
 private:
 	MoraineCatalogHandle *handle_;
@@ -259,8 +261,12 @@ private:
 		uint64_t batch_seq;
 		std::shared_ptr<const MetadataRows> rows;
 	};
+	// Keyed by scope as well as kind, as the per-transaction pin is. One
+	// entry per table narrowed to, and holding at a new stamp drops the
+	// kind's entries at older ones, so the map tracks what has been read
+	// since the last commit rather than every table ever addressed.
 	mutable std::mutex held_rows_lock_;
-	std::unordered_map<const MetadataTableSpec *, HeldRows> held_rows_;
+	std::map<std::pair<const MetadataTableSpec *, std::optional<uint64_t>>, HeldRows> held_rows_;
 
 	// Ensures the active transaction's schema cache is populated from the
 	// listing ABI, then returns it.

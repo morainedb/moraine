@@ -311,3 +311,67 @@ SELECT (SELECT coalesce(sum(nr_bytes), 0) FROM duckdb_external_file_cache()
      > (SELECT bytes FROM footer_only_bytes);
 ----
 true
+
+# A scan narrowed to one table is held the same way, under the scope as
+# well as the kind and the stamp. A hold that ignored the stamp would serve
+# the table's files from before a commit; one that ignored the scope would
+# serve another table's rows for them. Inlining off, so every insert writes
+# a data file for the narrowed scan to find.
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/pin-scope-store' AS scoped (
+  DATA_PATH '__TEST_DIR__/pin-scope-data/', DATA_INLINING_ROW_LIMIT 0);
+
+statement ok
+CREATE TABLE scoped.main.one(a BIGINT);
+
+statement ok
+CREATE TABLE scoped.main.two(a BIGINT);
+
+statement ok
+INSERT INTO scoped.main.one VALUES (1);
+
+statement ok
+INSERT INTO scoped.main.two VALUES (1);
+
+# Narrowing needs the table id as a literal, so it is pinned rather than
+# assumed.
+query IT
+SELECT table_id, table_name FROM __ducklake_metadata_scoped.ducklake_table
+WHERE end_snapshot IS NULL ORDER BY table_id;
+----
+1	one
+2	two
+
+statement ok con1
+SET VARIABLE one_files = (
+  SELECT count(*) FROM __ducklake_metadata_scoped.ducklake_data_file
+  WHERE table_id = 1 AND end_snapshot IS NULL
+);
+
+statement ok con2
+INSERT INTO scoped.main.one VALUES (2);
+
+# The narrowed rows con1 held stand at the stamp before con2's commit, so
+# this re-reads rather than serving them.
+query I con1
+SELECT (SELECT count(*) FROM __ducklake_metadata_scoped.ducklake_data_file
+        WHERE table_id = 1 AND end_snapshot IS NULL) = getvariable('one_files') + 1;
+----
+true
+
+# And the other table's narrowed read is its own run, not the one just
+# held for table 1.
+query I con1
+SELECT count(*) FROM __ducklake_metadata_scoped.ducklake_data_file
+WHERE table_id = 2 AND end_snapshot IS NULL;
+----
+1
+
+# The narrowed read and the whole one agree inside one transaction, which a
+# hold keyed by kind alone could not promise once either had run.
+query I con1
+SELECT (SELECT count(*) FROM __ducklake_metadata_scoped.ducklake_data_file WHERE table_id = 1)
+     = (SELECT count(*) FROM (SELECT * FROM __ducklake_metadata_scoped.ducklake_data_file)
+        WHERE table_id = 1);
+----
+true

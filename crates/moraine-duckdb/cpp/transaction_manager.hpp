@@ -16,6 +16,8 @@
 
 #include <mutex>
 #include <map>
+#include <optional>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -95,7 +97,8 @@ public:
 	// A live-narrowed materialization is a different row set from the full
 	// one, so `live_only` keys them apart rather than letting either stand
 	// in for the other.
-	std::shared_ptr<const MetadataRows> GetMetadataRows(const MetadataTableSpec &spec, bool live_only = false) const;
+	std::shared_ptr<const MetadataRows> GetMetadataRows(const MetadataTableSpec &spec, bool live_only = false,
+	                                                    std::optional<uint64_t> scope = std::nullopt) const;
 
 	// The invalidation count the held materializations stand at. Taken
 	// before building a set and handed back to `PutMetadataRows`, which
@@ -103,7 +106,7 @@ public:
 	// staged into its table, while it was being built.
 	uint64_t MetadataRowsEpoch() const;
 	void PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows, bool live_only,
-	                     uint64_t epoch);
+	                     uint64_t epoch, std::optional<uint64_t> scope = std::nullopt);
 
 	// Takes the rows one metadata scan emits row ids for, returning the id
 	// its first row carries. Ids come from a counter this transaction never
@@ -134,7 +137,12 @@ private:
 	uint64_t stamp_batch_seq_ = 0;
 	std::unordered_map<uint64_t, duckdb::unique_ptr<duckdb::SchemaCatalogEntry>> schema_cache_;
 	MoraineTxHandle *staged_tx_ = nullptr;
-	std::map<std::pair<const MetadataTableSpec *, bool>, std::shared_ptr<const MetadataRows>> metadata_rows_;
+	// Keyed by scope as well as kind: a set narrowed to one table must
+	// never answer a read of the kind, and one table's narrowed set must
+	// never answer another's.
+	std::map<std::tuple<const MetadataTableSpec *, bool, std::optional<uint64_t>>,
+	         std::shared_ptr<const MetadataRows>>
+	    metadata_rows_;
 	// Bumped by every drop from the map above, so a Put that raced the
 	// drop is refused rather than resurrecting what it removed.
 	uint64_t metadata_rows_epoch_ = 0;
