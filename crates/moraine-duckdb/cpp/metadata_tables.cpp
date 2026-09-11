@@ -559,6 +559,23 @@ std::vector<std::vector<duckdb::Value>> ProvideFileColumnStatsOf(MoraineCatalogH
 	return result;
 }
 
+// One table's delete files, as `ProvideDataFilesOf` for its own kind.
+std::vector<std::vector<duckdb::Value>> ProvideDeleteFilesOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                             MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineDeleteFileRow> rows(moraine_dump_delete_files_free);
+	MoraineError err {};
+	if (moraine_dump_delete_files_of(handle, table_id, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err) !=
+	    MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back(DeleteFileShape(r));
+	}
+	return result;
+}
+
 // `ducklake_schema_versions` rows are flattened out of the snapshot
 // records they fold into (the staged path stores only the per-snapshot
 // table-id set — begin_snapshot/schema_version are the snapshot's own
@@ -1047,8 +1064,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end_snapshot col */ 3,
 	        /* delete key: table_id, delete_file_id, end_snapshot */ {1, 0, 3},
 	        /* overlay_updatable */ false,
-	        /* scope_column */ -1,
+	        /* scope column: table_id */ 1,
 	        /* live_narrowable */ true,
+	        ProvideDeleteFilesOf,
 	    },
 	    {
 	        "ducklake_table_stats",

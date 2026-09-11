@@ -95,8 +95,8 @@ struct MetadataTableSpec {
 	// Index into `columns` of the `table_id` a scan may narrow to, or -1 for
 	// a kind always materialized whole. Set only where the dump grows with
 	// the data *and* the kind is keyed by that column first, so the scoped
-	// dump is one key range rather than a filter over the whole —
-	// `ducklake_data_file` and `ducklake_file_column_stats`.
+	// dump is one key range rather than a filter over the whole — the
+	// three kinds that grow with the data.
 	int32_t scope_column = -1;
 	// Whether a scan of this kind may be narrowed to the versions live at
 	// a filter's snapshot, skipping the ended half. Set on every versioned

@@ -458,6 +458,30 @@ pub async fn dump_delete_files(catalog: &ReadOnlyCatalog) -> Result<Vec<DeleteFi
     .await
 }
 
+/// One table's `ducklake_delete_file` rows, current and history, in the
+/// order [`dump_delete_files`] would emit them.
+///
+/// # Errors
+///
+/// As [`dump_delete_files`].
+#[doc(hidden)]
+pub async fn dump_delete_files_of(
+    catalog: &ReadOnlyCatalog,
+    table_id: u64,
+) -> Result<Vec<DeleteFileValue>> {
+    dump_table_entities(
+        catalog,
+        TableScopedKind::DeleteFile,
+        table_id,
+        HistoryNeed::Always,
+        |record| match record {
+            EntityRecord::DeleteFile(value) => Some(value.clone()),
+            _ => None,
+        },
+    )
+    .await
+}
+
 /// Every `ducklake_partition_info` row (with its embedded partition
 /// columns), current and history.
 #[doc(hidden)]
@@ -2171,6 +2195,90 @@ mod tests {
 
         assert!(
             dump_data_files_of(&catalog, u64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A scoped delete-file dump tiles the whole one, as the data-file
+    /// scope does — the kind DuckLake joins into every file list.
+    #[tokio::test]
+    async fn scoped_delete_files_tile_the_whole_dump() {
+        let catalog = seed().await;
+
+        // A second table with its own deletions, so neither table's run is
+        // the whole dump.
+        catalog
+            .commit(|tx| {
+                let schema = tx.schemas()[1].id;
+                let table = tx.create_table(
+                    schema,
+                    "returns",
+                    &[ColumnDef {
+                        name: "id".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: false,
+                        default_value: None,
+                        children: Vec::new(),
+                    }],
+                )?;
+                // One delete file per data file is the rule, so each
+                // deletion gets its own file to hang off.
+                for ordinal in 0..2 {
+                    let file = tx.register_data_file(
+                        table,
+                        DataFile {
+                            path: format!("returns/a{ordinal}.parquet"),
+                            path_is_relative: true,
+                            file_format: "parquet".into(),
+                            record_count: 4,
+                            file_size_bytes: 64,
+                            footer_size: 8,
+                            encryption_key: None,
+                            partition_values: vec![],
+                            column_stats: vec![],
+                        },
+                        &[],
+                    )?;
+                    tx.register_delete_file(
+                        table,
+                        DeleteFile {
+                            data_file_id: file,
+                            path: format!("returns/d{ordinal}.parquet"),
+                            path_is_relative: true,
+                            format: "parquet".into(),
+                            delete_count: 1,
+                            file_size_bytes: 32,
+                            footer_size: 8,
+                            encryption_key: None,
+                        },
+                        &[],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let whole = dump_delete_files(&catalog).await.unwrap();
+        let table_ids: std::collections::BTreeSet<u64> =
+            whole.iter().map(|row| row.table_id).collect();
+        assert_eq!(table_ids.len(), 2);
+
+        let mut tiled = Vec::new();
+        for &table_id in &table_ids {
+            let scoped = dump_delete_files_of(&catalog, table_id).await.unwrap();
+            assert!(!scoped.is_empty(), "table {table_id} holds delete files");
+            tiled.extend(scoped);
+        }
+        assert_eq!(
+            tiled, whole,
+            "the scopes must tile the whole dump, in order"
+        );
+
+        assert!(
+            dump_delete_files_of(&catalog, u64::MAX)
                 .await
                 .unwrap()
                 .is_empty()

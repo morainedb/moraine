@@ -435,7 +435,7 @@ schema, and implements:
 - **Scan** — given a table and the columns DuckDB asks for, produce rows from
   SlateDB. Row filters are **not** applied by the scan, so it materializes the
   addressed kind and DuckDB's executor filters over the returned rows. The
-  two data-scaled kinds narrow *how much* they materialize without taking on
+  data-scaled kinds narrow *how much* they materialize without taking on
   that filtering — see "Scoping the file and file-statistics scans" below.
   Projection is pushed down, but it selects output columns from an
   already-materialized row set rather than narrowing the read. What narrowing
@@ -516,17 +516,25 @@ exactly one, tested.
 ### Scoping the file and file-statistics scans
 
 Materializing the addressed kind whole is affordable for every kind but the
-two that grow with the data. `ducklake_file_column_stats` holds a row per
+three that grow with the data. `ducklake_file_column_stats` holds a row per
 file per column — a production catalog measured 145,995 of them against
 1,013 data files — and each becomes ten `duckdb::Value`s, two of them heap
-strings. `ducklake_data_file` holds one row per file, sixteen values wide.
-DuckLake's planner reads both to prune, so a statement pays them once and a
-writing transaction pays them per statement; on a lake whose files are
-spread across many tables, that is every table's files read to plan a query
-against one. Both name the table in the read — DuckLake's own file list is
-`WHERE data.table_id = ?` — so both narrow to it. Every other kind is
+strings. `ducklake_data_file` holds one row per file, sixteen values wide,
+and `ducklake_delete_file` one per file deleted from without a rewrite,
+thirteen wide. DuckLake's planner reads all three to prune — its file list
+selects the first and left-joins the other two — so a statement pays them
+once and a writing transaction pays them per statement; on a lake whose
+files are spread across many tables, that is every table's files read to
+plan a query against one. All three name the table in the read
+(`WHERE data.table_id = ?`), so all three narrow to it. Every other kind is
 bounded by the catalog's shape rather than its data, and none of them
 narrows.
+
+An append-only lake holds no delete files at all, so that third scope is
+worth nothing there and everything on a lake that deletes: over 20 000
+files across eight tables on a local store, giving every file a delete file
+cost a cold statement 237 ms against 159 ms without them, and a warm one
+51 ms against 39 ms — all of it the other seven tables' deletions.
 
 **The scan still applies no filters.** It reads the `table_id` equality
 through `pushdown_complex_filter` and **consumes nothing**, so DuckDB keeps
@@ -547,8 +555,8 @@ the list it emitted them for** with the transaction, numbered from a base
 that transaction hands out, and the `UPDATE`/`DELETE` sinks resolve each id
 against that run rather than against a fresh dump.
 
-What the keying buys is the cost of the narrowed read: both kinds are keyed
-table-major, so one table's rows are a **contiguous key range**, and the
+What the keying buys is the cost of the narrowed read: all three kinds are
+keyed table-major, so one table's rows are a **contiguous key range**, and the
 core's scoped dump reads that range out of the shared record set instead of
 walking every record of every kind. That is what `scope_column` records,
 paired with the `scoped_provider` that reads it.
