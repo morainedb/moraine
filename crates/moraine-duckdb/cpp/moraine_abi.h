@@ -41,6 +41,11 @@ enum {
 };
 
 
+// The `filter_snapshot` that asks for every version rather than the ones
+// live at a snapshot. Zero is a real snapshot id, so the sentinel is the
+// one value no snapshot can carry.
+#define MORAINE_EVERY_VERSION UINT64_MAX
+
 // An index's build lifecycle, as [`moraine_indexes`] reports it. `building`
 // collapses everything but `Ready`, so a terminally poisoned index is
 // distinguishable only here.
@@ -3270,6 +3275,21 @@ int32_t moraine_tx_dump_data_files_live_at(struct MoraineTxHandle *tx,
                                            size_t *out_len,
                                            struct MoraineError *err);
 
+// As [`moraine_tx_dump_data_files`], narrowed to one table and, unless
+// `filter_snapshot` is [`MORAINE_EVERY_VERSION`], to the versions live at
+// it: the rows the whole dump would show for `table_id`, staged rows
+// included. Freed with `moraine_dump_data_files_free`.
+//
+// # Safety
+//
+// As [`moraine_tx_dump_data_files`].
+int32_t moraine_tx_dump_data_files_of(struct MoraineTxHandle *tx,
+                                      uint64_t table_id,
+                                      uint64_t filter_snapshot,
+                                      struct MoraineDataFileRow **out_items,
+                                      size_t *out_len,
+                                      struct MoraineError *err);
+
 // Dumps every `ducklake_delete_file` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_delete_files_free`.
@@ -3285,6 +3305,20 @@ int32_t moraine_tx_dump_delete_files(struct MoraineTxHandle *tx,
                                      struct MoraineDeleteFileRow **out_items,
                                      size_t *out_len,
                                      struct MoraineError *err);
+
+// As [`moraine_tx_dump_delete_files`], narrowed as
+// [`moraine_tx_dump_data_files_of`] is. Freed with
+// `moraine_dump_delete_files_free`.
+//
+// # Safety
+//
+// As [`moraine_tx_dump_delete_files`].
+int32_t moraine_tx_dump_delete_files_of(struct MoraineTxHandle *tx,
+                                        uint64_t table_id,
+                                        uint64_t filter_snapshot,
+                                        struct MoraineDeleteFileRow **out_items,
+                                        size_t *out_len,
+                                        struct MoraineError *err);
 
 // As [`moraine_tx_dump_delete_files`], for a caller that keeps a row only
 // while `filter_snapshot < end_snapshot` (or it is null). Once
@@ -3316,6 +3350,19 @@ int32_t moraine_tx_dump_file_column_stats(struct MoraineTxHandle *tx,
                                           struct MoraineFileColumnStatsRow **out_items,
                                           size_t *out_len,
                                           struct MoraineError *err);
+
+// As [`moraine_tx_dump_file_column_stats`], narrowed to one table: the
+// rows the whole dump would show for `table_id`, staged rows included.
+// Freed with `moraine_dump_file_column_stats_free`.
+//
+// # Safety
+//
+// As [`moraine_tx_dump_file_column_stats`].
+int32_t moraine_tx_dump_file_column_stats_of(struct MoraineTxHandle *tx,
+                                             uint64_t table_id,
+                                             struct MoraineFileColumnStatsRow **out_items,
+                                             size_t *out_len,
+                                             struct MoraineError *err);
 
 // Dumps every `ducklake_files_scheduled_for_deletion` row as this
 // transaction sees it: committed rows at the transaction's read point with

@@ -1022,6 +1022,35 @@ std::shared_ptr<const MetadataRows> MoraineCatalog::HeldMetadataRows(const Metad
 	return it->second.rows;
 }
 
+namespace {
+
+// What one materialized row set weighs: the cells themselves plus the
+// bytes behind the string ones, which are most of it. Walked once, as the
+// set is held, rather than on every read of the tally.
+uint64_t MetadataRowsBytes(const MetadataRows &rows) {
+	uint64_t bytes = sizeof(MetadataRows);
+	for (auto &row : rows) {
+		bytes += sizeof(std::vector<duckdb::Value>) + row.size() * sizeof(duckdb::Value);
+		for (auto &cell : row) {
+			if (!cell.IsNull() && cell.type().id() == duckdb::LogicalTypeId::VARCHAR) {
+				bytes += duckdb::StringValue::Get(cell).size();
+			}
+		}
+	}
+	return bytes;
+}
+
+} // namespace
+
+uint64_t MoraineCatalog::HeldMetadataBytes() const {
+	std::lock_guard<std::mutex> guard(held_rows_lock_);
+	uint64_t bytes = 0;
+	for (auto &entry : held_rows_) {
+		bytes += entry.second.bytes;
+	}
+	return bytes;
+}
+
 void MoraineCatalog::HoldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id, uint64_t batch_seq,
                                       std::shared_ptr<const MetadataRows> rows, std::optional<uint64_t> scope) {
 	std::lock_guard<std::mutex> guard(held_rows_lock_);
@@ -1033,7 +1062,8 @@ void MoraineCatalog::HoldMetadataRows(const MetadataTableSpec &spec, uint64_t sn
 		                   (it->second.snapshot_id != snapshot_id || it->second.batch_seq != batch_seq);
 		it = stale ? held_rows_.erase(it) : std::next(it);
 	}
-	held_rows_[{&spec, scope}] = HeldRows {snapshot_id, batch_seq, std::move(rows)};
+	auto bytes = rows == nullptr ? 0 : MetadataRowsBytes(*rows);
+	held_rows_[{&spec, scope}] = HeldRows {snapshot_id, batch_seq, std::move(rows), bytes};
 }
 
 void MoraineCatalog::OnDetach(duckdb::ClientContext &context) {

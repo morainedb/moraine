@@ -243,6 +243,11 @@ public:
 	                      std::shared_ptr<const MetadataRows> rows,
 	                      std::optional<uint64_t> scope = std::nullopt);
 
+	// What this attach's held rows weigh, estimated as each set was held.
+	// Nothing else accounts for them: they are the shim's own allocation,
+	// outside both moraine's budgets and DuckDB's memory limit.
+	uint64_t HeldMetadataBytes() const;
+
 private:
 	MoraineCatalogHandle *handle_;
 	std::string path_;
@@ -260,6 +265,7 @@ private:
 		uint64_t snapshot_id;
 		uint64_t batch_seq;
 		std::shared_ptr<const MetadataRows> rows;
+		uint64_t bytes;
 	};
 	// Keyed by scope as well as kind, as the per-transaction pin is. One
 	// entry per table narrowed to, and holding at a new stamp drops the

@@ -31,3 +31,21 @@ fn data_paths_still_reject_internal_empty_segments() {
     }
     assert!(resolve_data_path("org-123/", "main/probe/", "other//data.parquet", false).is_err());
 }
+
+/// A cache directory silences the slow-open report however slow the open
+/// was, and a fast open without one says nothing.
+#[test]
+fn only_a_slow_open_with_nowhere_to_cache_is_reported() {
+    use std::{path::Path, time::Duration};
+
+    use super::handle::slow_open_without_cache;
+
+    let slow = Duration::from_millis(400);
+    let quick = Duration::from_millis(20);
+    let dir = Some(Path::new("/var/cache/lake"));
+
+    assert!(slow_open_without_cache(None, slow));
+    assert!(!slow_open_without_cache(dir, slow));
+    assert!(!slow_open_without_cache(None, quick));
+    assert!(!slow_open_without_cache(dir, quick));
+}

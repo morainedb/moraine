@@ -13,7 +13,8 @@ use crate::{
         handle::{ReadHandle, ScanShape},
         key::{
             CurrentKey, EntityKey, EntityKind, Key, SPLIT_SCAN_KINDS, Subspace, SysKey,
-            current_entity_kind_prefix, current_gc_file_prefix, history_entity_kind_prefix,
+            TableScopedKind, current_entity_kind_prefix, current_gc_file_prefix,
+            current_table_prefix, history_entity_kind_prefix, history_table_prefix,
             subspace_prefix,
         },
         proto::{
@@ -151,6 +152,17 @@ impl EntityRecordKind {
             Self::Option => Some(EntityKind::Option),
             Self::Tag => Some(EntityKind::Tag),
             Self::GcFile => None,
+        }
+    }
+
+    /// The table-scoped kind this is, for the three whose row count grows
+    /// with the data. `None` for every other kind, which is read whole.
+    fn table_scoped(self) -> Option<TableScopedKind> {
+        match self {
+            Self::File => Some(TableScopedKind::File),
+            Self::DeleteFile => Some(TableScopedKind::DeleteFile),
+            Self::FileColumnStats => Some(TableScopedKind::FileColumnStats),
+            _ => None,
         }
     }
 }
@@ -608,6 +620,50 @@ pub(crate) async fn scan_entity_kind(
     Ok(records)
 }
 
+/// As [`scan_entity_kind`], narrowed to one table. `None` for a kind the
+/// key layout does not scope by table, which the caller reads whole.
+pub(crate) async fn scan_entity_kind_of(
+    handle: ReadHandle<'_>,
+    kind: EntityRecordKind,
+    versions: Versions,
+    table_id: u64,
+) -> Result<Option<Vec<EntityRecord>>> {
+    let (Some(entity_kind), Some(scoped)) = (kind.entity_kind(), kind.table_scoped()) else {
+        return Ok(None);
+    };
+
+    let current = scan_decode_kind(
+        handle,
+        entity_kind,
+        current_table_prefix(scoped, table_id),
+        |key, bytes| match key {
+            Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, &bytes),
+            other => Err(Error::Corruption(format!(
+                "non-entity key in {kind:?} current scan: {other:?}"
+            ))),
+        },
+    );
+    if !entity_kind.is_versioned() || versions == Versions::Live {
+        return Ok(Some(current.await?));
+    }
+
+    let history = scan_decode_kind(
+        handle,
+        entity_kind,
+        history_table_prefix(scoped, table_id),
+        |key, bytes| match key {
+            Key::History(history) => decode_entity(history.entity, &bytes),
+            other => Err(Error::Corruption(format!(
+                "non-history key in {kind:?} history scan: {other:?}"
+            ))),
+        },
+    );
+    let (mut records, history) = futures::try_join!(current, history)?;
+    records.extend(history);
+
+    Ok(Some(records))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -881,6 +937,117 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(files, expected);
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// Where a first materialization's time goes, by phase, over a record
+    /// set the shape of a large lake's: the scan itself, decoding the
+    /// entries, wrapping each in an `Arc`, and building the ordered map.
+    ///
+    /// Measurement, not an assertion — ignored by default, and worth
+    /// running in release:
+    ///
+    /// ```text
+    /// cargo test --release -p moraine --lib -- --ignored --nocapture \
+    ///     a_materializations_phases
+    /// ```
+    #[tokio::test]
+    #[ignore = "a measurement, not an assertion"]
+    async fn a_materializations_phases() {
+        const FILES: u64 = 20_000;
+        const COLUMNS: u64 = 2;
+
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        for data_file_id in 0..FILES {
+            tx.put(
+                Key::current(EntityKey::File {
+                    table_id: 1,
+                    data_file_id,
+                })
+                .encode(),
+                value::encode_value(&DataFileValue {
+                    data_file_id,
+                    table_id: 1,
+                    path: format!("data/part-{data_file_id}.parquet"),
+                    record_count: 1_000,
+                    file_size_bytes: 64_000,
+                    ..DataFileValue::default()
+                }),
+            )
+            .unwrap();
+            for column_id in 0..COLUMNS {
+                tx.put(
+                    Key::current(EntityKey::FileColumnStats {
+                        table_id: 1,
+                        data_file_id,
+                        column_id,
+                    })
+                    .encode(),
+                    value::encode_value(&FileColumnStatsValue {
+                        data_file_id,
+                        table_id: 1,
+                        column_id,
+                        value_count: 1_000,
+                        min_value: Some("0".to_owned()),
+                        max_value: Some("999".to_owned()),
+                        ..FileColumnStatsValue::default()
+                    }),
+                )
+                .unwrap();
+            }
+        }
+        tx.commit()
+            .await
+            .unwrap()
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let handle = ReadHandle::Tx(&tx);
+        let prefix = subspace_prefix(Subspace::Current);
+        let splits = SPLIT_SCAN_KINDS.map(current_entity_kind_prefix);
+
+        let started = Instant::now();
+        let entries = handle
+            .scan_prefix_split(&prefix, &splits, ScanShape::Bulk)
+            .await
+            .unwrap();
+        let scanned = started.elapsed();
+
+        let started = Instant::now();
+        let decoded: Vec<EntityRecord> = entries
+            .iter()
+            .map(|entry| {
+                let key = Key::decode(&entry.key).unwrap();
+                decode_current_record(key, &entry.value).unwrap()
+            })
+            .collect();
+        let decode = started.elapsed();
+        assert_eq!(decoded.len(), entries.len());
+
+        let started = Instant::now();
+        let wrapped: Vec<(Bytes, Arc<EntityRecord>)> = entries
+            .into_iter()
+            .zip(decoded)
+            .map(|(entry, record)| (entry.key, Arc::new(record)))
+            .collect();
+        let wrap = started.elapsed();
+
+        let started = Instant::now();
+        let records: RecordSet = wrapped.into_iter().collect();
+        let build = started.elapsed();
+
+        println!(
+            "records={} scan={scanned:?} decode={decode:?} arc={wrap:?} ordmap={build:?}",
+            records.len()
+        );
         tx.rollback();
         db.close().await.unwrap();
     }

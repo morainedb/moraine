@@ -369,7 +369,10 @@ pub enum RowOperation {
 
 type CommittedRecords = Arc<Vec<read::EntityRecord>>;
 type CommittedRecordCache = tokio::sync::Mutex<
-    HashMap<(read::EntityRecordKind, read::Versions), Arc<tokio::sync::OnceCell<CommittedRecords>>>,
+    HashMap<
+        (read::EntityRecordKind, read::Versions, Option<u64>),
+        Arc<tokio::sync::OnceCell<CommittedRecords>>,
+    >,
 >;
 type CommittedSnapshots = tokio::sync::OnceCell<Arc<Vec<proto::SnapshotValue>>>;
 type CommittedSchemaVersions = tokio::sync::OnceCell<Arc<Vec<(u64, u64, u64)>>>;
@@ -595,28 +598,38 @@ impl StagedTransaction {
     /// record; one that needs ended versions scans both subspaces through
     /// `db_tx` as one consistent cut.
     ///
-    /// Memoized per `(kind, versions)`: a live-only set is a different set
-    /// from a full one and never stands in for it.
+    /// Memoized per `(kind, versions, scope)`: a live-only set is a
+    /// different set from a full one, and one table's set from the kind's,
+    /// and none of them ever stands in for another.
     async fn committed_entities(
         &self,
         kind: read::EntityRecordKind,
         versions: read::Versions,
+        scope: Option<u64>,
     ) -> Result<CommittedRecords> {
         let cell = {
             let mut committed = self.committed.lock().await;
             Arc::clone(
                 committed
-                    .entry((kind, versions))
+                    .entry((kind, versions, scope))
                     .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
             )
         };
         let records = cell
             .get_or_try_init(|| async {
                 if versions == read::Versions::Live || !kind.is_versioned() {
-                    let records = self.head_view().await?.live_records(kind);
+                    let records = match scope {
+                        Some(table_id) => self
+                            .head_view()
+                            .await?
+                            .live_records_of(kind, table_id)
+                            .unwrap_or_else(Vec::new),
+                        None => self.head_view().await?.live_records(kind),
+                    };
                     debug!(
                         transaction_id = self.diagnostic_id,
                         ?kind,
+                        scope,
                         records = records.len(),
                         "served committed entities from the head view"
                     );
@@ -624,8 +637,19 @@ impl StagedTransaction {
                 }
 
                 let started = Instant::now();
-                let records =
-                    read::scan_entity_kind(ReadHandle::Tx(&self.db_tx), kind, versions).await?;
+                let records = match scope {
+                    Some(table_id) => read::scan_entity_kind_of(
+                        ReadHandle::Tx(&self.db_tx),
+                        kind,
+                        versions,
+                        table_id,
+                    )
+                    .await?
+                    .unwrap_or_default(),
+                    None => {
+                        read::scan_entity_kind(ReadHandle::Tx(&self.db_tx), kind, versions).await?
+                    }
+                };
                 let history_records = records
                     .iter()
                     .filter(|record| {
@@ -639,6 +663,7 @@ impl StagedTransaction {
                     transaction_id = self.diagnostic_id,
                     ?kind,
                     ?versions,
+                    scope,
                     current_records,
                     history_records,
                     records = records.len(),
@@ -669,10 +694,11 @@ impl StagedTransaction {
         &self,
         kind: read::EntityRecordKind,
         versions: read::Versions,
+        scope: Option<u64>,
         extract: impl Fn(&read::EntityRecord) -> Option<T>,
     ) -> Result<Vec<T>> {
         Ok(self
-            .committed_entities(kind, versions)
+            .committed_entities(kind, versions, scope)
             .await?
             .iter()
             .filter_map(extract)
@@ -708,12 +734,47 @@ impl StagedTransaction {
     ) -> Result<Vec<proto::DataFileValue>> {
         let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(read::EntityRecordKind::File, versions, |r| match r {
+            .committed_rows(read::EntityRecordKind::File, versions, None, |r| match r {
                 read::EntityRecord::File(v) => Some(v.clone()),
                 _ => None,
             })
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// As [`visible_data_files`](Self::visible_data_files), narrowed to one
+    /// table and, where `filter_snapshot` is given, to the versions live at
+    /// it. The two narrowings compose: a read carrying both pays for
+    /// neither the other tables nor the ended versions.
+    ///
+    /// The overlay runs over the narrowed rows, so a staged row naming
+    /// another table finds no version to end or drop and is filtered out
+    /// if it inserts — the same rows the whole dump would show for this
+    /// table, in the same order.
+    ///
+    /// # Errors
+    ///
+    /// As [`visible_data_files`](Self::visible_data_files).
+    pub async fn visible_data_files_of(
+        &self,
+        table_id: u64,
+        filter_snapshot: Option<u64>,
+    ) -> Result<Vec<proto::DataFileValue>> {
+        let versions = self.versions_for(filter_snapshot).await?;
+        let committed = self
+            .committed_rows(
+                read::EntityRecordKind::File,
+                versions,
+                Some(table_id),
+                |r| match r {
+                    read::EntityRecord::File(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
+            .await?;
+        let mut rows = overlay::overlay_versioned(&self.ops, committed)?;
+        rows.retain(|row| row.table_id == table_id);
+        Ok(rows)
     }
 
     /// `ducklake_delete_file` rows as this transaction sees them.
@@ -740,10 +801,15 @@ impl StagedTransaction {
     ) -> Result<Vec<proto::DeleteFileValue>> {
         let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(read::EntityRecordKind::DeleteFile, versions, |r| match r {
-                read::EntityRecord::DeleteFile(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::DeleteFile,
+                versions,
+                None,
+                |r| match r {
+                    read::EntityRecord::DeleteFile(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -771,10 +837,15 @@ impl StagedTransaction {
     ) -> Result<Vec<proto::ColumnValue>> {
         let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(read::EntityRecordKind::Column, versions, |r| match r {
-                read::EntityRecord::Column(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::Column,
+                versions,
+                None,
+                |r| match r {
+                    read::EntityRecord::Column(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -802,12 +873,40 @@ impl StagedTransaction {
     ) -> Result<Vec<proto::TableValue>> {
         let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(read::EntityRecordKind::Table, versions, |r| match r {
+            .committed_rows(read::EntityRecordKind::Table, versions, None, |r| match r {
                 read::EntityRecord::Table(v) => Some(v.clone()),
                 _ => None,
             })
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// As [`visible_delete_files`](Self::visible_delete_files), narrowed as
+    /// [`visible_data_files_of`](Self::visible_data_files_of) is.
+    ///
+    /// # Errors
+    ///
+    /// As [`visible_delete_files`](Self::visible_delete_files).
+    pub async fn visible_delete_files_of(
+        &self,
+        table_id: u64,
+        filter_snapshot: Option<u64>,
+    ) -> Result<Vec<proto::DeleteFileValue>> {
+        let versions = self.versions_for(filter_snapshot).await?;
+        let committed = self
+            .committed_rows(
+                read::EntityRecordKind::DeleteFile,
+                versions,
+                Some(table_id),
+                |r| match r {
+                    read::EntityRecord::DeleteFile(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
+            .await?;
+        let mut rows = overlay::overlay_versioned(&self.ops, committed)?;
+        rows.retain(|row| row.table_id == table_id);
+        Ok(rows)
     }
 
     /// `ducklake_file_column_stats` rows as this transaction sees them.
@@ -820,6 +919,7 @@ impl StagedTransaction {
             .committed_rows(
                 read::EntityRecordKind::FileColumnStats,
                 read::Versions::LiveAndEnded,
+                None,
                 |r| match r {
                     read::EntityRecord::FileColumnStats(v) => Some(v.clone()),
                     _ => None,
@@ -827,6 +927,33 @@ impl StagedTransaction {
             )
             .await?;
         overlay::overlay_unversioned(&self.ops, committed)
+    }
+
+    /// As [`visible_file_column_stats`](Self::visible_file_column_stats),
+    /// narrowed to one table, as
+    /// [`visible_data_files_of`](Self::visible_data_files_of).
+    ///
+    /// # Errors
+    ///
+    /// As [`visible_file_column_stats`](Self::visible_file_column_stats).
+    pub async fn visible_file_column_stats_of(
+        &self,
+        table_id: u64,
+    ) -> Result<Vec<proto::FileColumnStatsValue>> {
+        let committed = self
+            .committed_rows(
+                read::EntityRecordKind::FileColumnStats,
+                read::Versions::LiveAndEnded,
+                Some(table_id),
+                |r| match r {
+                    read::EntityRecord::FileColumnStats(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
+            .await?;
+        let mut rows = overlay::overlay_unversioned(&self.ops, committed)?;
+        rows.retain(|row| row.table_id == table_id);
+        Ok(rows)
     }
 
     /// `ducklake_schema` rows as this transaction sees them.
@@ -839,6 +966,7 @@ impl StagedTransaction {
             .committed_rows(
                 read::EntityRecordKind::Schema,
                 read::Versions::LiveAndEnded,
+                None,
                 |r| match r {
                     read::EntityRecord::Schema(v) => Some(v.clone()),
                     _ => None,
@@ -871,7 +999,7 @@ impl StagedTransaction {
     ) -> Result<Vec<proto::ViewValue>> {
         let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(read::EntityRecordKind::View, versions, |r| match r {
+            .committed_rows(read::EntityRecordKind::View, versions, None, |r| match r {
                 read::EntityRecord::View(v) => Some(v.clone()),
                 _ => None,
             })
@@ -903,10 +1031,15 @@ impl StagedTransaction {
     ) -> Result<Vec<proto::PartitionValue>> {
         let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(read::EntityRecordKind::Partition, versions, |r| match r {
-                read::EntityRecord::Partition(v) => Some(v.clone()),
-                _ => None,
-            })
+            .committed_rows(
+                read::EntityRecordKind::Partition,
+                versions,
+                None,
+                |r| match r {
+                    read::EntityRecord::Partition(v) => Some(v.clone()),
+                    _ => None,
+                },
+            )
             .await?;
         overlay::overlay_versioned(&self.ops, committed)
     }
@@ -934,7 +1067,7 @@ impl StagedTransaction {
     ) -> Result<Vec<proto::SortValue>> {
         let versions = self.versions_for(filter_snapshot).await?;
         let committed = self
-            .committed_rows(read::EntityRecordKind::Sort, versions, |r| match r {
+            .committed_rows(read::EntityRecordKind::Sort, versions, None, |r| match r {
                 read::EntityRecord::Sort(v) => Some(v.clone()),
                 _ => None,
             })
@@ -952,6 +1085,7 @@ impl StagedTransaction {
             .committed_rows(
                 read::EntityRecordKind::Macro,
                 read::Versions::LiveAndEnded,
+                None,
                 |r| match r {
                     read::EntityRecord::Macro(v) => Some(v.clone()),
                     _ => None,
@@ -971,6 +1105,7 @@ impl StagedTransaction {
             .committed_rows(
                 read::EntityRecordKind::TableStats,
                 read::Versions::LiveAndEnded,
+                None,
                 |r| match r {
                     read::EntityRecord::TableStats(v) => Some(*v),
                     _ => None,
@@ -990,6 +1125,7 @@ impl StagedTransaction {
             .committed_rows(
                 read::EntityRecordKind::TableColumnStats,
                 read::Versions::LiveAndEnded,
+                None,
                 |r| match r {
                     read::EntityRecord::TableColumnStats(v) => Some(v.clone()),
                     _ => None,
@@ -1009,6 +1145,7 @@ impl StagedTransaction {
             .committed_rows(
                 read::EntityRecordKind::Mapping,
                 read::Versions::LiveAndEnded,
+                None,
                 |r| match r {
                     read::EntityRecord::Mapping(v) => Some(v.clone()),
                     _ => None,
@@ -1029,6 +1166,7 @@ impl StagedTransaction {
             .committed_rows(
                 read::EntityRecordKind::Tag,
                 read::Versions::LiveAndEnded,
+                None,
                 |r| match r {
                     read::EntityRecord::Tag(v) => Some(v.clone()),
                     _ => None,
@@ -1050,6 +1188,7 @@ impl StagedTransaction {
             .committed_rows(
                 read::EntityRecordKind::Option,
                 read::Versions::LiveAndEnded,
+                None,
                 |r| match r {
                     read::EntityRecord::Option {
                         scope_kind,
@@ -1219,6 +1358,7 @@ impl StagedTransaction {
             .committed_rows(
                 read::EntityRecordKind::GcFile,
                 read::Versions::LiveAndEnded,
+                None,
                 |r| match r {
                     read::EntityRecord::GcFile(v) => Some(v.clone()),
                     _ => None,

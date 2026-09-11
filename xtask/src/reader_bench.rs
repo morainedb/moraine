@@ -380,8 +380,15 @@ fn measure(
     cache_dir: Option<&Path>,
 ) -> anyhow::Result<Sample> {
     let mut script = preamble(artifacts, target)?;
+    // `META_`-prefixed: the attach is DuckLake's, which passes the option
+    // through to the moraine catalog under it and refuses it unprefixed.
     let cache = cache_dir
-        .map(|dir| format!(", CACHE_DIR {}", sql_literal(&dir.display().to_string())))
+        .map(|dir| {
+            format!(
+                ", META_CACHE_DIR {}",
+                sql_literal(&dir.display().to_string())
+            )
+        })
         .unwrap_or_default();
     script.push_str("CALL enable_logging(level => 'info', storage => 'memory');\n");
     script.push_str(".timer on\n");

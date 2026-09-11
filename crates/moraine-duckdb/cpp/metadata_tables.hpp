@@ -50,6 +50,11 @@ using MetadataScopedRowProvider = MetadataRows (*)(MoraineCatalogHandle *handle,
 // share one source of truth.
 constexpr int32_t kNotWritable = -1;
 
+// `moraine_tx_dump_*_of`'s "every version" `filter_snapshot` sentinel
+// (moraine_abi.h), mirrored here. Zero is a real snapshot id, so the
+// sentinel is the one value no snapshot can carry.
+constexpr uint64_t kEveryVersion = UINT64_MAX;
+
 // `ducklake_inlined_data_tables`'s sentinel: DuckLake's own inlined-table
 // registration batch always pairs `INSERT INTO ducklake_inlined_data_tables
 // VALUES (...)` with the `CREATE TABLE ducklake_inlined_data_<t>_<v>(...)`

@@ -250,6 +250,38 @@ impl CatalogSnapshot {
         view
     }
 
+    /// The live records of `kind` for one table, in store key order. Only
+    /// the kinds this view keys table-major can answer; the rest return
+    /// `None` and the caller reads the kind whole.
+    pub(crate) fn live_records_of(
+        &self,
+        kind: EntityRecordKind,
+        table_id: u64,
+    ) -> Option<Vec<EntityRecord>> {
+        fn of<K: Ord + Clone, V: Clone>(
+            rows: &OrdMap<u64, OrdMap<K, V>>,
+            table_id: u64,
+            wrap: impl Fn(V) -> EntityRecord,
+        ) -> Vec<EntityRecord> {
+            rows.get(&table_id)
+                .map(|inner| inner.values().cloned().map(wrap).collect())
+                .unwrap_or_default()
+        }
+
+        match kind {
+            EntityRecordKind::File => Some(of(&self.data_files, table_id, EntityRecord::File)),
+            EntityRecordKind::DeleteFile => {
+                Some(of(&self.delete_files, table_id, EntityRecord::DeleteFile))
+            }
+            EntityRecordKind::FileColumnStats => Some(of(
+                &self.file_column_stats,
+                table_id,
+                EntityRecord::FileColumnStats,
+            )),
+            _ => None,
+        }
+    }
+
     /// The live records of `kind`, in store key order: what a live scan of
     /// the kind returns at this view's head.
     pub(crate) fn live_records(&self, kind: EntityRecordKind) -> Vec<EntityRecord> {

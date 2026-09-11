@@ -44,7 +44,10 @@ const WRITER_MANIFEST_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// absent-key probe clears a filter instead of reading data blocks.
 const MIN_FILTER_KEYS: u32 = 0;
 
-/// The stored block grain for every writer and reader.
+/// The stored block grain for every writer and reader. Swept against 16
+/// and 64 KiB over a cold attach and a wide scan of 20 000 files: all
+/// three within noise, and the request count identical, since the bulk
+/// read-ahead coalesces blocks into far larger fetches either way.
 const SST_BLOCK_SIZE: SstBlockSize = SstBlockSize::Block4Kib;
 
 /// Creates a checkpoint of every write `db` has taken (not only the
