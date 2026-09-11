@@ -434,9 +434,9 @@ schema, and implements:
 
 - **Scan** — given a table and the columns DuckDB asks for, produce rows from
   SlateDB. Row filters are **not** applied by the scan, so it materializes the
-  addressed kind and DuckDB's executor filters over the returned rows. One
-  kind narrows *how much* it materializes without taking on that filtering —
-  see "Scoping the file-statistics scan" below.
+  addressed kind and DuckDB's executor filters over the returned rows. The
+  data-scaled kinds narrow *how much* they materialize without taking on
+  that filtering — see "Scoping the file and file-statistics scans" below.
   Projection is pushed down, but it selects output columns from an
   already-materialized row set rather than narrowing the read. What narrowing
   exists comes from the address, not from a predicate: the RFC 0002 key layout
@@ -513,16 +513,28 @@ else opaque — and the e2e suite pins it against every lifecycle transition
 real DuckLake SQL produces. The contract is not zero interpretation; it is
 exactly one, tested.
 
-### Scoping the file-statistics scan
+### Scoping the file and file-statistics scans
 
-Materializing the addressed kind whole is affordable for every kind but one.
-`ducklake_file_column_stats` holds a row per file per column — a production
-catalog measured 145,995 of them against 1,013 data files — and each becomes
-ten `duckdb::Value`s, two of them heap strings. DuckLake's planner reads it
-to prune, so a statement pays that once and a writing transaction pays it per
-statement. Every other kind is orders of magnitude smaller; the same catalog's
-`ducklake_data_file` is 1,013 rows. So this one kind narrows, and nothing
-else does.
+Materializing the addressed kind whole is affordable for every kind but the
+three that grow with the data. `ducklake_file_column_stats` holds a row per
+file per column — a production catalog measured 145,995 of them against
+1,013 data files — and each becomes ten `duckdb::Value`s, two of them heap
+strings. `ducklake_data_file` holds one row per file, sixteen values wide,
+and `ducklake_delete_file` one per file deleted from without a rewrite,
+thirteen wide. DuckLake's planner reads all three to prune — its file list
+selects the first and left-joins the other two — so a statement pays them
+once and a writing transaction pays them per statement; on a lake whose
+files are spread across many tables, that is every table's files read to
+plan a query against one. All three name the table in the read
+(`WHERE data.table_id = ?`), so all three narrow to it. Every other kind is
+bounded by the catalog's shape rather than its data, and none of them
+narrows.
+
+An append-only lake holds no delete files at all, so that third scope is
+worth nothing there and everything on a lake that deletes: over 20 000
+files across eight tables on a local store, giving every file a delete file
+cost a cold statement 237 ms against 159 ms without them, and a warm one
+51 ms against 39 ms — all of it the other seven tables' deletions.
 
 **The scan still applies no filters.** It reads the `table_id` equality
 through `pushdown_complex_filter` and **consumes nothing**, so DuckDB keeps
@@ -533,26 +545,42 @@ scan answerable for the whole of `TableFilterType`, which is a standing
 correctness liability — a filter type added upstream would begin silently
 dropping rows on a version bump.
 
-**Row identity is why only a table-major kind may narrow.** These tables have
-no physical row ids: a row's `rowid` is *its index into the materialized row
-set*, and the `UPDATE`/`DELETE` sinks resolve that index back to key cells by
-re-materializing the provider whole. A scan that simply filtered would
-renumber its rows, and a DML statement that narrowed would resolve row ids
-against the wrong rows — silently, and only when it both narrows and writes.
-The keying is the way out: this kind is keyed table-major, so a table's rows
-are a **contiguous run** of the whole dump. The scoped dump returns that run
-with where it starts, the scan emits `base + i`, and both sides keep counting
-rows of the same list. A kind whose rows do not form one run cannot narrow
-this way, which is what `scope_column` records.
+**Row identity is what a narrowed scan has to keep.** These tables have no
+physical row ids: a row's `rowid` is *its index into the materialized row
+set*, so a write resolving one against a second materialization would be
+trusting two lists to agree. Narrowing makes them disagree by construction,
+and a commit landing mid-statement does too — silently, and only when a
+statement both narrows and writes. So a scan that emits row ids **registers
+the list it emitted them for** with the transaction, numbered from a base
+that transaction hands out, and the `UPDATE`/`DELETE` sinks resolve each id
+against that run rather than against a fresh dump.
+
+What the keying buys is the cost of the narrowed read: all three kinds are
+keyed table-major, so one table's rows are a **contiguous key range**, and the
+core's scoped dump reads that range out of the shared record set instead of
+walking every record of every kind. That is what `scope_column` records,
+paired with the `scoped_provider` that reads it.
 
 The filter also has to arrive before the work. Materialization otherwise
 happens in `GetScanFunction`, at bind, before a plan exists; a narrowable
 kind therefore builds nothing there and `InitGlobal` materializes instead —
 scoped when an equality reached the bind data, whole otherwise. A scan
 mid-write drops the scope: only the unscoped dump carries the staged overlay
-a read then owes. Scoped materializations are not cached, since the
-per-transaction hold is keyed by spec and a scoped set is small and built
-once per statement.
+a read then owes.
+
+Scoped materializations are cached like unscoped ones, under a key that
+carries the scope: the per-transaction pin and the attach-level hold are
+both keyed by kind **and** scope, so a narrowed set can never answer a read
+of the kind, nor one table's run answer another's. Without that the scope
+would have to rebuild per statement where the whole set reuses, which costs
+more than narrowing saves on a lake whose addressed table is most of it.
+
+Within a transaction the whole set wins where it exists: a scoped read finds
+it pinned and filters it rather than reading the store, which is what keeps
+both standing at one head. Across transactions the attach holds each scope
+under the stamp it was dumped at, and holding at a new stamp drops the
+kind's entries at older ones, so the map tracks the tables read since the
+last commit rather than every table the attach has ever addressed.
 
 ### Composition: C++ shim over the Rust core (forced)
 

@@ -192,16 +192,25 @@ stays local, so the object-store counters describe only the metadata path.
 
 ```text
 MORAINE_S3_BUCKET=... [MORAINE_S3_ENDPOINT=...] \
-  cargo xtask reader-bench [--files 2000,20000] [--repeat 5] [--cache-dir <dir>]
+  cargo xtask reader-bench [--files 2000,20000] [--tables 1] [--repeat 5]
+                           [--cache-dir <dir>]
 ```
 
 Without `MORAINE_S3_BUCKET` the catalog is a local directory, which checks
 the task but shows no round trips; the request columns are what matter, and
-they need an endpoint with latency. Each size is seeded by inserts into a
-table partitioned 1 000 ways, one file per partition per insert, then read
-`--repeat` times cold. The report is medians: attach, file listing, cold
-plan, and warm plan in milliseconds, then GET counts and summed GET time
-for the cold statements and for the warm one.
+they need an endpoint with latency. Each size is seeded by inserts into
+tables partitioned 1 000 ways, one file per partition per insert, then read
+`--repeat` times cold. `--tables` spreads the same file count over that many
+tables and measures a query addressing one of them, which is what a
+many-table lake pays per statement.
+
+The report is medians: attach, the two halves the attach splits into, file
+listing, cold plan, and warm plan in milliseconds, then GET counts and summed
+GET time for the cold statements and for the warm one. The two halves are
+read from moraine's own log events rather than timed from outside:
+`open_ms` is the store open — manifest, WAL replay, and one metadata fetch
+per SST — and `view_ms` is the first materialization of the catalog. What
+the attach costs beyond their sum is DuckLake's own work over the rows.
 
 ### Durable-commit latency vs. flush interval
 

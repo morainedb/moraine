@@ -67,6 +67,12 @@ async fn catalog_open_reaches_the_sink_through_the_abi() {
         "record should carry the event's fields: {}",
         opened.1
     );
+    // The open's own duration, which a reader benchmark splits an attach by.
+    assert!(
+        opened.1.contains("elapsed_ms="),
+        "record should time the open: {}",
+        opened.1
+    );
 
     // Draining does not replay: the first pass emptied the buffer.
     assert!(drain().is_empty(), "a second drain should find nothing");

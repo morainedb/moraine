@@ -442,14 +442,13 @@ std::vector<std::vector<duckdb::Value>> ProvideDataFiles(MoraineCatalogHandle *h
 	                                    DataFileShape);
 }
 
-// The `ducklake_data_file` rows live at `live_bound`. The core compares the
-// bound against the read point it serves this dump from, so a bound that
-// has fallen behind one simply reads every version.
-std::vector<std::vector<duckdb::Value>> ProvideDataFilesLiveAt(MoraineCatalogHandle *handle, uint64_t live_bound,
-                                                               MoraineInterruptProbe probe, void *probe_ctx) {
+// One table's data files. `DumpRows` cannot serve this: the scoped entry
+// point takes a table id.
+std::vector<std::vector<duckdb::Value>> ProvideDataFilesOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                           MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MoraineDataFileRow> rows(moraine_dump_data_files_free);
 	MoraineError err {};
-	if (moraine_dump_data_files_live_at(handle, live_bound, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err) !=
+	if (moraine_dump_data_files_of(handle, table_id, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err) !=
 	    MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
@@ -556,6 +555,23 @@ std::vector<std::vector<duckdb::Value>> ProvideFileColumnStatsOf(MoraineCatalogH
 	result.reserve(rows.size());
 	for (auto &r : rows) {
 		result.push_back(FileColumnStatsShape(r));
+	}
+	return result;
+}
+
+// One table's delete files, as `ProvideDataFilesOf` for its own kind.
+std::vector<std::vector<duckdb::Value>> ProvideDeleteFilesOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                             MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineDeleteFileRow> rows(moraine_dump_delete_files_free);
+	MoraineError err {};
+	if (moraine_dump_delete_files_of(handle, table_id, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err) !=
+	    MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back(DeleteFileShape(r));
 	}
 	return result;
 }
@@ -1021,8 +1037,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end_snapshot col */ 3,
 	        /* delete key: table_id, data_file_id, end_snapshot */ {1, 0, 3},
 	        /* overlay_updatable */ false,
-	        /* scope_column */ -1,
+	        /* scope column: table_id */ 1,
 	        /* live_narrowable */ true,
+	        ProvideDataFilesOf,
 	    },
 	    {
 	        "ducklake_delete_file",
@@ -1047,8 +1064,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* end_snapshot col */ 3,
 	        /* delete key: table_id, delete_file_id, end_snapshot */ {1, 0, 3},
 	        /* overlay_updatable */ false,
-	        /* scope_column */ -1,
+	        /* scope column: table_id */ 1,
 	        /* live_narrowable */ true,
+	        ProvideDeleteFilesOf,
 	    },
 	    {
 	        "ducklake_table_stats",
@@ -1104,6 +1122,8 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* delete key: data_file_id, table_id, column_id (decoder order) */ {0, 1, 2},
 	        /* overlay updates */ true,
 	        /* scope column: table_id */ 1,
+	        /* live_narrowable */ false,
+	        ProvideFileColumnStatsOf,
 	    },
 	    {
 	        // Three-column form: (begin_snapshot, schema_version, table_id).
@@ -1436,13 +1456,14 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
 	}
 	auto &catalog = LiveBoundCatalog(context, bind_data);
 	if (bind_data.rows == nullptr) {
+		// A scan emitting row ids has its rows resolved back from them by
+		// the staged-write Sink, so it reads the same materialization
+		// every other writer of this table does — never a live-narrowed one.
+		auto live_bound = EmitsRowIds(state->column_ids) ? duckdb::optional_idx() : bind_data.live_bound;
 		if (bind_data.scope.IsValid()) {
-			state->rows = ScopedMetadataRowsFor(context, catalog, *bind_data.spec, bind_data.scope.GetIndex());
+			state->rows =
+			    ScopedMetadataRowsFor(context, catalog, *bind_data.spec, bind_data.scope.GetIndex(), live_bound);
 		} else {
-			// A scan emitting row ids has its rows resolved back from them by
-			// the staged-write Sink, so it reads the same materialization
-			// every other writer of this table does — never a narrowed one.
-			auto live_bound = EmitsRowIds(state->column_ids) ? duckdb::optional_idx() : bind_data.live_bound;
 			state->rows = MetadataRowsFor(context, catalog, *bind_data.spec, live_bound);
 		}
 	}
@@ -2013,7 +2034,7 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 		if (rows == nullptr) {
 			rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
 		}
-		transaction.PutMetadataRows(spec, rows, live_only, epoch);
+		transaction.PutMetadataRows(spec, rows, live_only, epoch, std::nullopt);
 		return rows;
 	}
 
@@ -2033,13 +2054,13 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 	const bool stamped = transaction.SnapshotStamp(before.snapshot_id, before.batch_seq);
 	if (stamped) {
 		if (auto held = moraine_catalog.HeldMetadataRows(spec, before.snapshot_id, before.batch_seq)) {
-			transaction.PutMetadataRows(spec, held, false, epoch);
+			transaction.PutMetadataRows(spec, held, false, epoch, std::nullopt);
 			return held;
 		}
 	}
 
 	auto rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
-	transaction.PutMetadataRows(spec, rows, false, epoch);
+	transaction.PutMetadataRows(spec, rows, false, epoch, std::nullopt);
 
 	// Hold them for the next transaction only if the store did not move
 	// under the dump: rows that straddled a commit stand at no single
@@ -2054,32 +2075,66 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 }
 
 std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
-                                                          const MetadataTableSpec &spec, uint64_t table_id) {
+                                                          const MetadataTableSpec &spec, uint64_t table_id,
+                                                          duckdb::optional_idx live_bound) {
 	auto catalog_transaction = catalog.GetCatalogTransaction(context);
 	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
 	// Mid-write the staged tx's overlay is what a read owes, and only the
 	// unscoped dump carries it, so the scope is dropped rather than served
-	// without it. `MetadataRowsFor` holds that set for the transaction.
-	if (spec.scope_column < 0 || transaction.StagedTxIfOpen() != nullptr) {
-		return MetadataRowsFor(context, catalog, spec);
+	// without it — but never the live bound, which is the staged tx's own
+	// narrowing. `MetadataRowsFor` holds that set for the transaction.
+	if (spec.scope_column < 0 || spec.scoped_provider == nullptr || transaction.StagedTxIfOpen() != nullptr) {
+		return MetadataRowsFor(context, catalog, spec, live_bound);
 	}
+	const std::optional<uint64_t> scope = table_id;
+	if (auto cached = transaction.GetMetadataRows(spec, false, scope)) {
+		return cached;
+	}
+	// Taken before the materialization it stamps, as the unscoped path
+	// does: a staged tx opened while the set is built invalidates it.
+	auto epoch = transaction.MetadataRowsEpoch();
+
 	// A transaction that already materialized this table narrows what it
 	// holds. Reading the store again here would serve one scan of the table
 	// rows from beyond the point every other scan of it stands at.
 	if (auto held = transaction.GetMetadataRows(spec)) {
-		auto scope = static_cast<duckdb::idx_t>(spec.scope_column);
-		MetadataRows scoped;
+		auto column = static_cast<duckdb::idx_t>(spec.scope_column);
+		MetadataRows narrowed;
 		for (auto &row : *held) {
-			if (scope < row.size() && !row[scope].IsNull() &&
-			    row[scope].GetValue<int64_t>() == static_cast<int64_t>(table_id)) {
-				scoped.push_back(row);
+			if (column < row.size() && !row[column].IsNull() &&
+			    row[column].GetValue<int64_t>() == static_cast<int64_t>(table_id)) {
+				narrowed.push_back(row);
 			}
 		}
-		return std::make_shared<const MetadataRows>(std::move(scoped));
+		auto rows = std::make_shared<const MetadataRows>(std::move(narrowed));
+		transaction.PutMetadataRows(spec, rows, false, epoch, scope);
+		return rows;
 	}
-	auto *handle = catalog.Cast<MoraineCatalog>().Handle();
-	return std::make_shared<const MetadataRows>(
-	    ProvideFileColumnStatsOf(handle, table_id, moraine_shim_is_interrupted, &context));
+
+	// As the unscoped path: the rows this attach last narrowed to this
+	// table are byte-identical to a fresh dump whenever no batch landed
+	// since, and are held only if the store did not move under the dump.
+	auto &moraine_catalog = catalog.Cast<MoraineCatalog>();
+	auto *handle = moraine_catalog.Handle();
+	MoraineHeadStamp before;
+	const bool stamped = transaction.SnapshotStamp(before.snapshot_id, before.batch_seq);
+	if (stamped) {
+		if (auto held = moraine_catalog.HeldMetadataRows(spec, before.snapshot_id, before.batch_seq, scope)) {
+			transaction.PutMetadataRows(spec, held, false, epoch, scope);
+			return held;
+		}
+	}
+
+	auto rows = std::make_shared<const MetadataRows>(
+	    spec.scoped_provider(handle, table_id, moraine_shim_is_interrupted, &context));
+	transaction.PutMetadataRows(spec, rows, false, epoch, scope);
+
+	MoraineHeadStamp after;
+	if (stamped && ReadHeadStamp(handle, context, after) && after.snapshot_id == before.snapshot_id &&
+	    after.batch_seq == before.batch_seq) {
+		moraine_catalog.HoldMetadataRows(spec, before.snapshot_id, before.batch_seq, rows, scope);
+	}
+	return rows;
 }
 
 duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientContext &context,

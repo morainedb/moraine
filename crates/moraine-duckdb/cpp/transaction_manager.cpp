@@ -117,8 +117,11 @@ void MoraineTransaction::DropMetadataRows() {
 void MoraineTransaction::DropMetadataRowsFor(const MetadataTableSpec &spec) {
 	// Both materializations of the table, since the overlay that just moved
 	// is under either one.
-	metadata_rows_.erase({&spec, false});
-	metadata_rows_.erase({&spec, true});
+	// Every scope of the kind, not just the unnarrowed set: a staged row
+	// moves what any of them would return.
+	for (auto it = metadata_rows_.begin(); it != metadata_rows_.end();) {
+		it = std::get<0>(it->first) == &spec ? metadata_rows_.erase(it) : std::next(it);
+	}
 	metadata_rows_epoch_++;
 }
 
@@ -148,9 +151,10 @@ const std::vector<duckdb::Value> *MoraineTransaction::ScannedRow(const MetadataT
 }
 
 std::shared_ptr<const MetadataRows> MoraineTransaction::GetMetadataRows(const MetadataTableSpec &spec,
-                                                                       bool live_only) const {
+                                                                       bool live_only,
+                                                                       std::optional<uint64_t> scope) const {
 	std::lock_guard<std::mutex> guard(staged_state_lock_);
-	auto it = metadata_rows_.find({&spec, live_only});
+	auto it = metadata_rows_.find({&spec, live_only, scope});
 	if (it == metadata_rows_.end()) {
 		return nullptr;
 	}
@@ -163,14 +167,14 @@ uint64_t MoraineTransaction::MetadataRowsEpoch() const {
 }
 
 void MoraineTransaction::PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows,
-                                         bool live_only, uint64_t epoch) {
+                                         bool live_only, uint64_t epoch, std::optional<uint64_t> scope) {
 	std::lock_guard<std::mutex> guard(staged_state_lock_);
 	// A moved epoch means a drop landed while `rows` was built: what it
 	// holds predates an overlay change, so serving it would undo the drop.
 	if (epoch != metadata_rows_epoch_) {
 		return;
 	}
-	metadata_rows_[{&spec, live_only}] = std::move(rows);
+	metadata_rows_[{&spec, live_only, scope}] = std::move(rows);
 }
 
 duckdb::optional_ptr<duckdb::SchemaCatalogEntry> MoraineTransaction::GetCachedSchema(uint64_t schema_id) const {

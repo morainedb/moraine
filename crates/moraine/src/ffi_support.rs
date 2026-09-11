@@ -22,12 +22,15 @@
 //! instead — [`staged::StagedTransaction`]'s `visible_*` family, which
 //! overlays the staged rows onto the same records these functions scan.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, ops::Bound, sync::Arc};
+
+use bytes::Bytes;
 
 use crate::{
     catalog::{ReadOnlyCatalog, projection, projection::ProjectionCache},
     error::{Error, Result},
     store::{
+        key::{TableScopedKind, current_table_prefix, history_table_prefix, increment_prefix},
         proto::{
             ColumnTag, ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue,
             GcFileValue, HeadValue, MacroValue, MappingValue, OptionScopeValue, PartitionValue,
@@ -272,6 +275,39 @@ async fn dump_entities<T>(
         .collect())
 }
 
+/// The records under `prefix`, in key order. One table's records of one
+/// kind are a contiguous key range, so a narrowed dump walks that range
+/// instead of every record the half holds.
+fn records_under(records: &RecordSet, prefix: Vec<u8>) -> impl Iterator<Item = &EntityRecord> {
+    let end = increment_prefix(prefix.clone());
+    let bounds = (
+        Bound::Included(Bytes::from(prefix)),
+        end.map_or(Bound::Unbounded, |end| Bound::Excluded(Bytes::from(end))),
+    );
+
+    records
+        .range::<_, Bytes>(bounds)
+        .map(|(_, record)| record.as_ref())
+}
+
+/// As [`dump_entities`], narrowed to one table's records of `kind` in each
+/// half, in the order the unnarrowed dump emits them.
+async fn dump_table_entities<T>(
+    catalog: &ReadOnlyCatalog,
+    kind: TableScopedKind,
+    table_id: u64,
+    history: HistoryNeed,
+    extract: impl Fn(&EntityRecord) -> Option<T>,
+) -> Result<Vec<T>> {
+    let (_, current, ended) = entity_halves(catalog, history).await?;
+    Ok(
+        records_under(&current, current_table_prefix(kind, table_id))
+            .chain(records_under(&ended, history_table_prefix(kind, table_id)))
+            .filter_map(extract)
+            .collect(),
+    )
+}
+
 /// As [`dump_entities`], for the unversioned kinds (statistics, tags,
 /// mappings, scheduled deletions), which are never mirrored to `history`.
 async fn dump_current_entities<T>(
@@ -388,6 +424,30 @@ pub async fn dump_data_files_live_at(
         .collect())
 }
 
+/// One table's `ducklake_data_file` rows, current and history, in the
+/// order [`dump_data_files`] would emit them.
+///
+/// # Errors
+///
+/// As [`dump_data_files`].
+#[doc(hidden)]
+pub async fn dump_data_files_of(
+    catalog: &ReadOnlyCatalog,
+    table_id: u64,
+) -> Result<Vec<DataFileValue>> {
+    dump_table_entities(
+        catalog,
+        TableScopedKind::File,
+        table_id,
+        HistoryNeed::Always,
+        |record| match record {
+            EntityRecord::File(value) => Some(value.clone()),
+            _ => None,
+        },
+    )
+    .await
+}
+
 /// Every `ducklake_delete_file` row, current and history.
 #[doc(hidden)]
 pub async fn dump_delete_files(catalog: &ReadOnlyCatalog) -> Result<Vec<DeleteFileValue>> {
@@ -395,6 +455,30 @@ pub async fn dump_delete_files(catalog: &ReadOnlyCatalog) -> Result<Vec<DeleteFi
         EntityRecord::DeleteFile(v) => Some(v.clone()),
         _ => None,
     })
+    .await
+}
+
+/// One table's `ducklake_delete_file` rows, current and history, in the
+/// order [`dump_delete_files`] would emit them.
+///
+/// # Errors
+///
+/// As [`dump_delete_files`].
+#[doc(hidden)]
+pub async fn dump_delete_files_of(
+    catalog: &ReadOnlyCatalog,
+    table_id: u64,
+) -> Result<Vec<DeleteFileValue>> {
+    dump_table_entities(
+        catalog,
+        TableScopedKind::DeleteFile,
+        table_id,
+        HistoryNeed::Always,
+        |record| match record {
+            EntityRecord::DeleteFile(value) => Some(value.clone()),
+            _ => None,
+        },
+    )
     .await
 }
 
@@ -517,10 +601,16 @@ pub async fn dump_file_column_stats_of(
     catalog: &ReadOnlyCatalog,
     table_id: u64,
 ) -> Result<Vec<FileColumnStatsValue>> {
-    dump_current_entities(catalog, |record| match record {
-        EntityRecord::FileColumnStats(value) if value.table_id == table_id => Some(value.clone()),
-        _ => None,
-    })
+    dump_table_entities(
+        catalog,
+        TableScopedKind::FileColumnStats,
+        table_id,
+        HistoryNeed::Never,
+        |record| match record {
+            EntityRecord::FileColumnStats(value) => Some(value.clone()),
+            _ => None,
+        },
+    )
     .await
 }
 
@@ -2027,6 +2117,168 @@ mod tests {
 
         assert!(
             dump_file_column_stats_of(&catalog, u64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A scoped data-file dump is the contiguous run its offset names in
+    /// the unscoped one, across both halves: the scopes tile the whole
+    /// dump, live rows then ended ones, in order.
+    #[tokio::test]
+    async fn scoped_data_files_tile_the_whole_dump() {
+        let catalog = seed().await;
+
+        // A second table, and an ended version on each, so neither half of
+        // the record set is a single table's run.
+        catalog
+            .commit(|tx| {
+                let schema = tx.schemas()[1].id;
+                let table = tx.create_table(
+                    schema,
+                    "returns",
+                    &[ColumnDef {
+                        name: "id".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: false,
+                        default_value: None,
+                        children: Vec::new(),
+                    }],
+                )?;
+                for path in ["returns/a.parquet", "returns/b.parquet"] {
+                    tx.register_data_file(
+                        table,
+                        DataFile {
+                            path: path.into(),
+                            path_is_relative: true,
+                            file_format: "parquet".into(),
+                            record_count: 4,
+                            file_size_bytes: 64,
+                            footer_size: 8,
+                            encryption_key: None,
+                            partition_values: vec![],
+                            column_stats: vec![],
+                        },
+                        &[],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        catalog
+            .commit(|tx| {
+                let schema = tx.schemas()[1].id;
+                let table = tx.tables_in(schema)[1].id;
+                let file = tx.data_files_of(table)[0].id;
+                tx.expire_data_file(table, file)
+            })
+            .await
+            .unwrap();
+
+        let whole = dump_data_files(&catalog).await.unwrap();
+        let table_ids: std::collections::BTreeSet<u64> =
+            whole.iter().map(|row| row.table_id).collect();
+        assert_eq!(table_ids.len(), 2);
+
+        let mut tiled = Vec::new();
+        for &table_id in &table_ids {
+            let scoped = dump_data_files_of(&catalog, table_id).await.unwrap();
+            assert!(!scoped.is_empty(), "table {table_id} holds files");
+            tiled.extend(scoped);
+        }
+        assert_eq!(
+            tiled, whole,
+            "the scopes must tile the whole dump, in order"
+        );
+
+        assert!(
+            dump_data_files_of(&catalog, u64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A scoped delete-file dump tiles the whole one, as the data-file
+    /// scope does — the kind DuckLake joins into every file list.
+    #[tokio::test]
+    async fn scoped_delete_files_tile_the_whole_dump() {
+        let catalog = seed().await;
+
+        // A second table with its own deletions, so neither table's run is
+        // the whole dump.
+        catalog
+            .commit(|tx| {
+                let schema = tx.schemas()[1].id;
+                let table = tx.create_table(
+                    schema,
+                    "returns",
+                    &[ColumnDef {
+                        name: "id".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: false,
+                        default_value: None,
+                        children: Vec::new(),
+                    }],
+                )?;
+                // One delete file per data file is the rule, so each
+                // deletion gets its own file to hang off.
+                for ordinal in 0..2 {
+                    let file = tx.register_data_file(
+                        table,
+                        DataFile {
+                            path: format!("returns/a{ordinal}.parquet"),
+                            path_is_relative: true,
+                            file_format: "parquet".into(),
+                            record_count: 4,
+                            file_size_bytes: 64,
+                            footer_size: 8,
+                            encryption_key: None,
+                            partition_values: vec![],
+                            column_stats: vec![],
+                        },
+                        &[],
+                    )?;
+                    tx.register_delete_file(
+                        table,
+                        DeleteFile {
+                            data_file_id: file,
+                            path: format!("returns/d{ordinal}.parquet"),
+                            path_is_relative: true,
+                            format: "parquet".into(),
+                            delete_count: 1,
+                            file_size_bytes: 32,
+                            footer_size: 8,
+                            encryption_key: None,
+                        },
+                        &[],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let whole = dump_delete_files(&catalog).await.unwrap();
+        let table_ids: std::collections::BTreeSet<u64> =
+            whole.iter().map(|row| row.table_id).collect();
+        assert_eq!(table_ids.len(), 2);
+
+        let mut tiled = Vec::new();
+        for &table_id in &table_ids {
+            let scoped = dump_delete_files_of(&catalog, table_id).await.unwrap();
+            assert!(!scoped.is_empty(), "table {table_id} holds delete files");
+            tiled.extend(scoped);
+        }
+        assert_eq!(
+            tiled, whole,
+            "the scopes must tile the whole dump, in order"
+        );
+
+        assert!(
+            dump_delete_files_of(&catalog, u64::MAX)
                 .await
                 .unwrap()
                 .is_empty()

@@ -40,6 +40,11 @@ struct MetadataColumnSpec {
 using MetadataRowProvider = MetadataRows (*)(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                              void *probe_ctx);
 
+// As `MetadataRowProvider`, for one table's rows of a narrowable kind, in
+// the order the whole-kind provider emits them.
+using MetadataScopedRowProvider = MetadataRows (*)(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                   MoraineInterruptProbe probe, void *probe_ctx);
+
 // `moraine_tx_stage`'s "not writable" `table_kind` sentinel (moraine_abi.h),
 // mirrored here so this spec and the staged-write Sink (staged_write.cpp)
 // share one source of truth.
@@ -88,20 +93,22 @@ struct MetadataTableSpec {
 	// overlay updates stay a statistics-table convention.
 	bool overlay_updatable = false;
 	// Index into `columns` of the `table_id` a scan may narrow to, or -1 for
-	// a kind always materialized whole. Set only where the dump is large
-	// enough to be worth narrowing *and* keyed by that column first, so one
-	// table's rows are a contiguous run of the whole and narrowing does not
-	// renumber them — `ducklake_file_column_stats` alone.
-	//
+	// a kind always materialized whole. Set only where the dump grows with
+	// the data *and* the kind is keyed by that column first, so the scoped
+	// dump is one key range rather than a filter over the whole — the
+	// three kinds that grow with the data.
 	int32_t scope_column = -1;
 	// Whether a scan of this kind may be narrowed to the versions live at
 	// a filter's snapshot, skipping the ended half. Set on every versioned
 	// kind the core exposes a live-bounded transactional dump for.
+	bool live_narrowable = false;
+	// Materializes one table's rows. Set exactly where `scope_column` is;
+	// without it a narrowable scan falls back to the whole kind.
 	//
 	// Last, and it must stay last: these specs are initialized positionally,
 	// so a field added anywhere earlier silently shifts every entry that
 	// relies on declaration order.
-	bool live_narrowable = false;
+	MetadataScopedRowProvider scoped_provider = nullptr;
 };
 
 // The rows of `spec` as the calling DuckDB transaction sees them. Every
@@ -146,10 +153,12 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 //
 // Uncached, unlike `MetadataRowsFor`: a narrowed set is small, built once per
 // statement, and keyed by a value the transaction's cache is not keyed by.
-// Falls back to the whole set when the kind cannot be narrowed, or mid-write,
-// where only the unscoped dump carries the staged overlay a read then owes.
+// Falls back to `MetadataRowsFor` at `live_bound` when the kind cannot be
+// narrowed, or mid-write, where only the unscoped dump carries the staged
+// overlay a read then owes.
 std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
-                                                          const MetadataTableSpec &spec, uint64_t table_id);
+                                                          const MetadataTableSpec &spec, uint64_t table_id,
+                                                          duckdb::optional_idx live_bound = duckdb::optional_idx());
 
 // The fixed list of synthesized tables, in the order they're registered.
 // Built once; returns the same static instance every call.

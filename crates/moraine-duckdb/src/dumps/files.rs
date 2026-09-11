@@ -192,6 +192,38 @@ pub unsafe extern "C" fn moraine_dump_data_files_live_at(
     }
 }
 
+/// Dumps one table's `ducklake_data_file` rows into
+/// `*out_items`/`*out_len`, in the order [`moraine_dump_data_files`] would
+/// emit them. Freed with [`moraine_dump_data_files_free`].
+///
+/// # Safety
+///
+/// As [`moraine_dump_data_files`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_data_files_of(
+    handle: *mut MoraineCatalogHandle,
+    table_id: u64,
+    out_items: *mut *mut MoraineDataFileRow,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            async |catalog| moraine::ffi_support::dump_data_files_of(catalog, table_id).await,
+            data_file_rows,
+        )
+    }
+}
+
 /// Frees the array returned by [`moraine_dump_data_files`].
 ///
 /// # Safety
@@ -316,6 +348,38 @@ pub unsafe extern "C" fn moraine_dump_delete_files(
             probe_ctx,
             err,
             moraine::ffi_support::dump_delete_files,
+            delete_file_rows,
+        )
+    }
+}
+
+/// Dumps one table's `ducklake_delete_file` rows into
+/// `*out_items`/`*out_len`, in the order [`moraine_dump_delete_files`]
+/// would emit them. Freed with [`moraine_dump_delete_files_free`].
+///
+/// # Safety
+///
+/// As [`moraine_dump_delete_files`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_delete_files_of(
+    handle: *mut MoraineCatalogHandle,
+    table_id: u64,
+    out_items: *mut *mut MoraineDeleteFileRow,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            async |catalog| moraine::ffi_support::dump_delete_files_of(catalog, table_id).await,
             delete_file_rows,
         )
     }
