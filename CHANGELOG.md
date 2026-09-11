@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5](https://github.com/morainedb/moraine/compare/v0.6.4...v0.6.5) - 2026-09-11
+
+### Other
+
+- narrow mid-write metadata reads, and surface a slow open ([#217](https://github.com/morainedb/moraine/pull/217))
+- narrow and hold the metadata scans that grow with the data ([#216](https://github.com/morainedb/moraine/pull/216))
+- cut round trips across the store, catalog, index, and shim paths ([#211](https://github.com/morainedb/moraine/pull/211))
+- fold committed writes into the shared record set ([#210](https://github.com/morainedb/moraine/pull/210))
+- parse a data file's footer once across read shapes ([#209](https://github.com/morainedb/moraine/pull/209))
+- unique index probes by point read and a build-owned bloom filter ([#207](https://github.com/morainedb/moraine/pull/207))
+- narrow a write's metadata scan to the versions and table it touches ([#218](https://github.com/morainedb/moraine/pull/218))
+
 ## [0.6.4](https://github.com/morainedb/moraine/compare/v0.6.3...v0.6.4) - 2026-09-09
 
 ### Added
