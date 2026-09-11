@@ -188,3 +188,92 @@ SELECT (SELECT coalesce(sum(a), 0) FROM lake.main.t1),
        (SELECT coalesce(sum(a), 0) FROM lake.main.t3);
 ----
 18	0	11
+
+# The third narrowing a scan can carry: `end_snapshot IS NULL` keeps only
+# the unended versions, so the scan reads `current` and leaves `history`
+# unread. A DML carrying it emits row ids, so its rows are resolved back
+# from the run that narrowed scan registered — against the live versions
+# it actually emitted, never the ended ones it never saw.
+#
+# History has to exist for the two lists to differ, which is what makes
+# this adversarial: a resolution against the whole list would name an
+# ended version at the positions the narrowed one gave out.
+statement ok
+CREATE TABLE lake.main.h1(a BIGINT, k BIGINT);
+
+statement ok
+CREATE TABLE lake.main.h2(a BIGINT, k BIGINT);
+
+# Two inserts, so h1 owns two files and one can be retired without
+# emptying the table.
+statement ok
+INSERT INTO lake.main.h1 VALUES (1, 1);
+
+statement ok
+INSERT INTO lake.main.h1 VALUES (2, 2);
+
+statement ok
+INSERT INTO lake.main.h2 VALUES (3, 3);
+
+# A delete covering a whole file drops the file rather than writing a
+# deletion beside it, which ends its row: h1 now has versions in both
+# halves. (An `UPDATE` would not — it writes a delete file and leaves the
+# data file's row live.)
+statement ok
+DELETE FROM lake.main.h1 WHERE a = 1;
+
+query IT
+SELECT table_id, table_name FROM __ducklake_metadata_lake.ducklake_table
+WHERE table_name IN ('h1', 'h2') AND end_snapshot IS NULL ORDER BY table_id;
+----
+4	h1
+5	h2
+
+# Both halves are populated, or the test below proves nothing.
+query II
+SELECT count(*) FILTER (WHERE end_snapshot IS NULL) > 0,
+       count(*) FILTER (WHERE end_snapshot IS NOT NULL) > 0
+FROM __ducklake_metadata_lake.ducklake_data_file WHERE table_id = 4;
+----
+true	true
+
+statement ok
+SET VARIABLE h1_ended = (
+  SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file
+  WHERE table_id = 4 AND end_snapshot IS NOT NULL
+);
+
+statement ok con1
+BEGIN;
+
+# Stage first, so the narrowed read below goes through the staged
+# transaction — the shape a flush takes, and the only one where the
+# narrowing engages.
+statement ok con1
+DELETE FROM __ducklake_metadata_lake.ducklake_file_column_stats WHERE table_id = 5;
+
+# The adversarial statement: narrowed to h1's live versions, emitting row
+# ids, resolved back through the run it registered.
+statement ok con1
+DELETE FROM __ducklake_metadata_lake.ducklake_data_file
+WHERE end_snapshot IS NULL AND table_id = 4;
+
+statement ok con1
+COMMIT;
+
+# Exactly the live versions went. The ended ones are untouched, which is
+# what a row id resolved against the whole list would have taken instead.
+query II
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file
+        WHERE table_id = 4 AND end_snapshot IS NULL),
+       (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file
+        WHERE table_id = 4 AND end_snapshot IS NOT NULL) = getvariable('h1_ended');
+----
+0	true
+
+# And the neighbour table kept every file it had.
+query I
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file
+WHERE table_id = 5 AND end_snapshot IS NULL;
+----
+1

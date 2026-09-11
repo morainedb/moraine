@@ -787,8 +787,8 @@ end_snapshot IS NULL)`, and at the head the second half of that keeps
 nothing from `history`.
 
 The rule: **a scan may read `current` alone when its caller has been shown
-that no version in `history` can satisfy it.** One filter shape proves
-that, and the core — not the shim — checks it:
+that no version in `history` can satisfy it.** Two filter shapes prove
+that, and the core — not the shim — checks the first:
 
 - A record reaches `history` by being ended, stamped with the snapshot that
   ended it, which is never past the head. A record there always carries an
@@ -797,6 +797,14 @@ that, and the core — not the shim — checks it:
   matches nothing in `history` once `filter_snapshot` has reached the head.
 - Time travel reads behind the head and keeps the full pair, which is what
   makes the narrowing safe by construction rather than by care.
+
+The second shape is `end_snapshot IS NULL` standing alone, which DuckLake's
+own writes carry where its reads carry the pair — the statement that ends a
+rewritten file names the versions it may end and nothing else. It needs no
+comparison against the head at all: a record in `history` always carries an
+`end_snapshot`, so this conjunct excludes every one of them whatever the
+head stands at. It travels as a snapshot id like the bounded form, valued
+at every snapshot a store can reach, so one path serves both.
 
 The bound crosses the ABI as a snapshot id, not as a boolean, and the
 comparison against the head happens inside the same consistent read that
@@ -810,15 +818,20 @@ that consumes nothing — the filter stays, DuckLake keeps applying it — so a
 bound recognized too generously costs a narrower materialization, never a
 wrong row, and the core still refuses a bound behind its read point.
 
-Two scans are left out deliberately. A scan emitting row ids feeds an
-UPDATE or DELETE whose Sink resolves those ids back into the very rows the
-scan handed out, so it reads what every other writer of that table reads,
-never a narrowed set. And outside a staged transaction the narrowing is not
+One scan is left out. Outside a staged transaction the narrowing is not
 applied at all: a plain reader resolves its head per scan, so a narrowed and
 an unnarrowed read of one table could stand at two heads — the tear
 "one materialization per metadata table" exists to prevent. Inside a staged
 transaction the read point is pinned for the transaction's life, so no such
 tear exists, and that is where the flush path lives.
+
+A scan emitting row ids narrows like any other. Its rows are resolved back
+from those ids by the staged-write Sink, against the run that scan
+registered — which is the narrowed list itself — so an id names the row the
+scan handed it out for, whatever that scan left unread. The list a *second*
+materialization would build never enters it. That is what makes narrowing a
+writing scan safe, and it is the property the row-id resolution suite pins
+against a table holding versions in both halves.
 
 A live-only read inside a staged transaction — one bounded at the read
 point, or of an unversioned kind — is served from the head view the
