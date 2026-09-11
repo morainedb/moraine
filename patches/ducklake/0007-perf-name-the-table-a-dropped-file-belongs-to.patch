@@ -1,0 +1,44 @@
+diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/storage/ducklake_metadata_manager.hpp
+index 211622d..615c5be 100644
+--- a/src/include/storage/ducklake_metadata_manager.hpp
++++ b/src/include/storage/ducklake_metadata_manager.hpp
+@@ -299 +299,2 @@ public:
+-	static string DropDataFiles(const set<DataFileIndex> &dropped_files);
++	static string DropDataFiles(const set<DataFileIndex> &dropped_files,
++	                            optional_idx table_id = optional_idx());
+diff --git a/src/storage/ducklake_metadata_manager.cpp b/src/storage/ducklake_metadata_manager.cpp
+index 6890c15..6c1cae8 100644
+--- a/src/storage/ducklake_metadata_manager.cpp
++++ b/src/storage/ducklake_metadata_manager.cpp
+@@ -4005,2 +4005,15 @@ string DuckLakeMetadataManager::WriteNewDataFilesSqlBatch(const vector<DuckLakeF
+-string DuckLakeMetadataManager::DropDataFiles(const set<DataFileIndex> &dropped_files) {
+-	return FlushDrop("ducklake_data_file", "data_file_id", dropped_files);
++string DuckLakeMetadataManager::DropDataFiles(const set<DataFileIndex> &dropped_files, optional_idx table_id) {
++	if (!table_id.IsValid()) {
++		return FlushDrop("ducklake_data_file", "data_file_id", dropped_files);
++	}
++	if (dropped_files.empty()) {
++		return {};
++	}
++	// Naming the table is redundant against the id list, which already
++	// identifies the rows. It is there for the metadata catalog: a catalog
++	// that narrows a scan by table can serve this update one table's files
++	// instead of every file in the lake.
++	auto dropped_id_list = GenerateIDList(dropped_files);
++	return StringUtil::Format(
++	    R"(UPDATE {METADATA_CATALOG}.ducklake_data_file SET end_snapshot = {SNAPSHOT_ID} WHERE table_id = %d AND end_snapshot IS NULL AND data_file_id IN (%s);)",
++	    table_id.GetIndex(), dropped_id_list);
+diff --git a/src/storage/ducklake_transaction_state.cpp b/src/storage/ducklake_transaction_state.cpp
+index 8d7a581..bf8c741 100644
+--- a/src/storage/ducklake_transaction_state.cpp
++++ b/src/storage/ducklake_transaction_state.cpp
+@@ -1506 +1506,8 @@ string DuckLakeTransactionState::CommitChanges(DuckLakeCommitState &commit_state
+-		batch_queries += DuckLakeMetadataManager::DropDataFiles(dropped_indexes);
++		// `tables_deleted_from` holds exactly the tables files were dropped
++		// from, so a drop confined to one can name it. With several no
++		// single equality describes the set, and the unnamed form stands.
++		optional_idx dropped_table;
++		if (tables_deleted_from.size() == 1) {
++			dropped_table = tables_deleted_from.begin()->index;
++		}
++		batch_queries += DuckLakeMetadataManager::DropDataFiles(dropped_indexes, dropped_table);
