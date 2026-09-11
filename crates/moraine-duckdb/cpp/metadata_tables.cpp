@@ -1456,10 +1456,11 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
 	}
 	auto &catalog = LiveBoundCatalog(context, bind_data);
 	if (bind_data.rows == nullptr) {
-		// A scan emitting row ids has its rows resolved back from them by
-		// the staged-write Sink, so it reads the same materialization
-		// every other writer of this table does — never a live-narrowed one.
-		auto live_bound = EmitsRowIds(state->column_ids) ? duckdb::optional_idx() : bind_data.live_bound;
+		// A scan emitting row ids narrows like any other: the staged-write
+		// Sink resolves those ids against the run this scan registers
+		// below, which is the narrowed list itself, so a row id names the
+		// row the scan handed it out for whatever the scan left unread.
+		auto live_bound = bind_data.live_bound;
 		if (bind_data.scope.IsValid()) {
 			state->rows =
 			    ScopedMetadataRowsFor(context, catalog, *bind_data.spec, bind_data.scope.GetIndex(), live_bound);
@@ -1522,17 +1523,31 @@ duckdb::optional_idx ConstantSnapshot(const duckdb::Expression &expression) {
 	return static_cast<duckdb::idx_t>(snapshot);
 }
 
-// The snapshot `S` of a `S < end_snapshot OR end_snapshot IS NULL` filter
-// over this scan's `end_snapshot` column — the shape every DuckLake read of
-// a versioned table carries, alongside its `S >= begin_snapshot` half.
+// The bound a bare `end_snapshot IS NULL` carries: every snapshot a store
+// can reach. `optional_idx` reserves `UINT64_MAX` for absence, so the value
+// is the largest one it can carry.
+constexpr uint64_t kLiveAtEverySnapshot = UINT64_MAX - 1;
+
+// The snapshot `S` this scan's filter keeps its rows against, from either
+// shape that proves the ended half unreachable: DuckLake's reads carry
+// `S < end_snapshot OR end_snapshot IS NULL` alongside their
+// `S >= begin_snapshot` half, and its writes carry `end_snapshot IS NULL`
+// alone.
 //
-// Only rows the disjunction keeps matter, so recognizing it is what proves
-// the ended half unreachable: an ended version's `end_snapshot` is the
-// snapshot that ended it, never past the head, and is never null. Both arms
-// therefore reject every ended version once `S` has reached the head — which
-// the core, not this function, is what checks.
+// An ended version's `end_snapshot` is the snapshot that ended it, never
+// past the head, and is never null. So the disjunction rejects every one of
+// them once `S` has reached the head — which the core, not this function,
+// is what checks — and the bare `IS NULL` rejects them all wherever the
+// head stands, needing no check at all.
 duckdb::optional_idx LiveBoundOf(const duckdb::Expression &filter, const duckdb::LogicalGet &get,
                                  duckdb::idx_t projected) {
+	if (filter.GetExpressionType() == duckdb::ExpressionType::OPERATOR_IS_NULL) {
+		auto &is_null = filter.Cast<duckdb::BoundOperatorExpression>();
+		if (is_null.children.size() == 1 && IsColumnRef(*is_null.children[0], get, projected)) {
+			return duckdb::optional_idx(kLiveAtEverySnapshot);
+		}
+		return duckdb::optional_idx();
+	}
 	if (filter.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONJUNCTION) {
 		return duckdb::optional_idx();
 	}
