@@ -33,6 +33,11 @@ const DEFAULT_REPEAT: usize = 5;
 /// statement for a query that addresses one of them.
 const DEFAULT_TABLES: usize = 1;
 
+/// Percentage of the seeded files that carry a delete file. None by
+/// default: a lake that has never deleted holds no delete-file rows, so
+/// the kind costs a statement nothing.
+const DEFAULT_DELETES: usize = 0;
+
 /// Files one seeding commit registers: one per partition value.
 const FILES_PER_COMMIT: usize = 1_000;
 
@@ -44,6 +49,7 @@ const MARKER: &str = "__MORAINE_READER_BENCH__";
 struct Options {
     files: Vec<usize>,
     tables: usize,
+    deletes: usize,
     repeat: usize,
     cache_dir: Option<PathBuf>,
 }
@@ -52,6 +58,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
     let mut options = Options {
         files: DEFAULT_FILES.to_vec(),
         tables: DEFAULT_TABLES,
+        deletes: DEFAULT_DELETES,
         repeat: DEFAULT_REPEAT,
         cache_dir: None,
     };
@@ -79,10 +86,15 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
                 options.tables = value.parse().context("parsing --tables")?;
                 ensure!(options.tables > 0, "--tables must be positive");
             }
-            "--cache-dir" => options.cache_dir = Some(PathBuf::from(value)),
-            other => {
-                bail!("unknown flag `{other}`; valid: --files, --tables, --repeat, --cache-dir")
+            "--deletes" => {
+                options.deletes = value.parse().context("parsing --deletes")?;
+                ensure!(options.deletes <= 100, "--deletes is a percentage");
             }
+            "--cache-dir" => options.cache_dir = Some(PathBuf::from(value)),
+            other => bail!(
+                "unknown flag `{other}`; valid: --files, --tables, --deletes, --repeat, \
+                 --cache-dir"
+            ),
         }
     }
     Ok(options)
@@ -247,8 +259,25 @@ fn table_name(index: usize) -> String {
     format!("items{index}")
 }
 
+/// The `DELETE` that gives `deletes` percent of one table's files a delete
+/// file: one row out of each, chosen so no file is covered whole (which
+/// would drop the file instead of writing a deletion beside it). The seed
+/// attach turns inlining off, or a deletion this small is recorded in the
+/// store rather than as a delete file.
+///
+/// A file holds the rows whose ids are `start + k + j * partitions` for
+/// `j` in `0..ROWS_PER_FILE`, so `id // partitions` names the row within
+/// its file and `k` names the file within its commit.
+fn delete_statement(name: &str, partitions: usize, deletes: usize) -> String {
+    format!(
+        "DELETE FROM lake.main.{name} WHERE (id // {partitions}) % {ROWS_PER_FILE} = 0 \
+         AND k % 100 < {deletes};"
+    )
+}
+
 /// Seeds `files` data files spread evenly over `tables` partitioned
-/// tables, each filled by inserts that write one file per partition value.
+/// tables, each filled by inserts that write one file per partition value,
+/// then gives `deletes` percent of them a delete file.
 fn seed(
     artifacts: &Artifacts<'_>,
     target: &CatalogTarget,
@@ -256,12 +285,14 @@ fn seed(
     catalog_uri: &str,
     files: usize,
     tables: usize,
+    deletes: usize,
 ) -> anyhow::Result<()> {
     let plan = seed_plan(files.div_ceil(tables));
     let mut script = preamble(artifacts, target)?;
     let _ = writeln!(
         script,
-        "ATTACH {} AS lake (DATA_PATH {}, META_DATA_PATH {}, META_FLUSH_INTERVAL_MS 1, READ_WRITE);",
+        "ATTACH {} AS lake (DATA_PATH {}, META_DATA_PATH {}, META_FLUSH_INTERVAL_MS 1, \
+         DATA_INLINING_ROW_LIMIT 0, READ_WRITE);",
         sql_literal(&format!("ducklake:moraine:{catalog_uri}")),
         sql_literal(&data_path.display().to_string()),
         sql_literal(&data_path.display().to_string())
@@ -286,10 +317,21 @@ fn seed(
                 start.saturating_add(rows_per_commit)
             );
         }
+        if deletes > 0 {
+            let _ = writeln!(
+                script,
+                "{}",
+                delete_statement(&name, plan.partitions, deletes)
+            );
+        }
     }
     let _ = writeln!(
         script,
-        "SELECT '{MARKER}', count(*) FROM __ducklake_metadata_lake.ducklake_data_file WHERE end_snapshot IS NULL;"
+        "SELECT '{MARKER}', \
+         (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file \
+          WHERE end_snapshot IS NULL), \
+         (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_delete_file \
+          WHERE end_snapshot IS NULL);"
     );
 
     let stdout = run_script(artifacts, &script, "seeding the reader benchmark")?;
@@ -306,6 +348,15 @@ fn seed(
     ensure!(
         seeded == expected,
         "seeding registered {seeded} files, expected {expected}"
+    );
+
+    // A delete that covered a file whole would drop it rather than write a
+    // deletion beside it, so the count is what says the shape is right.
+    let with_deletions: usize = parse_field(&fields, 2, "delete files")?;
+    let owed = expected.saturating_mul(deletes.min(100)) / 100;
+    ensure!(
+        with_deletions == owed,
+        "seeding registered {with_deletions} delete files, expected {owed}"
     );
     Ok(())
 }
@@ -404,8 +455,10 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
 
     println!("\n# Cold read-only attach against {}", target.description());
     println!(
-        "# local Parquet; {} tables; {} cold processes per size; cache dir: {}; request durations are summed and may overlap\n",
+        "# local Parquet; {} tables; {}% of files carrying a delete file; {} cold processes per \
+         size; cache dir: {}; request durations are summed and may overlap\n",
         options.tables,
+        options.deletes,
         options.repeat,
         options
             .cache_dir
@@ -438,6 +491,7 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
             &catalog_uri,
             files,
             options.tables,
+            options.deletes,
         )?;
 
         let mut samples = Vec::with_capacity(options.repeat);
@@ -490,6 +544,8 @@ mod tests {
             "2000,20000",
             "--tables",
             "4",
+            "--deletes",
+            "50",
             "--repeat",
             "3",
             "--cache-dir",
@@ -500,11 +556,13 @@ mod tests {
         let options = parse_options(&arguments).unwrap();
         assert_eq!(options.files, [2_000, 20_000]);
         assert_eq!(options.tables, 4);
+        assert_eq!(options.deletes, 50);
         assert_eq!(options.repeat, 3);
         assert_eq!(options.cache_dir.as_deref(), Some(Path::new("/tmp/c")));
         assert!(parse_options(&["--repeat".to_owned(), "0".to_owned()]).is_err());
         assert!(parse_options(&["--files".to_owned(), "0".to_owned()]).is_err());
         assert!(parse_options(&["--tables".to_owned(), "0".to_owned()]).is_err());
+        assert!(parse_options(&["--deletes".to_owned(), "101".to_owned()]).is_err());
     }
 
     #[test]
@@ -527,6 +585,15 @@ mod tests {
             seed_plan(2_500).partitions * seed_plan(2_500).commits,
             3_000
         );
+    }
+
+    /// The seeded delete takes one row from each file of the chosen
+    /// partitions — never a whole file, which would drop it instead.
+    #[test]
+    fn the_delete_takes_one_row_from_each_chosen_file() {
+        let statement = delete_statement("items0", 1_000, 25);
+        assert!(statement.contains("(id // 1000) % 10 = 0"), "{statement}");
+        assert!(statement.contains("k % 100 < 25"), "{statement}");
     }
 
     #[test]
