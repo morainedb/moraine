@@ -375,3 +375,11 @@ SELECT (SELECT count(*) FROM __ducklake_metadata_scoped.ducklake_data_file WHERE
         WHERE table_id = 1);
 ----
 true
+
+# The rows this attach holds are the shim's own allocation, outside
+# moraine's budgets and DuckDB's memory limit both, so the memory tally
+# names them. Non-zero here because the reads above left sets held.
+query I
+SELECT held_metadata_bytes > 0 FROM moraine_memory_tally('scoped');
+----
+true

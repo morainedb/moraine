@@ -314,8 +314,9 @@ duckdb::unique_ptr<duckdb::FunctionData> MemoryTallyBind(duckdb::ClientContext &
 	}
 	auto bind_data = duckdb::make_uniq<TallyBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
-	names = {"slatedb_unflushed_bytes", "projection_bytes", "cache_metadata_bytes", "cache_block_bytes",
-	         "auxiliary_metadata_bytes", "last_commit_index_entries", "last_commit_staged_bytes"};
+	names = {"slatedb_unflushed_bytes", "projection_bytes",  "cache_metadata_bytes",
+	         "cache_block_bytes",        "auxiliary_metadata_bytes", "last_commit_index_entries",
+	         "last_commit_staged_bytes", "held_metadata_bytes"};
 	return_types.assign(names.size(), duckdb::LogicalType::UBIGINT);
 	return bind_data;
 }
@@ -331,7 +332,8 @@ void MemoryTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput 
 	state.emitted = true;
 
 	MoraineMemoryTally tally {};
-	auto code = moraine_catalog_memory_tally(ResolveMoraineCatalog(context, bind_data.catalog_name).Handle(), &tally);
+	auto &moraine_catalog = ResolveMoraineCatalog(context, bind_data.catalog_name);
+	auto code = moraine_catalog_memory_tally(moraine_catalog.Handle(), &tally);
 	if (code != MORAINE_OK) {
 		throw duckdb::InternalException("moraine_memory_tally: could not read memory accounting");
 	}
@@ -342,6 +344,9 @@ void MemoryTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput 
 	output.SetValue(4, 0, duckdb::Value::UBIGINT(tally.auxiliary_metadata_bytes));
 	output.SetValue(5, 0, duckdb::Value::UBIGINT(tally.last_commit_index_entries));
 	output.SetValue(6, 0, duckdb::Value::UBIGINT(tally.last_commit_staged_bytes));
+	// The shim's own, not the core's: the rows this attach holds for the
+	// metadata tables it has narrowed or materialized.
+	output.SetValue(7, 0, duckdb::Value::UBIGINT(moraine_catalog.HeldMetadataBytes()));
 	output.SetCardinality(1);
 }
 

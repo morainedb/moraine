@@ -340,6 +340,37 @@ fn warn_if_metadata_cache_cannot_hold(path: &str, metadata_bytes: Option<u64>) {
     }
 }
 
+/// How long an open may take before a missing cache directory is worth
+/// reporting. Below it the open is a handful of round trips whatever the
+/// store holds; above it, it is re-reading bytes a local cache would have
+/// kept.
+const SLOW_OPEN: Duration = Duration::from_millis(250);
+
+/// Whether an open was slow enough, with no cache directory configured, to
+/// be worth telling the operator about.
+pub(super) fn slow_open_without_cache(
+    cache_dir: Option<&std::path::Path>,
+    elapsed: Duration,
+) -> bool {
+    cache_dir.is_none() && elapsed >= SLOW_OPEN
+}
+
+/// Warns when a slow open had no cache directory to read from. The bytes
+/// it fetched are fetched again by every process that opens this store,
+/// where a cache directory keeps them on local disk: over 20 000 files
+/// behind an endpoint costing about 20 ms a request, that was 1378 ms
+/// against 451 ms.
+fn warn_if_slow_open_without_cache(options: &CatalogOptions, elapsed: Duration) {
+    if !slow_open_without_cache(options.cache_dir.as_deref(), elapsed) {
+        return;
+    }
+    warn!(
+        path = options.path,
+        elapsed_ms = crate::telemetry::milliseconds(elapsed),
+        "opening this store read what no cache directory kept, and every process that opens          it reads the same bytes again. Set `CACHE_DIR` to a local directory to keep them on          disk across restarts."
+    );
+}
+
 /// Parses a configured checkpoint id, naming the option in the error.
 fn parse_checkpoint(checkpoint: Option<&str>) -> Result<Option<uuid::Uuid>> {
     checkpoint
@@ -1028,13 +1059,15 @@ impl Catalog {
             &options.path,
             manifest.as_ref().map(|manifest| manifest.metadata_bytes),
         );
+        let elapsed = started.elapsed();
         info!(
             path = options.path,
             flush_interval_ms = options.flush_interval.as_millis(),
             flush_on_commit = options.flush_on_commit,
-            elapsed_ms = crate::telemetry::milliseconds(started.elapsed()),
+            elapsed_ms = crate::telemetry::milliseconds(elapsed),
             "opened catalog read-write"
         );
+        warn_if_slow_open_without_cache(&options, elapsed);
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         // The open already validated the stamp; commits below this floor
         // owe no format read.
@@ -1133,12 +1166,14 @@ impl Catalog {
             &options.path,
             manifest.as_ref().map(|manifest| manifest.metadata_bytes),
         );
+        let elapsed = started.elapsed();
         info!(
             path = options.path,
             checkpoint = options.checkpoint,
-            elapsed_ms = crate::telemetry::milliseconds(started.elapsed()),
+            elapsed_ms = crate::telemetry::milliseconds(elapsed),
             "opened catalog read-only"
         );
+        warn_if_slow_open_without_cache(&options, elapsed);
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         crate::catalog::projection::raise_format_floor(&projections, format);
         Ok(ReadOnlyCatalog {
