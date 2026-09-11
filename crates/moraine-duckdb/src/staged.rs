@@ -419,6 +419,41 @@ pub unsafe extern "C" fn moraine_tx_dump_data_files_live_at(
     )
 }
 
+/// The `filter_snapshot` that asks for every version rather than the ones
+/// live at a snapshot. Zero is a real snapshot id, so the sentinel is the
+/// one value no snapshot can carry.
+pub const MORAINE_EVERY_VERSION: u64 = u64::MAX;
+
+/// As [`moraine_tx_dump_data_files`], narrowed to one table and, unless
+/// `filter_snapshot` is [`MORAINE_EVERY_VERSION`], to the versions live at
+/// it: the rows the whole dump would show for `table_id`, staged rows
+/// included. Freed with `moraine_dump_data_files_free`.
+///
+/// # Safety
+///
+/// As [`moraine_tx_dump_data_files`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_data_files_of(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    filter_snapshot: u64,
+    out_items: *mut *mut MoraineDataFileRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    let bound = (filter_snapshot != MORAINE_EVERY_VERSION).then_some(filter_snapshot);
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        StagedTransaction::visible_data_files_of,
+        data_file_rows,
+        table_id,
+        bound
+    )
+}
+
 /// Dumps every `ducklake_delete_file` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_delete_files_free`.
@@ -444,6 +479,35 @@ pub unsafe extern "C" fn moraine_tx_dump_delete_files(
         err,
         StagedTransaction::visible_delete_files,
         delete_file_rows
+    )
+}
+
+/// As [`moraine_tx_dump_delete_files`], narrowed as
+/// [`moraine_tx_dump_data_files_of`] is. Freed with
+/// `moraine_dump_delete_files_free`.
+///
+/// # Safety
+///
+/// As [`moraine_tx_dump_delete_files`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_delete_files_of(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    filter_snapshot: u64,
+    out_items: *mut *mut MoraineDeleteFileRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    let bound = (filter_snapshot != MORAINE_EVERY_VERSION).then_some(filter_snapshot);
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        StagedTransaction::visible_delete_files_of,
+        delete_file_rows,
+        table_id,
+        bound
     )
 }
 
@@ -500,6 +564,32 @@ pub unsafe extern "C" fn moraine_tx_dump_file_column_stats(
         err,
         StagedTransaction::visible_file_column_stats,
         file_column_stats_rows
+    )
+}
+
+/// As [`moraine_tx_dump_file_column_stats`], narrowed to one table: the
+/// rows the whole dump would show for `table_id`, staged rows included.
+/// Freed with `moraine_dump_file_column_stats_free`.
+///
+/// # Safety
+///
+/// As [`moraine_tx_dump_file_column_stats`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_file_column_stats_of(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    out_items: *mut *mut MoraineFileColumnStatsRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        StagedTransaction::visible_file_column_stats_of,
+        file_column_stats_rows,
+        table_id
     )
 }
 

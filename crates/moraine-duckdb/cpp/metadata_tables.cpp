@@ -1844,14 +1844,14 @@ std::vector<std::vector<duckdb::Value>> TxDumpRows(MoraineTxHandle *tx, DumpFn d
 	return result;
 }
 
-// As `TxDumpRows`, for a dump that takes the snapshot a reader keeps rows
-// against.
+// As `TxDumpRows`, for a dump that takes one extra `uint64_t` — the
+// snapshot a reader keeps rows against, or the table it narrows to.
 template <typename Row, typename DumpFn, typename ShapeFn>
-std::vector<std::vector<duckdb::Value>> TxDumpRowsLiveAt(MoraineTxHandle *tx, uint64_t live_bound, DumpFn dump,
-                                                         void (*free_fn)(Row *, size_t), ShapeFn shape) {
+std::vector<std::vector<duckdb::Value>> TxDumpRowsBy(MoraineTxHandle *tx, uint64_t argument, DumpFn dump,
+                                                     void (*free_fn)(Row *, size_t), ShapeFn shape) {
 	OwnedArray<Row> rows(free_fn);
 	MoraineError err {};
-	if (dump(tx, live_bound, rows.OutItems(), rows.OutLen(), &err) != MORAINE_OK) {
+	if (dump(tx, argument, rows.OutItems(), rows.OutLen(), &err) != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
 	std::vector<std::vector<duckdb::Value>> result;
@@ -1860,6 +1860,47 @@ std::vector<std::vector<duckdb::Value>> TxDumpRowsLiveAt(MoraineTxHandle *tx, ui
 		result.push_back(shape(r));
 	}
 	return result;
+}
+
+// As `TxDumpRowsBy`, for a scoped dump: a table, and the snapshot its
+// versions are kept against.
+template <typename Row, typename DumpFn, typename ShapeFn>
+std::vector<std::vector<duckdb::Value>> TxDumpRowsOf(MoraineTxHandle *tx, uint64_t table_id, uint64_t filter_snapshot,
+                                                     DumpFn dump, void (*free_fn)(Row *, size_t), ShapeFn shape) {
+	OwnedArray<Row> rows(free_fn);
+	MoraineError err {};
+	if (dump(tx, table_id, filter_snapshot, rows.OutItems(), rows.OutLen(), &err) != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back(shape(r));
+	}
+	return result;
+}
+
+// The transaction-aware rows for one `write_table_kind`, narrowed to one
+// table and to `live_bound` where it is given. Empty optional for a kind
+// with no scoped dump, which the caller reads whole.
+std::optional<std::vector<std::vector<duckdb::Value>>>
+TxAwareScopedRows(MoraineTxHandle *tx, int32_t write_table_kind, uint64_t table_id, duckdb::optional_idx live_bound) {
+	const uint64_t bound = live_bound.IsValid() ? static_cast<uint64_t>(live_bound.GetIndex()) : kEveryVersion;
+	switch (write_table_kind) {
+	case 6:
+		return TxDumpRowsOf<MoraineDataFileRow>(tx, table_id, bound, moraine_tx_dump_data_files_of,
+		                                        moraine_dump_data_files_free, DataFileShape);
+	case 7:
+		return TxDumpRowsOf<MoraineDeleteFileRow>(tx, table_id, bound, moraine_tx_dump_delete_files_of,
+		                                          moraine_dump_delete_files_free, DeleteFileShape);
+	case 10:
+		// Unversioned: no bound applies, and the ABI takes none.
+		return TxDumpRowsBy<MoraineFileColumnStatsRow>(tx, table_id, moraine_tx_dump_file_column_stats_of,
+		                                               moraine_dump_file_column_stats_free, FileColumnStatsShape);
+	default:
+		break;
+	}
+	return std::nullopt;
 }
 
 // The transaction-aware rows for one `write_table_kind`, or an empty
@@ -1885,25 +1926,25 @@ std::optional<std::vector<std::vector<duckdb::Value>>> TxAwareRows(MoraineTxHand
 		auto bound = static_cast<uint64_t>(live_bound.GetIndex());
 		switch (write_table_kind) {
 		case 3:
-			return TxDumpRowsLiveAt<MoraineTableRow>(tx, bound, moraine_tx_dump_tables_live_at,
+			return TxDumpRowsBy<MoraineTableRow>(tx, bound, moraine_tx_dump_tables_live_at,
 			                                         moraine_dump_tables_free, TableShape);
 		case 4:
-			return TxDumpRowsLiveAt<MoraineViewRow>(tx, bound, moraine_tx_dump_views_live_at, moraine_dump_views_free,
+			return TxDumpRowsBy<MoraineViewRow>(tx, bound, moraine_tx_dump_views_live_at, moraine_dump_views_free,
 			                                        ViewShape);
 		case 5:
-			return TxDumpRowsLiveAt<MoraineColumnRow>(tx, bound, moraine_tx_dump_columns_live_at,
+			return TxDumpRowsBy<MoraineColumnRow>(tx, bound, moraine_tx_dump_columns_live_at,
 			                                          moraine_dump_columns_free, ColumnShape);
 		case 6:
-			return TxDumpRowsLiveAt<MoraineDataFileRow>(tx, bound, moraine_tx_dump_data_files_live_at,
+			return TxDumpRowsBy<MoraineDataFileRow>(tx, bound, moraine_tx_dump_data_files_live_at,
 			                                            moraine_dump_data_files_free, DataFileShape);
 		case 7:
-			return TxDumpRowsLiveAt<MoraineDeleteFileRow>(tx, bound, moraine_tx_dump_delete_files_live_at,
+			return TxDumpRowsBy<MoraineDeleteFileRow>(tx, bound, moraine_tx_dump_delete_files_live_at,
 			                                              moraine_dump_delete_files_free, DeleteFileShape);
 		case 12:
-			return TxDumpRowsLiveAt<MorainePartitionInfoRow>(tx, bound, moraine_tx_dump_partition_info_live_at,
+			return TxDumpRowsBy<MorainePartitionInfoRow>(tx, bound, moraine_tx_dump_partition_info_live_at,
 			                                                 moraine_dump_partition_info_free, PartitionInfoShape);
 		case 15:
-			return TxDumpRowsLiveAt<MoraineSortInfoRow>(tx, bound, moraine_tx_dump_sort_info_live_at,
+			return TxDumpRowsBy<MoraineSortInfoRow>(tx, bound, moraine_tx_dump_sort_info_live_at,
 			                                            moraine_dump_sort_info_free, SortInfoShape);
 		default:
 			break;
@@ -2079,14 +2120,35 @@ std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext 
                                                           duckdb::optional_idx live_bound) {
 	auto catalog_transaction = catalog.GetCatalogTransaction(context);
 	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
-	// Mid-write the staged tx's overlay is what a read owes, and only the
-	// unscoped dump carries it, so the scope is dropped rather than served
-	// without it — but never the live bound, which is the staged tx's own
-	// narrowing. `MetadataRowsFor` holds that set for the transaction.
-	if (spec.scope_column < 0 || spec.scoped_provider == nullptr || transaction.StagedTxIfOpen() != nullptr) {
+	if (spec.scope_column < 0 || spec.scoped_provider == nullptr) {
 		return MetadataRowsFor(context, catalog, spec, live_bound);
 	}
 	const std::optional<uint64_t> scope = table_id;
+
+	// Mid-write a read owes the staged tx's overlay, so the narrowed dump
+	// is the staged one, which carries it — and takes the live bound too,
+	// so a read naming a table and a snapshot pays for neither the other
+	// tables nor the ended versions.
+	if (auto *staged_tx = transaction.StagedTxIfOpen()) {
+		const bool live_only = live_bound.IsValid() && spec.live_narrowable;
+		if (auto cached = transaction.GetMetadataRows(spec, live_only, scope)) {
+			return cached;
+		}
+		// Taken before the dump it stamps: a row staged into this table
+		// while it is built invalidates it.
+		auto epoch = transaction.MetadataRowsEpoch();
+		auto scoped = TxAwareScopedRows(staged_tx, spec.write_table_kind, table_id,
+		                                live_only ? live_bound : duckdb::optional_idx());
+		if (!scoped.has_value()) {
+			return MetadataRowsFor(context, catalog, spec, live_bound);
+		}
+		auto rows = std::make_shared<const MetadataRows>(std::move(*scoped));
+		// Held for this transaction only: the rows carry its uncommitted
+		// overlay, so the attach must never serve them to another.
+		transaction.PutMetadataRows(spec, rows, live_only, epoch, scope);
+		return rows;
+	}
+
 	if (auto cached = transaction.GetMetadataRows(spec, false, scope)) {
 		return cached;
 	}

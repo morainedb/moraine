@@ -7638,6 +7638,165 @@ async fn staged_rows_enforce_no_name_uniqueness() {
     );
     catalog.close().await.unwrap();
 }
+/// The table scope and the live bound compose: a read carrying both keeps
+/// one table's live versions, and drops the other tables and the ended
+/// versions alike.
+#[tokio::test]
+async fn a_scoped_read_takes_the_live_bound_too() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached(&catalog, db_tx);
+    for table_id in [1, 2] {
+        setup.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(table_id, 0, &format!("t{table_id}"), 1, None),
+        });
+        setup.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(table_id, 1, "a", 1),
+        });
+        setup.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: data_file_row(10 * table_id, table_id, 1),
+        });
+    }
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t1""#),
+    });
+    setup.commit().await.unwrap();
+
+    // End table 1's file, so it has a version in `history` to exclude.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(10), Cell::U64(2)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+
+    // Bounded at the read point: table 1's only version ended there, so
+    // its narrowed read is empty while the unbounded one still has it.
+    assert!(
+        tx.visible_data_files_of(1, Some(2))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(tx.visible_data_files_of(1, None).await.unwrap().len(), 1);
+
+    // The bound does not reach past the table: table 2's live file stays.
+    assert_eq!(tx.visible_data_files_of(2, Some(2)).await.unwrap().len(), 1);
+
+    // And each agrees with the whole read under the same bound.
+    let whole = tx.visible_data_files_live_at(Some(2)).await.unwrap();
+    for table_id in [1, 2] {
+        let scoped = tx.visible_data_files_of(table_id, Some(2)).await.unwrap();
+        let expected: Vec<_> = whole
+            .iter()
+            .filter(|row| row.table_id == table_id)
+            .cloned()
+            .collect();
+        assert_eq!(scoped, expected, "table {table_id}");
+    }
+    tx.rollback();
+}
+
+/// A narrowed read of a writing transaction is the whole read restricted
+/// to that table: same rows, same order, staged rows included, and no
+/// other table's staged row reaching it.
+#[tokio::test]
+async fn visible_rows_of_one_table_tile_the_whole_visible_read() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached(&catalog, db_tx);
+    for table_id in [1, 2] {
+        setup.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(table_id, 0, &format!("t{table_id}"), 1, None),
+        });
+        setup.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(table_id, 1, "a", 1),
+        });
+        for data_file_id in [10 * table_id, 10 * table_id + 1] {
+            setup.stage(RowOperation::Insert {
+                table: TableKind::DataFile,
+                cells: data_file_row(data_file_id, table_id, 1),
+            });
+        }
+    }
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t1""#),
+    });
+    setup.commit().await.unwrap();
+
+    // Stage into both tables, so a scope that leaked would be visible as
+    // the other table's row and a scope that dropped its own as a missing
+    // one.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+    for table_id in [1, 2] {
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: data_file_row(10 * table_id + 5, table_id, 2),
+        });
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::DataFile,
+            cells: vec![Cell::U64(table_id), Cell::U64(10 * table_id), Cell::U64(2)],
+        });
+    }
+
+    let whole = tx.visible_data_files().await.unwrap();
+    for table_id in [1, 2] {
+        let scoped = tx.visible_data_files_of(table_id, None).await.unwrap();
+        let expected: Vec<_> = whole
+            .iter()
+            .filter(|row| row.table_id == table_id)
+            .cloned()
+            .collect();
+        assert_eq!(scoped, expected, "table {table_id}");
+        assert!(
+            scoped
+                .iter()
+                .any(|row| row.data_file_id == 10 * table_id + 5),
+            "table {table_id} must carry its own staged insert"
+        );
+        assert!(
+            scoped
+                .iter()
+                .any(|row| row.data_file_id == 10 * table_id && row.end_snapshot == Some(2)),
+            "table {table_id} must carry its own staged end"
+        );
+    }
+
+    // A table with nothing staged and nothing committed is empty, not the
+    // kind.
+    assert!(tx.visible_data_files_of(99, None).await.unwrap().is_empty());
+    tx.rollback();
+}
 
 /// Read-your-writes for the data-file projection: a transaction that
 /// stages an insert, ends a committed row, and hard-deletes a history one

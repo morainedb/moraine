@@ -383,3 +383,49 @@ query I
 SELECT held_metadata_bytes > 0 FROM moraine_memory_tally('scoped');
 ----
 true
+
+# A narrowed scan inside a writing transaction reads through the staged tx,
+# which carries the rows staged so far. The scope used to be dropped here
+# and the whole kind read for the overlay's sake; the narrowed dump carries
+# the overlay itself, so the narrowing no longer costs it.
+#
+# A metadata DELETE stages at once, which an insert into the lake table
+# does not — DuckLake stages a data file's row when it commits.
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM __ducklake_metadata_scoped.ducklake_data_file WHERE table_id = 2;
+
+# The narrowed read of the table just staged into shows the staged delete.
+# Reading committed state here would report the file still live.
+query I con1
+SELECT count(*) FROM __ducklake_metadata_scoped.ducklake_data_file WHERE table_id = 2;
+----
+0
+
+# The table nothing was staged into is unmoved, so the overlay reaches the
+# scope it names and no other.
+query I con1
+SELECT (SELECT count(*) FROM __ducklake_metadata_scoped.ducklake_data_file
+        WHERE table_id = 1 AND end_snapshot IS NULL) = getvariable('one_files') + 1;
+----
+true
+
+# Narrowed and whole agree mid-write, which is what says the two dumps
+# stand at one read point and carry one overlay.
+query I con1
+SELECT (SELECT count(*) FROM __ducklake_metadata_scoped.ducklake_data_file WHERE table_id = 2)
+     = (SELECT count(*) FROM (SELECT * FROM __ducklake_metadata_scoped.ducklake_data_file)
+        WHERE table_id = 2);
+----
+true
+
+statement ok con1
+ROLLBACK;
+
+# The staged delete left with the transaction.
+query I con1
+SELECT count(*) FROM __ducklake_metadata_scoped.ducklake_data_file WHERE table_id = 2;
+----
+1

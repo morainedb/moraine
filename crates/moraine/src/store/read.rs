@@ -13,7 +13,8 @@ use crate::{
         handle::{ReadHandle, ScanShape},
         key::{
             CurrentKey, EntityKey, EntityKind, Key, SPLIT_SCAN_KINDS, Subspace, SysKey,
-            current_entity_kind_prefix, current_gc_file_prefix, history_entity_kind_prefix,
+            TableScopedKind, current_entity_kind_prefix, current_gc_file_prefix,
+            current_table_prefix, history_entity_kind_prefix, history_table_prefix,
             subspace_prefix,
         },
         proto::{
@@ -151,6 +152,17 @@ impl EntityRecordKind {
             Self::Option => Some(EntityKind::Option),
             Self::Tag => Some(EntityKind::Tag),
             Self::GcFile => None,
+        }
+    }
+
+    /// The table-scoped kind this is, for the three whose row count grows
+    /// with the data. `None` for every other kind, which is read whole.
+    fn table_scoped(self) -> Option<TableScopedKind> {
+        match self {
+            Self::File => Some(TableScopedKind::File),
+            Self::DeleteFile => Some(TableScopedKind::DeleteFile),
+            Self::FileColumnStats => Some(TableScopedKind::FileColumnStats),
+            _ => None,
         }
     }
 }
@@ -606,6 +618,50 @@ pub(crate) async fn scan_entity_kind(
     records.extend(history);
 
     Ok(records)
+}
+
+/// As [`scan_entity_kind`], narrowed to one table. `None` for a kind the
+/// key layout does not scope by table, which the caller reads whole.
+pub(crate) async fn scan_entity_kind_of(
+    handle: ReadHandle<'_>,
+    kind: EntityRecordKind,
+    versions: Versions,
+    table_id: u64,
+) -> Result<Option<Vec<EntityRecord>>> {
+    let (Some(entity_kind), Some(scoped)) = (kind.entity_kind(), kind.table_scoped()) else {
+        return Ok(None);
+    };
+
+    let current = scan_decode_kind(
+        handle,
+        entity_kind,
+        current_table_prefix(scoped, table_id),
+        |key, bytes| match key {
+            Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, &bytes),
+            other => Err(Error::Corruption(format!(
+                "non-entity key in {kind:?} current scan: {other:?}"
+            ))),
+        },
+    );
+    if !entity_kind.is_versioned() || versions == Versions::Live {
+        return Ok(Some(current.await?));
+    }
+
+    let history = scan_decode_kind(
+        handle,
+        entity_kind,
+        history_table_prefix(scoped, table_id),
+        |key, bytes| match key {
+            Key::History(history) => decode_entity(history.entity, &bytes),
+            other => Err(Error::Corruption(format!(
+                "non-history key in {kind:?} history scan: {other:?}"
+            ))),
+        },
+    );
+    let (mut records, history) = futures::try_join!(current, history)?;
+    records.extend(history);
+
+    Ok(Some(records))
 }
 
 #[cfg(test)]
