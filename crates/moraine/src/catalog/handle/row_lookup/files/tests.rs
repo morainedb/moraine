@@ -5,7 +5,9 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
 };
 use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+use proptest::prelude::*;
 
+use super::DenseRanges;
 use crate::{Catalog, CatalogOptions, ColumnDef, DataFile, DataFileId, DataStore, TableId};
 
 /// Writes `rows` values with no row-id column to `path`, returning the
@@ -166,4 +168,70 @@ async fn an_expired_file_leaves_a_warm_directory_without_a_rebuild() {
     assert_eq!(found[1].data_file_id, Some(warm.ids[1]));
     assert_eq!(warm.catalog.row_lookups.summarized_files(), 4);
     warm.catalog.close().await.unwrap();
+}
+
+/// A row is placed by the dense range starting at or before it; a range
+/// overlapping a live one is refused until that one leaves.
+#[test]
+fn dense_ranges_place_by_range_and_refuse_overlap() {
+    let mut ranges = DenseRanges::default();
+    assert!(ranges.insert(0, 2, 1));
+    assert!(ranges.insert(3, 5, 2));
+    assert!(ranges.insert(u64::MAX, u64::MAX, 3));
+    assert!(!ranges.insert(5, 7, 4), "an overlapping range was admitted");
+    assert!(!ranges.insert(1, 1, 5), "a nested range was admitted");
+
+    assert_eq!(ranges.file_holding(2), Some(1));
+    assert_eq!(ranges.file_holding(3), Some(2));
+    assert_eq!(ranges.file_holding(6), None);
+    assert_eq!(ranges.file_holding(u64::MAX), Some(3));
+
+    ranges.remove(2);
+    assert_eq!(ranges.file_holding(3), None);
+    assert!(ranges.insert(5, 7, 4));
+    assert_eq!(ranges.file_holding(5), Some(4));
+}
+
+proptest! {
+    /// Placement after any inserts and removes matches exhaustive
+    /// membership over the ranges that were admitted.
+    #[test]
+    fn dense_range_placement_matches_exhaustive_membership(
+        ranges in prop::collection::vec((any::<u64>(), 0u64..64), 0..64),
+        removed in prop::collection::vec(any::<prop::sample::Index>(), 0..8),
+        probe in any::<prop::sample::Index>(),
+        row in any::<u64>(),
+    ) {
+        let mut live: Vec<(u64, u64, u64)> = Vec::new();
+        let mut index = DenseRanges::default();
+        for (file, (start, length)) in ranges.into_iter().enumerate() {
+            let end = start.saturating_add(length);
+            let file = u64::try_from(file).unwrap();
+            let overlaps = live.iter().any(|&(s, e, _)| s <= end && start <= e);
+            prop_assert_eq!(index.insert(start, end, file), !overlaps);
+            if !overlaps {
+                live.push((start, end, file));
+            }
+        }
+        for pick in removed {
+            if live.is_empty() {
+                break;
+            }
+            let (_, _, file) = live.remove(pick.index(live.len()));
+            index.remove(file);
+        }
+
+        let mut rows = vec![row];
+        if !live.is_empty() {
+            let (start, end, _) = live[probe.index(live.len())];
+            rows.push(start + (row % (end - start + 1)));
+        }
+        for row in rows {
+            let expected = live
+                .iter()
+                .find(|&&(s, e, _)| s <= row && row <= e)
+                .map(|&(_, _, f)| f);
+            prop_assert_eq!(index.file_holding(row), expected);
+        }
+    }
 }

@@ -150,9 +150,9 @@ struct FileDirectory {
     data_prefix: String,
     table_prefix: String,
     files: OrdMap<u64, DataFileValue>,
-    ranges: Intervals<u64>,
+    ranges: files::DenseRanges,
     /// Summaries of files holding arbitrary ids, kept across lookups.
-    arbitrary: HashMap<u64, FileSummary>,
+    arbitrary: OrdMap<u64, FileSummary>,
     /// Files that could not be summarized; every lookup retries them.
     failed: Vec<u64>,
     /// Encoded size of `files`, carried across refreshes.
@@ -214,13 +214,6 @@ impl<T> Intervals<T> {
             .max(Self::augment(left))
             .max(Self::augment(right));
         root[0].maximum_end
-    }
-
-    /// Every interval as `(start, end, value)`.
-    fn iter(&self) -> impl Iterator<Item = (u64, u64, &T)> {
-        self.entries
-            .iter()
-            .map(|entry| (entry.start, entry.end, &entry.value))
     }
 
     fn visit(&self, row: u64, mut matched: impl FnMut(&T)) {

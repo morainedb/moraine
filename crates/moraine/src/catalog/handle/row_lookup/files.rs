@@ -10,18 +10,63 @@ use imbl::{OrdMap, ordmap::DiffItem};
 use prost::Message as _;
 use tracing::warn;
 
-use super::{FileDirectory, Intervals};
+use super::FileDirectory;
 use crate::{
     catalog::{
         CatalogSnapshot, DataFileId, DataFileInfo, ReadOnlyCatalog, TableId,
         snapshot::data_file_info,
     },
-    data_file::{DataStore, FileSummary},
+    data_file::DataStore,
     error::Result,
     store::proto::DataFileValue,
 };
 
 type Placements = HashMap<u64, Vec<DataFileId>>;
+
+/// Verified dense row ranges keyed by first row, `start -> (last, file)`,
+/// with each file's start for removal. Live ranges never overlap: a range
+/// that would is refused, and its file falls back to a summary probe.
+#[derive(Clone, Default)]
+pub(super) struct DenseRanges {
+    by_start: OrdMap<u64, (u64, u64)>,
+    starts: OrdMap<u64, u64>,
+}
+
+impl DenseRanges {
+    /// Admits `file` holding `start..=end`; `false` when a live range
+    /// overlaps it.
+    fn insert(&mut self, start: u64, end: u64, file: u64) -> bool {
+        let overlaps = self
+            .by_start
+            .get_prev(&end)
+            .is_some_and(|(_, (last, _))| *last >= start);
+        if overlaps {
+            return false;
+        }
+
+        self.by_start.insert(start, (end, file));
+        self.starts.insert(file, start);
+        true
+    }
+
+    fn remove(&mut self, file: u64) {
+        if let Some(start) = self.starts.remove(&file) {
+            self.by_start.remove(&start);
+        }
+    }
+
+    /// The file whose range holds `row`, if any.
+    fn file_holding(&self, row: u64) -> Option<u64> {
+        self.by_start
+            .get_prev(&row)
+            .and_then(|(_, (end, file))| (row <= *end).then_some(*file))
+    }
+
+    pub(super) fn estimated_bytes(&self) -> u64 {
+        // Two entries per file: `(start, end, file)` and `(file, start)`.
+        u64::try_from(self.by_start.len().saturating_mul(40)).unwrap_or(u64::MAX)
+    }
+}
 
 /// What a directory resolves files against; a directory built under a
 /// different scope is not reused.
@@ -39,8 +84,8 @@ impl FileDirectory {
             data_prefix: scope.data_prefix.into(),
             table_prefix: scope.table_prefix.into(),
             files: OrdMap::new(),
-            ranges: Intervals::new([]),
-            arbitrary: HashMap::new(),
+            ranges: DenseRanges::default(),
+            arbitrary: OrdMap::new(),
             failed: Vec::new(),
             file_bytes: 0,
             bytes: 0,
@@ -63,12 +108,12 @@ impl FileDirectory {
     fn place(&self, row_ids: &[u64]) -> Placements {
         let mut placements = Placements::new();
         for &row in row_ids {
-            self.ranges.visit(row, |file| {
+            if let Some(file) = self.ranges.file_holding(row) {
                 placements
                     .entry(row)
                     .or_default()
-                    .push(DataFileId::new(*file));
-            });
+                    .push(DataFileId::new(file));
+            }
         }
 
         for (file, summary) in &self.arbitrary {
@@ -202,18 +247,12 @@ impl ReadOnlyCatalog {
             file_bytes,
         } = previous.changes_to(files);
 
-        let mut ranges: Vec<_> = previous
-            .ranges
-            .iter()
-            .filter(|(_, _, file)| !removed.contains(*file))
-            .map(|(start, end, file)| (start, end, *file))
-            .collect();
-        let mut arbitrary: HashMap<u64, FileSummary> = previous
-            .arbitrary
-            .iter()
-            .filter(|(file, _)| !removed.contains(*file))
-            .map(|(file, summary)| (*file, summary.clone()))
-            .collect();
+        let mut ranges = previous.ranges.clone();
+        let mut arbitrary = previous.arbitrary.clone();
+        for file in &removed {
+            ranges.remove(*file);
+            arbitrary.remove(file);
+        }
         let mut failed = Vec::new();
 
         self.row_lookups.note_summarized(selected.len());
@@ -233,8 +272,9 @@ impl ReadOnlyCatalog {
                         // An empty range is a file holding no rows.
                         if let Some(end) =
                             range.end.checked_sub(1).filter(|end| *end >= range.start)
+                            && !ranges.insert(range.start, end, file.get())
                         {
-                            ranges.push((range.start, end, file.get()));
+                            arbitrary.insert(file.get(), summary);
                         }
                     }
                     None => {
@@ -250,7 +290,6 @@ impl ReadOnlyCatalog {
         }
         failed.sort_unstable();
 
-        let ranges = Intervals::new(ranges);
         let bytes = ranges
             .estimated_bytes()
             .saturating_add(
