@@ -18,8 +18,8 @@ bytes = "1"
 cpu-time = "1"
 dhat = "0.3"
 futures = { version = "0.3", default-features = false, features = ["std"] }
-# imbl 7 changed-branch diff can skip leaf boundaries; regression pinned in commit/diff.rs.
-imbl = "7"
+# Diff iterator misses updates past a shared leaf before 7.0.2; regression pinned in commit/diff.rs.
+imbl = "7.0.2"
 parquet = { version = "59.2.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
 moraine = { path = "crates/moraine", version = "0.6.4" }
 foyer = { version = "0.22", features = ["serde"] }

@@ -355,10 +355,7 @@ rescanning `current`:
 
 Entity maps use structurally shared ordered trees (`imbl::OrdMap`), including
 both levels of table-scoped maps. Name and index-owner lookups use persistent
-hash maps. `imbl` 5 brings the unmaintained transitive `bitmaps` crate
-([RUSTSEC-2026-0247](https://rustsec.org/advisories/RUSTSEC-2026-0247));
-`deny.toml` records a narrow exception for this maintenance advisory, to revisit
-on dependency upgrades. Cloning a view shares these trees; applying a change copies only
+hash maps. Cloning a view shares these trees; applying a change copies only
 the affected paths, preserving held readers. The snapshot record itself is
 copied. Replay work scales with changed records and tree height. The churn
 heuristic reads the base entity count in constant time: flat maps retain their

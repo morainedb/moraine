@@ -205,17 +205,18 @@ Debug builds compare both paths against a whole-catalog diff to detect omitted
 writes. Inserts, deletes, cascades, and chained edits retain the existing write
 order and history semantics. No additional mutation journal is required.
 
-Use the `imbl` 5 tree implementation: our tests reproduced a missing update in
-the 7.0.1 diff iterator at a shared-leaf boundary (64 sequential keys, then
-replace key 24). A missed diff would omit the entity write from a successful
-release-mode commit. This is a correctness constraint, not a performance choice.
-A saved property-test seed pins this failure for future dependency upgrades.
+Require `imbl` 7.0.2 or newer: the diff iterator in 6.0 through 7.0.1 missed
+an update at a shared-leaf boundary (64 sequential keys, then replace key 24).
+A missed diff would omit the entity write from a successful release-mode
+commit. This is a correctness constraint, not a performance choice. A saved
+property-test seed pins this failure for future dependency upgrades.
 
-Upstream [issue #161](https://github.com/jneem/imbl/issues/161) reports the same
-failure on 7.0.0. Proposed [fix #166](https://github.com/jneem/imbl/pull/166) also
-describes incorrect map equality and deletion results from the same cursor bug.
-As checked on 2026-09-07, the issue and fix are open and the fix is unmerged.
-An upgrade must pass the full-diff equivalence and shared-boundary regressions.
+Upstream [issue #161](https://github.com/jneem/imbl/issues/161) reported the
+failure and [fix #166](https://github.com/jneem/imbl/pull/166), which also
+corrected map equality and deletion results from the same cursor bug, merged
+on 2026-09-09 and shipped in 7.0.2. The `Cargo.toml` floor is that release, so
+a fresh resolve cannot pick a broken 7.0.x. Any upgrade must still pass the
+full-diff equivalence and shared-boundary regressions.
 
 Index maintenance resolves affected definitions through an in-memory
 index-id-to-table lookup. A known current format floor bypasses feature scans.
