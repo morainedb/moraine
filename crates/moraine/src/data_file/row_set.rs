@@ -108,6 +108,18 @@ impl FileRowSet {
         }
     }
 
+    /// The least and greatest member, `None` when empty.
+    pub(super) fn bounds(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Range { start, end } => end
+                .checked_sub(1)
+                .filter(|last| last >= start)
+                .map(|last| (*start, last)),
+            Self::Roaring(rows) => rows.min().zip(rows.max()),
+            Self::Sorted(rows) => rows.first().copied().zip(rows.last().copied()),
+        }
+    }
+
     /// Requested row ids physically present in this file, preserving request
     /// order.
     pub(super) fn matching(&self, requested: &[u64]) -> Vec<u64> {

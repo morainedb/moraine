@@ -170,6 +170,97 @@ async fn an_expired_file_leaves_a_warm_directory_without_a_rebuild() {
     warm.catalog.close().await.unwrap();
 }
 
+/// Writes a file whose rows carry the ids in `row_ids` in DuckLake's
+/// tagged row-id column, returning the file and footer sizes.
+async fn write_ids_file(store: &InMemory, path: &str, row_ids: &[u64]) -> (u64, u64) {
+    let row_id_field = Field::new("_ducklake_internal_row_id", DataType::Int64, false)
+        .with_metadata(std::collections::HashMap::from([(
+            parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2147483540".to_string(),
+        )]));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        row_id_field,
+    ]));
+    let ids: Vec<i64> = row_ids
+        .iter()
+        .map(|id| i64::try_from(*id).unwrap())
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(Int64Array::from(ids)),
+        ],
+    )
+    .unwrap();
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    let footer_offset = buffer.len() - 8;
+    let footer_size = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
+    let file_size = u64::try_from(buffer.len()).unwrap();
+    store.put(&Path::from(path), buffer.into()).await.unwrap();
+
+    (file_size, footer_size)
+}
+
+/// Files holding sparse ids over disjoint spans are each probed only for
+/// rows inside their span.
+#[tokio::test]
+async fn sparse_files_with_disjoint_spans_are_probed_only_within_their_span() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let data = Arc::new(InMemory::new());
+    let mut files = Vec::new();
+    for (ordinal, ids) in [vec![0, 2, 4, 6], vec![10, 12, 14], vec![20, 22]]
+        .iter()
+        .enumerate()
+    {
+        let name = format!("sparse-{ordinal}.parquet");
+        let (file_size_bytes, footer_size) =
+            write_ids_file(&data, &format!("main/t/{name}"), ids).await;
+        files.push(DataFile {
+            path: name,
+            path_is_relative: true,
+            file_format: "parquet".into(),
+            record_count: u64::try_from(ids.len()).unwrap(),
+            file_size_bytes,
+            footer_size,
+            encryption_key: None,
+            partition_values: vec![],
+            column_stats: vec![],
+        });
+    }
+    let (table, ids) = table_with(&catalog, files).await;
+    let store = DataStore::new(data);
+
+    let found = catalog
+        .locate_row_ids(Some(store), "", table, vec![2, 12, 22, 5, 30])
+        .await
+        .unwrap();
+    let located: Vec<_> = found.iter().map(|row| row.data_file_id).collect();
+    assert_eq!(
+        located,
+        vec![Some(ids[0]), Some(ids[1]), Some(ids[2]), None, None]
+    );
+    assert_eq!(catalog.row_lookups.summarized_files(), 3);
+    assert_eq!(
+        catalog.row_lookups.summary_probes(),
+        4,
+        "rows outside every span were probed"
+    );
+    catalog.close().await.unwrap();
+}
+
 /// A row is placed by the dense range starting at or before it; a range
 /// overlapping a live one is refused until that one leaves.
 #[test]

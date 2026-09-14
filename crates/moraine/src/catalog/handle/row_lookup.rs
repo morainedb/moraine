@@ -35,6 +35,8 @@ pub(super) struct RowLookupCache {
     summarized_files: AtomicU64,
     /// Inline directories built from a store scan.
     inline_directory_builds: AtomicU64,
+    /// Summary probes made placing rows against arbitrary-id files.
+    summary_probes: AtomicU64,
 }
 
 impl RowLookupCache {
@@ -46,6 +48,16 @@ impl RowLookupCache {
     #[cfg(test)]
     pub(super) fn summarized_files(&self) -> u64 {
         self.summarized_files.load(Ordering::Relaxed)
+    }
+
+    fn note_summary_probes(&self, probes: usize) {
+        self.summary_probes
+            .fetch_add(u64::try_from(probes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn summary_probes(&self) -> u64 {
+        self.summary_probes.load(Ordering::Relaxed)
     }
 
     fn note_inline_directory_built(&self) {
@@ -162,8 +174,12 @@ struct FileDirectory {
     table_prefix: String,
     files: OrdMap<u64, DataFileValue>,
     ranges: files::DenseRanges,
-    /// Summaries of files holding arbitrary ids, kept across lookups.
-    arbitrary: OrdMap<u64, FileSummary>,
+    /// Summaries of files holding arbitrary ids, kept across lookups: those
+    /// reached through `spans`, the span of each one's ids, and those probed
+    /// on every lookup because their span overlaps another's.
+    spanned: OrdMap<u64, FileSummary>,
+    spans: files::DenseRanges,
+    probed: OrdMap<u64, FileSummary>,
     /// Files that could not be summarized; every lookup retries them.
     failed: Vec<u64>,
     /// Encoded size of `files`, carried across refreshes.

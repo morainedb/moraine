@@ -16,16 +16,16 @@ use crate::{
         CatalogSnapshot, DataFileId, DataFileInfo, ReadOnlyCatalog, TableId,
         snapshot::data_file_info,
     },
-    data_file::DataStore,
+    data_file::{DataStore, FileSummary},
     error::Result,
     store::proto::DataFileValue,
 };
 
 type Placements = HashMap<u64, Vec<DataFileId>>;
 
-/// Verified dense row ranges keyed by first row, `start -> (last, file)`,
-/// with each file's start for removal. Live ranges never overlap: a range
-/// that would is refused, and its file falls back to a summary probe.
+/// Non-overlapping row ranges keyed by first row, `start -> (last, file)`,
+/// with each file's start for removal. A range that would overlap a live
+/// one is refused.
 #[derive(Clone, Default)]
 pub(super) struct DenseRanges {
     by_start: OrdMap<u64, (u64, u64)>,
@@ -85,7 +85,9 @@ impl FileDirectory {
             table_prefix: scope.table_prefix.into(),
             files: OrdMap::new(),
             ranges: DenseRanges::default(),
-            arbitrary: OrdMap::new(),
+            spanned: OrdMap::new(),
+            spans: DenseRanges::default(),
+            probed: OrdMap::new(),
             failed: Vec::new(),
             file_bytes: 0,
             bytes: 0,
@@ -104,9 +106,31 @@ impl FileDirectory {
         self.files.ptr_eq(files) && self.failed.is_empty()
     }
 
-    /// The files that hold, or may hold, each of `row_ids`.
-    fn place(&self, row_ids: &[u64]) -> Placements {
+    /// Keeps `summary` for `file`: behind its span when no kept span
+    /// overlaps it, otherwise probed on every lookup.
+    fn admit_summary(&mut self, file: u64, summary: FileSummary) {
+        let spanned = summary
+            .bounds()
+            .is_some_and(|(first, last)| self.spans.insert(first, last, file));
+        if spanned {
+            self.spanned.insert(file, summary);
+        } else {
+            self.probed.insert(file, summary);
+        }
+    }
+
+    fn forget(&mut self, file: u64) {
+        self.ranges.remove(file);
+        self.spans.remove(file);
+        self.spanned.remove(&file);
+        self.probed.remove(&file);
+    }
+
+    /// The files that hold, or may hold, each of `row_ids`, and how many
+    /// summaries were probed to say so.
+    fn place(&self, row_ids: &[u64]) -> (Placements, usize) {
         let mut placements = Placements::new();
+        let mut probes = 0;
         for &row in row_ids {
             if let Some(file) = self.ranges.file_holding(row) {
                 placements
@@ -114,9 +138,23 @@ impl FileDirectory {
                     .or_default()
                     .push(DataFileId::new(file));
             }
+            if let Some(file) = self.spans.file_holding(row) {
+                probes += 1;
+                if self
+                    .spanned
+                    .get(&file)
+                    .is_some_and(|summary| summary.contains(row))
+                {
+                    placements
+                        .entry(row)
+                        .or_default()
+                        .push(DataFileId::new(file));
+                }
+            }
         }
 
-        for (file, summary) in &self.arbitrary {
+        for (file, summary) in &self.probed {
+            probes += row_ids.len();
             for row in summary.matching(row_ids) {
                 placements
                     .entry(row)
@@ -134,7 +172,7 @@ impl FileDirectory {
             }
         }
 
-        placements
+        (placements, probes)
     }
 }
 
@@ -230,7 +268,9 @@ impl ReadOnlyCatalog {
             }
         };
 
-        Ok(directory.place(row_ids))
+        let (placements, probes) = directory.place(row_ids);
+        self.row_lookups.note_summary_probes(probes);
+        Ok(placements)
     }
 
     /// `previous` advanced to `files`: only files it has not summarized,
@@ -247,13 +287,22 @@ impl ReadOnlyCatalog {
             file_bytes,
         } = previous.changes_to(files);
 
-        let mut ranges = previous.ranges.clone();
-        let mut arbitrary = previous.arbitrary.clone();
+        let mut directory = FileDirectory {
+            identity: scope.store.cache_identity(),
+            data_prefix: scope.data_prefix.into(),
+            table_prefix: scope.table_prefix.into(),
+            files: files.clone(),
+            ranges: previous.ranges.clone(),
+            spanned: previous.spanned.clone(),
+            spans: previous.spans.clone(),
+            probed: previous.probed.clone(),
+            failed: Vec::new(),
+            file_bytes,
+            bytes: 0,
+        };
         for file in &removed {
-            ranges.remove(*file);
-            arbitrary.remove(file);
+            directory.forget(*file);
         }
-        let mut failed = Vec::new();
 
         self.row_lookups.note_summarized(selected.len());
         let summaries = self
@@ -272,46 +321,39 @@ impl ReadOnlyCatalog {
                         // An empty range is a file holding no rows.
                         if let Some(end) =
                             range.end.checked_sub(1).filter(|end| *end >= range.start)
-                            && !ranges.insert(range.start, end, file.get())
+                            && !directory.ranges.insert(range.start, end, file.get())
                         {
-                            arbitrary.insert(file.get(), summary);
+                            directory.admit_summary(file.get(), summary);
                         }
                     }
-                    None => {
-                        arbitrary.insert(file.get(), summary);
-                    }
+                    None => directory.admit_summary(file.get(), summary),
                 },
                 Err(error) => {
                     warn!(table_id = scope.table.get(), data_file_id = file.get(), %error,
                         "row location fell back to every requested row for this file");
-                    failed.push(file.get());
+                    directory.failed.push(file.get());
                 }
             }
         }
-        failed.sort_unstable();
+        directory.failed.sort_unstable();
 
-        let bytes = ranges
+        let summary_bytes = directory
+            .spanned
+            .values()
+            .chain(directory.probed.values())
+            .map(|summary| summary.estimated_bytes().saturating_add(16))
+            .sum::<u64>();
+        directory.bytes = directory
+            .ranges
             .estimated_bytes()
+            .saturating_add(directory.spans.estimated_bytes())
+            .saturating_add(summary_bytes)
             .saturating_add(
-                arbitrary
-                    .values()
-                    .map(|summary| summary.estimated_bytes().saturating_add(16))
-                    .sum(),
+                u64::try_from(directory.failed.capacity().saturating_mul(8)).unwrap_or(u64::MAX),
             )
-            .saturating_add(u64::try_from(failed.capacity().saturating_mul(8)).unwrap_or(u64::MAX))
             .saturating_add(file_bytes);
 
-        FileDirectory {
-            identity: scope.store.cache_identity(),
-            data_prefix: scope.data_prefix.into(),
-            table_prefix: scope.table_prefix.into(),
-            files: files.clone(),
-            ranges,
-            arbitrary,
-            failed,
-            file_bytes,
-            bytes,
-        }
+        directory
     }
 }
 

@@ -44,6 +44,15 @@ impl FileSummary {
         self.rows.rows.matching(requested)
     }
 
+    pub(crate) fn contains(&self, row_id: u64) -> bool {
+        self.rows.rows.contains(row_id)
+    }
+
+    /// The least and greatest row id this file holds, `None` when empty.
+    pub(crate) fn bounds(&self) -> Option<(u64, u64)> {
+        self.rows.rows.bounds()
+    }
+
     /// File positions of `requested` rows within this file; `None` for rows
     /// this file does not hold.
     pub(crate) fn positions_of(&self, requested: &[u64]) -> Vec<Option<u64>> {
