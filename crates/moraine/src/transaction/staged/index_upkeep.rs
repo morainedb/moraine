@@ -1217,12 +1217,7 @@ async fn committed_dead_positions(
     data_file_id: u64,
     context: &FileContext<'_>,
 ) -> Result<Vec<u64>> {
-    let committed = base
-        .delete_files
-        .get(&table_id)
-        .into_iter()
-        .flat_map(|per_table| per_table.values())
-        .filter(|delete_file| delete_file.data_file_id == data_file_id);
+    let committed = base.delete_files_targeting(table_id, data_file_id);
 
     stream::iter(
         committed.map(|delete_file| read_delete_file_positions(base, delete_file, context)),
