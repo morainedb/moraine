@@ -56,10 +56,7 @@ async fn repeated_inline_updates_preserve_each_versions_lifetime() {
             assert_eq!(rows.len(), 1, "snapshot {snapshot}");
             assert_eq!(rows[0].begin_snapshot, snapshot);
             assert_eq!(rows[0].end_snapshot, Some(snapshot + 1));
-            assert_eq!(
-                chunks[rows[0].chunk].1.body.as_ref(),
-                snapshot.to_be_bytes()
-            );
+            assert_eq!(chunks[rows[0].chunk].1.as_ref(), snapshot.to_be_bytes());
 
             let (deleted, _) = catalog
                 .select_inline_rows(

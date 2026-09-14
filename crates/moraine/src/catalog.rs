@@ -21,13 +21,13 @@ pub use census::{
 };
 #[cfg(test)]
 pub(crate) use handle::BACKFILL_FILE_READ_CONCURRENCY;
-pub(crate) use handle::Store;
 pub use handle::{
     CachePreload, Catalog, CatalogOptions, CommitMember, DeleteFileRegistration,
     ExistingDeleteFile, LocatedDeletion, LocatedPositions, LocatedRows, MaintenanceReport,
     MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep, MigrationRequest,
     ReadOnlyCatalog, RowSummaryWarmth,
 };
+pub(crate) use handle::{InlineScan, Store};
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;
 

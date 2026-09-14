@@ -1,23 +1,25 @@
-//! The inline read seam: materializes DuckLake's four inline scan variants
-//! over the `inline/*` keyspace and re-exports
+//! The inline read seam: serves DuckLake's four inline scan variants over
+//! the `inline/*` keyspace and re-exports
 //! [`InlineScanKind`](crate::catalog::inline::InlineScanKind) from the
-//! otherwise-private `catalog`. Each function opens a fresh read-only
-//! transaction, scans, and rolls back.
+//! otherwise-private `catalog`. Each function here opens a fresh
+//! read-only transaction, scans, and rolls back; an
+//! [`InlineScanCursor`] instead holds one open across the windows it
+//! serves, until it is finished.
 
 use std::collections::HashSet;
 
 use bytes::Bytes;
 
 #[doc(hidden)]
-pub use crate::catalog::inline::InlineScanKind;
+pub use crate::catalog::inline::{InlineBodies, InlineScanKind};
 use crate::{
-    catalog::ReadOnlyCatalog,
+    catalog::{InlineScan, ReadOnlyCatalog},
     error::{Error, Result},
     store::{inline as store_inline, key::InlineOperation},
 };
 
-/// One inlined row selected by [`scan_inline`], referencing its chunk's
-/// body by index into the scan's deduplicated
+/// One inlined row, referencing its chunk's body by index into its
+/// window's deduplicated
 /// [`chunk_bodies`](InlineScanRecord::chunk_bodies).
 #[doc(hidden)]
 pub struct InlineRowRecord {
@@ -35,23 +37,100 @@ pub struct InlineRowRecord {
     pub offset_in_chunk: u64,
 }
 
-/// A selected scan: the rows plus the chunk bodies they reference.
+/// One window of a scan: the rows plus the chunk bodies they reference.
 #[doc(hidden)]
 pub struct InlineScanRecord {
-    /// The selected rows, in the scan variant's order.
+    /// The window's rows, in the scan variant's order.
     pub rows: Vec<InlineRowRecord>,
     /// The referenced chunks' full Arrow IPC record-batch bodies, each
     /// appearing once, indexed by [`InlineRowRecord::chunk_index`].
     pub chunk_bodies: Vec<Bytes>,
 }
 
-/// Materializes `table_id`'s inlined rows and selects `kind`'s variant at
-/// `snapshot` (windowed from `start` for the incremental variants) — the
-/// read model behind `moraine_inline_scan`. Served from the chunk-range
-/// directory once it is known complete, hauling only the chunk bodies the
-/// selected rows reference. `schema_version`, when set, keeps only rows
-/// whose chunk was written under that version, so a caller serving one
-/// version's projection never hauls another version's bodies.
+/// A resumable inline scan: `table_id`'s rows under `kind`'s variant at
+/// `snapshot` (windowed from `start` for the incremental variants),
+/// selected once and returned a window at a time — the read model behind
+/// `moraine_inline_scan_open`. The selection is served from the
+/// chunk-range directory once it is known complete, and each window
+/// point-reads only the chunk bodies its own rows reference, so a
+/// consumer that drops each window never holds the table's payload.
+/// `schema_version`, when set, keeps only rows whose chunk was written
+/// under that version, so a caller serving one version's projection never
+/// reads another's.
+#[doc(hidden)]
+pub struct InlineScanCursor {
+    scan: InlineScan,
+}
+
+impl InlineScanCursor {
+    /// Opens the scan, holding one read session until [`Self::finish`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying store scan fails or decodes
+    /// corrupt bytes.
+    pub async fn open(
+        catalog: &ReadOnlyCatalog,
+        table_id: u64,
+        kind: InlineScanKind,
+        snapshot: u64,
+        start: u64,
+        schema_version: Option<u64>,
+        bodies: InlineBodies,
+    ) -> Result<Self> {
+        let scan = catalog
+            .open_inline_scan(table_id, kind, snapshot, start, schema_version, bodies)
+            .await?;
+
+        Ok(Self { scan })
+    }
+
+    /// The next at most `max_rows` rows, with the bodies they reference.
+    /// An exhausted scan returns an empty record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a chunk body read fails, or if the rows and
+    /// chunks disagree.
+    pub async fn next_window(&mut self, max_rows: usize) -> Result<InlineScanRecord> {
+        let (selected, chunks) = self.scan.next_window(max_rows).await?;
+
+        // Rows arrive with `chunk` dense-indexed in first-reference order
+        // over exactly the referenced chunks, which is the record's shape
+        // already.
+        let chunk_bodies: Vec<Bytes> = chunks.iter().map(|(_, body)| body.clone()).collect();
+        let rows = selected
+            .into_iter()
+            .map(|row| {
+                let (operation, _) = &chunks[row.chunk];
+                let InlineOperation::Insert { schema_version, .. } = operation else {
+                    return Err(Error::Corruption(format!(
+                        "inline row {} references a non-insert chunk key: {operation:?}",
+                        row.row_id
+                    )));
+                };
+
+                Ok(InlineRowRecord {
+                    row_id: row.row_id,
+                    schema_version: *schema_version,
+                    begin_snapshot: row.begin_snapshot,
+                    end_snapshot: row.end_snapshot,
+                    chunk_index: row.chunk as u64,
+                    offset_in_chunk: row.offset_in_chunk,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(InlineScanRecord { rows, chunk_bodies })
+    }
+
+    /// Releases the scan's read session.
+    pub fn finish(self) {
+        self.scan.finish();
+    }
+}
+
+/// [`InlineScanCursor`]'s whole selection in one record.
 ///
 /// # Errors
 ///
@@ -66,36 +145,20 @@ pub async fn scan_inline(
     start: u64,
     schema_version: Option<u64>,
 ) -> Result<InlineScanRecord> {
-    let (selected, chunks) = catalog
-        .select_inline_rows(table_id, kind, snapshot, start, schema_version)
-        .await?;
+    let mut cursor = InlineScanCursor::open(
+        catalog,
+        table_id,
+        kind,
+        snapshot,
+        start,
+        schema_version,
+        InlineBodies::Fetch,
+    )
+    .await?;
+    let record = cursor.next_window(usize::MAX).await;
+    cursor.finish();
 
-    // Rows arrive with `chunk` dense-indexed in first-reference order over
-    // exactly the referenced chunks, which is the record's shape already.
-    let chunk_bodies: Vec<Bytes> = chunks.iter().map(|(_, chunk)| chunk.body.clone()).collect();
-    let rows = selected
-        .into_iter()
-        .map(|row| {
-            let (operation, _) = &chunks[row.chunk];
-            let InlineOperation::Insert { schema_version, .. } = operation else {
-                return Err(Error::Corruption(format!(
-                    "inline row {} references a non-insert chunk key: {operation:?}",
-                    row.row_id
-                )));
-            };
-
-            Ok(InlineRowRecord {
-                row_id: row.row_id,
-                schema_version: *schema_version,
-                begin_snapshot: row.begin_snapshot,
-                end_snapshot: row.end_snapshot,
-                chunk_index: row.chunk as u64,
-                offset_in_chunk: row.offset_in_chunk,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(InlineScanRecord { rows, chunk_bodies })
+    record
 }
 
 /// Every `(schema_version, arrow_schema)` recorded for `table_id`, in
@@ -315,6 +378,149 @@ mod tests {
 
         let registered = inline_registered_tables(&catalog).await.unwrap();
         assert_eq!(registered, vec![(1, 0)]);
+    }
+
+    /// Three chunks of two rows each, committed together, then read a
+    /// window at a time: the windows concatenate to what one whole scan
+    /// returns, and each carries only the bodies its own rows reference.
+    #[tokio::test]
+    async fn inline_scan_windows_carry_only_the_bodies_their_rows_reference() {
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+
+        tx.stage(RowOperation::InlineSchema {
+            table_id: 1,
+            schema_version: 0,
+            arrow_schema: b"schema".to_vec(),
+        });
+        for chunk in 0..3u64 {
+            tx.stage(RowOperation::InlineInsert {
+                table_id: 1,
+                schema_version: 0,
+                begin_snapshot: 1,
+                row_id_start: chunk * 2,
+                row_count: 2,
+                arrow_body: format!("chunk-{chunk}").into_bytes(),
+            });
+        }
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        let whole = scan_inline(&catalog, 1, InlineScanKind::ForFlush, 1, 0, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(whole.rows.len(), 6);
+
+        let mut cursor = InlineScanCursor::open(
+            &catalog,
+            1,
+            InlineScanKind::ForFlush,
+            1,
+            0,
+            Some(0),
+            InlineBodies::Fetch,
+        )
+        .await
+        .unwrap();
+
+        let mut streamed = Vec::new();
+        let mut windows = 0;
+        loop {
+            let window = cursor.next_window(3).await.unwrap();
+            if window.rows.is_empty() {
+                // An exhausted scan keeps serving empty windows.
+                assert!(window.chunk_bodies.is_empty());
+                break;
+            }
+            assert_eq!(window.rows.len(), 3);
+            // Three rows spanning two chunks carry two bodies, never the
+            // table's six rows' worth.
+            assert_eq!(window.chunk_bodies.len(), 2);
+            for row in &window.rows {
+                let body = window.chunk_bodies[usize::try_from(row.chunk_index).unwrap()].clone();
+                streamed.push((row.row_id, body));
+            }
+            windows += 1;
+        }
+        assert_eq!(windows, 2);
+
+        let expected: Vec<(u64, Bytes)> = whole
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.row_id,
+                    whole.chunk_bodies[usize::try_from(row.chunk_index).unwrap()].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(streamed, expected);
+        cursor.finish();
+
+        catalog.close().await.unwrap();
+    }
+
+    /// A scan opened without bodies selects the same rows and names the
+    /// same chunks, with every body empty.
+    #[tokio::test]
+    async fn a_body_free_inline_scan_names_its_chunks_without_reading_them() {
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+
+        tx.stage(RowOperation::InlineSchema {
+            table_id: 1,
+            schema_version: 0,
+            arrow_schema: b"schema".to_vec(),
+        });
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk".to_vec(),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        let mut cursor = InlineScanCursor::open(
+            &catalog,
+            1,
+            InlineScanKind::ForFlush,
+            1,
+            0,
+            Some(0),
+            InlineBodies::Skip,
+        )
+        .await
+        .unwrap();
+        let window = cursor.next_window(usize::MAX).await.unwrap();
+        cursor.finish();
+
+        assert_eq!(
+            window.rows.iter().map(|row| row.row_id).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(window.rows.iter().all(|row| row.schema_version == 0));
+        assert_eq!(window.chunk_bodies, vec![Bytes::new()]);
+
+        catalog.close().await.unwrap();
     }
 
     /// A dropped schema version leaves `ducklake_inlined_data_tables`

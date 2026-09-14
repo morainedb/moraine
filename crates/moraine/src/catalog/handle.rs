@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) use inline_scan::InlineScan;
 pub use maintenance::{
     MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep,
 };

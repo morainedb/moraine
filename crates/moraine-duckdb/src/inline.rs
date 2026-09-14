@@ -1,22 +1,24 @@
-//! The inline read ABI surface: `moraine_inline_scan` materializes
+//! The inline read ABI surface: `moraine_inline_scan_open`/`_next` serve
 //! DuckLake's four inline scan variants (`SCAN_TABLE`/`SCAN_INSERTIONS`/
-//! `SCAN_DELETIONS`/`SCAN_FOR_FLUSH`) over the `inline/*` keyspace;
+//! `SCAN_DELETIONS`/`SCAN_FOR_FLUSH`) over the `inline/*` keyspace, a
+//! window of rows at a time;
 //! `moraine_inline_schemas`/`moraine_inline_registered_tables` serve the
 //! per-table Arrow schema and the `ducklake_inlined_data_tables`
 //! projection. Same conventions as [`crate::dumps`]: `catch_unwind`/null
 //! discipline via [`guard`](crate::abi), owned-first, one `_free` per
 //! array. Write-side staging lives in [`crate::staged`].
 //!
-//! A scan returns two parallel arrays: the [`MoraineInlineRow`]s and the
+//! A window is two parallel arrays: the [`MoraineInlineRow`]s and the
 //! deduplicated [`MoraineInlineChunk`]s their `chunk_index` points into.
 
 use std::{
     ffi::c_void,
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Mutex, MutexGuard},
 };
 
 use bytes::Bytes;
-use moraine::ffi_support::inline::InlineScanKind;
+use moraine::ffi_support::inline::{InlineBodies, InlineScanCursor, InlineScanKind};
 
 use crate::{
     abi::{free_array, guard, write_array},
@@ -32,7 +34,7 @@ fn decode_scan_kind(v: i32) -> Result<InlineScanKind, AbiError> {
         2 => Ok(InlineScanKind::Deletions),
         3 => Ok(InlineScanKind::ForFlush),
         other => Err(AbiError::invalid_argument(format!(
-            "moraine_inline_scan: unknown scan_kind {other}"
+            "moraine_inline_scan_open: unknown scan_kind {other}"
         ))),
     }
 }
@@ -60,9 +62,9 @@ unsafe fn release_shared_bytes(owner: *mut c_void) {
     drop(unsafe { Box::from_raw(owner.cast::<Bytes>()) });
 }
 
-/// One inlined row, as returned by [`moraine_inline_scan`]: `chunk_index`
-/// names the owning chunk in the scan's parallel [`MoraineInlineChunk`]
-/// array.
+/// One inlined row, as returned by [`moraine_inline_scan_next`]:
+/// `chunk_index` names the owning chunk in the window's parallel
+/// [`MoraineInlineChunk`] array.
 #[repr(C)]
 pub struct MoraineInlineRow {
     /// The row's dense id.
@@ -84,7 +86,8 @@ pub struct MoraineInlineRow {
 }
 
 /// One referenced chunk's full Arrow IPC record-batch body, owned;
-/// returned once per chunk however many rows reference it.
+/// returned once per chunk however many rows of the window reference it,
+/// and empty for a scan opened without bodies.
 #[repr(C)]
 pub struct MoraineInlineChunk {
     /// The chunk's Arrow IPC record-batch body, owned.
@@ -138,36 +141,148 @@ impl MoraineInlineChunk {
     }
 }
 
-/// Materializes `table_id`'s inlined rows and selects the `scan_kind`
+/// Decodes the ABI's `bodies` flag: a scan whose caller projects no user
+/// column reads no chunk body.
+fn decode_bodies(with_bodies: bool) -> InlineBodies {
+    if with_bodies {
+        InlineBodies::Fetch
+    } else {
+        InlineBodies::Skip
+    }
+}
+
+/// An open inline scan, opaque to C: the selected rows and the read
+/// session they were selected under, served a window at a time by
+/// [`moraine_inline_scan_next`] until [`moraine_inline_scan_close`].
+pub struct MoraineInlineScanCursor {
+    catalog: *const MoraineCatalogHandle,
+    cursor: Mutex<InlineScanCursor>,
+}
+
+impl MoraineInlineScanCursor {
+    /// The open scan, exclusively. A poisoned lock (a panic in an earlier
+    /// call, already contained) leaves the scan's position suspect, so it
+    /// is refused rather than served.
+    fn lock(&self) -> Result<MutexGuard<'_, InlineScanCursor>, AbiError> {
+        self.cursor.lock().map_err(|_| {
+            AbiError::new(
+                codes::INTERNAL,
+                "inline scan unusable after an earlier panic",
+            )
+        })
+    }
+}
+
+/// Opens a scan of `table_id`'s inlined rows under the `scan_kind`
 /// variant (`0` = `SCAN_TABLE`, `1` = `SCAN_INSERTIONS`, `2` =
 /// `SCAN_DELETIONS`, `3` = `SCAN_FOR_FLUSH`) at `snapshot`, windowed from
 /// `start` for the incremental variants (ignored by `SCAN_TABLE`/
 /// `SCAN_FOR_FLUSH`). Only rows written under `schema_version` are
-/// selected, and only their chunks' bodies are hauled: every caller
-/// serves one `ducklake_inlined_data_<t>_<v>` projection, so a
-/// schema-evolved table's other versions cost it nothing.
+/// selected: every caller serves one `ducklake_inlined_data_<t>_<v>`
+/// projection, so a schema-evolved table's other versions cost it
+/// nothing. With `with_bodies` false the scan reads no chunk body at all,
+/// which is what a caller projecting none of the user columns needs.
+///
+/// The rows are selected once, here; [`moraine_inline_scan_next`] then
+/// hauls one window's bodies at a time, so a consumer that releases each
+/// window never holds the table. The scan holds a read session until it
+/// is closed.
 ///
 /// Cancellable: races the core read against `probe` (polled immediately,
 /// then ~100 ms; a null `probe` disables polling). If a cancellation
-/// wins, returns [`codes::INTERRUPTED`] and the out-params are left
+/// wins, returns [`codes::INTERRUPTED`] and `out_cursor` is left
 /// unwritten.
 ///
 /// # Safety
 ///
 /// `handle` must be a pointer previously returned by
 /// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached.
-/// `out_items`/`out_len` must be valid, writable pointers. `probe`, if
-/// non-null, must be safe to call with `probe_ctx` from any thread.
-/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
-/// for the duration of this call.
+/// `out_cursor` must be a valid, writable pointer. `probe`, if non-null,
+/// must be safe to call with `probe_ctx` from any thread. `err`, if
+/// non-null, must be a valid, writable [`MoraineError`]. All for the
+/// duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_inline_scan(
+pub unsafe extern "C" fn moraine_inline_scan_open(
     handle: *mut MoraineCatalogHandle,
     table_id: u64,
     scan_kind: i32,
     snapshot: u64,
     start: u64,
     schema_version: u64,
+    with_bodies: bool,
+    out_cursor: *mut *mut MoraineInlineScanCursor,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<Box<MoraineInlineScanCursor>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_cursor.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        let kind = decode_scan_kind(scan_kind)?;
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let cursor = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                InlineScanCursor::open(
+                    handle_ref.catalog.reads(),
+                    table_id,
+                    kind,
+                    snapshot,
+                    start,
+                    Some(schema_version),
+                    decode_bodies(with_bodies),
+                ),
+            )
+        }?;
+
+        Ok(Box::new(MoraineInlineScanCursor {
+            catalog: handle,
+            cursor: Mutex::new(cursor),
+        }))
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(cursor) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe {
+                *out_cursor = Box::into_raw(cursor);
+            }
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Serves `cursor`'s next window: at most `max_rows` rows in scan order,
+/// with the chunks they reference — the bodies of a window the previous
+/// call served are not held. An exhausted scan writes empty arrays. Each
+/// window is freed by its own [`moraine_inline_scan_free`] call.
+///
+/// Cancellable on the same terms as [`moraine_inline_scan_open`]; a
+/// cancelled call leaves the out-params unwritten and the scan's position
+/// unmoved.
+///
+/// # Safety
+///
+/// `cursor` must be a pointer previously returned by
+/// [`moraine_inline_scan_open`] and not yet closed; its catalog must
+/// still be attached. `out_items`/`out_len`/`out_chunks`/`out_chunks_len`
+/// must be valid, writable pointers. `probe`, if non-null, must be safe
+/// to call with `probe_ctx` from any thread. `err`, if non-null, must be
+/// a valid, writable [`MoraineError`]. All for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_inline_scan_next(
+    cursor: *mut MoraineInlineScanCursor,
+    max_rows: usize,
     out_items: *mut *mut MoraineInlineRow,
     out_len: *mut usize,
     out_chunks: *mut *mut MoraineInlineChunk,
@@ -177,8 +292,8 @@ pub unsafe extern "C" fn moraine_inline_scan(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<(Vec<MoraineInlineRow>, Vec<MoraineInlineChunk>), AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
+        if cursor.is_null() {
+            return Err(AbiError::invalid_argument("`cursor` is null"));
         }
         if out_items.is_null()
             || out_len.is_null()
@@ -187,25 +302,18 @@ pub unsafe extern "C" fn moraine_inline_scan(
         {
             return Err(AbiError::invalid_argument("output pointer is null"));
         }
-        let kind = decode_scan_kind(scan_kind)?;
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract above.
+        let cursor_ref = unsafe { &*cursor };
+        // SAFETY: `catalog` outlives `cursor` per `moraine_inline_scan_open`'s
+        // contract.
+        let catalog_ref = unsafe { &*cursor_ref.catalog };
+        let mut open_scan = cursor_ref.lock()?;
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let record = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::inline::scan_inline(
-                    handle_ref.catalog.reads(),
-                    table_id,
-                    kind,
-                    snapshot,
-                    start,
-                    Some(schema_version),
-                ),
-            )
+            catalog_ref.block_on_cancellable(probe, probe_ctx, open_scan.next_window(max_rows))
         }?;
+
         let rows = record
             .rows
             .into_iter()
@@ -230,6 +338,7 @@ pub unsafe extern "C" fn moraine_inline_scan(
             .into_iter()
             .map(MoraineInlineChunk::from_bytes)
             .collect();
+
         Ok((rows, chunks))
     };
 
@@ -247,13 +356,35 @@ pub unsafe extern "C" fn moraine_inline_scan(
     }
 }
 
-/// Frees the row and chunk arrays returned by [`moraine_inline_scan`].
+/// Closes `cursor`, releasing its read session. Windows it already served
+/// stay valid until their own [`moraine_inline_scan_free`].
+///
+/// # Safety
+///
+/// `cursor`, if non-null, must be a pointer previously returned by
+/// [`moraine_inline_scan_open`] and not yet closed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_inline_scan_close(cursor: *mut MoraineInlineScanCursor) {
+    let attempt = || {
+        if cursor.is_null() {
+            return;
+        }
+        // SAFETY: caller contract above.
+        let owned = unsafe { Box::from_raw(cursor) };
+        if let Ok(scan) = owned.cursor.into_inner() {
+            scan.finish();
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// Frees one window's row and chunk arrays.
 ///
 /// # Safety
 ///
 /// `items`/`len` and `chunks`/`chunks_len` must be exactly the pointers
-/// and lengths written by one matching [`moraine_inline_scan`] call, not
-/// yet freed.
+/// and lengths written by one matching [`moraine_inline_scan_next`] call,
+/// not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_inline_scan_free(
     items: *mut MoraineInlineRow,
@@ -291,7 +422,7 @@ pub struct MoraineInlineSchemaRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_inline_scan`].
+/// Same pointer contract as [`moraine_inline_scan_open`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_inline_schemas(
     handle: *mut MoraineCatalogHandle,
@@ -381,7 +512,7 @@ pub struct MoraineInlineTableRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_inline_scan`].
+/// Same pointer contract as [`moraine_inline_scan_open`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_inline_registered_tables(
     handle: *mut MoraineCatalogHandle,
@@ -456,7 +587,7 @@ pub unsafe extern "C" fn moraine_inline_registered_tables_free(
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_inline_scan`], with `out_exists` in
+/// Same pointer contract as [`moraine_inline_scan_open`], with `out_exists` in
 /// place of `out_items`/`out_len`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_inline_file_delete_table_exists(
@@ -518,7 +649,7 @@ pub struct MoraineInlineFileDeleteRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_inline_scan`].
+/// Same pointer contract as [`moraine_inline_scan_open`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_inline_file_deletes(
     handle: *mut MoraineCatalogHandle,
@@ -611,6 +742,85 @@ mod tests {
             StrArena, TempDir, attach_ok, begin, commit, i64_cell, null_cell, stage, u64_cell,
         },
     };
+
+    /// One window of an open scan, as [`moraine_inline_scan_next`] serves
+    /// it; the arrays stay owned by the caller.
+    unsafe fn next_window(
+        cursor: *mut MoraineInlineScanCursor,
+        max_rows: usize,
+    ) -> (*mut MoraineInlineRow, usize, *mut MoraineInlineChunk, usize) {
+        let mut rows: *mut MoraineInlineRow = ptr::null_mut();
+        let mut len: usize = 0;
+        let mut chunks: *mut MoraineInlineChunk = ptr::null_mut();
+        let mut chunks_len: usize = 0;
+        let mut err = MoraineError::default();
+        // SAFETY: `cursor` is open; outputs are valid local slots.
+        let code = unsafe {
+            moraine_inline_scan_next(
+                cursor,
+                max_rows,
+                &raw mut rows,
+                &raw mut len,
+                &raw mut chunks,
+                &raw mut chunks_len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK);
+
+        (rows, len, chunks, chunks_len)
+    }
+
+    /// Opens a scan, takes its whole selection as one window, and closes
+    /// it; the arrays stay owned by the caller.
+    unsafe fn scan_all(
+        handle: *mut MoraineCatalogHandle,
+        table_id: u64,
+        kind: i32,
+        snapshot: u64,
+    ) -> (*mut MoraineInlineRow, usize, *mut MoraineInlineChunk, usize) {
+        // SAFETY: `handle` is attached.
+        let cursor = unsafe { open_scan(handle, table_id, kind, snapshot, true) };
+        // SAFETY: `cursor` was just opened.
+        let window = unsafe { next_window(cursor, usize::MAX) };
+        // SAFETY: `cursor` is open and served its window.
+        unsafe { moraine_inline_scan_close(cursor) };
+
+        window
+    }
+
+    /// An open scan of `table_id` at `snapshot`, under schema version 0.
+    unsafe fn open_scan(
+        handle: *mut MoraineCatalogHandle,
+        table_id: u64,
+        kind: i32,
+        snapshot: u64,
+        with_bodies: bool,
+    ) -> *mut MoraineInlineScanCursor {
+        let mut cursor: *mut MoraineInlineScanCursor = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: `handle` is attached; outputs are valid local slots.
+        let code = unsafe {
+            moraine_inline_scan_open(
+                handle,
+                table_id,
+                kind,
+                snapshot,
+                0,
+                0,
+                with_bodies,
+                &raw mut cursor,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK);
+
+        cursor
+    }
 
     /// The `(table_id, schema_version)` pairs `ducklake_inlined_data_tables`
     /// projects, freed before returning.
@@ -768,8 +978,105 @@ mod tests {
         }
     }
 
-    /// End-to-end over the ABI: stage an inline schema + insert, commit;
-    /// `moraine_inline_scan` (`Table`) returns the row with the right
+    /// The cursor serves a scan in windows: each call takes the next rows
+    /// with only the bodies they reference, an exhausted scan serves empty
+    /// arrays, and a scan opened without bodies still names every row's
+    /// chunk.
+    #[test]
+    fn an_inline_scan_cursor_serves_windows_over_the_abi() {
+        let dir = TempDir::new("scan-windows");
+        let handle = attach_ok(dir.path());
+
+        let tx = begin(handle);
+        let mut arena = StrArena::new();
+        let mut err = MoraineError::default();
+        // SAFETY: `tx` is live; the schema bytes are owned by the call.
+        let code = unsafe {
+            moraine_tx_stage_inline_schema_owned(
+                tx,
+                1,
+                0,
+                MoraineArrowBytes::from_vec(b"schema".to_vec()),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK);
+        for chunk in 0..2u64 {
+            // SAFETY: `tx` is live; the body is owned by the call.
+            let code = unsafe {
+                moraine_tx_stage_inline_insert_owned(
+                    tx,
+                    1,
+                    0,
+                    1,
+                    chunk * 2,
+                    2,
+                    MoraineArrowBytes::from_vec(format!("chunk-{chunk}").into_bytes()),
+                    &raw mut err,
+                )
+            };
+            assert_eq!(code, codes::OK);
+        }
+        stage_snapshot(tx, &mut arena, 1);
+        commit(tx);
+
+        // SAFETY: `handle` is attached.
+        let cursor = unsafe {
+            open_scan(handle, 1, /* SCAN_FOR_FLUSH */ 3, 1, true)
+        };
+        for chunk in 0..2u64 {
+            // SAFETY: `cursor` is open.
+            let (rows, len, chunks, chunks_len) = unsafe { next_window(cursor, 2) };
+            assert_eq!(len, 2);
+            // SAFETY: just populated above with `len` live elements.
+            let window = unsafe { std::slice::from_raw_parts(rows, len) };
+            assert_eq!(window[0].row_id, chunk * 2);
+            assert_eq!(window[1].row_id, chunk * 2 + 1);
+            // Both rows sit in one chunk, whose body crossed once.
+            assert_eq!(chunks_len, 1);
+            // SAFETY: just populated above with one live element.
+            let body = unsafe { &*chunks };
+            // SAFETY: `body` was just populated with `body_len` live bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(body.body, body.body_len) };
+            assert_eq!(bytes, format!("chunk-{chunk}").as_bytes());
+            // SAFETY: matching allocator, not yet freed.
+            unsafe { moraine_inline_scan_free(rows, len, chunks, chunks_len) };
+        }
+        // SAFETY: `cursor` is open and drained.
+        let (rows, len, chunks, chunks_len) = unsafe { next_window(cursor, 2) };
+        assert_eq!(len, 0, "an exhausted scan serves an empty window");
+        assert_eq!(chunks_len, 0);
+        // SAFETY: matching allocator (empty, but still owned per the
+        // `write_array` contract), not yet freed.
+        unsafe { moraine_inline_scan_free(rows, len, chunks, chunks_len) };
+        // SAFETY: `cursor` is open.
+        unsafe { moraine_inline_scan_close(cursor) };
+
+        // SAFETY: `handle` is attached.
+        let bodiless = unsafe {
+            open_scan(handle, 1, /* SCAN_FOR_FLUSH */ 3, 1, false)
+        };
+        // SAFETY: `bodiless` is open.
+        let (rows, len, chunks, chunks_len) = unsafe { next_window(bodiless, usize::MAX) };
+        assert_eq!(len, 4);
+        assert_eq!(chunks_len, 2, "every referenced chunk is still named");
+        // SAFETY: just populated above with `chunks_len` live elements.
+        let bodies = unsafe { std::slice::from_raw_parts(chunks, chunks_len) };
+        assert!(
+            bodies.iter().all(|chunk| chunk.body_len == 0),
+            "a scan opened without bodies reads none"
+        );
+        // SAFETY: matching allocator, not yet freed.
+        unsafe { moraine_inline_scan_free(rows, len, chunks, chunks_len) };
+        // SAFETY: `bodiless` is open.
+        unsafe { moraine_inline_scan_close(bodiless) };
+
+        // SAFETY: `handle` is attached and not yet detached.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// End-to-end over the ABI: stage an inline schema + insert, commit; a
+    /// `Table` scan returns the row with the right
     /// `row_id`/`begin_snapshot`/body, and `moraine_inline_schemas`/
     /// `moraine_inline_registered_tables` see the schema. Staging an
     /// `inline/inline_delete` then makes the row disappear from a `Table` scan
@@ -817,30 +1124,8 @@ mod tests {
         stage_snapshot(tx, &mut arena, 1);
         commit(tx);
 
-        let mut rows: *mut MoraineInlineRow = ptr::null_mut();
-        let mut len: usize = 0;
-        let mut chunks: *mut MoraineInlineChunk = ptr::null_mut();
-        let mut chunks_len: usize = 0;
-        let mut scan_err = MoraineError::default();
-        // SAFETY: `handle` is attached; outputs are valid local slots.
-        let code = unsafe {
-            moraine_inline_scan(
-                handle,
-                1,
-                0,
-                1,
-                0,
-                0,
-                &raw mut rows,
-                &raw mut len,
-                &raw mut chunks,
-                &raw mut chunks_len,
-                None,
-                ptr::null_mut(),
-                &raw mut scan_err,
-            )
-        };
-        assert_eq!(code, codes::OK);
+        // SAFETY: `handle` is attached.
+        let (rows, len, chunks, chunks_len) = unsafe { scan_all(handle, 1, 0, 1) };
         assert_eq!(len, 2);
         // SAFETY: just populated above with `len` live elements.
         let slice = unsafe { std::slice::from_raw_parts(rows, len) };
@@ -933,30 +1218,8 @@ mod tests {
         stage_snapshot(inline_delete_tx, &mut inline_delete_arena, 2);
         commit(inline_delete_tx);
 
-        let mut rows2: *mut MoraineInlineRow = ptr::null_mut();
-        let mut len2: usize = 0;
-        let mut chunks2: *mut MoraineInlineChunk = ptr::null_mut();
-        let mut chunks_len2: usize = 0;
-        let mut scan_err2 = MoraineError::default();
-        // SAFETY: `handle` is attached; outputs are valid local slots.
-        let code = unsafe {
-            moraine_inline_scan(
-                handle,
-                1,
-                0,
-                2,
-                0,
-                0,
-                &raw mut rows2,
-                &raw mut len2,
-                &raw mut chunks2,
-                &raw mut chunks_len2,
-                None,
-                ptr::null_mut(),
-                &raw mut scan_err2,
-            )
-        };
-        assert_eq!(code, codes::OK);
+        // SAFETY: `handle` is attached.
+        let (rows2, len2, chunks2, chunks_len2) = unsafe { scan_all(handle, 1, 0, 2) };
         assert_eq!(len2, 1);
         // SAFETY: just populated above.
         unsafe {
@@ -977,30 +1240,8 @@ mod tests {
         stage_snapshot(flush_tx, &mut flush_arena, 3);
         commit(flush_tx);
 
-        let mut rows3: *mut MoraineInlineRow = ptr::null_mut();
-        let mut len3: usize = 0;
-        let mut chunks3: *mut MoraineInlineChunk = ptr::null_mut();
-        let mut chunks_len3: usize = 0;
-        let mut scan_err3 = MoraineError::default();
-        // SAFETY: `handle` is attached; outputs are valid local slots.
-        let code = unsafe {
-            moraine_inline_scan(
-                handle,
-                1,
-                0,
-                3,
-                0,
-                0,
-                &raw mut rows3,
-                &raw mut len3,
-                &raw mut chunks3,
-                &raw mut chunks_len3,
-                None,
-                ptr::null_mut(),
-                &raw mut scan_err3,
-            )
-        };
-        assert_eq!(code, codes::OK);
+        // SAFETY: `handle` is attached.
+        let (rows3, len3, chunks3, chunks_len3) = unsafe { scan_all(handle, 1, 0, 3) };
         assert_eq!(len3, 0, "flushed chunk must be gone from the scan");
         // SAFETY: matching allocator (empty, but still owned per the
         // `write_array` contract), not yet freed.

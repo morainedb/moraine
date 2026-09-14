@@ -339,6 +339,39 @@ pub(crate) async fn scan_inline_chunks(
     .await
 }
 
+/// Every inlined-insert chunk for `table_id` as a body-free
+/// [`InlineChunkLocator`], in the same key order [`scan_inline_chunks`]
+/// walks. Each chunk's body is decoded and dropped rather than retained,
+/// so a caller that fetches bodies per window holds none of them. Empty
+/// chunks are skipped: they hold no row, and the directory never names
+/// them.
+///
+/// Walked as bulk: the pass reads every chunk in the table and keeps
+/// none, so admitting its blocks would evict the working set to cache
+/// what nothing reads again.
+pub(crate) async fn scan_inline_chunk_headers(
+    handle: ReadHandle<'_>,
+    table_id: u64,
+) -> Result<Vec<InlineChunkLocator>> {
+    let headers = scan_decode(
+        handle,
+        inline_live_table_prefix(InlineOperationKind::Insert, table_id),
+        ScanShape::Bulk,
+        |key, bytes| match key {
+            Key::Inline(InlineKey::Live(op @ InlineOperation::Insert { .. })) => {
+                let chunk: InlineChunkValue = value::decode_owned(bytes)?;
+                InlineChunkLocator::from_chunk(op, &chunk)
+            }
+            other => Err(Error::Corruption(format!(
+                "non-insert key in inline chunk header scan: {other:?}"
+            ))),
+        },
+    )
+    .await?;
+
+    Ok(headers.into_iter().flatten().collect())
+}
+
 /// Every inlined-insert-row tombstone, ordered by row id and end snapshot.
 pub(crate) async fn scan_inline_deletes(
     handle: ReadHandle<'_>,
@@ -675,6 +708,64 @@ mod tests {
                 .await
                 .unwrap(),
             None,
+        );
+
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// The header walk names the chunks the body scan walks, with the same
+    /// ranges and the same scoping to one table, hauling no body.
+    #[tokio::test]
+    async fn chunk_headers_name_every_chunk_the_body_scan_walks() {
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+
+        for (table_id, row_id_start, row_count, chunk_seq) in
+            [(7, 0, 10, 0), (7, 10, 5, 1), (7, 40, 1, 2), (8, 0, 3, 0)]
+        {
+            tx.put(
+                Key::Inline(InlineKey::Live(InlineOperation::Insert {
+                    table_id,
+                    schema_version: 3,
+                    begin_snapshot: 11,
+                    chunk_seq,
+                }))
+                .encode(),
+                value::encode_value(&InlineChunkValue {
+                    body: format!("chunk-{table_id}-{chunk_seq}").into_bytes().into(),
+                    row_id_start,
+                    row_count,
+                    data_file_id: None,
+                }),
+            )
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let headers = scan_inline_chunk_headers(ReadHandle::Tx(&tx), 7)
+            .await
+            .unwrap();
+        let walked: Vec<InlineChunkLocator> = scan_inline_chunks(ReadHandle::Tx(&tx), 7)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|(operation, chunk)| {
+                InlineChunkLocator::from_chunk(*operation, chunk).transpose()
+            })
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(headers, walked);
+        assert_eq!(
+            headers
+                .iter()
+                .map(|locator| (locator.row_id_start(), locator.row_id_end()))
+                .collect::<Vec<_>>(),
+            [(0, 9), (10, 14), (40, 40)]
         );
 
         tx.rollback();
