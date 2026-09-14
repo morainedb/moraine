@@ -665,6 +665,31 @@ pub(crate) enum InlineOperationKind {
     FileDelete,
 }
 
+impl InlineOperation {
+    pub(crate) fn table_id(self) -> u64 {
+        match self {
+            Self::Insert { table_id, .. }
+            | Self::InlineDelete { table_id, .. }
+            | Self::FileDelete { table_id, .. } => table_id,
+        }
+    }
+}
+
+impl InlineKey {
+    /// The table whose inline state this key belongs to.
+    pub(crate) fn table_id(&self) -> u64 {
+        match self {
+            Self::Live(operation) | Self::Arch(operation) => operation.table_id(),
+            Self::Schema { table_id, .. }
+            | Self::FileDeleteTable { table_id }
+            | Self::ChunkRange { table_id, .. }
+            | Self::SchemaDropped { table_id, .. }
+            | Self::ChunkLocator { table_id, .. }
+            | Self::RowTombstone { table_id, .. } => *table_id,
+        }
+    }
+}
+
 impl InlineOperationKind {
     /// An op of this kind with its table id set and every other component
     /// zeroed, for prefix derivation.

@@ -56,6 +56,94 @@ async fn fixture() -> (Arc<InMemory>, TableId) {
     (store, table)
 }
 
+/// A commit that writes no inline key of a table leaves the writer's
+/// inline directory for it in place; one that does rebuilds it.
+#[tokio::test]
+async fn a_writer_rebuilds_an_inline_directory_only_when_its_table_changes() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let chunk = InlineChunk {
+        schema_version: 0,
+        row_count: 2,
+        arrow_schema: b"schema".to_vec(),
+        arrow_body: b"body".to_vec(),
+    };
+    let tables = Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").unwrap().id;
+            let column = ColumnDef {
+                name: "a".into(),
+                column_type: "BIGINT".into(),
+                ..Default::default()
+            };
+            let looked_up = tx.create_table(schema, "looked_up", std::slice::from_ref(&column))?;
+            let unrelated = tx.create_table(schema, "unrelated", std::slice::from_ref(&column))?;
+            tx.inline_insert(looked_up, &chunk, &[])?;
+            tables.set(Some((looked_up, unrelated)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (looked_up, unrelated) = tables.get().unwrap();
+    let builds = || catalog.row_lookups.inline_directory_builds();
+
+    assert!(catalog.recent_row(looked_up, 1).await.unwrap().is_some());
+    assert_eq!(builds(), 1);
+
+    catalog
+        .commit(|tx| tx.inline_insert(unrelated, &chunk, &[]).map(|_| ()))
+        .await
+        .unwrap();
+    assert!(catalog.recent_row(looked_up, 1).await.unwrap().is_some());
+    assert_eq!(builds(), 1, "an unrelated commit rebuilt the directory");
+
+    catalog
+        .commit(|tx| tx.inline_delete(looked_up, 1, &[]))
+        .await
+        .unwrap();
+    assert!(catalog.recent_row(looked_up, 1).await.unwrap().is_none());
+    assert_eq!(builds(), 2, "a delete on the table kept a stale directory");
+    catalog.close().await.unwrap();
+}
+
+/// Rows requested together resolve their deletions at the head and at an
+/// earlier snapshot, with unrequested deleted rows between them. The
+/// fixture holds rows 0 to 5 with row 2 deleted.
+#[tokio::test]
+async fn requested_rows_resolve_deletions_across_skipped_tombstones() {
+    let (store, table) = fixture().await;
+    let catalog = Catalog::open(store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let before_deletes = catalog.snapshot().await.unwrap().snapshot.snapshot_id;
+    for row in [3, 4] {
+        catalog
+            .commit(|tx| tx.inline_delete(table, row, &[]))
+            .await
+            .unwrap();
+    }
+
+    let requested = [0, 1, 3, 4, 5, 2, 99];
+    let live = catalog
+        .requested_inline_row_ids(table, &requested, None)
+        .await
+        .unwrap();
+    let mut live: Vec<_> = live.into_iter().collect();
+    live.sort_unstable();
+    assert_eq!(live, vec![0, 1, 5]);
+
+    let live = catalog
+        .requested_inline_row_ids(table, &requested, Some(before_deletes))
+        .await
+        .unwrap();
+    let mut live: Vec<_> = live.into_iter().collect();
+    live.sort_unstable();
+    assert_eq!(live, vec![0, 1, 3, 4, 5]);
+    catalog.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn manifest_reader_caches_only_a_stable_inline_directory() {
     let (store, table) = fixture().await;

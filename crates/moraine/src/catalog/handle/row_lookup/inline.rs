@@ -32,11 +32,21 @@ impl ReadOnlyCatalog {
         table: TableId,
         head: HeadValue,
     ) -> Result<(Arc<InlineDirectory>, Option<ScannedChunks>)> {
-        let cached = super::lookup(&self.row_lookups.inline, table)
-            .filter(|directory| directory.head == head);
+        // A directory outlives its head while the writer's fold shows no
+        // batch since touched the table's inline keys.
+        let cached = super::lookup(&self.row_lookups.inline, table).filter(|directory| {
+            directory.head == head
+                || projection::inline_directory_current(
+                    &self.projections,
+                    table.get(),
+                    &directory.head,
+                    &head,
+                )
+        });
         if let Some(directory) = cached {
             return Ok((directory, None));
         }
+        self.row_lookups.note_inline_directory_built();
         let mut scanned = None;
         let locators = if projection::inline_directory_complete(&self.projections, table.get()) {
             store_inline::scan_inline_chunk_locators(handle, table.get()).await?
@@ -77,7 +87,7 @@ impl ReadOnlyCatalog {
         visible_at: Option<u64>,
     ) -> Result<(InlineRowSource, Vec<InlineRow>, Arc<InlineDirectory>)> {
         let (directory, scanned) = self.inline_lookup_directory(handle, table, head).await?;
-        let visible_at = visible_at.unwrap_or(directory.head.snapshot_id);
+        let visible_at = visible_at.unwrap_or(head.snapshot_id);
         let mut selected = Vec::new();
         let mut locators = Vec::new();
         let mut chunks = BTreeMap::new();
@@ -269,11 +279,6 @@ impl ReadOnlyCatalog {
     }
 }
 
-/// The ids of the selected rows, their chunks left unread.
-async fn live_row_ids(_: InlineRowSource, rows: Vec<InlineRow>) -> Result<HashSet<u64>> {
-    Ok(rows.into_iter().map(|row| row.row_id).collect())
-}
-
 async fn latest_deletion(
     handle: ReadHandle<'_>,
     table: TableId,
@@ -284,6 +289,11 @@ async fn latest_deletion(
         .await?
         .latest_at(row, head)
         .await
+}
+
+/// The ids of the selected rows, their chunks left unread.
+async fn live_row_ids(_: InlineRowSource, rows: Vec<InlineRow>) -> Result<HashSet<u64>> {
+    Ok(rows.into_iter().map(|row| row.row_id).collect())
 }
 
 #[cfg(test)]

@@ -33,6 +33,8 @@ pub(super) struct RowLookupCache {
     /// Files sent for a summary read while building or refreshing a file
     /// directory.
     summarized_files: AtomicU64,
+    /// Inline directories built from a store scan.
+    inline_directory_builds: AtomicU64,
 }
 
 impl RowLookupCache {
@@ -44,6 +46,15 @@ impl RowLookupCache {
     #[cfg(test)]
     pub(super) fn summarized_files(&self) -> u64 {
         self.summarized_files.load(Ordering::Relaxed)
+    }
+
+    fn note_inline_directory_built(&self) {
+        self.inline_directory_builds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn inline_directory_builds(&self) -> u64 {
+        self.inline_directory_builds.load(Ordering::Relaxed)
     }
 
     pub(super) fn estimated_bytes(&self) -> u64 {

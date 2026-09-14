@@ -314,6 +314,21 @@ pub(crate) fn note_migration_clear(cache: &std::sync::RwLock<ProjectionCache>, h
 }
 
 /// Whether `table_id`'s inline chunk-range directory is known complete.
+/// Whether an inline directory for `table_id` built at `built_at` still
+/// describes the table's inline state at `head`: every batch since
+/// `built_at` has folded here and none wrote the table's inline keys.
+pub(crate) fn inline_directory_current(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+    built_at: &HeadValue,
+    head: &HeadValue,
+) -> bool {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inline_directory_current(table_id, built_at, head)
+}
+
 pub(crate) fn inline_directory_complete(
     cache: &std::sync::RwLock<ProjectionCache>,
     table_id: u64,
@@ -458,6 +473,13 @@ pub(crate) struct ProjectionCache {
     /// Invalidation leaves it standing: it describes the store, not a view
     /// of it.
     inline_directory_complete: BTreeSet<u64>,
+    /// The head each table's inline keys were last written at by a folded
+    /// batch, recorded continuously since `inline_tracked_from`.
+    inline_changed: BTreeMap<u64, HeadValue>,
+    /// The state from which every later batch's inline writes are in
+    /// `inline_changed`; `None` until a batch folds, and again after one
+    /// cannot.
+    inline_tracked_from: Option<HeadValue>,
     /// Per table, an upper bound on the widest live inline chunk. Only ever
     /// raised, so it always bounds the true width from above however stale
     /// it is — a bound that could fall would silently skip a chunk.
@@ -504,6 +526,8 @@ impl ProjectionCache {
             format_floor: 0,
             migration_clear: None,
             inline_directory_complete: BTreeSet::new(),
+            inline_changed: BTreeMap::new(),
+            inline_tracked_from: None,
             inline_chunk_width: BTreeMap::new(),
             epoch: 0,
         }
@@ -511,6 +535,28 @@ impl ProjectionCache {
 
     /// Whether `table_id`'s chunk-range directory is known to name every
     /// chunk.
+    fn inline_directory_current(
+        &self,
+        table_id: u64,
+        built_at: &HeadValue,
+        head: &HeadValue,
+    ) -> bool {
+        let at_or_before = |earlier: &HeadValue, later: &HeadValue| {
+            (earlier.snapshot_id, earlier.batch_seq) <= (later.snapshot_id, later.batch_seq)
+        };
+        self.folded_head
+            .as_ref()
+            .is_some_and(|folded| same_head(folded, head))
+            && self
+                .inline_tracked_from
+                .as_ref()
+                .is_some_and(|from| at_or_before(from, built_at))
+            && self
+                .inline_changed
+                .get(&table_id)
+                .is_none_or(|changed| at_or_before(changed, built_at))
+    }
+
     pub(crate) fn inline_directory_complete(&self, table_id: u64) -> bool {
         self.inline_directory_complete.contains(&table_id)
     }
@@ -675,12 +721,16 @@ impl ProjectionCache {
         self.drop_what_lags_behind();
         let mut current = self.take_half(Half::Current);
         let mut history = self.take_half(Half::History);
+        let mut inline_tables = BTreeSet::new();
         for (encoded_key, write) in writes {
             let bytes = write.as_deref();
             let Ok(key) = Key::decode(encoded_key) else {
                 self.clear_folded();
                 return;
             };
+            if let Key::Inline(inline) = &key {
+                inline_tables.insert(inline.table_id());
+            }
             match key {
                 Key::Snapshot { snapshot_id } => self.snapshots.fold(snapshot_id, bytes),
                 Key::Current(CurrentKey::Entity(EntityKey::TableStats { table_id })) => {
@@ -711,6 +761,12 @@ impl ProjectionCache {
         self.table_column_stats.advance(stamp);
         self.current_entities = current.map(|(_, records)| (stamp, Arc::new(records)));
         self.history_entities = history.map(|(_, records)| (stamp, Arc::new(records)));
+        if self.inline_tracked_from.is_none() {
+            self.inline_tracked_from = Some(self.folded_head.unwrap_or(stamp));
+        }
+        for table_id in inline_tables {
+            self.inline_changed.insert(table_id, stamp);
+        }
         self.folded_head = Some(stamp);
     }
 
@@ -754,6 +810,8 @@ impl ProjectionCache {
     fn clear_folded(&mut self) {
         self.current_entities = None;
         self.history_entities = None;
+        self.inline_changed.clear();
+        self.inline_tracked_from = None;
         self.snapshots.clear();
         self.table_stats.clear();
         self.table_column_stats.clear();
