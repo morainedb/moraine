@@ -302,8 +302,9 @@ impl ReadOnlyCatalog {
     }
 
     /// The lowest index id at or after `from` holding an entry of `kind`,
-    /// or `None` past the last one. One seek per distinct index present —
-    /// the scan stops at the first key rather than walking the range.
+    /// or `None` past the last one. The scan stops at the first live key
+    /// but must read ahead: a swept index leaves its whole range as
+    /// tombstones ahead of that key until a store merge drops them.
     pub(crate) async fn first_index_id_from(
         &self,
         kind: IndexKind,
@@ -317,7 +318,7 @@ impl ReadOnlyCatalog {
         let session = self.begin_read().await?;
         let first = session
             .handle()
-            .scan_prefix(kind_prefix, suffix.., ScanShape::Seek)
+            .scan_prefix(kind_prefix, suffix.., ScanShape::Bulk)
             .await
             .map_err(Error::from)?
             .next()
