@@ -1048,20 +1048,26 @@ wear it or evict the probe set.
 A read that takes one entry — or a handful — from a wide range names a
 fourth shape, seek: one block fetched at a time, admitted. The probe shape
 would be wrong there, not merely wasteful: SlateDB spawns its read-ahead
-fetches eagerly when the iterator opens, up to 32 of 8 MiB each per SST,
-and a fetch task has no cancellation on drop, so an iterator dropped after
-one `next` leaves them running to completion. The seek sites are the first
-entry of a subspace or of a table's probe range (the cache warms), the
-highest key of a split kind (the adaptive split's one seek from the end),
-the first index id at or past a cursor (the dead-index sweep), and a
+fetches eagerly when the iterator opens, up to 32 of 8 MiB each per SST, and
+a fetch task has no cancellation on drop, so an iterator dropped after one
+`next` leaves them running to completion. The seek sites are the first entry
+of a subspace or of a table's probe range (the cache warms), the highest key
+of a split kind (the adaptive split's one seek from the end), and a
 chunk-directory walk that a known chunk width ends within a few entries of
-its last target. A directory walk with no width bound runs to the end of
-the directory and stays a probe. The preload's first-entry read of a
-subspace is the one seek site that consults the manifest: a segment whose
-recorded size fits one read-ahead warms in probe shape, since each SST
-costs one request either way and the probe's request brings the whole
-segment in and admits it, where a seek would fetch one block per subspace
-per SST and leave the rest cold; a larger or unrecorded segment seeks.
+its last target. A directory walk with no width bound runs to the end of the
+directory and stays a probe. The dead-index sweep's read of the first index
+id at or past a cursor is not a seek site, though it takes one entry: a
+swept index leaves its whole range as tombstones ahead of the first live key
+until a store merge drops them, and SlateDB filters tombstones from the
+iterator only after fetching every block they occupy, so a one-block seek
+there pays a round trip per block of them on every pass. That read stays a
+bulk scan, reading ahead and admitting nothing. The preload's first-entry
+read of a subspace is the one seek site that consults the manifest: a
+segment whose recorded size fits one read-ahead warms in probe shape, since
+each SST costs one request either way and the probe's request brings the
+whole segment in and admits it, where a seek would fetch one block per
+subspace per SST and leave the rest cold; a larger or unrecorded segment
+seeks.
 
 Bulk and probe scans use fixed 8 MiB read-ahead with 32 fetches in flight,
 sized for a remote object store. A third shape, streaming, serves a

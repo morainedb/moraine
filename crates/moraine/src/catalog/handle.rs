@@ -1350,6 +1350,19 @@ impl Catalog {
             .map_err(Error::from)
     }
 
+    /// Writes the memtable out as a sorted-string table, so a test can put
+    /// what it committed behind block reads.
+    #[cfg(test)]
+    pub(crate) async fn flush_memtable(&self) -> Result<()> {
+        use slatedb::config::{FlushOptions, FlushType};
+        self.writer()?
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .map_err(Error::from)
+    }
+
     /// Commits a raw store transaction through the writer's paced route,
     /// for tests that stage bytes the verbs do not; the writer runs no
     /// flush timer, so a bare durability wait would never resolve.

@@ -3087,6 +3087,71 @@ async fn maintain_sweeps_a_dropped_index_and_is_idempotent() {
     catalog.close().await.unwrap();
 }
 
+/// The pass after a sweep finds the first live index past the tombstoned
+/// range for a bounded handful of reads, not one per block of tombstones.
+#[tokio::test]
+async fn maintain_does_not_read_a_swept_range_block_by_block() {
+    use crate::catalog::{Catalog, CatalogOptions, ColumnDef, MaintenanceRequest};
+
+    const DEAD_ENTRIES: u64 = 20_000;
+    let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let open = || Catalog::open(Arc::clone(&backing), CatalogOptions::default());
+    let request = MaintenanceRequest {
+        sweep_orphaned_file_column_stats: false,
+        ..MaintenanceRequest::default()
+    };
+
+    // A wide index that will be dropped, and a small live one above it by id.
+    let catalog = open().await.unwrap();
+    let table = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.create_schema("s")?;
+            let column = ColumnDef {
+                name: "a".into(),
+                column_type: "BIGINT".into(),
+                nulls_allowed: true,
+                default_value: None,
+                children: Vec::new(),
+            };
+            table.set(Some(tx.create_table(schema, "t", &[column])?));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let table = table.get().unwrap();
+    let dead = indexed(&catalog, table, "dead", DEAD_ENTRIES).await;
+    let live = indexed(&catalog, table, "live", 3).await;
+    assert!(dead.get() < live.get());
+    catalog.commit(|tx| tx.drop_index(dead)).await.unwrap();
+    catalog.flush_memtable().await.unwrap();
+    catalog.close().await.unwrap();
+
+    // The sweep that tombstones the dead range, written out behind it.
+    let catalog = open().await.unwrap();
+    let swept = catalog.maintain(request.clone()).await.unwrap();
+    assert_eq!(swept.indexes_swept, 1);
+    assert_eq!(swept.index_entries_reclaimed, DEAD_ENTRIES);
+    catalog.flush_memtable().await.unwrap();
+    catalog.close().await.unwrap();
+
+    // A fresh writer's block cache is cold, so every block the next pass
+    // walks is an object-store read.
+    let catalog = open().await.unwrap();
+    let before = catalog.object_store_tally().main_gets;
+    let again = catalog.maintain(request).await.unwrap();
+    let reads = catalog.object_store_tally().main_gets - before;
+    catalog.close().await.unwrap();
+
+    assert_eq!(again.indexes_swept, 0);
+    let blocks = DEAD_ENTRIES / 128;
+    assert!(
+        reads < blocks,
+        "the pass after a sweep issued {reads} reads over a range of at least {blocks} \
+         blocks: the seek is walking the tombstones one block at a time"
+    );
+}
+
 /// With live and dead indexes interleaved by id, the sweep reclaims
 /// exactly the dead ones and every live index still answers lookups.
 #[tokio::test]
