@@ -387,7 +387,7 @@ fn decode_inline_body(
 }
 
 /// Decodes and consumes one chunk returned by
-/// [`crate::inline::moraine_inline_scan`]; its store-backed allocation
+/// [`crate::inline::moraine_inline_scan_next`]; its store-backed allocation
 /// becomes Arrow's data buffer without a copy.
 ///
 /// # Safety

@@ -84,6 +84,11 @@ typedef struct MoraineArrowSchema MoraineArrowSchema;
 // [`moraine_detach`](crate::abi::moraine_detach).
 typedef struct MoraineCatalogHandle MoraineCatalogHandle;
 
+// An open inline scan, opaque to C: the selected rows and the read
+// session they were selected under, served a window at a time by
+// [`moraine_inline_scan_next`] until [`moraine_inline_scan_close`].
+typedef struct MoraineInlineScanCursor MoraineInlineScanCursor;
+
 // A materialized snapshot view, held across the FFI boundary so
 // listing calls need no further store I/O.
 //
@@ -569,7 +574,8 @@ typedef struct MoraineArrowBytes {
 } MoraineArrowBytes;
 
 // One referenced chunk's full Arrow IPC record-batch body, owned;
-// returned once per chunk however many rows reference it.
+// returned once per chunk however many rows of the window reference it,
+// and empty for a scan opened without bodies.
 typedef struct MoraineInlineChunk {
   // The chunk's Arrow IPC record-batch body, owned.
   uint8_t *body;
@@ -1103,9 +1109,9 @@ typedef struct MoraineColumnTagRow {
   char *value;
 } MoraineColumnTagRow;
 
-// One inlined row, as returned by [`moraine_inline_scan`]: `chunk_index`
-// names the owning chunk in the scan's parallel [`MoraineInlineChunk`]
-// array.
+// One inlined row, as returned by [`moraine_inline_scan_next`]:
+// `chunk_index` names the owning chunk in the window's parallel
+// [`MoraineInlineChunk`] array.
 typedef struct MoraineInlineRow {
   // The row's dense id.
   uint64_t row_id;
@@ -2259,7 +2265,7 @@ int32_t moraine_arrow_schema_decode(const uint8_t *schema_ipc,
 void moraine_arrow_schema_free(struct MoraineArrowSchema *schema);
 
 // Decodes and consumes one chunk returned by
-// [`crate::inline::moraine_inline_scan`]; its store-backed allocation
+// [`crate::inline::moraine_inline_scan_next`]; its store-backed allocation
 // becomes Arrow's data buffer without a copy.
 //
 // # Safety
@@ -3007,49 +3013,89 @@ int32_t moraine_dump_column_tags(struct MoraineCatalogHandle *handle,
 // [`moraine_dump_column_tags`] call wrote, not yet freed.
 void moraine_dump_column_tags_free(struct MoraineColumnTagRow *items, size_t len);
 
-// Materializes `table_id`'s inlined rows and selects the `scan_kind`
+// Opens a scan of `table_id`'s inlined rows under the `scan_kind`
 // variant (`0` = `SCAN_TABLE`, `1` = `SCAN_INSERTIONS`, `2` =
 // `SCAN_DELETIONS`, `3` = `SCAN_FOR_FLUSH`) at `snapshot`, windowed from
 // `start` for the incremental variants (ignored by `SCAN_TABLE`/
 // `SCAN_FOR_FLUSH`). Only rows written under `schema_version` are
-// selected, and only their chunks' bodies are hauled: every caller
-// serves one `ducklake_inlined_data_<t>_<v>` projection, so a
-// schema-evolved table's other versions cost it nothing.
+// selected: every caller serves one `ducklake_inlined_data_<t>_<v>`
+// projection, so a schema-evolved table's other versions cost it
+// nothing. With `with_bodies` false the scan reads no chunk body at all,
+// which is what a caller projecting none of the user columns needs.
+//
+// The rows are selected once, here; [`moraine_inline_scan_next`] then
+// hauls one window's bodies at a time, so a consumer that releases each
+// window never holds the table. The scan holds a read session until it
+// is closed.
 //
 // Cancellable: races the core read against `probe` (polled immediately,
 // then ~100 ms; a null `probe` disables polling). If a cancellation
-// wins, returns [`codes::INTERRUPTED`] and the out-params are left
+// wins, returns [`codes::INTERRUPTED`] and `out_cursor` is left
 // unwritten.
 //
 // # Safety
 //
 // `handle` must be a pointer previously returned by
 // [`moraine_attach`](crate::abi::moraine_attach) and not yet detached.
-// `out_items`/`out_len` must be valid, writable pointers. `probe`, if
-// non-null, must be safe to call with `probe_ctx` from any thread.
-// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
-// for the duration of this call.
-int32_t moraine_inline_scan(struct MoraineCatalogHandle *handle,
-                            uint64_t table_id,
-                            int32_t scan_kind,
-                            uint64_t snapshot,
-                            uint64_t start,
-                            uint64_t schema_version,
-                            struct MoraineInlineRow **out_items,
-                            size_t *out_len,
-                            struct MoraineInlineChunk **out_chunks,
-                            size_t *out_chunks_len,
-                            MoraineInterruptProbe probe,
-                            void *probe_ctx,
-                            struct MoraineError *err);
+// `out_cursor` must be a valid, writable pointer. `probe`, if non-null,
+// must be safe to call with `probe_ctx` from any thread. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_inline_scan_open(struct MoraineCatalogHandle *handle,
+                                 uint64_t table_id,
+                                 int32_t scan_kind,
+                                 uint64_t snapshot,
+                                 uint64_t start,
+                                 uint64_t schema_version,
+                                 bool with_bodies,
+                                 struct MoraineInlineScanCursor **out_cursor,
+                                 MoraineInterruptProbe probe,
+                                 void *probe_ctx,
+                                 struct MoraineError *err);
 
-// Frees the row and chunk arrays returned by [`moraine_inline_scan`].
+// Serves `cursor`'s next window: at most `max_rows` rows in scan order,
+// with the chunks they reference — the bodies of a window the previous
+// call served are not held. An exhausted scan writes empty arrays. Each
+// window is freed by its own [`moraine_inline_scan_free`] call.
+//
+// Cancellable on the same terms as [`moraine_inline_scan_open`]; a
+// cancelled call leaves the out-params unwritten and the scan's position
+// unmoved.
+//
+// # Safety
+//
+// `cursor` must be a pointer previously returned by
+// [`moraine_inline_scan_open`] and not yet closed; its catalog must
+// still be attached. `out_items`/`out_len`/`out_chunks`/`out_chunks_len`
+// must be valid, writable pointers. `probe`, if non-null, must be safe
+// to call with `probe_ctx` from any thread. `err`, if non-null, must be
+// a valid, writable [`MoraineError`]. All for the duration of this call.
+int32_t moraine_inline_scan_next(struct MoraineInlineScanCursor *cursor,
+                                 size_t max_rows,
+                                 struct MoraineInlineRow **out_items,
+                                 size_t *out_len,
+                                 struct MoraineInlineChunk **out_chunks,
+                                 size_t *out_chunks_len,
+                                 MoraineInterruptProbe probe,
+                                 void *probe_ctx,
+                                 struct MoraineError *err);
+
+// Closes `cursor`, releasing its read session. Windows it already served
+// stay valid until their own [`moraine_inline_scan_free`].
+//
+// # Safety
+//
+// `cursor`, if non-null, must be a pointer previously returned by
+// [`moraine_inline_scan_open`] and not yet closed.
+void moraine_inline_scan_close(struct MoraineInlineScanCursor *cursor);
+
+// Frees one window's row and chunk arrays.
 //
 // # Safety
 //
 // `items`/`len` and `chunks`/`chunks_len` must be exactly the pointers
-// and lengths written by one matching [`moraine_inline_scan`] call, not
-// yet freed.
+// and lengths written by one matching [`moraine_inline_scan_next`] call,
+// not yet freed.
 void moraine_inline_scan_free(struct MoraineInlineRow *items,
                               size_t len,
                               struct MoraineInlineChunk *chunks,
@@ -3059,7 +3105,7 @@ void moraine_inline_scan_free(struct MoraineInlineRow *items,
 //
 // # Safety
 //
-// Same pointer contract as [`moraine_inline_scan`].
+// Same pointer contract as [`moraine_inline_scan_open`].
 int32_t moraine_inline_schemas(struct MoraineCatalogHandle *handle,
                                uint64_t table_id,
                                struct MoraineInlineSchemaRow **out_items,
@@ -3082,7 +3128,7 @@ void moraine_inline_schemas_free(struct MoraineInlineSchemaRow *items, size_t le
 //
 // # Safety
 //
-// Same pointer contract as [`moraine_inline_scan`].
+// Same pointer contract as [`moraine_inline_scan_open`].
 int32_t moraine_inline_registered_tables(struct MoraineCatalogHandle *handle,
                                          struct MoraineInlineTableRow **out_items,
                                          size_t *out_len,
@@ -3105,7 +3151,7 @@ void moraine_inline_registered_tables_free(struct MoraineInlineTableRow *items, 
 //
 // # Safety
 //
-// Same pointer contract as [`moraine_inline_scan`], with `out_exists` in
+// Same pointer contract as [`moraine_inline_scan_open`], with `out_exists` in
 // place of `out_items`/`out_len`.
 int32_t moraine_inline_file_delete_table_exists(struct MoraineCatalogHandle *handle,
                                                 uint64_t table_id,
@@ -3119,7 +3165,7 @@ int32_t moraine_inline_file_delete_table_exists(struct MoraineCatalogHandle *han
 //
 // # Safety
 //
-// Same pointer contract as [`moraine_inline_scan`].
+// Same pointer contract as [`moraine_inline_scan_open`].
 int32_t moraine_inline_file_deletes(struct MoraineCatalogHandle *handle,
                                     uint64_t table_id,
                                     struct MoraineInlineFileDeleteRow **out_items,

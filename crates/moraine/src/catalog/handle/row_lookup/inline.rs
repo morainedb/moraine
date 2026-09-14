@@ -52,14 +52,15 @@ impl ReadOnlyCatalog {
             store_inline::scan_inline_chunk_locators(handle, table.get()).await?
         } else {
             let chunks = store_inline::scan_inline_chunks(handle, table.get()).await?;
-            self.verify_inline_directory(handle, table, &chunks).await?;
-            let locators = chunks
+            let locators: Vec<_> = chunks
                 .iter()
                 .map(|(operation, chunk)| InlineChunkLocator::from_chunk(*operation, chunk))
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .flatten()
                 .collect();
+            self.verify_inline_directory(handle, table, &locators)
+                .await?;
             if !handle.is_isolated() {
                 scanned = Some(chunks);
             }

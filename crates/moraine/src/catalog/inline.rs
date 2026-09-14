@@ -106,6 +106,17 @@ fn materialize_spans(
     rows
 }
 
+/// Whether a scan's windows carry their chunks' Arrow bodies. A caller
+/// that projects no user column reads none: its rows still name their
+/// chunk, and that chunk's body arrives empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineBodies {
+    /// Point-read the bodies each window's rows reference.
+    Fetch,
+    /// Leave every body empty.
+    Skip,
+}
+
 /// The four ways DuckLake's inline reader queries a table, each a
 /// predicate over `(begin_snapshot, end_snapshot)` at snapshot `S`
 /// (optionally windowed from `start` for the incremental variants).

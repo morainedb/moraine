@@ -559,6 +559,16 @@ inserts; `cpp/inline_tables.cpp` recognizes two dynamic name families —
 staged-row commit path the fixed tables ride, instead of materializing
 real tables.
 
+A `SELECT` against the data family is served in windows rather than
+materialized. Binding reads nothing; the scan opens a core cursor when the
+plan initializes it and pulls 8 × `STANDARD_VECTOR_SIZE` rows at a time,
+decoding only those rows' chunk bodies and releasing them before the next
+window, so a flush of a large inlined table never holds more than a window
+of it. A scan that projects no user column — the flush's own `DELETE`, a
+`COUNT(*)` — reads no body at all. `UPDATE` and `DELETE` resolve their
+physical rowids against a per-statement ledger of what that plan's scan
+emitted, which carries row ids and begin snapshots and no payload.
+
 One property of the delete family is worth stating because it is easy to
 get wrong: it exists from the table's first inlined deletion until the
 table is dropped, and **emptying it does not remove it**.

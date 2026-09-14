@@ -842,3 +842,86 @@ fn an_update_re_inlining_scattered_rows_keeps_each_rows_own_id() {
         "a re-inlined row was relabelled by its chunk's dense range"
     );
 }
+
+/// A flush of an inlined table larger than one scan window: the shim
+/// serves the rows a window at a time, so what lands in Parquet must be
+/// every row, with each row's user columns still its own, and the flush's
+/// own `DELETE` must resolve rowids the later windows handed out.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn ducklake_inline_flush_spans_several_scan_windows() {
+    let dir = TempDir::new("inline-window-store");
+    let data_dir = TempDir::new("inline-window-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+    // Two and a half windows of 8 * STANDARD_VECTOR_SIZE rows, inlined by
+    // one statement under a raised limit.
+    let options = ", DATA_INLINING_ROW_LIMIT 100000";
+    let rows = 40_000;
+
+    run_ducklake_sql_with_options(
+        store,
+        data_path,
+        options,
+        "CREATE TABLE lake.main.t (i BIGINT, s VARCHAR);",
+    );
+    run_ducklake_sql_with_options(
+        store,
+        data_path,
+        options,
+        &format!("INSERT INTO lake.main.t SELECT i, 'v' || i FROM range({rows}) t(i);"),
+    );
+    let inline_files = csv_rows(&run_standalone_sql(
+        store,
+        "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+    ));
+    assert_eq!(
+        inline_files,
+        vec![vec!["0".to_string()]],
+        "the whole insert must inline, or the flush has nothing to window"
+    );
+
+    // Deleted rows tombstone inline rows the flush's windows walk past.
+    run_ducklake_sql_with_options(
+        store,
+        data_path,
+        options,
+        "DELETE FROM lake.main.t WHERE i % 10000 = 0;",
+    );
+    run_ducklake_sql_with_options(
+        store,
+        data_path,
+        options,
+        "CALL ducklake_flush_inlined_data('lake');",
+    );
+
+    let after_flush = csv_rows(&run_ducklake_sql_with_options(
+        store,
+        data_path,
+        options,
+        "SELECT count(*), sum(i), count(*) FILTER (WHERE s <> 'v' || i) FROM lake.main.t;",
+    ));
+    let kept = rows - 4;
+    let expected_sum = (0..rows).filter(|i| i % 10000 != 0).sum::<i64>();
+    assert_eq!(
+        after_flush,
+        vec![vec![
+            kept.to_string(),
+            expected_sum.to_string(),
+            "0".to_string()
+        ]],
+        "every surviving row must arrive once, carrying its own values"
+    );
+
+    // The flush drained the inline entry and wrote the rows as files.
+    let remaining_inline_rows = csv_rows(&run_standalone_sql(
+        store,
+        "SELECT count(*) FROM m.ducklake_inlined_data_1_1;",
+    ));
+    assert_eq!(remaining_inline_rows, vec![vec!["0".to_string()]]);
+    let post_flush_files = csv_rows(&run_standalone_sql(
+        store,
+        "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+    ));
+    assert_ne!(post_flush_files, vec![vec!["0".to_string()]]);
+}

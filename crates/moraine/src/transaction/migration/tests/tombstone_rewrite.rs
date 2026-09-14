@@ -138,7 +138,7 @@ async fn old_formats_migrate_to_versioned_inline_tombstones() {
             rows.iter().map(|row| row.end_snapshot).collect::<Vec<_>>(),
             [Some(2), Some(3), Some(4)]
         );
-        assert_eq!(chunks[0].1.body.as_ref(), b"preserved-row-bodies");
+        assert_eq!(chunks[0].1.as_ref(), b"preserved-row-bodies");
         let (rows, _) = catalog
             .select_inline_rows(7, crate::catalog::inline::InlineScanKind::Table, 2, 0, None)
             .await

@@ -326,6 +326,13 @@ way delete files do. The tombstone set for a table is scanned once and
 held in memory — inlined data is bounded by the row limit and flush
 cadence, so these sets are small by construction.
 
+A scan selects its rows once, under one read session, and then serves
+them in **windows**: each window point-reads the bodies its own rows
+reference and is released before the next is fetched. Row spans are the
+only whole-table state a reader holds; the payload it holds is one
+window's. A scan that projects none of the user columns — the flush's own
+`DELETE`, a `COUNT(*)` — reads no body at all.
+
 Equality-index maintenance for an `inline/row_tombstone` needs the deleted
 row's indexed values. It seeks the `inline/chunk_range` directory from that
 row id, reads only the owning immutable chunk, and decodes that body. A
@@ -348,6 +355,10 @@ monotone. From there:
   scan's rows, and point-reads only the chunk bodies the selected rows
   reference — a chunk whose rows are all tombstoned, or outside an
   incremental scan's window, is never hauled.
+
+A directory found short of complete costs the full chunk walk, but that
+walk keeps each chunk's row span and drops its body as it passes, so the
+fallback is a scan's cost in time rather than in resident bytes.
 
 Who judges and who repairs is split by capability. A flush that finds the
 directory incomplete heals the gap onto its own batch — locators for
@@ -386,10 +397,17 @@ that order — data before metadata, like any DuckLake write):
    row-by-row materialization would undo the transcode-free property the
    format was chosen for, one `Value` per cell, twice.
 
-   A physical rowid is the index into the scan's row list, so versions
-   sharing a logical `row_id` remain distinct. UPDATE and DELETE resolve
-   it against the statement's shared scan materialization, with no second
-   store scan or Arrow decode.
+   Windows are what reaches the writer, so the rows resident at any point
+   are one window's, however large the inlined table is. Chunk bodies are
+   fetched a window at a time, several at once, and dropped once decoded.
+
+   A physical rowid is the row's position in the scan's emission order, so
+   versions sharing a logical `row_id` remain distinct. UPDATE and DELETE
+   resolve it against a ledger the scan appends as it emits — row id and
+   begin snapshot per position, no payload — so a rowid handed out by an
+   early window still resolves during a later one, with no second store
+   scan or Arrow decode. The ledger is filled only when the plan asked for
+   rowids, which the flush's own read does not.
 2. In the commit batch: create the `file` (and `delfile`) records — the
    file record backdated to the minimum per-row snapshot, row-faithfully,
    as DuckLake writes it — and **delete** the flushed `inline/insert` chunks,

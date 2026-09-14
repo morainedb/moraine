@@ -1055,6 +1055,16 @@ cpp`) as the fixed `ducklake_*` tables, translating into `inline/*`
 records — see RFC 0005 for the exact wire shape and the encoding
 deviation from that RFC's Arrow-IPC design.
 
+The data family's scan is **windowed**: `moraine_inline_scan_open` selects
+the rows and holds them behind a cursor, and each `moraine_inline_scan_next`
+returns the next window with only that window's chunk bodies, so what the
+shim decodes is bounded by the window and not by the table. Binding reads
+nothing — the cursor opens when the plan initializes the scan, which is
+also where the projection is known, so a scan of the metadata columns
+alone opens without bodies and DuckLake's own existence probe costs no
+store read. `moraine_inline_scan_close` releases the cursor's read
+session.
+
 `ducklake_flush_inlined_data` and DuckLake's compaction/rewrite cleanup
 paths also touch fixed `ducklake_*` tables beyond the entity
 projections. `ducklake_files_scheduled_for_deletion` is served for real
