@@ -1,7 +1,7 @@
 //! An immutable, materialized catalog view. Built once from a consistent
 //! store scan; every accessor is an in-memory lookup afterwards.
 
-use imbl::{HashMap, OrdMap};
+use imbl::{HashMap, OrdMap, OrdSet};
 use prost::Message as _;
 
 use crate::{
@@ -50,6 +50,9 @@ pub struct CatalogSnapshot {
     pub(crate) macro_names: ScopedNames,
     pub(crate) data_files: OrdMap<u64, OrdMap<u64, DataFileValue>>,
     pub(crate) delete_files: OrdMap<u64, OrdMap<u64, DeleteFileValue>>,
+    /// Each table's live delete files by the data file they target, as
+    /// `(data_file_id, delete_file_id)`; derived from `delete_files`.
+    pub(crate) delete_file_targets: OrdMap<u64, OrdSet<(u64, u64)>>,
     pub(crate) partitions: OrdMap<u64, OrdMap<u64, PartitionValue>>,
     pub(crate) sorts: OrdMap<u64, OrdMap<u64, SortValue>>,
     pub(crate) mappings: OrdMap<u64, OrdMap<u64, MappingValue>>,
@@ -776,6 +779,7 @@ impl CatalogSnapshot {
             .delete_files
             .remove(&table_id)
             .map_or(0, |rows| rows.len());
+        self.delete_file_targets.remove(&table_id);
         self.nested_entity_count -= self
             .partitions
             .remove(&table_id)
@@ -962,22 +966,61 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn put_delete_file(&mut self, value: DeleteFileValue) {
+        let (table_id, delete_file_id, data_file_id) =
+            (value.table_id, value.delete_file_id, value.data_file_id);
+        if let Some(previous) = self
+            .delete_files
+            .get(&table_id)
+            .and_then(|files| files.get(&delete_file_id))
+            && let Some(targets) = self.delete_file_targets.get_mut(&table_id)
+        {
+            targets.remove(&(previous.data_file_id, delete_file_id));
+        }
         put_nested(
             &mut self.delete_files,
             &mut self.nested_entity_count,
-            value.table_id,
-            value.delete_file_id,
+            table_id,
+            delete_file_id,
             value,
         );
+        self.delete_file_targets
+            .entry(table_id)
+            .or_default()
+            .insert((data_file_id, delete_file_id));
     }
 
     pub(crate) fn delete_delete_file(&mut self, table_id: u64, delete_file_id: u64) {
+        let target = self
+            .delete_files
+            .get(&table_id)
+            .and_then(|files| files.get(&delete_file_id))
+            .map(|value| value.data_file_id);
+        if let Some(data_file_id) = target
+            && let Some(targets) = self.delete_file_targets.get_mut(&table_id)
+        {
+            targets.remove(&(data_file_id, delete_file_id));
+        }
         remove_nested(
             &mut self.delete_files,
             &mut self.nested_entity_count,
             table_id,
             &delete_file_id,
         );
+    }
+
+    /// The live delete files targeting `data_file_id`, by id.
+    pub(crate) fn delete_files_targeting(
+        &self,
+        table_id: u64,
+        data_file_id: u64,
+    ) -> impl Iterator<Item = &DeleteFileValue> {
+        let live = self.delete_files.get(&table_id);
+        self.delete_file_targets
+            .get(&table_id)
+            .into_iter()
+            .flat_map(move |targets| targets.range((data_file_id, 0)..=(data_file_id, u64::MAX)))
+            .filter_map(move |(_, delete_file_id)| live.and_then(|files| files.get(delete_file_id)))
+            .filter(move |value| value.data_file_id == data_file_id)
     }
 
     pub(crate) fn put_table_stats(&mut self, value: TableStatsValue) {
@@ -1272,7 +1315,7 @@ fn partition_values(value: &DataFileValue) -> Vec<String> {
         .collect()
 }
 
-fn delete_file_info(value: &DeleteFileValue) -> DeleteFileInfo {
+pub(crate) fn delete_file_info(value: &DeleteFileValue) -> DeleteFileInfo {
     DeleteFileInfo {
         id: DeleteFileId::new(value.delete_file_id),
         data_file_id: DataFileId::new(value.data_file_id),
@@ -1309,6 +1352,54 @@ mod tests {
     mod counts;
 
     use super::*;
+
+    /// A delete file is found by the data file it targets while it is live,
+    /// including alongside another targeting the same file, and not after it
+    /// or its table is removed.
+    #[test]
+    fn delete_files_are_found_by_the_data_file_they_target() {
+        let delete_file = |delete_file_id, data_file_id| DeleteFileValue {
+            delete_file_id,
+            table_id: 1,
+            begin_snapshot: 1,
+            end_snapshot: None,
+            data_file_id,
+            path: format!("d{delete_file_id}.parquet"),
+            path_is_relative: true,
+            format: "parquet".into(),
+            delete_count: 1,
+            file_size_bytes: 10,
+            footer_size: 4,
+            encryption_key: None,
+            partial_max: None,
+        };
+        let ids = |view: &CatalogSnapshot, data_file_id| -> Vec<u64> {
+            view.delete_files_targeting(1, data_file_id)
+                .map(|value| value.delete_file_id)
+                .collect()
+        };
+        let mut view = CatalogSnapshot::default();
+        view.put_delete_file(delete_file(4, 3));
+        view.put_delete_file(delete_file(6, 3));
+        view.put_delete_file(delete_file(7, 5));
+        assert_eq!(ids(&view, 3), vec![4, 6]);
+        assert_eq!(ids(&view, 5), vec![7]);
+        assert!(ids(&view, 9).is_empty());
+
+        view.put_delete_file(delete_file(7, 3));
+        assert!(ids(&view, 5).is_empty(), "a retargeted delete file stayed");
+        assert_eq!(ids(&view, 3), vec![4, 6, 7]);
+
+        view.delete_delete_file(1, 4);
+        assert_eq!(ids(&view, 3), vec![6, 7]);
+        assert!(view.delete_files_targeting(2, 3).next().is_none());
+
+        view.delete_table(1);
+        assert!(
+            ids(&view, 3).is_empty(),
+            "a dropped table's delete files stayed"
+        );
+    }
     use crate::catalog::types::DataFileId;
 
     #[test]

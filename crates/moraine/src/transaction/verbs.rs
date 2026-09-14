@@ -1464,11 +1464,7 @@ impl Transaction {
 
         let cascaded: Vec<u64> = self
             .state
-            .delete_files
-            .get(&table.get())
-            .into_iter()
-            .flat_map(imbl::OrdMap::values)
-            .filter(|d| d.data_file_id == file.get())
+            .delete_files_targeting(table.get(), file.get())
             .map(|d| d.delete_file_id)
             .collect();
         for delete_file_id in cascaded {
@@ -1528,13 +1524,9 @@ impl Transaction {
         // One live delete file per data file.
         let already_targeted = self
             .state
-            .delete_files
-            .get(&table.get())
-            .is_some_and(|files| {
-                files
-                    .values()
-                    .any(|existing| existing.data_file_id == file.data_file_id.get())
-            });
+            .delete_files_targeting(table.get(), file.data_file_id.get())
+            .next()
+            .is_some();
         if already_targeted {
             return Err(Error::Constraint(format!(
                 "data file {} of table {table} already has a live delete file; \

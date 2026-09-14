@@ -14,6 +14,7 @@ use crate::{
     catalog::{
         CatalogSnapshot, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo,
         FileIndexRemoval, FileRowCandidate, IndexInfo, SnapshotId, TableId, resolve_data_path,
+        snapshot::{data_file_info, delete_file_info},
     },
     data_file::{self, DataStore, FileSummary},
     error::{Error, Result},
@@ -455,13 +456,6 @@ impl ReadOnlyCatalog {
             .map(|file| (file.id, file.path.clone()))
             .collect();
 
-        let delete_files: HashMap<DataFileId, DeleteFileInfo> = scope
-            .snapshot
-            .delete_files_of(scope.table)
-            .into_iter()
-            .map(|file| (file.data_file_id, file))
-            .collect();
-
         let summaries: HashMap<DataFileId, Result<FileSummary>> = self
             .file_summaries(
                 scope.store,
@@ -474,9 +468,7 @@ impl ReadOnlyCatalog {
             .into_iter()
             .collect();
 
-        let existing_deletes = self
-            .existing_delete_files(scope, &file_id_paths, &delete_files)
-            .await;
+        let existing_deletes = self.existing_delete_files(scope, &file_id_paths).await;
 
         let mut located = Vec::with_capacity(file_id_paths.len());
         for ((file_id, path), existing_delete) in file_id_paths.into_iter().zip(existing_deletes) {
@@ -501,10 +493,13 @@ impl ReadOnlyCatalog {
         &self,
         scope: &LocationScope<'_>,
         file_id_paths: &[(DataFileId, String)],
-        delete_files: &HashMap<DataFileId, DeleteFileInfo>,
     ) -> Vec<Result<Option<ExistingDeleteFile>>> {
         stream::iter(file_id_paths.iter().map(|(file_id, _)| {
-            let delete_file = delete_files.get(file_id).cloned();
+            let delete_file = scope
+                .snapshot
+                .delete_files_targeting(scope.table.get(), file_id.get())
+                .next()
+                .map(delete_file_info);
             async move {
                 match delete_file {
                     Some(delete_file) => self
@@ -771,7 +766,6 @@ struct DeleteIndexScope<'a> {
     data_prefix: &'a str,
     table_prefix: &'a str,
     table: TableId,
-    files: &'a HashMap<DataFileId, DataFileInfo>,
     indexes: &'a [IndexInfo],
     union_positions: &'a [usize],
     per_index: &'a [Vec<usize>],
@@ -798,11 +792,6 @@ impl ReadOnlyCatalog {
         }
 
         let table_prefix = snapshot.table_data_prefix(table)?;
-        let files: HashMap<DataFileId, DataFileInfo> = snapshot
-            .data_files_of(table)
-            .into_iter()
-            .map(|file| (file.id, file))
-            .collect();
         let (union_positions, per_index) = union_index_keys(&indexes, |index| {
             snapshot.column_positions(table, &index.columns)
         })?;
@@ -815,7 +804,6 @@ impl ReadOnlyCatalog {
             data_prefix,
             table_prefix: &table_prefix,
             table,
-            files: &files,
             indexes: &indexes,
             union_positions: &union_positions,
             per_index: &per_index,
@@ -844,12 +832,18 @@ impl ReadOnlyCatalog {
         if registration.new_positions.is_empty() {
             return Ok(Vec::new());
         }
-        let file = scope.files.get(&registration.data_file_id).ok_or_else(|| {
-            Error::NotFound(format!(
-                "data file {} of table {}",
-                registration.data_file_id, scope.table
-            ))
-        })?;
+        let file = scope
+            .snapshot
+            .data_files
+            .get(&scope.table.get())
+            .and_then(|files| files.get(&registration.data_file_id.get()))
+            .map(data_file_info)
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "data file {} of table {}",
+                    registration.data_file_id, scope.table
+                ))
+            })?;
         let store = scope.data_store.ok_or_else(|| {
             Error::Constraint(format!(
                 "commit_located_deletion: table {} carries live indexes; no data store was \

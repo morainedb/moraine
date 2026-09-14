@@ -735,10 +735,16 @@ pub(super) fn apply_update_set_end(
         EntityKey::DeleteFile {
             table_id,
             delete_file_id,
-        } => state
-            .delete_files
-            .get_mut(&table_id)
-            .is_some_and(|files| files.remove(&delete_file_id).is_some()),
+        } => {
+            let live = state
+                .delete_files
+                .get(&table_id)
+                .is_some_and(|files| files.contains_key(&delete_file_id));
+            if live {
+                state.delete_delete_file(table_id, delete_file_id);
+            }
+            live
+        }
         EntityKey::Partition {
             table_id,
             partition_id,

@@ -10,7 +10,7 @@ use imbl::{OrdMap, ordmap::DiffItem};
 use prost::Message as _;
 use tracing::warn;
 
-use super::{FileDirectory, Intervals};
+use super::FileDirectory;
 use crate::{
     catalog::{
         CatalogSnapshot, DataFileId, DataFileInfo, ReadOnlyCatalog, TableId,
@@ -22,6 +22,51 @@ use crate::{
 };
 
 type Placements = HashMap<u64, Vec<DataFileId>>;
+
+/// Non-overlapping row ranges keyed by first row, `start -> (last, file)`,
+/// with each file's start for removal. A range that would overlap a live
+/// one is refused.
+#[derive(Clone, Default)]
+pub(super) struct DenseRanges {
+    by_start: OrdMap<u64, (u64, u64)>,
+    starts: OrdMap<u64, u64>,
+}
+
+impl DenseRanges {
+    /// Admits `file` holding `start..=end`; `false` when a live range
+    /// overlaps it.
+    fn insert(&mut self, start: u64, end: u64, file: u64) -> bool {
+        let overlaps = self
+            .by_start
+            .get_prev(&end)
+            .is_some_and(|(_, (last, _))| *last >= start);
+        if overlaps {
+            return false;
+        }
+
+        self.by_start.insert(start, (end, file));
+        self.starts.insert(file, start);
+        true
+    }
+
+    fn remove(&mut self, file: u64) {
+        if let Some(start) = self.starts.remove(&file) {
+            self.by_start.remove(&start);
+        }
+    }
+
+    /// The file whose range holds `row`, if any.
+    fn file_holding(&self, row: u64) -> Option<u64> {
+        self.by_start
+            .get_prev(&row)
+            .and_then(|(_, (end, file))| (row <= *end).then_some(*file))
+    }
+
+    pub(super) fn estimated_bytes(&self) -> u64 {
+        // Two entries per file: `(start, end, file)` and `(file, start)`.
+        u64::try_from(self.by_start.len().saturating_mul(40)).unwrap_or(u64::MAX)
+    }
+}
 
 /// What a directory resolves files against; a directory built under a
 /// different scope is not reused.
@@ -39,8 +84,10 @@ impl FileDirectory {
             data_prefix: scope.data_prefix.into(),
             table_prefix: scope.table_prefix.into(),
             files: OrdMap::new(),
-            ranges: Intervals::new([]),
-            arbitrary: HashMap::new(),
+            ranges: DenseRanges::default(),
+            spanned: OrdMap::new(),
+            spans: DenseRanges::default(),
+            probed: OrdMap::new(),
             failed: Vec::new(),
             file_bytes: 0,
             bytes: 0,
@@ -59,19 +106,55 @@ impl FileDirectory {
         self.files.ptr_eq(files) && self.failed.is_empty()
     }
 
-    /// The files that hold, or may hold, each of `row_ids`.
-    fn place(&self, row_ids: &[u64]) -> Placements {
+    /// Keeps `summary` for `file`: behind its span when no kept span
+    /// overlaps it, otherwise probed on every lookup.
+    fn admit_summary(&mut self, file: u64, summary: FileSummary) {
+        let spanned = summary
+            .bounds()
+            .is_some_and(|(first, last)| self.spans.insert(first, last, file));
+        if spanned {
+            self.spanned.insert(file, summary);
+        } else {
+            self.probed.insert(file, summary);
+        }
+    }
+
+    fn forget(&mut self, file: u64) {
+        self.ranges.remove(file);
+        self.spans.remove(file);
+        self.spanned.remove(&file);
+        self.probed.remove(&file);
+    }
+
+    /// The files that hold, or may hold, each of `row_ids`, and how many
+    /// summaries were probed to say so.
+    fn place(&self, row_ids: &[u64]) -> (Placements, usize) {
         let mut placements = Placements::new();
+        let mut probes = 0;
         for &row in row_ids {
-            self.ranges.visit(row, |file| {
+            if let Some(file) = self.ranges.file_holding(row) {
                 placements
                     .entry(row)
                     .or_default()
-                    .push(DataFileId::new(*file));
-            });
+                    .push(DataFileId::new(file));
+            }
+            if let Some(file) = self.spans.file_holding(row) {
+                probes += 1;
+                if self
+                    .spanned
+                    .get(&file)
+                    .is_some_and(|summary| summary.contains(row))
+                {
+                    placements
+                        .entry(row)
+                        .or_default()
+                        .push(DataFileId::new(file));
+                }
+            }
         }
 
-        for (file, summary) in &self.arbitrary {
+        for (file, summary) in &self.probed {
+            probes += row_ids.len();
             for row in summary.matching(row_ids) {
                 placements
                     .entry(row)
@@ -89,7 +172,7 @@ impl FileDirectory {
             }
         }
 
-        placements
+        (placements, probes)
     }
 }
 
@@ -185,7 +268,9 @@ impl ReadOnlyCatalog {
             }
         };
 
-        Ok(directory.place(row_ids))
+        let (placements, probes) = directory.place(row_ids);
+        self.row_lookups.note_summary_probes(probes);
+        Ok(placements)
     }
 
     /// `previous` advanced to `files`: only files it has not summarized,
@@ -202,19 +287,22 @@ impl ReadOnlyCatalog {
             file_bytes,
         } = previous.changes_to(files);
 
-        let mut ranges: Vec<_> = previous
-            .ranges
-            .iter()
-            .filter(|(_, _, file)| !removed.contains(*file))
-            .map(|(start, end, file)| (start, end, *file))
-            .collect();
-        let mut arbitrary: HashMap<u64, FileSummary> = previous
-            .arbitrary
-            .iter()
-            .filter(|(file, _)| !removed.contains(*file))
-            .map(|(file, summary)| (*file, summary.clone()))
-            .collect();
-        let mut failed = Vec::new();
+        let mut directory = FileDirectory {
+            identity: scope.store.cache_identity(),
+            data_prefix: scope.data_prefix.into(),
+            table_prefix: scope.table_prefix.into(),
+            files: files.clone(),
+            ranges: previous.ranges.clone(),
+            spanned: previous.spanned.clone(),
+            spans: previous.spans.clone(),
+            probed: previous.probed.clone(),
+            failed: Vec::new(),
+            file_bytes,
+            bytes: 0,
+        };
+        for file in &removed {
+            directory.forget(*file);
+        }
 
         self.row_lookups.note_summarized(selected.len());
         let summaries = self
@@ -233,46 +321,39 @@ impl ReadOnlyCatalog {
                         // An empty range is a file holding no rows.
                         if let Some(end) =
                             range.end.checked_sub(1).filter(|end| *end >= range.start)
+                            && !directory.ranges.insert(range.start, end, file.get())
                         {
-                            ranges.push((range.start, end, file.get()));
+                            directory.admit_summary(file.get(), summary);
                         }
                     }
-                    None => {
-                        arbitrary.insert(file.get(), summary);
-                    }
+                    None => directory.admit_summary(file.get(), summary),
                 },
                 Err(error) => {
                     warn!(table_id = scope.table.get(), data_file_id = file.get(), %error,
                         "row location fell back to every requested row for this file");
-                    failed.push(file.get());
+                    directory.failed.push(file.get());
                 }
             }
         }
-        failed.sort_unstable();
+        directory.failed.sort_unstable();
 
-        let ranges = Intervals::new(ranges);
-        let bytes = ranges
+        let summary_bytes = directory
+            .spanned
+            .values()
+            .chain(directory.probed.values())
+            .map(|summary| summary.estimated_bytes().saturating_add(16))
+            .sum::<u64>();
+        directory.bytes = directory
+            .ranges
             .estimated_bytes()
+            .saturating_add(directory.spans.estimated_bytes())
+            .saturating_add(summary_bytes)
             .saturating_add(
-                arbitrary
-                    .values()
-                    .map(|summary| summary.estimated_bytes().saturating_add(16))
-                    .sum(),
+                u64::try_from(directory.failed.capacity().saturating_mul(8)).unwrap_or(u64::MAX),
             )
-            .saturating_add(u64::try_from(failed.capacity().saturating_mul(8)).unwrap_or(u64::MAX))
             .saturating_add(file_bytes);
 
-        FileDirectory {
-            identity: scope.store.cache_identity(),
-            data_prefix: scope.data_prefix.into(),
-            table_prefix: scope.table_prefix.into(),
-            files: files.clone(),
-            ranges,
-            arbitrary,
-            failed,
-            file_bytes,
-            bytes,
-        }
+        directory
     }
 }
 
