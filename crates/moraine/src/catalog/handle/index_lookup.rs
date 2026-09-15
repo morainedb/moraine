@@ -8,7 +8,7 @@ use std::{
 use futures::{StreamExt, stream::FuturesUnordered};
 use tracing::debug;
 
-use super::{ReadOnlyCatalog, cache_epoch};
+use super::{ReadOnlyCatalog, cache_epoch, index_probe_cache::Probe};
 use crate::{
     catalog::{CatalogSnapshot, IndexId, IndexInfo, IndexState, TableId},
     error::{Error, Result},
@@ -187,29 +187,27 @@ impl ReadOnlyCatalog {
             .lookup_at_head(&mut session, table, index, async |handle, info| {
                 let head = started.elapsed();
                 let encoded = encode_lookup_keys(keys, &info, index)?;
-                let mut resolution =
-                    resolve_encoded(handle, index.get(), info.unique, encoded).await?;
-                resolution.metrics.head = head;
-                Ok(resolution)
+                self.scoped_probe(table, index, Probe::Many(encoded.clone()), async || {
+                    let mut resolution =
+                        resolve_encoded(handle, index.get(), info.unique, encoded).await?;
+                    resolution.metrics.head = head;
+                    log_lookup(
+                        table,
+                        index,
+                        keys.len(),
+                        started.elapsed(),
+                        &resolution.metrics,
+                        self.cache_tally().since(cache_before),
+                        self.object_store_tally().since(store_before),
+                    );
+                    Ok(resolution.row_ids)
+                })
+                .await
             })
             .await;
         finish_session(session);
 
-        match index_row_ids {
-            Ok(resolution) => {
-                log_lookup(
-                    table,
-                    index,
-                    keys.len(),
-                    started.elapsed(),
-                    &resolution.metrics,
-                    self.cache_tally().since(cache_before),
-                    self.object_store_tally().since(store_before),
-                );
-                Ok(resolution.row_ids)
-            }
-            Err(error) => Err(error),
-        }
+        index_row_ids
     }
 
     /// Resolves a comparison query to the rows whose indexed value falls
@@ -242,14 +240,22 @@ impl ReadOnlyCatalog {
                     encode_range_bounds(&info, index, lower.clone(), upper.clone())?;
                 let leading_nulls = info.nulls.first().copied().unwrap_or(NullOrder::Last);
 
-                index_maintenance::range_row_ids(
-                    handle,
-                    index.get(),
-                    info.unique,
-                    leading_nulls,
-                    byte_lower,
-                    byte_upper,
-                    ScanOrder::from_reverse(reverse),
+                self.scoped_probe(
+                    table,
+                    index,
+                    Probe::Range(byte_lower.clone(), byte_upper.clone(), reverse),
+                    async || {
+                        index_maintenance::range_row_ids(
+                            handle,
+                            index.get(),
+                            info.unique,
+                            leading_nulls,
+                            byte_lower,
+                            byte_upper,
+                            ScanOrder::from_reverse(reverse),
+                        )
+                        .await
+                    },
                 )
                 .await
             })
@@ -301,11 +307,19 @@ impl ReadOnlyCatalog {
 
                 let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
 
-                index_maintenance::null_prefix_row_ids(
-                    handle,
-                    index.get(),
-                    &key,
-                    ScanOrder::from_reverse(reverse),
+                self.scoped_probe(
+                    table,
+                    index,
+                    Probe::Nulls(key.clone(), reverse),
+                    async || {
+                        index_maintenance::null_prefix_row_ids(
+                            handle,
+                            index.get(),
+                            &key,
+                            ScanOrder::from_reverse(reverse),
+                        )
+                        .await
+                    },
                 )
                 .await
             })

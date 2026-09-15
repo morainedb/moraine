@@ -1,4 +1,5 @@
 #include "catalog.hpp"
+#include "index_cache.hpp"
 
 #include "inline_tables.hpp"
 #include "metadata_tables.hpp"
@@ -25,6 +26,10 @@
 #include <vector>
 
 namespace moraine_duckdb {
+
+duckdb::optional_idx MoraineCatalog::GetCatalogVersion(duckdb::ClientContext &context) {
+	return IndexCatalogVersion(context, *this);
+}
 
 // Reconstructs a column's DuckDB `LogicalType` from a table's flat,
 // position-ordered `ducklake_column` rows, folding nested children (linked
@@ -782,8 +787,9 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// configure a cache the process shares rather than this attach's, so
 	// only the first attach in the process sets them — a later attach naming
 	// different ones is served what stands. `CACHE_PUTS` and `CACHE_PRELOAD`
-	// are per attach: the first admits the SST metadata this store writes as
-	// it is written, the second warms this store's bytes as the attach opens
+	// are per attach: the first admits flushed SST blocks by default, while
+	// CACHE_COMPACTION_PUTS independently admits merge outputs (default off).
+	// CACHE_PRELOAD warms this store's bytes as the attach opens
 	// and defaults to 'l0'.
 	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
 	// time, so the open writes nothing at all; the ABI refuses it on a
@@ -794,7 +800,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	std::string cache_dir;
 	uint64_t cache_size_bytes = 0;
 	uint64_t cache_memory_bytes = 0;
-	bool cache_puts = false;
+	bool cache_puts = true;
+	bool cache_compaction_puts = false;
 	uint8_t cache_preload = 1;
 	std::string checkpoint;
 	// DuckLake's `META_DATA_PATH` passthrough arrives here as `data_path`;
@@ -834,6 +841,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			cache_memory_bytes = option.second.GetValue<uint64_t>();
 		} else if (name == "cache_puts") {
 			cache_puts = option.second.GetValue<bool>();
+		} else if (name == "cache_compaction_puts") {
+			cache_compaction_puts = option.second.GetValue<bool>();
 		} else if (name == "cache_preload") {
 			// Spelled as a level rather than a flag: "l0" is bounded by how far
 			// the store has run since its last merge, "all" by the whole store.
@@ -862,10 +871,10 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// the machine on top of DuckDB's. The ABI clamps it; read once here,
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
-	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
+	auto code = moraine_attach_with_cache_policy(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
 	                           flush_on_commit,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_memory_bytes,
-	                           cache_preload, cache_puts,
+	                           cache_preload, cache_puts, cache_compaction_puts,
 	                           data_path.empty() ? nullptr : data_path.c_str(),
 	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
 	                           moraine_shim_is_interrupted, &context, &handle, &err);

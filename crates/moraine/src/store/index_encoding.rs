@@ -285,6 +285,11 @@ impl<F> Decode<F> for CanonicalKey {
 }
 
 impl CanonicalKey {
+    /// Bytes retained by this canonical key.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.0.len()
+    }
+
     /// A key with no framed content, for prefix derivation only.
     pub(crate) const fn empty() -> Self {
         Self(Bytes::new())

@@ -1,5 +1,161 @@
 use crate::helpers::*;
 
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+fn prepared_index_reads_reuse_scoped_probes() {
+    for parameterized in [false, true] {
+        for joined in [false, true] {
+            for present in [false, true] {
+                for (kind, read, arguments) in reads(parameterized) {
+                    let store = TempDir::new("index-prepared-reuse");
+                    let data = TempDir::new("index-prepared-reuse-data");
+                    let options = format!(
+                        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 10",
+                        data.path().display()
+                    );
+                    let from = if joined {
+                        format!(
+                            "lake.main.t data JOIN {read} hits ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id"
+                        )
+                    } else {
+                        read
+                    };
+                    let insert = if present {
+                        "INSERT INTO lake.main.t VALUES (2),(NULL);"
+                    } else {
+                        ""
+                    };
+                    let result = run_session_with_env(&Attach::Moraine { store_dir: store.path(), data_path: data.path(), options: &options, read_only: false }, &format!(
+            "CREATE TABLE lake.main.t(a BIGINT);
+             {insert}
+             CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+             CALL enable_logging(level => 'debug', storage => 'memory');
+             PREPARE probe AS SELECT 'hits', count(*) FROM {from};
+             SELECT 'resolutions', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%index probe resolved%';
+             EXECUTE probe{arguments};
+             SELECT 'resolutions', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%index probe resolved%';
+             EXECUTE probe{arguments};
+             SELECT 'resolutions', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%index probe resolved%';
+             SELECT 'binds', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%index bind resolved%';
+             DEALLOCATE probe;"
+        ), &[("MORAINE_LOG", "debug")]);
+                    let output = combined_output(&result);
+                    assert!(result.status.success(), "{output}");
+                    let counts: Vec<_> = csv_rows(&output)
+                        .into_iter()
+                        .filter(|row| row[0] == "resolutions")
+                        .collect();
+                    assert_eq!(
+                        counts,
+                        vec![
+                            vec!["resolutions", if parameterized { "0" } else { "1" }],
+                            vec!["resolutions", "1"],
+                            vec!["resolutions", "1"]
+                        ],
+                        "{kind}, joined={joined}, present={present}, parameterized={parameterized}: {output}"
+                    );
+                    if !joined && !parameterized {
+                        assert!(
+                            csv_rows(&output).contains(&vec!["binds".into(), "1".into()]),
+                            "{output}"
+                        );
+                    }
+                    let hits: Vec<_> = csv_rows(&output)
+                        .into_iter()
+                        .filter(|row| row[0] == "hits")
+                        .collect();
+                    assert_eq!(
+                        hits,
+                        vec![vec!["hits", if present { "1" } else { "0" }]; 2],
+                        "{kind}: {output}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+fn prepared_index_arguments_depending_on_session_state_are_rebound() {
+    let store = TempDir::new("index-prepared-dynamic");
+    let data = TempDir::new("index-prepared-dynamic-data");
+    let options = format!(", META_DATA_PATH '{}'", data.path().display());
+    let output = run_ducklake_sql_with_options(store.path(), data.path(), &options,
+        "CREATE TABLE lake.main.t(a BIGINT);
+         INSERT INTO lake.main.t VALUES (1),(2);
+         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         SET VARIABLE key=1;
+         CREATE MACRO current_key() AS getvariable('key');
+         CREATE VIEW dynamic_hits AS SELECT * FROM moraine_index_lookup('lake','main','t','by_a',getvariable('key'));
+         PREPARE variable_probe AS SELECT 'variable', row_id FROM moraine_index_lookup('lake','main','t','by_a',getvariable('key'));
+         PREPARE macro_probe AS SELECT 'macro', row_id FROM moraine_index_lookup('lake','main','t','by_a',current_key());
+         PREPARE view_probe AS SELECT 'view', row_id FROM dynamic_hits;
+         EXECUTE variable_probe;
+         EXECUTE macro_probe;
+         EXECUTE view_probe;
+         SET VARIABLE key=2;
+         EXECUTE variable_probe;
+         EXECUTE macro_probe;
+         EXECUTE view_probe;
+         DEALLOCATE variable_probe;
+         DEALLOCATE macro_probe;
+         DEALLOCATE view_probe;");
+    for phase in ["variable", "macro", "view"] {
+        let rows: Vec<_> = csv_rows(&output)
+            .into_iter()
+            .filter(|row| row[0] == phase)
+            .collect();
+        assert_eq!(rows, vec![vec![phase, "0"], vec![phase, "1"]], "{output}");
+    }
+}
+
+/// Replacement attachments invalidate plans; manifest readers conservatively
+/// rebind.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+fn prepared_index_reads_invalidate_on_reattach_and_refuse_reader_caching() {
+    let store = TempDir::new("index-prepared-reattach");
+    let data = TempDir::new("index-prepared-reattach-data");
+    let options = format!(", META_DATA_PATH '{}'", data.path().display());
+    let output = run_ducklake_sql_with_options(store.path(), data.path(), &options, &format!(
+        "CREATE TABLE lake.main.t(a BIGINT);
+         INSERT INTO lake.main.t VALUES (2);
+         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         PREPARE probe AS SELECT 'hits', count(*) FROM moraine_index_lookup('lake','main','t','by_a',2);
+         EXECUTE probe;
+         DETACH lake;
+         ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}', META_DATA_PATH '{}');
+         INSERT INTO lake.main.t VALUES (2);
+         EXECUTE probe;
+         DEALLOCATE probe;", store.path().display(), data.path().display(), data.path().display()));
+    let hits: Vec<_> = csv_rows(&output)
+        .into_iter()
+        .filter(|row| row[0] == "hits")
+        .collect();
+    assert_eq!(hits, vec![vec!["hits", "1"], vec!["hits", "2"]], "{output}");
+
+    let output = run_session_with_env(&Attach::Moraine { store_dir: store.path(), data_path: data.path(), options: &options, read_only: true },
+        "CALL enable_logging(level => 'debug', storage => 'memory');
+         PREPARE probe AS SELECT 'hits', count(*) FROM moraine_index_lookup('lake','main','t','by_a',2);
+         EXECUTE probe;
+         EXECUTE probe;
+         SELECT 'probes', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%index probe resolved%';",
+         &[("MORAINE_LOG", "debug")]);
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let rows = csv_rows(&combined_output(&output));
+    assert!(
+        rows.contains(&vec!["probes".into(), "3".into()]),
+        "{rows:?}"
+    );
+    assert_eq!(rows.iter().filter(|row| row[0] == "hits").count(), 2);
+    assert!(
+        rows.iter()
+            .filter(|row| row[0] == "hits")
+            .all(|row| row[1] == "2")
+    );
+}
+
 /// Each read uses a literal or the same parameter values on every execution.
 fn reads(parameterized: bool) -> [(&'static str, String, &'static str); 4] {
     let key = if parameterized { "$1" } else { "2" };

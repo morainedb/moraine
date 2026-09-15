@@ -28,6 +28,9 @@ const STREAM_READ_AHEAD_BYTES: usize = 256 * 1024;
 /// How many read-ahead fetches a streaming scan keeps in flight.
 const STREAM_FETCH_TASKS: usize = 2;
 
+/// Equality probes retain useful coalescing for high-fanout keys.
+const EQUALITY_READ_AHEAD_BYTES: usize = 1024 * 1024;
+
 /// Sub-ranges a split bulk scan keeps in flight; sized for a remote object
 /// store, where each iterator's seek is a round trip.
 pub(crate) const SCAN_SPLIT: usize = 8;
@@ -46,6 +49,8 @@ pub(crate) enum ScanShape {
     Streaming,
     /// A targeted lookup; its blocks are admitted.
     Probe,
+    /// One equality prefix, with bounded read-ahead and cache admission.
+    Equality,
     /// One or a few entries from a wide range: one block fetched at a time,
     /// admitted. A read-ahead shape here keeps fetching after the iterator
     /// is dropped.
@@ -86,13 +91,14 @@ impl ScanShape {
         let (read_ahead_bytes, max_fetch_tasks) = match self {
             Self::Bulk | Self::Probe => (SCAN_READ_AHEAD_BYTES, SCAN_FETCH_TASKS),
             Self::Streaming => (STREAM_READ_AHEAD_BYTES, STREAM_FETCH_TASKS),
+            Self::Equality => (EQUALITY_READ_AHEAD_BYTES, 2),
             // SlateDB rounds the read-ahead up to one block.
             Self::Seek => (1, 1),
         };
         ScanOptions {
             read_ahead_bytes,
             max_fetch_tasks,
-            cache_blocks: matches!(self, Self::Probe | Self::Seek),
+            cache_blocks: matches!(self, Self::Probe | Self::Equality | Self::Seek),
             order: order.iteration_order(),
             ..ScanOptions::default()
         }
@@ -294,6 +300,8 @@ impl ReadHandle<'_> {
 pub(crate) enum ReadSession {
     /// A read-write transaction, rolled back on `finish`.
     Tx(DbTransaction),
+    /// A read transaction shared by every read in one pinned scope.
+    Pinned(Arc<DbTransaction>),
     /// A read-only reader, shared with the catalog.
     Reader(Arc<DbReader>),
 }
@@ -303,6 +311,7 @@ impl ReadSession {
     pub(crate) fn handle(&self) -> ReadHandle<'_> {
         match self {
             Self::Tx(tx) => ReadHandle::Tx(tx),
+            Self::Pinned(tx) => ReadHandle::Tx(tx),
             Self::Reader(reader) => ReadHandle::Reader(reader),
         }
     }
@@ -450,6 +459,15 @@ mod tests {
         let options = ScanShape::Probe.options(ScanOrder::Ascending);
         assert_eq!(options.read_ahead_bytes, SCAN_READ_AHEAD_BYTES);
         assert_eq!(options.max_fetch_tasks, SCAN_FETCH_TASKS);
+        assert!(options.cache_blocks);
+    }
+
+    /// Equality scans bound buffering independently of range probes.
+    #[test]
+    fn equality_scans_bound_read_ahead_and_admit_blocks() {
+        let options = ScanShape::Equality.options(ScanOrder::Ascending);
+        assert_eq!(options.read_ahead_bytes, 1024 * 1024);
+        assert_eq!(options.max_fetch_tasks, 2);
         assert!(options.cache_blocks);
     }
 

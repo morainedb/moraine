@@ -1,5 +1,6 @@
 //! Located rows read back whole at the snapshot the caller pins.
 
+mod scan;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -7,9 +8,11 @@ use std::{
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
+pub use scan::LocatedRowScan;
 
 use super::{
-    LocatedDeletion, LocationScope, current_files_for, first_row_error, group_deduped_pairs,
+    LocatedDeletion, LocationScope, MissingRows, current_files_for, first_row_error,
+    group_deduped_pairs,
 };
 use crate::{
     catalog::{
@@ -112,7 +115,7 @@ impl ReadOnlyCatalog {
             snapshot,
         };
         let located = self
-            .position_requested_files(&scope, by_file, requested_files)
+            .position_requested_files(&scope, by_file, requested_files, MissingRows::Reject)
             .await?;
         let reads = self.file_reads(&scope, table, located, visible_at).await?;
         let file_batches = self

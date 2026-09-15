@@ -48,6 +48,34 @@ use crate::{
 /// touch; every range of one is cut from that single block.
 const WHOLE_OBJECT_READ_BYTES: u64 = 1 << 20;
 
+/// Evicts only this summary, leaving unrelated stores and files untouched.
+#[cfg(test)]
+pub(crate) fn evict_summary(
+    store: &DataStore,
+    table_id: u64,
+    data_file_id: u64,
+    path: &str,
+    file_size: u64,
+) {
+    let key = AuxiliaryCache::file_summary_key(
+        store,
+        &FileSummaryKey {
+            table_id,
+            data_file_id,
+            path: &Path::from(path),
+            file_size,
+        },
+    );
+    match &shared().tier {
+        Tier::Memory(cache) => {
+            cache.remove(&key);
+        }
+        Tier::Hybrid(cache) => {
+            cache.remove(&key);
+        }
+    }
+}
+
 /// One file's identity within its store. The path and recorded size guard
 /// against a reused catalog file id: a mismatch misses.
 pub(super) struct FileSummaryKey<'a> {
@@ -166,6 +194,8 @@ mod tag {
     pub(super) const RANGE_ASCENDING: u8 = 12;
     /// A footer with its page index loaded.
     pub(super) const METADATA_WITH_PAGE_INDEX: u8 = 13;
+    pub(super) const ROARING_REPEATED: u8 = 14;
+    pub(super) const SORTED_REPEATED: u8 = 15;
 
     /// The `(range, roaring, sorted)` tags a delete-position set writes.
     pub(super) const DELETE_SHAPES: [u8; 3] = [DELETE_RANGE, DELETE_ROARING, DELETE_SORTED];
@@ -245,7 +275,10 @@ fn encode_positioned_row_set(
     // arithmetic on decode.
     if matches!(
         (&positioned.rows, &positioned.order),
-        (FileRowSet::Range { .. }, RowOrder::Permuted(_))
+        (
+            FileRowSet::Range { .. },
+            RowOrder::Permuted(_) | RowOrder::Repeated { .. }
+        )
     ) {
         return Err(foyer::Error::new(
             foyer::ErrorKind::Parse,
@@ -266,11 +299,20 @@ fn encode_positioned_row_set(
             tag::ROARING_PERMUTED,
             tag::SORTED_PERMUTED,
         ],
+        RowOrder::Repeated { .. } => [
+            tag::RANGE_ASCENDING,
+            tag::ROARING_REPEATED,
+            tag::SORTED_REPEATED,
+        ],
     };
     encode_row_set(&positioned.rows, shapes, writer)?;
 
     if let RowOrder::Permuted(permutation) = &positioned.order {
         write_permutation(permutation, writer)?;
+    }
+    if let RowOrder::Repeated { offsets, positions } = &positioned.order {
+        write_permutation(offsets, writer)?;
+        write_permutation(positions, writer)?;
     }
 
     Ok(())
@@ -346,6 +388,8 @@ fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<P
                 order: RowOrder::Permuted(permutation),
             })
         }
+        tag::ROARING_REPEATED => decode_repeated_row_set(RowSetShape::Roaring, reader),
+        tag::SORTED_REPEATED => decode_repeated_row_set(RowSetShape::Sorted, reader),
         tag::RANGE | tag::LEGACY_ROARING | tag::LEGACY_SORTED => Err(foyer::Error::new(
             foyer::ErrorKind::Parse,
             "a row summary predates positions and cannot answer them",
@@ -355,6 +399,49 @@ fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<P
             format!("unknown row-summary tag {other}"),
         )),
     }
+}
+
+fn decode_repeated_row_set(
+    shape: RowSetShape,
+    reader: &mut impl Read,
+) -> foyer::Result<PositionedRowSet> {
+    let rows = decode_row_set(shape, reader)?;
+    if let FileRowSet::Sorted(members) = &rows
+        && members.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(foyer::Error::new(
+            foyer::ErrorKind::Parse,
+            "invalid repeated row membership",
+        ));
+    }
+    let count = match &rows {
+        FileRowSet::Range { start, end } => end - start,
+        FileRowSet::Roaring(rows) => rows.len(),
+        FileRowSet::Sorted(rows) => usize_as_u64(rows.len()),
+    };
+    let count = usize::try_from(count)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1);
+    let offsets = read_permutation(count, reader)?;
+    let positions = read_permutation(offsets.last().copied().unwrap_or(0) as usize, reader)?;
+    let malformed = || foyer::Error::new(foyer::ErrorKind::Parse, "invalid repeated row positions");
+    if offsets.first() != Some(&0) || offsets.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(malformed());
+    }
+    let mut seen = vec![false; positions.len()];
+    for &position in &positions {
+        let Some(seen) = seen.get_mut(position as usize) else {
+            return Err(malformed());
+        };
+        if *seen {
+            return Err(malformed());
+        }
+        *seen = true;
+    }
+    Ok(PositionedRowSet {
+        rows,
+        order: RowOrder::Repeated { offsets, positions },
+    })
 }
 
 fn parse_failed(error: impl std::error::Error + Send + Sync + 'static) -> foyer::Error {
@@ -431,6 +518,8 @@ impl foyer::Code for Weighed {
             | tag::SORTED_ASCENDING
             | tag::ROARING_PERMUTED
             | tag::SORTED_PERMUTED
+            | tag::ROARING_REPEATED
+            | tag::SORTED_REPEATED
             | tag::RANGE_ASCENDING => {
                 AuxiliaryValue::Summary(Arc::new(decode_positioned_row_set(tag[0], reader)?))
             }

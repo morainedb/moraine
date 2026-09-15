@@ -66,13 +66,14 @@ pub unsafe extern "C" fn moraine_snapshot(
     }
 }
 
-/// Frees a snapshot handle previously returned by [`moraine_snapshot`].
+/// Frees a snapshot handle returned by [`moraine_snapshot`] or
+/// [`super::moraine_snapshot_scoped`].
 /// A null `snapshot` is a no-op.
 ///
 /// # Safety
 ///
 /// `snapshot`, if non-null, must be a pointer previously returned by
-/// [`moraine_snapshot`] and not yet freed.
+/// either snapshot-opening entry point and not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_snapshot_free(snapshot: *mut MoraineSnapshotHandle) {
     if snapshot.is_null() {

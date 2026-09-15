@@ -496,9 +496,9 @@ pub(super) fn cache_preload_option(
 /// [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller always
 /// names a level (the extension's `ATTACH` passes `1` unless told
 /// otherwise). A non-zero level also warms every table's probe ranges in
-/// the background after the open. `cache_puts` admits SST
-/// metadata (including compaction output) into the cache as it is written;
-/// `false` leaves the cache filled by reads alone.
+/// the background after the open. `cache_puts` admits flushed SST metadata
+/// and data blocks on write; `cache_compaction_puts` independently admits
+/// compaction outputs. Both are explicit at this ABI boundary.
 ///
 /// `checkpoint` pins a read-only attach to an existing SlateDB checkpoint
 /// (see [`super::moraine_create_checkpoint`]); the open writes nothing and
@@ -525,13 +525,13 @@ pub(super) fn cache_preload_option(
 /// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 /// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
 /// `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
-/// `flush_on_commit`, and `host_threads` are unconstrained.
-/// `probe`, if non-null, must be safe to call with `probe_ctx` from any
-/// thread. `out` must be a valid, writable `*mut *mut
+/// `cache_compaction_puts`, `flush_on_commit`, and `host_threads` are
+/// unconstrained. `probe`, if non-null, must be safe to call with `probe_ctx`
+/// from any thread. `out` must be a valid, writable `*mut *mut
 /// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
 /// [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_attach(
+pub unsafe extern "C" fn moraine_attach_with_cache_policy(
     path: *const c_char,
     s3: *const MoraineS3Config,
     read_only: bool,
@@ -543,6 +543,7 @@ pub unsafe extern "C" fn moraine_attach(
     cache_memory_bytes: u64,
     cache_preload: u8,
     cache_puts: bool,
+    cache_compaction_puts: bool,
     data_path: *const c_char,
     checkpoint: *const c_char,
     host_threads: u64,
@@ -603,9 +604,8 @@ pub unsafe extern "C" fn moraine_attach(
         options.path = prefix;
         options.cache_identity = Some(cache_identity);
         options.encrypted = encrypted;
-        if let Some(interval) = flush_interval_option(flush_interval_ms) {
-            options.flush_interval = interval;
-        }
+        options.flush_interval =
+            flush_interval_option(flush_interval_ms).unwrap_or(options.flush_interval);
         options.flush_on_commit = flush_on_commit;
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
         options.cache_size = cache_size_option(cache_size_bytes);
@@ -613,6 +613,7 @@ pub unsafe extern "C" fn moraine_attach(
         options.cache_preload = cache_preload_option(cache_preload)?;
         let preload = options.cache_preload.is_some();
         options.cache_puts = cache_puts;
+        options.cache_compaction_puts = cache_compaction_puts;
         options.checkpoint = checkpoint.map(str::to_owned);
         options.data_path.clone_from(&data_path_arg);
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
@@ -679,6 +680,62 @@ pub unsafe extern "C" fn moraine_attach(
             codes::OK
         }
         Err(code) => code,
+    }
+}
+
+/// Opens a catalog with one legacy flag controlling both flush and compaction
+/// admission. New callers use [`moraine_attach_with_cache_policy`] for
+/// independent policies.
+///
+/// # Safety
+///
+/// All pointer and callback requirements are identical to
+/// [`moraine_attach_with_cache_policy`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_attach(
+    path: *const c_char,
+    s3: *const MoraineS3Config,
+    read_only: bool,
+    encrypted: bool,
+    flush_interval_ms: u64,
+    flush_on_commit: bool,
+    cache_dir: *const c_char,
+    cache_size_bytes: u64,
+    cache_memory_bytes: u64,
+    cache_preload: u8,
+    cache_puts: bool,
+    data_path: *const c_char,
+    checkpoint: *const c_char,
+    host_threads: u64,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    out: *mut *mut MoraineCatalogHandle,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: forwards every pointer and callback unchanged under the same
+    // contract.
+    unsafe {
+        moraine_attach_with_cache_policy(
+            path,
+            s3,
+            read_only,
+            encrypted,
+            flush_interval_ms,
+            flush_on_commit,
+            cache_dir,
+            cache_size_bytes,
+            cache_memory_bytes,
+            cache_preload,
+            cache_puts,
+            cache_puts,
+            data_path,
+            checkpoint,
+            host_threads,
+            probe,
+            probe_ctx,
+            out,
+            err,
+        )
     }
 }
 
@@ -818,6 +875,7 @@ pub unsafe extern "C" fn moraine_migrate(
         options.cache_size = cache_size_option(cache_size_bytes);
         options.cache_preload = cache_preload_option(cache_preload)?;
         options.cache_puts = cache_puts;
+        options.cache_compaction_puts = cache_puts;
 
         let mut request = moraine::MigrationRequest::default();
         request.checkpoint = checkpoint;

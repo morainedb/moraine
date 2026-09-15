@@ -215,7 +215,7 @@ MoraineTransactionManager::Create(duckdb::optional_ptr<duckdb::StorageExtensionI
 duckdb::Transaction &MoraineTransactionManager::StartTransaction(duckdb::ClientContext &context) {
 	MoraineSnapshotHandle *snapshot = nullptr;
 	MoraineError err {};
-	auto code = moraine_snapshot(catalog_.Handle(), &snapshot, moraine_shim_is_interrupted, &context, &err);
+	auto code = moraine_snapshot_scoped(catalog_.Handle(), &snapshot, moraine_shim_is_interrupted, &context, &err);
 	// The commit-time drain only runs on writes; this one surfaces events a
 	// read-only workload produced — this resolve's own (it may be about to
 	// throw), and whatever the previous statement stranded — at the next

@@ -256,10 +256,12 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> RowsAtInit(duckdb::ClientCo
 	return duckdb::make_uniq<RowsAtGlobalState>();
 }
 
+} // namespace
+
 // Decodes one IPC stream into chunks typed as its own schema says. Each
 // batch is self-describing because a file written under an older schema
 // may carry a narrower type than the table does now; the caller casts.
-std::vector<duckdb::unique_ptr<duckdb::DataChunk>> DecodeBatch(duckdb::ClientContext &context,
+std::vector<duckdb::unique_ptr<duckdb::DataChunk>> DecodeLocatedBatch(duckdb::ClientContext &context,
                                                                const std::vector<uint8_t> &ipc) {
 	ArrowSchema c_schema;
 	ArrowArray c_array;
@@ -300,6 +302,8 @@ std::vector<duckdb::unique_ptr<duckdb::DataChunk>> DecodeBatch(duckdb::ClientCon
 	return pieces;
 }
 
+namespace {
+
 void RowsAtImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<RowsAtBindData>();
 	auto &state = data.global_state->Cast<RowsAtGlobalState>();
@@ -308,7 +312,7 @@ void RowsAtImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data
 			output.SetCardinality(0);
 			return;
 		}
-		auto pieces = DecodeBatch(context, bind_data.batches[state.next_batch++]);
+		auto pieces = DecodeLocatedBatch(context, bind_data.batches[state.next_batch++]);
 		// Emitted in order: the last decoded piece goes out last.
 		for (auto piece = pieces.rbegin(); piece != pieces.rend(); ++piece) {
 			state.pending.push_back(std::move(*piece));

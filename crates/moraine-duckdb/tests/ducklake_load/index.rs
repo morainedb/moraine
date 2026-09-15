@@ -4,6 +4,8 @@ use crate::helpers::*;
 
 mod prepared;
 mod schema_evolution;
+mod selective;
+mod wide_filter;
 
 /// The equality-index SQL surface end to end: `moraine_index_create`
 /// backfills an index over existing data by scoped-reading the table's

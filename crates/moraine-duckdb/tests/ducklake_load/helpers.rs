@@ -219,7 +219,17 @@ pub enum Attach<'a> {
 /// so it is upstream; one thread closes it so these tests exercise
 /// moraine's translation, not DuckLake's cache concurrency.
 pub fn run_session(attach: &Attach, sql: &str) -> std::process::Output {
+    run_session_with_env(attach, sql, &[])
+}
+
+/// Runs a session with process-local instrumentation settings.
+pub fn run_session_with_env(
+    attach: &Attach,
+    sql: &str,
+    environment: &[(&str, &str)],
+) -> std::process::Output {
     let mut command = Command::new(cli_path());
+    command.envs(environment.iter().copied());
     command.arg("-unsigned").arg("-csv");
     if !matches!(attach, Attach::Standalone { .. }) {
         command.arg("-c").arg("SET threads=1;");

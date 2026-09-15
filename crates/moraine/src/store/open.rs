@@ -50,6 +50,12 @@ const MIN_FILTER_KEYS: u32 = 0;
 /// read-ahead coalesces blocks into far larger fetches either way.
 const SST_BLOCK_SIZE: SstBlockSize = SstBlockSize::Block4Kib;
 
+#[cfg(test)]
+mod probe_tests;
+
+#[cfg(test)]
+mod compaction_cache_tests;
+
 /// Creates a checkpoint of every write `db` has taken (not only the
 /// already-durable ones), expiring after `lifetime` (never, if `None`),
 /// and reports its id.
@@ -93,6 +99,7 @@ pub(crate) struct StoreBuilder<'a> {
     cache_memory: Option<u64>,
     cache_preload: Option<CachePreload>,
     cache_puts: bool,
+    cache_compaction_puts: bool,
     checkpoint: Option<Uuid>,
     /// The manifest's per-segment sizes, when the attach read them; they
     /// decide how a preload reaches each subspace's first entry.
@@ -115,7 +122,8 @@ impl<'a> StoreBuilder<'a> {
             cache_size: None,
             cache_memory: None,
             cache_preload: None,
-            cache_puts: false,
+            cache_puts: true,
+            cache_compaction_puts: false,
             checkpoint: None,
             warm_segments: Vec::new(),
         }
@@ -193,11 +201,16 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// Sets whether the SST index and filters this store flushes or
-    /// compacts enter the cache as they are written (default: off). Data
-    /// blocks are never admitted on the write path.
+    /// Sets whether flushed SST metadata and data blocks enter the decoded
+    /// cache as they are written (default: on).
     pub(crate) fn cache_puts(mut self, cache_puts: bool) -> Self {
         self.cache_puts = cache_puts;
+        self
+    }
+
+    /// Sets compaction-output admission independently of flush admission.
+    pub(crate) fn cache_compaction_puts(mut self, enabled: bool) -> Self {
+        self.cache_compaction_puts = enabled;
         self
     }
 
@@ -217,6 +230,7 @@ impl<'a> StoreBuilder<'a> {
             .with_settings(settings)
             .with_sst_block_size(SST_BLOCK_SIZE)
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
+            .with_filter_policies(super::index_filter::policies())
             .with_block_cache_policy(self.block_cache_policy())
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)));
 
@@ -249,6 +263,7 @@ impl<'a> StoreBuilder<'a> {
         let counters = cache::store_counters();
         let mut builder = DbReader::builder(self.path, Arc::clone(&self.object_store))
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
+            .with_filter_policies(super::index_filter::policies())
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)))
             .with_options(options);
 
@@ -325,14 +340,19 @@ impl<'a> StoreBuilder<'a> {
     /// Which blocks of flushed and compacted SSTs enter the cache as they
     /// are written.
     fn block_cache_policy(&self) -> BlockCachePolicy {
-        let targets: &[CacheTarget] = if self.cache_puts {
-            &[CacheTarget::Index, CacheTarget::Filters, CacheTarget::Stats]
-        } else {
-            &[]
-        };
+        let targets: &[CacheTarget] = &[
+            CacheTarget::Index,
+            CacheTarget::Filters,
+            CacheTarget::Stats,
+            CacheTarget::data::<&[u8], _>(..),
+        ];
         BlockCachePolicy::default()
-            .with_flush_targets(targets)
-            .with_compaction_output_targets(targets)
+            .with_flush_targets(if self.cache_puts { targets } else { &[] })
+            .with_compaction_output_targets(if self.cache_compaction_puts {
+                targets
+            } else {
+                &[]
+            })
     }
 }
 
@@ -705,27 +725,45 @@ mod tests {
         );
     }
 
-    /// Writes enter the cache on flush only when asked: compaction output
-    /// goes through the same policy, so admitting everything by default
-    /// would let a merge evict what reads had warmed.
+    /// Flushes admit their blocks by default; compaction admission is
+    /// independent.
     #[test]
-    fn cache_puts_is_off_until_requested() {
+    fn flush_cache_puts_default_on_and_compaction_is_independent() {
         let object_store = memory_store();
         let unset = StoreBuilder::new("s", Arc::clone(&object_store));
+        let admitted = [
+            CacheTarget::Index,
+            CacheTarget::Filters,
+            CacheTarget::Stats,
+            CacheTarget::data::<&[u8], _>(..),
+        ];
         assert_eq!(
             unset.block_cache_policy(),
             BlockCachePolicy::default()
-                .with_flush_targets(&[])
-                .with_compaction_output_targets(&[]),
-            "writes must not be admitted unless asked for"
+                .with_flush_targets(&admitted)
+                .with_compaction_output_targets(&[])
         );
-
-        let admitted = [CacheTarget::Index, CacheTarget::Filters, CacheTarget::Stats];
-        let caching = StoreBuilder::new("s", object_store).cache_puts(true);
+        let disabled = StoreBuilder::new("s", Arc::clone(&object_store)).cache_puts(false);
+        assert_eq!(
+            disabled.block_cache_policy(),
+            BlockCachePolicy::default()
+                .with_flush_targets(&[])
+                .with_compaction_output_targets(&[])
+        );
+        let caching = StoreBuilder::new("s", Arc::clone(&object_store)).cache_puts(true);
         assert_eq!(
             caching.block_cache_policy(),
             BlockCachePolicy::default()
                 .with_flush_targets(&admitted)
+                .with_compaction_output_targets(&[])
+        );
+        let compaction = StoreBuilder::new("s", object_store)
+            .cache_puts(false)
+            .cache_compaction_puts(true);
+        assert_eq!(
+            compaction.block_cache_policy(),
+            BlockCachePolicy::default()
+                .with_flush_targets(&[])
                 .with_compaction_output_targets(&admitted)
         );
     }

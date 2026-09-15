@@ -8,6 +8,7 @@
 
 #include "catalog.hpp"
 #include "index_functions.hpp"
+#include "index_cache.hpp"
 #include "moraine_abi.h"
 #include "owned_array.hpp"
 
@@ -353,11 +354,20 @@ void SetRowId(duckdb::DataChunk &output, duckdb::idx_t row_index, const MoraineR
 }
 
 struct IndexReadBindData : public duckdb::FunctionData {
-	// Resolved rows, exact cardinalities, and derived filters belong to one execution.
+	bool cacheable = false;
 	bool SupportStatementCache() const override {
-		return false;
+		return cacheable;
 	}
 };
+
+template <class BindData>
+void FinishIndexBind(duckdb::ClientContext &context, BindData &data) {
+	const auto bytes = data.rows.capacity() * sizeof(MoraineRowId);
+	data.cacheable = data.cacheable && bytes <= 8 * 1024 * 1024;
+	WriteMoraineLog(duckdb::DatabaseInstance::GetDatabase(context), duckdb::LogLevel::LOG_DEBUG,
+	                 "index bind resolved rows=" + std::to_string(data.rows.size()) +
+	                 " retained_bytes=" + std::to_string(data.cacheable ? bytes : 0));
+}
 
 struct LookupBindData : public IndexReadBindData {
 	std::string catalog_name;
@@ -501,7 +511,7 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 		values.push_back(BuildLookupValue(input.inputs[i], backings, "moraine_index_lookup"));
 	}
 
-	auto handle = ResolveHandle(context, bind_data->catalog_name);
+	auto handle = BindIndexRead(context, input, bind_data->cacheable);
 	OwnedArray<MoraineRowId> row_ids(moraine_index_lookup_free);
 	MoraineError err {};
 	auto code = moraine_index_lookup(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
@@ -515,6 +525,7 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 		bind_data->rows.push_back(row_id);
 	}
 
+	FinishIndexBind(context, *bind_data);
 	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
 	names = {"row_id", "data_file_id"};
 	return bind_data;
@@ -564,7 +575,7 @@ duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context,
 		keys.push_back({values.data(), values.size()});
 	}
 
-	auto handle = ResolveHandle(context, bind_data->catalog_name);
+	auto handle = BindIndexRead(context, input, bind_data->cacheable);
 	OwnedArray<MoraineRowId> row_ids(moraine_index_in_free);
 	MoraineError err {};
 	auto code = moraine_index_in(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
@@ -578,6 +589,7 @@ duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context,
 		bind_data->rows.push_back(row_id);
 	}
 
+	FinishIndexBind(context, *bind_data);
 	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
 	names = {"row_id", "data_file_id"};
 	return bind_data;
@@ -685,7 +697,7 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 	    reverse_it != input.named_parameters.end() && !reverse_it->second.IsNull() && reverse_it->second.GetValue<bool>();
 	bind_data->bounds_repr += reverse ? "|rev" : "";
 
-	auto handle = ResolveHandle(context, bind_data->catalog_name);
+	auto handle = BindIndexRead(context, input, bind_data->cacheable);
 	OwnedArray<MoraineRowId> row_ids(moraine_index_range_free);
 	MoraineError err {};
 	auto code = moraine_index_range(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
@@ -699,6 +711,7 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 		bind_data->rows.push_back(row_id);
 	}
 
+	FinishIndexBind(context, *bind_data);
 	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
 	names = {"row_id", "data_file_id"};
 	return bind_data;
@@ -786,7 +799,7 @@ duckdb::unique_ptr<duckdb::FunctionData> NullsBind(duckdb::ClientContext &contex
 	    reverse_it != input.named_parameters.end() && !reverse_it->second.IsNull() && reverse_it->second.GetValue<bool>();
 	bind_data->prefix_repr += reverse ? "rev" : "";
 
-	auto handle = ResolveHandle(context, bind_data->catalog_name);
+	auto handle = BindIndexRead(context, input, bind_data->cacheable);
 	OwnedArray<MoraineRowId> row_ids(moraine_index_nulls_free);
 	MoraineError err {};
 	auto code = moraine_index_nulls(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
@@ -799,6 +812,7 @@ duckdb::unique_ptr<duckdb::FunctionData> NullsBind(duckdb::ClientContext &contex
 		bind_data->rows.push_back(row_id);
 	}
 
+	FinishIndexBind(context, *bind_data);
 	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::UBIGINT};
 	names = {"row_id", "data_file_id"};
 	return bind_data;
@@ -854,6 +868,31 @@ const std::vector<MoraineRowId> *IndexReadRows(const duckdb::TableFunction &func
 		return &bind_data->Cast<NullsBindData>().rows;
 	}
 	return nullptr;
+}
+
+template <class BindData>
+void CopyIndexTable(const duckdb::FunctionData &data, std::string &catalog, std::string &schema, std::string &table) {
+	auto &bound = data.Cast<BindData>();
+	catalog = bound.catalog_name;
+	schema = bound.schema_name;
+	table = bound.table_name;
+}
+
+bool IndexReadTable(const duckdb::TableFunction &function, const duckdb::FunctionData *data,
+                    std::string &catalog, std::string &schema, std::string &table) {
+	if (!data) {
+		return false;
+	}
+	if (function.function == LookupImpl) {
+		CopyIndexTable<LookupBindData>(*data, catalog, schema, table);
+	} else if (function.function == RangeImpl) {
+		CopyIndexTable<RangeBindData>(*data, catalog, schema, table);
+	} else if (function.function == NullsImpl) {
+		CopyIndexTable<NullsBindData>(*data, catalog, schema, table);
+	} else {
+		return false;
+	}
+	return true;
 }
 
 void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {

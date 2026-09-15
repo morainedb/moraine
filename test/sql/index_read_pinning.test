@@ -1,0 +1,89 @@
+# name: test/sql/index_read_pinning.test
+# group: [moraine]
+
+require-env MORAINE_DUCKDB_EXT
+
+require-env MORAINE_EXTENSION_DIR
+
+statement ok
+SET threads=1;
+
+statement ok
+SET extension_directory='${MORAINE_EXTENSION_DIR}';
+
+statement ok
+INSTALL parquet;
+
+statement ok
+LOAD parquet;
+
+statement ok
+LOAD '${MORAINE_DUCKDB_EXT}';
+
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/index-pins-store' AS indexed (DATA_PATH '__TEST_DIR__/index-pins-data/', META_DATA_PATH '__TEST_DIR__/index-pins-data/', DATA_INLINING_ROW_LIMIT 100);
+
+statement ok
+CREATE TABLE indexed.main.t(a BIGINT);
+
+statement ok
+INSERT INTO indexed.main.t VALUES (1);
+
+statement ok
+CALL moraine_index_create('indexed','main','t','by_a',['a'],false);
+
+statement ok reader
+PREPARE probe AS SELECT count(*) FROM indexed.main.t data JOIN moraine_index_lookup('indexed','main','t','by_a',1) hits ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+
+statement ok reader
+BEGIN;
+
+query I reader
+EXECUTE probe;
+----
+1
+
+statement ok writer
+INSERT INTO indexed.main.t VALUES (1);
+
+# The second execution and DuckLake scan retain the first execution's view.
+query I reader
+EXECUTE probe;
+----
+1
+
+statement ok writer
+CALL ducklake_flush_inlined_data('indexed');
+
+# Moving rows to a file must not change the old transaction's inline reads.
+query I reader
+EXECUTE probe;
+----
+1
+
+statement ok reader
+ROLLBACK;
+
+query I reader
+EXECUTE probe;
+----
+2
+
+statement ok writer
+CALL moraine_index_drop('indexed','main','t','by_a');
+
+statement error reader
+EXECUTE probe;
+----
+by_a
+
+statement ok writer
+CALL moraine_index_create('indexed','main','t','by_a',['a'],false);
+
+query I reader
+EXECUTE probe;
+----
+2
+
+statement ok reader
+DEALLOCATE probe;

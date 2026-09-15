@@ -11,10 +11,10 @@
 //!
 //! Every function opens one fresh read session, and most are served from a
 //! maintained projection when its head matches rather than by rescanning.
-//! Views spanning several `dump_*` calls are not snapshot-consistent: each
-//! call reads at whatever the current head is when it runs. Opening that
-//! session refuses a store undergoing a structural migration, so every
-//! function here can return [`crate::Error::Migration`] however it would
+//! Unscoped calls spanning several `dump_*` reads are not snapshot-consistent;
+//! a read surface from `IndexReadScope` instead shares its pinned session.
+//! Opening that session refuses a store undergoing a structural migration, so
+//! every function here can return [`crate::Error::Migration`] however it would
 //! otherwise have succeeded.
 //!
 //! All of them report **committed** state. A caller inside an open staged
@@ -43,6 +43,13 @@ use crate::{
         },
     },
 };
+
+/// The pinned store revision; an adapter must pair it with its attachment
+/// identity.
+#[must_use]
+pub fn index_read_revision(identity: &crate::IndexReadIdentity) -> u64 {
+    identity.revision()
+}
 
 /// The head snapshot id inside an open read session, or `None` on a
 /// store that has no head yet (mid-bootstrap).

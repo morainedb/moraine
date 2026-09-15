@@ -26,7 +26,7 @@ pub struct MoraineRowBatch {
 }
 
 impl MoraineRowBatch {
-    fn from_vec(mut bytes: Vec<u8>) -> Self {
+    pub(super) fn from_vec(mut bytes: Vec<u8>) -> Self {
         bytes.shrink_to_fit();
         let batch = Self {
             data: bytes.as_mut_ptr(),

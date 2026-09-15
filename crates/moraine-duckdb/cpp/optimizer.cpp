@@ -5,6 +5,9 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -12,8 +15,11 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 
 #include "index_functions.hpp"
+#include "summary_scan.hpp"
+#include "storage/ducklake_multi_file_reader.hpp"
 
 #include <set>
+#include <algorithm>
 
 namespace moraine_duckdb {
 
@@ -55,10 +61,14 @@ void ReplaceEmptyIndexReads(duckdb::ClientContext &context, duckdb::unique_ptr<d
 // beside the join rather than replacing it, and holds whatever the query
 // projects from either side.
 
-// Most distinct row ids one derived filter will list. Past this a lookup is a
-// scan in disguise, and evaluating the list against every row costs more than
-// the files it could still exclude are worth.
-constexpr duckdb::idx_t MAX_DERIVED_ROW_ID_VALUES = 256;
+// Bounds the row-id pruning list and its planning cost.
+constexpr duckdb::idx_t MAX_DERIVED_ROW_ID_VALUES = 4096;
+
+// Larger lists prune scan statistics only; the join performs exact matching.
+constexpr duckdb::idx_t MAX_EXACT_ROW_ID_VALUES = 256;
+
+// DuckLake expands these into metadata predicates as well as scan filters.
+constexpr duckdb::idx_t MAX_ROW_PRUNING_RANGES = 16;
 
 // Most distinct file ids one derived filter will list. The list dedups to the
 // files holding the rows and is checked against each file's constant id, not
@@ -92,7 +102,7 @@ bool ReferencedColumn(const duckdb::Expression &expression, const duckdb::Logica
 		return false;
 	}
 	auto &reference = expression.Cast<duckdb::BoundColumnRefExpression>();
-	if (reference.binding.table_index != get.table_index || !get.projection_ids.empty()) {
+	if (reference.binding.table_index != get.table_index) {
 		return false;
 	}
 	auto &column_ids = get.GetColumnIds();
@@ -190,9 +200,104 @@ duckdb::unique_ptr<duckdb::Expression> DerivedFilter(const duckdb::Expression &e
 	                                                             std::move(disjuncts[0]), std::move(disjuncts[1]));
 }
 
-void FilterJoinsAgainstIndexReads(duckdb::Optimizer &optimizer, duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
+struct RowPruning {
+	duckdb::unique_ptr<duckdb::Expression> expression;
+	duckdb::vector<duckdb::Value> values;
+};
+
+// Preserve the largest gaps, merging smaller gaps into conservative ranges.
+duckdb::unique_ptr<duckdb::TableFilter> RowRangeFilter(const duckdb::vector<duckdb::Value> &values) {
+	std::vector<int64_t> sorted;
+	for (auto &value : values) {
+		sorted.push_back(value.GetValue<int64_t>());
+	}
+	std::sort(sorted.begin(), sorted.end());
+	std::vector<std::pair<uint64_t, duckdb::idx_t>> gaps;
+	for (duckdb::idx_t i = 1; i < sorted.size(); i++) {
+		auto gap = static_cast<uint64_t>(sorted[i]) - static_cast<uint64_t>(sorted[i - 1]);
+		if (gap > 1) {
+			gaps.emplace_back(gap, i);
+		}
+	}
+	std::sort(gaps.begin(), gaps.end(), std::greater<std::pair<uint64_t, duckdb::idx_t>>());
+	if (gaps.size() >= MAX_ROW_PRUNING_RANGES) {
+		gaps.resize(MAX_ROW_PRUNING_RANGES - 1);
+	}
+	std::set<duckdb::idx_t> ends;
+	for (auto &gap : gaps) {
+		ends.insert(gap.second);
+	}
+	ends.insert(sorted.size());
+	auto result = duckdb::make_uniq<duckdb::ConjunctionOrFilter>();
+	duckdb::idx_t start = 0;
+	for (auto end : ends) {
+		auto range = duckdb::make_uniq<duckdb::ConjunctionAndFilter>();
+		range->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+		    duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::BIGINT(sorted[start])));
+		range->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+		    duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO, duckdb::Value::BIGINT(sorted[end - 1])));
+		result->child_filters.push_back(std::move(range));
+		start = end;
+	}
+	if (result->child_filters.size() == 1) {
+		return std::move(result->child_filters[0]);
+	}
+	return std::move(result);
+}
+
+// Attach only a statistics filter: an exact IN above the scan would repeat
+// thousands of comparisons per row after the ordinary IN optimizer has run.
+void PushRowPruning(duckdb::LogicalOperator &op, RowPruning &pruning) {
+	auto *scan = &op;
+	while (scan->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION ||
+	       scan->type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {
+		scan = scan->children[0].get();
+	}
+	if (scan->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
+		return;
+	}
+	auto &get = scan->Cast<duckdb::LogicalGet>();
+	duckdb::idx_t column = 0;
+	if (get.function.name != "ducklake_scan" || !get.function.filter_pushdown ||
+	    !ReferencedColumnBeneath(*pruning.expression, op, get, column) ||
+	    pruning.expression->return_type != duckdb::LogicalType::BIGINT) {
+		return;
+	}
+	get.table_filters.PushFilter(duckdb::ColumnIndex(column),
+	    duckdb::make_uniq<duckdb::OptionalFilter>(RowRangeFilter(pruning.values)));
+}
+
+duckdb::LogicalGet *ScanBeneath(duckdb::LogicalOperator &op) {
+	if (op.type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION || op.type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {
+		return ScanBeneath(*op.children[0]);
+	}
+	return op.type == duckdb::LogicalOperatorType::LOGICAL_GET ? &op.Cast<duckdb::LogicalGet>() : nullptr;
+}
+
+bool TrySummaryJoin(duckdb::ClientContext &context, duckdb::LogicalComparisonJoin &join,
+                    duckdb::idx_t index_side, duckdb::LogicalGet &index, const std::vector<MoraineRowId> &rows) {
+	auto &other = *join.children[1 - index_side];
+	auto scan = ScanBeneath(other);
+	if (!scan) { return false; }
+	bool row_id = false, file_id = false;
+	for (auto &condition : join.conditions) {
+		if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+		    condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) { continue; }
+		auto &index_expression = index_side == 0 ? *condition.left : *condition.right;
+		auto &scan_expression = index_side == 0 ? *condition.right : *condition.left;
+		duckdb::idx_t index_column, scan_column;
+		if (!ReferencedColumnBeneath(index_expression, *join.children[index_side], index, index_column) ||
+		    !ReferencedColumnBeneath(scan_expression, other, *scan, scan_column)) { continue; }
+		row_id = row_id || (index_column == INDEX_READ_ROW_ID_COLUMN && scan_column == duckdb::COLUMN_IDENTIFIER_ROW_ID);
+		file_id = file_id || (index_column == INDEX_READ_DATA_FILE_ID_COLUMN &&
+		    scan_column == duckdb::DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID);
+	}
+	return row_id && file_id && UseSummaryScan(context, *scan, index, rows);
+}
+
+void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimizer &optimizer, duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
 	for (auto &child : plan->children) {
-		FilterJoinsAgainstIndexReads(optimizer, child);
+		FilterJoinsAgainstIndexReads(context, optimizer, child);
 	}
 
 	if (plan->type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
@@ -227,8 +332,10 @@ void FilterJoinsAgainstIndexReads(duckdb::Optimizer &optimizer, duckdb::unique_p
 	if (!rows || rows->empty()) {
 		return;
 	}
+	if (TrySummaryJoin(context, join, index_side, *index_get, *rows)) { return; }
 
 	duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filters;
+	std::vector<RowPruning> row_pruning;
 	for (auto &condition : join.conditions) {
 		if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
 		    condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
@@ -252,22 +359,27 @@ void FilterJoinsAgainstIndexReads(duckdb::Optimizer &optimizer, duckdb::unique_p
 		if (!ResolvedValues(*rows, column, values, any_null)) {
 			continue;
 		}
+		if (column == INDEX_READ_ROW_ID_COLUMN && values.size() > MAX_EXACT_ROW_ID_VALUES) {
+			row_pruning.push_back({other_expression.Copy(), std::move(values)});
+			continue;
+		}
 		if (auto filter = DerivedFilter(other_expression, condition.comparison, values, any_null)) {
 			filters.push_back(std::move(filter));
 		}
 	}
-	if (filters.empty()) {
-		return;
-	}
-
 	auto other_side = 1 - index_side;
-	auto filter = duckdb::make_uniq<duckdb::LogicalFilter>();
-	filter->expressions = std::move(filters);
-	filter->children.push_back(std::move(join.children[other_side]));
-	filter->ResolveOperatorTypes();
-	// The built-in pushdown already ran; carry the filter down to the scan.
-	duckdb::FilterPushdown pushdown(optimizer);
-	join.children[other_side] = pushdown.Rewrite(std::move(filter));
+	if (!filters.empty()) {
+		auto filter = duckdb::make_uniq<duckdb::LogicalFilter>();
+		filter->expressions = std::move(filters);
+		filter->children.push_back(std::move(join.children[other_side]));
+		filter->ResolveOperatorTypes();
+		// The built-in pushdown already ran; carry the filter down to the scan.
+		duckdb::FilterPushdown pushdown(optimizer);
+		join.children[other_side] = pushdown.Rewrite(std::move(filter));
+	}
+	for (auto &pruning : row_pruning) {
+		PushRowPruning(*join.children[other_side], pruning);
+	}
 }
 
 class MoraineOptimizer : public duckdb::OptimizerExtension {
@@ -283,7 +395,7 @@ public:
 
 	static void PostOptimize(duckdb::OptimizerExtensionInput &input,
 	                         duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
-		FilterJoinsAgainstIndexReads(input.optimizer, plan);
+		FilterJoinsAgainstIndexReads(input.context, input.optimizer, plan);
 	}
 };
 

@@ -300,7 +300,7 @@ fn ducklake_attach_cache_options_are_applied() {
 
     let attach_options = format!(
         ", META_CACHE_DIR '{}', META_CACHE_SIZE 67108864, META_CACHE_PUTS true, \
-         META_CACHE_PRELOAD 'all'",
+         META_CACHE_COMPACTION_PUTS true, META_CACHE_PRELOAD 'all'",
         cache_dir.path().display()
     );
     run_ducklake_sql_with_options(

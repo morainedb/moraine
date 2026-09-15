@@ -9,6 +9,67 @@ fn key(value: i128) -> IndexKeyValue {
     }
 }
 
+/// A pinned scope keeps its catalog and index entries at one revision.
+#[tokio::test]
+async fn index_read_scope_survives_a_concurrent_index_drop() {
+    let catalog = open_memory().await;
+    let created = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").unwrap().id;
+            let table = tx.create_table(schema, "scoped", &[col("value")])?;
+            let index = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_value".into(),
+                    columns: vec![moraine::ColumnId::new(1)],
+                    unique: true,
+                },
+                &[IndexEntry {
+                    row_id: 7,
+                    values: vec![Some(key(10))],
+                }],
+            )?;
+            created.set(Some((table, index)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (table, index) = created.get().unwrap();
+    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let unchanged = catalog.index_read_scope().await.unwrap().unwrap();
+    assert_eq!(scope.identity(), unchanged.identity());
+    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+    let changed = catalog.index_read_scope().await.unwrap().unwrap();
+    assert_ne!(scope.identity(), changed.identity());
+    assert_eq!(
+        scope
+            .reads()
+            .index_lookup(table, index, &[key(10)])
+            .await
+            .unwrap(),
+        [7]
+    );
+    assert!(
+        scope
+            .reads()
+            .snapshot()
+            .await
+            .unwrap()
+            .index_by_name(table, "by_value")
+            .is_some()
+    );
+    assert!(
+        changed
+            .reads()
+            .index_lookup(table, index, &[key(10)])
+            .await
+            .is_err()
+    );
+    drop((scope, unchanged, changed));
+    catalog.close().await.unwrap();
+}
+
 /// An `IN` lookup is one logical read: duplicate and absent keys do not
 /// duplicate or invent rows, while every distinct present key is returned.
 #[tokio::test]

@@ -122,6 +122,7 @@ impl FileRowSet {
 
     /// Requested row ids physically present in this file, preserving request
     /// order.
+    #[cfg(test)]
     pub(super) fn matching(&self, requested: &[u64]) -> Vec<u64> {
         requested
             .iter()
@@ -171,6 +172,11 @@ pub(super) enum RowOrder {
     /// ascending order, so a permutation over a contiguous id set is kept
     /// as `Roaring` rather than collapsed to a range.
     Permuted(Vec<u32>),
+    /// Per-member ranges in `positions`, including historical versions.
+    Repeated {
+        offsets: Vec<u32>,
+        positions: Vec<u32>,
+    },
 }
 
 /// A membership set plus how to read file positions off it.
@@ -189,6 +195,10 @@ impl PositionedRowSet {
             RowOrder::Permuted(positions) => {
                 usize_as_u64(positions.len()).saturating_mul(size_of::<u32>() as u64)
             }
+            RowOrder::Repeated { offsets, positions } => {
+                usize_as_u64(offsets.len().saturating_add(positions.len()))
+                    .saturating_mul(size_of::<u32>() as u64)
+            }
         };
         self.rows
             .estimated_bytes()
@@ -196,6 +206,7 @@ impl PositionedRowSet {
     }
 
     /// File positions of `requested` rows; `None` for absent rows.
+    #[cfg(test)]
     pub(super) fn positions_of(&self, requested: &[u64]) -> Vec<Option<u64>> {
         requested
             .iter()
@@ -204,6 +215,30 @@ impl PositionedRowSet {
                     .and_then(|rank| self.order.position_of(rank))
             })
             .collect()
+    }
+
+    /// Visits all physical versions of a row; false means it is absent.
+    pub(super) fn visit_positions(&self, row_id: u64, mut visit: impl FnMut(u64)) -> bool {
+        let Some(rank) = self.rank_of(row_id) else {
+            return false;
+        };
+        if let RowOrder::Repeated { offsets, positions } = &self.order {
+            let Ok(rank) = usize::try_from(rank) else {
+                return false;
+            };
+            let Some((&start, &end)) = offsets.get(rank).zip(offsets.get(rank + 1)) else {
+                return false;
+            };
+            let Some(positions) = positions.get(start as usize..end as usize) else {
+                return false;
+            };
+            for &position in positions {
+                visit(u64::from(position));
+            }
+        } else if let Some(position) = self.order.position_of(rank) {
+            visit(position);
+        }
+        true
     }
 
     /// This row id's ascending-id rank among the set's members, if present.
@@ -219,8 +254,7 @@ impl PositionedRowSet {
         }
     }
 
-    /// Constructs from row ids in file order; duplicate ids are
-    /// [`Error::Constraint`].
+    /// Constructs from row IDs in file order, retaining repeated versions.
     pub(super) fn from_file_order(row_ids: Vec<u64>) -> Result<Self> {
         if is_strictly_ascending(&row_ids) {
             return Ok(Self {
@@ -232,7 +266,7 @@ impl PositionedRowSet {
         let mut ascending: Vec<u64> = row_ids.clone();
         ascending.sort_unstable();
         if ascending.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(Error::Constraint("file row ids must be unique".to_owned()));
+            return Self::repeated(row_ids);
         }
 
         let mut permutation = vec![0_u32; ascending.len()];
@@ -263,6 +297,50 @@ impl PositionedRowSet {
             order: RowOrder::Permuted(permutation),
         })
     }
+
+    fn repeated(row_ids: Vec<u64>) -> Result<Self> {
+        let mut ordered = row_ids
+            .into_iter()
+            .enumerate()
+            .map(|(position, row_id)| {
+                u32::try_from(position)
+                    .map(|position| (row_id, position))
+                    .map_err(|_| {
+                        Error::Constraint("file position exceeds the u32 domain".to_owned())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ordered.sort_unstable();
+        let mut members = Vec::new();
+        let mut offsets = Vec::new();
+        let mut positions = Vec::with_capacity(ordered.len());
+        for (row_id, position) in ordered {
+            if members.last() != Some(&row_id) {
+                offsets.push(u32::try_from(positions.len()).map_err(|_| {
+                    Error::Constraint("file position exceeds the u32 domain".to_owned())
+                })?);
+                members.push(row_id);
+            }
+            positions.push(position);
+        }
+        offsets.push(
+            u32::try_from(positions.len()).map_err(|_| {
+                Error::Constraint("file position exceeds the u32 domain".to_owned())
+            })?,
+        );
+        let rows = match FileRowSet::from_sorted(members)? {
+            FileRowSet::Range { start, end } => {
+                let mut rows = RoaringTreemap::new();
+                rows.insert_range(start..end);
+                FileRowSet::Roaring(rows)
+            }
+            rows => rows,
+        };
+        Ok(Self {
+            rows,
+            order: RowOrder::Repeated { offsets, positions },
+        })
+    }
 }
 
 impl RowOrder {
@@ -274,6 +352,7 @@ impl RowOrder {
                 .ok()
                 .and_then(|rank| positions.get(rank))
                 .map(|&position| u64::from(position)),
+            Self::Repeated { .. } => None,
         }
     }
 }

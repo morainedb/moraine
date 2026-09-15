@@ -23,9 +23,9 @@ pub use census::{
 pub(crate) use handle::BACKFILL_FILE_READ_CONCURRENCY;
 pub use handle::{
     CachePreload, Catalog, CatalogOptions, CommitMember, DeleteFileRegistration,
-    ExistingDeleteFile, LocatedDeletion, LocatedPositions, LocatedRows, MaintenanceReport,
-    MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep, MigrationRequest,
-    ReadOnlyCatalog, RowSummaryWarmth,
+    ExistingDeleteFile, IndexReadIdentity, IndexReadScope, LocatedDeletion, LocatedPositions,
+    LocatedRowScan, LocatedRows, MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass,
+    MaintenanceStatusStep, MigrationRequest, ReadOnlyCatalog, RowSummaryWarmth,
 };
 pub(crate) use handle::{InlineScan, Store};
 pub use snapshot::CatalogSnapshot;

@@ -844,7 +844,7 @@ pub(crate) async fn lookup_row_ids(
 
     let prefix = index_multi_value_prefix(index_id, key);
     let mut iter = reader
-        .scan_prefix(prefix, .., ScanShape::Probe)
+        .scan_prefix(prefix, .., ScanShape::Equality)
         .await
         .map_err(Error::from)?;
 

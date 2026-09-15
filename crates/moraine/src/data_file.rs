@@ -20,6 +20,8 @@ mod located_rows;
 mod metrics;
 mod reader;
 mod row_location;
+#[cfg(test)]
+pub(crate) use auxiliary_cache::evict_summary;
 mod row_set;
 mod schema;
 mod selection;
@@ -62,7 +64,9 @@ pub(crate) use crate::data_file::{
     delete_file::{delete_file_positions, delete_file_positions_at},
     inline_batch::{decode_inline_schema, inline_batch_entries, inline_batch_index_entries},
     inline_rows::InlineRows,
-    located_rows::{encode_located_batch, inline_rows_batch, scoped_read_row_batches},
+    located_rows::{
+        encode_located_batch, inline_rows_batch, scoped_read_row_batches, scoped_read_row_stream,
+    },
     metrics::{DataStoreCounters, ScopedReadMetrics, ScopedReadTally, run_bounded_index_encoding},
     row_location::{FileSummary, file_summary},
     schema::ReadColumn,

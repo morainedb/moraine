@@ -43,6 +43,13 @@
 //! fences the live writer, so any number may attach alongside it. See
 //! `README.md` for the pinned build shape.
 //!
+//! # Write-cache admission
+//!
+//! `META_CACHE_PUTS` defaults to `true`: freshly flushed SST metadata and
+//! data blocks enter the bounded decoded cache. `META_CACHE_COMPACTION_PUTS`
+//! independently admits compaction outputs and defaults to `false`.
+//! Both work without a disk cache; set both to `false` for read-only filling.
+//!
 //! # Maintenance
 //!
 //! `CALL moraine_maintenance('lake')` runs one pass of the configured

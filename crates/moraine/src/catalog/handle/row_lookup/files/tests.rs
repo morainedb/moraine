@@ -7,7 +7,7 @@ use arrow::{
 use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 use proptest::prelude::*;
 
-use super::DenseRanges;
+use super::{DenseRanges, FIRST_RETRY_SKIP};
 use crate::{Catalog, CatalogOptions, ColumnDef, DataFile, DataFileId, DataStore, TableId};
 
 /// Writes `rows` values with no row-id column to `path`, returning the
@@ -125,6 +125,109 @@ async fn warm_table() -> WarmTable {
     assert_eq!(warm.catalog.row_lookups.summarized_files(), 4);
 
     warm
+}
+
+/// Positioning reuses verified summaries only for the same immutable file and
+/// scope.
+#[tokio::test]
+async fn retained_summaries_preserve_positions_and_validate_the_source() {
+    let warm = warm_table().await;
+    let directory = super::super::lookup(&warm.catalog.row_lookups.files, warm.table).unwrap();
+    let file =
+        crate::catalog::snapshot::data_file_info(directory.files.get(&warm.ids[1].get()).unwrap());
+    let scope = super::DirectoryScope {
+        store: &warm.store,
+        data_prefix: "",
+        table_prefix: &directory.table_prefix,
+        table: warm.table,
+    };
+    let summary = directory.retained_summary(&scope, &file).unwrap();
+    assert_eq!(
+        summary.positions_of(&[3, 4, 5, 6]),
+        [Some(0), Some(1), Some(2), None]
+    );
+    assert!(!summary.built);
+
+    let mut changed = file.clone();
+    changed.path = "replacement.parquet".into();
+    assert!(directory.retained_summary(&scope, &changed).is_none());
+    changed = file.clone();
+    changed.row_id_start = Some(100);
+    assert!(directory.retained_summary(&scope, &changed).is_none());
+    let other = DataStore::new(warm.data.clone());
+    assert!(
+        directory
+            .retained_summary(
+                &super::DirectoryScope {
+                    store: &other,
+                    ..scope
+                },
+                &file
+            )
+            .is_none()
+    );
+    warm.catalog.close().await.unwrap();
+}
+
+/// Auxiliary eviction does not make positioning decode a retained summary
+/// again.
+#[tokio::test]
+async fn retained_permuted_summaries_survive_auxiliary_eviction() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let data = Arc::new(InMemory::new());
+    let row_ids: Vec<_> = (0..100_000).rev().map(|id| id * 2).collect();
+    let (file_size_bytes, footer_size) =
+        write_ids_file(&data, "main/t/permuted.parquet", &row_ids).await;
+    let (table, ids) = table_with(
+        &catalog,
+        vec![DataFile {
+            path: "permuted.parquet".into(),
+            path_is_relative: true,
+            file_format: "parquet".into(),
+            record_count: row_ids.len() as u64,
+            file_size_bytes,
+            footer_size,
+            encryption_key: None,
+            partition_values: vec![],
+            column_stats: vec![],
+        }],
+    )
+    .await;
+    let store = DataStore::new(data);
+    catalog
+        .locate_row_ids(Some(store.clone()), "", table, vec![0, 198])
+        .await
+        .unwrap();
+    let directory = super::super::lookup(&catalog.row_lookups.files, table).unwrap();
+    let file =
+        crate::catalog::snapshot::data_file_info(directory.files.get(&ids[0].get()).unwrap());
+    crate::data_file::evict_summary(
+        &store,
+        table.get(),
+        ids[0].get(),
+        "main/t/permuted.parquet",
+        file_size_bytes,
+    );
+    let start = std::time::Instant::now();
+    let summaries = catalog
+        .file_summaries(&store, "", &directory.table_prefix, table, vec![file])
+        .await;
+    let summary = summaries[0].1.as_ref().unwrap();
+    assert!(
+        !summary.built,
+        "positioning decoded the row-id column again"
+    );
+    assert_eq!(
+        summary.positions_of(&[0, 198, 1]),
+        [Some(99_999), Some(99_900), None]
+    );
+    eprintln!(
+        "100,000 permuted row IDs, positioning after auxiliary eviction: {:?}, no summary rebuild",
+        start.elapsed()
+    );
+    catalog.close().await.unwrap();
 }
 
 /// A file registered against a warm table is the only one summarized.
@@ -261,6 +364,71 @@ async fn sparse_files_with_disjoint_spans_are_probed_only_within_their_span() {
     catalog.close().await.unwrap();
 }
 
+/// Overlapping summaries are probed only when their spans cover a requested
+/// row.
+#[tokio::test]
+async fn overlapping_summary_spans_only_probe_files_covering_the_requested_rows() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let data = Arc::new(InMemory::new());
+    let mut files = Vec::new();
+    for ordinal in 0..64_u64 {
+        let first = ordinal / 2 * 100 + ordinal % 2;
+        let name = format!("overlap-{ordinal}.parquet");
+        let (file_size_bytes, footer_size) = write_ids_file(
+            &data,
+            &format!("main/t/{name}"),
+            &[first, first + 2, first + 4],
+        )
+        .await;
+        files.push(DataFile {
+            path: name,
+            path_is_relative: true,
+            file_format: "parquet".into(),
+            record_count: 3,
+            file_size_bytes,
+            footer_size,
+            encryption_key: None,
+            partition_values: vec![],
+            column_stats: vec![],
+        });
+    }
+    let (table, ids) = table_with(&catalog, files).await;
+    let store = DataStore::new(data);
+    for lookup in 1..=2 {
+        let found = catalog
+            .locate_row_ids(Some(store.clone()), "", table, vec![2, 103, 10000])
+            .await
+            .unwrap();
+        assert_eq!(
+            found.iter().map(|row| row.data_file_id).collect::<Vec<_>>(),
+            vec![Some(ids[0]), Some(ids[3]), None]
+        );
+        assert_eq!(catalog.row_lookups.summary_probes(), lookup * 4);
+        assert_eq!(catalog.row_lookups.summarized_files(), 64);
+    }
+    catalog
+        .commit(|tx| tx.expire_data_file(table, ids[0]))
+        .await
+        .unwrap();
+    let found = catalog
+        .locate_row_ids(Some(store), "", table, vec![2, 103])
+        .await
+        .unwrap();
+    assert_eq!(
+        found.iter().map(|row| row.data_file_id).collect::<Vec<_>>(),
+        vec![None, Some(ids[3])]
+    );
+    assert_eq!(
+        catalog.row_lookups.summarized_files(),
+        64,
+        "expiry rebuilt unchanged summaries"
+    );
+    assert_eq!(catalog.row_lookups.summary_probes(), 11);
+    catalog.close().await.unwrap();
+}
+
 /// A row is placed by the dense range starting at or before it; a range
 /// overlapping a live one is refused until that one leaves.
 #[test]
@@ -325,4 +493,177 @@ proptest! {
             prop_assert_eq!(index.file_holding(row), expected);
         }
     }
+}
+
+/// A record for a file the data store does not hold, so summarizing it
+/// fails.
+fn missing_file(ordinal: u64) -> DataFile {
+    DataFile {
+        path: format!("missing-{ordinal}.parquet"),
+        path_is_relative: true,
+        file_format: "parquet".into(),
+        record_count: 3,
+        file_size_bytes: 1024,
+        footer_size: 8,
+        encryption_key: None,
+        partition_values: vec![],
+        column_stats: vec![],
+    }
+}
+
+/// Registers a file that cannot be summarized against a warm table,
+/// returning its id and the summary count once its read has failed once.
+async fn warm_table_with_unreadable_file() -> (WarmTable, DataFileId, u64) {
+    let warm = warm_table().await;
+    let table = warm.table;
+    let added = Cell::new(None);
+    warm.catalog
+        .commit(|tx| {
+            added.set(Some(tx.register_data_file(table, missing_file(9), &[])?));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let unreadable = added.get().unwrap();
+    let found = warm.locate(vec![4]).await;
+    assert!(
+        found
+            .iter()
+            .any(|candidate| candidate.data_file_id == Some(unreadable)),
+        "a file with no summary must stay a candidate for every row"
+    );
+    let summarized = warm.catalog.row_lookups.summarized_files();
+    assert_eq!(summarized, 5);
+
+    (warm, unreadable, summarized)
+}
+
+/// A file that cannot be summarized is not read again on every lookup.
+#[tokio::test]
+async fn an_unreadable_file_waits_before_it_is_read_again() {
+    let (warm, unreadable, summarized) = warm_table_with_unreadable_file().await;
+
+    for _ in 0..FIRST_RETRY_SKIP / 2 {
+        let found = warm.locate(vec![4]).await;
+        assert!(
+            found
+                .iter()
+                .any(|candidate| candidate.data_file_id == Some(unreadable))
+        );
+    }
+
+    assert_eq!(
+        warm.catalog.row_lookups.summarized_files(),
+        summarized,
+        "an unreadable file was read again before its wait ended"
+    );
+    warm.catalog.close().await.unwrap();
+}
+
+/// The wait ends, so a failure that was only transient still heals.
+#[tokio::test]
+async fn an_unreadable_file_is_read_again_once_its_wait_ends() {
+    let (warm, _, summarized) = warm_table_with_unreadable_file().await;
+
+    for _ in 0..FIRST_RETRY_SKIP {
+        warm.locate(vec![4]).await;
+    }
+
+    assert_eq!(
+        warm.catalog.row_lookups.summarized_files(),
+        summarized + 1,
+        "an unreadable file was never read again"
+    );
+    warm.catalog.close().await.unwrap();
+}
+
+/// A readable file registered while another is failing is summarized
+/// without the failing one being read again.
+#[tokio::test]
+async fn a_new_file_is_summarized_without_retrying_a_failing_one() {
+    let (warm, _, summarized) = warm_table_with_unreadable_file().await;
+    let table = warm.table;
+    let file = dense_file(&warm.data, 5, 3).await;
+    warm.catalog
+        .commit(|tx| tx.register_data_file(table, file.clone(), &[]).map(|_| ()))
+        .await
+        .unwrap();
+
+    warm.locate(vec![4]).await;
+    assert_eq!(
+        warm.catalog.row_lookups.summarized_files(),
+        summarized + 1,
+        "the failing file was read again alongside the new one"
+    );
+    warm.catalog.close().await.unwrap();
+}
+
+/// File-list churn cannot postpone retries of a failed summary indefinitely.
+#[tokio::test]
+async fn registering_files_does_not_restart_the_failed_summary_wait() {
+    let (warm, _, summarized) = warm_table_with_unreadable_file().await;
+    for ordinal in 0..FIRST_RETRY_SKIP {
+        let file = dense_file(&warm.data, 100 + u64::from(ordinal), 3).await;
+        warm.catalog
+            .commit(|tx| {
+                tx.register_data_file(warm.table, file.clone(), &[])
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        warm.locate(vec![4]).await;
+    }
+    assert_eq!(
+        warm.catalog.row_lookups.summarized_files(),
+        summarized + u64::from(FIRST_RETRY_SKIP) + 1
+    );
+    warm.catalog.close().await.unwrap();
+}
+
+/// A restored immutable object clears its failed summary after the retry wait.
+#[tokio::test]
+async fn a_transient_summary_failure_recovers() {
+    let warm = warm_table().await;
+    let file = dense_file(&warm.data, 100, 3).await;
+    let path = Path::from("main/t/data-100.parquet");
+    let bytes = warm.data.get(&path).await.unwrap().bytes().await.unwrap();
+    warm.data.delete(&path).await.unwrap();
+    let added = Cell::new(None);
+    warm.catalog
+        .commit(|tx| {
+            added.set(Some(tx.register_data_file(
+                warm.table,
+                file.clone(),
+                &[],
+            )?));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let failed = added.get().unwrap();
+    assert!(
+        warm.locate(vec![4])
+            .await
+            .iter()
+            .any(|row| row.data_file_id == Some(failed))
+    );
+    warm.data.put(&path, bytes.into()).await.unwrap();
+    for _ in 0..FIRST_RETRY_SKIP {
+        warm.locate(vec![4]).await;
+    }
+    assert!(
+        !warm
+            .locate(vec![4])
+            .await
+            .iter()
+            .any(|row| row.data_file_id == Some(failed))
+    );
+    assert!(
+        warm.locate(vec![12])
+            .await
+            .iter()
+            .any(|row| row.data_file_id == Some(failed))
+    );
+    warm.catalog.close().await.unwrap();
 }
