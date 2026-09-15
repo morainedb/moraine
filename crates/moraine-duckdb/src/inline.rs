@@ -496,6 +496,59 @@ pub unsafe extern "C" fn moraine_inline_schemas_free(
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
+/// Reports whether `(table_id, schema_version)` is registered, via
+/// `*out_registered`: the pair-scoped form of
+/// [`moraine_inline_registered_tables`], for the `CREATE TABLE IF NOT
+/// EXISTS ducklake_inlined_data_<t>_<v>` existence gate.
+///
+/// # Safety
+///
+/// Same pointer contract as [`moraine_inline_scan_open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_inline_table_registered(
+    handle: *mut MoraineCatalogHandle,
+    table_id: u64,
+    schema_version: u64,
+    out_registered: *mut bool,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<bool, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_registered.is_null() {
+            return Err(AbiError::invalid_argument("`out_registered` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::inline::inline_table_registered(
+                    handle_ref.catalog.reads(),
+                    table_id,
+                    schema_version,
+                ),
+            )
+        }
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(registered) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { *out_registered = registered };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
 /// One `(table_id, schema_version)` pair, as returned by
 /// [`moraine_inline_registered_tables`].
 #[repr(C)]

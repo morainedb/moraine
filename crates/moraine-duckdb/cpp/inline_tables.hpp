@@ -202,9 +202,10 @@ duckdb::unique_ptr<duckdb::CatalogEntry> LookupInlineTableEntry(duckdb::ClientCo
 
 // Handles `CREATE TABLE [IF NOT EXISTS] ducklake_inlined_data_<t>_<v>(...)`:
 // stages `inline/schema` from `info`'s bound columns (skipping the three
-// system columns) and returns the new entry. Returns null if a schema is
-// already recorded for `(t, v)` and `on_conflict == IGNORE_ON_CONFLICT`;
-// throws CatalogException if already recorded and `ERROR_ON_CONFLICT`.
+// system columns) and returns the new entry. Returns null if `(t, v)` is
+// still registered and `on_conflict == IGNORE_ON_CONFLICT`; throws
+// CatalogException if still registered and `ERROR_ON_CONFLICT`. A
+// deregistered version is not "already there".
 duckdb::unique_ptr<duckdb::CatalogEntry> CreateInlineDataTable(duckdb::ClientContext &context, duckdb::Catalog &catalog,
                                                                duckdb::SchemaCatalogEntry &schema,
                                                                MoraineCatalogHandle *handle, MoraineTxHandle *tx,

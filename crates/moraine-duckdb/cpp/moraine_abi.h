@@ -3122,6 +3122,22 @@ int32_t moraine_inline_schemas(struct MoraineCatalogHandle *handle,
 // matching [`moraine_inline_schemas`] call, not yet freed.
 void moraine_inline_schemas_free(struct MoraineInlineSchemaRow *items, size_t len);
 
+// Reports whether `(table_id, schema_version)` is registered, via
+// `*out_registered`: the pair-scoped form of
+// [`moraine_inline_registered_tables`], for the `CREATE TABLE IF NOT
+// EXISTS ducklake_inlined_data_<t>_<v>` existence gate.
+//
+// # Safety
+//
+// Same pointer contract as [`moraine_inline_scan_open`].
+int32_t moraine_inline_table_registered(struct MoraineCatalogHandle *handle,
+                                        uint64_t table_id,
+                                        uint64_t schema_version,
+                                        bool *out_registered,
+                                        MoraineInterruptProbe probe,
+                                        void *probe_ctx,
+                                        struct MoraineError *err);
+
 // Dumps every `(table_id, schema_version)` with a recorded inline
 // schema, across every table: the `ducklake_inlined_data_tables`
 // projection.

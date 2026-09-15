@@ -925,3 +925,76 @@ fn ducklake_inline_flush_spans_several_scan_windows() {
     ));
     assert_ne!(post_flush_files, vec![vec!["0".to_string()]]);
 }
+
+/// Re-creating a deregistered inlined table registers it again, so the
+/// rows it was holding drain on the next flush. Its retained schema
+/// record keeps the name resolving and must not read as "already there".
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn recreating_a_deregistered_inlined_table_registers_it_again() {
+    let dir = TempDir::new("inline-reregister");
+    let data_dir = TempDir::new("inline-reregister-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CREATE TABLE lake.main.t (i BIGINT);\nINSERT INTO lake.main.t VALUES (1), (2);",
+    );
+    let registered = csv_rows(&run_standalone_sql(
+        store,
+        "SELECT table_name FROM m.ducklake_inlined_data_tables;",
+    ));
+    assert_eq!(
+        registered,
+        vec![vec!["ducklake_inlined_data_1_1".to_string()]]
+    );
+
+    // The deregistration a flush's cleanup performs, driven directly: the
+    // flush only reaches it for a version some later one supersedes.
+    run_standalone_sql(store, "DROP TABLE m.ducklake_inlined_data_1_1;");
+    let after_drop = csv_rows(&run_standalone_sql(
+        store,
+        "SELECT count(*) FROM m.ducklake_inlined_data_tables;",
+    ));
+    assert_eq!(after_drop, vec![vec!["0".to_string()]]);
+
+    // The version still resolves its columns, which is what makes the
+    // retained record the wrong answer to "does this exist?".
+    let still_binds = csv_rows(&run_standalone_sql(
+        store,
+        "SELECT count(*) FROM m.ducklake_inlined_data_1_1;",
+    ));
+    assert_eq!(still_binds, vec![vec!["2".to_string()]]);
+
+    run_standalone_sql(
+        store,
+        "CREATE TABLE IF NOT EXISTS m.ducklake_inlined_data_1_1(row_id BIGINT, \
+         begin_snapshot BIGINT, end_snapshot BIGINT, i BIGINT);",
+    );
+    let after_recreate = csv_rows(&run_standalone_sql(
+        store,
+        "SELECT table_name, schema_version FROM m.ducklake_inlined_data_tables;",
+    ));
+    assert_eq!(
+        after_recreate,
+        vec![vec![
+            "ducklake_inlined_data_1_1".to_string(),
+            "1".to_string()
+        ]],
+        "a re-created version is registered again, so a flush enumerates it"
+    );
+
+    // The rows the version was holding all along drain on the next flush.
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CALL ducklake_flush_inlined_data('lake');",
+    );
+    let flushed = csv_rows(&run_standalone_sql(
+        store,
+        "SELECT count(*), sum(record_count) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+    ));
+    assert_eq!(flushed, vec![vec!["1".to_string(), "2".to_string()]]);
+}

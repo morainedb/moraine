@@ -21,7 +21,8 @@ use crate::{
         },
         proto::{
             InlineChunkRangeValue, InlineChunkValue, InlineFileDeleteTableValue,
-            InlineFileDeleteValue, InlineInlineDeleteValue, InlineSchemaValue,
+            InlineFileDeleteValue, InlineInlineDeleteValue, InlineSchemaDroppedValue,
+            InlineSchemaValue,
         },
         read::{read_singleton, scan_decode, scan_keys},
         value,
@@ -557,6 +558,34 @@ pub(crate) async fn scan_all_inline_schema_keys(handle: ReadHandle<'_>) -> Resul
         },
     )
     .await
+}
+
+/// Whether `table_id`'s `schema_version` is still registered: it has a
+/// schema record and no drop marker. A deregistered version keeps its
+/// record so its name goes on resolving, so the record alone does not
+/// answer this.
+pub(crate) async fn read_inline_schema_registered(
+    handle: ReadHandle<'_>,
+    table_id: u64,
+    schema_version: u64,
+) -> Result<bool> {
+    let (schema, dropped) = futures::try_join!(
+        read_singleton::<InlineSchemaValue>(
+            handle,
+            Key::Inline(InlineKey::Schema {
+                table_id,
+                schema_version,
+            }),
+        ),
+        read_singleton::<InlineSchemaDroppedValue>(
+            handle,
+            Key::Inline(InlineKey::SchemaDropped {
+                table_id,
+                schema_version,
+            }),
+        ),
+    )?;
+    Ok(schema.is_some() && dropped.is_none())
 }
 
 /// Every deregistered schema version of `table_id`, in key order. Their
