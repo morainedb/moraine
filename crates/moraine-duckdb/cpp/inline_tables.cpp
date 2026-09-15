@@ -823,17 +823,17 @@ duckdb::unique_ptr<duckdb::CatalogEntry> CreateInlineDataTable(duckdb::ClientCon
                                                                MoraineCatalogHandle *handle, MoraineTxHandle *tx,
                                                                duckdb::BoundCreateTableInfo &info, uint64_t table_id,
                                                                uint64_t schema_version) {
-	OwnedArray<MoraineInlineSchemaRow> schemas(moraine_inline_schemas_free);
+	// Registration, not the retained record, is what "already exists" means:
+	// a flush deregisters an emptied version while its record stays so the
+	// name resolves. Re-creating it is the only thing that registers it again.
+	bool registered = false;
 	MoraineError lookup_err {};
-	auto lookup_code = moraine_inline_schemas(handle, table_id, schemas.OutItems(), schemas.OutLen(),
-	                                          moraine_shim_is_interrupted, &context, &lookup_err);
+	auto lookup_code = moraine_inline_table_registered(handle, table_id, schema_version, &registered,
+	                                                   moraine_shim_is_interrupted, &context, &lookup_err);
 	if (lookup_code != MORAINE_OK) {
 		ThrowMoraineError(lookup_err);
 	}
-	for (auto &row : schemas) {
-		if (row.schema_version != schema_version) {
-			continue;
-		}
+	if (registered) {
 		if (info.Base().on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT) {
 			return nullptr;
 		}

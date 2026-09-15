@@ -202,6 +202,29 @@ pub async fn inline_registered_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<(
         .collect())
 }
 
+/// Whether `(table_id, schema_version)` is one of the pairs
+/// [`inline_registered_tables`] lists — the read model behind
+/// `moraine_inline_table_registered`, which the `CREATE TABLE IF NOT
+/// EXISTS ducklake_inlined_data_<t>_<v>` existence gate consults.
+///
+/// # Errors
+///
+/// Returns an error if the underlying store read fails or decodes
+/// corrupt bytes.
+#[doc(hidden)]
+pub async fn inline_table_registered(
+    catalog: &ReadOnlyCatalog,
+    table_id: u64,
+    schema_version: u64,
+) -> Result<bool> {
+    let session = catalog.begin_read().await?;
+    let registered =
+        store_inline::read_inline_schema_registered(session.handle(), table_id, schema_version)
+            .await;
+    session.finish();
+    registered
+}
+
 /// Whether `table_id`'s `ducklake_inlined_delete_<table_id>` exists: it
 /// does not until the first `inline/file_delete` is staged, and stays
 /// existing after a flush clears the records. The record fallback covers
@@ -607,6 +630,79 @@ mod tests {
             record.rows.is_empty(),
             "the retained version scans empty; its rows are in the flushed file"
         );
+    }
+
+    /// A deregistered schema version registers again when its schema is
+    /// staged anew, and the retained record alone never counts as
+    /// registration.
+    #[tokio::test]
+    async fn restaging_a_dropped_schema_version_registers_it_again() {
+        let catalog = open().await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+        tx.stage(RowOperation::InlineSchema {
+            table_id: 1,
+            schema_version: 0,
+            arrow_schema: b"schema-v0".to_vec(),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+        assert!(inline_table_registered(&catalog, 1, 0).await.unwrap());
+
+        let db_tx2 = catalog.begin_write_tx().await.unwrap();
+        let mut drop_tx = StagedTransaction::begin_detached(&catalog, db_tx2);
+        drop_tx.stage(RowOperation::InlineSchemaDrop {
+            table_id: 1,
+            schema_version: 0,
+        });
+        drop_tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2),
+        });
+        drop_tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2),
+        });
+        drop_tx.commit().await.unwrap();
+        assert!(
+            !inline_table_registered(&catalog, 1, 0).await.unwrap(),
+            "the retained schema record does not keep the version registered"
+        );
+
+        let db_tx3 = catalog.begin_write_tx().await.unwrap();
+        let mut recreate = StagedTransaction::begin_detached(&catalog, db_tx3);
+        recreate.stage(RowOperation::InlineSchema {
+            table_id: 1,
+            schema_version: 0,
+            arrow_schema: b"schema-v0".to_vec(),
+        });
+        recreate.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(3),
+        });
+        recreate.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(3),
+        });
+        recreate.commit().await.unwrap();
+
+        assert!(inline_table_registered(&catalog, 1, 0).await.unwrap());
+        assert_eq!(
+            inline_registered_tables(&catalog).await.unwrap(),
+            vec![(1, 0)]
+        );
+
+        // A version no table ever recorded is registered nowhere.
+        assert!(!inline_table_registered(&catalog, 1, 7).await.unwrap());
+        assert!(!inline_table_registered(&catalog, 9, 0).await.unwrap());
     }
 
     /// The first `scan_inline` walk verifies the chunk directory and
