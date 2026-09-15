@@ -1,8 +1,12 @@
 //! Store census, maintenance status, reclamation, and compaction.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use futures::{StreamExt, TryStreamExt, stream};
+use tracing::info;
 
 use super::{Catalog, ReadOnlyCatalog};
 use crate::{
@@ -20,12 +24,15 @@ use crate::{
         census::{self as store_census, SegmentSize},
         compaction::{self as store_compaction, MergeEnd},
         handle::{ReadHandle, ScanShape},
+        inline as store_inline,
         key::{
             EntityKey, EntityKind, IndexKey, IndexKind, Key, Subspace, history_entity_kind_prefix,
             index_index_prefix, index_kind_prefix, subspace_prefix,
         },
     },
-    transaction::{commit, index_maintenance, maintenance_status},
+    transaction::{
+        commit, index_maintenance, maintenance_status, staged::inline::inline_schema_undrop_write,
+    },
 };
 
 /// One subspace's row, zeroed when the manifest carries no segment for it.
@@ -188,6 +195,38 @@ impl MaintenanceStatusPass {
             steps,
         }
     }
+}
+
+/// Every deregistered `(table_id, schema_version)` that still has both a
+/// schema record and live rows — the pairs a flush can no longer reach.
+/// Tables are scanned once each, and only tables carrying a marker at all.
+async fn stranded_inline_schemas(handle: ReadHandle<'_>) -> Result<Vec<(u64, u64)>> {
+    let (dropped, schemas) = futures::try_join!(
+        store_inline::scan_all_inline_dropped_schemas(handle),
+        store_inline::scan_all_inline_schema_keys(handle),
+    )?;
+    if dropped.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schemas: HashSet<(u64, u64)> = schemas.into_iter().collect();
+
+    let mut by_table: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (table_id, schema_version) in dropped {
+        by_table.entry(table_id).or_default().push(schema_version);
+    }
+
+    let mut stranded = Vec::new();
+    for (table_id, versions) in by_table {
+        let live = store_inline::scan_inline_live_schema_versions(handle, table_id).await?;
+        for schema_version in versions {
+            // A marker without its schema record belongs to a dropped
+            // table: re-listing it would name columns nothing resolves.
+            if live.contains(&schema_version) && schemas.contains(&(table_id, schema_version)) {
+                stranded.push((table_id, schema_version));
+            }
+        }
+    }
+    Ok(stranded)
 }
 
 impl ReadOnlyCatalog {
@@ -462,6 +501,65 @@ impl Catalog {
         }
 
         Ok(report)
+    }
+
+    /// Re-registers every inlined schema version that still holds rows
+    /// while carrying a deregistration marker, and returns the
+    /// `(table_id, schema_version)` pairs it re-listed.
+    ///
+    /// A flush deregisters the version it emptied, and the `CREATE TABLE`
+    /// that first made a version is the only thing that registers one. A
+    /// version left deregistered with rows still under it is therefore
+    /// listed by nothing: its name resolves and scans read it, but no
+    /// flush enumerates it, so its rows never reach a data file. Clearing
+    /// the marker puts it back in `ducklake_inlined_data_tables` with its
+    /// retained schema untouched, and the next flush drains it.
+    ///
+    /// Safe to repeat: a version whose rows are already flushed away has
+    /// nothing under its marker and is left deregistered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] if the catalog was opened read-only,
+    /// or a store error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// // A lake whose flushes all completed has nothing stranded.
+    /// assert!(catalog.reregister_stranded_inline_schemas().await?.is_empty());
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn reregister_stranded_inline_schemas(&self) -> Result<Vec<(u64, u64)>> {
+        self.writer()?;
+
+        let session = self.begin_read().await?;
+        let found = stranded_inline_schemas(session.handle()).await;
+        session.finish();
+        let stranded = found?;
+        if stranded.is_empty() {
+            return Ok(stranded);
+        }
+
+        let tx = self.begin_write_tx().await?;
+        for &(table_id, schema_version) in &stranded {
+            let (key, _) = inline_schema_undrop_write(table_id, schema_version);
+            tx.delete(key).map_err(Error::from)?;
+        }
+        // Non-durable: clearing a marker is idempotent, so a commit lost
+        // to a crash leaves versions the next pass rediscovers.
+        tx.commit().await.map_err(Error::from)?;
+
+        info!(
+            versions = stranded.len(),
+            "re-registered inlined schema versions that still held rows: {stranded:?}"
+        );
+        Ok(stranded)
     }
 
     /// Merges each targeted subspace's sorted runs into one, reclaiming the

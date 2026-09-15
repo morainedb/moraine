@@ -87,6 +87,25 @@
 //! is spelled as a string: `META_MAINTENANCE_EXPIRE_SNAPSHOTS_VERSIONS
 //! '[1,2]'`.
 //!
+//! # Inlined-data repair
+//!
+//! A flush deregisters the inlined schema version it emptied, and the
+//! `CREATE TABLE` DuckLake issues when it first writes under a version is
+//! the only thing that registers one. A version deregistered while rows
+//! were still under it is therefore enumerated by no later flush: its
+//! name resolves and scans read it, but its rows never reach a data file.
+//!
+//! Every read-write attach re-registers such a version, leaving its
+//! retained schema alone, so the next flush drains it; a version a flush
+//! legitimately emptied holds nothing and stays deregistered. The repair
+//! is attach-time because that is where it takes hold — DuckLake reads
+//! the registry when it loads the catalog for a schema version and caches
+//! that for the life of the attach, re-reading only when a drop
+//! invalidates it, so a version re-registered mid-process is drained by
+//! the first flush after the next attach. A read-only attach opens no
+//! writer and repairs nothing. What was repaired is reported to the
+//! database log at `WARN`.
+//!
 //! # Measurement
 //!
 //! `CALL moraine_store_census('lake')` measures the store itself: one row

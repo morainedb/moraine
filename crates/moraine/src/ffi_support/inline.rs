@@ -871,4 +871,95 @@ mod tests {
         assert!(inline_file_delete_table_exists(&catalog, 1).await.unwrap());
         assert_eq!(inline_file_deletes(&catalog, 9).await.unwrap(), vec![]);
     }
+
+    /// A version left deregistered with rows still under it is re-listed,
+    /// and one whose flush emptied it is left alone.
+    #[tokio::test]
+    async fn reregistering_relists_only_deregistered_versions_that_still_hold_rows() {
+        let catalog = open().await;
+
+        // Table 1 carries two versions, both holding rows; table 2 carries
+        // one, which its flush will empty.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+        for (table_id, schema_version) in [(1u64, 0u64), (1, 1), (2, 0)] {
+            tx.stage(RowOperation::InlineSchema {
+                table_id,
+                schema_version,
+                arrow_schema: format!("schema-{table_id}-{schema_version}").into_bytes(),
+            });
+            tx.stage(RowOperation::InlineInsert {
+                table_id,
+                schema_version,
+                begin_snapshot: 1,
+                row_id_start: schema_version * 10,
+                row_count: 2,
+                arrow_body: b"chunk".to_vec(),
+            });
+        }
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        // Table 2's version is flushed and then deregistered, which is the
+        // ordinary path. Table 1 version 0 is deregistered with its rows
+        // still live, which is the stranding.
+        let db_tx2 = catalog.begin_write_tx().await.unwrap();
+        let mut flush = StagedTransaction::begin_detached(&catalog, db_tx2);
+        flush.stage(RowOperation::InlineFlushDelete {
+            table_id: 2,
+            schema_version: 0,
+            flush_snapshot: 2,
+        });
+        flush.stage(RowOperation::InlineSchemaDrop {
+            table_id: 2,
+            schema_version: 0,
+        });
+        flush.stage(RowOperation::InlineSchemaDrop {
+            table_id: 1,
+            schema_version: 0,
+        });
+        flush.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2),
+        });
+        flush.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2),
+        });
+        flush.commit().await.unwrap();
+        assert_eq!(
+            inline_registered_tables(&catalog).await.unwrap(),
+            vec![(1, 1)],
+            "both versions leave the registry, only one of them emptied"
+        );
+
+        assert_eq!(
+            catalog.reregister_stranded_inline_schemas().await.unwrap(),
+            vec![(1, 0)]
+        );
+        assert_eq!(
+            inline_registered_tables(&catalog).await.unwrap(),
+            vec![(1, 0), (1, 1)],
+            "the stranded version is listed again; the emptied one stays out"
+        );
+        assert!(
+            inline_table_registered(&catalog, 1, 0).await.unwrap(),
+            "and its rows are enumerable again by the next flush"
+        );
+
+        // Nothing is stranded twice.
+        assert_eq!(
+            catalog.reregister_stranded_inline_schemas().await.unwrap(),
+            vec![]
+        );
+
+        catalog.close().await.unwrap();
+    }
 }
