@@ -293,6 +293,29 @@ pub(crate) async fn scan_inline_chunk_ranges(
     .await
 }
 
+/// Every schema version `table_id` still holds live inline rows under,
+/// taken from the chunk directory's keys alone. The directory names no
+/// empty chunk, so a version it lists has rows a flush would write out.
+pub(crate) async fn scan_inline_live_schema_versions(
+    handle: ReadHandle<'_>,
+    table_id: u64,
+) -> Result<BTreeSet<u64>> {
+    let versions = scan_decode(
+        handle,
+        inline_chunk_locator_table_prefix(table_id),
+        ScanShape::Probe,
+        |key, _| match key {
+            Key::Inline(InlineKey::ChunkLocator { schema_version, .. }) => Ok(schema_version),
+            other => Err(Error::Corruption(format!(
+                "non-directory key in inline live schema-version scan: {other:?}"
+            ))),
+        },
+    )
+    .await?;
+
+    Ok(versions.into_iter().collect())
+}
+
 /// Every superseded chunk-range key for `table_id`. Nothing writes these
 /// any more; a store carried across the change still holds them, and the
 /// directory's repair deletes what it finds.

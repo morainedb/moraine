@@ -926,9 +926,9 @@ fn ducklake_inline_flush_spans_several_scan_windows() {
     assert_ne!(post_flush_files, vec![vec!["0".to_string()]]);
 }
 
-/// Re-creating a deregistered inlined table registers it again, so the
-/// rows it was holding drain on the next flush. Its retained schema
-/// record keeps the name resolving and must not read as "already there".
+/// Re-creating a deregistered inlined table registers it again, so rows
+/// written under it afterwards drain. Its retained schema record keeps
+/// the name resolving and must not read as "already there".
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
 fn recreating_a_deregistered_inlined_table_registers_it_again() {
@@ -951,8 +951,13 @@ fn recreating_a_deregistered_inlined_table_registers_it_again() {
         vec![vec!["ducklake_inlined_data_1_1".to_string()]]
     );
 
-    // The deregistration a flush's cleanup performs, driven directly: the
-    // flush only reaches it for a version some later one supersedes.
+    // Emptied first, so deregistering it is the flush cleanup's ordinary
+    // outcome rather than the stranding an attach undoes.
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CALL ducklake_flush_inlined_data('lake');",
+    );
     run_standalone_sql(store, "DROP TABLE m.ducklake_inlined_data_1_1;");
     let after_drop = csv_rows(&run_standalone_sql(
         store,
@@ -966,7 +971,7 @@ fn recreating_a_deregistered_inlined_table_registers_it_again() {
         store,
         "SELECT count(*) FROM m.ducklake_inlined_data_1_1;",
     ));
-    assert_eq!(still_binds, vec![vec!["2".to_string()]]);
+    assert_eq!(still_binds, vec![vec!["0".to_string()]]);
 
     run_standalone_sql(
         store,
@@ -986,7 +991,76 @@ fn recreating_a_deregistered_inlined_table_registers_it_again() {
         "a re-created version is registered again, so a flush enumerates it"
     );
 
-    // The rows the version was holding all along drain on the next flush.
+    // Rows written under the re-registered version reach a data file.
+    run_ducklake_sql(
+        store,
+        data_path,
+        "INSERT INTO lake.main.t VALUES (3);\nCALL ducklake_flush_inlined_data('lake');",
+    );
+    let flushed = csv_rows(&run_standalone_sql(
+        store,
+        "SELECT count(*), sum(record_count) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+    ));
+    assert_eq!(flushed, vec![vec!["2".to_string(), "3".to_string()]]);
+    let read_back = csv_rows(&run_ducklake_sql(
+        store,
+        data_path,
+        "SELECT count(*), sum(i) FROM lake.main.t;",
+    ));
+    assert_eq!(read_back, vec![vec!["3".to_string(), "6".to_string()]]);
+}
+
+/// A version deregistered while its rows were still live is re-registered
+/// by the next read-write attach, so the next flush drains what was
+/// stranded under it. A read-only attach repairs nothing.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn attaching_re_registers_a_deregistered_inlined_table_that_still_holds_rows() {
+    let dir = TempDir::new("inline-stranded");
+    let data_dir = TempDir::new("inline-stranded-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CREATE TABLE lake.main.t (i BIGINT);\nINSERT INTO lake.main.t VALUES (1), (2);",
+    );
+
+    // The stranding: the version leaves the registry with its rows still
+    // under it, so no later flush enumerates it and nothing re-creates it.
+    run_standalone_sql(store, "DROP TABLE m.ducklake_inlined_data_1_1;");
+
+    let read_only = csv_rows(&run_standalone_read_only_sql(
+        store,
+        "SELECT count(*) FROM m.ducklake_inlined_data_tables;",
+    ));
+    assert_eq!(
+        read_only,
+        vec![vec!["0".to_string()]],
+        "a read-only attach opens no writer, so it repairs nothing"
+    );
+
+    // The attach that repairs says so, and the repair is durable: a later
+    // attach finds the version listed and nothing left to re-register.
+    let repair_log = run_standalone_sql(store, "SELECT 1;");
+    assert!(
+        repair_log.contains("re-registered 1 inlined table(s)"),
+        "the read-write attach reports what it re-registered: {repair_log}"
+    );
+    let repaired = csv_rows(&run_standalone_sql(
+        store,
+        "SELECT table_name, schema_version FROM m.ducklake_inlined_data_tables;",
+    ));
+    assert_eq!(
+        repaired,
+        vec![vec![
+            "ducklake_inlined_data_1_1".to_string(),
+            "1".to_string()
+        ]],
+        "the version its rows sit under is listed again"
+    );
+
     run_ducklake_sql(
         store,
         data_path,
@@ -996,5 +1070,15 @@ fn recreating_a_deregistered_inlined_table_registers_it_again() {
         store,
         "SELECT count(*), sum(record_count) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
     ));
-    assert_eq!(flushed, vec![vec!["1".to_string(), "2".to_string()]]);
+    assert_eq!(
+        flushed,
+        vec![vec!["1".to_string(), "2".to_string()]],
+        "the stranded rows reach a data file"
+    );
+    let read_back = csv_rows(&run_ducklake_sql(
+        store,
+        data_path,
+        "SELECT count(*), sum(i) FROM lake.main.t;",
+    ));
+    assert_eq!(read_back, vec![vec!["2".to_string(), "3".to_string()]]);
 }

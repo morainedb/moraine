@@ -656,6 +656,46 @@ void MoraineSchemaEntry::Alter(duckdb::CatalogTransaction transaction, duckdb::A
 	throw duckdb::NotImplementedException("moraine: altering an entry is not supported (read-only catalog)");
 }
 
+namespace {
+
+// A flush deregisters the schema version it emptied, and the `CREATE
+// TABLE` that first made a version is the only thing that registers one.
+// A version deregistered while rows were still under it is therefore
+// enumerated by no later flush, and its rows never reach a data file.
+//
+// Attach is where re-listing one takes hold. DuckLake reads the registry
+// when it loads the catalog for a schema version and caches that per
+// attach, re-reading only when a drop invalidates it, so a repair made
+// later in a process is invisible to the flushes that process runs.
+void ReregisterStrandedInlinedTables(MoraineCatalogHandle *handle, duckdb::AttachedDatabase &db) noexcept {
+	uint64_t repaired = 0;
+	MoraineError err {};
+	// No interrupt probe: this runs on the attaching thread, before there
+	// is a query to interrupt it from.
+	auto code = moraine_inline_reregister_stranded(handle, &repaired, nullptr, nullptr, &err);
+	if (code != MORAINE_OK) {
+		// Reported, not thrown. The lake reads and writes correctly
+		// without the repair — it is stranded rows that stay stranded —
+		// and failing the attach would take away the connection an
+		// operator would diagnose it from.
+		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		WriteMoraineLog(db.GetDatabase(), duckdb::LogLevel::LOG_WARNING,
+		                "could not re-register stranded inlined tables: " + message);
+		return;
+	}
+	if (repaired > 0) {
+		WriteMoraineLog(db.GetDatabase(), duckdb::LogLevel::LOG_WARNING,
+		                "re-registered " + std::to_string(repaired) +
+		                    " inlined table(s) left deregistered while still holding rows; "
+		                    "the next flush drains them");
+	}
+}
+
+} // namespace
+
 MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientContext &context,
                                MoraineCatalogHandle *handle, std::string path, MaintenanceConfig maintenance)
     : duckdb::Catalog(db), handle_(handle), path_(std::move(path)) {
@@ -678,6 +718,9 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientConte
 		// Routed per handle: another attached lake's events go to its own
 		// database, not this one.
 		moraine_register_log_sink(handle_, WriteMoraineLogRecordToDatabase, &db.GetDatabase());
+		if (!db.IsReadOnly()) {
+			ReregisterStrandedInlinedTables(handle_, db);
+		}
 	} catch (...) {
 		if (handle_ != nullptr) {
 			moraine_unregister_log_sink(handle_);

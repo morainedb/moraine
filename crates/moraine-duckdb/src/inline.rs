@@ -549,6 +549,59 @@ pub unsafe extern "C" fn moraine_inline_table_registered(
     }
 }
 
+/// Re-registers every inlined schema version left deregistered while it
+/// still holds rows, writing how many were re-listed to `*out_repaired`.
+///
+/// A flush deregisters the version it emptied, and only a `CREATE TABLE`
+/// registers one — so a version deregistered with rows still under it is
+/// enumerated by no flush and its rows never reach a data file. This is
+/// the repair: it clears the marker, leaving the retained schema alone.
+///
+/// # Safety
+///
+/// Same pointer contract as [`moraine_inline_scan_open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_inline_reregister_stranded(
+    handle: *mut MoraineCatalogHandle,
+    out_repaired: *mut u64,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<u64, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let repaired = unsafe {
+            handle_ref.block_on_commit(
+                probe,
+                probe_ctx,
+                handle_ref
+                    .catalog
+                    .writer()?
+                    .reregister_stranded_inline_schemas(),
+            )
+        }?;
+        Ok(repaired.len() as u64)
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(repaired) => {
+            if !out_repaired.is_null() {
+                // SAFETY: caller contract — non-null means writable.
+                unsafe { *out_repaired = repaired };
+            }
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
 /// One `(table_id, schema_version)` pair, as returned by
 /// [`moraine_inline_registered_tables`].
 #[repr(C)]

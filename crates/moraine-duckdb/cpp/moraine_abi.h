@@ -3138,6 +3138,23 @@ int32_t moraine_inline_table_registered(struct MoraineCatalogHandle *handle,
                                         void *probe_ctx,
                                         struct MoraineError *err);
 
+// Re-registers every inlined schema version left deregistered while it
+// still holds rows, writing how many were re-listed to `*out_repaired`.
+//
+// A flush deregisters the version it emptied, and only a `CREATE TABLE`
+// registers one — so a version deregistered with rows still under it is
+// enumerated by no flush and its rows never reach a data file. This is
+// the repair: it clears the marker, leaving the retained schema alone.
+//
+// # Safety
+//
+// Same pointer contract as [`moraine_inline_scan_open`].
+int32_t moraine_inline_reregister_stranded(struct MoraineCatalogHandle *handle,
+                                           uint64_t *out_repaired,
+                                           MoraineInterruptProbe probe,
+                                           void *probe_ctx,
+                                           struct MoraineError *err);
+
 // Dumps every `(table_id, schema_version)` with a recorded inline
 // schema, across every table: the `ducklake_inlined_data_tables`
 // projection.

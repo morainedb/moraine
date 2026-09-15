@@ -660,7 +660,10 @@ async fn translate_inline_schema_drop(
 
 /// Clears a version's drop marker, so registering it again cannot leave
 /// it both listed and deregistered.
-fn inline_schema_undrop_write(table_id: u64, schema_version: u64) -> commit::StagedWrite {
+pub(crate) fn inline_schema_undrop_write(
+    table_id: u64,
+    schema_version: u64,
+) -> commit::StagedWrite {
     (
         Key::Inline(InlineKey::SchemaDropped {
             table_id,
