@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6](https://github.com/morainedb/moraine/compare/v0.6.5...v0.6.6) - 2026-09-15
+
+### Fixed
+
+- re-register inlined tables left deregistered with rows still under them ([#224](https://github.com/morainedb/moraine/pull/224))
+- re-register a deregistered inlined table when DuckLake re-creates it ([#222](https://github.com/morainedb/moraine/pull/222))
+
 ## [0.6.5](https://github.com/morainedb/moraine/compare/v0.6.4...v0.6.5) - 2026-09-14
 
 ### Fixed
