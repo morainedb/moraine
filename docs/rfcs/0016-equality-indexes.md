@@ -681,10 +681,17 @@ equality on file id is the supported shape.
 `locate_row_ids` uses a per-table interval directory for verified dense file
 summaries. A cold directory resolves every current file once: `row_id_start`
 alone cannot exclude an embedded-ID file. Warm requests visit matching dense
-intervals and consult the arbitrary-ID summaries the directory retains, so a
-lookup re-resolves nothing it has already summarized. Failed summaries still
-broaden every requested ID to that file and are retried on the next request;
-a retry that succeeds moves the file into the directory. Results preserve
+intervals and an overlap-aware interval index over arbitrary-ID summary bounds.
+Only summaries whose inclusive spans cover a requested ID receive a membership
+check; overlapping spans do not fall back to probing every summary. The same
+augmented balanced interval representation serves inline chunk lookup. Its
+immutable array is shared by warm directories and rebuilt from retained bounds
+only when that summary map changes, without rereading unchanged Parquet files.
+A lookup re-resolves nothing it has already summarized. Failed summaries still
+broaden every requested ID to that file. Retries wait 16 lookups initially,
+doubling after each failure up to 4096; a successful retry moves the file into
+the directory. File-list refreshes preserve the countdown, so new registrations
+cannot postpone a failed file's retry indefinitely. Results preserve
 request order, deduplicate repeated requests, and retain overlapping physical
 and inline candidates.
 
@@ -697,6 +704,13 @@ therefore costs one summary per new file rather than one per current file,
 and unrelated catalog changes cost nothing. The directory's size estimate is
 carried across refreshes the same way. No file summary is inferred from a
 catalog range before the footer establishes which row-ID source applies.
+
+The directory also retains exact position summaries, including physical row
+order for permuted files. Position resolution and scoped row reads reuse
+these summaries even after auxiliary-cache eviction, provided the store
+identity, prefixes, and complete registered file record still match. Summary
+payloads are shared by reference and counted once in directory occupancy;
+removing or changing a file drops its retained summary.
 
 Inline point lookups build a chunk interval directory, then materialize only
 requested offsets, scan tombstones only for those IDs, and fetch only chunks
@@ -733,7 +747,7 @@ file, in whichever representation is smallest for that file:
 - a run-optimized 64-bit Roaring set, when it beats the raw ids;
 - a sorted `u64` vector, when fragmentation makes Roaring larger.
 
-A summary also answers a row id's **position** — the row's ordinal within
+A summary also answers a row id's **positions** — its physical ordinals within
 its file, which a delete file names. Positions are permanent facts of an
 immutable file, so caching them can never go stale; they are also implicit
 in the build, which reads the reserved row-id column front to back.
@@ -752,6 +766,17 @@ from the file — a one-time cold start, never a guessed position. A
 permutation over contiguous ids answers no question a dense range could
 not answer more cheaply, so construction demotes that case to the plain
 Roaring set instead of pairing a permutation with a range.
+
+A flushed inline file can contain several historical versions of one row ID.
+These are valid physical rows, not a malformed summary. The membership set
+deduplicates IDs; a repeated-order directory maps each member's rank to a range
+of physical positions through `u32` offsets and positions arrays. Exact reads
+and located deletions expand every position, then apply snapshot-aware delete
+visibility. This also removes the duplicate-ID summary failure after inline
+updates and flushes. Repeated-order summaries use new disk-cache tags (14 for
+Roaring membership, 15 for sorted membership); old tags remain readable and
+older readers treat the new tags as cache misses. Decoding validates offsets,
+cardinality, and the physical-position permutation.
 
 A recorded `row_id_start` does not by itself imply the range: a flushed file
 carries both a dense start and the reserved column, and that column's ids may
@@ -823,7 +848,8 @@ Left alone, a located join reads every file whose row-id statistics admit the
 key — which, because each update writes a file spanning the ids it preserved,
 is every update the table has taken.
 
-An extension optimizer rule closes that gap. An index read resolves its rows
+An extension optimizer rule first attempts the exact summary-driven scan below.
+When that scan is ineligible, an index read resolves its rows
 while binding, so a join against one is a join against a list of constants
 already visible to the planner; the rule restates that list as an `IN` filter
 on the other side of an inner or semi join. The filter only repeats what the
@@ -834,16 +860,18 @@ resolved as NULL contributes an `IS NULL` disjunct under null-safe equality
 and nothing under plain equality, matching what each comparison would have
 accepted.
 
-Point, IN, range, and NULL-prefix lookup bind data disable DuckDB's statement
-cache. Every execution of a prepared statement binds and optimizes again,
-including statements with literal arguments or unchanged parameter values.
-This refreshes resolved rows, exact cardinalities, empty-result rewrites, and
-derived row/file filters together while retaining pruning within an execution.
+Prepared index plans use the dependency validation described below in
+[Snapshot-validated index plans](#snapshot-validated-index-plans).
 
 Each derived list is bounded, and the bounds differ by what evaluating the
-list costs. The row-id list is checked against every row, so past a few
-hundred distinct ids the lookup is a scan in disguise and the rule declines —
-the dynamic row-id filter still covers that side. The file-id list dedups to
+list costs. Up to 256 distinct row IDs retain the ordinary derived filter.
+From 257 through 4096, the sorted IDs become at most 16 optional pruning
+ranges attached directly to the DuckLake scan. The largest gaps separate
+ranges; smaller gaps are merged, admitting extra candidates that the join
+rejects. This bounds both scan-filter cost and DuckLake's generated metadata
+predicates, without a per-row residual `IN` expression. Dense probes use one
+range. Above 4096 the rule declines row pruning
+and leaves any dynamic row-id filter available. The file-id list dedups to
 the files holding the rows and is checked against each file's constant id,
 not against every row, so it stays worthwhile far wider — its much larger
 bound only keeps a pathological plan bounded. A wide probe over a churned
@@ -866,6 +894,196 @@ probe gets, and only within the bounded list length.
 The current DuckLake catalog view stays authoritative for file lifetime.
 Ended compaction inputs are simply absent, new outputs are cache misses, and
 nothing pairs sources with outputs or hooks catalog changes.
+
+### Snapshot-validated index plans
+
+#### Contract
+
+An index plan is reusable only when its execution observes the same logical
+read state and bound arguments that produced its resolved rows. Unconditional
+rebinding is replaced by validation of those dependencies, not by allowing
+DuckDB to retain unvalidated lookup results.
+
+This preserves the existing exact cardinalities, empty-result elimination,
+and static row/file pruning. Refreshing only the lookup operator's rows is
+insufficient: an optimizer may have removed that operator entirely after an
+empty lookup, or embedded its old file IDs elsewhere in the plan.
+
+#### Core read scope
+
+The core owns an opaque `IndexReadScope`. It pins the store read view and the
+catalog projection used by index-definition reads, probes, file placement,
+inline membership, and delete visibility. DuckLake's file-list and metadata
+reads for the containing statement must observe that same scope. Validation
+and execution retain the scope together; a check followed by an unpinned
+latest-state read is not sufficient.
+
+Its identity contains the attachment incarnation and committed store revision.
+Dirty transactions refuse reuse rather than guessing a local revision. The store revision is the
+revision of the pinned read view, not a sampled latest counter. Writer
+snapshots expose a SlateDB sequence number; reader scopes must expose an
+equivalent stable revision or refuse reuse. A DuckLake snapshot ID alone is
+not sufficient: maintenance can change files or inline state without advancing
+it. A projection-cache epoch alone is also insufficient: cache replacement
+is not a complete index-data mutation clock.
+
+An unchanged logical view may reuse results even if SlateDB has rewritten
+its SSTs: an LSM compaction that preserves key/value visibility does not
+invalidate row results. DuckLake file replacement does invalidate them.
+The initial implementation may conservatively invalidate on every committed
+store revision; table/index-specific dependency clocks require separate proof.
+
+`ReadOnlyCatalog::index_read_scope` returns a scope whose `reads()` surface
+shares one SlateDB transaction and catalog projection. `identity()` compares
+the store incarnation and that transaction's sequence number. Manifest-following
+readers return `None` until an equivalent pinned reader view is available.
+
+The additive `moraine_snapshot_scoped` ABI owns that scope in a transaction
+snapshot. `moraine_snapshot_read_handle` lends a read-only catalog alias until
+the snapshot is freed; callers must never detach it. The alias shares the
+attachment's runtime and caches. `moraine_snapshot_read_revision` exposes the
+pinned sequence solely for pairing with DuckDB's attachment OID, not as a
+DuckLake snapshot ID. Existing unscoped entry points remain available.
+
+An index bind resolves the lake's actual metadata catalog and obtains the
+Moraine transaction through `DuckLakeTransaction::GetConnection`, not through
+the outer client connection. Metadata, inline scans, and probes therefore
+use the same read view. Ordinary metadata reads must not implicitly start a
+DuckLake transaction merely to obtain a catalog version.
+
+#### Scoped probe memo
+
+The core memoizes successful probe results within an attachment, keyed by the
+pinned sequence, table and index IDs, and canonical probe arguments. Equality
+keys are deduplicated canonical encodings; range bounds preserve inclusivity,
+and range/NULL probes include direction. Modes cannot alias. Definitions are
+validated against the pinned catalog before consulting the memo. Errors and
+unscoped reads are not cached; empty successful results are.
+
+The memo admits at most 8 MiB of accounted entries and 4096 entries, evicting
+least-recently-used entries. Keys, row IDs and entry headers are accounted;
+container slack is additionally reported through `projection_bytes` in the
+memory tally. Oversized results are returned without admission. Entries retain
+neither transactions nor files; old revisions remain reusable only by a scope
+that actually pins that revision. Location resolution still runs against that
+scope, using the existing row-summary directory.
+
+#### Prepared-statement lifecycle
+
+1. Binding registers the pinned revision and metadata attachment OID in the
+   statement's `read_databases`, plus the lake dependency. These survive empty
+   result elimination and other operator rewrites.
+2. DuckDB's catalog-version checks invalidate the whole plan on a changed
+   attachment or revision. `OnExecutePrepared` and `OnRebindPreparedStatement`
+   additionally validate the actual DuckLake metadata-connection scope. An
+   outer metadata transaction's version alone cannot establish equivalence.
+3. The initial whole-plan fast path accepts direct literal index invocations,
+   including literal lists, built-in range/row constructors and primitive
+   Boolean/integer casts. Parameters, session-dependent expressions, hidden
+   invocations in views/macros, and unsupported statement shapes conservatively
+   rebind. Canonical arguments in the core memo then allow identical evaluated
+   parameter values to reuse a probe without trusting SQL text.
+4. A mismatch rebinds and optimizes the whole statement under its pinned scope.
+   DuckDB's other rebind requirements remain authoritative. In particular, its
+   ordinary multi-file scan still requires rebind: indexed joins reuse the core
+   probe memo while rebuilding their scan and pruning plan.
+5. Prepared plans own their immutable row vectors, with an 8 MiB admission
+   limit per index invocation. Copies and destruction follow DuckDB ownership;
+   they never own a read transaction. Transaction completion, rollback and
+   cancellation release execution scopes. Connection state retains only
+   attachment names/identities, pruning detached associations on the next bind.
+
+Evicting a core memo entry requires a fresh probe on a later rebind; it does not
+invalidate an independently owned, revision-validated prepared plan. SQL
+`EXECUTE` does not install a rebound physical plan back into DuckDB's original
+named prepared statement, so it can continue rebinding after a revision change;
+the memo still prevents repeat probes for unchanged revised inputs.
+
+The fast path is especially important for `PREPARE` immediately followed by
+`EXECUTE`: if arguments and the pinned read state are unchanged, the second
+operation must not repeat the index probe. A write between executions requires
+refresh; a long-lived prepared statement does not pin query results forever.
+
+#### Filters and joins
+
+Pruning filters can admit extra rows. Independent row-ID and file-ID lists
+also lose the pairing relation, and filters derived through projections or
+filters above an index read can be supersets of that child's actual output.
+The general optimizer rule therefore retains the original join, including
+its extra conditions, output columns, null semantics, and multiplicity.
+
+Join elimination is a separate exact rewrite: only after proving pair
+membership, uniqueness, all predicates, and output equivalence may a located
+read replace the join. Summary-driven scans do not require join elimination.
+
+#### Exact summary-driven scans
+
+For an inner or semi join whose two location conditions identify `rowid` and
+`data_file_id` on the same current-snapshot DuckLake table as the index read,
+the optimizer replaces the scan with `moraine_summary_scan`. It retains the
+join, including predicates, output columns, and multiplicity. Projections and
+filters above either child may narrow the bound candidate pairs; the scan
+reads their deduplicated superset, and the unchanged join decides membership.
+
+The bind data holds pairs and table identity, never decoded rows. At execution,
+the scan uses DuckLake's metadata connection and its pinned Moraine read scope.
+It verifies the snapshot, resolves exact ordinals through retained summaries,
+and removes positions deleted at that snapshot. `ReadOnlyCatalog::scan_rows_at`
+accepts located pairs and ordered top-level column names, returning a
+`LocatedRowScan` cursor. `next_batch` returns one self-describing Arrow IPC
+batch with those columns followed by row and file IDs. Parquet reads select
+only the requested columns and physical positions, using page indexes when
+available. Files open on demand; decoded result batches are not accumulated
+across files. Inline chunks are decoded one at a time. Dropping the cursor
+releases pending reads and its execution-owned scope.
+`files_read` counts opened data files for query profiles. A verified summary
+may disprove a conservative candidate; the selective reader omits that pair,
+while strict located-position APIs continue to reject absent pairs. The cursor
+refuses partially visible historical files; ordinary time-travel queries retain
+DuckLake's per-row insertion-snapshot filtering.
+
+Pushed scan predicates are evaluated on the projected batches before filter-only
+columns are removed. The join remains even when both location keys match
+exactly. The selective scan has no 4096-row derived-filter cap: it carries exact
+pairs, not a large SQL `IN` expression.
+When candidates exceed both 4096 pairs and one quarter of the table's known
+row count, the optimizer keeps the ordinary scan to avoid selective-reader
+overhead on broad probes. This is a cost choice, not a correctness bound.
+
+The rewrite declines time travel, change scans, sampling, transaction-local
+changes, unsupported virtual columns, nested column projections, and types
+not supported by the core's logical schema projection. Supported scalar types
+are booleans, integers through 64 bits, floating point, strings, dates, and
+timestamps. Other shapes retain DuckLake's scan and the existing derived
+filters. A failed exact summary remains an error, never a fabricated position.
+The new scan retains the multi-file scan's statement-cache restriction; core
+probe memoization still avoids repeated index resolution when rebinding.
+
+#### Equality read-ahead
+
+Non-unique equality probes use a separate 1 MiB read-ahead with two fetch tasks
+per SST iterator, admitting fetched blocks. Prefix bounds still prevent reads
+past the key's range. Bulk and range scans retain their throughput settings;
+single-entry seeks retain one-block reads. The equality window bounds buffering
+without the one-GET-per-block penalty for high-fanout keys. It does not promise
+fewer GETs for small prefixes that already occupy a single block.
+
+#### Validation and integration order
+
+First add core pinned scopes and prove coherent metadata/index reads against
+concurrent commits and same-snapshot-ID maintenance. Then connect DuckLake
+statement metadata/file-list reads to those scopes. Finally enable validated
+plan reuse through the callbacks and remove unconditional rebinding for the
+covered functions. Until those prerequisites pass, the existing rebind guard
+remains the correctness fallback; changing its boolean alone is prohibited.
+
+Required tests cover unchanged literal and parameter executions (one probe),
+changed parameters, insert/update/delete, absent-to-present and present-to-absent
+results, index drop/recreate, inline flush, file rewrite, same-ID maintenance,
+explicit transactions and rollback, reader polling, attach replacement,
+cancellation, and prepared-statement destruction. A deterministic concurrent
+commit between validation and execution must not mix scopes. Benchmarks report
+probe counts, validation time, prepare time, execution time, and retained bytes.
 
 ### File-located deletion
 

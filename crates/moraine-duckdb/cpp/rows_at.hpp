@@ -51,4 +51,7 @@ void TableColumns(MoraineSnapshotHandle *snapshot, const std::string &schema_nam
 
 void RegisterMoraineRowsAtFunction(duckdb::ExtensionLoader &loader);
 
+std::vector<duckdb::unique_ptr<duckdb::DataChunk>> DecodeLocatedBatch(duckdb::ClientContext &context,
+                                                                    const std::vector<uint8_t> &ipc);
+
 } // namespace moraine_duckdb

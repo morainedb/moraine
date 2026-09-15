@@ -11,7 +11,10 @@ use arrow::{
     ipc::writer::StreamWriter,
 };
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{
+    StreamExt, TryStreamExt,
+    stream::{self, BoxStream},
+};
 use parquet::arrow::{
     arrow_reader::ArrowReaderOptions, async_reader::ParquetRecordBatchStreamBuilder,
 };
@@ -45,8 +48,21 @@ pub(crate) async fn scoped_read_row_batches(
     rows: ScopedRows<'_>,
     row_id_source: RowIdSource,
 ) -> Result<Vec<RecordBatch>> {
+    scoped_read_row_stream(file, requested, rows, row_id_source)
+        .await?
+        .try_collect()
+        .await
+}
+
+/// Opens a projected, position-selected reader without buffering its result.
+pub(crate) async fn scoped_read_row_stream(
+    file: ParquetFile,
+    requested: &[usize],
+    rows: ScopedRows<'_>,
+    row_id_source: RowIdSource,
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(stream::empty().boxed());
     }
 
     let reader = ObjectStoreReader::new(&file, rows.page_index_policy());
@@ -68,43 +84,45 @@ pub(crate) async fn scoped_read_row_batches(
             .with_projection(mask)
             .with_batch_size(BUILD_READ_BATCH_ROWS),
     );
-    let mut stream = builder.build().map_err(corrupt("located read"))?;
+    let stream = builder.build().map_err(corrupt("located read"))?;
 
-    let mut batches = Vec::new();
     let mut emitted = 0usize;
-    while let Some(batch) = stream.try_next().await.map_err(corrupt("located read"))? {
-        let batch = normalize_batch(batch, normalization.as_ref())?;
-        let row_ids: ArrayRef = if let Some(position) = row_id_output {
-            let column = batch.columns().get(position).ok_or_else(|| {
-                Error::Corruption("located read: row-id column is out of bounds".to_owned())
-            })?;
-            cast(column.as_ref(), &DataType::UInt64).map_err(corrupt("located read"))?
-        } else {
-            let ids = (0..batch.num_rows())
-                .map(|row| {
-                    ordinals
-                        .borrowed()
-                        .at(emitted.saturating_add(row))
-                        .map(|ordinal| row_id_start.saturating_add(ordinal))
-                })
-                .collect::<Result<Vec<u64>>>()?;
-            Arc::new(UInt64Array::from(ids))
-        };
-        emitted = emitted.saturating_add(batch.num_rows());
+    Ok(stream
+        .map(move |batch| {
+            let batch = batch.map_err(corrupt("located read"))?;
+            let batch = normalize_batch(batch, normalization.as_ref())?;
+            let row_ids: ArrayRef = if let Some(position) = row_id_output {
+                let column = batch.columns().get(position).ok_or_else(|| {
+                    Error::Corruption("located read: row-id column is out of bounds".to_owned())
+                })?;
+                cast(column.as_ref(), &DataType::UInt64).map_err(corrupt("located read"))?
+            } else {
+                let ids = (0..batch.num_rows())
+                    .map(|row| {
+                        ordinals
+                            .borrowed()
+                            .at(emitted.saturating_add(row))
+                            .map(|ordinal| row_id_start.saturating_add(ordinal))
+                    })
+                    .collect::<Result<Vec<u64>>>()?;
+                Arc::new(UInt64Array::from(ids))
+            };
+            emitted = emitted.saturating_add(batch.num_rows());
 
-        let mut arrays = output
-            .iter()
-            .map(|&position| {
-                batch.columns().get(position).cloned().ok_or_else(|| {
-                    Error::Corruption("located read: projected column is out of bounds".to_owned())
+            let mut arrays = output
+                .iter()
+                .map(|&position| {
+                    batch.columns().get(position).cloned().ok_or_else(|| {
+                        Error::Corruption(
+                            "located read: projected column is out of bounds".to_owned(),
+                        )
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        arrays.push(row_ids);
-        batches.push(unnamed_batch(arrays, batch.num_rows())?);
-    }
-
-    Ok(batches)
+                .collect::<Result<Vec<_>>>()?;
+            arrays.push(row_ids);
+            unnamed_batch(arrays, batch.num_rows())
+        })
+        .boxed())
 }
 
 /// The rows at `offsets` of one inline chunk, projected onto the logical

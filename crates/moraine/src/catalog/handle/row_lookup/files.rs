@@ -3,14 +3,17 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use imbl::{OrdMap, ordmap::DiffItem};
 use prost::Message as _;
-use tracing::warn;
+use tracing::{debug, warn};
 
-use super::FileDirectory;
+use super::{FileDirectory, Intervals};
 use crate::{
     catalog::{
         CatalogSnapshot, DataFileId, DataFileInfo, ReadOnlyCatalog, TableId,
@@ -22,6 +25,21 @@ use crate::{
 };
 
 type Placements = HashMap<u64, Vec<DataFileId>>;
+
+/// Lookups a failed summary waits before it is read again, doubling with
+/// each retry that fails.
+const FIRST_RETRY_SKIP: u32 = 16;
+
+/// The longest that wait grows to.
+const MAX_RETRY_SKIP: u32 = 4096;
+
+/// The lookups to wait after `retries` consecutive failures.
+fn skip_for(retries: u32) -> u32 {
+    FIRST_RETRY_SKIP
+        .checked_shl(retries)
+        .unwrap_or(MAX_RETRY_SKIP)
+        .min(MAX_RETRY_SKIP)
+}
 
 /// Non-overlapping row ranges keyed by first row, `start -> (last, file)`,
 /// with each file's start for removal. A range that would overlap a live
@@ -78,17 +96,49 @@ struct DirectoryScope<'a> {
 }
 
 impl FileDirectory {
+    fn estimated_bytes(&self) -> u64 {
+        let summary_bytes = self.summaries.values().fold(0_u64, |bytes, summary| {
+            bytes
+                .saturating_add(summary.estimated_bytes())
+                .saturating_add(16)
+        });
+        self.ranges
+            .estimated_bytes()
+            .saturating_add(self.spans.estimated_bytes())
+            .saturating_add(summary_bytes)
+            .saturating_add(self.spanned.len() as u64 * 16)
+            .saturating_add(
+                u64::try_from(self.failed.capacity().saturating_mul(8)).unwrap_or(u64::MAX),
+            )
+            .saturating_add(self.file_bytes)
+    }
+
+    fn retained_summary(
+        &self,
+        scope: &DirectoryScope<'_>,
+        file: &DataFileInfo,
+    ) -> Option<FileSummary> {
+        if !self.built_under(scope) || data_file_info(self.files.get(&file.id.get())?) != *file {
+            return None;
+        }
+        let mut summary = self.summaries.get(&file.id.get())?.clone();
+        summary.built = false;
+        Some(summary)
+    }
+
     fn empty(scope: &DirectoryScope<'_>) -> Self {
         Self {
             identity: scope.store.cache_identity(),
             data_prefix: scope.data_prefix.into(),
             table_prefix: scope.table_prefix.into(),
             files: OrdMap::new(),
+            summaries: OrdMap::new(),
             ranges: DenseRanges::default(),
             spanned: OrdMap::new(),
-            spans: DenseRanges::default(),
-            probed: OrdMap::new(),
+            spans: Arc::new(Intervals::new([])),
             failed: Vec::new(),
+            failed_retries: 0,
+            retry_skip: AtomicU32::new(0),
             file_bytes: 0,
             bytes: 0,
         }
@@ -100,30 +150,38 @@ impl FileDirectory {
             && self.table_prefix == scope.table_prefix
     }
 
-    /// Whether this directory already describes `files` with nothing left
-    /// to retry.
+    /// Whether this directory already describes `files` with no summary
+    /// read due.
     fn describes(&self, files: &OrdMap<u64, DataFileValue>) -> bool {
-        self.files.ptr_eq(files) && self.failed.is_empty()
+        self.files.ptr_eq(files) && !self.retry_due()
     }
 
-    /// Keeps `summary` for `file`: behind its span when no kept span
-    /// overlaps it, otherwise probed on every lookup.
+    /// Whether the files that failed to summarize have waited out their
+    /// skip and are to be read again.
+    fn retry_due(&self) -> bool {
+        !self.failed.is_empty() && self.retry_skip.load(Ordering::Relaxed) == 0
+    }
+
+    /// Counts one lookup against the wait before the next retry.
+    fn note_lookup(&self) {
+        let _ = self
+            .retry_skip
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |skip| {
+                skip.checked_sub(1)
+            });
+    }
+
+    /// Keeps nonempty summaries for the span index built on refresh.
     fn admit_summary(&mut self, file: u64, summary: FileSummary) {
-        let spanned = summary
-            .bounds()
-            .is_some_and(|(first, last)| self.spans.insert(first, last, file));
-        if spanned {
+        if summary.bounds().is_some() {
             self.spanned.insert(file, summary);
-        } else {
-            self.probed.insert(file, summary);
         }
     }
 
     fn forget(&mut self, file: u64) {
+        self.summaries.remove(&file);
         self.ranges.remove(file);
-        self.spans.remove(file);
         self.spanned.remove(&file);
-        self.probed.remove(&file);
     }
 
     /// The files that hold, or may hold, each of `row_ids`, and how many
@@ -138,7 +196,7 @@ impl FileDirectory {
                     .or_default()
                     .push(DataFileId::new(file));
             }
-            if let Some(file) = self.spans.file_holding(row) {
+            self.spans.visit(row, |&file| {
                 probes += 1;
                 if self
                     .spanned
@@ -150,17 +208,7 @@ impl FileDirectory {
                         .or_default()
                         .push(DataFileId::new(file));
                 }
-            }
-        }
-
-        for (file, summary) in &self.probed {
-            probes += row_ids.len();
-            for row in summary.matching(row_ids) {
-                placements
-                    .entry(row)
-                    .or_default()
-                    .push(DataFileId::new(*file));
-            }
+            });
         }
 
         for file in &self.failed {
@@ -185,9 +233,9 @@ struct FileChanges {
 }
 
 impl FileDirectory {
-    /// The changes from this directory's file map to `files`, with every
-    /// failed file still present selected again.
-    fn changes_to(&self, files: &OrdMap<u64, DataFileValue>) -> FileChanges {
+    /// The changes from this directory's file map to `files`. When
+    /// `retry_failed`, every failed file still present is selected again.
+    fn changes_to(&self, files: &OrdMap<u64, DataFileValue>, retry_failed: bool) -> FileChanges {
         let mut changes = FileChanges {
             selected: BTreeMap::new(),
             removed: HashSet::new(),
@@ -217,14 +265,16 @@ impl FileDirectory {
             }
         }
 
-        for id in &self.failed {
-            if !changes.removed.contains(id)
-                && let Some(value) = files.get(id)
-            {
-                changes
-                    .selected
-                    .entry(*id)
-                    .or_insert_with(|| data_file_info(value));
+        if retry_failed {
+            for id in &self.failed {
+                if !changes.removed.contains(id)
+                    && let Some(value) = files.get(id)
+                {
+                    changes
+                        .selected
+                        .entry(*id)
+                        .or_insert_with(|| data_file_info(value));
+                }
             }
         }
 
@@ -237,6 +287,23 @@ fn encoded_bytes(value: &DataFileValue) -> u64 {
 }
 
 impl ReadOnlyCatalog {
+    pub(in crate::catalog::handle) fn retained_file_summary(
+        &self,
+        store: &DataStore,
+        data_prefix: &str,
+        table_prefix: &str,
+        table: TableId,
+        file: &DataFileInfo,
+    ) -> Option<FileSummary> {
+        let scope = DirectoryScope {
+            store,
+            data_prefix,
+            table_prefix,
+            table,
+        };
+        super::lookup(&self.row_lookups.files, table)?.retained_summary(&scope, file)
+    }
+
     pub(in crate::catalog::handle) async fn locate_files(
         &self,
         store: &DataStore,
@@ -258,6 +325,9 @@ impl ReadOnlyCatalog {
 
         let held = super::lookup(&self.row_lookups.files, table)
             .filter(|directory| directory.built_under(&scope));
+        if let Some(directory) = &held {
+            directory.note_lookup();
+        }
         let directory = match held {
             Some(directory) if directory.describes(files) => directory,
             held => {
@@ -281,22 +351,34 @@ impl ReadOnlyCatalog {
         previous: &FileDirectory,
         files: &OrdMap<u64, DataFileValue>,
     ) -> FileDirectory {
+        let retry_failed = previous.retry_due();
         let FileChanges {
             selected,
             removed,
             file_bytes,
-        } = previous.changes_to(files);
+        } = previous.changes_to(files, retry_failed);
 
         let mut directory = FileDirectory {
             identity: scope.store.cache_identity(),
             data_prefix: scope.data_prefix.into(),
             table_prefix: scope.table_prefix.into(),
             files: files.clone(),
+            summaries: previous.summaries.clone(),
             ranges: previous.ranges.clone(),
             spanned: previous.spanned.clone(),
             spans: previous.spans.clone(),
-            probed: previous.probed.clone(),
-            failed: Vec::new(),
+            failed: if retry_failed {
+                Vec::new()
+            } else {
+                previous
+                    .failed
+                    .iter()
+                    .copied()
+                    .filter(|file| !removed.contains(file) && files.contains_key(file))
+                    .collect()
+            },
+            failed_retries: previous.failed_retries,
+            retry_skip: AtomicU32::new(previous.retry_skip.load(Ordering::Relaxed)),
             file_bytes,
             bytes: 0,
         };
@@ -305,6 +387,14 @@ impl ReadOnlyCatalog {
         }
 
         self.row_lookups.note_summarized(selected.len());
+        if !selected.is_empty() {
+            debug!(
+                table_id = scope.table.get(),
+                files = selected.len(),
+                retrying_failed = retry_failed,
+                "reading data file row summaries"
+            );
+        }
         let summaries = self
             .file_summaries(
                 scope.store,
@@ -315,6 +405,9 @@ impl ReadOnlyCatalog {
             )
             .await;
         for (file, summary) in summaries {
+            if let Ok(summary) = &summary {
+                directory.summaries.insert(file.get(), summary.clone());
+            }
             match summary {
                 Ok(summary) => match summary.dense_range() {
                     Some(range) => {
@@ -335,23 +428,26 @@ impl ReadOnlyCatalog {
                 }
             }
         }
+        if !directory.spanned.ptr_eq(&previous.spanned) {
+            directory.spans = Arc::new(Intervals::new(directory.spanned.iter().filter_map(
+                |(&file, summary)| summary.bounds().map(|(first, last)| (first, last, file)),
+            )));
+        }
         directory.failed.sort_unstable();
+        directory.failed.dedup();
+        if directory.failed.is_empty() {
+            directory.failed_retries = 0;
+            directory.retry_skip.store(0, Ordering::Relaxed);
+        } else if retry_failed || previous.failed.is_empty() {
+            if retry_failed {
+                directory.failed_retries = previous.failed_retries.saturating_add(1);
+            }
+            directory
+                .retry_skip
+                .store(skip_for(directory.failed_retries), Ordering::Relaxed);
+        }
 
-        let summary_bytes = directory
-            .spanned
-            .values()
-            .chain(directory.probed.values())
-            .map(|summary| summary.estimated_bytes().saturating_add(16))
-            .sum::<u64>();
-        directory.bytes = directory
-            .ranges
-            .estimated_bytes()
-            .saturating_add(directory.spans.estimated_bytes())
-            .saturating_add(summary_bytes)
-            .saturating_add(
-                u64::try_from(directory.failed.capacity().saturating_mul(8)).unwrap_or(u64::MAX),
-            )
-            .saturating_add(file_bytes);
+        directory.bytes = directory.estimated_bytes();
 
         directory
     }

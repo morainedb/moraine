@@ -27,12 +27,16 @@ use tracing::{info, warn};
 
 use crate::data_file;
 
+mod allocation;
+
 /// Memory the cache takes when no budget is configured: SlateDB's
 /// single-store default (512 MiB of blocks, 128 MiB of metadata).
 const DEFAULT_CACHE_MEMORY: u64 = 640 * 1024 * 1024;
 
 /// The most of the cache SST metadata may hold under eviction protection.
 const METADATA_PRIORITY_POOL_RATIO: f64 = 0.9;
+
+const CACHE_SHARDS: usize = 8;
 
 /// At most this much of the budget is reserved for parsed metadata outside
 /// SlateDB.
@@ -232,7 +236,8 @@ pub struct CacheStatus {
 pub struct MemoryTally {
     /// SlateDB's current WAL-plus-memtable bytes for this catalog.
     pub slatedb_unflushed_bytes: u64,
-    /// Estimated bytes in this handle's decoded catalog projections.
+    /// Estimated bytes in decoded catalog state, row directories, and scoped
+    /// probes.
     pub projection_bytes: u64,
     /// Process-wide decoded SlateDB metadata cache occupancy.
     pub cache_metadata_bytes: u64,
@@ -778,7 +783,7 @@ impl Tier {
         }
     }
 
-    fn resize(&self, capacity: u64) {
+    fn resize(&self, capacity: u64) -> bool {
         let capacity = usize::try_from(capacity).unwrap_or(usize::MAX);
         let resized = match self {
             Self::Memory(cache) => cache.resize(capacity),
@@ -786,7 +791,9 @@ impl Tier {
         };
         if let Err(error) = resized {
             warn!(capacity, %error, "could not resize a store's block cache");
+            return false;
         }
+        true
     }
 }
 
@@ -796,11 +803,13 @@ impl Tier {
 struct StoreCache {
     tier: Tier,
     attached: AtomicU64,
+    capacity: AtomicU64,
+    pressure: AtomicU64,
+    budget: Option<u64>,
 }
 
 /// Every store's cache, by store, with the sizing in force. The first
-/// attach settles the sizing; every attach and detach re-splits the block
-/// budget evenly across the stores currently attached.
+/// attach settles the sizing; admissions borrow unused capacity under it.
 struct Caches {
     config: Option<CacheConfig>,
     stores: HashMap<StoreLocation, Arc<StoreCache>>,
@@ -843,10 +852,6 @@ impl StoreLocation {
 pub(crate) fn stable_name(location: &str) -> uuid::Uuid {
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, location.as_bytes())
 }
-
-/// Memory a store keeps while nothing is attached to it: enough to stay
-/// open, with its blocks on disk if it has any.
-const IDLE_STORE_MEMORY: u64 = 1024 * 1024;
 
 /// Current process-wide cache sizing and occupancy, summed over every
 /// store's cache. The metadata figure is the ceiling past which metadata
@@ -920,31 +925,7 @@ impl CatalogCache {
 impl Drop for CatalogCache {
     fn drop(&mut self) {
         self.store.attached.fetch_sub(1, Ordering::AcqRel);
-        rebalance(&caches());
-    }
-}
-
-/// Splits the block budget evenly across attached stores; an idle store
-/// keeps [`IDLE_STORE_MEMORY`].
-fn rebalance(caches: &Caches) {
-    let Some(config) = caches.config.as_ref() else {
-        return;
-    };
-    let (_, shared_bytes) = config.slots();
-    let attached = caches
-        .stores
-        .values()
-        .filter(|store| store.attached.load(Ordering::Acquire) > 0)
-        .count();
-    let share = shared_bytes / u64::try_from(attached.max(1)).unwrap_or(u64::MAX);
-
-    for store in caches.stores.values() {
-        let capacity = if store.attached.load(Ordering::Acquire) > 0 {
-            share
-        } else {
-            IDLE_STORE_MEMORY.min(share)
-        };
-        store.tier.resize(capacity);
+        self.store.release();
     }
 }
 
@@ -963,6 +944,17 @@ impl CatalogCache {
         loader: CacheLoader,
         metadata: bool,
     ) -> Result<CachedEntry, slatedb::Error> {
+        if let Tier::Hybrid(cache) = self.tier()
+            && !cache.memory().contains(&key)
+        {
+            self.store.reserve(4096);
+        }
+        let store = Arc::clone(&self.store);
+        let loader = move || async move {
+            let entry = loader().await?;
+            store.reserve(as_bytes(entry.size()));
+            Ok::<_, slatedb::Error>(entry)
+        };
         let hint = if metadata { Hint::Normal } else { Hint::Low };
         let entry = match self.tier() {
             Tier::Memory(cache) => {
@@ -1002,11 +994,16 @@ impl CatalogCache {
     async fn read(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
         match self.tier() {
             Tier::Memory(cache) => Ok(cache.get(key).map(|entry| entry.value().clone())),
-            Tier::Hybrid(cache) => cache
-                .get(key)
-                .await
-                .map(|entry| entry.map(|entry| entry.value().clone()))
-                .map_err(fill_failed),
+            Tier::Hybrid(cache) => {
+                if !cache.memory().contains(key) {
+                    self.store.reserve(4096);
+                }
+                cache
+                    .get(key)
+                    .await
+                    .map(|entry| entry.map(|entry| entry.value().clone()))
+                    .map_err(fill_failed)
+            }
         }
     }
 }
@@ -1033,6 +1030,7 @@ impl DbCache for CatalogCache {
     /// is treated as a block; metadata is protected again on its next
     /// `fetch_*` read.
     async fn insert(&self, key: CachedKey, value: CachedEntry) {
+        self.store.reserve(as_bytes(value.size()));
         match self.tier() {
             Tier::Memory(cache) => {
                 cache.insert_with_properties(
@@ -1107,6 +1105,7 @@ pub(crate) fn eviction_config() -> LruConfig {
 
 fn memory_cache(capacity: u64) -> MemoryCache {
     foyer::CacheBuilder::new(usize::try_from(capacity).unwrap_or(usize::MAX))
+        .with_shards(CACHE_SHARDS)
         .with_eviction_config(eviction_config())
         .with_weighter(|_: &CachedKey, value: &CachedEntry| value.size())
         .with_event_listener(Arc::new(EvictionCounter))
@@ -1131,7 +1130,6 @@ pub(crate) async fn shared(
     };
 
     store.attached.fetch_add(1, Ordering::AcqRel);
-    rebalance(&caches());
 
     Some(Arc::new(CatalogCache { store }) as Arc<dyn DbCache>)
 }
@@ -1163,15 +1161,18 @@ async fn settled_config(config: &CacheConfig) -> CacheConfig {
 /// process, on disk under its own directory when one is configured.
 async fn open_store_cache(settled: &CacheConfig, location: StoreLocation) -> Arc<StoreCache> {
     let (_, shared_bytes) = settled.slots();
+    let initial = as_bytes(CACHE_SHARDS);
     let hybrid = match settled.dir.as_ref() {
         Some(dir) => {
             let dir = dir.join(location.directory()).join("blocks");
             let disk = settled.disk_size.unwrap_or(DEFAULT_CACHE_DISK);
-            hybrid(&dir, shared_bytes, disk).await
+            hybrid(&dir, initial, disk).await
         }
         None => None,
     };
-    let tier = hybrid.map_or_else(|| Tier::Memory(memory_cache(shared_bytes)), Tier::Hybrid);
+    let tier = hybrid.map_or_else(|| Tier::Memory(memory_cache(initial)), Tier::Hybrid);
+    // Construction needs a byte per shard; an empty store reserves no memory.
+    let capacity = if tier.resize(0) { 0 } else { initial };
     info!(
         identity = ?location.identity,
         path = %location.path,
@@ -1182,6 +1183,9 @@ async fn open_store_cache(settled: &CacheConfig, location: StoreLocation) -> Arc
     let store = Arc::new(StoreCache {
         tier,
         attached: AtomicU64::new(0),
+        capacity: AtomicU64::new(capacity),
+        pressure: AtomicU64::new(0),
+        budget: Some(shared_bytes),
     });
     caches().stores.insert(location, Arc::clone(&store));
     store
@@ -1288,11 +1292,49 @@ async fn hybrid(dir: &Path, memory: u64, disk: u64) -> Option<HybridCache> {
         .with_event_listener(Arc::new(EvictionCounter))
         .with_policy(HybridCachePolicy::WriteOnInsertion)
         .memory(usize::try_from(memory).unwrap_or(usize::MAX))
+        .with_shards(CACHE_SHARDS)
         .with_eviction_config(eviction_config())
         .with_weighter(|_: &CachedKey, value: &CachedEntry| value.size());
 
     disk_tier(memory, dir, disk).await
 }
+
+#[cfg(test)]
+pub(crate) struct TestCache {
+    pub(crate) handle: Arc<dyn DbCache>,
+    tier: Tier,
+}
+
+#[cfg(test)]
+impl TestCache {
+    pub(crate) async fn new(memory: u64, disk: Option<&Path>) -> Self {
+        let tier = match disk {
+            Some(path) => Tier::Hybrid(hybrid(path, memory, 64 * 1024 * 1024).await.unwrap()),
+            None => Tier::Memory(memory_cache(memory)),
+        };
+        let handle = Arc::new(CatalogCache {
+            store: Arc::new(StoreCache {
+                tier: tier.clone(),
+                attached: AtomicU64::new(1),
+                capacity: AtomicU64::new(memory),
+                pressure: AtomicU64::new(0),
+                budget: None,
+            }),
+        });
+        Self { handle, tier }
+    }
+
+    pub(crate) fn resize(&self, bytes: u64) {
+        self.tier.resize(bytes);
+    }
+
+    pub(crate) fn usage(&self) -> usize {
+        self.tier.usage()
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests;
 
 #[cfg(test)]
 mod tests {

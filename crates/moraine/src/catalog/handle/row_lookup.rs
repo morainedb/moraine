@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -173,15 +173,20 @@ struct FileDirectory {
     data_prefix: String,
     table_prefix: String,
     files: OrdMap<u64, DataFileValue>,
+    /// Exact position maps, including dense files with permuted row order.
+    summaries: OrdMap<u64, FileSummary>,
     ranges: files::DenseRanges,
-    /// Summaries of files holding arbitrary ids, kept across lookups: those
-    /// reached through `spans`, the span of each one's ids, and those probed
-    /// on every lookup because their span overlaps another's.
+    /// Summaries reached through their possibly overlapping row-id spans.
     spanned: OrdMap<u64, FileSummary>,
-    spans: files::DenseRanges,
-    probed: OrdMap<u64, FileSummary>,
-    /// Files that could not be summarized; every lookup retries them.
+    spans: Arc<Intervals<u64>>,
+    /// Files that could not be summarized. Every lookup places every
+    /// requested row against them, and they are read again only once
+    /// `retry_skip` lookups have passed.
     failed: Vec<u64>,
+    /// Consecutive retries of `failed` that failed again.
+    failed_retries: u32,
+    /// Lookups still to serve before `failed` is read again.
+    retry_skip: AtomicU32,
     /// Encoded size of `files`, carried across refreshes.
     file_bytes: u64,
     bytes: u64,

@@ -73,8 +73,24 @@ fn non_ascending_input_permutes_the_ascending_representation() {
 }
 
 #[test]
-fn non_ascending_duplicate_ids_are_refused() {
-    assert!(PositionedRowSet::from_file_order(vec![30, 10, 30]).is_err());
+fn repeated_ids_retain_every_physical_position() {
+    let rows = PositionedRowSet::from_file_order(vec![30, 10, 30]).unwrap();
+    let mut positions = Vec::new();
+    assert!(rows.visit_positions(30, |position| positions.push(position)));
+    assert_eq!(positions, vec![0, 2]);
+    assert!(!rows.visit_positions(999, |_| unreachable!()));
+}
+
+proptest::proptest! {
+    #[test]
+    fn repeated_positions_match_exhaustive_file_order(ids in proptest::collection::vec(0_u64..128, 0..512), requested in 0_u64..256) {
+        let rows = PositionedRowSet::from_file_order(ids.clone()).unwrap();
+        let mut actual = Vec::new();
+        let found = rows.visit_positions(requested, |position| actual.push(position));
+        let expected: Vec<_> = ids.iter().enumerate().filter(|(_, id)| **id == requested).map(|(position, _)| u64::try_from(position).unwrap()).collect();
+        proptest::prop_assert_eq!(found, !expected.is_empty());
+        proptest::prop_assert_eq!(actual, expected);
+    }
 }
 
 #[test]

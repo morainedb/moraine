@@ -89,6 +89,9 @@ typedef struct MoraineCatalogHandle MoraineCatalogHandle;
 // [`moraine_inline_scan_next`] until [`moraine_inline_scan_close`].
 typedef struct MoraineInlineScanCursor MoraineInlineScanCursor;
 
+// An execution-owned cursor, including its pinned read surface and runtime.
+typedef struct MoraineRowScan MoraineRowScan;
+
 // A materialized snapshot view, held across the FFI boundary so
 // listing calls need no further store I/O.
 //
@@ -1229,9 +1232,9 @@ void moraine_error_free(char *message);
 // [`codes::INVALID_ARGUMENT`]; the ABI has no default, the caller always
 // names a level (the extension's `ATTACH` passes `1` unless told
 // otherwise). A non-zero level also warms every table's probe ranges in
-// the background after the open. `cache_puts` admits SST
-// metadata (including compaction output) into the cache as it is written;
-// `false` leaves the cache filled by reads alone.
+// the background after the open. `cache_puts` admits flushed SST metadata
+// and data blocks on write; `cache_compaction_puts` independently admits
+// compaction outputs. Both are explicit at this ABI boundary.
 //
 // `checkpoint` pins a read-only attach to an existing SlateDB checkpoint
 // (see [`super::moraine_create_checkpoint`]); the open writes nothing and
@@ -1258,11 +1261,39 @@ void moraine_error_free(char *message);
 // valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 // `checkpoint`, if non-null, must be valid NUL-terminated C strings.
 // `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
-// `flush_on_commit`, and `host_threads` are unconstrained.
-// `probe`, if non-null, must be safe to call with `probe_ctx` from any
-// thread. `out` must be a valid, writable `*mut *mut
+// `cache_compaction_puts`, `flush_on_commit`, and `host_threads` are
+// unconstrained. `probe`, if non-null, must be safe to call with `probe_ctx`
+// from any thread. `out` must be a valid, writable `*mut *mut
 // MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
 // [`MoraineError`]. All for the duration of this call.
+int32_t moraine_attach_with_cache_policy(const char *path,
+                                         const struct MoraineS3Config *s3,
+                                         bool read_only,
+                                         bool encrypted,
+                                         uint64_t flush_interval_ms,
+                                         bool flush_on_commit,
+                                         const char *cache_dir,
+                                         uint64_t cache_size_bytes,
+                                         uint64_t cache_memory_bytes,
+                                         uint8_t cache_preload,
+                                         bool cache_puts,
+                                         bool cache_compaction_puts,
+                                         const char *data_path,
+                                         const char *checkpoint,
+                                         uint64_t host_threads,
+                                         MoraineInterruptProbe probe,
+                                         void *probe_ctx,
+                                         struct MoraineCatalogHandle **out,
+                                         struct MoraineError *err);
+
+// Opens a catalog with one legacy flag controlling both flush and compaction
+// admission. New callers use [`moraine_attach_with_cache_policy`] for
+// independent policies.
+//
+// # Safety
+//
+// All pointer and callback requirements are identical to
+// [`moraine_attach_with_cache_policy`].
 int32_t moraine_attach(const char *path,
                        const struct MoraineS3Config *s3,
                        bool read_only,
@@ -1944,6 +1975,81 @@ int32_t moraine_head_stamp(struct MoraineCatalogHandle *handle,
 // fails.
 char *moraine_subspace_names(void);
 
+// Opens a transaction snapshot with a pinned index/inline read surface when
+// supported. Readers without pinned revisions receive an ordinary snapshot
+// instead.
+//
+// # Safety
+// Same pointer and cancellation contract as [`super::moraine_snapshot`].
+int32_t moraine_snapshot_scoped(struct MoraineCatalogHandle *handle,
+                                struct MoraineSnapshotHandle **out,
+                                MoraineInterruptProbe probe,
+                                void *probe_ctx,
+                                struct MoraineError *err);
+
+// Borrows the snapshot's pinned read surface, or returns null when
+// unavailable. Never detach the returned alias; freeing the snapshot releases
+// it.
+//
+// # Safety
+// `snapshot` must be null or a live snapshot. The borrowed alias must not
+// outlive it.
+struct MoraineCatalogHandle *moraine_snapshot_read_handle(struct MoraineSnapshotHandle *snapshot);
+
+// Returns the pinned revision, to be paired with DuckDB's attachment OID.
+// False means this snapshot cannot validate statement-cache dependencies.
+//
+// # Safety
+// `snapshot` must be null or live; `out`, when non-null, must be writable.
+bool moraine_snapshot_read_revision(struct MoraineSnapshotHandle *snapshot, uint64_t *out);
+
+// Opens a projected selective scan; data batches are read by
+// `moraine_row_scan_next`.
+//
+// # Safety
+// `handle` and `snapshot` must be live and refer to the same pinned read
+// scope. Strings and arrays must be valid for their lengths; `out` must be
+// writable. Cancellation and error pointers follow the catalog ABI contract.
+int32_t moraine_row_scan_open(struct MoraineCatalogHandle *handle,
+                              struct MoraineSnapshotHandle *snapshot,
+                              const char *schema,
+                              const char *table,
+                              const struct MorainePositionPair *pairs,
+                              size_t pairs_len,
+                              const char *const *columns,
+                              size_t columns_len,
+                              struct MoraineRowScan **out,
+                              MoraineInterruptProbe probe,
+                              void *probe_ctx,
+                              struct MoraineError *err);
+
+// Returns zero or one IPC batch; free the returned array with
+// `moraine_rows_at_free`.
+//
+// # Safety
+// `scan` must be live and exclusively accessed, and outputs writable.
+// Cancellation and error pointers follow the catalog ABI contract.
+int32_t moraine_row_scan_next(struct MoraineRowScan *scan,
+                              struct MoraineRowBatch **out,
+                              size_t *len,
+                              MoraineInterruptProbe probe,
+                              void *probe_ctx,
+                              struct MoraineError *err);
+
+// Returns the number of data files opened by the selective scan.
+//
+// # Safety
+// `scan` must be null or live, with no concurrent `moraine_row_scan_next`
+// call.
+uint64_t moraine_row_scan_files_read(const struct MoraineRowScan *scan);
+
+// Closes a selective scan and releases its pinned read scope.
+//
+// # Safety
+// `scan` must be null or an unfreed pointer returned by
+// `moraine_row_scan_open`.
+void moraine_row_scan_free(struct MoraineRowScan *scan);
+
 // Materializes the catalog's current snapshot and writes the resulting
 // handle to `*out`.
 //
@@ -1965,13 +2071,14 @@ int32_t moraine_snapshot(struct MoraineCatalogHandle *handle,
                          void *probe_ctx,
                          struct MoraineError *err);
 
-// Frees a snapshot handle previously returned by [`moraine_snapshot`].
+// Frees a snapshot handle returned by [`moraine_snapshot`] or
+// [`super::moraine_snapshot_scoped`].
 // A null `snapshot` is a no-op.
 //
 // # Safety
 //
 // `snapshot`, if non-null, must be a pointer previously returned by
-// [`moraine_snapshot`] and not yet freed.
+// either snapshot-opening entry point and not yet freed.
 void moraine_snapshot_free(struct MoraineSnapshotHandle *snapshot);
 
 // Lists the snapshot's live schemas into `*out_items`/`*out_len`.

@@ -40,7 +40,7 @@ const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// from [`moraine_attach`](crate::abi::moraine_attach) and released via
 /// [`moraine_detach`](crate::abi::moraine_detach).
 pub struct MoraineCatalogHandle {
-    pub(crate) runtime: Runtime,
+    pub(crate) runtime: Arc<Runtime>,
     pub(crate) catalog: AttachedCatalog,
     /// Routes this handle's `tracing` events to its registered log sink.
     pub(crate) log_id: HandleId,
@@ -86,11 +86,24 @@ impl AttachedCatalog {
 impl MoraineCatalogHandle {
     pub(crate) fn new(runtime: Runtime, catalog: AttachedCatalog, log_id: HandleId) -> Self {
         Self {
-            runtime,
+            runtime: Arc::new(runtime),
             catalog,
             log_id,
             data_store: None,
             data_prefix: String::new(),
+            warming: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A borrowed read-only surface; its owner drops it without closing the
+    /// shared store.
+    pub(crate) fn read_alias(&self, reads: ReadOnlyCatalog) -> Self {
+        Self {
+            runtime: Arc::clone(&self.runtime),
+            catalog: AttachedCatalog::Reader(reads),
+            log_id: self.log_id,
+            data_store: self.data_store.clone(),
+            data_prefix: self.data_prefix.clone(),
             warming: Mutex::new(Vec::new()),
         }
     }
@@ -333,11 +346,17 @@ pub(crate) const CANCELLED_ATTACH_SHUTDOWN: Duration = Duration::from_secs(5);
 /// via [`moraine_snapshot_free`](crate::abi::moraine_snapshot_free).
 pub struct MoraineSnapshotHandle {
     pub(crate) snapshot: Arc<CatalogSnapshot>,
+    pub(crate) read_alias: Option<Box<MoraineCatalogHandle>>,
+    pub(crate) read_identity: Option<moraine::IndexReadIdentity>,
 }
 
 impl MoraineSnapshotHandle {
     pub(crate) fn new(snapshot: Arc<CatalogSnapshot>) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            read_alias: None,
+            read_identity: None,
+        }
     }
 }
 

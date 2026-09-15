@@ -280,21 +280,28 @@ this cache is the process-wide memory consumer beside it. A handle's
 decoded catalog is not in it: that is bounded by the catalog's size rather
 than by an option, and is reported rather than budgeted.
 
-**`CACHE_PUTS` — fill the cache from the write path too.** Left alone, the
-cache fills only from reads: blocks the store just flushed are fetched back
-from object storage and decoded the first time something asks for them,
-even though the writer had them in hand. `CACHE_PUTS true` inserts the
-blocks of flushed and compacted SSTs into the cache as they are written —
-decoded, on the write path, at the cost of memory-tier space and no fetch.
+**`CACHE_PUTS` — cache flushed blocks by default.** `CACHE_PUTS` defaults to
+`true` and inserts flushed SST metadata and data blocks into the decoded
+cache. `false` disables flush admission. `CACHE_COMPACTION_PUTS` independently
+controls admission of compaction-output metadata and data blocks, defaulting
+to `false`. Both work with or without `CACHE_DIR` and remain subject to the
+same byte budget and eviction policy.
 Within the process the effect reaches every handle: a reader session served
 by the shared cache reads what the writer just flushed with no round trip
 at all.
 
-It is opt-in because compaction output goes through the same insertion
-policy: a merge writing a large SST can evict blocks that reads had warmed,
-and a store whose merges outpace its queries is better off letting reads
-decide what stays. The option threads through the shim (`moraine_attach`'s
-`cache_puts`) into `CatalogOptions::cache_puts` and `StoreBuilder`.
+Keeping compaction admission separate prevents a large merge from displacing
+read-hot blocks merely because the writer caches its recent flushes. To
+restore the former explicit `CACHE_PUTS true` behavior for both outputs, set
+both options to `true`; disable both for read-only cache filling. Through
+DuckLake the names are `META_CACHE_PUTS` and `META_CACHE_COMPACTION_PUTS`.
+
+The core exposes `CatalogOptions::cache_puts` (default `true`) and
+`cache_compaction_puts` (default `false`). The shim uses the additive
+`moraine_attach_with_cache_policy` entry point, whose two flags are explicit.
+The existing `moraine_attach` keeps its signature and maps its single flag to
+both policies, preserving existing binary callers. The migration ABI likewise
+retains its legacy single-flag behavior.
 
 **`CACHE_PRELOAD` — fill it before the first query, not during it.** Both of
 the above leave a fresh process cold: the cache fills as queries ask for
@@ -800,7 +807,7 @@ core makes cancellation a dropped future. No first-party remote-catalog
 extension (postgres, mysql, iceberg, delta, httpfs — or DuckLake itself)
 cancels a blocked external call; their shipped mitigations are timeouts.
 
-Read-only cancellable entry points include: `moraine_snapshot`, the `moraine_dump_*` reads, the
+Read-only cancellable entry points include: `moraine_snapshot`, `moraine_snapshot_scoped`, the `moraine_dump_*` reads, the
 `moraine_inline_*` reads, and `moraine_tx_begin` (reads the head
 snapshot; nothing is staged yet, so aborting it leaves no state). The
 snapshot listing calls (`moraine_snapshot_schemas`/`tables_in`/

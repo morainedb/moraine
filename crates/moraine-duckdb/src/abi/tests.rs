@@ -2366,7 +2366,9 @@ fn cache_preload_codes_map_to_levels_and_reject_the_rest() {
 /// what it governs.
 #[test]
 fn an_attach_takes_the_write_admission_flag() {
-    for cache_puts in [false, true] {
+    for (cache_puts, cache_compaction_puts) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
         let dir = TempDir::new("put-cache-store");
         let cache = TempDir::new("put-cache-dir");
         let c_path = dir.c_path();
@@ -2377,7 +2379,7 @@ fn an_attach_takes_the_write_admission_flag() {
         // local slots; null s3/data_path/checkpoint are the documented
         // "none" cases.
         let code = unsafe {
-            moraine_attach(
+            moraine_attach_with_cache_policy(
                 c_path.as_ptr(),
                 ptr::null(),
                 false,
@@ -2389,6 +2391,7 @@ fn an_attach_takes_the_write_admission_flag() {
                 0,
                 0,
                 cache_puts,
+                cache_compaction_puts,
                 ptr::null(),
                 ptr::null(),
                 0,

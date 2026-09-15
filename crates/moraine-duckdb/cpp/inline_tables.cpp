@@ -346,6 +346,7 @@ constexpr duckdb::idx_t kInlineScanWindowRows = 8 * STANDARD_VECTOR_SIZE;
 // open its scan, and the ledger its own DML resolves rowids against.
 struct InlineDataScanBindData : public duckdb::FunctionData {
 	MoraineCatalogHandle *handle = nullptr;
+	std::string catalog_name;
 	uint64_t table_id = 0;
 	uint64_t schema_version = 0;
 	// This entry's user columns, in order — what a chunk body decodes to.
@@ -361,6 +362,7 @@ struct InlineDataScanBindData : public duckdb::FunctionData {
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<InlineDataScanBindData>();
 		result->handle = handle;
+		result->catalog_name = catalog_name;
 		result->table_id = table_id;
 		result->schema_version = schema_version;
 		result->user_types = user_types;
@@ -386,6 +388,7 @@ struct InlineDataScanGlobalState : public duckdb::GlobalTableFunctionState {
 	}
 
 	MoraineInlineScanCursor *cursor = nullptr;
+	MoraineCatalogHandle *read_handle = nullptr;
 	// The columns DuckDB asked for, by index into the table's column list,
 	// in output order. Empty for a zero-column probe, which DuckDB emits
 	// only because this function advertises projection pushdown.
@@ -424,7 +427,7 @@ const DecodedInlineSchema &InlineScanSchema(duckdb::ClientContext &context,
 		return *state.decoded_schema;
 	}
 	MoraineError err {};
-	if (moraine_inline_schemas(bind_data.handle, bind_data.table_id, state.schemas.OutItems(), state.schemas.OutLen(),
+	if (moraine_inline_schemas(state.read_handle, bind_data.table_id, state.schemas.OutItems(), state.schemas.OutLen(),
 	                           moraine_shim_is_interrupted, &context, &err) != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
@@ -518,6 +521,9 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InlineDataScanInitGlobal(du
                                                                               duckdb::TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<InlineDataScanBindData>();
 	auto state = duckdb::make_uniq<InlineDataScanGlobalState>();
+	auto &catalog = duckdb::Catalog::GetCatalog(context, bind_data.catalog_name).Cast<MoraineCatalog>();
+	auto transaction = catalog.GetCatalogTransaction(context);
+	state->read_handle = transaction.transaction->Cast<MoraineTransaction>().ReadHandle();
 	state->column_ids = input.column_ids;
 	for (auto col_id : state->column_ids) {
 		if (col_id == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
@@ -535,7 +541,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InlineDataScanInitGlobal(du
 	// version-scoped in the core, so a schema-evolved table's other
 	// versions cost this entry neither rows nor chunk bodies.
 	MoraineError err {};
-	auto code = moraine_inline_scan_open(bind_data.handle, bind_data.table_id, /* SCAN_FOR_FLUSH */ 3,
+	auto code = moraine_inline_scan_open(state->read_handle, bind_data.table_id, /* SCAN_FOR_FLUSH */ 3,
 	                                     std::numeric_limits<uint64_t>::max(), 0, bind_data.schema_version,
 	                                     state->wants_user_columns, &state->cursor, moraine_shim_is_interrupted,
 	                                     &context, &err);
@@ -688,6 +694,7 @@ MoraineInlineDataTableEntry::GetScanFunction(duckdb::ClientContext &,
 	// how DuckLake probes for the table, costs no store read at all.
 	auto scan_bind_data = duckdb::make_uniq<InlineDataScanBindData>();
 	scan_bind_data->handle = handle_;
+	scan_bind_data->catalog_name = catalog.GetName();
 	scan_bind_data->table_id = table_id_;
 	scan_bind_data->schema_version = schema_version_;
 	scan_bind_data->user_types = UserColumnTypes();
@@ -750,8 +757,10 @@ duckdb::TableFunction
 MoraineInlineDeleteTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                                duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
+	auto transaction = catalog.GetCatalogTransaction(context);
+	auto read_handle = transaction.transaction->Cast<MoraineTransaction>().ReadHandle();
 	scan_bind_data->rows =
-	    std::make_shared<const MetadataRows>(ProvideInlineFileDeleteRows(context, handle_, table_id_));
+	    std::make_shared<const MetadataRows>(ProvideInlineFileDeleteRows(context, read_handle, table_id_));
 	scan_bind_data->table_entry = this;
 	bind_data = std::move(scan_bind_data);
 	return MetadataScanTableFunction();
@@ -784,10 +793,12 @@ duckdb::unique_ptr<duckdb::CatalogEntry> LookupInlineTableEntry(duckdb::ClientCo
                                                                 duckdb::Catalog &catalog,
                                                                 duckdb::SchemaCatalogEntry &schema,
                                                                 MoraineCatalogHandle *handle, const std::string &name) {
+	auto transaction = catalog.GetCatalogTransaction(context);
+	auto read_handle = transaction.transaction->Cast<MoraineTransaction>().ReadHandle();
 	if (auto parsed = ParseInlinedDataTableName(name)) {
 		OwnedArray<MoraineInlineSchemaRow> schemas(moraine_inline_schemas_free);
 		MoraineError err {};
-		auto code = moraine_inline_schemas(handle, parsed->table_id, schemas.OutItems(), schemas.OutLen(),
+		auto code = moraine_inline_schemas(read_handle, parsed->table_id, schemas.OutItems(), schemas.OutLen(),
 		                                   moraine_shim_is_interrupted, &context, &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
@@ -805,7 +816,7 @@ duckdb::unique_ptr<duckdb::CatalogEntry> LookupInlineTableEntry(duckdb::ClientCo
 	if (auto table_id = ParseInlinedDeleteTableName(name)) {
 		bool exists = false;
 		MoraineError err {};
-		auto code = moraine_inline_file_delete_table_exists(handle, *table_id, &exists, moraine_shim_is_interrupted,
+		auto code = moraine_inline_file_delete_table_exists(read_handle, *table_id, &exists, moraine_shim_is_interrupted,
 		                                                    &context, &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
