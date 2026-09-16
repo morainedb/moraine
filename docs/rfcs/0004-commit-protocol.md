@@ -697,6 +697,24 @@ member *i* allocates its ids and detects its name collisions against
 everything members *1..i* did. That is what makes intra-batch conflicts
 unreachable rather than unlikely. Step 4 then runs once.
 
+The store's one submission slot is **released by ownership, not by a
+statement**: the slot is claimed under the lock that moves a batch out of
+forming, and the claim is dropped when the submitting task lets go of it.
+A submission that panics, or whose task is dropped before it finishes,
+therefore still admits the next batch. Nothing else clears the slot, so
+were it released by a statement the submitter could fail to reach, one lost
+submission would close the store to every later commit for the life of the
+process. A waiter subscribes to the slot's generation before reading the
+slot, so a submission that ends between the two wakes it rather than
+leaving it parked for the following one.
+
+For the same reason the write that holds the slot is **bounded**, where the
+durability wait that follows it is not. A write that never returns would
+hold the slot forever, so after five minutes — thirty stall reports — its
+batch is given up on and reported as an unknown outcome, which is what it
+is: the write may still land, so its members must not retry. The durability
+wait needs no bound because it runs after the slot is released.
+
 A batch batches commits; it does not merge them. Each member mints its own
 snapshot, which time travel resolves separately. What batching changes is
 durability granularity, not catalog shape.
