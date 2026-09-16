@@ -98,7 +98,15 @@ pub fn validate_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
         "the build for DuckDB {version} backfilled {row_id_stat_rows} of 3 expected row-ID \
          statistic rows or did not prune the scan to one file"
     );
-    println!("ok: the bundled DuckLake backfills and prunes row IDs under DuckDB {version}");
+    ensure!(
+        stdout.contains("remaining=8"),
+        "the build for DuckDB {version} did not stage a positional delete carrying existing \
+         delete positions; its bundled DuckLake is missing part of the patch series"
+    );
+    println!(
+        "ok: the bundled DuckLake backfills and prunes row IDs and takes existing delete \
+         positions under DuckDB {version}"
+    );
     Ok(())
 }
 

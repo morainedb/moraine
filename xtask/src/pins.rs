@@ -127,6 +127,7 @@ pub fn check_pins() -> anyhow::Result<()> {
         }
     }
 
+    problems.extend(patch_series_problems()?);
     let ducklake = pinned_ducklake_commit();
     match &ducklake {
         Ok(commit) => {
@@ -146,6 +147,53 @@ pub fn check_pins() -> anyhow::Result<()> {
         println!("ok: every DuckLake commit reference matches the one {pin} declares ({commit})");
     }
     Ok(())
+}
+
+/// The release build patches its bundled DuckLake from the list in
+/// `ducklake.cmake`; the local build patches from `PATCH_PATHS`. A patch
+/// on one list and not the other ships an extension whose bundled DuckLake
+/// lacks what its own code sends it.
+fn patch_series_problems() -> anyhow::Result<Vec<String>> {
+    let config = read(crate::ducklake_patch::CONFIG_PATH)?;
+    let in_cmake: Vec<&str> = config
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("${CMAKE_CURRENT_LIST_DIR}/"))
+        .filter(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("patch"))
+        })
+        .collect();
+    let in_xtask: Vec<&str> = crate::ducklake_patch::PATCH_PATHS
+        .iter()
+        .filter_map(|path| path.rsplit('/').next())
+        .collect();
+    let mut problems = Vec::new();
+    for name in &in_xtask {
+        if !in_cmake.contains(name) {
+            problems.push(format!(
+                "{} applies `{name}` but {} does not, so a release build ships a DuckLake \
+                 without it",
+                "xtask/src/ducklake_patch.rs",
+                crate::ducklake_patch::CONFIG_PATH
+            ));
+        }
+    }
+    for name in &in_cmake {
+        if !in_xtask.contains(name) {
+            problems.push(format!(
+                "{} applies `{name}` but xtask/src/ducklake_patch.rs does not",
+                crate::ducklake_patch::CONFIG_PATH
+            ));
+        }
+    }
+    if in_cmake != in_xtask && problems.is_empty() {
+        problems.push(format!(
+            "{} and xtask/src/ducklake_patch.rs apply the DuckLake patches in different orders",
+            crate::ducklake_patch::CONFIG_PATH
+        ));
+    }
+    Ok(problems)
 }
 
 fn ducklake_release_problems(
