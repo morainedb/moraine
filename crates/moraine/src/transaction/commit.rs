@@ -118,6 +118,15 @@ pub(crate) fn now_micros() -> i64 {
 /// and how often it is reported thereafter.
 const STALL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long the write that holds the store's flight slot may stall before
+/// its batch is given up on. The slot admits one batch at a time, so a
+/// write that never returns would close the store to every later commit;
+/// giving up reports the batch's fate as unknown, which is what it is, and
+/// keeps the store answering. Long enough that only a genuine stall
+/// reaches it: a healthy write returns in milliseconds, and this one has
+/// already been reported [stalled](STALL_INTERVAL) thirty times over.
+const FLIGHT_WRITE_DEADLINE: Duration = Duration::from_secs(300);
+
 /// How a durable commit's bytes reach object storage.
 #[derive(Clone, Default)]
 pub(crate) enum CommitDurability {
@@ -1297,7 +1306,22 @@ pub(crate) async fn submit_batch(
         invalidate_head_view(projections);
     }
     let durable_started = Instant::now();
-    match reporting_stalls("commit", staged_bytes, db_tx.commit()).await {
+    // Bounded, unlike the durability wait below it: this write holds the
+    // store's flight slot, so stalling here stalls every later commit.
+    let written = tokio::time::timeout(
+        FLIGHT_WRITE_DEADLINE,
+        reporting_stalls("commit", staged_bytes, db_tx.commit()),
+    )
+    .await;
+    let Ok(written) = written else {
+        // The write's fate is unknown, so the held view may be stale.
+        invalidate_head_view(projections);
+        return Err(Error::CommitOutcomeUnknown(format!(
+            "the store did not accept the batch within {} seconds; it may still land",
+            FLIGHT_WRITE_DEADLINE.as_secs()
+        )));
+    };
+    match written {
         Ok(handle) => {
             let projection_started = Instant::now();
             // `sys/head` is the conflict anchor, so winning it proves no

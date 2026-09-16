@@ -10,7 +10,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use futures::FutureExt;
@@ -175,11 +175,10 @@ impl Batch {
     }
 }
 
-/// The forming batch and whether one is in flight, under one lock so a
-/// batch leaves `forming` and enters flight atomically.
+/// The forming batch, under a lock so it leaves `forming` and enters
+/// flight atomically.
 struct Shared {
     forming: Option<Batch>,
-    in_flight: bool,
 }
 
 /// Where concurrent commits meet. One per store handle, shared by every
@@ -189,7 +188,10 @@ pub(crate) struct Coalescer {
     /// Callers that have arrived and not yet staged; a batch seals when
     /// this reaches zero.
     arriving: AtomicUsize,
-    /// Bumped under `shared` whenever a batch leaves flight.
+    /// Whether a batch holds the store's one flight slot. Claimed under
+    /// `shared`, released by dropping the [`Flight`] that claimed it.
+    in_flight: AtomicBool,
+    /// Bumped whenever a batch leaves flight.
     flights: watch::Sender<u64>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     /// How a sealed batch reaches object storage.
@@ -202,11 +204,9 @@ impl Coalescer {
         durability: CommitDurability,
     ) -> Self {
         Self {
-            shared: Mutex::new(Shared {
-                forming: None,
-                in_flight: false,
-            }),
+            shared: Mutex::new(Shared { forming: None }),
             arriving: AtomicUsize::new(0),
+            in_flight: AtomicBool::new(false),
             flights: watch::Sender::new(0),
             projections,
             durability,
@@ -226,16 +226,24 @@ impl Coalescer {
     /// forming one. Callers are admitted one at a time.
     async fn admit(&self) -> MutexGuard<'_, Shared> {
         loop {
+            // Subscribed before the slot is read: a flight that ends in
+            // between still bumps the generation, and `changed` reports
+            // that bump rather than waiting for the one after it.
+            let mut flights = self.flights.subscribe();
             let shared = self.shared.lock().await;
-            if !shared.in_flight {
+            if !self.in_flight.load(Ordering::Acquire) {
                 return shared;
             }
-            // Subscribed under the lock: the generation only moves under it,
-            // so the flight cannot end unnoticed in between.
-            let mut flights = self.flights.subscribe();
             drop(shared);
             let _ = flights.changed().await;
         }
+    }
+
+    /// Claims the store's flight slot. The caller must hold `shared`, so
+    /// the free slot it observed cannot be taken in between.
+    fn enter_flight(self: &Arc<Self>) -> Flight {
+        self.in_flight.store(true, Ordering::Release);
+        Flight(Arc::clone(self))
     }
 
     /// Stages `members` onto whichever batch is forming, opening one if
@@ -271,9 +279,9 @@ impl Coalescer {
         let alone = arrival.settle() == 0;
         let full = batch.members >= MAX_BATCH_MEMBERS;
         if (alone || full) && !batch.writes.is_empty() {
-            shared.in_flight = true;
+            let flight = self.enter_flight();
             drop(shared);
-            self.launch(batch);
+            self.launch(batch, flight);
         } else if batch.writes.is_empty() {
             batch.db_tx.rollback();
         } else {
@@ -291,13 +299,15 @@ impl Coalescer {
 
     /// Commits `batch` on a task of its own, so the caller that sealed it
     /// cannot take the batch down with it.
-    fn launch(self: &Arc<Self>, batch: Batch) {
+    fn launch(self: &Arc<Self>, batch: Batch, flight: Flight) {
         let coalescer = Arc::clone(self);
-        drop(tokio::spawn(async move { coalescer.land(batch).await }));
+        drop(tokio::spawn(
+            async move { coalescer.land(batch, flight).await },
+        ));
     }
 
     /// Commits one batch, tells its members, and reopens the store.
-    async fn land(self: Arc<Self>, batch: Batch) {
+    async fn land(self: Arc<Self>, batch: Batch, flight: Flight) {
         let Batch {
             db_tx,
             base,
@@ -325,7 +335,7 @@ impl Coalescer {
         .await;
         // Visible and folded, or decided: the store admits the next batch
         // while this one awaits its flush, so the two may share it.
-        self.reopen().await;
+        drop(flight);
 
         let landed = match submission {
             Ok(Ok(Submission::Submitted(submitted))) => {
@@ -367,19 +377,11 @@ impl Coalescer {
         let _ = outcome.send(BatchState::Finished(landed));
     }
 
-    /// Lets the next batch form and submit.
-    async fn reopen(&self) {
-        let mut shared = self.shared.lock().await;
-        shared.in_flight = false;
-        self.flights
-            .send_modify(|flight| *flight = flight.wrapping_add(1));
-    }
-
     /// Seals whatever batch is forming, if nothing else will: the path a
     /// caller that vanished before staging leaves behind.
     async fn seal_abandoned(self: Arc<Self>) {
         let mut shared = self.shared.lock().await;
-        if shared.in_flight || self.arriving.load(Ordering::Acquire) > 0 {
+        if self.in_flight.load(Ordering::Acquire) || self.arriving.load(Ordering::Acquire) > 0 {
             return;
         }
         let Some(batch) = shared.forming.take() else {
@@ -389,9 +391,24 @@ impl Coalescer {
             batch.db_tx.rollback();
             return;
         }
-        shared.in_flight = true;
+        let flight = self.enter_flight();
         drop(shared);
-        self.land(batch).await;
+        self.land(batch, flight).await;
+    }
+}
+
+/// Holds the store's one flight slot for as long as a batch needs it.
+/// Dropping it admits the next batch, so a submission whose task is
+/// dropped or which panics outside the guarded region cannot latch the
+/// store closed.
+struct Flight(Arc<Coalescer>);
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::Release);
+        self.0
+            .flights
+            .send_modify(|flight| *flight = flight.wrapping_add(1));
     }
 }
 
@@ -494,7 +511,61 @@ mod tests {
             Arc::clone(catalog.projections()),
             CommitDurability::OnFlushInterval,
         ));
-        coalescer.land(batch).await;
+        let flight = coalescer.enter_flight();
+        coalescer.land(batch, flight).await;
         assert!(matches!(await_outcome(outcome).await, Outcome::Unknown(_)));
+    }
+
+    /// A flight whose task never finishes still admits the next batch, so
+    /// a lost submission cannot close the store to every later commit.
+    #[tokio::test]
+    async fn a_dropped_flight_admits_the_next_batch() {
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        let coalescer = Arc::new(Coalescer::new(
+            Arc::clone(catalog.projections()),
+            CommitDurability::OnFlushInterval,
+        ));
+
+        // The slot is claimed and its holder vanishes without landing.
+        let flight = coalescer.enter_flight();
+        assert!(coalescer.in_flight.load(Ordering::Acquire));
+        drop(flight);
+
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(5), coalescer.admit())
+            .await
+            .is_ok();
+        assert!(admitted, "a dropped flight must not latch the store closed");
+        catalog.close().await.unwrap();
+    }
+
+    /// Admission is not lost when the flight ends between subscribing and
+    /// reading the slot.
+    #[tokio::test]
+    async fn a_flight_ending_during_admission_still_wakes_the_waiter() {
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        let coalescer = Arc::new(Coalescer::new(
+            Arc::clone(catalog.projections()),
+            CommitDurability::OnFlushInterval,
+        ));
+
+        let flight = coalescer.enter_flight();
+        let waiting = tokio::spawn({
+            let coalescer = Arc::clone(&coalescer);
+            async move {
+                drop(coalescer.admit().await);
+            }
+        });
+        tokio::task::yield_now().await;
+        drop(flight);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiter must observe the flight ending")
+            .unwrap();
+        catalog.close().await.unwrap();
     }
 }
