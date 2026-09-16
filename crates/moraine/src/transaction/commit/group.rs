@@ -25,7 +25,7 @@ use crate::{
     catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
     error::{Error, Result},
     store::StagedBytes,
-    telemetry::reporting_phase,
+    telemetry::{STALL_INTERVAL, reporting_phase},
     transaction::{operations::ChangeSet, verbs::Transaction},
 };
 
@@ -417,22 +417,42 @@ impl Drop for Flight {
     }
 }
 
-/// Waits for acknowledgement, retaining the submission boundary if the task
-/// exits.
-pub(crate) async fn await_outcome(mut outcome: watch::Receiver<BatchState>) -> Outcome {
+/// Waits for acknowledgement the way [`await_outcome`] does, and seals the
+/// batch itself if nothing else will.
+///
+/// A batch a caller staged onto without sealing is sealed by whichever
+/// arrival leaves last, on a task of its own. A task that never runs leaves
+/// the batch in `forming` with its outcome sender alive, so every member
+/// riding it waits for a message no one will send, against nothing that is
+/// running. The waiter cannot be the thing that went missing -- it is the
+/// one blocked -- so it takes the work rather than delegating it, and the
+/// caller that would otherwise have issued the next commit is exactly the
+/// caller stuck here.
+pub(crate) async fn await_outcome_sealing(
+    coalescer: &Arc<Coalescer>,
+    mut outcome: watch::Receiver<BatchState>,
+) -> Outcome {
     loop {
         if let BatchState::Finished(landed) = &*outcome.borrow_and_update() {
             return landed.clone();
         }
-        if outcome.changed().await.is_err() {
-            return match &*outcome.borrow() {
-                BatchState::Forming => Outcome::Abandoned,
-                BatchState::Submitted => {
-                    Outcome::Unknown("the submitted batch stopped reporting".into())
-                }
-                BatchState::Finished(landed) => landed.clone(),
-            };
+        match tokio::time::timeout(STALL_INTERVAL, outcome.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return finished_or_boundary(&outcome),
+            // `seal_abandoned` stands down while another arrival is on its
+            // way in or a batch holds the slot, so this only acts on a batch
+            // nothing else will take.
+            Err(_) => Arc::clone(coalescer).seal_abandoned().await,
         }
+    }
+}
+
+/// What a batch's last observed state means once its sender is gone.
+fn finished_or_boundary(outcome: &watch::Receiver<BatchState>) -> Outcome {
+    match &*outcome.borrow() {
+        BatchState::Forming => Outcome::Abandoned,
+        BatchState::Submitted => Outcome::Unknown("the submitted batch stopped reporting".into()),
+        BatchState::Finished(landed) => landed.clone(),
     }
 }
 
@@ -488,7 +508,7 @@ mod tests {
         ] {
             let (sender, receiver) = watch::channel(state);
             drop(sender);
-            assert_eq!(await_outcome(receiver).await, expected);
+            assert_eq!(finished_or_boundary(&receiver), expected);
         }
     }
 
@@ -517,8 +537,55 @@ mod tests {
             CommitDurability::OnFlushInterval,
         ));
         let flight = coalescer.enter_flight();
-        coalescer.land(batch, flight).await;
-        assert!(matches!(await_outcome(outcome).await, Outcome::Unknown(_)));
+        Arc::clone(&coalescer).land(batch, flight).await;
+        assert!(matches!(
+            await_outcome_sealing(&coalescer, outcome).await,
+            Outcome::Unknown(_)
+        ));
+    }
+
+    /// A batch left forming by a caller that was not the last one in, whose
+    /// sealing task never ran, is sealed by the member waiting on it rather
+    /// than stranding that member for the life of the process.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_seals_the_batch_no_one_else_will() {
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        let coalescer = Arc::new(Coalescer::new(
+            Arc::clone(catalog.projections()),
+            CommitDurability::OnFlushInterval,
+        ));
+        let store = catalog.store();
+        let db = store.writer_db().unwrap();
+
+        // Staged, not sealed: exactly what a caller leaves behind when it is
+        // not the last arrival in.
+        let mut batch = Batch::open(db, catalog.projections()).await.unwrap();
+        batch
+            .stage(
+                &[|tx: &mut Transaction| {
+                    tx.create_schema("stranded")?;
+                    Ok(())
+                }],
+                catalog.projections(),
+            )
+            .await
+            .unwrap();
+        let outcome = batch.outcome.subscribe();
+        coalescer.shared.lock().await.forming = Some(batch);
+
+        // No arrival remains to seal it and no task was spawned to do it, so
+        // nothing in the process will move this batch on its own.
+        assert_eq!(coalescer.arriving.load(Ordering::Acquire), 0);
+        assert!(!coalescer.in_flight.load(Ordering::Acquire));
+
+        let landed = await_outcome_sealing(&coalescer, outcome).await;
+        assert!(
+            matches!(landed, Outcome::Committed),
+            "the waiter must seal and land the batch it is riding, got {landed:?}"
+        );
+        catalog.close().await.unwrap();
     }
 
     /// A flight whose task never finishes still admits the next batch, so

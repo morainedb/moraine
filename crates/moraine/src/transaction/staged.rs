@@ -70,7 +70,7 @@ use decode::Cursor;
 use index_upkeep::stage_index_maintenance;
 use inline::translate_inline;
 
-use crate::telemetry::milliseconds;
+use crate::telemetry::{milliseconds, reporting_phase};
 
 fn next_diagnostic_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -1432,7 +1432,7 @@ impl StagedTransaction {
         let phase_started = Instant::now();
         let base = match head_view.into_inner() {
             Some(base) => Ok(base),
-            None => commit::head_view_for(&db_tx, &projections).await,
+            None => reporting_phase("head-view", commit::head_view_for(&db_tx, &projections)).await,
         };
         let base = match base {
             Ok(base) => base,
@@ -1456,20 +1456,26 @@ impl StagedTransaction {
         // poisoned definition rides the writes it produces.)
         let inline = async {
             let phase_started = Instant::now();
-            let (writes, uses_schema_reference) =
-                translate_inline(&db_tx, &projections, &ops).await?;
+            let (writes, uses_schema_reference) = reporting_phase(
+                "translate-inline",
+                translate_inline(&db_tx, &projections, &ops),
+            )
+            .await?;
             Ok::<_, Error>((writes, uses_schema_reference, phase_started.elapsed()))
         };
         let maintenance = async {
             let phase_started = Instant::now();
-            let entries = stage_index_maintenance(
-                &db_tx,
-                base_ref,
-                &ops,
-                store,
-                &data_prefix,
-                read_metrics,
-                &projections,
+            let entries = reporting_phase(
+                "index-maintenance",
+                stage_index_maintenance(
+                    &db_tx,
+                    base_ref,
+                    &ops,
+                    store,
+                    &data_prefix,
+                    read_metrics,
+                    &projections,
+                ),
             )
             .await?;
             Ok::<_, Error>((entries, phase_started.elapsed()))
