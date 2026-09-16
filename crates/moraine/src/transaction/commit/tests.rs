@@ -5025,14 +5025,3 @@ fn the_format_floor_takes_the_highest_term_that_applies() {
         FORMAT_WITH_DEFERRED_INDEX
     );
 }
-
-/// A reported phase outlives its own reports: the reporter names a slow
-/// wait, it never cuts one short.
-#[tokio::test(start_paused = true)]
-async fn a_reported_phase_is_never_abandoned() {
-    let slow = async {
-        tokio::time::sleep(STALL_INTERVAL * 4).await;
-        "landed"
-    };
-    assert_eq!(reporting_phase("test", slow).await, "landed");
-}

@@ -19,12 +19,13 @@ use tokio::sync::{Mutex, MutexGuard, watch};
 
 use super::{
     CommitDurability, HeadTransition, HeadViewUpdate, Landed, Prepared, StagedWrite, Submission,
-    await_submitted, fold, head_view_for, prepare_and_stage, reporting_phase, submit_batch,
+    await_submitted, fold, head_view_for, prepare_and_stage, submit_batch,
 };
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
     error::{Error, Result},
     store::StagedBytes,
+    telemetry::reporting_phase,
     transaction::{operations::ChangeSet, verbs::Transaction},
 };
 

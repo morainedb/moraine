@@ -726,6 +726,14 @@ reported by nothing else. These records are what make a stalled commit say
 which phase it is stuck in. They name a slow phase; they never cut one
 short.
 
+The process-wide work pools a commit passes through are named the same
+way, on both sides: the wait for a permit and the hold of one. A pool is
+shared by every catalog in the process and hands permits out in arrival
+order, so it cannot starve a waiter on its own — but a permit is held
+across blocking work that cannot be cancelled, so work that never returns
+takes a permit out of the process permanently. Reporting the hold names
+the holder, which no waiter's record can.
+
 A batch batches commits; it does not merge them. Each member mints its own
 snapshot, which time travel resolves separately. What batching changes is
 durability granularity, not catalog shape.

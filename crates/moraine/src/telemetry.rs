@@ -1,4 +1,34 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
+
+use tracing::warn;
+
+/// How long a wait runs before it is worth reporting, and how often it is
+/// reported thereafter.
+pub(crate) const STALL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Awaits `work`, naming `phase` in the log every [`STALL_INTERVAL`] the
+/// wait runs long, and never giving up on it.
+///
+/// A task parked mid-phase cannot be read from a thread dump: a parked
+/// `block_on` leaves its future's state machine on the heap, so the await
+/// it is suspended at is absent from every thread's stack. These records
+/// are the only thing that names the phase, so a stalled caller says which
+/// one it is stuck in rather than only that it is stuck.
+pub(crate) async fn reporting_phase<T>(phase: &'static str, work: impl Future<Output = T>) -> T {
+    let mut work = Box::pin(work);
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Ok(done) = tokio::time::timeout(STALL_INTERVAL, &mut work).await {
+            return done;
+        }
+        waited = waited.saturating_add(STALL_INTERVAL);
+        warn!(
+            phase,
+            waited_seconds = waited.as_secs(),
+            "a caller is still waiting in this phase"
+        );
+    }
+}
 
 /// Converts a duration for a saturating nanosecond accumulator.
 pub(crate) fn nanoseconds(duration: Duration) -> u64 {
@@ -36,6 +66,17 @@ pub(crate) fn recorded_levels(emit: impl FnOnce()) -> Vec<tracing::Level> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reported phase outlives its own reports: the reporter names a slow
+    /// wait, it never cuts one short.
+    #[tokio::test(start_paused = true)]
+    async fn a_reported_phase_is_never_abandoned() {
+        let slow = async {
+            tokio::time::sleep(STALL_INTERVAL * 4).await;
+            "landed"
+        };
+        assert_eq!(reporting_phase("test", slow).await, "landed");
+    }
 
     #[test]
     fn milliseconds_rounds_to_the_nearest_integer() {
