@@ -23,13 +23,26 @@ pub struct MoraineRowScan {
     handle: MoraineCatalogHandle,
 }
 
+/// File positions a selective scan treats as deleted on top of the
+/// snapshot's own delete files: the caller's uncommitted deletions.
+#[repr(C)]
+pub struct MoraineExcludedPositions {
+    /// The data file the positions are within.
+    pub data_file_id: u64,
+    /// `positions_len` positions within that file, borrowed for the open call.
+    pub positions: *const u64,
+    /// Length of `positions`.
+    pub positions_len: usize,
+}
+
 /// Opens a projected selective scan; data batches are read by
 /// `moraine_row_scan_next_arrow`.
 ///
 /// # Safety
 /// `handle` and `snapshot` must be live and refer to the same pinned read
 /// scope. Strings and arrays must be valid for their lengths; `out` must be
-/// writable. Cancellation and error pointers follow the catalog ABI contract.
+/// writable; `excluded` entries borrow their positions for the call.
+/// Cancellation and error pointers follow the catalog ABI contract.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn moraine_row_scan_open(
@@ -41,6 +54,8 @@ pub unsafe extern "C" fn moraine_row_scan_open(
     pairs_len: usize,
     columns: *const *const c_char,
     columns_len: usize,
+    excluded: *const MoraineExcludedPositions,
+    excluded_len: usize,
     out: *mut *mut MoraineRowScan,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
@@ -57,6 +72,8 @@ pub unsafe extern "C" fn moraine_row_scan_open(
             pairs_len,
             columns,
             columns_len,
+            excluded,
+            excluded_len,
             false,
             out,
             probe,
@@ -98,6 +115,8 @@ pub unsafe extern "C" fn moraine_rows_at_open(
             pairs_len,
             std::ptr::null(),
             0,
+            std::ptr::null(),
+            0,
             true,
             out,
             probe,
@@ -105,6 +124,45 @@ pub unsafe extern "C" fn moraine_rows_at_open(
             err,
         )
     }
+}
+
+/// Copies the caller's excluded positions into owned values.
+///
+/// # Safety
+/// `excluded` must point to `excluded_len` entries whose `positions` are
+/// valid for their `positions_len`, all for the duration of the call.
+unsafe fn owned_exclusions(
+    excluded: *const MoraineExcludedPositions,
+    excluded_len: usize,
+) -> Result<Vec<moraine::ExcludedPositions>, AbiError> {
+    // SAFETY: this function's own contract.
+    let entries = unsafe {
+        if excluded_len == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(excluded, excluded_len)
+        }
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.positions_len > 0 && entry.positions.is_null() {
+                return Err(AbiError::invalid_argument("null excluded positions"));
+            }
+            // SAFETY: checked non-null above; this function's own contract.
+            let positions = unsafe {
+                if entry.positions_len == 0 {
+                    &[]
+                } else {
+                    std::slice::from_raw_parts(entry.positions, entry.positions_len)
+                }
+            };
+            Ok(moraine::ExcludedPositions {
+                data_file_id: moraine::DataFileId::new(entry.data_file_id),
+                positions: positions.to_vec(),
+            })
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -117,6 +175,8 @@ unsafe fn open_scan(
     pairs_len: usize,
     columns: *const *const c_char,
     columns_len: usize,
+    excluded: *const MoraineExcludedPositions,
+    excluded_len: usize,
     strict: bool,
     out: *mut *mut MoraineRowScan,
     probe: MoraineInterruptProbe,
@@ -129,9 +189,13 @@ unsafe fn open_scan(
             || out.is_null()
             || (pairs_len > 0 && pairs.is_null())
             || (columns_len > 0 && columns.is_null())
+            || (excluded_len > 0 && excluded.is_null())
         {
             return Err(AbiError::invalid_argument("null selective scan argument"));
         }
+        // SAFETY: caller supplies `excluded_len` entries, each borrowing
+        // `positions_len` positions, for the duration of this call.
+        let excluded = unsafe { owned_exclusions(excluded, excluded_len) }?;
         // SAFETY: caller supplies live handles and valid strings and arrays.
         let (handle, schema, table, pairs, columns) = unsafe {
             (
@@ -184,13 +248,14 @@ unsafe fn open_scan(
                     .await
             } else {
                 reads
-                    .scan_rows_at(
+                    .scan_rows_at_excluding(
                         &view,
                         handle.data_store.clone(),
                         &handle.data_prefix,
                         table,
                         &pairs,
                         &columns,
+                        &excluded,
                     )
                     .await
             }

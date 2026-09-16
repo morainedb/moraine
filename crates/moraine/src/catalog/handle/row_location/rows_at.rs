@@ -1,6 +1,8 @@
 //! Located rows read back whole at the snapshot the caller pins.
 
 mod scan;
+#[cfg(test)]
+mod tests;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -10,14 +12,25 @@ use bytes::Bytes;
 use futures::{StreamExt, stream};
 pub use scan::LocatedRowScan;
 
+/// File positions a caller treats as deleted on top of the snapshot's own
+/// delete files, such as a transaction's uncommitted deletions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExcludedPositions {
+    /// The data file the positions are within.
+    pub data_file_id: DataFileId,
+    /// Positions within that file; order and duplicates do not matter.
+    pub positions: Vec<u64>,
+}
+
 use super::{
-    LocatedDeletion, LocationScope, MissingRows, current_files_for, first_row_error,
+    LocationScope, MissingRows, PositionedFile, current_files_for, first_row_error,
     group_deduped_pairs,
 };
 use crate::{
     catalog::{
-        CatalogSnapshot, DataFileId, DeleteFileId, ReadOnlyCatalog, RecentRow, TableId,
-        resolve_data_path, snapshot::data_file_info,
+        CatalogSnapshot, DataFileId, DeleteFileInfo, ReadOnlyCatalog, RecentRow, TableId,
+        resolve_data_path,
+        snapshot::{data_file_info, delete_file_info},
     },
     data_file::{self, DataStore, ReadColumn, RowIdSource, RowPositions, ScopedRows},
     error::{Error, Result},
@@ -47,20 +60,9 @@ impl ReadOnlyCatalog {
     async fn deleted_positions_at(
         &self,
         scope: &LocationScope<'_>,
-        table: TableId,
-        delete_file_id: DeleteFileId,
+        delete_file: DeleteFileInfo,
         visible_at: u64,
     ) -> Result<Vec<u64>> {
-        let delete_file = scope
-            .snapshot
-            .delete_files_of(table)
-            .into_iter()
-            .find(|file| file.id == delete_file_id)
-            .ok_or_else(|| {
-                Error::Corruption(format!(
-                    "delete file {delete_file_id} vanished from the snapshot"
-                ))
-            })?;
         let path = resolve_data_path(
             scope.data_prefix,
             scope.table_prefix,
@@ -83,11 +85,16 @@ impl ReadOnlyCatalog {
         &self,
         scope: &LocationScope<'_>,
         table: TableId,
-        located: Vec<LocatedDeletion>,
+        located: Vec<PositionedFile>,
         visible_at: u64,
+        excluded: &[ExcludedPositions],
     ) -> Result<Vec<FileRead>> {
         let snapshot = scope.snapshot;
         let inlined_deletes = self.inlined_file_deletes_at(table, visible_at).await?;
+        let excluded: HashMap<DataFileId, &[u64]> = excluded
+            .iter()
+            .map(|entry| (entry.data_file_id, entry.positions.as_slice()))
+            .collect();
         let session = self.begin_read().await?;
         let mut reads = Vec::with_capacity(located.len());
         for deletion in located {
@@ -116,13 +123,15 @@ impl ReadOnlyCatalog {
                 }
             };
 
-            // A replaced delete file embeds per-position snapshots and keeps
-            // the earliest begin, so only positions deleted at `visible_at`
-            // count; the positions decoded while positioning are unfiltered.
+            // Replacement delete files carry per-position snapshots; only
+            // positions deleted at `visible_at` count.
             let mut deleted: HashSet<u64> = HashSet::new();
-            if let Some(existing) = deletion.existing_delete {
+            if let Some(delete_file) = snapshot
+                .delete_files_targeting(table.get(), deletion.data_file_id.get())
+                .next()
+            {
                 let read = self
-                    .deleted_positions_at(scope, table, existing.delete_file_id, visible_at)
+                    .deleted_positions_at(scope, delete_file_info(delete_file), visible_at)
                     .await;
                 match read {
                     Ok(positions) => deleted.extend(positions),
@@ -134,6 +143,9 @@ impl ReadOnlyCatalog {
             }
             if let Some(positions) = inlined_deletes.get(&deletion.data_file_id.get()) {
                 deleted.extend(positions);
+            }
+            if let Some(positions) = excluded.get(&deletion.data_file_id) {
+                deleted.extend(positions.iter().copied());
             }
             let positions: Vec<u64> = deletion
                 .positions

@@ -326,3 +326,63 @@ fn prepared_located_joins_refresh_rows_and_file_filters() {
         }
     }
 }
+
+/// A transaction that has already written keeps its index probes pinned at
+/// the revision it started on, so prepared reads reuse them until commit.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+fn prepared_index_reads_reuse_probes_inside_a_writing_transaction() {
+    for limit in [0, 10] {
+        let store = TempDir::new("index-prepared-writing-tx");
+        let data = TempDir::new("index-prepared-writing-tx-data");
+        let options = format!(
+            ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT {limit}",
+            data.path().display()
+        );
+        let joined = "lake.main.t data JOIN moraine_index_in('lake','main','t','by_a',[1,2,3]) hits \
+             ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
+        let counts = "SELECT 'lookups', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%index lookup resolved%';";
+        let result = run_session_with_env(
+            &Attach::Moraine {
+                store_dir: store.path(),
+                data_path: data.path(),
+                options: &options,
+                read_only: false,
+            },
+            &format!(
+                "CREATE TABLE lake.main.t(a BIGINT);
+                 INSERT INTO lake.main.t VALUES (1),(2),(3);
+                 CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+                 CALL enable_logging(level => 'debug', storage => 'memory');
+                 BEGIN;
+                 INSERT INTO lake.main.t VALUES (9);
+                 PREPARE probe AS SELECT 'hits', count(*) FROM {joined};
+                 {counts}
+                 EXECUTE probe;
+                 {counts}
+                 DELETE FROM lake.main.t WHERE a = 2;
+                 EXECUTE probe;
+                 {counts}
+                 COMMIT;
+                 EXECUTE probe;
+                 {counts}"
+            ),
+            &[("MORAINE_LOG", "debug")],
+        );
+        let output = combined_output(&result);
+        assert!(result.status.success(), "{output}");
+        let rows = csv_rows(&output);
+        let lookups: Vec<_> = rows
+            .iter()
+            .filter(|row| row[0] == "lookups")
+            .map(|row| row[1].as_str())
+            .collect();
+        assert_eq!(lookups, vec!["1", "1", "1", "2"], "limit={limit}: {output}");
+        let hits: Vec<_> = rows
+            .iter()
+            .filter(|row| row[0] == "hits")
+            .map(|row| row[1].as_str())
+            .collect();
+        assert_eq!(hits, vec!["3", "2", "2"], "limit={limit}: {output}");
+    }
+}

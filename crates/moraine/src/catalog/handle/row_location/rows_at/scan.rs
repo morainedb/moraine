@@ -6,10 +6,10 @@ use arrow::array::RecordBatch;
 use futures::{TryStreamExt, stream::BoxStream};
 
 use super::{
-    Arc, Bytes, CatalogSnapshot, DataFileId, DataStore, Error, HashSet, InlineGroup, LocationScope,
-    MissingRows, ReadColumn, ReadOnlyCatalog, Result, RowIdSource, RowPositions, ScopedRows,
-    StreamExt, TableId, current_files_for, data_file, first_row_error, group_by_chunk,
-    group_deduped_pairs, resolve_data_path, stream,
+    Arc, Bytes, CatalogSnapshot, DataFileId, DataStore, Error, ExcludedPositions, HashSet,
+    InlineGroup, LocationScope, MissingRows, ReadColumn, ReadOnlyCatalog, Result, RowIdSource,
+    RowPositions, ScopedRows, StreamExt, TableId, current_files_for, data_file, first_row_error,
+    group_by_chunk, group_deduped_pairs, resolve_data_path, stream,
 };
 
 type FileSelection = (
@@ -163,6 +163,7 @@ impl ReadOnlyCatalog {
             pairs,
             &columns,
             MissingRows::Reject,
+            &[],
         )
         .await
     }
@@ -212,6 +213,36 @@ impl ReadOnlyCatalog {
         pairs: &[(u64, Option<DataFileId>)],
         columns: &[String],
     ) -> Result<LocatedRowScan> {
+        self.scan_rows_at_excluding(
+            snapshot,
+            data_store,
+            data_prefix,
+            table,
+            pairs,
+            columns,
+            &[],
+        )
+        .await
+    }
+
+    /// [`Self::scan_rows_at`] with `excluded` file positions treated as
+    /// deleted: deletions the caller holds that `snapshot` does not, such as
+    /// a transaction's own uncommitted ones.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::scan_rows_at`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn scan_rows_at_excluding(
+        &self,
+        snapshot: &CatalogSnapshot,
+        data_store: Option<DataStore>,
+        data_prefix: &str,
+        table: TableId,
+        pairs: &[(u64, Option<DataFileId>)],
+        columns: &[String],
+        excluded: &[ExcludedPositions],
+    ) -> Result<LocatedRowScan> {
         self.scan_rows_at_with_mode(
             snapshot,
             data_store,
@@ -220,6 +251,7 @@ impl ReadOnlyCatalog {
             pairs,
             columns,
             MissingRows::Omit,
+            excluded,
         )
         .await
     }
@@ -234,6 +266,7 @@ impl ReadOnlyCatalog {
         pairs: &[(u64, Option<DataFileId>)],
         columns: &[String],
         missing: MissingRows,
+        excluded: &[ExcludedPositions],
     ) -> Result<LocatedRowScan> {
         let requested = requested_columns(snapshot, table, columns)?;
         let read_metrics = self.data_read_metrics();
@@ -284,10 +317,13 @@ impl ReadOnlyCatalog {
                 table,
                 snapshot,
             };
-            let located = self
+            let (located, _) = self
                 .position_requested_files(&scope, by_file, requested_files, missing)
                 .await?;
-            for read in self.file_reads(&scope, table, located, visible_at).await? {
+            for read in self
+                .file_reads(&scope, table, located, visible_at, excluded)
+                .await?
+            {
                 if matches!(missing, MissingRows::Omit)
                     && read
                         .file

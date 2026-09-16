@@ -11,11 +11,14 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_delete_filter.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include <chrono>
+#include <map>
+#include <set>
 
 namespace moraine_duckdb {
 namespace {
@@ -56,8 +59,14 @@ bool SupportedType(const duckdb::LogicalType &type) {
 struct SummaryScanBindData : duckdb::FunctionData {
 	std::string lake, schema, table;
 	uint64_t snapshot_id;
+	uint64_t table_id = 0;
 	double costing_ms = 0;
 	std::vector<MorainePositionPair> pairs;
+	// DuckLake's path for every data file the pairs name, keyed by file id,
+	// and the inlined tables the scan covers: the keys the transaction's own
+	// deletions are recorded under.
+	std::map<uint64_t, std::string> file_paths;
+	std::vector<std::string> inlined_tables;
 	duckdb::vector<std::string> names;
 	duckdb::vector<duckdb::LogicalType> types;
 	duckdb::virtual_column_map_t virtual_columns;
@@ -88,6 +97,63 @@ struct SummaryScanState : duckdb::GlobalTableFunctionState {
 		return 1;
 	}
 };
+
+// The transaction's own deletions over what the pairs name, which the pinned
+// snapshot cannot know: positions per file (its pending delete file and
+// inlined file deletions), and the pairs left once deleted inlined rows are
+// dropped. Gathered per execution, so later deletes in the transaction count.
+struct LocalExclusions {
+	std::vector<std::pair<uint64_t, std::vector<uint64_t>>> positions;
+	std::vector<MoraineExcludedPositions> entries;
+	std::vector<MorainePositionPair> pairs;
+};
+
+LocalExclusions CollectLocalExclusions(duckdb::ClientContext &context, duckdb::DuckLakeTransaction &transaction,
+                                       const SummaryScanBindData &bound) {
+	LocalExclusions result;
+	if (!transaction.ChangesMade()) {
+		result.pairs = bound.pairs;
+		return result;
+	}
+	duckdb::TableIndex table_id(bound.table_id);
+	std::set<uint64_t> file_ids;
+	for (auto &pair : bound.pairs) {
+		if (pair.has_data_file_id) {
+			file_ids.insert(pair.data_file_id);
+		}
+	}
+	for (auto file_id : file_ids) {
+		std::set<duckdb::idx_t> deleted;
+		auto path = bound.file_paths.find(file_id);
+		if (path != bound.file_paths.end() && transaction.HasLocalDeleteForFile(table_id, path->second)) {
+			duckdb::DuckLakeFileData pending;
+			transaction.GetLocalDeleteForFile(table_id, path->second, pending);
+			auto scanned = duckdb::DuckLakeDeleteFilter::ScanDeleteFile(context, pending);
+			deleted.insert(scanned.deleted_rows.begin(), scanned.deleted_rows.end());
+		}
+		transaction.GetLocalInlinedFileDeletesForFile(table_id, file_id, deleted);
+		if (!deleted.empty()) {
+			result.positions.emplace_back(file_id, std::vector<uint64_t>(deleted.begin(), deleted.end()));
+		}
+	}
+	for (auto &entry : result.positions) {
+		result.entries.push_back({entry.first, entry.second.data(), entry.second.size()});
+	}
+	std::set<duckdb::idx_t> deleted_inlined;
+	for (auto &name : bound.inlined_tables) {
+		auto deletes = transaction.GetInlinedDeletes(table_id, name);
+		if (deletes) {
+			deleted_inlined.insert(deletes->rows.begin(), deletes->rows.end());
+		}
+	}
+	for (auto &pair : bound.pairs) {
+		if (!pair.has_data_file_id && deleted_inlined.count(pair.row_id)) {
+			continue;
+		}
+		result.pairs.push_back(pair);
+	}
+	return result;
+}
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::ClientContext &context,
                                                                      duckdb::TableFunctionInitInput &input) {
@@ -140,12 +206,14 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::Cli
 	if (moraine_snapshot_id(snapshot, &snapshot_id, &error) != MORAINE_OK) {
 		ThrowMoraineError(error);
 	}
-	if (!handle || snapshot_id != bound.snapshot_id || transaction.ChangesMade()) {
+	if (!handle || snapshot_id != bound.snapshot_id) {
 		throw duckdb::InvalidInputException("moraine: selective scan snapshot changed after binding");
 	}
-	auto code = moraine_row_scan_open(handle, snapshot, bound.schema.c_str(), bound.table.c_str(), bound.pairs.data(),
-	                                  bound.pairs.size(), requested.data(), requested.size(), &state->scan,
-	                                  moraine_shim_is_interrupted, &context, &error);
+	auto exclusions = CollectLocalExclusions(context, transaction, bound);
+	auto code = moraine_row_scan_open(handle, snapshot, bound.schema.c_str(), bound.table.c_str(),
+	                                  exclusions.pairs.data(), exclusions.pairs.size(), requested.data(),
+	                                  requested.size(), exclusions.entries.data(), exclusions.entries.size(),
+	                                  &state->scan, moraine_shim_is_interrupted, &context, &error);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(error);
 	}
@@ -232,15 +300,12 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	auto &lake = info.table.catalog.Cast<duckdb::DuckLakeCatalog>();
 	auto transaction = info.GetTransaction();
 	auto &files = scan.bind_data->Cast<duckdb::MultiFileBindData>().file_list->Cast<duckdb::DuckLakeMultiFileList>();
-	if (files.HasTransactionLocalData()) {
-		return false;
-	}
 	auto statistics = info.table.GetTableStats(context);
 	if (statistics && rows.size() > 4096 && rows.size() > statistics->record_count / 4) {
 		return false;
 	}
 	if (info.scan_type != duckdb::DuckLakeScanType::SCAN_TABLE || lake.CatalogSnapshot() ||
-	    transaction->ChangesMade() || info.snapshot.snapshot_id != transaction->GetSnapshot().snapshot_id) {
+	    info.snapshot.snapshot_id != transaction->GetSnapshot().snapshot_id) {
 		return false;
 	}
 	std::string catalog_name, schema, table;
@@ -272,11 +337,27 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	bound->schema = schema;
 	bound->table = table;
 	bound->snapshot_id = info.snapshot.snapshot_id;
+	bound->table_id = info.table.GetTableId().index;
 	bound->names = scan.names;
 	bound->types = scan.returned_types;
 	bound->virtual_columns = scan.virtual_columns;
 	for (auto &row : rows) {
 		bound->pairs.push_back({row.value, row.data_file_id, row.has_data_file_id});
+	}
+	// Transaction-local rows are never index hits, so the scan may skip the
+	// files and inlined data the transaction added; its deletions are
+	// subtracted at execution, which needs every named file's DuckLake path.
+	for (auto &entry : files.GetFiles()) {
+		if (entry.data_type == duckdb::DuckLakeDataType::INLINED_DATA) {
+			bound->inlined_tables.push_back(entry.file.path);
+		} else if (entry.data_type == duckdb::DuckLakeDataType::DATA_FILE && entry.file_id.IsValid()) {
+			bound->file_paths.emplace(entry.file_id.index, entry.file.path);
+		}
+	}
+	for (auto &pair : bound->pairs) {
+		if (pair.has_data_file_id && !bound->file_paths.count(pair.data_file_id)) {
+			return false;
+		}
 	}
 	std::vector<MorainePositionPair> file_pairs;
 	for (auto &pair : bound->pairs) {
@@ -296,10 +377,13 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		}
 		auto snapshot = metadata_tx.transaction->Cast<MoraineTransaction>().Snapshot();
 		MoraineError error {};
-		auto code =
-		    moraine_row_scan_open(moraine_snapshot_read_handle(snapshot), snapshot, schema.c_str(), table.c_str(),
-		                          file_pairs.data(), file_pairs.size(), columns.data(), columns.size(), &estimate.scan,
-		                          moraine_shim_is_interrupted, &context, &error);
+		// Coverage is estimated over the committed positions alone: the
+		// transaction's own deletions only remove rows, so they are gathered
+		// once, at execution.
+		auto code = moraine_row_scan_open(moraine_snapshot_read_handle(snapshot), snapshot, schema.c_str(),
+		                                  table.c_str(), file_pairs.data(), file_pairs.size(), columns.data(),
+		                                  columns.size(), nullptr, 0, &estimate.scan, moraine_shim_is_interrupted,
+		                                  &context, &error);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(error);
 		}

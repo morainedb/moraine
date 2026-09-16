@@ -251,3 +251,64 @@ fn summary_scan_prepare_defers_projected_reads() {
         "{result}"
     );
 }
+
+/// A transaction with staged writes keeps the selective path, and its own
+/// deletes vanish from it: pending delete files, inlined file deletions and
+/// inlined-data deletions alike.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn summary_scan_runs_inside_a_writing_transaction_minus_its_deletes() {
+    let query = "SELECT 'sum', sum(data.b) FROM lake.main.t data
+        JOIN moraine_index_in('lake','main','t','by_a',[1,3,7]) hits
+        ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
+    for (limit, table) in [
+        (
+            0,
+            "CREATE TABLE lake.main.t AS SELECT i a, i * 2 b FROM range(10000) r(i);",
+        ),
+        (
+            10,
+            "CREATE TABLE lake.main.t AS SELECT i a, i * 2 b FROM range(10000) r(i);",
+        ),
+        (
+            10,
+            "CREATE TABLE lake.main.t(a BIGINT, b BIGINT); INSERT INTO lake.main.t VALUES (1,2),(3,6),(7,14);",
+        ),
+    ] {
+        let store = TempDir::new("selective-writing-tx-store");
+        let data = TempDir::new("selective-writing-tx-data");
+        let options = format!(
+            ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT {limit}",
+            data.path().display()
+        );
+        let result = run_ducklake_sql_with_options(
+            store.path(),
+            data.path(),
+            &options,
+            &format!(
+                "{table}
+                 CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+                 BEGIN;
+                 INSERT INTO lake.main.t VALUES (20000, 1);
+                 EXPLAIN {query}; {query};
+                 DELETE FROM lake.main.t WHERE a = 3;
+                 EXPLAIN {query}; {query};
+                 DELETE FROM lake.main.t WHERE a = 7;
+                 EXPLAIN {query}; {query};
+                 COMMIT;
+                 {query};"
+            ),
+        );
+        assert_eq!(
+            result.matches("MORAINE_SUMMARY_SCAN").count(),
+            6,
+            "limit={limit}: {result}"
+        );
+        let sums: Vec<_> = csv_rows(&result)
+            .into_iter()
+            .filter(|row| row[0] == "sum")
+            .map(|row| row[1].clone())
+            .collect();
+        assert_eq!(sums, vec!["22", "16", "2", "2"], "limit={limit}: {result}");
+    }
+}

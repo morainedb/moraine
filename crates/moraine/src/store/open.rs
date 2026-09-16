@@ -54,6 +54,9 @@ const SST_BLOCK_SIZE: SstBlockSize = SstBlockSize::Block4Kib;
 mod probe_tests;
 
 #[cfg(test)]
+mod probe_bench;
+
+#[cfg(test)]
 mod compaction_cache_tests;
 
 /// Creates a checkpoint of every write `db` has taken (not only the

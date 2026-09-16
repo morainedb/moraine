@@ -27,6 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use slatedb::DbTransaction;
 use tracing::debug;
 
@@ -306,8 +307,9 @@ pub enum RowOperation {
         /// Row count carried by `arrow_body`.
         row_count: u64,
         /// The user-column cells, encoded as one Arrow IPC record-batch
-        /// body (opaque bytes to this layer).
-        arrow_body: Vec<u8>,
+        /// body, shared with index upkeep without copying. Convert an owned
+        /// `Vec<u8>` with `.into()` to transfer its allocation.
+        arrow_body: Bytes,
     },
     /// `inline/inline_delete`: tombstones one inlined-insert row.
     InlineInlineDelete {

@@ -468,6 +468,17 @@ typedef struct MoraineObjectStoreTally {
   uint64_t errors;
 } MoraineObjectStoreTally;
 
+// File positions a selective scan treats as deleted on top of the
+// snapshot's own delete files: the caller's uncommitted deletions.
+typedef struct MoraineExcludedPositions {
+  // The data file the positions are within.
+  uint64_t data_file_id;
+  // `positions_len` positions within that file, borrowed for the open call.
+  const uint64_t *positions;
+  // Length of `positions`.
+  size_t positions_len;
+} MoraineExcludedPositions;
+
 // Data-store bytes and ranges read by a cursor, excluding cache hits.
 typedef struct MoraineRowScanMetrics {
   // Payload/metadata bytes fetched.
@@ -1972,7 +1983,8 @@ bool moraine_snapshot_read_revision(struct MoraineSnapshotHandle *snapshot, uint
 // # Safety
 // `handle` and `snapshot` must be live and refer to the same pinned read
 // scope. Strings and arrays must be valid for their lengths; `out` must be
-// writable. Cancellation and error pointers follow the catalog ABI contract.
+// writable; `excluded` entries borrow their positions for the call.
+// Cancellation and error pointers follow the catalog ABI contract.
 int32_t moraine_row_scan_open(struct MoraineCatalogHandle *handle,
                               struct MoraineSnapshotHandle *snapshot,
                               const char *schema,
@@ -1981,6 +1993,8 @@ int32_t moraine_row_scan_open(struct MoraineCatalogHandle *handle,
                               size_t pairs_len,
                               const char *const *columns,
                               size_t columns_len,
+                              const struct MoraineExcludedPositions *excluded,
+                              size_t excluded_len,
                               struct MoraineRowScan **out,
                               MoraineInterruptProbe probe,
                               void *probe_ctx,

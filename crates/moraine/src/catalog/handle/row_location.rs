@@ -1,13 +1,16 @@
 //! Locating stable row ids in the physical files that currently hold them.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use futures::{StreamExt, TryStreamExt, stream};
 use tracing::{debug, warn};
 
 mod rows_at;
 
-pub use rows_at::LocatedRowScan;
+pub use rows_at::{ExcludedPositions, LocatedRowScan};
 
 use super::{Catalog, ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
 use crate::{
@@ -75,6 +78,13 @@ struct LocationScope<'a> {
     table_prefix: &'a str,
     table: TableId,
     snapshot: &'a CatalogSnapshot,
+}
+
+/// Exact physical positions before deletion visibility is applied.
+struct PositionedFile {
+    data_file_id: DataFileId,
+    file_path: String,
+    positions: Vec<u64>,
 }
 
 /// Deduplicates `pairs`, splitting them into rows grouped by named file and
@@ -422,12 +432,55 @@ impl ReadOnlyCatalog {
             snapshot,
         };
 
-        let deletions = self
+        let started = Instant::now();
+        let (positioned, summaries_built) = self
             .position_requested_files(&scope, by_file, requested_files, MissingRows::Reject)
             .await?;
+        let positioning_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let file_id_paths: Vec<_> = positioned
+            .iter()
+            .map(|file| (file.data_file_id, file.file_path.clone()))
+            .collect();
+        let existing_deletes = self.existing_delete_files(&scope, &file_id_paths).await;
+        let deletions = positioned
+            .into_iter()
+            .zip(existing_deletes)
+            .map(|(file, existing_delete)| {
+                Ok(LocatedDeletion {
+                    data_file_id: file.data_file_id,
+                    file_path: file.file_path,
+                    positions: file.positions,
+                    existing_delete: existing_delete?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         // Same snapshot the positions above were resolved against, so the
         // directory names the table's current location, not a later one.
         let write_directory = Some(snapshot.table_write_directory(table)?);
+
+        debug!(
+            table_id = table.get(),
+            pairs = pairs.len(),
+            files = deletions.len(),
+            positions = deletions
+                .iter()
+                .map(|file| file.positions.len())
+                .sum::<usize>(),
+            existing_delete_files = deletions
+                .iter()
+                .filter(|file| file.existing_delete.is_some())
+                .count(),
+            existing_positions = deletions
+                .iter()
+                .filter_map(|file| file.existing_delete.as_ref())
+                .map(|existing| existing.positions.len())
+                .sum::<usize>(),
+            summaries_built,
+            inlined_rows = inlined_rows.len(),
+            positioning_ms,
+            locate_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "located rows resolved"
+        );
 
         Ok(LocatedPositions {
             deletions,
@@ -457,7 +510,7 @@ impl ReadOnlyCatalog {
         by_file: HashMap<DataFileId, Vec<u64>>,
         requested_files: Vec<DataFileInfo>,
         missing: MissingRows,
-    ) -> Result<Vec<LocatedDeletion>> {
+    ) -> Result<(Vec<PositionedFile>, usize)> {
         // `current_files_for` already returned these in ascending id order;
         // carrying the pairs through avoids both a second sort and a
         // separate id-to-path lookup.
@@ -478,22 +531,23 @@ impl ReadOnlyCatalog {
             .into_iter()
             .collect();
 
-        let existing_deletes = self.existing_delete_files(scope, &file_id_paths).await;
-
+        let summaries_built = summaries
+            .values()
+            .filter(|summary| summary.as_ref().is_ok_and(|summary| summary.built))
+            .count();
         let mut located = Vec::with_capacity(file_id_paths.len());
-        for ((file_id, path), existing_delete) in file_id_paths.into_iter().zip(existing_deletes) {
+        for (file_id, path) in file_id_paths {
             let rows = by_file.get(&file_id).cloned().unwrap_or_default();
             let positions = positioned_rows(&summaries, file_id, &rows, missing)?;
 
-            located.push(LocatedDeletion {
+            located.push(PositionedFile {
                 data_file_id: file_id,
                 file_path: path,
                 positions,
-                existing_delete: existing_delete?,
             });
         }
 
-        Ok(located)
+        Ok((located, summaries_built))
     }
 
     /// The delete file currently registered against each of `file_id_paths`,

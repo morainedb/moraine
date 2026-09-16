@@ -44,6 +44,15 @@ public:
 		return scoped && !StagedTxIfOpen() ? scoped : catalog_handle_;
 	}
 
+	// The handle index probes read through: the revision this transaction
+	// started on, whether or not it has staged writes since. Index entries
+	// carry no staged overlay, so the pin stays the one view consistent with
+	// the DuckLake snapshot the transaction scans at.
+	MoraineCatalogHandle *IndexReadHandle() const {
+		auto scoped = moraine_snapshot_read_handle(snapshot_);
+		return scoped ? scoped : catalog_handle_;
+	}
+
 	bool SchemasLoaded() const {
 		return schemas_loaded_;
 	}

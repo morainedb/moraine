@@ -79,7 +79,7 @@ async fn recent_rows_serves_from_a_directory_verified_complete() {
                 begin_snapshot: 1,
                 row_id_start: 0,
                 row_count: 2,
-                arrow_body: b"chunk".to_vec(),
+                arrow_body: b"chunk".to_vec().into(),
             },
         ],
     )
@@ -151,7 +151,7 @@ async fn two_chunks_ending_at_one_row_id_keep_both_locators() {
                 begin_snapshot: 1,
                 row_id_start: 5,
                 row_count: 3,
-                arrow_body: b"chunk-a".to_vec(),
+                arrow_body: b"chunk-a".to_vec().into(),
             },
         ],
     )
@@ -168,7 +168,7 @@ async fn two_chunks_ending_at_one_row_id_keep_both_locators() {
             begin_snapshot: 2,
             row_id_start: 7,
             row_count: 1,
-            arrow_body: b"chunk-b".to_vec(),
+            arrow_body: b"chunk-b".to_vec().into(),
         }],
     )
     .await;
@@ -233,7 +233,7 @@ async fn recent_rows_reads_only_the_chunks_live_rows_reference() {
                 begin_snapshot: 1,
                 row_id_start: 0,
                 row_count: 2,
-                arrow_body: b"chunk-a".to_vec(),
+                arrow_body: b"chunk-a".to_vec().into(),
             },
         ],
     )
@@ -248,7 +248,7 @@ async fn recent_rows_reads_only_the_chunks_live_rows_reference() {
             begin_snapshot: 2,
             row_id_start: 2,
             row_count: 2,
-            arrow_body: b"chunk-b".to_vec(),
+            arrow_body: b"chunk-b".to_vec().into(),
         }],
     )
     .await;
@@ -427,7 +427,7 @@ async fn recent_row_does_not_fetch_unrequested_live_chunks() {
                 begin_snapshot: 1,
                 row_id_start: 0,
                 row_count: 128,
-                arrow_body: b"wanted".to_vec(),
+                arrow_body: b"wanted".to_vec().into(),
             },
             RowOperation::InlineInsert {
                 table_id: 1,
@@ -435,7 +435,7 @@ async fn recent_row_does_not_fetch_unrequested_live_chunks() {
                 begin_snapshot: 1,
                 row_id_start: 128,
                 row_count: 128,
-                arrow_body: b"unrelated".to_vec(),
+                arrow_body: b"unrelated".to_vec().into(),
             },
         ],
     )
@@ -497,7 +497,7 @@ async fn requested_inline_rows_follow_updates_and_wider_chunks() {
                 begin_snapshot: 1,
                 row_id_start: 10,
                 row_count: 2,
-                arrow_body: b"old".to_vec(),
+                arrow_body: b"old".to_vec().into(),
             },
         ],
     )
@@ -533,7 +533,7 @@ async fn requested_inline_rows_follow_updates_and_wider_chunks() {
                 begin_snapshot: 2,
                 row_id_start: 0,
                 row_count: 1024,
-                arrow_body: b"replacement".to_vec(),
+                arrow_body: b"replacement".to_vec().into(),
             },
         ],
     )

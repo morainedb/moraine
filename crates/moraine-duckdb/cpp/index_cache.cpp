@@ -184,19 +184,22 @@ struct IndexDependencyState : public duckdb::ClientContextState {
 	}
 };
 
+// `clean` is whether index reads may pin the transaction's starting
+// revision. Staged writes do not clear it: index entries carry no
+// transaction-local overlay either way, and the pin is the view consistent
+// with the DuckLake snapshot the transaction scans at. A time-travel attach
+// reads an older DuckLake snapshot than the pin and stays unpinned.
 MoraineTransaction &ReadTransaction(duckdb::ClientContext &context, MoraineCatalog &catalog,
                                     const std::string &lake_name, bool &clean) {
 	auto *metadata_context = &context;
 	if (!lake_name.empty()) {
 		auto &lake = duckdb::Catalog::GetCatalog(context, lake_name).Cast<duckdb::DuckLakeCatalog>();
 		auto &transaction = duckdb::DuckLakeTransaction::Get(context, lake);
-		clean = !transaction.ChangesMade() && !lake.CatalogSnapshot();
+		clean = !lake.CatalogSnapshot();
 		metadata_context = transaction.GetConnection().context.get();
 	}
 	auto transaction = catalog.GetCatalogTransaction(*metadata_context);
-	auto &moraine = transaction.transaction->Cast<MoraineTransaction>();
-	clean = clean && !moraine.StagedTxIfOpen();
-	return moraine;
+	return transaction.transaction->Cast<MoraineTransaction>();
 }
 
 } // namespace
@@ -275,7 +278,7 @@ MoraineCatalogHandle *BindIndexRead(duckdb::ClientContext &context, duckdb::Tabl
 			input.binder->GetStatementProperties().RegisterDBRead(duckdb::Catalog::GetCatalog(context, lake_name), context);
 		}
 	}
-	return clean ? transaction.ReadHandle() : catalog.Handle();
+	return clean ? transaction.IndexReadHandle() : catalog.Handle();
 }
 
 } // namespace moraine_duckdb

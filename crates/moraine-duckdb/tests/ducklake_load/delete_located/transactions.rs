@@ -222,3 +222,32 @@ fn located_file_deletes_do_not_duplicate_inline_deletion_records() {
         );
     }
 }
+
+/// A second located deletion on a file the transaction already deleted from
+/// merges with the pending delete file, and neither loses the committed
+/// deletions the first statement carried over.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn repeated_located_deletions_on_one_file_keep_every_deletion() {
+    for inline_limit in [0, 1024] {
+        let fixture = Fixture::new(inline_limit);
+        fixture.run(&fixture.deletion(1));
+        fixture.run(&format!(
+            "BEGIN; {} {} COMMIT;",
+            fixture.deletion(2),
+            fixture.deletion(3),
+        ));
+        assert_eq!(
+            csv_rows(&fixture.run("SELECT count(*) FROM lake.main.t;")),
+            vec![vec!["0"]],
+            "inline_limit={inline_limit}"
+        );
+        assert_eq!(
+            csv_rows(&fixture.run(
+                "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 1);"
+            )),
+            vec![vec!["0"]],
+            "inline_limit={inline_limit}"
+        );
+    }
+}

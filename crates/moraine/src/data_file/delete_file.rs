@@ -68,6 +68,19 @@ pub(crate) async fn delete_file_positions_at(
     file: ParquetFile,
     visible_at: u64,
 ) -> Result<Vec<u64>> {
+    let positions = auxiliary_cache::shared()
+        .delete_positions_at(&file, visible_at, || {
+            decode_delete_file_positions_at(file.clone(), visible_at)
+        })
+        .await?;
+    Ok(positions.to_sorted_vec())
+}
+
+/// Reads and sorts the positions `file` marks dead as of `visible_at`.
+async fn decode_delete_file_positions_at(
+    file: ParquetFile,
+    visible_at: u64,
+) -> Result<Arc<FileRowSet>> {
     file.metrics.parquet_file();
     let reader = ObjectStoreReader::new(&file, PageIndexPolicy::Skip);
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
@@ -114,7 +127,7 @@ pub(crate) async fn delete_file_positions_at(
     positions.sort_unstable();
     positions.dedup();
 
-    Ok(positions)
+    FileRowSet::from_sorted(positions).map(Arc::new)
 }
 
 /// The row positions a DuckLake delete file marks dead, ascending and

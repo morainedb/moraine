@@ -26,7 +26,7 @@ fn insertion(snapshot: u64) -> RowOperation {
         begin_snapshot: snapshot,
         row_id_start: 0,
         row_count: 1,
-        arrow_body: snapshot.to_be_bytes().to_vec(),
+        arrow_body: snapshot.to_be_bytes().to_vec().into(),
     }
 }
 

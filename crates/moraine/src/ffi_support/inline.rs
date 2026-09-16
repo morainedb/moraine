@@ -334,7 +334,7 @@ mod tests {
             begin_snapshot: 1,
             row_id_start: 0,
             row_count: 2,
-            arrow_body: b"chunk-a".to_vec(),
+            arrow_body: b"chunk-a".to_vec().into(),
         });
         tx.stage(RowOperation::InlineInsert {
             table_id: 1,
@@ -342,7 +342,7 @@ mod tests {
             begin_snapshot: 1,
             row_id_start: 2,
             row_count: 1,
-            arrow_body: b"chunk-b".to_vec(),
+            arrow_body: b"chunk-b".to_vec().into(),
         });
         tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
@@ -424,7 +424,7 @@ mod tests {
                 begin_snapshot: 1,
                 row_id_start: chunk * 2,
                 row_count: 2,
-                arrow_body: format!("chunk-{chunk}").into_bytes(),
+                arrow_body: format!("chunk-{chunk}").into_bytes().into(),
             });
         }
         tx.stage(RowOperation::Insert {
@@ -510,7 +510,7 @@ mod tests {
             begin_snapshot: 1,
             row_id_start: 0,
             row_count: 2,
-            arrow_body: b"chunk".to_vec(),
+            arrow_body: b"chunk".to_vec().into(),
         });
         tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
@@ -571,7 +571,7 @@ mod tests {
             begin_snapshot: 1,
             row_id_start: 0,
             row_count: 1,
-            arrow_body: b"chunk".to_vec(),
+            arrow_body: b"chunk".to_vec().into(),
         });
         tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
@@ -725,7 +725,7 @@ mod tests {
             begin_snapshot: 1,
             row_id_start: 0,
             row_count: 2,
-            arrow_body: b"chunk-a".to_vec(),
+            arrow_body: b"chunk-a".to_vec().into(),
         });
         tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
@@ -794,7 +794,7 @@ mod tests {
             begin_snapshot: 1,
             row_id_start: 0,
             row_count: 2,
-            arrow_body: b"chunk-v0".to_vec(),
+            arrow_body: b"chunk-v0".to_vec().into(),
         });
         tx.stage(RowOperation::InlineInsert {
             table_id: 1,
@@ -802,7 +802,7 @@ mod tests {
             begin_snapshot: 1,
             row_id_start: 2,
             row_count: 1,
-            arrow_body: b"chunk-v1".to_vec(),
+            arrow_body: b"chunk-v1".to_vec().into(),
         });
         tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
@@ -894,7 +894,7 @@ mod tests {
                 begin_snapshot: 1,
                 row_id_start: schema_version * 10,
                 row_count: 2,
-                arrow_body: b"chunk".to_vec(),
+                arrow_body: b"chunk".to_vec().into(),
             });
         }
         tx.stage(RowOperation::Insert {

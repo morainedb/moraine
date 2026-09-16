@@ -72,6 +72,54 @@ inherit that limitation.
 
 ## Design
 
+### Transient Arrow reuse at staging
+
+The durable chunk body remains Arrow IPC. The current extension imports the
+DuckDB Arrow arrays in `moraine_arrow_encode_chunk`, serializes them, and stages
+only the owned bytes. A staged `RowOperation::InlineInsert` holds that body as
+shared `Bytes`; commit-time index upkeep and durable translation clone the owner
+rather than copying the payload, and the owner is released with the transaction
+on commit, rollback or failure. The decoder passes a shared view of the payload
+region to Arrow; Arrow can still copy individual buffers to satisfy alignment
+requirements. Schemas are decoded once per table version per commit, and one
+chunk decode serves all maintained indexes. Tables with no maintained indexes
+skip derivation.
+
+An original-array reuse path must be transaction-owned, not a global cache keyed
+by buffer addresses or row IDs. Encoding and staging must share one ownership
+transfer so the retained arrays and durable bytes cannot describe different
+rows. An opaque encoded-batch value or a fused import/encode/stage entry point
+can provide that invariant; independently supplied bytes and arrays cannot.
+Existing bytes-only callers must retain the same decode fallback.
+
+The staging sidecar is keyed by the staged operation's identity, not just its
+row range: a transaction may update a range more than once. It holds owned Arrow
+buffers, never a borrowed `DataChunk`, and releases them on commit, rollback and
+failed staging. Retention is bounded by allocated backing-buffer bytes and an
+entry ceiling; oversized inputs fall back to durable bytes. Any retained parent
+allocation behind a slice must be charged, not only the slice's visible rows.
+The allowance must count toward transaction/process memory accounting.
+
+The exported temporary column names (`c0`, `c1`, ...) are not the registered
+inline schema. Reuse must apply the same versioned column identities, logical
+types, pending renames and widening rules as the existing IPC path before key
+derivation. NULLs, UUIDs, schema evolution, repeated updates, delete-plus-insert,
+rollback and budget exhaustion must produce identical keys through both paths.
+
+The prerequisite comparison separates three costs: copying and decoding the
+durable body, decoding a shared owned body, and deriving from retained arrays.
+If ownership-only sharing captures most of the gain, it is preferable to
+retaining a second payload allocation. The experimental microbenchmark in
+`data_file/inline_batch/reuse_bench.rs` makes that comparison; it does not install
+a staging sidecar or change the durable format.
+
+The initial 2048-row, two-index microbenchmark measured retained arrays at
+0.85–0.88 ms per batch versus 1.13–1.30 ms for copy-plus-decode, with 8 or 64
+columns and a 1 KiB unindexed string per row. Shared-body decoding took
+0.96–1.08 ms. Retention removed 25–33% of this isolated derivation cost but
+kept another 2.2–3.2 MB of arrays per batch. Serialization, staging, commit and
+remote I/O were excluded, so these are not end-to-end insertion speedups.
+
 ### Keyspace (fills in the RFC 0002 `inline` reservation)
 
 | Kind | Key components | Value |

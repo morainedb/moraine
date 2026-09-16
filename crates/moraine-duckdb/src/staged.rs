@@ -1576,7 +1576,7 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_insert(
             begin_snapshot,
             row_id_start,
             row_count,
-            arrow_body: bytes.to_vec(),
+            arrow_body: bytes.to_vec().into(),
         });
 
         Ok(())
@@ -1623,7 +1623,7 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_insert_owned(
             begin_snapshot,
             row_id_start,
             row_count,
-            arrow_body,
+            arrow_body: arrow_body.into(),
         });
         Ok(())
     };

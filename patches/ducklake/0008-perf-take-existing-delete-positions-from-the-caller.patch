@@ -1,0 +1,56 @@
+diff --git a/src/functions/ducklake_delete_positions.cpp b/src/functions/ducklake_delete_positions.cpp
+index 21cf828..b1118cf 100644
+--- a/src/functions/ducklake_delete_positions.cpp
++++ b/src/functions/ducklake_delete_positions.cpp
+@@ -29,0 +30,2 @@ struct PositionalDeletes {
++	//! Positions the caller already decoded from a file's committed delete file, per data file id, ascending
++	map<idx_t, vector<idx_t>> existing_positions;
+@@ -42 +44,2 @@ struct StagedDeletes {
+-static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &result, const char *function) {
++static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &result,
++                               map<idx_t, vector<idx_t>> &existing, const char *function) {
+@@ -55,0 +59 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
++	optional_idx existing_index;
+@@ -62,0 +67,2 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
++		} else if (name == "existing_positions") {
++			existing_index = i;
+@@ -65 +71,2 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
+-	if (children.size() != 2 || !file_index.IsValid() || !positions_index.IsValid()) {
++	if (children.size() != 2 + (existing_index.IsValid() ? 1 : 0) || !file_index.IsValid() ||
++	    !positions_index.IsValid()) {
+@@ -82 +89,2 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
+-		auto &positions = result[file_value.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>()];
++		auto file_id = file_value.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>();
++		auto &positions = result[file_id];
+@@ -88,0 +97,21 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
++		// A NULL `existing_positions` means the caller does not know them and the
++		// committed delete file is read here instead. Non-NULL is a BLOB of
++		// little-endian uint64 positions.
++		if (existing_index.IsValid() && !fields[existing_index.GetIndex()].IsNull()) {
++			auto &existing_value = fields[existing_index.GetIndex()];
++			if (existing_value.type().id() != LogicalTypeId::BLOB) {
++				throw InvalidInputException("%s: `existing_positions` must be a BLOB", function);
++			}
++			auto &packed = StringValue::Get(existing_value);
++			if (packed.size() % sizeof(uint64_t) != 0) {
++				throw InvalidInputException("%s: `existing_positions` must hold whole uint64 positions", function);
++			}
++			auto &known = existing[file_id];
++			known.reserve(packed.size() / sizeof(uint64_t));
++			for (idx_t offset = 0; offset + sizeof(uint64_t) <= packed.size(); offset += sizeof(uint64_t)) {
++				uint64_t position;
++				memcpy(&position, packed.data() + offset, sizeof(uint64_t));
++				known.push_back(position);
++			}
++			std::sort(known.begin(), known.end());
++		}
+@@ -96 +125 @@ static PositionalDeletes ParsePositionalDeletes(TableFunctionBindInput &input, c
+-	ParseFilePositions(input.inputs[3], result.file_positions, function);
++	ParseFilePositions(input.inputs[3], result.file_positions, result.existing_positions, function);
+@@ -263,0 +293 @@ static StagedDeletes StagePositionalDeletes(ClientContext &context, DuckLakeCata
++			auto known = request.existing_positions.find(requested.first);
+@@ -268,0 +299,4 @@ static StagedDeletes StagePositionalDeletes(ClientContext &context, DuckLakeCata
++			} else if (known != request.existing_positions.end()) {
++				// The caller resolved its positions at this snapshot or a newer one, so its decode of
++				// the committed delete file holds every position deleted here.
++				positions.insert(known->second.begin(), known->second.end());
