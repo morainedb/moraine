@@ -70,9 +70,13 @@ async fn fixture_with_cache(
         .with_metrics_recorder(cache::recorder(counters.clone()))
         .with_db_cache(match isolated {
             Some(cache) => cache,
-            None => cache::shared(&options.cache_config(), options.location())
-                .await
-                .unwrap(),
+            None => cache::shared(
+                &options.cache_config(),
+                options.location(),
+                cache::store_counters(),
+            )
+            .await
+            .unwrap(),
         })
         .build()
         .await

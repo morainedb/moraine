@@ -736,6 +736,63 @@ pub unsafe extern "C" fn moraine_cache_tally(
     catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(codes::INTERNAL)
 }
 
+/// Of the hits [`moraine_cache_tally`] reports, those the disk tier served
+/// after the memory tier missed; the rest were resident in memory. Zero
+/// without a disk tier. Process-wide; [`moraine_catalog_cache_tally_tiers`]
+/// narrows to one attach.
+///
+/// # Safety
+///
+/// Both out-pointers must be valid and writable for the duration of the
+/// call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_cache_tally_tiers(
+    out_metadata_disk_hits: *mut u64,
+    out_block_disk_hits: *mut u64,
+) -> i32 {
+    let attempt = || {
+        if out_metadata_disk_hits.is_null() || out_block_disk_hits.is_null() {
+            return codes::INVALID_ARGUMENT;
+        }
+        let tally = moraine::cache_tally();
+        // SAFETY: checked non-null above; caller contract for validity.
+        unsafe {
+            *out_metadata_disk_hits = tally.metadata_disk_hits;
+            *out_block_disk_hits = tally.block_disk_hits;
+        }
+        codes::OK
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(codes::INTERNAL)
+}
+
+/// As [`moraine_cache_tally_tiers`], for one attach.
+///
+/// # Safety
+///
+/// `handle` must be a live catalog handle and both out-pointers valid and
+/// writable for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_catalog_cache_tally_tiers(
+    handle: *mut MoraineCatalogHandle,
+    out_metadata_disk_hits: *mut u64,
+    out_block_disk_hits: *mut u64,
+) -> i32 {
+    let attempt = || {
+        if handle.is_null() || out_metadata_disk_hits.is_null() || out_block_disk_hits.is_null() {
+            return codes::INVALID_ARGUMENT;
+        }
+        // SAFETY: caller contract for `handle`.
+        let tally = unsafe { &*handle }.catalog.reads().cache_tally();
+        // SAFETY: checked non-null above; caller contract for validity.
+        unsafe {
+            *out_metadata_disk_hits = tally.metadata_disk_hits;
+            *out_block_disk_hits = tally.block_disk_hits;
+        }
+        codes::OK
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(codes::INTERNAL)
+}
+
 /// The counts [`moraine_cache_tally`] reports, narrowed to what the
 /// catalog `handle` names has spent since it attached.
 ///

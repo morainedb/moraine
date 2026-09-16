@@ -119,8 +119,12 @@ LocatedArguments ResolveLocatedArguments(duckdb::ClientContext &context, const s
 
 	using duckdb::LogicalType;
 	using duckdb::Value;
+	// `existing_positions` carries the committed delete file's positions the
+	// resolution already decoded, packed as little-endian u64s so DuckLake
+	// need not read that file again nor unpack one value per position.
 	duckdb::child_list_t<LogicalType> file_fields {{"data_file_id", LogicalType::UBIGINT},
-	                                               {"positions", LogicalType::LIST(LogicalType::UBIGINT)}};
+	                                               {"positions", LogicalType::LIST(LogicalType::UBIGINT)},
+	                                               {"existing_positions", LogicalType::BLOB}};
 	auto file_type = LogicalType::STRUCT(file_fields);
 	duckdb::vector<Value> file_values;
 	file_values.reserve(files.size());
@@ -130,8 +134,15 @@ LocatedArguments ResolveLocatedArguments(duckdb::ClientContext &context, const s
 		for (size_t i = 0; i < file.positions_len; i++) {
 			positions.push_back(Value::UBIGINT(file.positions[i]));
 		}
+		Value existing = Value(LogicalType::BLOB);
+		if (file.has_existing_delete) {
+			std::string packed(reinterpret_cast<const char *>(file.existing_positions),
+			                   file.existing_positions_len * sizeof(uint64_t));
+			existing = Value::BLOB_RAW(packed);
+		}
 		duckdb::child_list_t<Value> fields {{"data_file_id", Value::UBIGINT(file.data_file_id)},
-		                                    {"positions", Value::LIST(LogicalType::UBIGINT, std::move(positions))}};
+		                                    {"positions", Value::LIST(LogicalType::UBIGINT, std::move(positions))},
+		                                    {"existing_positions", std::move(existing)}};
 		file_values.push_back(Value::STRUCT(std::move(fields)));
 	}
 	duckdb::vector<Value> inlined_values;

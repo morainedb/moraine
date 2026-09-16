@@ -468,6 +468,17 @@ typedef struct MoraineObjectStoreTally {
   uint64_t errors;
 } MoraineObjectStoreTally;
 
+// File positions a selective scan treats as deleted on top of the
+// snapshot's own delete files: the caller's uncommitted deletions.
+typedef struct MoraineExcludedPositions {
+  // The data file the positions are within.
+  uint64_t data_file_id;
+  // `positions_len` positions within that file, borrowed for the open call.
+  const uint64_t *positions;
+  // Length of `positions`.
+  size_t positions_len;
+} MoraineExcludedPositions;
+
 // Data-store bytes and ranges read by a cursor, excluding cache hits.
 typedef struct MoraineRowScanMetrics {
   // Payload/metadata bytes fetched.
@@ -1865,6 +1876,27 @@ int32_t moraine_cache_tally(uint64_t *out_metadata_hits,
                             uint64_t *out_preload_block_misses,
                             uint64_t *out_preload_failures);
 
+// Of the hits [`moraine_cache_tally`] reports, those the disk tier served
+// after the memory tier missed; the rest were resident in memory. Zero
+// without a disk tier. Process-wide; [`moraine_catalog_cache_tally_tiers`]
+// narrows to one attach.
+//
+// # Safety
+//
+// Both out-pointers must be valid and writable for the duration of the
+// call.
+int32_t moraine_cache_tally_tiers(uint64_t *out_metadata_disk_hits, uint64_t *out_block_disk_hits);
+
+// As [`moraine_cache_tally_tiers`], for one attach.
+//
+// # Safety
+//
+// `handle` must be a live catalog handle and both out-pointers valid and
+// writable for the duration of the call.
+int32_t moraine_catalog_cache_tally_tiers(struct MoraineCatalogHandle *handle,
+                                          uint64_t *out_metadata_disk_hits,
+                                          uint64_t *out_block_disk_hits);
+
 // The counts [`moraine_cache_tally`] reports, narrowed to what the
 // catalog `handle` names has spent since it attached.
 //
@@ -1972,7 +2004,8 @@ bool moraine_snapshot_read_revision(struct MoraineSnapshotHandle *snapshot, uint
 // # Safety
 // `handle` and `snapshot` must be live and refer to the same pinned read
 // scope. Strings and arrays must be valid for their lengths; `out` must be
-// writable. Cancellation and error pointers follow the catalog ABI contract.
+// writable; `excluded` entries borrow their positions for the call.
+// Cancellation and error pointers follow the catalog ABI contract.
 int32_t moraine_row_scan_open(struct MoraineCatalogHandle *handle,
                               struct MoraineSnapshotHandle *snapshot,
                               const char *schema,
@@ -1981,6 +2014,8 @@ int32_t moraine_row_scan_open(struct MoraineCatalogHandle *handle,
                               size_t pairs_len,
                               const char *const *columns,
                               size_t columns_len,
+                              const struct MoraineExcludedPositions *excluded,
+                              size_t excluded_len,
                               struct MoraineRowScan **out,
                               MoraineInterruptProbe probe,
                               void *probe_ctx,

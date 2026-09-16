@@ -919,14 +919,14 @@ impl InlineChunk<'_> {
 }
 
 enum InlineBody<'a> {
-    Borrowed(&'a [u8]),
+    Borrowed(&'a Bytes),
     Owned(Bytes),
 }
 
 impl InlineBody<'_> {
     fn into_bytes(self) -> Bytes {
         match self {
-            Self::Borrowed(body) => Bytes::copy_from_slice(body),
+            Self::Borrowed(body) => body.clone(),
             Self::Owned(body) => body,
         }
     }
@@ -1508,6 +1508,26 @@ pub(super) fn index_positions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_inline_chunks_keep_the_staged_allocation() {
+        let body = vec![1, 2, 3, 4];
+        let pointer = body.as_ptr();
+        let operations = vec![RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 1,
+            arrow_body: body.into(),
+        }];
+        let mut chunks = staged_inline_chunks(&operations);
+        let bytes = chunks.get_mut(&1).unwrap().pop().unwrap().body.into_bytes();
+        assert_eq!(bytes.as_ptr(), pointer);
+        drop(chunks);
+        drop(operations);
+        assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
+    }
 
     #[test]
     fn owned_inline_body_keeps_its_allocation() {

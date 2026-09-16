@@ -119,6 +119,15 @@ enum AuxiliaryKey {
         path: String,
         file_size: u64,
     },
+    /// One delete file's positions deleted at or before `visible_at`: the
+    /// bytes decide the set, so an object is keyed with the cut it was
+    /// filtered at.
+    DeletePositionsAt {
+        store: CacheIdentity,
+        path: String,
+        file_size: u64,
+        visible_at: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -964,6 +973,40 @@ impl AuxiliaryCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Arc<FileRowSet>>> + Send + 'static,
     {
+        self.delete_positions_under(Self::delete_positions_key(file), decode)
+            .await
+    }
+
+    /// As [`Self::delete_positions`], for the positions deleted at or
+    /// before `visible_at`.
+    pub(super) async fn delete_positions_at<F, Fut>(
+        &self,
+        file: &ParquetFile,
+        visible_at: u64,
+        decode: F,
+    ) -> Result<Arc<FileRowSet>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Arc<FileRowSet>>> + Send + 'static,
+    {
+        let key = AuxiliaryKey::DeletePositionsAt {
+            store: file.store.identity,
+            path: file.path.to_string(),
+            file_size: file.file_size,
+            visible_at,
+        };
+        self.delete_positions_under(key, decode).await
+    }
+
+    async fn delete_positions_under<F, Fut>(
+        &self,
+        key: AuxiliaryKey,
+        decode: F,
+    ) -> Result<Arc<FileRowSet>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Arc<FileRowSet>>> + Send + 'static,
+    {
         let pending = decode();
         let fetch = || async move {
             pending
@@ -971,15 +1014,11 @@ impl AuxiliaryCache {
                 .map(|positions| Weighed::from(AuxiliaryValue::DeletePositions(positions)))
         };
 
-        let entry = self
-            .tier
-            .get_or_fetch(&Self::delete_positions_key(file), fetch)
-            .await
-            .map_err(|error| {
-                let cause = std::error::Error::source(&error)
-                    .map_or_else(|| error.to_string(), ToString::to_string);
-                Error::Corruption(format!("delete-file positions: {cause}"))
-            })?;
+        let entry = self.tier.get_or_fetch(&key, fetch).await.map_err(|error| {
+            let cause = std::error::Error::source(&error)
+                .map_or_else(|| error.to_string(), ToString::to_string);
+            Error::Corruption(format!("delete-file positions: {cause}"))
+        })?;
 
         match &entry.value {
             AuxiliaryValue::DeletePositions(positions) => Ok(Arc::clone(positions)),

@@ -24,6 +24,9 @@ use crate::{
     error::{Error, Result},
 };
 
+#[cfg(test)]
+mod reuse_bench;
+
 /// Decodes one schema-only inline IPC stream.
 pub(crate) fn decode_inline_schema(schema_ipc: Bytes) -> Result<SchemaRef> {
     #[cfg(test)]
@@ -38,7 +41,7 @@ pub(crate) fn decode_inline_schema(schema_ipc: Bytes) -> Result<SchemaRef> {
 
 /// Decodes an inline-insert Arrow body — `[u32-le message length][record-
 /// batch message][arrow data buffers]` — against its already-decoded table
-/// schema without copying the data region.
+/// schema using a shared data-region view. Arrow may copy unaligned buffers.
 pub(super) fn decode_inline_batch(schema: SchemaRef, body: &Bytes) -> Result<RecordBatch> {
     if body.len() < 4 {
         return Err(Error::Corruption("inline body truncated".to_owned()));

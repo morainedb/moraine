@@ -29,8 +29,8 @@ pub use maintenance::{
 };
 use object_store::ObjectStore;
 pub use row_location::{
-    DeleteFileRegistration, ExistingDeleteFile, LocatedDeletion, LocatedPositions, LocatedRowScan,
-    RowSummaryWarmth,
+    DeleteFileRegistration, ExcludedPositions, ExistingDeleteFile, LocatedDeletion,
+    LocatedPositions, LocatedRowScan, RowSummaryWarmth,
 };
 use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
 use tokio::sync::watch;
@@ -235,9 +235,10 @@ pub struct CatalogOptions {
     /// eviction. Defaults to `true`; `false` disables flush admission.
     pub cache_puts: bool,
     /// Whether compaction-output SST metadata and data blocks enter the
-    /// decoded cache on write. Defaults to `false`, independently of
-    /// [`cache_puts`](Self::cache_puts), so merges do not displace read-hot
-    /// blocks.
+    /// decoded cache on write. Defaults to `true`, independently of
+    /// [`cache_puts`](Self::cache_puts), so a rewritten index is resident
+    /// as soon as the merge lands; `false` keeps a large merge from
+    /// displacing read-hot blocks.
     pub cache_compaction_puts: bool,
     /// The lake's data root (DuckLake's `DATA_PATH`). Creation-time only:
     /// recorded as the stored global `data_path` option when a fresh store
@@ -281,7 +282,7 @@ impl Default for CatalogOptions {
             cache_memory: None,
             cache_preload: None,
             cache_puts: true,
-            cache_compaction_puts: false,
+            cache_compaction_puts: true,
             data_path: None,
             reader_poll_interval: Duration::from_secs(10),
             checkpoint: None,
@@ -344,6 +345,39 @@ fn warn_if_metadata_cache_cannot_hold(path: &str, metadata_bytes: Option<u64>) {
             "the metadata cache cannot hold this store's SST filters and indexes, so probes \
              will fetch them from object storage. Raise the cache memory budget on the first \
              attach in the process."
+        );
+    }
+}
+
+/// Warns when this store's share of the process's block cache is smaller
+/// than its index subspace: probes then read index blocks back from the
+/// disk tier or object storage on every statement, at a hit rate that
+/// looks healthy.
+///
+/// Diagnostics only. The share is the block capacity over the stores
+/// attached, which is what the cache borrows toward when they are all busy.
+fn warn_if_block_cache_cannot_hold_index(path: &str, index_bytes: Option<u64>) {
+    let Some(index_bytes) = index_bytes else {
+        return;
+    };
+    let status = cache_status();
+    let attached_stores = status.attached_stores.max(1);
+    let share_bytes = status.block_capacity_bytes / attached_stores;
+    if let Some(shortfall) = crate::store::cache::index_share_shortfall(
+        index_bytes,
+        status.block_capacity_bytes,
+        attached_stores,
+    ) {
+        warn!(
+            path,
+            index_bytes,
+            block_capacity_bytes = status.block_capacity_bytes,
+            attached_stores,
+            share_bytes,
+            shortfall,
+            "this store's share of the block cache cannot hold its index subspace, so probes \
+             will read index blocks from the disk tier or object storage on every statement. \
+             Raise the cache memory budget on the first attach in the process."
         );
     }
 }
@@ -1078,6 +1112,17 @@ impl Catalog {
             &options.path,
             manifest.as_ref().map(|manifest| manifest.metadata_bytes),
         );
+        warn_if_block_cache_cannot_hold_index(
+            &options.path,
+            manifest.as_ref().and_then(|manifest| {
+                let index = crate::store::key::subspace_prefix(crate::store::key::Subspace::Index);
+                manifest
+                    .segments
+                    .iter()
+                    .find(|segment| segment.prefix == index)
+                    .map(|segment| segment.bytes)
+            }),
+        );
         let elapsed = started.elapsed();
         info!(
             path = options.path,
@@ -1187,6 +1232,17 @@ impl Catalog {
         warn_if_metadata_cache_cannot_hold(
             &options.path,
             manifest.as_ref().map(|manifest| manifest.metadata_bytes),
+        );
+        warn_if_block_cache_cannot_hold_index(
+            &options.path,
+            manifest.as_ref().and_then(|manifest| {
+                let index = crate::store::key::subspace_prefix(crate::store::key::Subspace::Index);
+                manifest
+                    .segments
+                    .iter()
+                    .find(|segment| segment.prefix == index)
+                    .map(|segment| segment.bytes)
+            }),
         );
         let elapsed = started.elapsed();
         info!(

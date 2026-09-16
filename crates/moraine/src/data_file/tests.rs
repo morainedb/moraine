@@ -1817,6 +1817,52 @@ async fn a_small_delete_file_is_one_fetch_and_a_second_read_none() {
     );
 }
 
+/// Snapshot-filtered positions are memoized per object and cut: a repeat at
+/// the same cut decodes nothing, another cut decodes once more.
+#[tokio::test]
+async fn snapshot_filtered_delete_positions_memoize_per_cut() {
+    let store = Arc::new(CountingStore::new());
+    let data = DataStore::new(store.clone());
+    let metrics = Arc::new(ScopedReadMetrics::default());
+    let path = Path::from("filtered-delete.parquet");
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+            Field::new("_ducklake_internal_snapshot_id", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["target.parquet"; 3])),
+            Arc::new(Int64Array::from(vec![4, 1, 7])),
+            Arc::new(Int64Array::from(vec![Some(5), Some(3), Some(9)])),
+        ],
+    )
+    .unwrap();
+    let object_len = write_fixture(&store.inner, &path, &batch).await;
+    let file = || {
+        ParquetFile::new(data.clone(), path.clone(), object_len, 0).with_metrics(metrics.clone())
+    };
+
+    assert_eq!(
+        delete_file_positions_at(file(), 5).await.unwrap(),
+        vec![1, 4]
+    );
+    assert_eq!(
+        delete_file_positions_at(file(), 5).await.unwrap(),
+        vec![1, 4]
+    );
+    assert_eq!(
+        metrics.tally().parquet_files,
+        1,
+        "the same cut is served resident"
+    );
+    assert_eq!(
+        delete_file_positions_at(file(), 9).await.unwrap(),
+        vec![1, 4, 7]
+    );
+    assert_eq!(metrics.tally().parquet_files, 2, "another cut decodes once");
+}
+
 /// A memoized position set is keyed by the object, so a delete file at
 /// another path decodes on its own.
 #[tokio::test]

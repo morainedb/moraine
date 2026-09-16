@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 
 use super::{
@@ -440,7 +441,7 @@ pub(crate) fn inline_insert_write(
     chunk_seq: u64,
     row_id_start: u64,
     row_count: u64,
-    arrow_body: &[u8],
+    arrow_body: Bytes,
 ) -> commit::StagedWrite {
     (
         Key::Inline(InlineKey::Live(InlineOperation::Insert {
@@ -451,7 +452,7 @@ pub(crate) fn inline_insert_write(
         }))
         .encode(),
         Some(value::encode_value(&proto::InlineChunkValue {
-            body: arrow_body.to_vec().into(),
+            body: arrow_body,
             row_id_start,
             row_count,
             data_file_id: None,
@@ -849,7 +850,7 @@ pub(super) async fn translate_inline(
                     chunk_seq,
                     *row_id_start,
                     *row_count,
-                    arrow_body,
+                    arrow_body.clone(),
                 ));
                 writes.push(inline_chunk_range_write(
                     *table_id,

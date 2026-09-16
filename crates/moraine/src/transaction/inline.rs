@@ -237,7 +237,7 @@ pub(crate) async fn stage_inline_writes(
                     *chunk_seq,
                     *row_id_start,
                     *row_count,
-                    arrow_body,
+                    Bytes::copy_from_slice(arrow_body),
                 ));
                 writes.push(inline_chunk_range_write(
                     *table_id,

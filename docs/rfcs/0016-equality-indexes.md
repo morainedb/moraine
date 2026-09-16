@@ -951,6 +951,19 @@ the outer client connection. Metadata, inline scans, and probes therefore
 use the same read view. Ordinary metadata reads must not implicitly start a
 DuckLake transaction merely to obtain a catalog version.
 
+A DuckDB transaction that has staged writes keeps probing at the revision it
+started on. Its metadata reads move to the staged transaction's own read
+point, but index entries carry no transaction-local overlay: rows the
+transaction inserted are not in the index, and rows it deleted are still
+there, under either read point. The starting pin is the view consistent with
+the DuckLake snapshot the transaction scans at, whereas the moving head could
+name files that snapshot does not hold. Probes inside such a transaction are
+therefore scoped, memoized, and statement-cacheable exactly as before its
+first write; the join against the DuckLake scan applies transaction-local
+deletes, and a bare index read continues to report the committed index. Only
+a time-travel attach, whose DuckLake snapshot is older than any pin, stays
+unpinned and uncached.
+
 #### Scoped probe memo
 
 The core memoizes successful probe results within an attachment, keyed by the
@@ -1100,14 +1113,100 @@ Active polling includes synchronous cache access and decoding, but excludes
 asynchronous waits; fetch and polling times sum across workers and are not
 additive components of parallel wall time. Both paths retain their own caches.
 
-The rewrite declines time travel, change scans, sampling, transaction-local
-changes, unsupported virtual columns, nested column projections, and types
-not supported by the core's logical schema projection. Supported scalar types
-are booleans, integers through 64 bits, floating point, strings, dates, and
-timestamps. Other shapes retain DuckLake's scan and the existing derived
-filters. A failed exact summary remains an error, never a fabricated position.
-The new scan retains the multi-file scan's statement-cache restriction; core
-probe memoization still avoids repeated index resolution when rebinding.
+The rewrite declines time travel, change scans, sampling, unsupported
+virtual columns, nested column projections, and types not supported by the
+core's logical schema projection. Supported scalar types are booleans,
+integers through 64 bits, floating point, strings, dates, and timestamps.
+Other shapes retain DuckLake's scan and the existing derived filters. A
+failed exact summary remains an error, never a fabricated position. The new
+scan retains the multi-file scan's statement-cache restriction; core probe
+memoization still avoids repeated index resolution when rebinding.
+
+Transaction-local changes do not disqualify the rewrite. Index-derived pairs
+name committed rows only, so rows the transaction inserted (new files or
+inlined data) can never join and need no scan. Rows the transaction deleted
+must not be returned: at execution time the operator collects DuckLake's
+transaction-local deletions for every file it will read — the pending delete
+file the transaction wrote for the file, if any, plus inlined file deletions —
+and passes those positions to the core scan as exclusions, and drops pairs
+naming inlined rows the transaction deleted. Exclusions are gathered at
+execution, not binding, so a prepared plan executed after further deletes in
+the same transaction sees them. Under pinned probes this keeps the located
+delete's `SELECT` on the selective path throughout a multi-statement write
+transaction.
+
+#### Reusing positioning between costing and execution
+
+The current costing cursor is discarded and execution resolves positions again.
+Any reuse must distinguish raw physical positions from visibility-filtered rows.
+`position_requested_files` resolves raw positions, while `file_reads` applies
+snapshot-filtered file and inline deletes and resolves versioned columns.
+Retaining that entire cursor is not a safe position cache.
+
+Both delete-file readers cache their decoded result: the all-position reader
+by object, the snapshot-filtered reader by object and cut, so a transaction
+that opens the same files statement after statement decodes each once.
+Scan positioning resolves raw physical positions only; it takes the delete-file identity from its pinned
+snapshot and reads snapshot-filtered positions once. Only the located-delete
+API, which must hand the existing delete file's full position set to the
+rewriter, materializes the unfiltered positions. A scan therefore never
+populates the all-position cache with entries it does not use.
+
+A bounded position-only memo is the preferred boundary. Its identity includes
+the catalog store and pinned SlateDB revision, DuckLake snapshot, table, exact
+canonicalized row/file pairs, strict-versus-candidate mode, and data-store cache
+identity plus resolved path prefixes and file incarnation metadata. A DuckLake
+snapshot number alone is insufficient: maintenance can change metadata under
+that number, and numbers are not globally unique across catalogs. Unpinned
+manifest-following readers must bypass reuse. No entry retains a transaction,
+payload batches, errors, or a live read cursor.
+
+Execution validates the identity and current files, then reapplies delete
+visibility and schema projection under its pinned scope. It may reuse successful
+summary-to-ordinal resolution, not an earlier execution's post-delete result.
+Prepared statements miss after a revision change; an old pinned reader may
+reuse its own immutable revision. Exact schema/data identities also prevent a
+same-shaped table in another catalog or attachment from sharing positions.
+
+Admission must be bounded by pair/position bytes and an entry ceiling, with
+oversized inputs falling back to normal resolution. Required regressions cover
+prepare then delete/update/flush/compaction, strict missing rows, candidate
+omission, historical delete-file snapshots, equal snapshot numbers in distinct
+stores, path changes, and eviction. Measure actual repeated positioning and
+allocation work before adding the memo: existing summaries and footers are
+already cached. This defines the reuse boundary, not a claim that a memo is
+present in the current scan implementation.
+
+#### Exact-probe physical read batching experiments
+
+Prefix filters, tombstones and sequence visibility remain SlateDB's responsibility.
+Broad range scans are not a substitute for a multi-prefix API: the benchmark
+shows sparse-key over-read and cold-read parallelism regressions. The current
+SlateDB public API exposes no batched prefix probe sharing its internal SST setup.
+
+The test-only physical coalescer keeps existing prefix probes and combines
+concurrently requested overlapping/adjacent SST byte ranges underneath them.
+It does not combine query results or scan intervening keys. It waits one scheduler
+yield, not a fixed timer; disjoint ranges remain independently in flight. Queued
+requests and merged response widths are bounded. Conditional, versioned, HEAD,
+unbounded and non-SST requests bypass coalescing. Failed combined reads fall back
+to the original requests so individual bounds and error behavior are preserved.
+Each response owns only its requested bytes: caching a small block must not keep
+an unaccounted megabyte-sized merged allocation alive. No persistent coalescer
+cache is added; ordinary decoded-block admission is unchanged.
+
+This experiment does not remove per-probe iterator setup. Promotion requires
+measured dense benefits without material cold/scattered regressions, and robust
+cancellation and concurrent-query resource bounds. Production retains individual
+probes and does not gain a runtime batching switch from this benchmark.
+
+The initial 324-observation comparison found essentially unchanged GET counts
+and no consistent latency benefit across clustered, gapped and scattered keys.
+It covered one or eight concurrent 192-key statements, cold/fresh/warm blocks,
+and memory or synthetic 20 ms storage, including a 32-request service limit.
+The coalescer therefore stays test-only. Reducing warm probe CPU requires a
+different boundary: sharing SST/iterator setup across exact prefixes inside
+SlateDB, not delaying independent storage requests in this wrapper.
 
 #### Equality read-ahead
 
@@ -1194,9 +1293,12 @@ whose inputs are DuckLake's own identifiers: `(data_file_id, positions)` per
 file, row ids for inlined rows, and the snapshot the positions were resolved
 against. That function knows nothing about Moraine. It validates every file
 id and position against the transaction's snapshot, subtracts deletions the
-file already carries — its committed or pending delete file, read with the
-per-position snapshots a replaced delete file embeds, and inlined file
-deletions — and stages the remainder
+file already carries — the positions of its committed delete file, which the
+extension passes along as `existing_positions`, a BLOB of little-endian
+`u64`s from the resolution's own per-path cached decode, so the function
+need not read the file again on every statement nor unpack one SQL value per
+position; or its pending delete file when this transaction already wrote
+one; plus inlined file deletions — and stages the remainder
 exactly as `DELETE` would: inlined file deletions below the inlining
 threshold, otherwise a delete file replacing the file's current one. Inlined
 rows are resolved to their backing inlined table by a metadata query and

@@ -33,7 +33,7 @@ async fn compacted_fixture(
         }),
         ..options.settings()
     };
-    let counters = cache::store_counters();
+    let counters = Arc::clone(&cache.counters);
     let db = Db::builder("compaction-cache", objects.clone())
         .with_settings(settings)
         .with_sst_block_size(SST_BLOCK_SIZE)
@@ -119,10 +119,24 @@ async fn compaction_admission_and_eviction() {
                 "memory admission exceeded its resized budget: {}",
                 cache.usage()
             );
-            if !disk {
+            let after_eviction = counters.tally().since(before_cache);
+            if disk {
                 assert!(
-                    counters.tally().since(before_cache).block_misses > 0,
+                    after_eviction.block_disk_hits > 0,
+                    "evicted blocks read back from disk count as disk hits: {after_eviction:?}"
+                );
+                assert!(
+                    after_eviction.block_disk_hits <= after_eviction.block_hits,
+                    "a disk hit is one of the hits: {after_eviction:?}"
+                );
+            } else {
+                assert!(
+                    after_eviction.block_misses > 0,
                     "admitted blocks never evicted"
+                );
+                assert_eq!(
+                    after_eviction.block_disk_hits, 0,
+                    "no disk tier, no disk hits"
                 );
             }
             eprintln!(

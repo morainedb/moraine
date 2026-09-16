@@ -17,7 +17,9 @@ use tracing_subscriber::{layer::Context, prelude::*};
 use super::{inline::inline_schema_collapse_target, *};
 use crate::catalog::{Catalog, CatalogOptions, inline::InlineScanKind};
 
+mod body_ownership;
 mod data_path;
+mod inline_commit_bench;
 mod inline_history;
 
 fn schema_row(id: u64, name: &str, begin: u64) -> Vec<Cell> {
@@ -968,7 +970,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
         begin_snapshot: 1,
         row_id_start: 0,
         row_count: 2,
-        arrow_body: b"chunk-a".to_vec(),
+        arrow_body: b"chunk-a".to_vec().into(),
     });
     tx.stage(RowOperation::InlineInsert {
         table_id: 1,
@@ -976,7 +978,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
         begin_snapshot: 1,
         row_id_start: 2,
         row_count: 1,
-        arrow_body: b"chunk-b".to_vec(),
+        arrow_body: b"chunk-b".to_vec().into(),
     });
     tx.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -1122,7 +1124,7 @@ async fn inline_operations_leave_every_metadata_dump_unchanged() {
             begin_snapshot: 2,
             row_id_start: 0,
             row_count: 2,
-            arrow_body: b"chunk".to_vec(),
+            arrow_body: b"chunk".to_vec().into(),
         },
         RowOperation::InlineInlineDelete {
             table_id: 1,
@@ -1174,7 +1176,7 @@ async fn stages_inline_idel_and_row_disappears_from_table_scan_after_it() {
         begin_snapshot: 1,
         row_id_start: 0,
         row_count: 2,
-        arrow_body: b"chunk".to_vec(),
+        arrow_body: b"chunk".to_vec().into(),
     });
     setup.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -1411,7 +1413,7 @@ async fn inline_insert(
         begin_snapshot: snapshot_id,
         row_id_start,
         row_count: u64::try_from(values.len()).unwrap(),
-        arrow_body: inline_body(&batch),
+        arrow_body: inline_body(&batch).into(),
     });
     tx.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -1564,7 +1566,7 @@ async fn inline_delete_and_reinsert_in_one_commit_admits_the_same_unique_value()
         begin_snapshot: 4,
         row_id_start: 1,
         row_count: 1,
-        arrow_body: inline_body(&batch),
+        arrow_body: inline_body(&batch).into(),
     });
     tx.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -1672,7 +1674,7 @@ async fn inline_chunks_share_one_schema_and_decode_once_each() {
             begin_snapshot: 4,
             row_id_start,
             row_count: 1,
-            arrow_body: body.clone(),
+            arrow_body: body.clone().into(),
         });
     }
     tx.stage(RowOperation::Insert {
@@ -3778,7 +3780,7 @@ async fn create_index_backfills_inline_null_rows() {
         begin_snapshot: 2,
         row_id_start: 0,
         row_count: 3,
-        arrow_body: inline_body(&batch),
+        arrow_body: inline_body(&batch).into(),
     });
     tx.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -4408,7 +4410,7 @@ async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
         begin_snapshot: 1,
         row_id_start: 0,
         row_count: 2,
-        arrow_body: b"chunk".to_vec(),
+        arrow_body: b"chunk".to_vec().into(),
     });
     setup.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -4494,7 +4496,7 @@ async fn flush_delete_serves_from_a_directory_verified_complete() {
         begin_snapshot: 1,
         row_id_start: 0,
         row_count: 2,
-        arrow_body: b"chunk".to_vec(),
+        arrow_body: b"chunk".to_vec().into(),
     });
     setup.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -4589,7 +4591,7 @@ async fn flush_delete_sweeps_superseded_chunk_range_keys() {
         begin_snapshot: 1,
         row_id_start: 0,
         row_count: 2,
-        arrow_body: b"chunk".to_vec(),
+        arrow_body: b"chunk".to_vec().into(),
     });
     setup.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -4675,7 +4677,7 @@ async fn flush_delete_heals_an_incomplete_directory() {
         begin_snapshot: 1,
         row_id_start: 0,
         row_count: 2,
-        arrow_body: b"chunk".to_vec(),
+        arrow_body: b"chunk".to_vec().into(),
     });
     setup.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -4799,7 +4801,7 @@ async fn stages_inline_drop_removes_every_record_for_the_table() {
         begin_snapshot: 1,
         row_id_start: 0,
         row_count: 1,
-        arrow_body: b"chunk".to_vec(),
+        arrow_body: b"chunk".to_vec().into(),
     });
     setup.stage(RowOperation::InlineFileDelete {
         table_id: 1,
@@ -4879,7 +4881,7 @@ async fn stages_inline_schema_drop_marks_only_the_named_schema_version() {
         begin_snapshot: 1,
         row_id_start: 0,
         row_count: 1,
-        arrow_body: b"chunk".to_vec(),
+        arrow_body: b"chunk".to_vec().into(),
     });
     setup.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -5114,7 +5116,7 @@ async fn an_inline_insert_stamps_the_chunk_identity_format() {
         begin_snapshot: 1,
         row_id_start: 0,
         row_count: 2,
-        arrow_body: b"chunk".to_vec(),
+        arrow_body: b"chunk".to_vec().into(),
     });
     tx.stage(RowOperation::Insert {
         table: TableKind::Snapshot,

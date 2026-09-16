@@ -283,21 +283,22 @@ than by an option, and is reported rather than budgeted.
 **`CACHE_PUTS` — cache flushed blocks by default.** `CACHE_PUTS` defaults to
 `true` and inserts flushed SST metadata and data blocks into the decoded
 cache. `false` disables flush admission. `CACHE_COMPACTION_PUTS` independently
-controls admission of compaction-output metadata and data blocks, defaulting
-to `false`. Both work with or without `CACHE_DIR` and remain subject to the
-same byte budget and eviction policy.
+controls admission of compaction-output metadata and data blocks and also
+defaults to `true`: a store compaction rewrites the index SSTs, and a writer
+whose probes depend on them must not find them cold until the next round of
+probes reads them back. Both work with or without `CACHE_DIR` and remain
+subject to the same byte budget and eviction policy.
 Within the process the effect reaches every handle: a reader session served
 by the shared cache reads what the writer just flushed with no round trip
 at all.
 
-Keeping compaction admission separate prevents a large merge from displacing
-read-hot blocks merely because the writer caches its recent flushes. To
-restore the former explicit `CACHE_PUTS true` behavior for both outputs, set
-both options to `true`; disable both for read-only cache filling. Through
-DuckLake the names are `META_CACHE_PUTS` and `META_CACHE_COMPACTION_PUTS`.
+Keeping compaction admission separate lets a host whose merges would
+displace read-hot blocks turn it off alone. Disable both for read-only cache
+filling. Through DuckLake the names are `META_CACHE_PUTS` and
+`META_CACHE_COMPACTION_PUTS`.
 
 The core exposes `CatalogOptions::cache_puts` (default `true`) and
-`cache_compaction_puts` (default `false`). The shim uses the additive
+`cache_compaction_puts` (default `true`). The shim uses the additive
 `moraine_attach_with_cache_policy` entry point, whose two flags are explicit.
 The existing `moraine_attach` keeps its signature and maps its single flag to
 both policies, preserving existing binary callers. The migration ABI likewise
@@ -343,7 +344,10 @@ must return as fast as the open allows.
 `metadata_hits`/`metadata_misses` and `block_hits`/`block_misses` with a
 rate beside each, plus `errors` for lookups the cache itself failed and
 read through. `preload_metadata_hits`/`misses`, `preload_block_hits`/`misses`,
-and `preload_failures` attribute the attach-time warm subset. Without
+and `preload_failures` attribute the attach-time warm subset.
+`metadata_disk_hits` and `block_disk_hits` are the hits the disk tier served
+after the memory tier missed — a hit rate near one with most hits on disk is
+a memory budget too small for the working set, not a warm cache. Without
 arguments the numbers are the host's — a process
 keeps one cache and every attached store reads through it — which is the
 scope the budget is set at.
