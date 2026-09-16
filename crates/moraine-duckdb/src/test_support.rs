@@ -2,7 +2,7 @@
 //! attach/transaction drivers, and staged-row cell constructors.
 
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     path::{Path, PathBuf},
     ptr,
     sync::atomic::{AtomicU64, Ordering},
@@ -71,8 +71,13 @@ pub(crate) fn attach_ok(dir: &Path) -> *mut MoraineCatalogHandle {
             &raw mut err,
         )
     };
-    // SAFETY: `err.message` is null or was just written by the call above.
-    let err_message = unsafe { err.message.as_ref() };
+    // SAFETY: `err.message` is null or a NUL-terminated string the call
+    // above wrote, alive until freed.
+    let err_message = unsafe {
+        err.message
+            .as_ref()
+            .map(|c| CStr::from_ptr(c).to_string_lossy())
+    };
     assert_eq!(code, codes::OK, "attach failed: {err_message:?}");
     assert!(!handle.is_null());
     handle
@@ -109,8 +114,13 @@ pub(crate) fn attach_with_data_path(dir: &Path, data_dir: &Path) -> *mut Moraine
             &raw mut err,
         )
     };
-    // SAFETY: `err.message` is null or was just written by the call above.
-    let err_message = unsafe { err.message.as_ref() };
+    // SAFETY: `err.message` is null or a NUL-terminated string the call
+    // above wrote, alive until freed.
+    let err_message = unsafe {
+        err.message
+            .as_ref()
+            .map(|c| CStr::from_ptr(c).to_string_lossy())
+    };
     assert_eq!(code, codes::OK, "attach failed: {err_message:?}");
     assert!(!handle.is_null());
     handle
