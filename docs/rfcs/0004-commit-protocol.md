@@ -715,6 +715,17 @@ batch is given up on and reported as an unknown outcome, which is what it
 is: the write may still land, so its members must not retry. The durability
 wait needs no bound because it runs after the slot is released.
 
+Every await a commit can park on inside the coalescer is **named in the
+log** if it runs long: admitting, opening the batch, staging onto it,
+submitting it, and awaiting durability. A commit that parks cannot be read
+from a thread dump — the caller blocks on the runtime, so the future's
+state machine is on the heap and the await it is suspended at appears on no
+thread's stack — and the waits that are not object-store requests, such as
+the store's own flush and capacity backpressure, are bounded by nothing and
+reported by nothing else. These records are what make a stalled commit say
+which phase it is stuck in. They name a slow phase; they never cut one
+short.
+
 A batch batches commits; it does not merge them. Each member mints its own
 snapshot, which time travel resolves separately. What batching changes is
 durability granularity, not catalog shape.

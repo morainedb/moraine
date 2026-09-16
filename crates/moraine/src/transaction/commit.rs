@@ -179,6 +179,30 @@ pub(crate) async fn await_durable(
     }
 }
 
+/// Awaits `work`, naming `phase` in the log every [`STALL_INTERVAL`] the
+/// wait runs long, and never giving up on it.
+///
+/// A commit parked mid-phase cannot be read from a thread dump: a parked
+/// `block_on` leaves its future's state machine on the heap, so the await
+/// it is suspended at is absent from every thread's stack. These records
+/// are the only thing that names the phase, so a stalled commit says which
+/// one it is stuck in rather than only that it is stuck.
+pub(crate) async fn reporting_phase<T>(phase: &'static str, work: impl Future<Output = T>) -> T {
+    let mut work = Box::pin(work);
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Ok(done) = tokio::time::timeout(STALL_INTERVAL, &mut work).await {
+            return done;
+        }
+        waited = waited.saturating_add(STALL_INTERVAL);
+        warn!(
+            phase,
+            waited_seconds = waited.as_secs(),
+            "a commit is still waiting in this phase"
+        );
+    }
+}
+
 /// Awaits `write`, naming `operation` and the batch's `staged` size in the
 /// log every [`STALL_INTERVAL`] the wait runs long.
 async fn reporting_stalls<T>(
