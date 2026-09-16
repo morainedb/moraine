@@ -788,7 +788,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// only the first attach in the process sets them — a later attach naming
 	// different ones is served what stands. `CACHE_PUTS` and `CACHE_PRELOAD`
 	// are per attach: the first admits flushed SST blocks by default, while
-	// CACHE_COMPACTION_PUTS independently admits merge outputs (default off).
+	// CACHE_COMPACTION_PUTS independently admits merge outputs (default on).
 	// CACHE_PRELOAD warms this store's bytes as the attach opens
 	// and defaults to 'l0'.
 	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
@@ -801,7 +801,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	uint64_t cache_size_bytes = 0;
 	uint64_t cache_memory_bytes = 0;
 	bool cache_puts = true;
-	bool cache_compaction_puts = false;
+	bool cache_compaction_puts = true;
 	uint8_t cache_preload = 1;
 	std::string checkpoint;
 	// DuckLake's `META_DATA_PATH` passthrough arrives here as `data_path`;

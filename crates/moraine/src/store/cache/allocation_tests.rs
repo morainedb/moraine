@@ -76,7 +76,9 @@ async fn scenario(disk: bool, admission: bool, root: &Path) {
         manifest_poll_interval: Duration::from_secs(60),
         ..Settings::default()
     };
-    let cache = shared(&config, location("active")).await.unwrap();
+    let cache = shared(&config, location("active"), store_counters())
+        .await
+        .unwrap();
     let counters = store_counters();
     let db = Db::builder("active", objects.clone())
         .with_settings(settings.clone())
@@ -97,7 +99,11 @@ async fn scenario(disk: bool, admission: bool, root: &Path) {
         idle.push((
             Db::builder(path.as_str(), objects.clone())
                 .with_settings(settings.clone())
-                .with_db_cache(shared(&config, location(&path)).await.unwrap())
+                .with_db_cache(
+                    shared(&config, location(&path), store_counters())
+                        .await
+                        .unwrap(),
+                )
                 .with_metrics_recorder(recorder(counters.clone()))
                 .build()
                 .await

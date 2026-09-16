@@ -1134,7 +1134,8 @@ The attach options keep their surface (RFC 0006) and change machinery:
 - `CACHE_PUTS` — the flush insertion policy: SST metadata and data blocks
   enter decoded on write by default, with
   or without a disk tier. `CACHE_COMPACTION_PUTS` separately controls merge
-  output admission and defaults off. Either kind remains byte-bounded.
+  output admission and defaults on, so a rewritten index is resident when
+  the merge lands. Either kind remains byte-bounded.
 - `CACHE_PRELOAD` — a segment-aware warm, run as reads rather than as a
   manifest walk. SlateDB's per-SST warm call takes an id type its crate
   does not export, so no caller outside it can name one (the export request is

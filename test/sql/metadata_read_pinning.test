@@ -175,6 +175,14 @@ SELECT count(*) FROM moraine_cache_tally();
 ----
 1
 
+# Disk-tier hits are a subset of the hits, and none without a disk tier.
+query I
+SELECT metadata_disk_hits <= metadata_hits AND block_disk_hits <= block_hits
+       AND metadata_disk_hits + block_disk_hits = 0
+FROM moraine_cache_tally();
+----
+true
+
 # Named a lake, the same row is that attach's share of the one cache —
 # which is what says who is spending the budget the process-wide numbers
 # report.

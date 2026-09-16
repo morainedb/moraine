@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -92,6 +92,20 @@ fn metadata_ceiling(capacity: u64) -> u64 {
 pub(crate) fn metadata_shortfall(metadata_bytes: u64, capacity: u64) -> Option<u64> {
     metadata_bytes
         .checked_sub(capacity)
+        .filter(|shortfall| *shortfall > 0)
+}
+
+/// Bytes of a store's index subspace that its share of a block slot of
+/// `capacity`, split evenly over `attached_stores`, cannot hold; `None`
+/// when the share holds all of it.
+pub(crate) fn index_share_shortfall(
+    index_bytes: u64,
+    capacity: u64,
+    attached_stores: u64,
+) -> Option<u64> {
+    let share = capacity / attached_stores.max(1);
+    index_bytes
+        .checked_sub(share)
         .filter(|shortfall| *shortfall > 0)
 }
 
@@ -185,6 +199,12 @@ pub struct CacheTally {
     pub block_hits: u64,
     /// Those it did not, each one an object-store read.
     pub block_misses: u64,
+    /// Of `metadata_hits`, those the disk tier served after the memory
+    /// tier missed; the rest were resident in memory. Zero without a disk
+    /// tier.
+    pub metadata_disk_hits: u64,
+    /// As [`metadata_disk_hits`](Self::metadata_disk_hits), for data blocks.
+    pub block_disk_hits: u64,
     /// Lookups the cache itself failed, which read through rather than
     /// failing the caller.
     pub errors: u64,
@@ -205,6 +225,9 @@ pub struct CacheTally {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CacheStatus {
+    /// Stores currently attached through the shared cache; each one's
+    /// share of the block capacity is the whole divided by this.
+    pub attached_stores: u64,
     /// Memory reserved for decoded SlateDB filters, indexes, and stats.
     pub metadata_capacity_bytes: u64,
     /// Memory currently occupied by those entries.
@@ -315,6 +338,10 @@ impl CacheTally {
             metadata_misses: self.metadata_misses.saturating_sub(before.metadata_misses),
             block_hits: self.block_hits.saturating_sub(before.block_hits),
             block_misses: self.block_misses.saturating_sub(before.block_misses),
+            metadata_disk_hits: self
+                .metadata_disk_hits
+                .saturating_sub(before.metadata_disk_hits),
+            block_disk_hits: self.block_disk_hits.saturating_sub(before.block_disk_hits),
             errors: self.errors.saturating_sub(before.errors),
             preload_metadata_hits: self
                 .preload_metadata_hits
@@ -401,6 +428,8 @@ pub(crate) struct CacheCounters {
     metadata_misses: AtomicU64,
     block_hits: AtomicU64,
     block_misses: AtomicU64,
+    metadata_disk_hits: AtomicU64,
+    block_disk_hits: AtomicU64,
     errors: AtomicU64,
     preload_metadata_hits: AtomicU64,
     preload_metadata_misses: AtomicU64,
@@ -441,12 +470,24 @@ impl CacheCounters {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Counts one lookup the disk tier served after the memory tier missed.
+    fn record_disk_hit(&self, metadata: bool) {
+        if metadata {
+            &self.metadata_disk_hits
+        } else {
+            &self.block_disk_hits
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn tally(&self) -> CacheTally {
         CacheTally {
             metadata_hits: self.metadata_hits.load(Ordering::Relaxed),
             metadata_misses: self.metadata_misses.load(Ordering::Relaxed),
             block_hits: self.block_hits.load(Ordering::Relaxed),
             block_misses: self.block_misses.load(Ordering::Relaxed),
+            metadata_disk_hits: self.metadata_disk_hits.load(Ordering::Relaxed),
+            block_disk_hits: self.block_disk_hits.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             preload_metadata_hits: self.preload_metadata_hits.load(Ordering::Relaxed),
             preload_metadata_misses: self.preload_metadata_misses.load(Ordering::Relaxed),
@@ -866,6 +907,11 @@ pub fn cache_status() -> CacheStatus {
     let (_, shared_bytes) = config.slots();
     let usage: usize = caches.stores.values().map(|store| store.tier.usage()).sum();
     let usage = u64::try_from(usage).unwrap_or(u64::MAX);
+    let attached_stores = caches
+        .stores
+        .values()
+        .map(|store| store.attached.load(Ordering::Acquire))
+        .sum();
     let hybrid = caches
         .stores
         .values()
@@ -874,6 +920,7 @@ pub fn cache_status() -> CacheStatus {
     let (auxiliary_capacity, auxiliary_usage) = data_file::auxiliary_occupancy();
 
     CacheStatus {
+        attached_stores,
         metadata_capacity_bytes: metadata_ceiling(shared_bytes),
         metadata_occupancy_bytes: metadata_occupancy,
         metadata_evictions: METADATA_EVICTIONS.load(Ordering::Relaxed),
@@ -914,11 +961,19 @@ impl EventListener for EvictionCounter {
 /// capacity.
 struct CatalogCache {
     store: Arc<StoreCache>,
+    /// The opening store's counters, so a disk-tier hit is attributed
+    /// where SlateDB's own hit and miss counts land.
+    counters: Arc<CacheCounters>,
 }
 
 impl CatalogCache {
     fn tier(&self) -> &Tier {
         &self.store.tier
+    }
+
+    fn record_disk_hit(&self, metadata: bool) {
+        self.counters.record_disk_hit(metadata);
+        COUNTERS.record_disk_hit(metadata);
     }
 }
 
@@ -944,16 +999,23 @@ impl CatalogCache {
         loader: CacheLoader,
         metadata: bool,
     ) -> Result<CachedEntry, slatedb::Error> {
-        if let Tier::Hybrid(cache) = self.tier()
-            && !cache.memory().contains(&key)
-        {
+        let resident = match self.tier() {
+            Tier::Hybrid(cache) => cache.memory().contains(&key),
+            Tier::Memory(_) => true,
+        };
+        if !resident {
             self.store.reserve(4096);
         }
         let store = Arc::clone(&self.store);
-        let loader = move || async move {
-            let entry = loader().await?;
-            store.reserve(as_bytes(entry.size()));
-            Ok::<_, slatedb::Error>(entry)
+        let fetched = Arc::new(AtomicBool::new(false));
+        let loader = {
+            let fetched = Arc::clone(&fetched);
+            move || async move {
+                fetched.store(true, Ordering::Relaxed);
+                let entry = loader().await?;
+                store.reserve(as_bytes(entry.size()));
+                Ok::<_, slatedb::Error>(entry)
+            }
         };
         let hint = if metadata { Hint::Normal } else { Hint::Low };
         let entry = match self.tier() {
@@ -985,6 +1047,9 @@ impl CatalogCache {
                 .map_err(fill_failed)?,
         };
 
+        if !resident && !fetched.load(Ordering::Relaxed) {
+            self.record_disk_hit(metadata);
+        }
         if metadata {
             metadata_admitted(&key, as_bytes(entry.size()));
         }
@@ -995,14 +1060,19 @@ impl CatalogCache {
         match self.tier() {
             Tier::Memory(cache) => Ok(cache.get(key).map(|entry| entry.value().clone())),
             Tier::Hybrid(cache) => {
-                if !cache.memory().contains(key) {
+                let resident = cache.memory().contains(key);
+                if !resident {
                     self.store.reserve(4096);
                 }
-                cache
+                let entry = cache
                     .get(key)
                     .await
                     .map(|entry| entry.map(|entry| entry.value().clone()))
-                    .map_err(fill_failed)
+                    .map_err(fill_failed)?;
+                if !resident && entry.is_some() {
+                    self.record_disk_hit(metadata_left(key));
+                }
+                Ok(entry)
             }
         }
     }
@@ -1119,6 +1189,7 @@ fn memory_cache(capacity: u64) -> MemoryCache {
 pub(crate) async fn shared(
     config: &CacheConfig,
     location: StoreLocation,
+    counters: Arc<CacheCounters>,
 ) -> Option<Arc<dyn DbCache>> {
     let _opening = OPENING.lock().await;
 
@@ -1131,7 +1202,7 @@ pub(crate) async fn shared(
 
     store.attached.fetch_add(1, Ordering::AcqRel);
 
-    Some(Arc::new(CatalogCache { store }) as Arc<dyn DbCache>)
+    Some(Arc::new(CatalogCache { store, counters }) as Arc<dyn DbCache>)
 }
 
 /// The sizing in force, settling `config` if this is the first attach.
@@ -1302,6 +1373,9 @@ async fn hybrid(dir: &Path, memory: u64, disk: u64) -> Option<HybridCache> {
 #[cfg(test)]
 pub(crate) struct TestCache {
     pub(crate) handle: Arc<dyn DbCache>,
+    /// The counters the handle attributes disk-tier hits to; pass them to
+    /// the store's metrics recorder to see hits and misses beside them.
+    pub(crate) counters: Arc<CacheCounters>,
     tier: Tier,
 }
 
@@ -1312,6 +1386,7 @@ impl TestCache {
             Some(path) => Tier::Hybrid(hybrid(path, memory, 64 * 1024 * 1024).await.unwrap()),
             None => Tier::Memory(memory_cache(memory)),
         };
+        let counters = store_counters();
         let handle = Arc::new(CatalogCache {
             store: Arc::new(StoreCache {
                 tier: tier.clone(),
@@ -1320,8 +1395,13 @@ impl TestCache {
                 pressure: AtomicU64::new(0),
                 budget: None,
             }),
+            counters: Arc::clone(&counters),
         });
-        Self { handle, tier }
+        Self {
+            handle,
+            counters,
+            tier,
+        }
     }
 
     pub(crate) fn resize(&self, bytes: u64) {
@@ -1429,7 +1509,7 @@ mod tests {
                 identity: crate::CacheIdentity::local(object_store.as_ref()).unwrap(),
                 path: path.to_owned(),
             };
-            let cache = shared(&config, location).await.unwrap();
+            let cache = shared(&config, location, store_counters()).await.unwrap();
             let counters = store_counters();
             let reader = DbReader::builder(path, object_store.clone())
                 .with_db_cache(cache)
@@ -1555,7 +1635,7 @@ mod tests {
             identity: crate::CacheIdentity::default(),
             path: path.to_owned(),
         };
-        let built = shared(&first, location("first")).await;
+        let built = shared(&first, location("first"), store_counters()).await;
 
         // Whatever the second asks for, it is sized by the first's config.
         let second = CacheConfig {
@@ -1563,7 +1643,7 @@ mod tests {
             dir: Some(std::path::PathBuf::from("/tmp/moraine-ignored")),
             disk_size: Some(1),
         };
-        let served = shared(&second, location("second")).await;
+        let served = shared(&second, location("second"), store_counters()).await;
         assert_eq!(built.is_some(), served.is_some());
         assert!(
             caches()
@@ -1716,6 +1796,22 @@ mod tests {
         assert!((tally.block_hit_rate().unwrap() - 0.25).abs() < f64::EPSILON);
     }
 
+    /// A store's share of the block slot is the whole over the attached
+    /// count; an index larger than the share is short by the difference.
+    #[test]
+    fn an_index_larger_than_its_block_share_reports_its_shortfall() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(index_share_shortfall(0, 0, 0), None);
+        assert_eq!(index_share_shortfall(gib, 2 * gib, 1), None);
+        assert_eq!(index_share_shortfall(gib, 2 * gib, 2), None);
+        assert_eq!(index_share_shortfall(gib + 1, 2 * gib, 2), Some(1));
+        assert_eq!(
+            index_share_shortfall(3 * gib / 2, 2 * gib, 2),
+            Some(gib / 2)
+        );
+        assert_eq!(index_share_shortfall(3 * gib / 2, 16 * gib, 4), None);
+    }
+
     /// A meta slot smaller than the store's SST metadata reports what it
     /// cannot hold; equal is not a shortfall.
     #[test]
@@ -1782,7 +1878,7 @@ mod tests {
             identity: crate::CacheIdentity::default(),
             path: "status".to_owned(),
         };
-        let _ = shared(&CacheConfig::default(), location).await;
+        let _ = shared(&CacheConfig::default(), location, store_counters()).await;
         let status = cache_status();
         assert!(status.metadata_capacity_bytes > 0);
         assert!(status.block_capacity_bytes > 0);

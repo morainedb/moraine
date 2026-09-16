@@ -125,6 +125,8 @@ fn log_lookup(
         lookup_metadata_misses = cache.metadata_misses,
         lookup_block_hits = cache.block_hits,
         lookup_block_misses = cache.block_misses,
+        lookup_metadata_disk_hits = cache.metadata_disk_hits,
+        lookup_block_disk_hits = cache.block_disk_hits,
         lookup_cache_errors = cache.errors,
         lookup_gets = store.main_gets,
         lookup_get_ms = milliseconds(store.main_get_duration),

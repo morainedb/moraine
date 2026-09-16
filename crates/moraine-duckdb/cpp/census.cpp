@@ -185,13 +185,15 @@ struct TallyBindData : public duckdb::FunctionData {
 duckdb::unique_ptr<duckdb::FunctionData> TallyBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
                                                    duckdb::vector<duckdb::string> &names) {
-	names = {"metadata_hits", "metadata_misses", "metadata_hit_rate", "block_hits", "block_misses",
-	         "block_hit_rate", "errors", "preload_metadata_hits", "preload_metadata_misses",
-	         "preload_block_hits", "preload_block_misses", "preload_failures"};
+	names = {"metadata_hits",  "metadata_misses",       "metadata_hit_rate",       "block_hits",
+	         "block_misses",   "block_hit_rate",        "errors",                  "preload_metadata_hits",
+	         "preload_metadata_misses", "preload_block_hits", "preload_block_misses", "preload_failures",
+	         "metadata_disk_hits", "block_disk_hits"};
 	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
 	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
 	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
-	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
 
 	auto bind_data = duckdb::make_uniq<TallyBindData>();
 	if (!input.inputs.empty()) {
@@ -242,6 +244,15 @@ void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 	if (code != MORAINE_OK) {
 		throw duckdb::InternalException("moraine_cache_tally: could not read the cache counters");
 	}
+	uint64_t metadata_disk_hits = 0;
+	uint64_t block_disk_hits = 0;
+	code = bind_data.catalog_name.empty()
+	           ? moraine_cache_tally_tiers(&metadata_disk_hits, &block_disk_hits)
+	           : moraine_catalog_cache_tally_tiers(ResolveMoraineCatalog(context, bind_data.catalog_name).Handle(),
+	                                               &metadata_disk_hits, &block_disk_hits);
+	if (code != MORAINE_OK) {
+		throw duckdb::InternalException("moraine_cache_tally: could not read the cache tier counters");
+	}
 
 	// NULL rather than zero before anything has been looked up: a rate
 	// over no lookups is not zero, it is absent, and a monitoring query
@@ -264,6 +275,8 @@ void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 	output.SetValue(9, 0, duckdb::Value::UBIGINT(preload_block_hits));
 	output.SetValue(10, 0, duckdb::Value::UBIGINT(preload_block_misses));
 	output.SetValue(11, 0, duckdb::Value::UBIGINT(preload_failures));
+	output.SetValue(12, 0, duckdb::Value::UBIGINT(metadata_disk_hits));
+	output.SetValue(13, 0, duckdb::Value::UBIGINT(block_disk_hits));
 	output.SetCardinality(1);
 }
 

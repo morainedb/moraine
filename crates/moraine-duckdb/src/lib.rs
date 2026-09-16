@@ -47,8 +47,10 @@
 //!
 //! `META_CACHE_PUTS` defaults to `true`: freshly flushed SST metadata and
 //! data blocks enter the bounded decoded cache. `META_CACHE_COMPACTION_PUTS`
-//! independently admits compaction outputs and defaults to `false`.
-//! Both work without a disk cache; set both to `false` for read-only filling.
+//! independently admits compaction outputs and also defaults to `true`, so a
+//! rewritten index is resident as soon as the merge lands; set it to `false`
+//! when a large merge must not displace read-hot blocks. Both work without a
+//! disk cache; set both to `false` for read-only filling.
 //!
 //! # Maintenance
 //!

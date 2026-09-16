@@ -126,7 +126,7 @@ impl<'a> StoreBuilder<'a> {
             cache_memory: None,
             cache_preload: None,
             cache_puts: true,
-            cache_compaction_puts: false,
+            cache_compaction_puts: true,
             checkpoint: None,
             warm_segments: Vec::new(),
         }
@@ -237,7 +237,9 @@ impl<'a> StoreBuilder<'a> {
             .with_block_cache_policy(self.block_cache_policy())
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)));
 
-        if let Some(cache) = cache::shared(&self.cache_config(), self.location()).await {
+        if let Some(cache) =
+            cache::shared(&self.cache_config(), self.location(), Arc::clone(&counters)).await
+        {
             builder = builder.with_db_cache(cache);
         }
 
@@ -270,7 +272,9 @@ impl<'a> StoreBuilder<'a> {
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)))
             .with_options(options);
 
-        if let Some(cache) = cache::shared(&self.cache_config(), self.location()).await {
+        if let Some(cache) =
+            cache::shared(&self.cache_config(), self.location(), Arc::clone(&counters)).await
+        {
             builder = builder.with_db_cache(cache);
         }
         if let Some(checkpoint) = self.checkpoint {
@@ -728,46 +732,47 @@ mod tests {
         );
     }
 
-    /// Flushes admit their blocks by default; compaction admission is
-    /// independent.
+    /// Flush and compaction-output admission both default on and move
+    /// independently.
     #[test]
-    fn flush_cache_puts_default_on_and_compaction_is_independent() {
+    fn both_admissions_default_on_and_stay_independent() {
         let object_store = memory_store();
-        let unset = StoreBuilder::new("s", Arc::clone(&object_store));
         let admitted = [
             CacheTarget::Index,
             CacheTarget::Filters,
             CacheTarget::Stats,
             CacheTarget::data::<&[u8], _>(..),
         ];
+        let unset = StoreBuilder::new("s", Arc::clone(&object_store));
         assert_eq!(
             unset.block_cache_policy(),
             BlockCachePolicy::default()
                 .with_flush_targets(&admitted)
-                .with_compaction_output_targets(&[])
+                .with_compaction_output_targets(&admitted)
         );
-        let disabled = StoreBuilder::new("s", Arc::clone(&object_store)).cache_puts(false);
+        let no_flush = StoreBuilder::new("s", Arc::clone(&object_store)).cache_puts(false);
         assert_eq!(
-            disabled.block_cache_policy(),
+            no_flush.block_cache_policy(),
             BlockCachePolicy::default()
                 .with_flush_targets(&[])
-                .with_compaction_output_targets(&[])
+                .with_compaction_output_targets(&admitted)
         );
-        let caching = StoreBuilder::new("s", Arc::clone(&object_store)).cache_puts(true);
+        let no_compaction =
+            StoreBuilder::new("s", Arc::clone(&object_store)).cache_compaction_puts(false);
         assert_eq!(
-            caching.block_cache_policy(),
+            no_compaction.block_cache_policy(),
             BlockCachePolicy::default()
                 .with_flush_targets(&admitted)
                 .with_compaction_output_targets(&[])
         );
-        let compaction = StoreBuilder::new("s", object_store)
+        let neither = StoreBuilder::new("s", object_store)
             .cache_puts(false)
-            .cache_compaction_puts(true);
+            .cache_compaction_puts(false);
         assert_eq!(
-            compaction.block_cache_policy(),
+            neither.block_cache_policy(),
             BlockCachePolicy::default()
                 .with_flush_targets(&[])
-                .with_compaction_output_targets(&admitted)
+                .with_compaction_output_targets(&[])
         );
     }
 

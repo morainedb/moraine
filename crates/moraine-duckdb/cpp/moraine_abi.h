@@ -1876,6 +1876,27 @@ int32_t moraine_cache_tally(uint64_t *out_metadata_hits,
                             uint64_t *out_preload_block_misses,
                             uint64_t *out_preload_failures);
 
+// Of the hits [`moraine_cache_tally`] reports, those the disk tier served
+// after the memory tier missed; the rest were resident in memory. Zero
+// without a disk tier. Process-wide; [`moraine_catalog_cache_tally_tiers`]
+// narrows to one attach.
+//
+// # Safety
+//
+// Both out-pointers must be valid and writable for the duration of the
+// call.
+int32_t moraine_cache_tally_tiers(uint64_t *out_metadata_disk_hits, uint64_t *out_block_disk_hits);
+
+// As [`moraine_cache_tally_tiers`], for one attach.
+//
+// # Safety
+//
+// `handle` must be a live catalog handle and both out-pointers valid and
+// writable for the duration of the call.
+int32_t moraine_catalog_cache_tally_tiers(struct MoraineCatalogHandle *handle,
+                                          uint64_t *out_metadata_disk_hits,
+                                          uint64_t *out_block_disk_hits);
+
 // The counts [`moraine_cache_tally`] reports, narrowed to what the
 // catalog `handle` names has spent since it attached.
 //
