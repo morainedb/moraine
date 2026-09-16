@@ -388,6 +388,12 @@ fn warn_if_block_cache_cannot_hold_index(path: &str, index_bytes: Option<u64>) {
 /// kept.
 const SLOW_OPEN: Duration = Duration::from_millis(250);
 
+/// How long resolving rows may take before its diagnostic record is worth
+/// reporting at the level a host runs by default. Below it a resolution is
+/// a few cache-served reads; above it, it is waiting on storage or on a
+/// core, and the record's own fields say which.
+const SLOW_RESOLVE: Duration = Duration::from_millis(250);
+
 /// Whether an open was slow enough, with no cache directory configured, to
 /// be worth telling the operator about.
 pub(super) fn slow_open_without_cache(
