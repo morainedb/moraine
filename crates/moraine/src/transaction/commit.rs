@@ -37,7 +37,7 @@ use crate::{
         read::{self, RecordSet},
         value,
     },
-    telemetry::STALL_INTERVAL,
+    telemetry::{STALL_INTERVAL, reporting_phase},
     transaction::{
         index_maintenance, inline,
         operations::{ChangeSet, Operation},
@@ -851,7 +851,15 @@ where
         return Ok(CommitOutcome::Committed(staged.ids));
     }
 
-    match group::await_outcome(staged.outcome).await {
+    // The last await a commit can park on, and the one place it waits for
+    // something no thread holds: the batch lands on a task of its own, so a
+    // member stranded here has nothing running to point at.
+    match reporting_phase(
+        "outcome",
+        group::await_outcome_sealing(coalescer, staged.outcome),
+    )
+    .await
+    {
         Outcome::Committed => Ok(CommitOutcome::Committed(staged.ids)),
         Outcome::LostRace => Ok(CommitOutcome::LostRace {
             ours: staged.ours,
