@@ -1,4 +1,110 @@
+use std::fmt::Write as _;
+
 use crate::helpers::*;
+
+/// Scan selection is automatic and prepared reads need no public on/off
+/// control.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn summary_scan_is_automatic_without_a_public_switch() {
+    let store = TempDir::new("selective-control-store");
+    let data = TempDir::new("selective-control-data");
+    let query = "SELECT sum(data.b) FROM lake.main.t data
+        JOIN moraine_index_in('lake','main','t','by_a',[1,3,7]) hits
+        ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
+    let options = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let result = run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &options,
+        &format!(
+            "CREATE TABLE lake.main.t AS SELECT i a, i * 2 b FROM range(10000) r(i);
+         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         SELECT 'switches',count(*) FROM duckdb_settings() WHERE name='moraine_summary_scan';
+         EXPLAIN {query}; {query};
+         SELECT sum(b) FROM lake.main.t WHERE a IN (1,3,7);
+         PREPARE p AS {query}; EXECUTE p; EXECUTE p;"
+        ),
+    );
+    assert!(result.lines().any(|line| line == "switches,0"), "{result}");
+    assert_eq!(
+        result.matches("MORAINE_SUMMARY_SCAN").count(),
+        2,
+        "{result}"
+    );
+    assert_eq!(
+        result.lines().filter(|line| *line == "22").count(),
+        4,
+        "{result}"
+    );
+}
+
+/// Sparse rows spread over almost every row group keep the ordinary reader.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn summary_scan_uses_physical_coverage() {
+    let store = TempDir::new("selective-coverage-store");
+    let data = TempDir::new("selective-coverage-data");
+    let options = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let result = run_ducklake_sql_with_options(store.path(), data.path(), &options,
+        "CALL ducklake_set_option('lake','parquet_row_group_size','2048');
+         CREATE TABLE lake.main.t AS SELECT i a, md5(i::VARCHAR) payload FROM range(262144) r(i);
+         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         EXPLAIN SELECT sum(length(data.payload)) FROM lake.main.t data
+         JOIN moraine_index_in('lake','main','t','by_a',list_transform(range(128),x -> x * 2048)) hits
+         ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
+    assert!(!result.contains("MORAINE_SUMMARY_SCAN"), "{result}");
+}
+
+/// Parallel cursors preserve nullable strings and early-stop ownership.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn summary_scan_parallel_files_match_serial_and_ordinary() {
+    let store = TempDir::new("selective-parallel-store");
+    let data = TempDir::new("selective-parallel-data");
+    let options = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let query = "SELECT 'answer',count(*),sum(length(data.payload)) FROM lake.main.t data
+        JOIN moraine_index_lookup('lake','main','t','by_a',0) hits
+        ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
+    let mut sql = "CALL ducklake_set_option('lake','parquet_row_group_size','2048');
+        CREATE TABLE lake.main.t(a BIGINT, payload VARCHAR);"
+        .to_owned();
+    for _ in 0..4 {
+        sql.push_str("INSERT INTO lake.main.t SELECT i // 1024, CASE WHEN i % 2=0 THEN repeat('x',100) END FROM range(65536) r(i);");
+    }
+    sql.push_str("CALL moraine_index_create('lake','main','t','by_a',['a'],false); SET threads=4;");
+    sql.push_str("SELECT 'answer',count(*),sum(length(payload)) FROM lake.main.t WHERE a=0;");
+    for setting in [
+        "SET moraine_summary_scan_threads=1",
+        "SET moraine_summary_scan_threads=2",
+    ] {
+        write!(sql, "{setting}; EXPLAIN ANALYZE {query}; {query};").unwrap();
+    }
+    for _ in 0..8 {
+        sql.push_str("SELECT data.payload FROM lake.main.t data JOIN moraine_index_lookup('lake','main','t','by_a',0) hits
+            ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id LIMIT 1;");
+    }
+    let result = run_ducklake_sql_with_options(store.path(), data.path(), &options, &sql);
+    let answers: Vec<_> = csv_rows(&result)
+        .into_iter()
+        .filter(|row| row[0] == "answer")
+        .collect();
+    assert_eq!(
+        answers,
+        vec![vec!["answer", "4096", "204800"]; 3],
+        "{result}"
+    );
+    assert!(result.contains("Peak read workers"), "{result}");
+}
 
 /// Exact indexed joins scan projected positions and retain their residual
 /// predicates.

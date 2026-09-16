@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 mod rows_at;
 
-pub use rows_at::{LocatedRowScan, LocatedRows};
+pub use rows_at::LocatedRowScan;
 
 use super::{Catalog, ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
 use crate::{

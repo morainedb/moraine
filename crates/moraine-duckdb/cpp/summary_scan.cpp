@@ -6,6 +6,7 @@
 #include "rows_at.hpp"
 #include "transaction_manager.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -14,11 +15,16 @@
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
+#include <chrono>
 
 namespace moraine_duckdb {
 namespace {
 
 constexpr auto FILE_ID = duckdb::DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID;
+using ScanClock = std::chrono::steady_clock;
+double Milliseconds(ScanClock::time_point start) {
+	return std::chrono::duration<double, std::milli>(ScanClock::now() - start).count();
+}
 
 bool SupportedType(const duckdb::LogicalType &type) {
 	using duckdb::LogicalTypeId;
@@ -50,6 +56,7 @@ bool SupportedType(const duckdb::LogicalType &type) {
 struct SummaryScanBindData : duckdb::FunctionData {
 	std::string lake, schema, table;
 	uint64_t snapshot_id;
+	double costing_ms = 0;
 	std::vector<MorainePositionPair> pairs;
 	duckdb::vector<std::string> names;
 	duckdb::vector<duckdb::LogicalType> types;
@@ -73,6 +80,7 @@ struct SummaryScanState : duckdb::GlobalTableFunctionState {
 	duckdb::unique_ptr<duckdb::Expression> predicate;
 	duckdb::unique_ptr<duckdb::ExpressionExecutor> executor;
 	std::vector<duckdb::unique_ptr<duckdb::DataChunk>> pending;
+	double positioning_ms = 0, batch_ms = 0, conversion_ms = 0;
 	~SummaryScanState() override {
 		moraine_row_scan_free(scan);
 	}
@@ -84,6 +92,7 @@ struct SummaryScanState : duckdb::GlobalTableFunctionState {
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::ClientContext &context,
                                                                      duckdb::TableFunctionInitInput &input) {
 	auto &bound = input.bind_data->Cast<SummaryScanBindData>();
+	auto started = ScanClock::now();
 	auto state = duckdb::make_uniq<SummaryScanState>();
 	duckdb::vector<const char *> requested;
 	for (auto column : input.column_ids) {
@@ -140,9 +149,17 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::Cli
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(error);
 	}
+	duckdb::Value parallelism;
+	context.TryGetCurrentSetting("moraine_summary_scan_threads", parallelism);
+	auto maximum = std::min<uint64_t>(parallelism.GetValue<uint64_t>(),
+	                                  duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads());
+	if (moraine_row_scan_parallelism(state->scan, maximum, &error) != MORAINE_OK) {
+		ThrowMoraineError(error);
+	}
 	WriteMoraineLog(duckdb::DatabaseInstance::GetDatabase(context), duckdb::LogLevel::LOG_DEBUG,
 	                "summary scan opened pairs=" + std::to_string(bound.pairs.size()) +
 	                    " columns=" + std::to_string(requested.size()));
+	state->positioning_ms = Milliseconds(started);
 	return std::move(state);
 }
 
@@ -150,18 +167,23 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 	auto &state = input.global_state->Cast<SummaryScanState>();
 	while (true) {
 		if (state.pending.empty()) {
-			OwnedArray<MoraineRowBatch> batches(moraine_rows_at_free);
+			auto started = ScanClock::now();
+			duckdb::ArrowSchemaWrapper schema;
+			duckdb::ArrowArrayWrapper array;
+			bool has_batch = false;
 			MoraineError error {};
-			if (moraine_row_scan_next(state.scan, batches.OutItems(), batches.OutLen(), moraine_shim_is_interrupted,
-			                          &context, &error) != MORAINE_OK) {
+			if (moraine_row_scan_next_arrow(state.scan, &schema.arrow_schema, &array.arrow_array, &has_batch,
+			                                moraine_shim_is_interrupted, &context, &error) != MORAINE_OK) {
 				ThrowMoraineError(error);
 			}
-			if (!batches.size()) {
+			state.batch_ms += Milliseconds(started);
+			if (!has_batch) {
 				output.SetCardinality(0);
 				return;
 			}
-			auto &batch = *batches.begin();
-			auto pieces = DecodeLocatedBatch(context, std::vector<uint8_t>(batch.data, batch.data + batch.len));
+			started = ScanClock::now();
+			auto pieces = ImportLocatedBatch(context, schema.arrow_schema, array.arrow_array);
+			state.conversion_ms += Milliseconds(started);
 			for (auto piece = pieces.rbegin(); piece != pieces.rend(); ++piece) {
 				state.pending.push_back(std::move(*piece));
 			}
@@ -256,6 +278,44 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	for (auto &row : rows) {
 		bound->pairs.push_back({row.value, row.data_file_id, row.has_data_file_id});
 	}
+	std::vector<MorainePositionPair> file_pairs;
+	for (auto &pair : bound->pairs) {
+		if (pair.has_data_file_id) {
+			file_pairs.push_back(pair);
+		}
+	}
+	if (file_pairs.size() > 16) {
+		auto started = ScanClock::now();
+		SummaryScanState estimate;
+		duckdb::vector<const char *> columns;
+		for (auto &column : scan.GetColumnIds()) {
+			auto id = column.GetPrimaryIndex();
+			if (id < scan.names.size()) {
+				columns.push_back(scan.names[id].c_str());
+			}
+		}
+		auto snapshot = metadata_tx.transaction->Cast<MoraineTransaction>().Snapshot();
+		MoraineError error {};
+		auto code =
+		    moraine_row_scan_open(moraine_snapshot_read_handle(snapshot), snapshot, schema.c_str(), table.c_str(),
+		                          file_pairs.data(), file_pairs.size(), columns.data(), columns.size(), &estimate.scan,
+		                          moraine_shim_is_interrupted, &context, &error);
+		if (code != MORAINE_OK) {
+			ThrowMoraineError(error);
+		}
+		bool selective = false;
+		code = moraine_row_scan_is_selective(estimate.scan, &selective, moraine_shim_is_interrupted, &context, &error);
+		if (code != MORAINE_OK) {
+			ThrowMoraineError(error);
+		}
+		bound->costing_ms = Milliseconds(started);
+		WriteMoraineLog(duckdb::DatabaseInstance::GetDatabase(context), duckdb::LogLevel::LOG_DEBUG,
+		                "summary scan costing_ms=" + std::to_string(bound->costing_ms) +
+		                    " selected=" + std::to_string(selective));
+		if (!selective) {
+			return false;
+		}
+	}
 	duckdb::TableFunction function("moraine_summary_scan", {}, ScanSummary, nullptr, InitSummaryScan);
 	function.projection_pushdown = true;
 	function.filter_pushdown = true;
@@ -263,9 +323,21 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	function.verify_serialization = false;
 	function.dynamic_to_string = [](duckdb::TableFunctionDynamicToStringInput &input) {
 		duckdb::InsertionOrderPreservingMap<std::string> result;
+		if (input.bind_data) {
+			result["Coverage costing ms"] = std::to_string(input.bind_data->Cast<SummaryScanBindData>().costing_ms);
+		}
 		if (input.global_state) {
-			result["Total Files Read"] =
-			    std::to_string(moraine_row_scan_files_read(input.global_state->Cast<SummaryScanState>().scan));
+			auto &state = input.global_state->Cast<SummaryScanState>();
+			auto metrics = moraine_row_scan_metrics(state.scan);
+			result["Total Files Read"] = std::to_string(moraine_row_scan_files_read(state.scan));
+			result["Positioning ms"] = std::to_string(state.positioning_ms);
+			result["Read and decode ms"] = std::to_string(state.batch_ms);
+			result["Arrow import ms"] = std::to_string(state.conversion_ms);
+			result["Data bytes fetched"] = std::to_string(metrics.bytes_read);
+			result["Data ranges fetched"] = std::to_string(metrics.ranges_read);
+			result["Peak read workers"] = std::to_string(metrics.peak_workers);
+			result["Decode active ms"] = std::to_string(metrics.decode_seconds * 1000);
+			result["Data fetch ms"] = std::to_string(metrics.fetch_seconds * 1000);
 		}
 		return result;
 	};

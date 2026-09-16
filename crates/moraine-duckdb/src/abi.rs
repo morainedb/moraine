@@ -21,7 +21,6 @@
 mod attach;
 mod deletion;
 mod indexes;
-mod located_rows;
 mod lookup;
 mod maintenance;
 mod read_scope;
@@ -43,7 +42,6 @@ pub use attach::*;
 pub use checkpoints::*;
 pub use deletion::*;
 pub use indexes::*;
-pub use located_rows::*;
 pub use lookup::*;
 pub use maintenance::*;
 pub use read_scope::*;

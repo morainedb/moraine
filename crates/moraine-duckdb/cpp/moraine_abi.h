@@ -249,18 +249,6 @@ typedef struct MoraineIndexDesc {
   char *name;
 } MoraineIndexDesc;
 
-// One batch of located rows, as [`moraine_rows_at`] returns them: a
-// self-describing Arrow IPC stream holding one record batch. Free the
-// array with [`moraine_rows_at_free`].
-typedef struct MoraineRowBatch {
-  // The IPC bytes, owned.
-  uint8_t *data;
-  // Length of `data` in bytes.
-  size_t len;
-  // Capacity of the allocation behind `data`, retained for freeing.
-  size_t cap;
-} MoraineRowBatch;
-
 // A value passed to [`moraine_index_lookup`], tagged by kind. The shim
 // fills the field matching `kind`; the ABI coerces it to the indexed
 // column's canonical form.
@@ -479,6 +467,20 @@ typedef struct MoraineObjectStoreTally {
   // Failed request attempts across both stores, including handled errors.
   uint64_t errors;
 } MoraineObjectStoreTally;
+
+// Data-store bytes and ranges read by a cursor, excluding cache hits.
+typedef struct MoraineRowScanMetrics {
+  // Payload/metadata bytes fetched.
+  uint64_t bytes_read;
+  // Requested ranges before store-side coalescing.
+  uint64_t ranges_read;
+  // Peak simultaneous read-unit workers (zero for serial scans).
+  size_t peak_workers;
+  // Active batch polling time, excluding asynchronous waits.
+  double decode_seconds;
+  // Range-fetch elapsed time, summed across workers.
+  double fetch_seconds;
+} MoraineRowScanMetrics;
 
 // One schema, as returned by [`moraine_snapshot_schemas`].
 typedef struct MoraineSchemaDesc {
@@ -1591,45 +1593,6 @@ int32_t moraine_indexes(struct MoraineCatalogHandle *handle,
 // matching [`moraine_indexes`] call, not yet freed.
 void moraine_indexes_free(struct MoraineIndexDesc *items, size_t len);
 
-// Reads located rows back whole at `snapshot` (the catalog head when
-// null), without a scan. `pairs` are `(row_id, data_file_id)` as a lookup
-// reports them, `has_data_file_id` false naming a live inlined row.
-//
-// Writes `out_items`/`out_len`: one [`MoraineRowBatch`] per batch, each an
-// Arrow IPC stream whose columns are the table's top-level columns at the
-// snapshot under their current names, then `row_id` (`UInt64`) and
-// `data_file_id` (`UInt64`, NULL for an inlined row). A row deleted at the
-// snapshot is omitted; a pair that cannot be positioned exactly fails the
-// call. Written even when empty; free exactly once with
-// [`moraine_rows_at_free`].
-//
-// # Safety
-//
-// Every pointer must be valid per the ABI contract; `snapshot`, if
-// non-null, must be a live snapshot of `handle`'s catalog; `pairs` points
-// to `pairs_len` pairs; `out_items`/`out_len` must be non-null and
-// writable; `probe`/`probe_ctx` must satisfy the interrupt-probe contract;
-// `err`, if non-null, must be writable.
-int32_t moraine_rows_at(struct MoraineCatalogHandle *handle,
-                        struct MoraineSnapshotHandle *snapshot,
-                        const char *schema_name,
-                        const char *table_name,
-                        const struct MorainePositionPair *pairs,
-                        size_t pairs_len,
-                        struct MoraineRowBatch **out_items,
-                        size_t *out_len,
-                        MoraineInterruptProbe probe,
-                        void *probe_ctx,
-                        struct MoraineError *err);
-
-// Frees the array [`moraine_rows_at`] wrote, including each batch's bytes.
-//
-// # Safety
-//
-// `items`/`len` must be exactly the pointer and length written there by a
-// matching call, not yet freed.
-void moraine_rows_at_free(struct MoraineRowBatch *items, size_t len);
-
 // Resolves an equality lookup to the rows currently holding `values` — one
 // [`MoraineLookupValue`] per indexed column, in the index's column order,
 // each coerced to its column's type. The count must equal the index's
@@ -2004,7 +1967,7 @@ struct MoraineCatalogHandle *moraine_snapshot_read_handle(struct MoraineSnapshot
 bool moraine_snapshot_read_revision(struct MoraineSnapshotHandle *snapshot, uint64_t *out);
 
 // Opens a projected selective scan; data batches are read by
-// `moraine_row_scan_next`.
+// `moraine_row_scan_next_arrow`.
 //
 // # Safety
 // `handle` and `snapshot` must be live and refer to the same pinned read
@@ -2023,24 +1986,71 @@ int32_t moraine_row_scan_open(struct MoraineCatalogHandle *handle,
                               void *probe_ctx,
                               struct MoraineError *err);
 
-// Returns zero or one IPC batch; free the returned array with
-// `moraine_rows_at_free`.
+// Opens a whole-row cursor that rejects every unpositionable pair.
+// Payload batches are decoded by `moraine_row_scan_next_arrow`.
 //
 // # Safety
-// `scan` must be live and exclusively accessed, and outputs writable.
+// Handles must be live and share a pinned scope. Strings and pairs must be
+// valid for their lengths, and `out` writable. Cancellation and error
+// pointers follow the catalog ABI contract.
+int32_t moraine_rows_at_open(struct MoraineCatalogHandle *handle,
+                             struct MoraineSnapshotHandle *snapshot,
+                             const char *schema,
+                             const char *table,
+                             const struct MorainePositionPair *pairs,
+                             size_t pairs_len,
+                             struct MoraineRowScan **out,
+                             MoraineInterruptProbe probe,
+                             void *probe_ctx,
+                             struct MoraineError *err);
+
+// Estimates projected page coverage without reading payload columns.
+//
+// # Safety
+// `scan` is live and exclusive, `out` writable; cancellation/error pointers
+// follow the catalog ABI contract.
+int32_t moraine_row_scan_is_selective(struct MoraineRowScan *scan,
+                                      bool *out,
+                                      MoraineInterruptProbe probe,
+                                      void *probe_ctx,
+                                      struct MoraineError *err);
+
+// Samples cursor-local data-store reads.
+//
+// # Safety
+// `scan` must be null or live, with no concurrent cursor call.
+struct MoraineRowScanMetrics moraine_row_scan_metrics(const struct MoraineRowScan *scan);
+
+// Sets the per-scan prefetch ceiling before its first batch, additionally
+// bounded by the core process-wide worker limit.
+//
+// # Safety
+// `scan` is live and exclusively accessed; `err` is writable when non-null.
+int32_t moraine_row_scan_parallelism(struct MoraineRowScan *scan,
+                                     size_t maximum,
+                                     struct MoraineError *err);
+
+// Exports the next batch without IPC; `has_batch=false` means end of stream.
+// Returned buffers outlive the cursor and are owned by Arrow release
+// callbacks.
+//
+// # Safety
+// `scan` is live and exclusive; outputs are writable, empty Arrow slots.
+// The caller releases each exported array and schema exactly once.
 // Cancellation and error pointers follow the catalog ABI contract.
-int32_t moraine_row_scan_next(struct MoraineRowScan *scan,
-                              struct MoraineRowBatch **out,
-                              size_t *len,
-                              MoraineInterruptProbe probe,
-                              void *probe_ctx,
-                              struct MoraineError *err);
+int32_t moraine_row_scan_next_arrow(struct MoraineRowScan *scan,
+                                    ArrowSchema *out_schema,
+                                    ArrowArray *out_array,
+                                    bool *has_batch,
+                                    MoraineInterruptProbe probe,
+                                    void *probe_ctx,
+                                    struct MoraineError *err);
 
 // Returns the number of data files opened by the selective scan.
 //
 // # Safety
-// `scan` must be null or live, with no concurrent `moraine_row_scan_next`
-// call.
+// `scan` must be null or live, with no concurrent
+// `moraine_row_scan_next_arrow` call.
 uint64_t moraine_row_scan_files_read(const struct MoraineRowScan *scan);
 
 // Closes a selective scan and releases its pinned read scope.

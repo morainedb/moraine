@@ -1030,12 +1030,30 @@ the scan uses DuckLake's metadata connection and its pinned Moraine read scope.
 It verifies the snapshot, resolves exact ordinals through retained summaries,
 and removes positions deleted at that snapshot. `ReadOnlyCatalog::scan_rows_at`
 accepts located pairs and ordered top-level column names, returning a
-`LocatedRowScan` cursor. `next_batch` returns one self-describing Arrow IPC
-batch with those columns followed by row and file IDs. Parquet reads select
+`LocatedRowScan` cursor. `next_record_batch` returns an owned Arrow batch
+with row and file IDs appended after the projection.
+The SQL scan exports the original buffers through the Arrow C Data Interface,
+without IPC encoding, copying, or decoding. Release callbacks own each batch
+independently of the cursor; the shim consumes both structs under RAII even
+if Arrow import throws. Parquet reads select
 only the requested columns and physical positions, using page indexes when
-available. Files open on demand; decoded result batches are not accumulated
-across files. Inline chunks are decoded one at a time. Dropping the cursor
-releases pending reads and its execution-owned scope.
+available. Files open on demand; inline chunks are decoded one at a time.
+`set_parallelism` configures read-unit prefetch before iteration starts, defaulting
+to one for core callers. SQL uses `moraine_summary_scan_threads` (default two),
+clamped to DuckDB's thread count and a shared process ceiling of half the
+available CPUs, bounded to one through four. Each worker reserves a single
+output slot before decoding its next batch. Shared permits cover opening a reader
+or producing a batch, never waiting for a consumer to drain its output slot.
+Paused cursors therefore cannot reserve all workers. Worker tasks are execution-owned;
+dropping the cursor aborts them and releases their permits and pinned scope.
+For a file with at least 1024 selected positions, parallel execution partitions
+the selection into nonempty row-group work units using cached footer counts.
+Each unit retains original file ordinals and exact row selection, so embedded
+row IDs, sparse selections, and delete filtering are unchanged. Smaller selections
+avoid the partitioning step; one unit stays serial. File and row-group units use
+the same shared permits and one-batch output queues, never nested worker pools.
+`files_read` counts distinct files even when several groups are read concurrently.
+Parallel output has no file-order guarantee; an SQL ORDER BY remains authoritative.
 `files_read` counts opened data files for query profiles. A verified summary
 may disprove a conservative candidate; the selective reader omits that pair,
 while strict located-position APIs continue to reject absent pairs. The cursor
@@ -1049,6 +1067,38 @@ pairs, not a large SQL `IN` expression.
 When candidates exceed both 4096 pairs and one quarter of the table's known
 row count, the optimizer keeps the ordinary scan to avoid selective-reader
 overhead on broad probes. This is a cost choice, not a correctness bound.
+
+For more than 16 file-backed candidate pairs, the optimizer also estimates physical
+coverage under the pinned view, using summary positions, file schema projection,
+and cached Parquet footers/page indexes. It never decodes projected payloads
+for costing. `prefers_selective_reads` sums projected compressed bytes plus an
+8 KiB allowance per range; adjacent selected pages form one range. Missing page
+indexes conservatively charge entire touched column chunks. If at least 16 row
+groups are involved in the candidate files and selected cost reaches 80% of
+their full projected cost, ordinary DuckLake scanning wins the estimate.
+This catches small result sets scattered over almost every page. The existing
+data-store range reader coalesces nearby fetches for retained selective scans.
+Positioning and delete visibility are checked again at execution; estimation
+retains neither decoded payloads nor a transaction in the prepared plan. Inline
+candidates are excluded from costing so preparing a query cannot fetch their
+chunk bodies for this estimate.
+
+Scan selection is automatic, with no public runtime on/off switch. The
+`moraine_summary_scan` operator remains; `moraine_summary_scan_threads` only
+bounds its reader concurrency. The filter benchmark accepts `--baseline
+<extension>` to compare explicit builds using identical SQL and one unchanged
+fixture in separate processes. It alternates build order across query shapes,
+verifies every result, and reports each build's selected scan path and warm
+median after discarding its first observation. This compares builds rather than
+isolating the rewrite if the reference also differs elsewhere. `--parallel`
+creates a four-file fixture and alternates serial and two-reader configurations
+with four DuckDB threads; `--fixture` can reuse a single-file fixture instead.
+The former `--ordinary` and `--compare` runtime-switch modes are removed.
+Profiles report coverage costing, positioning, batch-read elapsed time, active Parquet
+polling time, Arrow import time, fetched bytes/ranges, and peak read workers.
+Active polling includes synchronous cache access and decoding, but excludes
+asynchronous waits; fetch and polling times sum across workers and are not
+additive components of parallel wall time. Both paths retain their own caches.
 
 The rewrite declines time travel, change scans, sampling, transaction-local
 changes, unsupported virtual columns, nested column projections, and types
@@ -1184,11 +1234,11 @@ A located update is a located deletion plus an insert of the replacement
 rows. The insert is DuckLake's own, which keeps inlining, partitioning,
 encryption, and statistics on their normal path; what a partial update
 lacks is the old values of the columns it does not change. The core
-supplies them without a scan: `ReadOnlyCatalog::rows_at` reads located
-rows back whole at a pinned snapshot. File rows are read at their exact
+supplies them without a scan: `ReadOnlyCatalog::scan_rows_at_strict` opens a
+whole-row cursor at a pinned snapshot. File rows are read at their exact
 positions through the row selection the file-row summaries already
-answer, so only the pages holding them are fetched, and every requested
-file is read concurrently under the summary-read bound. Inlined rows
+answer, so only the pages holding them are fetched. Execution uses the same
+bounded file/row-group readers as indexed summary scans. Inlined rows
 decode from their chunk through the inline lookup directory, touching
 only the store. Columns are matched by field id against the table's
 columns at the snapshot, so a file written before a column was added
@@ -1196,12 +1246,27 @@ reads NULL for it and a widened type is cast to the current one. A row
 deleted at the snapshot — by a delete file, honoring the per-position
 snapshots a replaced one embeds, or by an inlined file deletion — is
 omitted, and a pair that cannot be positioned exactly fails the call under
-the same contract as deletion. Each batch is returned as a
-self-describing Arrow IPC stream: the table's top-level columns under
+the same contract as deletion. Each batch is returned as owned Arrow arrays:
+the table's top-level columns under
 their current names, then `row_id` and `data_file_id`, NULL for an
-inlined row. Batches are self-describing rather than unified because a
+inlined row. Batches carry their own schemas because a
 file written under an older schema may carry a narrower physical type;
-the extension casts each column to the bound type as it decodes.
+the extension casts each column to the bound type as it imports Arrow buffers.
+There is no IPC-returning located-row interface. Rust callers use
+`scan_rows_at_strict` followed by `next_record_batch`, retaining batches or
+serializing them in their own transport layer if needed. This replaces
+`ReadOnlyCatalog::rows_at`, `LocatedRows`, and the IPC-returning cursor
+`next_batch` method; their removal is a breaking Rust API change.
+
+`moraine_rows_at` binds only the constant pairs and result schema; its execution
+state owns a strict cursor and imports batches through the Arrow C Data Interface.
+PREPARE and EXPLAIN do not position or decode requested rows. Invalid locations
+therefore fail at execution, not preparation. Each execution resolves positions
+and deletion visibility against its pinned transaction snapshot; dropping the
+state releases queued batches and cancels pending reads. Schema rebinding remains
+required between prepared executions, but carries no payload buffers. Both this
+function and indexed summary scans use `moraine_summary_scan_threads` for their
+shared bounded readers; only the strict cursor rejects absent candidate pairs.
 
 The extension surfaces this as `moraine_rows_at`. Spelled out, the update
 is one transaction:

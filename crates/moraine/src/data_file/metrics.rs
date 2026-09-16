@@ -69,6 +69,7 @@ pub(crate) struct ScopedReadMetrics {
     range_bytes: AtomicU64,
     range_nanoseconds: AtomicU64,
     encode_nanoseconds: AtomicU64,
+    decode_nanoseconds: AtomicU64,
     parquet_files: AtomicU64,
     inline_chunks: AtomicU64,
     arrow_batches: AtomicU64,
@@ -84,12 +85,17 @@ pub(crate) struct ScopedReadTally {
     pub(crate) range_bytes: u64,
     pub(crate) range_duration: Duration,
     pub(crate) encode_duration: Duration,
+    pub(crate) decode_duration: Duration,
     pub(crate) parquet_files: u64,
     pub(crate) inline_chunks: u64,
     pub(crate) arrow_batches: u64,
 }
 
 impl ScopedReadMetrics {
+    pub(super) fn decoded(&self, duration: Duration) {
+        self.decode_nanoseconds
+            .fetch_add(nanoseconds(duration), Ordering::Relaxed);
+    }
     /// A tally whose reads also count towards `upstream`.
     pub(crate) fn reporting_to(upstream: Arc<DataStoreCounters>) -> Self {
         Self {
@@ -147,6 +153,7 @@ impl ScopedReadMetrics {
             range_bytes: self.range_bytes.load(Ordering::Relaxed),
             range_duration: Duration::from_nanos(self.range_nanoseconds.load(Ordering::Relaxed)),
             encode_duration: Duration::from_nanos(self.encode_nanoseconds.load(Ordering::Relaxed)),
+            decode_duration: Duration::from_nanos(self.decode_nanoseconds.load(Ordering::Relaxed)),
             parquet_files: self.parquet_files.load(Ordering::Relaxed),
             inline_chunks: self.inline_chunks.load(Ordering::Relaxed),
             arrow_batches: self.arrow_batches.load(Ordering::Relaxed),

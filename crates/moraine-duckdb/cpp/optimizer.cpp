@@ -402,6 +402,8 @@ public:
 } // namespace
 
 void RegisterMoraineOptimizer(duckdb::DBConfig &config) {
+	config.AddExtensionOption("moraine_summary_scan_threads", "Maximum concurrent located-scan read units", duckdb::LogicalType::UBIGINT,
+	                          duckdb::Value::UBIGINT(2));
 	duckdb::OptimizerExtension::Register(config, MoraineOptimizer());
 }
 
