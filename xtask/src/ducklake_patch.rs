@@ -442,11 +442,6 @@ fn cmake_arguments(
         "-B".to_string(),
         patched.standalone_build().display().to_string(),
         "-DCMAKE_BUILD_TYPE=Release".to_string(),
-        // `-g` on top of the usual release flags: without it a stalled
-        // extension frame cannot be named in a production stack, and the
-        // symbols cost image size rather than speed.
-        "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -g".to_string(),
-        "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG -g".to_string(),
         "-DBUILD_EXTENSIONS_ONLY=TRUE".to_string(),
         "-DEXTENSION_STATIC_BUILD=TRUE".to_string(),
         format!("-DPREBUILT_BINARY={}", duckdb_static.display()),

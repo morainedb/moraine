@@ -64,6 +64,15 @@ foreach(EXT_TARGET ${TARGET_NAME}_extension ${TARGET_NAME}_loadable_extension)
     # C++11, so force C++17 per target (a target property overrides the
     # global CMAKE_CXX_STANDARD).
     set_target_properties(${EXT_TARGET} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    # Debug line information in every build, release included, and set here
+    # rather than on the cmake command line so it survives whichever build
+    # produces the shipped artifact. A stalled or spinning thread is
+    # diagnosed from the frames beneath it, and without this the shim's
+    # functions -- which are where such a thread is most likely to be --
+    # cannot be named at all. Costs image size, not speed.
+    if(NOT MSVC)
+        target_compile_options(${EXT_TARGET} PRIVATE -g)
+    endif()
     target_include_directories(${EXT_TARGET} PRIVATE ${CPP_DIR})
     # corrosion derives its target name from the cargo *lib* name
     # (underscores), not the package name, and exposes the imported static
@@ -76,3 +85,10 @@ foreach(EXT_TARGET ${TARGET_NAME}_extension ${TARGET_NAME}_loadable_extension)
     target_include_directories(${EXT_TARGET} PRIVATE ${MORAINE_DUCKLAKE_SOURCE_DIR}/src/include)
     target_link_libraries(${EXT_TARGET} ducklake_extension)
 endforeach()
+
+# The patched DuckLake links into the same binary but is a target of its own,
+# so the per-target flags above do not reach it. Our patch series lives in
+# that code; without this its frames cannot be named either.
+if(TARGET ducklake_extension AND NOT MSVC)
+    target_compile_options(ducklake_extension PRIVATE -g)
+endif()
