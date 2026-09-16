@@ -1,5 +1,6 @@
 //! Located rows read back whole at the snapshot the caller pins.
 
+mod scan;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -7,30 +8,21 @@ use std::{
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
+pub use scan::LocatedRowScan;
 
 use super::{
-    LocatedDeletion, LocationScope, current_files_for, first_row_error, group_deduped_pairs,
+    LocatedDeletion, LocationScope, MissingRows, current_files_for, first_row_error,
+    group_deduped_pairs,
 };
 use crate::{
     catalog::{
         CatalogSnapshot, DataFileId, DeleteFileId, ReadOnlyCatalog, RecentRow, TableId,
-        handle::SUMMARY_READ_CONCURRENCY, resolve_data_path, snapshot::data_file_info,
+        resolve_data_path, snapshot::data_file_info,
     },
     data_file::{self, DataStore, ReadColumn, RowIdSource, RowPositions, ScopedRows},
     error::{Error, Result},
     store::inline as store_inline,
 };
-
-/// What [`ReadOnlyCatalog::rows_at`] read: one Arrow IPC stream per batch,
-/// each carrying its own schema and one record batch. The columns are the
-/// table's top-level columns at the snapshot, in catalog order and under
-/// their current names, then `row_id` (`UInt64`) and `data_file_id`
-/// (`UInt64`, NULL for an inlined row).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LocatedRows {
-    /// Self-describing IPC streams holding one record batch each.
-    pub batches: Vec<Vec<u8>>,
-}
 
 /// One inline chunk's requested rows, decoded together.
 struct InlineGroup {
@@ -51,78 +43,6 @@ struct FileRead {
 }
 
 impl ReadOnlyCatalog {
-    /// Reads located rows — `(row_id, data_file_id)` pairs, as a lookup
-    /// returns them — back whole at `snapshot`, without a scan.
-    ///
-    /// File rows are read at their exact positions, only the pages holding
-    /// them; inlined rows decode from their chunk. Every column is matched
-    /// by field id, so a file written before a column was added reads NULL
-    /// for it. A row deleted at the snapshot is omitted. Positioning is
-    /// exact-or-failed as [`Self::locate_row_positions_at`] is; a `None`
-    /// file id must name an inlined row live at the snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::NotFound`] if the table does not exist, a store
-    /// error if a file or chunk cannot be read, or [`Error::RowPosition`]
-    /// for the first pair that cannot be positioned exactly.
-    pub async fn rows_at(
-        &self,
-        snapshot: &CatalogSnapshot,
-        data_store: Option<DataStore>,
-        data_prefix: &str,
-        table: TableId,
-        pairs: &[(u64, Option<DataFileId>)],
-    ) -> Result<LocatedRows> {
-        if pairs.is_empty() {
-            return Ok(LocatedRows::default());
-        }
-
-        let visible_at = snapshot.current_snapshot().id.get();
-        let (by_file, null_rows) = group_deduped_pairs(pairs);
-        let columns = snapshot.columns_of(table);
-        let (requested, names): (Vec<usize>, Vec<String>) = columns
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.parent_column.is_none())
-            .map(|(index, column)| (index, column.name.clone()))
-            .unzip();
-
-        let mut batches = self
-            .inline_rows_at(snapshot, table, &null_rows, visible_at, &requested, &names)
-            .await?;
-        if by_file.is_empty() {
-            return Ok(LocatedRows { batches });
-        }
-
-        let table_prefix = snapshot.table_data_prefix(table)?;
-        let requested_files = current_files_for(snapshot, table, &by_file)?;
-        let Some(store) = data_store else {
-            return Err(first_row_error(
-                &by_file,
-                requested_files[0].id,
-                "no data store was supplied to read the file",
-            ));
-        };
-        let scope = LocationScope {
-            store: &store,
-            data_prefix,
-            table_prefix: &table_prefix,
-            table,
-            snapshot,
-        };
-        let located = self
-            .position_requested_files(&scope, by_file, requested_files)
-            .await?;
-        let reads = self.file_reads(&scope, table, located, visible_at).await?;
-        let file_batches = self
-            .read_file_batches(&scope, reads, &requested, &names)
-            .await?;
-        batches.extend(file_batches);
-
-        Ok(LocatedRows { batches })
-    }
-
     /// The positions a registered delete file marks dead as of `visible_at`.
     async fn deleted_positions_at(
         &self,
@@ -233,124 +153,6 @@ impl ReadOnlyCatalog {
         session.finish();
 
         Ok(reads)
-    }
-
-    /// Reads every file concurrently and encodes its batches, ordered by
-    /// file id so the answer does not vary run to run.
-    async fn read_file_batches(
-        &self,
-        scope: &LocationScope<'_>,
-        reads: Vec<FileRead>,
-        requested: &[usize],
-        names: &[String],
-    ) -> Result<Vec<Vec<u8>>> {
-        let mut file_batches = stream::iter(reads.into_iter().map(|read| {
-            let store = scope.store.clone();
-            let metrics = self.data_read_metrics();
-            async move {
-                let path = resolve_data_path(
-                    scope.data_prefix,
-                    scope.table_prefix,
-                    &read.file.path,
-                    read.file.path_is_relative,
-                )?;
-                let file = data_file::ParquetFile::new(
-                    store,
-                    path,
-                    read.file.file_size_bytes,
-                    read.file.footer_size,
-                )
-                .with_columns(read.columns)
-                .with_metrics(metrics);
-                let positions = RowPositions::from_unsorted(read.positions);
-                let batches = data_file::scoped_read_row_batches(
-                    file,
-                    requested,
-                    ScopedRows::At(&positions),
-                    RowIdSource::Resolve {
-                        row_id_start: read.file.row_id_start,
-                    },
-                )
-                .await?;
-                let encoded = batches
-                    .iter()
-                    .map(|batch| {
-                        data_file::encode_located_batch(batch, names, Some(read.data_file_id.get()))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok::<_, Error>((read.data_file_id, encoded))
-            }
-        }))
-        .buffer_unordered(SUMMARY_READ_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
-        file_batches.sort_by_key(|(data_file_id, _)| *data_file_id);
-
-        Ok(file_batches
-            .into_iter()
-            .flat_map(|(_, encoded)| encoded)
-            .collect())
-    }
-
-    /// The requested inlined rows, decoded chunk by chunk; every row must be
-    /// live at `visible_at`.
-    async fn inline_rows_at(
-        &self,
-        snapshot: &CatalogSnapshot,
-        table: TableId,
-        rows: &[u64],
-        visible_at: u64,
-        requested: &[usize],
-        names: &[String],
-    ) -> Result<Vec<Vec<u8>>> {
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let recent = self
-            .requested_inline_recent_rows(table, rows, Some(visible_at))
-            .await?;
-        let found: HashSet<u64> = recent.iter().map(|row| row.row_id).collect();
-        if let Some(&row_id) = rows.iter().find(|row| !found.contains(row)) {
-            return Err(Error::RowPosition {
-                row_id,
-                data_file_id: None,
-                reason: "row is not a live inlined row".to_owned(),
-            });
-        }
-
-        let session = self.begin_read().await?;
-        let mut batches = Vec::new();
-        for group in group_by_chunk(recent) {
-            let columns = snapshot
-                .inline_read_columns(session.handle(), table, group.begin_snapshot)
-                .await;
-            let batch = columns.and_then(|columns| {
-                let schema =
-                    data_file::decode_inline_schema(Bytes::copy_from_slice(&group.arrow_schema))?;
-                let batch = data_file::inline_rows_batch(
-                    schema,
-                    &Bytes::copy_from_slice(&group.chunk_body),
-                    &group.offsets,
-                    &group.row_ids,
-                    &columns,
-                    requested,
-                )?;
-                data_file::encode_located_batch(&batch, names, None)
-            });
-            match batch {
-                Ok(batch) => batches.push(batch),
-                Err(error) => {
-                    session.finish();
-                    return Err(error);
-                }
-            }
-        }
-        session.finish();
-
-        Ok(batches)
     }
 
     /// Positions per data file deleted through inlined file deletions

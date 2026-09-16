@@ -657,6 +657,7 @@ The caches a moraine-backed query crosses, top to bottom:
 | DuckLake catalog cache | schema/catalog entries; the per-transaction snapshot | snapshot id + `schema_version` | live-catalog-sized | `schema_version` move; transaction end |
 | shim `MetadataRows` | decoded rows per synthesized table | head stamp at first scan | per transaction | transaction end |
 | core logical caches | `CatalogSnapshot`, entity record set, maintained projections | head stamp + install epoch | one catalog's decoded size, reported by `projection_bytes` | replaced on stamp move |
+| scoped index probes | canonical query and resolved row IDs | attachment + pinned store sequence + table/index + mode/arguments | 8 MiB accounted entries and 4096 entries per catalog; container slack also reported in `projection_bytes` | least-recently-used eviction; oversized results bypass admission |
 | core scoped-read metadata | parsed Parquet footer and page indexes used by equality-index upkeep, and file row-id summaries | object-store location + path + file size | process-wide share of `CACHE_MEMORY`, to a ceiling, over `CACHE_DIR/auxiliary-v2` | byte-bounded LRU (foyer), recovered on restart |
 | SlateDB block + meta cache | decoded SST blocks, indexes, filters | scoped SST id + offset | one cache per attached store: an even share of the process budget in memory over `CACHE_DIR/<store>/blocks` | LRU-ish (foyer), recovered on restart |
 
@@ -675,10 +676,24 @@ with, not consolidated), the byte tier (consolidated), and the data tier
 The SlateDB caches and the scoped reader's parsed-Parquet cache share a
 **budget and process lifetime, not an entry store**. `CACHE_MEMORY` is split
 once, at the first attach: the auxiliary metadata allowance comes off the
-top, and the remainder is the block budget, re-split evenly across the
-stores currently attached on every attach and detach (a store with nothing
-attached keeps 1 MiB, its blocks staying on disk if it has any). No attach
-may construct another allowance or grow any cache beyond that split.
+top, and the remainder is the block budget shared elastically by stores.
+An empty attach reserves no block memory and does not shrink another store.
+Read fills, disk promotions, and admitted flush or compaction output grow
+the requesting store's allowance under pressure. Growth first uses unassigned
+bytes, then borrows unused allowance from other stores, retaining headroom
+above their occupancy. If those bytes are insufficient, a newly busy store
+can reclaim its fair share from larger borrowers; stores with no resident
+entries are not counted as contenders. The allocator does not infer activity
+from wall-clock time: an attached store with resident entries still contends.
+An initial share comes from unused capacity without ramping through tiny
+quotas; reclaiming occupied capacity instead grows with measured demand.
+
+Capacity is transferred under one process lock, shrinking donors before
+growing the recipient. The sum of all store capacities never exceeds the
+block budget. A store's final detach releases its memory allowance entirely;
+its disk device remains open and retains persisted blocks. Allocation checks
+are amortized over bytes under pressure, and ordinary hits do not require
+the process lock. Per-store metadata protection and disk isolation remain.
 
 The allowance is a **share of the budget to a ceiling**, not a fixed figure.
 It cannot share one eviction store with SlateDB's — foyer's cache is
@@ -1069,7 +1084,7 @@ whole segment in and admits it, where a seek would fetch one block per
 subspace per SST and leave the rest cold; a larger or unrecorded segment
 seeks.
 
-Bulk and probe scans use fixed 8 MiB read-ahead with 32 fetches in flight,
+Bulk and range-probe scans use fixed 8 MiB read-ahead with 32 fetches in flight,
 sized for a remote object store. A third shape, streaming, serves a
 sequential consumer that derives as it goes — the staged index build's
 inline sources — and reads ahead 256 KiB with two fetches in flight: a
@@ -1077,6 +1092,12 @@ round trip's worth of blocks ahead of the cursor, admitting nothing, and
 holding at most about half a mebibyte per SST the iterator is positioned in
 rather than the bulk shape's window. Its previous setting of one block was
 one object-store round trip per 4 KiB.
+Non-unique equality probes have their own admitting shape: 1 MiB read-ahead
+and two fetch tasks per SST. Prefix bounds already restrict small keys to
+their blocks; the smaller window bounds buffering while retaining coalesced
+reads for high-fanout keys. Range probes and preload scans keep the larger
+window. A one-block equality window was rejected because a 131,072-match key
+went from 3 to 420 GETs in the real-SlateDB fixture.
 These are implementation constants, not attach policy: they remove the
 measured sequential-round-trip failure, while no local/S3 ladder demonstrates
 that per-attach tuning improves a supported workload. A different value needs
@@ -1110,9 +1131,10 @@ The attach options keep their surface (RFC 0006) and change machinery:
   outgrows the protected share says so. Unset:
   what SlateDB gave a single store, now for the whole process. Never
   inert — the memory tiers exist without a `CACHE_DIR`.
-- `CACHE_PUTS` — the flush/compaction insertion policy: written SSTs'
-  blocks enter decoded, on write. Opt-in as before: compaction output
-  evicts what reads warmed.
+- `CACHE_PUTS` — the flush insertion policy: SST metadata and data blocks
+  enter decoded on write by default, with
+  or without a disk tier. `CACHE_COMPACTION_PUTS` separately controls merge
+  output admission and defaults off. Either kind remains byte-bounded.
 - `CACHE_PRELOAD` — a segment-aware warm, run as reads rather than as a
   manifest walk. SlateDB's per-SST warm call takes an id type its crate
   does not export, so no caller outside it can name one (the export request is
@@ -1183,7 +1205,7 @@ directory at all.
 A cache per attach with its own budget is rejected: it would multiply
 `CACHE_MEMORY` by an unnamed attach count. A cache per *store* under one
 budget is what is built: every attach of a store shares its instance, the
-memory split follows the attached count, and the executor stays process-wide.
+memory allowance follows demand, and the executor stays process-wide.
 Disk is a ceiling per store, not a reservation — a store's device takes
 `CACHE_SIZE` as its cap and fills only with what that store reads.
 
@@ -1211,6 +1233,15 @@ per-attach policy.
   compacted state, neither of which a catalog writer needs within a second.
   A reader's cadence is its own attach option and is unchanged.
 
+Non-unique equality probes additionally use a bloom filter over the complete
+encoded indexed value, excluding the row-id suffix. The extractor recognizes
+the terminated storekey byte frame, so point keys and equality-prefix scans
+extract identical prefixes; shorter range prefixes cannot use this filter.
+Writers and readers register both the legacy whole-key policy and the named
+`moraine-index-equality-v1` prefix policy. Key bytes do not change. Existing
+SSTs keep their whole-key filters; new flushes and compactions add the prefix
+filter, and older readers safely ignore the additional named policy.
+
 Not changed: the WAL-flush bound on a memtable's life
 (`max_wal_flushes_before_l0_flush`) stays at SlateDB's 4096, its floor —
 SlateDB refuses a lower value at open — and SST compression stays off, since
@@ -1223,12 +1254,20 @@ path's own read-ahead (the measured fix for the 277 s materialization in
 shared between concurrent processes: a foyer device has one owner at a
 time — the deployed topology never shared a directory across hosts.
 
-### The query data path is DuckDB's; index upkeep reads scoped metadata
+### Ordinary scans use DuckDB; exact indexed scans use scoped readers
 
 Ordinary lake scans never send data-file bytes through moraine and add no
 data-page cache or read-through layer: a lakehouse's query data path belongs
 to the engine reading it, and duplicating DuckDB's would be the mistake this
 RFC removes from the catalog tier.
+
+Exact paired-location indexed joins are the exception: their summary-driven
+scan opens the core's projected position reader during execution. It uses the
+existing bounded auxiliary byte/page-index cache shared with located reads and
+index upkeep, rather than buffering the query's result during binding. DuckDB
+still executes the join and predicates. Broad or unsupported query shapes keep
+the ordinary scan. The auxiliary cache and DuckDB's external-file cache remain
+separate budgets and can contain overlapping file bytes.
 
 It does not have to. **A lake read goes through DuckDB's caching file
 system and populates the external-file cache**, so data bytes are held
@@ -1394,6 +1433,11 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
 - **One budget across attaches.** Several attached stores share one cache
   and one tally; a later attach's differing options are reported as
   ignored rather than silently applied.
+- **Unused allowances remain available.** Eight empty stores attaching beside
+  a warmed writer do not cause another GET. Read fills and admitted updates
+  retain the working set with or without a disk cache. A newly busy store
+  reclaims capacity, concurrent flushes remain within the shared allowance,
+  oversubscription evicts blocks, and final detach releases memory capacity.
 - **Restart persistence and isolation.** Two stores with colliding WAL and
   L0 ids are warmed by one process; a fresh process attaching them in the
   same order reads both without a cache miss, and one attaching them in

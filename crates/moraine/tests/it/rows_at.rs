@@ -1,11 +1,10 @@
-//! `ReadOnlyCatalog::rows_at`: located rows read back at a snapshot.
+//! Arrow cursors read located rows at a pinned snapshot.
 
 use std::sync::Arc;
 
 use arrow::{
     array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray},
     datatypes::{DataType, Field, Int64Type, Schema, UInt64Type},
-    ipc::reader::StreamReader,
 };
 use moraine::{
     Catalog, CatalogSnapshot, DataFile, DataFileId, DataStore, DeleteFile, Error, InlineChunk,
@@ -15,24 +14,21 @@ use object_store::memory::InMemory;
 
 use crate::fixtures::{col, datafile, open_memory, row_id_field, write_parquet};
 
-/// Decodes one returned IPC stream into its single batch.
-#[allow(clippy::unwrap_used)]
-fn decode(ipc: &[u8]) -> RecordBatch {
-    let mut batches: Vec<RecordBatch> = StreamReader::try_new(std::io::Cursor::new(ipc), None)
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert_eq!(batches.len(), 1, "one batch per stream");
-    batches.pop().unwrap()
+async fn read_all(scan: Result<moraine::LocatedRowScan, Error>) -> Result<Vec<RecordBatch>, Error> {
+    let mut scan = scan?;
+    let mut batches = Vec::new();
+    while let Some(batch) = scan.next_record_batch().await? {
+        batches.push(batch);
+    }
+    Ok(batches)
 }
 
 /// Every row of every returned batch as `(a, row_id, data_file_id)`, in
 /// row-id order.
 #[allow(clippy::expect_used)]
-fn rows(located: &moraine::LocatedRows) -> Vec<(Option<i64>, u64, Option<u64>)> {
+fn rows(located: &[RecordBatch]) -> Vec<(Option<i64>, u64, Option<u64>)> {
     let mut rows = Vec::new();
-    for batch in &located.batches {
-        let batch = decode(batch);
+    for batch in located {
         let a = batch
             .column_by_name("a")
             .expect("column a")
@@ -87,6 +83,83 @@ fn batch_with_row_ids(a: &[i64], row_ids: &[i64]) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+/// Opening a warm cursor reads no payload; a sparse projection skips unrelated
+/// bytes.
+#[tokio::test]
+async fn selective_cursor_defers_payload_and_skips_unselected_columns() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let values: Vec<_> = (0..262_144_i64)
+        .map(|i| i.wrapping_mul(6_364_136_223_846_793_005))
+        .collect();
+    let (file_size_bytes, footer_size) = write_parquet(
+        &data,
+        "main/orders/data-262144.parquet",
+        &dense_batch(&values, &values),
+    )
+    .await;
+    assert!(file_size_bytes > 1024 * 1024);
+    let table = table_with(
+        &catalog,
+        &["a", "b"],
+        vec![DataFile {
+            file_size_bytes,
+            footer_size,
+            ..datafile(262_144)
+        }],
+    )
+    .await;
+    let file = only_file(&catalog, table).await;
+    let snapshot = head(&catalog).await;
+    let store = DataStore::new(data);
+    catalog
+        .locate_row_ids(Some(store.clone()), "", table, vec![10, 200_000])
+        .await
+        .unwrap();
+    let before = catalog.object_store_tally();
+    let mut scan = catalog
+        .scan_rows_at(
+            &snapshot,
+            Some(store),
+            "",
+            table,
+            &[(10, Some(file)), (200_000, Some(file))],
+            &["b".to_owned()],
+        )
+        .await
+        .unwrap();
+    let opened = catalog.object_store_tally();
+    assert_eq!(
+        opened.data_bytes, before.data_bytes,
+        "opening read payload bytes"
+    );
+    let mut retained = Vec::new();
+    while let Some(batch) = scan.next_record_batch().await.unwrap() {
+        retained.push(batch);
+    }
+    drop(scan);
+    let actual: Vec<i64> = retained
+        .iter()
+        .flat_map(|batch| {
+            assert_eq!(batch.schema().field(0).name(), "b");
+            batch
+                .column(0)
+                .as_primitive::<Int64Type>()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect();
+    assert_eq!(actual, vec![values[10], values[200_000]]);
+    let bytes = catalog.object_store_tally().data_bytes - opened.data_bytes;
+    eprintln!("selective projection: {bytes} bytes of {file_size_bytes}");
+    assert!(
+        bytes > 0 && bytes * 3 < file_size_bytes,
+        "selection read too much: {bytes}/{file_size_bytes}"
+    );
+    catalog.close().await.unwrap();
 }
 
 /// A DuckLake-shaped delete file naming `positions`.
@@ -230,18 +303,21 @@ async fn file_rows_come_back_with_the_current_columns_and_their_ids() {
     let file = only_file(&catalog, table).await;
 
     let snapshot = head(&catalog).await;
-    let located = catalog
-        .rows_at(
-            &snapshot,
-            Some(DataStore::new(data)),
-            "",
-            table,
-            &[(2, Some(file)), (1, Some(file)), (1, Some(file))],
-        )
-        .await
-        .unwrap();
+    let located = read_all(
+        catalog
+            .scan_rows_at_strict(
+                &snapshot,
+                Some(DataStore::new(data)),
+                "",
+                table,
+                &[(2, Some(file)), (1, Some(file)), (1, Some(file))],
+            )
+            .await,
+    )
+    .await
+    .unwrap();
 
-    let batch = decode(&located.batches[0]);
+    let batch = &located[0];
     assert_eq!(
         batch
             .schema()
@@ -270,6 +346,86 @@ async fn file_rows_come_back_with_the_current_columns_and_their_ids() {
     catalog.close().await.unwrap();
 }
 
+/// A selective cursor projects columns, deduplicates pairs and ends after its
+/// rows.
+#[tokio::test]
+async fn selective_cursor_projects_and_streams_exact_rows() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let (file_size_bytes, footer_size) = write_parquet(
+        &data,
+        "main/orders/data-3.parquet",
+        &dense_batch(&[10, 20, 30], &[1, 2, 3]),
+    )
+    .await;
+    let table = table_with(
+        &catalog,
+        &["a", "b"],
+        vec![DataFile {
+            file_size_bytes,
+            footer_size,
+            ..datafile(3)
+        }],
+    )
+    .await;
+    let file = only_file(&catalog, table).await;
+    let snapshot = head(&catalog).await;
+    let strict = catalog
+        .scan_rows_at_strict(
+            &snapshot,
+            Some(DataStore::new(data.clone())),
+            "",
+            table,
+            &[(1, Some(file)), (9999, Some(file))],
+        )
+        .await;
+    assert!(matches!(
+        strict,
+        Err(Error::RowPosition { row_id: 9999, .. })
+    ));
+    for requested in [vec!["b".to_owned()], vec![]] {
+        let mut scan = catalog
+            .scan_rows_at(
+                &snapshot,
+                Some(DataStore::new(data.clone())),
+                "",
+                table,
+                &[
+                    (2, Some(file)),
+                    (1, Some(file)),
+                    (1, Some(file)),
+                    (9999, Some(file)),
+                ],
+                &requested,
+            )
+            .await
+            .unwrap();
+        let batch = scan.next_record_batch().await.unwrap().unwrap();
+        assert_eq!(batch.num_columns(), requested.len() + 2);
+        assert_eq!(batch.num_rows(), 2);
+        if !requested.is_empty() {
+            assert_eq!(
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .as_ref(),
+                &[2, 3]
+            );
+        }
+        assert_eq!(
+            batch
+                .column(requested.len())
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            &[1, 2]
+        );
+        assert!(scan.next_record_batch().await.unwrap().is_none());
+    }
+    catalog.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_file_with_embedded_ids_is_read_at_its_exact_positions() {
     let catalog = open_memory().await;
@@ -293,16 +449,19 @@ async fn a_file_with_embedded_ids_is_read_at_its_exact_positions() {
     let file = only_file(&catalog, table).await;
 
     let snapshot = head(&catalog).await;
-    let located = catalog
-        .rows_at(
-            &snapshot,
-            Some(DataStore::new(data)),
-            "",
-            table,
-            &[(9, Some(file)), (12, Some(file))],
-        )
-        .await
-        .unwrap();
+    let located = read_all(
+        catalog
+            .scan_rows_at_strict(
+                &snapshot,
+                Some(DataStore::new(data)),
+                "",
+                table,
+                &[(9, Some(file)), (12, Some(file))],
+            )
+            .await,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         rows(&located),
@@ -359,16 +518,19 @@ async fn rows_deleted_at_the_snapshot_are_omitted() {
         .unwrap();
 
     let snapshot = head(&catalog).await;
-    let located = catalog
-        .rows_at(
-            &snapshot,
-            Some(DataStore::new(data)),
-            "",
-            table,
-            &[(0, Some(file)), (1, Some(file)), (2, Some(file))],
-        )
-        .await
-        .unwrap();
+    let located = read_all(
+        catalog
+            .scan_rows_at_strict(
+                &snapshot,
+                Some(DataStore::new(data)),
+                "",
+                table,
+                &[(0, Some(file)), (1, Some(file)), (2, Some(file))],
+            )
+            .await,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         rows(&located),
@@ -377,6 +539,89 @@ async fn rows_deleted_at_the_snapshot_are_omitted() {
             (Some(30), 2, Some(file.get()))
         ]
     );
+    catalog.close().await.unwrap();
+}
+
+/// Repeated physical row versions are positioned together and deleted versions
+/// omitted.
+#[tokio::test]
+async fn repeated_summary_positions_read_only_the_live_version() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let (file_size_bytes, footer_size) = write_parquet(
+        &data,
+        "main/orders/data-3.parquet",
+        &batch_with_row_ids(&[10, 20, 30], &[5, 9, 5]),
+    )
+    .await;
+    let table = table_with(
+        &catalog,
+        &["a"],
+        vec![DataFile {
+            file_size_bytes,
+            footer_size,
+            ..datafile(3)
+        }],
+    )
+    .await;
+    let file = only_file(&catalog, table).await;
+    let (delete_size, delete_footer) =
+        write_parquet(&data, "main/orders/delete.parquet", &delete_batch(&[0])).await;
+    catalog
+        .commit(|tx| {
+            tx.register_delete_file(
+                table,
+                DeleteFile {
+                    data_file_id: file,
+                    path: "delete.parquet".into(),
+                    path_is_relative: true,
+                    format: "parquet".into(),
+                    delete_count: 1,
+                    file_size_bytes: delete_size,
+                    footer_size: delete_footer,
+                    encryption_key: None,
+                },
+                &[],
+            )
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+    let snapshot = head(&catalog).await;
+    let store = DataStore::new(data);
+    let expected = vec![(Some(30), 5, Some(file.get()))];
+    let located = read_all(
+        catalog
+            .scan_rows_at_strict(
+                &snapshot,
+                Some(store.clone()),
+                "",
+                table,
+                &[(5, Some(file))],
+            )
+            .await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows(&located), expected);
+    let mut scan = catalog
+        .scan_rows_at(
+            &snapshot,
+            Some(store),
+            "",
+            table,
+            &[(5, Some(file))],
+            &["a".to_owned()],
+        )
+        .await
+        .unwrap();
+    let mut located = Vec::new();
+    assert_eq!(scan.files_read(), 0);
+    while let Some(batch) = scan.next_record_batch().await.unwrap() {
+        located.push(batch);
+    }
+    assert_eq!(scan.files_read(), 1);
+    assert_eq!(rows(&located), expected);
     catalog.close().await.unwrap();
 }
 
@@ -393,10 +638,13 @@ async fn inlined_rows_decode_from_their_chunk() {
         .unwrap();
 
     let snapshot = head(&catalog).await;
-    let located = catalog
-        .rows_at(&snapshot, None, "", table, &[(1, None), (2, None)])
-        .await
-        .unwrap();
+    let located = read_all(
+        catalog
+            .scan_rows_at_strict(&snapshot, None, "", table, &[(1, None), (2, None)])
+            .await,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(rows(&located), vec![(Some(8), 1, None), (Some(9), 2, None)]);
     catalog.close().await.unwrap();
@@ -419,10 +667,13 @@ async fn an_inlined_row_deleted_at_the_snapshot_is_refused() {
         .unwrap();
 
     let snapshot = head(&catalog).await;
-    let error = catalog
-        .rows_at(&snapshot, None, "", table, &[(1, None)])
-        .await
-        .unwrap_err();
+    let error = read_all(
+        catalog
+            .scan_rows_at_strict(&snapshot, None, "", table, &[(1, None)])
+            .await,
+    )
+    .await
+    .unwrap_err();
 
     assert!(
         matches!(
@@ -465,18 +716,21 @@ async fn a_column_added_after_a_file_was_written_reads_as_null() {
         .unwrap();
 
     let snapshot = head(&catalog).await;
-    let located = catalog
-        .rows_at(
-            &snapshot,
-            Some(DataStore::new(data)),
-            "",
-            table,
-            &[(1, Some(file))],
-        )
-        .await
-        .unwrap();
+    let located = read_all(
+        catalog
+            .scan_rows_at_strict(
+                &snapshot,
+                Some(DataStore::new(data)),
+                "",
+                table,
+                &[(1, Some(file))],
+            )
+            .await,
+    )
+    .await
+    .unwrap();
 
-    let batch = decode(&located.batches[0]);
+    let batch = &located[0];
     let b = batch.column_by_name("b").unwrap();
     assert_eq!(b.data_type(), &DataType::Int64);
     assert!(b.is_null(0));
@@ -530,15 +784,21 @@ async fn an_older_snapshot_still_serves_a_row_deleted_later() {
         .await
         .unwrap();
 
-    let at_pinned = catalog
-        .rows_at(&pinned, Some(store.clone()), "", table, &[(0, Some(file))])
-        .await
-        .unwrap();
+    let at_pinned = read_all(
+        catalog
+            .scan_rows_at_strict(&pinned, Some(store.clone()), "", table, &[(0, Some(file))])
+            .await,
+    )
+    .await
+    .unwrap();
     let current = head(&catalog).await;
-    let at_head = catalog
-        .rows_at(&current, Some(store.clone()), "", table, &[(0, Some(file))])
-        .await
-        .unwrap();
+    let at_head = read_all(
+        catalog
+            .scan_rows_at_strict(&current, Some(store.clone()), "", table, &[(0, Some(file))])
+            .await,
+    )
+    .await
+    .unwrap();
     let positions_pinned = catalog
         .locate_row_positions_at(&pinned, Some(store.clone()), "", table, &[(0, Some(file))])
         .await
@@ -614,10 +874,13 @@ async fn a_file_the_snapshot_does_not_hold_is_refused() {
         .unwrap()
         .id;
 
-    let error = catalog
-        .rows_at(&pinned, Some(store), "", table, &[(3, Some(later))])
-        .await
-        .unwrap_err();
+    let error = read_all(
+        catalog
+            .scan_rows_at_strict(&pinned, Some(store), "", table, &[(3, Some(later))])
+            .await,
+    )
+    .await
+    .unwrap_err();
 
     assert!(
         matches!(error, Error::RowPosition { row_id: 3, data_file_id: Some(id), .. } if id == later),
@@ -649,16 +912,19 @@ async fn a_row_the_named_file_does_not_hold_is_refused() {
     let file = only_file(&catalog, table).await;
 
     let snapshot = head(&catalog).await;
-    let error = catalog
-        .rows_at(
-            &snapshot,
-            Some(DataStore::new(data)),
-            "",
-            table,
-            &[(7, Some(file))],
-        )
-        .await
-        .unwrap_err();
+    let error = read_all(
+        catalog
+            .scan_rows_at_strict(
+                &snapshot,
+                Some(DataStore::new(data)),
+                "",
+                table,
+                &[(7, Some(file))],
+            )
+            .await,
+    )
+    .await
+    .unwrap_err();
 
     assert!(
         matches!(error, Error::RowPosition { row_id: 7, .. }),
@@ -718,16 +984,19 @@ async fn a_position_a_replacement_delete_file_deletes_later_is_still_served() {
         .unwrap();
 
     let snapshot = head(&catalog).await;
-    let located = catalog
-        .rows_at(
-            &snapshot,
-            Some(DataStore::new(data)),
-            "",
-            table,
-            &[(0, Some(file)), (1, Some(file)), (2, Some(file))],
-        )
-        .await
-        .unwrap();
+    let located = read_all(
+        catalog
+            .scan_rows_at_strict(
+                &snapshot,
+                Some(DataStore::new(data)),
+                "",
+                table,
+                &[(0, Some(file)), (1, Some(file)), (2, Some(file))],
+            )
+            .await,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         rows(&located),

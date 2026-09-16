@@ -109,8 +109,8 @@ LocatedArguments ResolveLocatedArguments(duckdb::ClientContext &context, const s
 	MoraineError error {};
 	auto code = moraine_locate_row_positions(pinned.catalog->Handle(), pinned.snapshot, schema_name.c_str(),
 	                                         table_name.c_str(), pairs.data(), pairs.size(), files.OutItems(),
-	                                         files.OutLen(), inlined.OutItems(), inlined.OutLen(),
-	                                         &raw_write_directory, moraine_shim_is_interrupted, &context, &error);
+	                                         files.OutLen(), inlined.OutItems(), inlined.OutLen(), &raw_write_directory,
+	                                         moraine_shim_is_interrupted, &context, &error);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(error);
 	}
@@ -130,9 +130,8 @@ LocatedArguments ResolveLocatedArguments(duckdb::ClientContext &context, const s
 		for (size_t i = 0; i < file.positions_len; i++) {
 			positions.push_back(Value::UBIGINT(file.positions[i]));
 		}
-		duckdb::child_list_t<Value> fields {
-		    {"data_file_id", Value::UBIGINT(file.data_file_id)},
-		    {"positions", Value::LIST(LogicalType::UBIGINT, std::move(positions))}};
+		duckdb::child_list_t<Value> fields {{"data_file_id", Value::UBIGINT(file.data_file_id)},
+		                                    {"positions", Value::LIST(LogicalType::UBIGINT, std::move(positions))}};
 		file_values.push_back(Value::STRUCT(std::move(fields)));
 	}
 	duckdb::vector<Value> inlined_values;
@@ -185,10 +184,9 @@ struct RowsAtBindData : public duckdb::FunctionData {
 	std::string table_name;
 	std::string rows_repr;
 	duckdb::vector<duckdb::LogicalType> types;
-	// Each batch is one Arrow IPC stream, decoded during execution.
-	std::vector<std::vector<uint8_t>> batches;
+	std::vector<MorainePositionPair> pairs;
 
-	// Resolved rows belong to one execution.
+	// Rebind the result schema against the execution's catalog snapshot.
 	bool SupportStatementCache() const override {
 		return false;
 	}
@@ -204,9 +202,7 @@ struct RowsAtBindData : public duckdb::FunctionData {
 	}
 };
 
-// Resolves and reads the rows at bind, as the index lookups do: the rows
-// belong to the binding transaction's snapshot, and a prepared call binds
-// again for each execution.
+// Bind only the result schema and arguments; execution owns all row reads.
 duckdb::unique_ptr<duckdb::FunctionData> RowsAtBind(duckdb::ClientContext &context,
                                                     duckdb::TableFunctionBindInput &input,
                                                     duckdb::vector<duckdb::LogicalType> &return_types,
@@ -216,7 +212,7 @@ duckdb::unique_ptr<duckdb::FunctionData> RowsAtBind(duckdb::ClientContext &conte
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
 	bind_data->table_name = input.inputs[2].GetValue<std::string>();
 	bind_data->rows_repr = input.inputs[3].ToString();
-	auto pairs = ParseLocatedPairs(input.inputs[3], "moraine_rows_at");
+	bind_data->pairs = ParseLocatedPairs(input.inputs[3], "moraine_rows_at");
 
 	auto pinned =
 	    PinTransactionSnapshot(context, bind_data->catalog_name, bind_data->schema_name, bind_data->table_name);
@@ -228,56 +224,60 @@ duckdb::unique_ptr<duckdb::FunctionData> RowsAtBind(duckdb::ClientContext &conte
 	names.push_back("data_file_id");
 	bind_data->types = return_types;
 
-	OwnedArray<MoraineRowBatch> batches(moraine_rows_at_free);
-	MoraineError error {};
-	auto code = moraine_rows_at(pinned.catalog->Handle(), snapshot, bind_data->schema_name.c_str(),
-	                            bind_data->table_name.c_str(), pairs.data(), pairs.size(), batches.OutItems(),
-	                            batches.OutLen(), moraine_shim_is_interrupted, &context, &error);
-	if (code != MORAINE_OK) {
-		ThrowMoraineError(error);
-	}
-	for (auto &batch : batches) {
-		bind_data->batches.emplace_back(batch.data, batch.data + batch.len);
-	}
 	input.binder->SetAlwaysRequireRebind();
 	return bind_data;
 }
 
 struct RowsAtGlobalState : public duckdb::GlobalTableFunctionState {
-	size_t next_batch = 0;
+	MoraineRowScan *scan = nullptr;
 	std::vector<duckdb::unique_ptr<duckdb::DataChunk>> pending;
+	~RowsAtGlobalState() override {
+		moraine_row_scan_free(scan);
+	}
 	duckdb::idx_t MaxThreads() const override {
 		return 1;
 	}
 };
 
-duckdb::unique_ptr<duckdb::GlobalTableFunctionState> RowsAtInit(duckdb::ClientContext &,
-                                                                duckdb::TableFunctionInitInput &) {
-	return duckdb::make_uniq<RowsAtGlobalState>();
-}
-
-// Decodes one IPC stream into chunks typed as its own schema says. Each
-// batch is self-describing because a file written under an older schema
-// may carry a narrower type than the table does now; the caller casts.
-std::vector<duckdb::unique_ptr<duckdb::DataChunk>> DecodeBatch(duckdb::ClientContext &context,
-                                                               const std::vector<uint8_t> &ipc) {
-	ArrowSchema c_schema;
-	ArrowArray c_array;
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> RowsAtInit(duckdb::ClientContext &context,
+                                                                duckdb::TableFunctionInitInput &input) {
+	auto &bound = input.bind_data->Cast<RowsAtBindData>();
+	auto state = duckdb::make_uniq<RowsAtGlobalState>();
+	auto pinned = PinTransactionSnapshot(context, bound.catalog_name, bound.schema_name, bound.table_name);
 	MoraineError error {};
-	if (moraine_arrow_decode_stream(ipc.data(), ipc.size(), &c_schema, &c_array, &error) != MORAINE_OK) {
+	if (moraine_rows_at_open(moraine_snapshot_read_handle(pinned.snapshot), pinned.snapshot, bound.schema_name.c_str(),
+	                         bound.table_name.c_str(), bound.pairs.data(), bound.pairs.size(), &state->scan,
+	                         moraine_shim_is_interrupted, &context, &error) != MORAINE_OK) {
 		ThrowMoraineError(error);
 	}
+	duckdb::Value parallelism;
+	context.TryGetCurrentSetting("moraine_summary_scan_threads", parallelism);
+	auto maximum = std::min<uint64_t>(parallelism.GetValue<uint64_t>(),
+	                                  duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads());
+	if (moraine_row_scan_parallelism(state->scan, maximum, &error) != MORAINE_OK) {
+		ThrowMoraineError(error);
+	}
+	return std::move(state);
+}
+
+} // namespace
+
+std::vector<duckdb::unique_ptr<duckdb::DataChunk>> ImportLocatedBatch(duckdb::ClientContext &context,
+                                                                      ArrowSchema &c_schema, ArrowArray &c_array) {
+	duckdb::ArrowSchemaWrapper schema;
+	schema.arrow_schema = c_schema;
+	c_schema.release = nullptr;
+	auto chunk_wrapper = duckdb::make_uniq<duckdb::ArrowArrayWrapper>();
+	chunk_wrapper->arrow_array = c_array;
+	c_array.release = nullptr;
 
 	duckdb::ArrowTableSchema arrow_table;
-	duckdb::ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, c_schema);
+	duckdb::ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema.arrow_schema);
 	auto &columns = arrow_table.GetColumns();
 	duckdb::vector<duckdb::LogicalType> types;
 	for (duckdb::idx_t i = 0; i < columns.size(); i++) {
 		types.push_back(columns.at(i)->GetDuckType());
 	}
-
-	auto chunk_wrapper = duckdb::make_uniq<duckdb::ArrowArrayWrapper>();
-	chunk_wrapper->arrow_array = c_array;
 	auto total = static_cast<duckdb::idx_t>(chunk_wrapper->arrow_array.length);
 	duckdb::ArrowScanLocalState scan_state(std::move(chunk_wrapper), context);
 	for (duckdb::idx_t i = 0; i < types.size(); i++) {
@@ -294,21 +294,28 @@ std::vector<duckdb::unique_ptr<duckdb::DataChunk>> DecodeBatch(duckdb::ClientCon
 		pieces.push_back(std::move(out));
 		scan_state.chunk_offset += size;
 	}
-	if (c_schema.release) {
-		c_schema.release(&c_schema);
-	}
 	return pieces;
 }
+
+namespace {
 
 void RowsAtImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<RowsAtBindData>();
 	auto &state = data.global_state->Cast<RowsAtGlobalState>();
 	while (state.pending.empty()) {
-		if (state.next_batch >= bind_data.batches.size()) {
+		duckdb::ArrowSchemaWrapper schema;
+		duckdb::ArrowArrayWrapper array;
+		bool has_batch = false;
+		MoraineError error {};
+		if (moraine_row_scan_next_arrow(state.scan, &schema.arrow_schema, &array.arrow_array, &has_batch,
+		                                moraine_shim_is_interrupted, &context, &error) != MORAINE_OK) {
+			ThrowMoraineError(error);
+		}
+		if (!has_batch) {
 			output.SetCardinality(0);
 			return;
 		}
-		auto pieces = DecodeBatch(context, bind_data.batches[state.next_batch++]);
+		auto pieces = ImportLocatedBatch(context, schema.arrow_schema, array.arrow_array);
 		// Emitted in order: the last decoded piece goes out last.
 		for (auto piece = pieces.rbegin(); piece != pieces.rend(); ++piece) {
 			state.pending.push_back(std::move(*piece));
@@ -343,6 +350,15 @@ void RegisterMoraineRowsAtFunction(duckdb::ExtensionLoader &loader) {
 	    "moraine_rows_at",
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
 	    RowsAtImpl, RowsAtBind, RowsAtInit);
+	rows_at.dynamic_to_string = [](duckdb::TableFunctionDynamicToStringInput &input) {
+		duckdb::InsertionOrderPreservingMap<std::string> result;
+		if (input.global_state) {
+			auto scan = input.global_state->Cast<RowsAtGlobalState>().scan;
+			result["Total Files Read"] = std::to_string(moraine_row_scan_files_read(scan));
+			result["Peak read workers"] = std::to_string(moraine_row_scan_metrics(scan).peak_workers);
+		}
+		return result;
+	};
 	loader.RegisterFunction(rows_at);
 }
 

@@ -4,6 +4,8 @@
 mod backfill;
 mod index_build;
 mod index_lookup;
+mod index_probe_cache;
+mod index_read_scope;
 mod inline_scan;
 mod maintenance;
 mod row_location;
@@ -20,13 +22,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub use index_read_scope::{IndexReadIdentity, IndexReadScope};
 pub(crate) use inline_scan::InlineScan;
 pub use maintenance::{
     MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep,
 };
 use object_store::ObjectStore;
 pub use row_location::{
-    DeleteFileRegistration, ExistingDeleteFile, LocatedDeletion, LocatedPositions, LocatedRows,
+    DeleteFileRegistration, ExistingDeleteFile, LocatedDeletion, LocatedPositions, LocatedRowScan,
     RowSummaryWarmth,
 };
 use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
@@ -165,6 +168,8 @@ impl Store {
 /// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+// These are independent attach options, not states of one operation.
+#[allow(clippy::struct_excessive_bools)]
 pub struct CatalogOptions {
     /// Path prefix of the catalog within the bucket. Empty (the default)
     /// places the catalog at the bucket root; set it when several stores
@@ -224,15 +229,16 @@ pub struct CatalogOptions {
     /// open that preloads returns only once it has. `None` (the default)
     /// warms nothing, leaving the cache to fill as reads ask for blocks.
     pub cache_preload: Option<CachePreload>,
-    /// Whether objects this catalog writes are cached as they are written,
-    /// rather than only when something reads them back. A flushed or
-    /// compacted store object then costs one local write and no later
-    /// fetch, and — since store objects are immutable and land atomically
-    /// — a reader sharing the [`cache_dir`](Self::cache_dir) reads what
-    /// the writer cached. Compaction output is cached too, so a merge can
-    /// evict what reads had warmed; `false` (the default) leaves the cache
-    /// filled by reads alone. Inert without a `cache_dir`.
+    /// Whether flushed SST metadata and data blocks enter
+    /// the process-shared decoded cache on write. Works with or without
+    /// [`cache_dir`](Self::cache_dir); admitted blocks remain subject to
+    /// eviction. Defaults to `true`; `false` disables flush admission.
     pub cache_puts: bool,
+    /// Whether compaction-output SST metadata and data blocks enter the
+    /// decoded cache on write. Defaults to `false`, independently of
+    /// [`cache_puts`](Self::cache_puts), so merges do not displace read-hot
+    /// blocks.
+    pub cache_compaction_puts: bool,
     /// The lake's data root (DuckLake's `DATA_PATH`). Creation-time only:
     /// recorded as the stored global `data_path` option when a fresh store
     /// bootstraps, so a later open can read it back
@@ -274,7 +280,8 @@ impl Default for CatalogOptions {
             cache_size: None,
             cache_memory: None,
             cache_preload: None,
-            cache_puts: false,
+            cache_puts: true,
+            cache_compaction_puts: false,
             data_path: None,
             reader_poll_interval: Duration::from_secs(10),
             checkpoint: None,
@@ -425,11 +432,13 @@ pub type CommitMember<'a> = &'a (dyn Fn(&mut Transaction) -> Result<()> + Sync);
 /// ```
 #[derive(Clone)]
 pub struct ReadOnlyCatalog {
+    pinned: Option<Arc<index_read_scope::PinnedRead>>,
     store: Arc<Store>,
     reads: Arc<ReadTally>,
     cache: Arc<CacheCounters>,
     data_reads: Arc<data_file::DataStoreCounters>,
     row_lookups: Arc<row_lookup::RowLookupCache>,
+    index_probes: Arc<index_probe_cache::IndexProbeCache>,
     location: Arc<StoreLocation>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     commits: Arc<commit::Coalescer>,
@@ -501,20 +510,10 @@ impl ReadOnlyCatalog {
         self.cache.tally()
     }
 
-    /// Roughly what this handle's decoded catalog holds, in bytes.
-    ///
-    /// The other caches are the process's and are budgeted by
-    /// [`CatalogOptions::cache_memory`]; this one is the handle's, is
-    /// bounded by the catalog's own size rather than by a cap, and is
-    /// replaced when the head stamp moves rather than evicted under
-    /// pressure. It is reported so a host sizing a process can see it at
-    /// all.
-    ///
-    /// An estimate over the decoded record sets, the maintained
-    /// projections, and the head view derived from them. Encoded record
-    /// lengths stand in for what those records occupy in memory. Row lookup
-    /// directories include retained file metadata and can share it with the
-    /// view, so treat this as an approximation.
+    /// Estimated bytes in decoded catalog state, row directories, and scoped
+    /// probe results, outside the process-shared block-cache allowance.
+    /// Projections follow catalog size; directories and probe results have
+    /// separate eviction limits. Shared allocations can be counted twice.
     #[must_use]
     pub fn projection_bytes(&self) -> u64 {
         self.projections
@@ -522,6 +521,7 @@ impl ReadOnlyCatalog {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .estimated_bytes()
             .saturating_add(self.row_lookups.estimated_bytes())
+            .saturating_add(self.index_probes.estimated_bytes())
     }
 
     /// Logical memory attributed to this catalog and the process-shared caches.
@@ -630,6 +630,9 @@ impl ReadOnlyCatalog {
     /// reads. Callers must pair it with
     /// [`refuse_if_closed`](Self::refuse_if_closed).
     pub(crate) fn writer_head_view(&self) -> Option<Arc<CatalogSnapshot>> {
+        if let Some(pinned) = &self.pinned {
+            return Some(pinned.snapshot.clone());
+        }
         if !self.holds_the_writer() {
             return None;
         }
@@ -649,6 +652,13 @@ impl ReadOnlyCatalog {
     pub(crate) fn warm_writer_read(
         &self,
     ) -> Result<Option<(Arc<CatalogSnapshot>, ReadHandle<'_>)>> {
+        if let Some(pinned) = &self.pinned {
+            self.refuse_if_closed()?;
+            return Ok(Some((
+                pinned.snapshot.clone(),
+                ReadHandle::Tx(&pinned.transaction),
+            )));
+        }
         let (Some(view), Some(db)) = (self.writer_head_view(), self.store.writer_db()) else {
             return Ok(None);
         };
@@ -833,6 +843,9 @@ impl ReadOnlyCatalog {
     /// else a fresh materialization. Capture `epoch` before opening the
     /// read session so an intervening invalidation prevents installation.
     async fn head_view(&self, handle: ReadHandle<'_>, epoch: u64) -> Result<Arc<CatalogSnapshot>> {
+        if let Some(pinned) = &self.pinned {
+            return Ok(pinned.snapshot.clone());
+        }
         let view = self.load_head_view(handle).await?;
         install_head_view_at(&self.projections, epoch, Arc::clone(&view));
         Ok(view)
@@ -899,6 +912,10 @@ impl ReadOnlyCatalog {
     /// every batch and stays hot, where the absent marker is the store's
     /// most expensive possible read.
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
+        if let Some(pinned) = &self.pinned {
+            self.refuse_if_closed()?;
+            return Ok(ReadSession::Pinned(pinned.transaction.clone()));
+        }
         let session = match self.store.as_ref() {
             Store::Writer { db, .. } => {
                 self.reads.read_transactions.fetch_add(1, Ordering::Relaxed);
@@ -1043,7 +1060,8 @@ impl Catalog {
                     .map(|manifest| manifest.segments.clone())
                     .unwrap_or_default(),
             )
-            .cache_puts(options.cache_puts);
+            .cache_puts(options.cache_puts)
+            .cache_compaction_puts(options.cache_compaction_puts);
         let flush_spacing = if options.flush_on_commit {
             Duration::ZERO
         } else {
@@ -1076,6 +1094,7 @@ impl Catalog {
         let durability = commit::CommitDurability::Paced(Arc::clone(&pacer));
         Ok(Self {
             inner: ReadOnlyCatalog {
+                pinned: None,
                 writer_status: Some(db.subscribe()),
                 store: Arc::new(Store::Writer { db, pacer }),
                 location: Arc::new(StoreLocation {
@@ -1086,6 +1105,7 @@ impl Catalog {
                 cache,
                 data_reads: Arc::default(),
                 row_lookups: Arc::default(),
+                index_probes: Arc::default(),
                 commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections), durability)),
                 projections,
             },
@@ -1159,6 +1179,7 @@ impl Catalog {
                     .unwrap_or_default(),
             )
             .cache_puts(options.cache_puts)
+            .cache_compaction_puts(options.cache_compaction_puts)
             .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
 
@@ -1178,6 +1199,7 @@ impl Catalog {
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         crate::catalog::projection::raise_format_floor(&projections, format);
         Ok(ReadOnlyCatalog {
+            pinned: None,
             writer_status: None,
             store: Arc::new(Store::Reader(Arc::new(reader))),
             location: Arc::new(StoreLocation {
@@ -1188,6 +1210,7 @@ impl Catalog {
             cache,
             data_reads: Arc::default(),
             row_lookups: Arc::default(),
+            index_probes: Arc::default(),
             commits: Arc::new(commit::Coalescer::new(
                 Arc::clone(&projections),
                 commit::CommitDurability::OnFlushInterval,
@@ -1249,6 +1272,7 @@ impl Catalog {
             .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts)
+            .cache_compaction_puts(options.cache_compaction_puts)
             .open_writer()
             .await?;
 

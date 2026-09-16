@@ -11,15 +11,20 @@
 //! heap-allocated arrays of C descriptor structs; each has a paired
 //! `_free` function that must be called exactly once.
 //!
+//! Read-only entry points also accept the borrowed catalog alias returned by
+//! [`moraine_snapshot_read_handle`]. That alias must not be detached and must
+//! not outlive its owning scoped snapshot.
+//!
 //! [`Catalog`]: moraine::Catalog
 //! [`CatalogSnapshot`]: moraine::CatalogSnapshot
 
 mod attach;
 mod deletion;
 mod indexes;
-mod located_rows;
 mod lookup;
 mod maintenance;
+mod read_scope;
+mod row_scan;
 mod snapshot;
 
 #[cfg(test)]
@@ -37,9 +42,10 @@ pub use attach::*;
 pub use checkpoints::*;
 pub use deletion::*;
 pub use indexes::*;
-pub use located_rows::*;
 pub use lookup::*;
 pub use maintenance::*;
+pub use read_scope::*;
+pub use row_scan::*;
 pub use snapshot::*;
 
 use crate::{

@@ -39,6 +39,11 @@ public:
 		return snapshot_;
 	}
 
+	MoraineCatalogHandle *ReadHandle() const {
+		auto scoped = moraine_snapshot_read_handle(snapshot_);
+		return scoped && !StagedTxIfOpen() ? scoped : catalog_handle_;
+	}
+
 	bool SchemasLoaded() const {
 		return schemas_loaded_;
 	}

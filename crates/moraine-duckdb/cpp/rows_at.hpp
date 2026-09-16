@@ -51,4 +51,8 @@ void TableColumns(MoraineSnapshotHandle *snapshot, const std::string &schema_nam
 
 void RegisterMoraineRowsAtFunction(duckdb::ExtensionLoader &loader);
 
+// Consumes both Arrow structs, including when import throws.
+std::vector<duckdb::unique_ptr<duckdb::DataChunk>> ImportLocatedBatch(duckdb::ClientContext &context,
+                                                                      ArrowSchema &schema, ArrowArray &array);
+
 } // namespace moraine_duckdb

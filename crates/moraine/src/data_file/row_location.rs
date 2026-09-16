@@ -40,6 +40,7 @@ impl FileSummary {
     }
 
     /// Which of `requested` this file holds, in request order.
+    #[cfg(test)]
     pub(crate) fn matching(&self, requested: &[u64]) -> Vec<u64> {
         self.rows.rows.matching(requested)
     }
@@ -55,8 +56,14 @@ impl FileSummary {
 
     /// File positions of `requested` rows within this file; `None` for rows
     /// this file does not hold.
+    #[cfg(test)]
     pub(crate) fn positions_of(&self, requested: &[u64]) -> Vec<Option<u64>> {
         self.rows.positions_of(requested)
+    }
+
+    /// Visits every physical version of `row_id`; false means it is absent.
+    pub(crate) fn visit_positions(&self, row_id: u64, visit: impl FnMut(u64)) -> bool {
+        self.rows.visit_positions(row_id, visit)
     }
 }
 

@@ -472,6 +472,7 @@ mod proptests {
 
     fn file_order_strategy() -> impl Strategy<Value = Vec<u64>> {
         prop_oneof![
+            proptest::collection::vec(0_u64..16, 1..64),
             proptest::collection::vec(any::<u16>(), 1..64).prop_map(unique_preserving_order),
             contiguous_permuted_file_order(),
         ]
@@ -488,7 +489,12 @@ mod proptests {
 
             let positioned = PositionedRowSet::from_file_order(file_order.clone()).unwrap();
             let was_ascending = matches!(positioned.order, RowOrder::Ascending);
-            let expected_positions = positioned.positions_of(&file_order);
+            let all_positions = |rows: &PositionedRowSet| file_order.iter().map(|&row_id| {
+                let mut positions = Vec::new();
+                rows.visit_positions(row_id, |position| positions.push(position));
+                positions
+            }).collect::<Vec<_>>();
+            let expected_positions = all_positions(&positioned);
 
             let weighed = Weighed::from(AuxiliaryValue::Summary(Arc::new(positioned)));
             let mut encoded = Vec::new();
@@ -499,8 +505,35 @@ mod proptests {
             };
 
             prop_assert_eq!(matches!(decoded.order, RowOrder::Ascending), was_ascending);
-            prop_assert_eq!(decoded.positions_of(&file_order), expected_positions);
+            prop_assert_eq!(all_positions(decoded), expected_positions);
         }
+    }
+}
+
+/// Malformed repeated-position directories are cache misses, not guessed
+/// positions.
+#[test]
+fn repeated_summary_disk_form_rejects_invalid_positions() {
+    use foyer::Code;
+
+    use super::auxiliary_cache::{AuxiliaryValue, Weighed};
+
+    for (members, offsets, positions) in [
+        (vec![10, 30], vec![1, 2, 3], vec![0, 1, 2]),
+        (vec![10, 30], vec![0, 0, 3], vec![0, 1, 2]),
+        (vec![10, 30], vec![0, 1, 3], vec![0, 0, 2]),
+        (vec![10, 30], vec![0, 1, 3], vec![0, 1, 5]),
+        (vec![10, 10], vec![0, 1, 3], vec![0, 1, 2]),
+    ] {
+        let summary = PositionedRowSet {
+            rows: FileRowSet::Sorted(members),
+            order: RowOrder::Repeated { offsets, positions },
+        };
+        let mut encoded = Vec::new();
+        Weighed::from(AuxiliaryValue::Summary(Arc::new(summary)))
+            .encode(&mut encoded)
+            .unwrap();
+        assert!(Weighed::decode(&mut encoded.as_slice()).is_err());
     }
 }
 

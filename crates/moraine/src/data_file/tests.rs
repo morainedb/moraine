@@ -2055,6 +2055,134 @@ async fn row_group_row_counts_list_every_group_in_file_order() {
     assert_eq!(counts, [1_000, 1_000, 500]);
 }
 
+/// Coverage counts projected pages rather than matching rows.
+#[tokio::test]
+async fn scan_coverage_distinguishes_scattered_positions() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("coverage.parquet");
+    let (size, footer) = write_grouped_fixture(store.as_ref(), &path, 65_536, 2048).await;
+    let file = ParquetFile::new(DataStore::new(store), path, size, footer);
+    let clustered = read_coverage(
+        &file,
+        &[0],
+        &RowPositions::from_unsorted((0..512).collect()),
+        Some(0),
+    )
+    .await
+    .unwrap();
+    let scattered = read_coverage(
+        &file,
+        &[0],
+        &RowPositions::from_unsorted((0..512).map(|row| row * 127).collect()),
+        Some(0),
+    )
+    .await
+    .unwrap();
+    assert!(clustered.selective());
+    assert!(!scattered.selective());
+    assert!(clustered.selected_bytes * 10 < scattered.selected_bytes);
+    assert_eq!(clustered.total_bytes, scattered.total_bytes);
+}
+
+/// Group work units retain file ordinals, deduplicate rows and reject invalid
+/// positions.
+#[tokio::test]
+async fn row_group_selections_preserve_physical_positions() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("selected-groups.parquet");
+    let (size, footer) = write_grouped_fixture(store.as_ref(), &path, 8192, 2048).await;
+    let file = ParquetFile::new(DataStore::new(store), path, size, footer);
+    let positions = RowPositions::from_unsorted(vec![8191, 0, 2048, 2047, 6144, 2048]);
+    let groups = read_workers::row_group_selections(&file, &positions)
+        .await
+        .unwrap();
+    assert_eq!(
+        groups
+            .iter()
+            .map(RowPositions::as_slice)
+            .collect::<Vec<_>>(),
+        vec![&[0, 2047][..], &[2048][..], &[6144, 8191][..]]
+    );
+    let invalid = RowPositions::from_unsorted(vec![8192]);
+    assert!(
+        read_workers::row_group_selections(&file, &invalid)
+            .await
+            .is_err()
+    );
+}
+
+/// Concurrent readers use bounded workers and release permits on cancellation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selective_read_workers_are_bounded_and_cancelled() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("parallel-read.parquet");
+    let (size, footer) = write_grouped_fixture(store.as_ref(), &path, 65_536, 2048).await;
+    let file = ParquetFile::new(DataStore::new(store), path, size, footer);
+    let workers = Arc::new(ReadWorkers::default());
+    let streams = (0..4).map(|_| {
+        prefetched_row_stream(
+            file.clone(),
+            Arc::new(vec![0]),
+            RowPositions::from_unsorted((0..65_536).collect()),
+            RowIdSource::Resolve {
+                row_id_start: Some(0),
+            },
+            workers.clone(),
+        )
+    });
+    let batches = stream::iter(streams)
+        .flatten_unordered(2)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        4 * 65_536
+    );
+    assert!(workers.peak() <= read_worker_limit());
+    assert!(workers.peak() > 0);
+
+    let mut idle = Vec::new();
+    for _ in 0..read_worker_limit() {
+        let mut paused = prefetched_row_stream(
+            file.clone(),
+            Arc::new(vec![0]),
+            RowPositions::from_unsorted((0..65_536).collect()),
+            RowIdSource::Resolve {
+                row_id_start: Some(0),
+            },
+            workers.clone(),
+        );
+        assert!(paused.try_next().await.unwrap().is_some());
+        idle.push(paused);
+    }
+    let mut pending = prefetched_row_stream(
+        file,
+        Arc::new(vec![0]),
+        RowPositions::from_unsorted((0..65_536).collect()),
+        RowIdSource::Resolve {
+            row_id_start: Some(0),
+        },
+        workers.clone(),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), pending.try_next())
+            .await
+            .expect("paused consumers must not hold the shared read permits")
+            .unwrap()
+            .is_some()
+    );
+    drop(pending);
+    drop(idle);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while workers.active() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 /// A row-group read emits only that group, at the group's file ordinals,
 /// and resumes from a position inside the group.
 #[tokio::test]

@@ -249,14 +249,15 @@ pub use catalog::{
     CompactStoreReport, CompactStoreRequest, CompactionTarget, DataFile, DataFileId, DataFileInfo,
     DeleteFile, DeleteFileId, DeleteFileInfo, DeleteFileRegistration, ExistingDeleteFile,
     FileColumnStats, FileIndexEntry, FileIndexRemoval, FileRowCandidate, FlushedDataFile, IndexDef,
-    IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexState, InlineChunk, LiveCount,
-    LocatedDeletion, LocatedPositions, LocatedRows, MacroId, MacroImplementationDef, MacroInfo,
-    MacroParameterDef, MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass,
-    MaintenanceStatusStep, MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef,
-    OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow,
-    RowSummaryWarmth, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId,
-    SortKeyDef, SortSpec, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
-    TableId, TableInfo, TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
+    IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexReadIdentity, IndexReadScope,
+    IndexState, InlineChunk, LiveCount, LocatedDeletion, LocatedPositions, LocatedRowScan, MacroId,
+    MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest,
+    MaintenanceStatusPass, MaintenanceStatusStep, MappingId, MappingInfo, MergeOutcome,
+    MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef, PartitionId, PartitionSpec,
+    ReadOnlyCatalog, RecentRow, RowSummaryWarmth, ScheduledDeletion, SchemaId, SchemaInfo,
+    SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus, StoreObjects,
+    SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo, TableStats, TagEntry,
+    TagTarget, Timestamp, ViewId, ViewInfo,
 };
 pub use data_file::DataStore;
 pub use error::{Error, Result};

@@ -24,4 +24,7 @@ bool IsIndexRead(const std::string &name);
 const std::vector<MoraineRowId> *IndexReadRows(const duckdb::TableFunction &function,
                                                const duckdb::FunctionData *bind_data);
 
+bool IndexReadTable(const duckdb::TableFunction &function, const duckdb::FunctionData *bind_data,
+                    std::string &catalog, std::string &schema, std::string &table);
+
 } // namespace moraine_duckdb

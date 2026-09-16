@@ -1,5 +1,7 @@
 //! `moraine_rows_at` and the located update recipe it completes.
 
+use std::fmt::Write as _;
+
 use crate::helpers::*;
 
 struct Fixture {
@@ -43,6 +45,77 @@ impl Fixture {
 
     fn rows(&self) -> Vec<Vec<String>> {
         csv_rows(&self.run("SELECT a, b FROM lake.main.t ORDER BY a;"))
+    }
+}
+
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn located_rows_prepare_defers_strict_position_checks() {
+    let fixture = Fixture::new(0);
+    let prepare = "PREPARE located AS SELECT * FROM moraine_rows_at('lake','main','t',
+        [{row_id: 999999::BIGINT, data_file_id: NULL::UBIGINT}]);";
+    fixture.run(prepare);
+    let output = run_session(
+        &Attach::Moraine {
+            store_dir: fixture.store.path(),
+            data_path: fixture.data.path(),
+            options: &fixture.options,
+            read_only: false,
+        },
+        &format!("{prepare} EXECUTE located;"),
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not a live inlined row"));
+}
+
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn located_rows_and_summary_scans_parallelize_one_files_row_groups() {
+    for inline_limit in [0, 100_000] {
+        let fixture = Fixture::new(inline_limit);
+        let query = "SELECT 'answer',count(*),sum(length(payload)),sum(row_id),count(DISTINCT row_id) FROM moraine_rows_at(
+        'lake','main','t',getvariable('located'))";
+        let join = "SELECT 'answer',count(*),sum(length(data.payload)),sum(data.rowid),count(DISTINCT data.rowid) FROM lake.main.t data
+        JOIN moraine_index_lookup('lake','main','t','by_a',0) hits
+        ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id";
+        let mut sql = "DROP TABLE lake.main.t;
+        CALL ducklake_set_option('lake','parquet_row_group_size','2048');
+        CREATE TABLE lake.main.t AS SELECT i // 8192 a,
+            CASE WHEN i % 2=0 THEN repeat('x',100) END payload FROM range(65536) r(i);
+        CALL ducklake_flush_inlined_data('lake');
+        CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+        SET VARIABLE located = (SELECT list({row_id:row_id,data_file_id:data_file_id})
+            FROM moraine_index_lookup('lake','main','t','by_a',0));
+        SET threads=4;"
+            .to_owned();
+        for threads in [1, 2] {
+            write!(
+                sql,
+                "SET moraine_summary_scan_threads={threads};
+            EXPLAIN ANALYZE {query}; {query}; EXPLAIN ANALYZE {join}; {join};"
+            )
+            .unwrap();
+        }
+        sql.push_str("SELECT 'answer',count(*),sum(length(payload)),sum(rowid),count(DISTINCT rowid) FROM lake.main.t WHERE a=0;");
+        for _ in 0..8 {
+            sql.push_str("SELECT payload FROM moraine_rows_at('lake','main','t',getvariable('located')) LIMIT 1;");
+        }
+        let result = fixture.run(&sql);
+        let answers: Vec<_> = csv_rows(&result)
+            .into_iter()
+            .filter(|row| row[0] == "answer")
+            .collect();
+        assert_eq!(
+            answers,
+            vec![vec!["answer", "8192", "409600", "33550336", "8192"]; 5]
+        );
+        if std::thread::available_parallelism().is_ok_and(|cores| cores.get() >= 4) {
+            assert!(
+                result.contains("Peak read workers: 1") || result.contains("Peak read workers: 2"),
+                "{result}"
+            );
+        }
+        assert!(result.contains("Total Files Read: 1"), "{result}");
     }
 }
 

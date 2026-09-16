@@ -207,6 +207,7 @@ public:
 	duckdb::DatabaseSize GetDatabaseSize(duckdb::ClientContext &context) override;
 	bool InMemory() override;
 	std::string GetDBPath() override;
+	duckdb::optional_idx GetCatalogVersion(duckdb::ClientContext &context) override;
 
 	void OnDetach(duckdb::ClientContext &context) override;
 

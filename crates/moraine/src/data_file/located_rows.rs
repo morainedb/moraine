@@ -2,16 +2,23 @@
 //! ordinals, inline rows at chunk offsets, each batch projected onto the
 //! table's logical columns and ending with its row ids.
 
-use std::sync::Arc;
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Instant,
+};
 
 use arrow::{
     array::{ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array, new_null_array},
     compute::{cast, take},
     datatypes::{DataType, Field, Schema, SchemaRef},
-    ipc::writer::StreamWriter,
 };
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{
+    Stream, StreamExt,
+    stream::{self, BoxStream},
+};
 use parquet::arrow::{
     arrow_reader::ArrowReaderOptions, async_reader::ParquetRecordBatchStreamBuilder,
 };
@@ -29,6 +36,21 @@ use super::{
 };
 use crate::error::{Error, Result};
 
+struct TimedBatches {
+    stream: BoxStream<'static, Result<RecordBatch>>,
+    metrics: Arc<super::ScopedReadMetrics>,
+}
+
+impl Stream for TimedBatches {
+    type Item = Result<RecordBatch>;
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let started = Instant::now();
+        let result = self.stream.as_mut().poll_next(context);
+        self.metrics.decoded(started.elapsed());
+        result
+    }
+}
+
 /// The row-id column every located batch carries after its logical columns.
 pub(crate) const ROW_ID_COLUMN: &str = "row_id";
 
@@ -36,17 +58,15 @@ pub(crate) const ROW_ID_COLUMN: &str = "row_id";
 /// row.
 pub(crate) const DATA_FILE_ID_COLUMN: &str = "data_file_id";
 
-/// Reads the logical columns at `requested` for the rows `rows` selects.
-/// Each batch holds those columns in `requested` order, then a `UInt64`
-/// row-id column resolved per `row_id_source`.
-pub(crate) async fn scoped_read_row_batches(
+/// Opens a projected, position-selected reader without buffering its result.
+pub(crate) async fn scoped_read_row_stream(
     file: ParquetFile,
     requested: &[usize],
     rows: ScopedRows<'_>,
     row_id_source: RowIdSource,
-) -> Result<Vec<RecordBatch>> {
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(stream::empty().boxed());
     }
 
     let reader = ObjectStoreReader::new(&file, rows.page_index_policy());
@@ -68,43 +88,47 @@ pub(crate) async fn scoped_read_row_batches(
             .with_projection(mask)
             .with_batch_size(BUILD_READ_BATCH_ROWS),
     );
-    let mut stream = builder.build().map_err(corrupt("located read"))?;
+    let stream = builder.build().map_err(corrupt("located read"))?;
 
-    let mut batches = Vec::new();
     let mut emitted = 0usize;
-    while let Some(batch) = stream.try_next().await.map_err(corrupt("located read"))? {
-        let batch = normalize_batch(batch, normalization.as_ref())?;
-        let row_ids: ArrayRef = if let Some(position) = row_id_output {
-            let column = batch.columns().get(position).ok_or_else(|| {
-                Error::Corruption("located read: row-id column is out of bounds".to_owned())
-            })?;
-            cast(column.as_ref(), &DataType::UInt64).map_err(corrupt("located read"))?
-        } else {
-            let ids = (0..batch.num_rows())
-                .map(|row| {
-                    ordinals
-                        .borrowed()
-                        .at(emitted.saturating_add(row))
-                        .map(|ordinal| row_id_start.saturating_add(ordinal))
-                })
-                .collect::<Result<Vec<u64>>>()?;
-            Arc::new(UInt64Array::from(ids))
-        };
-        emitted = emitted.saturating_add(batch.num_rows());
+    let metrics = file.metrics.clone();
+    let stream = stream
+        .map(move |batch| {
+            let batch = batch.map_err(corrupt("located read"))?;
+            let batch = normalize_batch(batch, normalization.as_ref())?;
+            let row_ids: ArrayRef = if let Some(position) = row_id_output {
+                let column = batch.columns().get(position).ok_or_else(|| {
+                    Error::Corruption("located read: row-id column is out of bounds".to_owned())
+                })?;
+                cast(column.as_ref(), &DataType::UInt64).map_err(corrupt("located read"))?
+            } else {
+                let ids = (0..batch.num_rows())
+                    .map(|row| {
+                        ordinals
+                            .borrowed()
+                            .at(emitted.saturating_add(row))
+                            .map(|ordinal| row_id_start.saturating_add(ordinal))
+                    })
+                    .collect::<Result<Vec<u64>>>()?;
+                Arc::new(UInt64Array::from(ids))
+            };
+            emitted = emitted.saturating_add(batch.num_rows());
 
-        let mut arrays = output
-            .iter()
-            .map(|&position| {
-                batch.columns().get(position).cloned().ok_or_else(|| {
-                    Error::Corruption("located read: projected column is out of bounds".to_owned())
+            let mut arrays = output
+                .iter()
+                .map(|&position| {
+                    batch.columns().get(position).cloned().ok_or_else(|| {
+                        Error::Corruption(
+                            "located read: projected column is out of bounds".to_owned(),
+                        )
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        arrays.push(row_ids);
-        batches.push(unnamed_batch(arrays, batch.num_rows())?);
-    }
-
-    Ok(batches)
+                .collect::<Result<Vec<_>>>()?;
+            arrays.push(row_ids);
+            unnamed_batch(arrays, batch.num_rows())
+        })
+        .boxed();
+    Ok(TimedBatches { stream, metrics }.boxed())
 }
 
 /// The rows at `offsets` of one inline chunk, projected onto the logical
@@ -140,14 +164,13 @@ pub(crate) fn inline_rows_batch(
     unnamed_batch(arrays, offsets.len())
 }
 
-/// Encodes one located batch as a self-describing Arrow IPC stream: its
-/// logical columns under `names`, the row-id column, then the data-file
-/// column (`data_file_id` for every row, NULL when `None`).
-pub(crate) fn encode_located_batch(
+/// Names a projected batch and appends its file identity without copying
+/// columns.
+pub(crate) fn located_batch(
     batch: &RecordBatch,
     names: &[String],
     data_file_id: Option<u64>,
-) -> Result<Vec<u8>> {
+) -> Result<RecordBatch> {
     if batch.num_columns() != names.len().saturating_add(1) {
         return Err(Error::Corruption(
             "located batch does not match the table's columns".to_owned(),
@@ -169,19 +192,12 @@ pub(crate) fn encode_located_batch(
     });
 
     let schema = Arc::new(Schema::new(fields));
-    let output = RecordBatch::try_new_with_options(
+    RecordBatch::try_new_with_options(
         Arc::clone(&schema),
         arrays,
         &RecordBatchOptions::new().with_row_count(Some(rows)),
     )
-    .map_err(corrupt("located batch"))?;
-
-    let mut buffer = Vec::new();
-    let mut writer =
-        StreamWriter::try_new(&mut buffer, &schema).map_err(corrupt("located batch"))?;
-    writer.write(&output).map_err(corrupt("located batch"))?;
-    writer.finish().map_err(corrupt("located batch"))?;
-    Ok(buffer)
+    .map_err(corrupt("located batch"))
 }
 
 /// A batch over `arrays` with positional field names, for a caller that

@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 mod rows_at;
 
-pub use rows_at::LocatedRows;
+pub use rows_at::LocatedRowScan;
 
 use super::{Catalog, ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
 use crate::{
@@ -144,13 +144,19 @@ fn first_row_error(
     }
 }
 
-/// Positions `rows` within `file_id`'s summary, ascending and duplicate-free;
-/// a missing summary, an unreadable file, or a row this file does not hold
-/// is a typed error naming that row.
+/// Whether absent candidates fail exact positioning or are discarded by a scan.
+#[derive(Clone, Copy)]
+enum MissingRows {
+    Reject,
+    Omit,
+}
+
+/// All physical positions, with missing or unreadable summaries failing closed.
 fn positioned_rows(
     summaries: &HashMap<DataFileId, Result<FileSummary>>,
     file_id: DataFileId,
     rows: &[u64],
+    missing: MissingRows,
 ) -> Result<Vec<u64>> {
     let first_row = rows.first().copied().unwrap_or_default();
     let summary = match summaries.get(&file_id) {
@@ -172,16 +178,14 @@ fn positioned_rows(
     };
 
     let mut positions = Vec::with_capacity(rows.len());
-    for (row_id, position) in rows.iter().zip(summary.positions_of(rows)) {
-        match position {
-            Some(position) => positions.push(position),
-            None => {
-                return Err(Error::RowPosition {
-                    row_id: *row_id,
-                    data_file_id: Some(file_id),
-                    reason: "row is not held by this file".to_owned(),
-                });
-            }
+    for row_id in rows {
+        let found = summary.visit_positions(*row_id, |position| positions.push(position));
+        if !found && matches!(missing, MissingRows::Reject) {
+            return Err(Error::RowPosition {
+                row_id: *row_id,
+                data_file_id: Some(file_id),
+                reason: "row is not held by this file".to_owned(),
+            });
         }
     }
     positions.sort_unstable();
@@ -215,12 +219,17 @@ impl ReadOnlyCatalog {
         files: Vec<DataFileInfo>,
     ) -> Vec<(DataFileId, Result<FileSummary>)> {
         stream::iter(files.into_iter().map(|file| {
+            let retained =
+                self.retained_file_summary(store, data_prefix, table_prefix, table, &file);
             let relative =
                 resolve_data_path(data_prefix, table_prefix, &file.path, file.path_is_relative);
             let store = store.clone();
             let metrics = self.data_read_metrics();
 
             async move {
+                if let Some(summary) = retained {
+                    return (file.id, Ok(summary));
+                }
                 let path = match relative {
                     Ok(path) => path,
                     Err(error) => return (file.id, Err(error)),
@@ -414,7 +423,7 @@ impl ReadOnlyCatalog {
         };
 
         let deletions = self
-            .position_requested_files(&scope, by_file, requested_files)
+            .position_requested_files(&scope, by_file, requested_files, MissingRows::Reject)
             .await?;
         // Same snapshot the positions above were resolved against, so the
         // directory names the table's current location, not a later one.
@@ -447,6 +456,7 @@ impl ReadOnlyCatalog {
         scope: &LocationScope<'_>,
         by_file: HashMap<DataFileId, Vec<u64>>,
         requested_files: Vec<DataFileInfo>,
+        missing: MissingRows,
     ) -> Result<Vec<LocatedDeletion>> {
         // `current_files_for` already returned these in ascending id order;
         // carrying the pairs through avoids both a second sort and a
@@ -473,7 +483,7 @@ impl ReadOnlyCatalog {
         let mut located = Vec::with_capacity(file_id_paths.len());
         for ((file_id, path), existing_delete) in file_id_paths.into_iter().zip(existing_deletes) {
             let rows = by_file.get(&file_id).cloned().unwrap_or_default();
-            let positions = positioned_rows(&summaries, file_id, &rows)?;
+            let positions = positioned_rows(&summaries, file_id, &rows, missing)?;
 
             located.push(LocatedDeletion {
                 data_file_id: file_id,
