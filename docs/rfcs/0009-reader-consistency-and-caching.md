@@ -1131,6 +1131,11 @@ The attach options keep their surface (RFC 0006) and change machinery:
   outgrows the protected share says so. Unset:
   what SlateDB gave a single store, now for the whole process. Never
   inert — the memory tiers exist without a `CACHE_DIR`.
+- The disk device is cut into at most 64 blocks (never smaller than
+  foyer's 16 MiB), so a store holds at most 64 open files however large its
+  `CACHE_SIZE`. At foyer's fixed block a 16 GiB device was 1,024 files per
+  store, and a process attaching many stores ran into its descriptor limit
+  before its memory.
 - `CACHE_PUTS` — the flush insertion policy: SST metadata and data blocks
   enter decoded on write by default, with
   or without a disk tier. `CACHE_COMPACTION_PUTS` separately controls merge

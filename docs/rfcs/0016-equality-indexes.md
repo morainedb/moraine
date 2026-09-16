@@ -617,6 +617,13 @@ keys, hits, misses, peak in flight, metadata/block cache deltas, cache errors,
 and object-store GET count, duration, and errors. The event measures the
 whole pinned lookup without changing the SQL result surface.
 
+The event carries the same fields at either level: debug records every
+lookup, and info records the ones that took 250 ms or more, so a host
+running at its default level sees the slow probes without turning on debug
+for everything else. The probe window against the summed probe service says
+whether a slow lookup overlapped its probes or serialized them, and the
+disk-tier hit counts say whether the blocks it read came from memory.
+
 Lookups, ranges, and null queries are **head-only**: entries are live-only, so
 `snapshot_at(S)` fails with a typed error and time travel falls back to what
 it always was — a scan problem. The hot path (current head) gets the index;
@@ -675,6 +682,15 @@ equality, under which a NULL file id matches nothing, so every inlined or
 unlocated row silently drops out of the result. As a DELETE or UPDATE
 predicate that strands the row with no error. The join with null-safe
 equality on file id is the supported shape.
+
+Resolving a located delete's positions emits one `located rows resolved`
+diagnostic event: requested pairs, the files and positions they landed in,
+the delete files and existing positions already registered against those
+files, the summaries the resolution had to build, inlined rows, and the
+positioning and total durations. It follows the same level rule as `index
+lookup resolved` — debug for every resolution, info once one takes 250 ms
+or more — so a host at its default level sees which half of a slow located
+delete, the probe or the positioning, spent the time.
 
 ### Selective row lookup
 

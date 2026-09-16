@@ -236,3 +236,27 @@ async fn a_warm_writer_probes_without_a_head_read_or_a_transaction() {
     reader.close().await.unwrap();
     writer.close().await.unwrap();
 }
+
+/// A lookup's record rises to INFO once it crosses the slow threshold, so a
+/// host running at the default level sees the ones worth explaining.
+#[test]
+fn a_slow_lookup_records_above_the_debug_level() {
+    let levels = crate::telemetry::recorded_levels(|| {
+        for elapsed in [
+            SLOW_RESOLVE.saturating_sub(Duration::from_millis(1)),
+            SLOW_RESOLVE,
+        ] {
+            log_lookup(
+                TableId::new(1),
+                IndexId::new(1),
+                1,
+                elapsed,
+                &LookupMetrics::default(),
+                CacheTally::default(),
+                ObjectStoreTally::default(),
+            );
+        }
+    });
+
+    assert_eq!(levels, [tracing::Level::DEBUG, tracing::Level::INFO]);
+}

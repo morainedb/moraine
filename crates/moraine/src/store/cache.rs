@@ -50,6 +50,21 @@ const AUXILIARY_METADATA_SHARE_DIVISOR: u64 = 80;
 /// (SlateDB's own default).
 pub(crate) const DEFAULT_CACHE_DISK: u64 = 16 * 1024 * 1024 * 1024;
 
+/// The most files a store's disk device is cut into. Each block is one
+/// open file for the life of the process, and one process attaches many
+/// stores under one descriptor limit.
+const DISK_CACHE_BLOCKS: u64 = 64;
+
+/// The smallest block the disk device is cut into; foyer's own default,
+/// and the largest entry the device can hold.
+const MIN_DISK_CACHE_BLOCK: u64 = 16 * 1024 * 1024;
+
+/// The block size for a disk device of `capacity` bytes: the capacity over
+/// [`DISK_CACHE_BLOCKS`], never below [`MIN_DISK_CACHE_BLOCK`].
+pub(crate) fn disk_cache_block_size(capacity: u64) -> u64 {
+    (capacity / DISK_CACHE_BLOCKS).max(MIN_DISK_CACHE_BLOCK)
+}
+
 /// How the process's cache is built. The first store to open decides it;
 /// later stores share what it built, whatever they ask for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1340,12 +1355,13 @@ where
     };
     let spawner = Spawner::from(CACHE_RUNTIME.as_ref()?.handle().clone());
 
+    let block_size = usize::try_from(disk_cache_block_size(disk)).unwrap_or(usize::MAX);
     let built = memory
         .storage()
         .with_recover_mode(RecoverMode::Quiet)
         .with_spawner(spawner)
         .with_io_engine_config(PsyncIoEngineConfig::new())
-        .with_engine_config(BlockEngineConfig::new(device))
+        .with_engine_config(BlockEngineConfig::new(device).with_block_size(block_size))
         .build()
         .await;
     match built {
@@ -1794,6 +1810,20 @@ mod tests {
         };
         assert!((tally.metadata_hit_rate().unwrap() - 0.75).abs() < f64::EPSILON);
         assert!((tally.block_hit_rate().unwrap() - 0.25).abs() < f64::EPSILON);
+    }
+
+    /// A disk device holds at most 64 files however large it is, and never
+    /// cuts finer than foyer's 16 MiB block.
+    #[test]
+    fn a_disk_device_is_cut_into_at_most_sixty_four_blocks() {
+        let mib = 1024 * 1024;
+        assert_eq!(disk_cache_block_size(64 * mib), 16 * mib);
+        assert_eq!(disk_cache_block_size(1024 * mib), 16 * mib);
+        assert_eq!(disk_cache_block_size(DEFAULT_CACHE_DISK), 256 * mib);
+        assert_eq!(disk_cache_block_size(100 * 1024 * mib), 1600 * mib);
+        for capacity in [64 * mib, DEFAULT_CACHE_DISK, 100 * 1024 * mib] {
+            assert!(capacity / disk_cache_block_size(capacity) <= DISK_CACHE_BLOCKS);
+        }
     }
 
     /// A store's share of the block slot is the whole over the attached

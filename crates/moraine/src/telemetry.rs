@@ -11,6 +11,28 @@ pub(crate) fn milliseconds(duration: Duration) -> u64 {
     u64::try_from(rounded).unwrap_or(u64::MAX)
 }
 
+/// The level of every event `emit` records, in order.
+#[cfg(test)]
+pub(crate) fn recorded_levels(emit: impl FnOnce()) -> Vec<tracing::Level> {
+    use std::sync::{Arc, Mutex};
+
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct Levels(Arc<Mutex<Vec<Level>>>);
+
+    impl<S: Subscriber> Layer<S> for Levels {
+        fn on_event(&self, event: &Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            self.0.lock().unwrap().push(*event.metadata().level());
+        }
+    }
+
+    let levels = Levels::default();
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(levels.clone()), emit);
+    levels.0.lock().unwrap().clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
