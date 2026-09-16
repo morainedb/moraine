@@ -25,6 +25,7 @@ use crate::{
     catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
     error::{Error, Result},
     store::StagedBytes,
+    telemetry::reporting_phase,
     transaction::{operations::ChangeSet, verbs::Transaction},
 };
 
@@ -253,15 +254,17 @@ impl Coalescer {
         F: Fn(&mut Transaction) -> Result<()>,
     {
         let arrival = self.arrive();
-        let mut shared = self.admit().await;
+        // Each await below is named, because none of them can be read from
+        // a thread dump once the commit parks on it.
+        let mut shared = reporting_phase("admit", self.admit()).await;
 
         let mut batch = match shared.forming.take() {
             Some(batch) => batch,
-            None => Batch::open(db, &self.projections).await?,
+            None => reporting_phase("open", Batch::open(db, &self.projections)).await?,
         };
         let staged_before = batch.writes.len();
 
-        let staged = match batch.stage(members, &self.projections).await {
+        let staged = match reporting_phase("stage", batch.stage(members, &self.projections)).await {
             Ok(staged) => staged,
             Err(err) => {
                 // The batch is poisoned; its members learn that nothing
@@ -320,16 +323,19 @@ impl Coalescer {
         } = batch;
 
         outcome.send_replace(BatchState::Submitted);
-        let submission = std::panic::AssertUnwindSafe(submit_batch(
-            db_tx,
-            HeadTransition {
-                before: head_before,
-                after: head,
-            },
-            &writes,
-            staged_bytes,
-            HeadViewUpdate::Rebuild(base),
-            &self.projections,
+        let submission = std::panic::AssertUnwindSafe(reporting_phase(
+            "submit",
+            submit_batch(
+                db_tx,
+                HeadTransition {
+                    before: head_before,
+                    after: head,
+                },
+                &writes,
+                staged_bytes,
+                HeadViewUpdate::Rebuild(base),
+                &self.projections,
+            ),
         ))
         .catch_unwind()
         .await;
@@ -339,10 +345,9 @@ impl Coalescer {
 
         let landed = match submission {
             Ok(Ok(Submission::Submitted(submitted))) => {
-                match std::panic::AssertUnwindSafe(await_submitted(
-                    submitted,
-                    &self.projections,
-                    &self.durability,
+                match std::panic::AssertUnwindSafe(reporting_phase(
+                    "durable",
+                    await_submitted(submitted, &self.projections, &self.durability),
                 ))
                 .catch_unwind()
                 .await

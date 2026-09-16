@@ -91,15 +91,18 @@ async fn read_bounded<T>(
     workers: &Arc<ReadWorkers>,
     work: impl Future<Output = Result<T>>,
 ) -> Result<T> {
-    let _permit = PERMITS
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|error| Error::Interrupted(error.to_string()))?;
+    // Process-wide, so one catalog's reads starve every other one's; named
+    // here because a caller parked on it is otherwise silent.
+    let _permit =
+        crate::telemetry::reporting_phase("read-worker-permit", PERMITS.clone().acquire_owned())
+            .await
+            .map_err(|error| Error::Interrupted(error.to_string()))?;
     let active = workers.active.fetch_add(1, Ordering::Relaxed) + 1;
     workers.peak.fetch_max(active, Ordering::Relaxed);
     let _active = ActiveWorker(workers.clone());
-    work.await
+    // Named for the same reason as the wait above: a read that never
+    // returns holds its permit against every other catalog.
+    crate::telemetry::reporting_phase("read-worker-hold", work).await
 }
 
 pub(crate) fn prefetched_row_stream(

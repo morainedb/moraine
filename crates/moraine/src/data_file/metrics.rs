@@ -167,16 +167,27 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
-    let permit = Arc::clone(&INDEX_ENCODING_PERMITS)
-        .acquire_owned()
-        .await
-        .map_err(|_| {
-            Error::Interrupted("index encoding limiter stopped before work began".to_owned())
-        })?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        work()
-    })
+    // Process-wide, so one catalog's encoding starves every other one's;
+    // named here because a caller parked on it is otherwise silent.
+    let permit = crate::telemetry::reporting_phase(
+        "index-encoding-permit",
+        Arc::clone(&INDEX_ENCODING_PERMITS).acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        Error::Interrupted("index encoding limiter stopped before work began".to_owned())
+    })?;
+    // The permit is held until this blocking work returns, and a blocking
+    // task cannot be cancelled: work that never returns removes a permit
+    // from the process for good. Reporting the hold names the holder, which
+    // the waiters above cannot.
+    crate::telemetry::reporting_phase(
+        "index-encoding-hold",
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        }),
+    )
     .await
     .map_err(|error| Error::Interrupted(format!("index encoding worker stopped: {error}")))?
 }

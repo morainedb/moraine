@@ -17,7 +17,7 @@ const DUCKLAKE_REVISION: &str = "d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4";
 const SUPPORTED_DUCKDB_PIN: &str = "v1.5.5";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
-pub(crate) const PATCH_PATHS: [&str; 8] = [
+pub(crate) const PATCH_PATHS: [&str; 9] = [
     "patches/ducklake/0001-perf-prune-DuckLake-files-by-row-id.patch",
     "patches/ducklake/0002-feat-backfill-DuckLake-row-id-file-statistics.patch",
     "patches/ducklake/0003-feat-expose-DuckLake-data-file-ids-to-scans.patch",
@@ -26,6 +26,7 @@ pub(crate) const PATCH_PATHS: [&str; 8] = [
     "patches/ducklake/0006-feat-change-DuckLake-rows-by-position.patch",
     "patches/ducklake/0007-perf-name-the-table-a-dropped-file-belongs-to.patch",
     "patches/ducklake/0008-perf-take-existing-delete-positions-from-the-caller.patch",
+    "patches/ducklake/0009-fix-cancel-DuckLake-metadata-work-with-its-caller.patch",
 ];
 pub(crate) const CONFIG_PATH: &str = "patches/ducklake/ducklake.cmake";
 /// The patched-behaviour sqllogictests, run against the built artifact.
@@ -441,6 +442,11 @@ fn cmake_arguments(
         "-B".to_string(),
         patched.standalone_build().display().to_string(),
         "-DCMAKE_BUILD_TYPE=Release".to_string(),
+        // `-g` on top of the usual release flags: without it a stalled
+        // extension frame cannot be named in a production stack, and the
+        // symbols cost image size rather than speed.
+        "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -g".to_string(),
+        "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG -g".to_string(),
         "-DBUILD_EXTENSIONS_ONLY=TRUE".to_string(),
         "-DEXTENSION_STATIC_BUILD=TRUE".to_string(),
         format!("-DPREBUILT_BINARY={}", duckdb_static.display()),

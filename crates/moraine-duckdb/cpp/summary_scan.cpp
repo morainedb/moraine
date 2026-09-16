@@ -231,8 +231,16 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::Cli
 	return std::move(state);
 }
 
+// A scan reports a batch and this loop imports no rows from it: legal once,
+// since a batch may carry only rows the scan has already accounted for, but
+// an unbroken run of them means the scan is producing without progressing.
+// The loop would then spin on a thread that never sleeps and never yields,
+// which is unreadable from the outside, so it is bounded here instead.
+constexpr duckdb::idx_t MAX_BARREN_BATCHES = 1024;
+
 void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &input, duckdb::DataChunk &output) {
 	auto &state = input.global_state->Cast<SummaryScanState>();
+	duckdb::idx_t barren_batches = 0;
 	while (true) {
 		if (state.pending.empty()) {
 			auto started = ScanClock::now();
@@ -256,8 +264,15 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 				state.pending.push_back(std::move(*piece));
 			}
 			if (state.pending.empty()) {
+				if (++barren_batches > MAX_BARREN_BATCHES) {
+					throw duckdb::InternalException(
+					    "moraine summary scan read %llu consecutive batches without producing a row; "
+					    "refusing to spin",
+					    static_cast<unsigned long long>(barren_batches));
+				}
 				continue;
 			}
+			barren_batches = 0;
 		}
 		auto piece = std::move(state.pending.back());
 		state.pending.pop_back();

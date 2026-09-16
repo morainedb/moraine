@@ -37,6 +37,7 @@ use crate::{
         read::{self, RecordSet},
         value,
     },
+    telemetry::STALL_INTERVAL,
     transaction::{
         index_maintenance, inline,
         operations::{ChangeSet, Operation},
@@ -113,10 +114,6 @@ pub(crate) fn retry_backoff(attempt: usize) -> Duration {
 pub(crate) fn now_micros() -> i64 {
     Timestamp::now().as_micros()
 }
-
-/// How long a durable commit may wait before the wait itself is reported,
-/// and how often it is reported thereafter.
-const STALL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long the write that holds the store's flight slot may stall before
 /// its batch is given up on. The slot admits one batch at a time, so a

@@ -55,6 +55,13 @@ undocumented_unsafe_blocks = "deny"
 mod_module_files = "deny"
 
 
+[profile.release]
+# A spinning thread is diagnosed from its program counter, which needs a
+# symbol table; without these the innermost frames of a production stall
+# cannot be named at all.
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
 [profile.dev]
 opt-level = 0
 debug = "line-tables-only" # Shrinks target folder size dramatically

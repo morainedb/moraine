@@ -36,6 +36,7 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/0006-feat-change-DuckLake-rows-by-position.patch
             ${CMAKE_CURRENT_LIST_DIR}/0007-perf-name-the-table-a-dropped-file-belongs-to.patch
             ${CMAKE_CURRENT_LIST_DIR}/0008-perf-take-existing-delete-positions-from-the-caller.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0009-fix-cancel-DuckLake-metadata-work-with-its-caller.patch
     )
     FetchContent_GetProperties(moraine_patched_ducklake)
     if(NOT moraine_patched_ducklake_POPULATED)

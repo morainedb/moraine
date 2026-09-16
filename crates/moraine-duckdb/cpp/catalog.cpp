@@ -1,4 +1,6 @@
 #include "catalog.hpp"
+
+#include "storage/ducklake_transaction.hpp"
 #include "index_cache.hpp"
 
 #include "inline_tables.hpp"
@@ -125,7 +127,25 @@ MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const std:
 }
 
 extern "C" bool moraine_shim_is_interrupted(void *client_context) {
-	return static_cast<duckdb::ClientContext *>(client_context)->IsInterrupted();
+	auto &context = *static_cast<duckdb::ClientContext *>(client_context);
+	if (context.IsInterrupted()) {
+		return true;
+	}
+	// A commit reaches this catalog on the metadata connection DuckLake
+	// creates for its own use, never on the one the caller holds, so that
+	// context's own flag is one nobody can set. DuckLake records the caller
+	// driving it; interrupting the caller has to reach this far or a stalled
+	// commit cannot be cancelled at all.
+	if (!context.registered_state) {
+		return false;
+	}
+	auto parent_state =
+	    context.registered_state->Get<duckdb::DuckLakeParentContextState>(duckdb::DuckLakeParentContextState::KEY);
+	if (!parent_state) {
+		return false;
+	}
+	auto parent = parent_state->parent.lock();
+	return parent && parent->IsInterrupted();
 }
 
 namespace {
