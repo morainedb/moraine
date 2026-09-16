@@ -25,3 +25,17 @@ WHERE data.end_snapshot IS NULL
 ORDER BY data.data_file_id;
 
 EXPLAIN ANALYZE SELECT * FROM lake.items WHERE rowid = 3;
+
+-- The positional delete takes the caller's committed delete positions as a
+-- third struct field. A bundled DuckLake without that patch rejects the
+-- struct shape, which is exactly the skew this smoke exists to catch.
+SET VARIABLE first_file = (
+    SELECT min(data_file_id) FROM release_smoke.ducklake_data_file WHERE end_snapshot IS NULL
+);
+SELECT file_rows_deleted, inline_rows_deleted, delete_files_written
+FROM ducklake_delete_positions('lake', 'main', 'items',
+    [{'data_file_id': getvariable('first_file')::UBIGINT,
+      'positions': [1::UBIGINT],
+      'existing_positions': NULL::BLOB}],
+    inlined_rows => []::UBIGINT[]);
+SELECT 'remaining=' || count(*) AS remaining FROM lake.items;

@@ -17,7 +17,7 @@ const DUCKLAKE_REVISION: &str = "d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4";
 const SUPPORTED_DUCKDB_PIN: &str = "v1.5.5";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
-const PATCH_PATHS: [&str; 8] = [
+pub(crate) const PATCH_PATHS: [&str; 8] = [
     "patches/ducklake/0001-perf-prune-DuckLake-files-by-row-id.patch",
     "patches/ducklake/0002-feat-backfill-DuckLake-row-id-file-statistics.patch",
     "patches/ducklake/0003-feat-expose-DuckLake-data-file-ids-to-scans.patch",
@@ -27,7 +27,7 @@ const PATCH_PATHS: [&str; 8] = [
     "patches/ducklake/0007-perf-name-the-table-a-dropped-file-belongs-to.patch",
     "patches/ducklake/0008-perf-take-existing-delete-positions-from-the-caller.patch",
 ];
-const CONFIG_PATH: &str = "patches/ducklake/ducklake.cmake";
+pub(crate) const CONFIG_PATH: &str = "patches/ducklake/ducklake.cmake";
 /// The patched-behaviour sqllogictests, run against the built artifact.
 const REGRESSION_TEST_PATHS: [&str; 4] = [
     "test/sql/rowid/ducklake_row_id_file_pruning.test",
