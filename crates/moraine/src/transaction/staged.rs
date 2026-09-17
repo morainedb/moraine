@@ -1534,13 +1534,16 @@ impl StagedTransaction {
                 // A maintenance batch stamps the head too, reusing the
                 // standing snapshot id.
                 writes.push(commit::head_stamp(result_id, base_ref.batch_seq));
-                let staged_bytes = match stage_batch(
-                    &db_tx,
-                    &projections,
-                    &mut writes,
-                    inline_writes,
-                    entry_bytes,
-                    target_format,
+                let staged_bytes = match reporting_phase(
+                    "stage-batch",
+                    stage_batch(
+                        &db_tx,
+                        &projections,
+                        &mut writes,
+                        inline_writes,
+                        entry_bytes,
+                        target_format,
+                    ),
                 )
                 .await
                 {
@@ -1562,17 +1565,20 @@ impl StagedTransaction {
                     |view| commit::HeadViewUpdate::Prepared(Arc::new(view)),
                 );
                 let phase_started = Instant::now();
-                let landed = commit::commit_batch_off_task(
-                    db_tx,
-                    commit::HeadTransition {
-                        before: head_before.snapshot_id,
-                        after: result_id,
-                    },
-                    writes,
-                    staged_bytes,
-                    head_view_update,
-                    projections,
-                    durability,
+                let landed = reporting_phase(
+                    "commit-batch",
+                    commit::commit_batch_off_task(
+                        db_tx,
+                        commit::HeadTransition {
+                            before: head_before.snapshot_id,
+                            after: result_id,
+                        },
+                        writes,
+                        staged_bytes,
+                        head_view_update,
+                        projections,
+                        durability,
+                    ),
                 )
                 .await?;
                 phases.land = phase_started.elapsed();
@@ -1603,12 +1609,15 @@ impl StagedTransaction {
                         // Re-derived rather than threaded: this runs only on
                         // the losing path.
                         let snapshot = build_snapshot_value(&ops).ok();
-                        Err(staged_lost_race_against(
-                            catalog_store.as_deref(),
-                            head_before,
-                            snapshot.as_ref().map(|s| s.changes_made.as_str()),
-                            result_id,
-                            staged_rows,
+                        Err(reporting_phase(
+                            "lost-race",
+                            staged_lost_race_against(
+                                catalog_store.as_deref(),
+                                head_before,
+                                snapshot.as_ref().map(|s| s.changes_made.as_str()),
+                                result_id,
+                                staged_rows,
+                            ),
                         )
                         .await)
                     }
