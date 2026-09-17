@@ -123,6 +123,9 @@ jobs:
     needs: [should-release, build-extension, validate]
     if: needs.should-release.outputs.release == 'true'
     runs-on: ubuntu-latest
+    # See the extension workflow: the release upload has hung indefinitely,
+    # so the job is bounded rather than left to hold a runner in silence.
+    timeout-minutes: 30
     permissions:
       contents: write
     env:
