@@ -68,6 +68,18 @@ runs:
           echo "release upload did not finish in three bounded attempts" >&2
           exit 1
         fi
+        # Count what landed, not what was staged. The completeness check
+        # above runs on the local directory, so a release whose uploads
+        # mostly failed still passed it and revealed with one asset of
+        # eight. A reveal is the point of no return for anyone watching the
+        # releases page, so it happens only once the remote agrees.
+        staged=$(ls dist/*.duckdb_extension | wc -l)
+        landed=$(gh release view "${{ inputs.tag }}" \
+          --json assets --jq '[.assets[] | select(.state == "uploaded")] | length')
+        if [ "$landed" -ne "$staged" ]; then
+          echo "release has ${landed} of ${staged} assets; refusing to reveal" >&2
+          exit 1
+        fi
         timeout 120 gh release edit "${{ inputs.tag }}" --draft=false
     - name: Pin descriptor ref to the released commit
       shell: bash
