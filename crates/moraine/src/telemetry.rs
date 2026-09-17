@@ -92,3 +92,50 @@ mod tests {
         assert_eq!(nanoseconds(Duration::MAX), u64::MAX);
     }
 }
+
+#[cfg(test)]
+mod block_on_tests {
+    use super::*;
+
+    /// The shape the extension runs: a phase awaited inside `block_on` on a
+    /// multi-threaded runtime, where the calling thread parks and a worker
+    /// must drive the timer. A phase that never reports here reports nowhere
+    /// in production.
+    #[test]
+    fn a_phase_reports_from_inside_block_on() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Count(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(
+                &self,
+                _: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&fired);
+
+        let subscriber = tracing_subscriber::registry().with(Count(counter));
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let slow = tokio::time::sleep(STALL_INTERVAL + Duration::from_millis(500));
+                reporting_phase("block-on", slow).await;
+            });
+        });
+
+        assert!(
+            fired.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "a phase held past the interval inside block_on must report"
+        );
+    }
+}
