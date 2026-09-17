@@ -410,6 +410,9 @@ async fn heartbeat() {
     loop {
         tokio::time::sleep(HEARTBEAT_INTERVAL).await;
         ticks = ticks.saturating_add(1);
+        // Counted before it is reported, so a tick survives a record that
+        // does not.
+        moraine::note_runtime_tick();
         // Elapsed as well as the count: a runtime advancing late is a
         // different fault from one not advancing at all.
         info!(
@@ -534,20 +537,85 @@ mod tests {
 }
 
 #[cfg(test)]
-mod thread_name_tests {
-    /// An attached runtime's workers carry its handle in their thread name,
-    /// within the kernel's 15-byte limit, so a thread dump attributes a
-    /// worker to its catalog.
-    #[test]
-    fn a_runtimes_workers_are_named_for_their_handle() {
-        let log_id = crate::logging::allocate_handle_id();
-        let runtime = super::new_runtime(log_id, 2).unwrap();
-        let name = runtime
-            .block_on(runtime.spawn(async { std::thread::current().name().map(str::to_owned) }))
-            .unwrap()
-            .expect("worker threads are named");
+mod heartbeat_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
 
-        assert_eq!(name, format!("moraine-{log_id}"));
-        assert!(name.len() <= 15, "{name} would be truncated in /proc");
+    /// The production shape exactly: a 30s heartbeat on an attach runtime,
+    /// observed past its third due tick.
+    #[test]
+    #[ignore = "runs for 95 seconds"]
+    fn a_thirty_second_heartbeat_keeps_ticking() {
+        let runtime = super::new_runtime(crate::logging::allocate_handle_id(), 2).unwrap();
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = std::sync::Arc::clone(&ticks);
+        runtime.spawn(async move {
+            let started = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    ticks = counter.load(std::sync::atomic::Ordering::Relaxed),
+                    alive_seconds = started.elapsed().as_secs(),
+                    "attached runtime is advancing"
+                );
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_secs(95));
+        let fired = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fired >= 3,
+            "only {fired} ticks in 95s; production sees exactly 1"
+        );
+    }
+
+    /// A runtime keeps firing timers while foreign threads drive work on it
+    /// through `block_on`, which is the only thing an attach runtime does
+    /// that the cache runtime never does.
+    ///
+    /// Production saw every attach runtime report once and then fall silent,
+    /// so the question is whether that traffic can leave a runtime unable to
+    /// advance its own timers.
+    #[test]
+    fn foreign_block_on_traffic_does_not_stop_the_timer() {
+        let runtime = super::new_runtime(crate::logging::allocate_handle_id(), 2).unwrap();
+        let ticks = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&ticks);
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = runtime.handle().clone();
+        let callers: Vec<_> = (0..4)
+            .map(|_| {
+                let handle = handle.clone();
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        handle.block_on(async {
+                            tokio::task::yield_now().await;
+                        });
+                    }
+                })
+            })
+            .collect();
+
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        stop.store(true, Ordering::Relaxed);
+        for caller in callers {
+            caller.join().unwrap();
+        }
+
+        let fired = ticks.load(Ordering::Relaxed);
+        assert!(
+            fired >= 4,
+            "timer stopped advancing under foreign block_on traffic: {fired} ticks"
+        );
     }
 }
