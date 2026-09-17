@@ -91,6 +91,10 @@ jobs:
   release:
     needs: [build, validate]
     runs-on: ubuntu-latest
+    # Bounded because the upload below has hung for tens of minutes on a
+    # payload it moves in seconds, with nothing failing and nothing to read.
+    # A release that cannot finish should say so rather than hold a runner.
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
