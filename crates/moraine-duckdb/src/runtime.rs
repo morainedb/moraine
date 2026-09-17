@@ -528,3 +528,59 @@ mod tests {
         const { assert!(MIN_WORKER_THREADS >= 2) };
     }
 }
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+
+    /// A runtime keeps firing timers while foreign threads drive work on it
+    /// through `block_on`, which is the only thing an attach runtime does
+    /// that the cache runtime never does.
+    ///
+    /// Production saw every attach runtime report once and then fall silent,
+    /// so the question is whether that traffic can leave a runtime unable to
+    /// advance its own timers.
+    #[test]
+    fn foreign_block_on_traffic_does_not_stop_the_timer() {
+        let runtime = super::new_runtime(crate::logging::allocate_handle_id(), 2).unwrap();
+        let ticks = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&ticks);
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = runtime.handle().clone();
+        let callers: Vec<_> = (0..4)
+            .map(|_| {
+                let handle = handle.clone();
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        handle.block_on(async {
+                            tokio::task::yield_now().await;
+                        });
+                    }
+                })
+            })
+            .collect();
+
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        stop.store(true, Ordering::Relaxed);
+        for caller in callers {
+            caller.join().unwrap();
+        }
+
+        let fired = ticks.load(Ordering::Relaxed);
+        assert!(
+            fired >= 4,
+            "timer stopped advancing under foreign block_on traffic: {fired} ticks"
+        );
+    }
+}
