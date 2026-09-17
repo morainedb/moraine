@@ -4,14 +4,17 @@
 use std::{
     ffi::c_void,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use futures::future::join_all;
 use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog, TableId};
 use tokio::{
-    runtime::{Builder, Runtime},
+    runtime::{Builder, Handle, Runtime},
     task::JoinHandle,
 };
 use tracing::{info, warn};
@@ -85,8 +88,10 @@ impl AttachedCatalog {
 
 impl MoraineCatalogHandle {
     pub(crate) fn new(runtime: Runtime, catalog: AttachedCatalog, log_id: HandleId) -> Self {
+        let runtime = Arc::new(runtime);
+        watch_runtime(&runtime, log_id);
         Self {
-            runtime: Arc::new(runtime),
+            runtime,
             catalog,
             log_id,
             data_store: None,
@@ -393,6 +398,98 @@ pub(crate) fn new_runtime(log_id: HandleId, requested: usize) -> std::io::Result
     Ok(runtime)
 }
 
+/// How often the out-of-band watch samples its runtime.
+const WATCH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a probe sleeps before recording that a timer fired. Short
+/// enough that a healthy runtime always finishes one within a sample.
+const PROBE_SLEEP: Duration = Duration::from_secs(1);
+
+/// What one probe task reached before the next sample read it.
+#[derive(Default)]
+struct RuntimeProbe {
+    /// A worker began the task: the scheduler is still polling.
+    polled: AtomicBool,
+    /// The task's sleep returned: the time driver is still firing.
+    timer_fired: AtomicBool,
+}
+
+/// Watches `runtime` from a thread that is not on it, until the handle
+/// owning the runtime drops.
+///
+/// Every other instrument here runs as a task, so it reports only while
+/// the runtime is healthy -- a stalled time driver, a scheduler that never
+/// polls, and a dropped runtime are all silence from the inside. This
+/// samples from a foreign thread and sleeps off the time driver, so its
+/// records still arrive when nothing on the runtime can run.
+fn watch_runtime(runtime: &Arc<Runtime>, log_id: HandleId) {
+    watch_runtime_every(runtime, log_id, WATCH_INTERVAL);
+}
+
+/// [`watch_runtime`], sampling every `interval`. Returns the watching
+/// thread so a test can see it end.
+fn watch_runtime_every(
+    runtime: &Arc<Runtime>,
+    log_id: HandleId,
+    interval: Duration,
+) -> Option<std::thread::JoinHandle<()>> {
+    let watched: Weak<Runtime> = Arc::downgrade(runtime);
+    let handle = runtime.handle().clone();
+
+    // A detached thread: it observes the runtime rather than belonging to
+    // it, and ends on its own when the last handle drops.
+    let spawned = std::thread::Builder::new()
+        .name("moraine-watch".to_owned())
+        .spawn(move || {
+            tag_thread_for_handle(log_id);
+            let started = std::time::Instant::now();
+            let mut probe = arm_probe(&handle);
+
+            loop {
+                std::thread::sleep(interval);
+
+                // Checked without upgrading: holding the last reference
+                // here would run the runtime's shutdown on this thread.
+                if watched.strong_count() == 0 {
+                    return;
+                }
+
+                let metrics = handle.metrics();
+                info!(
+                    probe_polled = probe.polled.load(Ordering::Relaxed),
+                    probe_timer_fired = probe.timer_fired.load(Ordering::Relaxed),
+                    alive_tasks = metrics.num_alive_tasks(),
+                    global_queue_depth = metrics.global_queue_depth(),
+                    workers = metrics.num_workers(),
+                    watched_seconds = started.elapsed().as_secs(),
+                    "watching an attached runtime from off it"
+                );
+
+                probe = arm_probe(&handle);
+            }
+        });
+
+    match spawned {
+        Ok(thread) => Some(thread),
+        Err(error) => {
+            warn!(%error, "could not watch this runtime from off it");
+            None
+        }
+    }
+}
+
+/// Spawns a probe on `handle` and returns what it will record.
+fn arm_probe(handle: &Handle) -> Arc<RuntimeProbe> {
+    let probe = Arc::new(RuntimeProbe::default());
+    let armed = Arc::clone(&probe);
+    handle.spawn(async move {
+        armed.polled.store(true, Ordering::Relaxed);
+        tokio::time::sleep(PROBE_SLEEP).await;
+        armed.timer_fired.store(true, Ordering::Relaxed);
+    });
+    probe
+}
+
 /// How often an attached runtime says it is still advancing.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -616,6 +713,60 @@ mod heartbeat_tests {
         assert!(
             fired >= 4,
             "timer stopped advancing under foreign block_on traffic: {fired} ticks"
+        );
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        time::{Duration, Instant},
+    };
+
+    use super::{PROBE_SLEEP, arm_probe, new_runtime, watch_runtime_every};
+    use crate::logging::allocate_handle_id;
+
+    /// A probe on a healthy runtime records both that a worker polled it
+    /// and that its timer fired -- the two the watch tells apart.
+    #[test]
+    fn a_probe_records_polling_and_its_timer_firing() {
+        let runtime = new_runtime(allocate_handle_id(), 2).unwrap();
+        let probe = arm_probe(runtime.handle());
+
+        let deadline = Instant::now() + PROBE_SLEEP + Duration::from_secs(5);
+        while !probe.timer_fired.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            probe.polled.load(Ordering::Relaxed),
+            "a healthy runtime polls a spawned probe"
+        );
+        assert!(
+            probe.timer_fired.load(Ordering::Relaxed),
+            "a healthy runtime fires a probe's timer"
+        );
+    }
+
+    /// The watch ends when the last handle to its runtime drops, so an
+    /// attach does not leak a thread per detach.
+    #[test]
+    fn the_watch_ends_when_its_runtime_drops() {
+        let log_id = allocate_handle_id();
+        let runtime = Arc::new(new_runtime(log_id, 2).unwrap());
+        let watching = watch_runtime_every(&runtime, log_id, Duration::from_millis(20))
+            .expect("thread spawns");
+
+        drop(runtime);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !watching.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            watching.is_finished(),
+            "the watch must end with the runtime it watches"
         );
     }
 }
