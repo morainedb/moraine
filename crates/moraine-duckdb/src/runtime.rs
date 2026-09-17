@@ -378,11 +378,15 @@ pub(crate) fn worker_threads(requested: usize) -> usize {
 /// Builds the multi-threaded tokio runtime an attached catalog owns for
 /// the lifetime of its handle, sized for a host running `requested`
 /// threads of its own (`0` when the host does not say). Each worker is
-/// tagged with `log_id` at spawn. The size is fixed at attach.
+/// tagged with `log_id` at spawn and named for it, so a thread dump can
+/// tell which catalog a worker or driver belongs to. The size is fixed
+/// at attach.
 pub(crate) fn new_runtime(log_id: HandleId, requested: usize) -> std::io::Result<Runtime> {
     let runtime = Builder::new_multi_thread()
         .worker_threads(worker_threads(requested))
         .enable_all()
+        // At most 15 bytes: the kernel truncates longer names in `/proc`.
+        .thread_name(format!("moraine-{log_id}"))
         .on_thread_start(move || tag_thread_for_handle(log_id))
         .build()?;
     runtime.spawn(heartbeat());
@@ -526,5 +530,24 @@ mod tests {
             "a huge host thread count is capped"
         );
         const { assert!(MIN_WORKER_THREADS >= 2) };
+    }
+}
+
+#[cfg(test)]
+mod thread_name_tests {
+    /// An attached runtime's workers carry its handle in their thread name,
+    /// within the kernel's 15-byte limit, so a thread dump attributes a
+    /// worker to its catalog.
+    #[test]
+    fn a_runtimes_workers_are_named_for_their_handle() {
+        let log_id = crate::logging::allocate_handle_id();
+        let runtime = super::new_runtime(log_id, 2).unwrap();
+        let name = runtime
+            .block_on(runtime.spawn(async { std::thread::current().name().map(str::to_owned) }))
+            .unwrap()
+            .expect("worker threads are named");
+
+        assert_eq!(name, format!("moraine-{log_id}"));
+        assert!(name.len() <= 15, "{name} would be truncated in /proc");
     }
 }
