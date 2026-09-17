@@ -4,13 +4,17 @@
 //!
 //! Routing rides on threads: a handle's runtime tags its worker threads at
 //! spawn, and its `block_on` wrappers tag the calling thread per call. An
-//! event is attributed to whatever handle tagged the thread it fires on
-//! and, while that handle has a sink registered, written straight through
-//! it as it fires.
+//! event is attributed to whatever handle tagged the thread it fires on.
 //!
-//! Events with no attributed sink fall back to a bounded buffering layer
-//! (oldest dropped first), which the shim drains at operation boundaries on
-//! threads that hold a `ClientContext`.
+//! Nothing is written from the thread that logged. Events go to a bounded
+//! queue (oldest dropped first) that a dedicated thread drains, writing
+//! each to its handle's sink if one is registered. A sink is host code of
+//! unknown duration, and the emitting thread is often a runtime worker
+//! mid-task.
+//!
+//! Events with no attributed sink fall back to a bounded buffer, which the
+//! shim drains at operation boundaries on threads that hold a
+//! `ClientContext`.
 
 use std::{
     cell::Cell,
@@ -18,7 +22,7 @@ use std::{
     ffi::{CString, c_char, c_void},
     fmt::Write as _,
     sync::{
-        Mutex, OnceLock, RwLock,
+        Condvar, Mutex, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -84,6 +88,7 @@ mod levels {
 
 /// One buffered event, attributed to the handle whose thread it fired on
 /// (`None` when it fired outside any handle's threads).
+#[derive(Clone)]
 struct LogRecord {
     handle: Option<HandleId>,
     level: i32,
@@ -224,27 +229,164 @@ where
             message: visitor.finish(metadata.target()),
         };
 
-        // The read lock is held across the sink call, so unregistration
-        // (write lock) returning means no call is in flight.
-        if let Some(handle) = record.handle
-            && let Ok(sinks) = sinks().read()
-            && let Some(registered) = sinks.iter().find(|registered| registered.handle == handle)
-        {
-            // SAFETY: the registration contract keeps `sink` callable
-            // with `ctx` from any thread while the entry is present.
-            unsafe { write_record(registered.sink, registered.ctx, &record) };
-            return;
-        }
+        // Queued, never delivered from here: a sink is host code of
+        // unknown duration, and this runs on whatever thread logged --
+        // including a runtime worker in the middle of a task.
+        enqueue_for_delivery(record);
+    }
+}
 
-        let Ok(mut buffer) = buffer().lock() else {
+/// Records waiting for the delivery thread, and how many it never saw.
+struct PendingDelivery {
+    records: VecDeque<LogRecord>,
+    dropped: u64,
+    /// Totals since the process began; [`flush_delivery`] waits on the gap.
+    queued: u64,
+    delivered: u64,
+}
+
+fn pending() -> &'static (Mutex<PendingDelivery>, Condvar) {
+    static PENDING: OnceLock<(Mutex<PendingDelivery>, Condvar)> = OnceLock::new();
+    PENDING.get_or_init(|| {
+        (
+            Mutex::new(PendingDelivery {
+                records: VecDeque::new(),
+                dropped: 0,
+                queued: 0,
+                delivered: 0,
+            }),
+            Condvar::new(),
+        )
+    })
+}
+
+/// Queues `record` and wakes the delivery thread, starting it on first use.
+fn enqueue_for_delivery(record: LogRecord) {
+    start_delivery_thread();
+    let (lock, waiting) = pending();
+    let Ok(mut queue) = lock.lock() else {
+        return;
+    };
+    admit(&mut queue, record);
+
+    // Every waiter shares this condvar, so waking just one can wake a
+    // flusher and leave the queue undrained.
+    waiting.notify_all();
+}
+
+/// Admits `record`, evicting the oldest once full: a reader that has
+/// stopped consuming costs the oldest records rather than unbounded memory.
+///
+/// An evicted record counts as delivered. It will never reach a sink, and
+/// a flush that waited for it would wait out its whole timeout.
+fn admit(queue: &mut PendingDelivery, record: LogRecord) {
+    if queue.records.len() >= LOG_BUFFER_CAPACITY {
+        queue.records.pop_front();
+        queue.dropped = queue.dropped.saturating_add(1);
+        queue.delivered = queue.delivered.saturating_add(1);
+    }
+    queue.records.push_back(record);
+    queue.queued = queue.queued.saturating_add(1);
+}
+
+/// Waits until every record queued so far has reached a sink or the pull
+/// buffer, or until `timeout` passes.
+///
+/// Delivery runs on a thread of its own, so logging no longer proves
+/// arrival.
+pub(crate) fn flush_delivery(timeout: std::time::Duration) {
+    let (lock, waiting) = pending();
+    let Ok(mut queue) = lock.lock() else {
+        return;
+    };
+    let target = queue.queued;
+    let deadline = std::time::Instant::now() + timeout;
+    while queue.delivered < target {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
             return;
         };
-        if buffer.records.len() >= LOG_BUFFER_CAPACITY {
-            buffer.records.pop_front();
-            buffer.dropped = buffer.dropped.saturating_add(1);
-        }
-        buffer.records.push_back(record);
+        let Ok((next, _)) = waiting.wait_timeout(queue, remaining) else {
+            return;
+        };
+        queue = next;
     }
+}
+
+/// Starts the thread that delivers queued records, once per process.
+fn start_delivery_thread() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("moraine-logs".to_owned())
+            .spawn(deliver_forever);
+    });
+}
+
+/// Delivers queued records to their handle's sink, or leaves them for a
+/// caller to pull when no sink is registered.
+fn deliver_forever() {
+    loop {
+        let (records, dropped) = {
+            let (lock, waiting) = pending();
+            let Ok(mut queue) = lock.lock() else {
+                return;
+            };
+            while queue.records.is_empty() {
+                let Ok(next) = waiting.wait(queue) else {
+                    return;
+                };
+                queue = next;
+            }
+            (
+                queue.records.drain(..).collect::<Vec<_>>(),
+                std::mem::take(&mut queue.dropped),
+            )
+        };
+
+        if dropped > 0 {
+            deliver(&LogRecord {
+                handle: None,
+                level: levels::WARNING,
+                message: format!(
+                    "moraine: {dropped} diagnostic record(s) dropped; delivery fell behind"
+                ),
+            });
+        }
+        for record in &records {
+            deliver(record);
+        }
+        if let Ok(mut queue) = pending().0.lock() {
+            queue.delivered = queue
+                .delivered
+                .saturating_add(records.len().try_into().unwrap_or(u64::MAX));
+            pending().1.notify_all();
+        }
+    }
+}
+
+/// Hands one record to its handle's sink, falling back to the pull buffer
+/// when none is registered.
+fn deliver(record: &LogRecord) {
+    // The read lock is held across the sink call, so unregistration
+    // (write lock) returning means no call is in flight.
+    if let Some(handle) = record.handle
+        && let Ok(sinks) = sinks().read()
+        && let Some(registered) = sinks.iter().find(|registered| registered.handle == handle)
+    {
+        // SAFETY: the registration contract keeps `sink` callable with
+        // `ctx` from any thread while the entry is present.
+        unsafe { write_record(registered.sink, registered.ctx, record) };
+        return;
+    }
+
+    let Ok(mut buffer) = buffer().lock() else {
+        return;
+    };
+    if buffer.records.len() >= LOG_BUFFER_CAPACITY {
+        buffer.records.pop_front();
+        buffer.dropped = buffer.dropped.saturating_add(1);
+    }
+    buffer.records.push_back(record.clone());
 }
 
 /// Hands one record to `sink`, dropping a message that cannot cross as a C
@@ -323,6 +465,10 @@ pub unsafe extern "C" fn moraine_drain_logs(sink: MoraineLogSink, sink_ctx: *mut
     let Some(sink) = sink else {
         return;
     };
+    // A drain is a pull of what has been logged so far, and delivery is
+    // no longer synchronous with logging. Bounded short: this sits on an
+    // operation boundary, and a missed record only waits for the next one.
+    flush_delivery(std::time::Duration::from_millis(100));
     // SAFETY: caller contract.
     unsafe { drain_buffer_into(sink, sink_ctx) };
 }
@@ -362,6 +508,11 @@ pub unsafe extern "C" fn moraine_register_log_sink(
 ///
 /// As [`moraine_register_log_sink`], minus the handle-pointer clause.
 pub(crate) unsafe fn register_sink(handle: HandleId, sink: LogSinkFunction, ctx: *mut c_void) {
+    // Before the registry lock, never under it: delivery takes a read lock,
+    // so waiting on it while holding the write lock would deadlock. Queued
+    // records reach the backlog buffer first this way, so the flush below
+    // sees everything emitted before registration.
+    flush_delivery(std::time::Duration::from_secs(2));
     let Ok(mut sinks) = sinks().write() else {
         return;
     };
@@ -400,6 +551,10 @@ pub unsafe extern "C" fn moraine_unregister_log_sink(handle: *const MoraineCatal
 
 /// [`moraine_unregister_log_sink`] with the routing identity in hand.
 pub(crate) fn unregister_sink(handle: HandleId) {
+    // Before the registry lock, as in registration. A record still queued
+    // would miss its sink and land in a buffer nobody may drain; the bound
+    // keeps a detach from waiting on a reader.
+    flush_delivery(std::time::Duration::from_secs(2));
     let Ok(mut sinks) = sinks().write() else {
         return;
     };
@@ -463,6 +618,34 @@ mod tests {
         assert_eq!(duckdb_level(Level::DEBUG), 20);
     }
 
+    /// Eviction keeps `queued - delivered` equal to what is still queued,
+    /// so a flush past an overflow finishes instead of waiting out its
+    /// timeout.
+    #[test]
+    fn evicted_records_do_not_leave_a_flush_waiting() {
+        let mut queue = PendingDelivery {
+            records: VecDeque::new(),
+            dropped: 0,
+            queued: 0,
+            delivered: 0,
+        };
+
+        for index in 0..LOG_BUFFER_CAPACITY + 10 {
+            admit(
+                &mut queue,
+                LogRecord {
+                    handle: None,
+                    level: levels::INFO,
+                    message: format!("record {index}"),
+                },
+            );
+        }
+
+        assert_eq!(queue.dropped, 10);
+        assert_eq!(queue.records.len(), LOG_BUFFER_CAPACITY);
+        assert_eq!(queue.queued - queue.delivered, LOG_BUFFER_CAPACITY as u64);
+    }
+
     /// A drain with no sink is a no-op rather than a crash.
     #[test]
     fn draining_without_a_sink_is_a_no_op() {
@@ -512,6 +695,8 @@ mod tests {
             }
             tracing::info!("unattributed event");
 
+            // Delivery is no longer synchronous with the call that logged.
+            flush_delivery(std::time::Duration::from_secs(5));
             let pushed = std::mem::take(&mut *received().lock().unwrap());
             assert!(
                 pushed
@@ -551,6 +736,7 @@ mod tests {
                 let _guard = enter_handle(ours);
                 tracing::info!("buffered after unregistration");
             }
+            flush_delivery(std::time::Duration::from_secs(5));
             assert!(
                 received().lock().unwrap().is_empty(),
                 "an unregistered handle's events must not push"
