@@ -9,7 +9,7 @@ use std::{
 
 use moraine::CatalogOptions;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::{free_c_string, guard, to_c_string};
 use crate::{
@@ -1051,6 +1051,12 @@ pub unsafe extern "C" fn moraine_detach(handle: *mut MoraineCatalogHandle) {
         if let Err(err) = boxed.block_on(boxed.catalog.reads().close()) {
             warn!(error = %err, "catalog close failed during detach");
         }
+        // Dropping the handle drops the runtime, which takes every task on
+        // it -- including the one reporting that the runtime advances. A
+        // detach that says nothing makes a runtime that stopped ticking
+        // indistinguishable from one that was closed, which is the question
+        // those records exist to answer.
+        info!("detaching catalog; its runtime and tasks stop here");
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
