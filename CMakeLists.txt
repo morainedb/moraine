@@ -70,8 +70,13 @@ foreach(EXT_TARGET ${TARGET_NAME}_extension ${TARGET_NAME}_loadable_extension)
     # diagnosed from the frames beneath it, and without this the shim's
     # functions -- which are where such a thread is most likely to be --
     # cannot be named at all. Costs image size, not speed.
+    # Debug info names an address; frame pointers are what let an unwinder
+    # reach it. At -O3 they are omitted, so a stalled thread's innermost
+    # frames stayed unreadable even once the symbols were there -- the giveaway
+    # being that captures truncated at different depths rather than the same
+    # one. Both, or neither is any use.
     if(NOT MSVC)
-        target_compile_options(${EXT_TARGET} PRIVATE -g)
+        target_compile_options(${EXT_TARGET} PRIVATE -g -fno-omit-frame-pointer)
     endif()
     target_include_directories(${EXT_TARGET} PRIVATE ${CPP_DIR})
     # corrosion derives its target name from the cargo *lib* name
@@ -86,9 +91,3 @@ foreach(EXT_TARGET ${TARGET_NAME}_extension ${TARGET_NAME}_loadable_extension)
     target_link_libraries(${EXT_TARGET} ducklake_extension)
 endforeach()
 
-# The patched DuckLake links into the same binary but is a target of its own,
-# so the per-target flags above do not reach it. Our patch series lives in
-# that code; without this its frames cannot be named either.
-if(TARGET ducklake_extension AND NOT MSVC)
-    target_compile_options(ducklake_extension PRIVATE -g)
-endif()
