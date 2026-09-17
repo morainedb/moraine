@@ -1449,11 +1449,23 @@ pub unsafe extern "C" fn moraine_tx_rollback(tx: *mut MoraineTxHandle) {
     let attempt = || {
         // SAFETY: caller contract above.
         let boxed = unsafe { Box::from_raw(tx) };
+        let catalog = boxed.catalog;
         // A rollback discards either way, so a poisoned lock is drained
         // rather than refused.
         match boxed.tx.into_inner() {
             Ok(tx) => tx.rollback(),
             Err(poisoned) => poisoned.into_inner().rollback(),
+        }
+        // The host resolves its own conflicts against the head it read from
+        // this catalog, and refuses a commit before it ever reaches one. A
+        // refusal decided against a stale head would otherwise be decided
+        // the same way forever, because only a commit refreshes the head and
+        // the refusal is what stops one happening. Forgetting it here costs
+        // a rescan on a path that already failed.
+        if !catalog.is_null() {
+            // SAFETY: the handle's catalog outlives every transaction opened
+            // against it, which is this pointer's own contract.
+            unsafe { (*catalog).catalog.reads().forget_head_view() };
         }
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));

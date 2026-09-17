@@ -521,6 +521,19 @@ impl std::ops::Deref for Catalog {
 
 impl ReadOnlyCatalog {
     /// The maintained-projection state shared by this handle's clones.
+    /// Forgets the cached head view, so the next read resolves the head
+    /// from the store instead of from memory.
+    ///
+    /// The cache is otherwise refreshed only by this catalog's own commits.
+    /// A caller whose commit was refused before it reached this catalog --
+    /// a host that resolves its own conflicts against the head it read here
+    /// -- would keep re-reading the same stale head and be refused for the
+    /// same reason forever, since the refusal never reaches the commit that
+    /// would have refreshed it. Costs one rescan.
+    pub fn forget_head_view(&self) {
+        crate::catalog::projection::invalidate_head_view(self.projections());
+    }
+
     pub(crate) fn projections(&self) -> &Arc<std::sync::RwLock<ProjectionCache>> {
         &self.projections
     }
