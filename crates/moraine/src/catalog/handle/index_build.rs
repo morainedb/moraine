@@ -20,6 +20,7 @@ use crate::{
         key::{IndexKind, index_index_prefix},
         proto::{DataFileValue, DeleteFileValue, InlineBuildCursorValue},
     },
+    telemetry::reporting_phase,
     transaction::EncodedIndexEntry,
 };
 
@@ -520,7 +521,7 @@ impl Catalog {
             ));
         }
 
-        let snapshot = self.snapshot().await?;
+        let snapshot = reporting_phase("repair-snapshot", self.snapshot()).await?;
         let pending: Vec<_> = snapshot
             .indexes
             .values()
@@ -528,6 +529,18 @@ impl Catalog {
             .map(snapshot::index_info)
             .filter(|index| index.state == IndexState::Maintaining)
             .collect();
+
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        // Recorded on entry, not only on failure: this repair runs inside the
+        // commit that deferred the work, on a second block of the caller's
+        // thread, and until now nothing said it had started. A commit that
+        // never returns is indistinguishable from one that never got here.
+        info!(
+            pending = pending.len(),
+            "repairing indexes this commit deferred"
+        );
 
         let mut repaired = 0u64;
         for index in pending {
@@ -542,13 +555,16 @@ impl Catalog {
                 columns: index.columns.clone(),
                 unique: index.unique,
             };
-            self.drive_staged_build(
-                index.table_id,
-                &def,
-                index.id,
-                data_store.clone(),
-                data_prefix,
-                step,
+            reporting_phase(
+                "index-repair",
+                self.drive_staged_build(
+                    index.table_id,
+                    &def,
+                    index.id,
+                    data_store.clone(),
+                    data_prefix,
+                    step,
+                ),
             )
             .await?;
             repaired = repaired.saturating_add(1);
