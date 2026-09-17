@@ -14,7 +14,7 @@ use tokio::{
     runtime::{Builder, Runtime},
     task::JoinHandle,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     error::AbiError,
@@ -380,11 +380,40 @@ pub(crate) fn worker_threads(requested: usize) -> usize {
 /// threads of its own (`0` when the host does not say). Each worker is
 /// tagged with `log_id` at spawn. The size is fixed at attach.
 pub(crate) fn new_runtime(log_id: HandleId, requested: usize) -> std::io::Result<Runtime> {
-    Builder::new_multi_thread()
+    let runtime = Builder::new_multi_thread()
         .worker_threads(worker_threads(requested))
         .enable_all()
         .on_thread_start(move || tag_thread_for_handle(log_id))
-        .build()
+        .build()?;
+    runtime.spawn(heartbeat());
+    Ok(runtime)
+}
+
+/// How often an attached runtime says it is still advancing.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Reports that this runtime's timers still fire, for as long as it lives.
+///
+/// A commit parked on an await cannot be told apart from a runtime that
+/// stopped advancing: both leave every thread asleep with nothing running,
+/// and a thread dump cannot say which runtime a driver belongs to. This can,
+/// because it runs on the runtime in question and is tagged with its handle
+/// -- so a wedge where this keeps ticking is a lost wakeup, and one where it
+/// stops is a runtime that died under the commit.
+async fn heartbeat() {
+    let started = std::time::Instant::now();
+    let mut ticks: u64 = 0;
+    loop {
+        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+        ticks = ticks.saturating_add(1);
+        // Elapsed as well as the count: a runtime advancing late is a
+        // different fault from one not advancing at all.
+        info!(
+            ticks,
+            alive_seconds = started.elapsed().as_secs(),
+            "attached runtime is advancing"
+        );
+    }
 }
 
 #[cfg(test)]
