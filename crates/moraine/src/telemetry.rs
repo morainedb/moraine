@@ -2,6 +2,26 @@ use std::{future::Future, time::Duration};
 
 use tracing::warn;
 
+/// Timer ticks any attached runtime has completed since the process began.
+///
+/// A heartbeat that reports its own ticks cannot say whether a gap means the
+/// timer stopped or the record was lost, because the report travels the path
+/// under suspicion. This counter rides records that are known to arrive
+/// instead, so the two answers separate.
+pub(crate) static RUNTIME_TICKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Records one completed timer tick on some attached runtime.
+pub fn note_runtime_tick() {
+    RUNTIME_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Timer ticks completed process-wide, for a record that is known to reach
+/// its reader.
+pub(crate) fn runtime_ticks() -> u64 {
+    RUNTIME_TICKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How long a wait runs before it is worth reporting, and how often it is
 /// reported thereafter.
 pub(crate) const STALL_INTERVAL: Duration = Duration::from_secs(10);

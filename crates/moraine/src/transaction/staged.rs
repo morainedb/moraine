@@ -1763,6 +1763,10 @@ fn staged_landed(
         durable_ms = milliseconds(commit_timings.durable),
         projection_ms = milliseconds(commit_timings.projection),
         elapsed_ms = milliseconds(started.elapsed()),
+        // Rides here because this record demonstrably reaches its reader:
+        // a heartbeat reporting its own ticks cannot distinguish a stopped
+        // timer from a lost record, and this can.
+        runtime_ticks = crate::telemetry::runtime_ticks(),
         "staged commit landed"
     );
 }

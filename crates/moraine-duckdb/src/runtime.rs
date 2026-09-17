@@ -406,6 +406,9 @@ async fn heartbeat() {
     loop {
         tokio::time::sleep(HEARTBEAT_INTERVAL).await;
         ticks = ticks.saturating_add(1);
+        // Counted before it is reported, so a tick survives a record that
+        // does not.
+        moraine::note_runtime_tick();
         // Elapsed as well as the count: a runtime advancing late is a
         // different fault from one not advancing at all.
         info!(
@@ -535,6 +538,34 @@ mod heartbeat_tests {
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     };
+
+    /// The production shape exactly: a 30s heartbeat on an attach runtime,
+    /// observed past its third due tick.
+    #[test]
+    #[ignore = "runs for 95 seconds"]
+    fn a_thirty_second_heartbeat_keeps_ticking() {
+        let runtime = super::new_runtime(crate::logging::allocate_handle_id(), 2).unwrap();
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = std::sync::Arc::clone(&ticks);
+        runtime.spawn(async move {
+            let started = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    ticks = counter.load(std::sync::atomic::Ordering::Relaxed),
+                    alive_seconds = started.elapsed().as_secs(),
+                    "attached runtime is advancing"
+                );
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_secs(95));
+        let fired = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fired >= 3,
+            "only {fired} ticks in 95s; production sees exactly 1"
+        );
+    }
 
     /// A runtime keeps firing timers while foreign threads drive work on it
     /// through `block_on`, which is the only thing an attach runtime does

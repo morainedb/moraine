@@ -279,4 +279,5 @@ pub use store::{
     },
     index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder},
 };
+pub use telemetry::note_runtime_tick;
 pub use transaction::{MigrationReport, Transaction};
