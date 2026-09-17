@@ -75,6 +75,13 @@ foreach(EXT_TARGET ${TARGET_NAME}_extension ${TARGET_NAME}_loadable_extension)
     # frames stayed unreadable even once the symbols were there -- the giveaway
     # being that captures truncated at different depths rather than the same
     # one. Both, or neither is any use.
+    #
+    # Per target, never through `CMAKE_CXX_FLAGS`. That variable is scoped to
+    # the directory rather than the target, so setting it to reach a target
+    # that does not exist yet reaches every other target configured after it
+    # as well -- which once meant shipping DuckDB's own debug info and a
+    # 1.27 GB extension. The patched DuckLake has no symbols for that reason:
+    # there is no target to attach them to at the point it is loaded.
     if(NOT MSVC)
         target_compile_options(${EXT_TARGET} PRIVATE -g -fno-omit-frame-pointer)
     endif()

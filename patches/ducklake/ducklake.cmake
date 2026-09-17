@@ -66,16 +66,6 @@ endif()
 # registers it from its entry point; never linked into DuckDB itself.
 set(MORAINE_DUCKLAKE_SOURCE_DIR "${moraine_patched_ducklake_SOURCE_DIR}"
     CACHE INTERNAL "The patched DuckLake source moraine bundles")
-# The patched DuckLake links into moraine's binary and is built by the call
-# below, which creates its target after the extension's own CMakeLists has
-# been processed -- so per-target flags set there never reach it. Set here
-# instead, before the target exists: a stalled frame in this code is as
-# opaque as one in the shim, and our patch series lives in it.
-if(NOT MSVC)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -fno-omit-frame-pointer")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -fno-omit-frame-pointer")
-endif()
-
 duckdb_extension_load(ducklake
     SOURCE_DIR ${moraine_patched_ducklake_SOURCE_DIR}
     DONT_LINK

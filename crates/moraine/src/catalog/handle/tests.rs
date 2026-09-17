@@ -585,3 +585,40 @@ async fn requested_inline_rows_follow_updates_and_wider_chunks() {
     );
     catalog.close().await.unwrap();
 }
+
+/// Forgetting the head view sends the next read back to the store, and the
+/// head it resolves there is the same one the commit left behind.
+///
+/// Only a commit refreshes that cache, so a caller refused before it reaches
+/// one would otherwise keep deciding against the head it first read.
+#[tokio::test]
+async fn forgetting_the_head_view_resolves_it_from_the_store_again() {
+    let catalog = open().await;
+    catalog
+        .commit(|tx| {
+            tx.create_schema("forgettable")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let installed = catalog
+        .writer_head_view()
+        .expect("a commit installs the head view");
+
+    catalog.forget_head_view();
+    assert!(
+        catalog.writer_head_view().is_none(),
+        "forgetting must leave nothing cached to decide against"
+    );
+
+    // Re-resolved rather than merely absent: a cache that cleared but could
+    // not be rebuilt would trade one wrong answer for no answer.
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.current_snapshot().id,
+        installed.current_snapshot().id,
+        "the head read from the store must match the one the commit left"
+    );
+    catalog.close().await.unwrap();
+}
