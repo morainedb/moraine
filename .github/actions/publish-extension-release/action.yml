@@ -49,8 +49,38 @@ runs:
           --title "${{ inputs.tag }}" \
           --notes "Unsigned moraine extension, built for DuckDB ${versions}. Assets are named moraine.<duckdb-version>.<platform>.duckdb_extension; a build only loads into the DuckDB version it names, and needs a CLI started with -unsigned. Signed install (no flags, any supported version): INSTALL moraine FROM community; LOAD moraine;" \
           || true
-        gh release upload "${{ inputs.tag }}" dist/*.duckdb_extension --clobber
-        gh release edit "${{ inputs.tag }}" --draft=false
+        # The upload has hung indefinitely against the releases API on a
+        # payload it usually moves in under a minute, leaving a draft that
+        # never reveals and a job with nothing to read. Each attempt is
+        # bounded and retried; `--clobber` makes a partial upload safe to
+        # repeat, so a retry costs transfer rather than correctness.
+        uploaded=false
+        for attempt in 1 2 3; do
+          if timeout 600 gh release upload "${{ inputs.tag }}" \
+               dist/*.duckdb_extension --clobber; then
+            uploaded=true
+            break
+          fi
+          echo "release upload attempt ${attempt} did not finish; retrying" >&2
+          sleep $((attempt * 15))
+        done
+        if [ "$uploaded" != true ]; then
+          echo "release upload did not finish in three bounded attempts" >&2
+          exit 1
+        fi
+        # Count what landed, not what was staged. The completeness check
+        # above runs on the local directory, so a release whose uploads
+        # mostly failed still passed it and revealed with one asset of
+        # eight. A reveal is the point of no return for anyone watching the
+        # releases page, so it happens only once the remote agrees.
+        staged=$(ls dist/*.duckdb_extension | wc -l)
+        landed=$(gh release view "${{ inputs.tag }}" \
+          --json assets --jq '[.assets[] | select(.state == "uploaded")] | length')
+        if [ "$landed" -ne "$staged" ]; then
+          echo "release has ${landed} of ${staged} assets; refusing to reveal" >&2
+          exit 1
+        fi
+        timeout 120 gh release edit "${{ inputs.tag }}" --draft=false
     - name: Pin descriptor ref to the released commit
       shell: bash
       env:
