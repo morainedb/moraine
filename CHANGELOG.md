@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/morainedb/moraine/compare/v0.6.5...v0.7.0) - 2026-09-17
+
+### Added
+
+- have an attached runtime say it is still advancing ([#234](https://github.com/morainedb/moraine/pull/234))
+- record the index repair a commit defers ([#232](https://github.com/morainedb/moraine/pull/232))
+- name every wait a commit can park on ([#231](https://github.com/morainedb/moraine/pull/231))
+- name every stall point in the commit path, and ship symbols to read one by ([#230](https://github.com/morainedb/moraine/pull/230))
+- bound the disk cache's open files and surface slow index reads ([#227](https://github.com/morainedb/moraine/pull/227))
+
+### Fixed
+
+- name the waits on the commit path the extension actually runs ([#233](https://github.com/morainedb/moraine/pull/233))
+- release the commit flight slot by ownership, not by a statement ([#229](https://github.com/morainedb/moraine/pull/229))
+- re-register inlined tables left deregistered with rows still under them ([#224](https://github.com/morainedb/moraine/pull/224))
+- re-register a deregistered inlined table when DuckLake re-creates it ([#222](https://github.com/morainedb/moraine/pull/222))
+
+### Other
+
+- keep index reads pinned and selective inside writing transactions ([#226](https://github.com/morainedb/moraine/pull/226))
+- accelerate indexed scans and reuse bounded caches ([#225](https://github.com/morainedb/moraine/pull/225))
+
 ## [0.6.5](https://github.com/morainedb/moraine/compare/v0.6.4...v0.6.5) - 2026-09-14
 
 ### Fixed
