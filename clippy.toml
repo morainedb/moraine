@@ -3,4 +3,4 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 
 # Product names that may appear in docs without backticks (".." keeps defaults).
-doc-valid-idents = ["DuckLake", "SlateDB", "DuckDB", "MinIO", ".."]
+doc-valid-idents = ["DuckLake", "SlateDB", "DuckDB", "MinIO", "RustFS", ".."]

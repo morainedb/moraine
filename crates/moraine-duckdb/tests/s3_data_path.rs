@@ -31,16 +31,16 @@ fn indexed_parquet_mutations_reopen_roots_with_trailing_separators() {
                 format!(", DATA_PATH '{root}', META_DATA_PATH '{root}'")
             });
             let output = Command::new(cli_path())
-                .env("AWS_ACCESS_KEY_ID", "minioadmin")
-                .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+                .env("AWS_ACCESS_KEY_ID", "moraineadmin")
+                .env("AWS_SECRET_ACCESS_KEY", "moraineadmin")
                 .env("AWS_REGION", "us-east-1")
                 .env("AWS_ENDPOINT", format!("http://{endpoint}"))
                 .env("AWS_ALLOW_HTTP", "true")
                 .args(["-unsigned", "-csv", "-batch", "-bail", "-c"])
                 .arg(format!(
                     "LOAD httpfs; {}
-                     CREATE SECRET emulator (TYPE s3, KEY_ID 'minioadmin',
-                         SECRET 'minioadmin', REGION 'us-east-1', ENDPOINT '{endpoint}',
+                     CREATE SECRET emulator (TYPE s3, KEY_ID 'moraineadmin',
+                         SECRET 'moraineadmin', REGION 'us-east-1', ENDPOINT '{endpoint}',
                          USE_SSL false, URL_STYLE 'path');
                      ATTACH 'ducklake:moraine:{}' AS lake (META_FLUSH_INTERVAL_MS 1{options});
                      SELECT 'moraine_result_start';

@@ -721,7 +721,7 @@ async fn measure_commit_throughput_by_concurrency() {
 /// prints a table whose cells track the larger of the two; an additive one
 /// prints their sum.
 ///
-/// The injected latency is the honest instrument here: a localhost MinIO
+/// The injected latency is the honest instrument here: a localhost S3 server
 /// understates a real S3 PUT by an order of magnitude, so measuring against
 /// it would answer a question nobody asked. `object_storage.rs` carries the
 /// endpoint-backed run for the absolute number.
