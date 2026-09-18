@@ -273,7 +273,7 @@ buys nothing, and a fast store cannot make up for a slow flush cadence.
 The same sweep against a live S3-compatible endpoint, where the PUT is the
 endpoint's own round trip (`cargo xtask s3`, which runs
 `object_storage.rs`'s `measure_commit_latency_against_the_endpoint` in
-release against a pinned MinIO):
+release against a pinned RustFS):
 
 | flush interval | median commit | min | max |
 |---|---|---|---|
@@ -281,7 +281,7 @@ release against a pinned MinIO):
 | 25 ms | 25.9 ms | 22.5 ms | 29.9 ms |
 | 100 ms | 101.4 ms | 83.0 ms | 116.7 ms |
 
-A loopback MinIO's PUT costs about a millisecond, so it lands in the
+A loopback S3 server's PUT costs about a millisecond, so it lands in the
 `RTT ≈ 0` row of the table above and the flush cadence dominates everywhere:
 this validates the composition against a real object-storage protocol, but
 it understates S3.
@@ -334,7 +334,7 @@ count per phase:
 The `_l0` rows show what preloading the newest SSTs' metadata at attach
 buys the cold row: what moves out of `cold_first_lookup` and into the attach.
 
-Locally, `cargo xtask s3` runs it in release against the pinned MinIO; the
+Locally, `cargo xtask s3` runs it in release against the pinned RustFS; the
 main-only [`Real S3 benchmark`](docs/real-s3-benchmark.md) workflow runs it
 against AWS S3 and keeps the printed table in the run artifact. From an ARM
 CodeBuild worker against AWS S3 in `us-west-2` on 2026-08-16 (a run in which

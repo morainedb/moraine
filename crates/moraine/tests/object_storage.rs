@@ -1,11 +1,11 @@
 //! Real object storage tests: public-API round-trips against S3 or an
 //! S3-compatible endpoint. Ignored by default; `cargo xtask s3` starts
-//! MinIO and runs them with the endpoint environment set.
+//! a local S3 server and runs them with the endpoint environment set.
 //!
 //! Run manually against any S3-compatible endpoint:
 //!
 //! ```text
-//! AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+//! AWS_ACCESS_KEY_ID=moraineadmin AWS_SECRET_ACCESS_KEY=moraineadmin \
 //! AWS_REGION=us-east-1 AWS_ALLOW_HTTP=true \
 //! MORAINE_S3_ENDPOINT=http://127.0.0.1:9124 MORAINE_S3_BUCKET=moraine \
 //! cargo test -p moraine --test object_storage -- --ignored
@@ -445,9 +445,9 @@ async fn measure_attach_latency_against_the_endpoint() {
 /// `max(flush cadence, write RTT) + ~2 ms`, with the round trip injected
 /// rather than incurred. This is the same sweep against a live endpoint,
 /// so the round trip is the endpoint's own. Read it accordingly: against a
-/// loopback MinIO the PUT costs a millisecond or two and the flush cadence
-/// dominates every row, which *tests* the composition but understates S3;
-/// against a real bucket the first row is the write RTT itself.
+/// a loopback S3 server the PUT costs a millisecond or two and the flush
+/// cadence dominates every row, which *tests* the composition but understates
+/// S3; against a real bucket the first row is the write RTT itself.
 ///
 /// A measurement, not an assertion — it prints and passes.
 #[tokio::test]

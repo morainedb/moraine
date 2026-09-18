@@ -74,7 +74,7 @@ suite. Unchecked items are implementation gaps, not supported attach modes.
 
 
 ## Hardening & release
-- [x] Real object storage tests (MinIO)
+- [x] Real object storage tests (RustFS)
 - [x] Arbitrary-bytes decode proptests for store codecs (never panic on garbage)
 - [x] Release pipeline: versioned tags drive crate publishing and extension artifacts
 - [x] Extension distribution: per-DuckDB-version, per-platform builds attached to GitHub releases (unsigned)
