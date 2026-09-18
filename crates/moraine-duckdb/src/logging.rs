@@ -137,21 +137,57 @@ fn sinks() -> &'static RwLock<Vec<RegisteredSink>> {
     SINKS.get_or_init(|| RwLock::new(Vec::new()))
 }
 
-/// The lowest level captured, from `MORAINE_LOG` (`trace`, `debug`, `info`,
-/// `warn`, `error`); defaults to `info`. Events below it are never
-/// buffered.
+/// Parses a level name, falling back to `default` for anything else.
+fn level_from(name: &str, default: Level) -> Level {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "trace" => Level::TRACE,
+        "debug" => Level::DEBUG,
+        "info" => Level::INFO,
+        "warn" | "warning" => Level::WARN,
+        "error" => Level::ERROR,
+        _ => default,
+    }
+}
+
+/// The lowest level captured for moraine's own events, from `MORAINE_LOG`
+/// (`trace`, `debug`, `info`, `warn`, `error`); defaults to `info`.
 fn capture_level() -> Level {
     static LEVEL: OnceLock<Level> = OnceLock::new();
     *LEVEL.get_or_init(|| match std::env::var("MORAINE_LOG") {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "trace" => Level::TRACE,
-            "debug" => Level::DEBUG,
-            "warn" | "warning" => Level::WARN,
-            "error" => Level::ERROR,
-            _ => Level::INFO,
-        },
+        Ok(value) => level_from(&value, Level::INFO),
         Err(_) => Level::INFO,
     })
+}
+
+/// The lowest level captured for everything moraine depends on, from
+/// `MORAINE_LOG_DEPENDENCIES`; defaults to `info`.
+///
+/// Held separately because the dependencies out-log moraine by orders of
+/// magnitude: one HTTP client at `debug` buries a catalog's own records.
+fn dependency_capture_level() -> Level {
+    static LEVEL: OnceLock<Level> = OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("MORAINE_LOG_DEPENDENCIES") {
+        Ok(value) => level_from(&value, Level::INFO),
+        Err(_) => Level::INFO,
+    })
+}
+
+/// Whether `target` is moraine's own, rather than a dependency's. A
+/// target's first segment is the crate that emitted it.
+fn is_moraine_target(target: &str) -> bool {
+    matches!(
+        target.split("::").next(),
+        Some("moraine" | "moraine_duckdb")
+    )
+}
+
+/// The floor `target`'s events must clear to be captured.
+fn floor_for(target: &str) -> Level {
+    if is_moraine_target(target) {
+        capture_level()
+    } else {
+        dependency_capture_level()
+    }
 }
 
 fn duckdb_level(level: Level) -> i32 {
@@ -208,7 +244,7 @@ impl Visit for MessageVisitor {
     }
 }
 
-/// Buffers every event at or above [`capture_level`].
+/// Buffers every event at or above the floor its target names.
 struct BufferLayer;
 
 impl<S> tracing_subscriber::Layer<S> for BufferLayer
@@ -216,7 +252,7 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _: Context<'_, S>) -> bool {
-        metadata.level() <= &capture_level()
+        metadata.level() <= &floor_for(metadata.target())
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
@@ -588,6 +624,45 @@ unsafe fn flush_handle_backlog(handle: HandleId, sink: LogSinkFunction, ctx: *mu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dependency's events are held to their own floor, so raising
+    /// moraine's level does not admit an HTTP client's debug traffic.
+    #[test]
+    fn a_dependency_is_held_to_its_own_floor() {
+        for target in [
+            "hyper_util::client::legacy::pool",
+            "object_store::aws",
+            "moraineish",
+        ] {
+            assert!(
+                !is_moraine_target(target),
+                "{target} must not be taken for moraine's own"
+            );
+            assert_eq!(floor_for(target), dependency_capture_level());
+        }
+    }
+
+    /// The crate's own targets, including the shim's, take `MORAINE_LOG`.
+    #[test]
+    fn moraines_own_targets_take_the_capture_level() {
+        for target in [
+            "moraine",
+            "moraine::transaction::commit",
+            "moraine_duckdb::runtime",
+        ] {
+            assert!(is_moraine_target(target), "{target} is moraine's own");
+            assert_eq!(floor_for(target), capture_level());
+        }
+    }
+
+    /// An unparseable level leaves the default standing rather than
+    /// silently widening or narrowing what is captured.
+    #[test]
+    fn an_unknown_level_name_keeps_the_default() {
+        assert_eq!(level_from("verbose", Level::WARN), Level::WARN);
+        assert_eq!(level_from("  DEBUG ", Level::WARN), Level::DEBUG);
+        assert_eq!(level_from("warning", Level::INFO), Level::WARN);
+    }
 
     /// The visitor renders the message and the remaining fields in the
     /// shape the shim forwards to DuckDB.
