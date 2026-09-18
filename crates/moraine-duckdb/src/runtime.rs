@@ -35,6 +35,14 @@ pub type MoraineInterruptProbe = Option<unsafe extern "C" fn(probe_ctx: *mut c_v
 /// interrupt cancels before the future does any work.
 const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How many probe polls pass between reports that a call is still holding
+/// and still uninterrupted. Thirty seconds at [`INTERRUPT_POLL_INTERVAL`].
+const POLLS_PER_INTERRUPT_REPORT: u64 = 300;
+
+/// [`INTERRUPT_POLL_INTERVAL`] in milliseconds, for reporting elapsed time
+/// without converting a `u128` on every poll.
+const INTERRUPT_POLL_SECONDS_NUMERATOR: u64 = 100;
+
 /// An attached catalog: owns the tokio runtime created at `ATTACH` and
 /// the [`Catalog`] handle opened on it. Every FFI entry point `block_on`s
 /// through `runtime`.
@@ -318,8 +326,21 @@ where
                 return std::future::pending::<()>().await;
             };
             let mut ticks = tokio::time::interval(INTERRUPT_POLL_INTERVAL);
+            let mut polls: u64 = 0;
             loop {
                 ticks.tick().await;
+                polls = polls.saturating_add(1);
+                // A call held this long is one a caller is likely trying to
+                // interrupt. Saying the probe is still being polled, and
+                // still says no, separates a runtime that stopped firing
+                // timers from a probe that cannot see the caller's flag.
+                if polls.is_multiple_of(POLLS_PER_INTERRUPT_REPORT) {
+                    warn!(
+                        polls,
+                        seconds = polls * INTERRUPT_POLL_SECONDS_NUMERATOR / 1_000,
+                        "the interrupt probe is still polling and still reports no interrupt"
+                    );
+                }
                 // SAFETY: caller contract — `probe` is callable with
                 // `probe_ctx` for the duration of this call.
                 if unsafe { probe(probe_ctx) } {
