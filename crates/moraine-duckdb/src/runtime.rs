@@ -769,4 +769,59 @@ mod watch_tests {
             "the watch must end with the runtime it watches"
         );
     }
+
+    /// The watch's record reaches its handle's sink, prefixed with the
+    /// event target: it emits from a detached thread that tags itself
+    /// rather than from a runtime worker, and readers match on the
+    /// delivered form, not the message literal.
+    #[test]
+    fn the_watchs_record_reaches_its_handles_sink() {
+        use std::{
+            ffi::{CStr, c_char, c_void},
+            sync::Mutex,
+        };
+
+        static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        unsafe extern "C" fn collect(_: *mut c_void, _: i32, message: *const c_char) {
+            // SAFETY: the ABI documents `message` as NUL-terminated and
+            // valid for the duration of this call.
+            let text = unsafe { CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned();
+            SEEN.lock().unwrap().push(text);
+        }
+
+        crate::logging::install();
+        let log_id = allocate_handle_id();
+        // SAFETY: `collect` never unwinds, emits no events, and re-enters
+        // no entry point.
+        unsafe { crate::logging::register_sink(log_id, collect, std::ptr::null_mut()) };
+
+        let runtime = Arc::new(new_runtime(log_id, 2).unwrap());
+        let watching = watch_runtime_every(&runtime, log_id, Duration::from_millis(50))
+            .expect("thread spawns");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut delivered = None;
+        while delivered.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            delivered = SEEN
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|record| record.contains("watching an attached runtime from off it"))
+                .cloned();
+        }
+
+        crate::logging::unregister_sink(log_id);
+        drop(runtime);
+        let _ = watching.join();
+
+        let delivered = delivered.expect("the watch's record must reach its handle's sink");
+        assert!(
+            delivered.starts_with("moraine_duckdb::runtime: "),
+            "a delivered record leads with its target, not its message: {delivered}"
+        );
+    }
 }
