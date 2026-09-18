@@ -164,11 +164,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      # The pinned MinIO binaries xtask downloads, keyed on
-      # xtask/src/s3.rs, which owns those pins (same rust-cache cleanup
+      # The pinned rustfs binary xtask downloads, keyed on
+      # xtask/src/s3.rs, which owns that pin (same rust-cache cleanup
       # caveat as the DuckDB build cache above).
       - uses: actions/cache@v6
         with:
-          path: target/minio/bin
-          key: minio-${{ runner.os }}-${{ hashFiles('xtask/src/s3.rs') }}
+          path: target/rustfs/bin
+          key: rustfs-${{ runner.os }}-${{ hashFiles('xtask/src/s3.rs') }}
       - run: cargo xtask s3

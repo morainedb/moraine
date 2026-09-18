@@ -10,8 +10,8 @@
 //! - `commit-bench` breaks an S3-backed DuckLake commit into DuckLake metadata
 //!   statements, Moraine core time, and physical object-store requests (see
 //!   `commit_bench.rs`).
-//! - `s3` runs the catalog's object storage suite against a pinned MinIO server
-//!   (see `s3.rs`).
+//! - `s3` runs the catalog's object storage suite against a pinned RustFS
+//!   server (see `s3.rs`).
 //! - `check-pins` verifies every place naming a DuckDB version agrees with
 //!   `.github/duckdb-versions` (see `pins.rs`), and `version-matrix` prints
 //!   that manifest as the JSON array the release workflows build from.
