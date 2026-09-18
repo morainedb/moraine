@@ -19,6 +19,9 @@ pub(crate) struct FlushPacer {
     /// Serializes the flushes themselves, so a deferred one never overlaps
     /// an immediate one still in the air.
     flushes: tokio::sync::Mutex<()>,
+    /// Bumped when a scheduled flush ends without carrying its riders out.
+    /// The store has no flush timer, so nothing else would ever wake them.
+    stranded: tokio::sync::watch::Sender<u64>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +72,7 @@ impl FlushPacer {
             spacing,
             state: Mutex::new(PacerState::default()),
             flushes: tokio::sync::Mutex::new(()),
+            stranded: tokio::sync::watch::Sender::new(0),
         })
     }
 
@@ -77,40 +81,63 @@ impl FlushPacer {
     }
 
     /// Waits until `handle`'s already-committed batch is in object storage,
-    /// flushing now, later, or not at all per the pacing.
+    /// flushing now, later, or riding the flush already scheduled.
+    ///
+    /// A rider whose flush is abandoned claims again rather than waiting on
+    /// one that will not run.
     pub(crate) async fn await_durable(&self, handle: WriteHandle) -> Result<(), slatedb::Error> {
-        let claim = self.state().claim(self.spacing, Instant::now());
-        match claim {
-            Claim::FlushNow => {
-                let in_flight = InFlight(self);
-                let _serialized = self.flushes.lock().await;
-                self.flush(in_flight).await
-            }
-            Claim::FlushAt(deadline) => {
-                let mut scheduled = Scheduled {
-                    pacer: self,
-                    armed: true,
-                    phase: "spacing",
-                    claimed: Instant::now(),
-                };
-                tokio::time::sleep_until(deadline).await;
-                scheduled.phase = "serializing";
-                let _serialized = self.flushes.lock().await;
-                let in_flight = {
-                    let mut state = self.state();
-                    state.scheduled = false;
-                    state.in_flight = true;
-                    state.last_started = Some(Instant::now());
-                    InFlight(self)
-                };
-                scheduled.armed = false;
-                self.flush(in_flight).await
-            }
-            Claim::Await => {
-                let _riding = Riding(self);
-                handle.await_durable().await
+        loop {
+            // Subscribed before the claim, so a flush stranded between the
+            // two is seen as a change rather than missed.
+            let mut stranded = self.stranded.subscribe();
+            // Bound, not matched on directly: the guard would otherwise be
+            // held across the awaits below it.
+            let claim = self.state().claim(self.spacing, Instant::now());
+            match claim {
+                Claim::FlushNow => {
+                    let in_flight = InFlight(self);
+                    let _serialized = self.flushes.lock().await;
+                    return self.flush(in_flight).await;
+                }
+                Claim::FlushAt(deadline) => {
+                    let mut scheduled = Scheduled {
+                        pacer: self,
+                        armed: true,
+                        phase: "spacing",
+                        claimed: Instant::now(),
+                    };
+                    tokio::time::sleep_until(deadline).await;
+                    scheduled.phase = "serializing";
+                    let _serialized = self.flushes.lock().await;
+                    let in_flight = {
+                        let mut state = self.state();
+                        state.scheduled = false;
+                        state.in_flight = true;
+                        state.last_started = Some(Instant::now());
+                        InFlight(self)
+                    };
+                    scheduled.armed = false;
+                    return self.flush(in_flight).await;
+                }
+                Claim::Await => {
+                    let _riding = Riding(self);
+                    tokio::select! {
+                        durable = handle.await_durable() => return durable,
+                        // Nothing is going to carry these bytes out now, so
+                        // claim again rather than wait on a flush that left.
+                        _ = stranded.changed() => {}
+                    }
+                }
             }
         }
+    }
+
+    /// Wakes every commit riding a scheduled flush that will not carry
+    /// them out, so each claims again instead of waiting on it.
+    fn strand_riders(&self) {
+        self.stranded.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
     }
 
     /// Performs one flush; the caller holds the serializing lock.
@@ -118,13 +145,12 @@ impl FlushPacer {
         let outcome = self.db.flush().await;
         drop(in_flight);
         if let Err(error) = &outcome {
-            // The store has no flush timer: a failed flush leaves the
-            // commits riding it with nothing to advance their sequence.
+            self.strand_riders();
             tracing::warn!(
                 %error,
                 kind = ?error.kind(),
                 riding = self.state().riding,
-                "a flush failed; commits riding it are not durable"
+                "a flush failed; its riders claim again"
             );
         }
         outcome
@@ -152,14 +178,13 @@ impl Drop for Scheduled<'_> {
             state.scheduled = false;
             state.riding
         };
-        // The store has no flush timer, so commits already riding this
-        // flush have nothing else to advance their durable sequence.
+        self.pacer.strand_riders();
         tracing::warn!(
             phase = self.phase,
             riding,
             held_ms = crate::telemetry::milliseconds(self.claimed.elapsed()),
             unwinding = std::thread::panicking(),
-            "a deferred flush was abandoned before it ran; commits riding it have no other flush"
+            "a deferred flush was abandoned before it ran; its riders claim again"
         );
     }
 }
@@ -307,11 +332,11 @@ mod tests {
         assert_eq!(state.claim(Duration::ZERO, base), Claim::FlushAt(base));
     }
 
-    /// A deferred flush that is abandoned strands every commit riding on
-    /// it: the store has no flush timer, so no other flush follows.
+    /// A commit riding a deferred flush still lands when that flush is
+    /// abandoned: nothing else would carry its bytes out, so it claims
+    /// again rather than waiting on one that left.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "reproduces an unfixed strand: the riders never land"]
-    async fn an_abandoned_deferred_flush_strands_the_commits_riding_on_it() {
+    async fn a_rider_lands_when_the_flush_it_rides_is_abandoned() {
         let db = Db::builder("", Arc::new(InMemory::new()))
             .with_settings(Settings {
                 flush_interval: None,

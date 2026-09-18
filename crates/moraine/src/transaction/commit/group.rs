@@ -534,7 +534,7 @@ mod tests {
         catalog.close().await.unwrap();
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
-            CommitDurability::OnFlushInterval,
+            catalog.store().commit_durability(),
         ));
         let flight = coalescer.enter_flight();
         Arc::clone(&coalescer).land(batch, flight).await;
@@ -601,7 +601,7 @@ mod tests {
             .unwrap();
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
-            CommitDurability::OnFlushInterval,
+            catalog.store().commit_durability(),
         ));
 
         // The slot is claimed and its holder vanishes without landing.
@@ -625,7 +625,7 @@ mod tests {
             .unwrap();
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
-            CommitDurability::OnFlushInterval,
+            catalog.store().commit_durability(),
         ));
 
         let flight = coalescer.enter_flight();
