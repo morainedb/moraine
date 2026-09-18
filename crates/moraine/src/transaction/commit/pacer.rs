@@ -1,5 +1,9 @@
 //! Paces write-ahead-log flushes: at most one object-store PUT per spacing,
 //! and no commit waiting longer than the spacing for its bytes to land.
+//!
+//! The spacing is waited out off the runtime's time driver. A timer here
+//! sits on the durability path, where a driver that stops advancing parks
+//! every commit inside the spacing rather than one.
 
 use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
@@ -87,7 +91,7 @@ impl FlushPacer {
                     pacer: self,
                     armed: true,
                 };
-                tokio::time::sleep_until(deadline).await;
+                sleep_until_off_driver(deadline).await;
                 let _serialized = self.flushes.lock().await;
                 let in_flight = {
                     let mut state = self.state();
@@ -109,6 +113,21 @@ impl FlushPacer {
         drop(in_flight);
         outcome
     }
+}
+
+/// Waits until `deadline` without the runtime's time driver, so a driver
+/// that stops advancing cannot park a commit here.
+///
+/// At most one deferred flush exists per writer, so this holds at most one
+/// blocking thread per writer at a time.
+async fn sleep_until_off_driver(deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return;
+    }
+    // A failed spawn means the runtime is going down; flushing early is
+    // the safe way to lose that race.
+    let _ = tokio::task::spawn_blocking(move || std::thread::sleep(remaining)).await;
 }
 
 /// Clears `scheduled` if the deferred flush is abandoned before it starts,
@@ -137,9 +156,58 @@ impl Drop for InFlight<'_> {
 
 #[cfg(test)]
 mod tests {
+    use object_store::memory::InMemory;
+    use slatedb::config::Settings;
+
     use super::*;
 
     const SPACING: Duration = Duration::from_millis(100);
+
+    /// A deferred flush completes while the clock is frozen, so the
+    /// spacing is waited out off the time driver.
+    #[tokio::test(start_paused = true)]
+    async fn a_deferred_flush_waits_off_the_time_driver() {
+        // Always-ready work stops paused time from auto-advancing, so a
+        // wait on the driver would never end here.
+        let spinning = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let db = Db::builder("", Arc::new(InMemory::new()))
+            .with_settings(Settings {
+                flush_interval: None,
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let pacer = FlushPacer::new(db.clone(), SPACING);
+
+        // Leaves the spacing unelapsed with nothing in the air: the claim
+        // that waits it out before flushing.
+        pacer.state().claim(SPACING, Instant::now());
+        pacer.state().in_flight = false;
+
+        let tx = db.begin(slatedb::IsolationLevel::Snapshot).await.unwrap();
+        tx.put(b"key", b"value").unwrap();
+        let handle = tx.commit().await.unwrap().unwrap();
+
+        // Wall-clock, because the frozen clock rules out `timeout`: a wait
+        // on the time driver fails here rather than hanging the suite.
+        let (expired, watchdog) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(10));
+            let _ = expired.send(());
+        });
+
+        tokio::select! {
+            flushed = pacer.await_durable(handle) => flushed.unwrap(),
+            _ = watchdog => panic!("a deferred flush waited on the time driver"),
+        }
+        spinning.abort();
+    }
 
     fn at(base: Instant, millis: u64) -> Instant {
         base + Duration::from_millis(millis)
