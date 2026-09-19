@@ -6,6 +6,7 @@ use std::{
 };
 
 use futures::{StreamExt, stream::FuturesUnordered};
+use tracing::debug;
 
 use super::{ReadOnlyCatalog, cache_epoch, index_probe_cache::Probe};
 use crate::{
@@ -18,6 +19,7 @@ use crate::{
         },
         read,
     },
+    telemetry::milliseconds,
     transaction::index_maintenance,
 };
 
@@ -150,6 +152,16 @@ impl ReadOnlyCatalog {
                     let mut resolution =
                         resolve_encoded(handle, index.get(), info.unique, encoded).await?;
                     resolution.metrics.head = head;
+                    // One line per resolved lookup, and only what naming it
+                    // costs nothing to carry: a probe reused inside a
+                    // transaction resolves once, and this is what says so.
+                    debug!(
+                        table_id = table.get(),
+                        index_id = index.get(),
+                        lookup_keys = keys.len(),
+                        lookup_ms = milliseconds(started.elapsed()),
+                        "index lookup resolved"
+                    );
                     Ok(resolution.row_ids)
                 })
                 .await
