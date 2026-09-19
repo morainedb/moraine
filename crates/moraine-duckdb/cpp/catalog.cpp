@@ -163,6 +163,10 @@ void WriteThroughLogger(duckdb::Logger &logger, int32_t level, const char *messa
 		auto log_level = static_cast<duckdb::LogLevel>(level);
 		if (logger.ShouldLog(MORAINE_LOG_TYPE, log_level)) {
 			logger.WriteLog(MORAINE_LOG_TYPE, log_level, message);
+			// The in-memory log storage buffers a full vector before a
+			// record reaches `duckdb_logs`. Diagnostics arrive a few per
+			// minute, so an unflushed record is a lost one.
+			logger.Flush();
 		}
 	} catch (...) {
 	}

@@ -347,6 +347,7 @@ pub struct ObjectStoreTally {
 }
 
 impl CacheTally {
+    #[cfg(test)]
     pub(crate) fn since(self, before: Self) -> Self {
         Self {
             metadata_hits: self.metadata_hits.saturating_sub(before.metadata_hits),
@@ -391,6 +392,7 @@ impl CacheTally {
 }
 
 impl ObjectStoreTally {
+    #[cfg(test)]
     pub(crate) fn since(self, before: Self) -> Self {
         Self {
             main_gets: self.main_gets.saturating_sub(before.main_gets),

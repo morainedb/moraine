@@ -534,7 +534,7 @@ mod tests {
         catalog.close().await.unwrap();
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
-            CommitDurability::OnFlushInterval,
+            catalog.store().commit_durability(),
         ));
         let flight = coalescer.enter_flight();
         Arc::clone(&coalescer).land(batch, flight).await;
@@ -552,12 +552,16 @@ mod tests {
         let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
             .await
             .unwrap();
-        let coalescer = Arc::new(Coalescer::new(
-            Arc::clone(catalog.projections()),
-            CommitDurability::OnFlushInterval,
-        ));
         let store = catalog.store();
         let db = store.writer_db().unwrap();
+        // The store opens with no flush timer, so a durability wait has to
+        // be paired with an explicit flush. That is what the store's own
+        // pacer does; `OnFlushInterval` would wait for a timer that does
+        // not exist.
+        let coalescer = Arc::new(Coalescer::new(
+            Arc::clone(catalog.projections()),
+            store.commit_durability(),
+        ));
 
         // Staged, not sealed: exactly what a caller leaves behind when it is
         // not the last arrival in.
@@ -597,7 +601,7 @@ mod tests {
             .unwrap();
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
-            CommitDurability::OnFlushInterval,
+            catalog.store().commit_durability(),
         ));
 
         // The slot is claimed and its holder vanishes without landing.
@@ -621,7 +625,7 @@ mod tests {
             .unwrap();
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
-            CommitDurability::OnFlushInterval,
+            catalog.store().commit_durability(),
         ));
 
         let flight = coalescer.enter_flight();

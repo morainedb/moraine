@@ -1,23 +1,15 @@
 //! Locating stable row ids in the physical files that currently hold them.
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::{Duration, Instant},
-};
+use std::collections::{HashMap, HashSet};
 
 use futures::{StreamExt, TryStreamExt, stream};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 mod rows_at;
 
-#[cfg(test)]
-mod tests;
-
 pub use rows_at::{ExcludedPositions, LocatedRowScan};
 
-use super::{
-    Catalog, ReadOnlyCatalog, SLOW_RESOLVE, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY,
-};
+use super::{Catalog, ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
 use crate::{
     catalog::{
         CatalogSnapshot, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo,
@@ -220,53 +212,6 @@ pub struct RowSummaryWarmth {
     /// Files it could not summarize. They stay correct but cold: a later
     /// lookup leaves every requested row a candidate for them.
     pub files_failed: u64,
-}
-
-/// Records one resolved set of located rows. The record is the same at
-/// either level, so one parser reads both: debug carries every resolution,
-/// info only the slow ones.
-fn log_located(
-    table: TableId,
-    pairs: usize,
-    deletions: &[LocatedDeletion],
-    summaries_built: usize,
-    inlined_rows: usize,
-    positioning_ms: f64,
-    locate: Duration,
-) {
-    macro_rules! record {
-        ($emit:ident) => {
-            $emit!(
-                table_id = table.get(),
-                pairs,
-                files = deletions.len(),
-                positions = deletions
-                    .iter()
-                    .map(|file| file.positions.len())
-                    .sum::<usize>(),
-                existing_delete_files = deletions
-                    .iter()
-                    .filter(|file| file.existing_delete.is_some())
-                    .count(),
-                existing_positions = deletions
-                    .iter()
-                    .filter_map(|file| file.existing_delete.as_ref())
-                    .map(|existing| existing.positions.len())
-                    .sum::<usize>(),
-                summaries_built,
-                inlined_rows,
-                positioning_ms,
-                locate_ms = locate.as_secs_f64() * 1000.0,
-                "located rows resolved"
-            )
-        };
-    }
-
-    if locate >= SLOW_RESOLVE {
-        record!(info);
-    } else {
-        record!(debug);
-    }
 }
 
 impl ReadOnlyCatalog {
@@ -484,11 +429,9 @@ impl ReadOnlyCatalog {
             snapshot,
         };
 
-        let started = Instant::now();
-        let (positioned, summaries_built) = self
+        let (positioned, _) = self
             .position_requested_files(&scope, by_file, requested_files, MissingRows::Reject)
             .await?;
-        let positioning_ms = started.elapsed().as_secs_f64() * 1000.0;
         let file_id_paths: Vec<_> = positioned
             .iter()
             .map(|file| (file.data_file_id, file.file_path.clone()))
@@ -509,16 +452,6 @@ impl ReadOnlyCatalog {
         // Same snapshot the positions above were resolved against, so the
         // directory names the table's current location, not a later one.
         let write_directory = Some(snapshot.table_write_directory(table)?);
-
-        log_located(
-            table,
-            pairs.len(),
-            &deletions,
-            summaries_built,
-            inlined_rows.len(),
-            positioning_ms,
-            started.elapsed(),
-        );
 
         Ok(LocatedPositions {
             deletions,

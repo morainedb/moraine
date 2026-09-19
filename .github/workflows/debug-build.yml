@@ -1,0 +1,69 @@
+name: Debug build
+# An extension built with debug info, on demand. Release builds carry none:
+# symbols cost size and build time on every publish, and are wanted only
+# when a production stack has to be read frame by frame. Run this, attach
+# the artifact to the process under investigation, and take the dump.
+on:
+  workflow_dispatch:
+    inputs:
+      duckdb_version:
+        description: "DuckDB release to build against, e.g. v1.5.5"
+        required: true
+        default: "v1.5.5"
+      debug_level:
+        description: "Rust debug info: line-tables-only names frames, full adds locals"
+        required: true
+        default: "line-tables-only"
+        type: choice
+        options:
+          - line-tables-only
+          - full
+
+jobs:
+  build:
+    name: Build ${{ inputs.duckdb_version }} with ${{ inputs.debug_level }} symbols
+    runs-on: ubuntu-latest
+    # The extension compiles DuckDB itself; a cold build is most of an hour.
+    timeout-minutes: 180
+    env:
+      # Applied to this run alone. Cargo reads profile keys from the
+      # environment, so nothing in Cargo.toml has to carry them.
+      CARGO_PROFILE_RELEASE_DEBUG: ${{ inputs.debug_level }}
+      # Packed, not unpacked: the symbols have to travel inside the
+      # artifact that gets loaded, not sit beside it in the build tree.
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: packed
+      GEN: ninja
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Check out the requested DuckDB
+        run: |
+          cd duckdb
+          git fetch --depth 1 origin "${{ inputs.duckdb_version }}"
+          git checkout FETCH_HEAD
+
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build ccache
+
+      # RelWithDebInfo on the C++ side, so DuckDB's and the shim's frames
+      # are nameable too — a Rust-only symbol table stops at the ABI.
+      - name: Build
+        run: make reldebug
+
+      - name: Name the artifact after what produced it
+        id: name
+        run: echo "name=moraine-${{ inputs.duckdb_version }}-${{ inputs.debug_level }}-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          # The loadable extension, plus whatever debug files the build
+          # left beside it.
+          path: |
+            build/reldebug/extension/moraine/moraine.duckdb_extension
+            build/reldebug/**/*.dwp
+            build/reldebug/**/*.debug
+          if-no-files-found: error
+          retention-days: 30

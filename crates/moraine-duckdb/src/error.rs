@@ -127,6 +127,17 @@ impl AbiError {
         )
     }
 
+    /// The error a call reports when it outran its statement deadline.
+    /// Shares [`INTERRUPTED`](codes::INTERRUPTED) so a caller already
+    /// handling cancellation handles this, and a commit that had started
+    /// still reports its outcome unknown.
+    pub(crate) fn timed_out(deadline: std::time::Duration) -> Self {
+        Self::new(
+            codes::INTERRUPTED,
+            format!("moraine-duckdb: operation outran the {deadline:?} statement deadline"),
+        )
+    }
+
     /// Writes `self` into a caller-owned [`MoraineError`], if `err` is
     /// non-null. The message is sanitized (embedded NUL bytes stripped) so
     /// the `CString` construction below cannot fail.
