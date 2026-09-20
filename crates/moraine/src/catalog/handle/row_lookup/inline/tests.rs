@@ -56,11 +56,12 @@ async fn fixture() -> (Arc<InMemory>, TableId) {
     (store, table)
 }
 
-/// The writer's inline directory stands until a commit moves a chunk's
-/// row-id range. An unrelated table's commit and a row delete both leave
-/// every range where it was; a new chunk does not.
+/// The writer scans a table's chunks once and folds every batch after it
+/// into the set that scan seeded, so no later lookup goes back to the
+/// store -- not for an unrelated table's commit, not for a row delete, and
+/// not for a chunk the fold has to add.
 #[tokio::test]
-async fn a_writer_rebuilds_an_inline_directory_only_when_a_chunk_range_moves() {
+async fn a_writer_scans_a_table_once_and_folds_every_batch_after_it() {
     let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
         .unwrap();
@@ -107,15 +108,24 @@ async fn a_writer_rebuilds_an_inline_directory_only_when_a_chunk_range_moves() {
         .await
         .unwrap();
     assert!(catalog.recent_row(looked_up, 1).await.unwrap().is_none());
-    assert_eq!(builds(), 1, "a row delete rebuilt the directory");
+    assert_eq!(
+        builds(),
+        1,
+        "a row delete sent the lookup back to the store"
+    );
 
-    // A chunk arriving does move ranges, and has to be picked up.
+    // A chunk arriving moves ranges, and the fold carries it: the row it
+    // holds resolves, from a directory rebuilt without a scan.
     catalog
         .commit(|tx| tx.inline_insert(looked_up, &chunk, &[]).map(|_| ()))
         .await
         .unwrap();
     assert!(catalog.recent_row(looked_up, 2).await.unwrap().is_some());
-    assert_eq!(builds(), 2, "a new chunk was served from a stale directory");
+    assert_eq!(
+        builds(),
+        1,
+        "a folded chunk sent the lookup back to the store"
+    );
     catalog.close().await.unwrap();
 }
 

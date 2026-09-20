@@ -675,39 +675,7 @@ impl InlineOperation {
     }
 }
 
-impl InlineKey {
-    /// The table whose inline state this key belongs to.
-    /// Whether a write to this key can move a chunk's row-id range, and so
-    /// stale a table's inline directory. The directory mirrors the
-    /// [`ChunkLocator`](Self::ChunkLocator) subspace; a chunk record is
-    /// named too, so a chunk written without its locator stales the
-    /// directory rather than being served from a stale one.
-    ///
-    /// Exhaustive on purpose: a variant added later must be classified
-    /// rather than defaulting to "harmless".
-    pub(crate) fn moves_a_chunk_range(&self) -> bool {
-        match self {
-            Self::Live(_) | Self::Arch(_) | Self::ChunkLocator { .. } => true,
-            Self::Schema { .. }
-            | Self::FileDeleteTable { .. }
-            | Self::ChunkRange { .. }
-            | Self::SchemaDropped { .. }
-            | Self::RowTombstone { .. } => false,
-        }
-    }
-
-    pub(crate) fn table_id(&self) -> u64 {
-        match self {
-            Self::Live(operation) | Self::Arch(operation) => operation.table_id(),
-            Self::Schema { table_id, .. }
-            | Self::FileDeleteTable { table_id }
-            | Self::ChunkRange { table_id, .. }
-            | Self::SchemaDropped { table_id, .. }
-            | Self::ChunkLocator { table_id, .. }
-            | Self::RowTombstone { table_id, .. } => *table_id,
-        }
-    }
-}
+impl InlineKey {}
 
 impl InlineOperationKind {
     /// An op of this kind with its table id set and every other component
