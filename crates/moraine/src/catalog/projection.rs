@@ -728,7 +728,12 @@ impl ProjectionCache {
                 self.clear_folded();
                 return;
             };
-            if let Key::Inline(inline) = &key {
+            // Only a write that can move a chunk's range stales the
+            // directory: a row tombstone, a schema or a file-delete marker
+            // leaves every range exactly where it was.
+            if let Key::Inline(inline) = &key
+                && inline.moves_a_chunk_range()
+            {
                 inline_tables.insert(inline.table_id());
             }
             match key {
