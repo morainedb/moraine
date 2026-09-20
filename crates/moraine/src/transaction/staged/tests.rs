@@ -8577,7 +8577,7 @@ async fn an_oversized_batch_is_refused_rather_than_staged() {
     let catalog = open().await;
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
-    for id in 0..=u64::try_from(super::MAX_STAGED_ROWS_PER_COMMIT).unwrap() {
+    for id in 0..=u64::try_from(super::MAX_STAGED_COST_PER_COMMIT).unwrap() {
         tx.stage(RowOperation::Insert {
             table: TableKind::Schema,
             cells: schema_row(id, "s", 1),
@@ -8597,4 +8597,24 @@ async fn an_oversized_batch_is_refused_rather_than_staged() {
 
     // Nothing landed: the store still stands where it did.
     assert_eq!(catalog.snapshot().await.unwrap().snapshot.snapshot_id, 0);
+}
+
+/// An update counts twice against the budget, because it both ends the
+/// live version and writes what replaces it. Half the limit in updates is
+/// therefore the whole of it.
+#[tokio::test]
+async fn an_update_costs_twice_what_an_insert_does() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    for id in 0..=u64::try_from(super::MAX_STAGED_COST_PER_COMMIT / 2).unwrap() {
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::Schema,
+            cells: vec![Cell::U64(id), Cell::U64(2)],
+        });
+    }
+
+    let err = tx.commit().await.unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+    assert!(err.to_string().contains("twice the updates"), "{err}");
 }
