@@ -141,6 +141,7 @@ where
                 || message == "scanned committed snapshots for staged transaction"
                 || message == "scanned committed schema versions for staged transaction"
                 || message == "staged commit landed"
+                || message == "index upkeep landed"
         }) {
             self.0
                 .lock()
@@ -183,8 +184,20 @@ impl CapturedCommitEvents {
             .count()
     }
 
+    /// A phase's milliseconds, from whichever of the two commit records
+    /// carries it: the summary, or the index-upkeep detail beside it.
     fn phase_milliseconds(&self, transaction_id: u64, phase: &str) -> u64 {
-        self.one("staged commit landed", &transaction_id.to_string())
+        let id = transaction_id.to_string();
+        let mut carrying = self.one("staged commit landed", &id);
+        if !carrying.contains_key(phase) {
+            // The index detail rides its own record, and a commit that
+            // touched no index emits none: its index phases are zero.
+            if self.count("index upkeep landed", &id) == 0 {
+                return 0;
+            }
+            carrying = self.one("index upkeep landed", &id);
+        }
+        carrying
             .get(phase)
             .unwrap_or_else(|| panic!("commit event has no {phase}"))
             .parse()
@@ -248,19 +261,11 @@ async fn staged_commit_diagnostics_join_scan_counts_and_commit_phases() {
     for phase in [
         "head_view_ms",
         "inline_ms",
-        "index_maintenance_ms",
         "translate_ms",
         "stage_ms",
         "land_ms",
         "durable_ms",
         "projection_ms",
-        "index_delete_derivation_ms",
-        "index_add_derivation_ms",
-        "index_probe_window_ms",
-        "index_probe_service_ms",
-        "index_stage_ms",
-        "index_encode_ms",
-        "index_parquet_read_ms",
     ] {
         let value = commit
             .get(phase)
@@ -270,6 +275,9 @@ async fn staged_commit_diagnostics_join_scan_counts_and_commit_phases() {
             "{phase} is not integer ms: {value}"
         );
     }
+    // This commit touches no index, so the detail beside it is not
+    // reported at all rather than reported as a row of zeroes.
+    assert_eq!(events.count("index upkeep landed", &transaction_id), 0);
 
     catalog.close().await.unwrap();
 }
@@ -2687,7 +2695,7 @@ async fn a_cumulative_delete_file_derives_only_the_positions_it_newly_kills() {
 
     assert_eq!(
         events
-            .one("staged commit landed", &transaction_id)
+            .one("index upkeep landed", &transaction_id)
             .get("index_deletions")
             .map(String::as_str),
         Some("1"),
@@ -4077,10 +4085,10 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
     );
     // Derived deletions name rows live at the base, so the unique entries
     // are removed without a guard read each.
-    let landed = events.one("staged commit landed", &transaction_id);
-    assert_eq!(landed.get("index_deletions").map(String::as_str), Some("2"));
+    let upkeep = events.one("index upkeep landed", &transaction_id);
+    assert_eq!(upkeep.get("index_deletions").map(String::as_str), Some("2"));
     assert_eq!(
-        landed.get("index_guard_reads").map(String::as_str),
+        upkeep.get("index_guard_reads").map(String::as_str),
         Some("0")
     );
 }
@@ -8476,4 +8484,137 @@ fn staged_statistics_deletes_update_entity_counts_once() {
         .unwrap();
         assert_eq!(state.live_entity_count(), 0);
     }
+}
+
+/// A read-write handle serves its held view without resolving the head
+/// from the store, so that view stands at the snapshot its own last commit
+/// minted.
+#[tokio::test]
+async fn a_writers_view_stands_at_the_snapshot_its_last_commit_minted() {
+    const TABLE: u64 = 12;
+    let catalog = open().await;
+
+    let setup_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached_on(&catalog, setup_tx);
+    setup.stage(RowOperation::InlineInsert {
+        table_id: TABLE,
+        schema_version: 0,
+        begin_snapshot: 1,
+        row_id_start: 0,
+        row_count: 2,
+        arrow_body: b"chunk".to_vec().into(),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 0, 1),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "inlined_insert:12"),
+    });
+    let minted = setup.commit().await.unwrap();
+    assert_eq!(
+        catalog.snapshot().await.unwrap().snapshot.snapshot_id,
+        minted.get(),
+        "the view stands at the first commit"
+    );
+
+    // Reclaims the table's inline records, which clears the held view.
+    let flush_tx = catalog.begin_write_tx().await.unwrap();
+    let mut flush = StagedTransaction::begin_detached_on(&catalog, flush_tx);
+    flush.stage(RowOperation::InlineFlushDelete {
+        table_id: TABLE,
+        schema_version: 0,
+        flush_snapshot: 1,
+    });
+    flush.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 0, 1),
+    });
+    flush.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "inline_flush:12,deleted_from_table:12"),
+    });
+    let minted = flush.commit().await.unwrap();
+    assert_eq!(
+        catalog.snapshot().await.unwrap().snapshot.snapshot_id,
+        minted.get(),
+        "the view stands at the flush"
+    );
+
+    // Nothing else is committing; this lands on its own.
+    let next_tx = catalog.begin_write_tx().await.unwrap();
+    let mut next = StagedTransaction::begin_detached_on(&catalog, next_tx);
+    next.stage(RowOperation::InlineInsert {
+        table_id: TABLE,
+        schema_version: 0,
+        begin_snapshot: 3,
+        row_id_start: 2,
+        row_count: 2,
+        arrow_body: b"more".to_vec().into(),
+    });
+    next.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(3, 0, 1),
+    });
+    next.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, "inlined_insert:12"),
+    });
+    let minted = next.commit().await.unwrap();
+
+    assert_eq!(
+        catalog.snapshot().await.unwrap().snapshot.snapshot_id,
+        minted.get(),
+        "the writer must not serve a view behind the commit it just made"
+    );
+}
+
+/// A batch above the per-commit row limit is refused before it stages
+/// anything, and its refusal reads as final rather than retryable.
+#[tokio::test]
+async fn an_oversized_batch_is_refused_rather_than_staged() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    for id in 0..=u64::try_from(super::MAX_STAGED_COST_PER_COMMIT).unwrap() {
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Schema,
+            cells: schema_row(id, "s", 1),
+        });
+    }
+
+    let err = tx.commit().await.unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+    let text = err.to_string().to_ascii_lowercase();
+    assert!(text.contains("split the work"), "{text}");
+    for retried in ["conflict", "concurrent", "unique", "primary key"] {
+        assert!(
+            !text.contains(retried),
+            "the refusal must not read as retryable to DuckLake: {text}"
+        );
+    }
+
+    // Nothing landed: the store still stands where it did.
+    assert_eq!(catalog.snapshot().await.unwrap().snapshot.snapshot_id, 0);
+}
+
+/// An update counts twice against the budget, because it both ends the
+/// live version and writes what replaces it. Half the limit in updates is
+/// therefore the whole of it.
+#[tokio::test]
+async fn an_update_costs_twice_what_an_insert_does() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    for id in 0..=u64::try_from(super::MAX_STAGED_COST_PER_COMMIT / 2).unwrap() {
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::Schema,
+            cells: vec![Cell::U64(id), Cell::U64(2)],
+        });
+    }
+
+    let err = tx.commit().await.unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+    assert!(err.to_string().contains("twice the updates"), "{err}");
 }

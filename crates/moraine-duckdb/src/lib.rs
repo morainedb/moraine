@@ -183,7 +183,10 @@
 //!
 //! The core emits `tracing` events; this crate forwards them to DuckDB's
 //! logger, so they appear in `duckdb_logs` under the `moraine` type.
-//! `MORAINE_LOG` sets the captured level (default `info`). See [`logging`]
+//! `MORAINE_LOG` sets the captured level for moraine's own events (default
+//! `info`); `MORAINE_LOG_DEPENDENCIES` does the same for everything it
+//! depends on (default `warn`), which is held back separately because one
+//! HTTP client at `debug` buries a catalog's own records. See [`logging`]
 //! for the buffering and drain mechanics.
 //!
 //! `enable_logging` is a table function, and its default storage writes to

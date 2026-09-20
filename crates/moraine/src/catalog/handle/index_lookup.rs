@@ -6,14 +6,13 @@ use std::{
 };
 
 use futures::{StreamExt, stream::FuturesUnordered};
-use tracing::{debug, info};
+use tracing::debug;
 
-use super::{ReadOnlyCatalog, SLOW_RESOLVE, cache_epoch, index_probe_cache::Probe};
+use super::{ReadOnlyCatalog, cache_epoch, index_probe_cache::Probe};
 use crate::{
     catalog::{CatalogSnapshot, IndexId, IndexInfo, IndexState, TableId},
     error::{Error, Result},
     store::{
-        cache::{CacheTally, ObjectStoreTally},
         handle::{ReadHandle, ReadSession, ScanOrder},
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
@@ -29,7 +28,6 @@ const INDEX_LOOKUP_CONCURRENCY: usize = 512;
 
 #[derive(Default)]
 struct LookupMetrics {
-    unique_keys: u64,
     /// Time until a ready definition was in hand.
     head: Duration,
     probe_window: Duration,
@@ -51,7 +49,6 @@ async fn resolve_encoded(
     encoded: Vec<CanonicalKey>,
 ) -> Result<LookupResolution> {
     let mut metrics = LookupMetrics {
-        unique_keys: u64::try_from(encoded.len()).unwrap_or(u64::MAX),
         ..LookupMetrics::default()
     };
     let mut pending = encoded.into_iter();
@@ -100,54 +97,6 @@ async fn resolve_encoded(
     Ok(LookupResolution { row_ids, metrics })
 }
 
-/// Records one resolved lookup. The record is the same at either level, so
-/// one parser reads both: debug carries every lookup, info only the slow
-/// ones.
-fn log_lookup(
-    table: TableId,
-    index: IndexId,
-    requested_keys: usize,
-    elapsed: Duration,
-    metrics: &LookupMetrics,
-    cache: CacheTally,
-    store: ObjectStoreTally,
-) {
-    macro_rules! record {
-        ($emit:ident) => {
-            $emit!(
-                table_id = table.get(),
-                index_id = index.get(),
-                lookup_keys = requested_keys,
-                lookup_unique_keys = metrics.unique_keys,
-                lookup_ms = milliseconds(elapsed),
-                lookup_head_ms = milliseconds(metrics.head),
-                lookup_probe_window_ms = milliseconds(metrics.probe_window),
-                lookup_probe_service_ms = milliseconds(metrics.probe_service),
-                lookup_hits = metrics.hits,
-                lookup_misses = metrics.misses,
-                lookup_peak_in_flight = metrics.peak_in_flight,
-                lookup_metadata_hits = cache.metadata_hits,
-                lookup_metadata_misses = cache.metadata_misses,
-                lookup_block_hits = cache.block_hits,
-                lookup_block_misses = cache.block_misses,
-                lookup_metadata_disk_hits = cache.metadata_disk_hits,
-                lookup_block_disk_hits = cache.block_disk_hits,
-                lookup_cache_errors = cache.errors,
-                lookup_gets = store.main_gets,
-                lookup_get_ms = milliseconds(store.main_get_duration),
-                lookup_store_errors = store.errors,
-                "index lookup resolved"
-            )
-        };
-    }
-
-    if elapsed >= SLOW_RESOLVE {
-        record!(info);
-    } else {
-        record!(debug);
-    }
-}
-
 impl ReadOnlyCatalog {
     /// Resolves an equality lookup to the rows currently holding `values`.
     ///
@@ -194,9 +143,6 @@ impl ReadOnlyCatalog {
         keys: &[Vec<IndexKeyValue>],
     ) -> Result<Vec<u64>> {
         let started = Instant::now();
-        let cache_before = self.cache_tally();
-        let store_before = self.object_store_tally();
-
         let mut session = None;
         let index_row_ids = self
             .lookup_at_head(&mut session, table, index, async |handle, info| {
@@ -206,14 +152,15 @@ impl ReadOnlyCatalog {
                     let mut resolution =
                         resolve_encoded(handle, index.get(), info.unique, encoded).await?;
                     resolution.metrics.head = head;
-                    log_lookup(
-                        table,
-                        index,
-                        keys.len(),
-                        started.elapsed(),
-                        &resolution.metrics,
-                        self.cache_tally().since(cache_before),
-                        self.object_store_tally().since(store_before),
+                    // One line per resolved lookup, and only what naming it
+                    // costs nothing to carry: a probe reused inside a
+                    // transaction resolves once, and this is what says so.
+                    debug!(
+                        table_id = table.get(),
+                        index_id = index.get(),
+                        lookup_keys = keys.len(),
+                        lookup_ms = milliseconds(started.elapsed()),
+                        "index lookup resolved"
                     );
                     Ok(resolution.row_ids)
                 })

@@ -1421,6 +1421,11 @@ impl StagedTransaction {
             .map(Store::commit_durability)
             .unwrap_or_default();
         let staged_rows = ops.len();
+        let staged_cost = staged_cost(&ops);
+        if staged_cost > MAX_STAGED_COST_PER_COMMIT {
+            db_tx.rollback();
+            return Err(oversized_staged_cost(staged_cost));
+        }
         let mut uses_inline_chunk_directory = ops
             .iter()
             .any(|operation| matches!(operation, RowOperation::InlineInsert { .. }));
@@ -1592,8 +1597,11 @@ impl StagedTransaction {
                         staged_landed(
                             diagnostic_id,
                             result_id,
-                            staged_rows,
-                            staged_bytes,
+                            StagedSize {
+                                rows: staged_rows,
+                                cost: staged_cost,
+                                bytes: staged_bytes,
+                            },
                             &phases,
                             commit_timings,
                             started,
@@ -1716,11 +1724,21 @@ async fn stage_batch(
 }
 
 /// One landed staged commit's summary event.
+/// What one commit staged, the three ways the summary measures it.
+#[derive(Clone, Copy)]
+struct StagedSize {
+    /// Staged row operations.
+    rows: usize,
+    /// Those operations against [`MAX_STAGED_COST_PER_COMMIT`].
+    cost: usize,
+    /// Their encoded size.
+    bytes: StagedBytes,
+}
+
 fn staged_landed(
     transaction_id: u64,
     result_id: u64,
-    staged_rows: usize,
-    staged_bytes: StagedBytes,
+    staged: StagedSize,
     phases: &CommitPhases,
     commit_timings: commit::CommitTimings,
     started: Instant,
@@ -1728,10 +1746,37 @@ fn staged_landed(
     debug!(
         transaction_id,
         snapshot = result_id,
-        staged_rows,
-        staged_bytes = staged_bytes.0,
+        staged_rows = staged.rows,
+        staged_cost = staged.cost,
+        staged_bytes = staged.bytes.0,
         head_view_ms = milliseconds(phases.head_view),
         inline_ms = milliseconds(phases.inline),
+        translate_ms = milliseconds(phases.translate),
+        stage_ms = milliseconds(phases.stage),
+        land_ms = milliseconds(phases.land),
+        durable_ms = milliseconds(commit_timings.durable),
+        projection_ms = milliseconds(commit_timings.projection),
+        elapsed_ms = milliseconds(started.elapsed()),
+        "staged commit landed"
+    );
+    index_upkeep_landed(transaction_id, result_id, phases);
+}
+
+/// The index-maintenance detail behind one landed commit, reported only
+/// when that commit touched an index: twenty-odd fields of zeroes on every
+/// other commit would bury the summary above them.
+fn index_upkeep_landed(transaction_id: u64, result_id: u64, phases: &CommitPhases) {
+    let metrics = &phases.index_metrics;
+    let touched_an_index = metrics.additions > 0
+        || metrics.deletions > 0
+        || metrics.guard_reads > 0
+        || metrics.unique_probes > 0;
+    if !touched_an_index {
+        return;
+    }
+    debug!(
+        transaction_id,
+        snapshot = result_id,
         index_maintenance_ms = milliseconds(phases.index_maintenance),
         index_delete_derivation_ms = milliseconds(phases.index_metrics.deletion_derivation),
         index_add_derivation_ms = milliseconds(phases.index_metrics.addition_derivation),
@@ -1757,18 +1802,37 @@ fn staged_landed(
         index_files = phases.index_metrics.scoped_read.parquet_files,
         index_inline_chunks = phases.index_metrics.scoped_read.inline_chunks,
         index_arrow_batches = phases.index_metrics.scoped_read.arrow_batches,
-        translate_ms = milliseconds(phases.translate),
-        stage_ms = milliseconds(phases.stage),
-        land_ms = milliseconds(phases.land),
-        durable_ms = milliseconds(commit_timings.durable),
-        projection_ms = milliseconds(commit_timings.projection),
-        elapsed_ms = milliseconds(started.elapsed()),
-        // Rides here because this record demonstrably reaches its reader:
-        // a heartbeat reporting its own ticks cannot distinguish a stopped
-        // timer from a lost record, and this can.
-        runtime_ticks = crate::telemetry::runtime_ticks(),
-        "staged commit landed"
+        "index upkeep landed"
     );
+}
+
+/// The most a single commit may stage, counted as inserts plus twice the
+/// updates plus deletes. A batch is held whole in memory and leaves as one
+/// object-store PUT, so an oversized one is refused up front rather than
+/// discovered as a slow commit.
+const MAX_STAGED_COST_PER_COMMIT: usize = 100_000;
+
+/// What `ops` costs against [`MAX_STAGED_COST_PER_COMMIT`]. An update both
+/// ends the live version and writes what replaces it, so it counts twice.
+fn staged_cost(ops: &[RowOperation]) -> usize {
+    ops.iter().fold(0, |cost, op| {
+        let weight = match op {
+            RowOperation::UpdateSetEnd { .. } | RowOperation::UpdateSetBegin { .. } => 2,
+            _ => 1,
+        };
+        cost.saturating_add(weight)
+    })
+}
+
+/// The refusal for an oversized batch. Its text must avoid DuckLake's
+/// retry substrings (`conflict`, `concurrent`, `unique`, `primary key`),
+/// which would re-drive a commit that can only fail the same way.
+fn oversized_staged_cost(staged: usize) -> Error {
+    Error::Constraint(format!(
+        "commit stages {staged} operations, counted as inserts plus twice the updates \
+         plus deletes, above the {MAX_STAGED_COST_PER_COMMIT} a single commit allows. \
+         Split the work into several smaller commits."
+    ))
 }
 
 /// The lost-race error for a staged commit, logged as it is built. Its
