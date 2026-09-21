@@ -14,13 +14,102 @@ use bytes::Bytes;
 use crate::{
     catalog::CatalogSnapshot,
     store::{
-        key::{CurrentKey, EntityKey, Key, SysKey},
-        proto::{HeadValue, SnapshotValue, TableColumnStatsValue, TableStatsValue},
+        inline::InlineChunkLocator,
+        key::{CurrentKey, EntityKey, InlineKey, InlineOperation, Key, SysKey},
+        proto::{
+            HeadValue, InlineChunkRangeValue, SnapshotValue, TableColumnStatsValue, TableStatsValue,
+        },
         read::{EntityRecord, RecordSet, decode_current_record, decode_history_record},
         value,
     },
     transaction::commit::StagedWrite,
 };
+
+/// One batch's writes to the inline chunk directory, gathered as the batch
+/// is walked and applied once it is known to have landed.
+///
+/// The locator subspace is the directory, so a write there is the whole of
+/// what moves it. A chunk written without its locator is a batch this
+/// cannot follow: the table's set is dropped rather than left a range
+/// short, because a short set resolves a row to the wrong chunk.
+#[derive(Default)]
+struct InlineFold {
+    writes: Vec<(u64, InlineOperation, Option<InlineChunkLocator>)>,
+    chunks: BTreeSet<(u64, InlineOperation)>,
+    unfollowable: BTreeSet<u64>,
+}
+
+impl InlineFold {
+    fn observe(&mut self, key: &Key, bytes: Option<&[u8]>) {
+        match key {
+            Key::Inline(InlineKey::ChunkLocator {
+                table_id,
+                row_id_end,
+                schema_version,
+                begin_snapshot,
+                chunk_seq,
+            }) => {
+                let operation = InlineOperation::Insert {
+                    table_id: *table_id,
+                    schema_version: *schema_version,
+                    begin_snapshot: *begin_snapshot,
+                    chunk_seq: *chunk_seq,
+                };
+                let located = bytes
+                    .map(|bytes| {
+                        value::decode_owned::<InlineChunkRangeValue>(Bytes::copy_from_slice(bytes))
+                            .and_then(|range| {
+                                InlineChunkLocator::from_directory(
+                                    operation,
+                                    range.row_id_start,
+                                    *row_id_end,
+                                )
+                            })
+                    })
+                    .transpose();
+                match located {
+                    Ok(locator) => self.writes.push((*table_id, operation, locator)),
+                    Err(_) => {
+                        self.unfollowable.insert(*table_id);
+                    }
+                }
+            }
+            Key::Inline(InlineKey::Live(operation) | InlineKey::Arch(operation)) => {
+                self.chunks.insert((operation.table_id(), *operation));
+            }
+            _ => {}
+        }
+    }
+
+    fn apply(
+        mut self,
+        sets: &mut BTreeMap<u64, imbl::OrdMap<InlineOperation, InlineChunkLocator>>,
+    ) {
+        let located: BTreeSet<(u64, InlineOperation)> = self
+            .writes
+            .iter()
+            .map(|(table_id, operation, _)| (*table_id, *operation))
+            .collect();
+        for (table_id, _) in self.chunks.difference(&located) {
+            self.unfollowable.insert(*table_id);
+        }
+        for table_id in &self.unfollowable {
+            sets.remove(table_id);
+        }
+        for (table_id, operation, locator) in self.writes {
+            if self.unfollowable.contains(&table_id) {
+                continue;
+            }
+            let Some(set) = sets.get_mut(&table_id) else {
+                continue;
+            };
+            match locator {
+                Some(locator) => set.insert(operation, locator),
+                None => set.remove(&operation),
+            };
+        }
+    }
+}
 
 /// One maintained projection: decoded rows stamped with the head snapshot
 /// id they are valid at. `head: None` means not installed — serves refuse
@@ -317,16 +406,30 @@ pub(crate) fn note_migration_clear(cache: &std::sync::RwLock<ProjectionCache>, h
 /// Whether an inline directory for `table_id` built at `built_at` still
 /// describes the table's inline state at `head`: every batch since
 /// `built_at` has folded here and none wrote the table's inline keys.
-pub(crate) fn inline_directory_current(
+/// `table_id`'s live chunk locators, folded forward to `head`, or `None`
+/// when no set stands there and the store has to be scanned.
+pub(crate) fn folded_inline_locators(
     cache: &std::sync::RwLock<ProjectionCache>,
     table_id: u64,
-    built_at: &HeadValue,
     head: &HeadValue,
-) -> bool {
+) -> Option<imbl::OrdMap<InlineOperation, InlineChunkLocator>> {
     cache
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .inline_directory_current(table_id, built_at, head)
+        .folded_inline_locators(table_id, head)
+}
+
+/// Holds a scanned locator set so later batches fold it forward.
+pub(crate) fn seed_inline_locators(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    table_id: u64,
+    head: &HeadValue,
+    locators: imbl::OrdMap<InlineOperation, InlineChunkLocator>,
+) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .seed_inline_locators(table_id, head, locators);
 }
 
 pub(crate) fn inline_directory_complete(
@@ -473,13 +576,11 @@ pub(crate) struct ProjectionCache {
     /// Invalidation leaves it standing: it describes the store, not a view
     /// of it.
     inline_directory_complete: BTreeSet<u64>,
-    /// The head each table's inline keys were last written at by a folded
-    /// batch, recorded continuously since `inline_tracked_from`.
-    inline_changed: BTreeMap<u64, HeadValue>,
-    /// The state from which every later batch's inline writes are in
-    /// `inline_changed`; `None` until a batch folds, and again after one
-    /// cannot.
-    inline_tracked_from: Option<HeadValue>,
+    /// Every live chunk locator of a table, folded forward by each batch
+    /// and so always standing at `folded_head`. A table is absent until a
+    /// scan seeds it, and removed again whenever a batch writes a chunk
+    /// this cannot follow.
+    inline_locators: BTreeMap<u64, imbl::OrdMap<InlineOperation, InlineChunkLocator>>,
     /// Per table, an upper bound on the widest live inline chunk. Only ever
     /// raised, so it always bounds the true width from above however stale
     /// it is — a bound that could fall would silently skip a chunk.
@@ -526,35 +627,42 @@ impl ProjectionCache {
             format_floor: 0,
             migration_clear: None,
             inline_directory_complete: BTreeSet::new(),
-            inline_changed: BTreeMap::new(),
-            inline_tracked_from: None,
+            inline_locators: BTreeMap::new(),
             inline_chunk_width: BTreeMap::new(),
             epoch: 0,
         }
     }
 
-    /// Whether `table_id`'s chunk-range directory is known to name every
-    /// chunk.
-    fn inline_directory_current(
+    /// `table_id`'s live chunk locators, if a seeded set stands at `head`.
+    fn folded_inline_locators(
         &self,
         table_id: u64,
-        built_at: &HeadValue,
         head: &HeadValue,
-    ) -> bool {
-        let at_or_before = |earlier: &HeadValue, later: &HeadValue| {
-            (earlier.snapshot_id, earlier.batch_seq) <= (later.snapshot_id, later.batch_seq)
-        };
+    ) -> Option<imbl::OrdMap<InlineOperation, InlineChunkLocator>> {
         self.folded_head
             .as_ref()
             .is_some_and(|folded| same_head(folded, head))
-            && self
-                .inline_tracked_from
-                .as_ref()
-                .is_some_and(|from| at_or_before(from, built_at))
-            && self
-                .inline_changed
-                .get(&table_id)
-                .is_none_or(|changed| at_or_before(changed, built_at))
+            .then(|| self.inline_locators.get(&table_id).cloned())
+            .flatten()
+    }
+
+    /// Holds `locators` as `table_id`'s live chunk set, which every later
+    /// batch folds forward. Seeding a set the fold cannot follow would
+    /// serve wrong ranges, so a set only stands while it stands at
+    /// `folded_head`.
+    pub(crate) fn seed_inline_locators(
+        &mut self,
+        table_id: u64,
+        head: &HeadValue,
+        locators: imbl::OrdMap<InlineOperation, InlineChunkLocator>,
+    ) {
+        if self
+            .folded_head
+            .as_ref()
+            .is_some_and(|folded| same_head(folded, head))
+        {
+            self.inline_locators.insert(table_id, locators);
+        }
     }
 
     pub(crate) fn inline_directory_complete(&self, table_id: u64) -> bool {
@@ -721,16 +829,14 @@ impl ProjectionCache {
         self.drop_what_lags_behind();
         let mut current = self.take_half(Half::Current);
         let mut history = self.take_half(Half::History);
-        let mut inline_tables = BTreeSet::new();
+        let mut inline = InlineFold::default();
         for (encoded_key, write) in writes {
             let bytes = write.as_deref();
             let Ok(key) = Key::decode(encoded_key) else {
                 self.clear_folded();
                 return;
             };
-            if let Key::Inline(inline) = &key {
-                inline_tables.insert(inline.table_id());
-            }
+            inline.observe(&key, bytes);
             match key {
                 Key::Snapshot { snapshot_id } => self.snapshots.fold(snapshot_id, bytes),
                 Key::Current(CurrentKey::Entity(EntityKey::TableStats { table_id })) => {
@@ -761,12 +867,7 @@ impl ProjectionCache {
         self.table_column_stats.advance(stamp);
         self.current_entities = current.map(|(_, records)| (stamp, Arc::new(records)));
         self.history_entities = history.map(|(_, records)| (stamp, Arc::new(records)));
-        if self.inline_tracked_from.is_none() {
-            self.inline_tracked_from = Some(self.folded_head.unwrap_or(stamp));
-        }
-        for table_id in inline_tables {
-            self.inline_changed.insert(table_id, stamp);
-        }
+        inline.apply(&mut self.inline_locators);
         self.folded_head = Some(stamp);
     }
 
@@ -810,8 +911,7 @@ impl ProjectionCache {
     fn clear_folded(&mut self) {
         self.current_entities = None;
         self.history_entities = None;
-        self.inline_changed.clear();
-        self.inline_tracked_from = None;
+        self.inline_locators.clear();
         self.snapshots.clear();
         self.table_stats.clear();
         self.table_column_stats.clear();

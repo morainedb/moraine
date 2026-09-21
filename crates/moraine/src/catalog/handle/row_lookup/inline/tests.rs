@@ -56,10 +56,12 @@ async fn fixture() -> (Arc<InMemory>, TableId) {
     (store, table)
 }
 
-/// A commit that writes no inline key of a table leaves the writer's
-/// inline directory for it in place; one that does rebuilds it.
+/// The writer scans a table's chunks once and folds every batch after it
+/// into the set that scan seeded, so no later lookup goes back to the
+/// store -- not for an unrelated table's commit, not for a row delete, and
+/// not for a chunk the fold has to add.
 #[tokio::test]
-async fn a_writer_rebuilds_an_inline_directory_only_when_its_table_changes() {
+async fn a_writer_scans_a_table_once_and_folds_every_batch_after_it() {
     let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
         .unwrap();
@@ -99,12 +101,31 @@ async fn a_writer_rebuilds_an_inline_directory_only_when_its_table_changes() {
     assert!(catalog.recent_row(looked_up, 1).await.unwrap().is_some());
     assert_eq!(builds(), 1, "an unrelated commit rebuilt the directory");
 
+    // A tombstone moves no range: the directory stands, and the row is
+    // still resolved as dead from the tombstone beside it.
     catalog
         .commit(|tx| tx.inline_delete(looked_up, 1, &[]))
         .await
         .unwrap();
     assert!(catalog.recent_row(looked_up, 1).await.unwrap().is_none());
-    assert_eq!(builds(), 2, "a delete on the table kept a stale directory");
+    assert_eq!(
+        builds(),
+        1,
+        "a row delete sent the lookup back to the store"
+    );
+
+    // A chunk arriving moves ranges, and the fold carries it: the row it
+    // holds resolves, from a directory rebuilt without a scan.
+    catalog
+        .commit(|tx| tx.inline_insert(looked_up, &chunk, &[]).map(|_| ()))
+        .await
+        .unwrap();
+    assert!(catalog.recent_row(looked_up, 2).await.unwrap().is_some());
+    assert_eq!(
+        builds(),
+        1,
+        "a folded chunk sent the lookup back to the store"
+    );
     catalog.close().await.unwrap();
 }
 

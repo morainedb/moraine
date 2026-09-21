@@ -39,6 +39,25 @@ pub(crate) struct InlineChunkLocator {
 }
 
 impl InlineChunkLocator {
+    /// The locator a chunk-directory write names: the key carries the
+    /// chunk's identity and the end of its range, the value the start.
+    pub(crate) fn from_directory(
+        operation: InlineOperation,
+        row_id_start: u64,
+        row_id_end: u64,
+    ) -> Result<Self> {
+        if row_id_start > row_id_end {
+            return Err(Error::Corruption(format!(
+                "inline chunk directory names an inverted range {row_id_start}..={row_id_end}"
+            )));
+        }
+        Ok(Self {
+            operation,
+            row_id_start,
+            row_id_end,
+        })
+    }
+
     /// Metadata for a nonempty immutable insert chunk.
     pub(crate) fn from_chunk(
         operation: InlineOperation,

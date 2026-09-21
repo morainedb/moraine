@@ -32,18 +32,26 @@ impl ReadOnlyCatalog {
         table: TableId,
         head: HeadValue,
     ) -> Result<(Arc<InlineDirectory>, Option<ScannedChunks>)> {
-        // A directory outlives its head while the writer's fold shows no
-        // batch since touched the table's inline keys.
-        let cached = super::lookup(&self.row_lookups.inline, table).filter(|directory| {
-            directory.head == head
-                || projection::inline_directory_current(
-                    &self.projections,
-                    table.get(),
-                    &directory.head,
-                    &head,
-                )
-        });
+        let cached =
+            super::lookup(&self.row_lookups.inline, table).filter(|held| held.head == head);
         if let Some(directory) = cached {
+            return Ok((directory, None));
+        }
+
+        // The writer folds every batch's locator writes, so its set already
+        // stands at this head: rebuilt from memory, with no scan at all.
+        if let Some(locators) =
+            projection::folded_inline_locators(&self.projections, table.get(), &head)
+        {
+            let directory = Arc::new(InlineDirectory {
+                head,
+                ranges: Intervals::new(
+                    locators
+                        .values()
+                        .map(|locator| (locator.row_id_start(), locator.row_id_end(), *locator)),
+                ),
+            });
+            super::install(&self.row_lookups.inline, table, Arc::clone(&directory));
             return Ok((directory, None));
         }
         self.row_lookups.note_inline_directory_built();
@@ -66,6 +74,17 @@ impl ReadOnlyCatalog {
             }
             locators
         };
+        // Seeded so every later batch folds it forward instead of sending
+        // the next lookup back to the store.
+        projection::seed_inline_locators(
+            &self.projections,
+            table.get(),
+            &head,
+            locators
+                .iter()
+                .map(|locator| (locator.operation(), *locator))
+                .collect(),
+        );
         let directory = Arc::new(InlineDirectory {
             head,
             ranges: Intervals::new(
