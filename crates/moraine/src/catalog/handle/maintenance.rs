@@ -1,7 +1,7 @@
 //! Store census, maintenance status, reclamation, and compaction.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
 };
 
@@ -117,6 +117,15 @@ pub struct MaintenanceRequest {
     /// are therefore reclaimable only once the file is absent from both
     /// live state and history, which is where expiry leaves it.
     pub sweep_orphaned_file_column_stats: bool,
+    /// Reclaim the `inline/*` records of a table the catalog no longer
+    /// records at all.
+    ///
+    /// A table absent from both live state and history is named by no read
+    /// at any resolvable snapshot, so its inlined rows are reachable by
+    /// nothing: not a flush, which writes through a catalog entry, and not
+    /// a scan, which resolves one. Stores written before a drop took its
+    /// inlined rows with it still hold them.
+    pub sweep_orphaned_inline_tables: bool,
     /// Maximum entries deleted per commit. Must be nonzero.
     pub batch_size: usize,
 }
@@ -126,6 +135,7 @@ impl Default for MaintenanceRequest {
         Self {
             sweep_orphaned_index_entries: true,
             sweep_orphaned_file_column_stats: true,
+            sweep_orphaned_inline_tables: true,
             batch_size: 1024,
         }
     }
@@ -141,6 +151,10 @@ pub struct MaintenanceReport {
     pub index_entries_reclaimed: u64,
     /// File column statistics deleted for unresolvable data files.
     pub file_column_stats_reclaimed: u64,
+    /// Tables whose orphaned `inline/*` records were reclaimed.
+    pub inline_tables_swept: u64,
+    /// `inline/*` keys deleted across those tables.
+    pub inline_records_reclaimed: u64,
 }
 
 /// One step reported by a completed maintenance pass.
@@ -197,16 +211,36 @@ impl MaintenanceStatusPass {
     }
 }
 
+/// What one search for stranded inlined schemas examined, so a pass that
+/// repairs nothing says why rather than looking like a clean store.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct StrandedScan {
+    /// Deregistration markers found, across every table.
+    markers: usize,
+    /// Markers whose version holds no live rows: an ordinary flush.
+    without_rows: usize,
+    /// Markers whose version has no schema record, so re-listing it would
+    /// name columns nothing resolves.
+    without_schema: usize,
+}
+
 /// Every deregistered `(table_id, schema_version)` that still has both a
-/// schema record and live rows — the pairs a flush can no longer reach.
+/// schema record and live rows — the pairs a flush can no longer reach —
+/// and what the search examined to find them.
 /// Tables are scanned once each, and only tables carrying a marker at all.
-async fn stranded_inline_schemas(handle: ReadHandle<'_>) -> Result<Vec<(u64, u64)>> {
+async fn stranded_inline_schemas(
+    handle: ReadHandle<'_>,
+) -> Result<(Vec<(u64, u64)>, StrandedScan)> {
     let (dropped, schemas) = futures::try_join!(
         store_inline::scan_all_inline_dropped_schemas(handle),
         store_inline::scan_all_inline_schema_keys(handle),
     )?;
+    let mut scan = StrandedScan {
+        markers: dropped.len(),
+        ..StrandedScan::default()
+    };
     if dropped.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), scan));
     }
     let schemas: HashSet<(u64, u64)> = schemas.into_iter().collect();
 
@@ -219,14 +253,18 @@ async fn stranded_inline_schemas(handle: ReadHandle<'_>) -> Result<Vec<(u64, u64
     for (table_id, versions) in by_table {
         let live = store_inline::scan_inline_live_schema_versions(handle, table_id).await?;
         for schema_version in versions {
-            // A marker without its schema record belongs to a dropped
-            // table: re-listing it would name columns nothing resolves.
-            if live.contains(&schema_version) && schemas.contains(&(table_id, schema_version)) {
+            if !live.contains(&schema_version) {
+                scan.without_rows += 1;
+            } else if !schemas.contains(&(table_id, schema_version)) {
+                // The marker belongs to a dropped table.
+                scan.without_schema += 1;
+            } else {
                 stranded.push((table_id, schema_version));
             }
         }
     }
-    Ok(stranded)
+
+    Ok((stranded, scan))
 }
 
 impl ReadOnlyCatalog {
@@ -466,6 +504,13 @@ impl Catalog {
                 .reclaim_orphaned_file_column_stats(request.batch_size)
                 .await?;
         }
+        if request.sweep_orphaned_inline_tables {
+            let (tables, records) = self
+                .reclaim_orphaned_inline_tables(request.batch_size)
+                .await?;
+            report.inline_tables_swept = tables;
+            report.inline_records_reclaimed = records;
+        }
         if !request.sweep_orphaned_index_entries {
             return Ok(report);
         }
@@ -541,8 +586,17 @@ impl Catalog {
         let session = self.begin_read().await?;
         let found = stranded_inline_schemas(session.handle()).await;
         session.finish();
-        let stranded = found?;
+        let (stranded, scan) = found?;
         if stranded.is_empty() {
+            // Reported rather than returned silently: a pass that repairs
+            // nothing and a store with nothing to repair are otherwise
+            // indistinguishable.
+            info!(
+                markers = scan.markers,
+                without_rows = scan.without_rows,
+                without_schema = scan.without_schema,
+                "no inlined schema version needed re-registering"
+            );
             return Ok(stranded);
         }
 
@@ -556,6 +610,9 @@ impl Catalog {
         tx.commit().await.map_err(Error::from)?;
 
         info!(
+            markers = scan.markers,
+            without_rows = scan.without_rows,
+            without_schema = scan.without_schema,
             versions = stranded.len(),
             "re-registered inlined schema versions that still held rows: {stranded:?}"
         );
@@ -731,6 +788,84 @@ impl Catalog {
         Ok(seen)
     }
 
+    /// Every table id the catalog still records, live or in history — the
+    /// tables a read at a resolvable snapshot can name.
+    async fn recorded_tables(&self) -> Result<HashSet<u64>> {
+        let mut seen: HashSet<u64> = self.snapshot().await?.tables.keys().copied().collect();
+
+        let session = self.begin_read().await?;
+        // One kind's prefix, not the whole subspace: every other kind's
+        // history would be read and decoded only to be discarded.
+        let mut iter = session
+            .handle()
+            .scan_prefix(
+                history_entity_kind_prefix(EntityKind::Table),
+                ..,
+                ScanShape::Bulk,
+            )
+            .await?;
+        while let Some(entry) = iter.next().await? {
+            if let Ok(Key::History(history)) = Key::decode(&entry.key)
+                && let EntityKey::Table { table_id } = history.entity
+            {
+                seen.insert(table_id);
+            }
+        }
+        session.finish();
+
+        Ok(seen)
+    }
+
+    /// Deletes every `inline/*` record of a table the catalog records
+    /// nowhere, `batch_size` keys per commit. Returns the tables swept and
+    /// the keys deleted.
+    async fn reclaim_orphaned_inline_tables(&self, batch_size: usize) -> Result<(u64, u64)> {
+        let session = self.begin_read().await?;
+        let registered = store_inline::scan_all_inline_schema_keys(session.handle()).await;
+        session.finish();
+
+        let recorded = self.recorded_tables().await?;
+        let orphans: BTreeSet<u64> = registered?
+            .into_iter()
+            .map(|(table_id, _)| table_id)
+            .filter(|table_id| !recorded.contains(table_id))
+            .collect();
+
+        let mut swept = 0u64;
+        let mut reclaimed = 0u64;
+        for table_id in orphans {
+            let session = self.begin_read().await?;
+            let keys = store_inline::scan_inline_table_keys(session.handle(), table_id).await;
+            session.finish();
+            let keys = keys?;
+            if keys.is_empty() {
+                continue;
+            }
+
+            for batch in keys.chunks(batch_size) {
+                let tx = self.begin_write_tx().await?;
+                for key in batch {
+                    tx.delete(key.clone()).map_err(Error::from)?;
+                }
+                // Non-durable: the deletes are idempotent, so a batch lost
+                // to a crash leaves records a later pass rediscovers.
+                tx.commit().await.map_err(Error::from)?;
+                reclaimed += batch.len() as u64;
+            }
+            // The batches bypassed the commit protocol, so the maintained
+            // projections still hold what they removed.
+            invalidate_current_state(&self.projections);
+            swept += 1;
+            info!(
+                table_id,
+                keys = keys.len(),
+                "swept an orphaned inlined table"
+            );
+        }
+
+        Ok((swept, reclaimed))
+    }
+
     /// Deletes the statistics of every data file absent from both live
     /// state and history, `batch_size` per commit, and returns how many
     /// records went.
@@ -807,5 +942,139 @@ impl Catalog {
             total += deleted as u64;
             cursor = last;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use object_store::memory::InMemory;
+
+    use super::{StrandedScan, stranded_inline_schemas};
+    use crate::{
+        Catalog, CatalogOptions,
+        store::{
+            handle::ReadHandle,
+            key::{InlineKey, Key},
+        },
+    };
+
+    /// Writes one raw inline key. The scans behind the repair read keys
+    /// alone, so the value only has to exist.
+    async fn put(catalog: &Catalog, key: Key) {
+        let tx = catalog.begin_write_tx().await.unwrap();
+        tx.put(key.encode(), b"x").unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    /// A deregistered version is repairable only when it has both a schema
+    /// record and live rows. The two ways it can fail that are counted
+    /// apart, so a pass that repairs nothing says which it saw.
+    #[tokio::test]
+    async fn a_declined_marker_is_attributed_to_what_it_lacked() {
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+
+        // (1, 0): schema record and a locator — stranded, and repairable.
+        put(
+            &catalog,
+            Key::Inline(InlineKey::Schema {
+                table_id: 1,
+                schema_version: 0,
+            }),
+        )
+        .await;
+        put(
+            &catalog,
+            Key::Inline(InlineKey::SchemaDropped {
+                table_id: 1,
+                schema_version: 0,
+            }),
+        )
+        .await;
+        put(
+            &catalog,
+            Key::Inline(InlineKey::ChunkLocator {
+                table_id: 1,
+                row_id_end: 1,
+                schema_version: 0,
+                begin_snapshot: 1,
+                chunk_seq: 0,
+            }),
+        )
+        .await;
+
+        // (1, 1): a schema record but no locator — the flush emptied it.
+        put(
+            &catalog,
+            Key::Inline(InlineKey::Schema {
+                table_id: 1,
+                schema_version: 1,
+            }),
+        )
+        .await;
+        put(
+            &catalog,
+            Key::Inline(InlineKey::SchemaDropped {
+                table_id: 1,
+                schema_version: 1,
+            }),
+        )
+        .await;
+
+        // (2, 0): rows but no schema record — the table itself is gone.
+        put(
+            &catalog,
+            Key::Inline(InlineKey::SchemaDropped {
+                table_id: 2,
+                schema_version: 0,
+            }),
+        )
+        .await;
+        put(
+            &catalog,
+            Key::Inline(InlineKey::ChunkLocator {
+                table_id: 2,
+                row_id_end: 1,
+                schema_version: 0,
+                begin_snapshot: 1,
+                chunk_seq: 0,
+            }),
+        )
+        .await;
+
+        let tx = catalog.begin_write_tx().await.unwrap();
+        let (stranded, scan) = stranded_inline_schemas(ReadHandle::Tx(&tx)).await.unwrap();
+
+        assert_eq!(stranded, vec![(1, 0)]);
+        assert_eq!(
+            scan,
+            StrandedScan {
+                markers: 3,
+                without_rows: 1,
+                without_schema: 1,
+            }
+        );
+
+        catalog.close().await.unwrap();
+    }
+
+    /// A store with no marker at all is reported as examined, not as an
+    /// empty repair indistinguishable from a declined one.
+    #[tokio::test]
+    async fn a_store_with_no_marker_reports_nothing_examined() {
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+
+        let tx = catalog.begin_write_tx().await.unwrap();
+        let (stranded, scan) = stranded_inline_schemas(ReadHandle::Tx(&tx)).await.unwrap();
+
+        assert!(stranded.is_empty());
+        assert_eq!(scan, StrandedScan::default());
+
+        catalog.close().await.unwrap();
     }
 }

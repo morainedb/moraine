@@ -222,3 +222,42 @@ async fn a_read_only_catalog_reads_the_cut_it_is_pinned_to() {
     );
     reader.close().await.unwrap();
 }
+
+/// A listed checkpoint carries the manifest it pins and when it lapses, so
+/// an operator can tell a reader's refreshed lease from one that holds its
+/// objects until someone deletes it.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn a_listed_checkpoint_reports_its_manifest_and_lifetime() {
+    let store = Arc::new(InMemory::new());
+    let catalog = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    catalog
+        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .await
+        .unwrap();
+    let held = catalog.create_checkpoint(None).await.unwrap();
+    let leased = catalog
+        .create_checkpoint(Some(std::time::Duration::from_secs(600)))
+        .await
+        .unwrap();
+    catalog.close().await.unwrap();
+
+    let listed = Catalog::checkpoints(store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let held = listed.iter().find(|c| c.id == held).unwrap();
+    let leased = listed.iter().find(|c| c.id == leased).unwrap();
+
+    assert_eq!(
+        held.expires_at, None,
+        "a checkpoint minted without a lifetime holds until it is deleted"
+    );
+    assert!(leased.expires_at > Some(leased.created_at));
+    assert!(held.created_at > moraine::Timestamp::UNIX_EPOCH);
+    assert!(
+        leased.manifest_id >= held.manifest_id,
+        "the later mint pins no earlier a manifest"
+    );
+}

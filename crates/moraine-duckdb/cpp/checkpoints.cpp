@@ -52,9 +52,14 @@ struct CheckpointBindData : public duckdb::FunctionData {
 
 // One row per checkpoint, materialized at init and emitted in one chunk.
 // Every one of these calls touches a single manifest object, so there is
-// never more than a handful.
+// never more than a handful. Only the listing carries the manifest and
+// lifetime columns; minting knows the id and nothing else yet.
 struct CheckpointRow {
 	std::string id;
+	uint64_t manifest_id = 0;
+	int64_t created_at_micros = 0;
+	bool has_expires_at = false;
+	int64_t expires_at_micros = 0;
 };
 
 struct CheckpointGlobalState : public duckdb::GlobalTableFunctionState {
@@ -81,6 +86,16 @@ std::string RequireArgument(const std::string &function, const std::string &what
 void CheckpointReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names) {
 	return_types = {duckdb::LogicalType::VARCHAR};
 	names = {"checkpoint_id"};
+}
+
+// The listing reports what each checkpoint holds: the manifest it pins,
+// which says how far behind the live state it is, and its expiry, which
+// separates a reader's refreshed lease from a mint that holds until
+// someone releases it.
+void ListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names) {
+	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::TIMESTAMP_TZ};
+	names = {"checkpoint_id", "manifest_id", "created_at", "expires_at"};
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> CreateBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
@@ -110,7 +125,7 @@ duckdb::unique_ptr<duckdb::FunctionData> ListBind(duckdb::ClientContext &, duckd
                                                   duckdb::vector<duckdb::string> &names) {
 	auto bind_data = duckdb::make_uniq<CheckpointBindData>();
 	bind_data->target = RequireArgument("moraine_checkpoints", "store path", input, 0);
-	CheckpointReturnTypes(return_types, names);
+	ListReturnTypes(return_types, names);
 	return bind_data;
 }
 
@@ -174,6 +189,10 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ListInitGlobal(duckdb::Clie
 		if (checkpoint.id != nullptr) {
 			row.id = checkpoint.id;
 		}
+		row.manifest_id = checkpoint.manifest_id;
+		row.created_at_micros = checkpoint.created_at_micros;
+		row.has_expires_at = checkpoint.has_expires_at;
+		row.expires_at_micros = checkpoint.expires_at_micros;
 		state->rows.push_back(std::move(row));
 	}
 	return state;
@@ -217,6 +236,29 @@ void CheckpointImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, d
 	output.SetCardinality(row_index);
 }
 
+void ListImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
+	auto &state = data.global_state->Cast<CheckpointGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	duckdb::idx_t row_index = 0;
+	for (auto &row : state.rows) {
+		output.SetValue(0, row_index, duckdb::Value(row.id));
+		output.SetValue(1, row_index, duckdb::Value::UBIGINT(row.manifest_id));
+		output.SetValue(2, row_index, duckdb::Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(row.created_at_micros)));
+		// NULL rather than the epoch: a checkpoint minted without a
+		// lifetime has no expiry, it does not expire in 1970.
+		output.SetValue(3, row_index,
+		                row.has_expires_at
+		                    ? duckdb::Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(row.expires_at_micros))
+		                    : duckdb::Value(duckdb::LogicalType::TIMESTAMP_TZ));
+		row_index++;
+	}
+	state.emitted = true;
+	output.SetCardinality(row_index);
+}
+
 // The delete function returns only the released id, so it projects one
 // column out of the same row shape.
 void DeleteImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
@@ -238,8 +280,8 @@ void RegisterMoraineCheckpointFunctions(duckdb::ExtensionLoader &loader) {
 	create.named_parameters["lifetime"] = duckdb::LogicalType::INTERVAL;
 	loader.RegisterFunction(create);
 
-	loader.RegisterFunction(duckdb::TableFunction("moraine_checkpoints", {duckdb::LogicalType::VARCHAR},
-	                                              CheckpointImpl, ListBind, ListInitGlobal));
+	loader.RegisterFunction(duckdb::TableFunction("moraine_checkpoints", {duckdb::LogicalType::VARCHAR}, ListImpl,
+	                                              ListBind, ListInitGlobal));
 
 	loader.RegisterFunction(duckdb::TableFunction(
 	    "moraine_delete_checkpoint", {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR}, DeleteImpl,

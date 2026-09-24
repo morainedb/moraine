@@ -86,9 +86,11 @@ fails the attach rather than silently falling back to latest.
 store path, because the core mints through the writer that attach already
 opened and a second read-write open would fence it. The other two name a
 store path, and neither opens the writer, so both run against a live
-catalog: `moraine_checkpoints('<store>')` lists what the manifest carries
-— which is how a checkpoint whose id was lost is found, since one given no
-lifetime pins its objects until deleted — and
+catalog: `moraine_checkpoints('<store>')` lists what the manifest carries, with the
+`manifest_id` each one pins and its `created_at`/`expires_at` — which is
+how a checkpoint whose id was lost is found, and how a reader's refreshed
+lease is told from one given no lifetime, which pins its objects until
+deleted — and
 `moraine_delete_checkpoint('<store>', '<id>')` releases one.
 
 **Creating or writing an S3 lake requires `READ_WRITE`.** DuckDB opens any

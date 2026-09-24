@@ -59,6 +59,18 @@ mod probe_bench;
 #[cfg(test)]
 mod compaction_cache_tests;
 
+/// One checkpoint the manifest carries, with what it pins against garbage
+/// collection and when it lapses. Times are microseconds from the Unix
+/// epoch; `expires_micros` is `None` for a checkpoint minted without a
+/// lifetime, which holds until it is deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CheckpointRecord {
+    pub(crate) id: Uuid,
+    pub(crate) manifest_id: u64,
+    pub(crate) created_micros: i64,
+    pub(crate) expires_micros: Option<i64>,
+}
+
 /// Creates a checkpoint of every write `db` has taken (not only the
 /// already-durable ones), expiring after `lifetime` (never, if `None`),
 /// and reports its id.
@@ -307,14 +319,22 @@ impl<'a> StoreBuilder<'a> {
 
     /// Every checkpoint the store's manifest currently carries, oldest
     /// first — reader-established ones included.
-    pub(crate) async fn list_checkpoints(&self) -> Result<Vec<Uuid>> {
+    pub(crate) async fn list_checkpoints(&self) -> Result<Vec<CheckpointRecord>> {
         let checkpoints = AdminBuilder::new(self.path, Arc::clone(&self.object_store))
             .build()
             .list_checkpoints(None)
             .await
             .map_err(Error::from)?;
 
-        Ok(checkpoints.into_iter().map(|c| c.id).collect())
+        Ok(checkpoints
+            .into_iter()
+            .map(|c| CheckpointRecord {
+                id: c.id,
+                manifest_id: c.manifest_id,
+                created_micros: c.create_time.timestamp_micros(),
+                expires_micros: c.expire_time.map(|at| at.timestamp_micros()),
+            })
+            .collect())
     }
 
     /// SlateDB settings for a writer. The in-process compactor writes its

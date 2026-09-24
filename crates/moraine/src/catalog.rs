@@ -57,6 +57,6 @@ pub use types::{
     IndexId, IndexInfo, IndexMaintenance, IndexState, InlineChunk, MacroId, MacroImplementationDef,
     MacroInfo, MacroParameterDef, MappingId, MappingInfo, NameMappingDef, OptionScope,
     PartitionColumnDef, PartitionId, PartitionSpec, RecentRow, ScheduledDeletion, SchemaId,
-    SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, TableId, TableInfo,
-    TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
+    SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCheckpoint, TableId,
+    TableInfo, TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
 };

@@ -768,6 +768,30 @@ pub struct TagEntry {
     pub value: String,
 }
 
+/// One checkpoint the store's manifest carries: a pinned cut of the store
+/// that a read-only catalog can open against.
+///
+/// A checkpoint holds every object its manifest references against garbage
+/// collection, so a listing that shows one far behind the live manifest
+/// explains storage a compaction appears to have reclaimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreCheckpoint {
+    /// The id [`Catalog::create_checkpoint`](crate::Catalog::create_checkpoint)
+    /// hands out and
+    /// [`CatalogOptions::checkpoint`](crate::CatalogOptions::checkpoint)
+    /// takes.
+    pub id: String,
+    /// The manifest version it pins.
+    pub manifest_id: u64,
+    /// When it was minted.
+    pub created_at: Timestamp,
+    /// When it lapses. `None` for one minted without a lifetime, which
+    /// holds its objects until
+    /// [`Catalog::delete_checkpoint`](crate::Catalog::delete_checkpoint)
+    /// removes it.
+    pub expires_at: Option<Timestamp>,
+}
+
 /// One `ducklake_files_scheduled_for_deletion` row: a path awaiting
 /// physical deletion, decoupled from the expiry that scheduled it.
 #[derive(Debug, Clone, PartialEq, Eq)]

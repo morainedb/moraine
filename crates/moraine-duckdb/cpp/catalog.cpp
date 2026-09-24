@@ -661,9 +661,13 @@ void MoraineSchemaEntry::DropEntry(duckdb::ClientContext &context, duckdb::DropI
 	// only DROP reaching here: deregister just this schema version, leaving
 	// other schema versions' inline/* records untouched. The version's Arrow
 	// schema survives the deregistration, so a session still holding the
-	// pre-flush registry binds the name and scans it empty. The whole-table
-	// cascade (`moraine_tx_stage_inline_drop`) runs on the DuckLake attach's
-	// own catalog, not this metadata connection's schema.
+	// pre-flush registry binds the name and scans it empty.
+	//
+	// Dropping the user table it belongs to reaches neither this function
+	// nor any other moraine entry point — DuckLake ends the `ducklake_table`
+	// row itself. Those inline/* records are reclaimed by the maintenance
+	// sweep once the table is absent from live state and history, which is
+	// also what keeps a read below the drop able to resolve them.
 	if (info.type == duckdb::CatalogType::TABLE_ENTRY) {
 		if (auto parsed = ParseInlinedDataTableName(info.name)) {
 			auto catalog_transaction = catalog.GetCatalogTransaction(context);

@@ -197,6 +197,7 @@ configure:
 | 6 | Orphans | `DELETE_ORPHANED_FILES[_OLDER_THAN\|_CLEANUP_ALL]` | `CALL ducklake_delete_orphaned_files('lake', …)` |
 | 7 | Sweep | `SWEEP_INDEXES` (default **true**) | `Catalog::maintain` — core |
 | 7b | Sweep file stats | `SWEEP_INDEXES` (default **true**) | `Catalog::maintain` — core |
+| 7c | Sweep inlined tables | `SWEEP_INDEXES` (default **true**) | `Catalog::maintain` — core |
 | 8 | Merge store | `COMPACT_STORE[_SUBSPACE\|_TIMEOUT]` | `Catalog::compact_store` — core |
 
 Step 7b shares step 7's pass and its switch — one `Catalog::maintain` call
@@ -226,6 +227,16 @@ erasing it, and the past still resolves it.
 
 The call syntax is what the e2e suite already exercises against real
 DuckLake (`tests/ducklake_load/maintenance.rs:47,91,150,230,333`).
+
+**Steps 7b and 7c report what step 7's single pass reclaimed.** One
+`Catalog::maintain` call reclaims all three; the counts are split across
+three reported steps because what orphans each is different. Index entries
+are orphaned by moraine's own `drop_index`. File column statistics and
+inlined tables are orphaned by expiry, in step 1 — a dropped table's rows
+stay readable by a time-travelling read for as long as the catalog records
+the table, so they are reclaimable only once it is absent from both live
+state and history, which is where expiry leaves it. Reading one number
+against the other is how a leak in either gets noticed.
 
 **Why this order.** Expiry first, because it is the only step that
 *shrinks* the catalog rather than adding to it, and DuckLake re-reads the

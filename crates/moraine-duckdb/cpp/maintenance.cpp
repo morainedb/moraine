@@ -506,6 +506,13 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	                     ? RunFileStatsSweep()
 	                     : MaintenanceStep {"sweep_file_stats", "skipped", "disabled at attach"});
 
+	// Reported separately for the same reason: what strands inlined rows
+	// is a table dropped above, not anything moraine's own reclamation
+	// did.
+	report.push_back(config_.sweep_indexes
+	                     ? RunInlineTableSweep()
+	                     : MaintenanceStep {"sweep_inline_tables", "skipped", "disabled at attach"});
+
 	// The store merge runs last, on what every step above it left behind:
 	// expiry tombstones rows and the sweep deletes index ranges, so
 	// merging earlier would leave exactly the tombstones this pass just
@@ -587,15 +594,17 @@ MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connec
 MaintenanceStep MaintenanceScheduler::RunSweep() {
 	uint64_t indexes = 0;
 	uint64_t entries = 0;
-	// One pass reclaims both, so the file-statistics count is carried out
-	// here and reported by `RunFileStatsSweep` without a second call.
+	// One pass reclaims all three, so the file-statistics and inlined-table
+	// counts are carried out here and reported by the steps below without
+	// a second call.
 	file_stats_reclaimed_ = 0;
+	inline_tables_swept_ = 0;
+	inline_records_reclaimed_ = 0;
 	MoraineError err {};
 	// No interrupt probe: the sweep runs on the scheduler's own thread,
 	// which stops through the stop flag rather than a query interrupt.
-	auto code =
-	    moraine_maintain(handle_, config_.batch_size, &indexes, &entries, &file_stats_reclaimed_, nullptr, nullptr,
-	                     &err);
+	auto code = moraine_maintain(handle_, config_.batch_size, &indexes, &entries, &file_stats_reclaimed_,
+	                             &inline_tables_swept_, &inline_records_reclaimed_, nullptr, nullptr, &err);
 	if (code != MORAINE_OK) {
 		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
 		if (err.message != nullptr) {
@@ -618,6 +627,17 @@ MaintenanceStep MaintenanceScheduler::RunFileStatsSweep() {
 	return MaintenanceStep {"sweep_file_stats", "ran",
 	                        "reclaimed " + std::to_string(file_stats_reclaimed_) +
 	                            (file_stats_reclaimed_ == 1 ? " file column statistic" : " file column statistics")};
+}
+
+MaintenanceStep MaintenanceScheduler::RunInlineTableSweep() {
+	if (!file_stats_swept_) {
+		return MaintenanceStep {"sweep_inline_tables", "skipped", "the pass that reclaims them failed"};
+	}
+	return MaintenanceStep {"sweep_inline_tables", "ran",
+	                        "reclaimed " + std::to_string(inline_records_reclaimed_) +
+	                            (inline_records_reclaimed_ == 1 ? " inline record" : " inline records") + " from " +
+	                            std::to_string(inline_tables_swept_) +
+	                            (inline_tables_swept_ == 1 ? " forgotten table" : " forgotten tables")};
 }
 
 MaintenanceStep MaintenanceScheduler::RunStoreMerge() {

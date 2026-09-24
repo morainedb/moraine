@@ -103,6 +103,10 @@ private:
 	// statistics of data files no snapshot can still resolve. Runs after
 	// it and reads the counters it left.
 	MaintenanceStep RunFileStatsSweep();
+	// Reports what `RunSweep`'s single pass reclaimed from the `inline/*`
+	// records of tables the catalog records nowhere. Runs after it and
+	// reads the counters it left.
+	MaintenanceStep RunInlineTableSweep();
 	MaintenanceStep RunStoreMerge();
 	// The DuckLake catalog sitting above this metadata catalog, found by
 	// matching attached databases on path. DuckLake's own maintenance
@@ -121,6 +125,11 @@ private:
 	// read by `RunFileStatsSweep`, which always follows it in one pass.
 	uint64_t file_stats_reclaimed_ = 0;
 	bool file_stats_swept_ = false;
+
+	// What the last `RunSweep` reclaimed from orphaned inlined tables, on
+	// the same terms as the file-statistics counters above.
+	uint64_t inline_tables_swept_ = 0;
+	uint64_t inline_records_reclaimed_ = 0;
 
 	// Held for the duration of a pass, so the timer and the trigger can
 	// never overlap.

@@ -25,6 +25,15 @@ pub struct MoraineCheckpoint {
     /// The checkpoint's id, in the form `moraine_attach`'s `checkpoint`
     /// takes. Owned by the array.
     pub id: *mut c_char,
+    /// The manifest version it pins against garbage collection.
+    pub manifest_id: u64,
+    /// When it was minted, in microseconds from the Unix epoch.
+    pub created_at_micros: i64,
+    /// Whether `expires_at_micros` carries a time; false for a checkpoint
+    /// minted without a lifetime, which holds until it is deleted.
+    pub has_expires_at: bool,
+    /// When it lapses, in microseconds from the Unix epoch.
+    pub expires_at_micros: i64,
 }
 
 /// The object store and catalog options a path resolves to, for the
@@ -151,13 +160,21 @@ pub unsafe extern "C" fn moraine_checkpoints(
             .block_on(moraine::Catalog::checkpoints(object_store, options))
             .map_err(AbiError::from)?;
 
-        let ids = checkpoints
+        let owned = checkpoints
             .into_iter()
-            .map(to_c_string)
+            .map(|checkpoint| Ok((to_c_string(checkpoint.id.as_str())?, checkpoint)))
             .collect::<Result<Vec<_>, AbiError>>()?;
-        let items = ids
+        let items = owned
             .into_iter()
-            .map(|id| MoraineCheckpoint { id: id.into_raw() })
+            .map(|(id, checkpoint)| MoraineCheckpoint {
+                id: id.into_raw(),
+                manifest_id: checkpoint.manifest_id,
+                created_at_micros: checkpoint.created_at.as_micros(),
+                has_expires_at: checkpoint.expires_at.is_some(),
+                expires_at_micros: checkpoint
+                    .expires_at
+                    .map_or(0, moraine::Timestamp::as_micros),
+            })
             .collect::<Vec<_>>();
 
         // SAFETY: both out-parameters are non-null and writable per the
