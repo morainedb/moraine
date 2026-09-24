@@ -29,7 +29,7 @@ use std::{
 
 use bytes::Bytes;
 use slatedb::DbTransaction;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     catalog::{
@@ -1426,8 +1426,18 @@ impl StagedTransaction {
         let staged_rows = ops.len();
         let staged_cost = staged_cost(&ops);
         if staged_cost > MAX_STAGED_COST_PER_COMMIT {
-            db_tx.rollback();
-            return Err(oversized_staged_cost(staged_cost));
+            if !exempt_from_staged_cost(&ops) {
+                db_tx.rollback();
+                return Err(oversized_staged_cost(staged_cost));
+            }
+            // Reported rather than passed silently: the ceiling is there
+            // because a batch is held whole in memory and leaves as one
+            // PUT, and a flush over it pays that cost like any other.
+            warn!(
+                staged_cost,
+                limit = MAX_STAGED_COST_PER_COMMIT,
+                "a flush staged more than a commit's ceiling and was let through"
+            );
         }
         let mut uses_inline_chunk_directory = ops
             .iter()
@@ -1814,6 +1824,28 @@ fn index_upkeep_landed(transaction_id: u64, result_id: u64, phases: &CommitPhase
 /// object-store PUT, so an oversized one is refused up front rather than
 /// discovered as a slow commit.
 const MAX_STAGED_COST_PER_COMMIT: usize = 100_000;
+
+/// Whether `ops` may exceed [`MAX_STAGED_COST_PER_COMMIT`].
+///
+/// A flush is the only drain for inlined rows and inlined deletions, and
+/// its size is set by what is already inlined rather than by the caller,
+/// who cannot split it: the batch arrives as one DuckLake transaction.
+/// Refusing an oversized one strands exactly what it was going to move,
+/// and every later flush is larger than the one refused — the backlog
+/// becomes undrainable.
+///
+/// Both halves count. Draining chunks is one op for a whole
+/// `(table, schema_version)`, but materializing inlined deletions is one
+/// per row, so a flush carrying only the second half is the larger batch
+/// and the one that reaches the ceiling first.
+fn exempt_from_staged_cost(ops: &[RowOperation]) -> bool {
+    ops.iter().any(|op| {
+        matches!(
+            op,
+            RowOperation::InlineFlushDelete { .. } | RowOperation::InlineFileDeleteRemove { .. }
+        )
+    })
+}
 
 /// What `ops` costs against [`MAX_STAGED_COST_PER_COMMIT`]. An update both
 /// ends the live version and writes what replaces it, so it counts twice.

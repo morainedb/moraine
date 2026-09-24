@@ -8747,3 +8747,55 @@ async fn maintenance_keeps_inlined_records_of_a_table_history_still_records() {
     );
     catalog.close().await.unwrap();
 }
+
+/// A flush may exceed the per-commit ceiling; an ordinary batch may not.
+///
+/// The flush is the only drain for inlined rows, so refusing an oversized
+/// one strands exactly the rows it was going to move — and every later
+/// flush is larger than the one just refused.
+#[test]
+fn only_a_flush_may_exceed_the_commit_ceiling() {
+    use super::{exempt_from_staged_cost, staged_cost};
+
+    let inserts: Vec<RowOperation> = (0..4)
+        .map(|id| RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(id, 0, "t", 1, None),
+        })
+        .collect();
+    let mut flushing = inserts.clone();
+    flushing.push(RowOperation::InlineFlushDelete {
+        table_id: 1,
+        schema_version: 0,
+        flush_snapshot: 1,
+    });
+
+    // The half that reaches the ceiling first: materializing inlined
+    // deletions stages one op per row, where draining chunks stages one
+    // for a whole version.
+    let mut materializing = inserts.clone();
+    materializing.push(RowOperation::InlineFileDeleteRemove {
+        table_id: 1,
+        data_file_id: 1,
+        row_id: 7,
+    });
+
+    assert_eq!(staged_cost(&inserts), 4, "an insert costs one each");
+    assert!(!exempt_from_staged_cost(&inserts));
+    assert!(exempt_from_staged_cost(&flushing));
+    assert!(exempt_from_staged_cost(&materializing));
+}
+
+/// An update is charged twice: it ends the live version and writes what
+/// replaces it.
+#[test]
+fn an_update_is_charged_for_both_halves() {
+    use super::staged_cost;
+
+    let update = vec![RowOperation::UpdateSetEnd {
+        table: TableKind::Table,
+        cells: vec![Cell::U64(1), Cell::U64(2)],
+    }];
+
+    assert_eq!(staged_cost(&update), 2);
+}
