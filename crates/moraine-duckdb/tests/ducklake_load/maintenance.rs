@@ -565,8 +565,9 @@ fn maintenance_without_configuration_runs_only_the_sweep() {
         );
     }
     assert_eq!(by_step.get("sweep_indexes"), Some(&"ran"), "{rows:?}");
-    // Shares `sweep_indexes`' pass and its switch, so it runs with it.
+    // Both share `sweep_indexes`' pass and its switch, so they run with it.
     assert_eq!(by_step.get("sweep_file_stats"), Some(&"ran"), "{rows:?}");
+    assert_eq!(by_step.get("sweep_inline_tables"), Some(&"ran"), "{rows:?}");
     assert_eq!(by_step.get("compact_store"), Some(&"skipped"), "{rows:?}");
 
     // Nothing the pass did is observable in the data.
@@ -678,6 +679,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
             "delete_orphaned_files",
             "sweep_indexes",
             "sweep_file_stats",
+            "sweep_inline_tables",
             "compact_store",
         ],
         "steps must report in sequence order"
@@ -693,6 +695,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
         "cleanup_old_files",
         "sweep_indexes",
         "sweep_file_stats",
+        "sweep_inline_tables",
     ] {
         assert_eq!(by_step.get(step), Some(&"ran"), "{step} in {rows:?}");
     }
