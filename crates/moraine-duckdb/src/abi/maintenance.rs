@@ -14,11 +14,13 @@ use crate::{
 };
 
 /// Runs one moraine-owned maintenance pass, reclaiming the entry ranges
-/// of indexes no longer live and the file column statistics of data files
-/// no snapshot can still resolve, and writes what it reclaimed to
-/// `*indexes_swept`, `*entries_reclaimed`, and `*file_stats_reclaimed`.
-/// The pass mints no snapshot and leaves head unchanged. `batch_size`
-/// bounds the deletes per commit; 0 takes the core default.
+/// of indexes no longer live, the file column statistics of data files no
+/// snapshot can still resolve, and the `inline/*` records of tables the
+/// catalog records nowhere. What it reclaimed is written to
+/// `*indexes_swept`, `*entries_reclaimed`, `*file_stats_reclaimed`,
+/// `*inline_tables_swept`, and `*inline_records_reclaimed`. The pass mints
+/// no snapshot and leaves head unchanged. `batch_size` bounds the deletes
+/// per commit; 0 takes the core default.
 ///
 /// # Safety
 ///
@@ -32,6 +34,8 @@ pub unsafe extern "C" fn moraine_maintain(
     indexes_swept: *mut u64,
     entries_reclaimed: *mut u64,
     file_stats_reclaimed: *mut u64,
+    inline_tables_swept: *mut u64,
+    inline_records_reclaimed: *mut u64,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
@@ -88,6 +92,14 @@ pub unsafe extern "C" fn moraine_maintain(
         if !file_stats_reclaimed.is_null() {
             // SAFETY: caller contract — non-null means writable.
             unsafe { *file_stats_reclaimed = report.file_column_stats_reclaimed };
+        }
+        if !inline_tables_swept.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *inline_tables_swept = report.inline_tables_swept };
+        }
+        if !inline_records_reclaimed.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *inline_records_reclaimed = report.inline_records_reclaimed };
         }
         Ok(())
     };

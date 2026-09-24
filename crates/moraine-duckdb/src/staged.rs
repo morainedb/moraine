@@ -1797,6 +1797,12 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_flush_delete(
 
 /// Stages a table drop: removes every `inline/*` record for `table_id`.
 ///
+/// **Unused by the shim.** DuckLake ends the `ducklake_table` row itself,
+/// so no `DROP TABLE` reaches this. A dropped table's inline records are
+/// reclaimed by the maintenance sweep once the table is absent from live
+/// state and history — which is what keeps a read below the drop able to
+/// resolve them, as this entry point would not.
+///
 /// # Safety
 ///
 /// `tx` must be a pointer previously returned by [`moraine_tx_begin`]

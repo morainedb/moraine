@@ -353,7 +353,10 @@ pub enum RowOperation {
         flush_snapshot: u64,
     },
     /// Removes every `inline/*` record for `table_id`: schema, chunks,
-    /// and tombstones.
+    /// and tombstones. Nothing stages this today — a dropped table's
+    /// records are reclaimed by the maintenance sweep once it leaves both
+    /// live state and history, so a read below the drop still resolves
+    /// them.
     InlineDrop {
         /// The dropped table.
         table_id: u64,

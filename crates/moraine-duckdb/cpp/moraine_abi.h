@@ -577,6 +577,15 @@ typedef struct MoraineCheckpoint {
   // The checkpoint's id, in the form `moraine_attach`'s `checkpoint`
   // takes. Owned by the array.
   char *id;
+  // The manifest version it pins against garbage collection.
+  uint64_t manifest_id;
+  // When it was minted, in microseconds from the Unix epoch.
+  int64_t created_at_micros;
+  // Whether `expires_at_micros` carries a time; false for a checkpoint
+  // minted without a lifetime, which holds until it is deleted.
+  bool has_expires_at;
+  // When it lapses, in microseconds from the Unix epoch.
+  int64_t expires_at_micros;
 } MoraineCheckpoint;
 
 // A byte buffer owned by Rust and freed via [`moraine_arrow_bytes_free`].
@@ -1735,11 +1744,13 @@ int32_t moraine_index_nulls(struct MoraineCatalogHandle *handle,
 void moraine_index_nulls_free(struct MoraineRowId *items, size_t len);
 
 // Runs one moraine-owned maintenance pass, reclaiming the entry ranges
-// of indexes no longer live and the file column statistics of data files
-// no snapshot can still resolve, and writes what it reclaimed to
-// `*indexes_swept`, `*entries_reclaimed`, and `*file_stats_reclaimed`.
-// The pass mints no snapshot and leaves head unchanged. `batch_size`
-// bounds the deletes per commit; 0 takes the core default.
+// of indexes no longer live, the file column statistics of data files no
+// snapshot can still resolve, and the `inline/*` records of tables the
+// catalog records nowhere. What it reclaimed is written to
+// `*indexes_swept`, `*entries_reclaimed`, `*file_stats_reclaimed`,
+// `*inline_tables_swept`, and `*inline_records_reclaimed`. The pass mints
+// no snapshot and leaves head unchanged. `batch_size` bounds the deletes
+// per commit; 0 takes the core default.
 //
 // # Safety
 //
@@ -1751,6 +1762,8 @@ int32_t moraine_maintain(struct MoraineCatalogHandle *handle,
                          uint64_t *indexes_swept,
                          uint64_t *entries_reclaimed,
                          uint64_t *file_stats_reclaimed,
+                         uint64_t *inline_tables_swept,
+                         uint64_t *inline_records_reclaimed,
                          MoraineInterruptProbe probe,
                          void *probe_ctx,
                          struct MoraineError *err);
@@ -4166,6 +4179,12 @@ int32_t moraine_tx_stage_inline_flush_delete(struct MoraineTxHandle *tx,
                                              struct MoraineError *err);
 
 // Stages a table drop: removes every `inline/*` record for `table_id`.
+//
+// **Unused by the shim.** DuckLake ends the `ducklake_table` row itself,
+// so no `DROP TABLE` reaches this. A dropped table's inline records are
+// reclaimed by the maintenance sweep once the table is absent from live
+// state and history — which is what keeps a read below the drop able to
+// resolve them, as this entry point would not.
 //
 // # Safety
 //

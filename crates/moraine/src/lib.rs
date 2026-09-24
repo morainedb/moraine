@@ -256,8 +256,8 @@ pub use catalog::{
     MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef,
     PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow, RowSummaryWarmth, ScheduledDeletion,
     SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus,
-    StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo, TableStats,
-    TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
+    StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo,
+    TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
 };
 pub use data_file::DataStore;
 pub use error::{Error, Result};

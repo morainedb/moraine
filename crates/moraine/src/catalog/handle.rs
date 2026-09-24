@@ -38,7 +38,7 @@ use tracing::{info, warn};
 
 use crate::{
     catalog::{
-        CatalogSnapshot, RecentRow, SnapshotId, TableId,
+        CatalogSnapshot, RecentRow, SnapshotId, StoreCheckpoint, TableId, Timestamp,
         projection::{
             ProjectionCache, cache_epoch, cached_head_view, fold_replayed_writes, held_head_view,
             install_head_view_at, install_shared_current_entities, shared_current_entities,
@@ -1410,12 +1410,13 @@ impl Catalog {
             .await
     }
 
-    /// Every checkpoint the store's manifest carries, as the ids
-    /// [`create_checkpoint`](Self::create_checkpoint) hands out.
+    /// Every checkpoint the store's manifest carries, with the manifest it
+    /// pins and when it lapses.
     ///
     /// Reads the manifest and never opens the writer `Db`, so it runs
     /// against a live catalog without fencing it. Reader-established
-    /// checkpoints show up here too.
+    /// checkpoints show up here too, which is what distinguishes a lease a
+    /// live reader keeps refreshing from one nothing will ever release.
     ///
     /// # Errors
     ///
@@ -1423,11 +1424,19 @@ impl Catalog {
     pub async fn checkpoints(
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
-    ) -> Result<Vec<String>> {
-        let ids = StoreBuilder::new(&options.path, object_store)
+    ) -> Result<Vec<StoreCheckpoint>> {
+        let records = StoreBuilder::new(&options.path, object_store)
             .list_checkpoints()
             .await?;
-        Ok(ids.iter().map(uuid::Uuid::to_string).collect())
+        Ok(records
+            .into_iter()
+            .map(|record| StoreCheckpoint {
+                id: record.id.to_string(),
+                manifest_id: record.manifest_id,
+                created_at: Timestamp::from_micros(record.created_micros),
+                expires_at: record.expires_micros.map(Timestamp::from_micros),
+            })
+            .collect())
     }
 
     /// Opens a read-write transaction for the staged-row commit path. Fails

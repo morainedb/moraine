@@ -8618,3 +8618,132 @@ async fn an_update_costs_twice_what_an_insert_does() {
     assert!(matches!(err, Error::Constraint(_)), "{err}");
     assert!(err.to_string().contains("twice the updates"), "{err}");
 }
+
+/// Every inline record of table 1 still in the store.
+async fn inlined_records(catalog: &crate::Catalog) -> usize {
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let keys = crate::store::inline::scan_inline_table_keys(ReadHandle::Tx(&tx), 1)
+        .await
+        .unwrap();
+    keys.len()
+}
+
+/// Inline rows under a table id the catalog records nowhere — where a
+/// dropped table's rows end up once expiry has pruned its history. No
+/// flush enumerates them and no read resolves them, so maintenance
+/// reclaims them.
+#[tokio::test]
+async fn maintenance_sweeps_inlined_records_of_a_table_the_catalog_forgot() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    // No `ducklake_table` row: the table the records name is gone from
+    // live state and from history, as a dropped-and-expired one is.
+    tx.stage(RowOperation::InlineSchema {
+        table_id: 1,
+        schema_version: 0,
+        arrow_schema: b"schema".to_vec(),
+    });
+    tx.stage(RowOperation::InlineInsert {
+        table_id: 1,
+        schema_version: 0,
+        begin_snapshot: 1,
+        row_id_start: 0,
+        row_count: 2,
+        arrow_body: b"chunk".to_vec().into(),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "inlined_insert:1"),
+    });
+    tx.commit().await.unwrap();
+    assert!(inlined_records(&catalog).await > 0, "seeded with records");
+
+    let report = catalog
+        .maintain(crate::MaintenanceRequest::default())
+        .await
+        .unwrap();
+
+    assert_eq!(report.inline_tables_swept, 1);
+    assert!(report.inline_records_reclaimed > 0);
+    assert_eq!(inlined_records(&catalog).await, 0);
+
+    // Idempotent: a second pass finds nothing left to sweep.
+    let again = catalog
+        .maintain(crate::MaintenanceRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(again.inline_tables_swept, 0);
+
+    catalog.close().await.unwrap();
+}
+
+/// The sweep waits for history. A table ended but still recorded is
+/// reachable by a read below the drop, and its inlined rows are what that
+/// read returns — the same rule the file-statistics sweep follows.
+#[tokio::test]
+async fn maintenance_keeps_inlined_records_of_a_table_history_still_records() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    tx.stage(RowOperation::InlineSchema {
+        table_id: 1,
+        schema_version: 0,
+        arrow_schema: b"schema".to_vec(),
+    });
+    tx.stage(RowOperation::InlineInsert {
+        table_id: 1,
+        schema_version: 0,
+        begin_snapshot: 1,
+        row_id_start: 0,
+        row_count: 2,
+        arrow_body: b"chunk".to_vec().into(),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "inlined_insert:1"),
+    });
+    tx.commit().await.unwrap();
+    let before = inlined_records(&catalog).await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::Table,
+        cells: vec![Cell::U64(1), Cell::U64(2)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, r#"dropped_table:"main"."t""#),
+    });
+    tx.commit().await.unwrap();
+
+    let report = catalog
+        .maintain(crate::MaintenanceRequest::default())
+        .await
+        .unwrap();
+
+    assert_eq!(report.inline_tables_swept, 0);
+    assert_eq!(
+        inlined_records(&catalog).await,
+        before,
+        "a read below the drop still resolves the table, so its rows stay"
+    );
+    catalog.close().await.unwrap();
+}

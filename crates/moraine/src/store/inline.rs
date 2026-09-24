@@ -581,6 +581,41 @@ pub(crate) async fn scan_inline_schemas(
     .await
 }
 
+/// Every inline key belonging to `table_id`, across every kind: chunks,
+/// their locators, row tombstones, schema records, deregistration
+/// markers, the delete-table marker, and the superseded range keys a
+/// store carried across the locator change still holds.
+///
+/// The kind leads an inline key, so no single prefix spans a table; each
+/// kind is walked in turn. Bulk-shaped: the caller keeps the keys and
+/// nothing else, so admitting the blocks would evict the working set.
+pub(crate) async fn scan_inline_table_keys(
+    handle: ReadHandle<'_>,
+    table_id: u64,
+) -> Result<Vec<Vec<u8>>> {
+    let prefixes = [
+        inline_live_table_prefix(InlineOperationKind::Insert, table_id),
+        inline_live_table_prefix(InlineOperationKind::InlineDelete, table_id),
+        inline_live_table_prefix(InlineOperationKind::FileDelete, table_id),
+        inline_chunk_locator_table_prefix(table_id),
+        inline_chunk_range_table_prefix(table_id),
+        inline_row_tombstone_table_prefix(table_id),
+        inline_schema_table_prefix(table_id),
+        inline_schema_dropped_table_prefix(table_id),
+        Key::Inline(InlineKey::FileDeleteTable { table_id }).encode(),
+    ];
+
+    let scans = prefixes.into_iter().map(|prefix| async move {
+        scan_keys(handle, prefix, ScanShape::Bulk, |key| Ok(key.encode())).await
+    });
+
+    Ok(futures::future::try_join_all(scans)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
 /// Every `(table_id, schema_version)` with a schema record, in key order,
 /// without decoding the schemas themselves — the registry needs the pair,
 /// not the columns.

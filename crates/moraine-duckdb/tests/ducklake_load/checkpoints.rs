@@ -64,17 +64,24 @@ fn checkpoint_pinned_attach_serves_a_fixed_cut() {
         "an unpinned attach on the same store still follows head"
     );
 
-    // The checkpoint is listed while it lives and gone once released.
+    // The checkpoint is listed while it lives and gone once released, and
+    // the listing says what it pins and that it never lapses on its own.
     let listed = csv_rows(&run_standalone_sql(
         store,
         &format!(
-            "SELECT checkpoint_id FROM moraine_checkpoints('{}');",
+            "SELECT checkpoint_id, manifest_id > 0, expires_at IS NULL \
+             FROM moraine_checkpoints('{}');",
             store.display()
         ),
     ));
-    assert!(
-        listed.iter().any(|row| row[0] == checkpoint_id),
-        "minted checkpoint missing from {listed:?}"
+    let minted = listed
+        .iter()
+        .find(|row| row[0] == checkpoint_id)
+        .unwrap_or_else(|| panic!("minted checkpoint missing from {listed:?}"));
+    assert_eq!(minted[1], "true", "a checkpoint pins a manifest");
+    assert_eq!(
+        minted[2], "true",
+        "one minted without a lifetime reports no expiry"
     );
 
     run_standalone_sql(

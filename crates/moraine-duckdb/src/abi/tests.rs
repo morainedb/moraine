@@ -748,6 +748,8 @@ fn maintain_reports_through_the_out_parameters() {
     let mut indexes = u64::MAX;
     let mut entries = u64::MAX;
     let mut file_stats = u64::MAX;
+    let mut inline_tables = u64::MAX;
+    let mut inline_records = u64::MAX;
     // SAFETY: `handle` is live; every slot is a writable local.
     let code = unsafe {
         moraine_maintain(
@@ -756,6 +758,8 @@ fn maintain_reports_through_the_out_parameters() {
             &raw mut indexes,
             &raw mut entries,
             &raw mut file_stats,
+            &raw mut inline_tables,
+            &raw mut inline_records,
             None,
             ptr::null_mut(),
             &raw mut err,
@@ -765,6 +769,8 @@ fn maintain_reports_through_the_out_parameters() {
     assert_eq!(indexes, 0);
     assert_eq!(entries, 0);
     assert_eq!(file_stats, 0);
+    assert_eq!(inline_tables, 0);
+    assert_eq!(inline_records, 0);
 
     // Null out-parameters are accepted: a caller that wants only the
     // status code passes neither slot.
@@ -773,6 +779,8 @@ fn maintain_reports_through_the_out_parameters() {
         moraine_maintain(
             handle,
             64,
+            ptr::null_mut(),
+            ptr::null_mut(),
             ptr::null_mut(),
             ptr::null_mut(),
             ptr::null_mut(),

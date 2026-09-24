@@ -204,7 +204,10 @@ for the same reason `moraine_migrate` does: neither opens the writer, so
 both run against a live catalog without fencing it, and the processes that
 attach against the id hold no write credentials, so those calls happen
 wherever the credentials are. Listing exists so a checkpoint whose id was
-lost can still be found and released.
+lost can still be found and released; it reports the `manifest_id` each
+checkpoint pins and its `created_at`/`expires_at`, which is what separates
+a reader's refreshed lease from a mint that holds until someone releases
+it, and what says how far behind the live state the pinned objects are.
 
 **Creating an S3 lake needs `READ_WRITE`.** DuckDB bumps any attach whose
 path begins with a remote prefix (`s3://`, `gcs://`, `azure://`, `http(s)://`,
