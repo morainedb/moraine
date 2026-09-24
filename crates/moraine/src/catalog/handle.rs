@@ -397,19 +397,33 @@ pub(super) fn slow_open_without_cache(
     cache_dir.is_none() && elapsed >= SLOW_OPEN
 }
 
+/// Whether this is the first slow open to go unreported, latching
+/// `warned`. The advice is to set `CACHE_DIR`, which an operator does
+/// once, so repeating it on every open is noise rather than signal.
+pub(super) fn first_slow_open(warned: &std::sync::atomic::AtomicBool) -> bool {
+    !warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Warns when a slow open had no cache directory to read from. The bytes
 /// it fetched are fetched again by every process that opens this store,
 /// where a cache directory keeps them on local disk: over 20 000 files
 /// behind an endpoint costing about 20 ms a request, that was 1378 ms
-/// against 451 ms.
+/// against 451 ms. Reported once per process.
 fn warn_if_slow_open_without_cache(options: &CatalogOptions, elapsed: Duration) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     if !slow_open_without_cache(options.cache_dir.as_deref(), elapsed) {
+        return;
+    }
+    if !first_slow_open(&WARNED) {
         return;
     }
     warn!(
         path = options.path,
         elapsed_ms = crate::telemetry::milliseconds(elapsed),
-        "opening this store read what no cache directory kept, and every process that opens          it reads the same bytes again. Set `CACHE_DIR` to a local directory to keep them on          disk across restarts."
+        "opening this store read what no cache directory kept, and every process that \
+         opens it reads the same bytes again. Set `CACHE_DIR` to a local directory to \
+         keep them on disk across restarts."
     );
 }
 
