@@ -267,3 +267,39 @@ fn an_assignment_to_an_unknown_column_is_refused() {
         vec![vec!["1", "x"], vec!["2", "y"], vec!["3", "z"]]
     );
 }
+
+/// Locating a deletion's positions reports its phases and the deletion
+/// backlog it had to read back, which grows with the table's history rather
+/// than with the rows being deleted. At `info`, so a caller reads it without
+/// turning on the per-request chatter `debug` carries.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn locating_positions_reports_its_phases_and_backlog() {
+    let fixture = Fixture::new(0);
+    fixture.run(&format!(
+        "{} CALL moraine_delete_located('lake', 'main', 't', getvariable('located'));",
+        Fixture::locate("1")
+    ));
+    let output = run_session_with_env(
+        &Attach::Moraine {
+            store_dir: fixture.store.path(),
+            data_path: fixture.data.path(),
+            options: &fixture.options,
+            read_only: false,
+        },
+        &format!(
+            "CALL enable_logging(level => 'info', storage => 'memory');
+             {} CALL moraine_delete_located('lake', 'main', 't', getvariable('located'));
+             SELECT 'split', count(*) FROM duckdb_logs WHERE type='moraine'
+               AND message LIKE '%located row positions%pairs=1%existing_positions=1%positioning_ms=%existing_ms=%';",
+            Fixture::locate("3")
+        ),
+        &[("MORAINE_LOG", "info")],
+    );
+    let result = combined_output(&output);
+    assert!(output.status.success(), "{result}");
+    assert!(
+        csv_rows(&result).contains(&vec!["split".into(), "1".into()]),
+        "{result}"
+    );
+}
