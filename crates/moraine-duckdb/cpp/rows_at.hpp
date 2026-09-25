@@ -28,7 +28,11 @@ PinnedSnapshot PinTransactionSnapshot(duckdb::ClientContext &context, const std:
 // Parses a located-rows argument: a LIST of STRUCT(row_id BIGINT,
 // data_file_id UBIGINT) with the fields resolved by name; a NULL file id
 // names an inlined row. `caller` prefixes the error messages.
-std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, const char *caller);
+//
+// `payload`, when given, collects the names of any further fields in
+// caller order and permits them; without it a third field is an error.
+std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, const char *caller,
+                                                   std::vector<std::string> *payload = nullptr);
 
 // Located rows resolved to DuckLake's own identifiers at the pinned
 // snapshot: `files` is a LIST of STRUCT(data_file_id, positions),
@@ -42,7 +46,8 @@ struct LocatedArguments {
 
 LocatedArguments ResolveLocatedArguments(duckdb::ClientContext &context, const std::string &catalog_name,
                                          const std::string &schema_name, const std::string &table_name,
-                                         const duckdb::Value &rows, const char *caller);
+                                         const duckdb::Value &rows, const char *caller,
+                                         bool allow_payload = false);
 
 // The table's top-level columns at `snapshot`, in catalog order, typed as
 // the storage extension binds them.

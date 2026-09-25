@@ -1435,6 +1435,36 @@ explicit transaction DuckDB commits the statement on its own. The
 concurrency rules are the recipe's, since the same snapshot pinning and
 the same refusal of an older view apply.
 
+Assignments are one expression list applied to every located row, which
+suits a caller whose rows take the same new values — a patch clearing the
+same ids from many parents, say. A caller whose values differ per row
+supplies them in `rows`, which accepts named fields beyond `row_id` and
+`data_file_id`; `assignments` reaches them under the alias `new`:
+
+```sql
+CALL moraine_update('lake', 'main', 't',
+  [{row_id: 12::BIGINT, data_file_id: 3::UBIGINT, b: 40},
+   {row_id: 57::BIGINT, data_file_id: 3::UBIGINT, b: 41}],
+  'b = new.b');
+```
+
+The replacement query then joins `moraine_rows_at` to the payload on
+`row_id` rather than projecting over it alone. A located row's id is
+unique, so the join neither adds nor drops rows, and a `rows` list carrying
+only the two positional fields composes exactly the projection above. A
+`new` reference naming no payload field is rejected where every unresolved
+column is, in the binder. A repeated `row_id` is refused outright once a
+payload is present: without one the resolution dedups it, but two payloads
+for a row have no defined winner and the join would emit both.
+
+Without this a per-row caller writes a DuckLake `UPDATE … FROM (VALUES …)`,
+which reads whole files: DuckLake's DML scan projects the `filename`,
+`file_index`, and `file_row_number` columns that record delete positions,
+and the summary-driven scan produces only row and file ids, so that rewrite
+never applies to DML. Encoding the per-row values as a `CASE` per column
+keeps one statement but grows its text as rows times columns, and binding a
+wide located statement is already its dominant cost.
+
 ### Range and comparison queries
 
 Because the canonical encoding is order-preserving (Canonical value
@@ -1748,7 +1778,7 @@ written `…` below for brevity.
 | `moraine_indexes(catalog, schema, table)` | table function: index introspection — `index_id`, `index_name`, `is_unique`, `is_building`, and `state` (`ready`\|`building`\|`maintaining`\|`poisoned`) |
 | `moraine_delete_located(catalog, schema, table, rows)` | table function: delete the located rows without a scan (File-located deletion). `rows` is a list of `row(row_id, data_file_id)` pairs as a lookup returned them, a NULL file id naming an inlined row. Returns one row of counts: file rows deleted, inline rows deleted, delete files written |
 | `moraine_rows_at(catalog, schema, table, rows)` | table function: the located rows read back whole without a scan (Located rows and located updates). Same `rows` shape. Returns the table's current columns, then `row_id` and `data_file_id` (NULL for an inlined row); a row deleted at the transaction's snapshot is omitted |
-| `moraine_update(catalog, schema, table, rows, assignments)` | table function: update the located rows without a scan in one statement (Located rows and located updates). Same `rows` shape; `assignments` is `SET`-clause text, `column = expression` pairs over the table's columns. Returns one row of counts: file rows deleted, inline rows deleted, delete files written, rows inserted |
+| `moraine_update(catalog, schema, table, rows, assignments)` | table function: update the located rows without a scan in one statement (Located rows and located updates). Same `rows` shape, optionally carrying named payload fields beyond `row_id` and `data_file_id`; `assignments` is `SET`-clause text, `column = expression` pairs over the table's columns and, as `new.<field>`, the payload. Returns one row of counts: file rows deleted, inline rows deleted, delete files written, rows inserted |
 
 `moraine_index_in` binds `keys` as one constant list value (including a
 prepared-statement parameter), like the arguments of the other explicit
