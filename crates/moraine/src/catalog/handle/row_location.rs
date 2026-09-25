@@ -1,9 +1,12 @@
 //! Locating stable row ids in the physical files that currently hold them.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use futures::{StreamExt, TryStreamExt, stream};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 mod rows_at;
 
@@ -19,6 +22,7 @@ use crate::{
     data_file::{self, DataStore, FileSummary},
     error::{Error, Result},
     store::index_encoding::IndexKeyValue,
+    telemetry::milliseconds,
 };
 
 /// One requested row's exact position within one of a table's current data
@@ -400,58 +404,91 @@ impl ReadOnlyCatalog {
             return Ok(LocatedPositions::default());
         }
 
+        let started = Instant::now();
         let visible_at = snapshot.current_snapshot().id.get();
         let (by_file, null_rows) = group_deduped_pairs(pairs);
+        let requested_files_count = by_file.len();
         let inlined_rows = self.resolve_inlined(table, null_rows, visible_at).await?;
+        let inlined_ms = milliseconds(started.elapsed());
 
-        if by_file.is_empty() {
-            return Ok(LocatedPositions {
-                inlined_rows,
-                ..LocatedPositions::default()
-            });
+        let mut positioning_ms = 0;
+        let mut existing_ms = 0;
+        let mut deletions = Vec::new();
+        let mut write_directory = None;
+
+        if !by_file.is_empty() {
+            let table_prefix = snapshot.table_data_prefix(table)?;
+            let requested_files = current_files_for(snapshot, table, &by_file)?;
+
+            let Some(store) = data_store else {
+                return Err(first_row_error(
+                    &by_file,
+                    requested_files[0].id,
+                    "no data store was supplied to read the file",
+                ));
+            };
+            let scope = LocationScope {
+                store: &store,
+                data_prefix,
+                table_prefix: &table_prefix,
+                table,
+                snapshot,
+            };
+
+            let positioning_started = Instant::now();
+            let (positioned, _) = self
+                .position_requested_files(&scope, by_file, requested_files, MissingRows::Reject)
+                .await?;
+            positioning_ms = milliseconds(positioning_started.elapsed());
+
+            let file_id_paths: Vec<_> = positioned
+                .iter()
+                .map(|file| (file.data_file_id, file.file_path.clone()))
+                .collect();
+            let existing_started = Instant::now();
+            let existing_deletes = self.existing_delete_files(&scope, &file_id_paths).await;
+            existing_ms = milliseconds(existing_started.elapsed());
+
+            deletions = positioned
+                .into_iter()
+                .zip(existing_deletes)
+                .map(|(file, existing_delete)| {
+                    Ok(LocatedDeletion {
+                        data_file_id: file.data_file_id,
+                        file_path: file.file_path,
+                        positions: file.positions,
+                        existing_delete: existing_delete?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Same snapshot the positions above were resolved against, so the
+            // directory names the table's current location, not a later one.
+            write_directory = Some(snapshot.table_write_directory(table)?);
         }
 
-        let table_prefix = snapshot.table_data_prefix(table)?;
-        let requested_files = current_files_for(snapshot, table, &by_file)?;
-
-        let Some(store) = data_store else {
-            return Err(first_row_error(
-                &by_file,
-                requested_files[0].id,
-                "no data store was supplied to read the file",
-            ));
-        };
-        let scope = LocationScope {
-            store: &store,
-            data_prefix,
-            table_prefix: &table_prefix,
-            table,
-            snapshot,
-        };
-
-        let (positioned, _) = self
-            .position_requested_files(&scope, by_file, requested_files, MissingRows::Reject)
-            .await?;
-        let file_id_paths: Vec<_> = positioned
+        // `existing_positions` is the deletion backlog this call had to read
+        // back to rewrite: it grows with the table's history, not with the
+        // rows being deleted, so a locate slow in `existing_ms` against a
+        // small `pairs` is a compaction question, not a lookup one.
+        let existing_positions: usize = deletions
             .iter()
-            .map(|file| (file.data_file_id, file.file_path.clone()))
-            .collect();
-        let existing_deletes = self.existing_delete_files(&scope, &file_id_paths).await;
-        let deletions = positioned
-            .into_iter()
-            .zip(existing_deletes)
-            .map(|(file, existing_delete)| {
-                Ok(LocatedDeletion {
-                    data_file_id: file.data_file_id,
-                    file_path: file.file_path,
-                    positions: file.positions,
-                    existing_delete: existing_delete?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Same snapshot the positions above were resolved against, so the
-        // directory names the table's current location, not a later one.
-        let write_directory = Some(snapshot.table_write_directory(table)?);
+            .filter_map(|deletion| deletion.existing_delete.as_ref())
+            .map(|existing| existing.positions.len())
+            .sum();
+        // At `info`: one record per located delete, not per request, and the
+        // level a caller can afford to leave on in production.
+        info!(
+            table_id = table.get(),
+            pairs = pairs.len(),
+            inlined = inlined_rows.len(),
+            files = requested_files_count,
+            existing_positions,
+            inlined_ms,
+            positioning_ms,
+            existing_ms,
+            total_ms = milliseconds(started.elapsed()),
+            "located row positions"
+        );
 
         Ok(LocatedPositions {
             deletions,
