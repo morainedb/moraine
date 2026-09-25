@@ -610,10 +610,46 @@ pub fn run_reference_ducklake_sql_expect_err(meta_dir: &Path, data_path: &Path, 
 pub fn csv_rows(output: &str) -> Vec<Vec<String>> {
     output
         .lines()
+        .map(strip_ansi)
+        .filter(|line| !is_log_line(line))
         .skip(1)
         .filter(|line| !line.is_empty())
-        .map(|line| line.split(',').map(str::to_owned).collect())
+        .map(|line| line.split(',').map(String::from).collect())
         .collect()
+}
+
+/// `line` without the colour sequences the CLI writes log records in. They
+/// reach the same stream as results, and one leaves its reset on the front
+/// of the header that follows it.
+fn strip_ansi(line: &str) -> String {
+    let mut stripped = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            stripped.push(character);
+            continue;
+        }
+        // A control sequence runs to its final byte, `@` through `~`.
+        for character in chars.by_ref() {
+            if ('@'..='~').contains(&character) {
+                break;
+            }
+        }
+    }
+    stripped
+}
+
+/// Whether `line` is a log record rather than a result row: a tracing
+/// target (`crate::module`) followed by `": "`. A record that fires on
+/// timing — a slow open with no cache directory — would otherwise be
+/// parsed as data by whichever assertion ran next.
+fn is_log_line(line: &str) -> bool {
+    line.split_once(": ").is_some_and(|(target, _)| {
+        target.contains("::")
+            && target
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    })
 }
 
 /// Runs `sql` through the standalone metadata-only attach — see
@@ -719,4 +755,33 @@ pub fn parquet_files_under(dir: &Path) -> Vec<PathBuf> {
 /// [`Attach::MoraineBare`]. Returns the raw output.
 pub fn run_ducklake_sql_bare(store_dir: &Path, sql: &str) -> std::process::Output {
     run_session(&Attach::MoraineBare { store_dir }, sql)
+}
+
+/// A log record landing in the result stream is dropped, and the colour
+/// reset it leaves on the header does not cost the first row. Pure, so it
+/// runs without the CLI the rest of this suite needs.
+#[test]
+fn csv_rows_drops_a_log_record_sharing_the_result_stream() {
+    let output = concat!(
+        "\u{1b}[00m\u{1b}[90mmoraine::catalog::handle: opening this store read what no ",
+        "cache directory kept, and every process that opens it reads the same bytes ",
+        "again. (path=\"\", elapsed_ms=290)\n",
+        "\u{1b}[00ma\n",
+        "1\n2\n3\n"
+    );
+
+    assert_eq!(
+        csv_rows(output),
+        vec![vec!["1"], vec!["2"], vec!["3"]],
+        "the record and the header go, the rows stay"
+    );
+}
+
+/// A result row that merely contains a colon is not mistaken for one.
+#[test]
+fn csv_rows_keeps_a_row_that_looks_faintly_like_a_record() {
+    assert_eq!(
+        csv_rows("header\nplain: value\nducklake:moraine:/tmp/lake\n"),
+        vec![vec!["plain: value"], vec!["ducklake:moraine:/tmp/lake"]]
+    );
 }

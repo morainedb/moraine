@@ -49,3 +49,17 @@ fn only_a_slow_open_with_nowhere_to_cache_is_reported() {
     assert!(!slow_open_without_cache(None, quick));
     assert!(!slow_open_without_cache(dir, quick));
 }
+
+/// The advice is to set `CACHE_DIR`, which an operator does once, so only
+/// the first slow open reports it however many follow.
+#[test]
+fn only_the_first_slow_open_reports() {
+    use std::sync::atomic::AtomicBool;
+
+    use super::handle::first_slow_open;
+
+    let warned = AtomicBool::new(false);
+    assert!(first_slow_open(&warned));
+    assert!(!first_slow_open(&warned));
+    assert!(!first_slow_open(&warned));
+}
