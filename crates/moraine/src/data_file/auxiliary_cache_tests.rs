@@ -1,12 +1,25 @@
 use std::sync::Arc;
 
 use object_store::{ObjectStore, memory::InMemory, path::Path};
+use parquet::file::metadata::ParquetMetaData;
 
 use super::auxiliary_cache::{AuxiliaryCache, FileSummaryKey};
 use crate::data_file::{
     DataStore,
     row_set::{FileRowSet, FileRowSetKind, PositionedRowSet, RowOrder},
 };
+
+/// How many of the file's row groups hold an offset index.
+fn groups_with_offset_index(metadata: &ParquetMetaData) -> usize {
+    (0..metadata.num_row_groups())
+        .filter(|group| {
+            metadata
+                .page_index_for_row_group(*group)
+                .offset_index(0)
+                .is_some()
+        })
+        .count()
+}
 
 fn summary(row_ids: Vec<u64>) -> Arc<PositionedRowSet> {
     Arc::new(PositionedRowSet {
@@ -177,7 +190,12 @@ fn values_round_trip_through_their_disk_form() {
         .with_page_index_policy(PageIndexPolicy::Required)
         .parse_and_finish(&bytes::Bytes::from(file))
         .unwrap();
-    assert!(metadata.offset_index().is_some());
+    assert!(
+        metadata
+            .page_index_for_row_group(0)
+            .offset_index(0)
+            .is_some()
+    );
 
     let round_trip = |value: AuxiliaryValue| {
         let weighed = Weighed::from(value);
@@ -201,10 +219,15 @@ fn values_round_trip_through_their_disk_form() {
     assert_eq!(decoded.num_row_groups(), 10);
     assert_eq!(decoded.file_metadata().num_rows(), 1_000);
     assert_eq!(
-        decoded.offset_index().map(Vec::len),
-        metadata.offset_index().map(Vec::len)
+        groups_with_offset_index(decoded),
+        groups_with_offset_index(&metadata)
     );
-    assert!(decoded.column_index().is_some());
+    assert!(
+        decoded
+            .page_index_for_row_group(0)
+            .column_index(0)
+            .is_some()
+    );
 
     for rows in [
         summary((0..100).collect()),
@@ -254,7 +277,12 @@ fn a_footer_without_its_page_index_round_trips_through_its_disk_form() {
         .with_page_index_policy(PageIndexPolicy::Skip)
         .parse_and_finish(&bytes::Bytes::from(file))
         .unwrap();
-    assert!(metadata.offset_index().is_none());
+    assert!(
+        metadata
+            .page_index_for_row_group(0)
+            .offset_index(0)
+            .is_none()
+    );
 
     let weighed = Weighed::from(AuxiliaryValue::Metadata {
         metadata: Arc::new(metadata),
@@ -273,8 +301,18 @@ fn a_footer_without_its_page_index_round_trips_through_its_disk_form() {
     };
     assert!(!page_index, "a footer without its page index says so");
     assert_eq!(decoded.num_row_groups(), 10);
-    assert!(decoded.offset_index().is_none());
-    assert!(decoded.column_index().is_none());
+    assert!(
+        decoded
+            .page_index_for_row_group(0)
+            .offset_index(0)
+            .is_none()
+    );
+    assert!(
+        decoded
+            .page_index_for_row_group(0)
+            .column_index(0)
+            .is_none()
+    );
 }
 
 /// A permuted summary — the shape an UPDATE's rewritten rows take — round

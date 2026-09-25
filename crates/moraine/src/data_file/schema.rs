@@ -211,7 +211,7 @@ mod tests {
     fn field_ids_override_names_and_absent_fields_use_defaults() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("reused", DataType::Int32, false)
-                .with_metadata([("PARQUET:field_id".to_owned(), "1".to_owned())].into()),
+                .with_metadata([("PARQUET:field_id".to_owned(), "1".to_owned())]),
         ]));
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![10]))])
@@ -257,7 +257,7 @@ mod tests {
         ));
         let schema = Schema::new(vec![
             Field::new("original", DataType::Int64, false)
-                .with_metadata([("PARQUET:field_id".to_owned(), "1".to_owned())].into()),
+                .with_metadata([("PARQUET:field_id".to_owned(), "1".to_owned())]),
         ]);
         let (_, positions) = BatchProjection::resolve(&schema, &[column], &[0], None).unwrap();
         assert_eq!(positions, [0]);
