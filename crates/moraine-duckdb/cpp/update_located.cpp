@@ -118,11 +118,18 @@ std::string ReplacementQuery(duckdb::ClientContext &context, const std::string &
 	}
 	auto located_rows = duckdb::Value::LIST(duckdb::LogicalType::STRUCT(pair_fields), std::move(pair_values));
 
+	// An empty list renders as `[]`, which carries no element type, and the
+	// replacement query is re-bound from this text — so both lists are cast
+	// back to the type they were built with.
+	auto typed = [](const duckdb::Value &value) {
+		return value.ToSQLString() + "::" + value.type().ToString();
+	};
+
 	auto source = duckdb::StringUtil::Format("moraine_rows_at(%s, %s, %s, %s)",
 	                                         duckdb::KeywordHelper::WriteQuoted(catalog_name),
 	                                         duckdb::KeywordHelper::WriteQuoted(schema_name),
 	                                         duckdb::KeywordHelper::WriteQuoted(table_name),
-	                                         located_rows.ToSQLString());
+	                                         typed(located_rows));
 	if (payload.empty()) {
 		return duckdb::StringUtil::Format("SELECT %s, row_id FROM %s", projection, source);
 	}
@@ -131,7 +138,7 @@ std::string ReplacementQuery(duckdb::ClientContext &context, const std::string &
 	return duckdb::StringUtil::Format(
 	    "SELECT %s, %s.row_id FROM %s AS %s JOIN (SELECT unnest(%s, max_depth := 2)) AS %s "
 	    "ON %s.row_id = %s.row_id",
-	    projection, LOCATED_ALIAS, source, LOCATED_ALIAS, rows.ToSQLString(), PAYLOAD_ALIAS, PAYLOAD_ALIAS,
+	    projection, LOCATED_ALIAS, source, LOCATED_ALIAS, typed(rows), PAYLOAD_ALIAS, PAYLOAD_ALIAS,
 	    LOCATED_ALIAS);
 }
 

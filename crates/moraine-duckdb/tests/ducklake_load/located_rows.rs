@@ -358,3 +358,33 @@ fn a_payload_naming_one_row_twice_is_refused() {
         vec![vec!["1", "x"], vec!["2", "y"], vec!["3", "z"]]
     );
 }
+
+/// An empty selection is a no-op, with or without a payload. A caller that
+/// coalesces its rows can reach it, and rendering the list back into the
+/// replacement query is where the element type would otherwise be lost.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn an_empty_selection_updates_nothing() {
+    let fixture = Fixture::new(0);
+    for rows in [
+        "[]::STRUCT(row_id BIGINT, data_file_id UBIGINT)[]",
+        "[]::STRUCT(row_id BIGINT, data_file_id UBIGINT, b VARCHAR)[]",
+    ] {
+        let assignments = if rows.contains("b VARCHAR") {
+            "b = new.b"
+        } else {
+            "b = ''q''"
+        };
+        assert_eq!(
+            csv_rows(&fixture.run(&format!(
+                "SELECT rows_inserted FROM moraine_update('lake', 'main', 't', {rows}, '{assignments}');"
+            ))),
+            vec![vec!["0"]],
+            "{rows}"
+        );
+    }
+    assert_eq!(
+        fixture.rows(),
+        vec![vec!["1", "x"], vec!["2", "y"], vec!["3", "z"]]
+    );
+}
