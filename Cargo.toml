@@ -12,7 +12,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 anyhow = "1"
 fastbloom = "0.17"
-arrow = { version = "59.2.0", default-features = false }
+arrow = { version = "60.0.0", default-features = false }
 async-trait = "0.1"
 bytes = "1"
 cpu-time = "1"
