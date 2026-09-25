@@ -341,6 +341,16 @@ pub enum RowOperation {
         /// The row the removed deletion killed.
         row_id: u64,
     },
+    /// Removes every `inline/file_delete` record for `table_id`: the
+    /// table-wide form of
+    /// [`InlineFileDeleteRemove`](Self::InlineFileDeleteRemove),
+    /// staged when a clear matched every record rather than a subset. One
+    /// operation however many records go, where the per-record form costs
+    /// one each and a flush's clear is the whole backlog.
+    InlineFileDeleteClear {
+        /// Owning table.
+        table_id: u64,
+    },
     /// Removes every `inline/insert` chunk begun at or before
     /// `flush_snapshot` for `(table_id, schema_version)`, plus the
     /// `inline/inline_delete` tombstones on those chunks' rows.
@@ -1827,22 +1837,23 @@ const MAX_STAGED_COST_PER_COMMIT: usize = 100_000;
 
 /// Whether `ops` may exceed [`MAX_STAGED_COST_PER_COMMIT`].
 ///
-/// A flush is the only drain for inlined rows and inlined deletions, and
-/// its size is set by what is already inlined rather than by the caller,
-/// who cannot split it: the batch arrives as one DuckLake transaction.
-/// Refusing an oversized one strands exactly what it was going to move,
-/// and every later flush is larger than the one refused — the backlog
-/// becomes undrainable.
+/// A flush arrives as one DuckLake transaction and its caller cannot split
+/// it, so refusing an oversized one strands what it was going to move and
+/// leaves every later flush larger than the one refused. Its own
+/// operations are table-scoped and few, so this does not fire in practice;
+/// it is here so that a change making a flush expensive again degrades to
+/// a slow commit rather than to a backlog nothing can drain.
 ///
-/// Both halves count. Draining chunks is one op for a whole
-/// `(table, schema_version)`, but materializing inlined deletions is one
-/// per row, so a flush carrying only the second half is the larger batch
-/// and the one that reaches the ceiling first.
+/// The per-record
+/// [`InlineFileDeleteRemove`](RowOperation::InlineFileDeleteRemove)
+/// is deliberately not exempt. Now that a clear stages table-wide, it is
+/// reachable only from a filtered delete — which a caller can split, which
+/// is what the ceiling asks for.
 fn exempt_from_staged_cost(ops: &[RowOperation]) -> bool {
     ops.iter().any(|op| {
         matches!(
             op,
-            RowOperation::InlineFlushDelete { .. } | RowOperation::InlineFileDeleteRemove { .. }
+            RowOperation::InlineFlushDelete { .. } | RowOperation::InlineFileDeleteClear { .. }
         )
     })
 }

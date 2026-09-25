@@ -4178,6 +4178,21 @@ int32_t moraine_tx_stage_inline_flush_delete(struct MoraineTxHandle *tx,
                                              uint64_t flush_snapshot,
                                              struct MoraineError *err);
 
+// Stages the table-wide form of
+// [`moraine_tx_stage_inline_file_delete_remove`]: removes every
+// `inline/file_delete` record for `table_id` in one operation.
+//
+// Staged in place of the per-record calls when a clear matched every
+// record the table carries, which is what a flush's unqualified `DELETE`
+// against `ducklake_inlined_delete_<table_id>` always does.
+//
+// # Safety
+//
+// Same contract as [`moraine_tx_stage_inline_inline_delete`].
+int32_t moraine_tx_stage_inline_file_delete_clear(struct MoraineTxHandle *tx,
+                                                  uint64_t table_id,
+                                                  struct MoraineError *err);
+
 // Stages a table drop: removes every `inline/*` record for `table_id`.
 //
 // **Unused by the shim.** DuckLake ends the `ducklake_table` row itself,
