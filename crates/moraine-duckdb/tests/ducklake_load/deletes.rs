@@ -692,3 +692,50 @@ fn ducklake_narrowing_the_statistics_scan_changes_no_answer() {
         "{stats} WHERE value_count > 0 ORDER BY table_id, column_id;"
     ));
 }
+
+/// A clear that matches every inlined deletion is staged as one operation
+/// and a partial one is still staged per record — the distinction the
+/// flush's unqualified `DELETE` rests on. A filtered clear that took the
+/// table-wide path would drop deletions that should have survived, and
+/// the rows they killed would come back.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn a_filtered_clear_of_inlined_deletions_removes_only_what_it_matched() {
+    let dir = TempDir::new("delete-partial-store");
+    let data_dir = TempDir::new("delete-partial-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CREATE TABLE lake.main.child (parent_id BIGINT, line BIGINT);",
+    );
+    seed_flushed_rows(store, data_path, 3);
+    run_ducklake_sql(
+        store,
+        data_path,
+        "DELETE FROM lake.main.child WHERE parent_id = 1 AND line < 8;",
+    );
+    assert_eq!(
+        count(store, "SELECT count(*) FROM m.ducklake_inlined_delete_1;"),
+        "8"
+    );
+
+    run_standalone_sql(
+        store,
+        "DELETE FROM m.ducklake_inlined_delete_1 WHERE row_id < 3;",
+    );
+    assert_eq!(
+        count(store, "SELECT count(*) FROM m.ducklake_inlined_delete_1;"),
+        "5",
+        "a filtered clear removes exactly what it matched"
+    );
+
+    run_standalone_sql(store, "DELETE FROM m.ducklake_inlined_delete_1;");
+    assert_eq!(
+        count(store, "SELECT count(*) FROM m.ducklake_inlined_delete_1;"),
+        "0",
+        "an unqualified clear removes the rest"
+    );
+}

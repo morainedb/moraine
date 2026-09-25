@@ -8748,44 +8748,6 @@ async fn maintenance_keeps_inlined_records_of_a_table_history_still_records() {
     catalog.close().await.unwrap();
 }
 
-/// A flush may exceed the per-commit ceiling; an ordinary batch may not.
-///
-/// The flush is the only drain for inlined rows, so refusing an oversized
-/// one strands exactly the rows it was going to move — and every later
-/// flush is larger than the one just refused.
-#[test]
-fn only_a_flush_may_exceed_the_commit_ceiling() {
-    use super::{exempt_from_staged_cost, staged_cost};
-
-    let inserts: Vec<RowOperation> = (0..4)
-        .map(|id| RowOperation::Insert {
-            table: TableKind::Table,
-            cells: table_row(id, 0, "t", 1, None),
-        })
-        .collect();
-    let mut flushing = inserts.clone();
-    flushing.push(RowOperation::InlineFlushDelete {
-        table_id: 1,
-        schema_version: 0,
-        flush_snapshot: 1,
-    });
-
-    // The half that reaches the ceiling first: materializing inlined
-    // deletions stages one op per row, where draining chunks stages one
-    // for a whole version.
-    let mut materializing = inserts.clone();
-    materializing.push(RowOperation::InlineFileDeleteRemove {
-        table_id: 1,
-        data_file_id: 1,
-        row_id: 7,
-    });
-
-    assert_eq!(staged_cost(&inserts), 4, "an insert costs one each");
-    assert!(!exempt_from_staged_cost(&inserts));
-    assert!(exempt_from_staged_cost(&flushing));
-    assert!(exempt_from_staged_cost(&materializing));
-}
-
 /// An update is charged twice: it ends the live version and writes what
 /// replaces it.
 #[test]
@@ -8798,4 +8760,102 @@ fn an_update_is_charged_for_both_halves() {
     }];
 
     assert_eq!(staged_cost(&update), 2);
+}
+
+/// Clearing a table's inlined file deletions costs one operation however
+/// many records it removes, where removing them one at a time costs one
+/// each. The flush only ever clears the whole table, and its cost was
+/// growing with the delete backlog it exists to drain.
+#[tokio::test]
+async fn clearing_inlined_file_deletions_costs_one_operation() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    for row_id in 0..4u64 {
+        tx.stage(RowOperation::InlineFileDelete {
+            table_id: 1,
+            data_file_id: 7,
+            row_id,
+            begin_snapshot: 1,
+        });
+    }
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 0, 1),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "inlined_delete:1"),
+    });
+    tx.commit().await.unwrap();
+
+    let read = catalog.begin_write_tx().await.unwrap();
+    assert_eq!(
+        crate::store::inline::scan_inline_file_deletes(ReadHandle::Tx(&read), 1)
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+    drop(read);
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::InlineFileDeleteClear { table_id: 1 });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 0, 1),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "inlined_delete:1"),
+    });
+    tx.commit().await.unwrap();
+
+    let read = catalog.begin_write_tx().await.unwrap();
+    assert!(
+        crate::store::inline::scan_inline_file_deletes(ReadHandle::Tx(&read), 1)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the clear removes every record for the table"
+    );
+}
+
+/// One clear is one operation against the ceiling, whatever it removes.
+#[test]
+fn a_clear_costs_one_against_the_ceiling() {
+    use super::staged_cost;
+
+    assert_eq!(
+        staged_cost(&[RowOperation::InlineFileDeleteClear { table_id: 1 }]),
+        1
+    );
+}
+
+/// The ceiling is lifted for the operations a flush stages and for nothing
+/// else. A flush cannot be split by its caller; a filtered delete can, and
+/// the per-record removal is now reachable only from one.
+#[test]
+fn only_a_flush_s_own_operations_may_exceed_the_ceiling() {
+    use super::exempt_from_staged_cost;
+
+    let clear = [RowOperation::InlineFileDeleteClear { table_id: 1 }];
+    let drain = [RowOperation::InlineFlushDelete {
+        table_id: 1,
+        schema_version: 0,
+        flush_snapshot: 1,
+    }];
+    let per_record = [RowOperation::InlineFileDeleteRemove {
+        table_id: 1,
+        data_file_id: 1,
+        row_id: 7,
+    }];
+
+    assert!(exempt_from_staged_cost(&clear));
+    assert!(exempt_from_staged_cost(&drain));
+    assert!(
+        !exempt_from_staged_cost(&per_record),
+        "a filtered delete is the caller's to split"
+    );
 }

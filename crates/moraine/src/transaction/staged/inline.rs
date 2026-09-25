@@ -346,6 +346,29 @@ async fn translate_pruned_file_delete_cascade(
 
 /// Removes every `inline/*` record for `table_id`: schema, chunks, and
 /// tombstones, read from `db_tx`'s current (pre-commit) state.
+/// Removes every `inline/file_delete` record for `table_id`, the way a
+/// clear that matched all of them would one at a time.
+pub(super) async fn translate_inline_file_delete_clear(
+    db_tx: &DbTransaction,
+    table_id: u64,
+    writes: &mut Vec<commit::StagedWrite>,
+) -> Result<()> {
+    let removals = store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id).await?;
+    for (data_file_id, row_id, _) in removals {
+        writes.push((
+            Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
+                table_id,
+                data_file_id,
+                row_id,
+            }))
+            .encode(),
+            None,
+        ));
+    }
+
+    Ok(())
+}
+
 pub(super) async fn translate_inline_drop(
     db_tx: &DbTransaction,
     table_id: u64,
@@ -767,6 +790,7 @@ pub(super) async fn translate_inline(
                 RowOperation::InlineFlushDelete { .. }
                     | RowOperation::InlineDrop { .. }
                     | RowOperation::InlineSchemaDrop { .. }
+                    | RowOperation::InlineFileDeleteClear { .. }
             )
         })
         .collect();
@@ -791,6 +815,9 @@ pub(super) async fn translate_inline(
             }
             RowOperation::InlineDrop { table_id } => {
                 translate_inline_drop(db_tx, *table_id, &mut writes).await?;
+            }
+            RowOperation::InlineFileDeleteClear { table_id } => {
+                translate_inline_file_delete_clear(db_tx, *table_id, &mut writes).await?;
             }
             RowOperation::InlineSchemaDrop {
                 table_id,
@@ -889,6 +916,7 @@ pub(super) async fn translate_inline(
             | RowOperation::InlineFlushDelete { .. }
             | RowOperation::InlineDrop { .. }
             | RowOperation::InlineFileDeleteRemove { .. }
+            | RowOperation::InlineFileDeleteClear { .. }
             | RowOperation::Insert { .. }
             | RowOperation::Delete { .. }
             | RowOperation::UpdateSetEnd { .. }

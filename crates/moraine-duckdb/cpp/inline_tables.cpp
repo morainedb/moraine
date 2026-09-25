@@ -899,6 +899,12 @@ struct InlineDmlState : public duckdb::GlobalSinkState {
 	// materialization entirely (`ProvideInlineFileDeleteRows`).
 	bool old_delete_rows_loaded = false;
 	std::vector<std::vector<duckdb::Value>> old_delete_rows;
+	// Delete-table DELETE only: the `(file_id, row_id)` pairs the statement
+	// matched, staged at the end rather than as they arrive. A clear that
+	// matched every record the table carries is one operation instead of
+	// one per record, which is what the flush's unqualified DELETE always
+	// is and what made its cost grow with the backlog it drains.
+	std::vector<std::pair<uint64_t, uint64_t>> matched_file_deletes;
 	// DELETE only: the maximum `begin_snapshot` among matched rows, standing
 	// in for the flush-snapshot threshold.
 	std::optional<uint64_t> max_begin_snapshot;
@@ -1173,15 +1179,37 @@ public:
 			}
 			// Columns 0/1 of the scan are `file_id`/`row_id`.
 			auto &old_row = state.old_delete_rows[index];
-			MoraineError err {};
-			auto code = moraine_tx_stage_inline_file_delete_remove(tx, table_id_, CellAsU64(old_row[0]),
-			                                                       CellAsU64(old_row[1]), &err);
-			if (code != MORAINE_OK) {
-				ThrowMoraineError(err);
-			}
+			state.matched_file_deletes.emplace_back(CellAsU64(old_row[0]), CellAsU64(old_row[1]));
 			state.affected_count++;
 		}
 		return duckdb::SinkResultType::NEED_MORE_INPUT;
+	}
+
+	// Staged here rather than in `Sink`, because whether this statement
+	// matched every record is only known once its last row has arrived.
+	duckdb::SourceResultType GetDataInternal(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
+	                                         duckdb::OperatorSourceInput &input) const override {
+		auto &state = sink_state->Cast<InlineDmlState>();
+		if (!state.emitted && !state.matched_file_deletes.empty()) {
+			auto *tx = StagedTx(context.client);
+			MoraineError err {};
+			int32_t code = MORAINE_OK;
+			if (state.matched_file_deletes.size() == state.old_delete_rows.size()) {
+				code = moraine_tx_stage_inline_file_delete_clear(tx, table_id_, &err);
+			} else {
+				for (auto &matched : state.matched_file_deletes) {
+					code = moraine_tx_stage_inline_file_delete_remove(tx, table_id_, matched.first,
+					                                                  matched.second, &err);
+					if (code != MORAINE_OK) {
+						break;
+					}
+				}
+			}
+			if (code != MORAINE_OK) {
+				ThrowMoraineError(err);
+			}
+		}
+		return MoraineInlineDml::GetDataInternal(context, chunk, input);
 	}
 };
 
