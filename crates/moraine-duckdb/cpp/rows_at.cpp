@@ -5,6 +5,7 @@
 // rows decode from their chunk. The output is the table's current columns
 // followed by `row_id` and `data_file_id`.
 #include <unordered_map>
+#include <unordered_set>
 
 #include "duckdb.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
@@ -47,7 +48,8 @@ PinnedSnapshot PinTransactionSnapshot(duckdb::ClientContext &context, const std:
 	return pinned;
 }
 
-std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, const char *caller) {
+std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, const char *caller,
+                                                   std::vector<std::string> *payload) {
 	std::vector<MorainePositionPair> pairs;
 	if (rows.IsNull()) {
 		throw duckdb::InvalidInputException("%s: `rows` cannot be NULL", caller);
@@ -71,9 +73,16 @@ std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, co
 			data_file_id_index = i;
 		}
 	}
-	if (children.size() != 2 || !row_id_index.IsValid() || !data_file_id_index.IsValid()) {
+	if (!row_id_index.IsValid() || !data_file_id_index.IsValid() || (!payload && children.size() != 2)) {
 		throw duckdb::InvalidInputException(
 		    "%s: each `rows` entry must be exactly STRUCT(row_id BIGINT, data_file_id UBIGINT)", caller);
+	}
+	if (payload) {
+		for (duckdb::idx_t i = 0; i < children.size(); i++) {
+			if (i != row_id_index.GetIndex() && i != data_file_id_index.GetIndex()) {
+				payload->push_back(children[i].first);
+			}
+		}
 	}
 
 	for (auto &row : duckdb::ListValue::GetChildren(rows)) {
@@ -95,13 +104,27 @@ std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, co
 		pairs.push_back(pair);
 	}
 
+	// Without a payload a repeated row id is harmless — the resolution
+	// dedups it. With one, two payloads for a row have no defined winner,
+	// and the replacement join would emit both.
+	if (payload && !payload->empty()) {
+		std::unordered_set<uint64_t> seen;
+		for (auto &pair : pairs) {
+			if (!seen.insert(pair.row_id).second) {
+				throw duckdb::InvalidInputException("%s: `rows` names row id %llu twice; a payload row id must be unique",
+				                                    caller, static_cast<unsigned long long>(pair.row_id));
+			}
+		}
+	}
+
 	return pairs;
 }
 
 LocatedArguments ResolveLocatedArguments(duckdb::ClientContext &context, const std::string &catalog_name,
                                          const std::string &schema_name, const std::string &table_name,
-                                         const duckdb::Value &rows, const char *caller) {
-	auto pairs = ParseLocatedPairs(rows, caller);
+                                         const duckdb::Value &rows, const char *caller, bool allow_payload) {
+	std::vector<std::string> payload;
+	auto pairs = ParseLocatedPairs(rows, caller, allow_payload ? &payload : nullptr);
 	auto pinned = PinTransactionSnapshot(context, catalog_name, schema_name, table_name);
 	OwnedArray<MoraineLocatedFile> files(moraine_locate_row_positions_free_files);
 	OwnedArray<uint64_t> inlined(moraine_locate_row_positions_free_inlined);

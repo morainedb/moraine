@@ -303,3 +303,58 @@ fn locating_positions_reports_its_phases_and_backlog() {
         "{result}"
     );
 }
+
+/// Payload fields in `rows` give each located row its own new value, under
+/// a field named for the column it assigns.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn a_located_update_takes_per_row_values_from_the_payload() {
+    for inline_limit in [0, 1024] {
+        let fixture = Fixture::new(inline_limit);
+        let ids_before = csv_rows(&fixture.run("SELECT rowid, a FROM lake.main.t ORDER BY a;"));
+        let counts = csv_rows(&fixture.run(
+            "SET VARIABLE payload = (
+                 SELECT list({row_id: hits.row_id, data_file_id: hits.data_file_id, b: 'p-' || t.a})
+                 FROM lake.main.t AS t
+                 JOIN moraine_index_in('lake', 'main', 't', 'by_a', [1, 3]) hits
+                   ON t.rowid = hits.row_id AND t.data_file_id IS NOT DISTINCT FROM hits.data_file_id);
+             SELECT file_rows_deleted + inline_rows_deleted, rows_inserted FROM \
+             moraine_update('lake', 'main', 't', getvariable('payload'), 'b = new.b');",
+        ));
+        assert_eq!(counts, vec![vec!["2", "2"]]);
+        assert_eq!(
+            fixture.rows(),
+            vec![vec!["1", "p-1"], vec!["2", "y"], vec!["3", "p-3"]]
+        );
+        // The rows keep their ids, as an assignment-only update does.
+        assert_eq!(
+            csv_rows(&fixture.run("SELECT rowid, a FROM lake.main.t ORDER BY a;")),
+            ids_before
+        );
+    }
+}
+
+/// Two payloads for one row have no defined winner.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn a_payload_naming_one_row_twice_is_refused() {
+    let fixture = Fixture::new(0);
+    let output = run_ducklake_sql_output(
+        fixture.store.path(),
+        fixture.data.path(),
+        &fixture.options,
+        "SET VARIABLE payload = (
+             SELECT list({row_id: row_id, data_file_id: data_file_id, b: 'z'}) FROM (
+                 SELECT row_id, data_file_id FROM moraine_index_in('lake', 'main', 't', 'by_a', [1])
+                 UNION ALL
+                 SELECT row_id, data_file_id FROM moraine_index_in('lake', 'main', 't', 'by_a', [1])));
+         CALL moraine_update('lake', 'main', 't', getvariable('payload'), 'b = new.b');",
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("twice"), "{error}");
+    assert_eq!(
+        fixture.rows(),
+        vec![vec!["1", "x"], vec!["2", "y"], vec!["3", "z"]]
+    );
+}

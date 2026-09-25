@@ -57,6 +57,12 @@ std::unordered_map<std::string, std::string> ParseAssignments(const std::string 
 	return result;
 }
 
+// The located rows and the payload, as the replacement query names them.
+// `new` is the caller's handle on a payload field; the other only has to
+// differ from it and from any column a caller writes unqualified.
+constexpr auto LOCATED_ALIAS = "moraine_located";
+constexpr auto PAYLOAD_ALIAS = "new";
+
 // The replacement query: every column of the table in order, assigned
 // columns replaced by their expression, then the row id, read from the
 // located rows. DuckLake writes the id back, so the rows keep their ids as
@@ -70,6 +76,13 @@ std::string ReplacementQuery(duckdb::ClientContext &context, const std::string &
 	duckdb::vector<std::string> names;
 	TableColumns(pinned.snapshot, schema_name, table_name, types, names);
 
+	// A payload joins beside the row, so an unassigned column is qualified
+	// to stay unambiguous against a payload field of the same name — which
+	// is the ordinary case, a column updated from a field named for it.
+	std::vector<std::string> payload;
+	auto pairs = ParseLocatedPairs(rows, "moraine_update", &payload);
+	auto located = payload.empty() ? std::string() : std::string(LOCATED_ALIAS) + ".";
+
 	std::unordered_map<std::string, bool> known;
 	std::string projection;
 	for (auto &name : names) {
@@ -80,7 +93,8 @@ std::string ReplacementQuery(duckdb::ClientContext &context, const std::string &
 			projection += ", ";
 		}
 		auto assignment = assigned.find(lower);
-		projection += assignment == assigned.end() ? quoted : "(" + assignment->second + ") AS " + quoted;
+		projection += assignment == assigned.end() ? located + quoted
+		                                           : "(" + assignment->second + ") AS " + quoted;
 	}
 	for (auto &assignment : assigned) {
 		if (!known.count(assignment.first)) {
@@ -89,10 +103,36 @@ std::string ReplacementQuery(duckdb::ClientContext &context, const std::string &
 		}
 	}
 
-	return duckdb::StringUtil::Format("SELECT %s, row_id FROM moraine_rows_at(%s, %s, %s, %s)", projection,
-	                                  duckdb::KeywordHelper::WriteQuoted(catalog_name),
-	                                  duckdb::KeywordHelper::WriteQuoted(schema_name),
-	                                  duckdb::KeywordHelper::WriteQuoted(table_name), rows.ToSQLString());
+	// `moraine_rows_at` takes the pair shape and nothing else, so the read
+	// side gets the pairs back without their payload.
+	duckdb::child_list_t<duckdb::LogicalType> pair_fields {{"row_id", duckdb::LogicalType::BIGINT},
+	                                                       {"data_file_id", duckdb::LogicalType::UBIGINT}};
+	duckdb::vector<duckdb::Value> pair_values;
+	pair_values.reserve(pairs.size());
+	for (auto &pair : pairs) {
+		duckdb::child_list_t<duckdb::Value> fields {
+		    {"row_id", duckdb::Value::BIGINT(static_cast<int64_t>(pair.row_id))},
+		    {"data_file_id", pair.has_data_file_id ? duckdb::Value::UBIGINT(pair.data_file_id)
+		                                           : duckdb::Value(duckdb::LogicalType::UBIGINT)}};
+		pair_values.push_back(duckdb::Value::STRUCT(std::move(fields)));
+	}
+	auto located_rows = duckdb::Value::LIST(duckdb::LogicalType::STRUCT(pair_fields), std::move(pair_values));
+
+	auto source = duckdb::StringUtil::Format("moraine_rows_at(%s, %s, %s, %s)",
+	                                         duckdb::KeywordHelper::WriteQuoted(catalog_name),
+	                                         duckdb::KeywordHelper::WriteQuoted(schema_name),
+	                                         duckdb::KeywordHelper::WriteQuoted(table_name),
+	                                         located_rows.ToSQLString());
+	if (payload.empty()) {
+		return duckdb::StringUtil::Format("SELECT %s, row_id FROM %s", projection, source);
+	}
+	// `unnest` at depth two spreads the struct's fields into columns, so the
+	// payload is addressable as `new.<field>` without naming any of them here.
+	return duckdb::StringUtil::Format(
+	    "SELECT %s, %s.row_id FROM %s AS %s JOIN (SELECT unnest(%s, max_depth := 2)) AS %s "
+	    "ON %s.row_id = %s.row_id",
+	    projection, LOCATED_ALIAS, source, LOCATED_ALIAS, rows.ToSQLString(), PAYLOAD_ALIAS, PAYLOAD_ALIAS,
+	    LOCATED_ALIAS);
 }
 
 duckdb::unique_ptr<duckdb::TableRef> UpdateReplace(duckdb::ClientContext &context,
@@ -105,8 +145,8 @@ duckdb::unique_ptr<duckdb::TableRef> UpdateReplace(duckdb::ClientContext &contex
 	}
 	auto replacement = ReplacementQuery(context, catalog_name, schema_name, table_name, input.inputs[3],
 	                                    input.inputs[4].GetValue<std::string>());
-	auto located =
-	    ResolveLocatedArguments(context, catalog_name, schema_name, table_name, input.inputs[3], "moraine_update");
+	auto located = ResolveLocatedArguments(context, catalog_name, schema_name, table_name, input.inputs[3],
+	                                       "moraine_update", /* allow_payload */ true);
 
 	duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> arguments;
 	for (duckdb::idx_t i = 0; i < 3; i++) {
