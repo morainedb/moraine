@@ -312,3 +312,41 @@ fn summary_scan_runs_inside_a_writing_transaction_minus_its_deletes() {
         assert_eq!(sums, vec!["22", "16", "2", "2"], "limit={limit}: {result}");
     }
 }
+
+/// A `UUID` column the query filters and projects keeps the selective path.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn summary_scan_reads_uuid_columns() {
+    let store = TempDir::new("selective-uuid-store");
+    let data = TempDir::new("selective-uuid-data");
+    let options = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let owner = "11111111-1111-1111-1111-111111111111";
+    let query = format!(
+        "SELECT 'rows', count(*), min(data.owner_id::VARCHAR) FROM lake.main.t data
+         JOIN moraine_index_in('lake','main','t','by_a',[1,3,7]) hits
+         ON data.rowid = hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id
+         WHERE data.owner_id = '{owner}'::UUID"
+    );
+    let result = run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &options,
+        &format!(
+            "CREATE TABLE lake.main.t AS
+               SELECT i a, '{owner}'::UUID owner_id FROM range(10000) r(i);
+             CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+             EXPLAIN {query}; {query};"
+        ),
+    );
+    assert!(
+        result.contains("MORAINE_SUMMARY_SCAN"),
+        "no selective scan: {result}"
+    );
+    assert!(
+        result.lines().any(|line| line == format!("rows,3,{owner}")),
+        "wrong rows: {result}"
+    );
+}
