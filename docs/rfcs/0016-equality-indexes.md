@@ -1132,7 +1132,8 @@ additive components of parallel wall time. Both paths retain their own caches.
 The rewrite declines time travel, change scans, sampling, unsupported
 virtual columns, nested column projections, and types not supported by the
 core's logical schema projection. Supported scalar types are booleans,
-integers through 64 bits, floating point, strings, dates, and timestamps.
+integers through 64 bits, floating point, strings, UUIDs, dates, and
+timestamps.
 Other shapes retain DuckLake's scan and the existing derived filters. A
 failed exact summary remains an error, never a fabricated position. The new
 scan retains the multi-file scan's statement-cache restriction; core probe

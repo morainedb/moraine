@@ -44,6 +44,7 @@ bool SupportedType(const duckdb::LogicalType &type) {
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::UUID:
 	case LogicalTypeId::DATE:
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_TZ:
