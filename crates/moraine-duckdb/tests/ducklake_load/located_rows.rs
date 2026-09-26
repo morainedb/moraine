@@ -388,3 +388,38 @@ fn an_empty_selection_updates_nothing() {
         vec![vec!["1", "x"], vec!["2", "y"], vec!["3", "z"]]
     );
 }
+
+/// An index read resolves at bind, so both halves of that resolution — the
+/// lookup and turning its row ids into file candidates — report at `info`,
+/// where a caller reads them without the per-request chatter `debug` carries.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn an_index_read_reports_both_halves_of_its_bind() {
+    let fixture = Fixture::new(0);
+    let output = run_session_with_env(
+        &Attach::Moraine {
+            store_dir: fixture.store.path(),
+            data_path: fixture.data.path(),
+            options: &fixture.options,
+            read_only: false,
+        },
+        "CALL enable_logging(level => 'info', storage => 'memory');
+         SELECT count(*) FROM moraine_index_in('lake', 'main', 't', 'by_a', [1, 3]);
+         SELECT 'lookup', count(*) FROM duckdb_logs WHERE type='moraine'
+           AND message LIKE '%index lookup resolved%lookup_keys=2%lookup_ms=%';
+         SELECT 'located', count(*) FROM duckdb_logs WHERE type='moraine'
+           AND message LIKE '%located row ids%row_ids=2%files_ms=%inline_ms=%';",
+        &[("MORAINE_LOG", "info")],
+    );
+    let result = combined_output(&output);
+    assert!(output.status.success(), "{result}");
+    let rows = csv_rows(&result);
+    assert!(
+        rows.contains(&vec!["lookup".into(), "1".into()]),
+        "{result}"
+    );
+    assert!(
+        rows.contains(&vec!["located".into(), "1".into()]),
+        "{result}"
+    );
+}

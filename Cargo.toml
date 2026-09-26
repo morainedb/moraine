@@ -12,7 +12,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 anyhow = "1"
 fastbloom = "0.17"
-arrow = { version = "59.2.0", default-features = false }
+arrow = { version = "60.0.0", default-features = false }
 async-trait = "0.1"
 bytes = "1"
 cpu-time = "1"
@@ -20,7 +20,7 @@ dhat = "0.3"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 # Diff iterator misses updates past a shared leaf before 7.0.2; regression pinned in commit/diff.rs.
 imbl = "7.0.2"
-parquet = { version = "59.2.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
+parquet = { version = "60.0.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
 moraine = { path = "crates/moraine", version = "0.7.0" }
 foyer = { version = "0.22", features = ["serde"] }
 object_store = "0.14"

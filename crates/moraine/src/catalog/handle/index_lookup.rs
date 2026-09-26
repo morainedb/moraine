@@ -6,7 +6,7 @@ use std::{
 };
 
 use futures::{StreamExt, stream::FuturesUnordered};
-use tracing::debug;
+use tracing::info;
 
 use super::{ReadOnlyCatalog, cache_epoch, index_probe_cache::Probe};
 use crate::{
@@ -155,7 +155,10 @@ impl ReadOnlyCatalog {
                     // One line per resolved lookup, and only what naming it
                     // costs nothing to carry: a probe reused inside a
                     // transaction resolves once, and this is what says so.
-                    debug!(
+                    // At `info`: one record per resolved probe, and an
+                    // index read resolves at bind, so this is where a slow
+                    // statement's cost first becomes visible.
+                    info!(
                         table_id = table.get(),
                         index_id = index.get(),
                         lookup_keys = keys.len(),

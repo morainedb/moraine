@@ -83,10 +83,9 @@ pub(crate) async fn read_coverage(
             if selected.is_empty() {
                 continue;
             }
-            let pages = metadata
-                .offset_index()
-                .and_then(|groups| groups.get(group_index))
-                .and_then(|columns| columns.get(column_index))
+            let group_page_index = metadata.page_index_for_row_group(group_index);
+            let pages = group_page_index
+                .offset_index(column_index)
                 .map(OffsetIndexMetaData::page_locations);
             if let Some(pages) = pages.filter(|pages| !pages.is_empty()) {
                 let mut selected_bytes = 0_u64;
