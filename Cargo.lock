@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "moraine"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-duckdb"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow",
  "bytes",
