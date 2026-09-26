@@ -147,10 +147,7 @@ impl super::ReadOnlyCatalog {
         probe: Probe,
         read: impl AsyncFnOnce() -> crate::Result<Vec<u64>>,
     ) -> crate::Result<Vec<u64>> {
-        let revision = self
-            .pinned
-            .as_ref()
-            .map(|pinned| pinned.transaction.seqnum());
+        let revision = self.pinned_revision();
         if let Some(revision) = revision
             && let Some(rows) = self.index_probes.get(revision, table, index, &probe)
         {

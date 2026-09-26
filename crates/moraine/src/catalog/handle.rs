@@ -8,6 +8,7 @@ mod index_probe_cache;
 mod index_read_scope;
 mod inline_scan;
 mod maintenance;
+mod revision_memo;
 mod row_location;
 mod row_lookup;
 mod table_warm;
@@ -442,6 +443,13 @@ fn parse_checkpoint(checkpoint: Option<&str>) -> Result<Option<uuid::Uuid>> {
 /// one logical commit.
 pub type CommitMember<'a> = &'a (dyn Fn(&mut Transaction) -> Result<()> + Sync);
 
+/// Ceilings for the per-revision memos beside the probe cache: located
+/// candidates are a few tens of bytes per row; a deletion ledger can run to
+/// hundreds of thousands of positions.
+const LOCATED_MEMO_BYTES: usize = 8 * 1024 * 1024;
+const LEDGER_MEMO_BYTES: usize = 32 * 1024 * 1024;
+const MEMO_ENTRIES: usize = 4096;
+
 /// The read surface of a moraine catalog: cheap to clone, drives every
 /// read. This is what a read-only attach hands back, and what a
 /// read-write [`Catalog`] derefs to.
@@ -487,6 +495,17 @@ pub struct ReadOnlyCatalog {
     data_reads: Arc<data_file::DataStoreCounters>,
     row_lookups: Arc<row_lookup::RowLookupCache>,
     index_probes: Arc<index_probe_cache::IndexProbeCache>,
+    /// The file candidates a resolved probe's row ids located, keyed by
+    /// those ids; a rebind at the same revision locates nothing twice.
+    located_rows: Arc<revision_memo::RevisionMemo<Vec<u64>, Vec<crate::catalog::FileRowCandidate>>>,
+    /// A table's committed inlined deletions by data file, read once per
+    /// revision however many scans a statement opens.
+    inlined_file_deletes: Arc<
+        revision_memo::RevisionMemo<
+            u64,
+            std::collections::HashMap<u64, std::collections::HashSet<u64>>,
+        >,
+    >,
     location: Arc<StoreLocation>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     commits: Arc<commit::Coalescer>,
@@ -583,6 +602,8 @@ impl ReadOnlyCatalog {
             .estimated_bytes()
             .saturating_add(self.row_lookups.estimated_bytes())
             .saturating_add(self.index_probes.estimated_bytes())
+            .saturating_add(self.located_rows.estimated_bytes())
+            .saturating_add(self.inlined_file_deletes.estimated_bytes())
     }
 
     /// Logical memory attributed to this catalog and the process-shared caches.
@@ -690,6 +711,14 @@ impl ReadOnlyCatalog {
     /// head from the store; `None` on a read-only handle, which always
     /// reads. Callers must pair it with
     /// [`refuse_if_closed`](Self::refuse_if_closed).
+    /// The store revision a pinned read scope holds, under which a read's
+    /// answer is fixed and may be memoized; `None` outside one.
+    pub(crate) fn pinned_revision(&self) -> Option<u64> {
+        self.pinned
+            .as_ref()
+            .map(|pinned| pinned.transaction.seqnum())
+    }
+
     pub(crate) fn writer_head_view(&self) -> Option<Arc<CatalogSnapshot>> {
         if let Some(pinned) = &self.pinned {
             return Some(pinned.snapshot.clone());
@@ -1178,6 +1207,14 @@ impl Catalog {
                 data_reads: Arc::default(),
                 row_lookups: Arc::default(),
                 index_probes: Arc::default(),
+                located_rows: Arc::new(revision_memo::RevisionMemo::new(
+                    LOCATED_MEMO_BYTES,
+                    MEMO_ENTRIES,
+                )),
+                inlined_file_deletes: Arc::new(revision_memo::RevisionMemo::new(
+                    LEDGER_MEMO_BYTES,
+                    MEMO_ENTRIES,
+                )),
                 commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections), durability)),
                 projections,
             },
@@ -1294,6 +1331,14 @@ impl Catalog {
             data_reads: Arc::default(),
             row_lookups: Arc::default(),
             index_probes: Arc::default(),
+            located_rows: Arc::new(revision_memo::RevisionMemo::new(
+                LOCATED_MEMO_BYTES,
+                MEMO_ENTRIES,
+            )),
+            inlined_file_deletes: Arc::new(revision_memo::RevisionMemo::new(
+                LEDGER_MEMO_BYTES,
+                MEMO_ENTRIES,
+            )),
             commits: Arc::new(commit::Coalescer::new(
                 Arc::clone(&projections),
                 commit::CommitDurability::OnFlushInterval,

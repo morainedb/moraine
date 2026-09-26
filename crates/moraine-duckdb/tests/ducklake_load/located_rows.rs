@@ -423,3 +423,102 @@ fn an_index_read_reports_both_halves_of_its_bind() {
         "{result}"
     );
 }
+
+/// A prepared index read rebinds on every execution, and each rebind asks
+/// the same row ids where they live; at one store revision the answer is the
+/// same, so it is located once.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn a_rebind_locates_its_rows_once() {
+    let fixture = Fixture::new(0);
+    let output = run_session_with_env(
+        &Attach::Moraine {
+            store_dir: fixture.store.path(),
+            data_path: fixture.data.path(),
+            options: &fixture.options,
+            read_only: false,
+        },
+        "CALL enable_logging(level => 'info', storage => 'memory');
+         PREPARE p AS SELECT 'hits', count(*) FROM lake.main.t data
+           JOIN moraine_index_in('lake', 'main', 't', 'by_a', [1, 3]) hits
+           ON data.rowid = hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+         EXECUTE p;
+         EXECUTE p;
+         SELECT 'located', count(*) FROM duckdb_logs WHERE type='moraine'
+           AND message LIKE '%located row ids%row_ids=2%';",
+        &[("MORAINE_LOG", "info")],
+    );
+    let result = combined_output(&output);
+    assert!(output.status.success(), "{result}");
+    let rows = csv_rows(&result);
+    assert_eq!(
+        rows.iter().filter(|row| row[0] == "hits").count(),
+        2,
+        "{result}"
+    );
+    assert!(
+        rows.iter().all(|row| row[0] != "hits" || row[1] == "2"),
+        "{result}"
+    );
+    assert!(
+        rows.contains(&vec!["located".into(), "1".into()]),
+        "{result}"
+    );
+}
+
+/// Every scan a statement opens subtracts the table's committed inlined
+/// deletions; at one store revision that ledger is read once, not per open.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn a_statement_reads_the_inlined_deletion_ledger_once() {
+    let fixture = Fixture::new(0);
+    // Rows live in a file; deletions of them inline into the ledger.
+    let inlining = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 1024",
+        fixture.data.path().display()
+    );
+    let output = run_session_with_env(
+        &Attach::Moraine {
+            store_dir: fixture.store.path(),
+            data_path: fixture.data.path(),
+            options: &inlining,
+            read_only: false,
+        },
+        &format!(
+            "{} CALL moraine_delete_located('lake', 'main', 't', getvariable('located'));
+             CALL enable_logging(level => 'debug', storage => 'memory');
+             PREPARE p AS SELECT 'b', data.b FROM lake.main.t data
+               JOIN moraine_index_in('lake', 'main', 't', 'by_a', [2, 3]) hits
+               ON data.rowid = hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
+             EXECUTE p;
+             EXECUTE p;
+             SELECT 'opened', count(*) FROM duckdb_logs WHERE type='moraine'
+               AND message LIKE '%summary scan opened%';
+             SELECT 'scanned', count(*) FROM duckdb_logs WHERE type='moraine'
+               AND message LIKE '%inlined file deletions scanned%';",
+            Fixture::locate("1")
+        ),
+        &[("MORAINE_LOG", "debug")],
+    );
+    let result = combined_output(&output);
+    assert!(output.status.success(), "{result}");
+    let rows = csv_rows(&result);
+    assert_eq!(
+        rows.iter().filter(|row| row[0] == "b").count(),
+        4,
+        "two executions of two rows: {result}"
+    );
+    let opened: usize = rows
+        .iter()
+        .find(|row| row[0] == "opened")
+        .map(|row| row[1].parse().unwrap())
+        .unwrap();
+    assert!(
+        opened >= 2,
+        "expected one scan open per execution: {result}"
+    );
+    assert!(
+        rows.contains(&vec!["scanned".into(), "1".into()]),
+        "{result}"
+    );
+}

@@ -989,7 +989,16 @@ and range/NULL probes include direction. Modes cannot alias. Definitions are
 validated against the pinned catalog before consulting the memo. Errors and
 unscoped reads are not cached; empty successful results are.
 
-The memo admits at most 8 MiB of accounted entries and 4096 entries, evicting
+Two further reads memoize under the same pinned sequence. The file candidates
+a probe's row ids locate are kept keyed by those ids, so a rebind — which a
+summary-scan plan forces on every execution — repeats neither the lookup nor
+the location. A table's committed inlined-deletion ledger, which every scan
+open subtracts from its positions, is read once per revision however many
+scans a statement opens: the coverage estimate and the read that follows it
+share one scan. Each memo has its own byte ceiling and the probe memo's entry
+ceiling, and is skipped outside a pinned scope exactly as the probe memo is.
+
+The probe memo admits at most 8 MiB of accounted entries and 4096 entries, evicting
 least-recently-used entries. Keys, row IDs and entry headers are accounted;
 container slack is additionally reported through `projection_bytes` in the
 memory tally. Oversized results are returned without admission. Entries retain
@@ -1136,8 +1145,9 @@ integers through 64 bits, floating point, strings, UUIDs, dates, and
 timestamps.
 Other shapes retain DuckLake's scan and the existing derived filters. A
 failed exact summary remains an error, never a fabricated position. The new
-scan retains the multi-file scan's statement-cache restriction; core probe
-memoization still avoids repeated index resolution when rebinding.
+scan retains the multi-file scan's statement-cache restriction; the core's
+memos still avoid repeated index resolution, row location, and ledger reads
+when rebinding.
 
 Transaction-local changes do not disqualify the rewrite. Index-derived pairs
 name committed rows only, so rows the transaction inserted (new files or
