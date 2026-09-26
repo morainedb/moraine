@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/morainedb/moraine/compare/v0.7.0...v0.8.0) - 2026-09-26
+
+### Added
+
+- report both halves of an index read's bind ([#262](https://github.com/morainedb/moraine/pull/262))
+- report what locating a deletion's positions spent ([#256](https://github.com/morainedb/moraine/pull/256))
+- let a located update take per-row values ([#258](https://github.com/morainedb/moraine/pull/258))
+
+### Fixed
+
+- give the slow-open advice once, and keep records out of parsed output ([#248](https://github.com/morainedb/moraine/pull/248))
+- let a flush exceed the per-commit ceiling ([#254](https://github.com/morainedb/moraine/pull/254))
+- reclaim the inlined data of tables the catalog no longer records ([#247](https://github.com/morainedb/moraine/pull/247))
+- let an empty selection update nothing ([#260](https://github.com/morainedb/moraine/pull/260))
+
+### Other
+
+- locate a probe's rows and read the deletion ledger once per revision ([#263](https://github.com/morainedb/moraine/pull/263))
+- *(deps)* bump arrow and parquet to 60.0.0 ([#261](https://github.com/morainedb/moraine/pull/261))
+- clear a table's inlined deletions in one operation ([#255](https://github.com/morainedb/moraine/pull/255))
+- let a summary scan read UUID columns ([#257](https://github.com/morainedb/moraine/pull/257))
+
 ## [0.7.0](https://github.com/morainedb/moraine/compare/v0.6.5...v0.7.0) - 2026-09-20
 
 ### Added

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "xtask"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alexpropp/moraine"
@@ -21,7 +21,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 # Diff iterator misses updates past a shared leaf before 7.0.2; regression pinned in commit/diff.rs.
 imbl = "7.0.2"
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
-moraine = { path = "crates/moraine", version = "0.7.0" }
+moraine = { path = "crates/moraine", version = "0.8.0" }
 foyer = { version = "0.22", features = ["serde"] }
 object_store = "0.14"
 prost = "0.14"
