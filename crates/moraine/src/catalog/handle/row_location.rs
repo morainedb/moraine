@@ -295,21 +295,33 @@ impl ReadOnlyCatalog {
             return Ok(Vec::new());
         }
 
+        let started = Instant::now();
         let snapshot = self.snapshot().await?;
+        let snapshot_ms = milliseconds(started.elapsed());
 
+        // The two halves run concurrently, so their elapsed times overlap
+        // each other and need not sum to the total.
         let file_placements = async {
+            let started = Instant::now();
             let Some(store) = &data_store else {
-                return Ok(HashMap::<u64, Vec<DataFileId>>::new());
+                return Ok((HashMap::<u64, Vec<DataFileId>>::new(), 0));
             };
-            self.locate_files(store, data_prefix, &snapshot, table, &row_ids)
-                .await
+            let placements = self
+                .locate_files(store, data_prefix, &snapshot, table, &row_ids)
+                .await?;
+            Ok::<_, Error>((placements, milliseconds(started.elapsed())))
         };
 
         // A row can be inlined and still hold an expired physical copy in a
         // current file, so the inlined copy is its own candidate. Only the
         // ids are needed, so the bodies stay unread.
-        let inlined = self.requested_inline_row_ids(table, &row_ids, None);
-        let (mut placements, inlined) = futures::try_join!(file_placements, inlined)?;
+        let inlined = async {
+            let started = Instant::now();
+            let rows = self.requested_inline_row_ids(table, &row_ids, None).await?;
+            Ok::<_, Error>((rows, milliseconds(started.elapsed())))
+        };
+        let ((mut placements, files_ms), (inlined, inline_ms)) =
+            futures::try_join!(file_placements, inlined)?;
 
         // Emit in the caller's order; locating must not reorder.
         let mut seen = HashSet::new();
@@ -348,7 +360,22 @@ impl ReadOnlyCatalog {
 
                 file_placements.into_iter().chain(inline_placements)
             })
-            .collect();
+            .collect::<Vec<_>>();
+
+        // The other half of an index read's bind: the lookup returns row ids,
+        // this turns them into file candidates. `files_ms` is the summary
+        // directory; a lookup slow here is a file-count question, not an
+        // index one.
+        info!(
+            table_id = table.get(),
+            row_ids = row_ids.len(),
+            candidates = located.len(),
+            snapshot_ms,
+            files_ms,
+            inline_ms,
+            total_ms = milliseconds(started.elapsed()),
+            "located row ids"
+        );
 
         Ok(located)
     }
