@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::Instant,
 };
 
@@ -295,6 +296,20 @@ impl ReadOnlyCatalog {
             return Ok(Vec::new());
         }
 
+        // A rebind at the same revision asks for the same ids; the answer
+        // has not moved, and the probe behind it was already reused.
+        let revision = self.pinned_revision();
+        if let Some(revision) = revision
+            && let Some(located) = self.located_rows.get(revision, table, &row_ids)
+        {
+            debug!(
+                table_id = table.get(),
+                row_ids = row_ids.len(),
+                "located row ids reused"
+            );
+            return Ok(located.as_ref().clone());
+        }
+
         let started = Instant::now();
         let snapshot = self.snapshot().await?;
         let snapshot_ms = milliseconds(started.elapsed());
@@ -330,8 +345,9 @@ impl ReadOnlyCatalog {
             .copied()
             .filter(|row_id| seen.insert(*row_id))
             .flat_map(|row_id| {
-                // A live inlined row, and a row located nowhere at all, are both
-                // reported without a file rather than dropped.
+                // A live inlined row, and a row located nowhere at all, are
+                // both reported without a file rather than
+                // dropped.
                 let inline_placements =
                     if inlined.contains(&row_id) || !placements.contains_key(&row_id) {
                         Some(FileRowCandidate {
@@ -376,6 +392,13 @@ impl ReadOnlyCatalog {
             total_ms = milliseconds(started.elapsed()),
             "located row ids"
         );
+
+        if let Some(revision) = revision {
+            let bytes =
+                size_of_val(row_ids.as_slice()).saturating_add(size_of_val(located.as_slice()));
+            self.located_rows
+                .put(revision, table, row_ids, Arc::new(located.clone()), bytes);
+        }
 
         Ok(located)
     }
