@@ -37,6 +37,7 @@ else()
             ${CMAKE_CURRENT_LIST_DIR}/0007-perf-name-the-table-a-dropped-file-belongs-to.patch
             ${CMAKE_CURRENT_LIST_DIR}/0008-perf-take-existing-delete-positions-from-the-caller.patch
             ${CMAKE_CURRENT_LIST_DIR}/0009-fix-cancel-DuckLake-metadata-work-with-its-caller.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0010-fix-write-row-ids-when-merging-a-flushed-file.patch
     )
     FetchContent_GetProperties(moraine_patched_ducklake)
     if(NOT moraine_patched_ducklake_POPULATED)

@@ -302,6 +302,85 @@ fn ducklake_flush_clears_inlined_file_deletions() {
     );
 }
 
+/// A flush output's dense start is its lowest embedded id, so a batch
+/// straddling two partitions leaves one partition's file with gaps the
+/// start hides, ending exactly where a dense predecessor ends. Stock
+/// DuckLake's merge chains the two by start arithmetic and numbers the
+/// merged file by position, renumbering every row after a gap onto ids
+/// the other partition holds. The bundled DuckLake never chains a
+/// flushed file: the merge writes the row-id column and every row keeps
+/// its id. (The commit's refusal of a merge that would renumber is
+/// pinned at the core level, where such a merge can be staged directly.)
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn ducklake_merge_of_a_straddling_flush_output_keeps_every_row_id() {
+    let dir = TempDir::new("straddle-merge-store");
+    let data_dir = TempDir::new("straddle-merge-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+    // `META_DATA_PATH` is what gives moraine a data store to read the
+    // files through; without it the commit's own hold has nothing to read.
+    let options = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 1000",
+        data_path.display()
+    );
+    let options = options.as_str();
+
+    run_ducklake_sql_with_options(
+        store,
+        data_path,
+        options,
+        "CREATE TABLE lake.main.t (k BIGINT, m BIGINT);\n\
+         ALTER TABLE lake.main.t SET PARTITIONED BY (m);\n\
+         INSERT INTO lake.main.t SELECT range, 5 FROM range(0, 100);\n\
+         CALL ducklake_flush_inlined_data('lake');\n\
+         INSERT INTO lake.main.t \
+           SELECT range, CASE WHEN range % 10 = 9 THEN 6 ELSE 5 END FROM range(100, 200);\n\
+         CALL ducklake_flush_inlined_data('lake');",
+    );
+    let live_files = "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;";
+    assert_eq!(
+        csv_rows(&run_standalone_sql(store, live_files)),
+        vec![vec!["3"]],
+        "a dense file, then one file per partition for the straddling batch"
+    );
+
+    assert_eq!(
+        csv_rows(&run_ducklake_sql_with_options(
+            store,
+            data_path,
+            options,
+            "SELECT files_processed, files_created FROM ducklake_merge_adjacent_files('lake');",
+        )),
+        vec![vec!["2", "1"]],
+        "the dense file and the straddling batch's file merge within their partition"
+    );
+
+    assert_eq!(
+        csv_rows(&run_standalone_sql(store, live_files)),
+        vec![vec!["2"]]
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT row_id_start IS NULL FROM m.ducklake_data_file \
+             WHERE end_snapshot IS NULL AND record_count = 190;",
+        )),
+        vec![vec!["true"]],
+        "the merged file carries its rows' ids rather than a dense start"
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql_with_options(
+            store,
+            data_path,
+            options,
+            "SELECT count(*), count(*) FILTER (WHERE rowid <> k) FROM lake.main.t;",
+        )),
+        vec![vec!["200", "0"]],
+        "every row keeps the id it was inserted under"
+    );
+}
+
 /// Rows for `count` parents' worth of data in one insert, and the number
 /// of Parquet files the catalog holds afterwards. Inlining writes none.
 fn data_files_after_inserting(

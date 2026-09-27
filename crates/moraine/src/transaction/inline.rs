@@ -117,7 +117,7 @@ async fn translated_flushes(
     stream::iter(flushes)
         .map(|(table_id, schema_version, flush_snapshot)| async move {
             let mut writes = Vec::new();
-            let drained = translate_inline_flush_delete(
+            let drained: HashSet<u64> = translate_inline_flush_delete(
                 db_tx,
                 projections,
                 table_id,
@@ -125,7 +125,9 @@ async fn translated_flushes(
                 flush_snapshot,
                 &mut writes,
             )
-            .await?;
+            .await?
+            .into_iter()
+            .collect();
 
             Ok::<_, Error>((writes, drained))
         })

@@ -1,0 +1,72 @@
+diff --git a/src/functions/ducklake_compaction_functions.cpp b/src/functions/ducklake_compaction_functions.cpp
+index 860e4df..393c4e9 100644
+--- a/src/functions/ducklake_compaction_functions.cpp
++++ b/src/functions/ducklake_compaction_functions.cpp
+@@ -507 +507 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+-		if (!source.file.row_id_start.IsValid()) {
++		if (!source.file.row_id_start.IsValid() || source.max_partial_file_snapshot.IsValid()) {
+@@ -508,0 +509,3 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
++			// a flushed file carries its row ids per row and its row_id_start is only the lowest of them: the ids
++			// can have gaps (rows of the same flush that went to another partition), so numbering the merged file
++			// by position would renumber every row after a gap - it cannot be adjacent either
+diff --git a/test/sql/compaction/merge_flushed_files_keep_row_ids.test b/test/sql/compaction/merge_flushed_files_keep_row_ids.test
+new file mode 100644
+index 0000000..4a4dfd7
+--- /dev/null
++++ b/test/sql/compaction/merge_flushed_files_keep_row_ids.test
+@@ -0,0 +1,55 @@
++# name: test/sql/compaction/merge_flushed_files_keep_row_ids.test
++# description: merging a flushed file whose batch straddled two partitions keeps every row id
++# group: [compaction]
++
++require ducklake
++
++require parquet
++
++test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
++
++test-env DATA_PATH __TEST_DIR__
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/merge_flushed_files', METADATA_CATALOG 'merge_flushed_meta', DATA_INLINING_ROW_LIMIT 1000)
++
++statement ok
++CREATE TABLE ducklake.t(k BIGINT, m BIGINT)
++
++statement ok
++ALTER TABLE ducklake.t SET PARTITIONED BY (m)
++
++statement ok
++INSERT INTO ducklake.t SELECT range, 5 FROM range(0, 100)
++
++statement ok
++CALL ducklake_flush_inlined_data('ducklake')
++
++# Every tenth row of this batch lands in the other partition, so the flushed m=5 file's row ids have gaps
++# that its row_id_start (the lowest of them) hides: it ends exactly where the first file ends.
++statement ok
++INSERT INTO ducklake.t SELECT range, CASE WHEN range % 10 = 9 THEN 6 ELSE 5 END FROM range(100, 200)
++
++statement ok
++CALL ducklake_flush_inlined_data('ducklake')
++
++query II
++SELECT files_processed, files_created FROM ducklake_merge_adjacent_files('ducklake')
++----
++2	1
++
++# The merged file carries its rows' ids rather than numbering them by position.
++query II
++SELECT count(*), count(*) FILTER (WHERE rowid <> k) FROM ducklake.t
++----
++200	0
++
++query I
++SELECT count(*) FROM (SELECT rowid FROM ducklake.t GROUP BY rowid HAVING count(*) > 1)
++----
++0
++
++query I
++SELECT row_id_start IS NULL FROM merge_flushed_meta.ducklake_data_file WHERE end_snapshot IS NULL AND record_count = 190
++----
++true

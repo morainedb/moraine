@@ -21,6 +21,8 @@ mod body_ownership;
 mod data_path;
 mod inline_commit_bench;
 mod inline_history;
+mod located_inline_update;
+mod row_id_invariants;
 
 fn schema_row(id: u64, name: &str, begin: u64) -> Vec<Cell> {
     vec![
@@ -2771,19 +2773,21 @@ async fn replace_index_maintenance_overlaps_adds_and_removals() {
     catalog.close().await.unwrap();
 }
 
-/// A pure compaction preserves row ids and values, so it neither reads the
-/// replacement file nor stages index entries.
+/// A pure compaction preserves row ids and values, so it stages no index
+/// entries; its only reads are the row-id check of the source and its
+/// replacement.
 #[tokio::test]
-async fn compaction_only_index_maintenance_reads_no_data() {
+async fn compaction_only_index_maintenance_reads_only_row_ids() {
     let events = captured_commit_events();
     let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
     let store = Arc::new(InFlightStore::with_read_delay(CONTROLLED_READ_DELAY));
     register_indexed_data_files(&catalog, &store, 1, 3).await;
     let before = index_entry_keys(&catalog, false, index_id).await;
+    let (_, batch) = bigint_batch(&[0, 1, 2]);
+    let size = write_parquet(&store.inner, "main/t/merged.parquet", &batch).await;
     store.reset();
 
-    let mut merged =
-        rewrite_data_file_row(12, 4, "merged.parquet", 3, ParquetSize::recorded(1024, 64));
+    let mut merged = rewrite_data_file_row(12, 4, "merged.parquet", 3, size);
     merged[11] = Cell::U64(0);
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_with_store(
@@ -2815,15 +2819,20 @@ async fn compaction_only_index_maintenance_reads_no_data() {
     tx.commit().await.unwrap();
     let milliseconds = events.phase_milliseconds(transaction_id, "index_maintenance_ms");
 
-    assert_eq!(store.reads(), 0, "compaction never reads the merged file");
+    assert_eq!(
+        store.reads(),
+        2,
+        "the source and its replacement are read for their row ids and nothing else"
+    );
     assert_eq!(index_entry_keys(&catalog, false, index_id).await, before);
-    eprintln!("compaction-only: reads=0 index_maintenance_ms={milliseconds}");
+    eprintln!("compaction-only: reads=2 index_maintenance_ms={milliseconds}");
     catalog.close().await.unwrap();
 }
 
 /// Flushing inline rows into data and delete files only moves their physical
 /// representation. Their equality-index entries already name stable row ids,
-/// so the flush must not read either output file or rewrite those entries.
+/// so the flush must not rewrite those entries; its one read of the data
+/// file is the row-id check of its own output, never index upkeep.
 #[tokio::test]
 async fn inline_flush_index_maintenance_reads_no_data() {
     let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
@@ -2897,7 +2906,11 @@ async fn inline_flush_index_maintenance_reads_no_data() {
     });
     tx.commit().await.unwrap();
 
-    assert_eq!(store.reads(), 0, "an inline flush re-homes indexed rows");
+    assert_eq!(
+        store.reads(),
+        1,
+        "an inline flush reads its output once, for the row ids it must keep"
+    );
     assert_eq!(index_entry_keys(&catalog, false, index_id).await, before);
     catalog.close().await.unwrap();
 }
@@ -3015,16 +3028,25 @@ async fn per_row_id_registration_re_derives_entries_idempotently() {
 
 /// Stages a compaction-shaped commit under `changes`: file 12 replaces
 /// file 1, carrying per-row ids unless `row_id_start` gives it a dense
-/// range. The replacement is never written to the store, so a commit
-/// that reads it to derive entries fails and one that skips it lands.
+/// range. With `written`, the replacement holds file 1's rows under
+/// their ids; without, it is absent from the store, so a commit that
+/// reads it fails.
 async fn commit_compaction(
     catalog: &Catalog,
     store: &Arc<InMemory>,
     changes: &str,
     row_id_start: Option<u64>,
+    written: bool,
 ) -> Result<SnapshotId> {
-    let mut cells =
-        rewrite_data_file_row(12, 4, "merged.parquet", 3, ParquetSize::recorded(1024, 64));
+    let size = if !written {
+        ParquetSize::recorded(1024, 64)
+    } else if row_id_start.is_some() {
+        let (_, batch) = bigint_batch(&[10, 20, 30]);
+        write_parquet(store, "main/t/merged.parquet", &batch).await
+    } else {
+        write_parquet_with_row_ids(store, "main/t/merged.parquet", &[10, 20, 30], &[0, 1, 2]).await
+    };
+    let mut cells = rewrite_data_file_row(12, 4, "merged.parquet", 3, size);
     if let Some(start) = row_id_start {
         cells[11] = Cell::U64(start);
     }
@@ -3057,9 +3079,9 @@ async fn commit_compaction(
 
 /// Compaction re-homes rows without renumbering or rewriting them, so
 /// every entry it would derive is already stored under the same key.
-/// The commit stages no index work at all: it does not even read the
-/// file it registers, which is what keeps a merge of a large indexed
-/// table under the per-commit entry limit.
+/// The commit stages no index work at all: it reads the file it
+/// registers for its row ids alone, which is what keeps a merge of a
+/// large indexed table under the per-commit entry limit.
 #[tokio::test]
 async fn compaction_registration_stages_no_index_work() {
     for (changes, row_id_start) in [
@@ -3073,9 +3095,9 @@ async fn compaction_registration_stages_no_index_work() {
         let before = index_entry_keys(&catalog, true, index_id).await;
         assert_eq!(before.len(), 3);
 
-        commit_compaction(&catalog, &store, changes, row_id_start)
+        commit_compaction(&catalog, &store, changes, row_id_start, true)
             .await
-            .unwrap_or_else(|err| panic!("{changes} must not read the file it registers: {err}"));
+            .unwrap_or_else(|err| panic!("{changes} must not derive from the file: {err}"));
 
         assert_eq!(
             index_entry_keys(&catalog, true, index_id).await,
@@ -3099,6 +3121,7 @@ async fn a_commit_mixing_compaction_with_another_change_still_derives() {
         &store,
         "merge_adjacent:1,inserted_into_table:1",
         Some(0),
+        false,
     )
     .await
     .unwrap_err();

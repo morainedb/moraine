@@ -66,6 +66,18 @@ for DuckDB v1.5.5, applied in file-name order:
    dependency; explicit rollback, failed replacement inserts, repeated
    calls, and standalone autocommit are covered by `cargo xtask e2e`.
 
+`0010-fix-write-row-ids-when-merging-a-flushed-file.patch` stops
+`ducklake_merge_adjacent_files` from treating a flushed file as adjacent to
+its predecessor. A flushed file carries its row ids per row, and the
+`row_id_start` it is registered with is only the lowest of them; when the
+batch it came from straddled two partitions, the ids have gaps, yet the
+start still lands exactly where a dense predecessor ends. Stock DuckLake
+judges adjacency from `row_id_start + record_count` alone, drops the row-id
+column from the merged file, and numbers it by position, so every row after
+a gap is renumbered onto ids the other partition's rows hold. With the
+patch such a merge always writes the row-id column. The
+`merge_flushed_files_keep_row_ids` sqllogictest pins it.
+
 Later patches address the lines earlier ones produce, so the series is applied
 in one `git apply` invocation rather than one per file.
 
@@ -95,8 +107,9 @@ refuses a tree where the row-ID statistics hunk landed after its function's
 return, and DuckLake's `roaring` dependency resolves through vcpkg
 (`vcpkg.json` at the repository root declares it).
 
-`cargo xtask e2e` then runs the series' row-ID write, backfill, pruning, and
-inlined-append sqllogictests against the built moraine artifact, and the
+`cargo xtask e2e` then runs the series' row-ID write, backfill, pruning,
+inlined-append, and flushed-file-merge sqllogictests against the built
+moraine artifact, and the
 release workflow runs the same backfill-and-prune smoke against every
 published build (`cargo xtask validate-release-artifact`).
 

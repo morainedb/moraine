@@ -11,7 +11,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::{
+    Stream, StreamExt, TryStreamExt,
+    stream::{self, FuturesUnordered},
+};
 use slatedb::DbTransaction;
 use tracing::warn;
 
@@ -76,9 +79,10 @@ const UNIQUENESS_PROBE_CONCURRENCY: usize = 1024;
 /// batches.
 const PROBE_BATCH_SIZE: usize = 128;
 
-/// Additions derived while the deletion phase is still draining. Once full,
-/// backpressure pauses addition sources without holding up deletion staging.
-const ADDITION_PREFETCH: usize = 512;
+/// Uniqueness probes in flight while deletions still run, leaving the rest
+/// of the read window to their guard reads. Additions keep being derived
+/// past it; only their probes wait.
+const DELETION_PHASE_PROBE_WINDOW: usize = 512;
 
 /// The most equality-index entries one commit may derive.
 const MAX_INDEX_ENTRIES_PER_COMMIT: usize = 1_000_000;
@@ -322,12 +326,9 @@ fn plan_probe_batch(
     planner: &mut ProbePlanner,
     budget: &mut IndexCommitBudget,
     ready: &mut VecDeque<ReadyAddition>,
+    window: &mut ProbeWindow,
     metrics: &mut IndexMaintenanceMetrics,
-    in_flight: &mut usize,
-    first_probe: &mut Option<Instant>,
-) -> Result<Vec<PendingProbe>> {
-    let capacity = additions.len();
-    let mut probes = Vec::new();
+) -> Result<()> {
     for addition in additions {
         metrics.additions = metrics.additions.saturating_add(1);
         match planner.plan(addition, budget) {
@@ -340,10 +341,8 @@ fn plan_probe_batch(
                 });
             }
             ProbePlan::Probe(probe) => {
-                if probes.is_empty() {
-                    probes.reserve_exact(capacity);
-                }
-                probes.push(probe);
+                metrics.unique_probes = metrics.unique_probes.saturating_add(1);
+                window.pending.push_back(probe);
             }
             ProbePlan::Noop => {}
             ProbePlan::Collision {
@@ -361,28 +360,55 @@ fn plan_probe_batch(
             ProbePlan::Failure(error) => return Err(error),
         }
     }
-    if !probes.is_empty() {
-        first_probe.get_or_insert_with(Instant::now);
-        let count = u64::try_from(probes.len()).unwrap_or(u64::MAX);
-        metrics.unique_probes = metrics.unique_probes.saturating_add(count);
-        *in_flight += probes.len();
-        metrics.probe_peak_in_flight = metrics
-            .probe_peak_in_flight
-            .max(u64::try_from(*in_flight).unwrap_or(u64::MAX));
-    }
-    Ok(probes)
+    Ok(())
 }
 
-fn complete_probes(
-    resolutions: Result<Vec<CompletedProbe>>,
-    ready: &mut VecDeque<ReadyAddition>,
-    in_flight: &mut usize,
-) -> Result<usize> {
-    let resolutions = resolutions?;
-    let count = resolutions.len();
-    *in_flight -= count;
-    ready.extend(resolutions.into_iter().map(ReadyAddition::Probed));
-    Ok(count)
+/// The unique probes derivation has planned and the ones in flight.
+/// Derivation runs ahead of the reads; launching is what the window
+/// bounds.
+#[derive(Default)]
+struct ProbeWindow {
+    pending: VecDeque<PendingProbe>,
+    in_flight: usize,
+    first_launch: Option<Instant>,
+}
+
+impl ProbeWindow {
+    /// Launches planned probes a batch at a time until `window` are in
+    /// flight.
+    fn launch<F>(
+        &mut self,
+        window: usize,
+        probes: &mut FuturesUnordered<F>,
+        metrics: &mut IndexMaintenanceMetrics,
+        mut resolve: impl FnMut(Vec<PendingProbe>) -> F,
+    ) {
+        while !self.pending.is_empty() && self.in_flight < window {
+            let count = PROBE_BATCH_SIZE
+                .min(window - self.in_flight)
+                .min(self.pending.len());
+            let batch: Vec<PendingProbe> = self.pending.drain(..count).collect();
+            self.first_launch.get_or_insert_with(Instant::now);
+            self.in_flight += count;
+            metrics.probe_peak_in_flight = metrics
+                .probe_peak_in_flight
+                .max(u64::try_from(self.in_flight).unwrap_or(u64::MAX));
+            probes.push(resolve(batch));
+        }
+    }
+
+    /// Takes a resolved batch out of flight and queues it for staging.
+    fn complete(
+        &mut self,
+        resolutions: Result<Vec<CompletedProbe>>,
+        ready: &mut VecDeque<ReadyAddition>,
+    ) -> Result<usize> {
+        let resolutions = resolutions?;
+        let count = resolutions.len();
+        self.in_flight -= count;
+        ready.extend(resolutions.into_iter().map(ReadyAddition::Probed));
+        Ok(count)
+    }
 }
 
 /// Drops a unique deletion whose entry is held by some other row, counting
@@ -470,6 +496,11 @@ pub(crate) async fn stage_index_entries(
 /// Consumes deletion entries, then additions, as streams. Unique probes form
 /// one continuously replenished window; successful reads stage in
 /// completion order, and the first fatal result aborts.
+///
+/// Every stream is polled on every wait, in both phases. One left unpolled
+/// can hold what another waits on: a permit the encoding limiter assigned
+/// to its queued waiter, or a block read the store coalesced on it. The
+/// windows bound what is launched, never what is polled.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn stage_index_entry_stream<D, S>(
     db_tx: &DbTransaction,
@@ -489,47 +520,44 @@ where
     let guard_reads = AtomicU64::new(0);
     let mut deletes = std::pin::pin!(guarded_deletions(reader, deletes, &guard_reads));
     let mut entries = std::pin::pin!(entries.ready_chunks(PROBE_BATCH_SIZE));
-    let mut ready = VecDeque::with_capacity(ADDITION_PREFETCH);
+    let mut ready = VecDeque::new();
     let mut additions_done = false;
     let mut planner = ProbePlanner::default();
+    let mut window = ProbeWindow::default();
 
-    let mut probes = futures::stream::FuturesUnordered::new();
-    let mut in_flight = 0;
+    let mut probes = FuturesUnordered::new();
     let mut metrics = IndexMaintenanceMetrics::default();
-    let mut first_probe = None;
     let mut last_probe_completion = None;
 
     loop {
-        let buffered = ready.len().saturating_add(in_flight);
-        let deletion = if buffered > ADDITION_PREFETCH - PROBE_BATCH_SIZE {
-            deletes.next().await
-        } else {
-            tokio::select! {
-                biased;
-                deletion = deletes.next() => deletion,
-                resolution = probes.next(), if !probes.is_empty() => {
-                    if let Some(resolution) = resolution {
-                        let count = complete_probes(resolution, &mut ready, &mut in_flight)?;
-                        metrics.probes_completed_during_deletions = metrics
-                            .probes_completed_during_deletions
-                            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-                    }
-                    continue;
-                },
-                addition = entries.next(), if !additions_done => if let Some(addition) = addition {
-                    let pending = plan_probe_batch(
-                        addition, &mut planner, &mut budget, &mut ready,
-                        &mut metrics, &mut in_flight, &mut first_probe,
+        window.launch(
+            DELETION_PHASE_PROBE_WINDOW,
+            &mut probes,
+            &mut metrics,
+            |batch| resolve_probes(db_tx, batch),
+        );
+        let deletion = tokio::select! {
+            biased;
+            deletion = deletes.next() => deletion,
+            resolution = probes.next(), if !probes.is_empty() => {
+                if let Some(resolution) = resolution {
+                    let count = window.complete(resolution, &mut ready)?;
+                    metrics.probes_completed_during_deletions = metrics
+                        .probes_completed_during_deletions
+                        .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                }
+                continue;
+            },
+            addition = entries.next(), if !additions_done => {
+                if let Some(addition) = addition {
+                    plan_probe_batch(
+                        addition, &mut planner, &mut budget, &mut ready, &mut window, &mut metrics,
                     )?;
-                    if !pending.is_empty() {
-                        probes.push(resolve_probes(db_tx, pending));
-                    }
-                    continue;
                 } else {
                     additions_done = true;
                     metrics.addition_derivation = started.elapsed();
-                        continue;
                 }
+                continue;
             }
         };
         let Some(entry) = deletion else {
@@ -557,43 +585,37 @@ where
 
     let mut poisoned = Vec::new();
     loop {
-        let resolution = if let Some(resolution) = ready.pop_front() {
-            Some(resolution)
-        } else if additions_done || in_flight > UNIQUENESS_PROBE_CONCURRENCY - PROBE_BATCH_SIZE {
-            if let Some(resolutions) = probes.next().await {
-                complete_probes(resolutions, &mut ready, &mut in_flight)?;
-                continue;
+        window.launch(
+            UNIQUENESS_PROBE_CONCURRENCY,
+            &mut probes,
+            &mut metrics,
+            |batch| resolve_probes(db_tx, batch),
+        );
+        let Some(resolution) = ready.pop_front() else {
+            if additions_done && probes.is_empty() {
+                break;
             }
-            None
-        } else {
             tokio::select! {
                 biased;
                 resolution = probes.next(), if !probes.is_empty() => {
                     if let Some(resolution) = resolution {
-                        complete_probes(resolution, &mut ready, &mut in_flight)?;
+                        window.complete(resolution, &mut ready)?;
                     }
-                    continue;
                 },
-                addition = entries.next() => if let Some(addition) = addition {
-                    let pending = plan_probe_batch(
-                        addition, &mut planner, &mut budget, &mut ready,
-                        &mut metrics, &mut in_flight, &mut first_probe,
-                    )?;
-                    if !pending.is_empty() {
-                        probes.push(resolve_probes(db_tx, pending));
+                addition = entries.next(), if !additions_done => {
+                    if let Some(addition) = addition {
+                        plan_probe_batch(
+                            addition, &mut planner, &mut budget, &mut ready, &mut window, &mut metrics,
+                        )?;
+                    } else {
+                        additions_done = true;
+                        metrics.addition_derivation = started.elapsed();
                     }
-                    continue;
-                } else {
-                    additions_done = true;
-                    metrics.addition_derivation = started.elapsed();
-                    continue;
                 }
             }
+            continue;
         };
 
-        let Some(resolution) = resolution else {
-            break;
-        };
         match resolution {
             ReadyAddition::Put { key, row_id } => {
                 let stage_started = Instant::now();
@@ -643,8 +665,10 @@ where
         }
     }
 
-    if let (Some(first_probe), Some(last_probe_completion)) = (first_probe, last_probe_completion) {
-        metrics.probe_window = last_probe_completion.saturating_duration_since(first_probe);
+    if let (Some(first_launch), Some(last_probe_completion)) =
+        (window.first_launch, last_probe_completion)
+    {
+        metrics.probe_window = last_probe_completion.saturating_duration_since(first_launch);
     }
     poisoned.sort_unstable();
     poisoned.dedup();
