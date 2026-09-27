@@ -9,7 +9,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use super::{
     DbTransaction, EntityKey, Error, HashMap, InlineKey, InlineOperation, Key, ReadHandle, Result,
     RowOperation, TableKind, commit, decode::decode_hard_delete, materialize_inline_rows, proto,
-    store_inline, value,
+    row_id_invariants::DrainedRows, store_inline, value,
 };
 use crate::catalog::{
     inline::{InlineRow, materialize_locator_rows},
@@ -53,7 +53,7 @@ pub(crate) async fn translate_inline_flush_delete(
     schema_version: u64,
     flush_snapshot: u64,
     writes: &mut Vec<commit::StagedWrite>,
-) -> Result<HashSet<u64>> {
+) -> Result<Vec<u64>> {
     let is_flushed = |operation: InlineOperation| {
         matches!(operation, InlineOperation::Insert { schema_version: version, begin_snapshot, .. }
             if version == schema_version && begin_snapshot <= flush_snapshot)
@@ -148,20 +148,21 @@ pub(crate) async fn translate_inline_flush_delete(
 }
 
 /// Removes consumed deletion events that no surviving version needs and
-/// returns the drained row ids.
+/// returns the drained rows' ids, one per physical row: a row id repeats
+/// once per version drained.
 fn prune_flushed_tombstones(
     table_id: u64,
     rows: &[InlineRow],
     flushed: &[bool],
     tombstones: &[(u64, proto::InlineInlineDeleteValue)],
     writes: &mut Vec<commit::StagedWrite>,
-) -> HashSet<u64> {
-    let mut drained = HashSet::new();
+) -> Vec<u64> {
+    let mut drained = Vec::new();
     let mut consumed = HashSet::new();
     let mut retained = HashSet::new();
     for row in rows {
         if flushed[row.chunk] {
-            drained.insert(row.row_id);
+            drained.push(row.row_id);
             if let Some(end) = row.end_snapshot {
                 consumed.insert((row.row_id, end));
             }
@@ -756,7 +757,7 @@ pub(super) async fn translate_inline(
     db_tx: &DbTransaction,
     projections: &std::sync::RwLock<ProjectionCache>,
     ops: &[RowOperation],
-) -> Result<(Vec<commit::StagedWrite>, bool)> {
+) -> Result<(Vec<commit::StagedWrite>, bool, DrainedRows)> {
     let mut writes = Vec::new();
     let mut chunk_seqs = ChunkSeqAllocator::default();
     // One existence marker per table per commit.
@@ -797,13 +798,14 @@ pub(super) async fn translate_inline(
     let scoped = stream::iter(table_scoped.into_iter().map(|op| async move {
         let mut writes = Vec::new();
         let mut referenced = false;
+        let mut drained = None;
         match op {
             RowOperation::InlineFlushDelete {
                 table_id,
                 schema_version,
                 flush_snapshot,
             } => {
-                translate_inline_flush_delete(
+                let rows = translate_inline_flush_delete(
                     db_tx,
                     projections,
                     *table_id,
@@ -812,6 +814,7 @@ pub(super) async fn translate_inline(
                     &mut writes,
                 )
                 .await?;
+                drained = Some(((*table_id, *schema_version), rows));
             }
             RowOperation::InlineDrop { table_id } => {
                 translate_inline_drop(db_tx, *table_id, &mut writes).await?;
@@ -829,7 +832,7 @@ pub(super) async fn translate_inline(
             }
             _ => {}
         }
-        Ok::<_, Error>((writes, referenced))
+        Ok::<_, Error>((writes, referenced, drained))
     }))
     .buffer_unordered(INLINE_TRANSLATION_CONCURRENCY)
     .try_collect::<Vec<_>>();
@@ -925,10 +928,19 @@ pub(super) async fn translate_inline(
     }
 
     let mut uses_schema_reference = false;
-    for (scoped, referenced) in scoped_writes {
+    let mut drained: DrainedRows = DrainedRows::new();
+    for (scoped, referenced, flushed) in scoped_writes {
         writes.extend(scoped);
         uses_schema_reference |= referenced;
+        // DuckLake names a drain twice, once as the flush finalizes and
+        // once more at commit; the fuller of the two stands.
+        if let Some((version, rows)) = flushed {
+            let entry = drained.entry(version).or_default();
+            if rows.len() > entry.len() {
+                *entry = rows;
+            }
+        }
     }
 
-    Ok((writes, uses_schema_reference))
+    Ok((writes, uses_schema_reference, drained))
 }

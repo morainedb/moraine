@@ -358,7 +358,15 @@ fits in memory at all. These properties govern the implementation:
   copy of the batch's largest part in memory for nothing.
 
 The deletion phase still completes before any addition is staged. While it
-runs, the bounded prefetch holds at most 512 additions or logical probes.
+runs, additions keep being derived and planned, and at most 512 of their
+logical probes are launched (1,024 once deletions are done); the rest wait
+planned in memory. The windows bound what is launched, never what is
+polled: every stream the stager owns is driven on every wait, in both
+phases. A derivation left unpolled can hold what a deletion waits on — a
+permit the encoding limiter has assigned to its queued waiter, or a block
+read the store coalesces on its first reader — and hold the commit forever.
+The commit's entry budget bounds what the run-ahead can buffer, and the
+transaction's write batch holds every staged entry until commit anyway.
 Telemetry continues to count logical probes, hits, misses, and peak logical
 concurrency; summed probe service counts a shared read batch's interval once
 (including any sparse-key fallback), while batches planned as point reads
@@ -563,7 +571,8 @@ makes changes or compacts, enforced upstream where `changes_made` is built
 else re-homes rows and does nothing else to them: no ids allocated (RFC
 0008), no values changed, no rows killed. Every entry its files would
 derive is already stored under the same key, so those files are not read
-at all.
+for derivation; the commit reads only their row-id columns, to hold them
+to their sources (RFC 0008).
 
 The rule is read off the staged `ducklake_snapshot_changes` row, so what
 it trusts is the commit's own account of what it did — the same account

@@ -619,9 +619,9 @@ fn plan_deletes(
     Ok(plan)
 }
 
-/// The `(table, data file)` an `UpdateSetEnd` over `ducklake_data_file`
-/// names.
-fn ended_data_file(cells: &[Cell]) -> Result<(u64, u64)> {
+/// The `(table, data file)` an `UpdateSetEnd` or `UpdateSetBegin` over
+/// `ducklake_data_file` names.
+pub(super) fn ended_data_file(cells: &[Cell]) -> Result<(u64, u64)> {
     let mut cursor = Cursor::new(TableKind::DataFile, cells);
     let table_id = cursor.u64()?;
     let data_file_id = cursor.u64()?;

@@ -131,8 +131,28 @@ snapshot-minting commit:
   authors, and DuckLake authors no allocation.
 - **Equality-index entries untouched:** entries name rows, not files, and
   compaction changes neither a row's id nor its values. A commit whose
-  change set is compaction alone stages no index work and does not read
-  the files it registers (RFC 0016).
+  change set is compaction alone stages no index work (RFC 0016); it
+  reads the files it registers and consumes for their row-id columns
+  alone, for the hold below.
+- **Row ids held to the sources.** Before a compaction lands, the commit
+  reads the row ids of the files it registers (backdated for a merge,
+  rebased for a rewrite) and of the files it hard-deletes or ends, and
+  compares them: a merge's files must hold exactly the multiset its
+  sources held, and a rewrite's may hold fewer but none the sources
+  lacked. A difference is refused as corruption and the sources stay
+  live. The hold exists because DuckLake's merge judges two files
+  adjacent from `row_id_start + record_count` alone and then numbers the
+  merged file by position, while a flush output's `row_id_start` is
+  merely its lowest embedded id: a flushed batch that straddled two
+  partitions leaves one partition's file with gaps the start hides, a
+  dense predecessor chains onto it, and every row after a gap is
+  renumbered onto ids the other partition holds. Compaction derives no
+  index entries, so without the hold the index would keep naming the
+  rows the files had just stopped holding. The bundled DuckLake carries
+  the fix itself (`patches/ducklake/0010`): a flushed file is never
+  adjacent, so such a merge writes the row-id column. The hold stays as
+  the backstop, since it is the commit, not the planner, that owns the
+  rows' identity.
 
 ### Conflict classification
 
@@ -162,6 +182,10 @@ Core, against real SlateDB on in-memory `object_store`:
   scheduled; `next_row_id` unchanged.
 - **`SET begin_snapshot` misuse is rejected** (a non-current target is a
   shape error).
+- **Row ids held.** A merge whose output numbers a sparse source by
+  position is refused and keeps its sources; one carrying its sources'
+  ids lands. A rewrite dropping rows lands; one naming an id its source
+  lacked is refused.
 
 Live, via `cargo xtask e2e`:
 
@@ -172,6 +196,11 @@ Live, via `cargo xtask e2e`:
 - **`rewrite_data_files`**: after a DELETE, the rewrite leaves no live
   delete file; survivors keep their row ids; time travel to the
   pre-rewrite snapshot still shows the deleted rows.
+- **A merge over a flush output** whose batch straddled two partitions
+  keeps every row id: the bundled DuckLake writes the row-id column
+  rather than chaining the file, and the merged file carries no dense
+  start. (The commit's refusal of a merge that would renumber is pinned
+  at the core level, where such a merge can be staged directly.)
 
 ## Alternatives considered
 

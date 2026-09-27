@@ -465,6 +465,22 @@ that order — data before metadata, like any DuckLake write):
    flushed Parquet (per-row snapshot columns), not by retained chunks —
    retained chunks visible to any catalog scan would double-count rows.
 
+   The commit holds the flush to its own input before it lands: on the
+   staged-row path, where DuckLake's writer produced the files, the
+   multiset of row ids in the data files it registers for a table
+   (every version flushed, every partition written) must equal the
+   multiset of row ids of the chunks it drains, and the commit is refused
+   as corruption when they differ. A flush derives no index entries — the
+   entries point at row ids, and a flush re-homes rows without changing
+   them — so this is the one step at which a row id can silently part
+   from its entry; the check is what keeps that a loud failure. Files the
+   same commit registers at its own snapshot are not flush outputs and
+   are left out of the comparison. DuckLake names each drain twice, once
+   as the flush finalizes and once more at commit for its retries, so a
+   `(table, schema version)`'s drained rows count once however many
+   times the commit names them. Compaction re-homes rows the same way
+   and is held the same way (RFC 0008).
+
 ### Why this is a fit for the substrate
 
 Every inlined commit is a small append into SlateDB's WAL — the access

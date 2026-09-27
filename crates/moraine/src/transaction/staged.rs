@@ -59,6 +59,7 @@ mod decode;
 mod index_upkeep;
 pub(crate) mod inline;
 mod overlay;
+mod row_id_invariants;
 #[cfg(test)]
 mod tests;
 
@@ -1484,12 +1485,17 @@ impl StagedTransaction {
         // poisoned definition rides the writes it produces.)
         let inline = async {
             let phase_started = Instant::now();
-            let (writes, uses_schema_reference) = reporting_phase(
+            let (writes, uses_schema_reference, drained) = reporting_phase(
                 "translate-inline",
                 translate_inline(&db_tx, &projections, &ops),
             )
             .await?;
-            Ok::<_, Error>((writes, uses_schema_reference, phase_started.elapsed()))
+            Ok::<_, Error>((
+                writes,
+                uses_schema_reference,
+                drained,
+                phase_started.elapsed(),
+            ))
         };
         let maintenance = async {
             let phase_started = Instant::now();
@@ -1508,21 +1514,45 @@ impl StagedTransaction {
             .await?;
             Ok::<_, Error>((entries, phase_started.elapsed()))
         };
-        let (inline_writes, uses_inline_schema_reference, entries) =
+        let (inline_writes, uses_inline_schema_reference, drained, entries) =
             match futures::try_join!(inline, maintenance) {
                 Ok((
-                    (inline_writes, uses_schema_reference, inline_elapsed),
+                    (inline_writes, uses_schema_reference, drained, inline_elapsed),
                     (entries, maintenance_elapsed),
                 )) => {
                     phases.inline = inline_elapsed;
                     phases.index_maintenance = maintenance_elapsed;
-                    (inline_writes, uses_schema_reference, entries)
+                    (inline_writes, uses_schema_reference, drained, entries)
                 }
                 Err(err) => {
                     db_tx.rollback();
                     return Err(err);
                 }
             };
+        // Neither a flush nor a compaction derives entries, so this is
+        // where their files are held to the rows they re-home.
+        let held = async {
+            reporting_phase(
+                "flushed-row-ids",
+                row_id_invariants::verify_flushed_row_ids(
+                    base_ref,
+                    &ops,
+                    &drained,
+                    store,
+                    &data_prefix,
+                ),
+            )
+            .await?;
+            reporting_phase(
+                "compacted-row-ids",
+                row_id_invariants::verify_compacted_row_ids(base_ref, &ops, store, &data_prefix),
+            )
+            .await
+        };
+        if let Err(err) = held.await {
+            db_tx.rollback();
+            return Err(err);
+        }
         let StagedEntries {
             poisoned,
             deferred,
