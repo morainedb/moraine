@@ -2296,3 +2296,63 @@ async fn a_row_group_read_emits_that_group_at_file_ordinals() {
     assert_eq!(tail.len(), 500);
     assert_eq!(tail.last(), Some(&2_599));
 }
+
+/// A stream parked with queued encoders must not keep the permits the
+/// limiter reserves for them: an encoder elsewhere still runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_stream_of_queued_encoders_does_not_starve_another() {
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use futures::StreamExt;
+
+    use super::metrics::{index_encoding_concurrency, run_bounded_index_encoding};
+
+    let permits = index_encoding_concurrency();
+    let holding = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(Barrier::new(permits + 1));
+
+    // Every permit is held by work that waits to be released.
+    let holders: Vec<_> = (0..permits)
+        .map(|_| {
+            let holding = Arc::clone(&holding);
+            let release = Arc::clone(&release);
+            tokio::spawn(run_bounded_index_encoding(move || {
+                holding.fetch_add(1, Ordering::SeqCst);
+                release.wait();
+                Ok(())
+            }))
+        })
+        .collect();
+    while holding.load(Ordering::SeqCst) < permits {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // A stream of as many encoders, polled once so they queue, then parked.
+    let mut parked = futures::stream::iter(0..permits)
+        .map(|_| run_bounded_index_encoding(|| Ok(())))
+        .buffered(permits);
+    let mut first = Box::pin(parked.next());
+    assert!(futures::poll!(first.as_mut()).is_pending());
+
+    // The holders finish; the limiter reserves their permits for the queue.
+    tokio::task::spawn_blocking(move || release.wait())
+        .await
+        .unwrap();
+    for holder in holders {
+        holder.await.unwrap().unwrap();
+    }
+
+    // An encoder that arrives now must still get a permit.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_bounded_index_encoding(|| Ok(())),
+    )
+    .await
+    .expect("an encoder behind a parked stream must not wait forever")
+    .unwrap();
+    drop(first);
+    drop(parked);
+}
