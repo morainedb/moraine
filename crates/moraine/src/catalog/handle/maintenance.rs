@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
+    time::Instant,
 };
 
 use futures::{StreamExt, TryStreamExt, stream};
@@ -30,10 +31,14 @@ use crate::{
             index_index_prefix, index_kind_prefix, subspace_prefix,
         },
     },
+    telemetry::milliseconds,
     transaction::{
         commit, index_maintenance, maintenance_status, staged::inline::inline_schema_undrop_write,
     },
 };
+
+/// Batches between two progress records of one dead-range sweep.
+const SWEEP_PROGRESS_BATCHES: u64 = 64;
 
 /// One subspace's row, zeroed when the manifest carries no segment for it.
 fn measure(subspace: SubspaceName, segment: Option<&SegmentSize>) -> SubspaceCensus {
@@ -136,7 +141,7 @@ impl Default for MaintenanceRequest {
             sweep_orphaned_index_entries: true,
             sweep_orphaned_file_column_stats: true,
             sweep_orphaned_inline_tables: true,
-            batch_size: 1024,
+            batch_size: 8192,
         }
     }
 }
@@ -910,38 +915,68 @@ impl Catalog {
         Ok(total)
     }
 
+    /// Deletes every entry of one dead index: one streaming scan of the
+    /// range, `batch_size` deletes per commit, a progress record every
+    /// `SWEEP_PROGRESS_BATCHES` batches and one more when the range is
+    /// empty.
     async fn reclaim_dead_range(
         &self,
         kind: IndexKind,
         index_id: u64,
         batch_size: usize,
     ) -> Result<u64> {
+        let started = Instant::now();
+        // One scan for the whole range. Its snapshot predates every delete
+        // below, so it never revisits a key; a scan per batch would pay a
+        // seek and a fresh read-ahead for every commit.
+        let mut entries = ReadHandle::Writer(self.writer()?)
+            .scan_prefix(index_index_prefix(kind, index_id), .., ScanShape::Bulk)
+            .await?;
+
         let mut total = 0u64;
-        // Each batch resumes past the tombstones the last one left.
-        let mut cursor: Option<Vec<u8>> = None;
+        let mut batches = 0u64;
         loop {
             let tx = self.begin_write_tx().await?;
-            // Non-durable below, so nothing reads the staged size.
-            let mut staged = StagedBytes::default();
-            let (deleted, last) = index_maintenance::reclaim_entries_from(
-                &tx,
-                kind,
-                index_id,
-                batch_size,
-                cursor.as_deref(),
-                &mut staged,
-            )
-            .await?;
+            let mut deleted = 0usize;
+            while deleted < batch_size {
+                match entries.next().await? {
+                    Some(entry) => {
+                        tx.delete(entry.key)?;
+                        deleted = deleted.saturating_add(1);
+                    }
+                    None => break,
+                }
+            }
             if deleted == 0 {
                 tx.rollback();
-                return Ok(total);
+                break;
             }
             // Non-durable: the deletes are idempotent, so a batch lost to a
             // crash leaves entries a later pass rediscovers.
             tx.commit().await.map_err(Error::from)?;
-            total += deleted as u64;
-            cursor = last;
+            total = total.saturating_add(deleted as u64);
+            batches = batches.saturating_add(1);
+            if batches.is_multiple_of(SWEEP_PROGRESS_BATCHES) {
+                info!(
+                    kind = ?kind,
+                    index_id,
+                    reclaimed = total,
+                    batches,
+                    elapsed_ms = milliseconds(started.elapsed()),
+                    "reclaiming a dead index's entries"
+                );
+            }
         }
+
+        info!(
+            kind = ?kind,
+            index_id,
+            reclaimed = total,
+            batches,
+            elapsed_ms = milliseconds(started.elapsed()),
+            "reclaimed a dead index's entries"
+        );
+        Ok(total)
     }
 }
 
