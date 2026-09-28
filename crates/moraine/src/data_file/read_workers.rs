@@ -87,6 +87,10 @@ impl Drop for PendingWorker {
     }
 }
 
+/// Runs `work` under one read-worker permit, taken on the calling task.
+/// Call it only from a task that is always polled: a caller parked
+/// mid-stream would keep a reserved permit from every other read in the
+/// process.
 async fn read_bounded<T>(
     workers: &Arc<ReadWorkers>,
     work: impl Future<Output = Result<T>>,

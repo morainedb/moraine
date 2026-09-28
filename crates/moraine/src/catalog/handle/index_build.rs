@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::TryStreamExt;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -850,7 +850,7 @@ impl Catalog {
         let metrics = self.data_read_metrics();
         let deletions_by_file = deletions_by_file(snapshot, table);
 
-        let remaining = snapshot
+        let mut remaining = snapshot
             .data_files
             .get(&table.get())
             .into_iter()
@@ -864,40 +864,33 @@ impl Catalog {
                 };
                 (start < file.record_count).then_some((file, start))
             });
-        let plans = stream::iter(remaining)
-            .map(|(file, start)| {
-                plan_file(
-                    snapshot,
-                    table,
-                    handle,
-                    &object_store,
-                    Arc::clone(&metrics),
-                    &resolve,
-                    deletions_by_file
-                        .get(&file.data_file_id)
-                        .map_or(&[][..], Vec::as_slice),
-                    file,
-                    start,
-                )
-            })
-            .buffered(FILE_PLAN_CONCURRENCY);
-        let mut units = plans
-            .map_ok(|plan| stream::iter(plan.units(&projection).into_iter().map(Result::Ok)))
-            .try_flatten();
-
-        // The feeder starts units as the window admits them, so planning
-        // and reading run ahead while the consumer drains the head unit.
+        // Planning runs ahead of the unit window under one launch budget,
+        // and the feeder closes the window after the last unit, which is
+        // what ends the consumer.
         let (running, mut ready) = mpsc::channel::<RunningUnit>(UNIT_CONCURRENCY);
-        // Owning the sender, the feeder closes the window when the last
-        // unit is out, which is what ends the consumer.
-        let feed = async move {
-            while let Some(unit) = units.try_next().await? {
-                if running.send(unit.spawn()).await.is_err() {
-                    break;
-                }
-            }
-            Ok(())
-        };
+        let feed = feeder::feed_window(
+            || {
+                remaining.next().map(|(file, start)| {
+                    plan_file(
+                        snapshot,
+                        table,
+                        handle,
+                        &object_store,
+                        Arc::clone(&metrics),
+                        &resolve,
+                        deletions_by_file
+                            .get(&file.data_file_id)
+                            .map_or(&[][..], Vec::as_slice),
+                        file,
+                        start,
+                    )
+                })
+            },
+            |plan| plan.units(&projection),
+            Unit::spawn,
+            running,
+            FILE_PLAN_CONCURRENCY,
+        );
         let consume = async {
             while let Some(mut unit) = ready.recv().await {
                 while let Some(batch) = unit.batches.recv().await {
@@ -1068,6 +1061,7 @@ fn require_data_store(
 #[cfg(test)]
 mod tests;
 
+mod feeder;
 mod filter;
 mod inline_sources;
 use filter::BuildFilter;
