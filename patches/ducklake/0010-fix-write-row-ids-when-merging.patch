@@ -1,0 +1,135 @@
+diff --git a/src/functions/ducklake_compaction_functions.cpp b/src/functions/ducklake_compaction_functions.cpp
+index 860e4df..ebb8310 100644
+--- a/src/functions/ducklake_compaction_functions.cpp
++++ b/src/functions/ducklake_compaction_functions.cpp
+@@ -472,2 +471,0 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+-	bool files_are_adjacent = true;
+-	optional_idx prev_row_id;
+@@ -506,11 +503,0 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+-		// check if this file is adjacent (row-id wise) to the previous file
+-		if (!source.file.row_id_start.IsValid()) {
+-			// the file does not have a row_id_start defined - it cannot be adjacent
+-			files_are_adjacent = false;
+-		} else {
+-			if (prev_row_id.IsValid() && prev_row_id.GetIndex() != source.file.row_id_start.GetIndex()) {
+-				// not adjacent - we need to write row-ids to the file
+-				files_are_adjacent = false;
+-			}
+-			prev_row_id = source.file.row_id_start.GetIndex() + source.file.row_count;
+-		}
+@@ -556,2 +543,4 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+-		// if files are adjacent, we don't need to write the row-id to the file
+-		write_row_id = !files_are_adjacent;
++		// always write the row-id column: a file's row_id_start says nothing about the ids its rows carry (a
++		// flushed or updated file holds them per row, with gaps), so numbering the merged file by position would
++		// renumber rows onto ids other rows hold
++		write_row_id = true;
+diff --git a/test/sql/compaction/merge_flushed_files_keep_row_ids.test b/test/sql/compaction/merge_flushed_files_keep_row_ids.test
+new file mode 100644
+index 0000000..4a4dfd7
+--- /dev/null
++++ b/test/sql/compaction/merge_flushed_files_keep_row_ids.test
+@@ -0,0 +1,55 @@
++# name: test/sql/compaction/merge_flushed_files_keep_row_ids.test
++# description: merging a flushed file whose batch straddled two partitions keeps every row id
++# group: [compaction]
++
++require ducklake
++
++require parquet
++
++test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
++
++test-env DATA_PATH __TEST_DIR__
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/merge_flushed_files', METADATA_CATALOG 'merge_flushed_meta', DATA_INLINING_ROW_LIMIT 1000)
++
++statement ok
++CREATE TABLE ducklake.t(k BIGINT, m BIGINT)
++
++statement ok
++ALTER TABLE ducklake.t SET PARTITIONED BY (m)
++
++statement ok
++INSERT INTO ducklake.t SELECT range, 5 FROM range(0, 100)
++
++statement ok
++CALL ducklake_flush_inlined_data('ducklake')
++
++# Every tenth row of this batch lands in the other partition, so the flushed m=5 file's row ids have gaps
++# that its row_id_start (the lowest of them) hides: it ends exactly where the first file ends.
++statement ok
++INSERT INTO ducklake.t SELECT range, CASE WHEN range % 10 = 9 THEN 6 ELSE 5 END FROM range(100, 200)
++
++statement ok
++CALL ducklake_flush_inlined_data('ducklake')
++
++query II
++SELECT files_processed, files_created FROM ducklake_merge_adjacent_files('ducklake')
++----
++2	1
++
++# The merged file carries its rows' ids rather than numbering them by position.
++query II
++SELECT count(*), count(*) FILTER (WHERE rowid <> k) FROM ducklake.t
++----
++200	0
++
++query I
++SELECT count(*) FROM (SELECT rowid FROM ducklake.t GROUP BY rowid HAVING count(*) > 1)
++----
++0
++
++query I
++SELECT row_id_start IS NULL FROM merge_flushed_meta.ducklake_data_file WHERE end_snapshot IS NULL AND record_count = 190
++----
++true
+diff --git a/test/sql/compaction/merge_updated_files_keep_row_ids.test b/test/sql/compaction/merge_updated_files_keep_row_ids.test
+new file mode 100644
+index 0000000..acaaec7
+--- /dev/null
++++ b/test/sql/compaction/merge_updated_files_keep_row_ids.test
+@@ -0,0 +1,42 @@
++# name: test/sql/compaction/merge_updated_files_keep_row_ids.test
++# description: merging an update's output with the file registered after it keeps every row id
++# group: [compaction]
++
++require ducklake
++
++require parquet
++
++test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
++
++test-env DATA_PATH __TEST_DIR__
++
++statement ok
++ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/merge_updated_files', METADATA_CATALOG 'merge_updated_meta', DATA_INLINING_ROW_LIMIT 0)
++
++statement ok
++CREATE TABLE ducklake.t(k BIGINT, m BIGINT)
++
++statement ok
++INSERT INTO ducklake.t SELECT range, 0 FROM range(0, 100)
++
++# The update's output keeps its rows' ids per row (every tenth), yet is registered with a dense start at the
++# next free id, so the file inserted after it starts exactly where that start plus its row count ends.
++statement ok
++UPDATE ducklake.t SET m = 1 WHERE k % 10 = 9
++
++statement ok
++INSERT INTO ducklake.t SELECT range, 0 FROM range(110, 120)
++
++statement ok
++CREATE TABLE before AS SELECT rowid AS r, k FROM ducklake.t
++
++query II
++SELECT files_processed, files_created FROM ducklake_merge_adjacent_files('ducklake')
++----
++2	1
++
++# The merged file carries its rows' ids rather than numbering them by position.
++query II
++SELECT count(*), count(*) FILTER (WHERE (r, k) NOT IN (SELECT r, k FROM before)) FROM (SELECT rowid AS r, k FROM ducklake.t)
++----
++110	0

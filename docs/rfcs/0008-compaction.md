@@ -148,11 +148,14 @@ snapshot-minting commit:
   dense predecessor chains onto it, and every row after a gap is
   renumbered onto ids the other partition holds. Compaction derives no
   index entries, so without the hold the index would keep naming the
-  rows the files had just stopped holding. The bundled DuckLake carries
-  the fix itself (`patches/ducklake/0010`): a flushed file is never
-  adjacent, so such a merge writes the row-id column. The hold stays as
-  the backstop, since it is the commit, not the planner, that owns the
-  rows' identity.
+  rows the files had just stopped holding. An update's output has the
+  same exposure from the other side: its rows keep their original ids
+  while it is registered with a dense start at the next free id, so the
+  file registered after it starts exactly where that start plus its row
+  count ends. The bundled DuckLake carries the fix itself
+  (`patches/ducklake/0010`): a merge always writes the row-id column, and
+  adjacency no longer decides anything. The hold stays as the backstop,
+  since it is the commit, not the planner, that owns the rows' identity.
 
 ### Conflict classification
 
@@ -201,6 +204,9 @@ Live, via `cargo xtask e2e`:
   rather than chaining the file, and the merged file carries no dense
   start. (The commit's refusal of a merge that would renumber is pinned
   at the core level, where such a merge can be staged directly.)
+- **A merge over an update's output** and the file registered after it
+  keeps every row id, with the commit's hold live to refuse anything
+  else.
 
 ## Alternatives considered
 

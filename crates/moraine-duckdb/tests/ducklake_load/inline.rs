@@ -381,6 +381,82 @@ fn ducklake_merge_of_a_straddling_flush_output_keeps_every_row_id() {
     );
 }
 
+/// An update's output keeps its rows' original ids per row yet is
+/// registered with a dense start at the next free id, so the file
+/// inserted after it starts exactly where that start plus its row count
+/// ends. The bundled DuckLake never chains them: the merge writes the
+/// row-id column and every row keeps its id, with the commit's hold live
+/// to refuse anything else.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn ducklake_merge_of_an_update_output_keeps_every_row_id() {
+    let dir = TempDir::new("update-merge-store");
+    let data_dir = TempDir::new("update-merge-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+    let options = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data_path.display()
+    );
+    let options = options.as_str();
+
+    run_ducklake_sql_with_options(
+        store,
+        data_path,
+        options,
+        "CREATE TABLE lake.main.t (k BIGINT, m BIGINT);\n\
+         INSERT INTO lake.main.t SELECT range, 0 FROM range(0, 100);\n\
+         UPDATE lake.main.t SET m = 1 WHERE k % 10 = 9;\n\
+         INSERT INTO lake.main.t SELECT range, 0 FROM range(110, 120);",
+    );
+    let ids = "SELECT rowid, k FROM lake.main.t ORDER BY rowid;";
+    let before = csv_rows(&run_ducklake_sql_with_options(
+        store, data_path, options, ids,
+    ));
+    assert_eq!(before.len(), 110);
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT data_file_id, row_id_start, record_count FROM m.ducklake_data_file \
+             WHERE end_snapshot IS NULL ORDER BY data_file_id;",
+        )),
+        vec![
+            vec!["0", "0", "100"],
+            vec!["1", "100", "10"],
+            vec!["3", "110", "10"]
+        ],
+        "the update's output is registered at the next free id and the later file right after it"
+    );
+
+    assert_eq!(
+        csv_rows(&run_ducklake_sql_with_options(
+            store,
+            data_path,
+            options,
+            "SELECT files_processed, files_created FROM ducklake_merge_adjacent_files('lake');",
+        )),
+        vec![vec!["2", "1"]],
+        "the update's output and the file registered after it merge"
+    );
+
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT row_id_start IS NULL FROM m.ducklake_data_file \
+             WHERE end_snapshot IS NULL AND record_count = 20;",
+        )),
+        vec![vec!["true"]],
+        "the merged file carries its rows' ids rather than a dense start"
+    );
+    let after = csv_rows(&run_ducklake_sql_with_options(
+        store, data_path, options, ids,
+    ));
+    assert_eq!(
+        after, before,
+        "every row keeps the id it had before the merge"
+    );
+}
+
 /// Rows for `count` parents' worth of data in one insert, and the number
 /// of Parquet files the catalog holds afterwards. Inlining writes none.
 fn data_files_after_inserting(

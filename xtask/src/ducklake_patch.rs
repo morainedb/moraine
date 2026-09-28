@@ -27,16 +27,17 @@ pub(crate) const PATCH_PATHS: [&str; 10] = [
     "patches/ducklake/0007-perf-name-the-table-a-dropped-file-belongs-to.patch",
     "patches/ducklake/0008-perf-take-existing-delete-positions-from-the-caller.patch",
     "patches/ducklake/0009-fix-cancel-DuckLake-metadata-work-with-its-caller.patch",
-    "patches/ducklake/0010-fix-write-row-ids-when-merging-a-flushed-file.patch",
+    "patches/ducklake/0010-fix-write-row-ids-when-merging.patch",
 ];
 pub(crate) const CONFIG_PATH: &str = "patches/ducklake/ducklake.cmake";
 /// The patched-behaviour sqllogictests, run against the built artifact.
-const REGRESSION_TEST_PATHS: [&str; 5] = [
+const REGRESSION_TEST_PATHS: [&str; 6] = [
     "test/sql/rowid/ducklake_row_id_file_pruning.test",
     "test/sql/rowid/ducklake_data_file_id.test",
     "test/sql/data_inlining/data_inlining_appender.test",
     "test/sql/data_inlining/inlining_append_retry.test",
     "test/sql/compaction/merge_flushed_files_keep_row_ids.test",
+    "test/sql/compaction/merge_updated_files_keep_row_ids.test",
 ];
 
 #[derive(Debug, PartialEq, Eq)]

@@ -66,17 +66,17 @@ for DuckDB v1.5.5, applied in file-name order:
    dependency; explicit rollback, failed replacement inserts, repeated
    calls, and standalone autocommit are covered by `cargo xtask e2e`.
 
-`0010-fix-write-row-ids-when-merging-a-flushed-file.patch` stops
-`ducklake_merge_adjacent_files` from treating a flushed file as adjacent to
-its predecessor. A flushed file carries its row ids per row, and the
-`row_id_start` it is registered with is only the lowest of them; when the
-batch it came from straddled two partitions, the ids have gaps, yet the
-start still lands exactly where a dense predecessor ends. Stock DuckLake
-judges adjacency from `row_id_start + record_count` alone, drops the row-id
-column from the merged file, and numbers it by position, so every row after
-a gap is renumbered onto ids the other partition's rows hold. With the
-patch such a merge always writes the row-id column. The
-`merge_flushed_files_keep_row_ids` sqllogictest pins it.
+`0010-fix-write-row-ids-when-merging.patch` makes
+`ducklake_merge_adjacent_files` write the row-id column into every merged
+file. Stock DuckLake judges two files adjacent from `row_id_start +
+record_count` alone, drops the column when they are, and numbers the merged
+file by position. A file's registered start says nothing about the ids its
+rows carry: a flushed file whose batch straddled two partitions holds ids
+with gaps and a start that is only the lowest of them, and an update's
+output holds its rows' original ids under a start at the next free id, so
+either chains onto a neighbour and every row after a gap is renumbered
+onto ids other rows hold. The `merge_flushed_files_keep_row_ids` and
+`merge_updated_files_keep_row_ids` sqllogictests pin both shapes.
 
 Later patches address the lines earlier ones produce, so the series is applied
 in one `git apply` invocation rather than one per file.
