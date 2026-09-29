@@ -3283,6 +3283,172 @@ async fn maintain_resumes_each_batch_where_the_last_one_stopped() {
     catalog.close().await.unwrap();
 }
 
+/// A dead range is scanned once however small the batch: a scan per
+/// batch pays a seek and a fresh read-ahead for every commit.
+#[tokio::test]
+async fn maintain_streams_a_dead_range_in_one_scan() {
+    use crate::catalog::{Catalog, CatalogOptions, ColumnDef, MaintenanceRequest};
+
+    const DEAD_ENTRIES: u64 = 4_096;
+    let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let open = || Catalog::open(Arc::clone(&backing), CatalogOptions::default());
+
+    let catalog = open().await.unwrap();
+    let table = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.create_schema("s")?;
+            let column = ColumnDef {
+                name: "a".into(),
+                column_type: "BIGINT".into(),
+                nulls_allowed: true,
+                default_value: None,
+                children: Vec::new(),
+            };
+            table.set(Some(tx.create_table(schema, "t", &[column])?));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let table = table.get().unwrap();
+    let dead = indexed(&catalog, table, "dead", DEAD_ENTRIES).await;
+    catalog.commit(|tx| tx.drop_index(dead)).await.unwrap();
+    catalog.flush_memtable().await.unwrap();
+    catalog.close().await.unwrap();
+
+    // A fresh writer's block cache is cold, so every block the sweep reads
+    // is an object-store read.
+    let catalog = open().await.unwrap();
+    let before = catalog.object_store_tally().main_gets;
+    let report = catalog
+        .maintain(MaintenanceRequest {
+            batch_size: 1,
+            sweep_orphaned_file_column_stats: false,
+            ..MaintenanceRequest::default()
+        })
+        .await
+        .unwrap();
+    let reads = catalog.object_store_tally().main_gets - before;
+    catalog.close().await.unwrap();
+
+    assert_eq!(report.index_entries_reclaimed, DEAD_ENTRIES);
+    let bound = DEAD_ENTRIES / 32;
+    assert!(
+        reads < bound,
+        "a sweep in {DEAD_ENTRIES} batches issued {reads} reads over a range of a few dozen \
+         blocks: the range is being scanned once per batch"
+    );
+}
+
+/// A sweep says how far it has got every so many batches and once when
+/// the range is empty, so a long pass is visibly alive in a host's logs.
+#[test]
+fn maintain_reports_sweep_progress_and_completion() {
+    use std::sync::Mutex;
+
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+    use crate::catalog::MaintenanceRequest;
+
+    #[derive(Debug, Default)]
+    struct SweepRecord {
+        message: String,
+        index_id: Option<u64>,
+        reclaimed: Option<u64>,
+    }
+
+    impl Visit for SweepRecord {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            match field.name() {
+                "index_id" => self.index_id = Some(value),
+                "reclaimed" => self.reclaimed = Some(value),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    struct Capture(Arc<Mutex<Vec<SweepRecord>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut record = SweepRecord::default();
+            event.record(&mut record);
+            if record.message.contains("dead index") {
+                self.0.lock().unwrap().push(record);
+            }
+        }
+    }
+
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&records)));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // With a single registered dispatcher, tracing computes a callsite's
+    // interest from the default of whichever thread first reaches it, and
+    // another test's thread reaches these callsites with no subscriber. A
+    // second registered dispatcher makes it consult the registry instead,
+    // and the rebuild below corrects any callsite cached before it.
+    let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+    let (report, index) = tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        runtime.block_on(async {
+            let (catalog, table) = catalog_with_two_column_table().await;
+            register_three_row_file(&catalog, table).await;
+            let index = indexed(&catalog, table, "by_a", 200).await;
+            catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+
+            let report = catalog
+                .maintain(MaintenanceRequest {
+                    batch_size: 1,
+                    ..MaintenanceRequest::default()
+                })
+                .await
+                .unwrap();
+            catalog.close().await.unwrap();
+            (report, index)
+        })
+    });
+    assert_eq!(report.index_entries_reclaimed, 200);
+
+    let records = records.lock().unwrap();
+    let progress: Vec<u64> = records
+        .iter()
+        .filter(|record| record.message.contains("reclaiming"))
+        .filter_map(|record| record.reclaimed)
+        .collect();
+    assert_eq!(
+        progress,
+        vec![64, 128, 192],
+        "one progress record per 64 batches"
+    );
+
+    let completed: Vec<_> = records
+        .iter()
+        .filter(|record| record.message.contains("reclaimed a dead index"))
+        .collect();
+    assert_eq!(
+        completed.len(),
+        1,
+        "one completion record per dead index, got {records:?}"
+    );
+    assert_eq!(completed[0].reclaimed, Some(200));
+    assert_eq!(completed[0].index_id, Some(index.get()));
+}
+
 /// A zero batch size would loop forever rather than reclaim nothing, so
 /// it is refused.
 #[tokio::test]

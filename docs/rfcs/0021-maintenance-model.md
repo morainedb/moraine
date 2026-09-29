@@ -577,6 +577,16 @@ writer. Beyond the head record the two write disjoint keys — the sweep
 touches only dead index ids — so a lost race costs a retry of one batch and
 never a redo of the scan.
 
+**The range is read once.** The sweep opens one bulk scan over the dead
+range, with the core read profile's read-ahead, and drains it into commits
+of `batch_size` deletes. The scan's snapshot predates every delete it
+feeds, so it never revisits a key, and a range of tens of millions of
+entries costs one pass over its blocks rather than a seek and a fresh
+read-ahead per batch, which is what made a sweep of that size take hours.
+The pass records the entries reclaimed every 64 batches and once per range
+when it is empty, so a host reading its logs can tell a long sweep from a
+stalled one.
+
 ### The store merge
 
 The step names a tree and asks SlateDB to merge all of it. It builds
@@ -719,7 +729,7 @@ the census is a prerequisite, not merely post-hoc reporting (`BENCHMARK.md`,
 ```rust
 pub struct MaintenanceRequest {
     pub sweep_orphaned_index_entries: bool,  // default true
-    pub batch_size: usize,                   // default 1024
+    pub batch_size: usize,                   // default 8192
 }
 
 pub struct MaintenanceReport {
