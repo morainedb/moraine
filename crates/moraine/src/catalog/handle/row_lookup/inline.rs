@@ -111,7 +111,17 @@ impl ReadOnlyCatalog {
         let mut selected = Vec::new();
         let mut locators = Vec::new();
         let mut chunks = BTreeMap::new();
-        for row in requested.iter().copied().collect::<BTreeSet<_>>() {
+        let rows: BTreeSet<u64> = requested.iter().copied().collect();
+        // One scan over the whole requested span, resolved as the loop walks
+        // ascending; a scan per row is a store round trip per row.
+        let mut tombstones = match (rows.first(), rows.last()) {
+            (Some(&first), Some(&last)) => {
+                self.row_lookups.note_inline_tombstone_scan();
+                Some(InlineTombstones::open(handle, table.get(), first, last).await?)
+            }
+            _ => None,
+        };
+        for row in rows {
             let mut matches = Vec::new();
             directory
                 .ranges
@@ -119,7 +129,10 @@ impl ReadOnlyCatalog {
             if matches.is_empty() {
                 continue;
             }
-            let deletion = latest_deletion(handle, table, row, visible_at).await?;
+            let deletion = match tombstones.as_mut() {
+                Some(tombstones) => tombstones.latest_at(row, visible_at).await?,
+                None => None,
+            };
             for locator in matches {
                 let InlineOperation::Insert { begin_snapshot, .. } = locator.operation() else {
                     continue;
@@ -297,18 +310,6 @@ impl ReadOnlyCatalog {
         )
         .await
     }
-}
-
-async fn latest_deletion(
-    handle: ReadHandle<'_>,
-    table: TableId,
-    row: u64,
-    head: u64,
-) -> Result<Option<u64>> {
-    InlineTombstones::open(handle, table.get(), row, row)
-        .await?
-        .latest_at(row, head)
-        .await
 }
 
 /// The ids of the selected rows, their chunks left unread.

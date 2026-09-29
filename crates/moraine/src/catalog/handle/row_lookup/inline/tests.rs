@@ -376,3 +376,62 @@ async fn a_manifest_that_moves_on_every_pass_exhausts_the_read_budget() {
     session.finish();
     reader.close().await.unwrap();
 }
+
+/// One confirmation opens one tombstone scan however many rows it asks
+/// about, so its cost does not grow a store round trip per row.
+#[tokio::test]
+async fn a_confirmation_opens_one_tombstone_scan_whatever_it_asks_about() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let table = Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").unwrap().id;
+            let id = tx.create_table(
+                schema,
+                "inline_scale",
+                &[ColumnDef {
+                    name: "a".into(),
+                    column_type: "BIGINT".into(),
+                    ..Default::default()
+                }],
+            )?;
+            table.set(Some(id));
+            tx.inline_insert(
+                id,
+                &InlineChunk {
+                    schema_version: 0,
+                    row_count: 64,
+                    arrow_schema: b"schema".to_vec(),
+                    arrow_body: b"body".to_vec(),
+                },
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let table = table.get().unwrap();
+    catalog
+        .commit(|tx| tx.inline_delete(table, 7, &[]))
+        .await
+        .unwrap();
+
+    let requested: Vec<u64> = (0..64).collect();
+    let scans = || catalog.row_lookups.inline_tombstone_scans();
+    let before = scans();
+    let live = catalog
+        .requested_inline_row_ids(table, &requested, None)
+        .await
+        .unwrap();
+
+    assert_eq!(live.len(), 63, "every row but the deleted one is live");
+    assert!(!live.contains(&7), "the deleted row resolved as live");
+    assert_eq!(
+        scans() - before,
+        1,
+        "the confirmation opened a scan per row rather than one for the span"
+    );
+    catalog.close().await.unwrap();
+}
