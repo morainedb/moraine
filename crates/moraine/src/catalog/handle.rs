@@ -447,6 +447,9 @@ pub type CommitMember<'a> = &'a (dyn Fn(&mut Transaction) -> Result<()> + Sync);
 /// candidates are a few tens of bytes per row; a deletion ledger can run to
 /// hundreds of thousands of positions.
 const LOCATED_MEMO_BYTES: usize = 8 * 1024 * 1024;
+/// Positions are eight bytes a row, held for both halves of one located
+/// change rather than for a table's history.
+const POSITIONED_MEMO_BYTES: usize = 8 * 1024 * 1024;
 const LEDGER_MEMO_BYTES: usize = 32 * 1024 * 1024;
 const MEMO_ENTRIES: usize = 4096;
 
@@ -495,6 +498,14 @@ pub struct ReadOnlyCatalog {
     data_reads: Arc<data_file::DataStoreCounters>,
     row_lookups: Arc<row_lookup::RowLookupCache>,
     index_probes: Arc<index_probe_cache::IndexProbeCache>,
+    /// The exact positions a request's rows sit at, keyed by the rows asked
+    /// for; the scan and the deletion of one located change position once.
+    positioned_files: Arc<
+        revision_memo::RevisionMemo<
+            row_location::PositioningKey,
+            Vec<row_location::PositionedFile>,
+        >,
+    >,
     /// The file candidates a resolved probe's row ids located, keyed by
     /// those ids; a rebind at the same revision locates nothing twice.
     located_rows: Arc<revision_memo::RevisionMemo<Vec<u64>, Vec<crate::catalog::FileRowCandidate>>>,
@@ -603,6 +614,7 @@ impl ReadOnlyCatalog {
             .saturating_add(self.row_lookups.estimated_bytes())
             .saturating_add(self.index_probes.estimated_bytes())
             .saturating_add(self.located_rows.estimated_bytes())
+            .saturating_add(self.positioned_files.estimated_bytes())
             .saturating_add(self.inlined_file_deletes.estimated_bytes())
     }
 
@@ -1211,6 +1223,10 @@ impl Catalog {
                     LOCATED_MEMO_BYTES,
                     MEMO_ENTRIES,
                 )),
+                positioned_files: Arc::new(revision_memo::RevisionMemo::new(
+                    POSITIONED_MEMO_BYTES,
+                    MEMO_ENTRIES,
+                )),
                 inlined_file_deletes: Arc::new(revision_memo::RevisionMemo::new(
                     LEDGER_MEMO_BYTES,
                     MEMO_ENTRIES,
@@ -1333,6 +1349,10 @@ impl Catalog {
             index_probes: Arc::default(),
             located_rows: Arc::new(revision_memo::RevisionMemo::new(
                 LOCATED_MEMO_BYTES,
+                MEMO_ENTRIES,
+            )),
+            positioned_files: Arc::new(revision_memo::RevisionMemo::new(
+                POSITIONED_MEMO_BYTES,
                 MEMO_ENTRIES,
             )),
             inlined_file_deletes: Arc::new(revision_memo::RevisionMemo::new(
