@@ -62,7 +62,14 @@ for DuckDB v1.5.5, applied in file-name order:
    through DuckDB's binder and planned through the operators `UPDATE` uses
    in their row-id-writing mode, so the rows keep their ids, with the
    positional deletes staged once the rows are written, all in the current
-   transaction; `moraine_update` rewrites into it. Neither function has a Moraine
+   transaction; `moraine_update` rewrites into it. Both functions also take
+   `positions_token`, an alternative to `files` and `inlined_rows` for a
+   caller that would otherwise resolve positions while binding: the token is
+   carried through the plan untouched and handed to the resolver an extension
+   installs with `RegisterDuckLakePositionResolver`, which runs during
+   execution, in the transaction that stages the result. A token with no
+   registered resolver, or given beside a non-empty `files`, is an error. No
+   in-tree caller passes one yet. Neither function has a Moraine
    dependency; explicit rollback, failed replacement inserts, repeated
    calls, and standalone autocommit are covered by `cargo xtask e2e`.
 

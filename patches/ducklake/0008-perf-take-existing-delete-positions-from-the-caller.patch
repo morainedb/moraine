@@ -1,28 +1,25 @@
 diff --git a/src/functions/ducklake_delete_positions.cpp b/src/functions/ducklake_delete_positions.cpp
-index 21cf828..b1118cf 100644
+index 4291ac2..551351c 100644
 --- a/src/functions/ducklake_delete_positions.cpp
 +++ b/src/functions/ducklake_delete_positions.cpp
-@@ -29,0 +30,2 @@ struct PositionalDeletes {
-+	//! Positions the caller already decoded from a file's committed delete file, per data file id, ascending
-+	map<idx_t, vector<idx_t>> existing_positions;
-@@ -42 +44,2 @@ struct StagedDeletes {
+@@ -42 +42,2 @@ struct StagedDeletes {
 -static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &result, const char *function) {
 +static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &result,
 +                               map<idx_t, vector<idx_t>> &existing, const char *function) {
-@@ -55,0 +59 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
+@@ -55,0 +57 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
 +	optional_idx existing_index;
-@@ -62,0 +67,2 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
+@@ -62,0 +65,2 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
 +		} else if (name == "existing_positions") {
 +			existing_index = i;
-@@ -65 +71,2 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
+@@ -65 +69,2 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
 -	if (children.size() != 2 || !file_index.IsValid() || !positions_index.IsValid()) {
 +	if (children.size() != 2 + (existing_index.IsValid() ? 1 : 0) || !file_index.IsValid() ||
 +	    !positions_index.IsValid()) {
-@@ -82 +89,2 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
+@@ -82 +87,2 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
 -		auto &positions = result[file_value.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>()];
 +		auto file_id = file_value.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>();
 +		auto &positions = result[file_id];
-@@ -88,0 +97,21 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
+@@ -88,0 +95,21 @@ static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &resul
 +		// A NULL `existing_positions` means the caller does not know them and the
 +		// committed delete file is read here instead. Non-NULL is a BLOB of
 +		// little-endian uint64 positions.
@@ -44,13 +41,20 @@ index 21cf828..b1118cf 100644
 +			}
 +			std::sort(known.begin(), known.end());
 +		}
-@@ -96 +125 @@ static PositionalDeletes ParsePositionalDeletes(TableFunctionBindInput &input, c
+@@ -96 +123 @@ static PositionalDeletes ParsePositionalDeletes(TableFunctionBindInput &input, c
 -	ParseFilePositions(input.inputs[3], result.file_positions, function);
 +	ParseFilePositions(input.inputs[3], result.file_positions, result.existing_positions, function);
-@@ -263,0 +293 @@ static StagedDeletes StagePositionalDeletes(ClientContext &context, DuckLakeCata
+@@ -297,0 +325 @@ static StagedDeletes StagePositionalDeletes(ClientContext &context, DuckLakeCata
 +			auto known = request.existing_positions.find(requested.first);
-@@ -268,0 +299,4 @@ static StagedDeletes StagePositionalDeletes(ClientContext &context, DuckLakeCata
+@@ -302,0 +331,4 @@ static StagedDeletes StagePositionalDeletes(ClientContext &context, DuckLakeCata
 +			} else if (known != request.existing_positions.end()) {
 +				// The caller resolved its positions at this snapshot or a newer one, so its decode of
 +				// the committed delete file holds every position deleted here.
 +				positions.insert(known->second.begin(), known->second.end());
+diff --git a/src/include/functions/ducklake_table_functions.hpp b/src/include/functions/ducklake_table_functions.hpp
+index 4e9775d..ad44758 100644
+--- a/src/include/functions/ducklake_table_functions.hpp
++++ b/src/include/functions/ducklake_table_functions.hpp
+@@ -114,0 +115,2 @@ struct PositionalDeletes {
++	//! Positions the caller already decoded from a file's committed delete file, per data file id, ascending
++	map<idx_t, vector<idx_t>> existing_positions;
