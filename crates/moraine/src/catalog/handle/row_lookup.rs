@@ -35,6 +35,8 @@ pub(super) struct RowLookupCache {
     summarized_files: AtomicU64,
     /// Inline directories built from a store scan.
     inline_directory_builds: AtomicU64,
+    /// Store scans opened to resolve requested rows against tombstones.
+    inline_tombstone_scans: AtomicU64,
     /// Summary probes made placing rows against arbitrary-id files.
     summary_probes: AtomicU64,
 }
@@ -67,6 +69,15 @@ impl RowLookupCache {
     #[cfg(test)]
     pub(super) fn inline_directory_builds(&self) -> u64 {
         self.inline_directory_builds.load(Ordering::Relaxed)
+    }
+
+    fn note_inline_tombstone_scan(&self) {
+        self.inline_tombstone_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn inline_tombstone_scans(&self) -> u64 {
+        self.inline_tombstone_scans.load(Ordering::Relaxed)
     }
 
     pub(super) fn estimated_bytes(&self) -> u64 {
