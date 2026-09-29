@@ -300,3 +300,22 @@ query I
 SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake','main','t','by_a',40);
 ----
 1
+
+# The data store is counted apart from the catalog's own. Positioning a row
+# against its file summary and reading back an existing delete file are data
+# reads, and they reach none of the `main_*` counters -- so a statement can
+# spend its time there while the catalog's counters stay flat.
+statement ok
+SET VARIABLE data_gets_before = (SELECT data_gets FROM moraine_object_store_tally('lake'));
+
+statement ok
+SET VARIABLE located_40 = (SELECT list({row_id:row_id, data_file_id:data_file_id}) FROM moraine_index_lookup('lake','main','t','by_a',40));
+
+statement ok
+SELECT * FROM moraine_delete_located('lake','main','t',getvariable('located_40'));
+
+query I
+SELECT data_gets > getvariable('data_gets_before') AND data_bytes >= data_gets
+FROM moraine_object_store_tally('lake');
+----
+true

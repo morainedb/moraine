@@ -466,6 +466,11 @@ typedef struct MoraineObjectStoreTally {
   uint64_t wal_delete_nanoseconds;
   // Failed request attempts across both stores, including handled errors.
   uint64_t errors;
+  // Byte ranges read from the data store: Parquet footers, row-id
+  // columns, delete files, and scoped reads.
+  uint64_t data_gets;
+  // Bytes those reads returned.
+  uint64_t data_bytes;
 } MoraineObjectStoreTally;
 
 // File positions a selective scan treats as deleted on top of the

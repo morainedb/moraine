@@ -373,15 +373,18 @@ duckdb::unique_ptr<duckdb::FunctionData> ObjectStoreTallyBind(duckdb::ClientCont
 	auto bind_data = duckdb::make_uniq<TallyBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 
+	// `data_*` count the Parquet store, which the `main_`/`wal_` columns do
+	// not reach: a statement can read data files while showing no main-store
+	// request at all.
 	names = {"main_gets",          "main_get_ms",     "main_puts",          "main_put_ms",
 	         "main_deletes",       "main_delete_ms",  "wal_gets",           "wal_get_ms",
 	         "wal_puts",           "wal_put_ms",      "wal_deletes",        "wal_delete_ms",
-	         "errors"};
+	         "errors",             "data_gets",       "data_bytes"};
 	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT,
 	                duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
 	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT,
 	                duckdb::LogicalType::DOUBLE,  duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
-	                duckdb::LogicalType::UBIGINT};
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
 	return bind_data;
 }
 
@@ -418,6 +421,8 @@ void ObjectStoreTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionI
 	output.SetValue(10, 0, duckdb::Value::UBIGINT(tally.wal_deletes));
 	output.SetValue(11, 0, milliseconds(tally.wal_delete_nanoseconds));
 	output.SetValue(12, 0, duckdb::Value::UBIGINT(tally.errors));
+	output.SetValue(13, 0, duckdb::Value::UBIGINT(tally.data_gets));
+	output.SetValue(14, 0, duckdb::Value::UBIGINT(tally.data_bytes));
 	output.SetCardinality(1);
 }
 

@@ -781,6 +781,37 @@ mod locate_row_positions {
         catalog.close().await.unwrap();
     }
 
+    /// Positioning a row against its file counts against the data store,
+    /// which the catalog's own request counters do not reach.
+    #[tokio::test]
+    async fn positioning_a_row_counts_the_data_store_it_read() {
+        let catalog = open_memory().await;
+        let data = Arc::new(InMemory::new());
+        let store = DataStore::new(data.clone());
+        let (table, dense_id, _) = fixture(&catalog, &data).await;
+
+        let before = catalog.object_store_tally();
+        assert_eq!(before.data_gets, 0, "nothing has read a data file yet");
+
+        catalog
+            .locate_row_positions(Some(store), "", table, &[(1, Some(dense_id))])
+            .await
+            .unwrap();
+
+        let after = catalog.object_store_tally();
+        assert!(
+            after.data_gets > before.data_gets,
+            "positioning read no data file ({} -> {})",
+            before.data_gets,
+            after.data_gets
+        );
+        assert!(
+            after.data_bytes >= after.data_gets,
+            "a read returned fewer bytes than requests"
+        );
+        catalog.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_dense_file_a_rewrite_file_and_an_inlined_row_all_position_exactly() {
         let catalog = open_memory().await;

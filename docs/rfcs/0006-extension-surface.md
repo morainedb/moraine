@@ -425,11 +425,23 @@ metrics recorder. There is deliberately no process-wide SQL form: unlike the
 one shared cache budget, physical requests belong to the catalog handle that
 issued them.
 
-The data path needs none of this and gets none of it. Parquet reads are
-DuckDB's, not moraine's, and DuckDB caches them itself: a lake read goes
-through its caching file system, so data bytes sit under `memory_limit`
-rather than in a budget of moraine's (RFC 0009). What the embedding host
-should set beside a moraine attach — `validate_external_file_cache =
+`data_gets` and `data_bytes` count the data store separately: the byte
+ranges moraine itself reads from Parquet — footers, row-id columns, delete
+files, and scoped reads — and the bytes they returned. They are apart from
+`main_*` on purpose, because they are a different store reached over a
+different path, and a statement can be dominated by data reads while showing
+no main-store request at all. A located delete positions rows against file
+summaries and reads back existing delete files, so it is exactly that shape;
+without these two columns its cost is invisible to a caller sampling the
+tally around a statement. There is no duration beside them: the reads are
+issued concurrently and a sum of overlapping latencies would not divide into
+the wall time it is meant to explain.
+
+An ordinary lake scan still needs none of this and gets none of it. Those
+Parquet reads are DuckDB's, not moraine's, and DuckDB caches them itself: a
+lake read goes through its caching file system, so data bytes sit under
+`memory_limit` rather than in a budget of moraine's (RFC 0009). What the
+embedding host should set beside a moraine attach — `validate_external_file_cache =
 'NO_VALIDATION'` (safe: DuckLake data files are immutable),
 `parquet_metadata_cache = true`, `enable_http_metadata_cache = true` —
 is embedding guidance, documented with the attach options; the shim
