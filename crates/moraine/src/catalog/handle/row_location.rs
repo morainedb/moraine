@@ -591,9 +591,6 @@ impl ReadOnlyCatalog {
         requested_files: Vec<DataFileInfo>,
         missing: MissingRows,
     ) -> Result<(Vec<PositionedFile>, usize)> {
-        // `current_files_for` already returned these in ascending id order;
-        // carrying the pairs through avoids both a second sort and a
-        // separate id-to-path lookup.
         // Both halves of a located update position the same rows against the
         // same summaries: the scan reading the old values, then the deletion
         // staging their positions. Keyed by the rows asked for, so only an
@@ -612,6 +609,9 @@ impl ReadOnlyCatalog {
             return Ok((positioned.as_ref().clone(), 0));
         }
 
+        // `current_files_for` already returned these in ascending id order;
+        // carrying the pairs through avoids both a second sort and a
+        // separate id-to-path lookup.
         let file_id_paths: Vec<(DataFileId, String)> = requested_files
             .iter()
             .map(|file| (file.id, file.path.clone()))
