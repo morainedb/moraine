@@ -4,6 +4,7 @@
 // snapshot, with no scan. File rows come from exactly their pages; inlined
 // rows decode from their chunk. The output is the table's current columns
 // followed by `row_id` and `data_file_id`.
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -120,11 +121,37 @@ std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, co
 	return pairs;
 }
 
-LocatedArguments ResolveLocatedArguments(duckdb::ClientContext &context, const std::string &catalog_name,
-                                         const std::string &schema_name, const std::string &table_name,
-                                         const duckdb::Value &rows, const char *caller, bool allow_payload) {
-	std::vector<std::string> payload;
-	auto pairs = ParseLocatedPairs(rows, caller, allow_payload ? &payload : nullptr);
+uint64_t RegisterLocatedRows(duckdb::ClientContext &context, const std::string &catalog_name,
+                             const std::string &schema_name, const std::string &table_name,
+                             const duckdb::Value &rows, const char *caller, std::vector<std::string> *payload) {
+	// Parsed here rather than by the resolver, so a malformed `rows` fails
+	// the statement where the caller wrote it.
+	MoraineTransaction::LocatedRequest request;
+	request.schema = schema_name;
+	request.table = table_name;
+	request.pairs = ParseLocatedPairs(rows, caller, payload);
+
+	// Pinned at bind for the same reason it always was: DuckLake loads its
+	// transaction's snapshot lazily, and the metadata catalog's view must be
+	// taken after it, not before.
+	auto pinned = PinTransactionSnapshot(context, catalog_name, schema_name, table_name);
+	auto transaction = pinned.catalog->GetCatalogTransaction(context);
+	if (!transaction.transaction) {
+		throw duckdb::InternalException("moraine: no active transaction on the metadata catalog");
+	}
+	return transaction.transaction->Cast<MoraineTransaction>().RegisterLocatedRequest(std::move(request));
+}
+
+duckdb::Value EmptyLocatedFiles() {
+	duckdb::child_list_t<duckdb::LogicalType> fields {
+	    {"data_file_id", duckdb::LogicalType::UBIGINT},
+	    {"positions", duckdb::LogicalType::LIST(duckdb::LogicalType::UBIGINT)}};
+	return duckdb::Value::LIST(duckdb::LogicalType::STRUCT(fields), duckdb::vector<duckdb::Value>());
+}
+
+duckdb::PositionalDeletes LocatedPositionalDeletes(duckdb::ClientContext &context, const std::string &catalog_name,
+                                                   const std::string &schema_name, const std::string &table_name,
+                                                   const std::vector<MorainePositionPair> &pairs) {
 	auto pinned = PinTransactionSnapshot(context, catalog_name, schema_name, table_name);
 	OwnedArray<MoraineLocatedFile> files(moraine_locate_row_positions_free_files);
 	OwnedArray<uint64_t> inlined(moraine_locate_row_positions_free_inlined);
@@ -140,45 +167,49 @@ LocatedArguments ResolveLocatedArguments(duckdb::ClientContext &context, const s
 	// DuckLake composes the delete file's directory itself.
 	moraine_string_free(raw_write_directory);
 
-	using duckdb::LogicalType;
-	using duckdb::Value;
-	// `existing_positions` carries the committed delete file's positions the
-	// resolution already decoded, packed as little-endian u64s so DuckLake
-	// need not read that file again nor unpack one value per position.
-	duckdb::child_list_t<LogicalType> file_fields {{"data_file_id", LogicalType::UBIGINT},
-	                                               {"positions", LogicalType::LIST(LogicalType::UBIGINT)},
-	                                               {"existing_positions", LogicalType::BLOB}};
-	auto file_type = LogicalType::STRUCT(file_fields);
-	duckdb::vector<Value> file_values;
-	file_values.reserve(files.size());
+	duckdb::PositionalDeletes request;
 	for (auto &file : files) {
-		duckdb::vector<Value> positions;
-		positions.reserve(file.positions_len);
+		auto &positions = request.file_positions[file.data_file_id];
 		for (size_t i = 0; i < file.positions_len; i++) {
-			positions.push_back(Value::UBIGINT(file.positions[i]));
+			positions.insert(file.positions[i]);
 		}
-		Value existing = Value(LogicalType::BLOB);
+		// The committed delete file this locate already read back, so DuckLake
+		// does not read it a second time to rewrite it.
 		if (file.has_existing_delete) {
-			std::string packed(reinterpret_cast<const char *>(file.existing_positions),
-			                   file.existing_positions_len * sizeof(uint64_t));
-			existing = Value::BLOB_RAW(packed);
+			auto &known = request.existing_positions[file.data_file_id];
+			known.assign(file.existing_positions, file.existing_positions + file.existing_positions_len);
+			std::sort(known.begin(), known.end());
 		}
-		duckdb::child_list_t<Value> fields {{"data_file_id", Value::UBIGINT(file.data_file_id)},
-		                                    {"positions", Value::LIST(LogicalType::UBIGINT, std::move(positions))},
-		                                    {"existing_positions", std::move(existing)}};
-		file_values.push_back(Value::STRUCT(std::move(fields)));
 	}
-	duckdb::vector<Value> inlined_values;
-	inlined_values.reserve(inlined.size());
 	for (auto row_id : inlined) {
-		inlined_values.push_back(Value::UBIGINT(row_id));
+		request.inlined_rows.insert(row_id);
 	}
+	// Resolved inside the staging transaction, so this names the view the
+	// positions were taken from rather than one an earlier bind saw.
+	request.resolved_snapshot = pinned.snapshot_id;
+	return request;
+}
 
-	LocatedArguments arguments;
-	arguments.files = Value::LIST(file_type, std::move(file_values));
-	arguments.inlined_rows = Value::LIST(LogicalType::UBIGINT, std::move(inlined_values));
-	arguments.snapshot_id = pinned.snapshot_id;
-	return arguments;
+// Answers a `positions_token` DuckLake carried from a bind that registered
+// the rows without positioning them.
+static duckdb::PositionalDeletes ResolveRegisteredPositions(duckdb::ClientContext &context,
+                                                            const std::string &catalog_name, duckdb::idx_t token) {
+	auto &catalog = ResolveMoraineCatalog(context, catalog_name);
+	auto transaction = catalog.GetCatalogTransaction(context);
+	if (!transaction.transaction) {
+		throw duckdb::InternalException("moraine: no active transaction on the metadata catalog");
+	}
+	auto &moraine_transaction = transaction.transaction->Cast<MoraineTransaction>();
+	MoraineTransaction::LocatedRequest located;
+	if (!moraine_transaction.LocatedRequestFor(token, located)) {
+		throw duckdb::InternalException("moraine: no located rows are registered under token %llu",
+		                                static_cast<unsigned long long>(token));
+	}
+	return LocatedPositionalDeletes(context, catalog_name, located.schema, located.table, located.pairs);
+}
+
+void RegisterMorainePositionResolver() {
+	duckdb::RegisterDuckLakePositionResolver(ResolveRegisteredPositions);
 }
 
 void TableColumns(MoraineSnapshotHandle *snapshot, const std::string &schema_name, const std::string &table_name,
