@@ -83,7 +83,8 @@ struct LocationScope<'a> {
 }
 
 /// Exact physical positions before deletion visibility is applied.
-struct PositionedFile {
+#[derive(Clone)]
+pub(super) struct PositionedFile {
     data_file_id: DataFileId,
     file_path: String,
     positions: Vec<u64>,
@@ -161,6 +162,27 @@ fn first_row_error(
 enum MissingRows {
     Reject,
     Omit,
+}
+
+/// The rows one positioning was asked for: the snapshot it is answered at,
+/// whether rows a file does not hold are omitted, and the rows per file in
+/// ascending file order.
+pub(super) type PositioningKey = (u64, bool, Vec<(DataFileId, Vec<u64>)>);
+
+/// The rows a positioning was asked for, in a form two callers asking for
+/// the same rows produce identically. Rows keep the order they were named
+/// in, which is the order the positions come back in.
+fn positioning_key(
+    visible_at: u64,
+    missing: MissingRows,
+    by_file: &HashMap<DataFileId, Vec<u64>>,
+) -> PositioningKey {
+    let mut files: Vec<(DataFileId, Vec<u64>)> = by_file
+        .iter()
+        .map(|(id, rows)| (*id, rows.clone()))
+        .collect();
+    files.sort_by_key(|(id, _)| *id);
+    (visible_at, matches!(missing, MissingRows::Omit), files)
 }
 
 /// All physical positions, with missing or unreadable summaries failing closed.
@@ -569,6 +591,24 @@ impl ReadOnlyCatalog {
         requested_files: Vec<DataFileInfo>,
         missing: MissingRows,
     ) -> Result<(Vec<PositionedFile>, usize)> {
+        // Both halves of a located update position the same rows against the
+        // same summaries: the scan reading the old values, then the deletion
+        // staging their positions. Keyed by the rows asked for, so only an
+        // identical request at the same pinned revision is answered.
+        let revision = self.pinned_revision();
+        let visible_at = scope.snapshot.current_snapshot().id.get();
+        let key = positioning_key(visible_at, missing, &by_file);
+        if let Some(revision) = revision
+            && let Some(positioned) = self.positioned_files.get(revision, scope.table, &key)
+        {
+            debug!(
+                table_id = scope.table.get(),
+                files = positioned.len(),
+                "positioned files reused"
+            );
+            return Ok((positioned.as_ref().clone(), 0));
+        }
+
         // `current_files_for` already returned these in ascending id order;
         // carrying the pairs through avoids both a second sort and a
         // separate id-to-path lookup.
@@ -603,6 +643,17 @@ impl ReadOnlyCatalog {
                 file_path: path,
                 positions,
             });
+        }
+
+        if let Some(revision) = revision {
+            let bytes = located
+                .iter()
+                .map(|file| {
+                    size_of_val(file.positions.as_slice()).saturating_add(file.file_path.len())
+                })
+                .fold(0usize, usize::saturating_add);
+            self.positioned_files
+                .put(revision, scope.table, key, Arc::new(located.clone()), bytes);
         }
 
         Ok((located, summaries_built))

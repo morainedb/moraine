@@ -152,21 +152,19 @@ duckdb::unique_ptr<duckdb::TableRef> UpdateReplace(duckdb::ClientContext &contex
 	}
 	auto replacement = ReplacementQuery(context, catalog_name, schema_name, table_name, input.inputs[3],
 	                                    input.inputs[4].GetValue<std::string>());
-	auto located = ResolveLocatedArguments(context, catalog_name, schema_name, table_name, input.inputs[3],
-	                                       "moraine_update", /* allow_payload */ true);
+	std::vector<std::string> payload;
+	auto token = RegisterLocatedRows(context, catalog_name, schema_name, table_name, input.inputs[3], "moraine_update",
+	                                 &payload);
 
 	duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> arguments;
 	for (duckdb::idx_t i = 0; i < 3; i++) {
 		arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(input.inputs[i]));
 	}
-	arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(located.files));
+	arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(EmptyLocatedFiles()));
 	arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(duckdb::Value(replacement)));
-	auto inlined_rows = duckdb::make_uniq<duckdb::ConstantExpression>(located.inlined_rows);
-	inlined_rows->SetAlias("inlined_rows");
-	arguments.push_back(std::move(inlined_rows));
-	auto snapshot = duckdb::make_uniq<duckdb::ConstantExpression>(duckdb::Value::UBIGINT(located.snapshot_id));
-	snapshot->SetAlias("snapshot");
-	arguments.push_back(std::move(snapshot));
+	auto positions_token = duckdb::make_uniq<duckdb::ConstantExpression>(duckdb::Value::UBIGINT(token));
+	positions_token->SetAlias("positions_token");
+	arguments.push_back(std::move(positions_token));
 
 	auto result = duckdb::make_uniq<duckdb::TableFunctionRef>();
 	result->function = duckdb::make_uniq<duckdb::FunctionExpression>("ducklake_update_positions", std::move(arguments));

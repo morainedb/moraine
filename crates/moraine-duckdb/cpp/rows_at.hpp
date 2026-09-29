@@ -9,6 +9,8 @@
 
 #include "duckdb.hpp"
 
+#include "functions/ducklake_table_functions.hpp"
+
 #include "catalog.hpp"
 #include "moraine_abi.h"
 
@@ -34,20 +36,29 @@ PinnedSnapshot PinTransactionSnapshot(duckdb::ClientContext &context, const std:
 std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, const char *caller,
                                                    std::vector<std::string> *payload = nullptr);
 
-// Located rows resolved to DuckLake's own identifiers at the pinned
-// snapshot: `files` is a LIST of STRUCT(data_file_id, positions),
-// `inlined_rows` a LIST of row ids, and `snapshot_id` the view they were
-// resolved in, which DuckLake refuses to stage against an older one.
-struct LocatedArguments {
-	duckdb::Value files;
-	duckdb::Value inlined_rows;
-	uint64_t snapshot_id = 0;
-};
+// Parses `rows` and registers it on the current transaction unpositioned,
+// returning the token DuckLake carries in place of the positions.
+// `payload` behaves as it does for [`ParseLocatedPairs`].
+uint64_t RegisterLocatedRows(duckdb::ClientContext &context, const std::string &catalog_name,
+                             const std::string &schema_name, const std::string &table_name,
+                             const duckdb::Value &rows, const char *caller,
+                             std::vector<std::string> *payload = nullptr);
 
-LocatedArguments ResolveLocatedArguments(duckdb::ClientContext &context, const std::string &catalog_name,
-                                         const std::string &schema_name, const std::string &table_name,
-                                         const duckdb::Value &rows, const char *caller,
-                                         bool allow_payload = false);
+// The empty `files` a token-carrying call passes positionally, typed as the
+// pair struct rather than left as an untyped empty list.
+duckdb::Value EmptyLocatedFiles();
+
+// Positions `pairs` against the snapshot the current transaction pinned,
+// as DuckLake's own request: no Value is built for a position, and the
+// committed delete file's positions the locate decoded are handed over as
+// they were decoded.
+duckdb::PositionalDeletes LocatedPositionalDeletes(duckdb::ClientContext &context, const std::string &catalog_name,
+                                                   const std::string &schema_name, const std::string &table_name,
+                                                   const std::vector<MorainePositionPair> &pairs);
+
+// Installs the resolver DuckLake answers a `positions_token` with, so a
+// located change positions its rows when it runs rather than when it binds.
+void RegisterMorainePositionResolver();
 
 // The table's top-level columns at `snapshot`, in catalog order, typed as
 // the storage extension binds them.

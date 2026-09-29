@@ -688,6 +688,99 @@ mod locate_row_positions {
         (table, dense_id, rewrite_id)
     }
 
+    /// Counts the events the positioning memo emits when it is reused, so a
+    /// test can tell a second positioning from a shared one.
+    #[derive(Clone, Default)]
+    struct ReuseEvents(Arc<std::sync::Mutex<usize>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReuseEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Message(Option<String>);
+
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+
+            let mut message = Message::default();
+            event.record(&mut message);
+            if message
+                .0
+                .is_some_and(|text| text.contains("positioned files reused"))
+            {
+                *self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            }
+        }
+    }
+
+    /// A located update reads the rows it is about to delete: the scan and
+    /// the deletion position the same rows at the same pinned revision, and
+    /// the second takes the first's positions rather than reading the file
+    /// summaries again.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn a_scan_and_a_deletion_position_the_same_rows_once() {
+        use tracing_subscriber::prelude::*;
+
+        let reuses = ReuseEvents::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(reuses.clone()));
+
+        let catalog = open_memory().await;
+        let data = Arc::new(InMemory::new());
+        let store = DataStore::new(data.clone());
+        let (table, dense_id, _) = fixture(&catalog, &data).await;
+
+        let scope = catalog
+            .index_read_scope()
+            .await
+            .unwrap()
+            .expect("a writer holds the store, so the scope pins a revision");
+        let reads = scope.reads();
+        let snapshot = reads.snapshot().await.unwrap();
+        let pairs = [(1, Some(dense_id)), (2, Some(dense_id))];
+
+        // The read half of a located update, as `moraine_rows_at` runs it.
+        reads
+            .scan_rows_at_strict(&snapshot, Some(store.clone()), "", table, &pairs)
+            .await
+            .unwrap();
+        assert_eq!(
+            *reuses.0.lock().unwrap(),
+            0,
+            "the scan positions the rows first, with nothing to reuse"
+        );
+
+        // The delete half, as the positional resolver runs it.
+        reads
+            .locate_row_positions_at(&snapshot, Some(store), "", table, &pairs)
+            .await
+            .unwrap();
+        assert_eq!(
+            *reuses.0.lock().unwrap(),
+            1,
+            "the deletion takes the scan's positions rather than positioning again"
+        );
+
+        drop(scope);
+        catalog.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_dense_file_a_rewrite_file_and_an_inlined_row_all_position_exactly() {
         let catalog = open_memory().await;

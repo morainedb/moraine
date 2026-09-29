@@ -27,20 +27,17 @@ duckdb::unique_ptr<duckdb::TableRef> DeleteLocatedReplace(duckdb::ClientContext 
 	auto catalog_name = input.inputs[0].GetValue<std::string>();
 	auto schema_name = input.inputs[1].GetValue<std::string>();
 	auto table_name = input.inputs[2].GetValue<std::string>();
-	auto located =
-	    ResolveLocatedArguments(context, catalog_name, schema_name, table_name, input.inputs[3], "moraine_delete_located");
+	auto token = RegisterLocatedRows(context, catalog_name, schema_name, table_name, input.inputs[3],
+	                                 "moraine_delete_located");
 
 	duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> arguments;
 	for (duckdb::idx_t i = 0; i < 3; i++) {
 		arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(input.inputs[i]));
 	}
-	arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(located.files));
-	auto inlined_rows = duckdb::make_uniq<duckdb::ConstantExpression>(located.inlined_rows);
-	inlined_rows->SetAlias("inlined_rows");
-	arguments.push_back(std::move(inlined_rows));
-	auto snapshot = duckdb::make_uniq<duckdb::ConstantExpression>(duckdb::Value::UBIGINT(located.snapshot_id));
-	snapshot->SetAlias("snapshot");
-	arguments.push_back(std::move(snapshot));
+	arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(EmptyLocatedFiles()));
+	auto positions_token = duckdb::make_uniq<duckdb::ConstantExpression>(duckdb::Value::UBIGINT(token));
+	positions_token->SetAlias("positions_token");
+	arguments.push_back(std::move(positions_token));
 
 	auto result = duckdb::make_uniq<duckdb::TableFunctionRef>();
 	result->function = duckdb::make_uniq<duckdb::FunctionExpression>("ducklake_delete_positions", std::move(arguments));

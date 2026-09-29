@@ -13,9 +13,10 @@ diff --git a/src/functions/ducklake_delete_positions.cpp b/src/functions/ducklak
 new file mode 100644
 --- /dev/null
 +++ b/src/functions/ducklake_delete_positions.cpp
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,589 @@
 +#include "functions/ducklake_table_functions.hpp"
 +#include "duckdb/common/enums/database_modification_type.hpp"
++#include "duckdb/common/mutex.hpp"
 +#include "duckdb/execution/physical_operator.hpp"
 +#include "duckdb/execution/physical_plan_generator.hpp"
 +#include "duckdb/parser/parser.hpp"
@@ -40,14 +41,13 @@ new file mode 100644
 +//===--------------------------------------------------------------------===//
 +// Positional deletes, shared by ducklake_delete_positions and ducklake_update_positions
 +//===--------------------------------------------------------------------===//
-+struct PositionalDeletes {
-+	//! Requested positions per committed data file id
-+	map<idx_t, set<idx_t>> file_positions;
-+	//! Requested row ids of committed inlined rows
-+	set<idx_t> inlined_rows;
-+	//! The snapshot the caller resolved its positions against, if it says
-+	optional_idx resolved_snapshot;
-+};
++static mutex position_resolver_lock;
++static ducklake_position_resolver_t position_resolver = nullptr;
++
++void RegisterDuckLakePositionResolver(ducklake_position_resolver_t resolver) {
++	lock_guard<mutex> guard(position_resolver_lock);
++	position_resolver = resolver;
++}
 +
 +struct StagedDeletes {
 +	idx_t file_rows = 0;
@@ -123,7 +123,38 @@ new file mode 100644
 +	if (resolved != input.named_parameters.end() && !resolved->second.IsNull()) {
 +		result.resolved_snapshot = resolved->second.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>();
 +	}
++	auto token = input.named_parameters.find("positions_token");
++	if (token != input.named_parameters.end() && !token->second.IsNull()) {
++		if (!result.file_positions.empty() || !result.inlined_rows.empty()) {
++			throw InvalidInputException("%s: `positions_token` supplies the rows, so `files` and `inlined_rows` must "
++			                            "be empty",
++			                            function);
++		}
++		result.token = token->second.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>();
++	}
 +	return result;
++}
++
++//! The rows to stage, with a token's resolver run here rather than at bind: inside the transaction that stages
++//! them, against the snapshot they are staged at, so a rebind resolves nothing twice.
++static PositionalDeletes ResolvePositionalDeletes(ClientContext &context, DuckLakeCatalog &catalog,
++                                                  const PositionalDeletes &request, const char *function) {
++	if (!request.token.IsValid()) {
++		return request;
++	}
++	ducklake_position_resolver_t resolver;
++	{
++		lock_guard<mutex> guard(position_resolver_lock);
++		resolver = position_resolver;
++	}
++	if (!resolver) {
++		throw InvalidInputException("%s: `positions_token` was given, but no extension has registered a position "
++		                            "resolver to answer it",
++		                            function);
++	}
++	auto resolved = resolver(context, catalog.GetName(), request.token.GetIndex());
++	resolved.token = optional_idx();
++	return resolved;
 +}
 +
 +static DuckLakeTableEntry &LookupTable(ClientContext &context, DuckLakeCatalog &catalog, const Value &schema,
@@ -217,8 +248,11 @@ new file mode 100644
 +//! rows. Positions the snapshot already sees deleted are skipped. A failure after staging begins aborts the
 +//! transaction.
 +static StagedDeletes StagePositionalDeletes(ClientContext &context, DuckLakeCatalog &catalog,
-+                                            DuckLakeTableEntry &table, const PositionalDeletes &request,
++                                            DuckLakeTableEntry &table, const PositionalDeletes &requested,
 +                                            const char *function) {
++	auto resolved = ResolvePositionalDeletes(context, catalog, requested, function);
++	auto &request = resolved;
++
 +	auto &transaction = DuckLakeTransaction::Get(context, catalog);
 +	auto snapshot = transaction.GetSnapshot();
 +	auto table_id = table.GetTableId();
@@ -402,6 +436,7 @@ new file mode 100644
 +                    DeletePositionsExecute, DeletePositionsBind, DeletePositionsInit) {
 +	named_parameters["inlined_rows"] = LogicalType::LIST(LogicalType::UBIGINT);
 +	named_parameters["snapshot"] = LogicalType::UBIGINT;
++	named_parameters["positions_token"] = LogicalType::UBIGINT;
 +}
 +
 +//===--------------------------------------------------------------------===//
@@ -563,6 +598,7 @@ new file mode 100644
 +                    nullptr, nullptr, nullptr) {
 +	named_parameters["inlined_rows"] = LogicalType::LIST(LogicalType::UBIGINT);
 +	named_parameters["snapshot"] = LogicalType::UBIGINT;
++	named_parameters["positions_token"] = LogicalType::UBIGINT;
 +	bind_operator = UpdatePositionsBind;
 +}
 +
@@ -570,7 +606,30 @@ new file mode 100644
 diff --git a/src/include/functions/ducklake_table_functions.hpp b/src/include/functions/ducklake_table_functions.hpp
 --- a/src/include/functions/ducklake_table_functions.hpp
 +++ b/src/include/functions/ducklake_table_functions.hpp
-@@ -102,0 +103,10 @@ public:
+@@ -13,0 +14,3 @@
++#include "duckdb/common/map.hpp"
++#include "duckdb/common/optional_idx.hpp"
++#include "duckdb/common/set.hpp"
+@@ -102,0 +106,29 @@ public:
++//! The rows ducklake_delete_positions and ducklake_update_positions stage, either given as constants or named by
++//! `positions_token` for a registered resolver to supply when the statement runs.
++struct PositionalDeletes {
++	//! Requested positions per committed data file id
++	map<idx_t, set<idx_t>> file_positions;
++	//! Requested row ids of committed inlined rows
++	set<idx_t> inlined_rows;
++	//! The snapshot the caller resolved its positions against, if it says
++	optional_idx resolved_snapshot;
++	//! The caller's handle on positions it has not resolved yet
++	optional_idx token;
++};
++
++//! Turns a `positions_token` into the rows to stage. Called during execution, in the transaction that stages them.
++typedef PositionalDeletes (*ducklake_position_resolver_t)(ClientContext &context, const string &catalog, idx_t token);
++
++//! Installs the resolver that answers every `positions_token`. One per process; a later call replaces the earlier.
++void RegisterDuckLakePositionResolver(ducklake_position_resolver_t resolver);
++
 +class DuckLakeDeletePositionsFunction : public TableFunction {
 +public:
 +	DuckLakeDeletePositionsFunction();

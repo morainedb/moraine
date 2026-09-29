@@ -134,6 +134,26 @@ public:
 	// transaction covers it.
 	const std::vector<duckdb::Value> *ScannedRow(const MetadataTableSpec &spec, uint64_t row_id) const;
 
+	// Rows a located change named while binding, left unresolved for the
+	// statement's own execution to position.
+	struct LocatedRequest {
+		std::string schema;
+		std::string table;
+		std::vector<MorainePositionPair> pairs;
+	};
+
+	// Takes one, returning the token DuckLake carries in place of the
+	// positions. Every bind mints a token and a rebind mints another, so
+	// the oldest are dropped past a bound rather than held for a
+	// transaction's life.
+	uint64_t RegisterLocatedRequest(LocatedRequest request);
+
+	// Copies out the request `token` names, or returns false if no request
+	// of this transaction is registered under it. Does not consume it: the
+	// operator that stages a located update resolves per input chunk, and
+	// resolving twice must position the same rows again rather than fail.
+	bool LocatedRequestFor(uint64_t token, LocatedRequest &request) const;
+
 private:
 	// One scan's rows, at the id its first row was handed out at.
 	struct ScannedRun {
@@ -171,6 +191,13 @@ private:
 	std::vector<ScannedRun> scanned_runs_;
 	uint64_t next_scanned_row_id_ = 0;
 	mutable std::mutex scanned_runs_lock_;
+	// Unresolved located requests by token, ascending. A statement that
+	// errors between binding and executing leaves one behind, so the map is
+	// capped and the lowest tokens evicted; a token evicted before it was
+	// used resolves to an error, never to another statement's rows.
+	std::map<uint64_t, LocatedRequest> located_requests_;
+	uint64_t next_located_token_ = 0;
+	mutable std::mutex located_requests_lock_;
 
 	// Opens the staged tx if this transaction has none, leaving what the
 	// two public accessors hold to them. Caller holds `staged_state_lock_`.

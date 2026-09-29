@@ -125,6 +125,30 @@ void MoraineTransaction::DropMetadataRowsFor(const MetadataTableSpec &spec) {
 	metadata_rows_epoch_++;
 }
 
+// Enough for the binds one statement can mint, far below what holding a
+// long transaction's worth of abandoned requests would cost.
+static constexpr size_t MAX_LOCATED_REQUESTS = 64;
+
+uint64_t MoraineTransaction::RegisterLocatedRequest(LocatedRequest request) {
+	std::lock_guard<std::mutex> guard(located_requests_lock_);
+	auto token = next_located_token_++;
+	located_requests_.emplace(token, std::move(request));
+	while (located_requests_.size() > MAX_LOCATED_REQUESTS) {
+		located_requests_.erase(located_requests_.begin());
+	}
+	return token;
+}
+
+bool MoraineTransaction::LocatedRequestFor(uint64_t token, LocatedRequest &request) const {
+	std::lock_guard<std::mutex> guard(located_requests_lock_);
+	auto found = located_requests_.find(token);
+	if (found == located_requests_.end()) {
+		return false;
+	}
+	request = found->second;
+	return true;
+}
+
 uint64_t MoraineTransaction::RegisterScannedRows(const MetadataTableSpec &spec,
                                                  std::shared_ptr<const MetadataRows> rows) {
 	std::lock_guard<std::mutex> guard(scanned_runs_lock_);
