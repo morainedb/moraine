@@ -366,6 +366,11 @@ pub struct MoraineObjectStoreTally {
     pub wal_delete_nanoseconds: u64,
     /// Failed request attempts across both stores, including handled errors.
     pub errors: u64,
+    /// Byte ranges read from the data store: Parquet footers, row-id
+    /// columns, delete files, and scoped reads.
+    pub data_gets: u64,
+    /// Bytes those reads returned.
+    pub data_bytes: u64,
 }
 
 /// Process-wide cache capacity, occupancy, and eviction counters.
@@ -436,6 +441,8 @@ impl From<moraine::ObjectStoreTally> for MoraineObjectStoreTally {
             wal_deletes: tally.wal_deletes,
             wal_delete_nanoseconds: duration_nanoseconds(tally.wal_delete_duration),
             errors: tally.errors,
+            data_gets: tally.data_gets,
+            data_bytes: tally.data_bytes,
         }
     }
 }
