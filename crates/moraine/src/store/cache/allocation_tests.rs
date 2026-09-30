@@ -57,6 +57,37 @@ fn assert_budget() {
     );
 }
 
+/// Eight further stores on the same shared cache, so the active store's
+/// working set is measured against competition rather than an empty cache.
+async fn idle_stores(
+    config: &CacheConfig,
+    settings: &Settings,
+    objects: &Arc<object_store::memory::InMemory>,
+    identity: crate::CacheIdentity,
+) -> Vec<(Db, Arc<CacheCounters>)> {
+    let mut idle = Vec::new();
+    for number in 0..8 {
+        let path = format!("idle-{number}");
+        let counters = store_counters();
+        let location = StoreLocation {
+            identity,
+            path: path.clone(),
+        };
+        idle.push((
+            Db::builder(path.as_str(), objects.clone())
+                .with_settings(settings.clone())
+                .with_db_cache(shared(config, location, store_counters()).await.unwrap(), 1)
+                .with_metrics_recorder(recorder(counters.clone()))
+                .build()
+                .await
+                .unwrap(),
+            counters,
+        ));
+        assert_budget();
+    }
+    idle
+}
+
 async fn scenario(disk: bool, admission: bool, root: &Path) {
     let config = CacheConfig {
         auxiliary_percent: None,
@@ -93,27 +124,7 @@ async fn scenario(disk: bool, admission: bool, root: &Path) {
     probe(&db, &counters, 1, "initial").await;
     assert_eq!(probe(&db, &counters, 1, "warm alone").await, 0);
 
-    let mut idle = Vec::new();
-    for number in 0..8 {
-        let path = format!("idle-{number}");
-        let counters = store_counters();
-        idle.push((
-            Db::builder(path.as_str(), objects.clone())
-                .with_settings(settings.clone())
-                .with_db_cache(
-                    shared(&config, location(&path), store_counters())
-                        .await
-                        .unwrap(),
-                    1,
-                )
-                .with_metrics_recorder(recorder(counters.clone()))
-                .build()
-                .await
-                .unwrap(),
-            counters,
-        ));
-        assert_budget();
-    }
+    let idle = idle_stores(&config, &settings, &objects, identity).await;
     assert_eq!(
         probe(&db, &counters, 1, "warm with eight idle stores").await,
         0,
