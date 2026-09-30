@@ -108,9 +108,17 @@ impl CacheConfig {
     /// Bytes for the one auxiliary device and for each store's own, out of
     /// the configured cap. One store's two devices sum to it, so the cap is
     /// the whole size a single-store process takes.
+    ///
+    /// A share too small to cut into blocks is no device at all: it comes
+    /// back as zero, the store keeps the whole cap, and the auxiliary slot
+    /// stays in memory rather than opening a device that holds less than
+    /// one of its own blocks.
     fn disk_slots(&self) -> (u64, u64) {
         let budget = self.disk_size.unwrap_or(DEFAULT_CACHE_DISK);
         let auxiliary = self.auxiliary_share(budget);
+        if auxiliary < MIN_AUXILIARY_DISK {
+            return (0, budget);
+        }
 
         (auxiliary, budget.saturating_sub(auxiliary).max(1))
     }
@@ -1312,9 +1320,12 @@ async fn settle(config: &CacheConfig) {
     let (auxiliary_metadata_bytes, shared_bytes) = config.slots();
     AUXILIARY_METADATA_MEMORY.store(auxiliary_metadata_bytes, Ordering::Relaxed);
     let (auxiliary_disk, _) = config.disk_slots();
+    let auxiliary_dir = (auxiliary_disk > 0)
+        .then(|| config.dir.as_deref().map(|dir| dir.join("auxiliary-v2")))
+        .flatten();
     data_file::install_auxiliary(
         usize::try_from(auxiliary_metadata_bytes).unwrap_or(usize::MAX),
-        config.dir.as_deref().map(|dir| dir.join("auxiliary-v2")),
+        auxiliary_dir,
         auxiliary_disk,
     )
     .await;
@@ -1327,6 +1338,11 @@ async fn settle(config: &CacheConfig) {
         "settled the process's cache sizing"
     );
 }
+
+/// The least disk an auxiliary device is worth opening with: four of
+/// foyer's blocks, under which it holds less than it is cut into and the
+/// device will not open at all.
+const MIN_AUXILIARY_DISK: u64 = 4 * MIN_DISK_CACHE_BLOCK;
 
 /// The runtime the cache spawns its fetch and flush tasks on. Must not be
 /// an attach's runtime: the cache outlives every attach, and tokio cancels
@@ -1984,6 +2000,14 @@ mod tests {
         let (auxiliary_disk, store_disk) = asked.disk_slots();
         assert_eq!(auxiliary_disk, 2 * 1024 * 1024 * 1024);
         assert_eq!(auxiliary_disk + store_disk, 20 * 1024 * 1024 * 1024);
+
+        // A cap too small to cut an auxiliary device out of leaves the
+        // store's own whole, which is what the e2e attach configures.
+        let small = CacheConfig {
+            disk_size: Some(64 * 1024 * 1024),
+            ..config(None)
+        };
+        assert_eq!(small.disk_slots(), (0, 64 * 1024 * 1024));
 
         // Clamped: the slot it competes with is never starved outright.
         let (auxiliary, shared) = config(Some(90)).slots();
