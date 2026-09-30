@@ -295,6 +295,31 @@ impl ReadHandle<'_> {
     }
 }
 
+/// A read handle owning what it reads through, so work on it can run on a
+/// task the caller does not outlive. Only the forms that are already shared
+/// or cheap to clone have one; a session owning its transaction outright
+/// does not, since rolling that back needs the sole reference back.
+#[derive(Clone)]
+pub(crate) enum OwnedReadHandle {
+    /// A transaction shared by every read in one pinned scope.
+    Tx(Arc<DbTransaction>),
+    /// A read-only reader following the manifest.
+    Reader(Arc<DbReader>),
+    /// The writer's latest state. `Db` is a handle, so this clones one.
+    Writer(Db),
+}
+
+impl OwnedReadHandle {
+    /// Borrows a read handle over what this owns.
+    pub(crate) fn borrow(&self) -> ReadHandle<'_> {
+        match self {
+            Self::Tx(transaction) => ReadHandle::Tx(transaction),
+            Self::Reader(reader) => ReadHandle::Reader(reader),
+            Self::Writer(db) => ReadHandle::Writer(db),
+        }
+    }
+}
+
 /// An owned read session backing one materialization. Borrow a
 /// [`ReadHandle`] from it, then [`finish`](Self::finish) it.
 pub(crate) enum ReadSession {
