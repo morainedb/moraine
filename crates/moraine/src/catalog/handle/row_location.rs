@@ -233,8 +233,9 @@ fn positioned_rows(
 pub struct RowSummaryWarmth {
     /// Current data files the pass looked at.
     pub files_considered: u64,
-    /// Files whose row-id column it read and cached. The rest were already
-    /// resident or answer from their dense range.
+    /// Files whose row-id column it read, cached and published. The rest
+    /// were already resident, answered from a published summary, or answer
+    /// from their dense range.
     pub summaries_built: u64,
     /// Files it could not summarize. They stay correct but cold: a later
     /// lookup leaves every requested row a candidate for them.
