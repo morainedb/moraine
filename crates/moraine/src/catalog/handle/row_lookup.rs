@@ -198,6 +198,11 @@ struct FileDirectory {
     failed_retries: u32,
     /// Lookups still to serve before `failed` is read again.
     retry_skip: AtomicU32,
+    /// Files left unsummarized because their recorded row-id bounds hold
+    /// none of the ids asked for. A lookup inside one of these bounds
+    /// summarizes it then, so nothing is placed against a file whose
+    /// bounds are unknown.
+    deferred: OrdMap<u64, (u64, u64)>,
     /// Encoded size of `files`, carried across refreshes.
     file_bytes: u64,
     bytes: u64,

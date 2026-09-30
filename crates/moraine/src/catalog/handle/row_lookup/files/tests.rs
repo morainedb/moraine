@@ -136,6 +136,7 @@ async fn retained_summaries_preserve_positions_and_validate_the_source() {
     let file =
         crate::catalog::snapshot::data_file_info(directory.files.get(&warm.ids[1].get()).unwrap());
     let scope = super::DirectoryScope {
+        stats: None,
         store: &warm.store,
         data_prefix: "",
         table_prefix: &directory.table_prefix,
@@ -665,5 +666,115 @@ async fn a_transient_summary_failure_recovers() {
             .iter()
             .any(|row| row.data_file_id == Some(failed))
     );
+    warm.catalog.close().await.unwrap();
+}
+
+/// Row-id bounds are read only when both are present and parse to a
+/// non-inverted range. Anything else excludes no file.
+#[test]
+fn only_a_complete_parsable_range_bounds_a_file() {
+    use crate::store::proto::FileColumnStatsValue;
+
+    let stat = |min: Option<&str>, max: Option<&str>| FileColumnStatsValue {
+        min_value: min.map(str::to_string),
+        max_value: max.map(str::to_string),
+        ..FileColumnStatsValue::default()
+    };
+    let row_id = crate::data_file::ROW_ID_FIELD_ID;
+    let stats: imbl::OrdMap<(u64, u64), FileColumnStatsValue> = [
+        ((1, row_id), stat(Some("10"), Some("20"))),
+        ((2, row_id), stat(Some("10"), None)),
+        ((3, row_id), stat(None, Some("20"))),
+        ((4, row_id), stat(Some("20"), Some("10"))),
+        ((5, row_id), stat(Some("nonsense"), Some("20"))),
+        ((6, row_id), stat(Some("-1"), Some("20"))),
+        ((7, 1), stat(Some("10"), Some("20"))),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(super::row_id_bounds(Some(&stats), 1), Some((10, 20)));
+    for file in [2, 3, 4, 5, 6, 7, 99] {
+        assert_eq!(
+            super::row_id_bounds(Some(&stats), file),
+            None,
+            "file {file} was bounded on incomplete statistics"
+        );
+    }
+    assert_eq!(super::row_id_bounds(None, 1), None);
+}
+
+/// Selection keeps a file whose recorded bounds hold a requested id or
+/// whose bounds are unknown, defers one whose bounds exclude every
+/// requested id, and takes a deferred file back once a lookup falls
+/// inside it. A file is never dropped for want of statistics.
+#[tokio::test]
+async fn selection_defers_only_files_whose_bounds_exclude_every_requested_id() {
+    use std::collections::BTreeMap;
+
+    use imbl::OrdMap;
+
+    use crate::store::proto::{DataFileValue, FileColumnStatsValue};
+
+    let warm = warm_table().await;
+    let scope_store = DataStore::new(Arc::new(InMemory::new()));
+    let row_id = crate::data_file::ROW_ID_FIELD_ID;
+
+    let bounded = |min: u64, max: u64| FileColumnStatsValue {
+        min_value: Some(min.to_string()),
+        max_value: Some(max.to_string()),
+        ..FileColumnStatsValue::default()
+    };
+    // File 1 holds 0..=9, file 2 holds 100..=109, file 3 records nothing.
+    let stats: OrdMap<(u64, u64), FileColumnStatsValue> = [
+        ((1, row_id), bounded(0, 9)),
+        ((2, row_id), bounded(100, 109)),
+    ]
+    .into_iter()
+    .collect();
+
+    let scope = super::DirectoryScope {
+        store: &scope_store,
+        data_prefix: "",
+        table_prefix: "",
+        table: warm.table,
+        stats: Some(&stats),
+    };
+    let value = |id: u64| DataFileValue {
+        data_file_id: id,
+        table_id: warm.table.get(),
+        path: format!("f{id}.parquet"),
+        record_count: 10,
+        ..DataFileValue::default()
+    };
+    let files: OrdMap<u64, DataFileValue> = (1..=3).map(|id| (id, value(id))).collect();
+    let selected = || -> BTreeMap<u64, crate::catalog::DataFileInfo> {
+        files
+            .iter()
+            .map(|(id, v)| (*id, crate::catalog::snapshot::data_file_info(v)))
+            .collect()
+    };
+
+    let previous = super::FileDirectory::empty(&scope);
+    let mut deferred = OrdMap::new();
+    let kept = super::narrow_to_wanted(selected(), &mut deferred, &previous, &scope, &files, &[5]);
+
+    assert_eq!(
+        kept.keys().copied().collect::<Vec<_>>(),
+        vec![1, 3],
+        "the bounded miss was read, or the file with no statistics was dropped"
+    );
+    assert_eq!(deferred.get(&2), Some(&(100, 109)));
+
+    // The deferred file's bounds are remembered, so a later lookup inside
+    // them takes it back rather than losing the rows it holds.
+    let mut carried = super::FileDirectory::empty(&scope);
+    carried.deferred = deferred.clone();
+    let mut next = deferred;
+    let kept =
+        super::narrow_to_wanted(BTreeMap::new(), &mut next, &carried, &scope, &files, &[105]);
+    assert_eq!(kept.keys().copied().collect::<Vec<_>>(), vec![2]);
+    assert!(next.is_empty(), "a file read back is no longer deferred");
+
     warm.catalog.close().await.unwrap();
 }
