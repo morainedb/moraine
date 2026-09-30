@@ -1065,3 +1065,67 @@ pub(super) const KNOWN_SUBSPACES: [moraine::SubspaceName; 8] = [
     moraine::SubspaceName::SchemaVersion,
     moraine::SubspaceName::Changelog,
 ];
+
+/// Deletes published row summaries whose data file is gone, reporting what
+/// it considered, reclaimed and failed to reclaim.
+///
+/// A handle attached without a data path sweeps nothing and is not an
+/// error: there is no data path to list.
+///
+/// # Safety
+///
+/// `handle` must be a live handle from `moraine_attach`. Each non-null out
+/// pointer must be writable. `probe`/`probe_ctx` follow the interrupt
+/// contract, and `err` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_sweep_row_summaries(
+    handle: *mut MoraineCatalogHandle,
+    considered: *mut u64,
+    reclaimed: *mut u64,
+    failed: *mut u64,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+
+        let Some(data_store) = handle_ref.data_store.clone() else {
+            return Ok(());
+        };
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let swept = unsafe {
+            handle_ref.block_on_commit(
+                probe,
+                probe_ctx,
+                handle_ref
+                    .catalog
+                    .reads()
+                    .sweep_published_summaries(data_store, &handle_ref.data_prefix),
+            )
+        }?;
+
+        for (out, value) in [
+            (considered, swept.considered),
+            (reclaimed, swept.reclaimed),
+            (failed, swept.failed),
+        ] {
+            if !out.is_null() {
+                // SAFETY: caller contract — non-null means writable.
+                unsafe { *out = value };
+            }
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}

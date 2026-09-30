@@ -1990,6 +1990,25 @@ int32_t moraine_head_stamp(struct MoraineCatalogHandle *handle,
 // fails.
 char *moraine_subspace_names(void);
 
+// Deletes published row summaries whose data file is gone, reporting what
+// it considered, reclaimed and failed to reclaim.
+//
+// A handle attached without a data path sweeps nothing and is not an
+// error: there is no data path to list.
+//
+// # Safety
+//
+// `handle` must be a live handle from `moraine_attach`. Each non-null out
+// pointer must be writable. `probe`/`probe_ctx` follow the interrupt
+// contract, and `err` must be writable.
+int32_t moraine_sweep_row_summaries(struct MoraineCatalogHandle *handle,
+                                    uint64_t *considered,
+                                    uint64_t *reclaimed,
+                                    uint64_t *failed,
+                                    MoraineInterruptProbe probe,
+                                    void *probe_ctx,
+                                    struct MoraineError *err);
+
 // Opens a transaction snapshot with a pinned index/inline read surface when
 // supported. Readers without pinned revisions receive an ordinary snapshot
 // instead.
