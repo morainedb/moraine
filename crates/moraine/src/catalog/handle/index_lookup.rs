@@ -76,15 +76,28 @@ async fn resolve_chunked(
         let owned = owned.clone();
         let keys = chunk.to_vec();
         joined.push(tokio::spawn(async move {
+            // The chunk's own probes stay in flight against each other. A
+            // task is what puts a core on the batch; keeping the probes
+            // concurrent inside it is what keeps an index whose probes park
+            // on a read as overlapped as it was before the batch divided.
+            let held = &owned;
+            let mut probes: FuturesUnordered<_> = keys
+                .iter()
+                .map(|key| async move {
+                    let started = Instant::now();
+                    let found =
+                        index_maintenance::lookup_row_ids(held.borrow(), index_id, unique, key)
+                            .await;
+                    (found, started.elapsed())
+                })
+                .collect();
+
             let mut rows = Vec::new();
             let (mut hits, mut misses) = (0u64, 0u64);
             let mut service = Duration::ZERO;
-            for key in keys {
-                let probe = Instant::now();
-                let found =
-                    index_maintenance::lookup_row_ids(owned.borrow(), index_id, unique, &key)
-                        .await?;
-                service = service.saturating_add(probe.elapsed());
+            while let Some((found, elapsed)) = probes.next().await {
+                let found = found?;
+                service = service.saturating_add(elapsed);
                 if found.is_empty() {
                     misses = misses.saturating_add(1);
                 } else {
