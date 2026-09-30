@@ -49,7 +49,7 @@ async fn fixture_with_cache(
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let options = StoreBuilder::new("probe", objects.clone()).cache_puts(cache_puts);
     let settings = Settings {
-        manifest_poll_interval: std::time::Duration::from_secs(60),
+        manifest_poll_interval: std::time::Duration::from_mins(1),
         compactor_options: None,
         l0_max_ssts: 32,
         l0_max_ssts_per_key: 32,
@@ -68,16 +68,19 @@ async fn fixture_with_cache(
         .with_filter_policies(policies)
         .with_block_cache_policy(options.block_cache_policy())
         .with_metrics_recorder(cache::recorder(counters.clone()))
-        .with_db_cache(match isolated {
-            Some(cache) => cache,
-            None => cache::shared(
-                &options.cache_config(),
-                options.location(),
-                cache::store_counters(),
-            )
-            .await
-            .unwrap(),
-        })
+        .with_db_cache(
+            match isolated {
+                Some(cache) => cache,
+                None => cache::shared(
+                    &options.cache_config(),
+                    options.location(),
+                    cache::store_counters(),
+                )
+                .await
+                .unwrap(),
+            },
+            1,
+        )
         .build()
         .await
         .unwrap();

@@ -295,7 +295,7 @@ async fn compact_attach_store(store: Arc<dyn ObjectStore>, options: &CatalogOpti
     writer_options.flush_interval = Duration::from_millis(1);
     let writer = Catalog::open(store, writer_options).await.unwrap();
     let mut request = CompactStoreRequest::default();
-    request.wait = Some(Duration::from_secs(120));
+    request.wait = Some(Duration::from_mins(2));
     let report = writer.compact_store(request).await.unwrap();
     let completed = report
         .merges
@@ -436,7 +436,7 @@ async fn measure_attach_latency_against_endpoint() {
 #[tokio::test]
 #[ignore = "needs a live S3 endpoint; run through `cargo xtask s3`"]
 async fn measure_attach_latency_against_the_endpoint() {
-    measure_attach_latency_against_endpoint().await;
+    Box::pin(measure_attach_latency_against_endpoint()).await;
 }
 
 /// 0004 — durable-commit latency where the WAL flush is a real PUT.

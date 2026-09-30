@@ -40,14 +40,14 @@ async fn fixture(keys: u64) -> (Db, cache::TestCache, Arc<transport::Transport>)
             compactor_options: None,
             l0_max_ssts: 32,
             l0_max_ssts_per_key: 32,
-            manifest_poll_interval: Duration::from_secs(3600),
+            manifest_poll_interval: Duration::from_hours(1),
             ..options.settings()
         })
         .with_sst_block_size(SST_BLOCK_SIZE)
         .with_segment_extractor(Arc::new(TagSegmentExtractor))
         .with_filter_policies(crate::store::index_filter::policies())
         .with_block_cache_policy(options.block_cache_policy())
-        .with_db_cache(cache.handle.clone())
+        .with_db_cache(cache.handle.clone(), 1)
         .build()
         .await
         .unwrap();

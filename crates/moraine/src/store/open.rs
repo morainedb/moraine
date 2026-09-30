@@ -260,10 +260,12 @@ impl<'a> StoreBuilder<'a> {
             .with_block_cache_policy(self.block_cache_policy())
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)));
 
+        let location = self.location();
+        let cache_id = location.cache_id();
         if let Some(cache) =
-            cache::shared(&self.cache_config(), self.location(), Arc::clone(&counters)).await
+            cache::shared(&self.cache_config(), location, Arc::clone(&counters)).await
         {
-            builder = builder.with_db_cache(cache);
+            builder = builder.with_db_cache(cache, cache_id);
         }
 
         let db = builder.build().await.map_err(Error::from)?;
@@ -295,10 +297,12 @@ impl<'a> StoreBuilder<'a> {
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)))
             .with_options(options);
 
+        let location = self.location();
+        let cache_id = location.cache_id();
         if let Some(cache) =
-            cache::shared(&self.cache_config(), self.location(), Arc::clone(&counters)).await
+            cache::shared(&self.cache_config(), location, Arc::clone(&counters)).await
         {
-            builder = builder.with_db_cache(cache);
+            builder = builder.with_db_cache(cache, cache_id);
         }
         if let Some(checkpoint) = self.checkpoint {
             builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));

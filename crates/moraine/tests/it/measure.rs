@@ -372,7 +372,7 @@ async fn measure_attach_cost_under_get_latency() {
         if merged {
             let writer = open_with(store.clone(), SEED_FLUSH_MS).await;
             let mut request = moraine::CompactStoreRequest::default();
-            request.wait = Some(Duration::from_secs(60));
+            request.wait = Some(Duration::from_mins(1));
             let report = writer.compact_store(request).await.unwrap();
             let completed = report
                 .merges
@@ -1391,7 +1391,7 @@ async fn measure_reader_round_trips_under_get_latency() {
 
         // The poller is held off so its own gets stay out of the window.
         let mut options = CatalogOptions::default();
-        options.reader_poll_interval = Duration::from_secs(60);
+        options.reader_poll_interval = Duration::from_mins(1);
         let reader = Catalog::open_read_only(Arc::clone(&throttled), options)
             .await
             .unwrap();
@@ -1414,7 +1414,7 @@ async fn measure_reader_round_trips_under_get_latency() {
         let mut cold = Vec::with_capacity(REPEATS);
         for _ in 0..REPEATS {
             let mut options = CatalogOptions::default();
-            options.reader_poll_interval = Duration::from_secs(60);
+            options.reader_poll_interval = Duration::from_mins(1);
             let fresh = Catalog::open_read_only(Arc::clone(&throttled), options)
                 .await
                 .unwrap();

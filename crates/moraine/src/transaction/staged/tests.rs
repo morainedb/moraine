@@ -1901,7 +1901,7 @@ async fn commit_reports_the_deferred_indexes_it_leaves_maintaining() {
         table: TableKind::SnapshotChanges,
         cells: snapshot_changes_row(3, "inserted_into_table:1"),
     });
-    let report = tx.commit_reporting().await.unwrap();
+    let report = Box::pin(tx.commit_reporting()).await.unwrap();
 
     assert_eq!(report.snapshot_id, SnapshotId::new(3));
     assert_eq!(report.deferred_indexes, vec![IndexId::new(index_id)]);
@@ -1931,7 +1931,7 @@ async fn commit_touching_no_deferred_index_reports_none() {
         table: TableKind::SnapshotChanges,
         cells: snapshot_changes_row(3, "created_table:2"),
     });
-    let report = tx.commit_reporting().await.unwrap();
+    let report = Box::pin(tx.commit_reporting()).await.unwrap();
 
     assert_eq!(report.snapshot_id, SnapshotId::new(3));
     assert!(report.deferred_indexes.is_empty());
