@@ -163,12 +163,17 @@ the file. An **encrypted lake publishes nothing and loses nothing by it**: the
 nothing in `data_file` decrypts, so moraine cannot read an encrypted file's
 row-id column in the first place ([RFC 0014](0014-encryption.md)).
 
-A sidecar dies with its data file. moraine never deletes a data file — DuckLake
-schedules and removes them — so the reclaim is a sweep: one listing of the data
-path, and every `.rowsum` whose file that listing did not also find is deleted.
-Deciding from the listing alone, rather than from the catalog, keeps a summary
-whose file an older snapshot still reads. A leftover is garbage, never
+A sidecar dies with its data file. moraine never deletes a data file —
+DuckLake schedules and removes them — so the reclaim is a sweep: one listing of
+the data path, and every `.rowsum` whose file that listing did not also find is
+deleted. Deciding from the listing alone, rather than from the catalog, keeps a
+summary whose file an older snapshot still reads. A leftover is garbage, never
 corruption: its header names a `data_file_id` nothing matches.
+
+It runs as a maintenance step, after DuckLake's cleanup, which is what removes
+the files that strand them. DuckLake's own orphan scan cannot do this job: it
+matches `.parquet` only — the same rule that keeps it from deleting a live
+summary by mistake.
 
 ### Read path
 

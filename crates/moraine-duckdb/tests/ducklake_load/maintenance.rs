@@ -680,6 +680,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
             "sweep_indexes",
             "sweep_file_stats",
             "sweep_inline_tables",
+            "sweep_row_summaries",
             "compact_store",
         ],
         "steps must report in sequence order"
@@ -696,6 +697,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
         "sweep_indexes",
         "sweep_file_stats",
         "sweep_inline_tables",
+        "sweep_row_summaries",
     ] {
         assert_eq!(by_step.get(step), Some(&"ran"), "{step} in {rows:?}");
     }

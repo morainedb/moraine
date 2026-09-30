@@ -513,6 +513,12 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	                     ? RunInlineTableSweep()
 	                     : MaintenanceStep {"sweep_inline_tables", "skipped", "disabled at attach"});
 
+	// After DuckLake's cleanup above, which is what removes the data
+	// files that strand them. Its orphan scan cannot: it matches
+	// `.parquet` only, which is the same suffix rule that keeps it from
+	// deleting a live summary by mistake.
+	report.push_back(RunRowSummarySweep());
+
 	// The store merge runs last, on what every step above it left behind:
 	// expiry tombstones rows and the sweep deletes index ranges, so
 	// merging earlier would leave exactly the tombstones this pass just
@@ -638,6 +644,29 @@ MaintenanceStep MaintenanceScheduler::RunInlineTableSweep() {
 	                            (inline_records_reclaimed_ == 1 ? " inline record" : " inline records") + " from " +
 	                            std::to_string(inline_tables_swept_) +
 	                            (inline_tables_swept_ == 1 ? " forgotten table" : " forgotten tables")};
+}
+
+MaintenanceStep MaintenanceScheduler::RunRowSummarySweep() {
+	uint64_t considered = 0;
+	uint64_t reclaimed = 0;
+	uint64_t failed = 0;
+	MoraineError err {};
+	// No interrupt probe: the sweep runs on the scheduler's own thread,
+	// which stops through the stop flag rather than a query interrupt.
+	auto code = moraine_sweep_row_summaries(handle_, &considered, &reclaimed, &failed, nullptr, nullptr, &err);
+	if (code != MORAINE_OK) {
+		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		return MaintenanceStep {"sweep_row_summaries", "failed", message};
+	}
+	std::string detail = "reclaimed " + std::to_string(reclaimed) + " of " + std::to_string(considered) +
+	                     (considered == 1 ? " published summary" : " published summaries");
+	if (failed > 0) {
+		detail += ", " + std::to_string(failed) + " left for the next pass";
+	}
+	return MaintenanceStep {"sweep_row_summaries", "ran", detail};
 }
 
 MaintenanceStep MaintenanceScheduler::RunStoreMerge() {

@@ -107,6 +107,10 @@ private:
 	// records of tables the catalog records nowhere. Runs after it and
 	// reads the counters it left.
 	MaintenanceStep RunInlineTableSweep();
+	// Deletes published row summaries whose data file a listing of the
+	// data path no longer finds. Runs after DuckLake's cleanup, which is
+	// what removes the files that strand them.
+	MaintenanceStep RunRowSummarySweep();
 	MaintenanceStep RunStoreMerge();
 	// The DuckLake catalog sitting above this metadata catalog, found by
 	// matching attached databases on path. DuckLake's own maintenance
