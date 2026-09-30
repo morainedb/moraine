@@ -119,16 +119,22 @@ A mismatch, an unknown version, a short read or any decode error means
 
 ### Who writes and deletes one
 
-Three producers, in order of preference:
+Two producers:
 
-1. **The commit that already read the file**, whose scoped read derives the ids
-   for index maintenance anyway.
-2. **The reader that derived it**, publishing after answering its caller; a
-   failed publish is logged and otherwise ignored.
-3. **Maintenance**, for files that predate this or whose publish failed, bounded
-   and resumable per [RFC 0021](0021-maintenance-model.md).
+1. **The reader that derived it**, publishing after answering its caller on a
+   task the caller does not wait for; a failed publish is logged and otherwise
+   ignored.
+2. **Warming**, which walks a table's files deriving summaries and so publishes
+   whatever the readers have not — the producer for files that predate this or
+   whose publish failed.
 
-There is no write-time producer, because moraine writes no data file:
+**Not the commit**, though its scoped read passes the ids by. That read is
+filtered by the file's delete positions, and a summary describes a file
+physically, deleted rows included, so what the commit sees is the wrong set. A
+commit-time producer would need a second, unfiltered read, which is not the free
+by-product it looks like.
+
+There is no write-time producer either, because moraine writes no data file:
 `Transaction::flush_inlined_data` registers files the caller already wrote.
 Publishing needs a resolvable data path, the condition that already governs
 delete files; an absent one publishes nothing and is not an error, and
@@ -138,8 +144,11 @@ the file. An **encrypted lake publishes nothing and loses nothing by it**: the
 nothing in `data_file` decrypts, so moraine cannot read an encrypted file's
 row-id column in the first place ([RFC 0014](0014-encryption.md)).
 
-A sidecar dies with its data file, deleted wherever moraine already learns a
-file is gone, with a listing sweep for the rest. A leftover is garbage, never
+A sidecar dies with its data file. moraine never deletes a data file — DuckLake
+schedules and removes them — so the reclaim is a sweep: one listing of the data
+path, and every `.rowsum` whose file that listing did not also find is deleted.
+Deciding from the listing alone, rather than from the catalog, keeps a summary
+whose file an older snapshot still reads. A leftover is garbage, never
 corruption: its header names a `data_file_id` nothing matches.
 
 ### Read path
@@ -154,9 +163,14 @@ corruption: its header names a `data_file_id` nothing matches.
 
 Each step is a strict fallback, and step 3 yields what step 4 would have built —
 the same set, and the same order when the caller asked for one. Nothing
-downstream changes: `file_summary` gains a source, and `place` stays
-synchronous over resident summaries. Metrics distinguish sidecar hit, miss,
-rejected-on-identity and publish outcome.
+downstream changes: `file_summary` gains a source, and `place` stays synchronous
+over resident summaries.
+
+A caller says which it needs. A lookup wants membership, and its summary is
+cached apart from a whole one so neither evicts the other; a located delete or
+update wants positions, and a membership summary never answers it. Metrics
+count sidecar hit, miss, rejected-on-identity and publish outcome, so a
+deployment can tell "none published yet" from "published and refused".
 
 ### Memory
 

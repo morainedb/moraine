@@ -101,6 +101,15 @@ enum AuxiliaryKey {
         path: String,
         file_size: u64,
     },
+    /// A summary's membership alone, keyed apart from the whole so a
+    /// lookup that wants no positions neither reads nor evicts one.
+    Membership {
+        store: CacheIdentity,
+        table_id: u64,
+        data_file_id: u64,
+        path: String,
+        file_size: u64,
+    },
     /// One byte range of a file, exactly as a read asked for it. The
     /// recorded size guards against a path reused at another length, as it
     /// does for the other two.
@@ -139,6 +148,8 @@ pub(super) enum AuxiliaryValue {
         page_index: bool,
     },
     Summary(Arc<PositionedRowSet>),
+    /// A summary's membership without its order.
+    Membership(Arc<FileRowSet>),
     Block(Bytes),
     DeletePositions(Arc<FileRowSet>),
 }
@@ -157,7 +168,7 @@ impl From<AuxiliaryValue> for Weighed {
             AuxiliaryValue::Summary(positioned) => {
                 usize::try_from(positioned.estimated_bytes()).unwrap_or(usize::MAX)
             }
-            AuxiliaryValue::DeletePositions(rows) => {
+            AuxiliaryValue::Membership(rows) | AuxiliaryValue::DeletePositions(rows) => {
                 usize::try_from(rows.estimated_bytes()).unwrap_or(usize::MAX)
             }
             AuxiliaryValue::Block(bytes) => bytes.len(),
@@ -215,9 +226,18 @@ mod tag {
     pub(super) const SORTED_PERMUTED_PACKED: u8 = 17;
     pub(super) const ROARING_REPEATED_PACKED: u8 = 18;
     pub(super) const SORTED_REPEATED_PACKED: u8 = 19;
+    /// A summary's membership without its order, for a lookup that
+    /// resolves no positions.
+    pub(super) const MEMBERSHIP_RANGE: u8 = 20;
+    pub(super) const MEMBERSHIP_ROARING: u8 = 21;
+    pub(super) const MEMBERSHIP_SORTED: u8 = 22;
 
     /// The `(range, roaring, sorted)` tags a delete-position set writes.
     pub(super) const DELETE_SHAPES: [u8; 3] = [DELETE_RANGE, DELETE_ROARING, DELETE_SORTED];
+
+    /// As [`DELETE_SHAPES`], for a summary's membership alone.
+    pub(super) const MEMBERSHIP_SHAPES: [u8; 3] =
+        [MEMBERSHIP_RANGE, MEMBERSHIP_ROARING, MEMBERSHIP_SORTED];
 }
 
 /// Writes `rows` as one of `shapes`, whichever representation it took.
@@ -508,6 +528,31 @@ pub(super) fn decode_summary(reader: &mut impl Read) -> foyer::Result<Positioned
     decode_positioned_row_set(tag[0], reader)
 }
 
+/// Reads only a summary's membership, tag included, leaving whatever order
+/// follows unread.
+pub(super) fn decode_membership(reader: &mut impl Read) -> foyer::Result<FileRowSet> {
+    let mut tag = [0_u8; 1];
+    reader
+        .read_exact(&mut tag)
+        .map_err(foyer::Error::io_error)?;
+    let shape = match tag[0] {
+        tag::RANGE_ASCENDING => RowSetShape::Range,
+        tag::ROARING_ASCENDING | tag::ROARING_PERMUTED_PACKED | tag::ROARING_REPEATED_PACKED => {
+            RowSetShape::Roaring
+        }
+        tag::SORTED_ASCENDING | tag::SORTED_PERMUTED_PACKED | tag::SORTED_REPEATED_PACKED => {
+            RowSetShape::Sorted
+        }
+        other => {
+            return Err(foyer::Error::new(
+                foyer::ErrorKind::Parse,
+                format!("row-summary tag {other} carries no membership this reader writes"),
+            ));
+        }
+    };
+    decode_row_set(shape, reader)
+}
+
 /// Reads back the body [`encode_positioned_row_set`] wrote, given the
 /// consumed tag.
 fn decode_positioned_row_set(tag: u8, reader: &mut impl Read) -> foyer::Result<PositionedRowSet> {
@@ -700,6 +745,9 @@ impl foyer::Code for Weighed {
                 writer.write_all(&buffer).map_err(io)
             }
             AuxiliaryValue::Summary(positioned) => encode_positioned_row_set(positioned, writer),
+            AuxiliaryValue::Membership(rows) => {
+                encode_row_set(rows, tag::MEMBERSHIP_SHAPES, writer)
+            }
             AuxiliaryValue::DeletePositions(positions) => {
                 encode_row_set(positions, tag::DELETE_SHAPES, writer)
             }
@@ -749,6 +797,15 @@ impl foyer::Code for Weighed {
             | tag::SORTED_REPEATED_PACKED
             | tag::RANGE_ASCENDING => {
                 AuxiliaryValue::Summary(Arc::new(decode_positioned_row_set(tag[0], reader)?))
+            }
+            tag::MEMBERSHIP_RANGE => {
+                AuxiliaryValue::Membership(Arc::new(decode_row_set(RowSetShape::Range, reader)?))
+            }
+            tag::MEMBERSHIP_ROARING => {
+                AuxiliaryValue::Membership(Arc::new(decode_row_set(RowSetShape::Roaring, reader)?))
+            }
+            tag::MEMBERSHIP_SORTED => {
+                AuxiliaryValue::Membership(Arc::new(decode_row_set(RowSetShape::Sorted, reader)?))
             }
             tag::DELETE_RANGE => AuxiliaryValue::DeletePositions(Arc::new(decode_row_set(
                 RowSetShape::Range,
@@ -1176,6 +1233,49 @@ impl AuxiliaryCache {
         })
     }
 
+    /// This file's membership, building it through `fill` on a miss. A
+    /// whole summary already resident answers without a fetch, because it
+    /// holds the membership too; a membership entry never answers for a
+    /// caller wanting positions.
+    pub(super) async fn fetch_membership<F, Fut>(
+        &self,
+        store: &DataStore,
+        key: &FileSummaryKey<'_>,
+        fill: F,
+    ) -> Result<Arc<FileRowSet>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Arc<FileRowSet>>> + Send + 'static,
+    {
+        if let Some(positioned) = self.summary(store, key).await {
+            return Ok(Arc::new(positioned.rows.clone()));
+        }
+
+        let fill = fill();
+        let summaries = Arc::clone(&self.summaries);
+        let fill = || async move {
+            fill.await.map(|rows| {
+                let weighed = Weighed::from(AuxiliaryValue::Membership(rows));
+                summaries.entered(&weighed);
+                weighed
+            })
+        };
+
+        let entry = self
+            .tier
+            .get_or_fetch(&Self::membership_key(store, key), fill)
+            .await
+            .map_err(|error| {
+                let cause = std::error::Error::source(&error)
+                    .map_or_else(|| error.to_string(), ToString::to_string);
+                Error::Corruption(format!("row membership: {cause}"))
+            })?;
+
+        membership_of(&entry.value).ok_or_else(|| {
+            Error::Corruption("a footer was cached under a row membership key".to_owned())
+        })
+    }
+
     /// One delete file's positions, decoding them through `decode` on a
     /// miss. Concurrent misses on one object share the single decode.
     ///
@@ -1429,6 +1529,16 @@ impl AuxiliaryCache {
         }
     }
 
+    fn membership_key(store: &DataStore, key: &FileSummaryKey<'_>) -> AuxiliaryKey {
+        AuxiliaryKey::Membership {
+            store: store.identity,
+            table_id: key.table_id,
+            data_file_id: key.data_file_id,
+            path: key.path.to_string(),
+            file_size: key.file_size,
+        }
+    }
+
     /// Settles the allowance, evicting whatever no longer fits. A refusal
     /// leaves the previous capacity in force.
     pub(super) fn resize(&self, capacity: usize) {
@@ -1492,6 +1602,17 @@ fn summary_of(value: &AuxiliaryValue) -> Option<Arc<PositionedRowSet>> {
         AuxiliaryValue::Summary(positioned) => Some(Arc::clone(positioned)),
         AuxiliaryValue::Metadata { .. }
         | AuxiliaryValue::Block(_)
+        | AuxiliaryValue::Membership(_)
+        | AuxiliaryValue::DeletePositions(_) => None,
+    }
+}
+
+fn membership_of(value: &AuxiliaryValue) -> Option<Arc<FileRowSet>> {
+    match value {
+        AuxiliaryValue::Membership(rows) => Some(Arc::clone(rows)),
+        AuxiliaryValue::Summary(positioned) => Some(Arc::new(positioned.rows.clone())),
+        AuxiliaryValue::Metadata { .. }
+        | AuxiliaryValue::Block(_)
         | AuxiliaryValue::DeletePositions(_) => None,
     }
 }
@@ -1504,6 +1625,7 @@ fn metadata_of(value: &AuxiliaryValue) -> ParquetResult<(Arc<ParquetMetaData>, b
         } => Ok((Arc::clone(metadata), *page_index)),
         AuxiliaryValue::Summary(_)
         | AuxiliaryValue::Block(_)
+        | AuxiliaryValue::Membership(_)
         | AuxiliaryValue::DeletePositions(_) => Err(ParquetError::General(
             "a row set or block was cached under a metadata key".to_owned(),
         )),

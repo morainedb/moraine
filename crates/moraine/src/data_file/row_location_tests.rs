@@ -10,7 +10,7 @@ use super::{
     row_location::file_summary,
     tests::{tagged_row_id_field, write_fixture},
 };
-use crate::data_file::{DataStore, ParquetFile, metrics::ScopedReadMetrics};
+use crate::data_file::{DataStore, ParquetFile, Want, metrics::ScopedReadMetrics};
 
 /// Waits for the sidecar a derive publishes on its own task, so a test
 /// that reads it back is not racing the write.
@@ -57,6 +57,7 @@ async fn non_ascending_embedded_ids_position_by_file_order() {
         1,
         None,
         6,
+        Want::Positions,
     )
     .await
     .unwrap();
@@ -89,6 +90,7 @@ async fn a_derived_summary_is_published_and_answers_without_its_file() {
         1,
         None,
         6,
+        Want::Positions,
     )
     .await
     .unwrap();
@@ -105,6 +107,7 @@ async fn a_derived_summary_is_published_and_answers_without_its_file() {
         1,
         None,
         6,
+        Want::Positions,
     )
     .await
     .unwrap();
@@ -113,6 +116,54 @@ async fn a_derived_summary_is_published_and_answers_without_its_file() {
     assert_eq!(
         published.positions_of(&requested),
         derived.positions_of(&requested),
+    );
+}
+
+/// A lookup that resolves no positions reads a published summary's
+/// membership and leaves its order unread.
+#[tokio::test]
+async fn a_membership_want_reads_no_order() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("membership.parquet");
+    let batch = batch_with_embedded_row_ids(&[10, 11, 12, 3, 4, 5]);
+    let file_size = write_fixture(&store, &path, &batch).await;
+
+    file_summary(
+        ParquetFile::new(DataStore::new(store.clone()), path.clone(), file_size, 0),
+        1,
+        1,
+        None,
+        6,
+        Want::Positions,
+    )
+    .await
+    .unwrap();
+    published_sidecar(&store, &path).await;
+    store.delete(&path).await.unwrap();
+
+    let membership = file_summary(
+        ParquetFile::new(DataStore::new(store), path, file_size, 0),
+        1,
+        1,
+        None,
+        6,
+        Want::Membership,
+    )
+    .await
+    .unwrap();
+
+    assert!(!membership.built, "a published membership is not derived");
+    assert!(
+        !membership.resolves_positions(),
+        "membership alone carries no order"
+    );
+    assert_eq!(
+        membership.matching(&[10, 11, 12, 3, 4, 5, 999]),
+        vec![10, 11, 12, 3, 4, 5],
+    );
+    assert!(
+        membership.visit_positions(10, |_| ()).is_err(),
+        "a membership summary must refuse positions rather than invent them"
     );
 }
 
@@ -130,6 +181,7 @@ async fn a_sidecar_from_another_file_does_not_answer() {
         1,
         None,
         6,
+        Want::Positions,
     )
     .await
     .unwrap();
@@ -142,6 +194,7 @@ async fn a_sidecar_from_another_file_does_not_answer() {
         2,
         None,
         6,
+        Want::Positions,
     )
     .await
     .unwrap();
@@ -167,6 +220,7 @@ async fn ascending_embedded_ids_position_by_rank() {
         1,
         None,
         4,
+        Want::Positions,
     )
     .await
     .unwrap();
@@ -202,6 +256,7 @@ async fn a_dense_file_is_remembered_without_its_footer() {
             1,
             Some(100),
             4,
+            Want::Positions,
         )
     };
 

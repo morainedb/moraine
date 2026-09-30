@@ -201,3 +201,67 @@ where
     unit.await
         .map_err(|error| Error::Interrupted(format!("index encoding unit stopped: {error}")))?
 }
+
+/// Process-wide counts of what published row summaries have done, so a
+/// deployment can tell "none published yet" from "published and refused".
+static SIDECAR_HITS: AtomicU64 = AtomicU64::new(0);
+static SIDECAR_MISSES: AtomicU64 = AtomicU64::new(0);
+static SIDECAR_REFUSED: AtomicU64 = AtomicU64::new(0);
+static SIDECAR_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+static SIDECAR_PUBLISH_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// What published row summaries have done for this process.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SidecarTally {
+    /// Summaries a published sidecar answered, each one a row-id column
+    /// this process did not read.
+    pub hits: u64,
+    /// Summaries derived because no sidecar could be read, whether none
+    /// was published or the store would not serve it.
+    pub misses: u64,
+    /// Sidecars read and then refused: a header naming another file, a
+    /// version this build does not know, or bytes that would not decode.
+    /// Every one of these was also a miss.
+    pub refused: u64,
+    /// Summaries this process published.
+    pub published: u64,
+    /// Publishes that failed, costing nothing but a later derivation.
+    pub publish_failures: u64,
+}
+
+/// [`SidecarTally`] for this process, across every attached store.
+#[must_use]
+pub fn sidecar_tally() -> SidecarTally {
+    SidecarTally {
+        hits: SIDECAR_HITS.load(Ordering::Relaxed),
+        misses: SIDECAR_MISSES.load(Ordering::Relaxed),
+        refused: SIDECAR_REFUSED.load(Ordering::Relaxed),
+        published: SIDECAR_PUBLISHED.load(Ordering::Relaxed),
+        publish_failures: SIDECAR_PUBLISH_FAILURES.load(Ordering::Relaxed),
+    }
+}
+
+/// Records a sidecar that answered.
+pub(crate) fn sidecar_hit() {
+    SIDECAR_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records a summary derived because no sidecar answered.
+pub(crate) fn sidecar_miss() {
+    SIDECAR_MISSES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records a sidecar read and refused, which is also a miss.
+pub(crate) fn sidecar_refused() {
+    SIDECAR_REFUSED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records the outcome of one publish.
+pub(crate) fn sidecar_published(succeeded: bool) {
+    if succeeded {
+        SIDECAR_PUBLISHED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SIDECAR_PUBLISH_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}

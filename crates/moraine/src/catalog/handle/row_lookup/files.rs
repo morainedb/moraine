@@ -502,6 +502,7 @@ impl ReadOnlyCatalog {
                 scope.table_prefix,
                 scope.table,
                 selected.into_values().collect(),
+                crate::data_file::Want::Membership,
             )
             .await;
         for (file, summary) in summaries {

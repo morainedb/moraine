@@ -20,7 +20,7 @@ use crate::{
         FileIndexRemoval, FileRowCandidate, IndexInfo, SnapshotId, TableId, resolve_data_path,
         snapshot::{data_file_info, delete_file_info},
     },
-    data_file::{self, DataStore, FileSummary},
+    data_file::{self, DataStore, FileSummary, SidecarSweep, sidecar},
     error::{Error, Result},
     store::index_encoding::IndexKeyValue,
     telemetry::milliseconds,
@@ -213,7 +213,7 @@ fn positioned_rows(
 
     let mut positions = Vec::with_capacity(rows.len());
     for row_id in rows {
-        let found = summary.visit_positions(*row_id, |position| positions.push(position));
+        let found = summary.visit_positions(*row_id, |position| positions.push(position))?;
         if !found && matches!(missing, MissingRows::Reject) {
             return Err(Error::RowPosition {
                 row_id: *row_id,
@@ -251,10 +251,16 @@ impl ReadOnlyCatalog {
         table_prefix: &str,
         table: TableId,
         files: Vec<DataFileInfo>,
+        want: data_file::Want,
     ) -> Vec<(DataFileId, Result<FileSummary>)> {
         stream::iter(files.into_iter().map(|file| {
-            let retained =
-                self.retained_file_summary(store, data_prefix, table_prefix, table, &file);
+            let retained = self
+                .retained_file_summary(store, data_prefix, table_prefix, table, &file)
+                .filter(|summary| {
+                    // A summary held for membership alone cannot answer a
+                    // caller resolving positions, which fetches instead.
+                    want == data_file::Want::Membership || summary.resolves_positions()
+                });
             let relative =
                 resolve_data_path(data_prefix, table_prefix, &file.path, file.path_is_relative);
             let store = store.clone();
@@ -280,6 +286,7 @@ impl ReadOnlyCatalog {
                     file.id.get(),
                     file.row_id_start,
                     file.record_count,
+                    want,
                 )
                 .await;
                 (file.id, summary)
@@ -624,6 +631,7 @@ impl ReadOnlyCatalog {
                 scope.table_prefix,
                 scope.table,
                 requested_files,
+                data_file::Want::Positions,
             )
             .await
             .into_iter()
@@ -739,6 +747,31 @@ impl ReadOnlyCatalog {
             .await
     }
 
+    /// Deletes published row summaries whose data file is no longer under
+    /// `data_prefix`, which is how a sidecar that outlived its file is
+    /// reclaimed.
+    ///
+    /// Decided from one listing rather than a probe per object, and from
+    /// the store alone rather than the catalog: a summary is reclaimed only
+    /// when the listing that found it did not also find the file it names,
+    /// so a file an older snapshot still reads keeps its summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the prefix cannot be listed. Deletes that
+    /// fail are counted in [`SidecarSweep::failed`] and left for the next
+    /// sweep.
+    pub async fn sweep_published_summaries(
+        &self,
+        data_store: DataStore,
+        data_prefix: &str,
+    ) -> Result<SidecarSweep> {
+        let prefix = object_store::path::Path::parse(data_prefix.trim_end_matches('/'))
+            .map_err(|error| Error::Corruption(format!("invalid data path: {error}")))?;
+
+        sidecar::sweep(&data_store, &prefix).await
+    }
+
     /// Builds and caches the summaries a lookup would otherwise build cold,
     /// for every table the catalog currently holds.
     ///
@@ -808,7 +841,14 @@ impl ReadOnlyCatalog {
         };
 
         for (data_file_id, summary) in self
-            .file_summaries(data_store, data_prefix, &table_prefix, table, files)
+            .file_summaries(
+                data_store,
+                data_prefix,
+                &table_prefix,
+                table,
+                files,
+                data_file::Want::Positions,
+            )
             .await
         {
             match summary {

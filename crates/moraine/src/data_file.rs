@@ -27,8 +27,11 @@ mod row_set;
 mod scan_coverage;
 mod schema;
 mod selection;
-mod sidecar;
+pub(crate) mod sidecar;
 mod values;
+
+pub use metrics::{SidecarTally, sidecar_tally};
+pub use sidecar::SidecarSweep;
 
 #[cfg(test)]
 mod auxiliary_cache_tests;
@@ -72,7 +75,7 @@ pub(crate) use crate::data_file::{
     located_rows::{inline_rows_batch, located_batch, scoped_read_row_stream},
     metrics::{DataStoreCounters, ScopedReadMetrics, ScopedReadTally, run_bounded_index_encoding},
     read_workers::{ReadWorkers, prefetched_row_stream, read_worker_limit, row_group_selections},
-    row_location::{FileSummary, file_summary},
+    row_location::{FileSummary, Want, file_summary},
     scan_coverage::{ReadCoverage, read_coverage},
     schema::ReadColumn,
     selection::{RowPositions, ScopedRows},

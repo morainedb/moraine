@@ -168,3 +168,41 @@ proptest::proptest! {
         }
     }
 }
+
+#[tokio::test]
+async fn a_sweep_reclaims_summaries_whose_file_is_gone() {
+    use std::sync::Arc;
+
+    use object_store::{ObjectStoreExt, memory::InMemory};
+
+    use super::DataStore;
+
+    let store = Arc::new(InMemory::new());
+    let live = Path::from("lake/table/live.parquet");
+    let gone = Path::from("lake/table/gone.parquet");
+    for path in [&live, &gone] {
+        store.put(path, vec![0_u8; 8].into()).await.unwrap();
+        let sidecar = sidecar::path_for(path).unwrap();
+        let bytes = sidecar::encode(identity(), &permuted()).unwrap();
+        store.put(&sidecar, bytes.into()).await.unwrap();
+    }
+    store.delete(&gone).await.unwrap();
+
+    let data = DataStore::new(store.clone());
+    let swept = sidecar::sweep(&data, &Path::from("lake")).await.unwrap();
+
+    assert_eq!(swept.considered, 2);
+    assert_eq!(swept.reclaimed, 1);
+    assert_eq!(swept.failed, 0);
+    assert!(
+        store.head(&sidecar::path_for(&live).unwrap()).await.is_ok(),
+        "a summary whose file is still there must survive"
+    );
+    assert!(
+        store
+            .head(&sidecar::path_for(&gone).unwrap())
+            .await
+            .is_err(),
+        "a summary whose file is gone must be reclaimed"
+    );
+}

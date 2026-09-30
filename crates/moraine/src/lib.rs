@@ -259,7 +259,7 @@ pub use catalog::{
     StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo,
     TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
 };
-pub use data_file::DataStore;
+pub use data_file::{DataStore, SidecarSweep, SidecarTally, sidecar_tally};
 pub use error::{Error, Result};
 /// Fault injection for the migration driver. Unstable and not part of the
 /// semver contract.
