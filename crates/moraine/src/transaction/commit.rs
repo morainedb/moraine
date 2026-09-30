@@ -122,7 +122,7 @@ pub(crate) fn now_micros() -> i64 {
 /// keeps the store answering. Long enough that only a genuine stall
 /// reaches it: a healthy write returns in milliseconds, and this one has
 /// already been reported [stalled](STALL_INTERVAL) thirty times over.
-const FLIGHT_WRITE_DEADLINE: Duration = Duration::from_secs(300);
+const FLIGHT_WRITE_DEADLINE: Duration = Duration::from_mins(5);
 
 /// How a durable commit's bytes reach object storage.
 #[derive(Clone, Default)]

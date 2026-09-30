@@ -295,7 +295,7 @@ async fn compact_attach_store(store: Arc<dyn ObjectStore>, options: &CatalogOpti
     writer_options.flush_interval = Duration::from_millis(1);
     let writer = Catalog::open(store, writer_options).await.unwrap();
     let mut request = CompactStoreRequest::default();
-    request.wait = Some(Duration::from_secs(120));
+    request.wait = Some(Duration::from_mins(2));
     let report = writer.compact_store(request).await.unwrap();
     let completed = report
         .merges

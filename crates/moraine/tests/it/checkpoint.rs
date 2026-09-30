@@ -239,7 +239,7 @@ async fn a_listed_checkpoint_reports_its_manifest_and_lifetime() {
         .unwrap();
     let held = catalog.create_checkpoint(None).await.unwrap();
     let leased = catalog
-        .create_checkpoint(Some(std::time::Duration::from_secs(600)))
+        .create_checkpoint(Some(std::time::Duration::from_mins(10)))
         .await
         .unwrap();
     catalog.close().await.unwrap();

@@ -421,7 +421,7 @@ mod tests {
             CompactionSpec::for_segment(Bytes::copy_from_slice(prefix), sources, destination);
         let compaction = admin.submit_compaction(spec).await.unwrap();
 
-        let end = await_merge(path, object_store, &compaction, Duration::from_secs(60))
+        let end = await_merge(path, object_store, &compaction, Duration::from_mins(1))
             .await
             .unwrap();
         assert_eq!(end, MergeEnd::Completed);
@@ -443,7 +443,7 @@ mod tests {
                 path,
                 Arc::clone(&object_store),
                 &merge.compaction,
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             )
             .await
             .unwrap();

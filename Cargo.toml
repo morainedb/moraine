@@ -7,7 +7,7 @@ version = "0.7.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alexpropp/moraine"
-rust-version = "1.88"
+rust-version = "1.91"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -22,7 +22,8 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 imbl = "7.0.2"
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
 moraine = { path = "crates/moraine", version = "0.7.0" }
-foyer = { version = "0.22", features = ["serde"] }
+# 0.22.6 is the floor slatedb pins, and it is what sets the workspace MSRV.
+foyer = { version = "0.22.6", features = ["serde"] }
 object_store = "0.14"
 prost = "0.14"
 prost-build = "0.14"

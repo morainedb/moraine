@@ -73,7 +73,7 @@ async fn scenario(disk: bool, admission: bool, root: &Path) {
         flush_interval: None,
         compactor_options: None,
         // Keep background manifest reads outside the measured probe windows.
-        manifest_poll_interval: Duration::from_secs(60),
+        manifest_poll_interval: Duration::from_mins(1),
         ..Settings::default()
     };
     let cache = shared(&config, location("active"), store_counters())

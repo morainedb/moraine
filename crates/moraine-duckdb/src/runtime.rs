@@ -30,7 +30,7 @@ pub type MoraineInterruptProbe = Option<unsafe extern "C" fn(probe_ctx: *mut c_v
 /// The longest one call through this ABI may run before it is given up
 /// on. A backstop, not a latency target: durability waits are unbounded
 /// by design, since a deadline cannot retract bytes that may still land.
-pub(crate) const STATEMENT_DEADLINE: Duration = Duration::from_secs(60 * 60);
+pub(crate) const STATEMENT_DEADLINE: Duration = Duration::from_hours(1);
 
 /// How often a cancellable call polls its interrupt probe while the core
 /// future is pending. The first poll fires immediately, so a pending

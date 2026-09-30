@@ -388,7 +388,7 @@ pub fn run_ducklake_sql_with_pause(
     // These sessions exercise paths that can legitimately block — a
     // detach waits out a pass already running — so a bug there would
     // otherwise wedge the whole suite. Bound the wait and fail loudly.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
     loop {
         match child.try_wait().expect("poll duckdb CLI") {
             Some(_) => break,

@@ -75,7 +75,7 @@ async fn commit_update(catalog: &Catalog, selected: &[u64], tombstones: bool, re
         cells: snapshot_changes_row(7, "inlined_insert:1,inlined_delete:1"),
     });
 
-    tokio::time::timeout(Duration::from_secs(60), tx.commit())
+    tokio::time::timeout(Duration::from_mins(1), tx.commit())
         .await
         .expect("the located update's commit stalled")
         .unwrap();
