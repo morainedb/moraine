@@ -17,9 +17,10 @@ use crate::{
     error::Result,
 };
 
-/// What a sidecar read asks for before it has a header to size it by. A
-/// summary shorter than this arrives whole in one request.
-const SIDECAR_PREFIX_BYTES: u64 = 1 << 20;
+/// What a sidecar read asks for before it has a header to size it by,
+/// chosen above the membership a million-row file publishes so the common
+/// read is one request.
+const SIDECAR_PREFIX_BYTES: u64 = 4 << 20;
 
 /// What a caller needs of a summary. Every lookup tests membership; only a
 /// located delete or update resolves positions, and only it pays for them.
@@ -246,13 +247,15 @@ pub(crate) async fn publish_if_missing(
     data_file_id: u64,
     row_id_start: Option<u64>,
 ) -> Result<bool> {
-    let identity = identity_of(&file, table_id, data_file_id);
-    if sidecar::is_published(&file.store, &file.path, identity).await {
+    // Settled before the store is asked anything: a dense file needs no
+    // summary, so probing for one would be a guaranteed miss per file per
+    // pass.
+    if row_id_start.is_some() && !carries_embedded_row_ids(file.clone()).await? {
         return Ok(false);
     }
-    if row_id_start.is_some() && !carries_embedded_row_ids(file.clone()).await? {
-        // Its ids follow from the catalog, so there is nothing a summary
-        // would add.
+
+    let identity = identity_of(&file, table_id, data_file_id);
+    if sidecar::is_published(&file.store, &file.path, identity).await {
         return Ok(false);
     }
 
@@ -289,13 +292,10 @@ async fn published_membership(
     // The membership sits before the order, so one bounded read covers it
     // unless the set alone outruns the speculation.
     let bytes = match sidecar::layout_of(identity, &prefix) {
-        Ok(layout) if layout.membership_end() <= prefix.len() => prefix,
-        Ok(layout) => match u64::try_from(layout.membership_end()) {
-            Ok(end) => match file.store.read_prefix(&path, end).await {
-                Ok(bytes) => bytes,
-                Err(_) => return refused_membership(&path, sidecar::Rejected::Malformed),
-            },
-            Err(_) => return refused_membership(&path, sidecar::Rejected::Malformed),
+        Ok(layout) if layout.membership_end() <= prefix.len() => prefix.to_vec(),
+        Ok(layout) => match continued(file, &path, prefix, layout.membership_end()).await {
+            Some(bytes) => bytes,
+            None => return refused_membership(&path, sidecar::Rejected::Malformed),
         },
         Err(rejection) => return refused_membership(&path, rejection),
     };
@@ -338,14 +338,11 @@ async fn published_summary(
         Ok(layout) => {
             let whole = layout.membership_end().saturating_add(layout.order_len);
             if whole <= prefix.len() {
-                prefix
+                prefix.to_vec()
             } else {
-                match u64::try_from(whole) {
-                    Ok(whole) => match file.store.read_prefix(&path, whole).await {
-                        Ok(bytes) => bytes,
-                        Err(_) => return refused(&path, sidecar::Rejected::Malformed),
-                    },
-                    Err(_) => return refused(&path, sidecar::Rejected::Malformed),
+                match continued(file, &path, prefix, whole).await {
+                    Some(bytes) => bytes,
+                    None => return refused(&path, sidecar::Rejected::Malformed),
                 }
             }
         }
@@ -359,6 +356,24 @@ async fn published_summary(
         }
         Err(rejection) => refused(&path, rejection),
     }
+}
+
+/// `prefix` extended to `end` by reading only what it is missing, so a
+/// summary that outran the speculative read is not fetched twice.
+async fn continued(
+    file: &ParquetFile,
+    path: &object_store::path::Path,
+    prefix: bytes::Bytes,
+    end: usize,
+) -> Option<Vec<u8>> {
+    let from = u64::try_from(prefix.len()).ok()?;
+    let to = u64::try_from(end).ok()?;
+    let rest = file.store.read_range(path, from..to).await.ok()?;
+
+    let mut bytes = Vec::with_capacity(end);
+    bytes.extend_from_slice(&prefix);
+    bytes.extend_from_slice(&rest);
+    Some(bytes)
 }
 
 /// A sidecar that was there and would not answer: counted apart from one

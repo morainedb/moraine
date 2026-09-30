@@ -461,20 +461,30 @@ fn read_packed_positions(
     if width == 0 {
         return Ok(vec![0; count]);
     }
+    if width > u32::BITS {
+        return Err(foyer::Error::new(
+            foyer::ErrorKind::Parse,
+            format!("a position of {width} bits cannot be one this reader wrote"),
+        ));
+    }
 
     let packed_bytes = usize_as_u64(count)
         .saturating_mul(u64::from(width))
         .div_ceil(8);
-    let mut packed = vec![
-        0_u8;
-        usize::try_from(packed_bytes).map_err(|_| foyer::Error::new(
-            foyer::ErrorKind::Parse,
-            "packed positions exceed this target's address space",
-        ))?
-    ];
+    let mut packed = Vec::new();
     reader
-        .read_exact(&mut packed)
+        .take(packed_bytes)
+        .read_to_end(&mut packed)
         .map_err(foyer::Error::io_error)?;
+    if usize_as_u64(packed.len()) != packed_bytes {
+        return Err(foyer::Error::new(
+            foyer::ErrorKind::Parse,
+            format!(
+                "packed positions ran out after {} of {packed_bytes} bytes",
+                packed.len()
+            ),
+        ));
+    }
 
     let mask = u32::MAX >> (u32::BITS - width);
     let mut positions = Vec::with_capacity(count);
@@ -859,18 +869,29 @@ impl RowSummaryCounters {
         }
     }
 
+    /// The membership a value holds, whether it is a whole summary or a
+    /// lookup's half of one. Both are charged to the row-summary share.
+    fn counted(value: &AuxiliaryValue) -> Option<FileRowSetKind> {
+        match value {
+            AuxiliaryValue::Summary(positioned) => Some(positioned.rows.kind()),
+            AuxiliaryValue::Membership(rows) => Some(rows.kind()),
+            AuxiliaryValue::Metadata { .. }
+            | AuxiliaryValue::Block(_)
+            | AuxiliaryValue::DeletePositions(_) => None,
+        }
+    }
+
     fn entered(&self, weighed: &Weighed) {
-        if let AuxiliaryValue::Summary(positioned) = &weighed.value {
-            self.of(positioned.rows.kind())
-                .fetch_add(1, Ordering::Relaxed);
+        if let Some(kind) = Self::counted(&weighed.value) {
+            self.of(kind).fetch_add(1, Ordering::Relaxed);
             self.bytes
                 .fetch_add(usize_as_u64(weighed.bytes), Ordering::Relaxed);
         }
     }
 
     fn left(&self, weighed: &Weighed) {
-        if let AuxiliaryValue::Summary(positioned) = &weighed.value {
-            saturating_decrement(self.of(positioned.rows.kind()), 1);
+        if let Some(kind) = Self::counted(&weighed.value) {
+            saturating_decrement(self.of(kind), 1);
             saturating_decrement(&self.bytes, usize_as_u64(weighed.bytes));
         }
     }

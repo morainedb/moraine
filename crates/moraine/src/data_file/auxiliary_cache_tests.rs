@@ -600,6 +600,26 @@ fn positions_beyond_the_row_count_are_refused() {
     }
 }
 
+/// A repeated summary claiming more physical rows than it carries is a
+/// cache miss, not an allocation or a panicking shift width.
+#[test]
+fn a_repeated_summary_claiming_impossible_positions_is_refused() {
+    use foyer::Code;
+
+    use super::auxiliary_cache::Weighed;
+
+    // Tag 18 is the packed roaring-repeated form. The physical count that
+    // follows the membership sets both the packing width and the length
+    // this reader would otherwise reserve.
+    let mut encoded = vec![18_u8];
+    let mut bitmap = roaring::RoaringTreemap::new();
+    bitmap.insert(10);
+    bitmap.serialize_into(&mut encoded).unwrap();
+    encoded.extend_from_slice(&u64::MAX.to_le_bytes());
+
+    assert!(Weighed::decode(&mut encoded.as_slice()).is_err());
+}
+
 /// An entry written before positions were packed still decodes, so
 /// upgrading does not cold-start the tier.
 #[test]

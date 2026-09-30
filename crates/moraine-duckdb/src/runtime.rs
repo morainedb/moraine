@@ -125,7 +125,10 @@ impl MoraineCatalogHandle {
     /// else, so a lake that has been through it once barely notices the
     /// next.
     pub(crate) fn spawn_warm_at_attach(&self, preload: bool) {
-        let data_store = self.data_store.clone();
+        let data_store = match self.catalog {
+            AttachedCatalog::Writer(_) => self.data_store.clone(),
+            AttachedCatalog::Reader(_) => None,
+        };
         if !preload && data_store.is_none() {
             return;
         }
