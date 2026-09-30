@@ -21,7 +21,7 @@ use crate::{
     },
     data_file::{DataStore, FileSummary},
     error::Result,
-    store::proto::DataFileValue,
+    store::proto::{DataFileValue, FileColumnStatsValue},
 };
 
 type Placements = HashMap<u64, Vec<DataFileId>>;
@@ -93,6 +93,55 @@ struct DirectoryScope<'a> {
     data_prefix: &'a str,
     table_prefix: &'a str,
     table: TableId,
+    stats: Option<&'a OrdMap<(u64, u64), FileColumnStatsValue>>,
+}
+
+/// The files of `selected` a lookup for `row_ids` has to read, plus any the
+/// previous directory deferred whose bounds now hold a requested id.
+fn narrow_to_wanted(
+    mut selected: BTreeMap<u64, DataFileInfo>,
+    deferred: &mut OrdMap<u64, (u64, u64)>,
+    previous: &FileDirectory,
+    scope: &DirectoryScope<'_>,
+    files: &OrdMap<u64, DataFileValue>,
+    row_ids: &[u64],
+) -> BTreeMap<u64, DataFileInfo> {
+    for file in previous.deferred_for(row_ids) {
+        if let Some(value) = files.get(&file) {
+            selected
+                .entry(file)
+                .or_insert_with(|| data_file_info(value));
+        }
+    }
+    selected.retain(|file, _| {
+        let Some((low, high)) = row_id_bounds(scope.stats, *file) else {
+            deferred.remove(file);
+            return true;
+        };
+        let wanted = row_ids.iter().any(|row| *row >= low && *row <= high);
+        if wanted {
+            deferred.remove(file);
+        } else {
+            deferred.insert(*file, (low, high));
+        }
+        wanted
+    });
+    selected
+}
+
+/// The row-id bounds recorded for `file`, when both are present and parse.
+/// A file without them cannot be excluded and is always summarized.
+fn row_id_bounds(
+    stats: Option<&OrdMap<(u64, u64), FileColumnStatsValue>>,
+    file: u64,
+) -> Option<(u64, u64)> {
+    let recorded = stats?.get(&(file, crate::data_file::ROW_ID_FIELD_ID))?;
+    let parse = |value: &Option<String>| -> Option<u64> {
+        u64::try_from(value.as_ref()?.parse::<i64>().ok()?).ok()
+    };
+    let (low, high) = (parse(&recorded.min_value)?, parse(&recorded.max_value)?);
+
+    (low <= high).then_some((low, high))
 }
 
 impl FileDirectory {
@@ -135,6 +184,7 @@ impl FileDirectory {
             summaries: OrdMap::new(),
             ranges: DenseRanges::default(),
             spanned: OrdMap::new(),
+            deferred: OrdMap::new(),
             spans: Arc::new(Intervals::new([])),
             failed: Vec::new(),
             failed_retries: 0,
@@ -150,10 +200,64 @@ impl FileDirectory {
             && self.table_prefix == scope.table_prefix
     }
 
+    /// This directory carried onto `files`: everything it already holds,
+    /// with the failures it is not retrying and that survive the change.
+    fn advanced(
+        &self,
+        scope: &DirectoryScope<'_>,
+        files: &OrdMap<u64, DataFileValue>,
+        removed: &HashSet<u64>,
+        retry_failed: bool,
+        file_bytes: u64,
+    ) -> FileDirectory {
+        FileDirectory {
+            identity: scope.store.cache_identity(),
+            data_prefix: scope.data_prefix.into(),
+            table_prefix: scope.table_prefix.into(),
+            files: files.clone(),
+            summaries: self.summaries.clone(),
+            ranges: self.ranges.clone(),
+            spanned: self.spanned.clone(),
+            spans: self.spans.clone(),
+            failed: if retry_failed {
+                Vec::new()
+            } else {
+                self.failed
+                    .iter()
+                    .copied()
+                    .filter(|file| !removed.contains(file) && files.contains_key(file))
+                    .collect()
+            },
+            failed_retries: self.failed_retries,
+            retry_skip: AtomicU32::new(self.retry_skip.load(Ordering::Relaxed)),
+            deferred: self.deferred.clone(),
+            file_bytes,
+            bytes: 0,
+        }
+    }
+
     /// Whether this directory already describes `files` with no summary
     /// read due.
     fn describes(&self, files: &OrdMap<u64, DataFileValue>) -> bool {
         self.files.ptr_eq(files) && !self.retry_due()
+    }
+
+    /// Whether every deferred file's bounds exclude every one of `row_ids`,
+    /// so placing them against this directory omits no file that holds one.
+    fn covers(&self, row_ids: &[u64]) -> bool {
+        !self
+            .deferred
+            .iter()
+            .any(|(_, (low, high))| row_ids.iter().any(|row| row >= low && row <= high))
+    }
+
+    /// The deferred files whose bounds hold one of `row_ids`.
+    fn deferred_for(&self, row_ids: &[u64]) -> Vec<u64> {
+        self.deferred
+            .iter()
+            .filter(|(_, (low, high))| row_ids.iter().any(|row| row >= low && row <= high))
+            .map(|(file, _)| *file)
+            .collect()
     }
 
     /// Whether the files that failed to summarize have waited out their
@@ -182,6 +286,7 @@ impl FileDirectory {
         self.summaries.remove(&file);
         self.ranges.remove(file);
         self.spanned.remove(&file);
+        self.deferred.remove(&file);
     }
 
     /// The files that hold, or may hold, each of `row_ids`, and how many
@@ -300,6 +405,7 @@ impl ReadOnlyCatalog {
             data_prefix,
             table_prefix,
             table,
+            stats: None,
         };
         super::lookup(&self.row_lookups.files, table)?.retained_summary(&scope, file)
     }
@@ -321,6 +427,7 @@ impl ReadOnlyCatalog {
             data_prefix,
             table_prefix: &table_prefix,
             table,
+            stats: snapshot.file_column_stats.get(&table.get()),
         };
 
         let held = super::lookup(&self.row_lookups.files, table)
@@ -329,10 +436,16 @@ impl ReadOnlyCatalog {
             directory.note_lookup();
         }
         let directory = match held {
-            Some(directory) if directory.describes(files) => directory,
+            // A directory that describes these files still has to cover the
+            // ids asked for: one deferred file's bounds holding a requested
+            // id means the answer is not yet in hand.
+            Some(directory) if directory.describes(files) && directory.covers(row_ids) => directory,
             held => {
                 let previous = held.unwrap_or_else(|| Arc::new(FileDirectory::empty(&scope)));
-                let directory = Arc::new(self.refresh_directory(&scope, &previous, files).await);
+                let directory = Arc::new(
+                    self.refresh_directory(&scope, &previous, files, row_ids)
+                        .await,
+                );
                 super::install(&self.row_lookups.files, table, Arc::clone(&directory));
                 directory
             }
@@ -350,6 +463,7 @@ impl ReadOnlyCatalog {
         scope: &DirectoryScope<'_>,
         previous: &FileDirectory,
         files: &OrdMap<u64, DataFileValue>,
+        row_ids: &[u64],
     ) -> FileDirectory {
         let retry_failed = previous.retry_due();
         let FileChanges {
@@ -358,33 +472,19 @@ impl ReadOnlyCatalog {
             file_bytes,
         } = previous.changes_to(files, retry_failed);
 
-        let mut directory = FileDirectory {
-            identity: scope.store.cache_identity(),
-            data_prefix: scope.data_prefix.into(),
-            table_prefix: scope.table_prefix.into(),
-            files: files.clone(),
-            summaries: previous.summaries.clone(),
-            ranges: previous.ranges.clone(),
-            spanned: previous.spanned.clone(),
-            spans: previous.spans.clone(),
-            failed: if retry_failed {
-                Vec::new()
-            } else {
-                previous
-                    .failed
-                    .iter()
-                    .copied()
-                    .filter(|file| !removed.contains(file) && files.contains_key(file))
-                    .collect()
-            },
-            failed_retries: previous.failed_retries,
-            retry_skip: AtomicU32::new(previous.retry_skip.load(Ordering::Relaxed)),
-            file_bytes,
-            bytes: 0,
-        };
+        let mut directory = previous.advanced(scope, files, &removed, retry_failed, file_bytes);
         for file in &removed {
             directory.forget(*file);
         }
+
+        let selected = narrow_to_wanted(
+            selected,
+            &mut directory.deferred,
+            previous,
+            scope,
+            files,
+            row_ids,
+        );
 
         self.row_lookups.note_summarized(selected.len());
         if !selected.is_empty() {
