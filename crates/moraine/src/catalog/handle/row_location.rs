@@ -748,14 +748,49 @@ impl ReadOnlyCatalog {
             .await
     }
 
+    /// Derives and publishes the summaries of every file registered after
+    /// `since`, across every table the catalog holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the head view cannot be read. Per-file
+    /// failures are reported in [`RowSummaryWarmth::files_failed`].
+    pub async fn publish_row_summaries_since(
+        &self,
+        data_store: DataStore,
+        data_prefix: &str,
+        since: SnapshotId,
+    ) -> Result<RowSummaryWarmth> {
+        let snapshot = self.snapshot().await?;
+        let tables = snapshot
+            .schemas()
+            .into_iter()
+            .flat_map(|schema| snapshot.tables_in(schema.id))
+            .map(|table| table.id)
+            .collect::<Vec<_>>();
+
+        let mut total = RowSummaryWarmth::default();
+        for table in tables {
+            let table_total = self
+                .summarize_table_since(&snapshot, &data_store, data_prefix, table, since)
+                .await?;
+            total = RowSummaryWarmth {
+                files_considered: total
+                    .files_considered
+                    .saturating_add(table_total.files_considered),
+                summaries_built: total
+                    .summaries_built
+                    .saturating_add(table_total.summaries_built),
+                files_failed: total.files_failed.saturating_add(table_total.files_failed),
+            };
+        }
+
+        Ok(total)
+    }
+
     /// Deletes published row summaries whose data file is no longer under
     /// `data_prefix`, which is how a sidecar that outlived its file is
     /// reclaimed.
-    ///
-    /// Decided from one listing rather than a probe per object, and from
-    /// the store alone rather than the catalog: a summary is reclaimed only
-    /// when the listing that found it did not also find the file it names,
-    /// so a file an older snapshot still reads keeps its summary.
     ///
     /// # Errors
     ///
@@ -834,8 +869,51 @@ impl ReadOnlyCatalog {
         data_prefix: &str,
         table: TableId,
     ) -> Result<RowSummaryWarmth> {
-        let table_prefix = snapshot.table_data_prefix(table)?;
         let files = snapshot.data_files_of(table);
+        self.summarize_files(snapshot, data_store, data_prefix, table, files)
+            .await
+    }
+
+    /// One table's files registered after `since`, which is what a commit
+    /// just landed rather than everything the table holds.
+    async fn summarize_table_since(
+        &self,
+        snapshot: &CatalogSnapshot,
+        data_store: &DataStore,
+        data_prefix: &str,
+        table: TableId,
+        since: SnapshotId,
+    ) -> Result<RowSummaryWarmth> {
+        let files = snapshot
+            .data_files
+            .get(&table.get())
+            .map(|files| {
+                files
+                    .values()
+                    .filter(|file| file.begin_snapshot > since.get())
+                    .map(data_file_info)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        self.summarize_files(snapshot, data_store, data_prefix, table, files)
+            .await
+    }
+
+    /// Derives `files`' summaries, publishing each one that has to be read
+    /// from its row-id column.
+    async fn summarize_files(
+        &self,
+        snapshot: &CatalogSnapshot,
+        data_store: &DataStore,
+        data_prefix: &str,
+        table: TableId,
+        files: Vec<DataFileInfo>,
+    ) -> Result<RowSummaryWarmth> {
+        if files.is_empty() {
+            return Ok(RowSummaryWarmth::default());
+        }
+        let table_prefix = snapshot.table_data_prefix(table)?;
         let mut warmth = RowSummaryWarmth {
             files_considered: u64::try_from(files.len()).unwrap_or(u64::MAX),
             ..RowSummaryWarmth::default()

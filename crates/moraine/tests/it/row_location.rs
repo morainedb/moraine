@@ -10,7 +10,7 @@ use moraine::{
     Catalog, DataFile, DataFileId, DataStore, DeleteFile, DeleteFileRegistration, Error, IndexDef,
     IndexKeyValue, InlineChunk, IntWidth, TableId,
 };
-use object_store::{ObjectStore, memory::InMemory};
+use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 
 use crate::fixtures::{col, datafile, open_memory, row_id_field, write_parquet as write};
 
@@ -1675,5 +1675,78 @@ async fn warm_dense_directory_does_not_alias_data_stores() {
         .await
         .unwrap();
     assert_eq!(found[0].data_file_id, None);
+    catalog.close().await.unwrap();
+}
+
+/// A commit's files are summarized and published by a pass bounded to
+/// what that commit added, leaving files older than it untouched.
+#[tokio::test]
+async fn publishing_since_a_snapshot_covers_only_what_followed_it() {
+    let catalog = open_memory().await;
+    let data = Arc::new(InMemory::new());
+    let store = DataStore::new(data.clone());
+
+    let (file_size_bytes, footer_size) = write(
+        &data,
+        "main/orders/data-3.parquet",
+        &batch_with_row_ids(&[10, 20, 30], &[5, 9, 12]),
+    )
+    .await;
+    let table = table_with(
+        &catalog,
+        vec![DataFile {
+            file_size_bytes,
+            footer_size,
+            ..datafile(3)
+        }],
+    )
+    .await;
+    let before = catalog.snapshot().await.unwrap().current_snapshot().id;
+
+    let (file_size_bytes, footer_size) = write(
+        &data,
+        "main/orders/data-4.parquet",
+        &batch_with_row_ids(&[40, 50], &[21, 30]),
+    )
+    .await;
+    catalog
+        .commit(move |tx| {
+            tx.register_data_file(
+                table,
+                DataFile {
+                    file_size_bytes,
+                    footer_size,
+                    ..datafile(4)
+                },
+                &[],
+            )
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    let published = catalog
+        .publish_row_summaries_since(store, "", before)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        published.files_considered, 1,
+        "the pass must be bounded to the files the commit added"
+    );
+    assert_eq!(published.summaries_built, 1);
+    assert_eq!(published.files_failed, 0);
+    assert!(
+        data.head(&Path::from("main/orders/data-4.parquet.rowsum"))
+            .await
+            .is_ok(),
+        "the file the commit added must have a published summary"
+    );
+    assert!(
+        data.head(&Path::from("main/orders/data-3.parquet.rowsum"))
+            .await
+            .is_err(),
+        "a file older than the snapshot must be left alone"
+    );
     catalog.close().await.unwrap();
 }

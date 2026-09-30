@@ -119,23 +119,33 @@ A mismatch, an unknown version, a short read or any decode error means
 
 ### Who writes and deletes one
 
-Two producers:
+Three producers:
 
 1. **The reader that derived it**, publishing after answering its caller on a
    task the caller does not wait for; a failed publish is logged and otherwise
    ignored.
-2. **Warming**, which walks a table's files deriving summaries and so publishes
-   whatever the readers have not — the producer for files that predate this or
-   whose publish failed.
+2. **A pass over what a commit added**, run by the embedder once the commit
+   returns and bounded to the files registered after the snapshot that preceded
+   it. This is what moves the derivation off the first query.
+3. **Warming**, which walks a whole table — the producer for files that predate
+   this or whose publish failed.
 
-**Not the commit**, though its scoped read passes the ids by. That read is
+The second cannot live inside the commit, and not for want of trying: the
+commit protocol holds no data store, by design, so it cannot read the file it
+just registered. It is a verb the embedder calls afterwards.
+
+**Not the commit's own read**, either, though its ids pass by. That read is
 filtered by the file's delete positions, and a summary describes a file
 physically, deleted rows included, so what the commit sees is the wrong set. A
-commit-time producer would need a second, unfiltered read, which is not the free
-by-product it looks like.
+commit-time producer would need a second, unfiltered read, which is not the
+free by-product it looks like.
 
-There is no write-time producer either, because moraine writes no data file:
-`Transaction::flush_inlined_data` registers files the caller already wrote.
+There is no write-time producer, because moraine writes no data file:
+`Transaction::flush_inlined_data` registers files the caller already wrote. The
+caller does know the ids in file order at that moment and could report them,
+publishing with no read at all — but moraine could verify the set it was handed
+and never the order, and a wrong order is wrong positions that nothing
+downstream catches. Reading the file proves what a caller can only assert.
 Publishing needs a resolvable data path, the condition that already governs
 delete files; an absent one publishes nothing and is not an error, and
 concurrent publishes are safe, the contents being a deterministic function of
