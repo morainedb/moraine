@@ -548,6 +548,86 @@ mod proptests {
     }
 }
 
+/// A permutation is written at the width its row count needs, not four
+/// bytes a position.
+#[test]
+fn positions_pack_to_the_width_the_row_count_needs() {
+    use foyer::Code;
+
+    use super::auxiliary_cache::{AuxiliaryValue, Weighed};
+
+    let summary = PositionedRowSet {
+        rows: FileRowSet::Sorted(vec![10, 20, 30, 40, 50]),
+        order: RowOrder::Permuted(vec![4, 0, 3, 1, 2]),
+    };
+    let mut encoded = Vec::new();
+    Weighed::from(AuxiliaryValue::Summary(Arc::new(summary)))
+        .encode(&mut encoded)
+        .unwrap();
+
+    // Tag, then the sorted set as a count and five ids, then the
+    // permutation as a count and five three-bit positions.
+    assert_eq!(encoded.len(), 1 + 8 + 5 * 8 + 8 + 2);
+}
+
+/// A permutation whose positions exceed its cardinality cannot be written
+/// at the width that cardinality implies, and is refused rather than
+/// truncated.
+#[test]
+fn positions_beyond_the_row_count_are_refused() {
+    use foyer::Code;
+
+    use super::auxiliary_cache::{AuxiliaryValue, Weighed};
+
+    let permuted = PositionedRowSet {
+        rows: FileRowSet::Sorted(vec![10, 20]),
+        order: RowOrder::Permuted(vec![0, 9]),
+    };
+    let repeated = PositionedRowSet {
+        rows: FileRowSet::Sorted(vec![10, 30]),
+        order: RowOrder::Repeated {
+            offsets: vec![0, 1, 3],
+            positions: vec![0, 1, 5],
+        },
+    };
+    for summary in [permuted, repeated] {
+        let mut encoded = Vec::new();
+        assert!(
+            Weighed::from(AuxiliaryValue::Summary(Arc::new(summary)))
+                .encode(&mut encoded)
+                .is_err()
+        );
+    }
+}
+
+/// An entry written before positions were packed still decodes, so
+/// upgrading does not cold-start the tier.
+#[test]
+fn unpacked_positions_from_an_older_writer_still_decode() {
+    use foyer::Code;
+
+    use super::auxiliary_cache::{AuxiliaryValue, Weighed};
+
+    // Tag 11 is the retired sorted-permuted form: a sorted membership run
+    // followed by one `u32` a position.
+    let mut encoded = vec![11_u8];
+    encoded.extend_from_slice(&2_u64.to_le_bytes());
+    encoded.extend_from_slice(&10_u64.to_le_bytes());
+    encoded.extend_from_slice(&20_u64.to_le_bytes());
+    encoded.extend_from_slice(&2_u64.to_le_bytes());
+    encoded.extend_from_slice(&1_u32.to_le_bytes());
+    encoded.extend_from_slice(&0_u32.to_le_bytes());
+
+    let decoded = Weighed::decode(&mut encoded.as_slice()).unwrap();
+    let AuxiliaryValue::Summary(summary) = &decoded.value else {
+        panic!("a summary decoded as something else");
+    };
+    let mut positions = Vec::new();
+    assert!(summary.visit_positions(10, |position| positions.push(position)));
+    assert!(summary.visit_positions(20, |position| positions.push(position)));
+    assert_eq!(positions, vec![1, 0]);
+}
+
 /// Malformed repeated-position directories are cache misses, not guessed
 /// positions.
 #[test]
@@ -560,7 +640,6 @@ fn repeated_summary_disk_form_rejects_invalid_positions() {
         (vec![10, 30], vec![1, 2, 3], vec![0, 1, 2]),
         (vec![10, 30], vec![0, 0, 3], vec![0, 1, 2]),
         (vec![10, 30], vec![0, 1, 3], vec![0, 0, 2]),
-        (vec![10, 30], vec![0, 1, 3], vec![0, 1, 5]),
         (vec![10, 10], vec![0, 1, 3], vec![0, 1, 2]),
     ] {
         let summary = PositionedRowSet {
