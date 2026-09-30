@@ -1390,7 +1390,7 @@ pub unsafe extern "C" fn moraine_tx_commit(
         // safety contract.
         let report =
             unsafe { catalog_ref.block_on_commit(probe, probe_ctx, tx.commit_reporting()) }?;
-        catalog_ref.spawn_warm_tables(warm_tables);
+        catalog_ref.spawn_commit_passes(warm_tables, report.snapshot_id);
 
         // Repair runs only when this commit deferred entries, after the data
         // snapshot is durable; its failure, including cancellation, is not

@@ -23,6 +23,9 @@ const SIDECAR_PREFIX_BYTES: u64 = 1 << 20;
 
 /// What a caller needs of a summary. Every lookup tests membership; only a
 /// located delete or update resolves positions, and only it pays for them.
+///
+/// Reads never publish. A query answers its caller and writes nothing to
+/// the data path; publishing is something an embedder asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Want {
     /// Membership alone, which reads no order from a published summary.
@@ -171,9 +174,7 @@ pub(crate) async fn file_summary(
                         }
 
                         built.store(true, Ordering::Relaxed);
-                        let rows = read_row_ids(file.clone(), row_id_start).await?;
-                        publish_summary(&file, identity, &rows);
-                        Ok(rows)
+                        read_row_ids(file.clone(), row_id_start).await
                     }
                 };
                 Held::Positioned(
@@ -194,7 +195,6 @@ pub(crate) async fn file_summary(
 
                         built.store(true, Ordering::Relaxed);
                         let rows = read_row_ids(file.clone(), row_id_start).await?;
-                        publish_summary(&file, identity, &rows);
                         // The whole summary is in hand, so a later caller
                         // wanting positions finds it rather than reading
                         // the column over again.
@@ -211,11 +211,16 @@ pub(crate) async fn file_summary(
                         Ok(Arc::new(rows.rows.clone()))
                     }
                 };
-                Held::Membership(
-                    auxiliary_cache::shared()
-                        .fetch_membership(&store, &key, read)
-                        .await?,
-                )
+                let membership = auxiliary_cache::shared()
+                    .fetch_membership(&store, &key, read)
+                    .await?;
+                // A fill that had to read the column cached the whole
+                // summary as well. Prefer it: the order is already paid
+                // for, and holding it spares a later position the read.
+                match auxiliary_cache::shared().summary(&store, &key).await {
+                    Some(positioned) => Held::Positioned(positioned),
+                    None => Held::Membership(membership),
+                }
             }
         };
 
@@ -224,6 +229,36 @@ pub(crate) async fn file_summary(
             built: built.load(Ordering::Relaxed),
         })
     }
+}
+
+/// Publishes `file`'s summary unless one is already published for it,
+/// returning whether this call wrote one.
+///
+/// Neither reads nor fills the summary caches: a backfill over a lake
+/// should not evict the working set of the process running it.
+///
+/// # Errors
+///
+/// Returns a store error if the file's row-id column cannot be read.
+pub(crate) async fn publish_if_missing(
+    file: ParquetFile,
+    table_id: u64,
+    data_file_id: u64,
+    row_id_start: Option<u64>,
+) -> Result<bool> {
+    let identity = identity_of(&file, table_id, data_file_id);
+    if sidecar::is_published(&file.store, &file.path, identity).await {
+        return Ok(false);
+    }
+    if row_id_start.is_some() && !carries_embedded_row_ids(file.clone()).await? {
+        // Its ids follow from the catalog, so there is nothing a summary
+        // would add.
+        return Ok(false);
+    }
+
+    let rows = read_row_ids(file.clone(), row_id_start).await?;
+    publish_summary(&file, identity, &rows).await;
+    Ok(true)
 }
 
 /// The file a sidecar beside `file` must name to be believed.
@@ -338,11 +373,12 @@ fn refused(
     None
 }
 
-/// Publishes what a read just derived, for whichever process asks next.
-/// The write runs on its own task so the caller is answered without waiting
-/// for it, and a failure is logged and otherwise ignored: the answer is
-/// already in hand, and the next reader derives again.
-fn publish_summary(
+/// Publishes a derived summary for whichever process asks next, awaited
+/// so a pass that reports what it published has published it.
+///
+/// A failure is logged and otherwise ignored: the summary is already in
+/// hand for the caller, and the next pass derives it again.
+async fn publish_summary(
     file: &ParquetFile,
     identity: sidecar::SidecarIdentity<'_>,
     rows: &PositionedRowSet,
@@ -358,17 +394,14 @@ fn publish_summary(
         }
     };
 
-    let store = file.store.clone();
     let (path, bytes) = published;
-    tokio::spawn(async move {
-        match store.write(&path, bytes).await {
-            Ok(()) => metrics::sidecar_published(true),
-            Err(error) => {
-                debug!(path = %path, %error, "a row summary could not be published");
-                metrics::sidecar_published(false);
-            }
+    match file.store.write(&path, bytes).await {
+        Ok(()) => metrics::sidecar_published(true),
+        Err(error) => {
+            debug!(path = %path, %error, "a row summary could not be published");
+            metrics::sidecar_published(false);
         }
-    });
+    }
 }
 
 async fn read_row_ids(

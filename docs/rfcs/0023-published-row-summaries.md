@@ -119,20 +119,29 @@ A mismatch, an unknown version, a short read or any decode error means
 
 ### Who writes and deletes one
 
-Three producers:
+**A read never publishes.** A query answers its caller and writes nothing to
+the data path; a lookup that has to derive a summary keeps it for itself.
+Publishing puts objects in someone else's bucket, so it is asked for, not
+inferred — and every publish below is a verb an embedder calls.
 
-1. **The reader that derived it**, publishing after answering its caller on a
-   task the caller does not wait for; a failed publish is logged and otherwise
-   ignored.
-2. **A pass over what a commit added**, run by the embedder once the commit
-   returns and bounded to the files registered after the snapshot that preceded
-   it. This is what moves the derivation off the first query.
-3. **Warming**, which walks a whole table — the producer for files that predate
-   this or whose publish failed.
+Two producers, which between them leave nothing behind:
 
-The second cannot live inside the commit, and not for want of trying: the
-commit protocol holds no data store, by design, so it cannot read the file it
-just registered. It is a verb the embedder calls afterwards.
+1. **A pass over the whole catalog, at attach.** The backfill for files written
+   before summaries were published. It walks everything, but a file already
+   published costs one header read — no summary is fetched to find out — so it
+   is expensive exactly once per lake and negligible after.
+2. **A pass over what a commit added**, run once the commit returns and bounded
+   to the files registered after the snapshot that preceded it. Every commit
+   after the backfill publishes its own, so the two together cover the lake
+   without either one re-walking it.
+
+Neither can live inside the commit, and not for want of trying: the commit
+protocol holds no data store, by design, so it cannot read the file it just
+registered.
+
+Publishing neither reads nor fills the summary caches. A backfill over a lake
+would otherwise evict the working set of the process running it, and warming is
+not what it is for.
 
 **Not the commit's own read**, either, though its ids pass by. That read is
 filtered by the file's delete positions, and a summary describes a file

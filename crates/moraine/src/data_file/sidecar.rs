@@ -184,6 +184,28 @@ pub(super) fn summary(
     decode_summary(&mut &body[..]).map_err(|_| Rejected::Malformed)
 }
 
+/// The header and a generous path, which one read settles whether a
+/// summary is published without fetching what it holds.
+const IDENTITY_PREFIX_BYTES: u64 = 4096;
+
+/// Whether `data_file` already has a summary published beside it that
+/// describes it. One small read, so a pass over an already-published lake
+/// costs a header apiece rather than a summary apiece.
+pub(super) async fn is_published(
+    store: &DataStore,
+    data_file: &Path,
+    identity: SidecarIdentity<'_>,
+) -> bool {
+    let Ok(path) = path_for(data_file) else {
+        return false;
+    };
+    let Ok(prefix) = store.read_prefix(&path, IDENTITY_PREFIX_BYTES).await else {
+        return false;
+    };
+
+    layout_of(identity, &prefix).is_ok()
+}
+
 /// What a sweep of published summaries did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

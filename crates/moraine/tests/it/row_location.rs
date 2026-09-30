@@ -290,7 +290,7 @@ async fn warming_builds_the_summaries_a_cold_lookup_would_pay_for() {
     .await;
 
     let first = catalog
-        .warm_row_summaries(store.clone(), "", table)
+        .publish_row_summaries(store.clone(), "", table)
         .await
         .unwrap();
     assert_eq!(first.files_considered, 1);
@@ -300,7 +300,7 @@ async fn warming_builds_the_summaries_a_cold_lookup_would_pay_for() {
     // Idempotent: the summary is now resident, so a second pass reads
     // nothing.
     let second = catalog
-        .warm_row_summaries(store.clone(), "", table)
+        .publish_row_summaries(store.clone(), "", table)
         .await
         .unwrap();
     assert_eq!(second.summaries_built, 0);
@@ -339,7 +339,10 @@ async fn a_dense_file_needs_no_warming() {
     )
     .await;
 
-    let warmth = catalog.warm_row_summaries(store, "", table).await.unwrap();
+    let warmth = catalog
+        .publish_row_summaries(store, "", table)
+        .await
+        .unwrap();
 
     // It answers from its recorded range, so nothing is read or budgeted.
     assert_eq!(warmth.files_considered, 1);
@@ -355,7 +358,10 @@ async fn warming_counts_a_file_it_cannot_read_rather_than_failing() {
     let store = DataStore::new(data.clone());
     let table = table_with(&catalog, vec![datafile(3)]).await;
 
-    let warmth = catalog.warm_row_summaries(store, "", table).await.unwrap();
+    let warmth = catalog
+        .publish_row_summaries(store, "", table)
+        .await
+        .unwrap();
 
     assert_eq!(warmth.files_considered, 1);
     assert_eq!(warmth.summaries_built, 0);
@@ -410,7 +416,7 @@ async fn warming_every_table_reaches_tables_outside_the_first_schema() {
         .await
         .unwrap();
 
-    let warmth = catalog.warm_all_row_summaries(store, "").await.unwrap();
+    let warmth = catalog.publish_all_row_summaries(store, "").await.unwrap();
 
     assert_eq!(warmth.files_considered, 2);
     assert_eq!(warmth.summaries_built, 2);
@@ -453,7 +459,7 @@ async fn warming_every_table_carries_on_past_a_table_it_cannot_read() {
         .await
         .unwrap();
 
-    let warmth = catalog.warm_all_row_summaries(store, "").await.unwrap();
+    let warmth = catalog.publish_all_row_summaries(store, "").await.unwrap();
 
     assert_eq!(warmth.files_considered, 2);
     assert_eq!(warmth.summaries_built, 1);

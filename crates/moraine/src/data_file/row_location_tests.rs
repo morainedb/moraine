@@ -10,19 +10,16 @@ use super::{
     row_location::file_summary,
     tests::{tagged_row_id_field, write_fixture},
 };
-use crate::data_file::{DataStore, ParquetFile, Want, metrics::ScopedReadMetrics};
+use crate::data_file::{
+    DataStore, ParquetFile, Want, metrics::ScopedReadMetrics, publish_if_missing,
+};
 
-/// Waits for the sidecar a derive publishes on its own task, so a test
-/// that reads it back is not racing the write.
+/// The sidecar a publishing pass wrote, which it awaited before
+/// returning.
 async fn published_sidecar(store: &Arc<InMemory>, data_file: &Path) -> Path {
     let path = Path::parse(format!("{data_file}.rowsum")).unwrap();
-    for _ in 0..1_000 {
-        if store.head(&path).await.is_ok() {
-            return path;
-        }
-        tokio::task::yield_now().await;
-    }
-    panic!("a derived summary was never published to {path}");
+    store.head(&path).await.expect("a summary was published");
+    path
 }
 
 fn batch_with_embedded_row_ids(row_ids: &[i64]) -> RecordBatch {
@@ -96,6 +93,18 @@ async fn a_derived_summary_is_published_and_answers_without_its_file() {
     .unwrap();
     assert!(derived.built, "a cold summary must read and cache");
 
+    assert!(
+        publish_if_missing(
+            ParquetFile::new(DataStore::new(store.clone()), path.clone(), file_size, 0),
+            1,
+            1,
+            None,
+        )
+        .await
+        .unwrap(),
+        "a file with no published summary must get one"
+    );
+
     // Only what that read published remains: a summary now can have come
     // from nowhere else.
     published_sidecar(&store, &path).await;
@@ -128,13 +137,11 @@ async fn a_membership_want_reads_no_order() {
     let batch = batch_with_embedded_row_ids(&[10, 11, 12, 3, 4, 5]);
     let file_size = write_fixture(&store, &path, &batch).await;
 
-    file_summary(
+    publish_if_missing(
         ParquetFile::new(DataStore::new(store.clone()), path.clone(), file_size, 0),
         1,
         1,
         None,
-        6,
-        Want::Positions,
     )
     .await
     .unwrap();
@@ -175,13 +182,11 @@ async fn a_sidecar_from_another_file_does_not_answer() {
     let batch = batch_with_embedded_row_ids(&[10, 11, 12, 3, 4, 5]);
     let file_size = write_fixture(&store, &path, &batch).await;
 
-    file_summary(
+    publish_if_missing(
         ParquetFile::new(DataStore::new(store.clone()), path.clone(), file_size, 0),
         1,
         1,
         None,
-        6,
-        Want::Positions,
     )
     .await
     .unwrap();
@@ -278,5 +283,54 @@ async fn a_dense_file_is_remembered_without_its_footer() {
         (tally.metadata_hits, tally.metadata_misses),
         (0, 0),
         "a remembered dense range needs no footer"
+    );
+}
+
+/// A second publishing pass over a file that already has a summary writes
+/// nothing, which is what makes a backfill over a published lake cheap.
+#[tokio::test]
+async fn publishing_skips_a_file_that_already_has_a_summary() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("twice.parquet");
+    let batch = batch_with_embedded_row_ids(&[10, 11, 12, 3, 4, 5]);
+    let file_size = write_fixture(&store, &path, &batch).await;
+    let file = || ParquetFile::new(DataStore::new(store.clone()), path.clone(), file_size, 0);
+
+    assert!(publish_if_missing(file(), 1, 1, None).await.unwrap());
+    published_sidecar(&store, &path).await;
+
+    assert!(
+        !publish_if_missing(file(), 1, 1, None).await.unwrap(),
+        "a published summary must not be derived again"
+    );
+}
+
+/// A file whose ids the catalog already describes needs no summary, so
+/// publishing leaves it alone.
+#[tokio::test]
+async fn publishing_skips_a_file_whose_ids_are_derivable() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("dense-publish.parquet");
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![0, 1, 2]))]).unwrap();
+    let file_size = write_fixture(&store, &path, &batch).await;
+
+    assert!(
+        !publish_if_missing(
+            ParquetFile::new(DataStore::new(store.clone()), path.clone(), file_size, 0),
+            1,
+            1,
+            Some(100),
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        store
+            .head(&Path::from("dense-publish.parquet.rowsum"))
+            .await
+            .is_err(),
+        "a dense file must not get a summary it does not need"
     );
 }

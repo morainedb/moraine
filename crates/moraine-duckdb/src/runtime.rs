@@ -9,7 +9,7 @@ use std::{
 };
 
 use futures::future::join_all;
-use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog, TableId};
+use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog, SnapshotId, TableId};
 use tokio::{
     runtime::{Builder, Runtime},
     task::JoinHandle,
@@ -114,10 +114,16 @@ impl MoraineCatalogHandle {
         }
     }
 
-    /// Spawns the attach's best-effort warming pass: with `preload`, every
+    /// Spawns the attach's best-effort passes: with `preload`, every
     /// table's index and inline probe ranges into the block cache; with a
-    /// `DATA_PATH` store, the row summaries a later located lookup would
-    /// otherwise build cold. Spawns nothing when neither applies.
+    /// `DATA_PATH` store, the row summaries of files that have none.
+    ///
+    /// The summary pass is the backfill for files written before summaries
+    /// were published; every commit after this attach publishes its own,
+    /// so between them nothing is left behind. It walks the whole catalog,
+    /// but a file already published costs one header read and nothing
+    /// else, so a lake that has been through it once barely notices the
+    /// next.
     pub(crate) fn spawn_warm_at_attach(&self, preload: bool) {
         let data_store = self.data_store.clone();
         if !preload && data_store.is_none() {
@@ -134,19 +140,22 @@ impl MoraineCatalogHandle {
                 return;
             };
             if let Err(error) = catalog
-                .warm_all_row_summaries(data_store, &data_prefix)
+                .publish_all_row_summaries(data_store, &data_prefix)
                 .await
             {
-                warn!(%error, "row summary warming skipped this attach");
+                warn!(%error, "row summary publishing skipped this attach");
             }
         }));
     }
 
-    /// Spawns a best-effort pass warming the index and inline ranges of the
-    /// tables a commit just registered data files against, then their row
-    /// summaries. An empty `tables` spawns nothing; without a `DATA_PATH`
-    /// store only the block cache is warmed.
-    pub(crate) fn spawn_warm_tables(&self, tables: Vec<TableId>) {
+    /// Spawns a commit's best-effort follow-up: the touched tables' index
+    /// and inline ranges into the block cache, and — with a `DATA_PATH`
+    /// store — the row summaries of the files this commit registered,
+    /// published for every other process.
+    ///
+    /// Bounded to what the commit added rather than to whole tables, so a
+    /// hot ingest table does not re-walk itself on every commit.
+    pub(crate) fn spawn_commit_passes(&self, tables: Vec<TableId>, committed: SnapshotId) {
         if tables.is_empty() {
             return;
         }
@@ -161,11 +170,14 @@ impl MoraineCatalogHandle {
             let Some(data_store) = data_store else {
                 return;
             };
+            // Snapshot ids advance by one per commit, so the snapshot
+            // before this one bounds the pass to its own files.
+            let since = SnapshotId::new(committed.get().saturating_sub(1));
             if let Err(error) = catalog
-                .warm_selected_row_summaries(data_store, &data_prefix, tables)
+                .publish_row_summaries_since(data_store, &data_prefix, since)
                 .await
             {
-                warn!(%error, "row summary warming skipped this commit");
+                warn!(%error, "row summary publishing skipped this commit");
             }
         }));
     }

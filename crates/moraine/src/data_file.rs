@@ -75,7 +75,7 @@ pub(crate) use crate::data_file::{
     located_rows::{inline_rows_batch, located_batch, scoped_read_row_stream},
     metrics::{DataStoreCounters, ScopedReadMetrics, ScopedReadTally, run_bounded_index_encoding},
     read_workers::{ReadWorkers, prefetched_row_stream, read_worker_limit, row_group_selections},
-    row_location::{FileSummary, Want, file_summary},
+    row_location::{FileSummary, Want, file_summary, publish_if_missing},
     scan_coverage::{ReadCoverage, read_coverage},
     schema::ReadColumn,
     selection::{RowPositions, ScopedRows},

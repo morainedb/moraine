@@ -25,7 +25,7 @@ pub use handle::{
     CachePreload, Catalog, CatalogOptions, CommitMember, DeleteFileRegistration, ExcludedPositions,
     ExistingDeleteFile, IndexReadIdentity, IndexReadScope, LocatedDeletion, LocatedPositions,
     LocatedRowScan, MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass,
-    MaintenanceStatusStep, MigrationRequest, ReadOnlyCatalog, RowSummaryWarmth,
+    MaintenanceStatusStep, MigrationRequest, ReadOnlyCatalog, RowSummaryPublish,
 };
 pub(crate) use handle::{InlineScan, Store};
 pub use snapshot::CatalogSnapshot;
