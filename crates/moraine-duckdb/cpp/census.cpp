@@ -280,6 +280,37 @@ void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 	output.SetCardinality(1);
 }
 
+// moraine_sidecar_tally: what published row summaries have done for this
+// process. Read alongside `moraine_object_store_tally`: the bytes that
+// tally reports are the ones these hits avoided.
+duckdb::unique_ptr<duckdb::FunctionData> SidecarTallyBind(duckdb::ClientContext &,
+                                                          duckdb::TableFunctionBindInput &,
+                                                          duckdb::vector<duckdb::LogicalType> &return_types,
+                                                          duckdb::vector<duckdb::string> &names) {
+	names = {"hits", "misses", "refused", "published", "publish_failures"};
+	return_types.assign(names.size(), duckdb::LogicalType::UBIGINT);
+	return nullptr;
+}
+
+void SidecarTallyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
+	auto &state = data.global_state->Cast<TallyGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+	MoraineSidecarTally tally {};
+	if (moraine_sidecar_tally(&tally) != MORAINE_OK) {
+		throw duckdb::InternalException("moraine_sidecar_tally: could not read the row-summary counters");
+	}
+	output.SetValue(0, 0, duckdb::Value::UBIGINT(tally.hits));
+	output.SetValue(1, 0, duckdb::Value::UBIGINT(tally.misses));
+	output.SetValue(2, 0, duckdb::Value::UBIGINT(tally.refused));
+	output.SetValue(3, 0, duckdb::Value::UBIGINT(tally.published));
+	output.SetValue(4, 0, duckdb::Value::UBIGINT(tally.publish_failures));
+	output.SetCardinality(1);
+}
+
 duckdb::unique_ptr<duckdb::FunctionData> CacheStatusBind(duckdb::ClientContext &,
                                                          duckdb::TableFunctionBindInput &,
                                                          duckdb::vector<duckdb::LogicalType> &return_types,
@@ -443,6 +474,10 @@ void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader) {
 	duckdb::TableFunction cache_status("moraine_cache_status", {}, CacheStatusImpl, CacheStatusBind,
 	                                  TallyInitGlobal);
 	loader.RegisterFunction(cache_status);
+
+	duckdb::TableFunction sidecar_tally("moraine_sidecar_tally", {}, SidecarTallyImpl, SidecarTallyBind,
+	                                    TallyInitGlobal);
+	loader.RegisterFunction(sidecar_tally);
 
 	duckdb::TableFunction memory_tally("moraine_memory_tally", {duckdb::LogicalType::VARCHAR}, MemoryTallyImpl,
 	                                  MemoryTallyBind, TallyInitGlobal);
