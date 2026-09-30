@@ -158,10 +158,27 @@ impl ReadOnlyCatalog {
                     // At `info`: one record per resolved probe, and an
                     // index read resolves at bind, so this is where a slow
                     // statement's cost first becomes visible.
+                    //
+                    // The split is what makes a slow one actionable.
+                    // `head_ms` is everything before the first probe --
+                    // resolving the view and a ready definition -- and
+                    // `probe_window_ms` is first probe to last completion,
+                    // so a lookup slow in one is not slow in the other.
+                    // `probe_service_ms` sums the probes themselves, and
+                    // against the window it says whether they overlapped:
+                    // service near the window means they ran one at a time
+                    // however many were allowed in flight.
                     info!(
                         table_id = table.get(),
                         index_id = index.get(),
                         lookup_keys = keys.len(),
+                        head_ms = milliseconds(resolution.metrics.head),
+                        probe_window_ms = milliseconds(resolution.metrics.probe_window),
+                        probe_service_ms = milliseconds(resolution.metrics.probe_service),
+                        peak_in_flight = resolution.metrics.peak_in_flight,
+                        hits = resolution.metrics.hits,
+                        misses = resolution.metrics.misses,
+                        row_ids = resolution.row_ids.len(),
                         lookup_ms = milliseconds(started.elapsed()),
                         "index lookup resolved"
                     );
