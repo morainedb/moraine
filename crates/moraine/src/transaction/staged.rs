@@ -1401,7 +1401,9 @@ impl StagedTransaction {
     /// submission returns [`Error::CommitOutcomeUnknown`]; retain external
     /// files and reconcile the operation before resubmitting.
     pub async fn commit(self) -> Result<SnapshotId> {
-        self.commit_reporting()
+        // Boxed: the reporting commit's future is large enough that keeping
+        // it inline grows every caller's own.
+        Box::pin(self.commit_reporting())
             .await
             .map(|report| report.snapshot_id)
     }

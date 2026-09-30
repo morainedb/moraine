@@ -38,7 +38,7 @@ async fn compacted_fixture(
         .with_settings(settings)
         .with_sst_block_size(SST_BLOCK_SIZE)
         .with_block_cache_policy(options.block_cache_policy())
-        .with_db_cache(cache.handle.clone())
+        .with_db_cache(cache.handle.clone(), 1)
         .with_metrics_recorder(cache::recorder(counters.clone()))
         .build()
         .await

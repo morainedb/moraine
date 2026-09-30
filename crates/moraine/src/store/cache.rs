@@ -21,7 +21,7 @@ use foyer::{
     HybridCacheBuilder, HybridCachePolicy, HybridCacheProperties, LruConfig, PsyncIoEngineConfig,
     RecoverMode, Spawner,
 };
-use slatedb::db_cache::{CacheLoader, CachedEntry, CachedKey, DbCache, stats};
+use slatedb::db_cache::{CacheFetch, CacheLoader, CachedEntry, CachedKey, DbCache, stats};
 use slatedb_common::metrics::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn};
 use tracing::{info, warn};
 
@@ -904,6 +904,14 @@ impl StoreLocation {
         let name = stable_name(&format!("{}/{}", self.identity.directory(), self.path));
         format!("v2-{}", name.simple())
     }
+
+    /// This store's namespace within a cache it may share. Derived from the
+    /// same stable name its directory is, so reopening a store recovers the
+    /// entries its last run persisted rather than starting cold.
+    pub(crate) fn cache_id(&self) -> u64 {
+        let name = stable_name(&format!("{}/{}", self.identity.directory(), self.path));
+        u64::from_be_bytes(name.as_bytes()[..8].try_into().unwrap_or([0; 8]))
+    }
 }
 
 /// A name for `location` that every build and process derives alike.
@@ -1015,7 +1023,7 @@ impl CatalogCache {
         key: CachedKey,
         loader: CacheLoader,
         metadata: bool,
-    ) -> Result<CachedEntry, slatedb::Error> {
+    ) -> Result<CacheFetch, slatedb::Error> {
         let resident = match self.tier() {
             Tier::Hybrid(cache) => cache.memory().contains(&key),
             Tier::Memory(_) => true,
@@ -1064,13 +1072,21 @@ impl CatalogCache {
                 .map_err(fill_failed)?,
         };
 
-        if !resident && !fetched.load(Ordering::Relaxed) {
+        let from_store = fetched.load(Ordering::Relaxed);
+        if !resident && !from_store {
             self.record_disk_hit(metadata);
         }
         if metadata {
             metadata_admitted(&key, as_bytes(entry.size()));
         }
-        Ok(entry)
+        // The loader ran exactly when this fetch went to object storage,
+        // which is what a miss is; a disk-tier read is a hit the cache
+        // served.
+        Ok(if from_store {
+            CacheFetch::miss(entry)
+        } else {
+            CacheFetch::hit(entry)
+        })
     }
 
     async fn read(&self, key: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
@@ -1153,7 +1169,7 @@ impl DbCache for CatalogCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, slatedb::Error> {
+    ) -> Result<CacheFetch, slatedb::Error> {
         self.fetch(key, loader, false).await
     }
 
@@ -1161,7 +1177,7 @@ impl DbCache for CatalogCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, slatedb::Error> {
+    ) -> Result<CacheFetch, slatedb::Error> {
         self.fetch(key, loader, true).await
     }
 
@@ -1169,7 +1185,7 @@ impl DbCache for CatalogCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, slatedb::Error> {
+    ) -> Result<CacheFetch, slatedb::Error> {
         self.fetch(key, loader, true).await
     }
 
@@ -1177,7 +1193,7 @@ impl DbCache for CatalogCache {
         &self,
         key: CachedKey,
         loader: CacheLoader,
-    ) -> Result<CachedEntry, slatedb::Error> {
+    ) -> Result<CacheFetch, slatedb::Error> {
         self.fetch(key, loader, true).await
     }
 }
@@ -1530,7 +1546,7 @@ mod tests {
             let cache = shared(&config, location, store_counters()).await.unwrap();
             let counters = store_counters();
             let reader = DbReader::builder(path, object_store.clone())
-                .with_db_cache(cache)
+                .with_db_cache(cache, 1)
                 .with_metrics_recorder(recorder(Arc::clone(&counters)))
                 .build()
                 .await

@@ -47,7 +47,7 @@ async fn fixture(keys: u64) -> (Db, cache::TestCache, Arc<transport::Transport>)
         .with_segment_extractor(Arc::new(TagSegmentExtractor))
         .with_filter_policies(crate::store::index_filter::policies())
         .with_block_cache_policy(options.block_cache_policy())
-        .with_db_cache(cache.handle.clone())
+        .with_db_cache(cache.handle.clone(), 1)
         .build()
         .await
         .unwrap();

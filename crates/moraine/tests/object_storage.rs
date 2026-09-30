@@ -436,7 +436,7 @@ async fn measure_attach_latency_against_endpoint() {
 #[tokio::test]
 #[ignore = "needs a live S3 endpoint; run through `cargo xtask s3`"]
 async fn measure_attach_latency_against_the_endpoint() {
-    measure_attach_latency_against_endpoint().await;
+    Box::pin(measure_attach_latency_against_endpoint()).await;
 }
 
 /// 0004 — durable-commit latency where the WAL flush is a real PUT.
