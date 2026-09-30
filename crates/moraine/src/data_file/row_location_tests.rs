@@ -4,13 +4,26 @@ use arrow::{
     array::{Int64Array, RecordBatch},
     datatypes::{DataType, Field, Schema},
 };
-use object_store::{memory::InMemory, path::Path};
+use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 
 use super::{
     row_location::file_summary,
     tests::{tagged_row_id_field, write_fixture},
 };
 use crate::data_file::{DataStore, ParquetFile, metrics::ScopedReadMetrics};
+
+/// Waits for the sidecar a derive publishes on its own task, so a test
+/// that reads it back is not racing the write.
+async fn published_sidecar(store: &Arc<InMemory>, data_file: &Path) -> Path {
+    let path = Path::parse(format!("{data_file}.rowsum")).unwrap();
+    for _ in 0..1_000 {
+        if store.head(&path).await.is_ok() {
+            return path;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("a derived summary was never published to {path}");
+}
 
 fn batch_with_embedded_row_ids(row_ids: &[i64]) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -57,6 +70,85 @@ async fn non_ascending_embedded_ids_position_by_file_order() {
     assert_eq!(
         summary.positions_of(&[10, 11, 12, 3, 4, 5, 999]),
         vec![Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), None,],
+    );
+}
+
+/// A summary derived from a file is published beside it, and answers a
+/// later reader that cannot see the file at all.
+#[tokio::test]
+async fn a_derived_summary_is_published_and_answers_without_its_file() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("published.parquet");
+    let batch = batch_with_embedded_row_ids(&[10, 11, 12, 3, 4, 5]);
+    let file_size = write_fixture(&store, &path, &batch).await;
+    let requested = [10, 11, 12, 3, 4, 5, 999];
+
+    let derived = file_summary(
+        ParquetFile::new(DataStore::new(store.clone()), path.clone(), file_size, 0),
+        1,
+        1,
+        None,
+        6,
+    )
+    .await
+    .unwrap();
+    assert!(derived.built, "a cold summary must read and cache");
+
+    // Only what that read published remains: a summary now can have come
+    // from nowhere else.
+    published_sidecar(&store, &path).await;
+    store.delete(&path).await.unwrap();
+
+    let published = file_summary(
+        ParquetFile::new(DataStore::new(store), path, file_size, 0),
+        1,
+        1,
+        None,
+        6,
+    )
+    .await
+    .unwrap();
+
+    assert!(!published.built, "a published summary is not derived again");
+    assert_eq!(
+        published.positions_of(&requested),
+        derived.positions_of(&requested),
+    );
+}
+
+/// A sidecar whose header names another file is ignored, not believed.
+#[tokio::test]
+async fn a_sidecar_from_another_file_does_not_answer() {
+    let store = Arc::new(InMemory::new());
+    let path = Path::from("mismatched.parquet");
+    let batch = batch_with_embedded_row_ids(&[10, 11, 12, 3, 4, 5]);
+    let file_size = write_fixture(&store, &path, &batch).await;
+
+    file_summary(
+        ParquetFile::new(DataStore::new(store.clone()), path.clone(), file_size, 0),
+        1,
+        1,
+        None,
+        6,
+    )
+    .await
+    .unwrap();
+    published_sidecar(&store, &path).await;
+
+    // The same bytes, read as though they described a different file.
+    let summary = file_summary(
+        ParquetFile::new(DataStore::new(store), path, file_size, 0),
+        1,
+        2,
+        None,
+        6,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        summary.built,
+        "a sidecar naming another file must not be believed"
     );
 }
 

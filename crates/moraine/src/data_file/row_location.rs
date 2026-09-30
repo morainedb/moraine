@@ -6,15 +6,20 @@ use std::sync::{
 };
 
 use futures::TryStreamExt;
+use tracing::debug;
 
 use crate::{
     data_file::{
         ParquetFile, RowIdSource, ScopedRows, auxiliary_cache, carries_embedded_row_ids,
         row_set::{FileRowSet, PositionedRowSet, RowOrder},
-        scoped_read_entry_batches,
+        scoped_read_entry_batches, sidecar,
     },
     error::Result,
 };
+
+/// What a sidecar read asks for before it has a header to size it by. A
+/// summary shorter than this arrives whole in one request.
+const SIDECAR_PREFIX_BYTES: u64 = 1 << 20;
 
 /// One file's row-id membership, and what it cost to obtain.
 #[derive(Clone)]
@@ -107,8 +112,20 @@ pub(crate) async fn file_summary(
         let read = {
             let built = Arc::clone(&built);
             move || async move {
+                let identity = sidecar::SidecarIdentity {
+                    table_id,
+                    data_file_id,
+                    file_path: file.path.as_ref(),
+                    file_size: file.file_size,
+                };
+                if let Some(rows) = published_summary(&file, identity).await {
+                    return Ok(rows);
+                }
+
                 built.store(true, Ordering::Relaxed);
-                read_row_ids(file, row_id_start).await
+                let rows = read_row_ids(file.clone(), row_id_start).await?;
+                publish_summary(&file, identity, &rows);
+                Ok(rows)
             }
         };
 
@@ -121,6 +138,70 @@ pub(crate) async fn file_summary(
             built: built.load(Ordering::Relaxed),
         })
     }
+}
+
+/// The summary published beside `file`, or `None` when there is none to
+/// have. Every failure is the same answer — derive it instead — so nothing
+/// here returns an error to a caller that has a way of its own.
+async fn published_summary(
+    file: &ParquetFile,
+    identity: sidecar::SidecarIdentity<'_>,
+) -> Option<Arc<PositionedRowSet>> {
+    let path = sidecar::path_for(&file.path).ok()?;
+    let prefix = file
+        .store
+        .read_prefix(&path, SIDECAR_PREFIX_BYTES)
+        .await
+        .ok()?;
+
+    // One read covers the whole sidecar unless the file is large enough to
+    // outrun the speculation, in which case its header says by how much.
+    let layout = sidecar::layout_of(identity, &prefix).ok()?;
+    let whole = layout.membership_end().saturating_add(layout.order_len);
+    let bytes = if whole <= prefix.len() {
+        prefix
+    } else {
+        file.store
+            .read_prefix(&path, u64::try_from(whole).ok()?)
+            .await
+            .ok()?
+    };
+
+    match sidecar::summary(identity, &bytes) {
+        Ok(rows) => Some(Arc::new(rows)),
+        Err(rejection) => {
+            debug!(path = %path, ?rejection, "a published row summary was refused");
+            None
+        }
+    }
+}
+
+/// Publishes what a read just derived, for whichever process asks next.
+/// The write runs on its own task so the caller is answered without waiting
+/// for it, and a failure is logged and otherwise ignored: the answer is
+/// already in hand, and the next reader derives again.
+fn publish_summary(
+    file: &ParquetFile,
+    identity: sidecar::SidecarIdentity<'_>,
+    rows: &PositionedRowSet,
+) {
+    let published = match sidecar::path_for(&file.path).and_then(|path| {
+        sidecar::encode(identity, rows).map(|bytes| (path, bytes::Bytes::from(bytes)))
+    }) {
+        Ok(published) => published,
+        Err(error) => {
+            debug!(%error, "a row summary would not encode for publishing");
+            return;
+        }
+    };
+
+    let store = file.store.clone();
+    let (path, bytes) = published;
+    tokio::spawn(async move {
+        if let Err(error) = store.write(&path, bytes).await {
+            debug!(path = %path, %error, "a row summary could not be published");
+        }
+    });
 }
 
 async fn read_row_ids(

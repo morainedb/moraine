@@ -64,7 +64,7 @@ stay readable, so adopting them does not cold-start the tier.
 
 | | contents |
 | --- | --- |
-| header | version, `table_id`, `data_file_id`, `file_path`, `file_size`, `row_count`, and the byte length of each half |
+| header | version, `table_id`, `data_file_id`, the file's path as the reader resolved it, `file_size`, `row_count`, and the byte length of each half |
 | set | a tag byte, then `RoaringBitmap::serialize_into` or a sorted `u64` run |
 | order | for `Permuted`, the rank-to-position permutation; for `Repeated`, the physical row count, then offsets, then positions |
 

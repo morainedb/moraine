@@ -108,6 +108,15 @@ impl FileRowSet {
         }
     }
 
+    /// How many row ids this file holds.
+    pub(super) fn cardinality(&self) -> u64 {
+        match self {
+            Self::Range { start, end } => end.saturating_sub(*start),
+            Self::Roaring(rows) => rows.len(),
+            Self::Sorted(rows) => usize_as_u64(rows.len()),
+        }
+    }
+
     /// The least and greatest member, `None` when empty.
     pub(super) fn bounds(&self) -> Option<(u64, u64)> {
         match self {

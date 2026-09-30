@@ -27,6 +27,7 @@ mod row_set;
 mod scan_coverage;
 mod schema;
 mod selection;
+mod sidecar;
 mod values;
 
 #[cfg(test)]
@@ -35,6 +36,8 @@ mod auxiliary_cache_tests;
 mod row_location_tests;
 #[cfg(test)]
 mod row_set_tests;
+#[cfg(test)]
+mod sidecar_tests;
 #[cfg(test)]
 mod tests;
 

@@ -288,6 +288,18 @@ fn encode_positioned_row_set(
     positioned: &PositionedRowSet,
     writer: &mut impl Write,
 ) -> foyer::Result<()> {
+    let (set, order) = encode_summary_halves(positioned)?;
+    let io = foyer::Error::io_error;
+    writer.write_all(&set).map_err(io)?;
+    writer.write_all(&order).map_err(io)
+}
+
+/// The same bytes [`encode_positioned_row_set`] writes, split where the
+/// membership ends and the order begins, so a caller that stores them can
+/// record that boundary and later read only the first half.
+pub(super) fn encode_summary_halves(
+    positioned: &PositionedRowSet,
+) -> foyer::Result<(Vec<u8>, Vec<u8>)> {
     // Unreachable by construction: `PositionedRowSet::from_file_order` never
     // pairs a permutation with a range. A bare range tag carries no
     // permutation, so writing one here would silently answer positions by
@@ -324,23 +336,25 @@ fn encode_positioned_row_set(
             tag::SORTED_REPEATED_PACKED,
         ],
     };
-    encode_row_set(&positioned.rows, shapes, writer)?;
+    let mut set = Vec::new();
+    encode_row_set(&positioned.rows, shapes, &mut set)?;
 
+    let mut order = Vec::new();
     if let RowOrder::Permuted(permutation) = &positioned.order {
         // A permutation covers every physical row exactly once, so its
         // own length is the universe its positions fall in.
-        write_packed_positions(permutation, usize_as_u64(permutation.len()), writer)?;
+        write_packed_positions(permutation, usize_as_u64(permutation.len()), &mut order)?;
     }
     if let RowOrder::Repeated { offsets, positions } = &positioned.order {
         let physical = usize_as_u64(positions.len());
-        writer
+        order
             .write_all(&physical.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
-        write_packed_positions(offsets, physical.saturating_add(1), writer)?;
-        write_packed_positions(positions, physical, writer)?;
+        write_packed_positions(offsets, physical.saturating_add(1), &mut order)?;
+        write_packed_positions(positions, physical, &mut order)?;
     }
 
-    Ok(())
+    Ok((set, order))
 }
 
 /// Bits enough to hold every value below `universe`; none when the only
@@ -483,6 +497,15 @@ fn read_permutation(expected_len: usize, reader: &mut impl Read) -> foyer::Resul
             Ok(u32::from_le_bytes(buffer))
         })
         .collect()
+}
+
+/// Reads a whole summary, tag included, from a stream at its start.
+pub(super) fn decode_summary(reader: &mut impl Read) -> foyer::Result<PositionedRowSet> {
+    let mut tag = [0_u8; 1];
+    reader
+        .read_exact(&mut tag)
+        .map_err(foyer::Error::io_error)?;
+    decode_positioned_row_set(tag[0], reader)
 }
 
 /// Reads back the body [`encode_positioned_row_set`] wrote, given the
