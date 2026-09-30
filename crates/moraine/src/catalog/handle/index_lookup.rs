@@ -42,6 +42,81 @@ struct LookupResolution {
     metrics: LookupMetrics,
 }
 
+/// Probe tasks one batched lookup may run at once. A probe is synchronous
+/// between its await points, so putting every probe of a batch in flight on
+/// one task costs what a loop costs; tasks are what put more than one core
+/// on the batch.
+fn probe_tasks() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, std::num::NonZero::get)
+        .saturating_mul(2)
+        .clamp(2, 32)
+}
+
+/// Keys below which a batch resolves on the caller's task. Spawning costs
+/// more than it saves once a batch is small enough that one core finishes
+/// it while the tasks are still being set up.
+const CHUNKED_PROBE_KEYS: usize = 16;
+
+/// Resolves the batch as one adjacent run per task. The keys arrive sorted,
+/// so a chunk walks neighbouring entries and the tasks divide the batch
+/// rather than interleaving on it.
+async fn resolve_chunked(
+    owned: &crate::store::handle::OwnedReadHandle,
+    index_id: u64,
+    unique: bool,
+    encoded: Vec<CanonicalKey>,
+) -> Result<LookupResolution> {
+    let started = Instant::now();
+    let tasks = encoded.len().min(probe_tasks()).max(1);
+    let size = encoded.len().div_ceil(tasks);
+
+    let mut joined = Vec::with_capacity(tasks);
+    for chunk in encoded.chunks(size) {
+        let owned = owned.clone();
+        let keys = chunk.to_vec();
+        joined.push(tokio::spawn(async move {
+            let mut rows = Vec::new();
+            let (mut hits, mut misses) = (0u64, 0u64);
+            let mut service = Duration::ZERO;
+            for key in keys {
+                let probe = Instant::now();
+                let found =
+                    index_maintenance::lookup_row_ids(owned.borrow(), index_id, unique, &key)
+                        .await?;
+                service = service.saturating_add(probe.elapsed());
+                if found.is_empty() {
+                    misses = misses.saturating_add(1);
+                } else {
+                    hits = hits.saturating_add(1);
+                    rows.extend(found);
+                }
+            }
+            Ok::<_, Error>((rows, hits, misses, service))
+        }));
+    }
+
+    let mut metrics = LookupMetrics {
+        peak_in_flight: u64::try_from(tasks).unwrap_or(u64::MAX),
+        ..LookupMetrics::default()
+    };
+    let mut row_ids = Vec::new();
+    for task in joined {
+        let (rows, hits, misses, service) = task
+            .await
+            .map_err(|error| Error::Interrupted(error.to_string()))??;
+        row_ids.extend(rows);
+        metrics.hits = metrics.hits.saturating_add(hits);
+        metrics.misses = metrics.misses.saturating_add(misses);
+        metrics.probe_service = metrics.probe_service.saturating_add(service);
+    }
+    metrics.probe_window = started.elapsed();
+
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    Ok(LookupResolution { row_ids, metrics })
+}
+
 async fn resolve_encoded(
     handle: ReadHandle<'_>,
     index_id: u64,
@@ -148,9 +223,19 @@ impl ReadOnlyCatalog {
             .lookup_at_head(&mut session, table, index, async |handle, info| {
                 let head = started.elapsed();
                 let encoded = encode_lookup_keys(keys, &info, index)?;
+                // A non-unique probe is a prefix scan, whose cost is building
+                // the iterator rather than reading what it returns, so a
+                // batch of them divides across tasks. A unique probe is a
+                // point read and stays on the caller's task.
+                let chunked = (!info.unique && encoded.len() >= CHUNKED_PROBE_KEYS)
+                    .then(|| self.owned_read_handle());
                 self.scoped_probe(table, index, Probe::Many(encoded.clone()), async || {
-                    let mut resolution =
-                        resolve_encoded(handle, index.get(), info.unique, encoded).await?;
+                    let mut resolution = match &chunked {
+                        Some(owned) => {
+                            resolve_chunked(owned, index.get(), info.unique, encoded).await?
+                        }
+                        None => resolve_encoded(handle, index.get(), info.unique, encoded).await?,
+                    };
                     resolution.metrics.head = head;
                     // One line per resolved lookup, and only what naming it
                     // costs nothing to carry: a probe reused inside a

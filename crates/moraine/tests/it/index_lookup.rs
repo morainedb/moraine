@@ -150,3 +150,83 @@ async fn index_lookup_many_accepts_an_empty_key_set() {
             .is_empty()
     );
 }
+
+/// A batch large enough to divide across tasks answers exactly what the
+/// same keys answer one at a time, through a pinned scope and without one.
+/// Multi-valued keys, absent keys and duplicates all have to survive the
+/// split, since a chunk boundary can fall anywhere among them.
+#[tokio::test]
+async fn a_chunked_batch_answers_what_single_key_lookups_answer() {
+    const VALUES: i128 = 200;
+
+    let catalog = open_memory().await;
+    let created = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").unwrap().id;
+            let table = tx.create_table(schema, "chunked", &[col("value")])?;
+            // Two rows per value, so a probe returns more than it is asked.
+            let entries: Vec<_> = (0..VALUES)
+                .flat_map(|value| {
+                    [0u64, 1].map(|row| IndexEntry {
+                        row_id: u64::try_from(value).unwrap() * 2 + row,
+                        values: vec![Some(key(value))],
+                    })
+                })
+                .collect();
+            let index = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_value".into(),
+                    columns: vec![moraine::ColumnId::new(1)],
+                    unique: false,
+                },
+                &entries,
+            )?;
+            created.set(Some((table, index)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (table, index) = created.get().unwrap();
+
+    // Scattered, with duplicates and keys no row holds.
+    let mut asked: Vec<Vec<IndexKeyValue>> = (0..128)
+        .map(|i: i128| vec![key((i * 61) % (VALUES + 40))])
+        .collect();
+    asked.extend(asked.clone().into_iter().take(16));
+
+    let mut expected = Vec::new();
+    for one in &asked {
+        expected.extend(catalog.index_lookup(table, index, one).await.unwrap());
+    }
+    expected.sort_unstable();
+    expected.dedup();
+    assert!(
+        expected.len() > 200,
+        "the fixture must be big enough to divide"
+    );
+
+    assert_eq!(
+        catalog
+            .index_lookup_many(table, index, &asked)
+            .await
+            .unwrap(),
+        expected,
+        "a batch resolved across tasks disagreed with single-key lookups"
+    );
+
+    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    assert_eq!(
+        scope
+            .reads()
+            .index_lookup_many(table, index, &asked)
+            .await
+            .unwrap(),
+        expected,
+        "a pinned scope's batch disagreed with single-key lookups"
+    );
+    drop(scope);
+
+    catalog.close().await.unwrap();
+}

@@ -751,6 +751,21 @@ impl ReadOnlyCatalog {
     /// warm read-write handle; `None` on a read-only handle or a cold
     /// writer. The view stands at head: this handle is the store's only
     /// writer. Pair a pass over it with [`still_holds`](Self::still_holds).
+    /// A handle owning what it reads through, so work on it can run on a
+    /// task: the pinned scope's transaction when one is held, else the
+    /// store's own writer or reader.
+    pub(crate) fn owned_read_handle(&self) -> crate::store::handle::OwnedReadHandle {
+        use crate::store::handle::OwnedReadHandle;
+
+        if let Some(pinned) = &self.pinned {
+            return OwnedReadHandle::Tx(pinned.transaction.clone());
+        }
+        match self.store.as_ref() {
+            Store::Writer { db, .. } => OwnedReadHandle::Writer(db.clone()),
+            Store::Reader(reader) => OwnedReadHandle::Reader(reader.clone()),
+        }
+    }
+
     pub(crate) fn warm_writer_read(
         &self,
     ) -> Result<Option<(Arc<CatalogSnapshot>, ReadHandle<'_>)>> {
