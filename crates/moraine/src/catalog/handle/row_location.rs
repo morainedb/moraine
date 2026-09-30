@@ -20,7 +20,7 @@ use crate::{
         FileIndexRemoval, FileRowCandidate, IndexInfo, SnapshotId, TableId, resolve_data_path,
         snapshot::{data_file_info, delete_file_info},
     },
-    data_file::{self, DataStore, FileSummary},
+    data_file::{self, DataStore, FileSummary, SidecarSweep, sidecar},
     error::{Error, Result},
     store::index_encoding::IndexKeyValue,
     telemetry::milliseconds,
@@ -213,7 +213,7 @@ fn positioned_rows(
 
     let mut positions = Vec::with_capacity(rows.len());
     for row_id in rows {
-        let found = summary.visit_positions(*row_id, |position| positions.push(position));
+        let found = summary.visit_positions(*row_id, |position| positions.push(position))?;
         if !found && matches!(missing, MissingRows::Reject) {
             return Err(Error::RowPosition {
                 row_id: *row_id,
@@ -228,13 +228,14 @@ fn positioned_rows(
     Ok(positions)
 }
 
-/// What one warming pass did.
+/// What one publishing pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RowSummaryWarmth {
+pub struct RowSummaryPublish {
     /// Current data files the pass looked at.
     pub files_considered: u64,
-    /// Files whose row-id column it read and cached. The rest were already
-    /// resident or answer from their dense range.
+    /// Files whose row-id column it read, cached and published. The rest
+    /// were already resident, answered from a summary published earlier,
+    /// or answer from their dense range.
     pub summaries_built: u64,
     /// Files it could not summarize. They stay correct but cold: a later
     /// lookup leaves every requested row a candidate for them.
@@ -251,10 +252,16 @@ impl ReadOnlyCatalog {
         table_prefix: &str,
         table: TableId,
         files: Vec<DataFileInfo>,
+        want: data_file::Want,
     ) -> Vec<(DataFileId, Result<FileSummary>)> {
         stream::iter(files.into_iter().map(|file| {
-            let retained =
-                self.retained_file_summary(store, data_prefix, table_prefix, table, &file);
+            let retained = self
+                .retained_file_summary(store, data_prefix, table_prefix, table, &file)
+                .filter(|summary| {
+                    // A summary held for membership alone cannot answer a
+                    // caller resolving positions, which fetches instead.
+                    want == data_file::Want::Membership || summary.resolves_positions()
+                });
             let relative =
                 resolve_data_path(data_prefix, table_prefix, &file.path, file.path_is_relative);
             let store = store.clone();
@@ -280,6 +287,7 @@ impl ReadOnlyCatalog {
                     file.id.get(),
                     file.row_id_start,
                     file.record_count,
+                    want,
                 )
                 .await;
                 (file.id, summary)
@@ -624,6 +632,7 @@ impl ReadOnlyCatalog {
                 scope.table_prefix,
                 scope.table,
                 requested_files,
+                data_file::Want::Positions,
             )
             .await
             .into_iter()
@@ -717,7 +726,8 @@ impl ReadOnlyCatalog {
         })
     }
 
-    /// Builds and caches the summaries a lookup would otherwise build cold.
+    /// Derives the summaries a lookup would otherwise build cold, publishing
+    /// each one it had to read beside the file it describes.
     ///
     /// Best-effort and idempotent: a file already resident, or answering
     /// from its dense range, costs nothing, and a file that cannot be read
@@ -726,31 +736,32 @@ impl ReadOnlyCatalog {
     /// # Errors
     ///
     /// Returns a store error if the head view cannot be read. Per-file
-    /// failures are reported in [`RowSummaryWarmth::files_failed`].
-    pub async fn warm_row_summaries(
+    /// failures are reported in [`RowSummaryPublish::files_failed`].
+    pub async fn publish_row_summaries(
         &self,
         data_store: DataStore,
         data_prefix: &str,
         table: TableId,
-    ) -> Result<RowSummaryWarmth> {
+    ) -> Result<RowSummaryPublish> {
         let snapshot = self.snapshot().await?;
 
-        self.warm_table(&snapshot, &data_store, data_prefix, table)
+        self.publish_table(&snapshot, &data_store, data_prefix, table)
             .await
     }
 
-    /// Builds and caches the summaries a lookup would otherwise build cold,
-    /// for every table the catalog currently holds.
+    /// Derives and publishes the summaries of every file registered after
+    /// `since`, across every table the catalog holds.
     ///
     /// # Errors
     ///
     /// Returns a store error if the head view cannot be read. Per-file
-    /// failures are reported in [`RowSummaryWarmth::files_failed`].
-    pub async fn warm_all_row_summaries(
+    /// failures are reported in [`RowSummaryPublish::files_failed`].
+    pub async fn publish_row_summaries_since(
         &self,
         data_store: DataStore,
         data_prefix: &str,
-    ) -> Result<RowSummaryWarmth> {
+        since: SnapshotId,
+    ) -> Result<RowSummaryPublish> {
         let snapshot = self.snapshot().await?;
         let tables = snapshot
             .schemas()
@@ -759,7 +770,68 @@ impl ReadOnlyCatalog {
             .map(|table| table.id)
             .collect::<Vec<_>>();
 
-        self.warm_selected_row_summaries(data_store, data_prefix, tables)
+        let mut total = RowSummaryPublish::default();
+        for table in tables {
+            let table_total = self
+                .summarize_table_since(&snapshot, &data_store, data_prefix, table, since)
+                .await?;
+            total = RowSummaryPublish {
+                files_considered: total
+                    .files_considered
+                    .saturating_add(table_total.files_considered),
+                summaries_built: total
+                    .summaries_built
+                    .saturating_add(table_total.summaries_built),
+                files_failed: total.files_failed.saturating_add(table_total.files_failed),
+            };
+        }
+
+        Ok(total)
+    }
+
+    /// Deletes published row summaries whose data file is no longer under
+    /// `data_prefix`, which is how a sidecar that outlived its file is
+    /// reclaimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the prefix cannot be listed. Deletes that
+    /// fail are counted in [`SidecarSweep::failed`] and left for the next
+    /// sweep.
+    pub async fn sweep_published_summaries(
+        &self,
+        data_store: DataStore,
+        data_prefix: &str,
+    ) -> Result<SidecarSweep> {
+        let prefix = object_store::path::Path::parse(data_prefix.trim_end_matches('/'))
+            .map_err(|error| Error::Corruption(format!("invalid data path: {error}")))?;
+
+        sidecar::sweep(&data_store, &prefix).await
+    }
+
+    /// As [`publish_row_summaries`](Self::publish_row_summaries), for every
+    /// table the catalog currently holds. Unbounded by design: prefer
+    /// [`publish_row_summaries_since`](Self::publish_row_summaries_since)
+    /// once a lake is already published.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the head view cannot be read. Per-file
+    /// failures are reported in [`RowSummaryPublish::files_failed`].
+    pub async fn publish_all_row_summaries(
+        &self,
+        data_store: DataStore,
+        data_prefix: &str,
+    ) -> Result<RowSummaryPublish> {
+        let snapshot = self.snapshot().await?;
+        let tables = snapshot
+            .schemas()
+            .into_iter()
+            .flat_map(|schema| snapshot.tables_in(schema.id))
+            .map(|table| table.id)
+            .collect::<Vec<_>>();
+
+        self.publish_selected_row_summaries(data_store, data_prefix, tables)
             .await
     }
 
@@ -769,60 +841,142 @@ impl ReadOnlyCatalog {
     /// # Errors
     ///
     /// Returns a store error if the head view cannot be read. Per-file
-    /// failures are reported in [`RowSummaryWarmth::files_failed`].
-    pub async fn warm_selected_row_summaries(
+    /// failures are reported in [`RowSummaryPublish::files_failed`].
+    pub async fn publish_selected_row_summaries(
         &self,
         data_store: DataStore,
         data_prefix: &str,
         tables: Vec<TableId>,
-    ) -> Result<RowSummaryWarmth> {
+    ) -> Result<RowSummaryPublish> {
         let snapshot = self.snapshot().await?;
         let total = stream::iter(tables)
-            .map(|table| self.warm_table(&snapshot, &data_store, data_prefix, table))
+            .map(|table| self.publish_table(&snapshot, &data_store, data_prefix, table))
             .buffer_unordered(WARM_TABLE_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?
             .into_iter()
-            .fold(RowSummaryWarmth::default(), |acc, table| RowSummaryWarmth {
-                files_considered: acc.files_considered.saturating_add(table.files_considered),
-                summaries_built: acc.summaries_built.saturating_add(table.summaries_built),
-                files_failed: acc.files_failed.saturating_add(table.files_failed),
+            .fold(RowSummaryPublish::default(), |acc, table| {
+                RowSummaryPublish {
+                    files_considered: acc.files_considered.saturating_add(table.files_considered),
+                    summaries_built: acc.summaries_built.saturating_add(table.summaries_built),
+                    files_failed: acc.files_failed.saturating_add(table.files_failed),
+                }
             });
 
         Ok(total)
     }
 
-    /// One table's warming pass against an already-resolved head view.
-    async fn warm_table(
+    /// One table's publishing pass against an already-resolved head view.
+    async fn publish_table(
         &self,
         snapshot: &CatalogSnapshot,
         data_store: &DataStore,
         data_prefix: &str,
         table: TableId,
-    ) -> Result<RowSummaryWarmth> {
-        let table_prefix = snapshot.table_data_prefix(table)?;
+    ) -> Result<RowSummaryPublish> {
         let files = snapshot.data_files_of(table);
-        let mut warmth = RowSummaryWarmth {
+        self.summarize_files(snapshot, data_store, data_prefix, table, files)
+            .await
+    }
+
+    /// One table's files registered after `since`, which is what a commit
+    /// just landed rather than everything the table holds.
+    async fn summarize_table_since(
+        &self,
+        snapshot: &CatalogSnapshot,
+        data_store: &DataStore,
+        data_prefix: &str,
+        table: TableId,
+        since: SnapshotId,
+    ) -> Result<RowSummaryPublish> {
+        let files = snapshot
+            .data_files
+            .get(&table.get())
+            .map(|files| {
+                files
+                    .values()
+                    .filter(|file| file.begin_snapshot > since.get())
+                    .map(data_file_info)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        self.summarize_files(snapshot, data_store, data_prefix, table, files)
+            .await
+    }
+
+    /// Publishes `files`' summaries, skipping those already published and
+    /// those whose ids the catalog already describes.
+    ///
+    /// Concurrency matches a lookup's, and nothing here enters the summary
+    /// caches: a pass over a lake must not evict the working set of the
+    /// process running it.
+    async fn summarize_files(
+        &self,
+        snapshot: &CatalogSnapshot,
+        data_store: &DataStore,
+        data_prefix: &str,
+        table: TableId,
+        files: Vec<DataFileInfo>,
+    ) -> Result<RowSummaryPublish> {
+        if files.is_empty() {
+            return Ok(RowSummaryPublish::default());
+        }
+        let table_prefix = snapshot.table_data_prefix(table)?;
+        let mut published = RowSummaryPublish {
             files_considered: u64::try_from(files.len()).unwrap_or(u64::MAX),
-            ..RowSummaryWarmth::default()
+            ..RowSummaryPublish::default()
         };
 
-        for (data_file_id, summary) in self
-            .file_summaries(data_store, data_prefix, &table_prefix, table, files)
-            .await
-        {
-            match summary {
-                Ok(summary) if summary.built => {
-                    warmth.summaries_built = warmth.summaries_built.saturating_add(1);
+        let outcomes = stream::iter(files.into_iter().map(|file| {
+            let resolved = resolve_data_path(
+                data_prefix,
+                &table_prefix,
+                &file.path,
+                file.path_is_relative,
+            );
+            let store = data_store.clone();
+            let metrics = self.data_read_metrics();
+
+            async move {
+                let written = match resolved {
+                    Ok(path) => {
+                        data_file::publish_if_missing(
+                            data_file::ParquetFile::new(
+                                store,
+                                path,
+                                file.file_size_bytes,
+                                file.footer_size,
+                            )
+                            .with_metrics(metrics),
+                            table.get(),
+                            file.id.get(),
+                            file.row_id_start,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                (file.id, written)
+            }
+        }))
+        .buffer_unordered(SUMMARY_READ_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        for (data_file_id, written) in outcomes {
+            match written {
+                Ok(true) => {
+                    published.summaries_built = published.summaries_built.saturating_add(1);
                 }
-                Ok(_) => {}
+                Ok(false) => {}
                 Err(error) => {
-                    warmth.files_failed = warmth.files_failed.saturating_add(1);
+                    published.files_failed = published.files_failed.saturating_add(1);
                     warn!(
                         table_id = table.get(),
                         data_file_id = data_file_id.get(),
                         %error,
-                        "row summary warm skipped a file it could not read"
+                        "publishing skipped a row summary it could not read"
                     );
                 }
             }
@@ -830,13 +984,13 @@ impl ReadOnlyCatalog {
 
         debug!(
             table_id = table.get(),
-            files_considered = warmth.files_considered,
-            summaries_built = warmth.summaries_built,
-            files_failed = warmth.files_failed,
-            "row summaries warmed"
+            files_considered = published.files_considered,
+            summaries_built = published.summaries_built,
+            files_failed = published.files_failed,
+            "row summaries published"
         );
 
-        Ok(warmth)
+        Ok(published)
     }
 }
 

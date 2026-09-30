@@ -820,7 +820,7 @@ the file's metadata, never its rows, so building at registration would mean
 reading back the Parquet it was just told about, inside the commit path. A
 summary is also process-local, and the writer is not the process that reads.
 
-`ReadOnlyCatalog::warm_row_summaries` therefore exists to move that cost off
+`ReadOnlyCatalog::publish_row_summaries` therefore exists to move that cost off
 the first lookup rather than into the commit: a caller spawns it after a
 commit that lands compaction outputs, and it builds exactly the summaries a
 cold lookup would. It is best-effort and idempotent — a resident or dense

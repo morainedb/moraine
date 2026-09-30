@@ -213,7 +213,14 @@ async fn retained_permuted_summaries_survive_auxiliary_eviction() {
     );
     let start = std::time::Instant::now();
     let summaries = catalog
-        .file_summaries(&store, "", &directory.table_prefix, table, vec![file])
+        .file_summaries(
+            &store,
+            "",
+            &directory.table_prefix,
+            table,
+            vec![file],
+            crate::data_file::Want::Positions,
+        )
         .await;
     let summary = summaries[0].1.as_ref().unwrap();
     assert!(

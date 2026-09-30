@@ -1191,8 +1191,8 @@ where
 /// Every repetition attaches fresh and hands `locate_row_ids` a fresh data
 /// store handle, so `locate_cold` builds every file's summary; the summary
 /// cache is keyed by the handle. `locate_warm` repeats the ids on the same
-/// handle. `locate_after_warm_row_summaries` is the first lookup behind an
-/// explicit `warm_row_summaries` on another fresh attach and handle.
+/// handle. `locate_after_publish_row_summaries` is the first lookup behind an
+/// explicit `publish_row_summaries` on another fresh attach and handle.
 ///
 /// A measurement, not an assertion — it prints and passes.
 #[tokio::test]
@@ -1313,7 +1313,7 @@ async fn measure_located_lookup_latency_against_the_endpoint() {
         let data_store = moraine::DataStore::new(s3_store());
         let (elapsed, main_gets, data_gets, warmth) = timed_located(
             &reader,
-            Box::pin(reader.warm_row_summaries(data_store.clone(), &data_prefix, table)),
+            Box::pin(reader.publish_row_summaries(data_store.clone(), &data_prefix, table)),
         )
         .await;
         let warmth = warmth.unwrap();
@@ -1339,7 +1339,7 @@ async fn measure_located_lookup_latency_against_the_endpoint() {
     let warmth = first_warmth.expect("at least one repetition");
     let (range, roaring, sorted, bytes) = first_summaries.unwrap_or_default();
     println!(
-        "# warm_row_summaries considered {} files and built {} summaries; the cold locate added \
+        "# publish_row_summaries considered {} files and built {} summaries; the cold locate added \
          {range} range, {roaring} roaring, and {sorted} sorted row summaries ({bytes} bytes) to \
          the auxiliary cache\n",
         warmth.files_considered, warmth.summaries_built,
@@ -1351,7 +1351,7 @@ async fn measure_located_lookup_latency_against_the_endpoint() {
     attach.print("attach_read_only");
     locate_cold.print("locate_cold");
     locate_warm.print("locate_warm");
-    warm_summaries.print("warm_row_summaries");
-    locate_after_warm.print("locate_after_warm_row_summaries");
+    warm_summaries.print("publish_row_summaries");
+    locate_after_warm.print("locate_after_publish_row_summaries");
     println!();
 }

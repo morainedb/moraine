@@ -56,6 +56,35 @@ impl DataStore {
         .await
     }
 
+    /// Reads at most `len` bytes from the start of `path`, returning what
+    /// is there when the object is shorter. A caller that has not yet read
+    /// a header cannot know the object's size, so this asks for more than
+    /// it may get rather than taking a size first.
+    pub(crate) async fn read_prefix(&self, path: &Path, len: u64) -> object_store::Result<Bytes> {
+        let options = object_store::GetOptions {
+            range: Some(object_store::GetRange::Bounded(0..len)),
+            ..object_store::GetOptions::default()
+        };
+        retry::retrying("a sidecar read", path, || async {
+            self.store
+                .get_opts(path, options.clone())
+                .await?
+                .bytes()
+                .await
+        })
+        .await
+    }
+
+    /// Replaces whatever is at `path`. A sidecar's contents are a function
+    /// of the file it describes, so a racing writer writes the same bytes.
+    pub(crate) async fn write(&self, path: &Path, bytes: Bytes) -> object_store::Result<()> {
+        retry::retrying("a sidecar write", path, || {
+            self.store.put(path, bytes.clone().into())
+        })
+        .await
+        .map(|_| ())
+    }
+
     /// [`Self::read_range`] over several ranges in one request, so the
     /// store can still coalesce adjacent chunks.
     pub(crate) async fn read_ranges(

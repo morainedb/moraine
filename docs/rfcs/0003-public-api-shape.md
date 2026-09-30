@@ -192,7 +192,7 @@ on. Rows of one chunk share one body and rows of one schema version share one
 schema, so each set of bytes is read and returned once however many rows
 reference it.
 
-`warm_tables(&[table])` is the one read that returns nothing: it pulls the
+`publish_tables(&[table])` is the one read that returns nothing: it pulls the
 `index` and `inline` ranges a lookup on those tables probes into the block
 cache (RFC 0009), for a host that knows which tables a query is about to
 touch. The same pass runs on its own, in the background, the first time a
@@ -214,7 +214,7 @@ marked `#[non_exhaustive]` so fields can be added without a break:
   sent for the catalog store; `data_gets` and `data_bytes` count the byte
   ranges the handle read from the data store — footers, row-id columns,
   delete files, and scoped reads under `locate_row_ids`,
-  `warm_row_summaries`, backfill, index build, and commit-time index
+  `publish_row_summaries`, backfill, index build, and commit-time index
   maintenance. A footer or summary served from cache adds nothing.
 
 ### Writes: closure-with-retry
@@ -315,7 +315,7 @@ The public surface is hand-written domain types, decoupled from the
   `SortSpec`, `SortKeyDef`, `ColumnStats`, `TableStats`, `OptionScope`,
   `TagTarget`, `InlineChunk`, `FlushedDataFile`, `RecentRow`.
 - **`DataStore`:** the `DATA_PATH` object store every data-file read takes
-  (`locate_row_ids`, `warm_row_summaries`, backfill, index build, staged
+  (`locate_row_ids`, `publish_row_summaries`, backfill, index build, staged
   transactions), wrapping the `Arc<dyn ObjectStore>` with the identity the
   footer and row-summary caches key on. Built once per store and cloned:
   `DataStore::new` assigns an isolated random identity, regardless of the

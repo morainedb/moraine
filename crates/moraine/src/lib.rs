@@ -254,12 +254,12 @@ pub use catalog::{
     LocatedRowScan, MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef,
     MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep, MappingId,
     MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef,
-    PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow, RowSummaryWarmth, ScheduledDeletion,
+    PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow, RowSummaryPublish, ScheduledDeletion,
     SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus,
     StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo,
     TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
 };
-pub use data_file::DataStore;
+pub use data_file::{DataStore, SidecarSweep, SidecarTally, sidecar_tally};
 pub use error::{Error, Result};
 /// Fault injection for the migration driver. Unstable and not part of the
 /// semver contract.
