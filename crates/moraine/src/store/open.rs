@@ -112,6 +112,7 @@ pub(crate) struct StoreBuilder<'a> {
     cache_identity: crate::CacheIdentity,
     cache_size: Option<u64>,
     cache_memory: Option<u64>,
+    cache_auxiliary_percent: Option<u32>,
     cache_preload: Option<CachePreload>,
     cache_puts: bool,
     cache_compaction_puts: bool,
@@ -136,6 +137,7 @@ impl<'a> StoreBuilder<'a> {
             cache_identity: crate::CacheIdentity::default(),
             cache_size: None,
             cache_memory: None,
+            cache_auxiliary_percent: None,
             cache_preload: None,
             cache_puts: true,
             cache_compaction_puts: true,
@@ -199,6 +201,15 @@ impl<'a> StoreBuilder<'a> {
     /// whole process.
     pub(crate) fn cache_memory(mut self, cache_memory: Option<u64>) -> Self {
         self.cache_memory = cache_memory;
+        self
+    }
+
+    /// Sets the percent of each cache budget the auxiliary slot takes, for
+    /// parsed Parquet metadata and file row summaries. Process-wide and
+    /// settled by the first attach, like the budgets it divides. Unset
+    /// keeps the derived share.
+    pub(crate) fn cache_auxiliary_percent(mut self, percent: Option<u32>) -> Self {
+        self.cache_auxiliary_percent = percent;
         self
     }
 
@@ -358,6 +369,7 @@ impl<'a> StoreBuilder<'a> {
     /// How this store asks for the process-shared cache.
     fn cache_config(&self) -> cache::CacheConfig {
         cache::CacheConfig {
+            auxiliary_percent: self.cache_auxiliary_percent,
             memory: self.cache_memory,
             dir: self.cache_dir.clone(),
             disk_size: self.cache_size,
@@ -726,6 +738,7 @@ mod tests {
         assert_eq!(
             configured.cache_config(),
             cache::CacheConfig {
+                auxiliary_percent: None,
                 memory: Some(1 << 30),
                 dir: Some(dir),
                 disk_size: Some(64 * 1024 * 1024),

@@ -55,6 +55,7 @@ fn attach_memory() -> *mut MoraineCatalogHandle {
             0,
             0,
             0,
+            0,
             false,
             std::ptr::null(),
             std::ptr::null(),

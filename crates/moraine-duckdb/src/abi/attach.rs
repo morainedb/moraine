@@ -431,6 +431,50 @@ fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError 
 }
 
 /// The object-cache cap an ABI byte count names; zero means "not given".
+/// The runtime an attach owns, sized for a host running `host_threads`.
+fn attach_runtime(
+    log_id: crate::logging::HandleId,
+    host_threads: u64,
+) -> Result<tokio::runtime::Runtime, AbiError> {
+    new_runtime(log_id, usize::try_from(host_threads).unwrap_or(usize::MAX)).map_err(|error| {
+        AbiError::new(
+            codes::INTERNAL,
+            format!("failed to start tokio runtime: {error}"),
+        )
+    })
+}
+
+/// The cache arguments one attach carries, so setting them is one call.
+pub(super) struct CacheArguments<'a> {
+    pub(super) dir: Option<&'a str>,
+    pub(super) size_bytes: u64,
+    pub(super) memory_bytes: u64,
+    pub(super) auxiliary_percent: u32,
+    pub(super) preload: u8,
+    pub(super) puts: bool,
+    pub(super) compaction_puts: bool,
+}
+
+/// Applies `arguments` to `options`, failing on an unknown preload name.
+pub(super) fn set_cache_options(
+    options: &mut CatalogOptions,
+    arguments: &CacheArguments<'_>,
+) -> Result<(), AbiError> {
+    options.cache_dir = arguments.dir.map(std::path::PathBuf::from);
+    options.cache_size = cache_size_option(arguments.size_bytes);
+    options.cache_memory = cache_size_option(arguments.memory_bytes);
+    options.cache_auxiliary_percent = percent_option(arguments.auxiliary_percent);
+    options.cache_preload = cache_preload_option(arguments.preload)?;
+    options.cache_puts = arguments.puts;
+    options.cache_compaction_puts = arguments.compaction_puts;
+    Ok(())
+}
+
+/// A percent option, where zero is the caller saying nothing.
+pub(super) fn percent_option(percent: u32) -> Option<u32> {
+    (percent != 0).then_some(percent)
+}
+
 pub(super) fn cache_size_option(cache_size_bytes: u64) -> Option<u64> {
     (cache_size_bytes != 0).then_some(cache_size_bytes)
 }
@@ -541,6 +585,7 @@ pub unsafe extern "C" fn moraine_attach_with_cache_policy(
     cache_dir: *const c_char,
     cache_size_bytes: u64,
     cache_memory_bytes: u64,
+    cache_auxiliary_percent: u32,
     cache_preload: u8,
     cache_puts: bool,
     cache_compaction_puts: bool,
@@ -582,13 +627,7 @@ pub unsafe extern "C" fn moraine_attach_with_cache_policy(
         // from their first instant.
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
-        let runtime = new_runtime(log_id, usize::try_from(host_threads).unwrap_or(usize::MAX))
-            .map_err(|e| {
-                AbiError::new(
-                    codes::INTERNAL,
-                    format!("failed to start tokio runtime: {e}"),
-                )
-            })?;
+        let runtime = attach_runtime(log_id, host_threads)?;
 
         // SAFETY: `data_path` validity is this function's own safety contract.
         let data_path_arg = unsafe { opt_borrow_str(data_path, "data_path") }?.map(str::to_owned);
@@ -607,13 +646,19 @@ pub unsafe extern "C" fn moraine_attach_with_cache_policy(
         options.flush_interval =
             flush_interval_option(flush_interval_ms).unwrap_or(options.flush_interval);
         options.flush_on_commit = flush_on_commit;
-        options.cache_dir = cache_dir.map(std::path::PathBuf::from);
-        options.cache_size = cache_size_option(cache_size_bytes);
-        options.cache_memory = cache_size_option(cache_memory_bytes);
-        options.cache_preload = cache_preload_option(cache_preload)?;
+        set_cache_options(
+            &mut options,
+            &CacheArguments {
+                dir: cache_dir,
+                size_bytes: cache_size_bytes,
+                memory_bytes: cache_memory_bytes,
+                auxiliary_percent: cache_auxiliary_percent,
+                preload: cache_preload,
+                puts: cache_puts,
+                compaction_puts: cache_compaction_puts,
+            },
+        )?;
         let preload = options.cache_preload.is_some();
-        options.cache_puts = cache_puts;
-        options.cache_compaction_puts = cache_compaction_puts;
         options.checkpoint = checkpoint.map(str::to_owned);
         options.data_path.clone_from(&data_path_arg);
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
@@ -702,6 +747,7 @@ pub unsafe extern "C" fn moraine_attach(
     cache_dir: *const c_char,
     cache_size_bytes: u64,
     cache_memory_bytes: u64,
+    cache_auxiliary_percent: u32,
     cache_preload: u8,
     cache_puts: bool,
     data_path: *const c_char,
@@ -725,6 +771,7 @@ pub unsafe extern "C" fn moraine_attach(
             cache_dir,
             cache_size_bytes,
             cache_memory_bytes,
+            cache_auxiliary_percent,
             cache_preload,
             cache_puts,
             cache_puts,

@@ -59,6 +59,7 @@ fn assert_budget() {
 
 async fn scenario(disk: bool, admission: bool, root: &Path) {
     let config = CacheConfig {
+        auxiliary_percent: None,
         memory: Some(8 * 1024 * 1024),
         dir: disk.then(|| root.to_owned()),
         disk_size: Some(64 * 1024 * 1024),

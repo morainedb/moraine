@@ -437,3 +437,12 @@ query I con1
 SELECT count(*) FROM __ducklake_metadata_scoped.ducklake_data_file WHERE table_id = 2;
 ----
 1
+
+# The auxiliary slot's share is configurable and comes out of the budget it
+# divides rather than adding to it, so a caller sets the whole size.
+query I
+SELECT auxiliary_metadata_capacity_bytes > 0
+   AND auxiliary_metadata_capacity_bytes < metadata_capacity_bytes + block_capacity_bytes
+FROM moraine_cache_status();
+----
+true

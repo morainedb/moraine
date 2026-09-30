@@ -75,18 +75,50 @@ pub(crate) struct CacheConfig {
     pub(crate) dir: Option<PathBuf>,
     /// That device's byte cap.
     pub(crate) disk_size: Option<u64>,
+    /// Percent of each budget the auxiliary slot takes, in both memory and
+    /// disk. Unset keeps the derived share, which caps memory at 64 MiB and
+    /// takes an eightieth of a device sized for one store.
+    pub(crate) auxiliary_percent: Option<u32>,
 }
+
+/// The widest auxiliary share a caller may ask for. The slot it competes
+/// with holds SlateDB's own metadata and blocks, which a lookup needs
+/// before it needs a summary.
+const MAX_AUXILIARY_PERCENT: u32 = 50;
 
 impl CacheConfig {
     /// Bytes for scoped Parquet metadata and for the one cache SlateDB
     /// metadata and data blocks share.
     fn slots(&self) -> (u64, u64) {
         let budget = self.memory.unwrap_or(DEFAULT_CACHE_MEMORY).max(2);
-        let auxiliary_metadata =
-            (budget / AUXILIARY_METADATA_SHARE_DIVISOR).min(MAX_AUXILIARY_METADATA_MEMORY);
+        let auxiliary_metadata = match self.auxiliary_percent {
+            Some(percent) => {
+                budget.saturating_mul(u64::from(percent.min(MAX_AUXILIARY_PERCENT))) / 100
+            }
+            None => (budget / AUXILIARY_METADATA_SHARE_DIVISOR).min(MAX_AUXILIARY_METADATA_MEMORY),
+        };
         let shared = budget.saturating_sub(auxiliary_metadata).max(1);
 
         (auxiliary_metadata, shared)
+    }
+
+    /// Bytes for the one auxiliary device and for each store's own. A share
+    /// asked for is carved out of the cap, so one store's two devices sum to
+    /// it; the derived share is not, since the cap is per store while the
+    /// auxiliary cache is shared by all of them.
+    fn disk_slots(&self) -> (u64, u64) {
+        let budget = self.disk_size.unwrap_or(DEFAULT_CACHE_DISK);
+        let Some(percent) = self.auxiliary_percent else {
+            // Derived: the cap is per store and the auxiliary cache is not,
+            // so neither is sized out of the other.
+            return (
+                (budget / AUXILIARY_METADATA_SHARE_DIVISOR).max(MIN_AUXILIARY_DISK),
+                budget,
+            );
+        };
+        let auxiliary = budget.saturating_mul(u64::from(percent.min(MAX_AUXILIARY_PERCENT))) / 100;
+
+        (auxiliary, budget.saturating_sub(auxiliary).max(1))
     }
 }
 
@@ -1253,7 +1285,7 @@ async fn open_store_cache(settled: &CacheConfig, location: StoreLocation) -> Arc
     let hybrid = match settled.dir.as_ref() {
         Some(dir) => {
             let dir = dir.join(location.directory()).join("blocks");
-            let disk = settled.disk_size.unwrap_or(DEFAULT_CACHE_DISK);
+            let (_, disk) = settled.disk_slots();
             hybrid(&dir, initial, disk).await
         }
         None => None,
@@ -1284,12 +1316,11 @@ async fn open_store_cache(settled: &CacheConfig, location: StoreLocation) -> Arc
 async fn settle(config: &CacheConfig) {
     let (auxiliary_metadata_bytes, shared_bytes) = config.slots();
     AUXILIARY_METADATA_MEMORY.store(auxiliary_metadata_bytes, Ordering::Relaxed);
-    let auxiliary_disk =
-        config.disk_size.unwrap_or(DEFAULT_CACHE_DISK) / AUXILIARY_METADATA_SHARE_DIVISOR;
+    let (auxiliary_disk, _) = config.disk_slots();
     data_file::install_auxiliary(
         usize::try_from(auxiliary_metadata_bytes).unwrap_or(usize::MAX),
         config.dir.as_deref().map(|dir| dir.join("auxiliary-v2")),
-        auxiliary_disk.max(MIN_AUXILIARY_DISK),
+        auxiliary_disk,
     )
     .await;
 
@@ -1512,6 +1543,7 @@ mod tests {
         }
 
         let config = CacheConfig {
+            auxiliary_percent: None,
             memory: Some(8 * 1024 * 1024),
             dir: Some(cache_root),
             disk_size: Some(64 * 1024 * 1024),
@@ -1600,6 +1632,7 @@ mod tests {
     #[test]
     fn the_budget_includes_auxiliary_metadata() {
         let config = CacheConfig {
+            auxiliary_percent: None,
             memory: Some(1_000),
             ..CacheConfig::default()
         };
@@ -1625,6 +1658,7 @@ mod tests {
     fn the_auxiliary_allowance_scales_with_the_budget() {
         let allowance = |memory: u64| {
             CacheConfig {
+                auxiliary_percent: None,
                 memory: Some(memory),
                 ..CacheConfig::default()
             }
@@ -1646,6 +1680,7 @@ mod tests {
     #[tokio::test]
     async fn a_later_attachs_cache_options_are_reported_as_ignored() {
         let first = CacheConfig {
+            auxiliary_percent: None,
             memory: Some(4 * 1024 * 1024),
             ..CacheConfig::default()
         };
@@ -1657,6 +1692,7 @@ mod tests {
 
         // Whatever the second asks for, it is sized by the first's config.
         let second = CacheConfig {
+            auxiliary_percent: None,
             memory: Some(64 * 1024 * 1024),
             dir: Some(std::path::PathBuf::from("/tmp/moraine-ignored")),
             disk_size: Some(1),
@@ -1894,6 +1930,7 @@ mod tests {
     #[test]
     fn a_tiny_budget_still_splits() {
         let config = CacheConfig {
+            auxiliary_percent: None,
             memory: Some(1),
             ..CacheConfig::default()
         };
@@ -1922,5 +1959,49 @@ mod tests {
         assert!(
             status.auxiliary_metadata_occupancy_bytes <= status.auxiliary_metadata_capacity_bytes
         );
+    }
+
+    /// An auxiliary share is taken out of the budget it divides, not added
+    /// to it: one store's two devices sum to the configured cap, and the
+    /// memory slots sum to the configured budget. Unset keeps the derived
+    /// share, and a share wider than half the budget is clamped.
+    #[test]
+    fn an_auxiliary_share_comes_out_of_the_budget_it_divides() {
+        let config = |percent| CacheConfig {
+            memory: Some(8_000_000_000),
+            dir: None,
+            disk_size: Some(20 * 1024 * 1024 * 1024),
+            auxiliary_percent: percent,
+        };
+
+        // Unset: the eightieth, with memory held under its own ceiling.
+        let derived = config(None);
+        let (auxiliary, shared) = derived.slots();
+        assert_eq!(auxiliary, MAX_AUXILIARY_METADATA_MEMORY);
+        assert_eq!(auxiliary + shared, 8_000_000_000);
+        let (auxiliary_disk, store_disk) = derived.disk_slots();
+        assert_eq!(auxiliary_disk, 20 * 1024 * 1024 * 1024 / 80);
+        assert_eq!(
+            store_disk,
+            20 * 1024 * 1024 * 1024,
+            "a derived share must not shrink a device sized without it"
+        );
+
+        // Asked for: the share is honoured in both tiers and still summed.
+        let asked = config(Some(10));
+        let (auxiliary, shared) = asked.slots();
+        assert_eq!(auxiliary, 800_000_000);
+        assert_eq!(auxiliary + shared, 8_000_000_000);
+        let (auxiliary_disk, store_disk) = asked.disk_slots();
+        assert_eq!(auxiliary_disk, 2 * 1024 * 1024 * 1024);
+        assert_eq!(auxiliary_disk + store_disk, 20 * 1024 * 1024 * 1024);
+
+        // Clamped: the slot it competes with is never starved outright.
+        let (auxiliary, shared) = config(Some(90)).slots();
+        assert_eq!(
+            auxiliary,
+            8_000_000_000 / 100 * u64::from(MAX_AUXILIARY_PERCENT)
+        );
+        assert!(shared >= auxiliary);
     }
 }
