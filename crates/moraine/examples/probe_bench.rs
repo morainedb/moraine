@@ -149,6 +149,36 @@ async fn spawned(db: &Arc<Db>, values: &[u64]) -> Result<Duration, Failure> {
     Ok(started.elapsed())
 }
 
+/// `chunked`, with each task's own keys left in flight against each other:
+/// a task puts a core on the batch, and the probes inside it still overlap.
+async fn chunked_overlapped(
+    db: &Arc<Db>,
+    sorted: &[u64],
+    chunks: usize,
+) -> Result<Duration, Failure> {
+    let started = Instant::now();
+    let size = sorted.len().div_ceil(chunks.max(1));
+    let mut tasks = Vec::new();
+    for chunk in sorted.chunks(size) {
+        let db = Arc::clone(db);
+        let chunk = chunk.to_vec();
+        tasks.push(tokio::spawn(async move {
+            let mut probes: FuturesUnordered<_> =
+                chunk.iter().map(|&v| probe(Handle::Db(&db), v)).collect();
+            while let Some(found) = probes.next().await {
+                if found.is_err() {
+                    return false;
+                }
+            }
+            true
+        }));
+    }
+    for task in tasks {
+        task.await?;
+    }
+    Ok(started.elapsed())
+}
+
 /// Sorted keys cut into `chunks` adjacent runs, one task each: the spawn is
 /// paid per chunk, and a run's keys share the structure they walk.
 async fn chunked(db: &Arc<Db>, sorted: &[u64], chunks: usize) -> Result<Duration, Failure> {
@@ -209,14 +239,15 @@ async fn main() -> Result<(), Failure> {
         println!(
             "keys={count:<4} build={build:>9.2?} drain={drain:>9.2?} | \
              sequential={:>9.2?} unordered={:>9.2?} tx_unordered={tx_unordered:>9.2?} \
-             sorted={:>9.2?} seek={:>9.2?} spawned={:>9.2?} chunked8={:>9.2?} chunked16={:>9.2?}",
+             sorted={:>9.2?} seek={:>9.2?} spawned={:>9.2?} chunked16={:>9.2?} \
+             chunked16_overlapped={:>9.2?}",
             sequential(Handle::Db(&db), scattered).await?,
             unordered(Handle::Db(&db), scattered).await?,
             unordered(Handle::Db(&db), &sorted).await?,
             seeking(&db, &sorted).await?,
             spawned(&db, scattered).await?,
-            chunked(&db, &sorted, 8).await?,
             chunked(&db, &sorted, 16).await?,
+            chunked_overlapped(&db, &sorted, 16).await?,
         );
     }
 
