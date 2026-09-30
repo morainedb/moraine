@@ -223,6 +223,11 @@ pub struct CatalogOptions {
     /// SlateDB write buffers, catalog projections, commit staging, DuckDB,
     /// and allocator retention are additional when sizing a host.
     pub cache_memory: Option<u64>,
+    /// Percent of each cache budget the auxiliary slot takes, for parsed
+    /// Parquet metadata and file row summaries. Process-wide and settled by
+    /// the first attach; unset keeps the derived share, which caps memory at
+    /// 64 MiB and takes an eightieth of the configured device.
+    pub cache_auxiliary_percent: Option<u32>,
     /// What to warm into the cache while the catalog opens, so the first
     /// query pays no first touch. Warming is reading, so it is bounded by
     /// the same caps and best-effort throughout — a subspace that cannot
@@ -281,6 +286,7 @@ impl Default for CatalogOptions {
             cache_identity: None,
             cache_size: None,
             cache_memory: None,
+            cache_auxiliary_percent: None,
             cache_preload: None,
             cache_puts: true,
             cache_compaction_puts: true,
@@ -1170,6 +1176,7 @@ impl Catalog {
             .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
             .cache_memory(options.cache_memory)
+            .cache_auxiliary_percent(options.cache_auxiliary_percent)
             .cache_preload(options.cache_preload)
             .warm_segments(
                 manifest
@@ -1311,6 +1318,7 @@ impl Catalog {
             .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
             .cache_memory(options.cache_memory)
+            .cache_auxiliary_percent(options.cache_auxiliary_percent)
             .cache_preload(options.cache_preload)
             .warm_segments(
                 manifest
@@ -1433,6 +1441,7 @@ impl Catalog {
             .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
             .cache_memory(options.cache_memory)
+            .cache_auxiliary_percent(options.cache_auxiliary_percent)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts)
             .cache_compaction_puts(options.cache_compaction_puts)

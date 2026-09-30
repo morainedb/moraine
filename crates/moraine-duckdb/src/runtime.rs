@@ -515,6 +515,7 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 1,
                 false,
                 ptr::null(),

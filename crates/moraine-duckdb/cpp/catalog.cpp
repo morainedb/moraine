@@ -828,6 +828,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	std::string cache_dir;
 	uint64_t cache_size_bytes = 0;
 	uint64_t cache_memory_bytes = 0;
+	uint64_t cache_auxiliary_percent = 0;
 	bool cache_puts = true;
 	bool cache_compaction_puts = true;
 	uint8_t cache_preload = 1;
@@ -867,6 +868,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			cache_size_bytes = option.second.GetValue<uint64_t>();
 		} else if (name == "cache_memory") {
 			cache_memory_bytes = option.second.GetValue<uint64_t>();
+		} else if (name == "cache_auxiliary_percent") {
+			cache_auxiliary_percent = option.second.GetValue<uint64_t>();
 		} else if (name == "cache_puts") {
 			cache_puts = option.second.GetValue<bool>();
 		} else if (name == "cache_compaction_puts") {
@@ -902,6 +905,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	auto code = moraine_attach_with_cache_policy(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
 	                           flush_on_commit,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_memory_bytes,
+	                           static_cast<uint32_t>(cache_auxiliary_percent),
 	                           cache_preload, cache_puts, cache_compaction_puts,
 	                           data_path.empty() ? nullptr : data_path.c_str(),
 	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
