@@ -164,12 +164,13 @@ pub(crate) struct IndexMaintenanceMetrics {
     pub(crate) known_absent: u64,
     /// Unique deletes that read their entry to check which row holds it.
     pub(crate) guard_reads: u64,
-    /// Catalog-store reads the probe window took, and how many of them the
-    /// caches did not answer. A probe that clears a resident filter costs
-    /// nothing; one that fetches that filter costs a round trip, and only
-    /// these say which happened.
+    /// What the probe window's reads cost the caches. A probe clearing a
+    /// filter already in memory costs nothing; one the disk tier answers
+    /// pays a read and a decode; one neither tier holds pays a round trip.
+    /// Filters are metadata, so that is the count to read first.
     pub(crate) probe_store_misses: u64,
-    pub(crate) probe_store_gets: u64,
+    pub(crate) probe_metadata_disk_hits: u64,
+    pub(crate) probe_block_disk_hits: u64,
 }
 
 /// One unique put awaiting its committed-state probe.
@@ -726,7 +727,11 @@ where
             .metadata_misses
             .saturating_add(after.block_misses)
             .saturating_sub(before.metadata_misses.saturating_add(before.block_misses));
-        metrics.probe_store_gets = after.block_disk_hits.saturating_sub(before.block_disk_hits);
+        metrics.probe_metadata_disk_hits = after
+            .metadata_disk_hits
+            .saturating_sub(before.metadata_disk_hits);
+        metrics.probe_block_disk_hits =
+            after.block_disk_hits.saturating_sub(before.block_disk_hits);
     }
     poisoned.sort_unstable();
     poisoned.dedup();
