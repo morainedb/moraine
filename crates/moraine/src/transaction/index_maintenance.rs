@@ -1334,7 +1334,13 @@ mod tests {
                 _ = &mut staging => panic!("staging finished before deletion release"),
                 observed = observed_addition => observed.unwrap(),
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            // Driven, not just waited on: the probe runs on its own task,
+            // so staging has to be polled for its resolution to land while
+            // the deletion is still pending.
+            tokio::select! {
+                _ = &mut staging => panic!("staging finished before deletion release"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+            }
             release_deletion.send(()).unwrap();
             let staged = staging.as_mut().await.unwrap();
             assert_eq!(staged.metrics.unique_probes, 1);
