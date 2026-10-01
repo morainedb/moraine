@@ -102,8 +102,11 @@ also replaces and re-emits its function's return so it cannot land after that
 return.
 
 The source mapping lives in `source-pins`. Each entry binds one DuckDB release
-to the upstream DuckLake commit that release selects. A DuckDB bump must add a
-validated mapping before that release's build can fetch its DuckLake.
+to the upstream DuckLake commit that release selects, and a release's build
+cannot fetch its DuckLake without one. `cargo xtask bump-duckdb` writes the
+new release's entry and `check-pins` requires one per supported release, but
+neither says the series still lands where it should in that source — that is
+what `e2e` and the reading above are for.
 
 ## Build
 

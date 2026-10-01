@@ -892,7 +892,7 @@ mod tests {
             Path::new("/repo"),
             &patched,
             Path::new("/repo/build/libduckdb_static.a"),
-            "v1.5.5",
+            "v1.2.3",
             Some(&duckdb::CppCompilers {
                 c: "gcc-14",
                 cxx: "g++-14",
@@ -917,7 +917,7 @@ mod tests {
         assert!(
             arguments
                 .iter()
-                .any(|arg| arg == "-DOVERRIDE_GIT_DESCRIBE=v1.5.5")
+                .any(|arg| arg == "-DOVERRIDE_GIT_DESCRIBE=v1.2.3")
         );
         assert!(
             arguments

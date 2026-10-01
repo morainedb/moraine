@@ -243,7 +243,10 @@ per line, newest first, the first line carrying the commit each submodule
 must sit on. `xtask` reads it (`include_str!`), the release workflows build
 a matrix from it (`cargo xtask version-matrix`), and `cargo xtask
 check-pins` fails if any other place naming a version disagrees — the two
-submodules, both workflow files, and the table below.
+submodules, all three workflow files, the table below, the DuckLake source
+pin every supported release is built from, and the patch task's own target.
+It also fails when a supported release has no `validate` leg, since that
+matrix is written by hand while the build matrix is generated.
 
 | What | Pinned at |
 |---|---|
@@ -254,12 +257,14 @@ submodules, both workflow files, and the table below.
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/<version>/` (never committed) |
 | DuckLake (bundled) | the commit `INSTALL ducklake` resolves to against the pinned CLI, plus `patches/ducklake/` — see "The bundled DuckLake" below |
 
-**Bumping** is `cargo xtask bump-duckdb v1.5.6`: it moves both submodules
+**Bumping** is `cargo xtask bump-duckdb v1.5.7`: it moves both submodules
 to that release, rewrites the manifest around it, and carries every derived
-reference along — the workflow refs, the table above, and the DuckLake
-commit the new DuckDB declares. It stops short of the two things that are
-judgement rather than transcription: the codename above, and whether an
-older release should now leave the manifest.
+reference along — the workflow refs, the table above, the new release's
+DuckLake source pin, and the DuckLake commit the new DuckDB declares,
+wherever each is named. It stops short of the three things that are
+judgement rather than transcription: the codename above, whether an older
+release should now leave the manifest, and where the patch series lands in
+the DuckLake the new release declares.
 
 Then `cargo xtask check-pins` names whatever is still stale, and `cargo
 xtask e2e` re-proves the whole chain against the new pair, including the

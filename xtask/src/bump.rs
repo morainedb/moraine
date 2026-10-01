@@ -13,7 +13,7 @@ use anyhow::{Context, bail, ensure};
 
 use crate::{
     duckdb::{duckdb_pin, workspace_root},
-    pins::{DUCKLAKE_CONFIG, declared_ducklake_commit},
+    pins::{DUCKLAKE_CONFIG, DUCKLAKE_RELEASE_PINS, declared_ducklake_commit},
 };
 
 /// The submodules the primary entry pins, and the ref namespace each
@@ -28,12 +28,14 @@ const SUBMODULES: [(&str, &str); 2] = [
 /// Files naming the primary DuckDB version, its abbreviated commit, or
 /// the DuckLake commit that rides with it. Every one of them is checked
 /// by `check-pins`, which is what makes rewriting them mechanical.
-const PINNED_FILES: [&str; 5] = [
+const PINNED_FILES: [&str; 7] = [
     ".gitmodules",
     ".github/workflows/extension.yml",
     ".github/workflows/release.yml",
+    ".github/workflows/debug-build.yml",
     "crates/moraine-duckdb/README.md",
     "docs/rfcs/0006-extension-surface.md",
+    "xtask/src/ducklake_patch.rs",
 ];
 
 /// The wire-contract suite, which carries the DuckLake commit but no
@@ -74,6 +76,10 @@ pub fn bump_duckdb(arguments: &[String]) -> anyhow::Result<()> {
         MANIFEST,
         &rewrite_manifest(&read(MANIFEST)?, version, &pins),
     )?;
+    write(
+        DUCKLAKE_RELEASE_PINS,
+        &rewrite_source_pins(&read(DUCKLAKE_RELEASE_PINS)?, version, &ducklake),
+    )?;
 
     let duckdb_commit = pins
         .iter()
@@ -102,7 +108,9 @@ pub fn bump_duckdb(arguments: &[String]) -> anyhow::Result<()> {
         println!(
             "DuckLake moved {previous_ducklake} -> {ducklake}, because {version} declares it in \
              {DUCKLAKE_CONFIG}.\n  Read what changed before trusting the wire-contract pins: \
-             https://github.com/duckdb/ducklake/compare/{previous_ducklake}...{ducklake}"
+             https://github.com/duckdb/ducklake/compare/{previous_ducklake}...{ducklake}\n  \
+             Check where the patch series lands in it: a zero-context hunk applies at a line \
+             the new source may have moved, in the wrong place and often still compiling."
         );
     }
     println!(
@@ -143,6 +151,41 @@ fn rewrite_manifest(current: &str, version: &str, pins: &[(&str, String)]) -> St
     lines.push(&primary);
     let demoted: Vec<&str> = kept.collect();
     lines.extend(demoted);
+    format!("{}\n", lines.join("\n"))
+}
+
+/// The DuckLake source pins with `version` mapped to `commit`, newest
+/// first. Every other release keeps its own pin: it is still built, and
+/// still fetches the DuckLake its own DuckDB declares.
+fn rewrite_source_pins(current: &str, version: &str, commit: &str) -> String {
+    let is_pin = |line: &str| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && !trimmed.starts_with('#')
+    };
+    let names_version = |line: &str| line.split_whitespace().next() == Some(version);
+
+    let pin = format!("{version} {commit}");
+    let mut lines = Vec::new();
+    let mut placed = false;
+    for line in current.lines() {
+        if !is_pin(line) {
+            lines.push(line.to_owned());
+            continue;
+        }
+        if names_version(line) {
+            lines.push(pin.clone());
+            placed = true;
+            continue;
+        }
+        if !placed {
+            lines.push(pin.clone());
+            placed = true;
+        }
+        lines.push(line.to_owned());
+    }
+    if !placed {
+        lines.push(pin);
+    }
     format!("{}\n", lines.join("\n"))
 }
 
@@ -275,6 +318,34 @@ mod tests {
             1
         );
         assert!(bumped.ends_with("v1.5.4\n"));
+    }
+
+    #[test]
+    fn the_new_release_leads_the_source_pins_and_the_old_ones_keep_theirs() {
+        let pins = "# DuckDB version DuckLake commit\nv1.5.5 aaaa\nv1.5.4 bbbb\n";
+        assert_eq!(
+            rewrite_source_pins(pins, "v1.5.6", "cccc"),
+            "# DuckDB version DuckLake commit\nv1.5.6 cccc\nv1.5.5 aaaa\nv1.5.4 bbbb\n"
+        );
+    }
+
+    /// Re-running a bump re-pins that release in place rather than listing
+    /// it twice, which `check-pins` would then read as one pin too many.
+    #[test]
+    fn bumping_to_a_release_already_pinned_repins_it_where_it_is() {
+        let pins = "# head\nv1.5.6 stale\nv1.5.5 aaaa\n";
+        assert_eq!(
+            rewrite_source_pins(pins, "v1.5.6", "cccc"),
+            "# head\nv1.5.6 cccc\nv1.5.5 aaaa\n"
+        );
+    }
+
+    #[test]
+    fn a_source_pin_file_with_only_comments_gains_the_first_pin() {
+        assert_eq!(
+            rewrite_source_pins("# only a comment\n", "v1.5.6", "cccc"),
+            "# only a comment\nv1.5.6 cccc\n"
+        );
     }
 
     #[test]
