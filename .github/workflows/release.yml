@@ -80,8 +80,9 @@ jobs:
       test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir"}}'
 
   # The bundled DuckLake carries the patch series: prove a published build
-  # backfills row-ID statistics and prunes a scan by row id, on one Linux
-  # and one macOS build of every version, before anything is released.
+  # records row-ID statistics, prunes a scan by row id, and takes existing
+  # delete positions, on one Linux and one macOS build of every version,
+  # before anything is released.
   validate:
     name: Validate ${{ matrix.duckdb_version }} on ${{ matrix.runner }}
     needs: [should-release, build-extension]

@@ -1981,11 +1981,10 @@ static and dynamic `rowid` filters. A missing row is "unknown" and keeps the
 file, so a file registered before the patch was installed reads correctly and
 is never pruned.
 
-A reserved row-ID stat insert is the one file-stat insert a Moraine
-head-preserving maintenance batch may carry; every other file-stat insert
-still requires a snapshot. Nothing in-tree writes one — a repair tool for
-files that predate the writer would, and the earlier
-`ducklake_backfill_row_id_stats` did.
+Every file-stat insert requires a snapshot, the reserved row-ID column
+included: a head-preserving maintenance batch carries unversioned state
+only. A repair tool for files that predate the writer would need the
+snapshot a reserved-stat insert once rode without.
 
 **Resolution lives inside the scoped read.** The reader already fetches the
 file's footer; discovering the field-id column there costs nothing and

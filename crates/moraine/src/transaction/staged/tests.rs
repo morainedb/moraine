@@ -6108,12 +6108,10 @@ async fn maintenance_commit_rejects_entity_inserts() {
     catalog.close().await.unwrap();
 }
 
-/// Row-ID file statistics are derived from immutable Parquet files and are
-/// unversioned. A repair can therefore land without manufacturing a DuckLake
-/// snapshot, while still sharing the head stamp used to detect concurrent
-/// catalog changes.
+/// A file-stat insert is versioned state, so it is refused without a
+/// `ducklake_snapshot` insert — the reserved row-ID column included.
 #[tokio::test]
-async fn maintenance_commit_only_adds_row_id_file_stats_without_minting_a_snapshot() {
+async fn maintenance_commit_refuses_file_stats_without_minting_a_snapshot() {
     let catalog = open().await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
@@ -6140,33 +6138,16 @@ async fn maintenance_commit_only_adds_row_id_file_stats_without_minting_a_snapsh
     });
     tx.commit().await.unwrap();
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
-    tx.stage(RowOperation::Insert {
-        table: TableKind::FileColumnStats,
-        cells: file_column_stats_row(9, 1, 2_147_483_540, "0", "9"),
-    });
-    let id = tx.commit().await.unwrap();
-
-    assert_eq!(id.get(), 1);
-    let snapshot = catalog.snapshot().await.unwrap();
-    assert_eq!(snapshot.current_snapshot().id.get(), 1);
-    let stats = snapshot
-        .file_column_stats
-        .get(&1)
-        .and_then(|columns| columns.get(&(9, 2_147_483_540)))
-        .expect("backfilled row-ID stats");
-    assert_eq!(stats.min_value.as_deref(), Some("0"));
-    assert_eq!(stats.max_value.as_deref(), Some("9"));
-
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
-    tx.stage(RowOperation::Insert {
-        table: TableKind::FileColumnStats,
-        cells: file_column_stats_row(9, 1, 1, "0", "9"),
-    });
-    let err = tx.commit().await.unwrap_err();
-    assert!(matches!(err, Error::Constraint(_)), "{err}");
+    for column_id in [2_147_483_540, 1] {
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::FileColumnStats,
+            cells: file_column_stats_row(9, 1, column_id, "0", "9"),
+        });
+        let err = tx.commit().await.unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{column_id}: {err}");
+    }
 
     catalog.close().await.unwrap();
 }
