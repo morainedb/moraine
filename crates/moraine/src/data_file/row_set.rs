@@ -2,7 +2,7 @@
 
 use std::mem::size_of;
 
-use roaring::{RoaringBitmap, RoaringTreemap};
+use roaring::RoaringTreemap;
 
 use super::usize_as_u64;
 use crate::error::{Error, Result};
@@ -66,20 +66,11 @@ impl FileRowSet {
         }
 
         let raw_bytes = usize_as_u64(row_ids.len()).saturating_mul(size_of::<u64>() as u64);
-        let bitmaps = row_ids
-            .chunk_by(|left, right| high_word(*left) == high_word(*right))
-            .map(|partition| {
-                let mut bitmap = RoaringBitmap::from_sorted_iter(
-                    partition.iter().map(|row_id| low_word(*row_id)),
-                )
-                .map_err(|_| {
-                    Error::Constraint("file row ids must be strictly ascending".to_owned())
-                })?;
-                bitmap.optimize();
-                Ok((high_word(partition[0]), bitmap))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let roaring = RoaringTreemap::from_bitmaps(bitmaps);
+        let mut roaring = RoaringTreemap::from_sorted_iter(row_ids.iter().copied())
+            .map_err(|_| Error::Constraint("file row ids must be strictly ascending".to_owned()))?;
+        // Run compression is what makes a dense set cheap: unoptimized, a
+        // mostly-contiguous file costs 8 KiB of bitset per 65536 ids.
+        roaring.optimize();
 
         if roaring_estimated_bytes(&roaring) < raw_bytes {
             Ok(Self::Roaring(roaring))
@@ -364,16 +355,6 @@ impl RowOrder {
             Self::Repeated { .. } => None,
         }
     }
-}
-
-#[allow(clippy::cast_possible_truncation)]
-const fn high_word(row_id: u64) -> u32 {
-    (row_id >> 32) as u32
-}
-
-#[allow(clippy::cast_possible_truncation)]
-const fn low_word(row_id: u64) -> u32 {
-    row_id as u32
 }
 
 /// Whether `row_ids` is strictly increasing (and therefore also unique).
