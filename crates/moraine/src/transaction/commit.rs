@@ -1110,7 +1110,7 @@ pub(crate) fn schema_version_write(
 /// Runs the closure against `base` and stages the resulting writes.
 /// Options-only commits stage no snapshot record and no head advance.
 async fn prepare_and_stage<F>(
-    db_tx: &DbTransaction,
+    db_tx: &Arc<DbTransaction>,
     projections: &std::sync::RwLock<ProjectionCache>,
     f: &F,
     base: &CatalogSnapshot,
@@ -1291,18 +1291,34 @@ pub(crate) enum Submission {
     LostRace,
 }
 
+/// Discards everything staged on the transaction. Rolling back is dropping
+/// it, so this takes the last reference: the probes that shared it are all
+/// awaited before staging returns.
+pub(crate) fn rollback(db_tx: Arc<DbTransaction>) {
+    drop(db_tx);
+}
+
 /// Commits the batch's write and folds it into the projections, without
 /// waiting for the flush. Winning `sys/head` settles the race, so the
 /// projections may fold before the bytes are durable; a flush that then
 /// fails invalidates them.
 pub(crate) async fn submit_batch(
-    db_tx: DbTransaction,
+    db_tx: Arc<DbTransaction>,
     heads: HeadTransition,
     writes: &[StagedWrite],
     staged_bytes: StagedBytes,
     head_view_update: HeadViewUpdate,
     projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Result<Submission> {
+    // The probes read the transaction from their own tasks, so it is
+    // shared; every one is awaited before staging returns, leaving this
+    // the last reference.
+    let Some(db_tx) = Arc::into_inner(db_tx) else {
+        return Err(Error::Interrupted(
+            "a reader outlived the batch it read from; nothing was submitted".to_owned(),
+        ));
+    };
+
     let head = heads.after;
     // A head-preserving commit reuses the head id with new content, so the
     // cache is dropped before the write is visible.
@@ -1410,7 +1426,7 @@ pub(crate) async fn await_submitted(
 /// Commits one batch and waits for it to reach object storage:
 /// [`submit_batch`] then [`await_submitted`].
 pub(crate) async fn commit_batch(
-    db_tx: DbTransaction,
+    db_tx: Arc<DbTransaction>,
     heads: HeadTransition,
     writes: &[StagedWrite],
     staged_bytes: StagedBytes,
@@ -1441,7 +1457,7 @@ pub(crate) async fn commit_batch(
 /// [`Error::CommitOutcomeUnknown`]; the caller must reconcile the operation
 /// before resubmitting.
 pub(crate) async fn commit_batch_off_task(
-    db_tx: DbTransaction,
+    db_tx: Arc<DbTransaction>,
     heads: HeadTransition,
     writes: Vec<StagedWrite>,
     staged_bytes: StagedBytes,

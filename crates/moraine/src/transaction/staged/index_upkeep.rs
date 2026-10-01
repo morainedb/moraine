@@ -386,7 +386,7 @@ pub(super) fn staged_scoped_entry(
 /// put on the batch.
 #[allow(clippy::too_many_lines)]
 pub(super) async fn stage_index_maintenance(
-    db_tx: &DbTransaction,
+    db_tx: &Arc<DbTransaction>,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     data_store: Option<&DataStore>,
