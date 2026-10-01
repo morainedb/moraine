@@ -1059,11 +1059,24 @@ impl CatalogCache {
         loader: CacheLoader,
         metadata: bool,
     ) -> Result<CacheFetch, slatedb::Error> {
-        let resident = match self.tier() {
-            Tier::Hybrid(cache) => cache.memory().contains(&key),
-            Tier::Memory(_) => true,
-        };
-        if !resident {
+        // Served straight off the memory tier, because foyer re-enqueues
+        // a `get_or_fetch` hit to the disk tier whatever answered it, and
+        // sizing that write serializes the whole entry on this task --
+        // milliseconds for an SST filter. A plain memory read skips it.
+        if let Tier::Hybrid(cache) = self.tier()
+            && let Some(hit) = cache.memory().get(&key)
+        {
+            let entry = hit.value().clone();
+            if metadata {
+                metadata_admitted(&key, as_bytes(entry.size()));
+            }
+            return Ok(CacheFetch::hit(entry));
+        }
+
+        // Past the memory tier, so a hybrid fetch from here reads the disk
+        // tier or runs the loader, and wants the headroom either way.
+        let tiered = matches!(self.tier(), Tier::Hybrid(_));
+        if tiered {
             self.store.reserve(4096);
         }
         let store = Arc::clone(&self.store);
@@ -1108,7 +1121,7 @@ impl CatalogCache {
         };
 
         let from_store = fetched.load(Ordering::Relaxed);
-        if !resident && !from_store {
+        if tiered && !from_store {
             self.record_disk_hit(metadata);
         }
         if metadata {
@@ -1483,6 +1496,14 @@ impl TestCache {
 
     pub(crate) fn usage(&self) -> usize {
         self.tier.usage()
+    }
+
+    /// Bytes the disk tier has written, `None` without one.
+    pub(crate) fn disk_write_bytes(&self) -> Option<usize> {
+        match &self.tier {
+            Tier::Hybrid(cache) => Some(cache.statistics().disk_write_bytes()),
+            Tier::Memory(_) => None,
+        }
     }
 }
 

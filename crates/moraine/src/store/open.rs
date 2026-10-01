@@ -59,6 +59,9 @@ mod probe_bench;
 #[cfg(test)]
 mod compaction_cache_tests;
 
+#[cfg(test)]
+mod disk_tier_tests;
+
 /// One checkpoint the manifest carries, with what it pins against garbage
 /// collection and when it lapses. Times are microseconds from the Unix
 /// epoch; `expires_micros` is `None` for a checkpoint minted without a
