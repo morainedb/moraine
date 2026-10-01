@@ -37,7 +37,26 @@ const README: &str = "crates/moraine-duckdb/README.md";
 const DUCKLAKE_PROSE: [&str; 2] = [README, "docs/rfcs/0006-extension-surface.md"];
 
 /// The DuckLake commit each supported DuckDB release bundles.
-const DUCKLAKE_RELEASE_PINS: &str = "patches/ducklake/source-pins";
+pub const DUCKLAKE_RELEASE_PINS: &str = "patches/ducklake/source-pins";
+
+/// The task that prepares the patched DuckLake, which names both the DuckDB
+/// release the series targets and the DuckLake revision it fetches.
+const DUCKLAKE_PATCH_TASK: &str = "xtask/src/ducklake_patch.rs";
+
+/// Every workflow naming a DuckDB version: the two that publish builds, and
+/// the on-demand debug build whose default names the primary.
+const WORKFLOWS: [&str; 3] = [
+    ".github/workflows/extension.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/debug-build.yml",
+];
+
+/// The workflows whose hand-written `validate` matrix must cover every
+/// supported release.
+const VALIDATING_WORKFLOWS: [&str; 2] = [
+    ".github/workflows/extension.yml",
+    ".github/workflows/release.yml",
+];
 
 /// How much of a commit `duckdb_extensions()` reports as
 /// `extension_version`, and so how much the pins carry.
@@ -86,10 +105,7 @@ pub fn check_pins() -> anyhow::Result<()> {
     // every DuckDB version is a pin, so an unlisted one is a mistake; in
     // prose a version is often an example, so only the primary's presence
     // is required.
-    for file in [
-        ".github/workflows/extension.yml",
-        ".github/workflows/release.yml",
-    ] {
+    for file in WORKFLOWS {
         let contents = read(file)?;
         if !contents.contains(pin) {
             problems.push(format!("{file} never names the primary pin `{pin}`"));
@@ -100,6 +116,9 @@ pub fn check_pins() -> anyhow::Result<()> {
             ));
         }
         problems.extend(tools_ref_problem(file, &contents));
+        if VALIDATING_WORKFLOWS.contains(&file) {
+            problems.extend(validation_problems(file, &contents, &supported));
+        }
     }
 
     let readme = read(README)?;
@@ -127,6 +146,16 @@ pub fn check_pins() -> anyhow::Result<()> {
         }
     }
 
+    match string_constant(&read(DUCKLAKE_PATCH_TASK)?, "SUPPORTED_DUCKDB_PIN") {
+        Some(targeted) if targeted == pin => {}
+        Some(targeted) => problems.push(format!(
+            "{DUCKLAKE_PATCH_TASK} targets DuckDB `{targeted}`, not the primary pin `{pin}`"
+        )),
+        None => problems.push(format!(
+            "{DUCKLAKE_PATCH_TASK} declares no `SUPPORTED_DUCKDB_PIN`"
+        )),
+    }
+
     problems.extend(patch_series_problems()?);
     let ducklake = pinned_ducklake_commit();
     match &ducklake {
@@ -147,6 +176,78 @@ pub fn check_pins() -> anyhow::Result<()> {
         println!("ok: every DuckLake commit reference matches the one {pin} declares ({commit})");
     }
     Ok(())
+}
+
+/// One entry of a workflow's `validate` matrix: the platform whose artifact
+/// it downloads, and the DuckDB version it smoke-tests.
+#[derive(Debug, PartialEq, Eq)]
+struct ValidationLeg<'a> {
+    platform: &'a str,
+    version: &'a str,
+}
+
+/// The legs a workflow's `validate` matrix lists.
+///
+/// An entry opens with `- runner:`, which only that matrix's `include` block
+/// writes; the build job names its version through a matrix expression
+/// rather than a literal, so it is not one of these.
+fn validation_legs(contents: &str) -> Vec<ValidationLeg<'_>> {
+    let mut legs: Vec<ValidationLeg> = Vec::new();
+    let mut platform = None;
+    for line in contents.lines().map(str::trim) {
+        if line.starts_with("- runner:") {
+            platform = None;
+        }
+        if let Some(value) = line.strip_prefix("platform:") {
+            platform = Some(value.trim());
+        }
+        if let Some(value) = line.strip_prefix("duckdb_version:") {
+            let version = value.trim();
+            if let (Some(platform), true) = (platform, version.starts_with('v')) {
+                legs.push(ValidationLeg { platform, version });
+            }
+        }
+    }
+    legs
+}
+
+/// Every supported release the `validate` matrix leaves out.
+///
+/// The build matrix is generated from the manifest but this one is written
+/// by hand, so adding a release publishes builds for it that the
+/// backfill-and-prune smoke never runs on — green, and unproven.
+fn validation_problems(file: &str, contents: &str, supported: &[String]) -> Vec<String> {
+    let legs = validation_legs(contents);
+    let mut platforms: Vec<&str> = Vec::new();
+    for leg in &legs {
+        if !platforms.contains(&leg.platform) {
+            platforms.push(leg.platform);
+        }
+    }
+
+    let mut problems = Vec::new();
+    for version in supported {
+        let validated: Vec<&str> = legs
+            .iter()
+            .filter(|leg| leg.version == version)
+            .map(|leg| leg.platform)
+            .collect();
+        if validated.is_empty() {
+            problems.push(format!(
+                "{file}'s validate matrix has no leg for DuckDB `{version}`, so its builds \
+                 would publish unproven"
+            ));
+            continue;
+        }
+        for platform in &platforms {
+            if !validated.contains(platform) {
+                problems.push(format!(
+                    "{file}'s validate matrix has no `{platform}` leg for DuckDB `{version}`"
+                ));
+            }
+        }
+    }
+    problems
 }
 
 /// The release build patches its bundled DuckLake from the list in
@@ -311,6 +412,19 @@ fn ducklake_commit_matches(commit: &str, pinned: &str) -> bool {
 fn ducklake_problems(commit: &str) -> anyhow::Result<Vec<String>> {
     let short = commit.get(..SHORT_COMMIT).unwrap_or(commit);
     let mut problems = Vec::new();
+
+    // The whole commit, not a prefix: the task fetches this revision and
+    // then refuses a checkout whose `HEAD` is anything else.
+    match string_constant(&read(DUCKLAKE_PATCH_TASK)?, "DUCKLAKE_REVISION") {
+        Some(revision) if revision == commit => {}
+        Some(revision) => problems.push(format!(
+            "{DUCKLAKE_PATCH_TASK} fetches DuckLake `{revision}`, but {DUCKLAKE_CONFIG} \
+             declares `{commit}`"
+        )),
+        None => problems.push(format!(
+            "{DUCKLAKE_PATCH_TASK} declares no `DUCKLAKE_REVISION`"
+        )),
+    }
 
     match string_constant(&read(WIRE_CONTRACT)?, "DUCKLAKE_SOURCE_COMMIT") {
         Some(pinned) if ducklake_commit_matches(commit, pinned) => {}
@@ -481,11 +595,34 @@ mod tests {
         assert!(!ducklake_commit_matches(commit, "not-a-commit"));
     }
 
+    /// The checked-in workflows validate every release the manifest lists.
+    #[test]
+    fn every_supported_release_has_a_validate_leg() {
+        let supported = supported_duckdb_versions();
+        for file in VALIDATING_WORKFLOWS {
+            let contents = read(file).expect("reading the workflow");
+            assert_eq!(
+                validation_problems(file, &contents, &supported),
+                Vec::<String>::new()
+            );
+        }
+    }
+
+    /// The patch task targets the release the manifest calls primary.
+    #[test]
+    fn the_patch_task_targets_the_primary_pin() {
+        let source = read(DUCKLAKE_PATCH_TASK).expect("reading the patch task");
+        assert_eq!(
+            string_constant(&source, "SUPPORTED_DUCKDB_PIN"),
+            Some(duckdb_pin())
+        );
+    }
+
     /// The checked-in tree agrees with the submodule it is pinned to —
     /// the same assertion `check-pins` makes, run without the submodule
     /// present being a hard requirement.
     #[test]
-    fn the_wire_contract_pins_the_commit_duckdb_declares() {
+    fn every_pinned_ducklake_commit_is_the_one_duckdb_declares() {
         let Ok(config) = read(DUCKLAKE_CONFIG) else {
             return;
         };
@@ -513,6 +650,64 @@ mod tests {
         let problem = tools_ref_problem("w.yml", &workflow("${{ matrix.duckdb_version }}"))
             .expect("a differing ref is a problem");
         assert!(problem.contains("`v1.5.5`"), "{problem}");
+    }
+
+    fn validate_matrix(versions: &[&str]) -> String {
+        let mut lines = vec![
+            "  validate:".to_owned(),
+            "    strategy:".to_owned(),
+            "      matrix:".to_owned(),
+            "        include:".to_owned(),
+        ];
+        for platform in ["linux_amd64", "osx_arm64"] {
+            for version in versions {
+                lines.push("          - runner: a-runner".to_owned());
+                lines.push(format!("            platform: {platform}"));
+                lines.push(format!("            duckdb_version: {version}"));
+            }
+        }
+        // The build job, whose version is a matrix expression.
+        lines.push("      duckdb_version: ${{ matrix.duckdb_version }}".to_owned());
+        format!("{}\n", lines.join("\n"))
+    }
+
+    #[test]
+    fn a_validate_matrix_covering_every_release_on_every_platform_is_accepted() {
+        let supported = vec!["v1.5.6".to_string(), "v1.5.5".to_string()];
+        let workflow = validate_matrix(&["v1.5.6", "v1.5.5"]);
+        assert_eq!(validation_legs(&workflow).len(), 4);
+        assert_eq!(
+            validation_problems("w.yml", &workflow, &supported),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The failure this exists for: a bump moves the primary into the
+    /// hand-written matrix and the release it replaced keeps no leg.
+    #[test]
+    fn a_release_the_validate_matrix_leaves_out_is_a_problem() {
+        let supported = vec!["v1.5.6".to_string(), "v1.5.5".to_string()];
+        let problems = validation_problems("w.yml", &validate_matrix(&["v1.5.6"]), &supported);
+        assert_eq!(problems.len(), 1);
+        assert!(
+            problems[0].contains("no leg for DuckDB `v1.5.5`"),
+            "{problems:?}"
+        );
+    }
+
+    /// One platform's leg missing is not covered by the other's.
+    #[test]
+    fn a_release_validated_on_one_platform_only_is_a_problem() {
+        let supported = vec!["v1.5.6".to_string()];
+        let workflow = "        include:\n          - runner: a-runner\n            \
+                        platform: linux_amd64\n            duckdb_version: v1.5.6\n          \
+                        - runner: another\n            platform: osx_arm64\n            \
+                        duckdb_version: v1.5.5\n";
+        let problems = validation_problems("w.yml", workflow, &supported);
+        assert_eq!(
+            problems,
+            vec!["w.yml's validate matrix has no `osx_arm64` leg for DuckDB `v1.5.6`".to_string()]
+        );
     }
 
     #[test]

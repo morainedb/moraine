@@ -183,9 +183,11 @@ index 9e1650f7..ae032621 100644
 +++ b/src/storage/ducklake_table_entry.cpp
 @@ -90,0 +91 @@ constexpr column_t DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID;
 +constexpr column_t DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID;
-@@ -400,0 +402,2 @@ virtual_column_map_t DuckLakeTableEntry::GetVirtualColumns() const {
+@@ -400,2 +401,4 @@ virtual_column_map_t DuckLakeTableEntry::GetVirtualColumns() const {
+ 	                        TableColumn("snapshot_id", LogicalType::BIGINT)));
 +	result.insert(make_pair(DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID,
 +	                        TableColumn("data_file_id", LogicalType::UBIGINT)));
+ 	result.insert(make_pair(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN)));
 diff --git a/test/sql/rowid/ducklake_data_file_id.test b/test/sql/rowid/ducklake_data_file_id.test
 new file mode 100644
 index 00000000..73aa10d6

@@ -19,7 +19,7 @@ use crate::helpers::*;
 
 /// The exact DuckLake commit whose behaviour these pins describe and that
 /// the repository patch is applied to.
-const DUCKLAKE_SOURCE_COMMIT: &str = "d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4";
+const DUCKLAKE_SOURCE_COMMIT: &str = "ac7595b0a1305bea3d4cfaca763b0ce964c763a2";
 
 /// Git's default lower bound for an abbreviated object name.
 const MINIMUM_GIT_ABBREVIATION_LENGTH: usize = 7;
@@ -222,7 +222,7 @@ fn ducklakes_catalog_access_set_is_pinned() {
         })
         .collect();
 
-    // Pinned against DuckLake d8a1881e. Every entry is a table moraine
+    // Pinned against DuckLake ac7595b0. Every entry is a table moraine
     // serves; the two dynamic inline families carry the ids this workload
     // happens to allocate.
     let expected = [
@@ -379,7 +379,7 @@ fn moraine_serves_the_conflict_resolution_read_inside_a_transaction() {
 /// The DuckDB/DuckLake build pair the loadable is linked against, checked
 /// by running rather than assumed.
 ///
-/// moraine statically links DuckDB v1.5.5 and bundles the patched DuckLake
+/// moraine statically links DuckDB v1.5.6 and bundles the patched DuckLake
 /// built against the same release. ABI friction would show up as a load
 /// failure, a crash, or a wrong answer at the boundary where DuckLake hands
 /// moraine C++ objects by pointer — so the pin is: the bundle loads, reports

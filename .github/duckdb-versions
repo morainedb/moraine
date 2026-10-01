@@ -18,5 +18,6 @@
 # other place naming the version, then `cargo xtask check-pins` fails until
 # they all agree. Dropping an old line only stops future releases from
 # carrying it; published assets stay.
-v1.5.5 duckdb=d8cdaa33fda8df955cc76ef58a280f68f4cd43fa extension-ci-tools=72e76e99cd7fee45a99739cd118ec2db64e034ec
+v1.5.6 duckdb=069cc9f9b5be802405797faecc284961b07c70ef extension-ci-tools=3fd6109fc01555673b7c7123eba8d0d143fe8ce4
+v1.5.5
 v1.5.4

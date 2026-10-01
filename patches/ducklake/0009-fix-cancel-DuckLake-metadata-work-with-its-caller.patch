@@ -4,7 +4,10 @@ index b43c50f..94c95a2 100644
 +++ b/src/include/storage/ducklake_transaction.hpp
 @@ -15,0 +16 @@
 +#include "duckdb/main/client_context_state.hpp"
-@@ -165,0 +167,15 @@ struct DuckLakeRetryConfig {
+@@ -163,2 +164,17 @@ struct DuckLakeRetryConfig {
+ 	static DuckLakeRetryConfig FromContext(ClientContext &context);
+ };
++
 +//! Names the context that owns the transaction whose metadata connection
 +//! this is registered on. That connection is created by DuckLake and never
 +//! handed out, so nothing outside can interrupt it; work blocking beneath it
@@ -19,12 +22,12 @@ index b43c50f..94c95a2 100644
 +	//! The context whose COMMIT is driving the metadata connection.
 +	weak_ptr<ClientContext> parent;
 +};
-+
 diff --git a/src/storage/ducklake_transaction.cpp b/src/storage/ducklake_transaction.cpp
 index 7a25353..70c90c6 100644
 --- a/src/storage/ducklake_transaction.cpp
 +++ b/src/storage/ducklake_transaction.cpp
-@@ -776,0 +777,7 @@ Connection &DuckLakeTransaction::GetConnection() {
+@@ -776,2 +776,9 @@ Connection &DuckLakeTransaction::GetConnection() {
+ 		client_config.user_settings.SetUserSetting(CatalogErrorMaxSchemasSetting::SettingIndex, Value::UBIGINT(0));
 +
 +		// This connection is ours and is never handed out, so its own
 +		// interrupt flag is the one nobody can set. Record the context whose
@@ -32,3 +35,4 @@ index 7a25353..70c90c6 100644
 +		// catalog can be cancelled by interrupting that caller.
 +		connection->context->registered_state->Insert(
 +		    DuckLakeParentContextState::KEY, make_shared_ptr<DuckLakeParentContextState>(context));
+ 		connection->BeginTransaction();
