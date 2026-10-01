@@ -853,3 +853,64 @@ fn durable_stores_are_named_by_location() {
     assert_eq!(first.identity, first.clone().identity);
     assert_ne!(first.identity, DataStore::new(memory).identity);
 }
+
+/// Polls until the disk tier's write counter stops moving, so a later
+/// sample is not racing the flusher finishing earlier work.
+async fn settled_disk_writes(cache: &AuxiliaryCache) -> usize {
+    let mut stable = 0;
+    let mut last = cache.disk_write_bytes().unwrap();
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let now = cache.disk_write_bytes().unwrap();
+        if now == last {
+            stable += 1;
+            if stable == 4 {
+                return now;
+            }
+        } else {
+            stable = 0;
+            last = now;
+        }
+    }
+    panic!("the disk tier never stopped writing");
+}
+
+/// Summaries the memory tier answers never rewrite the disk tier. foyer
+/// re-enqueues a `get_or_fetch` hit whatever served it, and the entry is
+/// already both resident and on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn summaries_served_from_memory_never_rewrite_the_disk_tier() {
+    let directory =
+        std::env::temp_dir().join(format!("moraine-auxiliary-disk-{}", uuid::Uuid::new_v4()));
+    let cache = AuxiliaryCache::hybrid(8 << 20, &directory, 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    let store = DataStore::new(Arc::new(InMemory::new()));
+    let path = Path::from("summary.parquet");
+
+    let fill = || {
+        let summary = fragmented(20_000);
+        async move { Ok(summary) }
+    };
+    cache
+        .fetch_summary(&store, &key(&path), fill)
+        .await
+        .unwrap();
+    let warm = settled_disk_writes(&cache).await;
+    assert!(warm > 0, "the disk tier was never written at all");
+
+    for _ in 0..16 {
+        cache
+            .fetch_summary(&store, &key(&path), fill)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        settled_disk_writes(&cache).await,
+        warm,
+        "summaries the memory tier answered rewrote the disk tier"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+}

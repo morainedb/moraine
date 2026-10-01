@@ -965,10 +965,18 @@ impl Tier {
                 .get_or_fetch(key, fill)
                 .await
                 .map(|entry| entry.value().clone()),
-            Self::Hybrid(cache) => cache
-                .get_or_fetch(key, fill)
-                .await
-                .map(|entry| entry.value().clone()),
+            Self::Hybrid(cache) => {
+                // foyer re-enqueues a `get_or_fetch` hit to the disk tier
+                // whatever answered it, rewriting an entry already there.
+                // A memory read skips that.
+                if let Some(hit) = cache.memory().get(key) {
+                    return Ok(hit.value().clone());
+                }
+                cache
+                    .get_or_fetch(key, fill)
+                    .await
+                    .map(|entry| entry.value().clone())
+            }
         }
     }
 
@@ -1583,6 +1591,15 @@ impl AuxiliaryCache {
 
     pub(super) fn usage(&self) -> usize {
         self.tier.usage()
+    }
+
+    /// Bytes the disk tier has written, `None` without one.
+    #[cfg(test)]
+    pub(super) fn disk_write_bytes(&self) -> Option<usize> {
+        match &self.tier {
+            Tier::Hybrid(cache) => Some(cache.statistics().disk_write_bytes()),
+            Tier::Memory(_) => None,
+        }
     }
 
     pub(super) fn row_summaries(&self) -> RowSummaryOccupancy {
