@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       duckdb_version:
-        description: "DuckDB release to build against, e.g. v1.5.5"
+        description: "DuckDB release to build against, e.g. v1.5.6"
         required: true
-        default: "v1.5.5"
+        default: "v1.5.6"
       debug_level:
         description: "Rust debug info: line-tables-only names frames, full adds locals"
         required: true

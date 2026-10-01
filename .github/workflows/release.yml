@@ -61,11 +61,11 @@ jobs:
     # legs. A dropped leg leaves no job, no check run and no annotation: the
     # run goes red with every visible job green, and `publish` is skipped.
     # `cargo xtask check-pins` enforces it.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.6
     with:
       extension_name: moraine
       duckdb_version: ${{ matrix.duckdb_version }}
-      ci_tools_version: v1.5.5
+      ci_tools_version: v1.5.6
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
@@ -92,10 +92,16 @@ jobs:
         include:
           - runner: ubuntu-24.04
             platform: linux_amd64
+            duckdb_version: v1.5.6
+          - runner: ubuntu-24.04
+            platform: linux_amd64
             duckdb_version: v1.5.5
           - runner: ubuntu-24.04
             platform: linux_amd64
             duckdb_version: v1.5.4
+          - runner: macos-15
+            platform: osx_arm64
+            duckdb_version: v1.5.6
           - runner: macos-15
             platform: osx_arm64
             duckdb_version: v1.5.5

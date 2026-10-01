@@ -923,14 +923,14 @@ consequence of DuckDB's design rather than an unbuilt piece of moraine's.
 
 | What | Pinned at | Notes |
 |---|---|---|
-| DuckDB | **v1.5.5** | the primary entry of `.github/duckdb-versions`; both submodules sit on it, and it is the version the e2e suite proves the chain against |
-| DuckLake extension | **`d8a1881e`** | the DuckLake source moraine bundles, with the `patches/ducklake` series applied: what `INSTALL ducklake` resolves to against the pinned CLI, since DuckDB v1.5.5 hard-codes the commit in `.github/config/extensions/ducklake.cmake`, so the pair moves only when the DuckDB pin does. Verified by running, not assumed |
+| DuckDB | **v1.5.6** | the primary entry of `.github/duckdb-versions`; both submodules sit on it, and it is the version the e2e suite proves the chain against |
+| DuckLake extension | **`ac7595b0`** | the DuckLake source moraine bundles, with the `patches/ducklake` series applied: what `INSTALL ducklake` resolves to against the pinned CLI, since DuckDB v1.5.6 hard-codes the commit in `.github/config/extensions/ducklake.cmake`, so the pair moves only when the DuckDB pin does. Verified by running, not assumed |
 | DuckLake branch | **`v1.5-variegata`** | DuckLake publishes no release tags — it versions by DuckDB-series branches (`v1.3-ossivalis`, `v1.4-andium`, `v1.5-variegata`); `main` is development |
 | DuckLake catalog format | **`1.0`** (`DuckLakeVersion::V1_0`) | the highest version the stable branch writes (its migration chain ends at `'1.0'`); `V1_1_DEV_1` exists on `main` only and is not targeted |
 
 **Patch-level ABI friction between the two does not appear.** DuckDB's own CI
 builds the DuckLake extension against v1.5.3 while moraine statically links
-v1.5.5, and the concern was that objects crossing the extension↔host boundary
+v1.5.6, and the concern was that objects crossing the extension↔host boundary
 by pointer between those two builds might disagree. They do not: the bundled
 DuckLake loads with moraine and the full chain answers correctly, pinned by
 `wire_contract.rs` alongside the version strings, so a bump that introduces

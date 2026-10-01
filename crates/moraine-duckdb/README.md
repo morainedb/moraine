@@ -213,10 +213,10 @@ this crate; there is no `build.rs`.
 
 Two git submodules pin the build:
 
-- `duckdb/` — DuckDB source at tag **v1.5.5**: the shim compiles against its
+- `duckdb/` — DuckDB source at tag **v1.5.6**: the shim compiles against its
   full `src/include/` tree and links its static library.
 - `extension-ci-tools/` — the toolchain (Make + CMake helpers) at the
-  matching **v1.5.5**.
+  matching **v1.5.6**.
 
 The moraine Rust static library is bridged into CMake with
 [corrosion](https://github.com/corrosion-rs/corrosion) (see the repo-root
@@ -247,8 +247,8 @@ submodules, both workflow files, and the table below.
 
 | What | Pinned at |
 |---|---|
-| DuckDB | **v1.5.5** (git hash `d8cdaa33fd`, codename Variegata) |
-| Toolchain | `duckdb/extension-ci-tools` branch **v1.5.5** |
+| DuckDB | **v1.5.6** (git hash `069cc9f9b5`, codename Variegata) |
+| Toolchain | `duckdb/extension-ci-tools` branch **v1.5.6** |
 | C++ standard | C++17 |
 | Linux C++ compiler | GCC 14 |
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/<version>/` (never committed) |
@@ -312,7 +312,7 @@ duckdb -unsigned -c "LOAD './build/release/extension/moraine/moraine.duckdb_exte
 ```
 
 Release assets are named `moraine.<duckdb-version>.<platform>.duckdb_extension`
-(`moraine.v1.5.5.linux_amd64.duckdb_extension`). Pick the one matching your
+(`moraine.v1.5.6.linux_amd64.duckdb_extension`). Pick the one matching your
 DuckDB *exactly*: a mismatch is rejected even when unsigned, because a
 C++-ABI extension is bound to the version string in its footer. The
 loadable's base filename (`moraine`) is load-bearing too — DuckDB derives
@@ -320,15 +320,15 @@ the entry symbol (`moraine_duckdb_cpp_init`, defined in
 `cpp/moraine_extension.cpp`) from the filename before the first `.` — so
 rename an asset to `moraine.duckdb_extension` before loading it.
 
-## Obtaining a DuckDB v1.5.5 CLI for testing
+## Obtaining a DuckDB v1.5.6 CLI for testing
 
 Downloaded directly from the GitHub release, no build required:
 
 ```
-https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-osx-arm64.zip   # this machine
-https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-osx-universal.zip
-https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
-https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-arm64.zip
+https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-osx-arm64.zip   # this machine
+https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-osx-universal.zip
+https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-amd64.zip
+https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-arm64.zip
 # (+ windows-amd64/arm64, and -musl variants for linux)
 ```
 
@@ -364,10 +364,10 @@ Loading stock DuckLake *before* moraine is refused: it lacks the patches
 moraine's located functions rely on, and its log type would collide with
 the bundle's.
 
-The bundled source is the DuckLake commit DuckDB v1.5.5's own build-time pin
+The bundled source is the DuckLake commit DuckDB v1.5.6's own build-time pin
 selects (`.github/config/extensions/ducklake.cmake` in the `duckdb/duckdb`
 source tree names `GIT_URL https://github.com/duckdb/ducklake` at
-`GIT_TAG d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4`), so the bundle tracks
+`GIT_TAG ac7595b0a1305bea3d4cfaca763b0ce964c763a2`), so the bundle tracks
 exactly what `INSTALL ducklake` would install against this DuckDB, with the
 patch series on top. `patches/ducklake/source-pins` records that commit per
 supported DuckDB release; `cargo xtask check-pins` keeps it in step.
@@ -385,7 +385,7 @@ DuckLake drives moraine as its own metadata catalog by nesting an
 `ATTACH 'moraine:<path>' ...` inside `ATTACH 'ducklake:moraine:<path>' AS
 lake (DATA_PATH ...)`. The facts that attach chain depends on are pinned
 against the DuckLake source at commit
-`d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4`.
+`ac7595b0a1305bea3d4cfaca763b0ce964c763a2`.
 
 ### The `moraine:` prefix
 

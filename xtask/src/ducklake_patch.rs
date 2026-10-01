@@ -13,8 +13,8 @@ use anyhow::{Context, bail, ensure};
 use crate::duckdb;
 
 const DUCKLAKE_URL: &str = "https://github.com/duckdb/ducklake.git";
-const DUCKLAKE_REVISION: &str = "d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4";
-const SUPPORTED_DUCKDB_PIN: &str = "v1.5.5";
+const DUCKLAKE_REVISION: &str = "ac7595b0a1305bea3d4cfaca763b0ce964c763a2";
+const SUPPORTED_DUCKDB_PIN: &str = "v1.5.6";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
 pub(crate) const PATCH_PATHS: [&str; 10] = [

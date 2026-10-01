@@ -38,10 +38,12 @@ index 1d94d7ed8061f9611dcf61d32d3bb58ca909d4f1..aed20857cd66efb930dd43e1d1dac4e8
 +++ b/src/storage/ducklake_stats.cpp
 @@ -10,0 +11 @@
 +#include "duckdb/common/multi_file/multi_file_reader.hpp"
-@@ -212,0 +214,3 @@ void DuckLakeTableStats::MergeFileStats(const DuckLakeDataFile &file) {
+@@ -212,2 +213,5 @@ void DuckLakeTableStats::MergeFileStats(const DuckLakeDataFile &file) {
+ 	for (auto &entry : file.column_stats) {
 +		if (entry.first.index == static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID)) {
 +			continue;
 +		}
+ 		MergeStats(entry.first, entry.second);
 diff --git a/src/storage/ducklake_transaction.cpp b/src/storage/ducklake_transaction.cpp
 index f5eef0f40f258d073cd4d8425faa2e2625cbbb4c..d61d9dbd97fee2caaae14ceedd72b59d7d0f462d 100644
 --- a/src/storage/ducklake_transaction.cpp

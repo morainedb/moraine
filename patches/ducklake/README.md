@@ -1,7 +1,7 @@
 # Patched DuckLake row-ID statistics, pruning, inlined writes, commit cleanup, and positional deletes
 
 This directory carries the downstream DuckLake patch series moraine bundles,
-for DuckDB v1.5.5, applied in file-name order:
+for DuckDB v1.5.6, applied in file-name order:
 
 1. `0001-perf-prune-DuckLake-files-by-row-id.patch` stores file-level row-ID
    min/max statistics in DuckLake's existing `ducklake_file_column_stats`
@@ -92,9 +92,14 @@ The series is pinned separately to the DuckLake revisions selected by every
 DuckDB release moraine supports. The patched DuckLake is built alongside
 moraine and linked into its loadable, so `LOAD moraine` registers both and
 no separate DuckLake extension is installed or loaded.
-Most hunks use zero context to satisfy moraine's whitespace gate across both
-source pins. The control-flow-sensitive row-ID statistics hunk replaces and
-re-emits its function's return so it cannot land after that return.
+Most hunks use zero context to satisfy moraine's whitespace gate. Zero
+context leaves `git apply` nothing to match on, so it places the hunk by line
+number: one whose line has moved in a pinned source lands in the wrong place
+there, silently where the result still compiles. A hunk in a region the pins
+disagree on therefore carries context lines, which `git apply` locates by
+content in each of them. The control-flow-sensitive row-ID statistics hunk
+also replaces and re-emits its function's return so it cannot land after that
+return.
 
 The source mapping lives in `source-pins`. Each entry binds one DuckDB release
 to the upstream DuckLake commit that release selects. A DuckDB bump must add a
