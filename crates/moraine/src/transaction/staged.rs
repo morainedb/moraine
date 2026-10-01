@@ -1848,7 +1848,8 @@ fn index_upkeep_landed(transaction_id: u64, result_id: u64, phases: &CommitPhase
         index_probe_misses = phases.index_metrics.probe_misses,
         index_probe_peak_in_flight = phases.index_metrics.probe_peak_in_flight,
         index_probe_store_misses = phases.index_metrics.probe_store_misses,
-        index_probe_store_disk_hits = phases.index_metrics.probe_store_gets,
+        index_probe_metadata_disk_hits = phases.index_metrics.probe_metadata_disk_hits,
+        index_probe_block_disk_hits = phases.index_metrics.probe_block_disk_hits,
         index_probes_completed_during_deletions =
             phases.index_metrics.probes_completed_during_deletions,
         index_metadata_hits = phases.index_metrics.scoped_read.metadata_hits,

@@ -86,3 +86,68 @@ async fn lookups_served_from_memory_never_rewrite_the_disk_tier() {
     db.close().await.unwrap();
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+/// A filter the disk tier answers counts as a metadata disk hit, not a
+/// block one. The probe window reads these to tell a resident filter from
+/// one it had to fetch and decode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_filter_read_back_from_disk_counts_as_metadata() {
+    let directory = std::env::temp_dir().join(format!("moraine-filter-tier-{}", Uuid::new_v4()));
+    let cache = cache::TestCache::new(64 * 1024 * 1024, Some(directory.as_path())).await;
+
+    let objects: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let options = StoreBuilder::new("filter-tier", Arc::clone(&objects));
+    let db = Db::builder("filter-tier", Arc::clone(&objects))
+        .with_settings(options.settings())
+        .with_sst_block_size(SST_BLOCK_SIZE)
+        .with_block_cache_policy(options.block_cache_policy())
+        .with_db_cache(cache.handle.clone(), 1)
+        .with_metrics_recorder(cache::recorder(Arc::clone(&cache.counters)))
+        .build()
+        .await
+        .unwrap();
+
+    // Many SSTs, so their filters together outweigh what the metadata
+    // pool defends once the budget shrinks.
+    for sst in 0_u64..12 {
+        let base = sst * 100_000;
+        for key in (base..base + 8192).step_by(2) {
+            db.put(key.to_be_bytes(), [7_u8; 64]).await.unwrap();
+        }
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+    }
+    for sst in 0_u64..12 {
+        let base = sst * 100_000;
+        for key in (base + 1..base + 64).step_by(2) {
+            assert!(db.get(key.to_be_bytes()).await.unwrap().is_none());
+        }
+    }
+
+    // Evicted from memory, so the next lookup must come off the device.
+    cache.resize(32 * 1024);
+
+    let before = cache.counters.tally();
+    for sst in 0_u64..12 {
+        let base = sst * 100_000;
+        for key in (base + 1025..base + 1101).step_by(2) {
+            assert!(db.get(key.to_be_bytes()).await.unwrap().is_none());
+        }
+    }
+    let served = cache.counters.tally().since(before);
+
+    assert!(
+        served.metadata_disk_hits > 0,
+        "a filter off the device is a metadata disk hit: {served:?}"
+    );
+    assert_eq!(
+        served.metadata_misses, 0,
+        "the device answered, so nothing went to the object store: {served:?}"
+    );
+
+    db.close().await.unwrap();
+    let _ = std::fs::remove_dir_all(&directory);
+}
