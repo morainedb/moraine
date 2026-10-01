@@ -12,7 +12,7 @@ extension:
 
 repo:
   github: alexpropp/moraine
-  ref: b672b5db6f0866f61b5534e9775fadc10cb00349
+  ref: c38061042fc7946bc7b2dc7b62462f85ba04205c
 
 docs:
   hello_world: |
