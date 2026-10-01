@@ -21,6 +21,29 @@ fn moderately_sparse_rows_choose_roaring() {
     assert!(rows.estimated_bytes() < 800_000);
 }
 
+/// Run-heavy sets stay run-compressed across high-32-bit partitions.
+#[test]
+fn run_heavy_rows_stay_run_compressed() {
+    let row_ids: Vec<u64> = (0..2_u64)
+        .flat_map(|high| {
+            let base = high << 32;
+            (0..300_000_u64)
+                .filter(|offset| offset % 1_000 != 7)
+                .map(move |offset| base + offset)
+        })
+        .collect();
+
+    let rows = FileRowSet::from_sorted(row_ids).unwrap();
+
+    assert_eq!(rows.kind(), FileRowSetKind::Roaring);
+    assert!(rows.contains(6));
+    assert!(!rows.contains(1_007));
+    assert!(rows.contains((1 << 32) + 6));
+    assert!(!rows.contains((1 << 32) + 1_007));
+    // The same ids held as bitsets would cost ten containers, 80 KiB.
+    assert!(rows.estimated_bytes() < 8 * 1024);
+}
+
 #[test]
 fn fragmented_rows_choose_the_predictable_sorted_form() {
     let rows = FileRowSet::from_sorted((0..10_000).map(|row| row << 16).collect()).unwrap();
