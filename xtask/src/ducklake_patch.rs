@@ -17,17 +17,15 @@ const DUCKLAKE_REVISION: &str = "ac7595b0a1305bea3d4cfaca763b0ce964c763a2";
 const SUPPORTED_DUCKDB_PIN: &str = "v1.5.6";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
-pub(crate) const PATCH_PATHS: [&str; 10] = [
+pub(crate) const PATCH_PATHS: [&str; 8] = [
     "patches/ducklake/0001-perf-prune-DuckLake-files-by-row-id.patch",
-    "patches/ducklake/0002-feat-backfill-DuckLake-row-id-file-statistics.patch",
-    "patches/ducklake/0003-feat-expose-DuckLake-data-file-ids-to-scans.patch",
-    "patches/ducklake/0004-perf-append-DuckLake-inlined-data-rows.patch",
-    "patches/ducklake/0005-fix-retain-files-after-unknown-commit-outcomes.patch",
-    "patches/ducklake/0006-feat-change-DuckLake-rows-by-position.patch",
-    "patches/ducklake/0007-perf-name-the-table-a-dropped-file-belongs-to.patch",
-    "patches/ducklake/0008-perf-take-existing-delete-positions-from-the-caller.patch",
-    "patches/ducklake/0009-fix-cancel-DuckLake-metadata-work-with-its-caller.patch",
-    "patches/ducklake/0010-fix-write-row-ids-when-merging.patch",
+    "patches/ducklake/0002-feat-expose-DuckLake-data-file-ids-to-scans.patch",
+    "patches/ducklake/0003-perf-append-DuckLake-inlined-data-rows.patch",
+    "patches/ducklake/0004-fix-retain-files-after-unknown-commit-outcomes.patch",
+    "patches/ducklake/0005-feat-change-DuckLake-rows-by-position.patch",
+    "patches/ducklake/0006-perf-name-the-table-a-dropped-file-belongs-to.patch",
+    "patches/ducklake/0007-fix-cancel-DuckLake-metadata-work-with-its-caller.patch",
+    "patches/ducklake/0008-fix-write-row-ids-when-merging.patch",
 ];
 pub(crate) const CONFIG_PATH: &str = "patches/ducklake/ducklake.cmake";
 /// The patched-behaviour sqllogictests, run against the built artifact.
@@ -86,6 +84,16 @@ pub fn prepare() -> anyhow::Result<PatchedDuckLake> {
     let workspace = duckdb::workspace_root();
     let root = workspace.join("target/patched-ducklake");
     prepare_at(&workspace, root)
+}
+
+/// Applies the series to every pinned DuckLake source without building
+/// anything, fetching the sources the cache has not seen.
+pub fn check_pins() -> anyhow::Result<()> {
+    let workspace = duckdb::workspace_root();
+    let source = workspace.join("target/patched-ducklake/source");
+    fs::create_dir_all(&source).with_context(|| format!("creating {}", source.display()))?;
+    prepare_checkout(&source, DUCKLAKE_URL, DUCKLAKE_REVISION, "DuckLake")?;
+    check_pin_sources(&workspace, &source)
 }
 
 fn prepare_at(workspace: &Path, root: PathBuf) -> anyhow::Result<PatchedDuckLake> {
@@ -322,12 +330,12 @@ fn apply_patches(workspace: &Path, source: &Path) -> anyhow::Result<()> {
     ensure_clean_checkout(source, "cached DuckLake checkout")?;
 
     // One invocation for the whole series: git threads each patch's result
-    // into the next, so later hunks address the lines earlier ones produced.
+    // into the next, and a later patch edits files an earlier one creates.
     // The apply is all-or-nothing; `--check` cannot stand in for it because it
     // does not see files an earlier patch in the same run creates.
     duckdb::run(
         Command::new("git")
-            .args(["apply", "--unidiff-zero"])
+            .args(["apply"])
             .args(&patches)
             .current_dir(source),
     )?;
@@ -349,7 +357,7 @@ fn checkout_matches_patches(source: &Path, patches: &[PathBuf]) -> anyhow::Resul
     initialize_temporary_index(source, &expected_index)?;
     command_output(
         Command::new("git")
-            .args(["apply", "--cached", "--unidiff-zero"])
+            .args(["apply", "--cached"])
             .args(patches)
             .env("GIT_INDEX_FILE", &expected_index)
             .current_dir(source),
@@ -386,6 +394,127 @@ fn write_temporary_tree(source: &Path, index: &Path) -> anyhow::Result<String> {
             .current_dir(source),
     )
     .map(|tree| tree.trim().to_string())
+}
+
+/// Applies the series to the DuckLake source every `source-pins` entry
+/// names, so a hunk one of those sources has moved out from under fails
+/// here instead of in that release's build. Only the primary pin is built
+/// locally, and a release build is the first thing that would otherwise
+/// touch the rest.
+pub fn check_pin_sources(workspace: &Path, source: &Path) -> anyhow::Result<()> {
+    let patches: Vec<PathBuf> = PATCH_PATHS
+        .iter()
+        .map(|patch| workspace.join(patch))
+        .collect();
+    let pins = crate::pins::ducklake_source_pins()?;
+    let (primary, rest) = pins
+        .split_first()
+        .context("patches/ducklake/source-pins names no DuckLake source")?;
+
+    let indexes = TemporaryDirectory::create(
+        source
+            .parent()
+            .context("the DuckLake source checkout has no parent")?,
+        "pin-validation",
+    )?;
+
+    let primary_paths = series_paths(source, indexes.path(), primary, &patches)?;
+    println!(
+        "ok: the series applies to the DuckLake DuckDB {} selects, touching {} files",
+        primary.0,
+        primary_paths.len()
+    );
+    for pin in rest {
+        let paths = series_paths(source, indexes.path(), pin, &patches)?;
+        if let Some(problem) = pin_coverage_problem((&primary.0, &primary_paths), (&pin.0, &paths))
+        {
+            bail!("{problem}");
+        }
+        println!(
+            "ok: the series applies to the DuckLake DuckDB {} selects, touching the same files",
+            pin.0
+        );
+    }
+    Ok(())
+}
+
+/// The paths the series changes in one pinned source, applied through a
+/// throwaway index so no checkout is disturbed.
+fn series_paths(
+    source: &Path,
+    indexes: &Path,
+    pin: &(String, String),
+    patches: &[PathBuf],
+) -> anyhow::Result<Vec<String>> {
+    let (version, commit) = pin;
+    fetch_revision(source, commit)
+        .with_context(|| format!("fetching the DuckLake DuckDB {version} selects"))?;
+
+    let index = indexes.join(format!("{version}.index"));
+    command_output(
+        Command::new("git")
+            .args(["read-tree", commit])
+            .env("GIT_INDEX_FILE", &index)
+            .current_dir(source),
+    )?;
+    command_output(
+        Command::new("git")
+            .args(["apply", "--cached"])
+            .args(patches)
+            .env("GIT_INDEX_FILE", &index)
+            .current_dir(source),
+    )
+    .with_context(|| {
+        format!("applying the series to the DuckLake {commit} that DuckDB {version} selects")
+    })?;
+
+    let tree = write_temporary_tree(source, &index)?;
+    let names = command_output(
+        Command::new("git")
+            .args(["diff", "--name-only", commit, &tree])
+            .current_dir(source),
+    )?;
+    Ok(names.lines().map(str::to_owned).collect())
+}
+
+/// Fetches `revision` into `source` unless it is already there, so a pin
+/// the cached shallow clone has never seen can still be read.
+fn fetch_revision(source: &Path, revision: &str) -> anyhow::Result<()> {
+    let present = optional_command_output(
+        Command::new("git")
+            .args(["cat-file", "-e", &format!("{revision}^{{commit}}")])
+            .current_dir(source),
+    )?;
+    if present.is_some() {
+        return Ok(());
+    }
+    duckdb::run(
+        Command::new("git")
+            .args(["fetch", "--depth", "1", "origin", revision])
+            .current_dir(source),
+    )
+}
+
+/// States how `pin`'s series coverage differs from `primary`'s, or `None`
+/// when they cover the same files.
+fn pin_coverage_problem(primary: (&str, &[String]), pin: (&str, &[String])) -> Option<String> {
+    let (primary_version, primary_paths) = primary;
+    let (version, paths) = pin;
+    let missing: Vec<&String> = primary_paths
+        .iter()
+        .filter(|path| !paths.contains(path))
+        .collect();
+    let extra: Vec<&String> = paths
+        .iter()
+        .filter(|path| !primary_paths.contains(path))
+        .collect();
+    if missing.is_empty() && extra.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the series covers different files in the DuckLake DuckDB {version} selects than in \
+         {primary_version}'s; missing {missing:?}, unexpected {extra:?}"
+    ))
 }
 
 fn ensure_clean_checkout(source: &Path, name: &str) -> anyhow::Result<()> {
@@ -639,6 +768,30 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+
+    /// Same files in a different order is the same coverage.
+    #[test]
+    fn pins_covering_the_same_files_are_no_problem() {
+        let primary = vec!["src/a.cpp".to_owned(), "src/b.cpp".to_owned()];
+        let pin = vec!["src/b.cpp".to_owned(), "src/a.cpp".to_owned()];
+        assert_eq!(
+            pin_coverage_problem(("v1.5.6", &primary), ("v1.5.5", &pin)),
+            None
+        );
+    }
+
+    /// A file the series reaches in one source and not the other is named
+    /// on the side it is missing from.
+    #[test]
+    fn a_pin_the_series_covers_differently_is_a_problem() {
+        let primary = vec!["src/a.cpp".to_owned(), "src/b.cpp".to_owned()];
+        let pin = vec!["src/a.cpp".to_owned(), "src/c.cpp".to_owned()];
+        let problem = pin_coverage_problem(("v1.5.6", &primary), ("v1.5.5", &pin))
+            .expect("differing coverage is a problem");
+        assert!(problem.contains("v1.5.5"), "{problem}");
+        assert!(problem.contains("src/b.cpp"), "{problem}");
+        assert!(problem.contains("src/c.cpp"), "{problem}");
+    }
 
     fn commit_fixture(repository: &Path, name: &str, contents: &str) -> String {
         fs::write(repository.join(name), contents).expect("fixture file");

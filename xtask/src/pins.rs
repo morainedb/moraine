@@ -297,18 +297,31 @@ fn patch_series_problems() -> anyhow::Result<Vec<String>> {
     Ok(problems)
 }
 
-fn ducklake_release_problems(
-    versions: &[String],
-    primary_commit: &str,
-) -> anyhow::Result<Vec<String>> {
-    let contents = read(DUCKLAKE_RELEASE_PINS)?;
-    let pins: Vec<(&str, &str)> = contents
+/// Every `<DuckDB version> <DuckLake commit>` entry in `source-pins`, in
+/// file order.
+pub fn ducklake_source_pins() -> anyhow::Result<Vec<(String, String)>> {
+    Ok(parse_source_pins(&read(DUCKLAKE_RELEASE_PINS)?)
+        .into_iter()
+        .map(|(version, commit)| (version.to_owned(), commit.to_owned()))
+        .collect())
+}
+
+fn parse_source_pins(contents: &str) -> Vec<(&str, &str)> {
+    contents
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .filter_map(|line| line.split_once(char::is_whitespace))
         .map(|(version, commit)| (version, commit.trim()))
-        .collect();
+        .collect()
+}
+
+fn ducklake_release_problems(
+    versions: &[String],
+    primary_commit: &str,
+) -> anyhow::Result<Vec<String>> {
+    let contents = read(DUCKLAKE_RELEASE_PINS)?;
+    let pins = parse_source_pins(&contents);
     let mut problems = Vec::new();
 
     for version in versions {
@@ -535,6 +548,16 @@ pub fn print_version_matrix() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Comments, blank lines and trailing whitespace are not entries.
+    #[test]
+    fn source_pins_parse_to_their_version_and_commit() {
+        let contents = "# DuckDB version DuckLake commit\n\nv1.5.6 aaaa  \nv1.5.5 bbbb\n";
+        assert_eq!(
+            parse_source_pins(contents),
+            vec![("v1.5.6", "aaaa"), ("v1.5.5", "bbbb")]
+        );
+    }
 
     /// The manifest parses to at least one version, and the primary is the
     /// first of them.

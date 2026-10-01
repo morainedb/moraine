@@ -109,14 +109,15 @@ pub fn bump_duckdb(arguments: &[String]) -> anyhow::Result<()> {
             "DuckLake moved {previous_ducklake} -> {ducklake}, because {version} declares it in \
              {DUCKLAKE_CONFIG}.\n  Read what changed before trusting the wire-contract pins: \
              https://github.com/duckdb/ducklake/compare/{previous_ducklake}...{ducklake}\n  \
-             Check where the patch series lands in it: a zero-context hunk applies at a line \
-             the new source may have moved, in the wrong place and often still compiling."
+             The patch series is located by context, so a hunk the new source moved out from \
+             under fails its apply rather than landing quietly in the wrong place — \
+             `cargo xtask check-patch-pins` applies it to every pinned source."
         );
     }
     println!(
         "\nNot done for you: the codename in the README pin table, and whether an older \
-         release should now leave the manifest.\nNext: `cargo xtask check-pins`, then \
-         `cargo xtask e2e`."
+         release should now leave the manifest.\nNext: `cargo xtask check-pins`, \
+         `cargo xtask check-patch-pins`, then `cargo xtask e2e`."
     );
     Ok(())
 }

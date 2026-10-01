@@ -2,16 +2,25 @@ diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/sto
 index 2c9d3b91..211622d2 100644
 --- a/src/include/storage/ducklake_metadata_manager.hpp
 +++ b/src/include/storage/ducklake_metadata_manager.hpp
-@@ -420,0 +421,4 @@ protected:
+@@ -418,6 +418,10 @@ protected:
+ 	string GetColumnType(const DuckLakeColumnInfo &col);
+ 	string GetKnownFilesForCleanupQuery(const string &separator) const;
+
 +	//! Writes one table's inlined rows through the Appender API instead of an INSERT ... VALUES list.
 +	//! False means the caller must emit that SQL: the backend has no appender, or there are no rows.
 +	bool TryAppendInlinedData(DuckLakeSnapshot &commit_snapshot, const string &inlined_table_name,
 +	                          const DuckLakeInlinedDataInfo &entry, bool has_preserved_row_ids);
+ 	//! Optimized data file writing using DuckDB Appender API (only for DuckDB metadata manager)
+ 	string WriteNewDataFilesWithAppender(DuckLakeSnapshot &commit_snapshot, const vector<DuckLakeFileInfo> &new_files,
+ 	                                     const vector<DuckLakeTableInfo> &new_tables,
 diff --git a/src/storage/ducklake_metadata_manager.cpp b/src/storage/ducklake_metadata_manager.cpp
 index 168b989d..6890c152 100644
 --- a/src/storage/ducklake_metadata_manager.cpp
 +++ b/src/storage/ducklake_metadata_manager.cpp
-@@ -2802,0 +2803,56 @@ string DuckLakeMetadataManager::WriteNewViews(const vector<DuckLakeViewInfo> &ne
+@@ -2800,6 +2800,62 @@ string DuckLakeMetadataManager::WriteNewViews(const vector<DuckLakeViewInfo> &ne
+ 	return {};
+ }
+
 +bool DuckLakeMetadataManager::TryAppendInlinedData(DuckLakeSnapshot &commit_snapshot,
 +                                                  const string &inlined_table_name,
 +                                                  const DuckLakeInlinedDataInfo &entry, bool has_preserved_row_ids) {
@@ -68,24 +77,44 @@ index 168b989d..6890c152 100644
 +	return true;
 +}
 +
-@@ -2813,0 +2870,3 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
+ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_snapshot,
+                                                     const vector<DuckLakeInlinedDataInfo> &new_data,
+                                                     const vector<DuckLakeTableInfo> &new_tables,
+@@ -2811,11 +2867,15 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
+
+ 	auto context_ptr = transaction.context.lock();
+ 	auto &context = *context_ptr;
 +	// Appends run now; the batch this builds runs later. A table the batch still has to CREATE is
 +	// therefore not appendable yet, and those rows keep taking the SQL path.
 +	set<string> created_in_batch;
-@@ -2818,0 +2878 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
+ 	for (auto &entry : new_data) {
+ 		string inlined_table_name;
+ 		for (auto &inlined_table : new_inlined_data_tables_result) {
+ 			if (inlined_table.id == entry.table_id) {
+ 				inlined_table_name = InlinedTableNameFor(inlined_table.id.index, commit_snapshot.schema_version);
 +				created_in_batch.insert(inlined_table_name);
-@@ -2867,0 +2928 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
+ 			}
+ 		}
+ 		if (inlined_table_name.empty()) {
+@@ -2865,11 +2925,16 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
+ 			    GetInlinedTableQueries(commit_snapshot, table_info, inlined_tables, inlined_table_queries);
+ 			batch_query += "INSERT INTO {METADATA_CATALOG}.ducklake_inlined_data_tables VALUES " + inlined_tables + ";";
+ 			batch_query += inlined_table_queries;
 +			created_in_batch.insert(inlined_table_name);
-@@ -2870,2 +2930,0 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
+ 		}
+
 -		// Build one cell list per row, then defer formatting to the shared helper.
 -		// FIXME: we can do a much faster append than this
-@@ -2872,0 +2932,6 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
+ 		const bool has_preserved_row_ids = entry.data->HasPreservedRowIds();
 +		if (!created_in_batch.count(inlined_table_name) &&
 +		    TryAppendInlinedData(commit_snapshot, inlined_table_name, entry, has_preserved_row_ids)) {
 +			continue;
 +		}
 +
 +		// Build one cell list per row, then defer formatting to the shared helper.
+ 		vector<string> cells_per_row;
+ 		for (auto &chunk : entry.data->data->Chunks()) {
+ 			for (idx_t r = 0; r < chunk.size(); r++) {
 diff --git a/test/sql/data_inlining/data_inlining_appender.test b/test/sql/data_inlining/data_inlining_appender.test
 new file mode 100644
 index 00000000..b60df64d

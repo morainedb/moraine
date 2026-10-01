@@ -2,25 +2,46 @@ diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/sto
 index ad3536f8..2c9d3b91 100644
 --- a/src/include/storage/ducklake_metadata_manager.hpp
 +++ b/src/include/storage/ducklake_metadata_manager.hpp
-@@ -82,0 +83,3 @@ struct FilterPushdownInfo {
+@@ -80,6 +80,9 @@ struct ColumnFilterInfo {
+
+ struct FilterPushdownInfo {
+ 	unordered_map<idx_t, ColumnFilterInfo> column_filters;
 +	//! Filter on the data_file_id virtual column, applied to the file list
 +	//! directly rather than through column statistics.
 +	unique_ptr<TableFilter> data_file_id_filter;
-@@ -90,0 +94,3 @@ struct FilterPushdownInfo {
+
+ 	FilterPushdownInfo() = default;
+
+@@ -88,6 +91,9 @@ struct FilterPushdownInfo {
+ 		for (const auto &entry : column_filters) {
+ 			result->column_filters.emplace(entry.first, entry.second);
+ 		}
 +		if (data_file_id_filter) {
 +			result->data_file_id_filter = data_file_id_filter->Copy();
 +		}
+ 		return result;
+ 	}
+ };
 diff --git a/src/include/storage/ducklake_multi_file_reader.hpp b/src/include/storage/ducklake_multi_file_reader.hpp
 index 1898459b..7c76fca2 100644
 --- a/src/include/storage/ducklake_multi_file_reader.hpp
 +++ b/src/include/storage/ducklake_multi_file_reader.hpp
-@@ -22,0 +23 @@ public:
+@@ -20,6 +20,7 @@ class DuckLakeFieldData;
+ struct DuckLakeMultiFileReader : public MultiFileReader {
+ public:
+ 	static constexpr column_t COLUMN_IDENTIFIER_SNAPSHOT_ID = UINT64_C(10000000000000000000);
 +	static constexpr column_t COLUMN_IDENTIFIER_DATA_FILE_ID = UINT64_C(10000000000000000001);
+
+ public:
+ 	explicit DuckLakeMultiFileReader(DuckLakeFunctionInfo &read_info);
 diff --git a/src/storage/ducklake_metadata_manager.cpp b/src/storage/ducklake_metadata_manager.cpp
 index 487e074e..168b989d 100644
 --- a/src/storage/ducklake_metadata_manager.cpp
 +++ b/src/storage/ducklake_metadata_manager.cpp
-@@ -1073,0 +1074,104 @@ static void SetSnapshotFilter(const DuckLakeSnapshot &snapshot, idx_t max_partia
+@@ -1071,6 +1071,110 @@ static void SetSnapshotFilter(const DuckLakeSnapshot &snapshot, idx_t max_partia
+ 	file_entry.snapshot_filter_max = snapshot.snapshot_id;
+ }
+
 +static string GenerateDataFileIdFilter(const TableFilter &filter) {
 +	switch (filter.filter_type) {
 +	case TableFilterType::CONSTANT_COMPARISON: {
@@ -125,7 +146,13 @@ index 487e074e..168b989d 100644
 +	}
 +}
 +
-@@ -1668,0 +1773,12 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
+ string DuckLakeMetadataManager::GenerateFilterFromTableFilter(const TableFilter &filter, const LogicalType &type,
+                                                               unordered_set<string> &referenced_stats) {
+ 	switch (filter.filter_type) {
+@@ -1666,6 +1770,18 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
+ 		}
+ 	}
+
 +	// Prune the file list directly by id. This uses no column statistics, and
 +	// an unrepresentable filter simply adds no predicate.
 +	if (filter_info && filter_info->data_file_id_filter) {
@@ -138,31 +165,61 @@ index 487e074e..168b989d 100644
 +		}
 +	}
 +
+ 	// Add base query
+ 	query += StringUtil::Format(R"(
+ SELECT %s
 diff --git a/src/storage/ducklake_multi_file_list.cpp b/src/storage/ducklake_multi_file_list.cpp
 index 568fda69..90318ab0 100644
 --- a/src/storage/ducklake_multi_file_list.cpp
 +++ b/src/storage/ducklake_multi_file_list.cpp
-@@ -50,0 +51,5 @@ void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown
+@@ -48,6 +48,11 @@ void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown
+ 		pushdown_info.column_filters.emplace(field_index, std::move(filter_info_entry));
+ 		return;
+ 	}
 +	if (column_id == DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID) {
 +		// Answered by the metadata file list itself, not by column statistics.
 +		pushdown_info.data_file_id_filter = std::move(filter);
 +		return;
 +	}
-@@ -169,0 +175 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
+ 	if (IsVirtualColumn(column_id)) {
+ 		return;
+ 	}
+@@ -167,6 +172,7 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
+ 			extended_info->options["row_id_start"] = Value::UBIGINT(file_entry.row_id_start.GetIndex());
+ 		}
+ 		extended_info->options["snapshot_id"] = Value(LogicalType::BIGINT);
 +		extended_info->options["data_file_id"] = Value(LogicalType::UBIGINT);
-@@ -180,0 +187 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
+ 		if (file_entry.mapping_id.IsValid()) {
+ 			extended_info->options["mapping_id"] = Value::UBIGINT(file_entry.mapping_id.index);
+ 		}
+@@ -178,6 +184,7 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
+ 		extended_info->options["inlined_data"] = Value::BOOLEAN(true);
+ 		extended_info->options["schema_version"] =
+ 		    Value::BIGINT(NumericCast<int64_t>(inlined_data_table.schema_version));
 +		extended_info->options["data_file_id"] = Value(LogicalType::UBIGINT);
-@@ -195,0 +203,5 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
+ 	} else {
+ 		extended_info->options["file_size"] = Value::UBIGINT(file.file_size_bytes);
+ 		if (file.footer_size.IsValid()) {
+@@ -193,6 +200,11 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
+ 			snapshot_id = Value(LogicalType::BIGINT);
+ 		}
+ 		extended_info->options["snapshot_id"] = std::move(snapshot_id);
 +		if (file_entry.file_id.IsValid()) {
 +			extended_info->options["data_file_id"] = Value::UBIGINT(file_entry.file_id.index);
 +		} else {
 +			extended_info->options["data_file_id"] = Value(LogicalType::UBIGINT);
 +		}
+ 		if (!file.encryption_key.empty()) {
+ 			extended_info->options["encryption_key"] = Value::BLOB_RAW(file.encryption_key);
+ 		}
 diff --git a/src/storage/ducklake_multi_file_reader.cpp b/src/storage/ducklake_multi_file_reader.cpp
 index c50cc642..43ae44ed 100644
 --- a/src/storage/ducklake_multi_file_reader.cpp
 +++ b/src/storage/ducklake_multi_file_reader.cpp
-@@ -606,0 +607,14 @@ unique_ptr<Expression> DuckLakeMultiFileReader::GetVirtualColumnExpression(
+@@ -604,6 +604,20 @@ unique_ptr<Expression> DuckLakeMultiFileReader::GetVirtualColumnExpression(
+ 		}
+ 		return function_expr;
+ 	}
 +	if (column_id == COLUMN_IDENTIFIER_DATA_FILE_ID) {
 +
 +		// A physical file emits its persistent catalog id; inlined and
@@ -177,17 +234,30 @@ index c50cc642..43ae44ed 100644
 +		}
 +		return make_uniq<BoundConstantExpression>(std::move(data_file_id));
 +	}
+ 	if (column_id == COLUMN_IDENTIFIER_SNAPSHOT_ID) {
+ 		if (TryFindColumnByFieldId(local_columns, MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID,
+ 		                           snapshot_id_column.get(), global_column_reference)) {
 diff --git a/src/storage/ducklake_table_entry.cpp b/src/storage/ducklake_table_entry.cpp
-index 9e1650f7..ae032621 100644
+index ce9a7d1f..6e7921eb 100644
 --- a/src/storage/ducklake_table_entry.cpp
 +++ b/src/storage/ducklake_table_entry.cpp
-@@ -90,0 +91 @@ constexpr column_t DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID;
+@@ -88,6 +88,7 @@ void VerifyNoNullValues(ClientContext &context, DuckLakeTransaction &transaction
+ } // namespace
+
+ constexpr column_t DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID;
 +constexpr column_t DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID;
-@@ -400,2 +401,4 @@ virtual_column_map_t DuckLakeTableEntry::GetVirtualColumns() const {
+
+ void DuckLakeTableEntry::CheckSupportedTypes() {
+ 	for (auto &col : columns.Logical()) {
+@@ -402,6 +403,8 @@ virtual_column_map_t DuckLakeTableEntry::GetVirtualColumns() const {
+ 	result.insert(make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", LogicalType::BIGINT)));
+ 	result.insert(make_pair(DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID,
  	                        TableColumn("snapshot_id", LogicalType::BIGINT)));
 +	result.insert(make_pair(DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID,
 +	                        TableColumn("data_file_id", LogicalType::UBIGINT)));
  	result.insert(make_pair(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN)));
+ 	return result;
+ }
 diff --git a/test/sql/rowid/ducklake_data_file_id.test b/test/sql/rowid/ducklake_data_file_id.test
 new file mode 100644
 index 00000000..73aa10d6

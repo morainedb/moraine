@@ -1,57 +1,103 @@
 diff --git a/src/storage/ducklake_insert.cpp b/src/storage/ducklake_insert.cpp
-index e15d40c9ccfad3513ac8697396bd7d7ec1cbba9e..fc51b4aa37d97e56bf6776ad6c0a6eec622217ad 100644
+index e15d40c9..fc51b4aa 100644
 --- a/src/storage/ducklake_insert.cpp
 +++ b/src/storage/ducklake_insert.cpp
-@@ -150,0 +151 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
+@@ -148,13 +148,15 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
+ 				continue;
+ 			}
+ 			if (column_names[0] == "_ducklake_internal_row_id") {
 +				auto row_id_stats = ParseColumnStats(LogicalType::BIGINT, col_stats);
-@@ -153 +153,0 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
+ 				if (set_snapshot_id) {
+ 					// extract the min row_id so flushed files preserve the original row_id_start
 -					auto row_id_stats = ParseColumnStats(LogicalType::BIGINT, col_stats);
-@@ -157,0 +158,2 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
+ 					if (row_id_stats.has_min) {
+ 						data_file.flush_row_id_start = StringUtil::ToUnsigned(row_id_stats.min);
+ 					}
+ 				}
 +				data_file.column_stats.emplace(
 +				    FieldIndex(static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID)), std::move(row_id_stats));
+ 				continue;
+ 			}
+
 diff --git a/src/storage/ducklake_multi_file_list.cpp b/src/storage/ducklake_multi_file_list.cpp
-index 256b036cc9e1445a968ffb7e3b896a497ae6f76a..568fda6986ebd3135cd8e36f72c7dd22e4a3d723 100644
+index 256b036c..568fda69 100644
 --- a/src/storage/ducklake_multi_file_list.cpp
 +++ b/src/storage/ducklake_multi_file_list.cpp
-@@ -44,0 +45,6 @@ void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown
+@@ -42,6 +42,12 @@ DuckLakeMultiFileList::DuckLakeMultiFileList(DuckLakeFunctionInfo &read_info,
+
+ void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id,
+                                                     unique_ptr<TableFilter> filter) const {
 +	if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
 +		auto field_index = static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID);
 +		ColumnFilterInfo filter_info_entry(field_index, LogicalType::BIGINT, std::move(filter));
 +		pushdown_info.column_filters.emplace(field_index, std::move(filter_info_entry));
 +		return;
 +	}
+ 	if (IsVirtualColumn(column_id)) {
+ 		return;
+ 	}
 diff --git a/src/storage/ducklake_server_side_commit.cpp b/src/storage/ducklake_server_side_commit.cpp
-index 141db9e735adac918414ee74c56e5fc841283930..0fe81e8fe13ab554dc84f552479cf92fbcdbf889 100644
+index 01d572b8..f4973f09 100644
 --- a/src/storage/ducklake_server_side_commit.cpp
 +++ b/src/storage/ducklake_server_side_commit.cpp
-@@ -5,0 +6 @@
+@@ -3,6 +3,7 @@
+ #include "common/ducklake_row_helpers.hpp"
+ #include "common/ducklake_types.hpp"
+ #include "common/ducklake_util.hpp"
 +#include "duckdb/common/multi_file/multi_file_reader.hpp"
-@@ -234,0 +236,5 @@ void DuckLakeServerSideCommit::ReadColumnTypes() {
+ #include "duckdb/common/string_util.hpp"
+ #include "duckdb/main/client_context.hpp"
+ #include "duckdb/main/database.hpp"
+@@ -232,6 +233,11 @@ void DuckLakeServerSideCommit::ReadColumnTypes() {
+ 		column_types.emplace(ColumnKey {TableIndex(AsIdx(row, 0)), FieldIndex(AsIdx(row, 1))},
+ 		                     DuckLakeTypes::FromString(row.GetValue<string>(2)));
+ 	}
 +	for (auto table_id : table_ids) {
 +		column_types.emplace(
 +		    ColumnKey {TableIndex(table_id), FieldIndex(static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID))},
 +		    LogicalType::BIGINT);
 +	}
+ }
+
+ void DuckLakeServerSideCommit::ReadStagedDataFiles() {
 diff --git a/src/storage/ducklake_stats.cpp b/src/storage/ducklake_stats.cpp
-index 1d94d7ed8061f9611dcf61d32d3bb58ca909d4f1..aed20857cd66efb930dd43e1d1dac4e8b8bc54a0 100644
+index 88827119..ce874523 100644
 --- a/src/storage/ducklake_stats.cpp
 +++ b/src/storage/ducklake_stats.cpp
-@@ -10,0 +11 @@
+@@ -8,6 +8,7 @@
+ #include "duckdb/storage/statistics/base_statistics.hpp"
+ #include "duckdb/common/helper.hpp"
+ #include "duckdb/common/limits.hpp"
 +#include "duckdb/common/multi_file/multi_file_reader.hpp"
-@@ -212,2 +213,5 @@ void DuckLakeTableStats::MergeFileStats(const DuckLakeDataFile &file) {
+
+ #include "yyjson.hpp"
+
+@@ -230,6 +231,9 @@ void DuckLakeTableStats::MergeFileStats(const DuckLakeDataFile &file) {
+ 	}
+ 	table_size_bytes += file.file_size_bytes;
  	for (auto &entry : file.column_stats) {
 +		if (entry.first.index == static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID)) {
 +			continue;
 +		}
  		MergeStats(entry.first, entry.second);
+ 	}
+ }
 diff --git a/src/storage/ducklake_transaction.cpp b/src/storage/ducklake_transaction.cpp
-index f5eef0f40f258d073cd4d8425faa2e2625cbbb4c..d61d9dbd97fee2caaae14ceedd72b59d7d0f462d 100644
+index 94186cc9..34cc092e 100644
 --- a/src/storage/ducklake_transaction.cpp
 +++ b/src/storage/ducklake_transaction.cpp
-@@ -6,0 +7 @@
+@@ -4,6 +4,7 @@
+ #include "storage/ducklake_transaction_state.hpp"
+ #include "common/ducklake_types.hpp"
+ #include "common/ducklake_util.hpp"
 +#include "duckdb/common/multi_file/multi_file_reader.hpp"
-@@ -1240 +1242,19 @@ DuckLakeFileInfo DuckLakeTransaction::BuildDataFileInfo(const DuckLakeDataFile &
--	return data_file;
+ #include "duckdb/common/thread.hpp"
+ #include "duckdb/common/vector_operations/vector_operations.hpp"
+ #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
+@@ -1258,6 +1259,24 @@ DuckLakeFileInfo DuckLakeTransaction::BuildDataFileInfo(const DuckLakeDataFile &
+ 		partition_info.partition_value = partition_entry.partition_value;
+ 		data_file.partition_values.push_back(std::move(partition_info));
+ 	}
 +	auto row_id_field = FieldIndex(static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID));
 +	if (file.row_count > 0 && row_id_start.IsValid() &&
 +	    data_file.column_stats.find(row_id_field) == data_file.column_stats.end()) {
@@ -70,102 +116,12 @@ index f5eef0f40f258d073cd4d8425faa2e2625cbbb4c..d61d9dbd97fee2caaae14ceedd72b59d
 +			data_file.column_stats.emplace(row_id_field, std::move(row_id_stats));
 +		}
 +	}
-+	return data_file;
-diff --git a/test/sql/add_files/add_files_complex_nested_stats_mre.test b/test/sql/add_files/add_files_complex_nested_stats_mre.test
-index 257a4e675b69ef1376317e2d5cf5ba7afb9ff321..0d100b8cebbb5ae925ca6e50ac44496a47805d2d 100644
---- a/test/sql/add_files/add_files_complex_nested_stats_mre.test
-+++ b/test/sql/add_files/add_files_complex_nested_stats_mre.test
-@@ -42 +42,3 @@ query III
--SELECT column_id, min_value, max_value FROM metadata.ducklake_file_column_stats ORDER BY data_file_id, column_id
-+SELECT column_id, min_value, max_value FROM metadata.ducklake_file_column_stats
-+WHERE column_id <> 2147483540
-+ORDER BY data_file_id, column_id
-@@ -62 +64,3 @@ query IIII
--SELECT data_file_id, column_id, min_value, max_value FROM metadata.ducklake_file_column_stats ORDER BY data_file_id, column_id
-+SELECT data_file_id, column_id, min_value, max_value FROM metadata.ducklake_file_column_stats
-+WHERE column_id <> 2147483540
-+ORDER BY data_file_id, column_id
-diff --git a/test/sql/add_files/add_files_nested_list_struct_nulls.test b/test/sql/add_files/add_files_nested_list_struct_nulls.test
-index 63211beccc7cf64d0eca97fab01f9fb092a444d8..c5ce328dc2efe43505961d3daf15a5aae919f86d 100644
---- a/test/sql/add_files/add_files_nested_list_struct_nulls.test
-+++ b/test/sql/add_files/add_files_nested_list_struct_nulls.test
-@@ -68,0 +69 @@ WHERE f.path LIKE '%simple_test%'
-+  AND s.column_id <> 2147483540
-diff --git a/test/sql/geo/ducklake_geometry.test b/test/sql/geo/ducklake_geometry.test
-index 438c40fb1ec6f46ab28a38b4c7ac4c84b42db15a..32cb958ff0b6dba7a2ff4bb7ccbcab9ae0356f0b 100644
---- a/test/sql/geo/ducklake_geometry.test
-+++ b/test/sql/geo/ducklake_geometry.test
-@@ -31 +31 @@ query I
--select extra_stats from ducklake_meta.ducklake_file_column_stats;
-+select extra_stats from ducklake_meta.ducklake_file_column_stats where column_id <> 2147483540;
-@@ -51 +51 @@ query I
--select extra_stats from ducklake_meta.ducklake_file_column_stats order by all;
-+select extra_stats from ducklake_meta.ducklake_file_column_stats where column_id <> 2147483540 order by all;
-@@ -69 +69 @@ query I
--select extra_stats from ducklake_meta.ducklake_file_column_stats order by all;
-+select extra_stats from ducklake_meta.ducklake_file_column_stats where column_id <> 2147483540 order by all;
-@@ -91 +91 @@ query I
--select extra_stats from ducklake_meta.ducklake_file_column_stats order by all;
-+select extra_stats from ducklake_meta.ducklake_file_column_stats where column_id <> 2147483540 order by all;
-@@ -105 +105 @@ query I
--select extra_stats from ducklake_meta.ducklake_file_column_stats order by all;
-+select extra_stats from ducklake_meta.ducklake_file_column_stats where column_id <> 2147483540 order by all;
-diff --git a/test/sql/geo/ducklake_geometry_add_files.test b/test/sql/geo/ducklake_geometry_add_files.test
-index be2fe66e9d9baed35ee6300a23be042ee11d23d6..6e982a00efcc8e1623f6a9a0bb6170b336b90883 100644
---- a/test/sql/geo/ducklake_geometry_add_files.test
-+++ b/test/sql/geo/ducklake_geometry_add_files.test
-@@ -47 +47 @@ query I
--select extra_stats from ducklake_meta.ducklake_file_column_stats order by all;
-+select extra_stats from ducklake_meta.ducklake_file_column_stats where column_id <> 2147483540 order by all;
-@@ -49 +49 @@ select extra_stats from ducklake_meta.ducklake_file_column_stats order by all;
--{"bbox": {"xmin": 5.000000, "xmax": 5.000000, "ymin": 5.000000, "ymax": 5.000000, "zmin": null, "zmax": null, "mmin": null, "mmax": null}, "types": ["point"]}
-\ No newline at end of file
-+{"bbox": {"xmin": 5.000000, "xmax": 5.000000, "ymin": 5.000000, "ymax": 5.000000, "zmin": null, "zmax": null, "mmin": null, "mmax": null}, "types": ["point"]}
-diff --git a/test/sql/geo/ducklake_geometry_nested_list.test b/test/sql/geo/ducklake_geometry_nested_list.test
-index 20346faecfeffcbfe1204a643e234abfe8d51d56..a21cfd7859606ddccec15655ac11dd4a466cc0b8 100644
---- a/test/sql/geo/ducklake_geometry_nested_list.test
-+++ b/test/sql/geo/ducklake_geometry_nested_list.test
-@@ -44 +44 @@ query I
--select extra_stats from ducklake_meta.ducklake_file_column_stats;
-+select extra_stats from ducklake_meta.ducklake_file_column_stats where column_id <> 2147483540;
-@@ -46 +46 @@ select extra_stats from ducklake_meta.ducklake_file_column_stats;
--{"bbox": {"xmin": 0.000000, "xmax": 1.000000, "ymin": 0.000000, "ymax": 2.000000, "zmin": null, "zmax": null, "mmin": null, "mmax": null}, "types": ["linestring", "point"]}
-\ No newline at end of file
-+{"bbox": {"xmin": 0.000000, "xmax": 1.000000, "ymin": 0.000000, "ymax": 2.000000, "zmin": null, "zmax": null, "mmin": null, "mmax": null}, "types": ["linestring", "point"]}
-diff --git a/test/sql/geo/ducklake_geometry_nested_map.test b/test/sql/geo/ducklake_geometry_nested_map.test
-index a4eca53a407b83a575291ab297d0f7f62e152ff5..6a4f90525586c918749a7ed7dde6112b73f3db52 100644
---- a/test/sql/geo/ducklake_geometry_nested_map.test
-+++ b/test/sql/geo/ducklake_geometry_nested_map.test
-@@ -45 +45 @@ query I
--select extra_stats from ducklake_meta.ducklake_file_column_stats ORDER BY ALL;
-+select extra_stats from ducklake_meta.ducklake_file_column_stats where column_id <> 2147483540 ORDER BY ALL;
-@@ -49 +48,0 @@ NULL
--
-diff --git a/test/sql/geo/ducklake_geometry_nested_struct.test b/test/sql/geo/ducklake_geometry_nested_struct.test
-index c2a8d5e9b500e191e411b5c0bc711598b774ae69..f472403857578af15e49852c2bb19db781baa0a8 100644
---- a/test/sql/geo/ducklake_geometry_nested_struct.test
-+++ b/test/sql/geo/ducklake_geometry_nested_struct.test
-@@ -46 +46 @@ query I
--select extra_stats from ducklake_meta.ducklake_file_column_stats;
-+select extra_stats from ducklake_meta.ducklake_file_column_stats where column_id <> 2147483540;
-diff --git a/test/sql/metadata/appender_data_files.test b/test/sql/metadata/appender_data_files.test
-index e73d57c6b8cd185641caf16cdbac97906f7e6349..a28d7db933cd9aae998855bc3b5d16ec89487031 100644
---- a/test/sql/metadata/appender_data_files.test
-+++ b/test/sql/metadata/appender_data_files.test
-@@ -42,0 +43 @@ WHERE table_id = (SELECT table_id FROM dl.ducklake_table WHERE table_name = 'bas
-+  AND column_id <> 2147483540
-@@ -78,0 +80 @@ WHERE table_id = (SELECT table_id FROM dl.ducklake_table WHERE table_name = 'sta
-+  AND column_id <> 2147483540
-@@ -115,0 +118 @@ WHERE table_id = (SELECT table_id FROM dl.ducklake_table WHERE table_name = 'nul
-+  AND column_id <> 2147483540
-@@ -145 +148,3 @@ query I
--SELECT COUNT(*) FROM dl.ducklake_file_column_stats WHERE table_id = (SELECT table_id FROM dl.ducklake_table WHERE table_name = 'pruning_test')
-+SELECT COUNT(*) FROM dl.ducklake_file_column_stats
-+WHERE table_id = (SELECT table_id FROM dl.ducklake_table WHERE table_name = 'pruning_test')
-+  AND column_id <> 2147483540
+ 	return data_file;
+ }
+
 diff --git a/test/sql/rowid/ducklake_row_id_file_pruning.test b/test/sql/rowid/ducklake_row_id_file_pruning.test
 new file mode 100644
-index 0000000000000000000000000000000000000000..9c87e00fa1648bfbafdff0d64fd2684a3c568bfb
+index 00000000..9c87e00f
 --- /dev/null
 +++ b/test/sql/rowid/ducklake_row_id_file_pruning.test
 @@ -0,0 +1,160 @@
@@ -329,10 +285,3 @@ index 0000000000000000000000000000000000000000..9c87e00fa1648bfbafdff0d64fd2684a
 +SELECT rowid, i FROM ducklake.sparse WHERE rowid = 8
 +----
 +8	8
-diff --git a/test/sql/stats/variant_shredded_stats.test b/test/sql/stats/variant_shredded_stats.test
-index b85b641342dd46a09be5f3b7b956f737222d90e4..a66f07b89ec260d12c5b4577801dd0bf35a5521d 100644
---- a/test/sql/stats/variant_shredded_stats.test
-+++ b/test/sql/stats/variant_shredded_stats.test
-@@ -36 +36 @@ query II
--SELECT value_count, null_count FROM dl.ducklake_file_column_stats
-+SELECT value_count, null_count FROM dl.ducklake_file_column_stats WHERE column_id <> 2147483540

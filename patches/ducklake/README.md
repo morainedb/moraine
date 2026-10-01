@@ -8,10 +8,7 @@ for DuckDB v1.5.6, applied in file-name order:
    table and pushes `rowid` filters into its file list before any Parquet
    reader is created. Moraine can therefore return stable row ids without
    taking ownership of DuckLake scans or physical placement.
-2. `0002-feat-backfill-DuckLake-row-id-file-statistics.patch` adds the
-   metadata-only `ducklake_backfill_row_id_stats` function, which repairs
-   files written before the statistics patch was installed.
-3. `0003-feat-expose-DuckLake-data-file-ids-to-scans.patch` exposes
+2. `0002-feat-expose-DuckLake-data-file-ids-to-scans.patch` exposes
    `data_file_id` as an internal virtual `UBIGINT` column. A physical file
    emits its persistent catalog id; inlined and transaction-local sources
    emit NULL. Filters on it are pushed into the metadata file-list query as
@@ -19,7 +16,7 @@ for DuckDB v1.5.6, applied in file-name order:
    statistics, so a located index result restricts the file list as well as
    the rows read within it. A filter shape the translation does not cover
    adds no predicate, which keeps every file rather than guessing.
-4. `0004-perf-append-DuckLake-inlined-data-rows.patch` writes a commit's
+3. `0003-perf-append-DuckLake-inlined-data-rows.patch` writes a commit's
    inlined rows through the DuckDB Appender API instead of formatting them
    into an `INSERT ... VALUES` list, whose cost is per row and dominated by
    binding it. Backends without an appender keep the SQL branch, as does the
@@ -29,7 +26,7 @@ for DuckDB v1.5.6, applied in file-name order:
    the table itself is created or altered, so this covers same-transaction
    `CREATE`-then-`INSERT` and tables that predate inlining being enabled.
 
-5. `0005-fix-retain-files-after-unknown-commit-outcomes.patch` recognizes the
+4. `0004-fix-retain-files-after-unknown-commit-outcomes.patch` recognizes the
    metadata backend's structured `commit_outcome=unknown` error field, with
    Moraine's fixed message as a fallback when DuckDB's COMMIT wrapper drops
    extra fields. It
@@ -38,13 +35,17 @@ for DuckDB v1.5.6, applied in file-name order:
    Unregistered files remain eligible for orphan cleanup. Ordinary SQL deletion
    and standalone located deletion cancellation are tested by `cargo xtask e2e`.
 
-6. `0006-feat-change-DuckLake-rows-by-position.patch` adds
+5. `0005-feat-change-DuckLake-rows-by-position.patch` adds
    `ducklake_delete_positions(catalog, schema, table, files, inlined_rows := [], snapshot := NULL)`,
    which stages deletes of already-located rows in the current DuckLake
    transaction without scanning the table. `files` is a list of
-   `STRUCT(data_file_id UBIGINT, positions UBIGINT[])` naming positions
-   within committed data files at the transaction's snapshot; `inlined_rows`
-   lists row ids of committed inlined rows, and `snapshot`, when given, is
+   `STRUCT(data_file_id UBIGINT, positions UBIGINT[], existing_positions BLOB)`
+   naming positions within committed data files at the transaction's
+   snapshot. `existing_positions` carries the deletions the caller already
+   decoded from that file's current delete file, as whole uint64 positions;
+   NULL means the caller does not know them and DuckLake reads the file
+   itself. `inlined_rows` lists row ids of committed inlined rows, and
+   `snapshot`, when given, is
    the snapshot the caller resolved them against, refused with a
    transaction error if it is older than the one the transaction reads. The
    function validates every file id and position against that snapshot,
@@ -73,7 +74,7 @@ for DuckDB v1.5.6, applied in file-name order:
    dependency; explicit rollback, failed replacement inserts, repeated
    calls, and standalone autocommit are covered by `cargo xtask e2e`.
 
-`0010-fix-write-row-ids-when-merging.patch` makes
+`0008-fix-write-row-ids-when-merging.patch` makes
 `ducklake_merge_adjacent_files` write the row-id column into every merged
 file. Stock DuckLake judges two files adjacent from `row_id_start +
 record_count` alone, drops the column when they are, and numbers the merged
@@ -85,28 +86,29 @@ either chains onto a neighbour and every row after a gap is renumbered
 onto ids other rows hold. The `merge_flushed_files_keep_row_ids` and
 `merge_updated_files_keep_row_ids` sqllogictests pin both shapes.
 
-Later patches address the lines earlier ones produce, so the series is applied
-in one `git apply` invocation rather than one per file.
+A later patch edits files an earlier one creates, so the series is applied in
+one `git apply` invocation rather than one per file.
 
 The series is pinned separately to the DuckLake revisions selected by every
 DuckDB release moraine supports. The patched DuckLake is built alongside
 moraine and linked into its loadable, so `LOAD moraine` registers both and
 no separate DuckLake extension is installed or loaded.
-Most hunks use zero context to satisfy moraine's whitespace gate. Zero
-context leaves `git apply` nothing to match on, so it places the hunk by line
-number: one whose line has moved in a pinned source lands in the wrong place
-there, silently where the result still compiles. A hunk in a region the pins
-disagree on therefore carries context lines, which `git apply` locates by
-content in each of them. The control-flow-sensitive row-ID statistics hunk
-also replaces and re-emits its function's return so it cannot land after that
-return.
+
+Every hunk carries context, so `git apply` locates it by content in each
+pinned source rather than by line number, and a hunk whose region moved fails
+the apply instead of landing somewhere the result still compiles. Blank
+context lines are written without their trailing space, which `git apply`
+reads as the blank line it is.
 
 The source mapping lives in `source-pins`. Each entry binds one DuckDB release
 to the upstream DuckLake commit that release selects, and a release's build
 cannot fetch its DuckLake without one. `cargo xtask bump-duckdb` writes the
-new release's entry and `check-pins` requires one per supported release, but
-neither says the series still lands where it should in that source — that is
-what `e2e` and the reading above are for.
+new release's entry and `check-pins` requires one per supported release.
+Neither reads that source: `cargo xtask check-patch-pins` applies the series
+to every one of them and names the release whose source rejects it, which
+`cargo xtask e2e` also runs before building. Only the primary pin is built
+locally, so without it a hunk the other sources have moved out from under
+would first surface in that release's CI build.
 
 ## Build
 
@@ -117,16 +119,15 @@ and applies the patches, which is how the release and community pipelines
 build. `cargo xtask e2e` instead prepares a checkout under
 `target/patched-ducklake/` first: it fetches the pinned DuckLake and vcpkg
 revisions, applies the series and verifies the checkout's complete diff
-byte-for-byte, and passes the checkout in. Either way the CMake configure
-refuses a tree where the row-ID statistics hunk landed after its function's
-return, and DuckLake's `roaring` dependency resolves through vcpkg
-(`vcpkg.json` at the repository root declares it).
+byte-for-byte, and passes the checkout in. Either way DuckLake's `roaring`
+dependency resolves through vcpkg (`vcpkg.json` at the repository root
+declares it).
 
-`cargo xtask e2e` then runs the series' row-ID write, backfill, pruning,
+`cargo xtask e2e` then runs the series' row-ID write, pruning,
 inlined-append, and flushed-file-merge sqllogictests against the built
-moraine artifact, and the
-release workflow runs the same backfill-and-prune smoke against every
-published build (`cargo xtask validate-release-artifact`).
+moraine artifact, and the release workflow runs the same row-ID statistics
+and pruning smoke against every published build
+(`cargo xtask validate-release-artifact`).
 
 `cargo xtask ducklake-patch` builds the series as a standalone loadable under
 `target/patched-ducklake/build-extension-static/`, against moraine's DuckDB
@@ -142,7 +143,7 @@ A locally built artifact is unsigned, so start DuckDB with `-unsigned`. One
 load registers DuckLake and moraine:
 
 ```sh
-target/duckdb-cli/v1.5.5/cli/duckdb -unsigned
+target/duckdb-cli/v1.5.6/cli/duckdb -unsigned
 ```
 
 ```sql
@@ -159,53 +160,6 @@ the loaded `ducklake` extension, reporting its source revision through
 `duckdb_extensions()`. Loading stock DuckLake *before* moraine is refused,
 since it lacks the series and would collide with the bundle. The CLI and the
 artifact must match on DuckDB version.
-
-## Backfill existing files
-
-New files receive row-ID statistics when DuckLake registers them. Files that
-were already active when the patched extension was installed remain safe but
-unpruned: the absence of a statistics row means "unknown," so DuckLake keeps
-the file in every row-ID-filtered scan. Repair them with:
-
-```sql
-SELECT * FROM ducklake_backfill_row_id_stats('lake');
-```
-
-The result has one row per selected table:
-
-```text
-schema_name  table_name  files_backfilled  files_remaining
-```
-
-Scope a run by schema or table and bound the total files processed by one
-statement:
-
-```sql
-SELECT *
-FROM ducklake_backfill_row_id_stats(
-    'lake',
-    schema := 'main',
-    table_name := 'items',
-    max_files := 100
-);
-```
-
-Repeat bounded calls until every row reports `files_remaining = 0`.
-`max_files` is shared across the selected tables and must be greater than
-zero. Omitting it processes every missing non-empty active file.
-
-The operation changes metadata only: it neither rewrites Parquet nor mints a
-DuckLake snapshot. For an ordinary dense file it verifies that the reserved
-row-ID column is absent, then derives the range from `row_id_start` and
-`record_count`. For a rewrite or flushed file it reads the embedded row-ID
-column's Parquet min/max; if those footer statistics are absent, it scans only
-that physical column. Existing valid rows are left untouched, so the function
-is idempotent. A concurrent catalog commit can make a call fail; rerun it.
-
-With a Moraine metadata catalog, the Moraine extension must include support
-for head-preserving reserved row-ID-stat inserts. Older Moraine binaries reject
-the backfill commit even when the patched DuckLake binary exposes the
-function.
 
 ## Index-assisted read
 
@@ -257,6 +211,6 @@ optimization, not a correctness requirement — when in doubt, join on
 
 There is no separate DuckLake release. The moraine release workflow builds
 the bundle for every version in `.github/duckdb-versions` on the four native
-platforms, and before publishing runs the row-ID backfill and one-file
-pruning smoke (`release-smoke.sql`) against the Linux amd64 and macOS arm64
-builds of each version. A failed run leaves no partial public release.
+platforms, and before publishing runs the row-ID statistics, one-file
+pruning, and positional-delete smoke (`release-smoke.sql`) against the Linux
+amd64 and macOS arm64 builds of each version. A failed run leaves no partial public release.
