@@ -6,7 +6,10 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ops::Bound,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -78,6 +81,10 @@ const UNIQUENESS_PROBE_CONCURRENCY: usize = 1024;
 /// Ready keys sharing one transactional scan; pending sources flush partial
 /// batches.
 const PROBE_BATCH_SIZE: usize = 128;
+
+/// Tasks a batch's probes are split across, so the runtime's workers share
+/// the processor time a probe spends between its awaits.
+const PROBE_SHARDS: usize = 8;
 
 /// Uniqueness probes in flight while deletions still run, leaving the rest
 /// of the read window to their guard reads. Additions keep being derived
@@ -157,6 +164,12 @@ pub(crate) struct IndexMaintenanceMetrics {
     pub(crate) known_absent: u64,
     /// Unique deletes that read their entry to check which row holds it.
     pub(crate) guard_reads: u64,
+    /// Catalog-store reads the probe window took, and how many of them the
+    /// caches did not answer. A probe that clears a resident filter costs
+    /// nothing; one that fetches that filter costs a round trip, and only
+    /// these say which happened.
+    pub(crate) probe_store_misses: u64,
+    pub(crate) probe_store_gets: u64,
 }
 
 /// One unique put awaiting its committed-state probe.
@@ -304,21 +317,54 @@ async fn resolve_probe(transaction: &DbTransaction, probe: PendingProbe) -> Resu
     })
 }
 
-/// Resolves a batch by concurrent point reads. Each read is answered by
-/// the SST filters when the key is absent, so its cost is bounded by the
-/// sources the key could be in rather than by the batch's key span.
+/// Resolves a batch by concurrent point reads, spread over `PROBE_SHARDS`
+/// tasks. A read that misses is answered from cached filters and blocks,
+/// so it costs processor time rather than waiting: polled together on one
+/// task the batch runs serially, and the shards are what let the runtime's
+/// workers take a share each.
 async fn resolve_probes(
-    transaction: &DbTransaction,
+    transaction: Arc<DbTransaction>,
     probes: Vec<PendingProbe>,
 ) -> Result<Vec<CompletedProbe>> {
-    let reads: Vec<_> = probes
-        .into_iter()
-        .map(|probe| resolve_probe(transaction, probe))
-        .collect();
-    stream::iter(reads)
-        .buffer_unordered(PROBE_BATCH_SIZE)
-        .try_collect()
-        .await
+    let shard_size = probes.len().div_ceil(PROBE_SHARDS).max(1);
+    let depth = (PROBE_BATCH_SIZE / PROBE_SHARDS).max(1);
+
+    // A `JoinSet` so cancelling the window aborts its shards: a detached
+    // one would hold the transaction past the commit that needs it back.
+    let mut probes = VecDeque::from(probes);
+    let mut shards = tokio::task::JoinSet::new();
+    while !probes.is_empty() {
+        let transaction = Arc::clone(&transaction);
+        let shard: Vec<PendingProbe> = probes.drain(..shard_size.min(probes.len())).collect();
+        shards.spawn(async move {
+            let reads: Vec<_> = shard
+                .into_iter()
+                .map(|probe| resolve_probe(&transaction, probe))
+                .collect();
+            stream::iter(reads)
+                .buffer_unordered(depth)
+                .try_collect::<Vec<_>>()
+                .await
+        });
+    }
+
+    let mut completed = Vec::new();
+    let mut failure = None;
+    while let Some(shard) = shards.join_next().await {
+        match shard {
+            Ok(Ok(resolved)) => completed.extend(resolved),
+            Ok(Err(error)) => failure = failure.or(Some(error)),
+            Err(error) => {
+                failure = failure.or(Some(Error::Interrupted(format!(
+                    "a uniqueness probe did not report back ({error})"
+                ))));
+            }
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(completed),
+    }
 }
 
 fn plan_probe_batch(
@@ -371,6 +417,9 @@ struct ProbeWindow {
     pending: VecDeque<PendingProbe>,
     in_flight: usize,
     first_launch: Option<Instant>,
+    /// The cache tally when the first probe launched, so the window's own
+    /// misses can be read off against it.
+    cache_before: Option<crate::CacheTally>,
 }
 
 impl ProbeWindow {
@@ -389,6 +438,7 @@ impl ProbeWindow {
                 .min(self.pending.len());
             let batch: Vec<PendingProbe> = self.pending.drain(..count).collect();
             self.first_launch.get_or_insert_with(Instant::now);
+            self.cache_before.get_or_insert_with(crate::cache_tally);
             self.in_flight += count;
             metrics.probe_peak_in_flight = metrics
                 .probe_peak_in_flight
@@ -465,7 +515,7 @@ fn stage_probe_put(
 /// → no-op; absent → staged. Duplicates within the commit are caught in
 /// memory.
 pub(crate) async fn stage_index_entries(
-    db_tx: &DbTransaction,
+    db_tx: &Arc<DbTransaction>,
     entries: Vec<StagedIndexEntry>,
 ) -> Result<StagedEntries> {
     let entry_count = entries.len();
@@ -503,7 +553,7 @@ pub(crate) async fn stage_index_entries(
 /// windows bound what is launched, never what is polled.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn stage_index_entry_stream<D, S>(
-    db_tx: &DbTransaction,
+    db_tx: &Arc<DbTransaction>,
     deletes: D,
     entries: S,
     prior_entry_count: usize,
@@ -534,7 +584,7 @@ where
             DELETION_PHASE_PROBE_WINDOW,
             &mut probes,
             &mut metrics,
-            |batch| resolve_probes(db_tx, batch),
+            |batch| resolve_probes(Arc::clone(db_tx), batch),
         );
         let deletion = tokio::select! {
             biased;
@@ -589,7 +639,7 @@ where
             UNIQUENESS_PROBE_CONCURRENCY,
             &mut probes,
             &mut metrics,
-            |batch| resolve_probes(db_tx, batch),
+            |batch| resolve_probes(Arc::clone(db_tx), batch),
         );
         let Some(resolution) = ready.pop_front() else {
             if additions_done && probes.is_empty() {
@@ -669,6 +719,14 @@ where
         (window.first_launch, last_probe_completion)
     {
         metrics.probe_window = last_probe_completion.saturating_duration_since(first_launch);
+    }
+    if let Some(before) = window.cache_before {
+        let after = crate::cache_tally();
+        metrics.probe_store_misses = after
+            .metadata_misses
+            .saturating_add(after.block_misses)
+            .saturating_sub(before.metadata_misses.saturating_add(before.block_misses));
+        metrics.probe_store_gets = after.block_disk_hits.saturating_sub(before.block_disk_hits);
     }
     poisoned.sort_unstable();
     poisoned.dedup();
@@ -977,7 +1035,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
         let key = Bytes::from_static(b"absent value");
         let entries = stream::once(async {
             Ok(StagedIndexEntry {
@@ -1002,7 +1060,41 @@ mod tests {
             tx.get(&key).await.unwrap().as_deref(),
             Some(&7u64.to_be_bytes()[..])
         );
-        tx.rollback();
+        drop(tx);
+        db.close().await.unwrap();
+    }
+
+    /// A staged batch leaves no probe holding the transaction, which the
+    /// commit relies on to take it back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn staging_releases_every_probe_before_it_returns() {
+        let (db, _) = StoreBuilder::new("probe-release", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
+
+        // More than one shard's worth, so the window spawns.
+        let entries = stream::iter((0..PROBE_BATCH_SIZE as u64 * 3).map(|row_id| {
+            Ok(StagedIndexEntry {
+                index_id: 9,
+                unique: true,
+                key: Bytes::from(format!("value {row_id}")),
+                row_id,
+                delete: false,
+                building: false,
+                known_absent: false,
+                known_held: false,
+            })
+        }));
+
+        let staged = stage_index_entry_stream(&tx, stream::empty(), entries, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(staged.metrics.unique_probes, PROBE_BATCH_SIZE as u64 * 3);
+        assert_eq!(Arc::strong_count(&tx), 1);
+        assert!(Arc::into_inner(tx).is_some());
         db.close().await.unwrap();
     }
 
@@ -1013,7 +1105,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
         let entries = stream::iter([3u64, 4].map(|row_id| {
             Ok(StagedIndexEntry {
                 index_id: 9,
@@ -1033,7 +1125,7 @@ mod tests {
 
         assert_eq!(staged.poisoned, [9]);
         assert_eq!(staged.metrics.unique_probes, 0);
-        tx.rollback();
+        drop(tx);
         db.close().await.unwrap();
     }
 
@@ -1062,7 +1154,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
         let entries = stream::iter((0..ENTRIES).map(|position| {
             let row_id = u64::try_from(position).unwrap();
             Ok(StagedIndexEntry {
@@ -1082,7 +1174,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(staged.bytes, u64::try_from(ENTRIES * 16).unwrap());
-        tx.rollback();
+        drop(tx);
         db.close().await.unwrap();
     }
 
@@ -1100,9 +1192,9 @@ mod tests {
             .unwrap();
         let key = Bytes::from_static(b"one value");
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
         tx.put(key.clone(), 3u64.to_be_bytes()).unwrap();
-        tx.commit().await.unwrap();
+        Arc::into_inner(tx).unwrap().commit().await.unwrap();
 
         let deletion = |row_id: u64, key: Bytes| {
             stream::once(async move {
@@ -1119,15 +1211,15 @@ mod tests {
             })
         };
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
         let staged = stage_index_entry_stream(&tx, deletion(0, key.clone()), stream::empty(), 0)
             .await
             .unwrap();
         assert_eq!(staged.metrics.deletions, 0);
         assert_eq!(staged.metrics.guard_reads, 1);
-        tx.commit().await.unwrap();
+        Arc::into_inner(tx).unwrap().commit().await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
         assert!(
             ReadHandle::Tx(&tx)
                 .get(key.clone())
@@ -1140,11 +1232,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(staged.metrics.deletions, 1);
-        tx.commit().await.unwrap();
+        Arc::into_inner(tx).unwrap().commit().await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
         assert!(ReadHandle::Tx(&tx).get(key).await.unwrap().is_none());
-        tx.rollback();
+        drop(tx);
 
         db.close().await.unwrap();
     }
@@ -1159,11 +1251,11 @@ mod tests {
             .unwrap();
         let key = Bytes::from_static(b"held value");
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
         tx.put(key.clone(), 3u64.to_be_bytes()).unwrap();
-        tx.commit().await.unwrap();
+        Arc::into_inner(tx).unwrap().commit().await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
         let deletion_key = key.clone();
         let deletion = stream::once(async move {
             Ok(StagedIndexEntry {
@@ -1183,7 +1275,7 @@ mod tests {
         assert_eq!(staged.metrics.deletions, 1);
         assert_eq!(staged.metrics.guard_reads, 0);
         assert!(tx.get(&key).await.unwrap().is_none());
-        tx.rollback();
+        drop(tx);
 
         db.close().await.unwrap();
     }
@@ -1203,7 +1295,7 @@ mod tests {
         seed.put(key.clone(), 7_u64.to_be_bytes()).unwrap();
         seed.commit().await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
         let (release_deletion, deletion_released) = tokio::sync::oneshot::channel();
         let deletion_key = key.clone();
         let deletions = stream::once(async move {
@@ -1242,7 +1334,13 @@ mod tests {
                 _ = &mut staging => panic!("staging finished before deletion release"),
                 observed = observed_addition => observed.unwrap(),
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            // Driven, not just waited on: the probe runs on its own task,
+            // so staging has to be polled for its resolution to land while
+            // the deletion is still pending.
+            tokio::select! {
+                _ = &mut staging => panic!("staging finished before deletion release"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+            }
             release_deletion.send(()).unwrap();
             let staged = staging.as_mut().await.unwrap();
             assert_eq!(staged.metrics.unique_probes, 1);
@@ -1255,7 +1353,7 @@ mod tests {
             tx.get(&key).await.unwrap(),
             Some(Bytes::copy_from_slice(&7_u64.to_be_bytes()))
         );
-        tx.rollback();
+        drop(tx);
         db.close().await.unwrap();
     }
 

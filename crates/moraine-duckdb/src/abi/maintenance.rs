@@ -373,6 +373,22 @@ pub struct MoraineObjectStoreTally {
     pub data_bytes: u64,
 }
 
+/// Process-wide counts of what published row summaries have done.
+#[repr(C)]
+#[derive(Default)]
+pub struct MoraineSidecarTally {
+    /// Summaries a published sidecar answered.
+    pub hits: u64,
+    /// Summaries derived because no sidecar could be read.
+    pub misses: u64,
+    /// Sidecars read and then refused, each of which is also a miss.
+    pub refused: u64,
+    /// Summaries published.
+    pub published: u64,
+    /// Publishes that failed.
+    pub publish_failures: u64,
+}
+
 /// Process-wide cache capacity, occupancy, and eviction counters.
 #[repr(C)]
 #[derive(Default)]
@@ -901,6 +917,34 @@ pub unsafe extern "C" fn moraine_cache_status(out_status: *mut MoraineCacheStatu
     catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(codes::INTERNAL)
 }
 
+/// Process-wide counts of what published row summaries have done, so a
+/// deployment can tell "none published yet" from "published and refused".
+///
+/// # Safety
+///
+/// `out_tally` must be valid and writable for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_sidecar_tally(out_tally: *mut MoraineSidecarTally) -> i32 {
+    let attempt = || {
+        if out_tally.is_null() {
+            return codes::INVALID_ARGUMENT;
+        }
+        let tally = moraine::sidecar_tally();
+        // SAFETY: checked non-null above; caller contract for validity.
+        unsafe {
+            *out_tally = MoraineSidecarTally {
+                hits: tally.hits,
+                misses: tally.misses,
+                refused: tally.refused,
+                published: tally.published,
+                publish_failures: tally.publish_failures,
+            };
+        }
+        codes::OK
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(codes::INTERNAL)
+}
+
 /// Returns logical memory attributed to one attached catalog.
 ///
 /// # Safety
@@ -1065,3 +1109,67 @@ pub(super) const KNOWN_SUBSPACES: [moraine::SubspaceName; 8] = [
     moraine::SubspaceName::SchemaVersion,
     moraine::SubspaceName::Changelog,
 ];
+
+/// Deletes published row summaries whose data file is gone, reporting what
+/// it considered, reclaimed and failed to reclaim.
+///
+/// A handle attached without a data path sweeps nothing and is not an
+/// error: there is no data path to list.
+///
+/// # Safety
+///
+/// `handle` must be a live handle from `moraine_attach`. Each non-null out
+/// pointer must be writable. `probe`/`probe_ctx` follow the interrupt
+/// contract, and `err` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_sweep_row_summaries(
+    handle: *mut MoraineCatalogHandle,
+    considered: *mut u64,
+    reclaimed: *mut u64,
+    failed: *mut u64,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+
+        let Some(data_store) = handle_ref.data_store.clone() else {
+            return Ok(());
+        };
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let swept = unsafe {
+            handle_ref.block_on_commit(
+                probe,
+                probe_ctx,
+                handle_ref
+                    .catalog
+                    .reads()
+                    .sweep_published_summaries(data_store, &handle_ref.data_prefix),
+            )
+        }?;
+
+        for (out, value) in [
+            (considered, swept.considered),
+            (reclaimed, swept.reclaimed),
+            (failed, swept.failed),
+        ] {
+            if !out.is_null() {
+                // SAFETY: caller contract — non-null means writable.
+                unsafe { *out = value };
+            }
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}

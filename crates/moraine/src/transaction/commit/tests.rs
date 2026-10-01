@@ -3905,7 +3905,7 @@ async fn a_format_target_under_the_observed_floor_costs_no_read() {
         .unwrap();
 
     assert!(stamp.is_none(), "the floor already covers the target");
-    db_tx.rollback();
+    drop(db_tx);
     catalog.close().await.unwrap();
 }
 
@@ -3923,7 +3923,7 @@ async fn a_format_target_above_the_floor_reads_and_raises_it() {
 
     assert!(stamp.is_some(), "a higher target requires a stamp");
     assert_eq!(format_floor(projections), MIN_FORMAT_VERSION);
-    db_tx.rollback();
+    drop(db_tx);
     catalog.close().await.unwrap();
 }
 
@@ -3941,7 +3941,7 @@ async fn the_migration_check_is_skipped_at_a_head_already_found_clear() {
         .await
         .unwrap();
     assert!(migration_clear_at(projections, &head));
-    db_tx.rollback();
+    drop(db_tx);
 
     // Planted behind the stamp's back: same head, marker present.
     let tx = catalog.begin_write_tx().await.unwrap();
@@ -3971,7 +3971,7 @@ async fn the_migration_check_is_skipped_at_a_head_already_found_clear() {
         .unwrap();
     assert!(matches!(err, Error::Migration(_)), "{err:?}");
 
-    db_tx.rollback();
+    drop(db_tx);
     catalog.close().await.unwrap();
 }
 
@@ -4020,13 +4020,13 @@ async fn a_migration_start_moves_the_head() {
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let before = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
-    db_tx.rollback();
+    drop(db_tx);
 
     plant_migration_marker(&catalog).await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let after = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
-    db_tx.rollback();
+    drop(db_tx);
 
     assert_ne!(before, after, "the marker must not land at a still head");
     assert_eq!(after.batch_seq, before.batch_seq + 1);
@@ -4048,7 +4048,7 @@ async fn a_landed_commit_stamps_its_own_head_clear() {
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let head = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
-    db_tx.rollback();
+    drop(db_tx);
 
     assert!(
         migration_clear_at(projections, &head),
@@ -4696,7 +4696,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
     staged.push(head_stamp(head_before + 1, base.batch_seq));
     let staged_bytes = stage_writes(&attempt, &staged).unwrap();
     let landed = commit_batch(
-        attempt,
+        Arc::new(attempt),
         HeadTransition {
             before: head_before,
             after: head_before + 1,
@@ -5094,7 +5094,7 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
     };
 
     let base = catalog.snapshot().await.unwrap();
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = Arc::new(catalog.begin_write_tx().await.unwrap());
     let prepared = prepare_and_stage(
         &db_tx,
         catalog.projections(),
@@ -5137,7 +5137,7 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
         staged_bytes.0
     );
 
-    db_tx.rollback();
+    drop(db_tx);
     catalog.close().await.unwrap();
 }
 

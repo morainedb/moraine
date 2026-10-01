@@ -419,6 +419,20 @@ typedef struct MoraineCacheStatus {
   uint64_t auxiliary_metadata_evictions;
 } MoraineCacheStatus;
 
+// Process-wide counts of what published row summaries have done.
+typedef struct MoraineSidecarTally {
+  // Summaries a published sidecar answered.
+  uint64_t hits;
+  // Summaries derived because no sidecar could be read.
+  uint64_t misses;
+  // Sidecars read and then refused, each of which is also a miss.
+  uint64_t refused;
+  // Summaries published.
+  uint64_t published;
+  // Publishes that failed.
+  uint64_t publish_failures;
+} MoraineSidecarTally;
+
 // Logical memory attributed to one catalog and the process-shared caches.
 typedef struct MoraineMemoryTally {
   // SlateDB WAL-plus-memtable bytes for this catalog.
@@ -1943,6 +1957,14 @@ int32_t moraine_catalog_cache_tally(struct MoraineCatalogHandle *handle,
 // `out_status` must be valid and writable for the duration of the call.
 int32_t moraine_cache_status(struct MoraineCacheStatus *out_status);
 
+// Process-wide counts of what published row summaries have done, so a
+// deployment can tell "none published yet" from "published and refused".
+//
+// # Safety
+//
+// `out_tally` must be valid and writable for the duration of the call.
+int32_t moraine_sidecar_tally(struct MoraineSidecarTally *out_tally);
+
 // Returns logical memory attributed to one attached catalog.
 //
 // # Safety
@@ -1989,6 +2011,25 @@ int32_t moraine_head_stamp(struct MoraineCatalogHandle *handle,
 // message. Owned — free via [`super::moraine_string_free`]; null if allocation
 // fails.
 char *moraine_subspace_names(void);
+
+// Deletes published row summaries whose data file is gone, reporting what
+// it considered, reclaimed and failed to reclaim.
+//
+// A handle attached without a data path sweeps nothing and is not an
+// error: there is no data path to list.
+//
+// # Safety
+//
+// `handle` must be a live handle from `moraine_attach`. Each non-null out
+// pointer must be writable. `probe`/`probe_ctx` follow the interrupt
+// contract, and `err` must be writable.
+int32_t moraine_sweep_row_summaries(struct MoraineCatalogHandle *handle,
+                                    uint64_t *considered,
+                                    uint64_t *reclaimed,
+                                    uint64_t *failed,
+                                    MoraineInterruptProbe probe,
+                                    void *probe_ctx,
+                                    struct MoraineError *err);
 
 // Opens a transaction snapshot with a pinned index/inline read surface when
 // supported. Readers without pinned revisions receive an ordinary snapshot

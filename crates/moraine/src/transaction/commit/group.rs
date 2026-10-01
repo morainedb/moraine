@@ -75,7 +75,7 @@ pub(crate) struct Staged {
 /// A batch being formed: one open transaction carrying every member's
 /// writes, and the premise the next member stages against.
 struct Batch {
-    db_tx: DbTransaction,
+    db_tx: Arc<DbTransaction>,
     /// The head view the batch opened at.
     base: Arc<CatalogSnapshot>,
     /// `base` folded forward through the members staged so far; `None`
@@ -111,7 +111,7 @@ impl Batch {
         let head_before = base.snapshot.snapshot_id;
 
         Ok(Self {
-            db_tx,
+            db_tx: Arc::new(db_tx),
             base,
             premise: None,
             folded: 0,
@@ -269,7 +269,7 @@ impl Coalescer {
             Err(err) => {
                 // The batch is poisoned; its members learn that nothing
                 // landed when the outcome sender drops.
-                batch.db_tx.rollback();
+                super::rollback(batch.db_tx);
                 return Err(err);
             }
         };
@@ -286,7 +286,7 @@ impl Coalescer {
             drop(shared);
             self.launch(batch, flight);
         } else if batch.writes.is_empty() {
-            batch.db_tx.rollback();
+            super::rollback(batch.db_tx);
         } else {
             shared.forming = Some(batch);
         }
@@ -393,7 +393,7 @@ impl Coalescer {
             return;
         };
         if batch.writes.is_empty() {
-            batch.db_tx.rollback();
+            super::rollback(batch.db_tx);
             return;
         }
         let flight = self.enter_flight();

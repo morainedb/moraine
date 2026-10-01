@@ -407,7 +407,7 @@ fn corrupt_row(table: TableKind, detail: impl std::fmt::Display) -> Error {
 /// discards them.
 pub struct StagedTransaction {
     diagnostic_id: u64,
-    db_tx: DbTransaction,
+    db_tx: Arc<DbTransaction>,
     ops: Vec<RowOperation>,
     /// The committed records at this transaction's read point, read once
     /// per requested kind and shared by later reads of that kind.
@@ -451,7 +451,7 @@ impl StagedTransaction {
     ) -> Self {
         Self {
             diagnostic_id: next_diagnostic_id(),
-            db_tx,
+            db_tx: Arc::new(db_tx),
             ops: Vec::new(),
             committed: tokio::sync::Mutex::new(HashMap::new()),
             head_view: tokio::sync::OnceCell::new(),
@@ -548,7 +548,7 @@ impl StagedTransaction {
 
     /// Discards every staged row without writing anything.
     pub fn rollback(self) {
-        self.db_tx.rollback();
+        commit::rollback(self.db_tx);
     }
 
     /// Snapshot records as this transaction sees them: the committed
@@ -1440,7 +1440,7 @@ impl StagedTransaction {
         let staged_cost = staged_cost(&ops);
         if staged_cost > MAX_STAGED_COST_PER_COMMIT {
             if !exempt_from_staged_cost(&ops) {
-                db_tx.rollback();
+                commit::rollback(db_tx);
                 return Err(oversized_staged_cost(staged_cost));
             }
             // Reported rather than passed silently: the ceiling is there
@@ -1468,7 +1468,7 @@ impl StagedTransaction {
         let base = match base {
             Ok(base) => base,
             Err(err) => {
-                db_tx.rollback();
+                commit::rollback(db_tx);
                 return Err(err);
             }
         };
@@ -1527,7 +1527,7 @@ impl StagedTransaction {
                     (inline_writes, uses_schema_reference, drained, entries)
                 }
                 Err(err) => {
-                    db_tx.rollback();
+                    commit::rollback(db_tx);
                     return Err(err);
                 }
             };
@@ -1552,7 +1552,7 @@ impl StagedTransaction {
             .await
         };
         if let Err(err) = held.await {
-            db_tx.rollback();
+            commit::rollback(db_tx);
             return Err(err);
         }
         let StagedEntries {
@@ -1609,7 +1609,7 @@ impl StagedTransaction {
                 {
                     Ok(staged) => staged,
                     Err(err) => {
-                        db_tx.rollback();
+                        commit::rollback(db_tx);
                         return Err(err);
                     }
                 };
@@ -1687,7 +1687,7 @@ impl StagedTransaction {
                 }
             }
             Err(err) => {
-                db_tx.rollback();
+                commit::rollback(db_tx);
                 Err(err)
             }
         }
@@ -1847,6 +1847,8 @@ fn index_upkeep_landed(transaction_id: u64, result_id: u64, phases: &CommitPhase
         index_probe_hits = phases.index_metrics.probe_hits,
         index_probe_misses = phases.index_metrics.probe_misses,
         index_probe_peak_in_flight = phases.index_metrics.probe_peak_in_flight,
+        index_probe_store_misses = phases.index_metrics.probe_store_misses,
+        index_probe_store_disk_hits = phases.index_metrics.probe_store_gets,
         index_probes_completed_during_deletions =
             phases.index_metrics.probes_completed_during_deletions,
         index_metadata_hits = phases.index_metrics.scoped_read.metadata_hits,
