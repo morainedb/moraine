@@ -27,7 +27,7 @@ const DUCKLAKE_LOAD_TEST_COUNT: &str = "200 passed";
 /// the suites above — and a file that *skips* (its `require-env` unmet, or
 /// an extension download failing) reports no passing case at all, so a
 /// silent skip fails the gate instead of looking like a pass.
-const SQLLOGIC_TEST_COUNT: &str = "7 test cases";
+const SQLLOGIC_TEST_COUNT: &str = "6 test cases";
 
 /// Downloads/caches the pinned DuckDB CLI, builds Moraine and patched
 /// DuckLake, then runs every repository test against those artifacts.
@@ -40,6 +40,8 @@ pub fn e2e() -> anyhow::Result<()> {
         "ok: patched DuckLake checkout at {}",
         patched.source.display()
     );
+
+    ducklake_patch::check_pin_sources(&duckdb::workspace_root(), &patched.source)?;
 
     let extension = duckdb::build_and_package_extension(&patched)?;
     println!("ok: packaged {}", extension.display());

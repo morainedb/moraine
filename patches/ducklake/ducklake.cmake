@@ -27,40 +27,21 @@ else()
         GIT_REPOSITORY https://github.com/duckdb/ducklake.git
         GIT_TAG ${DUCKLAKE_SOURCE_COMMIT}
         PATCH_COMMAND
-            ${GIT_EXECUTABLE} apply --unidiff-zero
+            ${GIT_EXECUTABLE} apply
             ${CMAKE_CURRENT_LIST_DIR}/0001-perf-prune-DuckLake-files-by-row-id.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0002-feat-backfill-DuckLake-row-id-file-statistics.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0003-feat-expose-DuckLake-data-file-ids-to-scans.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0004-perf-append-DuckLake-inlined-data-rows.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0005-fix-retain-files-after-unknown-commit-outcomes.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0006-feat-change-DuckLake-rows-by-position.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0007-perf-name-the-table-a-dropped-file-belongs-to.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0008-perf-take-existing-delete-positions-from-the-caller.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0009-fix-cancel-DuckLake-metadata-work-with-its-caller.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0010-fix-write-row-ids-when-merging.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0002-feat-expose-DuckLake-data-file-ids-to-scans.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0003-perf-append-DuckLake-inlined-data-rows.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0004-fix-retain-files-after-unknown-commit-outcomes.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0005-feat-change-DuckLake-rows-by-position.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0006-perf-name-the-table-a-dropped-file-belongs-to.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0007-fix-cancel-DuckLake-metadata-work-with-its-caller.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0008-fix-write-row-ids-when-merging.patch
     )
     FetchContent_GetProperties(moraine_patched_ducklake)
     if(NOT moraine_patched_ducklake_POPULATED)
         FetchContent_Populate(moraine_patched_ducklake)
     endif()
 
-endif()
-
-# A zero-context hunk can apply at the right line but on the wrong side of a
-# nearby return. Refuse a source tree where the row-ID stats are unreachable.
-file(READ
-    "${moraine_patched_ducklake_SOURCE_DIR}/src/storage/ducklake_transaction.cpp"
-    DUCKLAKE_TRANSACTION_SOURCE)
-string(FIND "${DUCKLAKE_TRANSACTION_SOURCE}" "auto row_id_field = FieldIndex" ROW_ID_STATS_POSITION)
-if(ROW_ID_STATS_POSITION EQUAL -1)
-    message(FATAL_ERROR "The DuckLake row-ID statistics patch is missing")
-endif()
-string(SUBSTRING "${DUCKLAKE_TRANSACTION_SOURCE}" ${ROW_ID_STATS_POSITION} 1600 ROW_ID_STATS_TAIL)
-string(FIND "${ROW_ID_STATS_TAIL}" "\treturn data_file;" DATA_FILE_RETURN_POSITION)
-string(FIND "${ROW_ID_STATS_TAIL}" "\n}" BUILD_DATA_FILE_END_POSITION)
-if(DATA_FILE_RETURN_POSITION EQUAL -1 OR BUILD_DATA_FILE_END_POSITION EQUAL -1
-   OR DATA_FILE_RETURN_POSITION GREATER BUILD_DATA_FILE_END_POSITION)
-    message(FATAL_ERROR "The DuckLake row-ID statistics patch is unreachable")
 endif()
 
 # Built as its own static extension and linked into moraine's loadable, which

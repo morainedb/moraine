@@ -1,19 +1,34 @@
 diff --git a/src/ducklake_extension.cpp b/src/ducklake_extension.cpp
+index ffe9826e..09a24451 100644
 --- a/src/ducklake_extension.cpp
 +++ b/src/ducklake_extension.cpp
-@@ -81,0 +82,2 @@ static void LoadInternal(ExtensionLoader &loader) {
+@@ -79,6 +79,8 @@ static void LoadInternal(ExtensionLoader &loader) {
+ 	DuckLakeSetOptionFunction set_options;
+ 	loader.RegisterFunction(set_options);
+
 +	loader.RegisterFunction(DuckLakeDeletePositionsFunction());
 +	loader.RegisterFunction(DuckLakeUpdatePositionsFunction());
+ 	DuckLakeOptionsFunction options;
+ 	loader.RegisterFunction(options);
+
 diff --git a/src/functions/CMakeLists.txt b/src/functions/CMakeLists.txt
+index 18778f49..fadf9e43 100644
 --- a/src/functions/CMakeLists.txt
 +++ b/src/functions/CMakeLists.txt
-@@ -4,0 +5 @@ add_library(
+@@ -2,6 +2,7 @@ add_library(
+   ducklake_functions OBJECT
+   base_metadata_function.cpp
+   ducklake_add_data_files.cpp
 +  ducklake_delete_positions.cpp
+   ducklake_commit.cpp
+   ducklake_cleanup_files.cpp
+   ducklake_expire_snapshots.cpp
 diff --git a/src/functions/ducklake_delete_positions.cpp b/src/functions/ducklake_delete_positions.cpp
 new file mode 100644
+index 00000000..551351cc
 --- /dev/null
 +++ b/src/functions/ducklake_delete_positions.cpp
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,621 @@
 +#include "functions/ducklake_table_functions.hpp"
 +#include "duckdb/common/enums/database_modification_type.hpp"
 +#include "duckdb/common/mutex.hpp"
@@ -55,7 +70,8 @@ new file mode 100644
 +	idx_t files_written = 0;
 +};
 +
-+static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &result, const char *function) {
++static void ParseFilePositions(const Value &files, map<idx_t, set<idx_t>> &result,
++                               map<idx_t, vector<idx_t>> &existing, const char *function) {
 +	if (files.IsNull()) {
 +		throw InvalidInputException("%s: `files` cannot be NULL", function);
 +	}
@@ -69,6 +85,7 @@ new file mode 100644
 +	}
 +	optional_idx file_index;
 +	optional_idx positions_index;
++	optional_idx existing_index;
 +	auto &children = StructType::GetChildTypes(element_type);
 +	for (idx_t i = 0; i < children.size(); i++) {
 +		auto name = StringUtil::Lower(children[i].first);
@@ -76,9 +93,12 @@ new file mode 100644
 +			file_index = i;
 +		} else if (name == "positions") {
 +			positions_index = i;
++		} else if (name == "existing_positions") {
++			existing_index = i;
 +		}
 +	}
-+	if (children.size() != 2 || !file_index.IsValid() || !positions_index.IsValid()) {
++	if (children.size() != 2 + (existing_index.IsValid() ? 1 : 0) || !file_index.IsValid() ||
++	    !positions_index.IsValid()) {
 +		throw InvalidInputException("%s: each `files` entry must be STRUCT(data_file_id UBIGINT, positions UBIGINT[])",
 +		                            function);
 +	}
@@ -95,12 +115,34 @@ new file mode 100644
 +		if (positions_value.type().id() != LogicalTypeId::LIST) {
 +			throw InvalidInputException("%s: `positions` must be a list", function);
 +		}
-+		auto &positions = result[file_value.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>()];
++		auto file_id = file_value.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>();
++		auto &positions = result[file_id];
 +		for (auto &position : ListValue::GetChildren(positions_value)) {
 +			if (position.IsNull()) {
 +				throw InvalidInputException("%s: a position cannot be NULL", function);
 +			}
 +			positions.insert(position.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>());
++		}
++		// A NULL `existing_positions` means the caller does not know them and the
++		// committed delete file is read here instead. Non-NULL is a BLOB of
++		// little-endian uint64 positions.
++		if (existing_index.IsValid() && !fields[existing_index.GetIndex()].IsNull()) {
++			auto &existing_value = fields[existing_index.GetIndex()];
++			if (existing_value.type().id() != LogicalTypeId::BLOB) {
++				throw InvalidInputException("%s: `existing_positions` must be a BLOB", function);
++			}
++			auto &packed = StringValue::Get(existing_value);
++			if (packed.size() % sizeof(uint64_t) != 0) {
++				throw InvalidInputException("%s: `existing_positions` must hold whole uint64 positions", function);
++			}
++			auto &known = existing[file_id];
++			known.reserve(packed.size() / sizeof(uint64_t));
++			for (idx_t offset = 0; offset + sizeof(uint64_t) <= packed.size(); offset += sizeof(uint64_t)) {
++				uint64_t position;
++				memcpy(&position, packed.data() + offset, sizeof(uint64_t));
++				known.push_back(position);
++			}
++			std::sort(known.begin(), known.end());
 +		}
 +	}
 +}
@@ -109,7 +151,7 @@ new file mode 100644
 +//! `inlined_rows` and `snapshot`.
 +static PositionalDeletes ParsePositionalDeletes(TableFunctionBindInput &input, const char *function) {
 +	PositionalDeletes result;
-+	ParseFilePositions(input.inputs[3], result.file_positions, function);
++	ParseFilePositions(input.inputs[3], result.file_positions, result.existing_positions, function);
 +	auto inlined = input.named_parameters.find("inlined_rows");
 +	if (inlined != input.named_parameters.end() && !inlined->second.IsNull()) {
 +		for (auto &row_id : ListValue::GetChildren(inlined->second)) {
@@ -311,11 +353,16 @@ new file mode 100644
 +			// Positions the file already has deleted: its pending delete file if this transaction wrote one, else
 +			// the committed delete file, plus inlined file deletions from both.
 +			set<idx_t> positions;
++			auto known = request.existing_positions.find(requested.first);
 +			if (transaction.HasLocalDeleteForFile(table_id, file.file.path)) {
 +				DuckLakeFileData pending;
 +				transaction.GetLocalDeleteForFile(table_id, file.file.path, pending);
 +				auto scanned = DuckLakeDeleteFilter::ScanDeleteFile(context, pending);
 +				positions.insert(scanned.deleted_rows.begin(), scanned.deleted_rows.end());
++			} else if (known != request.existing_positions.end()) {
++				// The caller resolved its positions at this snapshot or a newer one, so its decode of
++				// the committed delete file holds every position deleted here.
++				positions.insert(known->second.begin(), known->second.end());
 +			} else if (!file.delete_file.path.empty()) {
 +				// A replaced delete file embeds per-position snapshots and keeps the earliest begin; only the
 +				// positions deleted at this snapshot count as already gone.
@@ -604,13 +651,23 @@ new file mode 100644
 +
 +} // namespace duckdb
 diff --git a/src/include/functions/ducklake_table_functions.hpp b/src/include/functions/ducklake_table_functions.hpp
+index b09bf400..2f0f8e17 100644
 --- a/src/include/functions/ducklake_table_functions.hpp
 +++ b/src/include/functions/ducklake_table_functions.hpp
-@@ -13,0 +14,3 @@
+@@ -11,6 +11,9 @@
+ #include "duckdb/function/table_function.hpp"
+ #include "duckdb/parser/parsed_data/create_macro_info.hpp"
+ #include "duckdb/function/function_set.hpp"
 +#include "duckdb/common/map.hpp"
 +#include "duckdb/common/optional_idx.hpp"
 +#include "duckdb/common/set.hpp"
-@@ -102,0 +106,29 @@ public:
+
+ namespace duckdb {
+ class DuckLakeCatalog;
+@@ -100,6 +103,37 @@ public:
+ 	DuckLakeSetOptionFunction();
+ };
+
 +//! The rows ducklake_delete_positions and ducklake_update_positions stage, either given as constants or named by
 +//! `positions_token` for a registered resolver to supply when the statement runs.
 +struct PositionalDeletes {
@@ -620,6 +677,8 @@ diff --git a/src/include/functions/ducklake_table_functions.hpp b/src/include/fu
 +	set<idx_t> inlined_rows;
 +	//! The snapshot the caller resolved its positions against, if it says
 +	optional_idx resolved_snapshot;
++	//! Positions the caller already decoded from a file's committed delete file, per data file id, ascending
++	map<idx_t, vector<idx_t>> existing_positions;
 +	//! The caller's handle on positions it has not resolved yet
 +	optional_idx token;
 +};
@@ -640,3 +699,6 @@ diff --git a/src/include/functions/ducklake_table_functions.hpp b/src/include/fu
 +	DuckLakeUpdatePositionsFunction();
 +};
 +
+ class DuckLakeSetCommitMessage : public TableFunction {
+ public:
+ 	DuckLakeSetCommitMessage();

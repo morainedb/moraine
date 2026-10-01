@@ -2165,9 +2165,8 @@ fn refuse_orphaned_children(children: &ChildRows) -> Result<()> {
 
 /// Translates a head-preserving maintenance commit (no `ducklake_snapshot`
 /// insert): the head snapshot id is retained and no snapshot record is
-/// written. Only raw deletes, schedule inserts, row-ID file-stat inserts,
-/// option writes, and inline ops are legal; anything versioned is a
-/// constraint violation.
+/// written. Only raw deletes, schedule inserts, option writes, and inline
+/// ops are legal; anything versioned is a constraint violation.
 fn translate_maintenance(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
@@ -2180,13 +2179,6 @@ fn translate_maintenance(
     let hard_deleted = collect_hard_deletes(ops)?;
     let mut touched = commit::Touched::default();
     for op in ops {
-        let row_id_statistics_insert = match op {
-            RowOperation::Insert {
-                table: TableKind::FileColumnStats,
-                cells,
-            } => file_column_stats_column_id(cells)? == data_file::ROW_ID_FIELD_ID,
-            _ => false,
-        };
         let allowed = matches!(
             op,
             RowOperation::Delete { .. }
@@ -2194,13 +2186,12 @@ fn translate_maintenance(
                     table: TableKind::FilesScheduledForDeletion | TableKind::Metadata,
                     ..
                 }
-        ) || row_id_statistics_insert
-            || is_inline_op(op);
+        ) || is_inline_op(op);
         if !allowed {
             return Err(Error::Constraint(
                 "a staged commit without a ducklake_snapshot insert may only maintain \
                  unversioned state (maintenance deletes, deletion-schedule inserts, \
-                 reserved row-ID file-stat inserts, and ducklake_metadata writes)"
+                 and ducklake_metadata writes)"
                     .to_string(),
             ));
         }
@@ -2219,13 +2210,4 @@ fn translate_maintenance(
     let mut writes = commit::diff_touched(base, &state, head, &touched);
     writes.extend(direct);
     Ok(writes)
-}
-
-/// The `column_id` cell of a `ducklake_file_column_stats` row; `apply_op`
-/// decodes the whole row.
-fn file_column_stats_column_id(cells: &[Cell]) -> Result<u64> {
-    let mut cursor = Cursor::new(TableKind::FileColumnStats, cells);
-    let _data_file_id = cursor.u64()?;
-    let _table_id = cursor.u64()?;
-    cursor.u64()
 }

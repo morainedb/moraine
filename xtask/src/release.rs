@@ -95,7 +95,7 @@ pub fn validate_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
     let row_id_stat_rows = stdout.matches("2147483540").count();
     ensure!(
         row_id_stat_rows == 3 && stdout.contains("Total Files Read: 1"),
-        "the build for DuckDB {version} backfilled {row_id_stat_rows} of 3 expected row-ID \
+        "the build for DuckDB {version} recorded {row_id_stat_rows} of 3 expected row-ID \
          statistic rows or did not prune the scan to one file"
     );
     ensure!(
@@ -104,7 +104,7 @@ pub fn validate_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
          delete positions; its bundled DuckLake is missing part of the patch series"
     );
     println!(
-        "ok: the bundled DuckLake backfills and prunes row IDs and takes existing delete \
+        "ok: the bundled DuckLake records and prunes by row IDs and takes existing delete \
          positions under DuckDB {version}"
     );
     Ok(())

@@ -1,10 +1,11 @@
 diff --git a/src/storage/ducklake_transaction_state.cpp b/src/storage/ducklake_transaction_state.cpp
-index 7b9758d..8d7a581 100644
+index c8c09b9b..e5716116 100644
 --- a/src/storage/ducklake_transaction_state.cpp
 +++ b/src/storage/ducklake_transaction_state.cpp
-@@ -1740 +1740,11 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
--			ErrorData error(ex);
-+			ErrorData error(ex);
+@@ -1742,6 +1742,16 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
+ 			break;
+ 		} catch (std::exception &ex) {
+ 			ErrorData error(ex);
 +			auto outcome = error.ExtraInfo().find("commit_outcome");
 +			// COMMIT can discard extra fields while preserving the backend's fixed message.
 +			bool outcome_unknown = (outcome != error.ExtraInfo().end() && outcome->second == "unknown") ||
@@ -15,3 +16,6 @@ index 7b9758d..8d7a581 100644
 +				context.try_rollback();
 +				error.Throw("DuckLake commit outcome unknown; files retained for reconciliation. ");
 +			}
+ 			// rollback if there is an active transaction
+ 			context.try_rollback();
+ 			bool retry_on_error = DuckLakeTransaction::RetryOnError(error.Message());

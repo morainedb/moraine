@@ -1,11 +1,20 @@
 diff --git a/src/functions/ducklake_compaction_functions.cpp b/src/functions/ducklake_compaction_functions.cpp
-index 860e4df..ebb8310 100644
+index 860e4dfd..ebb8310b 100644
 --- a/src/functions/ducklake_compaction_functions.cpp
 +++ b/src/functions/ducklake_compaction_functions.cpp
-@@ -472,2 +471,0 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+@@ -469,8 +469,6 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+ 	auto partition_id = source_files[0].file.partition_id;
+ 	auto partition_values = source_files[0].file.partition_values;
+
 -	bool files_are_adjacent = true;
 -	optional_idx prev_row_id;
-@@ -506,11 +503,0 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+ 	// set the files to scan as only the files we are trying to compact
+ 	vector<DuckLakeFileListEntry> files_to_scan;
+ 	vector<DuckLakeCompactionFileEntry> actionable_source_files;
+@@ -503,17 +501,6 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+ 			throw InternalException("Invalid Compaction Type");
+ 		}
+ 		actionable_source_files.push_back(source);
 -		// check if this file is adjacent (row-id wise) to the previous file
 -		if (!source.file.row_id_start.IsValid()) {
 -			// the file does not have a row_id_start defined - it cannot be adjacent
@@ -17,16 +26,25 @@ index 860e4df..ebb8310 100644
 -			}
 -			prev_row_id = source.file.row_id_start.GetIndex() + source.file.row_count;
 -		}
-@@ -556,2 +543,4 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+ 		files_to_scan.push_back(std::move(result));
+ 	}
+ 	if (actionable_source_files.empty()) {
+@@ -553,8 +540,10 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+ 	bool write_snapshot_id = false;
+ 	switch (type) {
+ 	case CompactionType::MERGE_ADJACENT_TABLES: {
 -		// if files are adjacent, we don't need to write the row-id to the file
 -		write_row_id = !files_are_adjacent;
 +		// always write the row-id column: a file's row_id_start says nothing about the ids its rows carry (a
 +		// flushed or updated file holds them per row, with gaps), so numbering the merged file by position would
 +		// renumber rows onto ids other rows hold
 +		write_row_id = true;
+ 		write_snapshot_id = true;
+ 		break;
+ 	}
 diff --git a/test/sql/compaction/merge_flushed_files_keep_row_ids.test b/test/sql/compaction/merge_flushed_files_keep_row_ids.test
 new file mode 100644
-index 0000000..4a4dfd7
+index 00000000..4a4dfd70
 --- /dev/null
 +++ b/test/sql/compaction/merge_flushed_files_keep_row_ids.test
 @@ -0,0 +1,55 @@
@@ -87,7 +105,7 @@ index 0000000..4a4dfd7
 +true
 diff --git a/test/sql/compaction/merge_updated_files_keep_row_ids.test b/test/sql/compaction/merge_updated_files_keep_row_ids.test
 new file mode 100644
-index 0000000..acaaec7
+index 00000000..acaaec7b
 --- /dev/null
 +++ b/test/sql/compaction/merge_updated_files_keep_row_ids.test
 @@ -0,0 +1,42 @@
