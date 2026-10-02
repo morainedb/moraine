@@ -11,7 +11,10 @@ use moraine::CatalogOptions;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 use tracing::{info, warn};
 
-use super::{free_c_string, guard, to_c_string};
+use super::{
+    free_c_string, guard, to_c_string,
+    wal_store::{MoraineWalStore, borrow_wal_store, refuse_wal_store_in_data_path},
+};
 use crate::{
     error::{AbiError, MoraineError, codes},
     runtime::{
@@ -187,42 +190,7 @@ impl StoreKind {
             }
             Self::Memory => Ok((Arc::new(InMemory::new()), moraine::CacheIdentity::default())),
             Self::S3 { bucket } => {
-                // With a secret, only the secret's values apply; without one,
-                // the environment credential chain does.
-                let base = if s3.is_some() {
-                    AmazonS3Builder::new()
-                } else {
-                    AmazonS3Builder::from_env()
-                };
-                let mut builder = base.with_bucket_name(bucket);
-                if let Some(c) = s3 {
-                    if let Some(v) = c.key_id {
-                        builder = builder.with_access_key_id(v);
-                    }
-                    if let Some(v) = c.secret {
-                        builder = builder.with_secret_access_key(v);
-                    }
-                    if let Some(v) = c.region {
-                        builder = builder.with_region(v);
-                    }
-                    if let Some(v) = c.session_token {
-                        builder = builder.with_token(v);
-                    }
-                    // DuckDB's secret defaults `endpoint` to `s3.amazonaws.com`;
-                    // forwarding that would override the region-derived endpoint.
-                    if let Some(v) = c.endpoint
-                        && !v.is_empty()
-                        && !v.contains("amazonaws.com")
-                    {
-                        builder = builder.with_endpoint(v);
-                    }
-                    if c.url_style == Some("path") {
-                        builder = builder.with_virtual_hosted_style_request(false);
-                    }
-                    if c.use_ssl == Some(false) {
-                        builder = builder.with_allow_http(true);
-                    }
-                }
+                let builder = s3_builder(bucket, s3);
                 let identity = s3_cache_identity(&builder);
                 let store = builder.build().map_err(|e| {
                     AbiError::invalid_argument(format!(
@@ -234,6 +202,62 @@ impl StoreKind {
             }
         }
     }
+}
+
+/// The configured S3 bucket, with the credentials a secret supplied and
+/// whatever the bucket's own name settles.
+pub(super) fn s3_builder(bucket: &str, s3: Option<&S3Creds>) -> AmazonS3Builder {
+    // With a secret, only the secret's values apply; without one, the
+    // environment credential chain does.
+    let base = if s3.is_some() {
+        AmazonS3Builder::new()
+    } else {
+        AmazonS3Builder::from_env()
+    };
+    let mut builder = base.with_bucket_name(bucket);
+    // A directory bucket is addressed zonally and signed with a session
+    // token, which is a different request shape rather than an option: the
+    // name is what says so, and AWS reserves the suffix for it.
+    if is_directory_bucket(bucket) {
+        builder = builder.with_s3_express(true);
+    }
+    if let Some(c) = s3 {
+        if let Some(v) = c.key_id {
+            builder = builder.with_access_key_id(v);
+        }
+        if let Some(v) = c.secret {
+            builder = builder.with_secret_access_key(v);
+        }
+        if let Some(v) = c.region {
+            builder = builder.with_region(v);
+        }
+        if let Some(v) = c.session_token {
+            builder = builder.with_token(v);
+        }
+        // DuckDB's secret defaults `endpoint` to `s3.amazonaws.com`;
+        // forwarding that would override the region-derived endpoint, and a
+        // directory bucket's zonal one.
+        if let Some(v) = c.endpoint
+            && !v.is_empty()
+            && !v.contains("amazonaws.com")
+        {
+            builder = builder.with_endpoint(v);
+        }
+        if c.url_style == Some("path") {
+            builder = builder.with_virtual_hosted_style_request(false);
+        }
+        if c.use_ssl == Some(false) {
+            builder = builder.with_allow_http(true);
+        }
+    }
+    builder
+}
+
+/// Whether `bucket` is an S3 directory bucket — an S3 Express One Zone
+/// bucket, whose name ends in the zone and the suffix AWS reserves for
+/// them.
+fn is_directory_bucket(bucket: &str) -> bool {
+    bucket.ends_with("--x-s3") || bucket.ends_with("--xa-s3")
 }
 
 /// Identifies the configured S3 object namespace without retaining credentials.
@@ -296,32 +320,36 @@ pub(crate) unsafe fn borrow_bytes<'a>(
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
-/// Refuses an attach whose catalog store and data root sit on the same
-/// object store with one containing the other: DuckLake's orphan cleanup
-/// would delete the catalog's own objects. Containment is compared
-/// lexically by path component; symlinks and `..` are not resolved.
-pub(super) fn refuse_overlapping_data_path(
-    store_path: &str,
-    data_path: &str,
-) -> Result<(), AbiError> {
-    let (store_kind, store_prefix) = StoreKind::from_path(store_path)?;
-    let (data_kind, data_prefix) = StoreKind::from_path(data_path)?;
+/// Whether two store URIs name the same object store with one containing
+/// the other. Containment is compared lexically by path component;
+/// symlinks and `..` are not resolved.
+pub(super) fn nested_stores(one: &str, other: &str) -> Result<bool, AbiError> {
+    let (one_kind, one_prefix) = StoreKind::from_path(one)?;
+    let (other_kind, other_prefix) = StoreKind::from_path(other)?;
 
     let overlaps = |a: &str, b: &str| {
         let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
         a.starts_with(b) || b.starts_with(a)
     };
 
-    let nested = match (&store_kind, &data_kind) {
+    Ok(match (&one_kind, &other_kind) {
         // An empty prefix is the bucket root, which contains everything.
-        (StoreKind::S3 { bucket: store }, StoreKind::S3 { bucket: data }) => {
-            store == data && overlaps(&store_prefix, &data_prefix)
+        (StoreKind::S3 { bucket: one }, StoreKind::S3 { bucket: other }) => {
+            one == other && overlaps(&one_prefix, &other_prefix)
         }
-        (StoreKind::LocalFile, StoreKind::LocalFile) => overlaps(store_path, data_path),
+        (StoreKind::LocalFile, StoreKind::LocalFile) => overlaps(one, other),
         _ => false,
-    };
+    })
+}
 
-    if nested {
+/// Refuses an attach whose catalog store and data root sit on the same
+/// object store with one containing the other: DuckLake's orphan cleanup
+/// would delete the catalog's own objects.
+pub(super) fn refuse_overlapping_data_path(
+    store_path: &str,
+    data_path: &str,
+) -> Result<(), AbiError> {
+    if nested_stores(store_path, data_path)? {
         return Err(AbiError::new(
             codes::CONSTRAINT,
             format!(
@@ -334,6 +362,17 @@ pub(super) fn refuse_overlapping_data_path(
     Ok(())
 }
 
+/// What resolving one attach's `DATA_PATH` store takes: the paths it is
+/// checked against, the credentials it opens with, and whether this attach
+/// may record a root the lake has none of.
+pub(super) struct DataStoreArguments<'a> {
+    pub(super) store_path: &'a str,
+    pub(super) data_path_arg: Option<String>,
+    pub(super) wal_store: Option<&'a moraine::WalStore>,
+    pub(super) read_only: bool,
+    pub(super) s3_creds: Option<&'a S3Creds<'a>>,
+}
+
 /// Resolves the `DATA_PATH` object store and its bucket-relative key
 /// prefix. The recorded data root is authoritative: a differing
 /// `data_path_arg` is refused, and a lake with none recorded adopts the
@@ -342,11 +381,15 @@ pub(super) fn refuse_overlapping_data_path(
 fn resolve_data_store(
     runtime: &tokio::runtime::Runtime,
     catalog: &AttachedCatalog,
-    store_path: &str,
-    data_path_arg: Option<String>,
-    read_only: bool,
-    s3_creds: Option<&S3Creds>,
+    arguments: DataStoreArguments<'_>,
 ) -> Result<(Option<moraine::DataStore>, String), AbiError> {
+    let DataStoreArguments {
+        store_path,
+        data_path_arg,
+        wal_store,
+        read_only,
+        s3_creds,
+    } = arguments;
     let recorded = runtime
         .block_on(catalog.reads().snapshot())
         .map_err(AbiError::from)?
@@ -373,6 +416,7 @@ fn resolve_data_store(
 
     if let Some(root) = data_root.as_deref() {
         refuse_overlapping_data_path(store_path, root)?;
+        refuse_wal_store_in_data_path(wal_store, root)?;
     }
 
     if adopting {
@@ -421,6 +465,32 @@ fn resolve_data_store(
         }
         None => Ok((None, String::new())),
     }
+}
+
+/// Turns an opened catalog into the handle the caller gets, resolving the
+/// `DATA_PATH` store its reads need — and closing the catalog rather than
+/// leaving it attached when that resolution fails.
+fn handle_for_catalog(
+    runtime: tokio::runtime::Runtime,
+    catalog: AttachedCatalog,
+    log_id: crate::logging::HandleId,
+    arguments: DataStoreArguments<'_>,
+    preload: bool,
+) -> Result<Box<MoraineCatalogHandle>, AbiError> {
+    let (data_store, data_prefix) = match resolve_data_store(&runtime, &catalog, arguments) {
+        Ok(parts) => parts,
+        Err(error) => {
+            // Flush and release the open catalog before failing the attach.
+            let _ = runtime.block_on(catalog.reads().close());
+            return Err(error);
+        }
+    };
+
+    let mut handle = MoraineCatalogHandle::new(runtime, catalog, log_id);
+    handle.data_store = data_store;
+    handle.data_prefix = data_prefix;
+    handle.spawn_warm_at_attach(preload);
+    Ok(Box::new(handle))
 }
 
 /// Winds down the runtime of an attach that will not produce a handle,
@@ -544,6 +614,13 @@ pub(super) fn cache_preload_option(
 /// and data blocks on write; `cache_compaction_puts` independently admits
 /// compaction outputs. Both are explicit at this ABI boundary.
 ///
+/// `wal`, if non-null, writes the catalog's write-ahead log to the store
+/// its `path` names — a URI of the same forms `path` takes, with its own
+/// credentials — instead of the catalog store. Settled when the catalog is
+/// created: the URI is recorded then, and a later attach naming a
+/// different store, or none, is refused. A log store nested in `DATA_PATH`
+/// is refused outright, since DuckLake's orphan sweep lists that root.
+///
 /// `checkpoint` pins a read-only attach to an existing SlateDB checkpoint
 /// (see [`super::moraine_create_checkpoint`]); the open writes nothing and
 /// serves a fixed cut. Null or empty follows the latest manifest; a non-null
@@ -568,6 +645,9 @@ pub(super) fn cache_preload_option(
 /// must point to a valid [`MoraineS3Config`] whose non-null fields are
 /// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 /// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
+/// `wal`, if non-null, must point to a valid [`MoraineWalStore`] whose
+/// `path` is null or a NUL-terminated C string and whose `s3` is null or a
+/// valid [`MoraineS3Config`].
 /// `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
 /// `cache_compaction_puts`, `flush_on_commit`, and `host_threads` are
 /// unconstrained. `probe`, if non-null, must be safe to call with `probe_ctx`
@@ -575,7 +655,7 @@ pub(super) fn cache_preload_option(
 /// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
 /// [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_attach_with_cache_policy(
+pub unsafe extern "C" fn moraine_attach_with_wal_store(
     path: *const c_char,
     s3: *const MoraineS3Config,
     read_only: bool,
@@ -590,6 +670,7 @@ pub unsafe extern "C" fn moraine_attach_with_cache_policy(
     cache_puts: bool,
     cache_compaction_puts: bool,
     data_path: *const c_char,
+    wal: *const MoraineWalStore,
     checkpoint: *const c_char,
     host_threads: u64,
     probe: MoraineInterruptProbe,
@@ -631,12 +712,15 @@ pub unsafe extern "C" fn moraine_attach_with_cache_policy(
 
         // SAFETY: `data_path` validity is this function's own safety contract.
         let data_path_arg = unsafe { opt_borrow_str(data_path, "data_path") }?.map(str::to_owned);
+        // SAFETY: `wal` validity is this function's own safety contract.
+        let wal_store = unsafe { borrow_wal_store(wal) }?;
 
-        // Checked before the open, which records `data_path` when it
-        // bootstraps a fresh store. `resolve_data_store` checks the
-        // recorded value again.
+        // Checked before the open, which records `data_path` and the log
+        // store when it bootstraps a fresh store. `resolve_data_store`
+        // checks the recorded data path against both again.
         if let Some(given) = data_path_arg.as_deref() {
             refuse_overlapping_data_path(path_str, given)?;
+            refuse_wal_store_in_data_path(wal_store.as_ref(), given)?;
         }
 
         let mut options = CatalogOptions::default();
@@ -661,6 +745,7 @@ pub unsafe extern "C" fn moraine_attach_with_cache_policy(
         let preload = options.cache_preload.is_some();
         options.checkpoint = checkpoint.map(str::to_owned);
         options.data_path.clone_from(&data_path_arg);
+        options.wal_store.clone_from(&wal_store);
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let opened = unsafe {
@@ -691,28 +776,19 @@ pub unsafe extern "C" fn moraine_attach_with_cache_policy(
         };
 
         // The DATA_PATH store reuses the catalog store's S3 secret.
-        let resolved = resolve_data_store(
-            &runtime,
-            &catalog,
-            path_str,
-            data_path_arg,
-            read_only,
-            s3_creds.as_ref(),
-        );
-        let (data_store, data_prefix) = match resolved {
-            Ok(parts) => parts,
-            Err(error) => {
-                // Flush and release the open catalog before failing the attach.
-                let _ = runtime.block_on(catalog.reads().close());
-                return Err(error);
-            }
-        };
-
-        let mut handle = MoraineCatalogHandle::new(runtime, catalog, log_id);
-        handle.data_store = data_store;
-        handle.data_prefix = data_prefix;
-        handle.spawn_warm_at_attach(preload);
-        Ok(Box::new(handle))
+        handle_for_catalog(
+            runtime,
+            catalog,
+            log_id,
+            DataStoreArguments {
+                store_path: path_str,
+                data_path_arg,
+                wal_store: wal_store.as_ref(),
+                read_only,
+                s3_creds: s3_creds.as_ref(),
+            },
+            preload,
+        )
     };
 
     // SAFETY: `err` validity is this function's own safety contract.
@@ -725,6 +801,66 @@ pub unsafe extern "C" fn moraine_attach_with_cache_policy(
             codes::OK
         }
         Err(code) => code,
+    }
+}
+
+/// Opens a catalog whose write-ahead log is in the catalog store. New
+/// callers use [`moraine_attach_with_wal_store`], whose `wal` argument
+/// places the log elsewhere.
+///
+/// # Safety
+///
+/// All pointer and callback requirements are identical to
+/// [`moraine_attach_with_wal_store`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_attach_with_cache_policy(
+    path: *const c_char,
+    s3: *const MoraineS3Config,
+    read_only: bool,
+    encrypted: bool,
+    flush_interval_ms: u64,
+    flush_on_commit: bool,
+    cache_dir: *const c_char,
+    cache_size_bytes: u64,
+    cache_memory_bytes: u64,
+    cache_auxiliary_percent: u32,
+    cache_preload: u8,
+    cache_puts: bool,
+    cache_compaction_puts: bool,
+    data_path: *const c_char,
+    checkpoint: *const c_char,
+    host_threads: u64,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    out: *mut *mut MoraineCatalogHandle,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: forwards every pointer and callback unchanged under the same
+    // contract.
+    unsafe {
+        moraine_attach_with_wal_store(
+            path,
+            s3,
+            read_only,
+            encrypted,
+            flush_interval_ms,
+            flush_on_commit,
+            cache_dir,
+            cache_size_bytes,
+            cache_memory_bytes,
+            cache_auxiliary_percent,
+            cache_preload,
+            cache_puts,
+            cache_compaction_puts,
+            data_path,
+            ptr::null(),
+            checkpoint,
+            host_threads,
+            probe,
+            probe_ctx,
+            out,
+            err,
+        )
     }
 }
 
@@ -860,6 +996,10 @@ pub struct MoraineMigrationReport {
 /// releases it once the run is durable, leaving a manual recovery point if
 /// the migration fails partway.
 ///
+/// `wal`, if non-null, names the store the catalog's write-ahead log lives
+/// on, exactly as [`moraine_attach_with_wal_store`] does; a catalog whose
+/// log sits elsewhere cannot be opened without it.
+///
 /// Returns [`codes::OK`] on success, having written `*out`. On failure
 /// `*out` is left unwritten and, if `err` is non-null, `*err` carries the
 /// code and a message.
@@ -868,16 +1008,19 @@ pub struct MoraineMigrationReport {
 ///
 /// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
 /// point to a valid [`MoraineS3Config`] whose non-null fields are valid
-/// NUL-terminated C strings. `cache_dir`, if non-null, must be a valid
-/// NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
+/// NUL-terminated C strings. `wal`, if non-null, must point to a valid
+/// [`MoraineWalStore`] under the same contract as
+/// [`moraine_attach_with_wal_store`]'s. `cache_dir`, if non-null, must be a
+/// valid NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
 /// `cache_puts` are unconstrained. `out`
 /// must be a valid, writable [`MoraineMigrationReport`]. `err`, if non-null,
 /// must be a valid, writable [`MoraineError`]. All for the duration of this
 /// call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_migrate(
+pub unsafe extern "C" fn moraine_migrate_with_wal_store(
     path: *const c_char,
     s3: *const MoraineS3Config,
+    wal: *const MoraineWalStore,
     flush_interval_ms: u64,
     cache_dir: *const c_char,
     cache_size_bytes: u64,
@@ -903,6 +1046,8 @@ pub unsafe extern "C" fn moraine_migrate(
         let s3_creds = unsafe { borrow_s3_creds(s3) };
 
         let (object_store, cache_identity) = store_kind.open(path_str, s3_creds.as_ref())?;
+        // SAFETY: `wal` validity is this function's own safety contract.
+        let wal_store = unsafe { borrow_wal_store(wal) }?;
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
         let runtime = new_runtime(log_id, 0).map_err(|e| {
@@ -923,6 +1068,7 @@ pub unsafe extern "C" fn moraine_migrate(
         options.cache_preload = cache_preload_option(cache_preload)?;
         options.cache_puts = cache_puts;
         options.cache_compaction_puts = cache_puts;
+        options.wal_store = wal_store;
 
         let mut request = moraine::MigrationRequest::default();
         request.checkpoint = checkpoint;
@@ -952,6 +1098,44 @@ pub unsafe extern "C" fn moraine_migrate(
     match unsafe { guard(err, attempt) } {
         Ok(()) => codes::OK,
         Err(code) => code,
+    }
+}
+
+/// Migrates a store whose write-ahead log is in the store itself. New
+/// callers use [`moraine_migrate_with_wal_store`].
+///
+/// # Safety
+///
+/// All pointer requirements are identical to
+/// [`moraine_migrate_with_wal_store`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_migrate(
+    path: *const c_char,
+    s3: *const MoraineS3Config,
+    flush_interval_ms: u64,
+    cache_dir: *const c_char,
+    cache_size_bytes: u64,
+    cache_preload: u8,
+    cache_puts: bool,
+    checkpoint: bool,
+    out: *mut MoraineMigrationReport,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: forwards every pointer unchanged under the same contract.
+    unsafe {
+        moraine_migrate_with_wal_store(
+            path,
+            s3,
+            ptr::null(),
+            flush_interval_ms,
+            cache_dir,
+            cache_size_bytes,
+            cache_preload,
+            cache_puts,
+            checkpoint,
+            out,
+            err,
+        )
     }
 }
 

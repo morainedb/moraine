@@ -654,6 +654,21 @@ fn is_log_line(line: &str) -> bool {
 
 /// Runs `sql` through the standalone metadata-only attach — see
 /// [`Attach::Standalone`].
+/// Runs `sql` in a session that loads the extension and attaches nothing,
+/// for the verbs that take a store path precisely because no session may
+/// hold the store.
+pub fn run_unattached(sql: &str) -> std::process::Output {
+    Command::new(cli_path())
+        .arg("-unsigned")
+        .arg("-csv")
+        .arg("-c")
+        .arg(format!("LOAD '{}';", ext_path().display()))
+        .arg("-c")
+        .arg(sql)
+        .output()
+        .expect("failed to spawn duckdb CLI")
+}
+
 pub fn run_standalone_sql(store_dir: &Path, sql: &str) -> String {
     let output = run_session(
         &Attach::Standalone {

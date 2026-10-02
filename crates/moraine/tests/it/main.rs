@@ -30,3 +30,4 @@ mod sorting;
 mod staged_index_build;
 mod tags;
 mod views_options;
+mod wal_store;

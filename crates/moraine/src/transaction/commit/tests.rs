@@ -102,6 +102,7 @@ async fn a_store_with_an_unreadable_manifest_refuses_to_open() {
         StoreBuilder::new("", object_store),
         false,
         None,
+        None,
         std::time::Duration::ZERO,
     )
     .await
@@ -136,6 +137,7 @@ async fn unknown_format_is_refused() {
         StoreBuilder::new("", object_store),
         false,
         None,
+        None,
         std::time::Duration::ZERO,
     )
     .await
@@ -167,6 +169,7 @@ async fn migration_marker_is_refused() {
     let err = open_initialized(
         StoreBuilder::new("", object_store),
         false,
+        None,
         None,
         std::time::Duration::ZERO,
     )
@@ -204,6 +207,7 @@ async fn older_format_refuses_toward_migrate() {
     let err = open_initialized(
         StoreBuilder::new("", object_store),
         false,
+        None,
         None,
         std::time::Duration::ZERO,
     )
@@ -4896,6 +4900,7 @@ async fn catalog_with_a_reclaimed_snapshot()
     let (db, _, _, _) = open_initialized(
         StoreBuilder::new("", object_store),
         false,
+        None,
         None,
         std::time::Duration::ZERO,
     )

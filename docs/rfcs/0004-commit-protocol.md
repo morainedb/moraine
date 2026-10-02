@@ -872,6 +872,49 @@ A validation test in the store harness (open `object_store`, commit, open a
 *fresh* reader, assert `N+1` is visible) pins that behavior against real
 SlateDB and measures its per-backend latency.
 
+### The log's object store
+
+A commit's latency floor is one PUT of the log, and that PUT need not go to
+the bucket the catalog lives in. `CatalogOptions::wal_store` writes the log
+to an object store of its own — an S3 Express One Zone directory bucket
+beside a standard one — while every other object, manifests and
+sorted-string tables alike, stays in the catalog store. The keys do not
+move: SlateDB lays the log out under the catalog's own path within whatever
+store it is handed, so both stores address the same key space and only the
+endpoint differs. The log store must be as durable as the catalog store,
+since a commit no sorted-string table holds yet lives only there.
+
+**The store a catalog records.** SlateDB persists nothing usable about it —
+the manifest field that carried it is dropped by the manifest version
+SlateDB now writes — so moraine records the log store's name itself, as
+the global `wal_path` option the bootstrap writes beside `encrypted` and
+`data_path`, and every open reads it back in the point read that already
+validates the format stamp. An open whose log store is not the recorded one
+is refused: one missing, one that differs, or one supplied where the record
+names none. Replaying an empty log over live state loses every commit no
+sorted-string table carries yet, silently, and the next flush buries the
+evidence.
+
+**Moving it.** `Catalog::move_wal_store` takes a catalog nothing holds and
+moves its log in two opens, whose order is the whole design:
+
+1. Open the writer against the log store the catalog records — refusing any
+   other — and write the memtable out as a sorted-string table. That
+   carries the log's contents into the catalog store and moves the replay
+   point past them, so the old log holds nothing a replay needs.
+2. Open the writer against the new log store and record its name there —
+   the only write that reaches it — then write that out too.
+
+Every crash point leaves the catalog openable with nothing lost. Before the
+second open's commit is durable the record still names the old store, whose
+log is drained: an open against it serves everything, and the move can be
+run again. After it, the record names the new store and the commit saying
+so is in the new log, which an open against that store replays. An open
+against the old store in that window is accepted too — the record it can
+see names it — and merely leaves the move un-applied. No window refuses
+both stores, which is what the ordering buys: recording the new name
+through the old log would produce exactly that.
+
 ### Test obligations
 
 Per RFC 0001, integration tests exercise the protocol against real

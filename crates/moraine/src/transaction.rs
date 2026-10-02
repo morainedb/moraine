@@ -9,7 +9,9 @@ pub(crate) mod migration;
 pub(crate) mod operations;
 pub(crate) mod staged;
 mod verbs;
+pub(crate) mod wal_move;
 
 pub use migration::MigrationReport;
 pub(crate) use verbs::EncodedIndexEntry;
 pub use verbs::Transaction;
+pub use wal_move::WalStoreMove;

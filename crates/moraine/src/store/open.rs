@@ -109,6 +109,7 @@ pub(crate) fn preload_shortfall(store_bytes: u64, cache_size: Option<u64>) -> Op
 pub(crate) struct StoreBuilder<'a> {
     path: &'a str,
     object_store: Arc<dyn ObjectStore>,
+    wal_object_store: Option<Arc<dyn ObjectStore>>,
     flush_interval: Option<Duration>,
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
@@ -134,6 +135,7 @@ impl<'a> StoreBuilder<'a> {
         Self {
             path,
             object_store: retry::Store::wrap(object_store),
+            wal_object_store: None,
             flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
@@ -147,6 +149,18 @@ impl<'a> StoreBuilder<'a> {
             checkpoint: None,
             warm_segments: Vec::new(),
         }
+    }
+
+    /// Writes the write-ahead log to `wal_object_store` instead of the
+    /// store's own, under the same keys. Nothing in the store itself
+    /// records that: the catalog records the store's name and holds every
+    /// later open to it.
+    pub(crate) fn wal_object_store(
+        mut self,
+        wal_object_store: Option<Arc<dyn ObjectStore>>,
+    ) -> Self {
+        self.wal_object_store = wal_object_store.map(retry::Store::wrap);
+        self
     }
 
     /// Sets how often a read-only handle polls for new state. Reader only —
@@ -262,6 +276,9 @@ impl<'a> StoreBuilder<'a> {
             .with_filter_policies(super::index_filter::policies())
             .with_block_cache_policy(self.block_cache_policy())
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)));
+        if let Some(wal) = &self.wal_object_store {
+            builder = builder.with_wal_object_store(Arc::clone(wal));
+        }
 
         let location = self.location();
         let cache_id = location.cache_id();
@@ -300,6 +317,10 @@ impl<'a> StoreBuilder<'a> {
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)))
             .with_options(options);
 
+        if let Some(wal) = &self.wal_object_store {
+            builder = builder.with_wal_object_store(Arc::clone(wal));
+        }
+
         let location = self.location();
         let cache_id = location.cache_id();
         if let Some(cache) =
@@ -328,8 +349,7 @@ impl<'a> StoreBuilder<'a> {
     /// Deletes the checkpoint `checkpoint`, unpinning whatever it held
     /// against garbage collection.
     pub(crate) async fn delete_checkpoint(&self, checkpoint: Uuid) -> Result<()> {
-        AdminBuilder::new(self.path, Arc::clone(&self.object_store))
-            .build()
+        self.admin()
             .delete_checkpoint(checkpoint)
             .await
             .map_err(Error::from)
@@ -338,8 +358,8 @@ impl<'a> StoreBuilder<'a> {
     /// Every checkpoint the store's manifest currently carries, oldest
     /// first — reader-established ones included.
     pub(crate) async fn list_checkpoints(&self) -> Result<Vec<CheckpointRecord>> {
-        let checkpoints = AdminBuilder::new(self.path, Arc::clone(&self.object_store))
-            .build()
+        let checkpoints = self
+            .admin()
             .list_checkpoints(None)
             .await
             .map_err(Error::from)?;
@@ -353,6 +373,16 @@ impl<'a> StoreBuilder<'a> {
                 expires_micros: c.expire_time.map(|at| at.timestamp_micros()),
             })
             .collect())
+    }
+
+    /// The admin surface over this store, which reaches the write-ahead
+    /// log wherever it lives.
+    fn admin(&self) -> slatedb::admin::Admin {
+        let mut builder = AdminBuilder::new(self.path, Arc::clone(&self.object_store));
+        if let Some(wal) = &self.wal_object_store {
+            builder = builder.with_wal_object_store(Arc::clone(wal));
+        }
+        builder.build()
     }
 
     /// SlateDB settings for a writer. The in-process compactor writes its

@@ -135,6 +135,46 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 Off by default. The two compose: the interval still bounds how long an
 *uncommitted* write sits in memory, and a commit no longer waits for it.
 
+**`WAL_PATH` — the write-ahead log on a faster bucket.** Whatever the two
+options above settle, a commit still waits on one PUT of the write-ahead
+log — so the log is the one object worth putting on faster storage than the
+rest of the catalog. `META_WAL_PATH` writes it to a store of its own, an S3
+Express One Zone directory bucket beside the standard bucket holding
+everything else:
+
+```sql
+CREATE SECRET wal (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-west-2',
+                   SCOPE 's3://lake-wal--usw2-az1--x-s3');
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE,
+   META_WAL_PATH 's3://lake-wal--usw2-az1--x-s3');
+```
+
+The log store resolves its own `s3` secret — a directory bucket is a
+different endpoint, and usually a different secret — and a bucket named with
+the suffix AWS reserves for directory buckets (`--x-s3`, `--xa-s3`) is
+addressed as S3 Express with no option asked for: the name is what says so.
+A local directory or `memory://` works here too, as it does for the catalog;
+the log store must be as durable as the catalog store, since a commit no
+sorted-string table holds yet lives only there.
+
+Where a lake's log lives is recorded in the lake, so **every later attach
+names the same store**, readers included; one that names a different store,
+or none, is refused with a message naming the one the lake records (which is
+also how to find out what it is). Move it with `moraine_move_wal`, which
+takes a store path and must run with the lake attached nowhere:
+
+```sql
+SELECT from_wal_path, to_wal_path, moved
+FROM moraine_move_wal('s3://bucket/prefix',
+                      wal_path => 's3://lake-wal--usw2-az1--x-s3');
+```
+
+It drains the log where it stands before recording the new store, so nothing
+in flight is lost; `from_wal_path => '…'` names the log store as it stands
+when the lake already has one, and `wal_path => NULL` moves the log back
+into the catalog store.
+
 **`CACHE_DIR` — on-disk object cache for S3 catalogs.** Each query reads the
 catalog metadata from the store; on S3 that is network latency every time, and
 the in-memory caches start empty in each new process. Point SlateDB's disk

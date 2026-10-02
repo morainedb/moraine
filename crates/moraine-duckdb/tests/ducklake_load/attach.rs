@@ -330,6 +330,58 @@ fn ducklake_attach_cache_options_are_applied() {
     );
 }
 
+/// `META_WAL_PATH` end to end: `ATTACH (META_WAL_PATH '…')` →
+/// DuckLake's `META_` passthrough → this shim's inner attach → the store
+/// SlateDB writes the log to. The log lands there and nowhere else, the
+/// lake reads back through it, and an attach that omits it is refused —
+/// the log holds commits no sorted-string table carries yet.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn ducklake_attach_writes_the_wal_to_the_store_it_names() {
+    let dir = TempDir::new("wal-path-store");
+    let data_dir = TempDir::new("wal-path-data");
+    let wal_dir = TempDir::new("wal-path-log");
+
+    let attach_options = format!(", META_WAL_PATH '{}'", wal_dir.path().display());
+    run_ducklake_sql_with_options(
+        dir.path(),
+        data_dir.path(),
+        &attach_options,
+        "CREATE TABLE lake.main.t(id BIGINT); \
+         INSERT INTO lake.main.t VALUES (1), (2);",
+    );
+
+    assert!(
+        wal_dir.path().join("wal").is_dir(),
+        "expected the write-ahead log under {:?}",
+        wal_dir.path()
+    );
+    assert!(
+        !dir.path().join("wal").exists(),
+        "the catalog store must carry no log directory"
+    );
+
+    assert_eq!(
+        csv_rows(&run_ducklake_sql_with_options(
+            dir.path(),
+            data_dir.path(),
+            &attach_options,
+            "SELECT count(*) FROM lake.main.t;",
+        )),
+        vec![vec!["2".to_string()]]
+    );
+
+    let refused = run_ducklake_sql_expect_err(
+        dir.path(),
+        data_dir.path(),
+        "SELECT count(*) FROM lake.main.t;",
+    );
+    assert!(
+        refused.contains("write-ahead log"),
+        "an attach omitting META_WAL_PATH must be refused, got: {refused}"
+    );
+}
+
 /// `META_CACHE_PRELOAD` on a lake with an indexed table: the attach also
 /// warms every table's probe ranges in the background, and a lookup that
 /// may race that warm still resolves. The tally shows the attach read

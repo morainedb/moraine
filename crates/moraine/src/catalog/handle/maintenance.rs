@@ -325,6 +325,7 @@ impl ReadOnlyCatalog {
         let physical = store_census::read_manifest_census(
             &self.location.path,
             Arc::clone(&self.location.object_store),
+            self.location.wal_object_store.clone(),
         );
         let live = async {
             if !request.count_live_entries {

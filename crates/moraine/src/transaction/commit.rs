@@ -203,7 +203,7 @@ async fn reporting_stalls<T>(
 /// Refuses a store this binary must not touch: mid-migration, or a
 /// format newer/older than it understands. `None` format means the store
 /// is empty and needs bootstrap.
-async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue>> {
+pub(crate) async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue>> {
     let (migration, format) = futures::try_join!(read::read_migration(tx), read::read_format(tx))?;
     if migration.is_some() {
         return Err(Error::Migration(
@@ -235,14 +235,55 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
     }
 }
 
+/// The log store the catalog records, `None` when its log is in the
+/// catalog store.
+pub(crate) async fn recorded_wal_store(tx: ReadHandle<'_>) -> Result<Option<String>> {
+    Ok(read::read_global_options(tx)
+        .await?
+        .and_then(|options| options.options.get("wal_path").cloned())
+        .filter(|name| !name.is_empty()))
+}
+
+/// Refuses an open whose write-ahead log store is not the one the catalog
+/// records. Either way round the log would be replayed from the wrong
+/// store, and whatever the other one holds lost silently; moving it is
+/// [`move_wal_store`](crate::Catalog::move_wal_store)'s job, which drains
+/// the log it leaves behind first.
+pub(crate) async fn validate_wal_store(tx: ReadHandle<'_>, configured: Option<&str>) -> Result<()> {
+    let recorded = recorded_wal_store(tx).await?;
+
+    match (recorded.as_deref(), configured) {
+        (Some(recorded), None) => Err(Error::Configuration(format!(
+            "this catalog keeps its write-ahead log on `{recorded}`, so every open has to name \
+             that store (`CatalogOptions::wal_store`, or the extension's `WAL_PATH`); \
+             `move_wal_store` is what brings the log back into the catalog store"
+        ))),
+        (None, Some(configured)) => Err(Error::Configuration(format!(
+            "this catalog keeps its write-ahead log in the catalog store, and this open names \
+             `{configured}`; where the log lives is recorded in the catalog, so move it with \
+             `move_wal_store` rather than at an open, which would leave the log it already \
+             holds unread"
+        ))),
+        (Some(recorded), Some(configured)) if recorded != configured => {
+            Err(Error::Configuration(format!(
+                "this catalog keeps its write-ahead log on `{recorded}` and this open names \
+                 `{configured}`; open it against the store it records, which holds the commits \
+                 no sorted-string table carries yet, or move the log with `move_wal_store`"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Stages the initial state of an empty store into `tx`: format stamp,
 /// snapshot 0, the `main` schema record, the global option record
-/// (`encrypted` as `"true"`/`"false"`, plus `data_path` when given), and
-/// the head pointer.
+/// (`encrypted` as `"true"`/`"false"`, plus `data_path` and `wal_path`
+/// when given), and the head pointer.
 fn stage_bootstrap(
     tx: &DbTransaction,
     encrypted: bool,
     data_path: Option<&str>,
+    wal_path: Option<&str>,
 ) -> Result<StagedBytes> {
     let mut writes: Vec<StagedWrite> = Vec::with_capacity(5);
     let mut stage = |key: Key, bytes: Vec<u8>| writes.push((key.encode(), Some(bytes)));
@@ -291,6 +332,9 @@ fn stage_bootstrap(
     if let Some(path) = data_path {
         options.insert("data_path".to_string(), path.to_string());
     }
+    if let Some(path) = wal_path {
+        options.insert("wal_path".to_string(), path.to_string());
+    }
     stage(
         Key::current(EntityKey::Option {
             scope_kind: 0,
@@ -332,11 +376,12 @@ pub(crate) async fn open_initialized(
     store: StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
+    wal_path: Option<&str>,
     flush_spacing: Duration,
 ) -> Result<(Db, Arc<CacheCounters>, u64, Arc<FlushPacer>)> {
     let mut attempt = 1;
     loop {
-        match open_attempt(&store, encrypted, data_path, flush_spacing).await {
+        match open_attempt(&store, encrypted, data_path, wal_path, flush_spacing).await {
             Ok(opened) => return Ok(opened),
             Err(OpenFailure::Fatal(err)) => return Err(err),
             Err(OpenFailure::FencedAtGenesis(err)) => {
@@ -360,6 +405,7 @@ async fn open_attempt(
     store: &StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
+    wal_path: Option<&str>,
     flush_spacing: Duration,
 ) -> std::result::Result<(Db, Arc<CacheCounters>, u64, Arc<FlushPacer>), OpenFailure> {
     let started = Instant::now();
@@ -373,7 +419,9 @@ async fn open_attempt(
 
     match validate_format(ReadHandle::Tx(&tx)).await {
         Ok(Some(format)) => {
+            let agreed = validate_wal_store(ReadHandle::Tx(&tx), wal_path).await;
             tx.rollback();
+            agreed.map_err(OpenFailure::Fatal)?;
             return Ok((db, counters, format.format_version, pacer));
         }
         Ok(None) => {}
@@ -383,7 +431,7 @@ async fn open_attempt(
         }
     }
 
-    let staged = match stage_bootstrap(&tx, encrypted, data_path) {
+    let staged = match stage_bootstrap(&tx, encrypted, data_path, wal_path) {
         Ok(staged) => staged,
         Err(err) => {
             tx.rollback();
@@ -394,16 +442,23 @@ async fn open_attempt(
     let durability = CommitDurability::Paced(Arc::clone(&pacer));
     match commit_durable(tx, "bootstrap", staged, &durability).await {
         Ok(_) => {
-            info!(encrypted, data_path, "bootstrapped a fresh catalog store");
+            info!(
+                encrypted,
+                data_path, wal_path, "bootstrapped a fresh catalog store"
+            );
             Ok((db, counters, MIN_FORMAT_VERSION, pacer))
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
             let tx = begin_snapshot(&db).await?;
             let validated = validate_format(ReadHandle::Tx(&tx)).await;
+            let agreed = validate_wal_store(ReadHandle::Tx(&tx), wal_path).await;
             tx.rollback();
             match validated {
-                Ok(Some(format)) => Ok((db, counters, format.format_version, pacer)),
+                Ok(Some(format)) => {
+                    agreed.map_err(OpenFailure::Fatal)?;
+                    Ok((db, counters, format.format_version, pacer))
+                }
                 Ok(None) => Err(OpenFailure::Fatal(Error::Corruption(
                     "bootstrap race left the store uninitialized".to_string(),
                 ))),
@@ -430,6 +485,7 @@ async fn begin_snapshot(db: &Db) -> std::result::Result<DbTransaction, OpenFailu
 /// bootstraps: an uninitialized store is refused.
 pub(crate) async fn open_reader_initialized(
     store: StoreBuilder<'_>,
+    wal_path: Option<&str>,
 ) -> Result<(DbReader, Arc<CacheCounters>, u64)> {
     let started = Instant::now();
     let (reader, counters) = store.open_reader().await?;
@@ -444,7 +500,10 @@ pub(crate) async fn open_reader_initialized(
     );
 
     match format {
-        Some(format) => Ok((reader, counters, format.format_version)),
+        Some(format) => {
+            validate_wal_store(ReadHandle::Reader(&reader), wal_path).await?;
+            Ok((reader, counters, format.format_version))
+        }
         None => Err(Error::Corruption(
             "store is not an initialized moraine catalog; a read-only attach \
              needs a writer to have created it first"

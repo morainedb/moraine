@@ -36,6 +36,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/maintenance.cpp
     ${CPP_DIR}/metadata_tables.cpp
     ${CPP_DIR}/migrate.cpp
+    ${CPP_DIR}/move_wal.cpp
     ${CPP_DIR}/optimizer.cpp
     ${CPP_DIR}/s3_secret.cpp
     ${CPP_DIR}/scan.cpp

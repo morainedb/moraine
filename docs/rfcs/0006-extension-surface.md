@@ -228,6 +228,56 @@ store the shim rewrites the terse store error to name this fix (add
 paths are not remote-file URIs — a Postgres/MySQL connection string never
 matches the prefix rule, and local DuckDB/SQLite files default read-write.
 
+**`WAL_PATH` — the write-ahead log on a store of its own.** A commit waits
+on one PUT of the log, so the log is the one object a latency-sensitive
+deployment wants on faster storage than the rest of the catalog.
+`META_WAL_PATH 's3://lake-wal--usw2-az1--x-s3'` through the DuckLake attach
+— or `WAL_PATH` directly on a standalone `moraine:` attach — puts it in an
+S3 Express One Zone directory bucket while everything else stays in a
+standard one. The URI takes the same forms an attach path does (a local
+directory, `memory://`, `s3://<bucket>[/<prefix>]`) and resolves its own
+`s3` secret, since a directory bucket is a different endpoint, and usually a
+different secret, from the catalog's. A bucket whose name carries the suffix
+AWS reserves for directory buckets (`--x-s3`, `--xa-s3`) is opened as S3
+Express without being told to: the name is what says the request is zonal
+and signed with a session token, so there is no option for it — on this
+path or on the catalog's own, which may equally be a directory bucket.
+
+Within that store the log keeps the catalog's own key prefix, under whatever
+prefix the URI carries: a catalog at `s3://lake/warehouse` with
+`WAL_PATH 's3://lake-wal--usw2-az1--x-s3/logs'` writes it under
+`logs/warehouse/wal/`. A log store nested in `DATA_PATH` is refused for the
+reason the catalog store is — DuckLake's orphaned-file cleanup lists that
+root, and would delete log objects holding commits no sorted-string table
+carries yet.
+
+Where a lake's log lives is recorded in the lake (RFC 0004), so **every
+attach of that lake names the same store**, readers included; one naming a
+different store, or none, is refused with a message naming the store the
+lake records. That refusal doubles as the discovery path: an operator who
+has lost track attaches without the option and reads the answer out of the
+error.
+
+**`moraine_move_wal` — moving an existing lake's log.** The option above
+settles where a *new* lake's log goes; this verb moves an existing one,
+either way:
+
+```sql
+SELECT from_wal_path, to_wal_path, moved
+FROM moraine_move_wal('s3://lake/warehouse',
+                      wal_path => 's3://lake-wal--usw2-az1--x-s3');
+```
+
+It takes a store path rather than an attached catalog for the reason
+`moraine_migrate` does: it takes the store's writer twice, so nothing may
+hold the lake while it runs, and it refuses an explicit transaction.
+`from_wal_path` names the log store as it stands — omitted when the log is
+in the catalog store — and must be the one the lake records, because
+draining that log is what makes the move lossless; `wal_path => NULL` moves
+the log back into the catalog store. A move to where the log already is
+writes nothing and reports `moved = false`. The protocol, and what each
+crash point leaves behind, is RFC 0004's.
+
 **`CACHE_DIR` — the block cache's disk tier, for S3 stores.** Every query
 rebinds the catalog by reading its metadata (snapshot → tables → columns →
 files → stats) from the store; on an `s3://`-backed catalog those reads are
@@ -302,10 +352,14 @@ filling. Through DuckLake the names are `META_CACHE_PUTS` and
 
 The core exposes `CatalogOptions::cache_puts` (default `true`) and
 `cache_compaction_puts` (default `true`). The shim uses the additive
-`moraine_attach_with_cache_policy` entry point, whose two flags are explicit.
-The existing `moraine_attach` keeps its signature and maps its single flag to
-both policies, preserving existing binary callers. The migration ABI likewise
-retains its legacy single-flag behavior.
+`moraine_attach_with_wal_store` entry point, whose cache flags and log store
+are explicit. Each earlier attach symbol keeps its signature and forwards:
+`moraine_attach_with_cache_policy` supplies no log store, and
+`moraine_attach` additionally maps its single cache flag to both policies,
+preserving existing binary callers. The migration ABI is additive the same
+way — `moraine_migrate_with_wal_store` reaches a lake whose log sits
+elsewhere, and `moraine_migrate` keeps its legacy signature and
+single-flag behavior.
 
 **`CACHE_PRELOAD` — fill it before the first query, not during it.** Both of
 the above leave a fresh process cold: the cache fills as queries ask for

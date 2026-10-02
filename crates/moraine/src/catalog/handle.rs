@@ -120,6 +120,9 @@ impl ReadTally {
 struct StoreLocation {
     path: String,
     object_store: Arc<dyn ObjectStore>,
+    /// The store the write-ahead log lives on, when it is not the one
+    /// beside it.
+    wal_object_store: Option<Arc<dyn ObjectStore>>,
 }
 
 /// The open store behind a catalog: the read-write `Db` writer, or a
@@ -194,6 +197,17 @@ pub struct CatalogOptions {
     /// [`flush_interval`](Self::flush_interval), kept for callers that set
     /// it. Defaults to `false`.
     pub flush_on_commit: bool,
+    /// The store the write-ahead log is written to, when it is not the
+    /// catalog's own ([`WalStore`](crate::WalStore) carries the name the
+    /// catalog records for it). The log keeps the catalog's own
+    /// [`path`](Self::path) within that store.
+    ///
+    /// Settled when the catalog is created: the name is recorded then, and
+    /// every later open must name the same store — an open that names a
+    /// different one, or none, is refused rather than replaying an empty
+    /// log over live state. `None` (the default) keeps the log in the
+    /// catalog store.
+    pub wal_store: Option<crate::WalStore>,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -282,6 +296,7 @@ impl Default for CatalogOptions {
             encrypted: false,
             flush_interval: Duration::from_millis(100),
             flush_on_commit: false,
+            wal_store: None,
             cache_dir: None,
             cache_identity: None,
             cache_size: None,
@@ -308,6 +323,14 @@ pub enum CachePreload {
     /// waits for a copy of the whole store, so this suits a store that
     /// fits the cache with room to spare.
     All,
+}
+
+/// The object store `options` names for the write-ahead log, if any.
+fn wal_object_store(options: &CatalogOptions) -> Option<Arc<dyn ObjectStore>> {
+    options
+        .wal_store
+        .as_ref()
+        .map(|wal| Arc::clone(wal.object_store()))
 }
 
 /// Warns when an `All` preload cannot hold the store it is about to load.
@@ -387,6 +410,24 @@ fn warn_if_block_cache_cannot_hold_index(path: &str, index_bytes: Option<u64>) {
              Raise the cache memory budget on the first attach in the process."
         );
     }
+}
+
+/// Warns about what this store's own figures say the process's caches
+/// cannot hold. Diagnostics only, from the manifest read the open already
+/// made.
+fn warn_if_caches_cannot_hold(path: &str, manifest: Option<&census::ManifestBytes>) {
+    warn_if_metadata_cache_cannot_hold(path, manifest.map(|manifest| manifest.metadata_bytes));
+    warn_if_block_cache_cannot_hold_index(
+        path,
+        manifest.and_then(|manifest| {
+            let index = crate::store::key::subspace_prefix(crate::store::key::Subspace::Index);
+            manifest
+                .segments
+                .iter()
+                .find(|segment| segment.prefix == index)
+                .map(|segment| segment.bytes)
+        }),
+    );
 }
 
 /// How long an open may take before a missing cache directory is worth
@@ -1168,9 +1209,14 @@ impl Catalog {
             .await
             .ok();
         warn_if_preload_cannot_fit(&options, manifest.as_ref());
+        let wal_object_store = options
+            .wal_store
+            .as_ref()
+            .map(|wal| Arc::clone(wal.object_store()));
         // The writer paces its own flushes; the store's timer stays off so
         // the pacing is exact.
         let store = StoreBuilder::new(&options.path, object_store)
+            .wal_object_store(wal_object_store.clone())
             .without_flush_timer()
             .cache_dir(options.cache_dir.clone())
             .cache_identity(options.cache_identity)
@@ -1195,24 +1241,11 @@ impl Catalog {
             store,
             options.encrypted,
             options.data_path.as_deref(),
+            options.wal_store.as_ref().map(crate::WalStore::name),
             flush_spacing,
         )
         .await?;
-        warn_if_metadata_cache_cannot_hold(
-            &options.path,
-            manifest.as_ref().map(|manifest| manifest.metadata_bytes),
-        );
-        warn_if_block_cache_cannot_hold_index(
-            &options.path,
-            manifest.as_ref().and_then(|manifest| {
-                let index = crate::store::key::subspace_prefix(crate::store::key::Subspace::Index);
-                manifest
-                    .segments
-                    .iter()
-                    .find(|segment| segment.prefix == index)
-                    .map(|segment| segment.bytes)
-            }),
-        );
+        warn_if_caches_cannot_hold(&options.path, manifest.as_ref());
         let elapsed = started.elapsed();
         info!(
             path = options.path,
@@ -1235,6 +1268,7 @@ impl Catalog {
                 location: Arc::new(StoreLocation {
                     path: options.path,
                     object_store: located,
+                    wal_object_store,
                 }),
                 reads: Arc::new(ReadTally::default()),
                 cache,
@@ -1313,7 +1347,12 @@ impl Catalog {
             .await
             .ok();
         warn_if_preload_cannot_fit(&options, manifest.as_ref());
+        let wal_object_store = options
+            .wal_store
+            .as_ref()
+            .map(|wal| Arc::clone(wal.object_store()));
         let store = StoreBuilder::new(&options.path, object_store)
+            .wal_object_store(wal_object_store.clone())
             .cache_dir(options.cache_dir.clone())
             .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
@@ -1331,22 +1370,12 @@ impl Catalog {
             .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
 
-        let (reader, cache, format) = commit::open_reader_initialized(store).await?;
-        warn_if_metadata_cache_cannot_hold(
-            &options.path,
-            manifest.as_ref().map(|manifest| manifest.metadata_bytes),
-        );
-        warn_if_block_cache_cannot_hold_index(
-            &options.path,
-            manifest.as_ref().and_then(|manifest| {
-                let index = crate::store::key::subspace_prefix(crate::store::key::Subspace::Index);
-                manifest
-                    .segments
-                    .iter()
-                    .find(|segment| segment.prefix == index)
-                    .map(|segment| segment.bytes)
-            }),
-        );
+        let (reader, cache, format) = commit::open_reader_initialized(
+            store,
+            options.wal_store.as_ref().map(crate::WalStore::name),
+        )
+        .await?;
+        warn_if_caches_cannot_hold(&options.path, manifest.as_ref());
         let elapsed = started.elapsed();
         info!(
             path = options.path,
@@ -1364,6 +1393,7 @@ impl Catalog {
             location: Arc::new(StoreLocation {
                 path: options.path,
                 object_store: located,
+                wal_object_store,
             }),
             reads: Arc::new(ReadTally::default()),
             cache,
@@ -1436,6 +1466,7 @@ impl Catalog {
         request: MigrationRequest,
     ) -> Result<MigrationReport> {
         let (db, _cache) = StoreBuilder::new(&options.path, object_store.clone())
+            .wal_object_store(wal_object_store(&options))
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
             .cache_identity(options.cache_identity)
@@ -1464,11 +1495,87 @@ impl Catalog {
 
         if let Some(checkpoint) = checkpoint {
             StoreBuilder::new(&options.path, object_store)
+                .wal_object_store(wal_object_store(&options))
                 .delete_checkpoint(checkpoint)
                 .await?;
         }
 
         Ok(report)
+    }
+
+    /// Moves the catalog's write-ahead log to `to` (into the catalog store
+    /// itself, when `None`), and reports where it was and where it is now.
+    ///
+    /// `options.wal_store` names the log store as it stands — the one the
+    /// catalog records — so a log already in the catalog store is moved out
+    /// with `None` there and the new store here. A log already on `to` is
+    /// left alone and reported as unmoved.
+    ///
+    /// Free-standing, and takes the writer twice: nothing may hold the
+    /// catalog while this runs, and a live attach is fenced by it. The
+    /// first open drains the log it finds into a sorted-string table, so a
+    /// crash anywhere in the move leaves the catalog openable against one
+    /// store or the other with nothing lost — at worst the move has to be
+    /// run again. Every attach after it names `to`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Configuration`] if `options.wal_store` is not the
+    /// log store the catalog records (the message names the one it does),
+    /// [`Error::Corruption`] if there is no catalog at `options.path`, or a
+    /// store error if a drain or the recording write fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, WalStore};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let object_store = Arc::new(InMemory::new());
+    /// let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
+    /// catalog.close().await?;
+    ///
+    /// let log = WalStore::new("memory://log", Arc::new(InMemory::new()));
+    /// let moved = Catalog::move_wal_store(
+    ///     object_store.clone(),
+    ///     CatalogOptions::default(),
+    ///     Some(log.clone()),
+    /// )
+    /// .await?;
+    /// assert_eq!(moved.from, None);
+    /// assert_eq!(moved.to.as_deref(), Some("memory://log"));
+    ///
+    /// // Every open from now on names it.
+    /// let mut options = CatalogOptions::default();
+    /// options.wal_store = Some(log);
+    /// let reopened = Catalog::open(object_store, options).await?;
+    /// reopened.close().await?;
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn move_wal_store(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+        to: Option<crate::WalStore>,
+    ) -> Result<crate::WalStoreMove> {
+        let builder = |wal: Option<&crate::WalStore>| {
+            StoreBuilder::new(&options.path, Arc::clone(&object_store))
+                .wal_object_store(wal.map(|wal| Arc::clone(wal.object_store())))
+                .flush_interval(options.flush_interval)
+                .cache_dir(options.cache_dir.clone())
+                .cache_identity(options.cache_identity)
+                .cache_size(options.cache_size)
+                .cache_memory(options.cache_memory)
+                .cache_auxiliary_percent(options.cache_auxiliary_percent)
+        };
+
+        crate::transaction::wal_move::run(
+            builder(options.wal_store.as_ref()),
+            builder(to.as_ref()),
+            options.wal_store.as_ref().map(crate::WalStore::name),
+            to.as_ref().map(crate::WalStore::name),
+        )
+        .await
     }
 
     /// Pins everything committed so far as a checkpoint, and reports its id.
@@ -1509,6 +1616,7 @@ impl Catalog {
         let id = parse_checkpoint(Some(checkpoint))?
             .ok_or_else(|| Error::Configuration("no checkpoint given".to_string()))?;
         StoreBuilder::new(&options.path, object_store)
+            .wal_object_store(wal_object_store(&options))
             .delete_checkpoint(id)
             .await
     }
@@ -1529,6 +1637,7 @@ impl Catalog {
         options: CatalogOptions,
     ) -> Result<Vec<StoreCheckpoint>> {
         let records = StoreBuilder::new(&options.path, object_store)
+            .wal_object_store(wal_object_store(&options))
             .list_checkpoints()
             .await?;
         Ok(records

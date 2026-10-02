@@ -63,6 +63,10 @@ suite. Unchecked items are implementation gaps, not supported attach modes.
 - [x] Commit-served projections: `snapshot`, `table_stats`, and `table_column_stats` are folded forward from each commit and served from an in-memory cache when current, removing per-commit latency growth with snapshot history. Attach-tunable WAL flush cadence bounds the per-commit durable wait.
 - [x] Catalog commit preparation shares unchanged maps and derives writes from
   changed entities; allocation and CPU benchmarks separate preparation from WAL latency.
+- [x] The write-ahead log on an object store of its own, so a commit's one PUT
+  can land on an S3 Express One Zone bucket while the rest of the catalog
+  stays on standard storage (`META_WAL_PATH`); `moraine_move_wal` moves an
+  existing lake's log either way (RFC 0004).
 - [x] Staged index derivation streams inline sources with resumable cursors and
   whole-operation peak-memory measurement.
 - [x] Small row lookups select requested inline ranges and use cached file
