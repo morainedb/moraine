@@ -24,18 +24,23 @@ namespace {
 
 struct MigrateBindData : public duckdb::FunctionData {
 	std::string path;
+	// The store the catalog's write-ahead log lives on, for a store
+	// attached with `WAL_PATH`: a migration opens the writer, which cannot
+	// reach such a catalog without it.
+	std::string wal_path;
 	bool checkpoint = false;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto copy = duckdb::make_uniq<MigrateBindData>();
 		copy->path = path;
+		copy->wal_path = wal_path;
 		copy->checkpoint = checkpoint;
 		return copy;
 	}
 
 	bool Equals(const duckdb::FunctionData &other) const override {
 		auto &that = other.Cast<MigrateBindData>();
-		return path == that.path && checkpoint == that.checkpoint;
+		return path == that.path && wal_path == that.wal_path && checkpoint == that.checkpoint;
 	}
 };
 
@@ -66,6 +71,8 @@ duckdb::unique_ptr<duckdb::FunctionData> MigrateBind(duckdb::ClientContext &, du
 	for (auto &option : input.named_parameters) {
 		if (duckdb::StringUtil::CIEquals(option.first, "checkpoint")) {
 			bind_data->checkpoint = duckdb::BooleanValue::Get(option.second);
+		} else if (duckdb::StringUtil::CIEquals(option.first, "wal_path")) {
+			bind_data->wal_path = option.second.GetValue<std::string>();
 		}
 	}
 
@@ -91,11 +98,19 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MigrateInitGlobal(duckdb::C
 	MoraineS3Config s3 {};
 	S3SecretStrings s3_strings;
 	bool is_s3 = ResolveS3Config(context, bind_data.path, s3, s3_strings);
+	MoraineS3Config wal_s3 {};
+	S3SecretStrings wal_s3_strings;
+	bool wal_is_s3 =
+	    !bind_data.wal_path.empty() && ResolveS3Config(context, bind_data.wal_path, wal_s3, wal_s3_strings);
+	MoraineWalStore wal {};
+	wal.path = bind_data.wal_path.empty() ? nullptr : bind_data.wal_path.c_str();
+	wal.s3 = wal_is_s3 ? &wal_s3 : nullptr;
 
 	MoraineMigrationReport report {};
 	MoraineError err {};
-	auto code = moraine_migrate(bind_data.path.c_str(), is_s3 ? &s3 : nullptr, 0, nullptr, 0, 0, false, bind_data.checkpoint,
-	                            &report, &err);
+	auto code = moraine_migrate_with_wal_store(bind_data.path.c_str(), is_s3 ? &s3 : nullptr,
+	                            bind_data.wal_path.empty() ? nullptr : &wal, 0, nullptr, 0, 0, false,
+	                            bind_data.checkpoint, &report, &err);
 	// Drained on both exits: a failed migration's events would otherwise sit
 	// buffered behind a commit that never comes.
 	DrainMoraineLogs(context);
@@ -134,6 +149,7 @@ void RegisterMoraineMigrateFunction(duckdb::ExtensionLoader &loader) {
 	duckdb::TableFunction migrate("moraine_migrate", {duckdb::LogicalType::VARCHAR}, MigrateImpl, MigrateBind,
 	                              MigrateInitGlobal);
 	migrate.named_parameters["checkpoint"] = duckdb::LogicalType::BOOLEAN;
+	migrate.named_parameters["wal_path"] = duckdb::LogicalType::VARCHAR;
 	loader.RegisterFunction(migrate);
 }
 

@@ -2741,3 +2741,278 @@ fn locate_and_commit_located_deletion_round_trip_an_inlined_row() {
     // SAFETY: `handle` was minted by `attach_ok`, detached once.
     unsafe { moraine_detach(handle) };
 }
+
+/// A directory bucket's name is what selects S3 Express addressing: the
+/// request goes zonally and is signed with a session token, which no
+/// attach option says.
+#[test]
+fn a_directory_bucket_name_selects_s3_express() {
+    use object_store::aws::AmazonS3ConfigKey;
+
+    let express = s3_builder("lake-wal--usw2-az1--x-s3", None);
+    assert_eq!(
+        express.get_config_value(&AmazonS3ConfigKey::S3Express),
+        Some("true".to_string())
+    );
+    assert_eq!(
+        s3_builder("lake-wal--usw2-az1--xa-s3", None)
+            .get_config_value(&AmazonS3ConfigKey::S3Express),
+        Some("true".to_string()),
+        "both reserved directory-bucket suffixes"
+    );
+
+    let standard = s3_builder("lake-wal", None);
+    assert_eq!(
+        standard.get_config_value(&AmazonS3ConfigKey::S3Express),
+        Some("false".to_string())
+    );
+    // The zone is what the endpoint is built from, so a bucket claiming
+    // the suffix without one is refused rather than addressed wrongly.
+    assert!(s3_builder("lake-wal--x-s3", None).build().is_err());
+}
+
+/// A log-store URI records itself as the catalog's log store, and its own
+/// key prefix is kept — SlateDB lays the log out under the catalog's path
+/// within whatever store it is handed.
+#[test]
+fn a_log_store_uri_keeps_its_prefix_and_names_itself() {
+    let prefixed = open_wal_store("s3://lake-wal--usw2-az1--x-s3/logs/", None).expect("opens");
+    assert_eq!(prefixed.name(), "s3://lake-wal--usw2-az1--x-s3/logs");
+    assert_eq!(
+        format!("{}", prefixed.object_store()),
+        "PrefixObjectStore(logs)"
+    );
+
+    let whole_bucket = open_wal_store("s3://lake-wal--usw2-az1--x-s3", None).expect("opens");
+    assert_eq!(whole_bucket.name(), "s3://lake-wal--usw2-az1--x-s3");
+    assert_eq!(
+        format!("{}", whole_bucket.object_store()),
+        "AmazonS3(lake-wal--usw2-az1--x-s3)"
+    );
+}
+
+/// DuckLake's orphan sweep lists `DATA_PATH` and deletes what it does not
+/// recognize, so a log store inside it is refused.
+#[test]
+fn a_log_store_inside_the_data_path_is_refused() {
+    let nested = open_wal_store("s3://lake/logs", None).expect("opens");
+    let error = refuse_wal_store_in_data_path(Some(&nested), "s3://lake/logs/live")
+        .expect_err("a log store under DATA_PATH must be refused");
+    assert_eq!(error.code, codes::CONSTRAINT);
+    assert!(
+        error.message.contains("write-ahead log"),
+        "{}",
+        error.message
+    );
+
+    let containing = refuse_wal_store_in_data_path(Some(&nested), "s3://lake")
+        .expect_err("DATA_PATH containing the log store must be refused too");
+    assert_eq!(containing.code, codes::CONSTRAINT);
+
+    let sibling = open_wal_store("s3://lake/logs", None).expect("opens");
+    assert!(refuse_wal_store_in_data_path(Some(&sibling), "s3://lake/data").is_ok());
+    assert!(refuse_wal_store_in_data_path(None, "s3://lake/logs/live").is_ok());
+}
+
+/// Attaches read-write to `dir`, writing the write-ahead log to
+/// `wal_path` when one is given, and reports the ABI code and message.
+fn attach_with_wal(dir: &Path, wal_path: Option<&Path>) -> (i32, String) {
+    let c_path = CString::new(dir.to_str().expect("utf-8")).expect("no NUL");
+    let c_wal = wal_path.map(|path| CString::new(path.to_str().expect("utf-8")).expect("no NUL"));
+    let wal = MoraineWalStore {
+        path: c_wal.as_ref().map_or(ptr::null(), |path| path.as_ptr()),
+        s3: ptr::null(),
+    };
+    let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+    let mut err = MoraineError::default();
+    // SAFETY: every pointer is a valid C string, a local slot, or null.
+    let code = unsafe {
+        moraine_attach_with_wal_store(
+            c_path.as_ptr(),
+            ptr::null(),
+            false,
+            false,
+            0,
+            false,
+            ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            ptr::null(),
+            if c_wal.is_some() {
+                &raw const wal
+            } else {
+                ptr::null()
+            },
+            ptr::null(),
+            0,
+            None,
+            ptr::null_mut(),
+            &raw mut handle,
+            &raw mut err,
+        )
+    };
+    // SAFETY: null, or a message this call wrote and nothing freed yet.
+    let message = unsafe { err.message.as_ref() }
+        .map(|message| {
+            // SAFETY: a non-null message is a NUL-terminated C string.
+            unsafe { CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_default();
+    if code == codes::OK {
+        // SAFETY: a successful attach wrote a live handle, detached once.
+        unsafe { moraine_detach(handle) };
+    } else {
+        // SAFETY: minted by the failed call, freed once.
+        unsafe { moraine_error_free(err.message) };
+    }
+    (code, message)
+}
+
+/// The log store a catalog is created with is the one it is held to: an
+/// attach that omits it would replay an empty log over live state.
+#[test]
+fn an_attach_must_name_the_log_store_the_catalog_records() {
+    let dir = TempDir::new("wal-store");
+    let wal = TempDir::new("wal-store-log");
+
+    let (created, message) = attach_with_wal(dir.path(), Some(wal.path()));
+    assert_eq!(created, codes::OK, "attach with a log store: {message}");
+    assert!(
+        std::fs::read_dir(wal.path())
+            .expect("the log store directory exists")
+            .next()
+            .is_some(),
+        "the log must be written to the store the attach named"
+    );
+
+    let (omitted, message) = attach_with_wal(dir.path(), None);
+    assert_ne!(omitted, codes::OK, "omitting the log store must be refused");
+    assert!(message.contains("write-ahead log"), "got: {message}");
+
+    let elsewhere = TempDir::new("wal-store-other");
+    let (moved, message) = attach_with_wal(dir.path(), Some(elsewhere.path()));
+    assert_ne!(moved, codes::OK, "another log store must be refused");
+    assert!(message.contains("write-ahead log"), "got: {message}");
+
+    let (reattached, message) = attach_with_wal(dir.path(), Some(wal.path()));
+    assert_eq!(reattached, codes::OK, "the recorded log store: {message}");
+}
+
+/// Moves the log of the store at `dir` from `from` to `to` (the catalog
+/// store itself for either `None`), and reports the ABI code, whether the
+/// log moved, and the message.
+fn move_wal(dir: &Path, from: Option<&Path>, to: Option<&Path>) -> (i32, bool, String) {
+    let c_path = CString::new(dir.to_str().expect("utf-8")).expect("no NUL");
+    let store = |path: Option<&Path>| {
+        path.map(|path| CString::new(path.to_str().expect("utf-8")).expect("no NUL"))
+    };
+    let (c_from, c_to) = (store(from), store(to));
+    let wal = |path: &Option<CString>| MoraineWalStore {
+        path: path.as_ref().map_or(ptr::null(), |path| path.as_ptr()),
+        s3: ptr::null(),
+    };
+    let (from_wal, to_wal) = (wal(&c_from), wal(&c_to));
+    let mut moved = false;
+    let mut err = MoraineError::default();
+    // SAFETY: every pointer is a valid C string, a local slot, or null.
+    let code = unsafe {
+        moraine_move_wal_store(
+            c_path.as_ptr(),
+            ptr::null(),
+            if c_from.is_some() {
+                &raw const from_wal
+            } else {
+                ptr::null()
+            },
+            if c_to.is_some() {
+                &raw const to_wal
+            } else {
+                ptr::null()
+            },
+            &raw mut moved,
+            &raw mut err,
+        )
+    };
+    // SAFETY: null, or a message this call wrote and nothing freed yet.
+    let message = unsafe { err.message.as_ref() }
+        .map(|message| {
+            // SAFETY: a non-null message is a NUL-terminated C string.
+            unsafe { CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_default();
+    if code != codes::OK {
+        // SAFETY: minted by the failed call, freed once.
+        unsafe { moraine_error_free(err.message) };
+    }
+    (code, moved, message)
+}
+
+/// An existing catalog moves its log onto a store of its own, and from
+/// then on every attach names that store — which is how a lake adopts a
+/// faster log store after the fact.
+#[test]
+fn a_move_adopts_a_log_store_for_an_existing_catalog() {
+    let dir = TempDir::new("move-wal");
+    let wal = TempDir::new("move-wal-log");
+
+    let (created, message) = attach_with_wal(dir.path(), None);
+    assert_eq!(
+        created,
+        codes::OK,
+        "a catalog with its log in place: {message}"
+    );
+
+    let (code, moved, message) = move_wal(dir.path(), None, Some(wal.path()));
+    assert_eq!(code, codes::OK, "the move failed: {message}");
+    assert!(moved, "the log moved stores");
+    assert!(
+        wal.path().join("wal").is_dir(),
+        "the log must be written out on the new store"
+    );
+
+    let (named, message) = attach_with_wal(dir.path(), Some(wal.path()));
+    assert_eq!(named, codes::OK, "attach naming the moved log: {message}");
+    let (omitted, message) = attach_with_wal(dir.path(), None);
+    assert_ne!(omitted, codes::OK, "the log store is recorded now");
+    assert!(message.contains("write-ahead log"), "got: {message}");
+
+    // A second move to the same store is a no-op, and the move back
+    // restores the plain attach.
+    let (code, again, message) = move_wal(dir.path(), Some(wal.path()), Some(wal.path()));
+    assert_eq!(code, codes::OK, "a repeated move failed: {message}");
+    assert!(!again, "the log was already there");
+
+    let (code, back, message) = move_wal(dir.path(), Some(wal.path()), None);
+    assert_eq!(code, codes::OK, "the move back failed: {message}");
+    assert!(back);
+    let (plain, message) = attach_with_wal(dir.path(), None);
+    assert_eq!(plain, codes::OK, "attach after the move back: {message}");
+}
+
+/// A move names the log store as it stands, because draining that log is
+/// what makes it lossless; the refusal names the recorded store.
+#[test]
+fn a_move_from_the_wrong_log_store_is_refused() {
+    let dir = TempDir::new("move-wal-wrong");
+    let wal = TempDir::new("move-wal-wrong-log");
+    let guess = TempDir::new("move-wal-wrong-guess");
+
+    let (created, message) = attach_with_wal(dir.path(), Some(wal.path()));
+    assert_eq!(created, codes::OK, "attach with a log store: {message}");
+
+    let (code, moved, message) = move_wal(dir.path(), Some(guess.path()), None);
+    assert_ne!(code, codes::OK, "a wrong `from` must be refused");
+    assert!(!moved);
+    assert!(
+        message.contains(wal.path().to_str().expect("utf-8")),
+        "the refusal must name the recorded store, got: {message}"
+    );
+}

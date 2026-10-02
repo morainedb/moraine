@@ -128,6 +128,18 @@ typedef struct MoraineS3Config {
   int32_t use_ssl;
 } MoraineS3Config;
 
+// Mirrors the C `MoraineWalStore`: where a catalog's write-ahead log is
+// written, when it is not the catalog store itself. `path` is a store URI
+// of the same forms an attach path takes; `s3` supplies credentials for
+// an `s3://` one and may be null to use the AWS_* environment.
+typedef struct MoraineWalStore {
+  // The store URI the log is written to. Null or empty keeps the log in
+  // the catalog store.
+  const char *path;
+  // S3 credentials for an `s3://` log store.
+  const struct MoraineS3Config *s3;
+} MoraineWalStore;
+
 // A C-side cancellation probe polled while a cancellable call's core
 // future is pending; returning `true` cancels the call. `None` disables
 // the pull channel for that call. Mirrors `MoraineInterruptProbe` in
@@ -1277,6 +1289,13 @@ void moraine_error_free(char *message);
 // and data blocks on write; `cache_compaction_puts` independently admits
 // compaction outputs. Both are explicit at this ABI boundary.
 //
+// `wal`, if non-null, writes the catalog's write-ahead log to the store
+// its `path` names — a URI of the same forms `path` takes, with its own
+// credentials — instead of the catalog store. Settled when the catalog is
+// created: the URI is recorded then, and a later attach naming a
+// different store, or none, is refused. A log store nested in `DATA_PATH`
+// is refused outright, since DuckLake's orphan sweep lists that root.
+//
 // `checkpoint` pins a read-only attach to an existing SlateDB checkpoint
 // (see [`super::moraine_create_checkpoint`]); the open writes nothing and
 // serves a fixed cut. Null or empty follows the latest manifest; a non-null
@@ -1301,12 +1320,45 @@ void moraine_error_free(char *message);
 // must point to a valid [`MoraineS3Config`] whose non-null fields are
 // valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 // `checkpoint`, if non-null, must be valid NUL-terminated C strings.
+// `wal`, if non-null, must point to a valid [`MoraineWalStore`] whose
+// `path` is null or a NUL-terminated C string and whose `s3` is null or a
+// valid [`MoraineS3Config`].
 // `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
 // `cache_compaction_puts`, `flush_on_commit`, and `host_threads` are
 // unconstrained. `probe`, if non-null, must be safe to call with `probe_ctx`
 // from any thread. `out` must be a valid, writable `*mut *mut
 // MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
 // [`MoraineError`]. All for the duration of this call.
+int32_t moraine_attach_with_wal_store(const char *path,
+                                      const struct MoraineS3Config *s3,
+                                      bool read_only,
+                                      bool encrypted,
+                                      uint64_t flush_interval_ms,
+                                      bool flush_on_commit,
+                                      const char *cache_dir,
+                                      uint64_t cache_size_bytes,
+                                      uint64_t cache_memory_bytes,
+                                      uint32_t cache_auxiliary_percent,
+                                      uint8_t cache_preload,
+                                      bool cache_puts,
+                                      bool cache_compaction_puts,
+                                      const char *data_path,
+                                      const struct MoraineWalStore *wal,
+                                      const char *checkpoint,
+                                      uint64_t host_threads,
+                                      MoraineInterruptProbe probe,
+                                      void *probe_ctx,
+                                      struct MoraineCatalogHandle **out,
+                                      struct MoraineError *err);
+
+// Opens a catalog whose write-ahead log is in the catalog store. New
+// callers use [`moraine_attach_with_wal_store`], whose `wal` argument
+// places the log elsewhere.
+//
+// # Safety
+//
+// All pointer and callback requirements are identical to
+// [`moraine_attach_with_wal_store`].
 int32_t moraine_attach_with_cache_policy(const char *path,
                                          const struct MoraineS3Config *s3,
                                          bool read_only,
@@ -1383,6 +1435,10 @@ int32_t moraine_data_path(struct MoraineCatalogHandle *handle,
 // releases it once the run is durable, leaving a manual recovery point if
 // the migration fails partway.
 //
+// `wal`, if non-null, names the store the catalog's write-ahead log lives
+// on, exactly as [`moraine_attach_with_wal_store`] does; a catalog whose
+// log sits elsewhere cannot be opened without it.
+//
 // Returns [`codes::OK`] on success, having written `*out`. On failure
 // `*out` is left unwritten and, if `err` is non-null, `*err` carries the
 // code and a message.
@@ -1391,12 +1447,33 @@ int32_t moraine_data_path(struct MoraineCatalogHandle *handle,
 //
 // `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
 // point to a valid [`MoraineS3Config`] whose non-null fields are valid
-// NUL-terminated C strings. `cache_dir`, if non-null, must be a valid
-// NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
+// NUL-terminated C strings. `wal`, if non-null, must point to a valid
+// [`MoraineWalStore`] under the same contract as
+// [`moraine_attach_with_wal_store`]'s. `cache_dir`, if non-null, must be a
+// valid NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
 // `cache_puts` are unconstrained. `out`
 // must be a valid, writable [`MoraineMigrationReport`]. `err`, if non-null,
 // must be a valid, writable [`MoraineError`]. All for the duration of this
 // call.
+int32_t moraine_migrate_with_wal_store(const char *path,
+                                       const struct MoraineS3Config *s3,
+                                       const struct MoraineWalStore *wal,
+                                       uint64_t flush_interval_ms,
+                                       const char *cache_dir,
+                                       uint64_t cache_size_bytes,
+                                       uint8_t cache_preload,
+                                       bool cache_puts,
+                                       bool checkpoint,
+                                       struct MoraineMigrationReport *out,
+                                       struct MoraineError *err);
+
+// Migrates a store whose write-ahead log is in the store itself. New
+// callers use [`moraine_migrate_with_wal_store`].
+//
+// # Safety
+//
+// All pointer requirements are identical to
+// [`moraine_migrate_with_wal_store`].
 int32_t moraine_migrate(const char *path,
                         const struct MoraineS3Config *s3,
                         uint64_t flush_interval_ms,
@@ -2330,6 +2407,40 @@ int32_t moraine_snapshot_stamp(struct MoraineSnapshotHandle *snapshot,
 int32_t moraine_snapshot_id(struct MoraineSnapshotHandle *snapshot,
                             uint64_t *out_snapshot_id,
                             struct MoraineError *err);
+
+// Moves the write-ahead log of the catalog at `path` from the store it
+// records (`from`, null when its log is in the catalog store) to `to`
+// (null to bring it back there), and writes to `*out_moved` whether the
+// log changed stores — `false` means it was already on `to`.
+//
+// Takes the store's writer twice, so no attach may hold it: an attach
+// that does is fenced, exactly as by [`super::moraine_migrate`]. The
+// first open drains the log it finds into a sorted-string table, so an
+// interrupted move leaves the catalog openable — against one store or the
+// other, with nothing lost — and can be run again. Every attach after a
+// move names `to`.
+//
+// `from` naming a store other than the recorded one is refused, and the
+// message names the recorded one, which is how an operator who has lost
+// track finds it.
+//
+// Returns [`codes::OK`] on success, having written `*out_moved`.
+//
+// # Safety
+//
+// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
+// point to a valid [`MoraineS3Config`] whose non-null fields are valid
+// NUL-terminated C strings. `from` and `to`, if non-null, must each point
+// to a valid [`MoraineWalStore`] under the contract
+// [`super::moraine_attach_with_wal_store`] states. `out_moved` must be a
+// valid, writable `*mut bool`, and `err`, if non-null, a valid, writable
+// [`MoraineError`]. All for the duration of this call.
+int32_t moraine_move_wal_store(const char *path,
+                               const struct MoraineS3Config *s3,
+                               const struct MoraineWalStore *from,
+                               const struct MoraineWalStore *to,
+                               bool *out_moved,
+                               struct MoraineError *err);
 
 // Mints a checkpoint over `handle`'s current durable state and writes its
 // id to `*out_id` (free with `moraine_string_free`).

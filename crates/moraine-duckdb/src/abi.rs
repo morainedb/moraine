@@ -26,6 +26,7 @@ mod maintenance;
 mod read_scope;
 mod row_scan;
 mod snapshot;
+mod wal_store;
 
 #[cfg(test)]
 mod tests;
@@ -47,6 +48,7 @@ pub use maintenance::*;
 pub use read_scope::*;
 pub use row_scan::*;
 pub use snapshot::*;
+pub use wal_store::*;
 
 use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},

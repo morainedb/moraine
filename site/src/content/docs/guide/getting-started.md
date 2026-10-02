@@ -86,6 +86,66 @@ writer wins, so a second read-write attach doesn't fail — it fences the
 incumbent's committer. Every process past the first should attach
 `READ_ONLY`.
 
+## Commit latency
+
+A commit is durable once one write-ahead log PUT reaches object storage,
+and that PUT is the whole latency floor: everything else about a commit is
+local work. Two attach options set how long a commit waits for it, and a
+third moves where it lands.
+
+`META_FLUSH_INTERVAL_MS` is the **minimum spacing between two log
+flushes**, 100 ms if unset. A commit that arrives past the spacing flushes
+at once and waits only on its own PUT; one that arrives inside it joins a
+single flush deferred to the moment the spacing elapses. So a lone commit
+costs one PUT, a burst costs at most the spacing plus a PUT, and the PUT
+rate never exceeds one per spacing however many commits arrive:
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (READ_WRITE, META_FLUSH_INTERVAL_MS 5);
+```
+
+Shorten it for a low commit rate that wants latency; leave it for a high
+one, where the spacing is exactly what merges many commits into one
+request. `META_FLUSH_ON_COMMIT true` is the same setting at zero: every
+commit flushes on its own, one PUT each.
+
+That leaves the PUT itself, and it need not go to the bucket the catalog
+lives in. `META_WAL_PATH` writes the log — and nothing else — to a store of
+its own, which is what lets an S3 Express One Zone directory bucket serve
+the one latency-critical write while standard storage holds the rest:
+
+```sql
+CREATE SECRET wal (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-west-2',
+                   SCOPE 's3://lake-wal--usw2-az1--x-s3');
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (READ_WRITE, META_WAL_PATH 's3://lake-wal--usw2-az1--x-s3');
+```
+
+The log store resolves its own `s3` secret, since it is a different bucket
+and a different endpoint, and a bucket named with the suffix AWS reserves
+for directory buckets (`--x-s3`, `--xa-s3`) is addressed as S3 Express with
+nothing further to set. It must be as durable as the catalog bucket: a
+commit no sorted-string table holds yet lives only there.
+
+Where a lake keeps its log is recorded in the lake, so **every later attach
+names the same store**, readers included. One that names a different store,
+or none, is refused rather than replaying an empty log over live state —
+and the refusal names the store the lake records, which is how to find out
+what it is. Moving an existing lake's log is a verb, run with the lake
+attached nowhere:
+
+```sql
+SELECT from_wal_path, to_wal_path, moved
+FROM moraine_move_wal('s3://bucket/prefix',
+                      wal_path => 's3://lake-wal--usw2-az1--x-s3');
+```
+
+It drains the log where it stands before recording the new store, so
+nothing in flight is lost; pass `from_wal_path => '…'` when the lake
+already has a log store of its own, and `wal_path => NULL` to bring the log
+back into the catalog bucket.
+
 ## Faster repeat queries on S3
 
 moraine keeps one block cache per process, shared by every store the process

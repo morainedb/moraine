@@ -158,6 +158,12 @@ that **one commit = exactly one SlateDB `WriteBatch`**.
   concurrent `commit` callers are batched without asking, using the flush
   already in the air as the window. A batch of one stays the normal path and
   waits for nobody.
+- **The log may live on its own object store.** A commit's floor is one PUT
+  of the write-ahead log, so that log — and nothing else — can sit on an S3
+  Express One Zone bucket beside the standard one holding the catalog. Which
+  store a catalog's log is on is recorded in the catalog, so every open is
+  held to it rather than silently replaying an empty log; `move_wal_store`
+  changes it, draining the old log before recording the new store.
 
 The commit point remains SlateDB's durable WAL. Moraine has no conditional-PUT
 commit log, log folder, leader forwarding, or automatic multi-writer migration.

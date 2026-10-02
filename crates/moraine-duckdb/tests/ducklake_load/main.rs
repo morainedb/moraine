@@ -36,6 +36,7 @@ mod inline;
 mod located_rows;
 mod maintenance;
 mod migrate;
+mod move_wal;
 mod partitioning;
 mod time_travel;
 mod types;

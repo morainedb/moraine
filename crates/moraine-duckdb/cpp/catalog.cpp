@@ -838,6 +838,12 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// files against. (DuckLake keeps its own unprefixed `DATA_PATH` for the
 	// data layer and does not forward it to this metadata attach.)
 	std::string data_path;
+	// `WAL_PATH` writes the write-ahead log to a store of its own — a
+	// commit waits on one PUT of it, so an S3 Express One Zone bucket beside
+	// a standard one shortens every commit. Its own secret resolves it, and
+	// the catalog records it: a later attach naming a different store, or
+	// none, is refused.
+	std::string wal_path;
 	// `MAINTENANCE_*` configures the scheduled pass: the cadence, and
 	// which of DuckLake's own maintenance functions it runs. Every step
 	// that mutates the lake is opt-in, so an attach naming none schedules
@@ -855,6 +861,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			encrypted = option.second.GetValue<bool>();
 		} else if (name == "data_path") {
 			data_path = option.second.GetValue<std::string>();
+		} else if (name == "wal_path") {
+			wal_path = option.second.GetValue<std::string>();
 		} else if (name == "flush_interval_ms") {
 			uint64_t requested = option.second.GetValue<uint64_t>();
 			// The ABI reads 0 as "not given"; map an explicit zero (flush
@@ -897,17 +905,26 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	MoraineS3Config s3 {};
 	S3SecretStrings s3_strings;
 	bool is_s3 = ResolveS3Config(context, info.path, s3, s3_strings);
+	// The log store resolves its own secret: it is a different bucket, and
+	// on S3 Express a different endpoint and region.
+	MoraineS3Config wal_s3 {};
+	S3SecretStrings wal_s3_strings;
+	bool wal_is_s3 = !wal_path.empty() && ResolveS3Config(context, wal_path, wal_s3, wal_s3_strings);
+	MoraineWalStore wal {};
+	wal.path = wal_path.empty() ? nullptr : wal_path.c_str();
+	wal.s3 = wal_is_s3 ? &wal_s3 : nullptr;
 	// DuckDB's own execution-thread count sizes the catalog's worker pool,
 	// so a session pinned with `SET threads=1` does not get one sized to
 	// the machine on top of DuckDB's. The ABI clamps it; read once here,
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
-	auto code = moraine_attach_with_cache_policy(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
+	auto code = moraine_attach_with_wal_store(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
 	                           flush_on_commit,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_memory_bytes,
 	                           static_cast<uint32_t>(cache_auxiliary_percent),
 	                           cache_preload, cache_puts, cache_compaction_puts,
 	                           data_path.empty() ? nullptr : data_path.c_str(),
+	                           wal_path.empty() ? nullptr : &wal,
 	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
 	                           moraine_shim_is_interrupted, &context, &handle, &err);
 	// Drained on both exits: the open's own events (and a failed open's)

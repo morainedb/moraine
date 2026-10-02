@@ -57,6 +57,25 @@ pub(crate) struct ObjectTotals {
     pub(crate) other_bytes: u64,
 }
 
+impl ObjectTotals {
+    /// The two tallies added kind by kind, for a store whose log sits on a
+    /// second object store.
+    fn plus(self, other: Self) -> Self {
+        Self {
+            total_objects: self.total_objects + other.total_objects,
+            total_bytes: self.total_bytes.saturating_add(other.total_bytes),
+            wal_objects: self.wal_objects + other.wal_objects,
+            wal_bytes: self.wal_bytes.saturating_add(other.wal_bytes),
+            manifest_objects: self.manifest_objects + other.manifest_objects,
+            manifest_bytes: self.manifest_bytes.saturating_add(other.manifest_bytes),
+            sst_objects: self.sst_objects + other.sst_objects,
+            sst_bytes: self.sst_bytes.saturating_add(other.sst_bytes),
+            other_objects: self.other_objects + other.other_objects,
+            other_bytes: self.other_bytes.saturating_add(other.other_bytes),
+        }
+    }
+}
+
 /// Every segment's physical size, at one manifest version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManifestCensus {
@@ -87,15 +106,18 @@ pub(crate) struct LiveTally {
 }
 
 /// Reads the latest manifest and reports each segment's physical size.
-/// Opens no `Db`, so it fences no writer.
+/// Opens no `Db`, so it fences no writer. `wal_object_store` is the store
+/// the write-ahead log lives on when it is not the catalog's own; the
+/// listing covers both, so the object totals still sum.
 pub(crate) async fn read_manifest_census(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
+    wal_object_store: Option<Arc<dyn ObjectStore>>,
 ) -> Result<ManifestCensus> {
     let admin = AdminBuilder::new(path, Arc::clone(&object_store)).build();
     let (view, objects) = futures::join!(
         admin.read_compactor_state_view(),
-        count_objects(path, object_store)
+        count_every_object(path, object_store, wal_object_store)
     );
 
     let mut census = census_of_manifest(view.map_err(Error::from)?.manifest());
@@ -149,6 +171,20 @@ pub(crate) async fn manifest_bytes(
         metadata_bytes,
         segments,
     })
+}
+
+/// Totals the store's objects and, when the write-ahead log lives
+/// elsewhere, that store's too.
+async fn count_every_object(
+    path: &str,
+    object_store: Arc<dyn ObjectStore>,
+    wal_object_store: Option<Arc<dyn ObjectStore>>,
+) -> std::result::Result<ObjectTotals, object_store::Error> {
+    let totals = count_objects(path, object_store).await?;
+    match wal_object_store {
+        Some(wal) => Ok(totals.plus(count_objects(path, wal).await?)),
+        None => Ok(totals),
+    }
 }
 
 /// Totals every object under the store's prefix, by kind, in one listing.
@@ -321,7 +357,9 @@ mod tests {
         db.write(batch).await.unwrap();
         flush_to_l0(&db).await;
 
-        let census = read_manifest_census("census/store", store).await.unwrap();
+        let census = read_manifest_census("census/store", store, None)
+            .await
+            .unwrap();
 
         let current = census
             .segment(&subspace_prefix(Subspace::Current))
@@ -368,7 +406,7 @@ mod tests {
         db.write(batch).await.unwrap();
         flush_to_l0(&db).await;
 
-        let census = read_manifest_census("census/metadata", Arc::clone(&store))
+        let census = read_manifest_census("census/metadata", Arc::clone(&store), None)
             .await
             .unwrap();
         let expected = census.segments.iter().fold(0, |total, segment| {
@@ -403,7 +441,7 @@ mod tests {
         db.write(batch).await.unwrap();
         db.flush().await.unwrap();
 
-        let census = read_manifest_census("census/unflushed", store)
+        let census = read_manifest_census("census/unflushed", store, None)
             .await
             .unwrap();
         assert!(census.segments.is_empty(), "{census:?}");
@@ -427,7 +465,9 @@ mod tests {
         db.write(batch).await.unwrap();
         db.flush().await.unwrap();
 
-        let census = read_manifest_census("census/objects", store).await.unwrap();
+        let census = read_manifest_census("census/objects", store, None)
+            .await
+            .unwrap();
         let objects = census.objects.expect("an in-memory store lists");
 
         // The write is still in the log, so the manifest accounts for no SST

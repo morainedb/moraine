@@ -27,6 +27,8 @@ void RegisterMoraineUpdateFunction(duckdb::ExtensionLoader &loader);
 void RegisterMoraineOptimizer(duckdb::DBConfig &config);
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader);
 void RegisterMoraineMigrateFunction(duckdb::ExtensionLoader &loader);
+// Defined in move_wal.cpp.
+void RegisterMoraineMoveWalFunction(duckdb::ExtensionLoader &loader);
 // Defined in checkpoints.cpp.
 void RegisterMoraineCheckpointFunctions(duckdb::ExtensionLoader &loader);
 } // namespace moraine_duckdb
@@ -70,6 +72,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	moraine_duckdb::RegisterMoraineUpdateFunction(loader);
 	moraine_duckdb::RegisterMoraineMaintenanceFunctions(loader);
 	moraine_duckdb::RegisterMoraineMigrateFunction(loader);
+	moraine_duckdb::RegisterMoraineMoveWalFunction(loader);
 	moraine_duckdb::RegisterMoraineCheckpointFunctions(loader);
 }
 

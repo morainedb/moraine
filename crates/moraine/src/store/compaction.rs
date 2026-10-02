@@ -201,7 +201,7 @@ mod tests {
         let db = open_writer("merge/reclaim", Arc::clone(&store)).await;
         merge_and_wait("merge/reclaim", Arc::clone(&store), Some(&current_prefix())).await;
 
-        let after = read_manifest_census("merge/reclaim", Arc::clone(&store))
+        let after = read_manifest_census("merge/reclaim", Arc::clone(&store), None)
             .await
             .unwrap();
         let after = after.segment(&current_prefix()).cloned().expect("current");
@@ -247,7 +247,7 @@ mod tests {
         )
         .await;
 
-        let census = read_manifest_census("merge/tombstone", Arc::clone(&store))
+        let census = read_manifest_census("merge/tombstone", Arc::clone(&store), None)
             .await
             .unwrap();
         let current = census.segment(&current_prefix()).cloned().expect("current");
@@ -284,7 +284,9 @@ mod tests {
         )
         .await;
 
-        let after = read_manifest_census("merge/isolated", store).await.unwrap();
+        let after = read_manifest_census("merge/isolated", store, None)
+            .await
+            .unwrap();
         assert_eq!(after.segment(&snapshots), Some(&before));
     }
 
@@ -392,7 +394,9 @@ mod tests {
         }
         db.close().await.unwrap();
 
-        read_manifest_census(path, object_store).await.unwrap()
+        read_manifest_census(path, object_store, None)
+            .await
+            .unwrap()
     }
 
     /// Compacts every L0 SST of one segment into a fresh sorted run.

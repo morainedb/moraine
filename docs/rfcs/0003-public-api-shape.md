@@ -121,6 +121,12 @@ deployment unit the README already sells ("a deployment is a bucket and
 credentials"). `CatalogOptions` surfaces deliberate SlateDB/WAL tuning (e.g.
 WAL bucket, flush cadence) through moraine's own type, so no `slatedb::` name
 appears publicly and options can be documented and evolved on moraine's terms.
+The WAL bucket is one of those: `CatalogOptions::wal_store` takes a
+`WalStore`, which pairs a second object store with the name the catalog
+records for it (RFC 0004), because a store and the name a later open is held
+to must not be settable apart. `Catalog::move_wal_store` moves it, and is
+free-standing for the reason `Catalog::migrate` is — it takes the writer, so
+no attach may hold the catalog while it runs.
 It also carries the store's path within the bucket, defaulting to the bucket
 root — the default deployment stays "a bucket and credentials", and a prefix
 is opt-in for hosts sharing a bucket.

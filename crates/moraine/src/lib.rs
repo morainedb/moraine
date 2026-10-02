@@ -107,6 +107,40 @@
 //! until it expires or [`Catalog::delete_checkpoint`] removes it, so give
 //! one a lifetime unless something else will.
 //!
+//! # The write-ahead log's store
+//!
+//! A commit is durable once one PUT of the write-ahead log lands, so the log
+//! is the one object worth putting on faster storage than the rest of the
+//! catalog — an S3 Express One Zone directory bucket beside a standard one.
+//! [`CatalogOptions::wal_store`] takes a [`WalStore`]: the store, and the
+//! name the catalog records for it. Nothing else moves, and the keys do not
+//! change; the log sits under the catalog's own path within that store.
+//!
+//! ```
+//! # use std::sync::Arc;
+//! # use moraine::{Catalog, CatalogOptions, WalStore};
+//! # use object_store::memory::InMemory;
+//! # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+//! # let object_store = Arc::new(InMemory::new());
+//! let log = WalStore::new("memory://log", Arc::new(InMemory::new()));
+//!
+//! let mut options = CatalogOptions::default();
+//! options.wal_store = Some(log.clone());
+//! let catalog = Catalog::open(object_store, options).await?;
+//! catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+//! # catalog.close().await?;
+//! # Ok::<(), moraine::Error>(()) }).unwrap();
+//! ```
+//!
+//! The recorded name is what every later open is held to, writers and
+//! readers alike: one that names a different store, or none, is refused
+//! rather than replaying an empty log over live state and losing the commits
+//! it held. [`Catalog::move_wal_store`] is how a catalog changes stores —
+//! including one created without a separate log, which is how an existing
+//! lake adopts a faster one. It takes the writer, so nothing may hold the
+//! catalog while it runs, and it drains the log where it stands before
+//! recording the new store, so nothing in flight is lost.
+//!
 //! # Maintenance
 //!
 //! Dropping an equality index (or a table that has one) makes its entries
@@ -257,7 +291,7 @@ pub use catalog::{
     PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow, RowSummaryPublish, ScheduledDeletion,
     SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus,
     StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo,
-    TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
+    TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo, store_paths_overlap,
 };
 pub use data_file::{DataStore, SidecarSweep, SidecarTally, sidecar_tally};
 pub use error::{Error, Result};
@@ -278,5 +312,6 @@ pub use store::{
         cache_tally,
     },
     index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder},
+    wal_store::WalStore,
 };
-pub use transaction::{MigrationReport, Transaction};
+pub use transaction::{MigrationReport, Transaction, WalStoreMove};

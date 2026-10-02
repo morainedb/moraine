@@ -301,6 +301,21 @@ pub(crate) async fn read_migration(handle: ReadHandle<'_>) -> Result<Option<Migr
     read_singleton(handle, Key::Sys(SysKey::Migration)).await
 }
 
+/// The global option record the bootstrap writes, which carries the
+/// catalog-wide settings an open must agree with.
+pub(crate) async fn read_global_options(
+    handle: ReadHandle<'_>,
+) -> Result<Option<crate::store::proto::OptionScopeValue>> {
+    read_singleton(
+        handle,
+        Key::current(EntityKey::Option {
+            scope_kind: 0,
+            scope_id: 0,
+        }),
+    )
+    .await
+}
+
 /// The bounded durable history of completed maintenance passes.
 pub(crate) async fn read_maintenance_status(
     handle: ReadHandle<'_>,

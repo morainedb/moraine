@@ -10,22 +10,7 @@
 //! reachable only through an attached catalog would be reachable only for
 //! stores that never needed it.
 
-use std::process::Command;
-
 use crate::helpers::*;
-
-/// Runs `sql` in a session that loads the extension and attaches nothing.
-fn run_unattached(sql: &str) -> std::process::Output {
-    Command::new(cli_path())
-        .arg("-unsigned")
-        .arg("-csv")
-        .arg("-c")
-        .arg(format!("LOAD '{}';", ext_path().display()))
-        .arg("-c")
-        .arg(sql)
-        .output()
-        .expect("failed to spawn duckdb CLI")
-}
 
 /// The verb reaches a store no session has attached, reports what it did,
 /// and re-runs as a no-op for a freshly created store.
