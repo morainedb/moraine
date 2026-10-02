@@ -291,7 +291,7 @@ pub use catalog::{
     PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow, RowSummaryPublish, ScheduledDeletion,
     SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus,
     StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo,
-    TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
+    TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo, store_paths_overlap,
 };
 pub use data_file::{DataStore, SidecarSweep, SidecarTally, sidecar_tally};
 pub use error::{Error, Result};

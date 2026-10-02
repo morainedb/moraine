@@ -8,7 +8,10 @@ use std::{
 };
 
 use futures::{StreamExt, TryStreamExt, stream};
-use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
+use slatedb::{
+    Db, DbReader, DbTransaction, IsolationLevel,
+    config::{FlushOptions, FlushType},
+};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -240,8 +243,31 @@ pub(crate) async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::
 pub(crate) async fn recorded_wal_store(tx: ReadHandle<'_>) -> Result<Option<String>> {
     Ok(read::read_global_options(tx)
         .await?
-        .and_then(|options| options.options.get("wal_path").cloned())
-        .filter(|name| !name.is_empty()))
+        .and_then(|options| options.options.get("wal_path").cloned()))
+}
+
+/// Writes `db`'s memtable out as a sorted-string table in the catalog
+/// store, which is what carries what the log holds into that store and
+/// moves the store's replay point past it.
+pub(crate) async fn flush_memtable(db: &Db) -> Result<()> {
+    db.flush_with_options(FlushOptions {
+        flush_type: FlushType::MemTable,
+    })
+    .await
+    .map_err(Error::from)
+}
+
+/// [`validate_wal_store`] against an already-open `db`, for the verbs that
+/// open the writer themselves rather than through
+/// [`open_initialized`].
+pub(crate) async fn verify_wal_store(db: &Db, configured: Option<&str>) -> Result<()> {
+    let tx = db
+        .begin(IsolationLevel::Snapshot)
+        .await
+        .map_err(Error::from)?;
+    let checked = validate_wal_store(ReadHandle::Tx(&tx), configured).await;
+    tx.rollback();
+    checked
 }
 
 /// Refuses an open whose write-ahead log store is not the one the catalog
@@ -442,6 +468,14 @@ async fn open_attempt(
     let durability = CommitDurability::Paced(Arc::clone(&pacer));
     match commit_durable(tx, "bootstrap", staged, &durability).await {
         Ok(_) => {
+            // The record naming the log store cannot be left in that log
+            // alone: an open handed the wrong one, or none, would find no
+            // catalog here and bootstrap a second one over this.
+            if wal_path.is_some()
+                && let Err(error) = flush_memtable(&db).await
+            {
+                return Err(OpenFailure::Fatal(error));
+            }
             info!(
                 encrypted,
                 data_path, wal_path, "bootstrapped a fresh catalog store"

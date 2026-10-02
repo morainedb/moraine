@@ -11,6 +11,7 @@ pub(crate) mod inline_policy;
 pub(crate) mod projection;
 mod schema_projection;
 mod snapshot;
+mod store_paths;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -30,6 +31,7 @@ pub use handle::{
 pub(crate) use handle::{InlineScan, Store};
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;
+pub use store_paths::store_paths_overlap;
 
 /// Resolves a data-file or delete-file path recorded relative to its table
 /// (or, when `path_is_relative` is false, already store-absolute) to the

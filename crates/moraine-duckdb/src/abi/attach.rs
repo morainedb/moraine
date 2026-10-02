@@ -321,25 +321,13 @@ pub(crate) unsafe fn borrow_bytes<'a>(
 }
 
 /// Whether two store URIs name the same object store with one containing
-/// the other. Containment is compared lexically by path component;
-/// symlinks and `..` are not resolved.
+/// the other, refusing a scheme neither could name. The comparison itself
+/// is the core's, so the attach and `moraine_move_wal` refuse the same
+/// layouts.
 pub(super) fn nested_stores(one: &str, other: &str) -> Result<bool, AbiError> {
-    let (one_kind, one_prefix) = StoreKind::from_path(one)?;
-    let (other_kind, other_prefix) = StoreKind::from_path(other)?;
-
-    let overlaps = |a: &str, b: &str| {
-        let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
-        a.starts_with(b) || b.starts_with(a)
-    };
-
-    Ok(match (&one_kind, &other_kind) {
-        // An empty prefix is the bucket root, which contains everything.
-        (StoreKind::S3 { bucket: one }, StoreKind::S3 { bucket: other }) => {
-            one == other && overlaps(&one_prefix, &other_prefix)
-        }
-        (StoreKind::LocalFile, StoreKind::LocalFile) => overlaps(one, other),
-        _ => false,
-    })
+    StoreKind::from_path(one)?;
+    StoreKind::from_path(other)?;
+    Ok(moraine::store_paths_overlap(one, other))
 }
 
 /// Refuses an attach whose catalog store and data root sit on the same

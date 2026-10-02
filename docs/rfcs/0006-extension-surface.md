@@ -274,7 +274,9 @@ hold the lake while it runs, and it refuses an explicit transaction.
 `from_wal_path` names the log store as it stands — omitted when the log is
 in the catalog store — and must be the one the lake records, because
 draining that log is what makes the move lossless; `wal_path => NULL` moves
-the log back into the catalog store. A move to where the log already is
+the log back into the catalog store. A destination nested in the lake's
+recorded `DATA_PATH` is refused here too, so the verb cannot record a
+layout the attach would then reject. A move to where the log already is
 writes nothing and reports `moved = false`. The protocol, and what each
 crash point leaves behind, is RFC 0004's.
 

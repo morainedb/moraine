@@ -135,6 +135,35 @@ fn move_wal_keeps_what_the_old_log_still_held() {
     );
 }
 
+/// A log store inside the lake's data root is refused by the verb as it is
+/// by an attach: DuckLake's orphaned-file cleanup lists that root. The
+/// root is the one the lake *records*, which is what `META_DATA_PATH`
+/// writes — DuckLake keeps its own `DATA_PATH` for the data layer and does
+/// not forward it to the metadata attach.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+fn move_wal_refuses_a_log_store_inside_the_data_path() {
+    let store = TempDir::new("move-wal-nested-store");
+    let data = TempDir::new("move-wal-nested-data");
+    run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &format!(", META_DATA_PATH '{}'", data.path().display()),
+        "CREATE TABLE lake.main.t(a BIGINT);",
+    );
+
+    let output = run_unattached(&format!(
+        "SELECT * FROM moraine_move_wal('{}', wal_path => '{}/wal');",
+        store.path().display(),
+        data.path().display()
+    ));
+    let combined = combined_output(&output);
+    assert!(
+        combined.contains("nested on the same object store"),
+        "expected the data-path refusal, got: {combined}"
+    );
+}
+
 /// The move commits through its own writer, so running it inside an
 /// explicit transaction would deadlock against the caller's.
 #[test]

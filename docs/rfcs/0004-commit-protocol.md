@@ -893,7 +893,18 @@ validates the format stamp. An open whose log store is not the recorded one
 is refused: one missing, one that differs, or one supplied where the record
 names none. Replaying an empty log over live state loses every commit no
 sorted-string table carries yet, silently, and the next flush buries the
-evidence.
+evidence. A migration is held to the same record, since it opens the
+writer itself and rewrites keys from whatever the log replayed.
+
+That record cannot be left in the log it describes. A bootstrap that
+configures an external log therefore writes its memtable out before the
+open returns, so the catalog store itself carries the stamp and the name
+from the moment the catalog exists — otherwise an open handed the wrong
+store, or none, would find no catalog at all and bootstrap a second one
+over the first, stranding everything the real log holds. The window that
+remains is inside creation, before any caller holds a handle, and is the
+genesis window RFC 0004 already allows for: a crash there leaves either a
+catalog whose store is recorded or no catalog at all.
 
 **Moving it.** `Catalog::move_wal_store` takes a catalog nothing holds and
 moves its log in two opens, whose order is the whole design:
@@ -904,6 +915,12 @@ moves its log in two opens, whose order is the whole design:
    point past them, so the old log holds nothing a replay needs.
 2. Open the writer against the new log store and record its name there —
    the only write that reaches it — then write that out too.
+
+A destination inside the lake's recorded data root is refused before the
+first open drains anything, for the reason the attach surface refuses one:
+the orphaned-file cleanup that lists that root would delete log objects
+holding commits no sorted-string table carries yet. The comparison is
+lexical and shared with the attach's, so both refuse the same layouts.
 
 Every crash point leaves the catalog openable with nothing lost. Before the
 second open's commit is durable the record still names the old store, whose

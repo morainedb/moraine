@@ -23,7 +23,8 @@ pub struct WalStore {
 }
 
 impl WalStore {
-    /// A log store addressed as `name`.
+    /// A log store addressed as `name`, which is recorded and compared
+    /// verbatim — give it something a later open can repeat exactly.
     #[must_use]
     pub fn new(name: impl Into<String>, store: Arc<dyn ObjectStore>) -> Self {
         Self {

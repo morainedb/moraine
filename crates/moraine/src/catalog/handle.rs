@@ -1479,6 +1479,17 @@ impl Catalog {
             .open_writer()
             .await?;
 
+        // A migration commits through the log, so it must be the log the
+        // catalog records: one opened elsewhere would rewrite keys from
+        // whatever the wrong log replayed.
+        if let Err(error) =
+            commit::verify_wal_store(&db, options.wal_store.as_ref().map(crate::WalStore::name))
+                .await
+        {
+            let _ = db.close().await;
+            return Err(error);
+        }
+
         let checkpoint = if request.checkpoint {
             let taken = open::create_checkpoint(&db, None).await?;
             info!(checkpoint = %taken, "took a pre-migration checkpoint");

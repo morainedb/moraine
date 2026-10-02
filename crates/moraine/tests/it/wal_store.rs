@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use moraine::{Catalog, CatalogOptions, CensusRequest, Error, WalStore};
+use moraine::{Catalog, CatalogOptions, CensusRequest, Error, MigrationRequest, WalStore};
 use object_store::{ObjectStore, memory::InMemory};
 
 /// Options naming `wal` as the write-ahead log's store, addressed as
@@ -88,17 +88,20 @@ async fn a_reopen_replays_the_log_from_the_wal_store() {
     let catalog = Catalog::open(catalog_store.clone(), with_wal(&wal_store))
         .await
         .unwrap();
+    // Creating the catalog writes its own state out; what follows is the
+    // commit the reopen has to find in the log.
+    let written_out = objects(&catalog_store).await.1;
     catalog
         .commit(|tx| tx.create_schema("sales").map(|_| ()))
         .await
         .unwrap();
-    // No close: nothing is flushed on the way out, so the commit lives in
-    // the log alone — and the log is on the other store.
     assert_eq!(
         objects(&catalog_store).await.1,
-        0,
+        written_out,
         "the commit must still be unflushed for the reopen to prove replay"
     );
+    // No close: nothing is flushed on the way out, so the commit lives in
+    // the log alone — and the log is on the other store.
     drop(catalog);
 
     let reopened = Catalog::open(catalog_store, with_wal(&wal_store))
@@ -195,6 +198,46 @@ async fn opening_against_another_wal_store_is_refused() {
         matches!(error, Error::Configuration(message)
             if message.contains("memory://log") && message.contains("memory://other")),
         "the refusal must name both stores"
+    );
+}
+
+/// The refusal holds from the moment the catalog exists: a catalog created
+/// and then lost without a clean close is refused, not mistaken for an
+/// empty store and created a second time over the one in the log.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn a_catalog_lost_before_any_flush_is_still_refused() {
+    let catalog_store = Arc::new(InMemory::new());
+    let wal_store = Arc::new(InMemory::new());
+
+    let catalog = Catalog::open(catalog_store.clone(), with_wal(&wal_store))
+        .await
+        .unwrap();
+    catalog
+        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .await
+        .unwrap();
+    drop(catalog);
+
+    let error = Catalog::open(catalog_store.clone(), CatalogOptions::default())
+        .await
+        .expect_err("the catalog records its log store from the moment it exists");
+    assert!(
+        matches!(error, Error::Configuration(message) if message.contains("memory://wal")),
+        "a second bootstrap would strand the commits the log holds"
+    );
+
+    // And the commit itself is still there, through the store it names.
+    let reopened = Catalog::open(catalog_store, with_wal(&wal_store))
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("sales")
+            .is_some()
     );
 }
 
@@ -404,6 +447,77 @@ async fn a_move_is_reversible_and_idempotent() {
             .schema_by_name("sales")
             .is_some()
     );
+}
+
+/// A migration opens the writer itself, and rewrites keys from what the
+/// log replayed, so it is held to the recorded log store exactly as an
+/// attach is.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn a_migration_must_name_the_log_store() {
+    let catalog_store = Arc::new(InMemory::new());
+    let wal_store = Arc::new(InMemory::new());
+    let catalog = Catalog::open(catalog_store.clone(), with_wal(&wal_store))
+        .await
+        .unwrap();
+    catalog.close().await.unwrap();
+
+    let error = Catalog::migrate(
+        catalog_store.clone(),
+        CatalogOptions::default(),
+        MigrationRequest::default(),
+    )
+    .await
+    .expect_err("a migration without the recorded log store must be refused");
+    assert!(matches!(error, Error::Configuration(message) if message.contains("memory://wal")));
+
+    let report = Catalog::migrate(
+        catalog_store,
+        with_wal(&wal_store),
+        MigrationRequest::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.from_format, report.to_format,
+        "named, the migration runs and finds nothing to do"
+    );
+}
+
+/// A log store inside the catalog's data root is refused by the move as it
+/// is by an open: the orphaned-file cleanup that lists that root would
+/// delete the log objects under it.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn a_move_into_the_data_path_is_refused() {
+    let catalog_store = Arc::new(InMemory::new());
+    let mut created = CatalogOptions::default();
+    created.data_path = Some("/lake/data".to_string());
+    let catalog = Catalog::open(catalog_store.clone(), created).await.unwrap();
+    catalog.close().await.unwrap();
+
+    let error = Catalog::move_wal_store(
+        catalog_store.clone(),
+        CatalogOptions::default(),
+        Some(WalStore::new(
+            "/lake/data/wal",
+            Arc::new(InMemory::new()) as Arc<dyn ObjectStore>,
+        )),
+    )
+    .await
+    .expect_err("a log store under the data root must be refused");
+    assert!(
+        matches!(error, Error::Constraint(message) if message.contains("/lake/data")),
+        "the refusal must name the data root it would sit under"
+    );
+
+    // Refused before anything moved: the log is still in the catalog store.
+    Catalog::open(catalog_store, CatalogOptions::default())
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
 }
 
 /// A move has to name the log store as it stands, since that is the log it

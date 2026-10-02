@@ -6,10 +6,7 @@
 //! replay to miss; the second takes the new store and records it there,
 //! the only write that reaches it.
 
-use slatedb::{
-    Db, IsolationLevel,
-    config::{FlushOptions, FlushType},
-};
+use slatedb::{Db, IsolationLevel};
 use tracing::info;
 
 use crate::{
@@ -21,7 +18,7 @@ use crate::{
         open::StoreBuilder,
         proto, read, value,
     },
-    transaction::commit::{self, CommitDurability, commit_durable},
+    transaction::commit::{self, CommitDurability, commit_durable, flush_memtable},
 };
 
 /// Where a catalog's write-ahead log was and where it is now. Equal
@@ -54,7 +51,7 @@ pub(crate) async fn run(
     next_name: Option<&str>,
 ) -> Result<WalStoreMove> {
     let (db, _) = current.open_writer().await?;
-    let recorded = closing(&db, drain_recorded_log(&db, current_name)).await?;
+    let recorded = closing(&db, drain_recorded_log(&db, current_name, next_name)).await?;
     if recorded.as_deref() == next_name {
         return Ok(WalStoreMove {
             from: recorded.clone(),
@@ -81,10 +78,15 @@ async fn closing<T>(db: &Db, work: impl Future<Output = Result<T>>) -> Result<T>
     outcome.and_then(|value| closed.map(|()| value))
 }
 
-/// Validates that this catalog's log is the one `db` was opened against,
-/// reports the store it records, and writes the memtable out so that log
-/// holds nothing a later open has to replay.
-async fn drain_recorded_log(db: &Db, current_name: Option<&str>) -> Result<Option<String>> {
+/// Validates that this catalog's log is the one `db` was opened against
+/// and that `next_name` is somewhere the log may live, reports the store
+/// the catalog records, and writes the memtable out so the log it holds
+/// now has nothing a later open has to replay.
+async fn drain_recorded_log(
+    db: &Db,
+    current_name: Option<&str>,
+    next_name: Option<&str>,
+) -> Result<Option<String>> {
     let tx = db
         .begin(IsolationLevel::Snapshot)
         .await
@@ -99,7 +101,13 @@ async fn drain_recorded_log(db: &Db, current_name: Option<&str>) -> Result<Optio
             ));
         }
         commit::validate_wal_store(ReadHandle::Tx(&tx), current_name).await?;
-        commit::recorded_wal_store(ReadHandle::Tx(&tx)).await
+
+        let options = read::read_global_options(ReadHandle::Tx(&tx))
+            .await?
+            .unwrap_or_default()
+            .options;
+        refuse_log_store_in_data_path(next_name, options.get("data_path").map(String::as_str))?;
+        Ok(options.get("wal_path").cloned())
     }
     .await;
     tx.rollback();
@@ -107,6 +115,24 @@ async fn drain_recorded_log(db: &Db, current_name: Option<&str>) -> Result<Optio
 
     flush_memtable(db).await?;
     Ok(recorded)
+}
+
+/// Refuses moving the log inside the lake's data root: DuckLake's
+/// orphaned-file cleanup lists that root and would delete log objects
+/// holding commits no sorted-string table carries yet.
+fn refuse_log_store_in_data_path(next: Option<&str>, data_path: Option<&str>) -> Result<()> {
+    let (Some(next), Some(data_path)) = (next, data_path) else {
+        return Ok(());
+    };
+    if crate::store_paths_overlap(next, data_path) {
+        return Err(Error::Constraint(format!(
+            "the write-ahead log store `{next}` and this catalog's data path `{data_path}` are \
+             nested on the same object store; the data root's orphaned-file cleanup would \
+             delete log objects holding commits no sorted-string table carries yet. Put them in \
+             sibling locations."
+        )));
+    }
+    Ok(())
 }
 
 /// Records `name` as the catalog's log store, in the log store `db` was
@@ -156,15 +182,4 @@ async fn record_log_store(db: &Db, name: Option<&str>) -> Result<()> {
     )
     .await?;
     flush_memtable(db).await
-}
-
-/// Writes the memtable out as a sorted-string table, which is what carries
-/// the log's contents into the catalog store and moves the store's replay
-/// point past them.
-async fn flush_memtable(db: &Db) -> Result<()> {
-    db.flush_with_options(FlushOptions {
-        flush_type: FlushType::MemTable,
-    })
-    .await
-    .map_err(Error::from)
 }
