@@ -32,7 +32,8 @@ fn move_wal_adopts_a_log_store_for_an_existing_lake() {
     assert_eq!(
         moved,
         vec![vec![
-            String::new(),
+            // The log was in the catalog store, which is no store of its own.
+            "NULL".to_string(),
             log.path().display().to_string(),
             "true".to_string(),
         ]],
