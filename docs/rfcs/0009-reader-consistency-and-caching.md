@@ -1339,9 +1339,11 @@ the store rather than on a core, so the number that matters is the requests
 an object store serves at once. Its floor is the widest fan-out any single
 path asks for, so admission bounds the aggregate instead of rationing a
 path that already sized itself, and a cache hit takes no permit because
-admission sits below the cache. It does not yet account for
-`RLIMIT_NOFILE`, which the process shares with the engine's own
-connections; reading that limit needs a dependency moraine does not carry.
+admission sits below the cache. The process's soft open-file limit caps it
+last: reads may hold an eighth of that budget, leaving the rest for the
+engine's own connections and the metadata store, and a limit low enough to
+narrow admission past the floor narrows it to eight rather than closing it.
+A platform that will not report the limit leaves the cores term standing.
 
 **Data-block caching rides on the Parquet reader's prefetch, taken only
 for files that are not on local disk** — without it the reader issues a

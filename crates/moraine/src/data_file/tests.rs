@@ -59,12 +59,35 @@ async fn scoped_read_entries(
     .await
 }
 
-/// Admission is never narrower than the widest fan-out a single read path
-/// asks for, so it bounds the aggregate instead of rationing a path.
+/// Admission follows the cores, floored at the widest path fan-out, capped
+/// at 256, and narrowed by the descriptor share.
 #[test]
-fn admission_covers_the_widest_path_fan_out() {
-    assert!(data_store::in_flight_reads() >= data_store::WIDEST_PATH_FAN_OUT);
-    assert!(data_store::in_flight_reads() <= 256);
+fn admission_is_the_cores_term_capped_by_the_descriptor_share() {
+    use data_store::{MINIMUM_IN_FLIGHT, WIDEST_PATH_FAN_OUT, admission_for};
+
+    // A descriptor budget with room to spare leaves the cores term standing.
+    assert_eq!(admission_for(Some(1), Some(1 << 20)), WIDEST_PATH_FAN_OUT);
+    assert_eq!(admission_for(Some(16), Some(1 << 20)), 128);
+    assert_eq!(admission_for(Some(256), Some(1 << 20)), 256);
+
+    // A descriptor budget below that narrows it, never past the minimum.
+    assert_eq!(admission_for(Some(16), Some(256)), 32);
+    assert_eq!(admission_for(Some(16), Some(8)), MINIMUM_IN_FLIGHT);
+
+    // Cores the platform will not report fall back to the floor; a limit it
+    // will not report leaves the cores term uncapped.
+    assert_eq!(admission_for(None, None), WIDEST_PATH_FAN_OUT);
+    assert_eq!(admission_for(Some(16), None), 128);
+}
+
+/// Admission on this machine stays inside the bounds the sizing promises,
+/// whatever its cores and descriptor limit happen to be.
+#[test]
+fn admission_stays_within_its_bounds() {
+    let derived = data_store::in_flight_reads();
+
+    assert!(derived >= data_store::MINIMUM_IN_FLIGHT);
+    assert!(derived <= 256);
 }
 
 /// Data-file reads from every path are admitted against one bound, however

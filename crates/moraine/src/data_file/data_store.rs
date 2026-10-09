@@ -16,16 +16,48 @@ use crate::{CacheIdentity, store::retry};
 /// this many files at once. Admission must not sit below it.
 pub(crate) const WIDEST_PATH_FAN_OUT: usize = 64;
 
+/// The share of the process's descriptor budget data-file reads may hold at
+/// once. The rest serves the engine's own connections and the metadata
+/// store.
+const DESCRIPTOR_SHARE: u64 = 8;
+
+/// Reads admitted when the descriptor budget would allow fewer, so a low
+/// `RLIMIT_NOFILE` narrows admission without closing it.
+pub(super) const MINIMUM_IN_FLIGHT: usize = 8;
+
 /// Data-file reads one process may have in flight, across every path that
-/// issues one. Sized above the core count and floored at
-/// [`WIDEST_PATH_FAN_OUT`]; `RLIMIT_NOFILE` is not accounted for.
+/// issues one. Sized above the core count, floored at
+/// [`WIDEST_PATH_FAN_OUT`], and capped by the descriptor share.
 pub(crate) fn in_flight_reads() -> usize {
-    std::thread::available_parallelism().map_or(WIDEST_PATH_FAN_OUT, |cores| {
-        cores
-            .get()
-            .saturating_mul(8)
-            .clamp(WIDEST_PATH_FAN_OUT, 256)
-    })
+    let cores = std::thread::available_parallelism()
+        .ok()
+        .map(std::num::NonZero::get);
+    admission_for(cores, descriptor_limit())
+}
+
+/// `cores` unknown falls back to the floor; `descriptors` unknown leaves
+/// the cores term uncapped.
+pub(super) fn admission_for(cores: Option<usize>, descriptors: Option<u64>) -> usize {
+    let wanted = cores
+        .map_or(WIDEST_PATH_FAN_OUT, |cores| cores.saturating_mul(8))
+        .clamp(WIDEST_PATH_FAN_OUT, 256);
+    let allowed = descriptors
+        .map(|descriptors| descriptors / DESCRIPTOR_SHARE)
+        .and_then(|share| usize::try_from(share).ok())
+        .map_or(wanted, |share| share.max(MINIMUM_IN_FLIGHT));
+    wanted.min(allowed)
+}
+
+/// The process's soft open-file limit, where the platform reports one.
+fn descriptor_limit() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 static ADMISSION: LazyLock<Arc<tokio::sync::Semaphore>> =
