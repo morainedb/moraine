@@ -59,6 +59,144 @@ async fn scoped_read_entries(
     .await
 }
 
+/// Admission is never narrower than the widest fan-out a single read path
+/// asks for, so it bounds the aggregate instead of rationing a path.
+#[test]
+fn admission_covers_the_widest_path_fan_out() {
+    assert!(data_store::in_flight_reads() >= data_store::WIDEST_PATH_FAN_OUT);
+    assert!(data_store::in_flight_reads() <= 256);
+}
+
+/// Data-file reads from every path are admitted against one bound, however
+/// many callers ask at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn data_file_reads_are_admitted_against_one_bound() {
+    let store = Arc::new(ConcurrencyStore::new());
+    let path = Path::from("admitted.parquet");
+    store
+        .inner
+        .put(&path, vec![0_u8; 4_096].into())
+        .await
+        .unwrap();
+    let data_store = DataStore::new(store.clone());
+
+    let asked = data_store::in_flight_reads() * 3;
+    let reads = (0..asked).map(|_| {
+        let data_store = data_store.clone();
+        let path = path.clone();
+        tokio::spawn(async move { data_store.read_range(&path, 0..1_024).await })
+    });
+    for read in futures::future::join_all(reads).await {
+        read.unwrap().unwrap();
+    }
+
+    assert!(
+        store.peak() <= data_store::in_flight_reads(),
+        "{} reads were in flight against a bound of {}",
+        store.peak(),
+        data_store::in_flight_reads()
+    );
+    assert!(store.peak() > 1, "the reads must actually have overlapped");
+}
+
+/// Counts how many reads an inner store is serving at once.
+#[derive(Debug)]
+struct ConcurrencyStore {
+    inner: InMemory,
+    in_flight: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl ConcurrencyStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemory::new(),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        }
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    /// Holds the read long enough for every admitted caller to pile up.
+    async fn serving<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(active, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let result = work.await;
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        result
+    }
+}
+
+impl std::fmt::Display for ConcurrencyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ConcurrencyStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ConcurrencyStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.serving(self.inner.get_opts(location, options)).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.serving(self.inner.get_ranges(location, ranges)).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
 /// The read-worker ceiling follows the machine's cores, clamped to
 /// `[2, 8]`.
 #[test]

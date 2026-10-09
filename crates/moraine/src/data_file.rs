@@ -69,6 +69,7 @@ pub(crate) use crate::data_file::{
     auxiliary_cache::{
         install as install_auxiliary, occupancy as auxiliary_occupancy, row_summary_occupancy,
     },
+    data_store::WIDEST_PATH_FAN_OUT,
     delete_file::{delete_file_positions, delete_file_positions_at},
     inline_batch::{decode_inline_schema, inline_batch_entries, inline_batch_index_entries},
     inline_rows::InlineRows,

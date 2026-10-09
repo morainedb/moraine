@@ -1320,6 +1320,29 @@ chunks. The footer and the summary are cached whatever the read declares.
 This cache exists because DuckDB's metadata cache cannot be reached from the
 direct Rust reader, not as a second copy of metadata DuckDB served to it.
 
+**A scoped read's time is the store's.** On a simulated remote store at
+30 ms a request, thirty-two positions spread over thirty-two row groups
+spent 1.07 s fetching and 10 ms decoding; a bulk read of the same file
+spent 1.11 s and 18 ms. Overlapping fetches with each other is therefore
+what moves wall time — the same selection costs 597 ms across two read
+units and 328 ms across four — while overlapping a fetch with a decode
+cannot recover more than the decode, and is not worth a pipeline.
+
+**Every data-file read is admitted against one process-wide bound.** The
+paths that read one — scoped reads, delete files, footers, sidecars, and
+the maintenance passes — each size their own fan-out, and nothing bounded
+their sum: index upkeep alone asks for sixty-four files at once, a cursor
+asks for up to eight read units, and a process holds a cursor per attached
+catalog. Admission sits at the data store, which every one of those reads
+passes through, and is sized well above the core count: these reads wait on
+the store rather than on a core, so the number that matters is the requests
+an object store serves at once. Its floor is the widest fan-out any single
+path asks for, so admission bounds the aggregate instead of rationing a
+path that already sized itself, and a cache hit takes no permit because
+admission sits below the cache. It does not yet account for
+`RLIMIT_NOFILE`, which the process shares with the engine's own
+connections; reading that limit needs a dependency moraine does not carry.
+
 **Data-block caching rides on the Parquet reader's prefetch, taken only
 for files that are not on local disk** — without it the reader issues a
 deliberately non-caching read. So a local `DATA_PATH` caches the footer
