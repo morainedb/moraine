@@ -34,6 +34,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/index_cache.cpp
     ${CPP_DIR}/inline_tables.cpp
     ${CPP_DIR}/maintenance.cpp
+    ${CPP_DIR}/metadata_manager.cpp
     ${CPP_DIR}/metadata_tables.cpp
     ${CPP_DIR}/migrate.cpp
     ${CPP_DIR}/move_wal.cpp

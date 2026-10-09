@@ -27,6 +27,8 @@ void RegisterMoraineUpdateFunction(duckdb::ExtensionLoader &loader);
 void RegisterMoraineOptimizer(duckdb::DBConfig &config);
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader);
 void RegisterMoraineMigrateFunction(duckdb::ExtensionLoader &loader);
+// Defined in metadata_manager.cpp.
+void RegisterMoraineMetadataManager();
 // Defined in move_wal.cpp.
 void RegisterMoraineMoveWalFunction(duckdb::ExtensionLoader &loader);
 // Defined in checkpoints.cpp.
@@ -62,6 +64,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// it registers.
 	LoadBundledDuckLake(loader);
 	loader.SetDescription("moraine: a SlateDB-backed DuckLake catalog, DuckLake bundled");
+	moraine_duckdb::RegisterMoraineMetadataManager();
 	moraine_duckdb::RegisterMoraineStorageExtension(loader.GetDatabaseInstance().config);
 	moraine_duckdb::RegisterMoraineOptimizer(loader.GetDatabaseInstance().config);
 	moraine_duckdb::RegisterMoraineCensusFunctions(loader);
