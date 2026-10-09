@@ -59,6 +59,179 @@ async fn scoped_read_entries(
     .await
 }
 
+/// Admission follows the cores, floored at the widest path fan-out, capped
+/// at 256, and narrowed by the descriptor share.
+#[test]
+fn admission_is_the_cores_term_capped_by_the_descriptor_share() {
+    use data_store::{MINIMUM_IN_FLIGHT, WIDEST_PATH_FAN_OUT, admission_for};
+
+    // A descriptor budget with room to spare leaves the cores term standing.
+    assert_eq!(admission_for(Some(1), Some(1 << 20)), WIDEST_PATH_FAN_OUT);
+    assert_eq!(admission_for(Some(16), Some(1 << 20)), 128);
+    assert_eq!(admission_for(Some(256), Some(1 << 20)), 256);
+
+    // A descriptor budget below that narrows it, never past the minimum.
+    assert_eq!(admission_for(Some(16), Some(256)), 32);
+    assert_eq!(admission_for(Some(16), Some(8)), MINIMUM_IN_FLIGHT);
+
+    // Cores the platform will not report fall back to the floor; a limit it
+    // will not report leaves the cores term uncapped.
+    assert_eq!(admission_for(None, None), WIDEST_PATH_FAN_OUT);
+    assert_eq!(admission_for(Some(16), None), 128);
+}
+
+/// Admission on this machine stays inside the bounds the sizing promises,
+/// whatever its cores and descriptor limit happen to be.
+#[test]
+fn admission_stays_within_its_bounds() {
+    let derived = data_store::in_flight_reads();
+
+    assert!(derived >= data_store::MINIMUM_IN_FLIGHT);
+    assert!(derived <= 256);
+}
+
+/// Data-file reads from every path are admitted against one bound, however
+/// many callers ask at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn data_file_reads_are_admitted_against_one_bound() {
+    let store = Arc::new(ConcurrencyStore::new());
+    let path = Path::from("admitted.parquet");
+    store
+        .inner
+        .put(&path, vec![0_u8; 4_096].into())
+        .await
+        .unwrap();
+    let data_store = DataStore::new(store.clone());
+
+    let asked = data_store::in_flight_reads() * 3;
+    let reads = (0..asked).map(|_| {
+        let data_store = data_store.clone();
+        let path = path.clone();
+        tokio::spawn(async move { data_store.read_range(&path, 0..1_024).await })
+    });
+    for read in futures::future::join_all(reads).await {
+        read.unwrap().unwrap();
+    }
+
+    assert!(
+        store.peak() <= data_store::in_flight_reads(),
+        "{} reads were in flight against a bound of {}",
+        store.peak(),
+        data_store::in_flight_reads()
+    );
+    assert!(store.peak() > 1, "the reads must actually have overlapped");
+}
+
+/// Counts how many reads an inner store is serving at once.
+#[derive(Debug)]
+struct ConcurrencyStore {
+    inner: InMemory,
+    in_flight: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl ConcurrencyStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemory::new(),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        }
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    /// Holds the read long enough for every admitted caller to pile up.
+    async fn serving<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(active, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let result = work.await;
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        result
+    }
+}
+
+impl std::fmt::Display for ConcurrencyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ConcurrencyStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ConcurrencyStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.serving(self.inner.get_opts(location, options)).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.serving(self.inner.get_ranges(location, ranges)).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// The read-worker ceiling follows the machine's cores, clamped to
+/// `[2, 8]`.
+#[test]
+fn read_worker_limit_is_the_core_count_clamped() {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+
+    let derived = read_worker_limit();
+
+    assert_eq!(derived, cores.clamp(2, 8));
+    assert!((2..=8).contains(&derived));
+}
+
 /// The encoding permit count follows the machine's cores, clamped to
 /// `[4, 32]`.
 #[test]
@@ -938,6 +1111,236 @@ async fn simulated_remote_store_bench() {
              {range_read:>9.2?}"
         );
     }
+}
+
+/// A file with `rows` rows in `group_rows`-row groups, carrying a payload
+/// column wide enough to keep the object past the whole-object read cut.
+/// Returns the written object's size and footer size.
+async fn write_grouped_payload_fixture(
+    store: &dyn ObjectStore,
+    path: &Path,
+    rows: usize,
+    group_rows: usize,
+) -> (u64, u64) {
+    let properties = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(group_rows))
+        .build();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let ids: Vec<i64> = (0..i64::try_from(rows).unwrap()).collect();
+    // Row-unique text, so the payload column stays large on disk.
+    let payload: Vec<String> = (0..rows)
+        .map(|row| format!("payload-{row:012}-abcdefghijklmnopqrstuvwxyz-0123456789"))
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(payload)),
+        ],
+    )
+    .unwrap();
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer =
+            ArrowWriter::try_new(&mut buffer, batch.schema(), Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    let object_len = u64::try_from(buffer.len()).unwrap();
+    let footer_offset = buffer.len() - 8;
+    let footer_size = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
+    store.put(path, buffer.into()).await.unwrap();
+    (object_len, footer_size)
+}
+
+/// Where a selection's time goes on a simulated remote store, swept over
+/// the width the scan is allowed to fan out to. Reports the fetch and
+/// decode each width paid, which is what sizes both the split threshold
+/// and the worker ceiling.
+/// Run with:
+/// `cargo test -p moraine --lib -- --ignored --nocapture selection_fan_out`
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "timing probe; run manually with --nocapture"]
+async fn simulated_remote_selection_fan_out_bench() {
+    const ROWS: usize = 65_536;
+    const GROUP_ROWS: usize = 2_048;
+
+    let remote: Arc<dyn ObjectStore> = Arc::new(LatencyStore {
+        inner: InMemory::new(),
+    });
+    let local: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = Path::from("fan-out.parquet");
+    let (size, footer) =
+        write_grouped_payload_fixture(remote.as_ref(), &path, ROWS, GROUP_ROWS).await;
+    write_grouped_payload_fixture(local.as_ref(), &path, ROWS, GROUP_ROWS).await;
+    println!("\nfile {size} B in {} groups", ROWS / GROUP_ROWS);
+
+    // Scattered is point-lookup shaped and stays one unit today (under the
+    // scan's 1024-position split); bulk is what a located scan of the
+    // whole file costs.
+    let shapes = [
+        (
+            "scattered 32 rows",
+            RowPositions::from_unsorted((0..ROWS as u64).step_by(GROUP_ROWS).collect::<Vec<_>>()),
+        ),
+        (
+            "bulk 65536 rows  ",
+            RowPositions::from_unsorted((0..ROWS as u64).collect::<Vec<_>>()),
+        ),
+    ];
+
+    for (transport, store) in [("remote", &remote), ("local ", &local)] {
+        for (shape, positions) in &shapes {
+            for width in [1usize, 2, 4, 8] {
+                // A cache identity of its own, so no run reads another's
+                // resident footer or ranges.
+                let file = ParquetFile::new(
+                    DataStore::with_cache_identity(
+                        Arc::clone(store),
+                        crate::CacheIdentity::new(&format!("{transport}/{shape}/{width}")),
+                    ),
+                    path.clone(),
+                    size,
+                    footer,
+                );
+                let source = RowIdSource::Resolve {
+                    row_id_start: Some(0),
+                };
+                let requested = Arc::new(vec![0, 1]);
+
+                let positions = positions.clone();
+                let started = std::time::Instant::now();
+                let rows = if width == 1 {
+                    scoped_read_row_stream(
+                        file.clone(),
+                        &requested,
+                        ScopedRows::At(&positions),
+                        source,
+                    )
+                    .await
+                    .unwrap()
+                    .try_fold(
+                        0usize,
+                        |rows, batch| async move { Ok(rows + batch.num_rows()) },
+                    )
+                    .await
+                    .unwrap()
+                } else {
+                    let groups = read_workers::row_group_selections(&file, &positions)
+                        .await
+                        .unwrap();
+                    let streams = groups.into_iter().map(|positions| {
+                        prefetched_row_stream(
+                            file.clone(),
+                            requested.clone(),
+                            positions,
+                            source,
+                            Arc::new(ReadWorkers::default()),
+                        )
+                    });
+                    stream::iter(streams)
+                        .flatten_unordered(width)
+                        .try_fold(
+                            0usize,
+                            |rows, batch| async move { Ok(rows + batch.num_rows()) },
+                        )
+                        .await
+                        .unwrap()
+                };
+                let wall = started.elapsed();
+
+                let tally = file.metrics().tally();
+                println!(
+                    "{transport}  {shape}  width {width}: wall {wall:>9.2?}  fetch {:>9.2?}  decode {:>9.2?}  \
+                 {:>3} fetches / {:>8} B  ({rows} rows)",
+                    tally.range_duration,
+                    tally.decode_duration,
+                    tally.range_fetches,
+                    tally.range_bytes
+                );
+            }
+        }
+    }
+}
+
+/// What a cursor's decoding costs the runtime it shares with SlateDB's
+/// flush and compaction: a heartbeat's worst lateness on a two-worker
+/// runtime, alone and against a full-width fan-out decoding from a local
+/// store. Decides whether decode belongs on the blocking pool.
+/// Run with:
+/// `cargo test -p moraine --lib -- --ignored --nocapture runtime_starvation`
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "timing probe; run manually with --nocapture"]
+async fn simulated_runtime_starvation_bench() {
+    const ROWS: usize = 65_536;
+    const GROUP_ROWS: usize = 2_048;
+    const BEATS: usize = 300;
+    const INTERVAL: Duration = Duration::from_millis(1);
+
+    // Local store: no request latency, so every millisecond a reader takes
+    // is a millisecond of decoding on a runtime worker.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = Path::from("starvation.parquet");
+    let (size, footer) =
+        write_grouped_payload_fixture(store.as_ref(), &path, ROWS, GROUP_ROWS).await;
+
+    // The heartbeat stands in for the flush and compaction work that shares
+    // an attached catalog's runtime.
+    let heartbeat = || async {
+        let mut worst = Duration::ZERO;
+        for _ in 0..BEATS {
+            let started = std::time::Instant::now();
+            tokio::time::sleep(INTERVAL).await;
+            worst = worst.max(started.elapsed().saturating_sub(INTERVAL));
+        }
+        worst
+    };
+
+    let idle = heartbeat().await;
+
+    let readers = read_worker_limit();
+    let beating = tokio::spawn(async move { heartbeat().await });
+    let file = ParquetFile::new(
+        DataStore::with_cache_identity(Arc::clone(&store), crate::CacheIdentity::new("starved")),
+        path,
+        size,
+        footer,
+    );
+    let positions = RowPositions::from_unsorted((0..ROWS as u64).collect::<Vec<_>>());
+    let groups = read_workers::row_group_selections(&file, &positions)
+        .await
+        .unwrap();
+    let streams = groups.into_iter().map(|positions| {
+        prefetched_row_stream(
+            file.clone(),
+            Arc::new(vec![0, 1]),
+            positions,
+            RowIdSource::Resolve {
+                row_id_start: Some(0),
+            },
+            Arc::new(ReadWorkers::default()),
+        )
+    });
+    let rows = stream::iter(streams)
+        .flatten_unordered(readers)
+        .try_fold(
+            0usize,
+            |rows, batch| async move { Ok(rows + batch.num_rows()) },
+        )
+        .await
+        .unwrap();
+    let loaded = beating.await.unwrap();
+
+    println!(
+        "\nheartbeat worst lateness over {BEATS} beats: idle {idle:>9.2?}, under {readers} \
+         decoding readers {loaded:>9.2?}  ({rows} rows)"
+    );
 }
 
 /// Writes `batch` to `path` as a Parquet object, returning its byte size.
@@ -2157,9 +2560,10 @@ async fn row_group_selections_preserve_physical_positions() {
     );
 }
 
-/// Concurrent readers use bounded workers and release permits on cancellation.
+/// Concurrent readers run no more workers than the consumer polls, and
+/// cancellation retires every one of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn selective_read_workers_are_bounded_and_cancelled() {
+async fn selective_read_workers_are_tracked_and_cancelled() {
     let store = Arc::new(InMemory::new());
     let path = Path::from("parallel-read.parquet");
     let (size, footer) = write_grouped_fixture(store.as_ref(), &path, 65_536, 2048).await;
@@ -2185,7 +2589,9 @@ async fn selective_read_workers_are_bounded_and_cancelled() {
         batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
         4 * 65_536
     );
-    assert!(workers.peak() <= read_worker_limit());
+    // Two streams are polled at a time, and a worker only runs while its
+    // stream is polled.
+    assert!(workers.peak() <= 2);
     assert!(workers.peak() > 0);
 
     let mut idle = Vec::new();
@@ -2214,7 +2620,7 @@ async fn selective_read_workers_are_bounded_and_cancelled() {
     assert!(
         tokio::time::timeout(Duration::from_secs(2), pending.try_next())
             .await
-            .expect("paused consumers must not hold the shared read permits")
+            .expect("a paused consumer must not stall another reader")
             .unwrap()
             .is_some()
     );
@@ -2227,6 +2633,165 @@ async fn selective_read_workers_are_bounded_and_cancelled() {
     })
     .await
     .unwrap();
+}
+
+/// Holds every payload read until `expected` of them are in flight at once,
+/// then lets all later reads straight through. A set of reads that cannot
+/// reach the store together fails the gate by timeout rather than by
+/// timing.
+#[derive(Debug)]
+struct GatedStore {
+    inner: InMemory,
+    expected: usize,
+    arrived: AtomicUsize,
+    tripped: std::sync::atomic::AtomicBool,
+    gate: tokio::sync::Semaphore,
+}
+
+impl GatedStore {
+    fn new(expected: usize) -> Self {
+        Self {
+            inner: InMemory::new(),
+            expected,
+            arrived: AtomicUsize::new(0),
+            tripped: std::sync::atomic::AtomicBool::new(false),
+            gate: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    async fn gate(&self) {
+        if self.tripped.load(Ordering::Acquire) {
+            return;
+        }
+        if self.arrived.fetch_add(1, Ordering::AcqRel) + 1 >= self.expected {
+            self.tripped.store(true, Ordering::Release);
+            // Permits persist, so a reader arriving after the trip is let
+            // through without racing the release.
+            self.gate.add_permits(self.expected);
+            return;
+        }
+        if let Ok(permit) = self.gate.acquire().await {
+            permit.forget();
+        }
+    }
+}
+
+impl std::fmt::Display for GatedStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GatedStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for GatedStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if !options.head {
+            self.gate().await;
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.gate().await;
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Readers on separate cursors reach the store together: one cursor's
+/// decoding does not stand between another's and its first byte range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readers_on_separate_cursors_reach_the_store_together() {
+    const ROWS: usize = 8_192;
+    let readers = read_worker_limit() + 1;
+    let store = Arc::new(GatedStore::new(readers));
+
+    let mut files = Vec::new();
+    for index in 0..readers {
+        let path = Path::from(format!("together-{index}.parquet"));
+        let (size, footer) = write_grouped_fixture(store.as_ref(), &path, ROWS, 2048).await;
+        files.push(ParquetFile::new(
+            DataStore::new(store.clone()),
+            path,
+            size,
+            footer,
+        ));
+    }
+
+    let streams = files.into_iter().map(|file| {
+        prefetched_row_stream(
+            file,
+            Arc::new(vec![0]),
+            RowPositions::from_unsorted((0..ROWS as u64).collect()),
+            RowIdSource::Resolve {
+                row_id_start: Some(0),
+            },
+            Arc::new(ReadWorkers::default()),
+        )
+    });
+
+    let batches = tokio::time::timeout(
+        Duration::from_secs(10),
+        stream::iter(streams)
+            .flatten_unordered(readers)
+            .try_collect::<Vec<_>>(),
+    )
+    .await
+    .expect("a read shared across cursors must not gate another cursor's first range")
+    .unwrap();
+
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        readers * ROWS
+    );
 }
 
 /// A row-group read emits only that group, at the group's file ordinals,

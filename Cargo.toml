@@ -31,6 +31,7 @@ protox = "0.9"
 proptest = "1"
 proptest-derive = "0.8"
 roaring = "0.11"
+rustix = { version = "1", default-features = false, features = ["process", "std"] }
 serde = { version = "1", features = ["derive"] }
 slatedb = "0.17.0"
 # must move in lockstep with slatedb: it is where the metrics traits live

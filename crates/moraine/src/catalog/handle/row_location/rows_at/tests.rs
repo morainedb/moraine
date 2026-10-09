@@ -93,6 +93,124 @@ async fn first_column_values(mut scan: LocatedRowScan) -> Vec<i64> {
     values
 }
 
+/// Writes `rows` ascending values in `group_rows`-row groups, so a
+/// selection can straddle row-group boundaries.
+async fn grouped_parquet(
+    store: &InMemory,
+    path: &str,
+    name: &str,
+    rows: i64,
+    group_rows: usize,
+) -> (u64, u64) {
+    let values: Vec<i64> = (0..rows).collect();
+    let batch =
+        RecordBatch::try_from_iter([(name, Arc::new(Int64Array::from(values)) as _)]).unwrap();
+    let properties = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(group_rows))
+        .build();
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let footer = u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap());
+    let size = bytes.len() as u64;
+    store.put(&Path::from(path), bytes.into()).await.unwrap();
+    (size, u64::from(footer))
+}
+
+/// A selection the size of a point lookup still partitions into row-group
+/// work units, so a cursor allowed more than one worker reads its groups
+/// concurrently instead of in turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_small_selection_fans_out_across_row_groups() {
+    const ROWS: i64 = 4_096;
+    const GROUP_ROWS: usize = 512;
+
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let data = Arc::new(InMemory::new());
+    let (size, footer) = grouped_parquet(&data, "data.parquet", "a", ROWS, GROUP_ROWS).await;
+    catalog
+        .commit(|tx| {
+            tx.set_option(OptionScope::Global, "data_path", "/lake/")?;
+            let schema = tx.schema_by_name("main").unwrap().id;
+            let table = tx.create_table(
+                schema,
+                "t",
+                &[ColumnDef {
+                    name: "a".into(),
+                    column_type: "BIGINT".into(),
+                    ..Default::default()
+                }],
+            )?;
+            tx.register_data_file(
+                table,
+                DataFile {
+                    path: "data.parquet".into(),
+                    path_is_relative: false,
+                    file_format: "parquet".into(),
+                    record_count: u64::try_from(ROWS).unwrap(),
+                    file_size_bytes: size,
+                    footer_size: footer,
+                    encryption_key: None,
+                    partition_values: vec![],
+                    column_stats: vec![],
+                },
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    let schema = snapshot.schema_by_name("main").unwrap().id;
+    let table = snapshot.table_by_name(schema, "t").unwrap().id;
+    let file = snapshot.data_files_of(table)[0].id;
+    let store = DataStore::new(data);
+    // One row per group: eight positions, far below a row group's rows.
+    let pairs: Vec<_> = (0..ROWS)
+        .step_by(GROUP_ROWS)
+        .map(|row_id| (u64::try_from(row_id).unwrap(), Some(file)))
+        .collect();
+    let expected: Vec<i64> = (0..ROWS).step_by(GROUP_ROWS).collect();
+
+    for (parallelism, fans_out) in [(1, false), (2, true)] {
+        let mut scan = catalog
+            .scan_rows_at(
+                &snapshot,
+                Some(store.clone()),
+                "",
+                table,
+                &pairs,
+                &["a".into()],
+            )
+            .await
+            .unwrap();
+        scan.set_parallelism(parallelism).unwrap();
+
+        let mut values = Vec::new();
+        while let Some(batch) = scan.next_record_batch().await.unwrap() {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            values.extend(column.values().iter().copied());
+        }
+        values.sort_unstable();
+        assert_eq!(values, expected, "every selected row arrives either way");
+        assert_eq!(
+            scan.peak_workers() > 0,
+            fans_out,
+            "at parallelism {parallelism} the groups must {}be read as work units",
+            if fans_out { "" } else { "not " }
+        );
+    }
+    catalog.close().await.unwrap();
+}
+
 /// Scan setup must not fill the deletion-merging cache with unused positions.
 #[tokio::test]
 async fn scan_positions_do_not_materialize_unfiltered_deletes() {

@@ -1992,6 +1992,7 @@ dependencies = [
  "prost-build",
  "protox",
  "roaring",
+ "rustix",
  "serde",
  "slatedb",
  "slatedb-common",

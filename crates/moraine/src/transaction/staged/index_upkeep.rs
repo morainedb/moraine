@@ -47,7 +47,7 @@ fn pending_mappings(ops: &[RowOperation]) -> Result<HashMap<(u64, u64), proto::M
 }
 
 /// How many files one upkeep phase reads at once.
-const FILE_READ_CONCURRENCY: usize = 64;
+const FILE_READ_CONCURRENCY: usize = crate::data_file::WIDEST_PATH_FAN_OUT;
 
 /// Per-commit fan-out into the process-wide Arrow encoding worker pool.
 const INLINE_DECODE_CONCURRENCY: usize = 8;

@@ -1320,6 +1320,37 @@ chunks. The footer and the summary are cached whatever the read declares.
 This cache exists because DuckDB's metadata cache cannot be reached from the
 direct Rust reader, not as a second copy of metadata DuckDB served to it.
 
+**A scoped read's time is the store's.** On a simulated remote store at
+30 ms a request, thirty-two positions spread over thirty-two row groups
+spent 1.07 s fetching and 10 ms decoding; a bulk read of the same file
+spent 1.11 s and 18 ms. Overlapping fetches with each other is therefore
+what moves wall time — the same selection costs 597 ms across two read
+units and 328 ms across four — while overlapping a fetch with a decode
+cannot recover more than the decode, and is not worth a pipeline.
+Decoding stays on the runtime's own workers rather than a blocking pool:
+on a two-worker runtime a full-width fan-out decoding from a local store —
+the adversarial case, since a remote read spends its time waiting — pushed
+a one-millisecond heartbeat's worst lateness from 1.4 ms to 10 ms, a delay
+rather than the stall the worker floor exists to prevent, and a blocking
+task could not be cancelled when its cursor is dropped.
+
+**Every data-file read is admitted against one process-wide bound.** The
+paths that read one — scoped reads, delete files, footers, sidecars, and
+the maintenance passes — each size their own fan-out, and nothing bounded
+their sum: index upkeep alone asks for sixty-four files at once, a cursor
+asks for up to eight read units, and a process holds a cursor per attached
+catalog. Admission sits at the data store, which every one of those reads
+passes through, and is sized well above the core count: these reads wait on
+the store rather than on a core, so the number that matters is the requests
+an object store serves at once. Its floor is the widest fan-out any single
+path asks for, so admission bounds the aggregate instead of rationing a
+path that already sized itself, and a cache hit takes no permit because
+admission sits below the cache. The process's soft open-file limit caps it
+last: reads may hold an eighth of that budget, leaving the rest for the
+engine's own connections and the metadata store, and a limit low enough to
+narrow admission past the floor narrows it to eight rather than closing it.
+A platform that will not report the limit leaves the cores term standing.
+
 **Data-block caching rides on the Parquet reader's prefetch, taken only
 for files that are not on local disk** — without it the reader issues a
 deliberately non-caching read. So a local `DATA_PATH` caches the footer

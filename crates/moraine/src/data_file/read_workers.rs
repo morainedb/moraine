@@ -3,7 +3,7 @@
 use std::{
     future::Future,
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -13,20 +13,16 @@ use futures::{
     StreamExt, TryStreamExt,
     stream::{self, BoxStream},
 };
-use tokio::{
-    sync::{Semaphore, mpsc},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::{ParquetFile, RowIdSource, RowPositions, ScopedRows, scoped_read_row_stream};
 use crate::error::{Error, Result};
 
+/// Prefetch workers one cursor may run at once, per cursor rather than
+/// per process.
 pub(crate) fn read_worker_limit() -> usize {
-    std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 2).clamp(1, 4))
+    std::thread::available_parallelism().map_or(2, |cores| cores.get().clamp(2, 8))
 }
-
-static PERMITS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(read_worker_limit())));
 
 /// Partitions exact file positions into nonempty row-group work units.
 pub(crate) async fn row_group_selections(
@@ -87,25 +83,18 @@ impl Drop for PendingWorker {
     }
 }
 
-/// Runs `work` under one read-worker permit, taken on the calling task.
-/// Call it only from a task that is always polled: a caller parked
-/// mid-stream would keep a reserved permit from every other read in the
-/// process.
-async fn read_bounded<T>(
+/// Runs `work` as one accounted read worker, so the cursor can report what
+/// it ran concurrently. Readers are bounded by the cursor's own
+/// parallelism: a process-wide gate here would put one cursor's decoding
+/// between another's and its first byte range.
+async fn tracked<T>(
     workers: &Arc<ReadWorkers>,
     work: impl Future<Output = Result<T>>,
 ) -> Result<T> {
-    // Process-wide, so one catalog's reads starve every other one's; named
-    // here because a caller parked on it is otherwise silent.
-    let _permit =
-        crate::telemetry::reporting_phase("read-worker-permit", PERMITS.clone().acquire_owned())
-            .await
-            .map_err(|error| Error::Interrupted(error.to_string()))?;
     let active = workers.active.fetch_add(1, Ordering::Relaxed) + 1;
     workers.peak.fetch_max(active, Ordering::Relaxed);
     let _active = ActiveWorker(workers.clone());
-    // Named for the same reason as the wait above: a read that never
-    // returns holds its permit against every other catalog.
+    // Named because a read that never returns is otherwise silent.
     crate::telemetry::reporting_phase("read-worker-hold", work).await
 }
 
@@ -120,7 +109,7 @@ pub(crate) fn prefetched_row_stream(
         let (sender, receiver) = mpsc::channel(1);
         let task = tokio::spawn(async move {
             let result = async {
-                let mut batches = read_bounded(
+                let mut batches = tracked(
                     &workers,
                     scoped_read_row_stream(file, &requested, ScopedRows::At(&positions), source),
                 )
@@ -130,9 +119,10 @@ pub(crate) fn prefetched_row_stream(
                     let Ok(slot) = sender.reserve().await else {
                         return Ok(());
                     };
-                    let Some(batch) = read_bounded(&workers, batches.try_next()).await? else {
+                    let Some(batch) = tracked(&workers, batches.try_next()).await? else {
                         return Ok::<_, Error>(());
                     };
+
                     slot.send(Ok(batch));
                 }
             }

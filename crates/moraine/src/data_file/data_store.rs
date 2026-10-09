@@ -1,12 +1,85 @@
 //! The object store data files live in, named once for the caches, and
 //! read through the retries a blipping transport needs.
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    future::Future,
+    ops::Range,
+    sync::{Arc, LazyLock},
+};
 
 use bytes::Bytes;
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 
 use crate::{CacheIdentity, store::retry};
+
+/// The widest fan-out any single read path asks for: index upkeep reads
+/// this many files at once. Admission must not sit below it.
+pub(crate) const WIDEST_PATH_FAN_OUT: usize = 64;
+
+/// The share of the process's descriptor budget data-file reads may hold at
+/// once. The rest serves the engine's own connections and the metadata
+/// store.
+const DESCRIPTOR_SHARE: u64 = 8;
+
+/// Reads admitted when the descriptor budget would allow fewer, so a low
+/// `RLIMIT_NOFILE` narrows admission without closing it.
+pub(super) const MINIMUM_IN_FLIGHT: usize = 8;
+
+/// Data-file reads one process may have in flight, across every path that
+/// issues one. Sized above the core count, floored at
+/// [`WIDEST_PATH_FAN_OUT`], and capped by the descriptor share.
+pub(crate) fn in_flight_reads() -> usize {
+    let cores = std::thread::available_parallelism()
+        .ok()
+        .map(std::num::NonZero::get);
+    admission_for(cores, descriptor_limit())
+}
+
+/// `cores` unknown falls back to the floor; `descriptors` unknown leaves
+/// the cores term uncapped.
+pub(super) fn admission_for(cores: Option<usize>, descriptors: Option<u64>) -> usize {
+    let wanted = cores
+        .map_or(WIDEST_PATH_FAN_OUT, |cores| cores.saturating_mul(8))
+        .clamp(WIDEST_PATH_FAN_OUT, 256);
+    let allowed = descriptors
+        .map(|descriptors| descriptors / DESCRIPTOR_SHARE)
+        .and_then(|share| usize::try_from(share).ok())
+        .map_or(wanted, |share| share.max(MINIMUM_IN_FLIGHT));
+    wanted.min(allowed)
+}
+
+/// The process's soft open-file limit, where the platform reports one.
+fn descriptor_limit() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+static ADMISSION: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(in_flight_reads())));
+
+/// Runs one store read under admission. A retry inside `work` is the same
+/// logical read and keeps its permit; the wait is named because a caller
+/// held by a saturated store is otherwise silent.
+async fn admitted<T>(
+    work: impl Future<Output = object_store::Result<T>>,
+) -> object_store::Result<T> {
+    let _permit = crate::telemetry::reporting_phase(
+        "data-read-admission",
+        Arc::clone(&ADMISSION).acquire_owned(),
+    )
+    .await
+    .map_err(|error| object_store::Error::Generic {
+        store: "moraine data store",
+        source: Box::new(error),
+    })?;
+    work.await
+}
 
 /// An object store holding data files, named once for the caches that key
 /// on it. Build one per store and clone it to share cached reads.
@@ -50,9 +123,9 @@ impl DataStore {
         path: &Path,
         range: Range<u64>,
     ) -> object_store::Result<Bytes> {
-        retry::retrying("a data-file read", path, || {
+        admitted(retry::retrying("a data-file read", path, || {
             self.store.get_range(path, range.clone())
-        })
+        }))
         .await
     }
 
@@ -65,13 +138,13 @@ impl DataStore {
             range: Some(object_store::GetRange::Bounded(0..len)),
             ..object_store::GetOptions::default()
         };
-        retry::retrying("a sidecar read", path, || async {
+        admitted(retry::retrying("a sidecar read", path, || async {
             self.store
                 .get_opts(path, options.clone())
                 .await?
                 .bytes()
                 .await
-        })
+        }))
         .await
     }
 
@@ -92,9 +165,9 @@ impl DataStore {
         path: &Path,
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
-        retry::retrying("a data-file read", path, || {
+        admitted(retry::retrying("a data-file read", path, || {
             self.store.get_ranges(path, ranges)
-        })
+        }))
         .await
     }
 }

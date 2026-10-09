@@ -1086,19 +1086,23 @@ if Arrow import throws. Parquet reads select
 only the requested columns and physical positions, using page indexes when
 available. Files open on demand; inline chunks are decoded one at a time.
 `set_parallelism` configures read-unit prefetch before iteration starts, defaulting
-to one for core callers. SQL uses `moraine_summary_scan_threads` (default two),
-clamped to DuckDB's thread count and a shared process ceiling of half the
-available CPUs, bounded to one through four. Each worker reserves a single
-output slot before decoding its next batch. Shared permits cover opening a reader
-or producing a batch, never waiting for a consumer to drain its output slot.
-Paused cursors therefore cannot reserve all workers. Worker tasks are execution-owned;
-dropping the cursor aborts them and releases their permits and pinned scope.
-For a file with at least 1024 selected positions, parallel execution partitions
-the selection into nonempty row-group work units using cached footer counts.
+to one for core callers. SQL uses `moraine_summary_scan_threads` (default four),
+clamped to DuckDB's thread count and a per-cursor ceiling of the available CPUs,
+bounded to two through eight. The ceiling follows the requests an object store
+serves at once, not the cores available to decode them: a scoped read spends
+almost all of its time waiting on the store. Each worker reserves a single
+output slot before decoding its next batch, and that slot is what bounds a
+cursor's queued batches. No process-wide pool gates a worker, so one cursor's
+decoding never stands between another's and its first byte range. Worker tasks
+are execution-owned; dropping the cursor aborts them and releases their pinned
+scope. Parallel execution partitions every selection into nonempty row-group
+work units using cached footer counts — the counts opening the file requires
+anyway, so no selection is small enough that partitioning costs a request.
 Each unit retains original file ordinals and exact row selection, so embedded
-row IDs, sparse selections, and delete filtering are unchanged. Smaller selections
-avoid the partitioning step; one unit stays serial. File and row-group units use
-the same shared permits and one-batch output queues, never nested worker pools.
+row IDs, sparse selections, and delete filtering are unchanged. A selection
+inside one row group yields one unit and fans out to nothing. File and
+row-group units use the same one-batch output queues, never nested worker
+pools.
 `files_read` counts distinct files even when several groups are read concurrently.
 Parallel output has no file-order guarantee; an SQL ORDER BY remains authoritative.
 `files_read` counts opened data files for query profiles. A verified summary

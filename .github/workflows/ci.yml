@@ -77,14 +77,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          # An `ignore` entry whose advisory no longer matches anything is
-          # only a warning, and the check still exits 0 — which is how two
-          # suppressions outlived their advisories unnoticed. Failing on it
-          # makes a stale one say so. `command-arguments` lands after the
-          # subcommand, which is where a `check` flag belongs.
-          command-arguments: -D advisory-not-detected
+      # Not `EmbarkStudios/cargo-deny-action`: it is a Docker action, so every
+      # run pulls its base image from Docker Hub unauthenticated and fails
+      # whenever that rate-limits or its token endpoint is down — which it did
+      # twice in a row, once with a 429 and once with a 504, neither of them
+      # reaching the check. This installs a prebuilt binary instead.
+      - uses: taiki-e/install-action@cargo-deny
+      # An `ignore` entry whose advisory no longer matches anything is only a
+      # warning, and the check still exits 0 — which is how two suppressions
+      # outlived their advisories unnoticed. Failing on it makes a stale one
+      # say so.
+      - run: cargo deny check -D advisory-not-detected
 
   pins:
     runs-on: ubuntu-latest
