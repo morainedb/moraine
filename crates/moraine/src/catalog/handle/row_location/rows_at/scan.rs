@@ -406,10 +406,6 @@ impl LocatedRowScan {
             let mut units = Vec::new();
             for (file, file_id, positions, row_id_start) in files {
                 let started = Arc::new(AtomicBool::new(false));
-                // Partitioning reads the footer row counts the scan loads to
-                // open the file anyway, so there is no selection small enough
-                // that splitting it costs a request. A single-group selection
-                // yields one unit and fans out to nothing.
                 let groups = if parallelism > 1 {
                     data_file::row_group_selections(&file, &positions).await?
                 } else {

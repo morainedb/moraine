@@ -20,12 +20,6 @@ use crate::error::{Error, Result};
 
 /// Prefetch workers one cursor may run at once, per cursor rather than
 /// per process.
-///
-/// A scoped read spends almost all of its time waiting on the store, so
-/// the ceiling follows the requests an object store will serve at once
-/// rather than the cores available to decode them. The floor keeps a
-/// two-core machine overlapping at all; the ceiling stands until a
-/// store-level admission bound replaces it.
 pub(crate) fn read_worker_limit() -> usize {
     std::thread::available_parallelism().map_or(2, |cores| cores.get().clamp(2, 8))
 }
@@ -128,6 +122,7 @@ pub(crate) fn prefetched_row_stream(
                     let Some(batch) = tracked(&workers, batches.try_next()).await? else {
                         return Ok::<_, Error>(());
                     };
+
                     slot.send(Ok(batch));
                 }
             }
