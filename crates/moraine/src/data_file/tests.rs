@@ -940,6 +940,146 @@ async fn simulated_remote_store_bench() {
     }
 }
 
+/// A file with `rows` rows in `group_rows`-row groups, carrying a payload
+/// column wide enough to keep the object past the whole-object read cut.
+/// Returns the written object's size and footer size.
+async fn write_grouped_payload_fixture(
+    store: &dyn ObjectStore,
+    path: &Path,
+    rows: usize,
+    group_rows: usize,
+) -> (u64, u64) {
+    let properties = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(group_rows))
+        .build();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let ids: Vec<i64> = (0..i64::try_from(rows).unwrap()).collect();
+    // Row-unique text, so the payload column stays large on disk.
+    let payload: Vec<String> = (0..rows)
+        .map(|row| format!("payload-{row:012}-abcdefghijklmnopqrstuvwxyz-0123456789"))
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(payload)),
+        ],
+    )
+    .unwrap();
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer =
+            ArrowWriter::try_new(&mut buffer, batch.schema(), Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    let object_len = u64::try_from(buffer.len()).unwrap();
+    let footer_offset = buffer.len() - 8;
+    let footer_size = u64::from(u32::from_le_bytes(
+        buffer[footer_offset..footer_offset + 4].try_into().unwrap(),
+    ));
+    store.put(path, buffer.into()).await.unwrap();
+    (object_len, footer_size)
+}
+
+/// Where a scattered selection's time goes on a simulated remote store:
+/// the serial unit the scan builds below its split threshold, against the
+/// same row groups read as separate units. Reports the fetch and decode
+/// each path paid, which is what decides between pipelining one unit and
+/// fanning the groups out.
+/// Run with:
+/// `cargo test -p moraine --lib -- --ignored --nocapture scattered_selection`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "timing probe; run manually with --nocapture"]
+async fn simulated_remote_scattered_selection_bench() {
+    const ROWS: usize = 65_536;
+    const GROUP_ROWS: usize = 2_048;
+
+    let store = Arc::new(LatencyStore {
+        inner: InMemory::new(),
+    });
+    let path = Path::from("scattered.parquet");
+    let (size, footer) =
+        write_grouped_payload_fixture(store.as_ref(), &path, ROWS, GROUP_ROWS).await;
+    // One row per group: 32 positions, well under the 1024 the scan splits at.
+    let positions =
+        RowPositions::from_unsorted((0..ROWS as u64).step_by(GROUP_ROWS).collect::<Vec<_>>());
+    println!(
+        "\nfile {size} B in {} groups, {} positions selected",
+        ROWS / GROUP_ROWS,
+        positions.as_slice().len()
+    );
+
+    for (shape, requested) in [("row-id column only", vec![0]), ("payload column", vec![1])] {
+        for (label, fan_out) in [("serial   ", false), ("fanned out", true)] {
+            // A cache identity of its own, so neither run reads the
+            // other's resident footer or ranges.
+            let file = ParquetFile::new(
+                DataStore::with_cache_identity(
+                    store.clone(),
+                    crate::CacheIdentity::new(&format!("{shape}/{label}")),
+                ),
+                path.clone(),
+                size,
+                footer,
+            );
+            let source = RowIdSource::Resolve {
+                row_id_start: Some(0),
+            };
+
+            let started = std::time::Instant::now();
+            let rows = if fan_out {
+                let groups = read_workers::row_group_selections(&file, &positions)
+                    .await
+                    .unwrap();
+                let streams = groups.into_iter().map(|positions| {
+                    prefetched_row_stream(
+                        file.clone(),
+                        Arc::new(requested.clone()),
+                        positions,
+                        source,
+                        Arc::new(ReadWorkers::default()),
+                    )
+                });
+                stream::iter(streams)
+                    .flatten_unordered(8)
+                    .try_fold(
+                        0usize,
+                        |rows, batch| async move { Ok(rows + batch.num_rows()) },
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                scoped_read_row_stream(file.clone(), &requested, ScopedRows::At(&positions), source)
+                    .await
+                    .unwrap()
+                    .try_fold(
+                        0usize,
+                        |rows, batch| async move { Ok(rows + batch.num_rows()) },
+                    )
+                    .await
+                    .unwrap()
+            };
+            let wall = started.elapsed();
+
+            let tally = file.metrics().tally();
+            println!(
+                "{shape:<18} {label}: wall {wall:>9.2?}  fetch {:>9.2?}  decode {:>9.2?}  \
+                 {:>3} fetches / {:>3} ranges / {:>8} B  ({rows} rows)",
+                tally.range_duration,
+                tally.decode_duration,
+                tally.range_fetches,
+                tally.ranges,
+                tally.range_bytes
+            );
+        }
+    }
+}
+
 /// Writes `batch` to `path` as a Parquet object, returning its byte size.
 pub(super) async fn write_fixture(
     object_store: &InMemory,
