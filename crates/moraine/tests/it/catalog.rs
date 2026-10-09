@@ -11,6 +11,64 @@ use object_store::memory::InMemory;
 
 use crate::fixtures::{col, open_memory, seeded};
 
+/// Metadata reads taken at once on a handle that has materialized nothing
+/// yet — the shape DuckLake issues once a statement's scans initialize in
+/// parallel rather than one pipeline at a time. Every reader sees the same
+/// catalog, and none fails against a half-built one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_metadata_reads_agree() {
+    const READERS: usize = 16;
+
+    let store: Arc<InMemory> = Arc::new(InMemory::new());
+    let seeding = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    seeding
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").unwrap().id;
+            tx.create_table(schema, "t", &[col("a")])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    seeding.close().await.unwrap();
+
+    // A fresh handle, read by everyone at once before anything is resident.
+    let catalog = Arc::new(
+        Catalog::open(store, CatalogOptions::default())
+            .await
+            .unwrap(),
+    );
+    let mut readers = Vec::with_capacity(READERS);
+    for _ in 0..READERS {
+        let catalog = Arc::clone(&catalog);
+        readers.push(tokio::spawn(async move {
+            let snapshot = catalog.snapshot().await?;
+            let table = snapshot
+                .schema_by_name("main")
+                .and_then(|schema| snapshot.table_by_name(schema.id, "t"))
+                .map(|table| table.id);
+            Ok::<_, Error>((snapshot.current_snapshot().id, table))
+        }));
+    }
+
+    let mut seen = Vec::with_capacity(READERS);
+    for reader in readers {
+        seen.push(reader.await.unwrap().unwrap());
+    }
+    let first = seen[0];
+    assert!(
+        first.1.is_some(),
+        "the seeded table must be visible to a first read"
+    );
+    assert!(
+        seen.iter().all(|answer| *answer == first),
+        "concurrent first reads disagreed: {seen:?}"
+    );
+
+    Arc::into_inner(catalog).unwrap().close().await.unwrap();
+}
+
 #[tokio::test]
 async fn encrypted_flag_is_fixed_at_bootstrap() {
     // A fresh store bootstraps with the requested flag as the stored
