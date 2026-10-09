@@ -70,7 +70,7 @@ cargo +nightly-2026-08-29 fmt --check && cargo clippy --workspace --all-targets 
   && cargo test --workspace --locked \
   && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
   && cargo deny check -D advisory-not-detected \
-  && cargo xtask check-pins && cargo xtask e2e
+  && cargo xtask check-pins && cargo xtask check-patch-pins && cargo xtask e2e
 ```
 
 `e2e` compiles DuckDB itself, and DuckDB's cmake picks up `ccache` or
