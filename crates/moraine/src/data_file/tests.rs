@@ -986,42 +986,48 @@ async fn write_grouped_payload_fixture(
     (object_len, footer_size)
 }
 
-/// Where a scattered selection's time goes on a simulated remote store:
-/// the serial unit the scan builds below its split threshold, against the
-/// same row groups read as separate units. Reports the fetch and decode
-/// each path paid, which is what decides between pipelining one unit and
-/// fanning the groups out.
+/// Where a selection's time goes on a simulated remote store, swept over
+/// the width the scan is allowed to fan out to. Reports the fetch and
+/// decode each width paid, which is what sizes both the split threshold
+/// and the worker ceiling.
 /// Run with:
-/// `cargo test -p moraine --lib -- --ignored --nocapture scattered_selection`
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// `cargo test -p moraine --lib -- --ignored --nocapture selection_fan_out`
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "timing probe; run manually with --nocapture"]
-async fn simulated_remote_scattered_selection_bench() {
+async fn simulated_remote_selection_fan_out_bench() {
     const ROWS: usize = 65_536;
     const GROUP_ROWS: usize = 2_048;
 
     let store = Arc::new(LatencyStore {
         inner: InMemory::new(),
     });
-    let path = Path::from("scattered.parquet");
+    let path = Path::from("fan-out.parquet");
     let (size, footer) =
         write_grouped_payload_fixture(store.as_ref(), &path, ROWS, GROUP_ROWS).await;
-    // One row per group: 32 positions, well under the 1024 the scan splits at.
-    let positions =
-        RowPositions::from_unsorted((0..ROWS as u64).step_by(GROUP_ROWS).collect::<Vec<_>>());
-    println!(
-        "\nfile {size} B in {} groups, {} positions selected",
-        ROWS / GROUP_ROWS,
-        positions.as_slice().len()
-    );
+    println!("\nfile {size} B in {} groups", ROWS / GROUP_ROWS);
 
-    for (shape, requested) in [("row-id column only", vec![0]), ("payload column", vec![1])] {
-        for (label, fan_out) in [("serial   ", false), ("fanned out", true)] {
-            // A cache identity of its own, so neither run reads the
-            // other's resident footer or ranges.
+    // Scattered is point-lookup shaped and stays one unit today (under the
+    // scan's 1024-position split); bulk is what a located scan of the
+    // whole file costs.
+    let shapes = [
+        (
+            "scattered 32 rows",
+            RowPositions::from_unsorted((0..ROWS as u64).step_by(GROUP_ROWS).collect::<Vec<_>>()),
+        ),
+        (
+            "bulk 65536 rows  ",
+            RowPositions::from_unsorted((0..ROWS as u64).collect::<Vec<_>>()),
+        ),
+    ];
+
+    for (shape, positions) in shapes {
+        for width in [1usize, 2, 4, 8] {
+            // A cache identity of its own, so no run reads another's
+            // resident footer or ranges.
             let file = ParquetFile::new(
                 DataStore::with_cache_identity(
                     store.clone(),
-                    crate::CacheIdentity::new(&format!("{shape}/{label}")),
+                    crate::CacheIdentity::new(&format!("{shape}/{width}")),
                 ),
                 path.clone(),
                 size,
@@ -1030,23 +1036,13 @@ async fn simulated_remote_scattered_selection_bench() {
             let source = RowIdSource::Resolve {
                 row_id_start: Some(0),
             };
+            let requested = Arc::new(vec![0, 1]);
 
             let started = std::time::Instant::now();
-            let rows = if fan_out {
-                let groups = read_workers::row_group_selections(&file, &positions)
+            let rows = if width == 1 {
+                scoped_read_row_stream(file.clone(), &requested, ScopedRows::At(&positions), source)
                     .await
-                    .unwrap();
-                let streams = groups.into_iter().map(|positions| {
-                    prefetched_row_stream(
-                        file.clone(),
-                        Arc::new(requested.clone()),
-                        positions,
-                        source,
-                        Arc::new(ReadWorkers::default()),
-                    )
-                });
-                stream::iter(streams)
-                    .flatten_unordered(8)
+                    .unwrap()
                     .try_fold(
                         0usize,
                         |rows, batch| async move { Ok(rows + batch.num_rows()) },
@@ -1054,9 +1050,20 @@ async fn simulated_remote_scattered_selection_bench() {
                     .await
                     .unwrap()
             } else {
-                scoped_read_row_stream(file.clone(), &requested, ScopedRows::At(&positions), source)
+                let groups = read_workers::row_group_selections(&file, &positions)
                     .await
-                    .unwrap()
+                    .unwrap();
+                let streams = groups.into_iter().map(|positions| {
+                    prefetched_row_stream(
+                        file.clone(),
+                        requested.clone(),
+                        positions,
+                        source,
+                        Arc::new(ReadWorkers::default()),
+                    )
+                });
+                stream::iter(streams)
+                    .flatten_unordered(width)
                     .try_fold(
                         0usize,
                         |rows, batch| async move { Ok(rows + batch.num_rows()) },
@@ -1068,13 +1075,9 @@ async fn simulated_remote_scattered_selection_bench() {
 
             let tally = file.metrics().tally();
             println!(
-                "{shape:<18} {label}: wall {wall:>9.2?}  fetch {:>9.2?}  decode {:>9.2?}  \
-                 {:>3} fetches / {:>3} ranges / {:>8} B  ({rows} rows)",
-                tally.range_duration,
-                tally.decode_duration,
-                tally.range_fetches,
-                tally.ranges,
-                tally.range_bytes
+                "{shape}  width {width}: wall {wall:>9.2?}  fetch {:>9.2?}  decode {:>9.2?}  \
+                 {:>3} fetches / {:>8} B  ({rows} rows)",
+                tally.range_duration, tally.decode_duration, tally.range_fetches, tally.range_bytes
             );
         }
     }
