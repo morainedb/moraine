@@ -9,6 +9,21 @@ namespace moraine_duckdb {
 class MoraineMetadataManager : public duckdb::DuckLakeMetadataManager {
 public:
 	explicit MoraineMetadataManager(duckdb::DuckLakeTransaction &transaction);
+
+	//! Writes each table's inlined rows through the Appender API, falling
+	//! back to the base `INSERT ... VALUES` batch for a table the same
+	//! commit still has to create.
+	duckdb::string
+	WriteNewInlinedData(duckdb::DuckLakeSnapshot &commit_snapshot,
+	                    const duckdb::vector<duckdb::DuckLakeInlinedDataInfo> &new_data,
+	                    const duckdb::vector<duckdb::DuckLakeTableInfo> &new_tables,
+	                    const duckdb::vector<duckdb::DuckLakeTableInfo> &new_inlined_data_tables_result) override;
+
+private:
+	//! One table's rows through the Appender. False means the caller must
+	//! emit the SQL instead: no appender, or no rows.
+	bool TryAppendInlinedData(duckdb::DuckLakeSnapshot &commit_snapshot, const duckdb::string &inlined_table_name,
+	                          const duckdb::DuckLakeInlinedDataInfo &entry, bool has_preserved_row_ids);
 };
 
 //! Registers the manager under the prefix DuckLake extracts from a metadata
