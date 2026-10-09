@@ -97,6 +97,12 @@ jobs:
           submodules: recursive
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask check-pins
+      # `check-pins` reads files; this one fetches the DuckLake each pin
+      # names and applies the series to it in a throwaway index, so a pin
+      # the primary build never touches cannot quietly stop taking the
+      # patches. Otherwise that surfaces only in a per-version release
+      # build, a whole extension compile later.
+      - run: cargo xtask check-patch-pins
 
   # e2e builds the loadable extension through the DuckDB toolchain (`make
   # release`), which compiles DuckDB from the `duckdb` submodule and links

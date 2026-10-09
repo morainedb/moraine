@@ -559,6 +559,24 @@ mod tests {
         );
     }
 
+    /// A release ref is a `v` and a tag body, whatever the release is
+    /// called: a prerelease carries a suffix a patch release does not.
+    #[test]
+    fn a_release_ref_is_a_v_and_a_tag_body() {
+        for version in ["v1.5.6", "v2.0.0-alpha1", "v2.0.0-rc.1", "v2.0"] {
+            assert!(
+                crate::duckdb::is_release(version),
+                "`{version}` names a release"
+            );
+        }
+        for version in ["", "v", "main", "1.5.6", "v 1.5.6", "vnext"] {
+            assert!(
+                !crate::duckdb::is_release(version),
+                "`{version}` names no release"
+            );
+        }
+    }
+
     /// The manifest parses to at least one version, and the primary is the
     /// first of them.
     #[test]
@@ -568,8 +586,8 @@ mod tests {
         assert_eq!(supported[0], duckdb_pin());
         for version in &supported {
             assert!(
-                version.starts_with('v') && version.split('.').count() == 3,
-                "`{version}` is not a `vMAJOR.MINOR.PATCH` DuckDB release"
+                crate::duckdb::is_release(version),
+                "`{version}` names no DuckDB release"
             );
         }
     }
