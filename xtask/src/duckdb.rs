@@ -31,6 +31,16 @@ fn manifest_entries() -> impl Iterator<Item = &'static str> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
 }
 
+/// Whether `version` names a DuckDB release ref: a `v` and a tag body
+/// opening on a digit. No shape beyond that, so a prerelease is a release
+/// like any other.
+pub fn is_release(version: &str) -> bool {
+    version.strip_prefix('v').is_some_and(|body| {
+        body.starts_with(|character: char| character.is_ascii_digit())
+            && !body.contains(char::is_whitespace)
+    })
+}
+
 /// Every DuckDB release moraine builds for, newest first, as
 /// `.github/duckdb-versions` lists them.
 pub fn supported_duckdb_versions() -> Vec<String> {

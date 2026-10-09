@@ -54,8 +54,9 @@ pub fn bump_duckdb(arguments: &[String]) -> anyhow::Result<()> {
         bail!("usage: cargo xtask bump-duckdb <version>, e.g. `cargo xtask bump-duckdb v1.5.6`");
     };
     ensure!(
-        version.starts_with('v') && version.split('.').count() == 3,
-        "`{version}` is not a `vMAJOR.MINOR.PATCH` DuckDB release"
+        crate::duckdb::is_release(version),
+        "`{version}` is not a DuckDB release ref, which is a `v` and a tag \
+         body opening on a digit"
     );
 
     let previous = duckdb_pin().to_owned();

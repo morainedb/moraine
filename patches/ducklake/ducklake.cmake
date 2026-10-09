@@ -7,8 +7,12 @@ find_package(Git REQUIRED)
 if(DEFINED DUCKLAKE_PATCH_SOURCE AND NOT DUCKLAKE_PATCH_SOURCE STREQUAL "")
     set(moraine_patched_ducklake_SOURCE_DIR "${DUCKLAKE_PATCH_SOURCE}")
 else()
+    # Every entry line, whatever the release is called: a prerelease carries
+    # a suffix the digits of a patch release do not, and matching on those
+    # digits left its pin unselectable. `check-pins` holds the file to one
+    # pin per supported release.
     file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/source-pins" DUCKLAKE_SOURCE_PINS
-        REGEX "^v[0-9]+\\.[0-9]+\\.[0-9]+ ")
+        REGEX "^v[0-9]")
     set(DUCKLAKE_SOURCE_COMMIT "")
     foreach(PIN IN LISTS DUCKLAKE_SOURCE_PINS)
         string(REPLACE " " ";" PIN_FIELDS "${PIN}")
