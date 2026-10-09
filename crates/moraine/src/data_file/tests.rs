@@ -2157,9 +2157,10 @@ async fn row_group_selections_preserve_physical_positions() {
     );
 }
 
-/// Concurrent readers use bounded workers and release permits on cancellation.
+/// Concurrent readers run no more workers than the consumer polls, and
+/// cancellation retires every one of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn selective_read_workers_are_bounded_and_cancelled() {
+async fn selective_read_workers_are_tracked_and_cancelled() {
     let store = Arc::new(InMemory::new());
     let path = Path::from("parallel-read.parquet");
     let (size, footer) = write_grouped_fixture(store.as_ref(), &path, 65_536, 2048).await;
@@ -2185,7 +2186,9 @@ async fn selective_read_workers_are_bounded_and_cancelled() {
         batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
         4 * 65_536
     );
-    assert!(workers.peak() <= read_worker_limit());
+    // Two streams are polled at a time, and a worker only runs while its
+    // stream is polled.
+    assert!(workers.peak() <= 2);
     assert!(workers.peak() > 0);
 
     let mut idle = Vec::new();
@@ -2214,7 +2217,7 @@ async fn selective_read_workers_are_bounded_and_cancelled() {
     assert!(
         tokio::time::timeout(Duration::from_secs(2), pending.try_next())
             .await
-            .expect("paused consumers must not hold the shared read permits")
+            .expect("a paused consumer must not stall another reader")
             .unwrap()
             .is_some()
     );
@@ -2227,6 +2230,165 @@ async fn selective_read_workers_are_bounded_and_cancelled() {
     })
     .await
     .unwrap();
+}
+
+/// Holds every payload read until `expected` of them are in flight at once,
+/// then lets all later reads straight through. A set of reads that cannot
+/// reach the store together fails the gate by timeout rather than by
+/// timing.
+#[derive(Debug)]
+struct GatedStore {
+    inner: InMemory,
+    expected: usize,
+    arrived: AtomicUsize,
+    tripped: std::sync::atomic::AtomicBool,
+    gate: tokio::sync::Semaphore,
+}
+
+impl GatedStore {
+    fn new(expected: usize) -> Self {
+        Self {
+            inner: InMemory::new(),
+            expected,
+            arrived: AtomicUsize::new(0),
+            tripped: std::sync::atomic::AtomicBool::new(false),
+            gate: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    async fn gate(&self) {
+        if self.tripped.load(Ordering::Acquire) {
+            return;
+        }
+        if self.arrived.fetch_add(1, Ordering::AcqRel) + 1 >= self.expected {
+            self.tripped.store(true, Ordering::Release);
+            // Permits persist, so a reader arriving after the trip is let
+            // through without racing the release.
+            self.gate.add_permits(self.expected);
+            return;
+        }
+        if let Ok(permit) = self.gate.acquire().await {
+            permit.forget();
+        }
+    }
+}
+
+impl std::fmt::Display for GatedStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GatedStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for GatedStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if !options.head {
+            self.gate().await;
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.gate().await;
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Readers on separate cursors reach the store together: one cursor's
+/// decoding does not stand between another's and its first byte range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readers_on_separate_cursors_reach_the_store_together() {
+    const ROWS: usize = 8_192;
+    let readers = read_worker_limit() + 1;
+    let store = Arc::new(GatedStore::new(readers));
+
+    let mut files = Vec::new();
+    for index in 0..readers {
+        let path = Path::from(format!("together-{index}.parquet"));
+        let (size, footer) = write_grouped_fixture(store.as_ref(), &path, ROWS, 2048).await;
+        files.push(ParquetFile::new(
+            DataStore::new(store.clone()),
+            path,
+            size,
+            footer,
+        ));
+    }
+
+    let streams = files.into_iter().map(|file| {
+        prefetched_row_stream(
+            file,
+            Arc::new(vec![0]),
+            RowPositions::from_unsorted((0..ROWS as u64).collect()),
+            RowIdSource::Resolve {
+                row_id_start: Some(0),
+            },
+            Arc::new(ReadWorkers::default()),
+        )
+    });
+
+    let batches = tokio::time::timeout(
+        Duration::from_secs(10),
+        stream::iter(streams)
+            .flatten_unordered(readers)
+            .try_collect::<Vec<_>>(),
+    )
+    .await
+    .expect("a read shared across cursors must not gate another cursor's first range")
+    .unwrap();
+
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        readers * ROWS
+    );
 }
 
 /// A row-group read emits only that group, at the group's file ordinals,
