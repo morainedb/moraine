@@ -1269,6 +1269,80 @@ async fn simulated_remote_selection_fan_out_bench() {
     }
 }
 
+/// What a cursor's decoding costs the runtime it shares with SlateDB's
+/// flush and compaction: a heartbeat's worst lateness on a two-worker
+/// runtime, alone and against a full-width fan-out decoding from a local
+/// store. Decides whether decode belongs on the blocking pool.
+/// Run with:
+/// `cargo test -p moraine --lib -- --ignored --nocapture runtime_starvation`
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "timing probe; run manually with --nocapture"]
+async fn simulated_runtime_starvation_bench() {
+    const ROWS: usize = 65_536;
+    const GROUP_ROWS: usize = 2_048;
+    const BEATS: usize = 300;
+    const INTERVAL: Duration = Duration::from_millis(1);
+
+    // Local store: no request latency, so every millisecond a reader takes
+    // is a millisecond of decoding on a runtime worker.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = Path::from("starvation.parquet");
+    let (size, footer) =
+        write_grouped_payload_fixture(store.as_ref(), &path, ROWS, GROUP_ROWS).await;
+
+    // The heartbeat stands in for the flush and compaction work that shares
+    // an attached catalog's runtime.
+    let heartbeat = || async {
+        let mut worst = Duration::ZERO;
+        for _ in 0..BEATS {
+            let started = std::time::Instant::now();
+            tokio::time::sleep(INTERVAL).await;
+            worst = worst.max(started.elapsed().saturating_sub(INTERVAL));
+        }
+        worst
+    };
+
+    let idle = heartbeat().await;
+
+    let readers = read_worker_limit();
+    let beating = tokio::spawn(async move { heartbeat().await });
+    let file = ParquetFile::new(
+        DataStore::with_cache_identity(Arc::clone(&store), crate::CacheIdentity::new("starved")),
+        path,
+        size,
+        footer,
+    );
+    let positions = RowPositions::from_unsorted((0..ROWS as u64).collect::<Vec<_>>());
+    let groups = read_workers::row_group_selections(&file, &positions)
+        .await
+        .unwrap();
+    let streams = groups.into_iter().map(|positions| {
+        prefetched_row_stream(
+            file.clone(),
+            Arc::new(vec![0, 1]),
+            positions,
+            RowIdSource::Resolve {
+                row_id_start: Some(0),
+            },
+            Arc::new(ReadWorkers::default()),
+        )
+    });
+    let rows = stream::iter(streams)
+        .flatten_unordered(readers)
+        .try_fold(
+            0usize,
+            |rows, batch| async move { Ok(rows + batch.num_rows()) },
+        )
+        .await
+        .unwrap();
+    let loaded = beating.await.unwrap();
+
+    println!(
+        "\nheartbeat worst lateness over {BEATS} beats: idle {idle:>9.2?}, under {readers} \
+         decoding readers {loaded:>9.2?}  ({rows} rows)"
+    );
+}
+
 /// Writes `batch` to `path` as a Parquet object, returning its byte size.
 pub(super) async fn write_fixture(
     object_store: &InMemory,

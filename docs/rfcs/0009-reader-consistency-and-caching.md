@@ -1327,6 +1327,12 @@ spent 1.11 s and 18 ms. Overlapping fetches with each other is therefore
 what moves wall time — the same selection costs 597 ms across two read
 units and 328 ms across four — while overlapping a fetch with a decode
 cannot recover more than the decode, and is not worth a pipeline.
+Decoding stays on the runtime's own workers rather than a blocking pool:
+on a two-worker runtime a full-width fan-out decoding from a local store —
+the adversarial case, since a remote read spends its time waiting — pushed
+a one-millisecond heartbeat's worst lateness from 1.4 ms to 10 ms, a delay
+rather than the stall the worker floor exists to prevent, and a blocking
+task could not be cancelled when its cursor is dropped.
 
 **Every data-file read is admitted against one process-wide bound.** The
 paths that read one — scoped reads, delete files, footers, sidecars, and
