@@ -406,7 +406,11 @@ impl LocatedRowScan {
             let mut units = Vec::new();
             for (file, file_id, positions, row_id_start) in files {
                 let started = Arc::new(AtomicBool::new(false));
-                let groups = if parallelism > 1 && positions.as_slice().len() >= 1024 {
+                // Partitioning reads the footer row counts the scan loads to
+                // open the file anyway, so there is no selection small enough
+                // that splitting it costs a request. A single-group selection
+                // yields one unit and fans out to nothing.
+                let groups = if parallelism > 1 {
                     data_file::row_group_selections(&file, &positions).await?
                 } else {
                     vec![positions]
@@ -422,6 +426,7 @@ impl LocatedRowScan {
                 }
             }
             let parallelism = parallelism.min(units.len().max(1));
+
             Ok::<_, Error>(
                 stream::iter(units)
                     .map(move |(file, file_id, positions, row_id_start, started)| {
@@ -429,6 +434,7 @@ impl LocatedRowScan {
                         let names = names.clone();
                         let opened = opened.clone();
                         let workers = read_workers.clone();
+
                         stream::once(async move {
                             if !started.swap(true, Ordering::Relaxed) {
                                 opened.fetch_add(1, Ordering::Relaxed);
@@ -447,6 +453,7 @@ impl LocatedRowScan {
                                 )
                                 .await?
                             };
+
                             Ok::<_, Error>(batches.map(move |batch| {
                                 data_file::located_batch(&batch?, &names, Some(file_id.get()))
                             }))
@@ -458,6 +465,7 @@ impl LocatedRowScan {
             )
         })
         .try_flatten();
+
         Self {
             batches: inline.chain(files).boxed(),
             files_read,

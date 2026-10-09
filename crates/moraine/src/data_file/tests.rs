@@ -998,12 +998,14 @@ async fn simulated_remote_selection_fan_out_bench() {
     const ROWS: usize = 65_536;
     const GROUP_ROWS: usize = 2_048;
 
-    let store = Arc::new(LatencyStore {
+    let remote: Arc<dyn ObjectStore> = Arc::new(LatencyStore {
         inner: InMemory::new(),
     });
+    let local: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let path = Path::from("fan-out.parquet");
     let (size, footer) =
-        write_grouped_payload_fixture(store.as_ref(), &path, ROWS, GROUP_ROWS).await;
+        write_grouped_payload_fixture(remote.as_ref(), &path, ROWS, GROUP_ROWS).await;
+    write_grouped_payload_fixture(local.as_ref(), &path, ROWS, GROUP_ROWS).await;
     println!("\nfile {size} B in {} groups", ROWS / GROUP_ROWS);
 
     // Scattered is point-lookup shaped and stays one unit today (under the
@@ -1020,65 +1022,76 @@ async fn simulated_remote_selection_fan_out_bench() {
         ),
     ];
 
-    for (shape, positions) in shapes {
-        for width in [1usize, 2, 4, 8] {
-            // A cache identity of its own, so no run reads another's
-            // resident footer or ranges.
-            let file = ParquetFile::new(
-                DataStore::with_cache_identity(
-                    store.clone(),
-                    crate::CacheIdentity::new(&format!("{shape}/{width}")),
-                ),
-                path.clone(),
-                size,
-                footer,
-            );
-            let source = RowIdSource::Resolve {
-                row_id_start: Some(0),
-            };
-            let requested = Arc::new(vec![0, 1]);
+    for (transport, store) in [("remote", &remote), ("local ", &local)] {
+        for (shape, positions) in &shapes {
+            for width in [1usize, 2, 4, 8] {
+                // A cache identity of its own, so no run reads another's
+                // resident footer or ranges.
+                let file = ParquetFile::new(
+                    DataStore::with_cache_identity(
+                        Arc::clone(store),
+                        crate::CacheIdentity::new(&format!("{transport}/{shape}/{width}")),
+                    ),
+                    path.clone(),
+                    size,
+                    footer,
+                );
+                let source = RowIdSource::Resolve {
+                    row_id_start: Some(0),
+                };
+                let requested = Arc::new(vec![0, 1]);
 
-            let started = std::time::Instant::now();
-            let rows = if width == 1 {
-                scoped_read_row_stream(file.clone(), &requested, ScopedRows::At(&positions), source)
-                    .await
-                    .unwrap()
-                    .try_fold(
-                        0usize,
-                        |rows, batch| async move { Ok(rows + batch.num_rows()) },
-                    )
-                    .await
-                    .unwrap()
-            } else {
-                let groups = read_workers::row_group_selections(&file, &positions)
-                    .await
-                    .unwrap();
-                let streams = groups.into_iter().map(|positions| {
-                    prefetched_row_stream(
+                let positions = positions.clone();
+                let started = std::time::Instant::now();
+                let rows = if width == 1 {
+                    scoped_read_row_stream(
                         file.clone(),
-                        requested.clone(),
-                        positions,
+                        &requested,
+                        ScopedRows::At(&positions),
                         source,
-                        Arc::new(ReadWorkers::default()),
                     )
-                });
-                stream::iter(streams)
-                    .flatten_unordered(width)
+                    .await
+                    .unwrap()
                     .try_fold(
                         0usize,
                         |rows, batch| async move { Ok(rows + batch.num_rows()) },
                     )
                     .await
                     .unwrap()
-            };
-            let wall = started.elapsed();
+                } else {
+                    let groups = read_workers::row_group_selections(&file, &positions)
+                        .await
+                        .unwrap();
+                    let streams = groups.into_iter().map(|positions| {
+                        prefetched_row_stream(
+                            file.clone(),
+                            requested.clone(),
+                            positions,
+                            source,
+                            Arc::new(ReadWorkers::default()),
+                        )
+                    });
+                    stream::iter(streams)
+                        .flatten_unordered(width)
+                        .try_fold(
+                            0usize,
+                            |rows, batch| async move { Ok(rows + batch.num_rows()) },
+                        )
+                        .await
+                        .unwrap()
+                };
+                let wall = started.elapsed();
 
-            let tally = file.metrics().tally();
-            println!(
-                "{shape}  width {width}: wall {wall:>9.2?}  fetch {:>9.2?}  decode {:>9.2?}  \
+                let tally = file.metrics().tally();
+                println!(
+                    "{transport}  {shape}  width {width}: wall {wall:>9.2?}  fetch {:>9.2?}  decode {:>9.2?}  \
                  {:>3} fetches / {:>8} B  ({rows} rows)",
-                tally.range_duration, tally.decode_duration, tally.range_fetches, tally.range_bytes
-            );
+                    tally.range_duration,
+                    tally.decode_duration,
+                    tally.range_fetches,
+                    tally.range_bytes
+                );
+            }
         }
     }
 }
