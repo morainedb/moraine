@@ -1224,9 +1224,9 @@ Summary-driven indexed scans are selected automatically by eligibility and
 physical coverage. There is no SQL on/off setting for this rewrite. The
 `moraine_summary_scan` operator remains in query plans; only its former
 Boolean session setting is removed.
-`moraine_summary_scan_threads` defaults to two and limits file/row-group prefetch
+`moraine_summary_scan_threads` defaults to four and limits file/row-group prefetch
 for both summary scans and `moraine_rows_at`; the
-effective count also respects DuckDB's thread count and the core shared ceiling.
+effective count also respects DuckDB's thread count and the per-cursor ceiling.
 
 The additive `moraine_row_scan_next_arrow` exports an owned Arrow C Data pair
 and a `has_batch` flag. On success with a batch the caller releases both structs

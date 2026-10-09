@@ -59,6 +59,18 @@ async fn scoped_read_entries(
     .await
 }
 
+/// The read-worker ceiling follows the machine's cores, clamped to
+/// `[2, 8]`.
+#[test]
+fn read_worker_limit_is_the_core_count_clamped() {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+
+    let derived = read_worker_limit();
+
+    assert_eq!(derived, cores.clamp(2, 8));
+    assert!((2..=8).contains(&derived));
+}
+
 /// The encoding permit count follows the machine's cores, clamped to
 /// `[4, 32]`.
 #[test]

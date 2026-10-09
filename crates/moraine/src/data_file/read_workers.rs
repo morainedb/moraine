@@ -18,11 +18,16 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use super::{ParquetFile, RowIdSource, RowPositions, ScopedRows, scoped_read_row_stream};
 use crate::error::{Error, Result};
 
-/// Prefetch workers one cursor may run at once. A worker fetches and
-/// decodes in the same step, so this bounds decoding and the queued
-/// batches that come with it, per cursor rather than per process.
+/// Prefetch workers one cursor may run at once, per cursor rather than
+/// per process.
+///
+/// A scoped read spends almost all of its time waiting on the store, so
+/// the ceiling follows the requests an object store will serve at once
+/// rather than the cores available to decode them. The floor keeps a
+/// two-core machine overlapping at all; the ceiling stands until a
+/// store-level admission bound replaces it.
 pub(crate) fn read_worker_limit() -> usize {
-    std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 2).clamp(1, 4))
+    std::thread::available_parallelism().map_or(2, |cores| cores.get().clamp(2, 8))
 }
 
 /// Partitions exact file positions into nonempty row-group work units.
