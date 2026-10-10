@@ -553,11 +553,11 @@ duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context,
 		for (auto &key : keys) {
 			// A whole NULL row cannot make an IN predicate true. Skipping it
 			// here also avoids asking StructValue for a NULL payload.
-			if (key.IsNull() && key.type().id() == duckdb::LogicalTypeId::STRUCT) {
+			if (key.IsNull() && duckdb::StructType::IsStruct(key.type())) {
 				continue;
 			}
 			auto &values = key_values.emplace_back();
-			if (key.type().id() == duckdb::LogicalTypeId::STRUCT) {
+			if (duckdb::StructType::IsStruct(key.type())) {
 				auto &children = duckdb::StructValue::GetChildren(key);
 				values.reserve(children.size());
 				for (auto &child : children) {
@@ -677,7 +677,7 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 			return;
 		}
 		duckdb::vector<duckdb::Value> columns;
-		if (value.type().id() == duckdb::LogicalTypeId::STRUCT) {
+		if (duckdb::StructType::IsStruct(value.type())) {
 			columns = duckdb::StructValue::GetChildren(value);
 		} else {
 			columns.push_back(value);
