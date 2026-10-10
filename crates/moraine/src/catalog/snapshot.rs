@@ -577,6 +577,17 @@ impl CatalogSnapshot {
             .map(index_info)
     }
 
+    /// The table's ready equality index on exactly `columns`, by field id in
+    /// that order, for a reader deciding whether a filter can be answered
+    /// from an index. Indexes still building, maintaining or poisoned refuse
+    /// lookups, so they are not returned.
+    #[must_use]
+    pub fn index_on_columns(&self, table: TableId, columns: &[ColumnId]) -> Option<IndexInfo> {
+        self.indexes_of(table)
+            .into_iter()
+            .find(|index| index.state == IndexState::Ready && index.columns.as_slice() == columns)
+    }
+
     /// The table's data directory (`<schema path><table path>`), itself
     /// relative to `DATA_PATH` — the prefix a relative data-file path
     /// resolves under.
@@ -1436,6 +1447,50 @@ mod tests {
                 std::ptr::from_ref(&next.data_files[&99][&99])
             ),
             "mutating a snapshot copied another table's files"
+        );
+    }
+
+    /// A filter finds an index by the columns it covers, in order, and only
+    /// a ready one: the others refuse lookups.
+    #[test]
+    fn an_index_is_found_by_its_columns_when_it_is_ready() {
+        let mut state = CatalogSnapshot::default();
+        state.put_index(IndexValue {
+            table_id: 1,
+            index_id: 2,
+            index_name: "by_key".into(),
+            column_ids: vec![7],
+            ..Default::default()
+        });
+        state.put_index(IndexValue {
+            table_id: 1,
+            index_id: 3,
+            index_name: "by_pair".into(),
+            column_ids: vec![7, 8],
+            build_state: Some("building".into()),
+            ..Default::default()
+        });
+        let table = TableId::new(1);
+        let column = |id| ColumnId::new(id);
+
+        assert_eq!(
+            state
+                .index_on_columns(table, &[column(7)])
+                .map(|index| index.name),
+            Some("by_key".to_string())
+        );
+        // A building index refuses lookups, so it is not offered.
+        assert!(
+            state
+                .index_on_columns(table, &[column(7), column(8)])
+                .is_none()
+        );
+        // Column order is part of the match, and an unindexed column has none.
+        assert!(state.index_on_columns(table, &[column(8)]).is_none());
+        assert!(
+            state
+                .index_on_columns(TableId::new(2), &[column(7)])
+                .is_none()
         );
     }
 

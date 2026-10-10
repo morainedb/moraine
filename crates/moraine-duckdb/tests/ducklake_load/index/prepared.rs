@@ -381,7 +381,11 @@ fn prepared_index_reads_reuse_probes_inside_a_writing_transaction() {
             .filter(|row| row[0] == "lookups")
             .map(|row| row[1].as_str())
             .collect();
-        assert_eq!(lookups, vec!["1", "1", "1", "2"], "limit={limit}: {output}");
+        // The third reading counts one lookup the probe did not make: the
+        // `DELETE` filters on the indexed column, so its scan asks the index
+        // which files can hold a match. The probe's own lookup is still
+        // reused across both executions inside the transaction.
+        assert_eq!(lookups, vec!["1", "1", "2", "3"], "limit={limit}: {output}");
         let hits: Vec<_> = rows
             .iter()
             .filter(|row| row[0] == "hits")

@@ -1,5 +1,7 @@
 #include "metadata_manager.hpp"
 
+#include "index_pushdown.hpp"
+
 #include "common/ducklake_util.hpp"
 #include "common/index.hpp"
 #include "storage/ducklake_catalog.hpp"
@@ -37,6 +39,50 @@ duckdb::unique_ptr<duckdb::QueryResult> MoraineMetadataManager::Query(duckdb::st
 duckdb::unique_ptr<duckdb::QueryResult> MoraineMetadataManager::AttachMetadata(const duckdb::string &attach_query) {
 	RecordDrivingContext();
 	return duckdb::DuckLakeMetadataManager::AttachMetadata(attach_query);
+}
+
+namespace {
+
+// Drops every committed data file the index excluded. Inlined and
+// transaction-local entries stay: the first is not in the file list the
+// lookup placed rows in, and the second holds rows no committed index has
+// seen.
+template <class Entry>
+void PruneToCandidates(duckdb::vector<Entry> &files,
+                       const std::optional<std::unordered_set<uint64_t>> &candidates) {
+	if (!candidates) {
+		return;
+	}
+	for (duckdb::idx_t position = 0; position < files.size();) {
+		auto &entry = files[position];
+		// A transaction-local id belongs to a file this transaction wrote,
+		// which no committed index has seen.
+		auto prunable = entry.data_type == duckdb::DuckLakeDataType::DATA_FILE && entry.file_id.IsValid() &&
+		                entry.file_id.index < duckdb::DuckLakeConstants::TRANSACTION_LOCAL_ID_START;
+		if (prunable && candidates->count(entry.file_id.index) == 0) {
+			files.erase_at(position);
+			continue;
+		}
+		position++;
+	}
+}
+
+} // namespace
+
+duckdb::vector<duckdb::DuckLakeFileListEntry>
+MoraineMetadataManager::GetFilesForTable(duckdb::DuckLakeTableEntry &table, duckdb::DuckLakeSnapshot snapshot,
+                                         const duckdb::FilterPushdownInfo *filter_info) {
+	auto files = DuckLakeMetadataManager::GetFilesForTable(table, snapshot, filter_info);
+	PruneToCandidates(files, IndexCandidateFiles(transaction, table, snapshot, filter_info));
+	return files;
+}
+
+duckdb::vector<duckdb::DuckLakeFileListExtendedEntry>
+MoraineMetadataManager::GetExtendedFilesForTable(duckdb::DuckLakeTableEntry &table, duckdb::DuckLakeSnapshot snapshot,
+                                                 const duckdb::FilterPushdownInfo *filter_info) {
+	auto files = DuckLakeMetadataManager::GetExtendedFilesForTable(table, snapshot, filter_info);
+	PruneToCandidates(files, IndexCandidateFiles(transaction, table, snapshot, filter_info));
+	return files;
 }
 
 bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &commit_snapshot,

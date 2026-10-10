@@ -920,6 +920,67 @@ The current DuckLake catalog view stays authoritative for file lifetime.
 Ended compaction inputs are simply absent, new outputs are cache misses, and
 nothing pairs sources with outputs or hooks catalog changes.
 
+### A plain predicate reaches the index through the file list
+
+The rule above needs a lookup in the query. An ordinary `WHERE key = 'x'`
+has none, and DuckLake's own column statistics prune nothing once the key is
+scattered — every file's min/max spans every key. The filters DuckLake
+pushes down reach moraine anyway: it hands them to the metadata manager
+while building the file list, keyed by **field id**, which is the identity an
+index is declared on. So the registered manager answers them from the index
+and returns a shorter list, before any reader opens a file.
+
+`GetFilesForTable` and `GetExtendedFilesForTable` both do it — a scan takes
+whichever suits what it needs per file — by calling the base and then
+dropping the committed data files the index excluded. Equality against a
+constant is the only shape taken: ranges, `IN` lists and null checks are
+answerable from an index too, but through probes that take more than one
+key.
+
+Pruning is only ever the narrowing of a correct list, so every uncertainty
+declines and leaves it whole:
+
+- **Another snapshot.** The index resolves against the revision this
+  transaction's metadata reads are pinned to, so a list built for any other
+  snapshot — time travel above all — describes a different cut, and a lookup
+  at this one says nothing about which files held a row then.
+- **An unplaced row.** A hit the lookup could not place, or one living in
+  inlined data, could be anywhere the list describes.
+- **No index, or one not ready.** Building, maintaining and poisoned indexes
+  refuse lookups, so `index_on_columns` does not offer them.
+- **A read that failed.** The statement still answers from every file; the
+  decline is logged rather than raised. An interrupt is the exception, since
+  the caller asked for the statement to stop.
+
+Transaction-local rows need no condition: DuckLake appends those entries
+after the hook returns, so they are never in the list this prunes.
+
+What it does not narrow is the *rows* read inside a surviving file. Deleting
+one row by key from a 100,000-row lake in two files, keys permuted so that
+statistics prune nothing:
+
+| how the row is named | files read | Parquet bytes read |
+| --- | --- | --- |
+| `WHERE a = k`, no index | 2 | 477,245 |
+| `WHERE a = k`, pruned by this path | 1 | 238,622 |
+| `USING moraine_index_lookup(…)`, the rule above | 1 | 2,923 |
+| `moraine_delete_located(…)` | — | 0 |
+
+So the file list is worth the file it drops and nothing more: what remains
+is the filter column swept across the surviving file, and only naming the
+rows removes it. The rule above does that today for a lookup in the query —
+it pushes `rowid` and `data_file_id` as scan filters, and the reader skips to
+the row group holding that id. Carrying the same filters for an indexed
+equality would reach the third row from the first, without the join; it
+stays sound under a residual predicate, because pushed filters only narrow
+what the scan reads while the scan still evaluates the predicate in full.
+Rewriting the DML into the positional path instead reaches the fourth row,
+reads nothing, and is sound only where the index answers the predicate
+exactly — a residual condition would delete rows that do not match it.
+
+(The last row reads nothing *through DuckDB's reader*; the positions come
+from moraine's own file-row summaries, which that counter does not see.)
+
 ### Snapshot-validated index plans
 
 #### Contract

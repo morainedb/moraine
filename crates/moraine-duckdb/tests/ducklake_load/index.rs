@@ -3,6 +3,7 @@ use std::fmt::Write;
 use crate::helpers::*;
 
 mod prepared;
+mod pushdown;
 mod schema_evolution;
 mod selective;
 mod wide_filter;

@@ -325,6 +325,118 @@ pub unsafe extern "C" fn moraine_index_lookup_free(items: *mut MoraineRowId, len
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
+/// The files that can hold rows whose `field_id` column equals `value`, for
+/// a scan to prune its file list by.
+///
+/// `out_prunable` is false when the answer cannot be trusted to be
+/// complete — no ready index covers that column on its own, the value is
+/// NULL, or a matching row could not be placed in a file — and the caller
+/// must then read every file. An empty list with `out_prunable` set means
+/// no file can hold a matching row.
+///
+/// Reads through `handle`, so a borrowed alias from a scoped snapshot
+/// answers at that snapshot's revision — which is what makes the answer
+/// usable for a file list built at the same revision.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `value` points to one
+/// value whose string/bytes fields (if used) are valid; `err`, if non-null,
+/// must be writable.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn moraine_index_candidate_files(
+    handle: *mut MoraineCatalogHandle,
+    schema_name: *const c_char,
+    table_name: *const c_char,
+    field_id: u64,
+    value: *const MoraineLookupValue,
+    out_items: *mut *mut u64,
+    out_len: *mut usize,
+    out_prunable: *mut bool,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<u64>, AbiError> {
+        if out_prunable.is_null() {
+            return Err(AbiError::invalid_argument("`out_prunable` is null"));
+        }
+        if value.is_null() {
+            return Err(AbiError::invalid_argument("`value` is null"));
+        }
+        // SAFETY: checked non-null above. Only the prunable path raises it.
+        unsafe { *out_prunable = false };
+        // SAFETY: caller contract for the string pointers.
+        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+        // SAFETY: caller contract.
+        let table = unsafe { borrow_str(table_name, "table_name") }?;
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+        }?;
+        let table_id = resolve_table(&snapshot, schema, table)?;
+        let Some(index) = snapshot.index_on_columns(table_id, &[moraine::ColumnId::new(field_id)])
+        else {
+            return Ok(Vec::new());
+        };
+        let columns = snapshot.columns_of(table_id);
+        // SAFETY: non-null checked; caller contract for the value's
+        // string/bytes fields.
+        let raw_values = unsafe { std::slice::from_raw_parts(value, 1) };
+        // SAFETY: caller contract for the value's string/bytes fields.
+        let Some(key) =
+            unsafe { coerce_index_key(&index, &index.name, table_id, &columns, raw_values) }?
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+        else {
+            // A NULL is not an equality key; `IS NULL` is a different probe.
+            return Ok(Vec::new());
+        };
+
+        let lookup = handle_ref
+            .catalog
+            .reads()
+            .index_lookup(table_id, index.id, &key);
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let rows = unsafe { abi_located_row_ids(handle_ref, probe, probe_ctx, table_id, lookup) }?;
+        if rows.iter().any(|row| !row.has_data_file_id) {
+            // A row this lookup could not place may live in any file, and a
+            // live inlined row is not in the file list at all; neither can
+            // be pruned around.
+            return Ok(Vec::new());
+        }
+
+        let mut files: Vec<u64> = rows.iter().map(|row| row.data_file_id).collect();
+        files.sort_unstable();
+        files.dedup();
+        // SAFETY: checked non-null above.
+        unsafe { *out_prunable = true };
+        Ok(files)
+    };
+
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
+}
+
+/// Frees the array a [`moraine_index_candidate_files`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_index_candidate_files`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_index_candidate_files_free(items: *mut u64, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |_| {});
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
 /// Resolves an `IN` lookup to the union of rows holding any complete key.
 /// Each key is coerced to the indexed columns' canonical types. Duplicate
 /// keys are probed once; a key containing NULL matches no row; an empty key
