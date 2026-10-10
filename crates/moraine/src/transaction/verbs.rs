@@ -1394,7 +1394,6 @@ impl Transaction {
             mapping_id: None,
             partial_max: None,
             partition_values: file_partition_values(&file.partition_values),
-            // Supplied by the writer's INSERT, not by this verb.
             row_group_count: None,
         });
         for entry in file.column_stats {
@@ -2345,7 +2344,6 @@ impl Transaction {
             mapping_id: None,
             partial_max: flush.partial_max.map(SnapshotId::get),
             partition_values: file_partition_values(&flush.file.partition_values),
-            // Supplied by the writer's INSERT, not by this verb.
             row_group_count: None,
         });
         for entry in &flush.file.column_stats {
@@ -2373,14 +2371,23 @@ impl Transaction {
     }
 }
 
-/// Refuses the global `encrypted` key, which is fixed at catalog creation.
+/// Refuses the global keys that are store facts rather than settings:
+/// `encrypted` is fixed at catalog creation, and `version` names the
+/// catalog shape, which only a migration moves.
 fn reserved_option(scope: OptionScope, key: &str) -> Result<()> {
-    if scope == OptionScope::Global && key == "encrypted" {
-        return Err(Error::Constraint(
-            "the global `encrypted` option is fixed at catalog creation".to_string(),
-        ));
+    if scope != OptionScope::Global {
+        return Ok(());
     }
-    Ok(())
+    match key {
+        "encrypted" => Err(Error::Constraint(
+            "the global `encrypted` option is fixed at catalog creation".to_string(),
+        )),
+        "version" => Err(Error::Constraint(
+            "the global `version` option names the catalog shape; only a migration moves it"
+                .to_string(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Refuses an empty name; `what` names the rejected item in the error.
@@ -3502,6 +3509,27 @@ mod tests {
 
     /// The global `encrypted` option is fixed at catalog creation: set and
     /// unset both refuse it, while a non-global `encrypted` key (or any
+    #[test]
+    fn global_version_option_is_reserved() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+
+        assert!(matches!(
+            transaction.set_option(OptionScope::Global, "version", "1.1-dev1"),
+            Err(Error::Constraint(_))
+        ));
+        assert!(matches!(
+            transaction.unset_option(OptionScope::Global, "version"),
+            Err(Error::Constraint(_))
+        ));
+
+        // Table scope is a user setting of the same name, not the fact.
+        transaction
+            .set_option(OptionScope::Table(t), "version", "x")
+            .unwrap();
+    }
+
     /// other global key) stays writable.
     #[test]
     fn global_encrypted_option_is_reserved() {

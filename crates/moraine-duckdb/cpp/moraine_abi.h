@@ -1431,6 +1431,18 @@ int32_t moraine_data_path(struct MoraineCatalogHandle *handle,
                           char **out,
                           struct MoraineError *err);
 
+// Writes the DuckLake catalog version this store serves to `*out`, as a
+// NUL-terminated string to free exactly once with [`moraine_string_free`].
+//
+// # Safety
+// `handle` is live and exclusively accessed; `out` is writable; `err` is
+// writable when non-null.
+int32_t moraine_catalog_version(struct MoraineCatalogHandle *handle,
+                                MoraineInterruptProbe probe,
+                                void *probe_ctx,
+                                char **out,
+                                struct MoraineError *err);
+
 // Applies every structural format migration this binary carries that the
 // store at `path` still needs. Opens the store itself; a store carrying a
 // migration marker is one an attach refuses.

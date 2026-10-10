@@ -69,6 +69,22 @@ async fn concurrent_first_metadata_reads_agree() {
     Arc::into_inner(catalog).unwrap().close().await.unwrap();
 }
 
+/// A catalog records the DuckLake catalog version it serves, so the shape
+/// the extension reports can follow it rather than a build-time constant.
+#[tokio::test]
+async fn catalog_version_is_recorded_at_bootstrap() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let head = catalog.snapshot().await.unwrap();
+
+    assert_eq!(
+        head.option(OptionScope::Global, "version").as_deref(),
+        Some("1.0")
+    );
+    catalog.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn encrypted_flag_is_fixed_at_bootstrap() {
     // A fresh store bootstraps with the requested flag as the stored

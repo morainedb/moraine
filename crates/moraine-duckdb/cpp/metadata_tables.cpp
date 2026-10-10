@@ -769,8 +769,18 @@ std::vector<std::vector<duckdb::Value>> FixedMetadataRows(MoraineCatalogHandle *
 	}
 	auto null_varchar = duckdb::Value(duckdb::LogicalType::VARCHAR);
 	auto null_bigint = duckdb::Value(duckdb::LogicalType::BIGINT);
+	// The catalog version is the store's, not this build's: the shape served
+	// below follows it, and a migration is what moves it.
+	char *version = nullptr;
+	MoraineError version_err {};
+	if (moraine_catalog_version(handle, probe, probe_ctx, &version, &version_err) != MORAINE_OK) {
+		ThrowMoraineError(version_err);
+	}
+	std::string served_version(version == nullptr ? "" : version);
+	moraine_string_free(version);
+
 	std::vector<std::vector<duckdb::Value>> rows = {
-	    {Varchar("version"), Varchar("1.0"), null_varchar, null_bigint},
+	    {Varchar("version"), Varchar(served_version.c_str()), null_varchar, null_bigint},
 	    {Varchar("created_by"), Varchar("moraine"), null_varchar, null_bigint},
 	    {Varchar("encrypted"), Varchar(encrypted ? "true" : "false"), null_varchar, null_bigint},
 	};

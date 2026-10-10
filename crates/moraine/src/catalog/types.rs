@@ -2,6 +2,11 @@
 //! from the wire types so on-disk field evolution never becomes a public
 //! breaking change.
 
+/// The DuckLake catalog version this build serves, recorded in a store's
+/// global `version` option when it is created. A store written before that
+/// was recorded carries no row and reads as this same version.
+pub const CATALOG_VERSION: &str = "1.0";
+
 /// Declares a newtype id over the catalog's `u64` id space.
 macro_rules! id_type {
     ($(#[$doc:meta])* $name:ident) => {
