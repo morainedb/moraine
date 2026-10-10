@@ -399,7 +399,7 @@ void RowsAtImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data
 		}
 		if (!has_batch) {
 			state.PublishMetrics();
-			output.SetCardinality(0);
+			output.SetChildCardinality(0);
 			return;
 		}
 		auto pieces = ImportLocatedBatch(context, schema.arrow_schema, array.arrow_array);
@@ -423,7 +423,7 @@ void RowsAtImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data
 			duckdb::VectorOperations::DefaultCast(piece->data[i], output.data[i], piece->size());
 		}
 	}
-	output.SetCardinality(piece->size());
+	output.SetChildCardinality(piece->size());
 }
 
 } // namespace

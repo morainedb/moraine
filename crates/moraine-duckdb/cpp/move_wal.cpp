@@ -143,7 +143,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MoveWalInitGlobal(duckdb::C
 void MoveWalImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<MoveWalGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	auto store = [](const std::string &path) {
@@ -153,7 +153,7 @@ void MoveWalImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 	output.SetValue(1, 0, store(state.to_wal_path));
 	output.SetValue(2, 0, duckdb::Value::BOOLEAN(state.moved));
 	state.emitted = true;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 } // namespace

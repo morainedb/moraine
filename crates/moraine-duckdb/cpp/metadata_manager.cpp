@@ -80,7 +80,7 @@ bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &comm
 		for (duckdb::idx_t c = 0; c < chunk.ColumnCount(); c++) {
 			append_chunk.data[3 + c].Reference(chunk.data[c]);
 		}
-		append_chunk.SetCardinality(count);
+		append_chunk.SetChildCardinality(count);
 		appender.AppendDataChunk(append_chunk);
 	}
 	appender.Close();

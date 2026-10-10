@@ -114,7 +114,7 @@ void RaiseImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 	auto &bind_data = data.bind_data->Cast<RaiseBindData>();
 	auto &state = data.global_state->Cast<RaiseGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
@@ -135,7 +135,7 @@ void RaiseImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 
 	output.SetValue(0, 0, duckdb::Value(move.first));
 	output.SetValue(1, 0, duckdb::Value(move.second));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 } // namespace

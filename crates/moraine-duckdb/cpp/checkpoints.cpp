@@ -224,7 +224,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DeleteInitGlobal(duckdb::Cl
 void CheckpointImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<CheckpointGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t row_index = 0;
@@ -233,13 +233,13 @@ void CheckpointImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, d
 		row_index++;
 	}
 	state.emitted = true;
-	output.SetCardinality(row_index);
+	output.SetChildCardinality(row_index);
 }
 
 void ListImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<CheckpointGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t row_index = 0;
@@ -256,7 +256,7 @@ void ListImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb:
 		row_index++;
 	}
 	state.emitted = true;
-	output.SetCardinality(row_index);
+	output.SetChildCardinality(row_index);
 }
 
 // The delete function returns only the released id, so it projects one
@@ -264,12 +264,12 @@ void ListImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb:
 void DeleteImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<CheckpointGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	output.SetValue(0, 0, duckdb::Value(state.rows.front().id));
 	state.emitted = true;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 } // namespace

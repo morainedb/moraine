@@ -120,7 +120,7 @@ void IndexesImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 	auto &bind_data = data.bind_data->Cast<IndexesBindData>();
 	auto &state = data.global_state->Cast<IndexesGlobalState>();
 	if (state.offset >= bind_data.rows.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
@@ -133,7 +133,7 @@ void IndexesImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 		output.SetValue(4, i, duckdb::Value(row.state));
 	}
 	state.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 // moraine_index_create / moraine_index_drop: autonomous-commit DDL.
@@ -223,12 +223,12 @@ void IndexDdlImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duc
 	auto &state = data.global_state->Cast<IndexDdlGlobalState>();
 	auto &bind_data = data.bind_data->Cast<IndexDdlBindData>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	std::string message = (bind_data.is_create ? "created index " : "dropped index ") + bind_data.index_name;
 	output.SetValue(0, 0, duckdb::Value(message));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 	state.emitted = true;
 }
 
@@ -611,7 +611,7 @@ void LookupImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 	auto &bind_data = data.bind_data->Cast<LookupBindData>();
 	auto &state = data.global_state->Cast<LookupGlobalState>();
 	if (state.offset >= bind_data.rows.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
@@ -620,7 +620,7 @@ void LookupImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 		SetRowId(output, i, row);
 	}
 	state.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 struct RangeBindData : public IndexReadBindData {
@@ -733,7 +733,7 @@ void RangeImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 	auto &bind_data = data.bind_data->Cast<RangeBindData>();
 	auto &state = data.global_state->Cast<RangeGlobalState>();
 	if (state.offset >= bind_data.rows.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
@@ -742,7 +742,7 @@ void RangeImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 		SetRowId(output, i, row);
 	}
 	state.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 struct NullsBindData : public IndexReadBindData {
@@ -834,7 +834,7 @@ void NullsImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 	auto &bind_data = data.bind_data->Cast<NullsBindData>();
 	auto &state = data.global_state->Cast<NullsGlobalState>();
 	if (state.offset >= bind_data.rows.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
@@ -843,7 +843,7 @@ void NullsImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 		SetRowId(output, i, row);
 	}
 	state.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace

@@ -138,11 +138,11 @@ public:
 		// later source phase.
 		auto &state = sink_state->Cast<MetadataDmlState>();
 		if (state.emitted) {
-			chunk.SetCardinality(0);
+			chunk.SetChildCardinality(0);
 			return duckdb::SourceResultType::FINISHED;
 		}
 		chunk.SetValue(0, 0, duckdb::Value::BIGINT(static_cast<int64_t>(state.affected_count)));
-		chunk.SetCardinality(1);
+		chunk.SetChildCardinality(1);
 		state.emitted = true;
 		return duckdb::SourceResultType::FINISHED;
 	}

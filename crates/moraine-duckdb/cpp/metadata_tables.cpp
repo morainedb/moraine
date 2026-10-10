@@ -1882,7 +1882,7 @@ void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInpu
 	auto &rows = *materialized;
 	auto start = state.offset.fetch_add(STANDARD_VECTOR_SIZE);
 	if (start >= rows.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, rows.size() - start);
@@ -1903,7 +1903,7 @@ void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInpu
 		}
 		EmitMetadataColumn(rows, start, count, col_id, target);
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace

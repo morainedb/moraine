@@ -831,7 +831,7 @@ void MaintenanceImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, 
 		state.emitted++;
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 // moraine_compact_store: step 8 on its own, for a store that needs
@@ -970,7 +970,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CompactInitGlobal(duckdb::C
 void CompactImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<CompactGlobalState>();
 	if (state.offset >= state.rows.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, state.rows.size() - state.offset);
@@ -987,7 +987,7 @@ void CompactImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 		                                    : duckdb::Value(duckdb::LogicalType::UBIGINT));
 	}
 	state.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace
@@ -1056,7 +1056,7 @@ void RaiseFormatImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput 
 	auto &bind_data = data.bind_data->Cast<RaiseFormatBindData>();
 	auto &state = data.global_state->Cast<RaiseFormatGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
@@ -1072,7 +1072,7 @@ void RaiseFormatImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput 
 
 	output.SetValue(0, 0, duckdb::Value::UBIGINT(from_format));
 	output.SetValue(1, 0, duckdb::Value::UBIGINT(to_format));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader) {

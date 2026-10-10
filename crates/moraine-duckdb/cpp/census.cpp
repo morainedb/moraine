@@ -116,7 +116,7 @@ void CensusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 	auto &bind_data = data.bind_data->Cast<CensusBindData>();
 	auto &state = data.global_state->Cast<CensusGlobalState>();
 	if (state.offset >= bind_data.rows.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
@@ -157,7 +157,7 @@ void CensusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 		output.SetValue(16, i, store(objects.sst_bytes));
 	}
 	state.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 // moraine_cache_tally: what the block cache has served.
@@ -218,7 +218,7 @@ void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 	auto &bind_data = data.bind_data->Cast<TallyBindData>();
 	auto &state = data.global_state->Cast<TallyGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
@@ -277,7 +277,7 @@ void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 	output.SetValue(11, 0, duckdb::Value::UBIGINT(preload_failures));
 	output.SetValue(12, 0, duckdb::Value::UBIGINT(metadata_disk_hits));
 	output.SetValue(13, 0, duckdb::Value::UBIGINT(block_disk_hits));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 // moraine_sidecar_tally: what published row summaries have done for this
@@ -295,7 +295,7 @@ duckdb::unique_ptr<duckdb::FunctionData> SidecarTallyBind(duckdb::ClientContext 
 void SidecarTallyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<TallyGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
@@ -308,7 +308,7 @@ void SidecarTallyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data,
 	output.SetValue(2, 0, duckdb::Value::UBIGINT(tally.refused));
 	output.SetValue(3, 0, duckdb::Value::UBIGINT(tally.published));
 	output.SetValue(4, 0, duckdb::Value::UBIGINT(tally.publish_failures));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> CacheStatusBind(duckdb::ClientContext &,
@@ -327,7 +327,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CacheStatusBind(duckdb::ClientContext &
 void CacheStatusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<TallyGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
@@ -346,7 +346,7 @@ void CacheStatusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, 
 	output.SetValue(7, 0, duckdb::Value::UBIGINT(status.auxiliary_metadata_capacity_bytes));
 	output.SetValue(8, 0, duckdb::Value::UBIGINT(status.auxiliary_metadata_occupancy_bytes));
 	output.SetValue(9, 0, duckdb::Value::UBIGINT(status.auxiliary_metadata_evictions));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> MemoryTallyBind(duckdb::ClientContext &,
@@ -370,7 +370,7 @@ void MemoryTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput 
 	auto &bind_data = data.bind_data->Cast<TallyBindData>();
 	auto &state = data.global_state->Cast<TallyGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
@@ -391,7 +391,7 @@ void MemoryTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput 
 	// The shim's own, not the core's: the rows this attach holds for the
 	// metadata tables it has narrowed or materialized.
 	output.SetValue(7, 0, duckdb::Value::UBIGINT(moraine_catalog.HeldMetadataBytes()));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> ObjectStoreTallyBind(duckdb::ClientContext &,
@@ -424,7 +424,7 @@ void ObjectStoreTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionI
 	auto &bind_data = data.bind_data->Cast<TallyBindData>();
 	auto &state = data.global_state->Cast<TallyGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.emitted = true;
@@ -454,7 +454,7 @@ void ObjectStoreTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionI
 	output.SetValue(12, 0, duckdb::Value::UBIGINT(tally.errors));
 	output.SetValue(13, 0, duckdb::Value::UBIGINT(tally.data_gets));
 	output.SetValue(14, 0, duckdb::Value::UBIGINT(tally.data_bytes));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 } // namespace

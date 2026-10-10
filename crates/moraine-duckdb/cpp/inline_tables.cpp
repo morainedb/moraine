@@ -195,7 +195,7 @@ MoraineArrowBytes EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::
 	for (duckdb::idx_t i = 0; i < user_count; i++) {
 		user_chunk.data[i].Slice(chunk.data[user_col_start + i], row_offset, row_offset + row_count);
 	}
-	user_chunk.SetCardinality(row_count);
+	user_chunk.SetChildCardinality(row_count);
 
 	// Lossless, matching the inline schema registration: a UUID encodes as a
 	// 16-byte blob (as in Parquet), not a string, so index maintenance sees
@@ -633,7 +633,7 @@ void InlineDataScanImpl(duckdb::ClientContext &context, duckdb::TableFunctionInp
 	auto &bind_data = data.bind_data->Cast<InlineDataScanBindData>();
 	auto &state = data.global_state->Cast<InlineDataScanGlobalState>();
 	if (state.offset >= state.rows.size() && !RefillInlineWindow(context, bind_data, state)) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, state.rows.size() - state.offset);
@@ -678,7 +678,7 @@ void InlineDataScanImpl(duckdb::ClientContext &context, duckdb::TableFunctionInp
 
 	state.offset += count;
 	state.emitted += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace
@@ -987,11 +987,11 @@ public:
 	                                         duckdb::OperatorSourceInput &) const override {
 		auto &state = sink_state->Cast<InlineDmlState>();
 		if (state.emitted) {
-			chunk.SetCardinality(0);
+			chunk.SetChildCardinality(0);
 			return duckdb::SourceResultType::FINISHED;
 		}
 		chunk.SetValue(0, 0, duckdb::Value::BIGINT(static_cast<int64_t>(state.affected_count)));
-		chunk.SetCardinality(1);
+		chunk.SetChildCardinality(1);
 		state.emitted = true;
 		return duckdb::SourceResultType::FINISHED;
 	}

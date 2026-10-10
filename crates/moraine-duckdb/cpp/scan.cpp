@@ -27,7 +27,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MoraineScanInitGlobal(duckd
 // non-null function pointer.
 void MoraineScanFunctionImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
                              duckdb::DataChunk &output) {
-	output.SetCardinality(0);
+	output.SetChildCardinality(0);
 }
 
 } // namespace

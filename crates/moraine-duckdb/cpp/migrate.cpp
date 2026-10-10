@@ -132,7 +132,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MigrateInitGlobal(duckdb::C
 void MigrateImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<MigrateGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	output.SetValue(0, 0, duckdb::Value::UBIGINT(state.from_format));
@@ -140,7 +140,7 @@ void MigrateImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 	output.SetValue(2, 0, duckdb::Value::BOOLEAN(state.resumed));
 	output.SetValue(3, 0, duckdb::Value(state.units_run));
 	state.emitted = true;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 } // namespace

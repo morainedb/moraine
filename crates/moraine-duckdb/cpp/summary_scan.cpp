@@ -284,7 +284,7 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 			}
 			state.batch_ms += Milliseconds(started);
 			if (!has_batch) {
-				output.SetCardinality(0);
+				output.SetChildCardinality(0);
 				return;
 			}
 			started = ScanClock::now();
@@ -309,7 +309,7 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 		state.pending.pop_back();
 		duckdb::DataChunk projected;
 		projected.Initialize(context, state.types);
-		projected.SetCardinality(piece->size());
+		projected.SetChildCardinality(piece->size());
 		for (duckdb::idx_t i = 0; i < state.types.size(); i++) {
 			auto &source = piece->data[state.decoded_columns[i]];
 			if (source.GetType() == state.types[i]) {
@@ -329,7 +329,7 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 		for (duckdb::idx_t i = 0; i < state.projection.size(); i++) {
 			output.data[i].Reference(projected.data[state.projection[i]]);
 		}
-		output.SetCardinality(projected.size());
+		output.SetChildCardinality(projected.size());
 		return;
 	}
 }
