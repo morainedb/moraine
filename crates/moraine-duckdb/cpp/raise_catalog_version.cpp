@@ -11,10 +11,10 @@
 // One-way in practice: a DuckLake that requires the older version refuses
 // the store outright at its own catalog-version check, before it reads a
 // table. DuckLake advertises no required version to gate on — it compares
-// against a literal — so a real raise takes `confirm`, and the operator
-// weighs it against the DuckLake they intend to run. A dry run needs no
-// acknowledgement: it records nothing, and reading the version a store
-// serves is what the pre-flight is for.
+// against a literal — so a raise that would record takes `confirm`, and the
+// operator weighs it against the DuckLake they intend to run. Neither a dry
+// run nor a store already at the newest shape asks for one: the first
+// records nothing, the second has no move to make.
 
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -24,6 +24,7 @@
 #include "moraine_abi.h"
 
 #include <string>
+#include <utility>
 
 namespace moraine_duckdb {
 
@@ -78,12 +79,6 @@ duckdb::unique_ptr<duckdb::FunctionData> RaiseBind(duckdb::ClientContext &,
 		}
 	}
 
-	if (!bind_data->dry_run && !bind_data->confirm) {
-		throw duckdb::BinderException(
-		    "moraine_raise_catalog_version: raising is one way and a DuckLake that requires the older catalog "
-		    "version refuses the store outright; run it with dry_run => true to see the move, then confirm => "
-		    "true to make it");
-	}
 	return bind_data;
 }
 
@@ -96,6 +91,25 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> RaiseInitGlobal(duckdb::Cli
 	return duckdb::make_uniq<RaiseGlobalState>();
 }
 
+// The move `dry_run` would make, or has made. A dry run records nothing,
+// so it doubles as the pre-flight that reads the version a store serves.
+std::pair<std::string, std::string> RaiseMove(duckdb::ClientContext &context, MoraineCatalog &catalog, bool dry_run) {
+	char *from = nullptr;
+	char *to = nullptr;
+	MoraineError err {};
+	auto code = moraine_raise_catalog_version(catalog.Handle(), dry_run, moraine_shim_is_interrupted, &context, &from,
+	                                          &to, &err);
+	DrainMoraineLogs(context);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+
+	std::pair<std::string, std::string> move {from == nullptr ? "" : from, to == nullptr ? "" : to};
+	moraine_string_free(from);
+	moraine_string_free(to);
+	return move;
+}
+
 void RaiseImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<RaiseBindData>();
 	auto &state = data.global_state->Cast<RaiseGlobalState>();
@@ -106,23 +120,21 @@ void RaiseImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 	state.emitted = true;
 
 	auto &catalog = ResolveMoraineCatalog(context, bind_data.catalog_name);
-	char *from = nullptr;
-	char *to = nullptr;
-	MoraineError err {};
-	auto code = moraine_raise_catalog_version(catalog.Handle(), bind_data.dry_run, moraine_shim_is_interrupted,
-	                                          &context, &from, &to, &err);
-	DrainMoraineLogs(context);
-	if (code != MORAINE_OK) {
-		ThrowMoraineError(err);
+	// Read the move first: a store already at the newest shape has nothing
+	// to acknowledge, and only a raise that would record asks for one.
+	auto move = RaiseMove(context, catalog, true);
+	if (!bind_data.dry_run && move.first != move.second) {
+		if (!bind_data.confirm) {
+			throw duckdb::InvalidInputException(
+			    "moraine_raise_catalog_version: raising \"%s\" from %s to %s is one way, and a DuckLake that "
+			    "requires %s refuses the store outright; pass confirm => true to make the move",
+			    bind_data.catalog_name, move.first, move.second, move.first);
+		}
+		move = RaiseMove(context, catalog, false);
 	}
 
-	std::string from_version(from == nullptr ? "" : from);
-	std::string to_version(to == nullptr ? "" : to);
-	moraine_string_free(from);
-	moraine_string_free(to);
-
-	output.SetValue(0, 0, duckdb::Value(from_version));
-	output.SetValue(1, 0, duckdb::Value(to_version));
+	output.SetValue(0, 0, duckdb::Value(move.first));
+	output.SetValue(1, 0, duckdb::Value(move.second));
 	output.SetCardinality(1);
 }
 
