@@ -713,6 +713,37 @@ pub(super) fn apply_column_tag_set_end(
     }
 }
 
+/// Ends a live view-column tag without ending its containing view.
+fn apply_view_column_tag_set_end(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    new_id: u64,
+    touched: &mut Touched,
+) -> Result<()> {
+    let mut cursor = Cursor::new(TableKind::ViewColumnTag, cells);
+    let view_id = cursor.u64()?;
+    let column_name = cursor.string()?;
+    let key = cursor.string()?;
+    let end_snapshot = cursor.u64()?;
+    cursor.finish()?;
+    check_end_snapshot(TableKind::ViewColumnTag, end_snapshot, new_id)?;
+    let ended = state.views.get_mut(&view_id).is_some_and(|view| {
+        end_live_entry(
+            &mut view.column_tags,
+            |tag| tag.column_name == column_name && tag.key == key && tag.end_snapshot.is_none(),
+            |tag| tag.end_snapshot = Some(end_snapshot),
+        )
+    });
+    if !ended {
+        return Err(corrupt_row(
+            TableKind::ViewColumnTag,
+            format!("no live view column tag ({view_id}, {column_name:?}, {key:?}) to end"),
+        ));
+    }
+    touched.touch(EntityKey::View { view_id });
+    Ok(())
+}
+
 pub(super) fn apply_update_set_end(
     state: &mut CatalogSnapshot,
     table: TableKind,
@@ -723,6 +754,9 @@ pub(super) fn apply_update_set_end(
     match table {
         TableKind::Tag => return apply_tag_set_end(state, cells, new_id, touched),
         TableKind::ColumnTag => return apply_column_tag_set_end(state, cells, new_id, touched),
+        TableKind::ViewColumnTag => {
+            return apply_view_column_tag_set_end(state, cells, new_id, touched);
+        }
         _ => {}
     }
 

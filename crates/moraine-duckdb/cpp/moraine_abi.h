@@ -4180,6 +4180,22 @@ int32_t moraine_tx_dump_column_tags(struct MoraineTxHandle *tx,
                                     size_t *out_len,
                                     struct MoraineError *err);
 
+// Dumps every `ducklake_view_column_tag` row as this transaction sees it:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_view_column_tags_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_view_column_tags(struct MoraineTxHandle *tx,
+                                         struct MoraineViewColumnTagRow **out_items,
+                                         size_t *out_len,
+                                         struct MoraineError *err);
+
 // Dumps every `ducklake_macro_impl` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_macro_impls_free`.

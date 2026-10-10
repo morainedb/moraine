@@ -409,18 +409,23 @@ fn diff_views(
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
-    diff_versioned_map(
-        writes,
-        flat_ids(scope, &base.views, &state.views, |t| &t.views),
-        &base.views,
-        &state.views,
-        |view_id| EntityKey::View { view_id },
-        new_snapshot,
-        |prior| proto::ViewValue {
-            end_snapshot: Some(new_snapshot),
-            ..prior.clone()
-        },
-    );
+    for view_id in flat_ids(scope, &base.views, &state.views, |t| &t.views) {
+        stage_transition_with_internal(
+            writes,
+            EntityKey::View { view_id },
+            base.views.get(&view_id),
+            state.views.get(&view_id),
+            new_snapshot,
+            |prior| proto::ViewValue {
+                end_snapshot: Some(new_snapshot),
+                ..prior.clone()
+            },
+            |view| proto::ViewValue {
+                column_tags: Vec::new(),
+                ..view.clone()
+            },
+        );
+    }
 }
 
 pub(super) fn diff_options(

@@ -107,8 +107,17 @@ fn raising_the_catalog_version_widens_the_shape_for_later_sessions() {
     );
 
     assert_eq!(
-        raise(store.path(), ", confirm => true"),
-        vec![vec!["1.0", "1.1-dev1"]]
+        csv_rows(&run_standalone_sql(store.path(),
+            "CREATE TEMP TABLE seen AS SELECT 0 AS step, value FROM m.ducklake_metadata WHERE key = 'version';
+             CREATE TEMP TABLE raised AS SELECT from_version, to_version FROM moraine_raise_catalog_version('m', confirm => true);
+             INSERT INTO seen SELECT 1, from_version || '->' || to_version FROM raised;
+             INSERT INTO seen SELECT 2, value FROM m.ducklake_metadata WHERE key = 'version';
+             BEGIN;
+             INSERT INTO m.ducklake_metadata VALUES ('test_pinned_shape', 'yes', NULL, NULL);
+             INSERT INTO seen SELECT 3, value FROM m.ducklake_metadata WHERE key = 'version';
+             COMMIT;
+             SELECT value FROM seen ORDER BY step;")),
+        vec![vec!["1.0"], vec!["1.0->1.1-dev1"], vec!["1.0"], vec!["1.0"]]
     );
     assert!(
         serves_extended_shape(store.path()),

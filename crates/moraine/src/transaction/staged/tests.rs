@@ -5794,6 +5794,52 @@ async fn tag_rows_land_and_a_recomment_ends_the_old_entry() {
     catalog.close().await.unwrap();
 }
 
+/// A staged `ducklake_view_column_tag` row is visible to the transaction
+/// that staged it. DuckLake re-reads this table after staging its own
+/// writes, so committed-only state would make it re-author them.
+#[tokio::test]
+async fn staged_view_column_tags_are_visible_to_their_own_transaction() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+    assert!(
+        crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing staged, nothing committed"
+    );
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::ViewColumnTag,
+        cells: vec![
+            Cell::U64(7),
+            Cell::Str("amount".into()),
+            Cell::U64(3),
+            Cell::Null,
+            Cell::Str("unit".into()),
+            Cell::Str("cents".into()),
+        ],
+    });
+
+    let rows = crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the staged row is visible before any commit");
+    assert_eq!(
+        (rows[0].view_id, rows[0].column_name.as_str()),
+        (7, "amount")
+    );
+    assert_eq!(
+        (rows[0].key.as_str(), rows[0].value.as_str()),
+        ("unit", "cents")
+    );
+
+    tx.rollback();
+    catalog.close().await.unwrap();
+}
+
 /// A column tag rides its column's record without minting a column
 /// version: after tagging, the column still has exactly one row on
 /// the dump surface, and the tag ends in place on a re-comment.
@@ -8933,4 +8979,94 @@ fn only_a_flush_s_own_operations_may_exceed_the_ceiling() {
         !exempt_from_staged_cost(&per_record),
         "a filtered delete is the caller's to split"
     );
+}
+
+/// View-column tags end in place and expose their staged lifecycle.
+#[tokio::test]
+async fn view_column_tags_end_in_place() {
+    let catalog = open().await;
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").unwrap().id;
+            tx.create_view(schema, "v", "duckdb", "SELECT 1 AS amount")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let view = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .views
+        .values()
+        .next()
+        .unwrap()
+        .view_id;
+    for (snapshot, value) in [(2, "cents"), (3, "dollars")] {
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+        if snapshot == 3 {
+            tx.stage(RowOperation::UpdateSetEnd {
+                table: TableKind::ViewColumnTag,
+                cells: vec![
+                    Cell::U64(view),
+                    Cell::Str("amount".into()),
+                    Cell::Str("unit".into()),
+                    Cell::U64(snapshot),
+                ],
+            });
+            let rows = crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+                .await
+                .unwrap();
+            assert_eq!(rows[0].end_snapshot, Some(3));
+        }
+        tx.stage(RowOperation::Insert {
+            table: TableKind::ViewColumnTag,
+            cells: vec![
+                Cell::U64(view),
+                Cell::Str("amount".into()),
+                Cell::U64(snapshot),
+                Cell::Null,
+                Cell::Str("unit".into()),
+                Cell::Str(value.into()),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(snapshot, 1, view + 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(snapshot, "altered_view:1"),
+        });
+        tx.commit().await.unwrap();
+    }
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(snapshot.views[&view].begin_snapshot, 1);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let reader = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    assert_eq!(reader.visible_views().await.unwrap().len(), 1);
+    reader.rollback();
+    let tags = &snapshot.views[&view].column_tags;
+    assert_eq!(tags.len(), 2);
+    assert_eq!(tags[0].end_snapshot, Some(3));
+    assert_eq!(tags[1].end_snapshot, None);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::Delete {
+        table: TableKind::ViewColumnTag,
+        cells: vec![
+            Cell::U64(view),
+            Cell::Str("amount".into()),
+            Cell::Str("unit".into()),
+            Cell::U64(2),
+        ],
+    });
+    let rows = crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value, "dollars");
+    tx.rollback();
+    catalog.close().await.unwrap();
 }

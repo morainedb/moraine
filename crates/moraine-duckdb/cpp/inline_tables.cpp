@@ -794,7 +794,7 @@ duckdb::unique_ptr<MoraineInlineDataTableEntry>
 MakeInlineDataTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, MoraineCatalogHandle *handle,
                          uint64_t table_id, uint64_t schema_version,
                          const std::vector<DecodedInlineColumn> &user_columns) {
-	InlinedColumnNames names(MoraineServesExtendedCatalog(handle));
+	InlinedColumnNames names(catalog.Cast<MoraineCatalog>().ServesExtendedCatalog());
 	auto info = BuildInlineDataTableInfo(schema, table_id, schema_version, user_columns, names);
 	return duckdb::make_uniq<MoraineInlineDataTableEntry>(catalog, schema, info, handle, table_id, schema_version);
 }
@@ -803,7 +803,7 @@ duckdb::unique_ptr<MoraineInlineDeleteTableEntry> MakeInlineDeleteTableEntry(duc
                                                                              duckdb::SchemaCatalogEntry &schema,
                                                                              MoraineCatalogHandle *handle,
                                                                              uint64_t table_id) {
-	InlinedColumnNames names(MoraineServesExtendedCatalog(handle));
+	InlinedColumnNames names(catalog.Cast<MoraineCatalog>().ServesExtendedCatalog());
 	duckdb::CreateTableInfo info(schema, InlinedDeleteTableName(table_id));
 	info.columns.AddColumn(duckdb::ColumnDefinition("file_id", duckdb::LogicalType::BIGINT));
 	info.columns.AddColumn(duckdb::ColumnDefinition(names.row_id, duckdb::LogicalType::BIGINT));

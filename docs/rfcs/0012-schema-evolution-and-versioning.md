@@ -340,6 +340,10 @@ setting a caller may choose, so only a raise moves it. Stores are created
 at `1.0` and never at the newest shape — raising is a deliberate act, not a
 default.
 
+View-column tags carry their own begin/end lifecycle inside the view record.
+Tag-only updates rewrite that record in place, without minting a view version;
+transaction reads apply staged tag inserts, ends, and deletions in order.
+
 This build serves two shapes. `1.1-dev1` adds the `ducklake_view_column_tag`
 table, `row_group_count` on `ducklake_data_file` and `ducklake_delete_file`,
 and `min_is_exact`/`max_is_exact` on `ducklake_file_column_stats` and

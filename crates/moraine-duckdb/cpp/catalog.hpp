@@ -224,6 +224,15 @@ public:
 		return path_;
 	}
 
+	// Whether this attach serves the shape catalog version 1.1-dev1
+	// declares, read once when it attached. Every entry the attach
+	// registers declares that one shape, so a raise under a live attach
+	// moves the store without mixing shapes in a session that is already
+	// reading one.
+	bool ServesExtendedCatalog() const {
+		return extended_catalog_;
+	}
+
 	// The maintenance driver for this attach. Always present — it serves
 	// the on-demand trigger even when no interval was configured.
 	MaintenanceScheduler &Scheduler() const {
@@ -252,6 +261,7 @@ public:
 private:
 	MoraineCatalogHandle *handle_;
 	std::string path_;
+	bool extended_catalog_ = false;
 	duckdb::shared_ptr<MaintenanceScheduler> scheduler_;
 
 	// One dumped row set per synthesized table, stamped with the store

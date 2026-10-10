@@ -1287,14 +1287,23 @@ impl StagedTransaction {
         self.staged_children(TableKind::ColumnTag, decode::decode_column_tag_row)
     }
 
-    /// The `ducklake_view_column_tag` rows this transaction staged, each
-    /// with its view's id.
+    /// The view-column tags visible to this transaction, with each view's id.
     ///
     /// # Errors
     ///
-    /// Returns an error if a staged row is malformed.
-    pub fn staged_view_column_tags(&self) -> Result<Vec<(u64, proto::ViewColumnTag)>> {
-        self.staged_children(TableKind::ViewColumnTag, decode::decode_view_column_tag_row)
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_view_column_tags(&self) -> Result<Vec<(u64, proto::ViewColumnTag)>> {
+        let rows = self
+            .visible_views()
+            .await?
+            .into_iter()
+            .flat_map(|view| {
+                view.column_tags
+                    .into_iter()
+                    .map(move |tag| (view.view_id, tag))
+            })
+            .collect();
+        overlay::overlay_view_column_tags(&self.ops, rows)
     }
 
     /// The `ducklake_macro_impl` rows this transaction staged, each with

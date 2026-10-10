@@ -670,3 +670,55 @@ pub(super) fn overlay_option_scopes(
 
     Ok(scopes)
 }
+
+/// Applies view-column tag inserts, lifecycle updates, and deletes in order.
+pub(super) fn overlay_view_column_tags(
+    ops: &[RowOperation],
+    mut rows: Vec<(u64, proto::ViewColumnTag)>,
+) -> Result<Vec<(u64, proto::ViewColumnTag)>> {
+    for op in ops {
+        match op {
+            RowOperation::Insert {
+                table: TableKind::ViewColumnTag,
+                cells,
+            } => {
+                rows.push(super::decode::decode_view_column_tag_row(cells)?);
+            }
+            RowOperation::UpdateSetEnd {
+                table: TableKind::ViewColumnTag,
+                cells,
+            }
+            | RowOperation::Delete {
+                table: TableKind::ViewColumnTag,
+                cells,
+            } => {
+                let mut cursor = Cursor::new(TableKind::ViewColumnTag, cells);
+                let view_id = cursor.u64()?;
+                let column_name = cursor.string()?;
+                let key = cursor.string()?;
+                let snapshot = cursor.u64()?;
+                cursor.finish()?;
+                if matches!(op, RowOperation::Delete { .. }) {
+                    rows.retain(|(id, tag)| {
+                        !(*id == view_id
+                            && tag.column_name == column_name
+                            && tag.key == key
+                            && tag.begin_snapshot == snapshot)
+                    });
+                } else {
+                    for (id, tag) in &mut rows {
+                        if *id == view_id
+                            && tag.column_name == column_name
+                            && tag.key == key
+                            && tag.end_snapshot.is_none()
+                        {
+                            tag.end_snapshot = Some(snapshot);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(rows)
+}
