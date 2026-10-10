@@ -736,6 +736,7 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientConte
 	// destructor never runs — so the handle would leak with no
 	// `moraine_detach`. Release it by hand and re-throw instead.
 	try {
+		extended_catalog_ = MoraineServesExtendedCatalog(handle_);
 		scheduler_ = duckdb::make_shared_ptr<MaintenanceScheduler>(db.GetDatabase(), db.GetName(), path_, handle_,
 		                                                           std::move(maintenance));
 		// A read-only attach never schedules — maintenance mutates, and

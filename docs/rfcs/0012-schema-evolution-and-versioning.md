@@ -45,6 +45,9 @@ evolution because they reference columns by field id.
 - The column-level operations that must set RFC 0004's `schema_changed`
   flag are enumerated, so `schema_version` advances exactly when DuckLake's
   does.
+- The DuckLake catalog version — the shape of the `ducklake_*` tables
+  themselves — is a third axis, independent of `schema_version` and of the
+  store format, moved only by a deliberate one-way raise.
 
 Non-goals:
 
@@ -317,6 +320,73 @@ the `schema_version` subspace (RFC 0002) — their own keys rather than a
 field of the snapshot record, so snapshot expiry (RFC 0007) cannot take
 the reverse index a surviving data file still needs.
 
+### The DuckLake catalog version is a third axis
+
+Two version axes are already specified elsewhere: `schema_version`, the
+per-commit counter above, and the structural store format `sys/format`
+([RFC 0015](0015-format-migration.md)). A third is independent of both —
+the DuckLake **catalog version**, which names the shape of the `ducklake_*`
+tables themselves: which tables exist and which columns each one carries.
+`schema_version` versions the *user's* columns; the catalog version
+versions the *catalog's* own. A store moves on each axis for its own
+reasons and on its own schedule.
+
+The version a store serves is the global `version` option, served
+row-faithfully like every other option row. A store that never recorded
+one reads as `1.0`, so a store written before the version was recorded
+needs no backfill. The key is **reserved** from `set_option`/`unset_option`
+(`Error::Constraint`): it names the shape moraine synthesizes rather than a
+setting a caller may choose, so only a raise moves it. Stores are created
+at `1.0` and never at the newest shape — raising is a deliberate act, not a
+default.
+
+This build serves two shapes. `1.1-dev1` adds the `ducklake_view_column_tag`
+table, `row_group_count` on `ducklake_data_file` and `ducklake_delete_file`,
+and `min_is_exact`/`max_is_exact` on `ducklake_file_column_stats` and
+`ducklake_table_column_stats`. The shape is selected **once per attach**,
+when the catalog entries are registered, and the entries carry that choice
+for the life of the attach — so a raise shows up in sessions that attach
+after it, never in the one that made it.
+
+`Catalog::raise_catalog_version(dry_run)` reports the move as
+`CatalogVersionRaise { from, to }`, reaching SQL as
+`moraine_raise_catalog_version(<lake>, dry_run => BOOLEAN, confirm =>
+BOOLEAN)` over the C ABI
+([RFC 0006](0006-extension-surface.md)). It takes an attached catalog name
+rather than a store path, unlike `moraine_migrate`: a catalog version never
+refuses ATTACH, so the stores it moves are exactly the ones already
+attached. Equal `from` and `to` mean there was nothing to raise — the
+report says so rather than failing. A version this build cannot order is a
+newer build's, and the raise **refuses** it rather than lowering the shape
+a store serves, the same way RFC 0015's format raise refuses to move a
+store already at or above its ceiling.
+
+The raise is **one way, and out of an older DuckLake's reach entirely**.
+DuckLake's initializer compares the recorded tag against a bare `1.0`
+literal and throws `InvalidInputException` on anything else; under
+`AUTOMATIC_MIGRATION` it instead walks a migration ladder whose rungs stop
+at `1.0` and throws `NotImplementedException`. Either way the refusal lands
+at DuckLake's own version check, before it reads a single wider table, so a
+raised store is not a lake with extra columns — it is a lake that DuckLake
+will not open. There is no route back: the recorded version is reserved
+from `set_option` and the raise will not lower it. Nor can moraine ask the
+loaded DuckLake what it wants, because that `1.0` is a literal and
+DuckLake exposes no required-version surface to query.
+
+So the door takes an acknowledgement rather than a capability check: a
+raise that records refuses without `confirm => true`, and the refusal names
+the pre-flight that reads the move first. Gating on the loaded DuckLake
+instead was rejected for having nothing to gate on — the only runtime
+signal is the extension's own version string, which no DuckLake relates to
+the catalog version it accepts, and which a locally built unsigned
+extension may not report at all. A check keyed on that would refuse every
+session that could legitimately raise while still passing a DuckLake that
+cannot read the result: a capability signal in form only. The dry run is
+exempt, because it records nothing and is how an operator reads the version
+a store serves. `1.1-dev1` is a pre-release marker, and DuckLake's ladder
+migrates `-dev1` rungs into their release (`0.3-dev1` to `0.3`), so a
+DuckLake that asks for `1.1` is expected to consume it.
+
 ### Conflicts
 
 Two concurrent schema changes to the same table overlap on `table_id` and
@@ -368,6 +438,16 @@ SlateDB on in-memory `object_store` and against real DuckLake SQL in e2e:
 - **`schema_version` transitions match DuckLake** for every operation in
   the table above (the RFC 0004 schema-version matrix, extended to
   column-level ops).
+- **A catalog-version raise widens the shape for later sessions and
+  nothing else.** A dry run reports the move and records nothing; the raise
+  is idempotent; a session attaching after it finds the wider tables; a
+  version this build cannot order is refused rather than lowered; and a
+  raise that would record refuses without its acknowledgement, recording
+  nothing when it does. At the
+  e2e tier the pinned DuckLake's refusal of a raised store is pinned too —
+  the one-way door is a fact about DuckLake's code, so it is re-verified by
+  running (`catalog_version.rs`), like the other DuckLake pins in
+  `wire_contract.rs`.
 
 ## Alternatives considered
 

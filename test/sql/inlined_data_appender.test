@@ -1,0 +1,51 @@
+# name: test/sql/inlined_data_appender.test
+# group: [moraine]
+#
+# Inlined rows written through the Appender API match the SQL path they
+# replace, and a table the same commit still has to create keeps taking
+# that SQL path.
+#
+# moraine's metadata manager writes inlined rows through DuckDB's Appender
+# rather than an INSERT ... VALUES list. The appender runs now while the
+# batch it would otherwise join runs later, so a table this commit creates
+# cannot be appended to yet.
+#
+# Needs the built extension, which `cargo xtask e2e` supplies.
+
+require-env MORAINE_DUCKDB_EXT
+
+require-env MORAINE_EXTENSION_DIR
+
+statement ok
+SET extension_directory='${MORAINE_EXTENSION_DIR}';
+
+statement ok
+INSTALL parquet;
+
+statement ok
+LOAD parquet;
+
+statement ok
+LOAD '${MORAINE_DUCKDB_EXT}';
+
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/appender-store' AS lake (DATA_PATH '__TEST_DIR__/appender-data/', DATA_INLINING_ROW_LIMIT 5000);
+
+statement ok
+CREATE TABLE lake.main.t(a INTEGER, b VARCHAR, c DOUBLE, d INTEGER[]);
+
+# The first insert creates the inlined table, so it still takes the SQL path.
+statement ok
+INSERT INTO lake.main.t SELECT i, 'x' || i, i * 1.5, [i, i + 1] FROM range(1000) t(i);
+
+# Every later insert appends into the table the first one created.
+statement ok
+INSERT INTO lake.main.t SELECT i, 'y' || i, i * 2.5, [i, i + 2] FROM range(1000, 3000) t(i);
+
+statement ok
+INSERT INTO lake.main.t VALUES (NULL, NULL, NULL, NULL);
+
+query IIII
+SELECT count(*), count(a), sum(a), max(d[2]) FROM lake.main.t
+----
+3001	3000	4498500	3001

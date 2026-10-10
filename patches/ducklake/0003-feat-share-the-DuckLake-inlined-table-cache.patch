@@ -1,0 +1,19 @@
+diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/storage/ducklake_metadata_manager.hpp
+index ad3536f8..61dceb33 100644
+--- a/src/include/storage/ducklake_metadata_manager.hpp
++++ b/src/include/storage/ducklake_metadata_manager.hpp
+@@ -487,10 +487,13 @@ private:
+ 	                                                                         DuckLakeSnapshot start_snapshot,
+ 	                                                                         DuckLakeSnapshot end_snapshot);
+ 
+-	unordered_map<idx_t, string> insert_inlined_table_name_cache;
+ 	unordered_set<idx_t> delete_inlined_table_cache;
+ 
+ protected:
++	//! The inlined table a commit last resolved for a table id. Protected so a
++	//! registered metadata manager overriding the inlined-data write shares the
++	//! cache `ClearInlinedTableCaches` invalidates.
++	unordered_map<idx_t, string> insert_inlined_table_name_cache;
+ 	DuckLakeTransaction &transaction;
+ 	mutex paths_lock;
+ 	map<SchemaIndex, string> schema_paths;

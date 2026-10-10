@@ -1166,6 +1166,70 @@ impl Catalog {
         Ok(raised)
     }
 
+    /// Raises the catalog version this store records to the newest shape
+    /// this build serves, and reports what moved.
+    ///
+    /// The shape moraine synthesizes follows that version, so this is
+    /// **one-way in practice**: a DuckLake that requires the older version
+    /// refuses the store outright at its own catalog-version check, before
+    /// it reads a table. Raise only alongside the DuckLake that asks for
+    /// the wider shape.
+    ///
+    /// `dry_run` reports the move it would make and records nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Migration`] if the store records a version this
+    /// build does not serve — a newer build wrote it, and lowering it
+    /// would move a shape this one cannot read — or an error if the move
+    /// cannot be committed.
+    pub async fn raise_catalog_version(
+        &self,
+        dry_run: bool,
+    ) -> Result<crate::transaction::migration::CatalogVersionRaise> {
+        let from = self
+            .snapshot()
+            .await?
+            .option(crate::catalog::OptionScope::Global, "version")
+            .unwrap_or_else(|| crate::catalog::CATALOG_VERSION.to_owned());
+        let to = crate::catalog::MAX_CATALOG_VERSION.to_owned();
+
+        // Never lower a store: a version this build cannot order is one a
+        // newer build recorded, and that shape is not ours to move.
+        if from != crate::catalog::CATALOG_VERSION && from != crate::catalog::MAX_CATALOG_VERSION {
+            return Err(Error::Migration(format!(
+                "store records catalog version {from}, which this build does not serve"
+            )));
+        }
+
+        if dry_run || from == to {
+            return Ok(crate::transaction::migration::CatalogVersionRaise { from, to });
+        }
+
+        let target = to.clone();
+        self.commit(move |tx| {
+            // Re-read inside the commit. Recording the version is
+            // last-write-wins, so a check made against the snapshot above
+            // could be overtaken between that read and this write; this is
+            // the one that holds the never-lower invariant.
+            let recorded = tx
+                .catalog_version()
+                .unwrap_or_else(|| crate::catalog::CATALOG_VERSION.to_owned());
+            if recorded != crate::catalog::CATALOG_VERSION
+                && recorded != crate::catalog::MAX_CATALOG_VERSION
+            {
+                return Err(Error::Migration(format!(
+                    "store records catalog version {recorded}, which this build does not serve"
+                )));
+            }
+
+            tx.set_catalog_version(&target);
+            Ok(())
+        })
+        .await?;
+        Ok(crate::transaction::migration::CatalogVersionRaise { from, to })
+    }
+
     /// Opens (creating and initializing if empty) the catalog in
     /// `object_store` at `options.path`.
     ///

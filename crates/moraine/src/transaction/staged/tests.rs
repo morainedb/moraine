@@ -5323,6 +5323,76 @@ fn file_partition_value_row(
     ]
 }
 
+/// A `ducklake_view_column_tag` row decodes to its view and the tag it
+/// carries, keyed within the view by column name rather than a column id.
+#[test]
+fn a_view_column_tag_row_decodes_to_its_view_and_tag() {
+    let cells = vec![
+        Cell::U64(7),
+        Cell::Str("amount".into()),
+        Cell::U64(3),
+        Cell::Null,
+        Cell::Str("unit".into()),
+        Cell::Str("cents".into()),
+    ];
+
+    let (view_id, tag) = decode::decode_view_column_tag_row(&cells).unwrap();
+
+    assert_eq!(view_id, 7);
+    assert_eq!(tag.column_name, "amount");
+    assert_eq!(tag.begin_snapshot, 3);
+    assert_eq!(tag.end_snapshot, None);
+    assert_eq!((tag.key.as_str(), tag.value.as_str()), ("unit", "cents"));
+}
+
+/// Every column catalog version 1.1-dev1 appends decodes whether the
+/// writer sends it or not, so one build serves a writer on either version.
+#[test]
+fn appended_catalog_columns_decode_from_either_writer() {
+    let delete_cells = delete_file_row(4, 1, 3, 1);
+    let without = decode::decode_delete_file(&delete_cells).unwrap();
+    assert_eq!(without.row_group_count, None);
+    let mut appended = delete_cells;
+    appended.push(Cell::U64(5));
+    assert_eq!(
+        decode::decode_delete_file(&appended)
+            .unwrap()
+            .row_group_count,
+        Some(5)
+    );
+
+    let stats_cells = file_column_stats_row(3, 1, 0, "1", "9");
+    let without = decode::decode_file_column_stats(&stats_cells).unwrap();
+    assert_eq!((without.min_is_exact, without.max_is_exact), (None, None));
+    let mut appended = stats_cells;
+    appended.push(Cell::Bool(true));
+    appended.push(Cell::Bool(false));
+    let with = decode::decode_file_column_stats(&appended).unwrap();
+    assert_eq!(
+        (with.min_is_exact, with.max_is_exact),
+        (Some(true), Some(false))
+    );
+}
+
+/// A writer on catalog version 1.0 omits `row_group_count`; one on
+/// 1.1-dev1 appends it. Both shapes decode, and only the later one carries
+/// a count.
+#[test]
+fn a_data_file_row_decodes_with_or_without_its_row_group_count() {
+    let without = decode::decode_data_file(&data_file_row(3, 1, 1)).unwrap();
+    assert_eq!(without.row_group_count, None);
+
+    let mut appended = data_file_row(3, 1, 1);
+    appended.push(Cell::U64(7));
+    let with = decode::decode_data_file(&appended).unwrap();
+    assert_eq!(with.row_group_count, Some(7));
+
+    // Appending the column leaves every earlier one where it was.
+    assert_eq!(with.data_file_id, without.data_file_id);
+    assert_eq!(with.footer_size, without.footer_size);
+    assert_eq!(with.path, without.path);
+}
+
 fn data_file_row(data_file_id: u64, table_id: u64, begin: u64) -> Vec<Cell> {
     vec![
         Cell::U64(data_file_id),
@@ -5721,6 +5791,52 @@ async fn tag_rows_land_and_a_recomment_ends_the_old_entry() {
         (tags[1].value.as_str(), tags[1].end_snapshot),
         ("second", None)
     );
+    catalog.close().await.unwrap();
+}
+
+/// A staged `ducklake_view_column_tag` row is visible to the transaction
+/// that staged it. DuckLake re-reads this table after staging its own
+/// writes, so committed-only state would make it re-author them.
+#[tokio::test]
+async fn staged_view_column_tags_are_visible_to_their_own_transaction() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+    assert!(
+        crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing staged, nothing committed"
+    );
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::ViewColumnTag,
+        cells: vec![
+            Cell::U64(7),
+            Cell::Str("amount".into()),
+            Cell::U64(3),
+            Cell::Null,
+            Cell::Str("unit".into()),
+            Cell::Str("cents".into()),
+        ],
+    });
+
+    let rows = crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the staged row is visible before any commit");
+    assert_eq!(
+        (rows[0].view_id, rows[0].column_name.as_str()),
+        (7, "amount")
+    );
+    assert_eq!(
+        (rows[0].key.as_str(), rows[0].value.as_str()),
+        ("unit", "cents")
+    );
+
+    tx.rollback();
     catalog.close().await.unwrap();
 }
 
@@ -7019,7 +7135,7 @@ fn table_kind_wire_order_is_pinned() {
         assert_eq!(*kind as usize, index, "{kind:?}");
         assert_eq!(TableKind::try_from(*kind as i32), Ok(*kind));
     }
-    assert_eq!(TableKind::try_from(26), Err(26));
+    assert_eq!(TableKind::try_from(27), Err(27));
     assert_eq!(TableKind::try_from(-1), Err(-1));
 
     for kind in TableKind::ALL {
@@ -7049,7 +7165,8 @@ fn table_kind_wire_order_is_pinned() {
             | TableKind::MacroParameters
             | TableKind::ColumnMapping
             | TableKind::NameMapping
-            | TableKind::Metadata => {}
+            | TableKind::Metadata
+            | TableKind::ViewColumnTag => {}
         }
     }
 }

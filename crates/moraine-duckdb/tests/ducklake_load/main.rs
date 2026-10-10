@@ -23,6 +23,7 @@
 mod helpers;
 
 mod attach;
+mod catalog_version;
 mod change_feed;
 mod checkpoints;
 mod commit_protocol;

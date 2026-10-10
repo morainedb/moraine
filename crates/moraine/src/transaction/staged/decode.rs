@@ -45,6 +45,33 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// As [`trailing_opt_u64`](Self::trailing_opt_u64), for an appended
+    /// boolean column.
+    pub(super) fn trailing_opt_bool(&mut self) -> Result<Option<bool>> {
+        match self.items.next() {
+            None | Some(Cell::Null) => Ok(None),
+            Some(Cell::Bool(value)) => Ok(Some(*value)),
+            Some(other) => Err(corrupt_row(
+                self.table,
+                format!("expected optional bool, got {other:?}"),
+            )),
+        }
+    }
+
+    /// A column a later catalog version appends, absent from a writer still
+    /// on the earlier one. Unlike [`opt_u64`](Self::opt_u64) a missing cell
+    /// is not an error.
+    pub(super) fn trailing_opt_u64(&mut self) -> Result<Option<u64>> {
+        match self.items.next() {
+            None | Some(Cell::Null) => Ok(None),
+            Some(Cell::U64(value)) => Ok(Some(*value)),
+            Some(other) => Err(corrupt_row(
+                self.table,
+                format!("expected optional u64, got {other:?}"),
+            )),
+        }
+    }
+
     pub(super) fn i64(&mut self) -> Result<i64> {
         match self.next()? {
             Cell::I64(v) => Ok(*v),
@@ -183,6 +210,8 @@ pub(super) fn decode_view(cells: &[Cell]) -> Result<proto::ViewValue> {
         dialect: c.string()?,
         sql: c.string()?,
         column_aliases: c.opt_string()?,
+        // Tags arrive through their own table, never a view INSERT.
+        column_tags: Vec::new(),
     };
     c.finish()?;
     Ok(value)
@@ -230,6 +259,7 @@ pub(super) fn decode_data_file(cells: &[Cell]) -> Result<proto::DataFileValue> {
         mapping_id: c.opt_u64()?,
         partial_max: c.opt_u64()?,
         partition_values: Vec::new(),
+        row_group_count: c.trailing_opt_u64()?,
     };
     c.finish()?;
     Ok(value)
@@ -251,6 +281,7 @@ pub(super) fn decode_delete_file(cells: &[Cell]) -> Result<proto::DeleteFileValu
         footer_size: c.u64()?,
         encryption_key: c.opt_string()?,
         partial_max: c.opt_u64()?,
+        row_group_count: c.trailing_opt_u64()?,
     };
     c.finish()?;
     Ok(value)
@@ -278,6 +309,8 @@ pub(super) fn decode_table_column_stats(cells: &[Cell]) -> Result<proto::TableCo
         min_value: c.opt_string()?,
         max_value: c.opt_string()?,
         extra_stats: c.opt_string()?,
+        min_is_exact: c.trailing_opt_bool()?,
+        max_is_exact: c.trailing_opt_bool()?,
     };
     c.finish()?;
     Ok(value)
@@ -297,6 +330,8 @@ pub(super) fn decode_file_column_stats(cells: &[Cell]) -> Result<proto::FileColu
         contains_nan: c.opt_bool()?,
         extra_stats: c.opt_string()?,
         variant_stats: Vec::new(),
+        min_is_exact: c.trailing_opt_bool()?,
+        max_is_exact: c.trailing_opt_bool()?,
     };
     c.finish()?;
     Ok(value)
@@ -382,6 +417,21 @@ pub(super) fn decode_column_tag_row(cells: &[Cell]) -> Result<((u64, u64), proto
     c.finish()?;
 
     Ok(((table_id, column_id), tag))
+}
+
+pub(super) fn decode_view_column_tag_row(cells: &[Cell]) -> Result<(u64, proto::ViewColumnTag)> {
+    let mut c = Cursor::new(TableKind::ViewColumnTag, cells);
+    let view_id = c.u64()?;
+    let tag = proto::ViewColumnTag {
+        column_name: c.string()?,
+        begin_snapshot: c.u64()?,
+        end_snapshot: c.opt_u64()?,
+        key: c.string()?,
+        value: c.string()?,
+    };
+    c.finish()?;
+
+    Ok((view_id, tag))
 }
 
 pub(super) fn decode_gc_file_row(cells: &[Cell]) -> Result<proto::GcFileValue> {
@@ -538,6 +588,7 @@ pub(super) fn decode_end(table: TableKind, cells: &[Cell]) -> Result<(EntityKey,
         | TableKind::SortExpression
         | TableKind::Tag
         | TableKind::ColumnTag
+        | TableKind::ViewColumnTag
         | TableKind::FilesScheduledForDeletion
         | TableKind::MacroImpl
         | TableKind::MacroParameters

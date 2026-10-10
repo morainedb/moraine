@@ -1372,6 +1372,7 @@ mod tests {
             footer_size: 4,
             encryption_key: None,
             partial_max: None,
+            row_group_count: None,
         };
         let ids = |view: &CatalogSnapshot, data_file_id| -> Vec<u64> {
             view.delete_files_targeting(1, data_file_id)
@@ -1543,6 +1544,7 @@ mod tests {
             mapping_id: None,
             partial_max: None,
             partition_values: vec![],
+            row_group_count: None,
         }
     }
 
@@ -1557,6 +1559,7 @@ mod tests {
             dialect: "duckdb".into(),
             sql: format!("select * from {name}"),
             column_aliases: None,
+            column_tags: Vec::new(),
         }
     }
 
@@ -1727,6 +1730,8 @@ mod tests {
             min_value: Some("9".into()),
             max_value: Some("10".into()),
             extra_stats: None,
+            min_is_exact: None,
+            max_is_exact: None,
         });
         // Verbatim strings: '9'/'10' come back untouched, never compared.
         let stats = view
@@ -1750,6 +1755,7 @@ mod tests {
             footer_size: 4,
             encryption_key: None,
             partial_max: None,
+            row_group_count: None,
         });
         assert_eq!(
             view.delete_files_of(TableId::new(1))[0].data_file_id,
@@ -1768,6 +1774,8 @@ mod tests {
             contains_nan: None,
             extra_stats: None,
             variant_stats: vec![],
+            min_is_exact: None,
+            max_is_exact: None,
         });
 
         // Dropping the table clears every per-table map except

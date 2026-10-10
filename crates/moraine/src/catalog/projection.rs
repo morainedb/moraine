@@ -1269,6 +1269,8 @@ mod tests {
             min_value: Some("1".into()),
             max_value: Some("9".into()),
             extra_stats: None,
+            min_is_exact: None,
+            max_is_exact: None,
         }
     }
 
