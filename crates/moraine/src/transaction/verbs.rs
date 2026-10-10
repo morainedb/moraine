@@ -1915,6 +1915,15 @@ impl Transaction {
         Ok(())
     }
 
+    /// The catalog version this transaction sees, absent when the store
+    /// records none.
+    pub(crate) fn catalog_version(&self) -> Option<String> {
+        self.state
+            .options
+            .get(&OptionScope::Global.key_components())
+            .and_then(|record| record.options.get("version").cloned())
+    }
+
     /// Records the catalog version this store serves. Reserved from
     /// `set_option`, because the shape moraine serves follows it; only a
     /// raise moves it.

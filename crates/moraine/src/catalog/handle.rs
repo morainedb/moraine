@@ -1208,6 +1208,21 @@ impl Catalog {
 
         let target = to.clone();
         self.commit(move |tx| {
+            // Re-read inside the commit. Recording the version is
+            // last-write-wins, so a check made against the snapshot above
+            // could be overtaken between that read and this write; this is
+            // the one that holds the never-lower invariant.
+            let recorded = tx
+                .catalog_version()
+                .unwrap_or_else(|| crate::catalog::CATALOG_VERSION.to_owned());
+            if recorded != crate::catalog::CATALOG_VERSION
+                && recorded != crate::catalog::MAX_CATALOG_VERSION
+            {
+                return Err(Error::Migration(format!(
+                    "store records catalog version {recorded}, which this build does not serve"
+                )));
+            }
+
             tx.set_catalog_version(&target);
             Ok(())
         })
