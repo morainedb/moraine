@@ -4,7 +4,8 @@
 //! The shape a store serves is read once per attach, so a raise shows up in
 //! sessions that attach after it rather than the one that made it. That, the
 //! dry run that records nothing, the acknowledgement a recording raise
-//! takes, and the pinned DuckLake's refusal of a raised store are the
+//! takes, the lifecycle columns an inlined table declares under each
+//! shape, and the pinned DuckLake's refusal of a raised store are the
 //! properties under test.
 
 use std::path::Path;
@@ -46,6 +47,34 @@ fn serves_extended_shape(store: &Path) -> bool {
         "expected the narrow shape to lack {EXTENDED_ONLY_TABLE}, got: {combined}"
     );
     false
+}
+
+/// The one inlined data table a seeded store has, named by the registry.
+/// The per-table entry is built when a lookup asks for it by name, so it
+/// is absent from `duckdb_tables()`.
+fn inlined_table_name(store: &Path) -> String {
+    let rows = csv_rows(&run_standalone_sql(
+        store,
+        "SELECT table_name FROM m.ducklake_inlined_data_tables;",
+    ));
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected one inlined data table, got {rows:?}"
+    );
+    rows[0][0].clone()
+}
+
+/// The lifecycle columns `table` declares, in declaration order.
+fn lifecycle_columns(store: &Path, table: &str) -> Vec<String> {
+    csv_rows(&run_standalone_sql(
+        store,
+        &format!("SELECT column_name FROM (DESCRIBE SELECT * FROM m.{table});"),
+    ))
+    .into_iter()
+    .map(|row| row[0].clone())
+    .take(3)
+    .collect()
 }
 
 /// Raising reports the move, records it for later sessions, and is
@@ -192,5 +221,84 @@ fn a_recording_raise_takes_an_acknowledgement() {
     assert_eq!(
         raise(store.path(), ", dry_run => true"),
         vec![vec!["1.0", "1.1-dev1"]]
+    );
+}
+
+/// 1.1-dev1 moves an inlined table's lifecycle columns behind the
+/// `_ducklake_` prefix, rows inlined under the old shape read back under
+/// the new one, and the staged-row lifecycle UPDATE takes the prefixed
+/// spelling while any other UPDATE is still refused.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and packaged extension"]
+fn raising_prefixes_the_lifecycle_columns_of_an_inlined_table() {
+    let store = TempDir::new("raise-inline-store");
+    let data = TempDir::new("raise-inline-data");
+    let options = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 1000",
+        data.path().display()
+    );
+
+    run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &options,
+        "CREATE TABLE lake.main.t (k BIGINT);\n\
+         INSERT INTO lake.main.t SELECT range FROM range(0, 3);",
+    );
+
+    let table = inlined_table_name(store.path());
+    assert_eq!(
+        lifecycle_columns(store.path(), &table),
+        vec!["row_id", "begin_snapshot", "end_snapshot"],
+        "the 1.0 shape declares the lifecycle columns unprefixed"
+    );
+
+    assert_eq!(
+        raise(store.path(), ", confirm => true"),
+        vec![vec!["1.0", "1.1-dev1"]]
+    );
+
+    assert_eq!(
+        lifecycle_columns(store.path(), &table),
+        vec![
+            "_ducklake_row_id",
+            "_ducklake_begin_snapshot",
+            "_ducklake_end_snapshot"
+        ],
+        "1.1-dev1 moves them behind the prefix DuckLake reserves"
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store.path(),
+            &format!("SELECT count(*) FROM m.{table};"),
+        )),
+        vec![vec!["3"]],
+        "rows inlined under the old shape read back under the new one"
+    );
+
+    // Expiring an inlined row is the one write DuckLake drives on these
+    // tables, and it arrives under the prefixed name.
+    run_standalone_sql(
+        store.path(),
+        &format!("UPDATE m.{table} SET _ducklake_end_snapshot = 42 WHERE _ducklake_row_id = 0;"),
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store.path(),
+            &format!("SELECT count(*) FROM m.{table} WHERE _ducklake_end_snapshot = 42;"),
+        )),
+        vec![vec!["1"]]
+    );
+
+    let refused = combined_output(&run_session(
+        &Attach::Standalone {
+            store_dir: store.path(),
+            read_only: false,
+        },
+        &format!("UPDATE m.{table} SET k = 7 WHERE _ducklake_row_id = 1;"),
+    ));
+    assert!(
+        refused.contains("the only UPDATE supported"),
+        "every other UPDATE is still refused, got: {refused}"
     );
 }
