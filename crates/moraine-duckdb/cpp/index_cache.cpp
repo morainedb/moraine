@@ -228,7 +228,11 @@ duckdb::optional_idx IndexCatalogVersion(duckdb::ClientContext &context, Moraine
 
 MoraineCatalogHandle *BindIndexRead(duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
                                     bool &cacheable) {
-	auto name = input.inputs[0].GetValue<std::string>();
+	return BindIndexReadFor(context, input.inputs[0].GetValue<std::string>(), input.binder, cacheable);
+}
+
+MoraineCatalogHandle *BindIndexReadFor(duckdb::ClientContext &context, const std::string &name,
+                                       duckdb::optional_ptr<duckdb::Binder> binder, bool &cacheable) {
 	auto named = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(name));
 	auto &catalog = named && named->GetCatalogType() == "ducklake"
 	    ? ResolveMoraineCatalog(context, named->Cast<duckdb::DuckLakeCatalog>().MetadataDatabaseName())
@@ -265,20 +269,20 @@ MoraineCatalogHandle *BindIndexRead(duckdb::ClientContext &context, duckdb::Tabl
 	bool clean = true;
 	auto &transaction = ReadTransaction(context, catalog, lake_name, clean);
 	uint64_t revision = 0;
-	cacheable = clean && input.binder && !state->catalogs.at(catalog.GetName().GetIdentifierName()).ambiguous &&
+	cacheable = clean && binder && !state->catalogs.at(catalog.GetName().GetIdentifierName()).ambiguous &&
 	            moraine_snapshot_read_revision(transaction.Snapshot(), &revision);
-	if (input.binder) {
-		auto &properties = input.binder->GetStatementProperties();
+	if (binder) {
+		auto &properties = binder->GetStatementProperties();
 		duckdb::StatementProperties::CatalogIdentity identity {catalog.GetOid(),
 		    cacheable ? duckdb::optional_idx(revision) : duckdb::optional_idx()};
 		auto existing_read = properties.read_databases.find(catalog.GetName());
 		if (existing_read != properties.read_databases.end() && existing_read->second != identity) {
 			cacheable = false;
-			input.binder->SetAlwaysRequireRebind();
+			binder->SetAlwaysRequireRebind();
 		}
 		properties.read_databases[catalog.GetName()] = identity;
 		if (!lake_name.empty()) {
-			input.binder->GetStatementProperties().RegisterDBRead(
+			binder->GetStatementProperties().RegisterDBRead(
 			    duckdb::Catalog::GetCatalog(context, duckdb::Identifier(lake_name)), context);
 		}
 	}

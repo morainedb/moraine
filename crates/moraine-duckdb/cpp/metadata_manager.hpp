@@ -35,17 +35,6 @@ public:
 	duckdb::unique_ptr<duckdb::QueryResult> Query(duckdb::string &query) override;
 	duckdb::unique_ptr<duckdb::QueryResult> AttachMetadata(const duckdb::string &attach_query) override;
 
-	//! Narrows the file list to the files an index says a pushed-down
-	//! equality filter can match, leaving it whole when no filter can be
-	//! answered that way. Both arities, because a scan uses whichever suits
-	//! what it needs from each file.
-	duckdb::vector<duckdb::DuckLakeFileListEntry>
-	GetFilesForTable(duckdb::DuckLakeTableEntry &table, duckdb::DuckLakeSnapshot snapshot,
-	                 const duckdb::FilterPushdownInfo *filter_info) override;
-	duckdb::vector<duckdb::DuckLakeFileListExtendedEntry>
-	GetExtendedFilesForTable(duckdb::DuckLakeTableEntry &table, duckdb::DuckLakeSnapshot snapshot,
-	                         const duckdb::FilterPushdownInfo *filter_info) override;
-
 	//! Writes each table's inlined rows through the Appender API, falling
 	//! back to the base `INSERT ... VALUES` batch for a table the same
 	//! commit still has to create.

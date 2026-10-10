@@ -1,28 +1,31 @@
-//! An ordinary `WHERE key = 'x'` reads only the files an index places the
-//! matching rows in.
+//! An ordinary `WHERE key = 'x'` is answered through the index: the
+//! optimizer resolves the equality once and pushes the rows' ids and files
+//! into the scan, with no lookup call and no join in the query.
 //!
-//! The filter reaches moraine while DuckLake builds its file list, so the
-//! narrowing happens before any reader opens a file, with no lookup call
-//! and no join in the query. The fixture scatters keys across both files so
-//! that DuckLake's own column statistics cannot prune: every file's
-//! min/max spans every key, and a file that is read anyway was read because
-//! the index was not consulted.
+//! The fixture scatters keys across both files so DuckLake's own column
+//! statistics cannot prune — every file's min/max spans every key — and
+//! makes the files large enough that the probe pays for itself.
 
 use crate::helpers::*;
 
-/// Two files, keys interleaved: file one holds the even values, file two the
-/// odd ones, both spanning the whole range. `c` carries the same values as
-/// `a` but goes unindexed, so a filter on it is one no index can answer
-/// while DuckLake's own statistics prune no better than for `a`.
+/// Keys permuted over two files of incompressible rows, ~2.4 MB each: the
+/// first file holds the first half of the permutation, the second the rest,
+/// and both span the whole key range. `c` repeats `a` unindexed.
 fn scattered_lake(store: &std::path::Path, data: &std::path::Path, options: &str) {
     run_ducklake_sql_with_options(
         store,
         data,
         options,
-        "CREATE TABLE lake.main.t AS SELECT i*2 AS a, i*2 AS c, repeat('x',20) AS b FROM range(1000) r(i);
-         INSERT INTO lake.main.t SELECT i*2+1, i*2+1, repeat('y',20) FROM range(1000) r(i);",
+        "CALL ducklake_set_option('lake','parquet_row_group_size','20000');
+         CREATE TABLE lake.main.t AS SELECT (i*7919)%100000 AS a, (i*7919)%100000 AS c,
+             repeat(md5(i::VARCHAR),6) AS b FROM range(50000) r(i);
+         INSERT INTO lake.main.t SELECT (i*7919)%100000, (i*7919)%100000,
+             repeat(md5(i::VARCHAR),6) FROM range(50000,100000) r(i);",
     );
 }
+
+/// `30000` is `(70000*7919) % 100000`, so it lives in the second file.
+const KEY_IN_SECOND_FILE: &str = "30000";
 
 fn files_read(output: &str) -> Vec<&str> {
     output
@@ -34,7 +37,7 @@ fn files_read(output: &str) -> Vec<&str> {
 
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn an_indexed_equality_filter_reads_only_the_files_holding_its_rows() {
+fn an_indexed_equality_reads_only_the_rows_holding_its_value() {
     let store = TempDir::new("pushdown-store");
     let data = TempDir::new("pushdown-data");
     let options = format!(
@@ -42,6 +45,7 @@ fn an_indexed_equality_filter_reads_only_the_files_holding_its_rows() {
         data.path().display()
     );
     scattered_lake(store.path(), data.path(), &options);
+    let query = format!("SELECT count(*) FROM lake.main.t WHERE a = {KEY_IN_SECOND_FILE};");
 
     // Without an index the filter prunes nothing: both files' statistics
     // admit the key, which is what makes the reading below meaningful.
@@ -49,7 +53,7 @@ fn an_indexed_equality_filter_reads_only_the_files_holding_its_rows() {
         store.path(),
         data.path(),
         &options,
-        "EXPLAIN ANALYZE SELECT count(*) FROM lake.main.t WHERE a = 1501;",
+        &format!("EXPLAIN ANALYZE {query}"),
     );
     assert_eq!(files_read(&before), vec!["2"], "{before}");
 
@@ -63,38 +67,45 @@ fn an_indexed_equality_filter_reads_only_the_files_holding_its_rows() {
         store.path(),
         data.path(),
         &options,
-        "EXPLAIN ANALYZE SELECT count(*) FROM lake.main.t WHERE a = 1501;",
+        &format!("EXPLAIN ANALYZE {query}"),
     );
     assert_eq!(files_read(&after), vec!["1"], "{after}");
-
-    // The answer is the filter's, not the index's: pruning only drops files
-    // that cannot hold a match.
-    assert_eq!(
-        csv_rows(&run_ducklake_sql_with_options(
-            store.path(),
-            data.path(),
-            &options,
-            "SELECT a, b FROM lake.main.t WHERE a = 1501;",
-        )),
-        vec![vec!["1501".to_owned(), "y".repeat(20)]]
+    // The scan carries the resolved row and its file, which is what lets the
+    // reader skip to one row group rather than sweep the key column.
+    assert!(
+        after.contains("rowid") && after.contains("data_file_id"),
+        "the scan was not told which row to read: {after}"
     );
+
+    // The answer is the filter's, not the index's.
     assert_eq!(
         csv_rows(&run_ducklake_sql_with_options(
             store.path(),
             data.path(),
             &options,
-            "SELECT count(*) FROM lake.main.t WHERE a = 7777777;",
+            &format!("SELECT a, c FROM lake.main.t WHERE a = {KEY_IN_SECOND_FILE};"),
         )),
-        vec![vec!["0"]],
-        "a key no file holds prunes every file"
+        vec![vec![KEY_IN_SECOND_FILE, KEY_IN_SECOND_FILE]]
+    );
+    let missing = run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &options,
+        "EXPLAIN ANALYZE SELECT count(*) FROM lake.main.t WHERE a = 7777777;",
+    );
+    // A value no row holds reads no file: the scan either reports none or
+    // is planned away altogether.
+    assert!(
+        files_read(&missing).iter().all(|count| *count == "0"),
+        "a value no row holds read a file: {missing}"
     );
 }
 
-/// What the narrowing declines to answer. Each of these reads every file,
-/// because the index cannot establish that the others hold nothing.
+/// What the rule declines. Each reads every file — or, for a table too
+/// small to be worth a probe, never asks the index at all.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn filters_an_index_cannot_answer_leave_the_file_list_whole() {
+fn equalities_the_index_cannot_answer_cheaply_leave_the_scan_alone() {
     let store = TempDir::new("pushdown-decline-store");
     let data = TempDir::new("pushdown-decline-data");
     let options = format!(
@@ -121,14 +132,13 @@ fn filters_an_index_cannot_answer_leave_the_file_list_whole() {
 
     let declines = [
         // An unindexed column, scattered so statistics prune nothing either.
-        "SELECT count(*) FROM lake.main.t WHERE c = 1501;".to_owned(),
+        format!("SELECT count(*) FROM lake.main.t WHERE c = {KEY_IN_SECOND_FILE};"),
         // A range, which an index answers through a different probe.
-        "SELECT count(*) FROM lake.main.t WHERE a > 1500;".to_owned(),
-        // A time-travelled list is a different cut than the index read, even
-        // where it holds the same files: this version is the one before the
-        // index itself was created.
+        "SELECT count(*) FROM lake.main.t WHERE a > 50000;".to_owned(),
+        // A time-travelled scan is a different cut than the index resolves
+        // against, even where it holds the same files.
         format!(
-            "SELECT count(*) FROM lake.main.t AT (VERSION => {loaded_version}) WHERE a = 1501;"
+            "SELECT count(*) FROM lake.main.t AT (VERSION => {loaded_version}) WHERE a = {KEY_IN_SECOND_FILE};"
         ),
     ];
     for query in &declines {
@@ -140,4 +150,34 @@ fn filters_an_index_cannot_answer_leave_the_file_list_whole() {
         );
         assert_eq!(files_read(&output), vec!["2"], "{query}: {output}");
     }
+
+    // A table below the probe's worth is scanned without asking the index:
+    // the lookup count stays at what the index's own functions made.
+    let small_store = TempDir::new("pushdown-small-store");
+    let small_data = TempDir::new("pushdown-small-data");
+    let small_options = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        small_data.path().display()
+    );
+    let result = run_session_with_env(
+        &Attach::Moraine {
+            store_dir: small_store.path(),
+            data_path: small_data.path(),
+            options: &small_options,
+            read_only: false,
+        },
+        "CREATE TABLE lake.main.t(a BIGINT);
+         INSERT INTO lake.main.t VALUES (1),(2),(3),(4);
+         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         CALL enable_logging(level => 'debug', storage => 'memory');
+         SELECT count(*) FROM lake.main.t WHERE a = 2;
+         SELECT 'lookups', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%index lookup resolved%';",
+        &[("MORAINE_LOG", "debug")],
+    );
+    let output = combined_output(&result);
+    assert!(result.status.success(), "{output}");
+    assert!(
+        csv_rows(&output).contains(&vec!["lookups".into(), "0".into()]),
+        "a four-row table paid for a probe: {output}"
+    );
 }

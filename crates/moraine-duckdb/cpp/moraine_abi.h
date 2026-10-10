@@ -1822,43 +1822,28 @@ int32_t moraine_index_lookup(struct MoraineCatalogHandle *handle,
 // matching [`moraine_index_lookup`] call, not yet freed.
 void moraine_index_lookup_free(struct MoraineRowId *items, size_t len);
 
-// The files that can hold rows whose `field_id` column equals `value`, for
-// a scan to prune its file list by.
-//
-// `out_prunable` is false when the answer cannot be trusted to be
-// complete — no ready index covers that column on its own, the value is
-// NULL, or a matching row could not be placed in a file — and the caller
-// must then read every file. An empty list with `out_prunable` set means
-// no file can hold a matching row.
-//
-// Reads through `handle`, so a borrowed alias from a scoped snapshot
-// answers at that snapshot's revision — which is what makes the answer
-// usable for a file list built at the same revision.
+// As [`moraine_index_lookup`], addressing the index by the column it
+// covers rather than by name: the rows holding `value` in the column with
+// field id `field_id`, through whichever ready single-column index covers
+// it. `out_covered` is false, with no rows, when no such index exists —
+// which is a decline rather than an empty answer.
 //
 // # Safety
 //
 // Every pointer must be valid per the ABI contract; `value` points to one
 // value whose string/bytes fields (if used) are valid; `err`, if non-null,
 // must be writable.
-int32_t moraine_index_candidate_files(struct MoraineCatalogHandle *handle,
-                                      const char *schema_name,
-                                      const char *table_name,
-                                      uint64_t field_id,
-                                      const struct MoraineLookupValue *value,
-                                      uint64_t **out_items,
-                                      size_t *out_len,
-                                      bool *out_prunable,
-                                      MoraineInterruptProbe probe,
-                                      void *probe_ctx,
-                                      struct MoraineError *err);
-
-// Frees the array a [`moraine_index_candidate_files`] call returned.
-//
-// # Safety
-//
-// `items`/`len` must be exactly the pointer and length written by a
-// matching [`moraine_index_candidate_files`] call, not yet freed.
-void moraine_index_candidate_files_free(uint64_t *items, size_t len);
+int32_t moraine_index_lookup_by_column(struct MoraineCatalogHandle *handle,
+                                       const char *schema_name,
+                                       const char *table_name,
+                                       uint64_t field_id,
+                                       const struct MoraineLookupValue *value,
+                                       struct MoraineRowId **out_items,
+                                       size_t *out_len,
+                                       bool *out_covered,
+                                       MoraineInterruptProbe probe,
+                                       void *probe_ctx,
+                                       struct MoraineError *err);
 
 // Resolves an `IN` lookup to the union of rows holding any complete key.
 // Each key is coerced to the indexed columns' canonical types. Duplicate

@@ -32,7 +32,6 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/summary_scan.cpp
     ${CPP_DIR}/update_located.cpp
     ${CPP_DIR}/index_functions.cpp
-    ${CPP_DIR}/index_pushdown.cpp
     ${CPP_DIR}/index_cache.cpp
     ${CPP_DIR}/inline_tables.cpp
     ${CPP_DIR}/maintenance.cpp
