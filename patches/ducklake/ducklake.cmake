@@ -52,7 +52,8 @@ endif()
 # registers it from its entry point; never linked into DuckDB itself.
 set(MORAINE_DUCKLAKE_SOURCE_DIR "${moraine_patched_ducklake_SOURCE_DIR}"
     CACHE INTERNAL "The patched DuckLake source moraine bundles")
+# Nothing is linked into DuckDB unless `duckdb_extension_statically_link`
+# names it, so not naming it is what keeps this out of the CLI binary.
 duckdb_extension_load(ducklake
     SOURCE_DIR ${moraine_patched_ducklake_SOURCE_DIR}
-    DONT_LINK
 )
