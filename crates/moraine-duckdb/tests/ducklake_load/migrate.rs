@@ -15,7 +15,7 @@ use crate::helpers::*;
 /// The verb reaches a store no session has attached, reports what it did,
 /// and re-runs as a no-op for a freshly created store.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extension"]
+#[ignore = "needs the built DuckDB CLI and packaged extension"]
 fn migrate_reaches_a_store_without_attaching_it() {
     let store = TempDir::new("migrate-store");
     let data = TempDir::new("migrate-data");
@@ -65,7 +65,7 @@ fn migrate_reaches_a_store_without_attaching_it() {
 /// explicit transaction would deadlock against the caller's. It refuses
 /// instead, the way maintenance does.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extension"]
+#[ignore = "needs the built DuckDB CLI and packaged extension"]
 fn migrate_refuses_an_explicit_transaction() {
     let store = TempDir::new("migrate-txn-store");
     let data = TempDir::new("migrate-txn-data");

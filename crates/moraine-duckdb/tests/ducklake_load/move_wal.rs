@@ -10,7 +10,7 @@ use crate::helpers::*;
 /// A lake created with its log in the catalog store moves it out, reads
 /// back through the new store, and from then on is held to it.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn move_wal_adopts_a_log_store_for_an_existing_lake() {
     let store = TempDir::new("move-wal-store");
     let data = TempDir::new("move-wal-data");
@@ -96,7 +96,7 @@ fn move_wal_adopts_a_log_store_for_an_existing_lake() {
 /// are still in the log keeps them — proven by moving the log of a lake
 /// that was never cleanly detached.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn move_wal_keeps_what_the_old_log_still_held() {
     let store = TempDir::new("move-wal-drain-store");
     let data = TempDir::new("move-wal-drain-data");
@@ -141,7 +141,7 @@ fn move_wal_keeps_what_the_old_log_still_held() {
 /// writes — DuckLake keeps its own `DATA_PATH` for the data layer and does
 /// not forward it to the metadata attach.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn move_wal_refuses_a_log_store_inside_the_data_path() {
     let store = TempDir::new("move-wal-nested-store");
     let data = TempDir::new("move-wal-nested-data");
@@ -167,7 +167,7 @@ fn move_wal_refuses_a_log_store_inside_the_data_path() {
 /// The move commits through its own writer, so running it inside an
 /// explicit transaction would deadlock against the caller's.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn move_wal_refuses_an_explicit_transaction() {
     let store = TempDir::new("move-wal-txn-store");
     let data = TempDir::new("move-wal-txn-data");

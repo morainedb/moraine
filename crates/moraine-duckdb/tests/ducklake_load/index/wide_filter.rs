@@ -3,7 +3,7 @@ use crate::helpers::*;
 /// Paired locations above 256 rows use the exact scan; row-only joins retain
 /// pruning.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_wide_sparse_probe_derives_row_pruning() {
     let store = TempDir::new("wide-row-pruning-store");
     let data = TempDir::new("wide-row-pruning-data");
@@ -105,7 +105,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
 
 /// Embedded row IDs resolve exact rows rather than whole row-group candidates.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_wide_probe_skips_embedded_row_groups() {
     let store = TempDir::new("wide-embedded-store");
     let data = TempDir::new("wide-embedded-data");

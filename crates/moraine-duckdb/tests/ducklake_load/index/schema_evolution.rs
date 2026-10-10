@@ -1,7 +1,7 @@
 use crate::helpers::*;
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn indexes_follow_field_identity_after_dropping_a_preceding_column() {
     for limit in [0, 10] {
         for staged in [false, true] {
@@ -58,7 +58,7 @@ fn indexes_follow_field_identity_after_dropping_a_preceding_column() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn indexes_materialize_added_columns_initial_defaults() {
     for limit in [0, 10] {
         for staged in [false, true] {
@@ -101,7 +101,7 @@ fn indexes_materialize_added_columns_initial_defaults() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn indexes_follow_renamed_and_reused_column_names() {
     for limit in [0, 10] {
         let store = TempDir::new("index-schema-rename");
@@ -141,7 +141,7 @@ fn indexes_follow_renamed_and_reused_column_names() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn indexes_follow_foreign_file_name_mappings() {
     let store = TempDir::new("index-schema-mapping");
     let data = TempDir::new("index-schema-mapping-data");
@@ -182,7 +182,7 @@ fn indexes_follow_foreign_file_name_mappings() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn indexes_ignore_nested_fields_before_a_scalar_column() {
     for limit in [0, 10] {
         let store = TempDir::new("index-schema-nested");

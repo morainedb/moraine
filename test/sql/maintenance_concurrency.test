@@ -37,16 +37,13 @@ statement ok
 SET threads=1;
 
 statement ok
-SET extension_directory='${MORAINE_EXTENSION_DIR}';
-
-statement ok
-INSTALL parquet;
+SET extension_directory='{MORAINE_EXTENSION_DIR}';
 
 statement ok
 LOAD parquet;
 
 statement ok
-LOAD '${MORAINE_DUCKDB_EXT}';
+LOAD '{MORAINE_DUCKDB_EXT}';
 
 # Configured so the pass actually writes. A bare attach skips every
 # DuckLake step and sweeps nothing, which would make this file assert that
@@ -54,7 +51,7 @@ LOAD '${MORAINE_DUCKDB_EXT}';
 # sweep take one durable commit per entry, so the trigger's connection is
 # writing the catalog for the whole of the window con1 holds open.
 statement ok
-ATTACH 'ducklake:moraine:__TEST_DIR__/maint-store' AS lake (DATA_PATH '__TEST_DIR__/maint-data/', META_DATA_PATH '__TEST_DIR__/maint-data/', META_MAINTENANCE_EXPIRE_SNAPSHOTS true, META_MAINTENANCE_CLEANUP_OLD_FILES true, META_MAINTENANCE_BATCH_SIZE 1);
+ATTACH 'ducklake:moraine:{TEST_DIR}/maint-store' AS lake (DATA_PATH '{TEST_DIR}/maint-data/', META_DATA_PATH '{TEST_DIR}/maint-data/', META_MAINTENANCE_EXPIRE_SNAPSHOTS true, META_MAINTENANCE_CLEANUP_OLD_FILES true, META_MAINTENANCE_BATCH_SIZE 1);
 
 statement ok
 CREATE TABLE lake.main.t(a BIGINT);

@@ -57,13 +57,13 @@ fn wait_until(mut ready: impl FnMut() -> bool, description: &str) {
 /// An interrupted commit can still land; its registered delete file must
 /// survive.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn an_interrupted_located_deletion_keeps_its_committed_file() {
     interrupted_deletion_retains_files(true);
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn an_interrupted_sql_deletion_keeps_its_committed_file() {
     interrupted_deletion_retains_files(false);
 }

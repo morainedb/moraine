@@ -4,9 +4,9 @@
 //! The shape a store serves is read once per attach, so a raise shows up in
 //! sessions that attach after it rather than the one that made it. That, the
 //! dry run that records nothing, the acknowledgement a recording raise
-//! takes, the lifecycle columns an inlined table declares under each
-//! shape, and the pinned DuckLake's refusal of a raised store are the
-//! properties under test.
+//! takes, the lifecycle columns an inlined table declares under each shape,
+//! and the lake still answering on the raised one are the properties under
+//! test.
 
 use std::path::Path;
 
@@ -80,7 +80,7 @@ fn lifecycle_columns(store: &Path, table: &str) -> Vec<String> {
 /// Raising reports the move, records it for later sessions, and is
 /// idempotent; a dry run reports the same move and records nothing.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extension"]
+#[ignore = "needs the built DuckDB CLI and packaged extension"]
 fn raising_the_catalog_version_widens_the_shape_for_later_sessions() {
     let store = TempDir::new("raise-version-store");
     let data = TempDir::new("raise-version-data");
@@ -139,14 +139,11 @@ fn raising_the_catalog_version_widens_the_shape_for_later_sessions() {
     );
 }
 
-/// The pinned DuckLake requires catalog version 1.0 and refuses a raised
-/// store outright, at its own version check rather than on a wider table.
-/// The raise is a one-way door out of this DuckLake's reach: moraine still
-/// serves the store, and nothing but a DuckLake that asks for the wider
-/// shape can read the lake again.
+/// The pinned DuckLake reads and writes a store on either catalog version,
+/// so a raise keeps the lake usable rather than closing it.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extension"]
-fn a_raised_store_is_refused_by_the_pinned_ducklake() {
+#[ignore = "needs the built DuckDB CLI and packaged extension"]
+fn a_raised_store_still_serves_the_lake() {
     let store = TempDir::new("raised-lake-store");
     let data = TempDir::new("raised-lake-data");
     run_ducklake_sql(
@@ -173,27 +170,24 @@ fn a_raised_store_is_refused_by_the_pinned_ducklake() {
         raise(store.path(), ", confirm => true"),
         vec![vec!["1.0", "1.1-dev1"]]
     );
-
-    let refused = run_ducklake_sql_expect_err(
-        store.path(),
-        data.path(),
-        "SELECT a FROM lake.main.t ORDER BY a;",
-    );
-    assert!(
-        refused.contains("catalog version mismatch") && refused.contains("1.1-dev1"),
-        "expected DuckLake's version refusal, got: {refused}"
-    );
-
-    // moraine itself keeps serving the store it raised; only DuckLake's
-    // own check stands between the operator and the lake.
     assert!(serves_extended_shape(store.path()));
+
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "INSERT INTO lake.main.t VALUES (3); SELECT a FROM lake.main.t ORDER BY a;",
+        )),
+        vec![vec!["1"], vec!["2"], vec!["3"]],
+        "the raised store takes a write and reads back every row"
+    );
 }
 
 /// A raise that would record refuses without an acknowledgement, and
 /// records nothing when it refuses. A dry run needs none: it is the
 /// pre-flight for the door.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extension"]
+#[ignore = "needs the built DuckDB CLI and packaged extension"]
 fn a_recording_raise_takes_an_acknowledgement() {
     let store = TempDir::new("raise-confirm-store");
     let data = TempDir::new("raise-confirm-data");
@@ -238,7 +232,7 @@ fn a_recording_raise_takes_an_acknowledgement() {
 /// the new one, and the staged-row lifecycle UPDATE takes the prefixed
 /// spelling while any other UPDATE is still refused.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extension"]
+#[ignore = "needs the built DuckDB CLI and packaged extension"]
 fn raising_prefixes_the_lifecycle_columns_of_an_inlined_table() {
     let store = TempDir::new("raise-inline-store");
     let data = TempDir::new("raise-inline-data");

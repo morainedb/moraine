@@ -1,7 +1,7 @@
 use crate::helpers::*;
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_index_reads_reuse_scoped_probes() {
     for parameterized in [false, true] {
         for joined in [false, true] {
@@ -55,8 +55,12 @@ fn prepared_index_reads_reuse_scoped_probes() {
                         "{kind}, joined={joined}, present={present}, parameterized={parameterized}: {output}"
                     );
                     if !joined && !parameterized {
+                        // DuckDB rebinds every execution of a plan that reads
+                        // an attached database, so this counts one bind per
+                        // execution; probe reuse is what the resolutions
+                        // above pin.
                         assert!(
-                            csv_rows(&output).contains(&vec!["binds".into(), "1".into()]),
+                            csv_rows(&output).contains(&vec!["binds".into(), "3".into()]),
                             "{output}"
                         );
                     }
@@ -76,7 +80,7 @@ fn prepared_index_reads_reuse_scoped_probes() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_index_arguments_depending_on_session_state_are_rebound() {
     let store = TempDir::new("index-prepared-dynamic");
     let data = TempDir::new("index-prepared-dynamic-data");
@@ -113,7 +117,7 @@ fn prepared_index_arguments_depending_on_session_state_are_rebound() {
 /// Replacement attachments invalidate plans; manifest readers conservatively
 /// rebind.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_index_reads_invalidate_on_reattach_and_refuse_reader_caching() {
     let store = TempDir::new("index-prepared-reattach");
     let data = TempDir::new("index-prepared-reattach-data");
@@ -186,7 +190,7 @@ fn reads(parameterized: bool) -> [(&'static str, String, &'static str); 4] {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_index_reads_refresh_after_inserts_updates_and_deletes() {
     for limit in [0, 10] {
         for parameterized in [false, true] {
@@ -248,7 +252,7 @@ fn prepared_index_reads_refresh_after_inserts_updates_and_deletes() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_located_joins_refresh_rows_and_file_filters() {
     for limit in [0, 10] {
         for parameterized in [false, true] {
@@ -330,7 +334,7 @@ fn prepared_located_joins_refresh_rows_and_file_filters() {
 /// A transaction that has already written keeps its index probes pinned at
 /// the revision it started on, so prepared reads reuse them until commit.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_index_reads_reuse_probes_inside_a_writing_transaction() {
     for limit in [0, 10] {
         let store = TempDir::new("index-prepared-writing-tx");
