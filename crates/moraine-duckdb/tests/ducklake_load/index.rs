@@ -101,7 +101,7 @@ fn absent_index_lookup_eliminates_the_ducklake_scan() {
            ON hits.row_id = data.rowid; \
          EXPLAIN ANALYZE EXECUTE absent_lookup(9999);");
     assert!(
-        plan.contains("EMPTY_RESULT"),
+        plan.contains("Empty Result"),
         "the known-empty lookup did not eliminate the join:\n{plan}"
     );
     assert!(

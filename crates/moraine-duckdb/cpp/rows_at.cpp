@@ -16,6 +16,9 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/binder.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "catalog.hpp"
 #include "moraine_abi.h"
 #include "owned_array.hpp"
@@ -247,16 +250,8 @@ void TableColumns(MoraineSnapshotHandle *snapshot, const std::string &schema_nam
 
 namespace {
 
-// What the scan reports to EXPLAIN ANALYZE. Shared with the bind data
-// because `to_string` is handed the bind data alone.
-struct RowsAtMetrics {
-	std::atomic<uint64_t> files_read {0};
-	std::atomic<uint64_t> peak_workers {0};
-};
-
 struct RowsAtBindData : public duckdb::FunctionData {
 	std::string catalog_name;
-	std::shared_ptr<RowsAtMetrics> metrics = std::make_shared<RowsAtMetrics>();
 	std::string schema_name;
 	std::string table_name;
 	std::string rows_repr;
@@ -308,15 +303,7 @@ duckdb::unique_ptr<duckdb::FunctionData> RowsAtBind(duckdb::ClientContext &conte
 struct RowsAtGlobalState : public duckdb::GlobalTableFunctionState {
 	MoraineRowScan *scan = nullptr;
 	std::vector<duckdb::unique_ptr<duckdb::DataChunk>> pending;
-	std::shared_ptr<RowsAtMetrics> metrics;
-	void PublishMetrics() const {
-		if (metrics && scan) {
-			metrics->files_read.store(moraine_row_scan_files_read(scan));
-			metrics->peak_workers.store(moraine_row_scan_metrics(scan).peak_workers);
-		}
-	}
 	~RowsAtGlobalState() override {
-		PublishMetrics();
 		moraine_row_scan_free(scan);
 	}
 	duckdb::idx_t MaxThreads() const override {
@@ -328,7 +315,6 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> RowsAtInit(duckdb::ClientCo
                                                                 duckdb::TableFunctionInitInput &input) {
 	auto &bound = input.bind_data->Cast<RowsAtBindData>();
 	auto state = duckdb::make_uniq<RowsAtGlobalState>();
-	state->metrics = bound.metrics;
 	auto pinned = PinTransactionSnapshot(context, bound.catalog_name, bound.schema_name, bound.table_name);
 	MoraineError error {};
 	if (moraine_rows_at_open(moraine_snapshot_read_handle(pinned.snapshot), pinned.snapshot, bound.schema_name.c_str(),
@@ -398,7 +384,6 @@ void RowsAtImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data
 			ThrowMoraineError(error);
 		}
 		if (!has_batch) {
-			state.PublishMetrics();
 			output.SetChildCardinality(0);
 			return;
 		}
@@ -437,14 +422,19 @@ void RegisterMoraineRowsAtFunction(duckdb::ExtensionLoader &loader) {
 	    "moraine_rows_at",
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
 	    RowsAtImpl, RowsAtBind, RowsAtInit);
-	rows_at.to_string = [](duckdb::TableFunctionToStringInput &input) {
-		duckdb::InsertionOrderPreservingMap<std::string> result;
-		if (input.bind_data) {
-			auto &metrics = *input.bind_data->Cast<RowsAtBindData>().metrics;
-			result["Total Files Read"] = std::to_string(metrics.files_read.load());
-			result["Peak read workers"] = std::to_string(metrics.peak_workers.load());
+	// Runtime counters go through the metrics hook, which is handed the
+	// scan's state after it has run; `to_string` renders before it reads.
+	rows_at.get_metrics = [](duckdb::TableFunctionGetMetricsInput &input) {
+		if (!input.global_state) {
+			return;
 		}
-		return result;
+		auto scan = input.global_state->Cast<RowsAtGlobalState>().scan;
+		if (!scan) {
+			return;
+		}
+		input.operator_metrics.AddExtraInfo("Total Files Read", std::to_string(moraine_row_scan_files_read(scan)));
+		input.operator_metrics.AddExtraInfo("Peak read workers",
+		                                   std::to_string(moraine_row_scan_metrics(scan).peak_workers));
 	};
 	loader.RegisterFunction(rows_at);
 }

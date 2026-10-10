@@ -31,7 +31,7 @@ fn summary_scan_is_automatic_without_a_public_switch() {
     );
     assert!(result.lines().any(|line| line == "switches,0"), "{result}");
     assert_eq!(
-        result.matches("MORAINE_SUMMARY_SCAN").count(),
+        result.matches("Moraine Summary Scan").count(),
         2,
         "{result}"
     );
@@ -59,7 +59,7 @@ fn summary_scan_uses_physical_coverage() {
          EXPLAIN SELECT sum(length(data.payload)) FROM lake.main.t data
          JOIN moraine_index_in('lake','main','t','by_a',list_transform(range(128),x -> x * 2048)) hits
          ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
-    assert!(!result.contains("MORAINE_SUMMARY_SCAN"), "{result}");
+    assert!(!result.contains("Moraine Summary Scan"), "{result}");
 }
 
 /// Parallel cursors preserve nullable strings and early-stop ownership.
@@ -126,7 +126,7 @@ fn summary_driven_scan_keeps_join_and_filters() {
          CALL moraine_index_create('lake','main','t','by_a',['a'],false);
          EXPLAIN {query}; {query};"));
     assert!(
-        result.contains("MORAINE_SUMMARY_SCAN"),
+        result.contains("Moraine Summary Scan"),
         "no selective scan: {result}"
     );
     assert!(
@@ -207,7 +207,7 @@ fn summary_driven_scan_declines_unsafe_rewrites() {
          EXPLAIN SELECT data.b FROM lake.main.t data JOIN moraine_index_lookup('lake','main','t','by_a',1) hits
          ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
     assert!(
-        !result.contains("MORAINE_SUMMARY_SCAN"),
+        !result.contains("Moraine Summary Scan"),
         "unsafe replacement: {result}"
     );
 }
@@ -300,7 +300,7 @@ fn summary_scan_runs_inside_a_writing_transaction_minus_its_deletes() {
             ),
         );
         assert_eq!(
-            result.matches("MORAINE_SUMMARY_SCAN").count(),
+            result.matches("Moraine Summary Scan").count(),
             6,
             "limit={limit}: {result}"
         );
@@ -342,7 +342,7 @@ fn summary_scan_reads_uuid_columns() {
         ),
     );
     assert!(
-        result.contains("MORAINE_SUMMARY_SCAN"),
+        result.contains("Moraine Summary Scan"),
         "no selective scan: {result}"
     );
     assert!(

@@ -26,7 +26,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
         ),
     );
     assert!(
-        result.contains("MORAINE_SUMMARY_SCAN"),
+        result.contains("Moraine Summary Scan"),
         "the wide probe lost its exact scan: {result}"
     );
     assert!(
@@ -71,7 +71,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
             &format!("EXPLAIN {query}; {query};"),
         );
         assert!(
-            result.contains("MORAINE_SUMMARY_SCAN"),
+            result.contains("Moraine Summary Scan"),
             "cap boundary {expected}: {result}"
         );
         assert!(
@@ -124,7 +124,7 @@ fn a_wide_probe_skips_embedded_row_groups() {
          AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;",
     );
     assert!(
-        result.contains("MORAINE_SUMMARY_SCAN") && !result.contains("4,096 rows"),
+        result.contains("Moraine Summary Scan") && !result.contains("4,096 rows"),
         "the scan did not use exact positions: {result}"
     );
     assert!(
