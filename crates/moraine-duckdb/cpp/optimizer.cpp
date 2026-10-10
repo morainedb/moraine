@@ -114,6 +114,19 @@ bool ReferencedColumn(const duckdb::Expression &expression, const duckdb::Logica
 	return true;
 }
 
+// Where `column` sits in this scan's projection. A pushed filter is keyed by
+// that position, and the scan resolves it back through its own column list,
+// so a key carrying the table's column index names the wrong column.
+duckdb::optional_idx ProjectedColumn(const duckdb::LogicalGet &get, duckdb::idx_t column) {
+	auto &column_ids = get.GetColumnIds();
+	for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
+		if (column_ids[i].GetPrimaryIndex() == column) {
+			return duckdb::optional_idx(i);
+		}
+	}
+	return duckdb::optional_idx();
+}
+
 // As `ReferencedColumn`, but resolving `expression` through the projections
 // between `op` and `get` — each rebinds the columns it forwards.
 bool ReferencedColumnBeneath(const duckdb::Expression &expression, duckdb::LogicalOperator &op,
@@ -264,7 +277,11 @@ void PushRowPruning(duckdb::LogicalOperator &op, RowPruning &pruning) {
 	    pruning.expression->GetReturnType() != duckdb::LogicalType::BIGINT) {
 		return;
 	}
-	get.table_filters.PushFilter(duckdb::ProjectionIndex(column),
+	auto projected = ProjectedColumn(get, column);
+	if (!projected.IsValid()) {
+		return;
+	}
+	get.table_filters.PushFilter(duckdb::ProjectionIndex(projected.GetIndex()),
 	    duckdb::make_uniq<duckdb::LegacyOptionalFilter>(RowRangeFilter(pruning.values)));
 }
 
