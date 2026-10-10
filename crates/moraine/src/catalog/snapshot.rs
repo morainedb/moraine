@@ -1559,6 +1559,7 @@ mod tests {
             dialect: "duckdb".into(),
             sql: format!("select * from {name}"),
             column_aliases: None,
+            column_tags: Vec::new(),
         }
     }
 

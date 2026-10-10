@@ -15,7 +15,7 @@ use super::{
         decode_metadata, decode_metadata_key, decode_name_mapping, decode_partition_column,
         decode_partition_info, decode_schema, decode_sort_expression, decode_sort_info,
         decode_table, decode_table_column_stats, decode_table_stats, decode_tag_row, decode_view,
-        table_value,
+        decode_view_column_tag_row, table_value,
     },
     proto,
 };
@@ -425,6 +425,19 @@ fn apply_tag_insert(
         return Ok(());
     }
 
+    if table == TableKind::ViewColumnTag {
+        let (view_id, tag) = decode_view_column_tag_row(cells)?;
+        let Some(view) = state.views.get_mut(&view_id) else {
+            return Err(corrupt_row(
+                table,
+                format!("view column tag names an absent view ({view_id})"),
+            ));
+        };
+        view.column_tags.push(tag);
+        touched.touch(EntityKey::View { view_id });
+        return Ok(());
+    }
+
     let ((table_id, column_id), tag) = decode_column_tag_row(cells)?;
     let Some(column) = state
         .columns
@@ -587,7 +600,9 @@ pub(super) fn apply_insert(
             touched.touch_gc_file(value.data_file_id);
             state.put_gc_file(value);
         }
-        TableKind::Tag | TableKind::ColumnTag => apply_tag_insert(state, table, cells, touched)?,
+        TableKind::Tag | TableKind::ColumnTag | TableKind::ViewColumnTag => {
+            apply_tag_insert(state, table, cells, touched)?;
+        }
     }
     Ok(())
 }
@@ -1001,6 +1016,7 @@ pub(super) fn apply_delete(
             }
             Ok(())
         }
+        TableKind::ViewColumnTag => apply_view_column_tag_delete(state, cells, touched),
         TableKind::PartitionColumn
         | TableKind::SortExpression
         | TableKind::FilePartitionValue
@@ -1009,6 +1025,32 @@ pub(super) fn apply_delete(
         | TableKind::NameMapping => apply_embedded_delete(state, table, cells, hard_deleted),
         TableKind::SchemaVersions => apply_schema_version_delete(cells, direct),
     }
+}
+
+/// Removes a dead `ducklake_view_column_tag` entry. An entry on a
+/// still-current view rewrites the view in place; on a pruned view there
+/// is nothing to rewrite.
+fn apply_view_column_tag_delete(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
+    let mut c = Cursor::new(TableKind::ViewColumnTag, cells);
+    let view_id = c.u64()?;
+    let column_name = c.string()?;
+    let key = c.string()?;
+    let begin_snapshot = c.u64()?;
+    c.finish()?;
+
+    touched.touch(EntityKey::View { view_id });
+    if let Some(view) = state.views.get_mut(&view_id) {
+        view.column_tags.retain(|tag| {
+            !(tag.column_name == column_name
+                && tag.key == key
+                && tag.begin_snapshot == begin_snapshot)
+        });
+    }
+    Ok(())
 }
 
 /// Removes a dead `ducklake_tag` entry from its container; a container

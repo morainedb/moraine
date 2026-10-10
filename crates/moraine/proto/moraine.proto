@@ -49,6 +49,18 @@ message ViewValue {
   string dialect = 7;
   string sql = 8;
   optional string column_aliases = 9;
+  // Written from catalog version 1.1-dev1 on.
+  repeated ViewColumnTag column_tags = 10;
+}
+
+// ducklake_view_column_tag — embedded in ViewValue. Keyed within the view
+// by column name, which a view's columns carry instead of ids.
+message ViewColumnTag {
+  string column_name = 1;
+  uint64 begin_snapshot = 2;
+  optional uint64 end_snapshot = 3;
+  string key = 4;
+  string value = 5;
 }
 
 // ducklake_macro_parameters — embedded in MacroImplementation.

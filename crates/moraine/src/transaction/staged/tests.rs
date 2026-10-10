@@ -5323,6 +5323,28 @@ fn file_partition_value_row(
     ]
 }
 
+/// A `ducklake_view_column_tag` row decodes to its view and the tag it
+/// carries, keyed within the view by column name rather than a column id.
+#[test]
+fn a_view_column_tag_row_decodes_to_its_view_and_tag() {
+    let cells = vec![
+        Cell::U64(7),
+        Cell::Str("amount".into()),
+        Cell::U64(3),
+        Cell::Null,
+        Cell::Str("unit".into()),
+        Cell::Str("cents".into()),
+    ];
+
+    let (view_id, tag) = decode::decode_view_column_tag_row(&cells).unwrap();
+
+    assert_eq!(view_id, 7);
+    assert_eq!(tag.column_name, "amount");
+    assert_eq!(tag.begin_snapshot, 3);
+    assert_eq!(tag.end_snapshot, None);
+    assert_eq!((tag.key.as_str(), tag.value.as_str()), ("unit", "cents"));
+}
+
 /// Every column catalog version 1.1-dev1 appends decodes whether the
 /// writer sends it or not, so one build serves a writer on either version.
 #[test]
@@ -7067,7 +7089,7 @@ fn table_kind_wire_order_is_pinned() {
         assert_eq!(*kind as usize, index, "{kind:?}");
         assert_eq!(TableKind::try_from(*kind as i32), Ok(*kind));
     }
-    assert_eq!(TableKind::try_from(26), Err(26));
+    assert_eq!(TableKind::try_from(27), Err(27));
     assert_eq!(TableKind::try_from(-1), Err(-1));
 
     for kind in TableKind::ALL {
@@ -7097,7 +7119,8 @@ fn table_kind_wire_order_is_pinned() {
             | TableKind::MacroParameters
             | TableKind::ColumnMapping
             | TableKind::NameMapping
-            | TableKind::Metadata => {}
+            | TableKind::Metadata
+            | TableKind::ViewColumnTag => {}
         }
     }
 }

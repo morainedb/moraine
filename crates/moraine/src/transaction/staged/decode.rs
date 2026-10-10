@@ -210,6 +210,8 @@ pub(super) fn decode_view(cells: &[Cell]) -> Result<proto::ViewValue> {
         dialect: c.string()?,
         sql: c.string()?,
         column_aliases: c.opt_string()?,
+        // Tags arrive through their own table, never a view INSERT.
+        column_tags: Vec::new(),
     };
     c.finish()?;
     Ok(value)
@@ -417,6 +419,21 @@ pub(super) fn decode_column_tag_row(cells: &[Cell]) -> Result<((u64, u64), proto
     Ok(((table_id, column_id), tag))
 }
 
+pub(super) fn decode_view_column_tag_row(cells: &[Cell]) -> Result<(u64, proto::ViewColumnTag)> {
+    let mut c = Cursor::new(TableKind::ViewColumnTag, cells);
+    let view_id = c.u64()?;
+    let tag = proto::ViewColumnTag {
+        column_name: c.string()?,
+        begin_snapshot: c.u64()?,
+        end_snapshot: c.opt_u64()?,
+        key: c.string()?,
+        value: c.string()?,
+    };
+    c.finish()?;
+
+    Ok((view_id, tag))
+}
+
 pub(super) fn decode_gc_file_row(cells: &[Cell]) -> Result<proto::GcFileValue> {
     let mut c = Cursor::new(TableKind::FilesScheduledForDeletion, cells);
     let value = proto::GcFileValue {
@@ -571,6 +588,7 @@ pub(super) fn decode_end(table: TableKind, cells: &[Cell]) -> Result<(EntityKey,
         | TableKind::SortExpression
         | TableKind::Tag
         | TableKind::ColumnTag
+        | TableKind::ViewColumnTag
         | TableKind::FilesScheduledForDeletion
         | TableKind::MacroImpl
         | TableKind::MacroParameters

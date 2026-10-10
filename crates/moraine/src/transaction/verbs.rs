@@ -1755,6 +1755,7 @@ impl Transaction {
             dialect: dialect.to_owned(),
             sql: sql.to_owned(),
             column_aliases: None,
+            column_tags: Vec::new(),
         });
         self.ops.push(Operation::CreateView {
             schema_id: schema.get(),

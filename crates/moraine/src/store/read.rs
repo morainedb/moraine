@@ -780,6 +780,7 @@ mod tests {
             dialect: "duckdb".into(),
             sql: "SELECT 1".into(),
             column_aliases: None,
+            column_tags: Vec::new(),
         };
         tx.put(
             Key::current(EntityKey::View { view_id: 4 }).encode(),
