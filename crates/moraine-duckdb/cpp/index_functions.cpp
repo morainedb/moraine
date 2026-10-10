@@ -79,7 +79,7 @@ struct IndexesBindData : public duckdb::FunctionData {
 duckdb::unique_ptr<duckdb::FunctionData> IndexesBind(duckdb::ClientContext &context,
                                                      duckdb::TableFunctionBindInput &input,
                                                      duckdb::vector<duckdb::LogicalType> &return_types,
-                                                     duckdb::vector<duckdb::string> &names) {
+                                                     duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<IndexesBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -234,7 +234,7 @@ void IndexDdlImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duc
 
 duckdb::unique_ptr<duckdb::FunctionData> CreateBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                    duckdb::vector<duckdb::string> &names) {
+                                                    duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<IndexDdlBindData>();
 	bind_data->is_create = true;
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
@@ -328,7 +328,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CreateBind(duckdb::ClientContext &, duc
 
 duckdb::unique_ptr<duckdb::FunctionData> DropBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                   duckdb::vector<duckdb::LogicalType> &return_types,
-                                                  duckdb::vector<duckdb::string> &names) {
+                                                  duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<IndexDdlBindData>();
 	bind_data->is_create = false;
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
@@ -495,7 +495,7 @@ MoraineLookupValue BuildLookupValue(const duckdb::Value &value, LookupValueArena
 duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &context,
                                                     duckdb::TableFunctionBindInput &input,
                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                    duckdb::vector<duckdb::string> &names) {
+                                                    duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<LookupBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -537,7 +537,7 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context,
                                                 duckdb::TableFunctionBindInput &input,
                                                 duckdb::vector<duckdb::LogicalType> &return_types,
-                                                duckdb::vector<duckdb::string> &names) {
+                                                duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<LookupBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -652,7 +652,7 @@ struct RangeBindData : public IndexReadBindData {
 duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &context,
                                                    duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
-                                                   duckdb::vector<duckdb::string> &names) {
+                                                   duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<RangeBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -771,7 +771,7 @@ struct NullsBindData : public IndexReadBindData {
 duckdb::unique_ptr<duckdb::FunctionData> NullsBind(duckdb::ClientContext &context,
                                                    duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
-                                                   duckdb::vector<duckdb::string> &names) {
+                                                   duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<NullsBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -908,17 +908,19 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	     LogicalType::LIST(LogicalType::VARCHAR), LogicalType::BOOLEAN},
 	    IndexDdlImpl, CreateBind, IndexDdlInitGlobal);
-	// Optional per-column sort directions ['asc'|'desc', ...] and NULL
-	// placement ['first'|'last', ...], each parallel to the columns.
-	create.named_parameters["directions"] = LogicalType::LIST(LogicalType::VARCHAR);
-	create.named_parameters["nulls"] = LogicalType::LIST(LogicalType::VARCHAR);
-	create.named_parameters["maintenance"] = LogicalType::VARCHAR;
-	// Multi-commit build, for a backfill too large for one commit, and the
-	// bounds on one step of it — each step is one object-store request, so a
-	// slow link wants them smaller than the default.
-	create.named_parameters["staged"] = LogicalType::BOOLEAN;
-	create.named_parameters["step_entries"] = LogicalType::BIGINT;
-	create.named_parameters["step_bytes"] = LogicalType::BIGINT;
+	create.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		// Optional per-column sort directions ['asc'|'desc', ...] and NULL
+		// placement ['first'|'last', ...], each parallel to the columns.
+		options.Add("directions", LogicalType::LIST(LogicalType::VARCHAR));
+		options.Add("nulls", LogicalType::LIST(LogicalType::VARCHAR));
+		options.Add("maintenance", LogicalType::VARCHAR);
+		// Multi-commit build, for a backfill too large for one commit, and
+		// the bounds on one step of it — each step is one object-store
+		// request, so a slow link wants them smaller than the default.
+		options.Add("staged", LogicalType::BOOLEAN);
+		options.Add("step_entries", LogicalType::BIGINT);
+		options.Add("step_bytes", LogicalType::BIGINT);
+	});
 	loader.RegisterFunction(create);
 
 	// (catalog, schema, table, index, then the equality key as variadic args
@@ -927,7 +929,7 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                             {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                              LogicalType::VARCHAR},
 	                             LookupImpl, LookupBind, LookupInitGlobal);
-	lookup.varargs = LogicalType::ANY;
+	lookup.GetSignature().AddArgs("keys", LogicalType::ANY);
 	lookup.cardinality = ExactIndexCardinality<LookupBindData>;
 	loader.RegisterFunction(lookup);
 
@@ -953,7 +955,9 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                             LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY,
 	                             LogicalType::BOOLEAN, LogicalType::BOOLEAN},
 	                            RangeImpl, RangeBind, RangeInitGlobal);
-	range.named_parameters["reverse"] = LogicalType::BOOLEAN;
+	range.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		options.Add("reverse", LogicalType::BOOLEAN);
+	});
 	range.cardinality = ExactIndexCardinality<RangeBindData>;
 	loader.RegisterFunction(range);
 
@@ -963,8 +967,10 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR},
 	                            NullsImpl, NullsBind, NullsInitGlobal);
-	nulls.varargs = LogicalType::ANY;
-	nulls.named_parameters["reverse"] = LogicalType::BOOLEAN;
+	nulls.GetSignature().AddArgs("keys", LogicalType::ANY);
+	nulls.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		options.Add("reverse", LogicalType::BOOLEAN);
+	});
 	nulls.cardinality = ExactIndexCardinality<NullsBindData>;
 	loader.RegisterFunction(nulls);
 }

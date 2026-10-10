@@ -417,7 +417,7 @@ std::vector<duckdb::idx_t> ExtractSetRefs(duckdb::LogicalUpdate &op) {
 			    "\"%s\"",
 			    op.table.name);
 		}
-		refs.push_back(expr->Cast<duckdb::BoundReferenceExpression>().index);
+		refs.push_back(expr->Cast<duckdb::BoundReferenceExpression>().Index());
 	}
 	return refs;
 }
@@ -506,7 +506,7 @@ duckdb::PhysicalOperator &PlanMetadataDelete(duckdb::PhysicalPlanGenerator &plan
 			}
 			auto &bound_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>();
 			return planner.Make<MoraineInlineRegistryDelete>(op.types, spec, op.table.catalog, op.estimated_cardinality,
-			                                                 bound_ref.index);
+			                                                 bound_ref.Index());
 		}
 		return planner.Make<MoraineMetadataVoidDelete>(op.types, spec, op.table.catalog, op.estimated_cardinality);
 	}
@@ -519,7 +519,7 @@ duckdb::PhysicalOperator &PlanMetadataDelete(duckdb::PhysicalPlanGenerator &plan
 	}
 	auto &bound_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>();
 	return planner.Make<MoraineMetadataDelete>(op.types, spec, op.table.catalog, op.estimated_cardinality,
-	                                           bound_ref.index);
+	                                           bound_ref.Index());
 }
 
 } // namespace moraine_duckdb

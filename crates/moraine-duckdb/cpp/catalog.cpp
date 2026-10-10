@@ -90,7 +90,7 @@ MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const std:
 	const std::string metadata_prefix = "__ducklake_metadata_";
 
 	auto as_moraine = [&](const std::string &name) -> MoraineCatalog * {
-		auto catalog = duckdb::Catalog::GetCatalogEntry(context, name);
+		auto catalog = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(name));
 		if (catalog && catalog->GetCatalogType() == "moraine") {
 			return &catalog->Cast<MoraineCatalog>();
 		}
@@ -106,7 +106,7 @@ MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const std:
 	}
 	// A lake attached with `METADATA_CATALOG` named its metadata catalog
 	// itself, so no name derivation finds it. Match on path instead.
-	auto named = duckdb::Catalog::GetCatalogEntry(context, catalog_name);
+	auto named = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(catalog_name));
 	if (named) {
 		auto lake_path = named->GetDBPath();
 		for (auto &attached : duckdb::DatabaseManager::Get(context).GetDatabases(context)) {
@@ -357,7 +357,8 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type) {
 
 MoraineTableEntry::MoraineTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema,
                                      duckdb::CreateTableInfo &info, MoraineSnapshotHandle *snapshot, uint64_t table_id)
-    : duckdb::TableCatalogEntry(catalog, schema, info), snapshot_(snapshot), table_id_(table_id) {
+    : duckdb::TableCatalogEntry(catalog, schema, info), snapshot_(snapshot), table_id_(table_id),
+      columns_(std::move(info.columns)) {
 }
 
 duckdb::unique_ptr<duckdb::BaseStatistics> MoraineTableEntry::GetStatistics(duckdb::ClientContext &context,
@@ -400,7 +401,7 @@ std::string MoraineViewEntry::ToSQL() const {
 	// `query` is null (view definitions are never parsed yet); compose the
 	// definition textually from the listing ABI's strings instead.
 	std::string result = "CREATE VIEW ";
-	result += duckdb::KeywordHelper::WriteOptionallyQuoted(name);
+	result += duckdb::KeywordHelper::WriteOptionallyQuoted(name.GetIdentifierName());
 	result += " AS ";
 	result += sql;
 	result += ";";
@@ -463,7 +464,7 @@ void MoraineSchemaEntry::EnsureTablesLoaded() {
 		                duckdb::make_uniq<MoraineTableEntry>(catalog, *this, info, snapshot_, table_desc.id));
 	}
 
-	if (duckdb::StringUtil::CIEquals(name, "main")) {
+	if (name == "main") {
 		// DuckLake's metadata connection queries every `ducklake_*` table from
 		// the default schema, which is "main". A same-named real table wins
 		// over the synthesized one via `emplace`'s no-overwrite rule.
@@ -542,7 +543,7 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::LookupEntry(duckd
 		// connection's default schema, matching PopulateMetadataTables).
 		// Cached into `tables_` on success so a repeat lookup within this
 		// transaction is free.
-		if (duckdb::StringUtil::CIEquals(this->name, "main") && transaction.context) {
+		if (this->name == "main" && transaction.context) {
 			auto &moraine_catalog = ParentCatalog().Cast<MoraineCatalog>();
 			auto inline_entry =
 			    LookupInlineTableEntry(*transaction.context, catalog, *this, moraine_catalog.Handle(), name);
@@ -575,10 +576,10 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateFunction(du
 
 duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckdb::CatalogTransaction transaction,
                                                                            duckdb::BoundCreateTableInfo &info) {
-	auto &table_name = info.Base().table;
+	auto &table_name = info.Base().GetTableName();
 	auto &moraine_catalog = ParentCatalog().Cast<MoraineCatalog>();
 
-	if (auto parsed = ParseInlinedDataTableName(table_name)) {
+	if (auto parsed = ParseInlinedDataTableName(table_name.GetIdentifierName())) {
 		if (!transaction.transaction) {
 			throw duckdb::InternalException("moraine: CREATE TABLE without an active transaction");
 		}
@@ -598,13 +599,13 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckd
 		return entry_ptr;
 	}
 
-	if (auto delete_table_id = ParseInlinedDeleteTableName(table_name)) {
+	if (auto delete_table_id = ParseInlinedDeleteTableName(table_name.GetIdentifierName())) {
 		// Fixed shape, no store-side schema to stage — the store records the
 		// table's existence when the first `inline/fdel` is staged against it
 		// (see inline_tables.hpp), so CREATE only builds and caches the entry
 		// for the rest of this transaction. The find below is a defensive
 		// re-check; DuckLake de-duplicates its own CREATE-per-batch.
-		auto found = tables_.find(table_name);
+		auto found = tables_.find(table_name.GetIdentifierName());
 		if (found != tables_.end()) {
 			if (info.Base().on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT) {
 				return nullptr;
@@ -669,7 +670,7 @@ void MoraineSchemaEntry::DropEntry(duckdb::ClientContext &context, duckdb::DropI
 	// sweep once the table is absent from live state and history, which is
 	// also what keeps a read below the drop able to resolve them.
 	if (info.type == duckdb::CatalogType::TABLE_ENTRY) {
-		if (auto parsed = ParseInlinedDataTableName(info.name)) {
+		if (auto parsed = ParseInlinedDataTableName(info.GetQualifiedName().Name().GetIdentifierName())) {
 			auto catalog_transaction = catalog.GetCatalogTransaction(context);
 			auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
 			MoraineError err {};
@@ -678,7 +679,7 @@ void MoraineSchemaEntry::DropEntry(duckdb::ClientContext &context, duckdb::DropI
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
 			}
-			tables_.erase(info.name);
+			tables_.erase(info.GetQualifiedName().Name().GetIdentifierName());
 			return;
 		}
 	}
@@ -737,7 +738,8 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientConte
 	// `moraine_detach`. Release it by hand and re-throw instead.
 	try {
 		extended_catalog_ = MoraineServesExtendedCatalog(handle_);
-		scheduler_ = duckdb::make_shared_ptr<MaintenanceScheduler>(db.GetDatabase(), db.GetName(), path_, handle_,
+		scheduler_ = duckdb::make_shared_ptr<MaintenanceScheduler>(db.GetDatabase(), db.GetName().GetIdentifierName(),
+		                                                           path_, handle_,
 		                                                           std::move(maintenance));
 		// A read-only attach never schedules — maintenance mutates, and
 		// a `DbReader` never opens a writer. The trigger refuses too.
@@ -974,7 +976,7 @@ MoraineCatalog::LookupSchema(duckdb::CatalogTransaction transaction, const duckd
 		}
 		for (auto &schema_desc : schema_descs) {
 			duckdb::CreateSchemaInfo info;
-			info.schema = schema_desc.name;
+			info.SetSchema(duckdb::Identifier(schema_desc.name));
 			tx.PutSchema(schema_desc.id,
 			             duckdb::make_uniq<MoraineSchemaEntry>(*this, info, tx.Snapshot(), schema_desc.id));
 		}
@@ -983,7 +985,7 @@ MoraineCatalog::LookupSchema(duckdb::CatalogTransaction transaction, const duckd
 
 	duckdb::optional_ptr<duckdb::SchemaCatalogEntry> found;
 	tx.ForEachSchema([&](duckdb::SchemaCatalogEntry &entry) {
-		if (!found && duckdb::StringUtil::CIEquals(entry.name, schema_lookup.GetEntryName())) {
+		if (!found && entry.name == schema_lookup.GetEntryName()) {
 			found = &entry;
 		}
 	});

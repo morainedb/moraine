@@ -752,7 +752,7 @@ struct MaintenanceGlobalState : public duckdb::GlobalTableFunctionState {
 
 duckdb::unique_ptr<duckdb::FunctionData> MaintenanceBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                          duckdb::vector<duckdb::LogicalType> &return_types,
-                                                         duckdb::vector<duckdb::string> &names) {
+                                                         duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<MaintenanceBindData>();
 	if (input.inputs[0].IsNull()) {
 		throw duckdb::BinderException("moraine_maintenance: the lake name must not be NULL");
@@ -766,7 +766,7 @@ duckdb::unique_ptr<duckdb::FunctionData> MaintenanceBind(duckdb::ClientContext &
 duckdb::unique_ptr<duckdb::FunctionData> StatusBind(duckdb::ClientContext &context,
                                                     duckdb::TableFunctionBindInput &input,
                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                    duckdb::vector<duckdb::string> &names) {
+                                                    duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = MaintenanceBind(context, input, return_types, names);
 	bind_data->Cast<MaintenanceBindData>().status_only = true;
 	// Retained passes carry when they ran and what drove them.
@@ -873,7 +873,7 @@ struct CompactRow {
 duckdb::unique_ptr<duckdb::FunctionData> CompactBind(duckdb::ClientContext &,
                                                      duckdb::TableFunctionBindInput &input,
                                                      duckdb::vector<duckdb::LogicalType> &return_types,
-                                                     duckdb::vector<duckdb::string> &names) {
+                                                     duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<CompactBindData>();
 	if (input.inputs[0].IsNull()) {
 		throw duckdb::BinderException("moraine_compact_store: the lake name must not be NULL");
@@ -1020,7 +1020,7 @@ struct RaiseFormatBindData : public duckdb::FunctionData {
 duckdb::unique_ptr<duckdb::FunctionData> RaiseFormatBind(duckdb::ClientContext &,
                                                          duckdb::TableFunctionBindInput &input,
                                                          duckdb::vector<duckdb::LogicalType> &return_types,
-                                                         duckdb::vector<duckdb::string> &names) {
+                                                         duckdb::vector<duckdb::Identifier> &names) {
 	names = {"from_format", "to_format"};
 	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
 
@@ -1033,7 +1033,7 @@ duckdb::unique_ptr<duckdb::FunctionData> RaiseFormatBind(duckdb::ClientContext &
 		throw duckdb::BinderException("moraine_raise_format: the lake name must not be empty");
 	}
 	for (auto &option : input.named_parameters) {
-		if (duckdb::StringUtil::CIEquals(option.first, "dry_run")) {
+		if (option.first == "dry_run") {
 			if (option.second.IsNull()) {
 				throw duckdb::BinderException("moraine_raise_format: dry_run must not be NULL");
 			}
@@ -1088,14 +1088,18 @@ void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader) {
 
 	duckdb::TableFunction compact("moraine_compact_store", {duckdb::LogicalType::VARCHAR}, CompactImpl,
 	                              CompactBind, CompactInitGlobal);
-	compact.named_parameters["subspace"] = duckdb::LogicalType::VARCHAR;
-	compact.named_parameters["timeout"] = duckdb::LogicalType::ANY;
-	compact.named_parameters["require_completed"] = duckdb::LogicalType::BOOLEAN;
+	compact.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		options.Add("subspace", duckdb::LogicalType::VARCHAR);
+		options.Add("timeout", duckdb::LogicalType::ANY);
+		options.Add("require_completed", duckdb::LogicalType::BOOLEAN);
+	});
 	loader.RegisterFunction(compact);
 
 	duckdb::TableFunction raise_format("moraine_raise_format", {duckdb::LogicalType::VARCHAR}, RaiseFormatImpl,
 	                                   RaiseFormatBind, RaiseFormatInitGlobal);
-	raise_format.named_parameters["dry_run"] = duckdb::LogicalType::BOOLEAN;
+	raise_format.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		options.Add("dry_run", duckdb::LogicalType::BOOLEAN);
+	});
 	loader.RegisterFunction(raise_format);
 }
 

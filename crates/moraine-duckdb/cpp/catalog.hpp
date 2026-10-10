@@ -6,7 +6,9 @@
 
 #include "duckdb.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/logging/logging.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
@@ -96,6 +98,17 @@ public:
 private:
 	MoraineSnapshotHandle *snapshot_;
 	uint64_t table_id_;
+
+public:
+	// 2.0's `TableCatalogEntry` declares `GetColumns` pure and stores no
+	// columns of its own, so every entry owns its list.
+	const duckdb::ColumnList &GetColumns() const override {
+		return columns_;
+	}
+
+private:
+	duckdb::ColumnList columns_;
+
 };
 
 // A moraine-backed view entry. Cataloging (name/schema lookup, `DESCRIBE`)

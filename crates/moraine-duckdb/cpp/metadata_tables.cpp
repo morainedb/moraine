@@ -1523,11 +1523,10 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	return specs;
 }
 
-duckdb::BindInfo MetadataScanBindInfo(const duckdb::optional_ptr<duckdb::FunctionData> bind_data) {
+duckdb::optional_ptr<duckdb::TableCatalogEntry>
+MetadataScanTableEntry(duckdb::optional_ptr<const duckdb::FunctionData> bind_data) {
 	auto &data = bind_data->Cast<MetadataScanBindData>();
-	duckdb::BindInfo info(duckdb::ScanType::TABLE);
-	info.table = data.table_entry;
-	return info;
+	return data.table_entry;
 }
 
 // The catalog a deferred scan reads through, proven still attached.
@@ -1537,7 +1536,8 @@ duckdb::BindInfo MetadataScanBindInfo(const duckdb::optional_ptr<duckdb::Functio
 // therefore only ever compared, never followed — the reference returned is
 // the one the database manager resolves now.
 duckdb::Catalog &LiveBoundCatalog(duckdb::ClientContext &context, const MetadataScanBindData &bind_data) {
-	auto database = duckdb::DatabaseManager::Get(context).GetDatabase(context, bind_data.catalog_name);
+	auto database =
+	    duckdb::DatabaseManager::Get(context).GetDatabase(context, duckdb::Identifier(bind_data.catalog_name));
 	if (database && &database->GetCatalog() == bind_data.catalog) {
 		return *bind_data.catalog;
 	}
@@ -1629,7 +1629,7 @@ bool IsColumnRef(const duckdb::Expression &expression, const duckdb::LogicalGet 
 		return false;
 	}
 	auto &column = expression.Cast<duckdb::BoundColumnRefExpression>();
-	return column.binding.table_index == get.table_index && column.binding.column_index == projected;
+	return column.Binding().table_index == get.table_index && column.Binding().column_index == projected;
 }
 
 // The non-negative BIGINT constant `expression` holds, if it is one.
@@ -1637,7 +1637,7 @@ duckdb::optional_idx ConstantSnapshot(const duckdb::Expression &expression) {
 	if (expression.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
 		return duckdb::optional_idx();
 	}
-	auto &value = expression.Cast<duckdb::BoundConstantExpression>().value;
+	auto &value = expression.Cast<duckdb::BoundConstantExpression>().GetValue();
 	if (value.IsNull() || value.type().id() != duckdb::LogicalTypeId::BIGINT) {
 		return duckdb::optional_idx();
 	}
@@ -1671,7 +1671,7 @@ duckdb::optional_idx LiveBoundOf(const duckdb::Expression &filter, const duckdb:
                                  duckdb::idx_t projected) {
 	if (filter.GetExpressionType() == duckdb::ExpressionType::OPERATOR_IS_NULL) {
 		auto &is_null = filter.Cast<duckdb::BoundOperatorExpression>();
-		if (is_null.children.size() == 1 && IsColumnRef(*is_null.children[0], get, projected)) {
+		if (is_null.GetChildren().size() == 1 && IsColumnRef(*is_null.GetChildren()[0], get, projected)) {
 			return duckdb::optional_idx(kLiveAtEverySnapshot);
 		}
 		return duckdb::optional_idx();
@@ -1681,16 +1681,16 @@ duckdb::optional_idx LiveBoundOf(const duckdb::Expression &filter, const duckdb:
 	}
 	auto &disjunction = filter.Cast<duckdb::BoundConjunctionExpression>();
 	if (disjunction.GetExpressionType() != duckdb::ExpressionType::CONJUNCTION_OR ||
-	    disjunction.children.size() != 2) {
+	    disjunction.GetChildren().size() != 2) {
 		return duckdb::optional_idx();
 	}
 
 	duckdb::optional_idx bound;
 	bool saw_is_null = false;
-	for (auto &child : disjunction.children) {
+	for (auto &child : disjunction.GetChildren()) {
 		if (child->GetExpressionType() == duckdb::ExpressionType::OPERATOR_IS_NULL) {
 			auto &is_null = child->Cast<duckdb::BoundOperatorExpression>();
-			if (is_null.children.size() == 1 && IsColumnRef(*is_null.children[0], get, projected)) {
+			if (is_null.GetChildren().size() == 1 && IsColumnRef(*is_null.GetChildren()[0], get, projected)) {
 				saw_is_null = true;
 			}
 			continue;
@@ -1700,15 +1700,17 @@ duckdb::optional_idx LiveBoundOf(const duckdb::Expression &filter, const duckdb:
 		    type != duckdb::ExpressionType::COMPARE_GREATERTHAN) {
 			continue;
 		}
-		auto &comparison = child->Cast<duckdb::BoundComparisonExpression>();
+		auto &comparison = child->Cast<duckdb::BoundFunctionExpression>();
+		auto &left = duckdb::BoundComparisonExpression::Left(comparison);
+		auto &right = duckdb::BoundComparisonExpression::Right(comparison);
 		// `S < end_snapshot` either way round; anything else, including the
 		// inclusive forms, is left alone.
-		auto &constant = type == duckdb::ExpressionType::COMPARE_LESSTHAN ? comparison.left : comparison.right;
-		auto &column = type == duckdb::ExpressionType::COMPARE_LESSTHAN ? comparison.right : comparison.left;
-		if (!IsColumnRef(*column, get, projected)) {
+		auto &constant = type == duckdb::ExpressionType::COMPARE_LESSTHAN ? left : right;
+		auto &column = type == duckdb::ExpressionType::COMPARE_LESSTHAN ? right : left;
+		if (!IsColumnRef(column, get, projected)) {
 			continue;
 		}
-		if (auto snapshot = ConstantSnapshot(*constant); snapshot.IsValid()) {
+		if (auto snapshot = ConstantSnapshot(constant); snapshot.IsValid()) {
 			bound = snapshot;
 		}
 	}
@@ -1777,11 +1779,13 @@ void MetadataScanPushdownComplexFilter(duckdb::ClientContext &, duckdb::LogicalG
 		if (filter->GetExpressionType() != duckdb::ExpressionType::COMPARE_EQUAL) {
 			continue;
 		}
-		auto &comparison = filter->Cast<duckdb::BoundComparisonExpression>();
+		auto &comparison = filter->Cast<duckdb::BoundFunctionExpression>();
+		auto &left = duckdb::BoundComparisonExpression::Left(comparison);
+		auto &right = duckdb::BoundComparisonExpression::Right(comparison);
 		// Either side may hold the column reference.
-		duckdb::Expression *orderings[2][2] = {
-		    {comparison.left.get(), comparison.right.get()},
-		    {comparison.right.get(), comparison.left.get()},
+		const duckdb::Expression *orderings[2][2] = {
+		    {&left, &right},
+		    {&right, &left},
 		};
 		for (auto &ordering : orderings) {
 			auto *reference = ordering[0];
@@ -1791,11 +1795,11 @@ void MetadataScanPushdownComplexFilter(duckdb::ClientContext &, duckdb::LogicalG
 				continue;
 			}
 			auto &column = reference->Cast<duckdb::BoundColumnRefExpression>();
-			if (column.binding.table_index != get.table_index ||
-			    column.binding.column_index != projected.GetIndex()) {
+			if (column.Binding().table_index != get.table_index ||
+			    column.Binding().column_index != projected.GetIndex()) {
 				continue;
 			}
-			auto &value = constant->Cast<duckdb::BoundConstantExpression>().value;
+			auto &value = constant->Cast<duckdb::BoundConstantExpression>().GetValue();
 			if (value.IsNull() || value.type().id() != duckdb::LogicalTypeId::BIGINT) {
 				continue;
 			}
@@ -1819,7 +1823,7 @@ void MetadataScanPushdownComplexFilter(duckdb::ClientContext &, duckdb::LogicalG
 // column of a type without a typed path below goes through `SetValue`.
 void EmitMetadataColumn(const MetadataRows &rows, duckdb::idx_t start, duckdb::idx_t count, duckdb::column_t col_id,
                         duckdb::Vector &target) {
-	auto &validity = duckdb::FlatVector::Validity(target);
+	auto &validity = duckdb::FlatVector::ValidityMutable(target);
 	auto cell = [&](duckdb::idx_t out_row) -> const duckdb::Value * {
 		auto &row = rows[start + out_row];
 		if (duckdb::IsVirtualColumn(col_id) || col_id >= row.size() || row[col_id].IsNull()) {
@@ -1830,7 +1834,7 @@ void EmitMetadataColumn(const MetadataRows &rows, duckdb::idx_t start, duckdb::i
 	};
 	switch (target.GetType().id()) {
 	case duckdb::LogicalTypeId::BIGINT: {
-		auto data = duckdb::FlatVector::GetData<int64_t>(target);
+		auto data = duckdb::FlatVector::GetDataMutable<int64_t>(target);
 		for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
 			if (auto *value = cell(out_row)) {
 				data[out_row] = value->GetValue<int64_t>();
@@ -1839,7 +1843,7 @@ void EmitMetadataColumn(const MetadataRows &rows, duckdb::idx_t start, duckdb::i
 		return;
 	}
 	case duckdb::LogicalTypeId::BOOLEAN: {
-		auto data = duckdb::FlatVector::GetData<bool>(target);
+		auto data = duckdb::FlatVector::GetDataMutable<bool>(target);
 		for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
 			if (auto *value = cell(out_row)) {
 				data[out_row] = value->GetValue<bool>();
@@ -1848,7 +1852,7 @@ void EmitMetadataColumn(const MetadataRows &rows, duckdb::idx_t start, duckdb::i
 		return;
 	}
 	case duckdb::LogicalTypeId::VARCHAR: {
-		auto data = duckdb::FlatVector::GetData<duckdb::string_t>(target);
+		auto data = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(target);
 		for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
 			if (auto *value = cell(out_row)) {
 				data[out_row] = duckdb::StringVector::AddString(target, duckdb::StringValue::Get(*value));
@@ -1891,7 +1895,7 @@ void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInpu
 			// very row — never to the same position in a second
 			// materialization, which a narrowed scan and a commit
 			// landing under it can each make a different list.
-			auto ids = duckdb::FlatVector::GetData<int64_t>(target);
+			auto ids = duckdb::FlatVector::GetDataMutable<int64_t>(target);
 			for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
 				ids[out_row] = static_cast<int64_t>(state.row_id_base + start + out_row);
 			}
@@ -1945,7 +1949,7 @@ duckdb::TableFunction MetadataScanTableFunction() {
 	function.pushdown_complex_filter = MetadataScanPushdownComplexFilter;
 	// Resolves `LogicalGet::GetTable()` so UPDATE/DELETE statements bind
 	// against these tables.
-	function.get_bind_info = MetadataScanBindInfo;
+	function.get_table_entry = MetadataScanTableEntry;
 	return function;
 }
 
@@ -2020,7 +2024,8 @@ const std::vector<MetadataTableSpec> &MoraineMetadataTableSpecs(bool extended) {
 MoraineMetadataTableEntry::MoraineMetadataTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema,
                                                      duckdb::CreateTableInfo &info, const MetadataTableSpec &spec,
                                                      MoraineCatalogHandle *handle)
-    : duckdb::TableCatalogEntry(catalog, schema, info), spec_(spec), handle_(handle) {
+    : duckdb::TableCatalogEntry(catalog, schema, info), spec_(spec), handle_(handle),
+      columns_(std::move(info.columns)) {
 }
 
 duckdb::unique_ptr<duckdb::BaseStatistics> MoraineMetadataTableEntry::GetStatistics(duckdb::ClientContext &,
@@ -2426,7 +2431,7 @@ duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientC
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
 	scan_bind_data->spec = &spec_;
 	scan_bind_data->catalog = &ParentCatalog();
-	scan_bind_data->catalog_name = ParentCatalog().GetName();
+	scan_bind_data->catalog_name = ParentCatalog().GetName().GetIdentifierName();
 	// A narrowable kind is left unmaterialized for `InitGlobal`: the filter
 	// deciding how much of it to build has not been pushed down yet.
 	if (spec_.scope_column < 0 && !spec_.live_narrowable) {

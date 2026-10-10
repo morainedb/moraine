@@ -29,6 +29,7 @@
 // writer is excluded by the store's single-writer fencing).
 #pragma once
 
+#include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb.hpp"
 
 #include "moraine_abi.h"

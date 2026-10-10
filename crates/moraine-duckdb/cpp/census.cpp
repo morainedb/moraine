@@ -59,7 +59,7 @@ struct CensusBindData : public duckdb::FunctionData {
 duckdb::unique_ptr<duckdb::FunctionData> CensusBind(duckdb::ClientContext &context,
                                                     duckdb::TableFunctionBindInput &input,
                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                    duckdb::vector<duckdb::string> &names) {
+                                                    duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<CensusBindData>();
 	if (input.inputs[0].IsNull()) {
 		throw duckdb::BinderException("moraine_store_census: the lake name must not be NULL");
@@ -184,7 +184,7 @@ struct TallyBindData : public duckdb::FunctionData {
 
 duckdb::unique_ptr<duckdb::FunctionData> TallyBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
-                                                   duckdb::vector<duckdb::string> &names) {
+                                                   duckdb::vector<duckdb::Identifier> &names) {
 	names = {"metadata_hits",  "metadata_misses",       "metadata_hit_rate",       "block_hits",
 	         "block_misses",   "block_hit_rate",        "errors",                  "preload_metadata_hits",
 	         "preload_metadata_misses", "preload_block_hits", "preload_block_misses", "preload_failures",
@@ -286,7 +286,7 @@ void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 duckdb::unique_ptr<duckdb::FunctionData> SidecarTallyBind(duckdb::ClientContext &,
                                                           duckdb::TableFunctionBindInput &,
                                                           duckdb::vector<duckdb::LogicalType> &return_types,
-                                                          duckdb::vector<duckdb::string> &names) {
+                                                          duckdb::vector<duckdb::Identifier> &names) {
 	names = {"hits", "misses", "refused", "published", "publish_failures"};
 	return_types.assign(names.size(), duckdb::LogicalType::UBIGINT);
 	return nullptr;
@@ -314,7 +314,7 @@ void SidecarTallyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data,
 duckdb::unique_ptr<duckdb::FunctionData> CacheStatusBind(duckdb::ClientContext &,
                                                          duckdb::TableFunctionBindInput &,
                                                          duckdb::vector<duckdb::LogicalType> &return_types,
-                                                         duckdb::vector<duckdb::string> &names) {
+                                                         duckdb::vector<duckdb::Identifier> &names) {
 	using duckdb::LogicalType;
 	names = {"metadata_capacity_bytes", "metadata_occupancy_bytes", "metadata_evictions",
 	         "block_capacity_bytes", "block_occupancy_bytes", "block_evictions", "block_disk_capacity_bytes",
@@ -352,7 +352,7 @@ void CacheStatusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, 
 duckdb::unique_ptr<duckdb::FunctionData> MemoryTallyBind(duckdb::ClientContext &,
                                                          duckdb::TableFunctionBindInput &input,
                                                          duckdb::vector<duckdb::LogicalType> &return_types,
-                                                         duckdb::vector<duckdb::string> &names) {
+                                                         duckdb::vector<duckdb::Identifier> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw duckdb::BinderException("moraine_memory_tally: the lake name must not be NULL");
 	}
@@ -397,7 +397,7 @@ void MemoryTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput 
 duckdb::unique_ptr<duckdb::FunctionData> ObjectStoreTallyBind(duckdb::ClientContext &,
                                                               duckdb::TableFunctionBindInput &input,
                                                               duckdb::vector<duckdb::LogicalType> &return_types,
-                                                              duckdb::vector<duckdb::string> &names) {
+                                                              duckdb::vector<duckdb::Identifier> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw duckdb::BinderException("moraine_object_store_tally: the lake name must not be NULL");
 	}
@@ -462,7 +462,9 @@ void ObjectStoreTallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionI
 void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader) {
 	duckdb::TableFunction census("moraine_store_census", {duckdb::LogicalType::VARCHAR}, CensusImpl, CensusBind,
 	                             CensusInitGlobal);
-	census.named_parameters["live"] = duckdb::LogicalType::BOOLEAN;
+	census.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		options.Add("live", duckdb::LogicalType::BOOLEAN);
+	});
 	loader.RegisterFunction(census);
 
 	duckdb::TableFunctionSet tally("moraine_cache_tally");

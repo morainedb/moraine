@@ -44,7 +44,7 @@ namespace duckdb {
 // registration. A standalone DuckLake loaded earlier lacks the patches and
 // collides on its log type, so it is refused.
 static void LoadBundledDuckLake(ExtensionLoader &loader) {
-	auto load = ExtensionManager::Get(loader.GetDatabaseInstance()).BeginLoad("ducklake");
+	auto load = ExtensionManager::Get(loader.GetDatabaseInstance()).BeginLoad(ExtensionLoadOptions("ducklake"));
 	if (!load) {
 		throw InvalidInputException("moraine bundles its own DuckLake; LOAD moraine without loading ducklake");
 	}

@@ -63,7 +63,7 @@ void RegisterMorainePositionResolver();
 // The table's top-level columns at `snapshot`, in catalog order, typed as
 // the storage extension binds them.
 void TableColumns(MoraineSnapshotHandle *snapshot, const std::string &schema_name, const std::string &table_name,
-                  duckdb::vector<duckdb::LogicalType> &types, duckdb::vector<std::string> &names);
+                  duckdb::vector<duckdb::LogicalType> &types, duckdb::vector<duckdb::Identifier> &names);
 
 void RegisterMoraineRowsAtFunction(duckdb::ExtensionLoader &loader);
 

@@ -5,6 +5,8 @@
 // rows decode from their chunk. The output is the table's current columns
 // followed by `row_id` and `data_file_id`.
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -12,6 +14,7 @@
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/binder.hpp"
 
 #include "catalog.hpp"
 #include "moraine_abi.h"
@@ -28,9 +31,10 @@ PinnedSnapshot PinTransactionSnapshot(duckdb::ClientContext &context, const std:
 	// first pins that snapshot before the metadata catalog's own view is
 	// taken below, so the view can only be the same or newer; DuckLake
 	// refuses positions resolved against a newer one.
-	auto lake = duckdb::Catalog::GetCatalogEntry(context, catalog_name);
+	auto lake = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(catalog_name));
 	if (lake && lake->GetCatalogType() != "moraine") {
-		lake->GetEntry(context, duckdb::CatalogType::TABLE_ENTRY, schema_name, table_name,
+		duckdb::EntryLookupInfo lookup(duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
+		lake->GetEntry(context, duckdb::Identifier(schema_name), lookup,
 		               duckdb::OnEntryNotFound::THROW_EXCEPTION);
 	}
 
@@ -67,7 +71,7 @@ std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, co
 	duckdb::optional_idx row_id_index;
 	duckdb::optional_idx data_file_id_index;
 	for (duckdb::idx_t i = 0; i < children.size(); i++) {
-		auto name = duckdb::StringUtil::Lower(children[i].first);
+		auto &name = children[i].first;
 		if (name == "row_id") {
 			row_id_index = i;
 		} else if (name == "data_file_id") {
@@ -81,7 +85,7 @@ std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, co
 	if (payload) {
 		for (duckdb::idx_t i = 0; i < children.size(); i++) {
 			if (i != row_id_index.GetIndex() && i != data_file_id_index.GetIndex()) {
-				payload->push_back(children[i].first);
+				payload->push_back(children[i].first.GetIdentifierName());
 			}
 		}
 	}
@@ -213,7 +217,7 @@ void RegisterMorainePositionResolver() {
 }
 
 void TableColumns(MoraineSnapshotHandle *snapshot, const std::string &schema_name, const std::string &table_name,
-                  duckdb::vector<duckdb::LogicalType> &types, duckdb::vector<std::string> &names) {
+                  duckdb::vector<duckdb::LogicalType> &types, duckdb::vector<duckdb::Identifier> &names) {
 	uint64_t table_id = 0;
 	MoraineError error {};
 	if (moraine_snapshot_resolve_table(snapshot, schema_name.c_str(), table_name.c_str(), &table_id, &error) !=
@@ -243,8 +247,16 @@ void TableColumns(MoraineSnapshotHandle *snapshot, const std::string &schema_nam
 
 namespace {
 
+// What the scan reports to EXPLAIN ANALYZE. Shared with the bind data
+// because `to_string` is handed the bind data alone.
+struct RowsAtMetrics {
+	std::atomic<uint64_t> files_read {0};
+	std::atomic<uint64_t> peak_workers {0};
+};
+
 struct RowsAtBindData : public duckdb::FunctionData {
 	std::string catalog_name;
+	std::shared_ptr<RowsAtMetrics> metrics = std::make_shared<RowsAtMetrics>();
 	std::string schema_name;
 	std::string table_name;
 	std::string rows_repr;
@@ -271,7 +283,7 @@ struct RowsAtBindData : public duckdb::FunctionData {
 duckdb::unique_ptr<duckdb::FunctionData> RowsAtBind(duckdb::ClientContext &context,
                                                     duckdb::TableFunctionBindInput &input,
                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                    duckdb::vector<std::string> &names) {
+                                                    duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<RowsAtBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -296,7 +308,15 @@ duckdb::unique_ptr<duckdb::FunctionData> RowsAtBind(duckdb::ClientContext &conte
 struct RowsAtGlobalState : public duckdb::GlobalTableFunctionState {
 	MoraineRowScan *scan = nullptr;
 	std::vector<duckdb::unique_ptr<duckdb::DataChunk>> pending;
+	std::shared_ptr<RowsAtMetrics> metrics;
+	void PublishMetrics() const {
+		if (metrics && scan) {
+			metrics->files_read.store(moraine_row_scan_files_read(scan));
+			metrics->peak_workers.store(moraine_row_scan_metrics(scan).peak_workers);
+		}
+	}
 	~RowsAtGlobalState() override {
+		PublishMetrics();
 		moraine_row_scan_free(scan);
 	}
 	duckdb::idx_t MaxThreads() const override {
@@ -308,6 +328,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> RowsAtInit(duckdb::ClientCo
                                                                 duckdb::TableFunctionInitInput &input) {
 	auto &bound = input.bind_data->Cast<RowsAtBindData>();
 	auto state = duckdb::make_uniq<RowsAtGlobalState>();
+	state->metrics = bound.metrics;
 	auto pinned = PinTransactionSnapshot(context, bound.catalog_name, bound.schema_name, bound.table_name);
 	MoraineError error {};
 	if (moraine_rows_at_open(moraine_snapshot_read_handle(pinned.snapshot), pinned.snapshot, bound.schema_name.c_str(),
@@ -377,6 +398,7 @@ void RowsAtImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data
 			ThrowMoraineError(error);
 		}
 		if (!has_batch) {
+			state.PublishMetrics();
 			output.SetCardinality(0);
 			return;
 		}
@@ -415,12 +437,12 @@ void RegisterMoraineRowsAtFunction(duckdb::ExtensionLoader &loader) {
 	    "moraine_rows_at",
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
 	    RowsAtImpl, RowsAtBind, RowsAtInit);
-	rows_at.dynamic_to_string = [](duckdb::TableFunctionDynamicToStringInput &input) {
+	rows_at.to_string = [](duckdb::TableFunctionToStringInput &input) {
 		duckdb::InsertionOrderPreservingMap<std::string> result;
-		if (input.global_state) {
-			auto scan = input.global_state->Cast<RowsAtGlobalState>().scan;
-			result["Total Files Read"] = std::to_string(moraine_row_scan_files_read(scan));
-			result["Peak read workers"] = std::to_string(moraine_row_scan_metrics(scan).peak_workers);
+		if (input.bind_data) {
+			auto &metrics = *input.bind_data->Cast<RowsAtBindData>().metrics;
+			result["Total Files Read"] = std::to_string(metrics.files_read.load());
+			result["Peak read workers"] = std::to_string(metrics.peak_workers.load());
 		}
 		return result;
 	};

@@ -54,12 +54,9 @@ duckdb::TableFunction MoraineScanFunction() {
 	// Lets `LogicalGet::GetTable()` find the catalog entry behind this scan,
 	// so DESCRIBE/SHOW can read its NOT NULL constraints (otherwise every
 	// column looks nullable).
-	function.get_bind_info = [](const duckdb::optional_ptr<duckdb::FunctionData> bind_data) {
+	function.get_table_entry = [](duckdb::optional_ptr<const duckdb::FunctionData> bind_data) {
 		auto &data = bind_data->Cast<MoraineScanBindData>();
-		if (data.table_entry != nullptr) {
-			return duckdb::BindInfo(*data.table_entry);
-		}
-		return duckdb::BindInfo(duckdb::ScanType::EXTERNAL);
+		return duckdb::optional_ptr<duckdb::TableCatalogEntry>(data.table_entry);
 	};
 	return function;
 }

@@ -314,12 +314,13 @@ duckdb::CreateTableInfo BuildInlineDataTableInfo(duckdb::SchemaCatalogEntry &sch
                                                  uint64_t schema_version,
                                                  const std::vector<DecodedInlineColumn> &user_columns,
                                                  const InlinedColumnNames &names) {
-	duckdb::CreateTableInfo info(schema, InlinedDataTableName(table_id, schema_version));
-	info.columns.AddColumn(duckdb::ColumnDefinition(names.row_id, duckdb::LogicalType::BIGINT));
-	info.columns.AddColumn(duckdb::ColumnDefinition(names.begin_snapshot, duckdb::LogicalType::BIGINT));
-	info.columns.AddColumn(duckdb::ColumnDefinition(names.end_snapshot, duckdb::LogicalType::BIGINT));
+	duckdb::CreateTableInfo info(schema, duckdb::Identifier(InlinedDataTableName(table_id, schema_version)));
+	info.columns.AddColumn(duckdb::ColumnDefinition(duckdb::Identifier(names.row_id), duckdb::LogicalType::BIGINT));
+	info.columns.AddColumn(
+	    duckdb::ColumnDefinition(duckdb::Identifier(names.begin_snapshot), duckdb::LogicalType::BIGINT));
+	info.columns.AddColumn(duckdb::ColumnDefinition(duckdb::Identifier(names.end_snapshot), duckdb::LogicalType::BIGINT));
 	for (auto &col : user_columns) {
-		info.columns.AddColumn(duckdb::ColumnDefinition(col.name, col.type));
+		info.columns.AddColumn(duckdb::ColumnDefinition(duckdb::Identifier(col.name), col.type));
 	}
 	return info;
 }
@@ -541,7 +542,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InlineDataScanInitGlobal(du
                                                                               duckdb::TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<InlineDataScanBindData>();
 	auto state = duckdb::make_uniq<InlineDataScanGlobalState>();
-	auto &catalog = duckdb::Catalog::GetCatalog(context, bind_data.catalog_name).Cast<MoraineCatalog>();
+	auto &catalog =
+	    duckdb::Catalog::GetCatalog(context, duckdb::Identifier(bind_data.catalog_name)).Cast<MoraineCatalog>();
 	auto transaction = catalog.GetCatalogTransaction(context);
 	state->read_handle = transaction.transaction->Cast<MoraineTransaction>().ReadHandle();
 	state->column_ids = input.column_ids;
@@ -572,19 +574,18 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InlineDataScanInitGlobal(du
 	return state;
 }
 
-duckdb::BindInfo InlineDataScanBindInfo(const duckdb::optional_ptr<duckdb::FunctionData> bind_data) {
+duckdb::optional_ptr<duckdb::TableCatalogEntry>
+InlineDataScanTableEntry(duckdb::optional_ptr<const duckdb::FunctionData> bind_data) {
 	auto &data = bind_data->Cast<InlineDataScanBindData>();
-	duckdb::BindInfo info(duckdb::ScanType::TABLE);
-	info.table = data.table_entry;
-	return info;
+	return data.table_entry;
 }
 
 // The three metadata columns, written straight into the output's flat
 // vectors — no `Value` in the loop.
 void EmitMetadataColumn(const std::vector<InlineDataRow> &rows, duckdb::idx_t offset, duckdb::idx_t count,
                         duckdb::column_t col_id, duckdb::Vector &target) {
-	auto data = duckdb::FlatVector::GetData<int64_t>(target);
-	auto &validity = duckdb::FlatVector::Validity(target);
+	auto data = duckdb::FlatVector::GetDataMutable<int64_t>(target);
+	auto &validity = duckdb::FlatVector::ValidityMutable(target);
 	for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
 		auto &row = rows[offset + out_row];
 		switch (col_id) {
@@ -642,7 +643,7 @@ void InlineDataScanImpl(duckdb::ClientContext &context, duckdb::TableFunctionInp
 		auto &target = output.data[out_col];
 		if (col_id == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
 			// Physical rowids distinguish historical versions sharing a logical id.
-			auto rowids = duckdb::FlatVector::GetData<int64_t>(target);
+			auto rowids = duckdb::FlatVector::GetDataMutable<int64_t>(target);
 			for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
 				rowids[out_row] = static_cast<int64_t>(state.emitted + out_row);
 			}
@@ -686,7 +687,7 @@ MoraineInlineDataTableEntry::MoraineInlineDataTableEntry(duckdb::Catalog &catalo
                                                          duckdb::CreateTableInfo &info, MoraineCatalogHandle *handle,
                                                          uint64_t table_id, uint64_t schema_version)
     : duckdb::TableCatalogEntry(catalog, schema, info), handle_(handle), table_id_(table_id),
-      schema_version_(schema_version) {
+      schema_version_(schema_version), columns_(std::move(info.columns)) {
 }
 
 duckdb::unique_ptr<duckdb::BaseStatistics> MoraineInlineDataTableEntry::GetStatistics(duckdb::ClientContext &,
@@ -714,7 +715,7 @@ MoraineInlineDataTableEntry::GetScanFunction(duckdb::ClientContext &,
 	// how DuckLake probes for the table, costs no store read at all.
 	auto scan_bind_data = duckdb::make_uniq<InlineDataScanBindData>();
 	scan_bind_data->handle = handle_;
-	scan_bind_data->catalog_name = catalog.GetName();
+	scan_bind_data->catalog_name = catalog.GetName().GetIdentifierName();
 	scan_bind_data->table_id = table_id_;
 	scan_bind_data->schema_version = schema_version_;
 	scan_bind_data->user_types = UserColumnTypes();
@@ -730,7 +731,7 @@ MoraineInlineDataTableEntry::GetScanFunction(duckdb::ClientContext &,
 	function.projection_pushdown = true;
 	// Resolves `LogicalGet::GetTable()` so UPDATE/DELETE bind against this
 	// entry.
-	function.get_bind_info = InlineDataScanBindInfo;
+	function.get_table_entry = InlineDataScanTableEntry;
 	return function;
 }
 
@@ -742,7 +743,8 @@ MoraineInlineDeleteTableEntry::MoraineInlineDeleteTableEntry(duckdb::Catalog &ca
                                                              duckdb::SchemaCatalogEntry &schema,
                                                              duckdb::CreateTableInfo &info,
                                                              MoraineCatalogHandle *handle, uint64_t table_id)
-    : duckdb::TableCatalogEntry(catalog, schema, info), handle_(handle), table_id_(table_id) {
+    : duckdb::TableCatalogEntry(catalog, schema, info), handle_(handle), table_id_(table_id),
+      columns_(std::move(info.columns)) {
 }
 
 duckdb::unique_ptr<duckdb::BaseStatistics> MoraineInlineDeleteTableEntry::GetStatistics(duckdb::ClientContext &,
@@ -804,10 +806,11 @@ duckdb::unique_ptr<MoraineInlineDeleteTableEntry> MakeInlineDeleteTableEntry(duc
                                                                              MoraineCatalogHandle *handle,
                                                                              uint64_t table_id) {
 	InlinedColumnNames names(catalog.Cast<MoraineCatalog>().ServesExtendedCatalog());
-	duckdb::CreateTableInfo info(schema, InlinedDeleteTableName(table_id));
+	duckdb::CreateTableInfo info(schema, duckdb::Identifier(InlinedDeleteTableName(table_id)));
 	info.columns.AddColumn(duckdb::ColumnDefinition("file_id", duckdb::LogicalType::BIGINT));
-	info.columns.AddColumn(duckdb::ColumnDefinition(names.row_id, duckdb::LogicalType::BIGINT));
-	info.columns.AddColumn(duckdb::ColumnDefinition(names.begin_snapshot, duckdb::LogicalType::BIGINT));
+	info.columns.AddColumn(duckdb::ColumnDefinition(duckdb::Identifier(names.row_id), duckdb::LogicalType::BIGINT));
+	info.columns.AddColumn(
+	    duckdb::ColumnDefinition(duckdb::Identifier(names.begin_snapshot), duckdb::LogicalType::BIGINT));
 	return duckdb::make_uniq<MoraineInlineDeleteTableEntry>(catalog, schema, info, handle, table_id);
 }
 
@@ -870,14 +873,14 @@ duckdb::unique_ptr<duckdb::CatalogEntry> CreateInlineDataTable(duckdb::ClientCon
 		if (info.Base().on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT) {
 			return nullptr;
 		}
-		throw duckdb::CatalogException("moraine: \"%s\" already exists", info.Base().table);
+		throw duckdb::CatalogException("moraine: \"%s\" already exists", info.Base().GetTableName());
 	}
 
 	std::vector<DecodedInlineColumn> user_columns;
 	duckdb::idx_t index = 0;
 	for (auto &col : info.Base().columns.Logical()) {
 		if (index >= 3) {
-			user_columns.push_back(DecodedInlineColumn {col.Name(), col.Type()});
+			user_columns.push_back(DecodedInlineColumn {col.Name().GetIdentifierName(), col.Type()});
 		}
 		index++;
 	}
@@ -1251,9 +1254,9 @@ duckdb::PhysicalOperator &PlanInlineDataUpdate(duckdb::PhysicalPlanGenerator &pl
 	}
 	// Catalog version 1.0 declares `end_snapshot`, 1.1-dev1 the prefixed
 	// name; a table carries one or the other, never both.
-	const auto is_end_snapshot = [&](const duckdb::string &name) {
-		return duckdb::StringUtil::CIEquals(name, "end_snapshot") ||
-		       duckdb::StringUtil::CIEquals(name, std::string(InlinedColumnNames::PREFIX) + "end_snapshot");
+	const auto is_end_snapshot = [&](const duckdb::Identifier &name) {
+		return name == "end_snapshot" ||
+		       name == duckdb::Identifier(std::string(InlinedColumnNames::PREFIX) + "end_snapshot");
 	};
 	if (op.columns.size() != 1 || !is_end_snapshot(table_entry.GetColumns().GetColumn(op.columns[0]).GetName())) {
 		throw duckdb::NotImplementedException(
@@ -1265,7 +1268,7 @@ duckdb::PhysicalOperator &PlanInlineDataUpdate(duckdb::PhysicalPlanGenerator &pl
 		throw duckdb::NotImplementedException(
 		    "moraine: UPDATE with a non-column SET expression is not supported on \"%s\"", op.table.name);
 	}
-	auto set_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>().index;
+	auto set_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>().Index();
 	return planner.Make<MoraineInlineDataUpdateOp>(op.types, op.table.catalog, op.estimated_cardinality,
 	                                               table_entry.Handle(), table_entry.TableId(),
 	                                               table_entry.SchemaVersion(), set_ref);
@@ -1284,7 +1287,7 @@ duckdb::PhysicalOperator &PlanInlineDataDelete(duckdb::PhysicalPlanGenerator &pl
 	auto &bound_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>();
 	return planner.Make<MoraineInlineDataDeleteOp>(
 	    op.types, op.table.catalog, op.estimated_cardinality, table_entry.Handle(), table_entry.TableId(),
-	    table_entry.SchemaVersion(), bound_ref.index);
+	    table_entry.SchemaVersion(), bound_ref.Index());
 }
 
 duckdb::PhysicalOperator &PlanInlineDeleteInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,
@@ -1305,7 +1308,7 @@ duckdb::PhysicalOperator &PlanInlineDeleteDelete(duckdb::PhysicalPlanGenerator &
 	}
 	auto &bound_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>();
 	return planner.Make<MoraineInlineDeleteDeleteOp>(op.types, op.table.catalog, op.estimated_cardinality,
-	                                                 table_entry.Handle(), table_entry.TableId(), bound_ref.index);
+	                                                 table_entry.Handle(), table_entry.TableId(), bound_ref.Index());
 }
 
 } // namespace moraine_duckdb

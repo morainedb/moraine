@@ -24,11 +24,14 @@ namespace moraine_duckdb {
 namespace {
 
 // The assigned expression per lowercase column name.
-std::unordered_map<std::string, std::string> ParseAssignments(const std::string &assignments) {
+std::unordered_map<std::string, std::string> ParseAssignments(duckdb::ClientContext &context,
+                                                              const std::string &assignments) {
 	std::unordered_map<std::string, std::string> result;
 	duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> expressions;
 	try {
-		expressions = duckdb::Parser::ParseExpressionList(assignments);
+		// 2.0 parses through an instance, configured from the context.
+		duckdb::Parser parser(context);
+		expressions = parser.ParseExpressionList(assignments);
 	} catch (std::exception &error) {
 		throw duckdb::InvalidInputException("moraine_update: `assignments` must be `column = expression` pairs "
 		                                    "separated by commas: %s",
@@ -40,16 +43,16 @@ std::unordered_map<std::string, std::string> ParseAssignments(const std::string 
 			    "moraine_update: `assignments` must be `column = expression` pairs separated by commas");
 		}
 		auto &comparison = expression->Cast<duckdb::ComparisonExpression>();
-		if (comparison.left->GetExpressionType() != duckdb::ExpressionType::COLUMN_REF) {
+		if (comparison.Left().GetExpressionType() != duckdb::ExpressionType::COLUMN_REF) {
 			throw duckdb::InvalidInputException("moraine_update: an assignment must name a column on its left side");
 		}
-		auto &column = comparison.left->Cast<duckdb::ColumnRefExpression>();
+		auto &column = comparison.Left().Cast<duckdb::ColumnRefExpression>();
 		if (column.IsQualified()) {
 			throw duckdb::InvalidInputException("moraine_update: assigned column \"%s\" must not be qualified",
 			                                    column.ToString());
 		}
-		auto name = duckdb::StringUtil::Lower(column.GetColumnName());
-		if (!result.emplace(name, comparison.right->ToString()).second) {
+		auto name = duckdb::StringUtil::Lower(column.GetColumnName().GetIdentifierName());
+		if (!result.emplace(name, comparison.Right().ToString()).second) {
 			throw duckdb::InvalidInputException("moraine_update: column \"%s\" is assigned twice",
 			                                    column.GetColumnName());
 		}
@@ -70,11 +73,15 @@ constexpr auto PAYLOAD_ALIAS = "new";
 std::string ReplacementQuery(duckdb::ClientContext &context, const std::string &catalog_name,
                              const std::string &schema_name, const std::string &table_name,
                              const duckdb::Value &rows, const std::string &assignments) {
-	auto assigned = ParseAssignments(assignments);
+	auto assigned = ParseAssignments(context, assignments);
 	auto pinned = PinTransactionSnapshot(context, catalog_name, schema_name, table_name);
 	duckdb::vector<duckdb::LogicalType> types;
+	duckdb::vector<duckdb::Identifier> column_names;
+	TableColumns(pinned.snapshot, schema_name, table_name, types, column_names);
 	duckdb::vector<std::string> names;
-	TableColumns(pinned.snapshot, schema_name, table_name, types, names);
+	for (auto &column_name : column_names) {
+		names.push_back(column_name.GetIdentifierName());
+	}
 
 	// A payload joins beside the row, so an unassigned column is qualified
 	// to stay unambiguous against a payload field of the same name — which
@@ -158,11 +165,11 @@ duckdb::unique_ptr<duckdb::TableRef> UpdateReplace(duckdb::ClientContext &contex
 
 	duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> arguments;
 	for (duckdb::idx_t i = 0; i < 3; i++) {
-		arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(input.inputs[i]));
+		arguments.push_back(duckdb::ConstantExpression::FromValue(input.inputs[i]));
 	}
-	arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(EmptyLocatedFiles()));
-	arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(duckdb::Value(replacement)));
-	auto positions_token = duckdb::make_uniq<duckdb::ConstantExpression>(duckdb::Value::UBIGINT(token));
+	arguments.push_back(duckdb::ConstantExpression::FromValue(EmptyLocatedFiles()));
+	arguments.push_back(duckdb::ConstantExpression::FromValue(duckdb::Value(replacement)));
+	auto positions_token = duckdb::ConstantExpression::FromValue(duckdb::Value::UBIGINT(token));
 	positions_token->SetAlias("positions_token");
 	arguments.push_back(std::move(positions_token));
 

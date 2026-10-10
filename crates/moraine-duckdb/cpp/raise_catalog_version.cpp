@@ -53,7 +53,7 @@ struct RaiseBindData : public duckdb::FunctionData {
 duckdb::unique_ptr<duckdb::FunctionData> RaiseBind(duckdb::ClientContext &,
                                                    duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
-                                                   duckdb::vector<duckdb::string> &names) {
+                                                   duckdb::vector<duckdb::Identifier> &names) {
 	names = {"from_version", "to_version"};
 	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
 
@@ -66,12 +66,12 @@ duckdb::unique_ptr<duckdb::FunctionData> RaiseBind(duckdb::ClientContext &,
 		throw duckdb::BinderException("moraine_raise_catalog_version: the lake name must not be empty");
 	}
 	for (auto &option : input.named_parameters) {
-		if (duckdb::StringUtil::CIEquals(option.first, "dry_run")) {
+		if (option.first == "dry_run") {
 			if (option.second.IsNull()) {
 				throw duckdb::BinderException("moraine_raise_catalog_version: dry_run must not be NULL");
 			}
 			bind_data->dry_run = option.second.GetValue<bool>();
-		} else if (duckdb::StringUtil::CIEquals(option.first, "confirm")) {
+		} else if (option.first == "confirm") {
 			if (option.second.IsNull()) {
 				throw duckdb::BinderException("moraine_raise_catalog_version: confirm must not be NULL");
 			}
@@ -143,8 +143,10 @@ void RaiseImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data,
 void RegisterMoraineRaiseCatalogVersionFunction(duckdb::ExtensionLoader &loader) {
 	duckdb::TableFunction raise("moraine_raise_catalog_version", {duckdb::LogicalType::VARCHAR}, RaiseImpl, RaiseBind,
 	                            RaiseInitGlobal);
-	raise.named_parameters["dry_run"] = duckdb::LogicalType::BOOLEAN;
-	raise.named_parameters["confirm"] = duckdb::LogicalType::BOOLEAN;
+	raise.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		options.Add("dry_run", duckdb::LogicalType::BOOLEAN);
+		options.Add("confirm", duckdb::LogicalType::BOOLEAN);
+	});
 	loader.RegisterFunction(raise);
 }
 

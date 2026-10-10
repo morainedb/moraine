@@ -32,10 +32,10 @@ duckdb::unique_ptr<duckdb::TableRef> DeleteLocatedReplace(duckdb::ClientContext 
 
 	duckdb::vector<duckdb::unique_ptr<duckdb::ParsedExpression>> arguments;
 	for (duckdb::idx_t i = 0; i < 3; i++) {
-		arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(input.inputs[i]));
+		arguments.push_back(duckdb::ConstantExpression::FromValue(input.inputs[i]));
 	}
-	arguments.push_back(duckdb::make_uniq<duckdb::ConstantExpression>(EmptyLocatedFiles()));
-	auto positions_token = duckdb::make_uniq<duckdb::ConstantExpression>(duckdb::Value::UBIGINT(token));
+	arguments.push_back(duckdb::ConstantExpression::FromValue(EmptyLocatedFiles()));
+	auto positions_token = duckdb::ConstantExpression::FromValue(duckdb::Value::UBIGINT(token));
 	positions_token->SetAlias("positions_token");
 	arguments.push_back(std::move(positions_token));
 

@@ -59,7 +59,7 @@ struct MigrateGlobalState : public duckdb::GlobalTableFunctionState {
 
 duckdb::unique_ptr<duckdb::FunctionData> MigrateBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                      duckdb::vector<duckdb::LogicalType> &return_types,
-                                                     duckdb::vector<duckdb::string> &names) {
+                                                     duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<MigrateBindData>();
 	if (input.inputs[0].IsNull()) {
 		throw duckdb::BinderException("moraine_migrate: the store path must not be NULL");
@@ -69,9 +69,9 @@ duckdb::unique_ptr<duckdb::FunctionData> MigrateBind(duckdb::ClientContext &, du
 		throw duckdb::BinderException("moraine_migrate: the store path must not be empty");
 	}
 	for (auto &option : input.named_parameters) {
-		if (duckdb::StringUtil::CIEquals(option.first, "checkpoint")) {
+		if (option.first == "checkpoint") {
 			bind_data->checkpoint = duckdb::BooleanValue::Get(option.second);
-		} else if (duckdb::StringUtil::CIEquals(option.first, "wal_path")) {
+		} else if (option.first == "wal_path") {
 			bind_data->wal_path = option.second.GetValue<std::string>();
 		}
 	}
@@ -148,8 +148,10 @@ void MigrateImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 void RegisterMoraineMigrateFunction(duckdb::ExtensionLoader &loader) {
 	duckdb::TableFunction migrate("moraine_migrate", {duckdb::LogicalType::VARCHAR}, MigrateImpl, MigrateBind,
 	                              MigrateInitGlobal);
-	migrate.named_parameters["checkpoint"] = duckdb::LogicalType::BOOLEAN;
-	migrate.named_parameters["wal_path"] = duckdb::LogicalType::VARCHAR;
+	migrate.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		options.Add("checkpoint", duckdb::LogicalType::BOOLEAN);
+		options.Add("wal_path", duckdb::LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(migrate);
 }
 
