@@ -900,6 +900,20 @@ snapshot listing calls (`moraine_snapshot_schemas`/`tables_in`/
 `columns_of`/`views_in`/`data_files_of`) walk the already-materialized
 snapshot in memory and take no probe.
 
+**Proving it takes a seam.** A cancellation only means something while a
+read is blocked, and nothing makes a local store block on command — so the
+extension carries one fault seam:
+`moraine_fault_stall_next_read(milliseconds)`, whose ABI entry point of the
+same name arms a stall the next cancellable call awaits *inside* the
+`select!` that polls its probe, in place of a slow store. One arming stalls
+one call. It ships rather than hiding behind a build feature because the
+only harness that can drive it is a real DuckDB session, and that session
+loads the artifact a release publishes; dormant, it is one relaxed atomic
+load per cancellable call, and nothing on a lake's data path can arm it.
+What it buys is the test that a statement interrupted while its metadata
+read is blocked ends in that statement's failure rather than in the read
+finishing — the one assertion that fails if the hop above is removed.
+
 `moraine_attach` is cancellable too, and is the exception to
 "mutates nothing": the store open is the one long blocking call an attach
 makes, and against an unreachable endpoint it is the one a user is most

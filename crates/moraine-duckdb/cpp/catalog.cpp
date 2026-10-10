@@ -1,4 +1,5 @@
 #include "catalog.hpp"
+#include "fault.hpp"
 
 #include "storage/ducklake_transaction.hpp"
 #include "index_cache.hpp"
@@ -137,15 +138,16 @@ extern "C" bool moraine_shim_is_interrupted(void *client_context) {
 	// context's own flag is one nobody can set. The metadata manager records
 	// the caller driving it; interrupting the caller has to reach this far or
 	// a stalled commit cannot be cancelled at all.
-	if (!context.registered_state) {
-		return false;
-	}
-	auto parent_state = context.registered_state->Get<ParentContextState>(ParentContextState::KEY);
-	if (!parent_state) {
-		return false;
-	}
-	auto parent = parent_state->parent.lock();
-	return parent && parent->IsInterrupted();
+    auto parent_state = context.registered_state->Get<ParentContextState>(ParentContextState::KEY);
+    auto parent = parent_state ? parent_state->parent.lock() : nullptr;
+    if (parent && parent->IsInterrupted()) {
+        return true;
+    }
+    auto stall = TakeMoraineReadStall(parent ? *parent : context);
+    if (stall) {
+        moraine_fault_stall_next_read(stall);
+    }
+    return false;
 }
 
 namespace {

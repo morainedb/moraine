@@ -26,6 +26,7 @@ void RegisterMoraineUpdateFunction(duckdb::ExtensionLoader &loader);
 // Defined in optimizer.cpp.
 void RegisterMoraineOptimizer(duckdb::DBConfig &config);
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader);
+void RegisterMoraineFaultFunctions(duckdb::ExtensionLoader &loader);
 void RegisterMoraineMigrateFunction(duckdb::ExtensionLoader &loader);
 // Defined in metadata_manager.cpp.
 void RegisterMoraineMetadataManager();
@@ -77,6 +78,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	moraine_duckdb::RegisterMoraineUpdateFunction(loader);
 	moraine_duckdb::RegisterMoraineMaintenanceFunctions(loader);
 	moraine_duckdb::RegisterMoraineMigrateFunction(loader);
+	moraine_duckdb::RegisterMoraineFaultFunctions(loader);
 	moraine_duckdb::RegisterMoraineRaiseCatalogVersionFunction(loader);
 	moraine_duckdb::RegisterMoraineMoveWalFunction(loader);
 	moraine_duckdb::RegisterMoraineCheckpointFunctions(loader);

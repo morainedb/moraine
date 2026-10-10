@@ -62,7 +62,9 @@ jobs:
 
       - name: Name the artifact after what produced it
         id: name
-        run: echo "name=moraine-${{ inputs.duckdb_ref }}-${{ inputs.debug_level }}-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+        run: |
+          duckdb_commit=$(git -C duckdb rev-parse --short=12 HEAD)
+          echo "name=moraine-${duckdb_commit}-${{ inputs.debug_level }}-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v7
         with:

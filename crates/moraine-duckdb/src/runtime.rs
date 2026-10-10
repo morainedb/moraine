@@ -348,6 +348,7 @@ unsafe fn block_on_cancellable_within<T, E>(
 where
     AbiError: From<E>,
 {
+    let stall = crate::abi::take_read_stall();
     runtime.block_on(async {
         let probe_fired = async {
             let Some(probe) = probe else {
@@ -364,6 +365,15 @@ where
             }
         };
 
+        // An armed stall precedes the work rather than replacing it, so a
+        // cancelled call is cancelled where a slow store would hold it.
+        let stalled = async {
+            if !stall.is_zero() {
+                tokio::time::sleep(stall).await;
+            }
+            future.await
+        };
+
         // `biased`: a cancellation signal wins whenever ready, even if
         // the core future is also immediately ready. The deadline comes
         // last, so a call that finishes on the same poll reports its own
@@ -371,7 +381,7 @@ where
         tokio::select! {
             biased;
             () = probe_fired => Err(AbiError::interrupted()),
-            result = future => result.map_err(AbiError::from),
+            result = stalled => result.map_err(AbiError::from),
             () = tokio::time::sleep(deadline) => Err(AbiError::timed_out(deadline)),
         }
     })

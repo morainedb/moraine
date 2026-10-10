@@ -23,6 +23,8 @@
 mod helpers;
 
 mod attach;
+#[cfg(unix)]
+mod cancellation;
 mod catalog_version;
 mod change_feed;
 mod checkpoints;
