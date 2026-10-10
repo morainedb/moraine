@@ -4,6 +4,7 @@
 #include "index_cache.hpp"
 
 #include "inline_tables.hpp"
+#include "metadata_manager.hpp"
 #include "metadata_tables.hpp"
 #include "owned_array.hpp"
 #include "scan.hpp"
@@ -133,14 +134,13 @@ extern "C" bool moraine_shim_is_interrupted(void *client_context) {
 	}
 	// A commit reaches this catalog on the metadata connection DuckLake
 	// creates for its own use, never on the one the caller holds, so that
-	// context's own flag is one nobody can set. DuckLake records the caller
-	// driving it; interrupting the caller has to reach this far or a stalled
-	// commit cannot be cancelled at all.
+	// context's own flag is one nobody can set. The metadata manager records
+	// the caller driving it; interrupting the caller has to reach this far or
+	// a stalled commit cannot be cancelled at all.
 	if (!context.registered_state) {
 		return false;
 	}
-	auto parent_state =
-	    context.registered_state->Get<duckdb::DuckLakeParentContextState>(duckdb::DuckLakeParentContextState::KEY);
+	auto parent_state = context.registered_state->Get<ParentContextState>(ParentContextState::KEY);
 	if (!parent_state) {
 		return false;
 	}

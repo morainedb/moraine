@@ -28,15 +28,14 @@ const DUCKLAKE_FETCH_DEPTH: &str = "50";
 const SHALLOW: &str = "1";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
-pub(crate) const PATCH_PATHS: [&str; 8] = [
+pub(crate) const PATCH_PATHS: [&str; 7] = [
     "patches/ducklake/0001-perf-prune-DuckLake-files-by-row-id.patch",
     "patches/ducklake/0002-feat-expose-DuckLake-data-file-ids-to-scans.patch",
     "patches/ducklake/0003-feat-share-the-DuckLake-inlined-table-cache.patch",
     "patches/ducklake/0004-fix-retain-files-after-unknown-commit-outcomes.patch",
     "patches/ducklake/0005-feat-change-DuckLake-rows-by-position.patch",
     "patches/ducklake/0006-perf-name-the-table-a-dropped-file-belongs-to.patch",
-    "patches/ducklake/0007-fix-cancel-DuckLake-metadata-work-with-its-caller.patch",
-    "patches/ducklake/0008-fix-write-row-ids-when-merging.patch",
+    "patches/ducklake/0007-fix-write-row-ids-when-merging.patch",
 ];
 pub(crate) const CONFIG_PATH: &str = "patches/ducklake/ducklake.cmake";
 /// The patched-behaviour sqllogictests, run against the built artifact.

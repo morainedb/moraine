@@ -79,7 +79,7 @@ applies them) and then the series below, in file-name order:
    dependency; explicit rollback, failed replacement inserts, repeated
    calls, and standalone autocommit are covered by `cargo xtask e2e`.
 
-`0008-fix-write-row-ids-when-merging.patch` makes
+`0007-fix-write-row-ids-when-merging.patch` makes
 `ducklake_merge_adjacent_files` write the row-id column into every merged
 file. Stock DuckLake judges two files adjacent from `row_id_start +
 record_count` alone, drops the column when they are, and numbers the merged

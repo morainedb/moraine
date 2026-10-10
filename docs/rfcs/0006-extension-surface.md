@@ -866,6 +866,17 @@ leak past the call that observed it: the probe is only consulted while a
 call is in flight, and DuckDB clears the flag before the next query
 issues one.
 
+One hop is needed before that load. DuckLake runs its metadata SQL on a
+connection it creates and never hands out, so that context's flag is one
+nobody can set, and a commit stalled in this catalog could not be
+cancelled at all. The registered metadata manager records the driving
+context on that connection — in its `Query` override, which every metadata
+read funnels through, and in `AttachMetadata`, the nested attach that does
+not — and the probe reads the driver's flag when the connection's own is
+clear. Registering where the queries are issued rather than where the
+connection is built is what lets this live in the shim instead of in a
+DuckLake patch.
+
 Per-call is what the deployment shape requires, and it is why the earlier
 per-handle `Notify` and its `moraine_interrupt(handle)` push channel are
 gone rather than merely unused. DuckDB's flag is per *connection*, and

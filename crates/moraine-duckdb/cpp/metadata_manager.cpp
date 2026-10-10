@@ -20,6 +20,25 @@ MoraineMetadataManager::MoraineMetadataManager(duckdb::DuckLakeTransaction &tran
     : duckdb::DuckLakeMetadataManager(transaction) {
 }
 
+void MoraineMetadataManager::RecordDrivingContext() {
+	auto &registered = *transaction.GetConnection().context->registered_state;
+	if (registered.Get<ParentContextState>(ParentContextState::KEY)) {
+		return;
+	}
+	registered.Insert(ParentContextState::KEY,
+	                  duckdb::make_shared_ptr<ParentContextState>(transaction.context));
+}
+
+duckdb::unique_ptr<duckdb::QueryResult> MoraineMetadataManager::Query(duckdb::string &query) {
+	RecordDrivingContext();
+	return duckdb::DuckLakeMetadataManager::Query(query);
+}
+
+duckdb::unique_ptr<duckdb::QueryResult> MoraineMetadataManager::AttachMetadata(const duckdb::string &attach_query) {
+	RecordDrivingContext();
+	return duckdb::DuckLakeMetadataManager::AttachMetadata(attach_query);
+}
+
 bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &commit_snapshot,
                                                  const duckdb::string &inlined_table_name,
                                                  const duckdb::DuckLakeInlinedDataInfo &entry,
