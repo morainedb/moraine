@@ -216,6 +216,114 @@ pub unsafe extern "C" fn moraine_dump_column_tags_free(
     }
 }
 
+/// One `ducklake_view_column_tag` row, as returned by
+/// [`moraine_dump_view_column_tags`] — flattened from the view's latest
+/// record, as column tags are from their column's.
+#[repr(C)]
+pub struct MoraineViewColumnTagRow {
+    /// `view_id`.
+    pub view_id: u64,
+    /// `column_name`, owned. A view's columns are named rather than given
+    /// ids, so the name is the key within the view.
+    pub column_name: *mut c_char,
+    /// `begin_snapshot`.
+    pub begin_snapshot: u64,
+    /// Whether `end_snapshot` is present.
+    pub has_end_snapshot: bool,
+    /// `end_snapshot`, valid iff `has_end_snapshot`.
+    pub end_snapshot: u64,
+    /// `key`, owned.
+    pub key: *mut c_char,
+    /// `value`, owned.
+    pub value: *mut c_char,
+}
+
+/// Converts core `ducklake_view_column_tag` records into the C row shape.
+pub(crate) fn view_column_tag_rows(
+    rows: Vec<moraine::ffi_support::ViewColumnTagRow>,
+) -> Result<Vec<MoraineViewColumnTagRow>, AbiError> {
+    let owned = rows
+        .into_iter()
+        .map(|mut row| {
+            let column_name = to_c_string(std::mem::take(&mut row.column_name))?;
+            let key = to_c_string(std::mem::take(&mut row.key))?;
+            let value = to_c_string(std::mem::take(&mut row.value))?;
+            Ok((row, column_name, key, value))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(row, column_name, key, value)| {
+            let (has_end, end) = opt_u64(row.end_snapshot);
+            MoraineViewColumnTagRow {
+                view_id: row.view_id,
+                column_name: column_name.into_raw(),
+                begin_snapshot: row.begin_snapshot,
+                has_end_snapshot: has_end,
+                end_snapshot: end,
+                key: key.into_raw(),
+                value: value.into_raw(),
+            }
+        })
+        .collect())
+}
+
+/// Dumps every `ducklake_view_column_tag` row into
+/// `*out_items`/`*out_len`.
+///
+/// # Safety
+///
+/// The shared dump-entry contract (`dump_rows`): a live `handle` from
+/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+/// thread, and a null-or-writable `err`, all for the duration of the
+/// call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_view_column_tags(
+    handle: *mut MoraineCatalogHandle,
+    out_items: *mut *mut MoraineViewColumnTagRow,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            moraine::ffi_support::dump_view_column_tags,
+            view_column_tag_rows,
+        )
+    }
+}
+
+/// Frees the array returned by [`moraine_dump_view_column_tags`].
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_view_column_tags`] call wrote, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_view_column_tags_free(
+    items: *mut MoraineViewColumnTagRow,
+    len: usize,
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |t| {
+            free_c_string(t.column_name);
+            free_c_string(t.key);
+            free_c_string(t.value);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{ffi::CStr, ptr};

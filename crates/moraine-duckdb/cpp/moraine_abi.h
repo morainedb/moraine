@@ -1169,6 +1169,27 @@ typedef struct MoraineColumnTagRow {
   char *value;
 } MoraineColumnTagRow;
 
+// One `ducklake_view_column_tag` row, as returned by
+// [`moraine_dump_view_column_tags`] — flattened from the view's latest
+// record, as column tags are from their column's.
+typedef struct MoraineViewColumnTagRow {
+  // `view_id`.
+  uint64_t view_id;
+  // `column_name`, owned. A view's columns are named rather than given
+  // ids, so the name is the key within the view.
+  char *column_name;
+  // `begin_snapshot`.
+  uint64_t begin_snapshot;
+  // Whether `end_snapshot` is present.
+  bool has_end_snapshot;
+  // `end_snapshot`, valid iff `has_end_snapshot`.
+  uint64_t end_snapshot;
+  // `key`, owned.
+  char *key;
+  // `value`, owned.
+  char *value;
+} MoraineViewColumnTagRow;
+
 // One inlined row, as returned by [`moraine_inline_scan_next`]:
 // `chunk_index` names the owning chunk in the window's parallel
 // [`MoraineInlineChunk`] array.
@@ -3352,6 +3373,31 @@ int32_t moraine_dump_column_tags(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pair a matching
 // [`moraine_dump_column_tags`] call wrote, not yet freed.
 void moraine_dump_column_tags_free(struct MoraineColumnTagRow *items, size_t len);
+
+// Dumps every `ducklake_view_column_tag` row into
+// `*out_items`/`*out_len`.
+//
+// # Safety
+//
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
+int32_t moraine_dump_view_column_tags(struct MoraineCatalogHandle *handle,
+                                      struct MoraineViewColumnTagRow **out_items,
+                                      size_t *out_len,
+                                      MoraineInterruptProbe probe,
+                                      void *probe_ctx,
+                                      struct MoraineError *err);
+
+// Frees the array returned by [`moraine_dump_view_column_tags`].
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_view_column_tags`] call wrote, not yet freed.
+void moraine_dump_view_column_tags_free(struct MoraineViewColumnTagRow *items, size_t len);
 
 // Opens a scan of `table_id`'s inlined rows under the `scan_kind`
 // variant (`0` = `SCAN_TABLE`, `1` = `SCAN_INSERTIONS`, `2` =
