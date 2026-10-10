@@ -83,15 +83,18 @@ fn a_wide_sparse_probe_derives_row_pruning() {
     let sparse = run_ducklake_sql_with_options(
         store.path(), data.path(), &options,
         "EXPLAIN SELECT count(*) FROM lake.main.boundary data
-         JOIN moraine_index_in('lake','main','boundary','by_a',list_transform(range(4096), x -> x * 7)) hits
+         JOIN moraine_index_in('lake','main','boundary','by_a',list_transform(range(4096), lambda x: x * 7)) hits
          ON data.rowid IS NOT DISTINCT FROM hits.row_id;
          SELECT count(*) FROM lake.main.boundary data
-         JOIN moraine_index_in('lake','main','boundary','by_a',list_transform(range(4096), x -> x * 7)) hits
+         JOIN moraine_index_in('lake','main','boundary','by_a',list_transform(range(4096), lambda x: x * 7)) hits
          ON data.rowid IS NOT DISTINCT FROM hits.row_id;",
     );
-    assert!(sparse.contains("optional: rowid>="));
     assert!(
-        sparse.matches("rowid>=").count() <= 16,
+        sparse.contains("rowid >= "),
+        "no derived row pruning: {sparse}"
+    );
+    assert!(
+        sparse.matches("rowid >= ").count() <= 16,
         "too many metadata predicates: {sparse}"
     );
     assert!(
@@ -124,7 +127,7 @@ fn a_wide_probe_skips_embedded_row_groups() {
          AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;",
     );
     assert!(
-        result.contains("Moraine Summary Scan") && !result.contains("4,096 rows"),
+        result.contains("Coverage costing ms") && !result.contains("4,096 rows"),
         "the scan did not use exact positions: {result}"
     );
     assert!(

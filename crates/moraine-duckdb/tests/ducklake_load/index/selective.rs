@@ -32,7 +32,7 @@ fn summary_scan_is_automatic_without_a_public_switch() {
     assert!(result.lines().any(|line| line == "switches,0"), "{result}");
     assert_eq!(
         result.matches("Moraine Summary Scan").count(),
-        2,
+        1,
         "{result}"
     );
     assert_eq!(
@@ -57,7 +57,7 @@ fn summary_scan_uses_physical_coverage() {
          CREATE TABLE lake.main.t AS SELECT i a, md5(i::VARCHAR) payload FROM range(262144) r(i);
          CALL moraine_index_create('lake','main','t','by_a',['a'],true);
          EXPLAIN SELECT sum(length(data.payload)) FROM lake.main.t data
-         JOIN moraine_index_in('lake','main','t','by_a',list_transform(range(128),x -> x * 2048)) hits
+         JOIN moraine_index_in('lake','main','t','by_a',list_transform(range(128), lambda x: x * 2048)) hits
          ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
     assert!(!result.contains("Moraine Summary Scan"), "{result}");
 }
@@ -130,7 +130,7 @@ fn summary_driven_scan_keeps_join_and_filters() {
         "no selective scan: {result}"
     );
     assert!(
-        result.contains("HASH_JOIN"),
+        result.contains("Hash Join"),
         "the join was removed: {result}"
     );
     assert!(
@@ -301,7 +301,7 @@ fn summary_scan_runs_inside_a_writing_transaction_minus_its_deletes() {
         );
         assert_eq!(
             result.matches("Moraine Summary Scan").count(),
-            6,
+            3,
             "limit={limit}: {result}"
         );
         let sums: Vec<_> = csv_rows(&result)

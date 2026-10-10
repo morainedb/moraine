@@ -1,4 +1,5 @@
 #include "duckdb/planner/filter/list.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
@@ -281,8 +282,14 @@ void PushRowPruning(duckdb::LogicalOperator &op, RowPruning &pruning) {
 	if (!projected.IsValid()) {
 		return;
 	}
-	get.table_filters.PushFilter(duckdb::ProjectionIndex(projected.GetIndex()),
-	    duckdb::make_uniq<duckdb::LegacyOptionalFilter>(RowRangeFilter(pruning.values)));
+	// A pushed filter is an expression now, and carries no "optional" mark:
+	// the ranges cover every located row id, so requiring it drops nothing.
+	auto ranges = RowRangeFilter(pruning.values);
+	auto expression = duckdb::ExpressionFilter::FromTableFilter(*ranges, duckdb::LogicalType::BIGINT);
+	if (!expression || !expression->expr) {
+		return;
+	}
+	get.table_filters.PushFilter(duckdb::ProjectionIndex(projected.GetIndex()), std::move(expression));
 }
 
 duckdb::LogicalGet *ScanBeneath(duckdb::LogicalOperator &op) {

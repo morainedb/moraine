@@ -16,8 +16,6 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/binder.hpp"
 
-#include <cstdio>
-#include <cstdlib>
 #include "duckdb/main/profiler/profiling_node.hpp"
 #include "catalog.hpp"
 #include "moraine_abi.h"
