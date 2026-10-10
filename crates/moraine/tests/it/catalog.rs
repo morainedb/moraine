@@ -69,6 +69,52 @@ async fn concurrent_first_metadata_reads_agree() {
     Arc::into_inner(catalog).unwrap().close().await.unwrap();
 }
 
+/// Raising moves the recorded version to the newest shape this build
+/// serves, reports the move, and is idempotent. A dry run records nothing.
+#[tokio::test]
+async fn raising_the_catalog_version_records_the_newest_shape() {
+    let store: Arc<InMemory> = Arc::new(InMemory::new());
+    let catalog = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+
+    let planned = catalog.raise_catalog_version(true).await.unwrap();
+    assert_eq!(
+        (planned.from.as_str(), planned.to.as_str()),
+        ("1.0", "1.1-dev1")
+    );
+    assert_eq!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .option(OptionScope::Global, "version")
+            .as_deref(),
+        Some("1.0"),
+        "a dry run records nothing"
+    );
+
+    let raised = catalog.raise_catalog_version(false).await.unwrap();
+    assert_eq!(
+        (raised.from.as_str(), raised.to.as_str()),
+        ("1.0", "1.1-dev1")
+    );
+    assert_eq!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .option(OptionScope::Global, "version")
+            .as_deref(),
+        Some("1.1-dev1")
+    );
+
+    // Nothing left to raise; the report says so rather than failing.
+    let again = catalog.raise_catalog_version(false).await.unwrap();
+    assert_eq!(again.from, again.to);
+    catalog.close().await.unwrap();
+}
+
 /// A catalog records the DuckLake catalog version it serves, so the shape
 /// the extension reports can follow it rather than a build-time constant.
 #[tokio::test]

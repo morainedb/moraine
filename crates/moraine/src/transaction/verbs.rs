@@ -1915,14 +1915,31 @@ impl Transaction {
         Ok(())
     }
 
+    /// Records the catalog version this store serves. Reserved from
+    /// `set_option`, because the shape moraine serves follows it; only a
+    /// raise moves it.
+    pub(crate) fn set_catalog_version(&mut self, version: &str) {
+        let components = OptionScope::Global.key_components();
+        let mut record = self
+            .state
+            .options
+            .get(&components)
+            .cloned()
+            .unwrap_or_default();
+        record
+            .options
+            .insert("version".to_owned(), version.to_owned());
+        self.state.set_option_record(components, record);
+    }
+
     /// Sets an option in a scope. Last-write-wins; an options-only
     /// commit mints no snapshot.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if the scope's schema or table does
-    /// not exist, or [`Error::Constraint`] for the reserved global
-    /// `encrypted` key.
+    /// not exist, or [`Error::Constraint`] for a reserved global key
+    /// (`encrypted`, `version`).
     pub fn set_option(&mut self, scope: OptionScope, key: &str, value: &str) -> Result<()> {
         nonempty_name("option key", key)?;
         self.live_scope(scope)?;
@@ -2381,7 +2398,7 @@ impl Transaction {
 
 /// Refuses the global keys that are store facts rather than settings:
 /// `encrypted` is fixed at catalog creation, and `version` names the
-/// catalog shape, which only a migration moves.
+/// catalog shape, which only a catalog-version raise moves.
 fn reserved_option(scope: OptionScope, key: &str) -> Result<()> {
     if scope != OptionScope::Global {
         return Ok(());

@@ -1484,6 +1484,25 @@ int32_t moraine_catalog_version(struct MoraineCatalogHandle *handle,
                                 char **out,
                                 struct MoraineError *err);
 
+// Raises the catalog version this store records to the newest shape this
+// build serves, writing the move to `*out_from`/`*out_to` as
+// NUL-terminated strings to free exactly once each with
+// [`moraine_string_free`].
+//
+// `dry_run` reports the move it would make and records nothing. Equal
+// values mean there was nothing to raise.
+//
+// # Safety
+// `handle` is live and exclusively accessed; `out_from`/`out_to` are
+// writable; `err` is writable when non-null.
+int32_t moraine_raise_catalog_version(struct MoraineCatalogHandle *handle,
+                                      bool dry_run,
+                                      MoraineInterruptProbe probe,
+                                      void *probe_ctx,
+                                      char **out_from,
+                                      char **out_to,
+                                      struct MoraineError *err);
+
 // Applies every structural format migration this binary carries that the
 // store at `path` still needs. Opens the store itself; a store carrying a
 // migration marker is one an attach refuses.

@@ -7,6 +7,12 @@
 /// was recorded carries no row and reads as this same version.
 pub const CATALOG_VERSION: &str = "1.0";
 
+/// The DuckLake catalog version this build can raise a store to: the
+/// newest shape it serves. Raising is one-way — a DuckLake that requires
+/// an older version refuses the raised store — so it is never the version
+/// a store is created with.
+pub const MAX_CATALOG_VERSION: &str = "1.1-dev1";
+
 /// Declares a newtype id over the catalog's `u64` id space.
 macro_rules! id_type {
     ($(#[$doc:meta])* $name:ident) => {
