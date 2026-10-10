@@ -140,16 +140,9 @@ jobs:
           key: duckdb-corrosion-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             duckdb-corrosion-${{ runner.os }}-
-      # The pinned DuckDB CLI xtask downloads, keyed on the versions
-      # manifest, which owns the pin. The whole directory, not the `cli`
-      # subdirectory: xtask nests the download under the version it is
-      # for, so a narrower path names nothing and caches nothing.
-      - uses: actions/cache@v6
-        with:
-          path: target/duckdb-cli
-          key: duckdb-cli-${{ runner.os }}-${{ hashFiles('.github/duckdb-versions') }}
-      # Tests still install supporting extensions such as spatial and
-      # parquet into this directory; DuckLake itself is built from the
+      # The CLI the suites run is the one this build produces, so there is
+      # nothing to download or cache for it. Tests still install supporting
+      # extensions into this directory; DuckLake itself is built from the
       # repository patch and loaded by path.
       - uses: actions/cache@v6
         with:

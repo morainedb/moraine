@@ -51,7 +51,7 @@ const MANIFEST: &str = ".github/duckdb-versions";
 /// anything still stale, and `e2e` is what actually proves the new pair.
 pub fn bump_duckdb(arguments: &[String]) -> anyhow::Result<()> {
     let Some(version) = arguments.first() else {
-        bail!("usage: cargo xtask bump-duckdb <version>, e.g. `cargo xtask bump-duckdb v1.5.6`");
+        bail!("usage: cargo xtask bump-duckdb <version>, e.g. `cargo xtask bump-duckdb v2.0.0`");
     };
     ensure!(
         crate::duckdb::is_release(version),

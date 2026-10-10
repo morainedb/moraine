@@ -1,16 +1,16 @@
 diff --git a/src/ducklake_extension.cpp b/src/ducklake_extension.cpp
-index ffe9826e..09a24451 100644
+index 49dc38f8..4e46bb01 100644
 --- a/src/ducklake_extension.cpp
 +++ b/src/ducklake_extension.cpp
-@@ -79,6 +79,8 @@ static void LoadInternal(ExtensionLoader &loader) {
+@@ -83,6 +83,8 @@ static void LoadInternal(ExtensionLoader &loader) {
  	DuckLakeSetOptionFunction set_options;
  	loader.RegisterFunction(set_options);
-
+ 
 +	loader.RegisterFunction(DuckLakeDeletePositionsFunction());
 +	loader.RegisterFunction(DuckLakeUpdatePositionsFunction());
  	DuckLakeOptionsFunction options;
  	loader.RegisterFunction(options);
-
+ 
 diff --git a/src/functions/CMakeLists.txt b/src/functions/CMakeLists.txt
 index 18778f49..fadf9e43 100644
 --- a/src/functions/CMakeLists.txt
@@ -25,10 +25,10 @@ index 18778f49..fadf9e43 100644
    ducklake_expire_snapshots.cpp
 diff --git a/src/functions/ducklake_delete_positions.cpp b/src/functions/ducklake_delete_positions.cpp
 new file mode 100644
-index 00000000..551351cc
+index 00000000..e539a4dc
 --- /dev/null
 +++ b/src/functions/ducklake_delete_positions.cpp
-@@ -0,0 +1,621 @@
+@@ -0,0 +1,626 @@
 +#include "functions/ducklake_table_functions.hpp"
 +#include "duckdb/common/enums/database_modification_type.hpp"
 +#include "duckdb/common/mutex.hpp"
@@ -88,7 +88,7 @@ index 00000000..551351cc
 +	optional_idx existing_index;
 +	auto &children = StructType::GetChildTypes(element_type);
 +	for (idx_t i = 0; i < children.size(); i++) {
-+		auto name = StringUtil::Lower(children[i].first);
++		auto &name = children[i].first;
 +		if (name == "data_file_id") {
 +			file_index = i;
 +		} else if (name == "positions") {
@@ -194,16 +194,17 @@ index 00000000..551351cc
 +		                            "resolver to answer it",
 +		                            function);
 +	}
-+	auto resolved = resolver(context, catalog.GetName(), request.token.GetIndex());
++	auto resolved = resolver(context, catalog.GetName().GetIdentifierName(), request.token.GetIndex());
 +	resolved.token = optional_idx();
 +	return resolved;
 +}
 +
 +static DuckLakeTableEntry &LookupTable(ClientContext &context, DuckLakeCatalog &catalog, const Value &schema,
 +                                       const Value &table) {
++	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, Identifier(table.GetValue<string>()), nullptr,
++	                       QueryErrorContext());
 +	return catalog
-+	    .GetEntry<TableCatalogEntry>(context, schema.GetValue<string>(), table.GetValue<string>(),
-+	                                 OnEntryNotFound::THROW_EXCEPTION)
++	    .GetEntry(context, Identifier(schema.GetValue<string>()), lookup, OnEntryNotFound::THROW_EXCEPTION)
 +	    ->Cast<DuckLakeTableEntry>();
 +}
 +
@@ -304,7 +305,7 @@ index 00000000..551351cc
 +		                            "does not support; use DELETE instead",
 +		                            function, table.name);
 +	}
-+	if (table_id.IsTransactionLocal()) {
++	if (IsTransactionLocal(table_id)) {
 +		throw InvalidInputException("%s: table \"%s\" was created in this transaction; only committed tables have "
 +		                            "addressable files",
 +		                            function, table.name);
@@ -331,7 +332,7 @@ index 00000000..551351cc
 +	auto &fs = FileSystem::GetFileSystem(context);
 +	try {
 +		for (auto &requested : request.file_positions) {
-+			if (context.interrupted) {
++			if (context.IsInterrupted()) {
 +				throw InterruptException();
 +			}
 +			auto file_entry = files.find(requested.first);
@@ -446,7 +447,7 @@ index 00000000..551351cc
 +};
 +
 +static unique_ptr<FunctionData> DeletePositionsBind(ClientContext &context, TableFunctionBindInput &input,
-+                                                    vector<LogicalType> &types, vector<string> &names) {
++                                                    vector<LogicalType> &types, vector<Identifier> &names) {
 +	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]).Cast<DuckLakeCatalog>();
 +	auto &table = LookupTable(context, catalog, input.inputs[1], input.inputs[2]);
 +	auto result = make_uniq<DeletePositionsBindData>(catalog, table,
@@ -481,9 +482,11 @@ index 00000000..551351cc
 +    : TableFunction("ducklake_delete_positions",
 +                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
 +                    DeletePositionsExecute, DeletePositionsBind, DeletePositionsInit) {
-+	named_parameters["inlined_rows"] = LogicalType::LIST(LogicalType::UBIGINT);
-+	named_parameters["snapshot"] = LogicalType::UBIGINT;
-+	named_parameters["positions_token"] = LogicalType::UBIGINT;
++	GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
++		options.Add("inlined_rows", LogicalType::LIST(LogicalType::UBIGINT))
++		    .Add("snapshot", LogicalType::UBIGINT)
++		    .Add("positions_token", LogicalType::UBIGINT);
++	});
 +}
 +
 +//===--------------------------------------------------------------------===//
@@ -531,12 +534,12 @@ index 00000000..551351cc
 +
 +class DuckLakeLogicalUpdatePositions : public LogicalExtensionOperator {
 +public:
-+	DuckLakeLogicalUpdatePositions(idx_t table_index, DuckLakeCatalog &catalog, DuckLakeTableEntry &table,
++	DuckLakeLogicalUpdatePositions(TableIndex table_index, DuckLakeCatalog &catalog, DuckLakeTableEntry &table,
 +	                               PositionalDeletes request)
 +	    : table_index(table_index), catalog(catalog), table(table), request(std::move(request)) {
 +	}
 +
-+	idx_t table_index;
++	TableIndex table_index;
 +	DuckLakeCatalog &catalog;
 +	DuckLakeTableEntry &table;
 +	PositionalDeletes request;
@@ -575,7 +578,7 @@ index 00000000..551351cc
 +	vector<ColumnBinding> GetColumnBindings() override {
 +		vector<ColumnBinding> result;
 +		for (idx_t i = 0; i < 4; i++) {
-+			result.emplace_back(table_index, i);
++			result.emplace_back(table_index, ProjectionIndex(i));
 +		}
 +		return result;
 +	}
@@ -588,7 +591,7 @@ index 00000000..551351cc
 +//! Binds `replacement` — a SELECT producing the table's columns followed by each row's id — casts it to the
 +//! table's types, and plans it through the update path with the positional deletes staged once it has run.
 +static unique_ptr<LogicalOperator> UpdatePositionsBind(ClientContext &context, TableFunctionBindInput &input,
-+                                                       idx_t bind_index, vector<string> &return_names) {
++                                                       TableIndex bind_index, vector<Identifier> &return_names) {
 +	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]).Cast<DuckLakeCatalog>();
 +	auto &table = LookupTable(context, catalog, input.inputs[1], input.inputs[2]);
 +	auto request = ParsePositionalDeletes(input, "ducklake_update_positions");
@@ -596,7 +599,7 @@ index 00000000..551351cc
 +		throw InvalidInputException("ducklake_update_positions: `replacement` cannot be NULL");
 +	}
 +
-+	Parser parser;
++	Parser parser(context);
 +	parser.ParseQuery(input.inputs[4].GetValue<string>());
 +	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 +		throw InvalidInputException("ducklake_update_positions: `replacement` must be a single SELECT statement");
@@ -643,31 +646,33 @@ index 00000000..551351cc
 +                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 +                     LogicalType::LIST(LogicalType::ANY), LogicalType::VARCHAR},
 +                    nullptr, nullptr, nullptr) {
-+	named_parameters["inlined_rows"] = LogicalType::LIST(LogicalType::UBIGINT);
-+	named_parameters["snapshot"] = LogicalType::UBIGINT;
-+	named_parameters["positions_token"] = LogicalType::UBIGINT;
++	GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
++		options.Add("inlined_rows", LogicalType::LIST(LogicalType::UBIGINT))
++		    .Add("snapshot", LogicalType::UBIGINT)
++		    .Add("positions_token", LogicalType::UBIGINT);
++	});
 +	bind_operator = UpdatePositionsBind;
 +}
 +
 +} // namespace duckdb
 diff --git a/src/include/functions/ducklake_table_functions.hpp b/src/include/functions/ducklake_table_functions.hpp
-index b09bf400..2f0f8e17 100644
+index dac3f3b5..10f38f12 100644
 --- a/src/include/functions/ducklake_table_functions.hpp
 +++ b/src/include/functions/ducklake_table_functions.hpp
-@@ -11,6 +11,9 @@
- #include "duckdb/function/table_function.hpp"
+@@ -12,6 +12,9 @@
+ #include "duckdb/catalog/catalog.hpp"
  #include "duckdb/parser/parsed_data/create_macro_info.hpp"
  #include "duckdb/function/function_set.hpp"
 +#include "duckdb/common/map.hpp"
 +#include "duckdb/common/optional_idx.hpp"
 +#include "duckdb/common/set.hpp"
-
+ 
  namespace duckdb {
  class DuckLakeCatalog;
-@@ -100,6 +103,37 @@ public:
+@@ -101,6 +104,37 @@ public:
  	DuckLakeSetOptionFunction();
  };
-
+ 
 +//! The rows ducklake_delete_positions and ducklake_update_positions stage, either given as constants or named by
 +//! `positions_token` for a registered resolver to supply when the statement runs.
 +struct PositionalDeletes {

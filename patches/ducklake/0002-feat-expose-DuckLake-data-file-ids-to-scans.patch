@@ -1,51 +1,57 @@
 diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/storage/ducklake_metadata_manager.hpp
-index ad3536f8..2c9d3b91 100644
+index 1f3a8506..23cb9db5 100644
 --- a/src/include/storage/ducklake_metadata_manager.hpp
 +++ b/src/include/storage/ducklake_metadata_manager.hpp
-@@ -80,6 +80,9 @@ struct ColumnFilterInfo {
-
- struct FilterPushdownInfo {
- 	unordered_map<idx_t, ColumnFilterInfo> column_filters;
+@@ -156,6 +156,9 @@ struct FilterPushdownInfo {
+ 	//! Filter trees, which must hold alongside the single-column filters above. Usually cross-column -
+ 	//! a single-column tree is only kept when it expresses something the per-column filters cannot.
+ 	vector<DuckLakeFilterTree> filter_trees;
 +	//! Filter on the data_file_id virtual column, applied to the file list
 +	//! directly rather than through column statistics.
-+	unique_ptr<TableFilter> data_file_id_filter;
-
++	shared_ptr<TableFilter> data_file_id_filter;
+ 
  	FilterPushdownInfo() = default;
-
-@@ -88,6 +91,9 @@ struct FilterPushdownInfo {
- 		for (const auto &entry : column_filters) {
- 			result->column_filters.emplace(entry.first, entry.second);
+ 
+@@ -171,6 +174,9 @@ struct FilterPushdownInfo {
+ 		for (const auto &tree : filter_trees) {
+ 			result->filter_trees.push_back(tree.Copy());
  		}
-+		if (data_file_id_filter) {
-+			result->data_file_id_filter = data_file_id_filter->Copy();
-+		}
++		// Shared rather than cloned: the file list only reads this filter,
++		// and a `TableFilter` is no longer copyable.
++		result->data_file_id_filter = data_file_id_filter;
  		return result;
  	}
  };
 diff --git a/src/include/storage/ducklake_multi_file_reader.hpp b/src/include/storage/ducklake_multi_file_reader.hpp
-index 1898459b..7c76fca2 100644
+index 2b0e08fe..c3e1c513 100644
 --- a/src/include/storage/ducklake_multi_file_reader.hpp
 +++ b/src/include/storage/ducklake_multi_file_reader.hpp
-@@ -20,6 +20,7 @@ class DuckLakeFieldData;
+@@ -43,6 +43,7 @@ struct DuckLakeMultiFileReaderGlobalState : public MultiFileReaderGlobalState {
  struct DuckLakeMultiFileReader : public MultiFileReader {
  public:
  	static constexpr column_t COLUMN_IDENTIFIER_SNAPSHOT_ID = UINT64_C(10000000000000000000);
 +	static constexpr column_t COLUMN_IDENTIFIER_DATA_FILE_ID = UINT64_C(10000000000000000001);
-
+ 
  public:
  	explicit DuckLakeMultiFileReader(DuckLakeFunctionInfo &read_info);
 diff --git a/src/storage/ducklake_metadata_manager.cpp b/src/storage/ducklake_metadata_manager.cpp
-index 487e074e..168b989d 100644
+index e162b8a3..1dfedd4d 100644
 --- a/src/storage/ducklake_metadata_manager.cpp
 +++ b/src/storage/ducklake_metadata_manager.cpp
-@@ -1071,6 +1071,110 @@ static void SetSnapshotFilter(const DuckLakeSnapshot &snapshot, idx_t max_partia
- 	file_entry.snapshot_filter_max = snapshot.snapshot_id;
+@@ -1,4 +1,5 @@
+ #include "storage/ducklake_metadata_manager.hpp"
++#include "duckdb/planner/filter/list.hpp"
+ #include "duckdb/common/file_system.hpp"
+ #include "functions/ducklake_table_functions.hpp"
+ #include "storage/ducklake_transaction.hpp"
+@@ -1348,6 +1349,111 @@ static bool IsSimpleFilterSubject(const Expression &expr) {
+ 	       expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF;
  }
-
+ 
 +static string GenerateDataFileIdFilter(const TableFilter &filter) {
 +	switch (filter.filter_type) {
-+	case TableFilterType::CONSTANT_COMPARISON: {
-+		auto &constant_filter = filter.Cast<ConstantFilter>();
++	case TableFilterType::LEGACY_CONSTANT_COMPARISON: {
++		auto &constant_filter = filter.Cast<LegacyConstantFilter>();
 +		if (constant_filter.constant.IsNull()) {
 +			return string();
 +		}
@@ -74,17 +80,17 @@ index 487e074e..168b989d 100644
 +		}
 +		return StringUtil::Format("data.data_file_id %s %s", comparison, constant_filter.constant.ToString());
 +	}
-+	case TableFilterType::IS_NOT_NULL:
++	case TableFilterType::LEGACY_IS_NOT_NULL:
 +		// Every row of the file list has an id, so this excludes nothing.
 +		return string();
-+	case TableFilterType::IS_NULL:
++	case TableFilterType::LEGACY_IS_NULL:
 +		// No file carries a NULL id: a NULL names an inlined or
 +		// transaction-local row, which the file list does not describe. As a
 +		// disjunct beside a located id this contributes nothing, which is
 +		// what lets the null-safe join shape prune at all.
 +		return "FALSE";
-+	case TableFilterType::CONJUNCTION_AND: {
-+		auto &conjunction_and_filter = filter.Cast<ConjunctionAndFilter>();
++	case TableFilterType::LEGACY_CONJUNCTION_AND: {
++		auto &conjunction_and_filter = filter.Cast<LegacyConjunctionAndFilter>();
 +		string result;
 +		for (auto &child_filter : conjunction_and_filter.child_filters) {
 +			auto child = GenerateDataFileIdFilter(*child_filter);
@@ -98,8 +104,8 @@ index 487e074e..168b989d 100644
 +		}
 +		return result;
 +	}
-+	case TableFilterType::CONJUNCTION_OR: {
-+		auto &conjunction_or_filter = filter.Cast<ConjunctionOrFilter>();
++	case TableFilterType::LEGACY_CONJUNCTION_OR: {
++		auto &conjunction_or_filter = filter.Cast<LegacyConjunctionOrFilter>();
 +		string result;
 +		for (auto &child_filter : conjunction_or_filter.child_filters) {
 +			auto child = GenerateDataFileIdFilter(*child_filter);
@@ -116,15 +122,15 @@ index 487e074e..168b989d 100644
 +		}
 +		return result;
 +	}
-+	case TableFilterType::OPTIONAL_FILTER: {
-+		auto &optional_filter = filter.Cast<OptionalFilter>();
++	case TableFilterType::LEGACY_OPTIONAL_FILTER: {
++		auto &optional_filter = filter.Cast<LegacyOptionalFilter>();
 +		if (!optional_filter.child_filter) {
 +			return string();
 +		}
 +		return GenerateDataFileIdFilter(*optional_filter.child_filter);
 +	}
-+	case TableFilterType::IN_FILTER: {
-+		auto &in_filter = filter.Cast<InFilter>();
++	case TableFilterType::LEGACY_IN_FILTER: {
++		auto &in_filter = filter.Cast<LegacyInFilter>();
 +		string in_list;
 +		for (auto &value : in_filter.values) {
 +			if (value.IsNull()) {
@@ -146,22 +152,23 @@ index 487e074e..168b989d 100644
 +	}
 +}
 +
- string DuckLakeMetadataManager::GenerateFilterFromTableFilter(const TableFilter &filter, const LogicalType &type,
-                                                               unordered_set<string> &referenced_stats) {
- 	switch (filter.filter_type) {
-@@ -1666,6 +1770,18 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
- 		}
++
+ bool DuckLakeMetadataManager::ValueIsFinite(const Value &val) {
+ 	if (val.type().id() != LogicalTypeId::FLOAT && val.type().id() != LogicalTypeId::DOUBLE) {
+ 		return true;
+@@ -2061,6 +2167,18 @@ string DuckLakeMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table,
+ 		              GetDeleteFileSelectList("del") + stats_select_list;
  	}
-
+ 
 +	// Prune the file list directly by id. This uses no column statistics, and
 +	// an unrepresentable filter simply adds no predicate.
 +	if (filter_info && filter_info->data_file_id_filter) {
 +		auto data_file_id_clause = GenerateDataFileIdFilter(*filter_info->data_file_id_filter);
 +		if (!data_file_id_clause.empty()) {
-+			if (!where_clause.empty()) {
-+				where_clause += " AND ";
++			if (!filter_result.where_conditions.empty()) {
++				filter_result.where_conditions += " AND ";
 +			}
-+			where_clause += data_file_id_clause;
++			filter_result.where_conditions += data_file_id_clause;
 +		}
 +	}
 +
@@ -169,22 +176,22 @@ index 487e074e..168b989d 100644
  	query += StringUtil::Format(R"(
  SELECT %s
 diff --git a/src/storage/ducklake_multi_file_list.cpp b/src/storage/ducklake_multi_file_list.cpp
-index 568fda69..90318ab0 100644
+index 2b1e7b42..28d77936 100644
 --- a/src/storage/ducklake_multi_file_list.cpp
 +++ b/src/storage/ducklake_multi_file_list.cpp
-@@ -48,6 +48,11 @@ void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown
- 		pushdown_info.column_filters.emplace(field_index, std::move(filter_info_entry));
- 		return;
- 	}
+@@ -152,6 +152,11 @@ unique_ptr<DuckLakeFilterNode> DuckLakeMultiFileList::GetExpressionFilterNode(Mu
+ 
+ void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id,
+                                                     unique_ptr<TableFilter> filter) const {
 +	if (column_id == DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID) {
 +		// Answered by the metadata file list itself, not by column statistics.
 +		pushdown_info.data_file_id_filter = std::move(filter);
 +		return;
 +	}
- 	if (IsVirtualColumn(column_id)) {
- 		return;
- 	}
-@@ -167,6 +172,7 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
+ 	if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
+ 		auto field_index = static_cast<idx_t>(MultiFileReader::ROW_ID_FIELD_ID);
+ 		ColumnFilterInfo filter_info_entry(field_index, LogicalType::BIGINT,
+@@ -488,6 +493,7 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
  			extended_info->options["row_id_start"] = Value::UBIGINT(file_entry.row_id_start.GetIndex());
  		}
  		extended_info->options["snapshot_id"] = Value(LogicalType::BIGINT);
@@ -192,7 +199,7 @@ index 568fda69..90318ab0 100644
  		if (file_entry.mapping_id.IsValid()) {
  			extended_info->options["mapping_id"] = Value::UBIGINT(file_entry.mapping_id.index);
  		}
-@@ -178,6 +184,7 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
+@@ -499,6 +505,7 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
  		extended_info->options["inlined_data"] = Value::BOOLEAN(true);
  		extended_info->options["schema_version"] =
  		    Value::BIGINT(NumericCast<int64_t>(inlined_data_table.schema_version));
@@ -200,7 +207,7 @@ index 568fda69..90318ab0 100644
  	} else {
  		extended_info->options["file_size"] = Value::UBIGINT(file.file_size_bytes);
  		if (file.footer_size.IsValid()) {
-@@ -193,6 +200,11 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
+@@ -514,6 +521,11 @@ OpenFileInfo DuckLakeMultiFileList::GetFile(idx_t i) const {
  			snapshot_id = Value(LogicalType::BIGINT);
  		}
  		extended_info->options["snapshot_id"] = std::move(snapshot_id);
@@ -213,12 +220,12 @@ index 568fda69..90318ab0 100644
  			extended_info->options["encryption_key"] = Value::BLOB_RAW(file.encryption_key);
  		}
 diff --git a/src/storage/ducklake_multi_file_reader.cpp b/src/storage/ducklake_multi_file_reader.cpp
-index c50cc642..43ae44ed 100644
+index 230ef33b..c8a321c5 100644
 --- a/src/storage/ducklake_multi_file_reader.cpp
 +++ b/src/storage/ducklake_multi_file_reader.cpp
-@@ -604,6 +604,20 @@ unique_ptr<Expression> DuckLakeMultiFileReader::GetVirtualColumnExpression(
- 		}
- 		return function_expr;
+@@ -647,6 +647,20 @@ MultiFileReaderVirtualColumnBinding DuckLakeMultiFileReader::GetVirtualColumnExp
+ 		column_ids.push_back(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER);
+ 		return MultiFileReaderVirtualColumnBinding(std::move(function_expr), std::move(column_ids));
  	}
 +	if (column_id == COLUMN_IDENTIFIER_DATA_FILE_ID) {
 +
@@ -232,24 +239,35 @@ index c50cc642..43ae44ed 100644
 +				data_file_id = entry->second;
 +			}
 +		}
-+		return make_uniq<BoundConstantExpression>(std::move(data_file_id));
++		return MultiFileReaderVirtualColumnBinding(std::move(data_file_id));
 +	}
  	if (column_id == COLUMN_IDENTIFIER_SNAPSHOT_ID) {
- 		if (TryFindColumnByFieldId(local_columns, MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID,
- 		                           snapshot_id_column.get(), global_column_reference)) {
+ 		if (TryFindColumnByFieldId(local_columns, MultiFileReader::LAST_UPDATED_SEQUENCE_NUMBER_ID)) {
+ 			return MultiFileReaderVirtualColumnBinding(*snapshot_id_column.get());
 diff --git a/src/storage/ducklake_table_entry.cpp b/src/storage/ducklake_table_entry.cpp
-index ce9a7d1f..6e7921eb 100644
+index 9e781722..0083af0e 100644
 --- a/src/storage/ducklake_table_entry.cpp
 +++ b/src/storage/ducklake_table_entry.cpp
-@@ -88,6 +88,7 @@ void VerifyNoNullValues(ClientContext &context, DuckLakeTransaction &transaction
+@@ -93,6 +93,7 @@ void VerifyNoNullValues(ClientContext &context, DuckLakeTransaction &transaction
  } // namespace
-
+ 
  constexpr column_t DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID;
 +constexpr column_t DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID;
-
+ 
  void DuckLakeTableEntry::CheckSupportedTypes() {
- 	for (auto &col : columns.Logical()) {
-@@ -402,6 +403,8 @@ virtual_column_map_t DuckLakeTableEntry::GetVirtualColumns() const {
+ 	DuckLakeTypes::CheckSupportedTypes(columns, ParentCatalog().Cast<DuckLakeCatalog>().GetDuckLakeVersion());
+@@ -337,6 +338,10 @@ case_insensitive_set_t DuckLakeTableEntry::GetNotNullFields() const {
+ }
+ 
+ unique_ptr<BaseStatistics> DuckLakeTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
++	if (IsVirtualColumn(column_id)) {
++		// A virtual column has no field entry, so no statistics to read.
++		return nullptr;
++	}
+ 	auto table_stats = GetTableStats(context);
+ 	if (!table_stats) {
+ 		return nullptr;
+@@ -421,6 +426,8 @@ virtual_column_map_t DuckLakeTableEntry::GetVirtualColumns() const {
  	result.insert(make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", LogicalType::BIGINT)));
  	result.insert(make_pair(DuckLakeMultiFileReader::COLUMN_IDENTIFIER_SNAPSHOT_ID,
  	                        TableColumn("snapshot_id", LogicalType::BIGINT)));

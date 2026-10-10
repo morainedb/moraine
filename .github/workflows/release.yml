@@ -1,8 +1,15 @@
 name: Release
 # On push to main, when Cargo.toml's version isn't on crates.io yet: build the
-# extension for every platform, and only if that succeeds, publish the crate and
-# cut both the v<version> crate release and the ext-v<version> extension release
-# (binaries attached).
+# extension for every platform, and only if that succeeds, publish the crate
+# and cut the v<version> crate release.
+#
+# The ext-v<version> extension release is absent on purpose: the primary pin
+# in .github/duckdb-versions is a development revision of DuckDB, and a
+# C++-ABI extension only loads into the exact version stamped in its footer
+# — so there is no DuckDB anyone could load a published build into. The
+# builds below still have to pass, since they are what says the bump is
+# whole. Publishing returns with the first tagged DuckDB 2.0, through the
+# `publish-extension-release` action this job used to call.
 on:
   workflow_dispatch:
   push:
@@ -21,7 +28,6 @@ jobs:
     outputs:
       release: ${{ steps.check.outputs.release }}
       version: ${{ steps.check.outputs.version }}
-      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
       - id: check
@@ -39,38 +45,36 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
             echo "moraine $version not on crates.io - release pending."
           fi
-      # A C++-ABI extension only loads into the exact DuckDB version stamped
-      # in its footer, so every supported release gets its own build. The
-      # list lives in .github/duckdb-versions.
-      - id: matrix
-        if: steps.check.outputs.release == 'true'
-        run: echo "matrix=$(cargo run -q -p xtask -- version-matrix)" >> "$GITHUB_OUTPUT"
-
   build-extension:
     needs: should-release
     if: needs.should-release.outputs.release == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        duckdb_version: ${{ fromJson(needs.should-release.outputs.matrix) }}
-    # Pinned to the primary release; `duckdb_version`, not this ref, selects
-    # which DuckDB each matrix entry checks out. `ci_tools_version` has to
-    # name this same ref: it decides which distribution matrix the build is
-    # generated from, and a matrix from an older ref omits fields this one's
-    # jobs read — v1.5.4's carries no macOS runner, which drops both macOS
-    # legs. A dropped leg leaves no job, no check run and no annotation: the
-    # run goes red with every visible job green, and `publish` is skipped.
-    # `cargo xtask check-pins` enforces it.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.6
+    # `duckdb_version` is omitted, so the build takes the `duckdb` submodule
+    # as checked out — the commit .github/duckdb-versions pins, which has no
+    # release to check out by tag. `duckdb_tag` stamps the version string
+    # that submodule's build reports, and `ci_tools_version` has to name the
+    # same ref as `uses`: it decides which distribution matrix the build is
+    # generated from, and a matrix from another ref omits fields this one's
+    # jobs read — one such omission drops a platform's leg entirely, which
+    # leaves no job, no check run and no annotation: the run goes red with
+    # every visible job green. `cargo xtask check-pins` enforces it.
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@969bc76276acec1c0a3922ff500d2ec3a1a3b037
     with:
       extension_name: moraine
-      duckdb_version: ${{ matrix.duckdb_version }}
-      ci_tools_version: v1.5.6
+      ci_tools_version: 969bc76276acec1c0a3922ff500d2ec3a1a3b037
+      duckdb_tag: v2.0.0-dev0
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
       # the same set.
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
+      # The bundled DuckLake carries the patch series: prove the build
+      # records row-ID statistics, prunes a scan by row id, and takes
+      # existing delete positions. It runs here rather than in a job of its
+      # own because the only CLI that can load the artifact is the one this
+      # container just built beside it.
+      post_build_command: >-
+        cargo run -q -p xtask -- validate-release-artifact v2.0.0-dev0
+        build/release/extension/moraine/moraine.duckdb_extension
       # The Linux builds run in a container with a ccache directory mounted
       # at /ccache_dir and cached between runs, but nothing points ccache at
       # it, so every release recompiles DuckDB from scratch into a cache
@@ -79,64 +83,15 @@ jobs:
       # hook this workflow gives us to set it.
       test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir"}}'
 
-  # The bundled DuckLake carries the patch series: prove a published build
-  # records row-ID statistics, prunes a scan by row id, and takes existing
-  # delete positions, on one Linux and one macOS build of every version,
-  # before anything is released.
-  validate:
-    name: Validate ${{ matrix.duckdb_version }} on ${{ matrix.runner }}
+  publish:
     needs: [should-release, build-extension]
     if: needs.should-release.outputs.release == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            platform: linux_amd64
-            duckdb_version: v1.5.6
-          - runner: ubuntu-24.04
-            platform: linux_amd64
-            duckdb_version: v1.5.5
-          - runner: ubuntu-24.04
-            platform: linux_amd64
-            duckdb_version: v1.5.4
-          - runner: macos-15
-            platform: osx_arm64
-            duckdb_version: v1.5.6
-          - runner: macos-15
-            platform: osx_arm64
-            duckdb_version: v1.5.5
-          - runner: macos-15
-            platform: osx_arm64
-            duckdb_version: v1.5.4
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: moraine-${{ matrix.duckdb_version }}-extension-${{ matrix.platform }}
-          path: artifact
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v6
-        with:
-          path: target/duckdb-cli
-          key: duckdb-cli-${{ matrix.platform }}-${{ matrix.duckdb_version }}
-      - run: >-
-          cargo xtask validate-release-artifact
-          ${{ matrix.duckdb_version }}
-          artifact/moraine.duckdb_extension
-
-  publish:
-    needs: [should-release, build-extension, validate]
-    if: needs.should-release.outputs.release == 'true'
     runs-on: ubuntu-latest
-    # See the extension workflow: the release upload has hung indefinitely,
-    # so the job is bounded rather than left to hold a runner in silence.
+    # Bounded rather than left to hold a runner in silence: the releases
+    # API has hung indefinitely on uploads it usually moves in seconds.
     timeout-minutes: 30
     permissions:
       contents: write
-    env:
-      VERSION: ${{ needs.should-release.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -154,9 +109,3 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - name: Publish the ext-v<version> extension release
-        uses: ./.github/actions/publish-extension-release
-        with:
-          tag: ext-v${{ env.VERSION }}
-          target: ${{ github.sha }}
-          token: ${{ secrets.RELEASE_PLZ_TOKEN }}

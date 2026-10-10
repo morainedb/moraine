@@ -253,10 +253,12 @@ this crate; there is no `build.rs`.
 
 Two git submodules pin the build:
 
-- `duckdb/` — DuckDB source at tag **v1.5.6**: the shim compiles against its
-  full `src/include/` tree and links its static library.
+- `duckdb/` — DuckDB source at the commit the manifest pins: the shim
+  compiles against its full `src/include/` tree and links its static
+  library. The pin is a commit rather than a tag because DuckDB 2.0 has
+  none yet.
 - `extension-ci-tools/` — the toolchain (Make + CMake helpers) at the
-  matching **v1.5.6**.
+  commit the same manifest line names.
 
 The moraine Rust static library is bridged into CMake with
 [corrosion](https://github.com/corrosion-rs/corrosion) (see the repo-root
@@ -280,24 +282,29 @@ builds it that way and drives it through a real DuckDB CLI.
 
 `.github/duckdb-versions` is the single source of truth: one DuckDB release
 per line, newest first, the first line carrying the commit each submodule
-must sit on. `xtask` reads it (`include_str!`), the release workflows build
-a matrix from it (`cargo xtask version-matrix`), and `cargo xtask
-check-pins` fails if any other place naming a version disagrees — the two
-submodules, all three workflow files, the table below, the DuckLake source
-pin every supported release is built from, and the patch task's own target.
-It also fails when a supported release has no `validate` leg, since that
-matrix is written by hand while the build matrix is generated.
+must sit on. `xtask` reads it (`include_str!`) and `cargo xtask check-pins`
+fails if any other place naming a version disagrees — the two submodules,
+all three workflow files, the table below, the DuckLake source pin every
+supported release is built from, and the patch task's own target. It also
+fails when a workflow builds the extension without running the release
+smoke against what it built.
+
+The single entry is a **development** pin: DuckDB 2.0 has no tag and no
+release assets. Nothing is published against it, because a C++-ABI
+extension only loads into the exact version string in its footer and no
+released DuckDB reports this one; the CLI the suites run is the one the
+build produces beside the extension.
 
 | What | Pinned at |
 |---|---|
-| DuckDB | **v1.5.6** (git hash `069cc9f9b5`, codename Variegata) |
-| Toolchain | `duckdb/extension-ci-tools` branch **v1.5.6** |
+| DuckDB | **v2.0.0-dev0** (git hash `6b6099a3e9`, codename Cyanoptera) |
+| Toolchain | `duckdb/extension-ci-tools` at `969bc76276` |
 | C++ standard | C++17 |
 | Linux C++ compiler | GCC 14 |
-| DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/<version>/` (never committed) |
+| DuckDB CLI (for `LOAD` testing) | `build/release/duckdb`, built beside the extension: the pin names no release to download |
 | DuckLake (bundled) | the commit `INSTALL ducklake` resolves to against the pinned CLI, plus `patches/ducklake/` — see "The bundled DuckLake" below |
 
-**Bumping** is `cargo xtask bump-duckdb v1.5.7`: it moves both submodules
+**Bumping** is `cargo xtask bump-duckdb v2.0.0`: it moves both submodules
 to that release, rewrites the manifest around it, and carries every derived
 reference along — the workflow refs, the table above, the new release's
 DuckLake source pin, and the DuckLake commit the new DuckDB declares,
@@ -323,7 +330,8 @@ release cannot load another's build. The list is short by design — each entry
 multiplies the release build by five platforms, and only the primary is
 proven end-to-end against a real DuckLake — so it holds the releases users
 are plausibly on, and older ones keep whatever assets they were already
-published with.
+published with. While the only entry is a development pin, the builds run
+and prove themselves but nothing is published.
 
 **Which DuckDB series moraine tracks.** The one DuckLake's current release
 branch targets, adopted when DuckLake cuts that branch rather than when
@@ -357,31 +365,23 @@ duckdb -unsigned -c "LOAD './build/release/extension/moraine/moraine.duckdb_exte
 ```
 
 Release assets are named `moraine.<duckdb-version>.<platform>.duckdb_extension`
-(`moraine.v1.5.6.linux_amd64.duckdb_extension`). Pick the one matching your
-DuckDB *exactly*: a mismatch is rejected even when unsigned, because a
+(`moraine.v1.5.5.linux_amd64.duckdb_extension`, from the last published
+release). Pick the one matching your DuckDB *exactly*: a mismatch is
+rejected even when unsigned, because a
 C++-ABI extension is bound to the version string in its footer. The
 loadable's base filename (`moraine`) is load-bearing too — DuckDB derives
 the entry symbol (`moraine_duckdb_cpp_init`, defined in
 `cpp/moraine_extension.cpp`) from the filename before the first `.` — so
 rename an asset to `moraine.duckdb_extension` before loading it.
 
-## Obtaining a DuckDB v1.5.6 CLI for testing
+## Obtaining a CLI for testing
 
-Downloaded directly from the GitHub release, no build required:
-
-```
-https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-osx-arm64.zip   # this machine
-https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-osx-universal.zip
-https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-amd64.zip
-https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-arm64.zip
-# (+ windows-amd64/arm64, and -musl variants for linux)
-```
-
-Cached under `target/duckdb-cli/<version>/` (gitignored, never committed) —
-keyed by version, so a pin bump downloads afresh rather than handing back
-a CLI the new build cannot load into. The CLI is
-downloaded from a release asset; the DuckDB *source* the extension builds
-against comes from the `duckdb` submodule, not this download.
+`make release` builds `build/release/duckdb` from the `duckdb` submodule
+alongside the extension, stamped with the pinned version string. That is
+the CLI the suites load the artifact into, and the only one that can:
+DuckDB 2.0 publishes no release, and a loadable is refused by any DuckDB
+reporting another version. `cargo xtask e2e` passes it to every suite as
+`MORAINE_DUCKDB_CLI` and checks that it reports the pin before doing so.
 
 ## The bundled DuckLake
 
@@ -400,7 +400,7 @@ $ duckdb -unsigned \
 ┌────────────────┬─────────┬───────────────────┐
 │ extension_name │ loaded  │ extension_version │
 ├────────────────┼─────────┼───────────────────┤
-│ ducklake       │ true    │ d8a1881           │
+│ ducklake       │ true    │ e8924cf           │
 │ moraine        │ true    │ …                 │
 └────────────────┴─────────┴───────────────────┘
 ```
@@ -409,12 +409,13 @@ Loading stock DuckLake *before* moraine is refused: it lacks the patches
 moraine's located functions rely on, and its log type would collide with
 the bundle's.
 
-The bundled source is the DuckLake commit DuckDB v1.5.6's own build-time pin
-selects (`.github/config/extensions/ducklake.cmake` in the `duckdb/duckdb`
-source tree names `GIT_URL https://github.com/duckdb/ducklake` at
-`GIT_TAG ac7595b0a1305bea3d4cfaca763b0ce964c763a2`), so the bundle tracks
-exactly what `INSTALL ducklake` would install against this DuckDB, with the
-patch series on top. `patches/ducklake/source-pins` records that commit per
+The bundled source is the DuckLake commit the pinned DuckDB's own
+build-time pin selects (`.github/config/extensions/ducklake.cmake` in the
+`duckdb/duckdb` source tree names `GIT_URL
+https://github.com/duckdb/ducklake` at `GIT_TAG
+e8924cfc9ccbb9a1a148e8ff367b75d493ca9df5`), so the bundle tracks exactly
+what `INSTALL ducklake` would install against this DuckDB: that commit,
+then DuckDB's own DuckLake patches, then the series on top. `patches/ducklake/source-pins` records that commit per
 supported DuckDB release; `cargo xtask check-pins` keeps it in step.
 
 The patch series records file-level row-id min/max statistics, pushes

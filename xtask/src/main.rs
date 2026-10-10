@@ -13,8 +13,7 @@
 //! - `s3` runs the catalog's object storage suite against a pinned RustFS
 //!   server (see `s3.rs`).
 //! - `check-pins` verifies every place naming a DuckDB version agrees with
-//!   `.github/duckdb-versions` (see `pins.rs`), and `version-matrix` prints
-//!   that manifest as the JSON array the release workflows build from.
+//!   `.github/duckdb-versions` (see `pins.rs`).
 //! - `check-patch-pins` applies the DuckLake patch series to every source
 //!   `patches/ducklake/source-pins` names, which `e2e` also does.
 //! - `filter-bench <extension> <results-directory>` measures wide located
@@ -64,21 +63,17 @@ fn main() -> anyhow::Result<()> {
         Some("check-release-assets") => release::check_release_assets(&arguments),
         Some("validate-release-artifact") => release::validate_release_artifact(&arguments),
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
-        Some("version-matrix") => {
-            pins::print_version_matrix();
-            Ok(())
-        }
         Some(other) => {
             bail!(
                 "unknown task `{other}`; available: e2e, bench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
                  check-patch-pins, check-release-assets, validate-release-artifact, \
-                 version-matrix, bump-duckdb, ducklake-patch"
+                 bump-duckdb, ducklake-patch"
             )
         }
         None => bail!(
             "usage: cargo xtask <task>; available: e2e, bench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
              check-patch-pins, check-release-assets, validate-release-artifact, \
-             version-matrix, bump-duckdb, ducklake-patch"
+             bump-duckdb, ducklake-patch"
         ),
     }
 }

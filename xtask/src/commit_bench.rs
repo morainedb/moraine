@@ -320,8 +320,8 @@ fn count_per_commit(value: u64, commits: usize) -> f64 {
 pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let options = parse_options(arguments)?;
     let target = CatalogTarget::from_environment_s3_only()?;
-    let cli = duckdb::ensure_duckdb_cli()?;
     let moraine = duckdb::build_and_package_extension(&ducklake_patch::prepare()?)?;
+    let cli = duckdb::ensure_duckdb_cli()?;
     let artifacts = Artifacts {
         cli: &cli,
         moraine: &moraine,

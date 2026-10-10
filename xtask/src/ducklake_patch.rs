@@ -10,11 +10,22 @@ use std::{
 
 use anyhow::{Context, bail, ensure};
 
-use crate::duckdb;
+use crate::duckdb::{self, command_output, optional_command_output};
 
 const DUCKLAKE_URL: &str = "https://github.com/duckdb/ducklake.git";
-const DUCKLAKE_REVISION: &str = "ac7595b0a1305bea3d4cfaca763b0ce964c763a2";
-const SUPPORTED_DUCKDB_PIN: &str = "v1.5.6";
+const DUCKLAKE_REVISION: &str = "e8924cfc9ccbb9a1a148e8ff367b75d493ca9df5";
+const SUPPORTED_DUCKDB_PIN: &str = "v2.0.0-dev0";
+/// DuckDB's own DuckLake patches, which it applies to the commit it pins
+/// before building the extension. The series here targets that patched
+/// source, so every application composes theirs first.
+const UPSTREAM_PATCH_DIRECTORY: &str = "duckdb/.github/patches/extensions/ducklake";
+/// How much DuckLake history to fetch. Deep enough that DuckDB's patches
+/// find the blobs their three-way merge needs: they are maintained against
+/// a moving branch, and at depth one git has nothing to merge against and
+/// refuses the hunks whose region has moved.
+const DUCKLAKE_FETCH_DEPTH: &str = "50";
+/// vcpkg is fetched for one revision's ports, with nothing to merge.
+const SHALLOW: &str = "1";
 const VCPKG_URL: &str = "https://github.com/microsoft/vcpkg.git";
 const VCPKG_REVISION: &str = "ea1a7396b05637a53bf23c078647ecc0edee4b80";
 pub(crate) const PATCH_PATHS: [&str; 8] = [
@@ -90,7 +101,13 @@ pub fn check_pins() -> anyhow::Result<()> {
     let workspace = duckdb::workspace_root();
     let source = workspace.join("target/patched-ducklake/source");
     fs::create_dir_all(&source).with_context(|| format!("creating {}", source.display()))?;
-    prepare_checkout(&source, DUCKLAKE_URL, DUCKLAKE_REVISION, "DuckLake")?;
+    prepare_checkout(
+        &source,
+        DUCKLAKE_URL,
+        DUCKLAKE_REVISION,
+        DUCKLAKE_FETCH_DEPTH,
+        "DuckLake",
+    )?;
     check_pin_sources(&workspace, &source)
 }
 
@@ -111,9 +128,15 @@ fn prepare_at(workspace: &Path, root: PathBuf) -> anyhow::Result<PatchedDuckLake
     let patched = PatchedDuckLake::at(root);
     fs::create_dir_all(&patched.root)
         .with_context(|| format!("creating {}", patched.root.display()))?;
-    prepare_checkout(&patched.source, DUCKLAKE_URL, DUCKLAKE_REVISION, "DuckLake")?;
+    prepare_checkout(
+        &patched.source,
+        DUCKLAKE_URL,
+        DUCKLAKE_REVISION,
+        DUCKLAKE_FETCH_DEPTH,
+        "DuckLake",
+    )?;
     apply_patches(workspace, &patched.source)?;
-    prepare_checkout(&patched.vcpkg, VCPKG_URL, VCPKG_REVISION, "vcpkg")?;
+    prepare_checkout(&patched.vcpkg, VCPKG_URL, VCPKG_REVISION, SHALLOW, "vcpkg")?;
     bootstrap_vcpkg(&patched.vcpkg)?;
     Ok(patched)
 }
@@ -244,7 +267,13 @@ fn validate_duckdb_checkout(workspace: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn prepare_checkout(path: &Path, url: &str, revision: &str, name: &str) -> anyhow::Result<()> {
+fn prepare_checkout(
+    path: &Path,
+    url: &str,
+    revision: &str,
+    depth: &str,
+    name: &str,
+) -> anyhow::Result<()> {
     let git_directory = path.join(".git");
     if git_directory.is_dir() && !git_directory.join("HEAD").exists() {
         println!(
@@ -278,7 +307,7 @@ fn prepare_checkout(path: &Path, url: &str, revision: &str, name: &str) -> anyho
     if head.is_none() {
         duckdb::run(
             Command::new("git")
-                .args(["fetch", "--depth", "1", "origin", revision])
+                .args(["fetch", "--depth", depth, "origin", revision])
                 .current_dir(path),
         )?;
         duckdb::run(
@@ -317,16 +346,26 @@ fn ensure_directory_is_empty(path: &Path, name: &str) -> anyhow::Result<()> {
 }
 
 fn apply_patches(workspace: &Path, source: &Path) -> anyhow::Result<()> {
+    let upstream = upstream_patches(workspace)?;
     let patches: Vec<PathBuf> = PATCH_PATHS
         .iter()
         .map(|patch| workspace.join(patch))
         .collect();
-    if checkout_matches_patches(source, &patches)? {
+    if checkout_matches_patches(source, &upstream, &patches)? {
         return Ok(());
     }
 
     ensure_clean_checkout(source, "cached DuckLake checkout")?;
 
+    // DuckDB's own patches first, three-way: they are maintained against a
+    // moving branch and DuckDB applies them with `patch`, which tolerates the
+    // same drift.
+    duckdb::run(
+        Command::new("git")
+            .args(["apply", "--3way"])
+            .args(&upstream)
+            .current_dir(source),
+    )?;
     // One invocation for the whole series: git threads each patch's result
     // into the next, and a later patch edits files an earlier one creates.
     // The apply is all-or-nothing; `--check` cannot stand in for it because it
@@ -338,13 +377,44 @@ fn apply_patches(workspace: &Path, source: &Path) -> anyhow::Result<()> {
             .current_dir(source),
     )?;
     ensure!(
-        checkout_matches_patches(source, &patches)?,
+        checkout_matches_patches(source, &upstream, &patches)?,
         "applying the DuckLake patch series did not produce its exact tracked diff"
     );
     Ok(())
 }
 
-fn checkout_matches_patches(source: &Path, patches: &[PathBuf]) -> anyhow::Result<bool> {
+/// DuckDB's DuckLake patches, in the order DuckDB itself applies them.
+fn upstream_patches(workspace: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let directory = workspace.join(UPSTREAM_PATCH_DIRECTORY);
+    let entries = fs::read_dir(&directory).with_context(|| {
+        format!(
+            "reading {} (run `git submodule update --init duckdb`)",
+            directory.display()
+        )
+    })?;
+    let mut patches: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "patch")
+        })
+        .collect();
+    patches.sort();
+    ensure!(
+        !patches.is_empty(),
+        "{} holds no patches; DuckDB stopped patching DuckLake, so the series should \
+         target the pinned commit directly",
+        directory.display()
+    );
+    Ok(patches)
+}
+
+fn checkout_matches_patches(
+    source: &Path,
+    upstream: &[PathBuf],
+    patches: &[PathBuf],
+) -> anyhow::Result<bool> {
     let parent = source
         .parent()
         .context("the DuckLake source checkout has no parent")?;
@@ -353,13 +423,7 @@ fn checkout_matches_patches(source: &Path, patches: &[PathBuf]) -> anyhow::Resul
     let actual_index = indexes.path().join("actual.index");
 
     initialize_temporary_index(source, &expected_index)?;
-    command_output(
-        Command::new("git")
-            .args(["apply", "--cached"])
-            .args(patches)
-            .env("GIT_INDEX_FILE", &expected_index)
-            .current_dir(source),
-    )?;
+    apply_series_to_index(source, &expected_index, upstream, patches)?;
     let expected_tree = write_temporary_tree(source, &expected_index)?;
 
     initialize_temporary_index(source, &actual_index)?;
@@ -372,6 +436,36 @@ fn checkout_matches_patches(source: &Path, patches: &[PathBuf]) -> anyhow::Resul
     let actual_tree = write_temporary_tree(source, &actual_index)?;
 
     Ok(expected_tree == actual_tree)
+}
+
+/// Applies DuckDB's patches and then the series to `index`, composing them
+/// the way a build does: theirs three-way, ours strictly. Returns the tree
+/// their application leaves, which is the base the series is tracked
+/// against.
+fn apply_series_to_index(
+    source: &Path,
+    index: &Path,
+    upstream: &[PathBuf],
+    patches: &[PathBuf],
+) -> anyhow::Result<String> {
+    command_output(
+        Command::new("git")
+            .args(["apply", "--cached", "--3way"])
+            .args(upstream)
+            .env("GIT_INDEX_FILE", index)
+            .current_dir(source),
+    )
+    .context("applying DuckDB's own DuckLake patches")?;
+    let base = write_temporary_tree(source, index)?;
+    command_output(
+        Command::new("git")
+            .args(["apply", "--cached"])
+            .args(patches)
+            .env("GIT_INDEX_FILE", index)
+            .current_dir(source),
+    )
+    .context("applying the DuckLake patch series")?;
+    Ok(base)
 }
 
 fn initialize_temporary_index(source: &Path, index: &Path) -> anyhow::Result<()> {
@@ -400,6 +494,7 @@ fn write_temporary_tree(source: &Path, index: &Path) -> anyhow::Result<String> {
 /// locally, and a release build is the first thing that would otherwise
 /// touch the rest.
 pub fn check_pin_sources(workspace: &Path, source: &Path) -> anyhow::Result<()> {
+    let upstream = upstream_patches(workspace)?;
     let patches: Vec<PathBuf> = PATCH_PATHS
         .iter()
         .map(|patch| workspace.join(patch))
@@ -416,14 +511,14 @@ pub fn check_pin_sources(workspace: &Path, source: &Path) -> anyhow::Result<()> 
         "pin-validation",
     )?;
 
-    let primary_paths = series_paths(source, indexes.path(), primary, &patches)?;
+    let primary_paths = series_paths(source, indexes.path(), primary, &upstream, &patches)?;
     println!(
         "ok: the series applies to the DuckLake DuckDB {} selects, touching {} files",
         primary.0,
         primary_paths.len()
     );
     for pin in rest {
-        let paths = series_paths(source, indexes.path(), pin, &patches)?;
+        let paths = series_paths(source, indexes.path(), pin, &upstream, &patches)?;
         if let Some(problem) = pin_coverage_problem((&primary.0, &primary_paths), (&pin.0, &paths))
         {
             bail!("{problem}");
@@ -442,6 +537,7 @@ fn series_paths(
     source: &Path,
     indexes: &Path,
     pin: &(String, String),
+    upstream: &[PathBuf],
     patches: &[PathBuf],
 ) -> anyhow::Result<Vec<String>> {
     let (version, commit) = pin;
@@ -455,28 +551,20 @@ fn series_paths(
             .env("GIT_INDEX_FILE", &index)
             .current_dir(source),
     )?;
-    command_output(
-        Command::new("git")
-            .args(["apply", "--cached"])
-            .args(patches)
-            .env("GIT_INDEX_FILE", &index)
-            .current_dir(source),
-    )
-    .with_context(|| {
-        format!("applying the series to the DuckLake {commit} that DuckDB {version} selects")
-    })?;
+    let base = apply_series_to_index(source, &index, upstream, patches)
+        .with_context(|| format!("the DuckLake {commit} that DuckDB {version} selects"))?;
 
     let tree = write_temporary_tree(source, &index)?;
     let names = command_output(
         Command::new("git")
-            .args(["diff", "--name-only", commit, &tree])
+            .args(["diff", "--name-only", &base, &tree])
             .current_dir(source),
     )?;
     Ok(names.lines().map(str::to_owned).collect())
 }
 
 /// Fetches `revision` into `source` unless it is already there, so a pin
-/// the cached shallow clone has never seen can still be read.
+/// the cached clone has never seen can still be read.
 fn fetch_revision(source: &Path, revision: &str) -> anyhow::Result<()> {
     let present = optional_command_output(
         Command::new("git")
@@ -488,7 +576,7 @@ fn fetch_revision(source: &Path, revision: &str) -> anyhow::Result<()> {
     }
     duckdb::run(
         Command::new("git")
-            .args(["fetch", "--depth", "1", "origin", revision])
+            .args(["fetch", "--depth", DUCKLAKE_FETCH_DEPTH, "origin", revision])
             .current_dir(source),
     )
 }
@@ -662,8 +750,8 @@ fn preload_ducklake_test(test_path: &str, script: &str) -> anyhow::Result<String
     ))
 }
 
-/// Runs the series' own row-ID write, backfill, pruning, and inlined-append
-/// sqllogictests with `artifact` preloaded in place of `require ducklake`.
+/// Runs the series' own row-ID write, pruning and file-merge sqllogictests
+/// with `artifact` preloaded in place of `require ducklake`.
 pub fn run_row_id_regression(patched: &PatchedDuckLake, artifact: &Path) -> anyhow::Result<()> {
     let runner = duckdb::workspace_root().join("build/release/test/unittest");
     ensure!(
@@ -734,31 +822,6 @@ impl Drop for TemporaryDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
-}
-
-fn command_output(command: &mut Command) -> anyhow::Result<String> {
-    let output = command
-        .output()
-        .with_context(|| format!("spawning {command:?}"))?;
-    ensure!(
-        output.status.success(),
-        "{command:?} exited with {}: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    String::from_utf8(output.stdout).context("command output was not UTF-8")
-}
-
-fn optional_command_output(command: &mut Command) -> anyhow::Result<Option<String>> {
-    let output = command
-        .output()
-        .with_context(|| format!("spawning {command:?}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    String::from_utf8(output.stdout)
-        .map(Some)
-        .context("command output was not UTF-8")
 }
 
 #[cfg(test)]
@@ -901,6 +964,7 @@ mod tests {
             &source,
             origin.to_str().expect("UTF-8 origin path"),
             &revision,
+            SHALLOW,
             "fixture",
         )
         .expect("repair stripped cache");
@@ -920,6 +984,7 @@ mod tests {
             &source,
             origin.to_str().expect("UTF-8 origin path"),
             &later_revision,
+            SHALLOW,
             "fixture",
         )
         .expect_err("a real checkout at another revision stays protected");
@@ -933,6 +998,8 @@ mod tests {
         assert_eq!(preserved.trim(), revision);
     }
 
+    /// The cached checkout is reused only when its tree is exactly what
+    /// DuckDB's patches and then the series produce.
     #[test]
     fn cached_patch_series_requires_the_exact_resulting_tree() {
         let root = TemporaryDirectory::create(&std::env::temp_dir(), "patch-tree-test")
@@ -988,17 +1055,24 @@ mod tests {
              +new\n",
         )
         .expect("second patch file");
-        let patches = [first, second];
+        // The first stands in for one of DuckDB's own patches, the second
+        // for the series: the comparison composes them in that order.
+        let upstream = [first];
+        let patches = [second];
         fs::write(source.join("source.cpp"), "new\n").expect("apply expected edit");
 
-        assert!(checkout_matches_patches(&source, &patches).expect("matching tree"));
+        assert!(checkout_matches_patches(&source, &upstream, &patches).expect("matching tree"));
 
         fs::write(source.join("sibling.cpp"), "extra edit\n").expect("extra tracked edit");
-        assert!(!checkout_matches_patches(&source, &patches).expect("extra tracked edit"));
+        assert!(
+            !checkout_matches_patches(&source, &upstream, &patches).expect("extra tracked edit")
+        );
 
         fs::write(source.join("sibling.cpp"), "unchanged\n").expect("restore sibling");
         fs::write(source.join("untracked.cpp"), "extra\n").expect("extra untracked file");
-        assert!(!checkout_matches_patches(&source, &patches).expect("extra untracked file"));
+        assert!(
+            !checkout_matches_patches(&source, &upstream, &patches).expect("extra untracked file")
+        );
     }
 
     #[test]

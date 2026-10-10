@@ -18,6 +18,10 @@
 # other place naming the version, then `cargo xtask check-pins` fails until
 # they all agree. Dropping an old line only stops future releases from
 # carrying it; published assets stay.
-v1.5.6 duckdb=069cc9f9b5be802405797faecc284961b07c70ef extension-ci-tools=3fd6109fc01555673b7c7123eba8d0d143fe8ce4
-v1.5.5
-v1.5.4
+#
+# The current pin is a development revision: DuckDB 2.0 has no tag and no
+# release assets, so there is no CLI to download and nothing to publish
+# against. The version string is the one both the local build and CI stamp
+# onto the checkout the `duckdb` submodule pins, and the CLI the e2e suites
+# run is the one that build produces.
+v2.0.0-dev0 duckdb=6b6099a3e9787f1b32c59fab61fcdd1d3bc835cd extension-ci-tools=969bc76276acec1c0a3922ff500d2ec3a1a3b037
