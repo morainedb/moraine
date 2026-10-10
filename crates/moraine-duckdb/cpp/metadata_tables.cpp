@@ -1975,6 +1975,17 @@ const std::vector<MetadataTableSpec> &ExtendedMetadataTableSpecsImpl() {
 	return specs;
 }
 
+bool MoraineServesExtendedCatalog(MoraineCatalogHandle *handle) {
+	char *version = nullptr;
+	MoraineError err {};
+	if (moraine_catalog_version(handle, nullptr, nullptr, &version, &err) != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::string recorded(version == nullptr ? "" : version);
+	moraine_string_free(version);
+	return recorded == kExtendedCatalogVersion;
+}
+
 const std::vector<MetadataTableSpec> &MoraineMetadataTableSpecs(bool extended) {
 	return extended ? ExtendedMetadataTableSpecsImpl() : MetadataTableSpecsImpl();
 }
@@ -2390,18 +2401,9 @@ duckdb::TableStorageInfo MoraineMetadataTableEntry::GetStorageInfo(duckdb::Clien
 
 void PopulateMetadataTables(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, MoraineCatalogHandle *handle,
                             duckdb::case_insensitive_map_t<duckdb::unique_ptr<duckdb::CatalogEntry>> &tables) {
-	// The shape this store serves follows the catalog version it records,
-	// read once here: the entries registered below carry it for the life of
-	// the attach.
-	char *version = nullptr;
-	MoraineError version_err {};
-	if (moraine_catalog_version(handle, nullptr, nullptr, &version, &version_err) != MORAINE_OK) {
-		ThrowMoraineError(version_err);
-	}
-	std::string recorded(version == nullptr ? "" : version);
-	moraine_string_free(version);
-
-	for (auto &spec : MoraineMetadataTableSpecs(recorded == kExtendedCatalogVersion)) {
+	// Read once here: the entries registered below carry the choice for the
+	// life of the attach.
+	for (auto &spec : MoraineMetadataTableSpecs(MoraineServesExtendedCatalog(handle))) {
 		duckdb::CreateTableInfo info(schema, spec.name);
 		duckdb::idx_t column_index = 0;
 		for (auto &col : spec.columns) {
