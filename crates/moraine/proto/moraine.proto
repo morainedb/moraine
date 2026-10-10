@@ -217,6 +217,9 @@ message DataFileValue {
   optional uint64 mapping_id = 15;
   optional uint64 partial_max = 16;
   repeated FilePartitionValue partition_values = 17;
+  // Written from catalog version 1.1-dev1 on; absent for a file an older
+  // writer registered.
+  optional uint64 row_group_count = 18;
 }
 
 // ducklake_delete_file.

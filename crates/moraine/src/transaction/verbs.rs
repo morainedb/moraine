@@ -1394,6 +1394,8 @@ impl Transaction {
             mapping_id: None,
             partial_max: None,
             partition_values: file_partition_values(&file.partition_values),
+            // Supplied by the writer's INSERT, not by this verb.
+            row_group_count: None,
         });
         for entry in file.column_stats {
             self.state.put_file_column_stats(FileColumnStatsValue {
@@ -2343,6 +2345,8 @@ impl Transaction {
             mapping_id: None,
             partial_max: flush.partial_max.map(SnapshotId::get),
             partition_values: file_partition_values(&flush.file.partition_values),
+            // Supplied by the writer's INSERT, not by this verb.
+            row_group_count: None,
         });
         for entry in &flush.file.column_stats {
             self.state.put_file_column_stats(FileColumnStatsValue {
@@ -3559,6 +3563,7 @@ mod tests {
             mapping_id: None,
             partial_max: None,
             partition_values: vec![],
+            row_group_count: None,
         });
     }
 
@@ -3766,6 +3771,7 @@ mod tests {
             mapping_id: None,
             partial_max: None,
             partition_values: vec![],
+            row_group_count: None,
         });
 
         let err = transaction

@@ -45,6 +45,20 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// A column a later catalog version appends, absent from a writer still
+    /// on the earlier one. Unlike [`opt_u64`](Self::opt_u64) a missing cell
+    /// is not an error.
+    pub(super) fn trailing_opt_u64(&mut self) -> Result<Option<u64>> {
+        match self.items.next() {
+            None | Some(Cell::Null) => Ok(None),
+            Some(Cell::U64(value)) => Ok(Some(*value)),
+            Some(other) => Err(corrupt_row(
+                self.table,
+                format!("expected optional u64, got {other:?}"),
+            )),
+        }
+    }
+
     pub(super) fn i64(&mut self) -> Result<i64> {
         match self.next()? {
             Cell::I64(v) => Ok(*v),
@@ -230,6 +244,7 @@ pub(super) fn decode_data_file(cells: &[Cell]) -> Result<proto::DataFileValue> {
         mapping_id: c.opt_u64()?,
         partial_max: c.opt_u64()?,
         partition_values: Vec::new(),
+        row_group_count: c.trailing_opt_u64()?,
     };
     c.finish()?;
     Ok(value)

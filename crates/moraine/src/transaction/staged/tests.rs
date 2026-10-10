@@ -5323,6 +5323,25 @@ fn file_partition_value_row(
     ]
 }
 
+/// A writer on catalog version 1.0 omits `row_group_count`; one on
+/// 1.1-dev1 appends it. Both shapes decode, and only the later one carries
+/// a count.
+#[test]
+fn a_data_file_row_decodes_with_or_without_its_row_group_count() {
+    let without = decode::decode_data_file(&data_file_row(3, 1, 1)).unwrap();
+    assert_eq!(without.row_group_count, None);
+
+    let mut appended = data_file_row(3, 1, 1);
+    appended.push(Cell::U64(7));
+    let with = decode::decode_data_file(&appended).unwrap();
+    assert_eq!(with.row_group_count, Some(7));
+
+    // Appending the column leaves every earlier one where it was.
+    assert_eq!(with.data_file_id, without.data_file_id);
+    assert_eq!(with.footer_size, without.footer_size);
+    assert_eq!(with.path, without.path);
+}
+
 fn data_file_row(data_file_id: u64, table_id: u64, begin: u64) -> Vec<Cell> {
     vec![
         Cell::U64(data_file_id),

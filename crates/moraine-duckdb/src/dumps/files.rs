@@ -62,6 +62,10 @@ pub struct MoraineDataFileRow {
     pub has_partial_max: bool,
     /// `partial_max`, valid iff `has_partial_max`.
     pub partial_max: u64,
+    /// Whether `row_group_count` is present.
+    pub has_row_group_count: bool,
+    /// `row_group_count`, valid iff `has_row_group_count`.
+    pub row_group_count: u64,
 }
 
 /// Converts core `ducklake_data_file` records into the C row shape.
@@ -89,6 +93,7 @@ pub(crate) fn data_file_rows(
             let (has_mapping, mapping) = opt_u64(v.mapping_id);
             let (has_partial_max, partial_max) = opt_u64(v.partial_max);
             let (has_row_id_start, row_id_start) = opt_u64(v.row_id_start);
+            let (has_row_group_count, row_group_count) = opt_u64(v.row_group_count);
 
             MoraineDataFileRow {
                 data_file_id: v.data_file_id,
@@ -113,6 +118,8 @@ pub(crate) fn data_file_rows(
                 mapping_id: mapping,
                 has_partial_max,
                 partial_max,
+                has_row_group_count,
+                row_group_count,
             }
         })
         .collect())

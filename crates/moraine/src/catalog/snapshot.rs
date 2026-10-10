@@ -1543,6 +1543,7 @@ mod tests {
             mapping_id: None,
             partial_max: None,
             partition_values: vec![],
+            row_group_count: None,
         }
     }
 

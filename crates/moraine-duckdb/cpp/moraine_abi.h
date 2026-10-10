@@ -795,6 +795,10 @@ typedef struct MoraineDataFileRow {
   bool has_partial_max;
   // `partial_max`, valid iff `has_partial_max`.
   uint64_t partial_max;
+  // Whether `row_group_count` is present.
+  bool has_row_group_count;
+  // `row_group_count`, valid iff `has_row_group_count`.
+  uint64_t row_group_count;
 } MoraineDataFileRow;
 
 // One `ducklake_delete_file` row, as returned by
