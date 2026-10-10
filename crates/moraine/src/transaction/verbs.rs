@@ -1409,6 +1409,8 @@ impl Transaction {
                 contains_nan: entry.contains_nan,
                 extra_stats: entry.extra_stats,
                 variant_stats: vec![],
+                min_is_exact: None,
+                max_is_exact: None,
             });
         }
         self.stage_file_index_entries(table, row_id_start, index_entries)?;
@@ -1587,6 +1589,7 @@ impl Transaction {
             footer_size: file.footer_size,
             encryption_key: file.encryption_key,
             partial_max: None,
+            row_group_count: None,
         });
 
         self.stage_delete_file_index_entries(table, index_entries)?;
@@ -1710,6 +1713,8 @@ impl Transaction {
             min_value: stats.min_value,
             max_value: stats.max_value,
             extra_stats: stats.extra_stats,
+            min_is_exact: None,
+            max_is_exact: None,
         });
         self.ops.push(Operation::UpdateStats {
             table_id: table.get(),
@@ -2359,6 +2364,8 @@ impl Transaction {
                 contains_nan: entry.contains_nan,
                 extra_stats: entry.extra_stats.clone(),
                 variant_stats: vec![],
+                min_is_exact: None,
+                max_is_exact: None,
             });
         }
 

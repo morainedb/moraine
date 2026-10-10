@@ -237,6 +237,9 @@ message DeleteFileValue {
   uint64 footer_size = 11;
   optional string encryption_key = 12;
   optional uint64 partial_max = 13;
+  // Written from catalog version 1.1-dev1 on; absent for a file an older
+  // writer registered.
+  optional uint64 row_group_count = 14;
 }
 
 // ducklake_name_mapping — embedded in MappingValue. column_id is a
@@ -287,6 +290,10 @@ message FileColumnStatsValue {
   optional bool contains_nan = 9;
   optional string extra_stats = 10;
   repeated FileVariantStats variant_stats = 11;
+  // Whether the recorded bound is the exact value rather than a widened
+  // one. Written from catalog version 1.1-dev1 on.
+  optional bool min_is_exact = 12;
+  optional bool max_is_exact = 13;
 }
 
 // ducklake_table_stats. next_row_id is the per-table row-id counter.
@@ -306,6 +313,10 @@ message TableColumnStatsValue {
   optional string min_value = 5;
   optional string max_value = 6;
   optional string extra_stats = 7;
+  // Whether the recorded bound is the exact value rather than a widened
+  // one. Written from catalog version 1.1-dev1 on.
+  optional bool min_is_exact = 8;
+  optional bool max_is_exact = 9;
 }
 
 // ducklake_tag entry: one row, embedded in its object's container.

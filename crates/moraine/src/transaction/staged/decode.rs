@@ -45,6 +45,19 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// As [`trailing_opt_u64`](Self::trailing_opt_u64), for an appended
+    /// boolean column.
+    pub(super) fn trailing_opt_bool(&mut self) -> Result<Option<bool>> {
+        match self.items.next() {
+            None | Some(Cell::Null) => Ok(None),
+            Some(Cell::Bool(value)) => Ok(Some(*value)),
+            Some(other) => Err(corrupt_row(
+                self.table,
+                format!("expected optional bool, got {other:?}"),
+            )),
+        }
+    }
+
     /// A column a later catalog version appends, absent from a writer still
     /// on the earlier one. Unlike [`opt_u64`](Self::opt_u64) a missing cell
     /// is not an error.
@@ -266,6 +279,7 @@ pub(super) fn decode_delete_file(cells: &[Cell]) -> Result<proto::DeleteFileValu
         footer_size: c.u64()?,
         encryption_key: c.opt_string()?,
         partial_max: c.opt_u64()?,
+        row_group_count: c.trailing_opt_u64()?,
     };
     c.finish()?;
     Ok(value)
@@ -293,6 +307,8 @@ pub(super) fn decode_table_column_stats(cells: &[Cell]) -> Result<proto::TableCo
         min_value: c.opt_string()?,
         max_value: c.opt_string()?,
         extra_stats: c.opt_string()?,
+        min_is_exact: c.trailing_opt_bool()?,
+        max_is_exact: c.trailing_opt_bool()?,
     };
     c.finish()?;
     Ok(value)
@@ -312,6 +328,8 @@ pub(super) fn decode_file_column_stats(cells: &[Cell]) -> Result<proto::FileColu
         contains_nan: c.opt_bool()?,
         extra_stats: c.opt_string()?,
         variant_stats: Vec::new(),
+        min_is_exact: c.trailing_opt_bool()?,
+        max_is_exact: c.trailing_opt_bool()?,
     };
     c.finish()?;
     Ok(value)

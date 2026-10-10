@@ -5323,6 +5323,35 @@ fn file_partition_value_row(
     ]
 }
 
+/// Every column catalog version 1.1-dev1 appends decodes whether the
+/// writer sends it or not, so one build serves a writer on either version.
+#[test]
+fn appended_catalog_columns_decode_from_either_writer() {
+    let delete_cells = delete_file_row(4, 1, 3, 1);
+    let without = decode::decode_delete_file(&delete_cells).unwrap();
+    assert_eq!(without.row_group_count, None);
+    let mut appended = delete_cells;
+    appended.push(Cell::U64(5));
+    assert_eq!(
+        decode::decode_delete_file(&appended)
+            .unwrap()
+            .row_group_count,
+        Some(5)
+    );
+
+    let stats_cells = file_column_stats_row(3, 1, 0, "1", "9");
+    let without = decode::decode_file_column_stats(&stats_cells).unwrap();
+    assert_eq!((without.min_is_exact, without.max_is_exact), (None, None));
+    let mut appended = stats_cells;
+    appended.push(Cell::Bool(true));
+    appended.push(Cell::Bool(false));
+    let with = decode::decode_file_column_stats(&appended).unwrap();
+    assert_eq!(
+        (with.min_is_exact, with.max_is_exact),
+        (Some(true), Some(false))
+    );
+}
+
 /// A writer on catalog version 1.0 omits `row_group_count`; one on
 /// 1.1-dev1 appends it. Both shapes decode, and only the later one carries
 /// a count.
