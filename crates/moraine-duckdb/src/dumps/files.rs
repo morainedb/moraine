@@ -283,6 +283,10 @@ pub struct MoraineDeleteFileRow {
     pub has_partial_max: bool,
     /// `partial_max`, valid iff `has_partial_max`.
     pub partial_max: u64,
+    /// Whether `row_group_count` is present.
+    pub has_row_group_count: bool,
+    /// `row_group_count`, valid iff `has_row_group_count`.
+    pub row_group_count: u64,
 }
 
 /// Converts core `ducklake_delete_file` records into the C row shape. Shared by
@@ -305,6 +309,7 @@ pub(crate) fn delete_file_rows(
         .map(|(v, path, format, encryption_key)| {
             let (has_end, end) = opt_u64(v.end_snapshot);
             let (has_partial_max, partial_max) = opt_u64(v.partial_max);
+            let (has_row_group_count, row_group_count) = opt_u64(v.row_group_count);
             MoraineDeleteFileRow {
                 delete_file_id: v.delete_file_id,
                 table_id: v.table_id,
@@ -321,6 +326,8 @@ pub(crate) fn delete_file_rows(
                 encryption_key: opt_into_raw(encryption_key),
                 has_partial_max,
                 partial_max,
+                has_row_group_count,
+                row_group_count,
             }
         })
         .collect())

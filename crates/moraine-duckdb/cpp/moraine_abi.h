@@ -834,6 +834,10 @@ typedef struct MoraineDeleteFileRow {
   bool has_partial_max;
   // `partial_max`, valid iff `has_partial_max`.
   uint64_t partial_max;
+  // Whether `row_group_count` is present.
+  bool has_row_group_count;
+  // `row_group_count`, valid iff `has_row_group_count`.
+  uint64_t row_group_count;
 } MoraineDeleteFileRow;
 
 // One `ducklake_file_partition_value` row, as returned by
@@ -1099,6 +1103,14 @@ typedef struct MoraineTableColumnStatsRow {
   char *max_value;
   // `extra_stats`, owned, null if absent.
   char *extra_stats;
+  // Whether `min_is_exact` is present.
+  bool has_min_is_exact;
+  // `min_is_exact`, valid iff `has_min_is_exact`.
+  bool min_is_exact;
+  // Whether `max_is_exact` is present.
+  bool has_max_is_exact;
+  // `max_is_exact`, valid iff `has_max_is_exact`.
+  bool max_is_exact;
 } MoraineTableColumnStatsRow;
 
 // One `ducklake_file_column_stats` row, as returned by
@@ -1128,6 +1140,14 @@ typedef struct MoraineFileColumnStatsRow {
   bool contains_nan;
   // `extra_stats`, owned, null if absent.
   char *extra_stats;
+  // Whether `min_is_exact` is present.
+  bool has_min_is_exact;
+  // `min_is_exact`, valid iff `has_min_is_exact`.
+  bool min_is_exact;
+  // Whether `max_is_exact` is present.
+  bool has_max_is_exact;
+  // `max_is_exact`, valid iff `has_max_is_exact`.
+  bool max_is_exact;
 } MoraineFileColumnStatsRow;
 
 // One `ducklake_tag` row, as returned by [`moraine_dump_tags`] —
