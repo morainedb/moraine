@@ -463,8 +463,8 @@ std::vector<std::vector<duckdb::Value>> ProvideDataFiles(MoraineCatalogHandle *h
 
 // One table's data files. `DumpRows` cannot serve this: the scoped entry
 // point takes a table id.
-std::vector<std::vector<duckdb::Value>> ProvideDataFilesOf(MoraineCatalogHandle *handle, uint64_t table_id,
-                                                           MoraineInterruptProbe probe, void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideDataFilesOfAt(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                           MoraineInterruptProbe probe, void *probe_ctx, bool extended) {
 	OwnedArray<MoraineDataFileRow> rows(moraine_dump_data_files_free);
 	MoraineError err {};
 	if (moraine_dump_data_files_of(handle, table_id, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err) !=
@@ -474,9 +474,19 @@ std::vector<std::vector<duckdb::Value>> ProvideDataFilesOf(MoraineCatalogHandle 
 	std::vector<std::vector<duckdb::Value>> result;
 	result.reserve(rows.size());
 	for (auto &r : rows) {
-		result.push_back(DataFileShape(r));
+		result.push_back(DataFileShapeAt(r, extended));
 	}
 	return result;
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideDataFilesOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                           MoraineInterruptProbe probe, void *probe_ctx) {
+	return ProvideDataFilesOfAt(handle, table_id, probe, probe_ctx, false);
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideExtendedDataFilesOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                           MoraineInterruptProbe probe, void *probe_ctx) {
+	return ProvideDataFilesOfAt(handle, table_id, probe, probe_ctx, true);
 }
 
 // One `ducklake_delete_file` record's column list, shared by the committed
@@ -620,8 +630,8 @@ std::vector<std::vector<duckdb::Value>> ProvideFileColumnStats(MoraineCatalogHan
 
 // One table's file column statistics. `DumpRows` cannot serve this: the
 // scoped entry point takes a table id.
-std::vector<std::vector<duckdb::Value>> ProvideFileColumnStatsOf(MoraineCatalogHandle *handle, uint64_t table_id,
-                                                                 MoraineInterruptProbe probe, void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideFileColumnStatsOfAt(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                                 MoraineInterruptProbe probe, void *probe_ctx, bool extended) {
 	OwnedArray<MoraineFileColumnStatsRow> rows(moraine_dump_file_column_stats_free);
 	MoraineError err {};
 	auto code =
@@ -632,14 +642,24 @@ std::vector<std::vector<duckdb::Value>> ProvideFileColumnStatsOf(MoraineCatalogH
 	std::vector<std::vector<duckdb::Value>> result;
 	result.reserve(rows.size());
 	for (auto &r : rows) {
-		result.push_back(FileColumnStatsShape(r));
+		result.push_back(FileColumnStatsShapeAt(r, extended));
 	}
 	return result;
 }
 
+std::vector<std::vector<duckdb::Value>> ProvideFileColumnStatsOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                           MoraineInterruptProbe probe, void *probe_ctx) {
+	return ProvideFileColumnStatsOfAt(handle, table_id, probe, probe_ctx, false);
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideExtendedFileColumnStatsOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                           MoraineInterruptProbe probe, void *probe_ctx) {
+	return ProvideFileColumnStatsOfAt(handle, table_id, probe, probe_ctx, true);
+}
+
 // One table's delete files, as `ProvideDataFilesOf` for its own kind.
-std::vector<std::vector<duckdb::Value>> ProvideDeleteFilesOf(MoraineCatalogHandle *handle, uint64_t table_id,
-                                                             MoraineInterruptProbe probe, void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideDeleteFilesOfAt(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                             MoraineInterruptProbe probe, void *probe_ctx, bool extended) {
 	OwnedArray<MoraineDeleteFileRow> rows(moraine_dump_delete_files_free);
 	MoraineError err {};
 	if (moraine_dump_delete_files_of(handle, table_id, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err) !=
@@ -649,9 +669,19 @@ std::vector<std::vector<duckdb::Value>> ProvideDeleteFilesOf(MoraineCatalogHandl
 	std::vector<std::vector<duckdb::Value>> result;
 	result.reserve(rows.size());
 	for (auto &r : rows) {
-		result.push_back(DeleteFileShape(r));
+		result.push_back(DeleteFileShapeAt(r, extended));
 	}
 	return result;
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideDeleteFilesOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                           MoraineInterruptProbe probe, void *probe_ctx) {
+	return ProvideDeleteFilesOfAt(handle, table_id, probe, probe_ctx, false);
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideExtendedDeleteFilesOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                           MoraineInterruptProbe probe, void *probe_ctx) {
+	return ProvideDeleteFilesOfAt(handle, table_id, probe, probe_ctx, true);
 }
 
 // `ducklake_schema_versions` rows are flattened out of the snapshot
@@ -1941,13 +1971,16 @@ const std::vector<MetadataTableSpec> &ExtendedMetadataTableSpecsImpl() {
 			if (name == "ducklake_data_file") {
 				spec.columns.push_back({"row_group_count", "BIGINT", false});
 				spec.provider = ProvideExtendedDataFiles;
+				spec.scoped_provider = ProvideExtendedDataFilesOf;
 			} else if (name == "ducklake_delete_file") {
 				spec.columns.push_back({"row_group_count", "BIGINT", false});
 				spec.provider = ProvideExtendedDeleteFiles;
+				spec.scoped_provider = ProvideExtendedDeleteFilesOf;
 			} else if (name == "ducklake_file_column_stats") {
 				spec.columns.push_back({"min_is_exact", "BOOLEAN", false});
 				spec.columns.push_back({"max_is_exact", "BOOLEAN", false});
 				spec.provider = ProvideExtendedFileColumnStats;
+				spec.scoped_provider = ProvideExtendedFileColumnStatsOf;
 			} else if (name == "ducklake_table_column_stats") {
 				spec.columns.push_back({"min_is_exact", "BOOLEAN", false});
 				spec.columns.push_back({"max_is_exact", "BOOLEAN", false});
@@ -2064,19 +2097,24 @@ std::vector<std::vector<duckdb::Value>> TxDumpRowsOf(MoraineTxHandle *tx, uint64
 // table and to `live_bound` where it is given. Empty optional for a kind
 // with no scoped dump, which the caller reads whole.
 std::optional<std::vector<std::vector<duckdb::Value>>>
-TxAwareScopedRows(MoraineTxHandle *tx, int32_t write_table_kind, uint64_t table_id, duckdb::optional_idx live_bound) {
+TxAwareScopedRows(MoraineTxHandle *tx, int32_t write_table_kind, uint64_t table_id, duckdb::optional_idx live_bound,
+                   bool extended) {
 	const uint64_t bound = live_bound.IsValid() ? static_cast<uint64_t>(live_bound.GetIndex()) : kEveryVersion;
 	switch (write_table_kind) {
 	case 6:
 		return TxDumpRowsOf<MoraineDataFileRow>(tx, table_id, bound, moraine_tx_dump_data_files_of,
-		                                        moraine_dump_data_files_free, DataFileShape);
+		                                        moraine_dump_data_files_free,
+		                                        extended ? ExtendedDataFileShape : DataFileShape);
 	case 7:
 		return TxDumpRowsOf<MoraineDeleteFileRow>(tx, table_id, bound, moraine_tx_dump_delete_files_of,
-		                                          moraine_dump_delete_files_free, DeleteFileShape);
+		                                          moraine_dump_delete_files_free,
+		                                          extended ? ExtendedDeleteFileShape : DeleteFileShape);
 	case 10:
 		// Unversioned: no bound applies, and the ABI takes none.
 		return TxDumpRowsBy<MoraineFileColumnStatsRow>(tx, table_id, moraine_tx_dump_file_column_stats_of,
-		                                               moraine_dump_file_column_stats_free, FileColumnStatsShape);
+		                                               moraine_dump_file_column_stats_free,
+		                                               extended ? ExtendedFileColumnStatsShape
+		                                                        : FileColumnStatsShape);
 	default:
 		break;
 	}
@@ -2101,7 +2139,8 @@ TxAwareScopedRows(MoraineTxHandle *tx, int32_t write_table_kind, uint64_t table_
 std::optional<std::vector<std::vector<duckdb::Value>>> TxAwareRows(MoraineTxHandle *tx, MoraineCatalogHandle *handle,
                                                                    duckdb::ClientContext &context,
                                                                    int32_t write_table_kind,
-                                                                   duckdb::optional_idx live_bound) {
+                                                                   duckdb::optional_idx live_bound,
+                                                                   bool extended) {
 	if (live_bound.IsValid()) {
 		auto bound = static_cast<uint64_t>(live_bound.GetIndex());
 		switch (write_table_kind) {
@@ -2139,13 +2178,15 @@ std::optional<std::vector<std::vector<duckdb::Value>>> TxAwareRows(MoraineTxHand
 		                                      SnapshotChangesShape);
 	case 6:
 		return TxDumpRows<MoraineDataFileRow>(tx, moraine_tx_dump_data_files, moraine_dump_data_files_free,
-		                                      DataFileShape);
+		                                      extended ? ExtendedDataFileShape : DataFileShape);
 	case 7:
 		return TxDumpRows<MoraineDeleteFileRow>(tx, moraine_tx_dump_delete_files, moraine_dump_delete_files_free,
-		                                        DeleteFileShape);
+		                                        extended ? ExtendedDeleteFileShape : DeleteFileShape);
 	case 10:
 		return TxDumpRows<MoraineFileColumnStatsRow>(tx, moraine_tx_dump_file_column_stats,
-		                                             moraine_dump_file_column_stats_free, FileColumnStatsShape);
+		                                             moraine_dump_file_column_stats_free,
+		                                             extended ? ExtendedFileColumnStatsShape
+		                                                      : FileColumnStatsShape);
 	case 19:
 		return TxDumpRows<MoraineScheduledDeletionRow>(tx, moraine_tx_dump_scheduled_deletions,
 		                                               moraine_dump_scheduled_deletions_free, ScheduledDeletionShape);
@@ -2162,7 +2203,9 @@ std::optional<std::vector<std::vector<duckdb::Value>>> TxAwareRows(MoraineTxHand
 		                                        TableStatsShape);
 	case 9:
 		return TxDumpRows<MoraineTableColumnStatsRow>(tx, moraine_tx_dump_table_column_stats,
-		                                              moraine_dump_table_column_stats_free, TableColumnStatsShape);
+		                                              moraine_dump_table_column_stats_free,
+		                                              extended ? ExtendedTableColumnStatsShape
+		                                                       : TableColumnStatsShape);
 	case 11:
 		return TxDumpRows<MoraineSchemaVersionRow>(tx, moraine_tx_dump_schema_versions,
 		                                           moraine_dump_schema_versions_free, SchemaVersionShape);
@@ -2187,6 +2230,9 @@ std::optional<std::vector<std::vector<duckdb::Value>>> TxAwareRows(MoraineTxHand
 	case 18:
 		return TxDumpRows<MoraineColumnTagRow>(tx, moraine_tx_dump_column_tags, moraine_dump_column_tags_free,
 		                                       ColumnTagShape);
+	case 26:
+		return TxDumpRows<MoraineViewColumnTagRow>(tx, moraine_tx_dump_view_column_tags,
+		                                           moraine_dump_view_column_tags_free, ViewColumnTagShape);
 	case 20:
 		return TxDumpRows<MoraineMacroRow>(tx, moraine_tx_dump_macros, moraine_dump_macros_free, MacroShape);
 	case 21:
@@ -2248,7 +2294,8 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 		std::shared_ptr<const MetadataRows> rows;
 		if (spec.write_table_kind != kNotWritable) {
 			if (auto staged = TxAwareRows(staged_tx, handle, context, spec.write_table_kind,
-			                              live_only ? live_bound : duckdb::optional_idx())) {
+			                              live_only ? live_bound : duckdb::optional_idx(),
+			                              catalog.Cast<MoraineCatalog>().ServesExtendedCatalog())) {
 				rows = std::make_shared<const MetadataRows>(std::move(*staged));
 			}
 		}
@@ -2318,7 +2365,8 @@ std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext 
 		// while it is built invalidates it.
 		auto epoch = transaction.MetadataRowsEpoch();
 		auto scoped = TxAwareScopedRows(staged_tx, spec.write_table_kind, table_id,
-		                                live_only ? live_bound : duckdb::optional_idx());
+		                                live_only ? live_bound : duckdb::optional_idx(),
+		                                catalog.Cast<MoraineCatalog>().ServesExtendedCatalog());
 		if (!scoped.has_value()) {
 			return MetadataRowsFor(context, catalog, spec, live_bound);
 		}
@@ -2401,9 +2449,9 @@ duckdb::TableStorageInfo MoraineMetadataTableEntry::GetStorageInfo(duckdb::Clien
 
 void PopulateMetadataTables(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, MoraineCatalogHandle *handle,
                             duckdb::case_insensitive_map_t<duckdb::unique_ptr<duckdb::CatalogEntry>> &tables) {
-	// Read once here: the entries registered below carry the choice for the
-	// life of the attach.
-	for (auto &spec : MoraineMetadataTableSpecs(MoraineServesExtendedCatalog(handle))) {
+	// The attach pinned the shape; the entries registered below carry that
+	// one choice for its life.
+	for (auto &spec : MoraineMetadataTableSpecs(catalog.Cast<MoraineCatalog>().ServesExtendedCatalog())) {
 		duckdb::CreateTableInfo info(schema, spec.name);
 		duckdb::idx_t column_index = 0;
 		for (auto &col : spec.columns) {

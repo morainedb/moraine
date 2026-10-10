@@ -5794,6 +5794,52 @@ async fn tag_rows_land_and_a_recomment_ends_the_old_entry() {
     catalog.close().await.unwrap();
 }
 
+/// A staged `ducklake_view_column_tag` row is visible to the transaction
+/// that staged it. DuckLake re-reads this table after staging its own
+/// writes, so committed-only state would make it re-author them.
+#[tokio::test]
+async fn staged_view_column_tags_are_visible_to_their_own_transaction() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+    assert!(
+        crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing staged, nothing committed"
+    );
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::ViewColumnTag,
+        cells: vec![
+            Cell::U64(7),
+            Cell::Str("amount".into()),
+            Cell::U64(3),
+            Cell::Null,
+            Cell::Str("unit".into()),
+            Cell::Str("cents".into()),
+        ],
+    });
+
+    let rows = crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the staged row is visible before any commit");
+    assert_eq!(
+        (rows[0].view_id, rows[0].column_name.as_str()),
+        (7, "amount")
+    );
+    assert_eq!(
+        (rows[0].key.as_str(), rows[0].value.as_str()),
+        ("unit", "cents")
+    );
+
+    tx.rollback();
+    catalog.close().await.unwrap();
+}
+
 /// A column tag rides its column's record without minting a column
 /// version: after tagging, the column still has exactly one row on
 /// the dump surface, and the tag ends in place on a re-comment.
