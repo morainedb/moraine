@@ -47,11 +47,11 @@ fn a_maintained_index_verifies_clean_through_dml() {
     );
 }
 
-/// Verification reads; it neither commits nor needs a writer, so a
-/// read-only attach can run it.
+/// Verification reads: it commits nothing, so the lake's newest snapshot is
+/// the same before and after.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn verification_takes_no_snapshot_and_needs_no_writer() {
+fn verification_commits_no_snapshot() {
     let store = TempDir::new("verify-readonly-store");
     let data = TempDir::new("verify-readonly-data");
     let options = format!(

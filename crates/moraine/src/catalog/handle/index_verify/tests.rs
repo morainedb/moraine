@@ -113,6 +113,12 @@ async fn an_index_built_from_the_rows_verifies_clean() {
 
 /// The index, the live rows, and the verifier's view of both.
 async fn indexed_table() -> (Catalog, TableId, crate::IndexInfo, DataStore) {
+    indexed_table_with_uniqueness(true).await
+}
+
+async fn indexed_table_with_uniqueness(
+    unique: bool,
+) -> (Catalog, TableId, crate::IndexInfo, DataStore) {
     let data = InMemory::new();
     let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
@@ -123,7 +129,7 @@ async fn indexed_table() -> (Catalog, TableId, crate::IndexInfo, DataStore) {
     let def = IndexDef {
         name: "by_a".into(),
         columns: vec![column],
-        unique: true,
+        unique,
     };
     catalog
         .create_index_staged(table, &def, &[], Some(store.clone()), "/lake/", None)
@@ -178,6 +184,34 @@ async fn an_entry_no_row_requires_is_dead() {
     assert_eq!(report.sample_dead, vec![7]);
     assert!(!report.is_clean());
     catalog.close().await.unwrap();
+}
+
+/// Dead multi-shaped entries retain their row IDs, including unique NULL
+/// entries.
+#[tokio::test]
+async fn dead_multi_entries_report_their_rows() {
+    for unique in [false, true] {
+        let (catalog, table, info, store) = indexed_table_with_uniqueness(unique).await;
+        let (key, _) = crate::store::index_encoding::encode_ordered_index_entry(
+            &[(!unique).then(|| integer(999))],
+            &info.directions,
+            &info.nulls,
+            info.id.get(),
+            unique,
+            77,
+        )
+        .unwrap();
+        let transaction = catalog.begin_write_tx().await.unwrap();
+        transaction.put(key, []).unwrap();
+        transaction.commit().await.unwrap();
+        let report = catalog
+            .verify_index(table, "by_a", Some(store), "/lake/")
+            .await
+            .unwrap();
+        assert_eq!(report.dead, 1);
+        assert_eq!(report.sample_dead, vec![77]);
+        catalog.close().await.unwrap();
+    }
 }
 
 /// A live row whose entry was dropped is reported missing, and names the row.
@@ -538,4 +572,44 @@ async fn null_entries_on_a_unique_index_are_not_reported_missing() {
     assert_eq!(report.stored, 4);
     assert!(report.is_clean(), "{report:?}");
     catalog.close().await.unwrap();
+}
+
+/// Verification writes nothing, so a read-only handle serves it.
+#[tokio::test]
+async fn a_read_only_catalog_can_verify() {
+    let metadata: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let data = InMemory::new();
+    let catalog = Catalog::open(Arc::clone(&metadata), CatalogOptions::default())
+        .await
+        .unwrap();
+    let table = table_with_one_deleted_row(&catalog, &data).await;
+    let store = DataStore::new(Arc::new(data));
+    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    catalog
+        .create_index_staged(
+            table,
+            &IndexDef {
+                name: "by_a".into(),
+                columns: vec![column],
+                unique: true,
+            },
+            &[],
+            Some(store.clone()),
+            "/lake/",
+            None,
+        )
+        .await
+        .unwrap();
+    catalog.close().await.unwrap();
+
+    let reader = Catalog::open_read_only(metadata, CatalogOptions::default())
+        .await
+        .unwrap();
+    let report = reader
+        .verify_index(table, "by_a", Some(store), "/lake/")
+        .await
+        .unwrap();
+    assert_eq!(report.expected, 2);
+    assert!(report.is_clean(), "{report:?}");
+    reader.close().await.unwrap();
 }

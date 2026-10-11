@@ -15,7 +15,7 @@ use crate::{
     error::{Error, Result},
     store::{
         handle::ScanShape,
-        key::{IndexKind, index_index_prefix},
+        key::{IndexKey, IndexKind, Key, index_index_prefix},
         proto::InlineBuildCursorValue,
     },
     transaction::EncodedIndexEntry,
@@ -52,10 +52,9 @@ impl IndexVerification {
     }
 }
 
-/// One stored entry: the row it names, for a unique index, and whether a
-/// derived entry has claimed it.
+/// One stored entry: the row it names and whether a derived entry claimed it.
 struct StoredEntry {
-    row_id: Option<u64>,
+    row_id: u64,
     claimed: bool,
 }
 
@@ -79,7 +78,7 @@ impl VerifySink {
             Some(stored) => {
                 // A unique key stores its row id as the value, so an entry
                 // under the right value can still name the wrong row.
-                if stored.row_id.is_some_and(|row_id| row_id != entry.row_id) {
+                if stored.row_id != entry.row_id {
                     self.report.mismatched = self.report.mismatched.saturating_add(1);
                     if self.report.sample_missing.len() < SAMPLE {
                         self.report.sample_missing.push(entry.row_id);
@@ -97,8 +96,8 @@ impl VerifySink {
                 continue;
             }
             self.report.dead = self.report.dead.saturating_add(1);
-            if let (Some(row_id), true) = (entry.row_id, self.report.sample_dead.len() < SAMPLE) {
-                self.report.sample_dead.push(row_id);
+            if self.report.sample_dead.len() < SAMPLE {
+                self.report.sample_dead.push(entry.row_id);
             }
         }
     }
@@ -121,19 +120,19 @@ async fn stored_entries(
             .scan_prefix(index_index_prefix(kind, info.id.get()), .., ScanShape::Bulk)
             .await?;
         while let Some(entry) = entries.next().await? {
-            let row_id = (kind == IndexKind::Unique)
-                .then(|| {
-                    <[u8; 8]>::try_from(entry.value.as_ref())
-                        .map(u64::from_be_bytes)
-                        .map_err(|_| {
-                            Error::Corruption(format!(
-                                "unique index {} holds a {}-byte row id",
-                                info.name,
-                                entry.value.len()
-                            ))
-                        })
-                })
-                .transpose()?;
+            let row_id = match Key::decode(&entry.key)? {
+                Key::Index(IndexKey::Unique { .. }) => <[u8; 8]>::try_from(entry.value.as_ref())
+                    .map(u64::from_be_bytes)
+                    .map_err(|_| {
+                        Error::Corruption(format!(
+                            "unique index {} holds a {}-byte row id",
+                            info.name,
+                            entry.value.len()
+                        ))
+                    })?,
+                Key::Index(IndexKey::Multi { row_id, .. }) => row_id,
+                _ => return Err(Error::Corruption("unexpected index entry key".into())),
+            };
             stored.insert(
                 entry.key.to_vec(),
                 StoredEntry {
@@ -254,6 +253,8 @@ impl ReadOnlyCatalog {
             missing = sink.report.missing,
             dead = sink.report.dead,
             mismatched = sink.report.mismatched,
+            sample_missing = ?sink.report.sample_missing,
+            sample_dead = ?sink.report.sample_dead,
             verify_ms = crate::telemetry::milliseconds(started.elapsed()),
             "index verified"
         );
