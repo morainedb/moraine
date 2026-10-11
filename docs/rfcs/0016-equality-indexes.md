@@ -936,20 +936,39 @@ The current DuckLake catalog view stays authoritative for file lifetime.
 Ended compaction inputs are simply absent, new outputs are cache misses, and
 nothing pairs sources with outputs or hooks catalog changes.
 
-### A plain predicate reaches the index through the rule
+### Ordinary predicates reach indexes through the rule
 
-The rule above needs a lookup in the query. An ordinary `WHERE key = 'x'`
-has none, and DuckLake's own column statistics prune nothing once the key is
-scattered — every file's min/max spans every key. So the same rule takes a
-second trigger: a `ducklake_scan` carrying a pushed equality against a
-constant on a column a ready index covers. It resolves the value once,
-through the same probe the join trigger uses — the metadata transaction's
-pinned view, the revision-keyed probe cache, the statement's dependency
-registration — and pushes the resolved `rowid` and `data_file_id` as scan
-filters, exactly as it would for the join. The scan still evaluates the
-predicate in full over whatever it reads, so a pushed filter can only narrow
-the reading; the one thing it rests on is that the index is complete for the
-snapshot the scan reads, which is the contract every pruning here rests on.
+The optimizer translates pushed constant predicates into conjunctive column
+comparisons: equality or `IN`, lower and upper bounds, and `IS NULL`. The
+core selects a ready index with the longest usable prefix, reorders predicates
+into index-column order, and expands independent equality lists into complete
+keys, bounded to 4096 combinations. Full keys use batched point probes; an
+incomplete equality prefix or a final range uses an ordered scan; a prefix
+containing `IS NULL` uses the NULL-prefix lookup. Unsupported predicates remain
+residuals. The original SQL predicate remains evaluated over candidate rows.
+
+`ReadOnlyCatalog::index_predicate_rows(snapshot, table, predicates)` accepts
+`IndexPredicate { column, comparison }`, where `IndexComparison` represents
+an equality list, NULL, or inclusive/exclusive lower/upper bound. It returns
+`None` when no ready index covers a leading predicate, otherwise candidate row
+IDs and whether a certified index answered every supplied predicate exactly.
+The call requires the pinned scope owning `snapshot`. The extension's internal
+`moraine_index_predicate_rows` ABI translates typed SQL constants to this API;
+it replaces the single-column equality-only ABI.
+
+A certified full-key probe can also feed positional DELETE, but only if the
+entire scan predicate was translated and no residual operator survives.
+Tuple equality and tuple `IN` first expose implied per-column choices before
+DuckDB rewrites lists into joins. The original tuple predicate remains, rejecting
+cross-products and preserving row-NULL semantics.
+
+Range and NULL-prefix probes retain predicate evaluation. Optional filters may
+prune reads but cannot certify a DELETE rewrite.
+
+The metadata transaction's pinned view, revision-keyed probe cache, and
+statement dependencies are shared with direct lookups. Candidates feed the
+existing selective reader or row/file pruning, so SELECT, UPDATE, and DELETE
+all benefit without naming an index in SQL.
 
 The file filter prunes the file list through the metadata predicate the
 `data_file_id` column already has, and the row filter lets the reader skip to
@@ -969,7 +988,7 @@ Where the rule declines, the scan is left as it was:
   time travel — is a different cut than the index resolves against.
 - **Transaction-local inserts.** Rows this transaction inserted carry no
   file id and no index entry yet; a file filter would drop them.
-- **No ready index on that column alone**, a NULL, a value of a type
+- **No ready index on a usable leading prefix**, a value of a type
   equality indexes do not cover, or a read that failed, which is logged
   rather than raised. An interrupt is raised, since the caller asked the
   statement to stop.
@@ -2146,12 +2165,10 @@ another, so the recording names the definition version the pass observed
 and is refused if the definition moved in between. A rebuild landing
 between a pass and its commit must not inherit the pass's agreement.
 
-**What reads it.** Nothing yet. It exists so that a plan may stop
-re-checking what the index answered — dropping the key predicate from a
-scan, and rewriting an indexed-equality `DELETE` into the positional path —
-and both of those read the certificate rather than a setting, because the
-failure they trade for is a wrong row returned or deleted rather than a
-slow query.
+**What reads it.** Positional DELETE requires a certified exact probe.
+Ordinary selective scans retain their predicates and do not require a
+certificate. Verification is optional for index use, but required to omit
+predicate evaluation on the positional DELETE path.
 
 ### Test obligations
 
@@ -2435,3 +2452,24 @@ while the whole graph stays cache-resident, seconds when it does not.
 Equality (and the range upgrade) fits RFC 0009's read model; vector search
 does not, and that is the entire reason it is out. The boundary is read
 cost, not storability.
+
+### Automatic predicate coverage limits
+
+Index selection keeps the 4 MiB probe gate, pinned-snapshot check, and
+transaction-local-insert fallback. Independent key lists expand to at most
+4096 combinations. Full equality keys, non-unique equality prefixes, final
+comparison bounds, and NULL-bearing prefixes can supply candidates. A unique
+index's incomplete non-null prefix declines: trailing NULL-bearing keys live
+in the separate multi-entry region and must not be silently omitted.
+
+Explicit SQL lookup functions remain available for compatibility and benchmark
+comparisons. Ordinary SQL is the application-facing path; administrative index
+creation, verification, introspection, and dropping remain explicit operations.
+
+The selective reader builds its metadata file list from resolved file IDs,
+including inline tables when a candidate has no file ID. It retains required
+predicates but does not execute optional pruning hints a second time. On the
+524,288-row filter benchmark, the 192-key hole pattern's warm median fell
+from roughly 56 ms to 11 ms with the candidate file list, versus 9 ms for the
+explicit lookup join. Benchmarks exercise ordinary predicates and retain the
+explicit join as a comparison, with exact result checks for every run.

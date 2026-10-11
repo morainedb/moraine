@@ -1,10 +1,13 @@
 //! Index key conversion and row lookups.
 
+mod predicate;
 use std::{
     ffi::{c_char, c_void},
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
 };
+
+pub use predicate::*;
 
 use super::{borrow_bytes, borrow_str, free_array, handle_list, resolve_table};
 use crate::{
@@ -323,88 +326,6 @@ pub unsafe extern "C" fn moraine_index_lookup_free(items: *mut MoraineRowId, len
         }
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
-}
-
-/// As [`moraine_index_lookup`], addressing the index by the column it
-/// covers rather than by name: the rows holding `value` in the column with
-/// field id `field_id`, through whichever ready single-column index covers
-/// it. `out_covered` is false, with no rows, when no such index exists —
-/// which is a decline rather than an empty answer.
-///
-/// # Safety
-///
-/// Every pointer must be valid per the ABI contract; `value` points to one
-/// value whose string/bytes fields (if used) are valid; `err`, if non-null,
-/// must be writable.
-#[unsafe(no_mangle)]
-#[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn moraine_index_lookup_by_column(
-    handle: *mut MoraineCatalogHandle,
-    schema_name: *const c_char,
-    table_name: *const c_char,
-    field_id: u64,
-    value: *const MoraineLookupValue,
-    out_items: *mut *mut MoraineRowId,
-    out_len: *mut usize,
-    out_covered: *mut bool,
-    out_certified: *mut bool,
-    probe: MoraineInterruptProbe,
-    probe_ctx: *mut c_void,
-    err: *mut MoraineError,
-) -> i32 {
-    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowId>, AbiError> {
-        if out_covered.is_null() || out_certified.is_null() {
-            return Err(AbiError::invalid_argument(
-                "coverage output pointer is null",
-            ));
-        }
-        if value.is_null() {
-            return Err(AbiError::invalid_argument("`value` is null"));
-        }
-        // SAFETY: checked non-null above. Only a covered column raises
-        // them, and only a verifier pass raises the second.
-        unsafe {
-            *out_covered = false;
-            *out_certified = false;
-        }
-        // SAFETY: caller contract for the string pointers.
-        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
-        // SAFETY: caller contract.
-        let table = unsafe { borrow_str(table_name, "table_name") }?;
-
-        // SAFETY: caller contract for `probe`/`probe_ctx`.
-        let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
-        }?;
-        let table_id = resolve_table(&snapshot, schema, table)?;
-        let Some(index) = snapshot.index_on_columns(table_id, &[moraine::ColumnId::new(field_id)])
-        else {
-            return Ok(Vec::new());
-        };
-        // SAFETY: checked non-null above.
-        unsafe {
-            *out_covered = true;
-            *out_certified = index.verified_at_snapshot.is_some();
-        }
-        let columns = snapshot.columns_of(table_id);
-        // SAFETY: non-null checked; caller contract for the value's
-        // string/bytes fields.
-        let raw_values = unsafe { std::slice::from_raw_parts(value, 1) };
-        // SAFETY: caller contract for the value's string/bytes fields.
-        let key = unsafe { coerce_index_key(&index, &index.name, table_id, &columns, raw_values) }?
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(no_null_in_key)?;
-        let lookup = handle_ref
-            .catalog
-            .reads()
-            .index_lookup(table_id, index.id, &key);
-        // SAFETY: caller contract for `probe`/`probe_ctx`.
-        unsafe { abi_located_row_ids(handle_ref, probe, probe_ctx, table_id, lookup) }
-    };
-
-    // SAFETY: caller contract for the pointers.
-    unsafe { handle_list(handle, out_items, out_len, err, produce) }
 }
 
 /// Resolves an `IN` lookup to the union of rows holding any complete key.

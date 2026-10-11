@@ -13,6 +13,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_delete_filter.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
@@ -72,6 +73,26 @@ constexpr auto FILE_ID = duckdb::DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA
 using ScanClock = std::chrono::steady_clock;
 double Milliseconds(ScanClock::time_point start) {
 	return std::chrono::duration<double, std::milli>(ScanClock::now() - start).count();
+}
+
+// Optional filters are pruning hints; their exact predicates remain above
+// the scan. Re-evaluating a wide IN hint here repeats the hash join's work.
+duckdb::unique_ptr<duckdb::Expression> RequiredPredicate(const duckdb::Expression &expression) {
+    if (duckdb::ExpressionFilter::IsRootOptionalExpression(expression)) { return nullptr; }
+	if (expression.GetExpressionType() != duckdb::ExpressionType::CONJUNCTION_AND) {
+		return expression.Copy();
+	}
+	auto result = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
+	for (auto &child : expression.Cast<duckdb::BoundConjunctionExpression>().GetChildren()) {
+		auto required = RequiredPredicate(*child);
+		if (required) {
+			result->GetChildrenMutable().push_back(std::move(required));
+		}
+	}
+	if (result->GetChildren().empty()) {
+		return nullptr;
+	}
+	return std::move(result);
 }
 
 bool SupportedType(const duckdb::LogicalType &type) {
@@ -237,10 +258,16 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::Cli
 		for (auto filter : *input.filters) {
 			auto column_index = filter.GetIndex().GetIndex();
 			duckdb::BoundReferenceExpression column(state->types[column_index], column_index);
-			conjunction->GetChildrenMutable().push_back(filter.Filter().ToExpression(column));
+			auto expression = filter.Filter().ToExpression(column);
+			auto required = RequiredPredicate(*expression);
+			if (required) {
+				conjunction->GetChildrenMutable().push_back(std::move(required));
+			}
 		}
-		state->predicate = std::move(conjunction);
-		state->executor = duckdb::make_uniq<duckdb::ExpressionExecutor>(context, *state->predicate);
+		if (!conjunction->GetChildren().empty()) {
+			state->predicate = std::move(conjunction);
+			state->executor = duckdb::make_uniq<duckdb::ExpressionExecutor>(context, *state->predicate);
+		}
 	}
 	auto &lake = duckdb::Catalog::GetCatalog(context, duckdb::Identifier(bound.lake)).Cast<duckdb::DuckLakeCatalog>();
 	auto &transaction = duckdb::DuckLakeTransaction::Get(context, lake);
@@ -364,14 +391,12 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, const std::string &catalog_name,
                     const std::string &schema, const std::string &table, const std::vector<MoraineRowId> &rows) {
 	if (scan.function.GetDefinition()->name != "ducklake_scan" || !scan.function.function_info ||
-	    scan.row_group_order_options ||
-	    scan.extra_info.sample_options) {
+	    scan.row_group_order_options || scan.table_filters.HasMultiColumnFilters() || scan.extra_info.sample_options) {
 		return false;
 	}
 	auto &info = scan.function.function_info->Cast<duckdb::DuckLakeFunctionInfo>();
 	auto &lake = info.table.catalog.Cast<duckdb::DuckLakeCatalog>();
 	auto transaction = info.GetTransaction();
-	auto &files = scan.bind_data->Cast<duckdb::MultiFileBindData>().file_list->Cast<duckdb::DuckLakeMultiFileList>();
 	auto statistics = info.table.GetTableStats(context);
 	if (statistics && rows.size() > 4096 && rows.size() > statistics->record_count / 4) {
 		return false;
@@ -414,9 +439,39 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	bound->types = scan.returned_types;
 	bound->virtual_columns = scan.virtual_columns;
 	bound->pairs = rows;
-	// Transaction-local rows are never index hits, so the scan may skip the
-	// files and inlined data the transaction added; its deletions are
-	// subtracted at execution, which needs every named file's DuckLake path.
+	// Fetch candidate file paths for transaction-local deletion masks. Using
+	// file IDs avoids expanding the original key predicate in metadata SQL.
+	std::set<uint64_t> file_ids;
+	bool includes_inline = false;
+	for (auto &row : rows) {
+		if (row.has_data_file_id) {
+			file_ids.insert(row.data_file_id);
+		} else {
+			includes_inline = true;
+		}
+	}
+	duckdb::vector<duckdb::Value> values;
+	for (auto file_id : file_ids) {
+		values.push_back(duckdb::Value::UBIGINT(file_id));
+	}
+	auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::UBIGINT, 0);
+	duckdb::unique_ptr<duckdb::Expression> file_filter;
+	if (!values.empty()) {
+		file_filter = duckdb::ExpressionFilter::CreateInExpression(column->Copy(), std::move(values));
+	}
+	if (includes_inline) {
+		auto nulls = duckdb::ExpressionFilter::CreateNullCheckExpression(column->Copy(),
+		                                                                 duckdb::ExpressionType::OPERATOR_IS_NULL);
+		file_filter = file_filter
+		                  ? duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
+		                        duckdb::ExpressionType::CONJUNCTION_OR, std::move(file_filter), std::move(nulls))
+		                  : std::move(nulls);
+	}
+	auto filters = duckdb::make_uniq<duckdb::FilterPushdownInfo>();
+	if (file_filter) {
+		filters->data_file_id_filter = duckdb::make_shared_ptr<duckdb::ExpressionFilter>(std::move(file_filter));
+	}
+	duckdb::DuckLakeMultiFileList files(info, duckdb::vector<duckdb::DuckLakeDataFile> {}, nullptr, std::move(filters));
 	for (auto &entry : files.GetFiles()) {
 		if (entry.data_type == duckdb::DuckLakeDataType::INLINED_DATA) {
 			bound->inlined_tables.push_back(entry.file.path);

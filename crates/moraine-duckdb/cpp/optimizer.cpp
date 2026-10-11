@@ -28,6 +28,7 @@
 #include "index_cache.hpp"
 #include "index_functions.hpp"
 #include "owned_array.hpp"
+#include "optimizer_predicates.hpp"
 #include "summary_scan.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
@@ -429,32 +430,6 @@ void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimi
 // would save: a probe costs about 3 ms, about what scanning a megabyte does.
 constexpr duckdb::idx_t MIN_PRUNABLE_TABLE_BYTES = 4ULL * 1024 * 1024;
 
-// The constant an equality filter compares its column against, if that is
-// the filter's whole shape. `Left`/`Right` below index the children
-// unchecked, so the shape is established first: a filter expression is also
-// how an optional wrapper or a scalar call arrives.
-bool EqualityConstant(const duckdb::TableFilter &filter, duckdb::Value &constant) {
-	if (filter.filter_type != duckdb::TableFilterType::EXPRESSION_FILTER) {
-		return false;
-	}
-	auto &expression = filter.Cast<duckdb::ExpressionFilter>().expr;
-	if (!expression || expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION ||
-	    !duckdb::BoundComparisonExpression::IsComparison(*expression)) {
-		return false;
-	}
-	auto &comparison = expression->Cast<duckdb::BoundFunctionExpression>();
-	if (comparison.GetChildren().size() != 2) {
-		return false;
-	}
-	auto comparison_type = duckdb::ExpressionType::INVALID;
-	auto bound = duckdb::ExpressionFilter::TryGetColumnConstantComparison(comparison, comparison_type);
-	if (!bound || comparison_type != duckdb::ExpressionType::COMPARE_EQUAL) {
-		return false;
-	}
-	constant = bound->GetValue();
-	return true;
-}
-
 // A column the scan reads for a filter and nothing else. Appended after the
 // projected ones, with the projection pinned to what it was, so the
 // operator's output does not change.
@@ -476,26 +451,22 @@ duckdb::unique_ptr<duckdb::Expression> ScanColumn(duckdb::LogicalType type) {
 	return duckdb::make_uniq<duckdb::BoundReferenceExpression>(std::move(type), 0);
 }
 
-// The rows and certificate for a pushed equality at the scan's snapshot.
-struct ResolvedEquality {
+// Candidate rows and exact-answer certification at the scan's snapshot.
+struct ResolvedPredicate {
 	duckdb::optional_ptr<duckdb::DuckLakeTableEntry> table;
 	std::string catalog_name;
 	std::string schema_name;
 	std::string table_name;
 	std::vector<MoraineRowId> rows;
-	// How many filters the scan pushed. A rewrite that drops the scan
-	// needs this to be one, since it evaluates no residual predicate.
-	duckdb::idx_t pushed_filters = 0;
 	// The snapshot the scan reads, which a positional change names so
 	// DuckLake refuses it against a newer view.
 	uint64_t snapshot_id = 0;
 	bool certified = false;
 };
 
-// Resolves the scan's first pushed equality on a column a ready index
-// covers. Returns nothing when any gate declines, in which case the scan
-// is left exactly as it was.
-std::optional<ResolvedEquality> ResolveIndexedEquality(duckdb::ClientContext &context,
+// Resolves supported predicates through a ready index. A declined probe
+// leaves the scan unchanged.
+std::optional<ResolvedPredicate> ResolveIndexedPredicate(duckdb::ClientContext &context,
                                                        duckdb::Optimizer &optimizer,
                                                        duckdb::LogicalGet &get) {
 	if (!get.function.GetDefinition() || get.function.GetDefinition()->name != "ducklake_scan") {
@@ -536,48 +507,50 @@ std::optional<ResolvedEquality> ResolveIndexedEquality(duckdb::ClientContext &co
 		return std::nullopt;
 	}
 
-	// The first pushed equality on a stored column.
 	auto &column_ids = get.GetColumnIds();
 	auto stored_columns = table.GetColumns().PhysicalColumnCount();
-	duckdb::optional_idx field_id;
-	duckdb::Value constant;
-	for (duckdb::idx_t position = 0; position < column_ids.size() && !field_id.IsValid(); position++) {
-		auto column = column_ids[position].GetPrimaryIndex();
-		if (column >= stored_columns) {
+	PredicateArena predicates;
+	bool complete = !get.table_filters.HasMultiColumnFilters();
+	for (duckdb::idx_t position = 0; position < column_ids.size(); position++) {
+		auto filter = get.table_filters.TryGetFilterByColumnIndex(duckdb::ProjectionIndex(position));
+		if (!filter) {
 			continue;
 		}
-		auto filter = get.table_filters.TryGetFilterByColumnIndex(duckdb::ProjectionIndex(position));
-		if (filter && EqualityConstant(*filter, constant)) {
-			field_id = table.GetFieldId(duckdb::PhysicalIndex(column)).GetFieldIndex().index;
+		auto column = column_ids[position].GetPrimaryIndex();
+		if (column >= stored_columns || filter->filter_type != duckdb::TableFilterType::EXPRESSION_FILTER) {
+			complete = false;
+			continue;
+		}
+		auto &expression = filter->Cast<duckdb::ExpressionFilter>();
+		if (!expression.column_indexes.empty()) {
+			complete = false;
+			continue;
+		}
+		auto field = table.GetFieldId(duckdb::PhysicalIndex(column)).GetFieldIndex().index;
+		auto previous = predicates.predicates.size();
+		try {
+			complete = ExtractPredicates(*expression.expr, field, predicates) && complete;
+		} catch (const std::exception &) {
+			predicates.predicates.resize(previous);
+			complete = false;
 		}
 	}
-	if (!field_id.IsValid()) {
-		return std::nullopt;
-	}
-	LookupValueArena arena;
-	MoraineLookupValue value {};
-	try {
-		value = BuildLookupValue(constant, arena, "moraine index pushdown");
-	} catch (const std::exception &) {
-		// A type equality indexes do not cover.
-		return std::nullopt;
-	}
-	if (value.kind == 0) {
+	if (predicates.predicates.empty()) {
 		return std::nullopt;
 	}
 
 	bool cacheable = false;
-	auto handle = BindIndexReadFor(context, table.ParentCatalog().GetName().GetIdentifierName(), &optimizer.binder,
-	                               cacheable);
+	auto handle =
+	    BindIndexReadFor(context, table.ParentCatalog().GetName().GetIdentifierName(), &optimizer.binder, cacheable);
 	auto schema_name = table.ParentSchema().name.GetIdentifierName();
 	auto table_name = table.name.GetIdentifierName();
 	OwnedArray<MoraineRowId> rows(moraine_index_lookup_free);
 	bool covered = false;
 	MoraineError error {};
 	bool certified = false;
-	auto code = moraine_index_lookup_by_column(handle, schema_name.c_str(), table_name.c_str(), field_id.GetIndex(),
-	                                           &value, rows.OutItems(), rows.OutLen(), &covered, &certified,
-	                                           moraine_shim_is_interrupted, &context, &error);
+	auto code = moraine_index_predicate_rows(
+	    handle, schema_name.c_str(), table_name.c_str(), predicates.predicates.data(), predicates.predicates.size(),
+	    rows.OutItems(), rows.OutLen(), &covered, &certified, moraine_shim_is_interrupted, &context, &error);
 	if (code == MORAINE_INTERRUPTED) {
 		ThrowMoraineError(error);
 	}
@@ -593,25 +566,24 @@ std::optional<ResolvedEquality> ResolveIndexedEquality(duckdb::ClientContext &co
 		return std::nullopt;
 	}
 
-	return ResolvedEquality {
+	return ResolvedPredicate {
 	    &table,
 	    table.ParentCatalog().GetName().GetIdentifierName(),
 	    schema_name,
 	    table_name,
 	    std::vector<MoraineRowId>(rows.begin(), rows.end()),
-	    get.table_filters.FilterCount(),
 	    info->snapshot.snapshot_id,
-	    certified,
+	    certified && complete,
 	};
 }
 
 // Pushes `rowid` and `data_file_id` filters for the rows an index resolves a
-// pushed equality to, as the join rule pushes them for a lookup in the query.
+// predicate to, as the join rule pushes them for a lookup in the query.
 // Every uncertainty leaves the scan as it was: the filter still runs in full
 // over whatever is read, so a pushed filter can only narrow the reading, and
 // only an index that is complete for the scan's snapshot may narrow it.
-void PruneScanByIndexedEquality(duckdb::ClientContext &context, duckdb::LogicalGet &get,
-                                const ResolvedEquality &found) {
+void PruneScanByIndexedPredicate(duckdb::ClientContext &context, duckdb::LogicalGet &get,
+                                const ResolvedPredicate &found) {
 	auto &table = *found.table;
 	auto &schema_name = found.schema_name;
 	auto &table_name = found.table_name;
@@ -723,11 +695,11 @@ duckdb::Value PositionalFiles(const OwnedArray<MoraineLocatedFile> &files) {
 	return duckdb::Value::LIST(duckdb::LogicalType::STRUCT(fields), std::move(entries));
 }
 
-// Replace a certified equality delete with positional deletion.
+// Replace an exactly answered, certified delete with positional deletion.
 // Residual predicates and unsupported delete formats retain the scan.
-bool RewriteDeleteByIndexedEquality(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
+bool RewriteDeleteByIndexedPredicate(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
                                     duckdb::unique_ptr<duckdb::LogicalOperator> &plan,
-                                    const ResolvedEquality &found) {
+                                    const ResolvedPredicate &found) {
 	auto &deletion = plan->Cast<duckdb::LogicalDelete>();
 	if (deletion.return_chunk) {
 		return false;
@@ -737,7 +709,7 @@ bool RewriteDeleteByIndexedEquality(duckdb::ClientContext &context, duckdb::Opti
 	auto &table = *found.table;
 	auto &catalog = table.ParentCatalog().Cast<duckdb::DuckLakeCatalog>();
 	auto &schema = table.ParentSchema().Cast<duckdb::DuckLakeSchemaEntry>();
-	if (!found.certified || found.pushed_filters != 1 || catalog.CatalogSnapshot() ||
+	if (!found.certified || catalog.CatalogSnapshot() ||
 	    catalog.WriteDeletionVectors(schema.GetSchemaId(), table.GetTableId())) {
 		return false;
 	}
@@ -812,26 +784,26 @@ bool RewriteDeleteByIndexedEquality(duckdb::ClientContext &context, duckdb::Opti
 	return true;
 }
 
-void OptimizeIndexedEqualities(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
+void OptimizeIndexedPredicates(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
                                duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
 	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_DELETE && plan->children.size() == 1) {
 		auto scan = DeleteSourceScan(*plan->children[0]);
 		if (scan && scan->children.empty()) {
-			auto found = ResolveIndexedEquality(context, optimizer, *scan);
-			if (found && !RewriteDeleteByIndexedEquality(context, optimizer, plan, *found)) {
-				PruneScanByIndexedEquality(context, *scan, *found);
+			auto found = ResolveIndexedPredicate(context, optimizer, *scan);
+			if (found && !RewriteDeleteByIndexedPredicate(context, optimizer, plan, *found)) {
+				PruneScanByIndexedPredicate(context, *scan, *found);
 			}
 			return;
 		}
 	}
 	for (auto &child : plan->children) {
-		OptimizeIndexedEqualities(context, optimizer, child);
+		OptimizeIndexedPredicates(context, optimizer, child);
 	}
 	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
 		auto &get = plan->Cast<duckdb::LogicalGet>();
-		auto found = ResolveIndexedEquality(context, optimizer, get);
+		auto found = ResolveIndexedPredicate(context, optimizer, get);
 		if (found) {
-			PruneScanByIndexedEquality(context, get, *found);
+			PruneScanByIndexedPredicate(context, get, *found);
 		}
 	}
 }
@@ -845,12 +817,13 @@ public:
 
 	static void PreOptimize(duckdb::OptimizerExtensionInput &input, duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
 		ReplaceEmptyIndexReads(input.context, plan);
+		ExposeTuplePredicates(input.context, *plan);
 	}
 
 	static void PostOptimize(duckdb::OptimizerExtensionInput &input,
 	                         duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
 		FilterJoinsAgainstIndexReads(input.context, input.optimizer, plan);
-		OptimizeIndexedEqualities(input.context, input.optimizer, plan);
+		OptimizeIndexedPredicates(input.context, input.optimizer, plan);
 	}
 };
 

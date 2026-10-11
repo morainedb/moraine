@@ -3,8 +3,9 @@
 use std::{
     fmt::Write as _,
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use anyhow::{Context, bail, ensure};
@@ -16,9 +17,16 @@ fn quoted(value: &str) -> String {
 }
 
 fn execute(cli: &Path, preamble: &str, sql: &str) -> anyhow::Result<String> {
-    let output = Command::new(cli)
-        .args(["-unsigned", "-csv", "-bail", "-c", preamble, "-c", sql])
-        .output()?;
+    let mut child = Command::new(cli)
+        .args(["-unsigned", "-csv", "-bail"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = child.stdin.take().context("DuckDB stdin is unavailable")?;
+    writeln!(input, "{preamble}\n{sql}")?;
+    drop(input);
+    let output = child.wait_with_output()?;
     ensure!(
         output.status.success(),
         "{}",
@@ -133,31 +141,47 @@ impl Options {
     }
 }
 
+fn cases() -> [(&'static str, Vec<i64>); 6] {
+    [
+        ("clustered_3264", (0..192).collect()),
+        ("holes_3264", (0..192).map(|x| x * 4).collect()),
+        ("split_3264", (0..96).chain(30000..30096).collect()),
+        ("scattered_4080", (0..240).map(|x| x * 127).collect()),
+        ("over_cap_4097", (0..241).collect()),
+        ("broad_278528", (0..16384).collect()),
+    ]
+}
+
 fn measure(
     cli: &Path,
     builds: &[(&str, String)],
     output: &Path,
     parallel: bool,
 ) -> anyhow::Result<()> {
-    let cases = [
-        ("clustered_3264", "range(192)"),
-        ("holes_3264", "list_transform(range(192), x -> x * 4)"),
-        ("split_3264", "list_concat(range(96),range(30000,30096))"),
-        ("scattered_4080", "list_transform(range(240), x -> x * 127)"),
-        ("over_cap_4097", "range(241)"),
-        ("broad_278528", "range(16384)"),
-    ];
-    println!(
-        "case,equality,build,read_threads,scan_path,first_profile_seconds,warm_median_seconds"
-    );
-    for (case_index, (name, keys)) in cases.into_iter().enumerate() {
-        for equality in ["=", "IS NOT DISTINCT FROM"] {
-            let query = format!(
-                "SELECT count(*),sum(length(data.payload)) FROM lake.main.t data
-                 JOIN moraine_index_in('lake','main','t','by_a',{keys}) hits
-                 ON data.rowid {equality} hits.row_id
+    println!("case,query,build,read_threads,scan_path,first_profile_seconds,warm_median_seconds");
+    for (case_index, (name, keys)) in cases().into_iter().enumerate() {
+        let keys = keys
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        for (suffix, query) in [
+            (
+                "predicate",
+                format!(
+                    "SELECT count(*),sum(length(payload)) FROM lake.main.t WHERE a IN ({keys})"
+                ),
+            ),
+            (
+                "lookup",
+                format!(
+                    "SELECT count(*),sum(length(data.payload)) FROM lake.main.t data
+                 JOIN moraine_index_in('lake','main','t','by_a',[{keys}]) hits
+                 ON data.rowid = hits.row_id
                  AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id"
-            );
+                ),
+            ),
+        ] {
             let mut order: Vec<_> = builds.iter().collect();
             if case_index % 2 != 0 {
                 order.reverse();
@@ -194,7 +218,7 @@ fn measure(
                         .filter(|line| *line == format!("{rows},{}", rows * 32))
                         .count()
                         == modes.len(),
-                    "result changed for {name}/{equality}"
+                    "result changed for {name}/{suffix}"
                 );
                 let times = profile_times(&text)?;
                 ensure!(
@@ -202,13 +226,8 @@ fn measure(
                     "unexpected profile count: {}",
                     times.len()
                 );
-                let suffix = if equality == "=" {
-                    "equal"
-                } else {
-                    "null_safe"
-                };
                 fs::write(output.join(format!("{name}-{suffix}-{label}.log")), &text)?;
-                let path = if text.contains("MORAINE_SUMMARY_SCAN") {
+                let path = if text.contains("Coverage costing ms") {
                     "selective"
                 } else {
                     "ordinary"

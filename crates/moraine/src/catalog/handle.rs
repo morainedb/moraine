@@ -4,7 +4,9 @@
 mod backfill;
 mod index_build;
 mod index_lookup;
+mod index_predicate;
 mod index_probe_cache;
+pub use index_predicate::{IndexComparison, IndexPredicate, IndexPredicateRows};
 mod index_read_scope;
 mod index_verify;
 pub use index_verify::IndexVerification;

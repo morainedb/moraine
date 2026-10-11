@@ -37,6 +37,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/migrate.cpp
     ${CPP_DIR}/move_wal.cpp
     ${CPP_DIR}/optimizer.cpp
+    ${CPP_DIR}/optimizer_predicates.cpp
     ${CPP_DIR}/raise_catalog_version.cpp
     ${CPP_DIR}/s3_secret.cpp
     ${CPP_DIR}/scan.cpp
