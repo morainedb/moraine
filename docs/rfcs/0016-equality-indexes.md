@@ -229,15 +229,16 @@ Hash-overflow is rejected for v1.
 ### Coverage — who writes entries, and when
 
 Coverage is total over live rows, maintained at the three moments rows
-enter, and the two moments they die:
+enter, and the two moments they die. Who computes an entry depends on who
+wrote the rows, which differs between the two paths:
 
-| Moment | Who has the rows | Entry source |
-|---|---|---|
-| `inline_insert` | moraine (rows arrive through the API) | computed by moraine, staged in the same batch |
-| flush (RFC 0005) | moraine (it writes the Parquet) | **nothing to do** — entries point at row ids, which flush preserves |
-| `register_data_file` | the writer | **writer-supplied**: `(row ordinal, key values)` pairs alongside the file, mapped to row ids at commit (`row_id_start + ordinal`) — or `(row_id, key values)` for rewrite files that preserve row ids — like the file column stats the writer already computes |
-| `inline_delete` of a store-resident row | moraine (the chunk is in the store) | moraine recomputes the key values from the chunk and stages the entry delete |
-| `register_delete_file`, or `inline_delete` against flushed rows | the writer (it read the rows to produce positions) | **writer-supplied**: `(row_id, key values)` per deleted row; moraine deletes the named entries |
+| Moment | Who has the rows | Embedding API | Extension path |
+|---|---|---|---|
+| `inline_insert` | moraine (rows arrive through the API) | computed by moraine, staged in the same batch | same |
+| flush (RFC 0005) | moraine (it writes the Parquet) | **nothing to do** — entries point at row ids, which flush preserves | same |
+| `register_data_file` | the writer | **writer-supplied**: `(row ordinal, key values)` pairs alongside the file, mapped to row ids at commit (`row_id_start + ordinal`) — or `(row_id, key values)` for rewrite files that preserve row ids — like the file column stats the writer already computes | **moraine reads the file** |
+| `inline_delete` of a store-resident row | moraine (the chunk is in the store) | moraine recomputes the key values from the chunk and stages the entry delete | same |
+| `register_delete_file`, or `inline_delete` against flushed rows | the writer (it read the rows to produce positions) | **writer-supplied**: `(row_id, key values)` per deleted row; moraine deletes the named entries | **moraine reads the delete file** |
 
 The embedding-path rule generalizing the last two: any operation that kills
 rows moraine cannot read from the store must name their indexed key values —
@@ -256,6 +257,21 @@ DuckLake staged registration carries no entries by construction, so on any
 indexed table moraine derives them by the scoped read (Extension path) —
 however the index was created. Reject-vs-read splits by who writes, not by
 which API made the index.
+
+So on the extension path every entry is moraine's own work: it opens the
+registered data file, or the delete file and then the rows it names, and
+computes the key values from the rows themselves. Nothing a writer asserts
+is taken on trust, because no writer asserts anything.
+
+**A data store is mandatory for an indexed table on that path.** Deriving
+entries needs the file, so a commit registering a data or delete file on a
+table that carries a maintained index fails `Constraint` when the attach
+supplied no `DATA_PATH` store, naming the file it could not read. The index
+is never quietly left short: the commit does not happen. `create_index` is
+fail-closed at the other end for the same reason — a table that already
+holds files cannot be indexed without a store to backfill from. So an attach
+with no `META_DATA_PATH` can carry an indexed table only while its rows stay
+inlined, and a test written that way exercises none of the file reads above.
 
 An UPDATE on the verb path (expire + register preserving row ids) composes:
 the delete side removes old entries, the insert side adds new — same commit,
