@@ -312,6 +312,15 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 
 bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, const duckdb::LogicalGet &index,
                     const std::vector<MoraineRowId> &rows) {
+	std::string catalog_name, schema, table;
+	if (!IndexReadTable(*index.function.GetDefinition(), index.bind_data.get(), catalog_name, schema, table)) {
+		return false;
+	}
+	return UseSummaryScan(context, scan, catalog_name, schema, table, rows);
+}
+
+bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, const std::string &catalog_name,
+                    const std::string &schema, const std::string &table, const std::vector<MoraineRowId> &rows) {
 	if (scan.function.GetDefinition()->name != "ducklake_scan" || !scan.function.function_info ||
 	    scan.row_group_order_options ||
 	    scan.extra_info.sample_options) {
@@ -329,9 +338,7 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	    info.snapshot.snapshot_id != transaction->GetSnapshot().snapshot_id) {
 		return false;
 	}
-	std::string catalog_name, schema, table;
-	if (!IndexReadTable(*index.function.GetDefinition(), index.bind_data.get(), catalog_name, schema, table) ||
-	    schema != info.table.schema.name || table != info.table.name) {
+	if (schema != info.table.schema.name || table != info.table.name) {
 		return false;
 	}
 	auto catalog = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(catalog_name));

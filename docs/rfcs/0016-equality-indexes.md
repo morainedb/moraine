@@ -970,22 +970,37 @@ by key:
 | --- | --- | --- |
 | `WHERE a = k`, no index | 2 | 477,245 |
 | `WHERE a = k`, files pruned only | 1 | 238,622 |
-| `WHERE a = k`, this trigger | 1 | 99,443 |
+| `WHERE a = k`, this trigger, filters pushed | 1 | 99,443 |
+| `WHERE a = k`, this trigger, summary scan | 1 | 96,532 (moraine's reader) |
 | `… USING moraine_index_lookup(…)`, the join trigger | 1 | 2,923 |
 | `moraine_delete_located(…)` | — | 0 |
 
 The file list is worth the file it drops; naming the rows is worth most of
-the rest. What this trigger still reads is the key column of the one row
-group the row-id filter leaves — the predicate it deliberately keeps has to
-be evaluated on something, and `rowid` is not a stored column, so no page
-index narrows that read below the row group. The join form never pays it,
-because it carries no predicate on the column at all. Closing the gap means
-reading the located row's pages rather than its row group — the summary
-scan the join trigger already elects when it judges a probe selective — and
-that is the next increment rather than this one. The last row reads nothing
-through DuckDB's reader because the positions come from moraine's file-row
-summaries, which that counter does not see; it needs the index to answer the
-predicate *exactly*, so it stays the explicit surface rather than a rewrite.
+the rest. What this trigger still reads is the key column's chunk in the one
+row group the located row sits in: the predicate it deliberately keeps has
+to be evaluated on something. The join form never pays it, because it
+carries no predicate on the column at all.
+
+A `SELECT` elects the summary scan the way the join trigger does — the scan
+is replaced in place, its pushed filters stay with it, and the summary scan
+evaluates them over what it reads — and that moves the read from DuckDB's
+reader to moraine's without shrinking it. DuckDB's Parquet writer starts a
+new data page only at 100 MiB uncompressed, so a column chunk is one page,
+and a read by position fetches the same chunk a read by row group does: on
+the fixture above, 993,508 bytes for `SELECT b … WHERE a = k` either way.
+The election would pay only on files whose chunks hold several pages, which
+DuckDB does not write. DML never elects it: a `DELETE` or `UPDATE` scan
+asks for `file_row_number`, which the summary scan does not produce.
+
+The last row reads nothing through DuckDB's reader because the positions
+come from moraine's file-row summaries, which that counter does not see; it
+needs the index to answer the predicate *exactly*, so it stays the explicit
+surface rather than a rewrite. Dropping the predicate from the scan would
+reach the same place for a `SELECT`, and the lookup contract is close to
+licensing it — entries are live-only and the summary scan subtracts the
+transaction's deletes — but every pruning here rests on the predicate being
+evaluated in full, and a stale entry would then surface as a wrong row
+rather than a slow one. That line is not crossed.
 
 ### Snapshot-validated index plans
 

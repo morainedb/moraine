@@ -1,6 +1,7 @@
 //! An ordinary `WHERE key = 'x'` is answered through the index: the
-//! optimizer resolves the equality once and pushes the rows' ids and files
-//! into the scan, with no lookup call and no join in the query.
+//! optimizer resolves the equality once and reads the resolved rows by
+//! position — or, where that is not the cheaper read, pushes their ids and
+//! files into the scan — with no lookup call and no join in the query.
 //!
 //! The fixture scatters keys across both files so DuckLake's own column
 //! statistics cannot prune — every file's min/max spans every key — and
@@ -70,11 +71,13 @@ fn an_indexed_equality_reads_only_the_rows_holding_its_value() {
         &format!("EXPLAIN ANALYZE {query}"),
     );
     assert_eq!(files_read(&after), vec!["1"], "{after}");
-    // The scan carries the resolved row and its file, which is what lets the
-    // reader skip to one row group rather than sweep the key column.
+    // The resolved row is read by position — its pages, not its row group —
+    // with the predicate evaluated over what that read returns.
+    // The summary scan renders as a table scan carrying its own costing
+    // line, which no other scan prints.
     assert!(
-        after.contains("rowid") && after.contains("data_file_id"),
-        "the scan was not told which row to read: {after}"
+        after.contains("Coverage costing ms"),
+        "the resolved row was not read by position: {after}"
     );
 
     // The answer is the filter's, not the index's.

@@ -579,6 +579,13 @@ void PruneScanByIndexedEquality(duckdb::ClientContext &context, duckdb::Optimize
 		                                 duckdb::ExpressionType::COMPARE_LESSTHAN, duckdb::Value::BIGINT(0)));
 		return;
 	}
+	// Reading the located rows' pages beats narrowing the scan to their row
+	// groups; the predicate stays pushed, and the summary scan evaluates it
+	// over what it reads.
+	if (UseSummaryScan(context, get, table.ParentCatalog().GetName().GetIdentifierName(), schema_name, table_name,
+	                   resolved)) {
+		return;
+	}
 	duckdb::vector<duckdb::Value> file_ids;
 	bool any_unplaced = false;
 	duckdb::vector<duckdb::Value> row_ids;
