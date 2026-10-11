@@ -13,16 +13,15 @@ mod rows_at;
 
 pub use rows_at::{ExcludedPositions, LocatedRowScan};
 
-use super::{Catalog, ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
+use super::{ReadOnlyCatalog, SUMMARY_READ_CONCURRENCY, WARM_TABLE_CONCURRENCY};
 use crate::{
     catalog::{
-        CatalogSnapshot, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo,
-        FileIndexRemoval, FileRowCandidate, IndexInfo, SnapshotId, TableId, resolve_data_path,
+        CatalogSnapshot, DataFileId, DataFileInfo, DeleteFileInfo, FileRowCandidate, SnapshotId,
+        TableId, resolve_data_path,
         snapshot::{data_file_info, delete_file_info},
     },
     data_file::{self, DataStore, FileSummary, SidecarSweep, sidecar},
     error::{Error, Result},
-    store::index_encoding::IndexKeyValue,
     telemetry::milliseconds,
 };
 
@@ -32,19 +31,16 @@ use crate::{
 pub struct LocatedDeletion {
     /// The data file the positions below are within.
     pub data_file_id: DataFileId,
-    /// The file's recorded path.
-    pub file_path: String,
     /// Positions of the requested rows within this file, ascending and
     /// duplicate-free.
     pub positions: Vec<u64>,
-    /// The delete file currently registered against this data file, if any.
-    pub existing_delete: Option<ExistingDeleteFile>,
+    /// Positions in the registered delete file, or `None` if there is none.
+    pub existing_positions: Option<Vec<u64>>,
 }
 
 /// What [`ReadOnlyCatalog::locate_row_positions`] resolved: one
 /// [`LocatedDeletion`] per data file carrying a requested row, the row ids
-/// resolved as live inlined rows, and — when any position was resolved —
-/// the directory a new delete file for this table belongs in.
+/// resolved as live inlined rows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LocatedPositions {
     /// Per-data-file located positions and any delete file already
@@ -52,23 +48,6 @@ pub struct LocatedPositions {
     pub deletions: Vec<LocatedDeletion>,
     /// Row ids resolved as live inlined rows.
     pub inlined_rows: Vec<u64>,
-    /// The absolute directory a new delete file for this table belongs in,
-    /// resolved from the same snapshot `deletions` was positioned against.
-    /// `None` when `deletions` is empty, since only then does a caller need
-    /// to write nothing.
-    pub write_directory: Option<String>,
-}
-
-/// A delete file already registered against a data file a caller is about
-/// to delete more rows from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExistingDeleteFile {
-    /// The delete file's id.
-    pub delete_file_id: DeleteFileId,
-    /// The file's recorded path.
-    pub path: String,
-    /// Its decoded positions, ascending and duplicate-free.
-    pub positions: Vec<u64>,
 }
 
 /// What [`ReadOnlyCatalog::locate_row_positions`] needs to resolve one
@@ -86,7 +65,6 @@ struct LocationScope<'a> {
 #[derive(Clone)]
 pub(super) struct PositionedFile {
     data_file_id: DataFileId,
-    file_path: String,
     positions: Vec<u64>,
 }
 
@@ -494,7 +472,6 @@ impl ReadOnlyCatalog {
         let mut positioning_ms = 0;
         let mut existing_ms = 0;
         let mut deletions = Vec::new();
-        let mut write_directory = None;
 
         if !by_file.is_empty() {
             let table_prefix = snapshot.table_data_prefix(table)?;
@@ -521,12 +498,8 @@ impl ReadOnlyCatalog {
                 .await?;
             positioning_ms = milliseconds(positioning_started.elapsed());
 
-            let file_id_paths: Vec<_> = positioned
-                .iter()
-                .map(|file| (file.data_file_id, file.file_path.clone()))
-                .collect();
             let existing_started = Instant::now();
-            let existing_deletes = self.existing_delete_files(&scope, &file_id_paths).await;
+            let existing_deletes = self.existing_delete_files(&scope, &positioned).await;
             existing_ms = milliseconds(existing_started.elapsed());
 
             deletions = positioned
@@ -535,15 +508,11 @@ impl ReadOnlyCatalog {
                 .map(|(file, existing_delete)| {
                     Ok(LocatedDeletion {
                         data_file_id: file.data_file_id,
-                        file_path: file.file_path,
                         positions: file.positions,
-                        existing_delete: existing_delete?,
+                        existing_positions: existing_delete?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            // Same snapshot the positions above were resolved against, so the
-            // directory names the table's current location, not a later one.
-            write_directory = Some(snapshot.table_write_directory(table)?);
         }
 
         // `existing_positions` is the deletion backlog this call had to read
@@ -552,8 +521,8 @@ impl ReadOnlyCatalog {
         // small `pairs` is a compaction question, not a lookup one.
         let existing_positions: usize = deletions
             .iter()
-            .filter_map(|deletion| deletion.existing_delete.as_ref())
-            .map(|existing| existing.positions.len())
+            .filter_map(|deletion| deletion.existing_positions.as_ref())
+            .map(Vec::len)
             .sum();
         // At `info`: one record per located delete, not per request, and the
         // level a caller can afford to leave on in production.
@@ -573,7 +542,6 @@ impl ReadOnlyCatalog {
         Ok(LocatedPositions {
             deletions,
             inlined_rows,
-            write_directory,
         })
     }
 
@@ -585,8 +553,23 @@ impl ReadOnlyCatalog {
         null_rows: Vec<u64>,
         visible_at: u64,
     ) -> Result<Vec<u64>> {
-        self.require_live_inlined_rows(table, &null_rows, Some(visible_at))
+        if null_rows.is_empty() {
+            return Ok(null_rows);
+        }
+
+        let live = self
+            .requested_inline_row_ids(table, &null_rows, Some(visible_at))
             .await?;
+        for &row_id in &null_rows {
+            if !live.contains(&row_id) {
+                return Err(Error::RowPosition {
+                    row_id,
+                    data_file_id: None,
+                    reason: "row is not a live inlined row".to_owned(),
+                });
+            }
+        }
+
         Ok(null_rows)
     }
 
@@ -599,10 +582,7 @@ impl ReadOnlyCatalog {
         requested_files: Vec<DataFileInfo>,
         missing: MissingRows,
     ) -> Result<(Vec<PositionedFile>, usize)> {
-        // Both halves of a located update position the same rows against the
-        // same summaries: the scan reading the old values, then the deletion
-        // staging their positions. Keyed by the rows asked for, so only an
-        // identical request at the same pinned revision is answered.
+        // Only identical requests at the same pinned revision share positions.
         let revision = self.pinned_revision();
         let visible_at = scope.snapshot.current_snapshot().id.get();
         let key = positioning_key(visible_at, missing, &by_file);
@@ -617,13 +597,7 @@ impl ReadOnlyCatalog {
             return Ok((positioned.as_ref().clone(), 0));
         }
 
-        // `current_files_for` already returned these in ascending id order;
-        // carrying the pairs through avoids both a second sort and a
-        // separate id-to-path lookup.
-        let file_id_paths: Vec<(DataFileId, String)> = requested_files
-            .iter()
-            .map(|file| (file.id, file.path.clone()))
-            .collect();
+        let file_ids: Vec<_> = requested_files.iter().map(|file| file.id).collect();
 
         let summaries: HashMap<DataFileId, Result<FileSummary>> = self
             .file_summaries(
@@ -642,14 +616,13 @@ impl ReadOnlyCatalog {
             .values()
             .filter(|summary| summary.as_ref().is_ok_and(|summary| summary.built))
             .count();
-        let mut located = Vec::with_capacity(file_id_paths.len());
-        for (file_id, path) in file_id_paths {
+        let mut located = Vec::with_capacity(file_ids.len());
+        for file_id in file_ids {
             let rows = by_file.get(&file_id).cloned().unwrap_or_default();
             let positions = positioned_rows(&summaries, file_id, &rows, missing)?;
 
             located.push(PositionedFile {
                 data_file_id: file_id,
-                file_path: path,
                 positions,
             });
         }
@@ -657,9 +630,7 @@ impl ReadOnlyCatalog {
         if let Some(revision) = revision {
             let bytes = located
                 .iter()
-                .map(|file| {
-                    size_of_val(file.positions.as_slice()).saturating_add(file.file_path.len())
-                })
+                .map(|file| size_of_val(file.positions.as_slice()))
                 .fold(0usize, usize::saturating_add);
             self.positioned_files
                 .put(revision, scope.table, key, Arc::new(located.clone()), bytes);
@@ -668,18 +639,18 @@ impl ReadOnlyCatalog {
         Ok((located, summaries_built))
     }
 
-    /// The delete file currently registered against each of `file_id_paths`,
+    /// The delete file currently registered against each positioned file,
     /// in the same order, with positions decoded for those that carry one.
     /// Reads run at the same bounded concurrency as a file summary read.
     async fn existing_delete_files(
         &self,
         scope: &LocationScope<'_>,
-        file_id_paths: &[(DataFileId, String)],
-    ) -> Vec<Result<Option<ExistingDeleteFile>>> {
-        stream::iter(file_id_paths.iter().map(|(file_id, _)| {
+        files: &[PositionedFile],
+    ) -> Vec<Result<Option<Vec<u64>>>> {
+        stream::iter(files.iter().map(|file| {
             let delete_file = scope
                 .snapshot
-                .delete_files_targeting(scope.table.get(), file_id.get())
+                .delete_files_targeting(scope.table.get(), file.data_file_id.get())
                 .next()
                 .map(delete_file_info);
             async move {
@@ -702,7 +673,7 @@ impl ReadOnlyCatalog {
         &self,
         scope: &LocationScope<'_>,
         delete_file: DeleteFileInfo,
-    ) -> Result<ExistingDeleteFile> {
+    ) -> Result<Vec<u64>> {
         let relative = resolve_data_path(
             scope.data_prefix,
             scope.table_prefix,
@@ -717,13 +688,7 @@ impl ReadOnlyCatalog {
         )
         .with_metrics(self.data_read_metrics());
 
-        let positions = data_file::delete_file_positions(file).await?;
-
-        Ok(ExistingDeleteFile {
-            delete_file_id: delete_file.id,
-            path: delete_file.path,
-            positions,
-        })
+        data_file::delete_file_positions(file).await
     }
 
     /// Derives the summaries a lookup would otherwise build cold, publishing
@@ -991,390 +956,5 @@ impl ReadOnlyCatalog {
         );
 
         Ok(published)
-    }
-}
-
-/// One delete file to land through [`Catalog::commit_located_deletion`]:
-/// the caller has already written it — the union of an existing delete
-/// file's positions (if any) with newly located deletions — and supplies
-/// enough to register it in place of the file it replaces.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeleteFileRegistration {
-    /// The data file this delete file's positions apply to.
-    pub data_file_id: DataFileId,
-    /// The delete file's name within the table's own data directory (a
-    /// bare file name, no path components) — the caller already wrote it
-    /// there. `commit_located_deletion` registers it relative to the
-    /// table, the same resolution DuckLake's own reader applies, so a
-    /// scan can open it without going through this store.
-    pub path: String,
-    /// Total file size in bytes.
-    pub file_size: u64,
-    /// Parquet footer size in bytes. Not derivable from `file_size` or
-    /// `delete_count`, so the writer — who already produced the file —
-    /// supplies it directly.
-    pub footer_size: u64,
-    /// Number of positions the file records.
-    pub delete_count: u64,
-    /// The delete file this one replaces, expired in the same commit. A
-    /// data file admits only one live delete file, so this must name the
-    /// one currently registered against `data_file_id`, if any.
-    pub expires: Option<DeleteFileId>,
-    /// Physical positions within the data file that this registration
-    /// newly marks dead — the delete file's own recorded positions minus
-    /// whatever `expires` already carried, exactly the positions a lookup
-    /// resolved through [`ReadOnlyCatalog::locate_row_positions`]. Read
-    /// only to derive index entry removals for the table's live equality
-    /// indexes; empty when the table carries none.
-    pub new_positions: Vec<u64>,
-}
-
-/// The union of keys every index in `indexes` touches, plus each index's
-/// positions within that union, preserving first-seen order so the union is
-/// deterministic. Reading the union once and slicing per index avoids
-/// re-reading the same columns once per index.
-fn union_index_keys<T: Eq + std::hash::Hash + Copy>(
-    indexes: &[IndexInfo],
-    keys_of: impl Fn(&IndexInfo) -> Result<Vec<T>>,
-) -> Result<(Vec<T>, Vec<Vec<usize>>)> {
-    let mut union = Vec::new();
-    let mut seen: HashMap<T, usize> = HashMap::new();
-    let mut per_index = Vec::with_capacity(indexes.len());
-    for index in indexes {
-        let mapped = keys_of(index)?
-            .into_iter()
-            .map(|key| {
-                *seen.entry(key).or_insert_with(|| {
-                    union.push(key);
-                    union.len() - 1
-                })
-            })
-            .collect();
-        per_index.push(mapped);
-    }
-
-    Ok((union, per_index))
-}
-
-/// Splits `entries` — each a row id with values in the union's key order —
-/// into one [`FileIndexRemoval`] per live index per entry, using `per_index`
-/// (as [`union_index_keys`] built it) to select that index's own values.
-fn split_index_removals(
-    indexes: &[IndexInfo],
-    per_index: &[Vec<usize>],
-    entries: impl IntoIterator<Item = (u64, Vec<Option<IndexKeyValue>>)>,
-) -> Vec<FileIndexRemoval> {
-    entries
-        .into_iter()
-        .flat_map(|(row_id, values)| {
-            indexes
-                .iter()
-                .zip(per_index)
-                .map(|(index, mapped)| FileIndexRemoval {
-                    index: index.id,
-                    row_id,
-                    values: mapped
-                        .iter()
-                        .map(|&position| values[position].clone())
-                        .collect(),
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-/// What deriving one registration's index removals needs, shared across a
-/// table's registrations to keep a per-registration call under the
-/// argument-count lint.
-struct DeleteIndexScope<'a> {
-    snapshot: &'a CatalogSnapshot,
-    handle: crate::store::handle::ReadHandle<'a>,
-    data_store: Option<&'a DataStore>,
-    data_prefix: &'a str,
-    table_prefix: &'a str,
-    table: TableId,
-    indexes: &'a [IndexInfo],
-    union_positions: &'a [usize],
-    per_index: &'a [Vec<usize>],
-}
-
-impl ReadOnlyCatalog {
-    /// The removal every live index needs for each registration's newly
-    /// killed rows, one list per registration in input order — derived by
-    /// one scoped read per registration's own data file at `new_positions`,
-    /// at the union of every live index's columns, then split per index.
-    /// Reads only the data files the registrations name, at bounded
-    /// concurrency.
-    async fn delete_file_index_removals(
-        &self,
-        data_store: Option<&DataStore>,
-        data_prefix: &str,
-        snapshot: &CatalogSnapshot,
-        table: TableId,
-        registrations: &[DeleteFileRegistration],
-    ) -> Result<Vec<Vec<FileIndexRemoval>>> {
-        let indexes = snapshot.indexes_of(table);
-        if indexes.is_empty() {
-            return Ok(vec![Vec::new(); registrations.len()]);
-        }
-
-        let table_prefix = snapshot.table_data_prefix(table)?;
-        let (union_positions, per_index) = union_index_keys(&indexes, |index| {
-            snapshot.column_positions(table, &index.columns)
-        })?;
-
-        let session = self.begin_read().await?;
-        let scope = DeleteIndexScope {
-            snapshot,
-            handle: session.handle(),
-            data_store,
-            data_prefix,
-            table_prefix: &table_prefix,
-            table,
-            indexes: &indexes,
-            union_positions: &union_positions,
-            per_index: &per_index,
-        };
-
-        // Cloning into an owned future avoids the future's type depending on
-        // an external borrow, which trips a higher-ranked lifetime the
-        // buffered adapter cannot express for a `map` over borrowed items.
-        stream::iter(registrations.iter().cloned().map(|registration| {
-            let scope = &scope;
-            async move { self.registration_index_removals(scope, &registration).await }
-        }))
-        .buffered(SUMMARY_READ_CONCURRENCY)
-        .try_collect()
-        .await
-    }
-
-    /// One registration's index removals: empty if it kills nothing, else
-    /// one scoped read at the union of every live index's columns, split
-    /// per index by [`split_index_removals`].
-    async fn registration_index_removals(
-        &self,
-        scope: &DeleteIndexScope<'_>,
-        registration: &DeleteFileRegistration,
-    ) -> Result<Vec<FileIndexRemoval>> {
-        if registration.new_positions.is_empty() {
-            return Ok(Vec::new());
-        }
-        let file = scope
-            .snapshot
-            .data_files
-            .get(&scope.table.get())
-            .and_then(|files| files.get(&registration.data_file_id.get()))
-            .map(data_file_info)
-            .ok_or_else(|| {
-                Error::NotFound(format!(
-                    "data file {} of table {}",
-                    registration.data_file_id, scope.table
-                ))
-            })?;
-        let store = scope.data_store.ok_or_else(|| {
-            Error::Constraint(format!(
-                "commit_located_deletion: table {} carries live indexes; no data store was \
-                 supplied to derive index entry removals for data file {}",
-                scope.table, registration.data_file_id
-            ))
-        })?;
-        let relative = resolve_data_path(
-            scope.data_prefix,
-            scope.table_prefix,
-            &file.path,
-            file.path_is_relative,
-        );
-        let path = relative?;
-        let positions = data_file::RowPositions::from_unsorted(registration.new_positions.clone());
-        let parquet = data_file::ParquetFile::new(
-            store.clone(),
-            path,
-            file.file_size_bytes,
-            file.footer_size,
-        )
-        .with_columns(
-            scope
-                .snapshot
-                .file_read_columns_at(
-                    scope.handle,
-                    scope.table,
-                    scope
-                        .snapshot
-                        .data_files
-                        .get(&scope.table.get())
-                        .and_then(|files| files.get(&file.id.get()))
-                        .ok_or_else(|| Error::NotFound(format!("data file {}", file.id)))?,
-                )
-                .await?,
-        )
-        .with_metrics(self.data_read_metrics());
-
-        let entries = data_file::scoped_read_recorded_entries(
-            parquet,
-            scope.union_positions,
-            data_file::ScopedRows::At(&positions),
-            data_file::RowIdSource::Resolve {
-                row_id_start: file.row_id_start,
-            },
-        )
-        .await?;
-
-        Ok(split_index_removals(
-            scope.indexes,
-            scope.per_index,
-            entries
-                .into_iter()
-                .map(|entry| (entry.row_id, entry.values)),
-        ))
-    }
-
-    /// Fails typed on any id in `inlined_rows` no longer a live inlined
-    /// row: a flush settling between locate and commit would otherwise turn
-    /// the tombstone into a silent no-op. A flush racing after this check
-    /// conflicts at commit.
-    async fn require_live_inlined_rows(
-        &self,
-        table: TableId,
-        inlined_rows: &[u64],
-        visible_at: Option<u64>,
-    ) -> Result<()> {
-        if inlined_rows.is_empty() {
-            return Ok(());
-        }
-
-        let live = self
-            .requested_inline_row_ids(table, inlined_rows, visible_at)
-            .await?;
-        for &row_id in inlined_rows {
-            if !live.contains(&row_id) {
-                return Err(Error::RowPosition {
-                    row_id,
-                    data_file_id: None,
-                    reason: "row is not a live inlined row".to_owned(),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    /// The removal every live index needs per inlined row, in
-    /// `inlined_rows` order — derived from one pass over every live chunk
-    /// at the union of every live index's columns, then split per index.
-    /// Inline data has no per-file grain, so every live chunk is read.
-    async fn inline_delete_index_removals(
-        &self,
-        snapshot: &CatalogSnapshot,
-        table: TableId,
-        inlined_rows: &[u64],
-    ) -> Result<Vec<Vec<FileIndexRemoval>>> {
-        let indexes = snapshot.indexes_of(table);
-        if indexes.is_empty() || inlined_rows.is_empty() {
-            return Ok(vec![Vec::new(); inlined_rows.len()]);
-        }
-
-        let (union_columns, per_index) =
-            union_index_keys(&indexes, |index| Ok(index.columns.clone()))?;
-        let wanted: HashSet<u64> = inlined_rows.iter().copied().collect();
-        let entries = self.inline_backfill_entries(table, &union_columns).await?;
-
-        let mut by_row: HashMap<u64, Vec<FileIndexRemoval>> = HashMap::new();
-        for removal in split_index_removals(
-            &indexes,
-            &per_index,
-            entries
-                .into_iter()
-                .filter(|entry| wanted.contains(&entry.row_id))
-                .map(|entry| (entry.row_id, entry.values)),
-        ) {
-            by_row.entry(removal.row_id).or_default().push(removal);
-        }
-
-        Ok(inlined_rows
-            .iter()
-            .map(|row_id| by_row.remove(row_id).unwrap_or_default())
-            .collect())
-    }
-}
-
-impl Catalog {
-    /// Lands located deletions in one autonomous commit: per registration,
-    /// the replaced delete file is expired (a data file admits one live
-    /// delete file), the new one — already written by the caller — is
-    /// registered with the index entry removals its newly killed rows
-    /// need, and each inlined row is tombstoned by
-    /// [`inline_delete`](crate::Transaction::inline_delete). Removals are
-    /// derived by scoped-reading the indexed columns at exactly the
-    /// positions or rows going dead.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::NotFound`] if the table is not live, if a
-    /// registration's `data_file_id` is not a live data file, or if
-    /// `expires` does not name a delete file currently live on the table.
-    /// Returns [`Error::Constraint`] if the table carries live indexes and
-    /// no `data_store` was supplied to derive a file registration's index
-    /// entry removals. Returns [`Error::RowPosition`] if an id in
-    /// `inlined_rows` is not a live inlined row of the table. Returns
-    /// [`Error::CommitConflict`] if a concurrent commit touched the same
-    /// table.
-    pub async fn commit_located_deletion(
-        &self,
-        data_store: Option<DataStore>,
-        data_prefix: &str,
-        table: TableId,
-        registrations: &[DeleteFileRegistration],
-        inlined_rows: &[u64],
-    ) -> Result<SnapshotId> {
-        let snapshot = self.snapshot().await?;
-        self.require_live_inlined_rows(table, inlined_rows, None)
-            .await?;
-        let file_removals = self
-            .delete_file_index_removals(
-                data_store.as_ref(),
-                data_prefix,
-                &snapshot,
-                table,
-                registrations,
-            )
-            .await?;
-        let inline_removals = self
-            .inline_delete_index_removals(&snapshot, table, inlined_rows)
-            .await?;
-
-        self.commit(move |tx| {
-            for (registration, removals) in registrations.iter().zip(file_removals.iter()) {
-                if let Some(expires) = registration.expires {
-                    tx.expire_delete_file(table, expires)?;
-                }
-                tx.register_delete_file(
-                    table,
-                    DeleteFile {
-                        data_file_id: registration.data_file_id,
-                        path: registration.path.clone(),
-                        // `registration.path` is a bare file name: DuckLake's
-                        // own reader resolves a delete file's path against
-                        // the table's directory when `path_is_relative`, the
-                        // same composition this store's own
-                        // `resolve_data_path` applies for its reads — a
-                        // caller-supplied absolute path (`false`) is not an
-                        // object-store-absolute key here, so it round-trips
-                        // through neither reader correctly.
-                        path_is_relative: true,
-                        format: "parquet".to_owned(),
-                        delete_count: registration.delete_count,
-                        file_size_bytes: registration.file_size,
-                        footer_size: registration.footer_size,
-                        encryption_key: None,
-                    },
-                    removals,
-                )?;
-            }
-            for (&row_id, removals) in inlined_rows.iter().zip(inline_removals.iter()) {
-                tx.inline_delete(table, row_id, removals)?;
-            }
-            Ok(())
-        })
-        .await
     }
 }

@@ -14,6 +14,15 @@ use object_store::memory::InMemory;
 
 use crate::fixtures::{col, datafile, open_memory, row_id_field, write_parquet};
 
+fn all_columns(snapshot: &CatalogSnapshot, table: TableId) -> Vec<String> {
+    snapshot
+        .columns_of(table)
+        .iter()
+        .filter(|column| column.parent_column.is_none())
+        .map(|column| column.name.clone())
+        .collect()
+}
+
 async fn read_all(scan: Result<moraine::LocatedRowScan, Error>) -> Result<Vec<RecordBatch>, Error> {
     let mut scan = scan?;
     let mut batches = Vec::new();
@@ -305,12 +314,13 @@ async fn file_rows_come_back_with_the_current_columns_and_their_ids() {
     let snapshot = head(&catalog).await;
     let located = read_all(
         catalog
-            .scan_rows_at_strict(
+            .scan_rows_at(
                 &snapshot,
                 Some(DataStore::new(data)),
                 "",
                 table,
                 &[(2, Some(file)), (1, Some(file)), (1, Some(file))],
+                &all_columns(&snapshot, table),
             )
             .await,
     )
@@ -370,8 +380,8 @@ async fn selective_cursor_projects_and_streams_exact_rows() {
     .await;
     let file = only_file(&catalog, table).await;
     let snapshot = head(&catalog).await;
-    let strict = catalog
-        .scan_rows_at_strict(
+    let positions = catalog
+        .locate_row_positions_at(
             &snapshot,
             Some(DataStore::new(data.clone())),
             "",
@@ -380,7 +390,7 @@ async fn selective_cursor_projects_and_streams_exact_rows() {
         )
         .await;
     assert!(matches!(
-        strict,
+        positions,
         Err(Error::RowPosition { row_id: 9999, .. })
     ));
     for requested in [vec!["b".to_owned()], vec![]] {
@@ -451,12 +461,13 @@ async fn a_file_with_embedded_ids_is_read_at_its_exact_positions() {
     let snapshot = head(&catalog).await;
     let located = read_all(
         catalog
-            .scan_rows_at_strict(
+            .scan_rows_at(
                 &snapshot,
                 Some(DataStore::new(data)),
                 "",
                 table,
                 &[(9, Some(file)), (12, Some(file))],
+                &all_columns(&snapshot, table),
             )
             .await,
     )
@@ -520,12 +531,13 @@ async fn rows_deleted_at_the_snapshot_are_omitted() {
     let snapshot = head(&catalog).await;
     let located = read_all(
         catalog
-            .scan_rows_at_strict(
+            .scan_rows_at(
                 &snapshot,
                 Some(DataStore::new(data)),
                 "",
                 table,
                 &[(0, Some(file)), (1, Some(file)), (2, Some(file))],
+                &all_columns(&snapshot, table),
             )
             .await,
     )
@@ -592,12 +604,13 @@ async fn repeated_summary_positions_read_only_the_live_version() {
     let expected = vec![(Some(30), 5, Some(file.get()))];
     let located = read_all(
         catalog
-            .scan_rows_at_strict(
+            .scan_rows_at(
                 &snapshot,
                 Some(store.clone()),
                 "",
                 table,
                 &[(5, Some(file))],
+                &all_columns(&snapshot, table),
             )
             .await,
     )
@@ -640,7 +653,14 @@ async fn inlined_rows_decode_from_their_chunk() {
     let snapshot = head(&catalog).await;
     let located = read_all(
         catalog
-            .scan_rows_at_strict(&snapshot, None, "", table, &[(1, None), (2, None)])
+            .scan_rows_at(
+                &snapshot,
+                None,
+                "",
+                table,
+                &[(1, None), (2, None)],
+                &all_columns(&snapshot, table),
+            )
             .await,
     )
     .await
@@ -669,7 +689,14 @@ async fn an_inlined_row_deleted_at_the_snapshot_is_refused() {
     let snapshot = head(&catalog).await;
     let error = read_all(
         catalog
-            .scan_rows_at_strict(&snapshot, None, "", table, &[(1, None)])
+            .scan_rows_at(
+                &snapshot,
+                None,
+                "",
+                table,
+                &[(1, None)],
+                &all_columns(&snapshot, table),
+            )
             .await,
     )
     .await
@@ -718,12 +745,13 @@ async fn a_column_added_after_a_file_was_written_reads_as_null() {
     let snapshot = head(&catalog).await;
     let located = read_all(
         catalog
-            .scan_rows_at_strict(
+            .scan_rows_at(
                 &snapshot,
                 Some(DataStore::new(data)),
                 "",
                 table,
                 &[(1, Some(file))],
+                &all_columns(&snapshot, table),
             )
             .await,
     )
@@ -786,7 +814,14 @@ async fn an_older_snapshot_still_serves_a_row_deleted_later() {
 
     let at_pinned = read_all(
         catalog
-            .scan_rows_at_strict(&pinned, Some(store.clone()), "", table, &[(0, Some(file))])
+            .scan_rows_at(
+                &pinned,
+                Some(store.clone()),
+                "",
+                table,
+                &[(0, Some(file))],
+                &all_columns(&pinned, table),
+            )
             .await,
     )
     .await
@@ -794,7 +829,14 @@ async fn an_older_snapshot_still_serves_a_row_deleted_later() {
     let current = head(&catalog).await;
     let at_head = read_all(
         catalog
-            .scan_rows_at_strict(&current, Some(store.clone()), "", table, &[(0, Some(file))])
+            .scan_rows_at(
+                &current,
+                Some(store.clone()),
+                "",
+                table,
+                &[(0, Some(file))],
+                &all_columns(&current, table),
+            )
             .await,
     )
     .await
@@ -810,12 +852,9 @@ async fn an_older_snapshot_still_serves_a_row_deleted_later() {
 
     assert_eq!(rows(&at_pinned), vec![(Some(10), 0, Some(file.get()))]);
     assert!(rows(&at_head).is_empty());
-    assert!(positions_pinned.deletions[0].existing_delete.is_none());
+    assert!(positions_pinned.deletions[0].existing_positions.is_none());
     assert_eq!(
-        positions_head.deletions[0]
-            .existing_delete
-            .as_ref()
-            .map(|existing| existing.positions.clone()),
+        positions_head.deletions[0].existing_positions.clone(),
         Some(vec![0])
     );
     catalog.close().await.unwrap();
@@ -876,7 +915,14 @@ async fn a_file_the_snapshot_does_not_hold_is_refused() {
 
     let error = read_all(
         catalog
-            .scan_rows_at_strict(&pinned, Some(store), "", table, &[(3, Some(later))])
+            .scan_rows_at(
+                &pinned,
+                Some(store),
+                "",
+                table,
+                &[(3, Some(later))],
+                &all_columns(&pinned, table),
+            )
             .await,
     )
     .await
@@ -890,7 +936,7 @@ async fn a_file_the_snapshot_does_not_hold_is_refused() {
 }
 
 #[tokio::test]
-async fn a_row_the_named_file_does_not_hold_is_refused() {
+async fn a_candidate_the_named_file_does_not_hold_is_omitted() {
     let catalog = open_memory().await;
     let data = Arc::new(InMemory::new());
     let (file_size_bytes, footer_size) = write_parquet(
@@ -912,24 +958,22 @@ async fn a_row_the_named_file_does_not_hold_is_refused() {
     let file = only_file(&catalog, table).await;
 
     let snapshot = head(&catalog).await;
-    let error = read_all(
+    let batches = read_all(
         catalog
-            .scan_rows_at_strict(
+            .scan_rows_at(
                 &snapshot,
                 Some(DataStore::new(data)),
                 "",
                 table,
                 &[(7, Some(file))],
+                &all_columns(&snapshot, table),
             )
             .await,
     )
     .await
-    .unwrap_err();
+    .unwrap();
 
-    assert!(
-        matches!(error, Error::RowPosition { row_id: 7, .. }),
-        "{error}"
-    );
+    assert!(rows(&batches).is_empty());
     catalog.close().await.unwrap();
 }
 
@@ -986,12 +1030,13 @@ async fn a_position_a_replacement_delete_file_deletes_later_is_still_served() {
     let snapshot = head(&catalog).await;
     let located = read_all(
         catalog
-            .scan_rows_at_strict(
+            .scan_rows_at(
                 &snapshot,
                 Some(DataStore::new(data)),
                 "",
                 table,
                 &[(0, Some(file)), (1, Some(file)), (2, Some(file))],
+                &all_columns(&snapshot, table),
             )
             .await,
     )

@@ -41,7 +41,8 @@ fn a_certified_equality_delete_reads_nothing() {
     assert_eq!(
         csv_rows(&run(
             "SELECT count(*) FROM duckdb_functions() WHERE function_name IN
-            ('moraine_rows_at', 'moraine_delete_located', 'moraine_update');"
+            ('moraine_rows_at', 'moraine_delete_located', 'moraine_update',
+             'ducklake_update_positions');"
         )),
         vec![vec!["0"]],
         "the automatic rewrite must not restore public locator functions"
@@ -120,7 +121,25 @@ fn an_uncertified_index_keeps_the_scan() {
     let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
     indexed_table(&run);
 
-    let plan = run("EXPLAIN DELETE FROM lake.main.t WHERE a = 30001;");
+    let result = run_session_with_env(
+        &Attach::Moraine {
+            store_dir: store.path(),
+            data_path: data.path(),
+            options: &meta,
+            read_only: false,
+        },
+        "CALL enable_logging(level => 'debug', storage => 'memory');
+         EXPLAIN DELETE FROM lake.main.t WHERE a = 30001;
+         SELECT 'placements', count(*) FROM duckdb_logs
+         WHERE type = 'moraine' AND message LIKE '%located row ids%';",
+        &[("MORAINE_LOG", "debug")],
+    );
+    let plan = combined_output(&result);
+    assert!(result.status.success(), "{plan}");
+    assert!(
+        csv_rows(&plan).contains(&vec!["placements".into(), "1".into()]),
+        "a declined rewrite must reuse its lookup for scan pruning: {plan}"
+    );
     assert!(
         !plan.contains("DUCKLAKE_DELETE_POSITIONS"),
         "an unchecked index must not answer a delete: {plan}"

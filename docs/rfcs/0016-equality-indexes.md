@@ -1373,6 +1373,18 @@ probe counts, validation time, prepare time, execution time, and retained bytes.
 
 ### An indexed-equality DELETE needs no scan
 
+The core exposes selective reads and exact position resolution. The retired
+locator verbs' `scan_rows_at_strict`, `commit_located_deletion`,
+`DeleteFileRegistration`, and `table_write_directory` are removed. Resolved
+file positions carry only the data-file ID, requested offsets, and optional
+existing delete offsets; callers no longer receive unused paths or delete
+file IDs. DuckLake owns deletion staging, writing, and commit.
+
+The DuckLake patch retains file-position DELETE only. Its unused positional
+UPDATE, inline-row mutation argument, and deferred position-token resolver
+are removed. The optimizer resolves an equality once, offering its result
+to the DELETE rewrite and reusing it for scan pruning when rewriting declines.
+
 A `DELETE` whose whole predicate a certified index answers does not need to
 look at the table: the rows it would find are the rows the index reports. So
 the plan is replaced outright — `LOGICAL_DELETE` becomes a projection,
@@ -1404,9 +1416,8 @@ unless all of these hold, and leaves the ordinary plan alone when any fails:
   there is nothing left to evaluate it;
 - the scan is at the transaction's snapshot, with no transaction-local
   inserts, and the table is past the probe's size gate;
-- every resolved row sits in a committed file, since an inlined row's
-  deletion is counted in a second output column this projection does not
-  carry;
+- every resolved row sits in a committed file, which is the positional
+  writer's scope;
 - the table does not write deletion vectors, which the positional function
   does not support;
 - there is no `RETURNING`, which DuckLake refuses on this path anyway;
@@ -1843,7 +1854,7 @@ Before deriving keys, old physical values are converted to the indexed
 column's current type with checked casts; an unsupported default or failed
 conversion returns a typed error. The same projection serves immediate and
 staged backfills, deferred repair, file registration, SQL deletes and updates,
-and located-delete removals. Projection bounds are checked before calling
+and delete-file removals. Projection bounds are checked before calling
 Arrow or Parquet APIs that assume valid positions.
 
 A value is indexable only if its Parquet form and its inline Arrow form

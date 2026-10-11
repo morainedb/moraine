@@ -453,19 +453,6 @@ typedef struct MoraineObjectStoreTally {
   uint64_t data_bytes;
 } MoraineObjectStoreTally;
 
-// One `(row_id, data_file_id)` pair naming a row to read by position, as
-// an index lookup reports it. `has_data_file_id` false means the row's
-// file id is NULL — a live inlined row.
-typedef struct MorainePositionPair {
-  // The row id to position.
-  uint64_t row_id;
-  // The data file it was located in; meaningful only when
-  // `has_data_file_id`.
-  uint64_t data_file_id;
-  // Whether `data_file_id` names a file.
-  bool has_data_file_id;
-} MorainePositionPair;
-
 // One data file carrying located positions, as
 // [`moraine_locate_row_positions`] groups its answer. Free with
 // [`moraine_locate_row_positions_free_files`].
@@ -487,6 +474,19 @@ typedef struct MoraineLocatedFile {
   // Length of `existing_positions`.
   size_t existing_positions_len;
 } MoraineLocatedFile;
+
+// One `(row_id, data_file_id)` pair naming a row to read by position, as
+// an index lookup reports it. `has_data_file_id` false means the row's
+// file id is NULL — a live inlined row.
+typedef struct MorainePositionPair {
+  // The row id to position.
+  uint64_t row_id;
+  // The data file it was located in; meaningful only when
+  // `has_data_file_id`.
+  uint64_t data_file_id;
+  // Whether `data_file_id` names a file.
+  bool has_data_file_id;
+} MorainePositionPair;
 
 // File positions a selective scan treats as deleted on top of the
 // snapshot's own delete files: the caller's uncommitted deletions.
@@ -2126,35 +2126,21 @@ int32_t moraine_sweep_row_summaries(struct MoraineCatalogHandle *handle,
                                     void *probe_ctx,
                                     struct MoraineError *err);
 
-// Resolves located rows to exact file positions for deletion without a
-// scan. `pairs` are `(row_id, data_file_id)` as a lookup reports them,
-// `has_data_file_id` false naming a live inlined row. Resolution is
-// against `snapshot` when non-null, else the catalog head.
-//
-// Writes `out_files` (one entry per data file carrying a requested
-// position, each with its own positions and whatever delete file is
-// already registered against it) and `out_inlined` (row ids resolved as
-// live inlined rows, from `pairs` entries naming no file). Both arrays are
-// written even when empty, and each must be freed with its own matching
-// `_free` function exactly once.
+// Resolves index hits in committed files to exact positions for deletion.
+// The handle must pin the scan's catalog revision. Free the returned files
+// with [`moraine_locate_row_positions_free_files`].
 //
 // # Safety
-//
-// Every pointer must be valid per the ABI contract; `snapshot`, if
-// non-null, must be a live snapshot of `handle`'s catalog; `pairs` points
-// to `pairs_len` pairs; every `out_*` pointer must be non-null and
-// writable; `probe`/`probe_ctx` must satisfy the interrupt-probe contract;
-// `err`, if non-null, must be writable.
+// Every pointer must satisfy the ABI contract; `pairs` points to `pairs_len`
+// hits, output pointers are non-null and writable, and `probe`/`probe_ctx`
+// satisfy the interrupt-probe contract.
 int32_t moraine_locate_row_positions(struct MoraineCatalogHandle *handle,
-                                     struct MoraineSnapshotHandle *snapshot,
                                      const char *schema_name,
                                      const char *table_name,
-                                     const struct MorainePositionPair *pairs,
+                                     const struct MoraineRowId *pairs,
                                      size_t pairs_len,
                                      struct MoraineLocatedFile **out_files,
                                      size_t *out_files_len,
-                                     uint64_t **out_inlined,
-                                     size_t *out_inlined_len,
                                      MoraineInterruptProbe probe,
                                      void *probe_ctx,
                                      struct MoraineError *err);
@@ -2168,15 +2154,6 @@ int32_t moraine_locate_row_positions(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written there by a
 // matching call, not yet freed.
 void moraine_locate_row_positions_free_files(struct MoraineLocatedFile *items, size_t len);
-
-// Frees the array [`moraine_locate_row_positions`] wrote to
-// `out_inlined`/`out_inlined_len`.
-//
-// # Safety
-//
-// `items`/`len` must be exactly the pointer and length written there by a
-// matching call, not yet freed.
-void moraine_locate_row_positions_free_inlined(uint64_t *items, size_t len);
 
 // Opens a transaction snapshot with a pinned index/inline read surface when
 // supported. Readers without pinned revisions receive an ordinary snapshot

@@ -226,26 +226,18 @@ async fn scan_positions_do_not_materialize_unfiltered_deletes() {
     let store = DataStore::new(data);
     let pairs = [(0, Some(file)), (1, Some(file)), (2, Some(file))];
 
-    for strict in [false, true] {
-        let scan = if strict {
-            catalog
-                .scan_rows_at_strict(&snapshot, Some(store.clone()), "", table, &pairs)
-                .await
-        } else {
-            catalog
-                .scan_rows_at(
-                    &snapshot,
-                    Some(store.clone()),
-                    "",
-                    table,
-                    &pairs,
-                    &["a".into()],
-                )
-                .await
-        }
+    let scan = catalog
+        .scan_rows_at(
+            &snapshot,
+            Some(store.clone()),
+            "",
+            table,
+            &pairs,
+            &["a".into()],
+        )
+        .await
         .unwrap();
-        assert_eq!(first_column_values(scan).await, vec![10, 30]);
-    }
+    assert_eq!(first_column_values(scan).await, vec![10, 30]);
 
     let metrics = Arc::new(data_file::ScopedReadMetrics::default());
     let delete_file = data_file::ParquetFile::new(
@@ -267,8 +259,8 @@ async fn scan_positions_do_not_materialize_unfiltered_deletes() {
         .locate_row_positions(Some(store), "", table, &pairs)
         .await
         .unwrap();
-    let existing = located.deletions[0].existing_delete.as_ref().unwrap();
-    assert_eq!(existing.positions, vec![1]);
+    let existing = located.deletions[0].existing_positions.as_ref().unwrap();
+    assert_eq!(existing, &vec![1]);
     catalog.close().await.unwrap();
 }
 

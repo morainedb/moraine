@@ -1265,14 +1265,15 @@ cursor. `moraine_row_scan_is_selective` costs projected page coverage,
 `moraine_row_scan_parallelism` configures prefetch before iteration, and
 `moraine_row_scan_metrics` samples cursor-local I/O and decode/worker counters.
 `moraine_row_scan_open` is the only cursor the ABI opens. The strict
-variant that rejected an unpositionable pair went with the located verbs it
-served — nothing else asked for that contract — and with it the positional
-ABI those verbs owned: `moraine_locate_row_positions` and its two free
-functions, and `moraine_commit_located_deletion`. The earlier
-IPC-returning `moraine_rows_at`, `moraine_rows_at_free` and
-`moraine_row_scan_next`, with their `MoraineRowBatch` type, were already
-withdrawn in favour of the Arrow pair. Durable inline chunk IPC encoding is
-unchanged.
+whole-row cursor and standalone deletion commit were removed with the
+located SQL verbs. The internal `moraine_locate_row_positions` instead
+accepts index hits in committed files, using the handle's pinned revision,
+and returns exact positions plus existing deletion masks for the automatic
+DELETE rewrite. Its single free function releases the nested file arrays;
+there is no inline-row output or separate snapshot argument.
+The earlier IPC-returning `moraine_rows_at`, `moraine_rows_at_free` and
+`moraine_row_scan_next`, with their `MoraineRowBatch` type, are withdrawn in
+favour of the Arrow pair. Durable inline chunk IPC encoding is unchanged.
 The planning estimate owns no payload batches and discards its temporary scope
 before storing the prepared plan. See RFC 0016 for the eligibility and cost rules.
 

@@ -610,17 +610,13 @@ std::optional<ResolvedEquality> ResolveIndexedEquality(duckdb::ClientContext &co
 // Every uncertainty leaves the scan as it was: the filter still runs in full
 // over whatever is read, so a pushed filter can only narrow the reading, and
 // only an index that is complete for the scan's snapshot may narrow it.
-void PruneScanByIndexedEquality(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
-                                duckdb::LogicalGet &get) {
-	auto found = ResolveIndexedEquality(context, optimizer, get);
-	if (!found) {
-		return;
-	}
-	auto &table = *found->table;
-	auto &schema_name = found->schema_name;
-	auto &table_name = found->table_name;
-	auto &resolved = found->rows;
-	if (found->rows.empty()) {
+void PruneScanByIndexedEquality(duckdb::ClientContext &context, duckdb::LogicalGet &get,
+                                const ResolvedEquality &found) {
+	auto &table = *found.table;
+	auto &schema_name = found.schema_name;
+	auto &table_name = found.table_name;
+	auto &resolved = found.rows;
+	if (found.rows.empty()) {
 		// No row holds the value, so no row passes: a range no row id is in.
 		get.table_filters.PushFilter(FilterOnlyColumn(get, duckdb::COLUMN_IDENTIFIER_ROW_ID),
 		                             duckdb::ExpressionFilter::CreateComparisonFilter(
@@ -730,58 +726,40 @@ duckdb::Value PositionalFiles(const OwnedArray<MoraineLocatedFile> &files) {
 // Replace a certified equality delete with positional deletion.
 // Residual predicates and unsupported delete formats retain the scan.
 bool RewriteDeleteByIndexedEquality(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
-                                    duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
-	if (plan->type != duckdb::LogicalOperatorType::LOGICAL_DELETE || plan->children.size() != 1) {
-		return false;
-	}
+                                    duckdb::unique_ptr<duckdb::LogicalOperator> &plan,
+                                    const ResolvedEquality &found) {
 	auto &deletion = plan->Cast<duckdb::LogicalDelete>();
 	if (deletion.return_chunk) {
 		return false;
 	}
-	auto scan = DeleteSourceScan(*plan->children[0]);
-	if (!scan) {
-		return false;
-	}
-	auto found = ResolveIndexedEquality(context, optimizer, *scan);
-	if (!found) {
-		return false;
-	}
 	// No residual predicate may survive, because none is evaluated; and the
 	// index's answer stands in for the scan's, so it must be certified.
-	auto &table = *found->table;
+	auto &table = *found.table;
 	auto &catalog = table.ParentCatalog().Cast<duckdb::DuckLakeCatalog>();
 	auto &schema = table.ParentSchema().Cast<duckdb::DuckLakeSchemaEntry>();
-	if (!found->certified || found->pushed_filters != 1 || catalog.CatalogSnapshot() ||
+	if (!found.certified || found.pushed_filters != 1 || catalog.CatalogSnapshot() ||
 	    catalog.WriteDeletionVectors(schema.GetSchemaId(), table.GetTableId())) {
 		return false;
 	}
-	if (found->rows.empty()) {
+	if (found.rows.empty()) {
 		// Nothing to delete, and the ordinary plan already reads nothing:
 		// the pushed impossible row filter prunes every file.
 		return false;
 	}
 
-	// Every row must sit in a committed file. An inlined row would be
-	// deleted through `inlined_rows`, whose count lands in a second output
-	// column this projection does not carry.
-	std::vector<MorainePositionPair> pairs;
-	pairs.reserve(found->rows.size());
-	for (auto &row : found->rows) {
+	// The positional writer handles committed files only.
+	for (auto &row : found.rows) {
 		if (!row.has_data_file_id) {
 			return false;
 		}
-		pairs.push_back(MorainePositionPair {row.value, row.data_file_id, true});
 	}
 
 	bool cacheable = false;
-	auto handle = BindIndexReadFor(context, found->catalog_name, &optimizer.binder, cacheable);
+	auto handle = BindIndexReadFor(context, found.catalog_name, &optimizer.binder, cacheable);
 	OwnedArray<MoraineLocatedFile> files(moraine_locate_row_positions_free_files);
-	OwnedArray<uint64_t> inlined(moraine_locate_row_positions_free_inlined);
 	MoraineError error {};
-	auto code = moraine_locate_row_positions(handle, nullptr, found->schema_name.c_str(),
-	                                         found->table_name.c_str(), pairs.data(), pairs.size(),
-	                                         files.OutItems(), files.OutLen(), inlined.OutItems(),
-	                                         inlined.OutLen(),
+	auto code = moraine_locate_row_positions(handle, found.schema_name.c_str(), found.table_name.c_str(),
+	                                         found.rows.data(), found.rows.size(), files.OutItems(), files.OutLen(),
 	                                         moraine_shim_is_interrupted, &context, &error);
 	if (code == MORAINE_INTERRUPTED) {
 		ThrowMoraineError(error);
@@ -794,18 +772,15 @@ bool RewriteDeleteByIndexedEquality(duckdb::ClientContext &context, duckdb::Opti
 		moraine_error_free(error.message);
 		return false;
 	}
-	if (inlined.begin() != inlined.end()) {
-		return false;
-	}
 
 	duckdb::DuckLakeDeletePositionsFunction function;
-	duckdb::vector<duckdb::Value> inputs {duckdb::Value(found->catalog_name),
-	                                      duckdb::Value(found->schema_name),
-	                                      duckdb::Value(found->table_name), PositionalFiles(files)};
+	duckdb::vector<duckdb::Value> inputs {duckdb::Value(found.catalog_name),
+	                                      duckdb::Value(found.schema_name),
+	                                      duckdb::Value(found.table_name), PositionalFiles(files)};
 	duckdb::named_argument_map_t named;
 	// Positions were resolved against the scan's snapshot; naming it makes
 	// DuckLake refuse them if its transaction has moved past it.
-	named["snapshot"] = duckdb::Value::UBIGINT(found->snapshot_id);
+	named["snapshot"] = duckdb::Value::UBIGINT(found.snapshot_id);
 	duckdb::vector<duckdb::LogicalType> input_types;
 	duckdb::vector<duckdb::Identifier> input_names;
 	duckdb::BoundTableFunction bound_function(function);
@@ -837,23 +812,27 @@ bool RewriteDeleteByIndexedEquality(duckdb::ClientContext &context, duckdb::Opti
 	return true;
 }
 
-void RewriteDeletesByIndexedEquality(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
-                                     duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
-	if (RewriteDeleteByIndexedEquality(context, optimizer, plan)) {
-		return;
+void OptimizeIndexedEqualities(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
+                               duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
+	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_DELETE && plan->children.size() == 1) {
+		auto scan = DeleteSourceScan(*plan->children[0]);
+		if (scan && scan->children.empty()) {
+			auto found = ResolveIndexedEquality(context, optimizer, *scan);
+			if (found && !RewriteDeleteByIndexedEquality(context, optimizer, plan, *found)) {
+				PruneScanByIndexedEquality(context, *scan, *found);
+			}
+			return;
+		}
 	}
 	for (auto &child : plan->children) {
-		RewriteDeletesByIndexedEquality(context, optimizer, child);
+		OptimizeIndexedEqualities(context, optimizer, child);
 	}
-}
-
-void PruneScansByIndexedEquality(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
-                                 duckdb::LogicalOperator &op) {
-	for (auto &child : op.children) {
-		PruneScansByIndexedEquality(context, optimizer, *child);
-	}
-	if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
-		PruneScanByIndexedEquality(context, optimizer, op.Cast<duckdb::LogicalGet>());
+	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+		auto &get = plan->Cast<duckdb::LogicalGet>();
+		auto found = ResolveIndexedEquality(context, optimizer, get);
+		if (found) {
+			PruneScanByIndexedEquality(context, get, *found);
+		}
 	}
 }
 
@@ -871,10 +850,7 @@ public:
 	static void PostOptimize(duckdb::OptimizerExtensionInput &input,
 	                         duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
 		FilterJoinsAgainstIndexReads(input.context, input.optimizer, plan);
-		// The rewrite drops the scan outright, so it is offered the plan
-		// before the rule that would narrow that scan's reading.
-		RewriteDeletesByIndexedEquality(input.context, input.optimizer, plan);
-		PruneScansByIndexedEquality(input.context, input.optimizer, *plan);
+		OptimizeIndexedEqualities(input.context, input.optimizer, plan);
 	}
 };
 

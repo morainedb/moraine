@@ -37,11 +37,11 @@ applies them) and then the series below, in file-name order:
    extra fields. It
    stops retries and releases the transaction's file-cleanup ownership before
    rollback, so an unacknowledged commit cannot lose files it registered.
-   Unregistered files remain eligible for orphan cleanup. Ordinary SQL deletion
-   and standalone located deletion cancellation are tested by `cargo xtask e2e`.
+   Unregistered files remain eligible for orphan cleanup. Ordinary SQL deletion and
+   unknown commit outcomes are tested by `cargo xtask e2e`.
 
 5. `0005-feat-change-DuckLake-rows-by-position.patch` adds
-   `ducklake_delete_positions(catalog, schema, table, files, inlined_rows := [], snapshot := NULL)`,
+   `ducklake_delete_positions(catalog, schema, table, files, snapshot := NULL)`,
    which stages deletes of already-located rows in the current DuckLake
    transaction without scanning the table. `files` is a list of
    `STRUCT(data_file_id UBIGINT, positions UBIGINT[], existing_positions BLOB)`
@@ -49,8 +49,7 @@ applies them) and then the series below, in file-name order:
    snapshot. `existing_positions` carries the deletions the caller already
    decoded from that file's current delete file, as whole uint64 positions;
    NULL means the caller does not know them and DuckLake reads the file
-   itself. `inlined_rows` lists row ids of committed inlined rows, and
-   `snapshot`, when given, is
+   itself. `snapshot`, when given, is
    the snapshot the caller resolved them against, refused with a
    transaction error if it is older than the one the transaction reads. The
    function validates every file id and position against that snapshot,
@@ -59,23 +58,12 @@ applies them) and then the series below, in file-name order:
    inlined file deletions below the inlining threshold, otherwise a new
    delete file that replaces the file's current one. `COMMIT` publishes
    these together with the transaction's other changes, and `ROLLBACK`
-   discards them and removes any file written. The same patch
-   adds `ducklake_update_positions(catalog, schema, table, files,
-   replacement, inlined_rows := [], snapshot := NULL)`: `replacement` is a
-   `SELECT` producing the table's columns followed by each row's id, bound
-   through DuckDB's binder and planned through the operators `UPDATE` uses
-   in their row-id-writing mode, so the rows keep their ids, with the
-   positional deletes staged once the rows are written, all in the current
-   transaction. Both functions also take
-   `positions_token`, an alternative to `files` and `inlined_rows` for a
-   caller that would otherwise resolve positions while binding: the token is
-   carried through the plan untouched and handed to the resolver an extension
-   installs with `RegisterDuckLakePositionResolver`, which runs during
-   execution, in the transaction that stages the result. A token with no
-   registered resolver, or given beside a non-empty `files`, is an error. No
-   in-tree caller passes one yet. Neither function has a Moraine
-   dependency; explicit rollback, failed replacement inserts, repeated
-   calls, and standalone autocommit are covered by `cargo xtask e2e`.
+   discards them and removes any file written. The function returns
+   `file_rows_deleted` and `delete_files_written`. It has no Moraine
+   dependency. Positional UPDATE, inline-row arguments, and deferred
+   position tokens are removed; the optimizer supplies committed file
+   positions directly. Rollback, repeated deletes, prepared statements,
+   and autocommit are covered by `cargo xtask e2e`.
 
 `0007-fix-write-row-ids-when-merging.patch` makes
 `ducklake_merge_adjacent_files` write the row-id column into every merged
