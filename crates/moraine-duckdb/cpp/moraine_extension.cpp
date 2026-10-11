@@ -18,6 +18,7 @@ void RegisterMoraineStorageExtension(duckdb::DBConfig &config);
 void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader);
 // Defined in index_functions.cpp.
 void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader);
+void RegisterMoraineIndexDdl(duckdb::DBConfig &config);
 // Defined in optimizer.cpp.
 void RegisterMoraineOptimizer(duckdb::DBConfig &config);
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader);
@@ -67,6 +68,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	moraine_duckdb::RegisterMoraineOptimizer(loader.GetDatabaseInstance().config);
 	moraine_duckdb::RegisterMoraineCensusFunctions(loader);
 	moraine_duckdb::RegisterMoraineIndexFunctions(loader);
+	moraine_duckdb::RegisterMoraineIndexDdl(loader.GetDatabaseInstance().config);
 	moraine_duckdb::RegisterMoraineMaintenanceFunctions(loader);
 	moraine_duckdb::RegisterMoraineMigrateFunction(loader);
 	moraine_duckdb::RegisterMoraineFaultFunctions(loader);

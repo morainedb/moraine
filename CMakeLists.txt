@@ -29,6 +29,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/fault.cpp
     ${CPP_DIR}/summary_scan.cpp
     ${CPP_DIR}/index_functions.cpp
+    ${CPP_DIR}/index_ddl.cpp
     ${CPP_DIR}/index_cache.cpp
     ${CPP_DIR}/inline_tables.cpp
     ${CPP_DIR}/maintenance.cpp
@@ -99,4 +100,3 @@ foreach(EXT_TARGET ${TARGET_NAME}_extension ${TARGET_NAME}_loadable_extension)
     target_include_directories(${EXT_TARGET} PRIVATE ${MORAINE_DUCKLAKE_SOURCE_DIR}/src/include)
     target_link_libraries(${EXT_TARGET} ducklake_extension)
 endforeach()
-

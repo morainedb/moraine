@@ -239,6 +239,37 @@ warning at attach when that is the case. `'all'` pays a slower ATTACH for a
 first query that touches S3 not at all, and is worth it when the whole store
 fits the cache — check with `moraine_store_census`.
 
+## Indexes
+
+Create indexes with ordinary SQL on a Moraine-backed DuckLake table:
+
+```sql
+CREATE UNIQUE INDEX by_id ON lake.main.users(id);
+CREATE INDEX IF NOT EXISTS by_region ON lake.main.users(region)
+    WITH (staged = true, step_entries = 100000);
+SELECT * FROM lake.main.users WHERE id IN (12, 34);
+DROP INDEX IF EXISTS lake.main.by_region;
+```
+
+Index DDL requires autocommit and a writable attach. Index names are
+case-insensitively unique within a schema. The `staged`, `step_entries`,
+`step_bytes`, and `maintenance` options use the existing build engine;
+repeating an interrupted staged create without `IF NOT EXISTS` resumes it.
+Expression indexes and table-level key constraints are unsupported.
+Qualify DROP targets as `catalog.schema.index` when using multiple schemas or
+catalogs; unqualified Moraine index names use the current default schema.
+
+Ordinary predicates choose eligible indexes automatically. `moraine_indexes`
+lists them; `moraine_index_verify` checks their contents and certifies a clean
+index for optimizations such as scan-free DELETE. Verification is not required
+for ordinary indexed queries. The existing table-qualified administration and
+lookup functions remain available, including explicit per-column sort orders
+that DuckDB's native index parser currently discards.
+
+Rebuild currently uses drop followed by create, then a fresh verification pass
+when certification is wanted. During that gap, the index provides neither query
+acceleration nor uniqueness enforcement. Online replacement is not implemented.
+
 ## How it is built
 
 moraine-duckdb builds through DuckDB's own extension toolchain

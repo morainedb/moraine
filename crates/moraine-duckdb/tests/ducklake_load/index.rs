@@ -3,6 +3,7 @@ use std::fmt::Write;
 use crate::helpers::*;
 
 mod delete_rewrite;
+mod native_ddl;
 mod predicates;
 mod prepared;
 mod pushdown;
@@ -1595,7 +1596,7 @@ fn moraine_index_create_takes_a_step_size() {
     run("INSERT INTO lake.main.u SELECT i FROM range(5) t(i);");
     let before = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
     run(
-        "CALL moraine_index_create('lake', 'main', 'u', 'by_a', ['a'], true, \
+        "CALL moraine_index_create('lake', 'main', 'u', 'by_u', ['a'], true, \
          staged := true, step_bytes := 1);",
     );
     let after = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));

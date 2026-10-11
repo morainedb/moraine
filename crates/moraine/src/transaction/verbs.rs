@@ -801,12 +801,8 @@ impl Transaction {
     }
 
     fn index_name_free(&self, table: TableId, name: &str) -> Result<()> {
-        let taken = self
-            .state
-            .indexes
-            .get(&table.get())
-            .is_some_and(|per_table| per_table.values().any(|i| i.index_name == name));
-        if taken {
+        let schema = SchemaId::new(self.live_table(table)?.schema_id);
+        if self.index_by_schema_name(schema, name)?.is_some() {
             return Err(Error::AlreadyExists(format!("index {name}")));
         }
         Ok(())
@@ -858,10 +854,10 @@ impl Transaction {
     ///
     /// Returns [`Error::NotFound`] if the table or any referenced column is
     /// not live. Returns [`Error::AlreadyExists`] if an index with that name
-    /// already exists on the table. Returns [`Error::Constraint`] if the
-    /// column list is empty, an entry's value count does not match the
-    /// column count, an indexed value exceeds the size cap, or the backfill
-    /// contains a duplicate of a unique value.
+    /// already exists in the schema (case-insensitive). Returns
+    /// [`Error::Constraint`] if the column list is empty, an entry's value
+    /// count does not match the column count, an indexed value exceeds the
+    /// size cap, or the backfill contains a duplicate of a unique value.
     pub fn create_index(
         &mut self,
         table: TableId,

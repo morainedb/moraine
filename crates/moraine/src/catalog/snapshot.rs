@@ -571,6 +571,34 @@ impl CatalogSnapshot {
             .map(index_info)
     }
 
+    /// Resolves a case-insensitive index name within a schema.
+    ///
+    /// # Errors
+    /// Returns [`Error::Constraint`] when a legacy catalog has ambiguous names.
+    pub fn index_by_schema_name(&self, schema: SchemaId, name: &str) -> Result<Option<IndexInfo>> {
+        let mut found = None;
+        for table in self
+            .tables
+            .values()
+            .filter(|table| table.schema_id == schema.get())
+        {
+            if let Some(indexes) = self.indexes.get(&table.table_id) {
+                for index in indexes
+                    .values()
+                    .filter(|index| index.index_name.eq_ignore_ascii_case(name))
+                {
+                    if found.is_some() {
+                        return Err(Error::Constraint(format!(
+                            "index {name} is ambiguous in schema {schema}; use a table-qualified index operation"
+                        )));
+                    }
+                    found = Some(index_info(index));
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// The table's ready equality index on exactly `columns`, by field id in
     /// that order, for a reader deciding whether a filter can be answered
     /// from an index. Indexes still building, maintaining or poisoned refuse
@@ -1443,6 +1471,42 @@ mod tests {
             state
                 .index_on_columns(TableId::new(2), &[column(7)])
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_index_names_require_table_qualification_when_ambiguous() {
+        let mut state = CatalogSnapshot::default();
+        for table in [1, 2] {
+            state.put_table(TableValue {
+                table_id: table,
+                schema_id: 0,
+                table_name: format!("table_{table}"),
+                ..Default::default()
+            });
+            state.put_index(IndexValue {
+                table_id: table,
+                index_id: table + 2,
+                index_name: "by_key".into(),
+                ..Default::default()
+            });
+        }
+        assert!(matches!(
+            state.index_by_schema_name(SchemaId::new(0), "BY_KEY"),
+            Err(Error::Constraint(_))
+        ));
+        assert_eq!(
+            state.index_by_name(TableId::new(1), "by_key").unwrap().id,
+            IndexId::new(3)
+        );
+        state.delete_index(1, 3);
+        assert_eq!(
+            state
+                .index_by_schema_name(SchemaId::new(0), "by_key")
+                .unwrap()
+                .unwrap()
+                .id,
+            IndexId::new(4)
         );
     }
 

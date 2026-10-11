@@ -122,8 +122,13 @@ Verbs on `Transaction`:
 | `create_index(table, name, columns, unique)` | Insert the definition; build entries for every live row (see Coverage) in the same commit. |
 | `drop_index(index)` | End the definition into `history`. Entries are orphaned and reclaimed lazily (see Reclamation). |
 
-`CatalogSnapshot` gains `indexes_of(table)`; domain types gain `IndexId` and
-`IndexInfo`.
+`CatalogSnapshot` exposes `indexes_of(table)` and
+`index_by_schema_name(schema, name)`; domain types include `IndexId` and
+`IndexInfo`. New index names are case-insensitively unique within a schema,
+checked inside the creation commit for both SQL and embedding callers.
+The physical definition remains table-scoped. Older catalogs with duplicate
+names remain readable; schema-level resolution refuses ambiguity, and the
+existing table-qualified operations can remove the duplicates.
 
 **Commit classification.** Index DDL is recorded in `changes_made` as
 `altered_table:<table_id>` — DuckLake's parser throws on unknown kinds
@@ -1802,15 +1807,43 @@ stamp, per the existing posture.
 ### Extension path: SQL surface and the scoped read
 
 moraine is DuckLake's metadata catalog, not the catalog that owns user tables
-(RFC 0006). `CREATE INDEX` and `PRIMARY KEY`/`UNIQUE` on a DuckLake table die
-in DuckLake's own binder (`NotImplementedException`) before moraine is
-consulted, so DuckLake-native syntax is not moraine's to offer. The extension
-path instead ships its own surface over the same native index and covers
-DuckLake's writes itself.
+(RFC 0006). DuckLake rejects index DDL, but DuckDB offers failed binding to
+`OperatorExtension`. Moraine handles `CREATE INDEX`, `CREATE UNIQUE INDEX`,
+and `DROP INDEX` there for Moraine-backed lakes. A `PlannerExtension`
+post-bind callback handles `DROP INDEX IF EXISTS`, which can otherwise bind
+successfully without finding an index. Both paths use the same execution
+callbacks as the existing SQL functions; no DuckLake patch is added.
 
-**The SQL surface.** DuckDB's stable C API registers table functions (only
-catalog registration forces the C++ shim, RFC 0006), so the extension exposes
-the native index without touching DuckLake's binder:
+```sql
+CREATE UNIQUE INDEX by_id ON lake.main.users(id);
+CREATE INDEX IF NOT EXISTS by_region ON lake.main.users(region)
+    WITH (staged = true, step_entries = 100000);
+DROP INDEX IF EXISTS lake.main.by_region;
+```
+
+Native DDL requires autocommit and a writable lake. The existing build engine
+commits independently; rejecting explicit transactions prevents a SQL rollback
+from falsely appearing to undo index DDL. Binding and ordinary `EXPLAIN` do
+not mutate indexes. Native DDL returns no result rows. `IF NOT EXISTS` tests
+the schema-level name and leaves an existing definition unchanged; repeating
+an interrupted staged create without that clause resumes its build.
+Use `catalog.schema.index` for DROP when a search path spans multiple schemas
+or catalogs; an unqualified Moraine index uses the current default schema.
+
+Native indexes accept stored column references and the options `staged`,
+`step_entries`, `step_bytes`, and `maintenance`. Expression and partial indexes
+are unsupported. DuckDB's parser currently discards per-column `ASC`/`DESC`
+and NULL-placement clauses, so native creation uses ascending / NULLS LAST;
+the table-qualified creation function remains available for explicit orders.
+`PRIMARY KEY` and table-level `UNIQUE` constraints remain unsupported.
+
+Rebuild currently means dropping and recreating the definition. It temporarily
+removes query acceleration and uniqueness enforcement, and the recreated index
+needs a new verification pass for certified optimizations. An online rebuild
+with an atomic replacement is separate from native DDL and is not implemented.
+
+**The table-qualified SQL surface.** Existing administration, introspection,
+verification, and explicit lookup functions remain available:
 
 Every function names its target by four leading positional strings —
 `catalog, schema, table, index` (`moraine_indexes` stops at the table) —
@@ -1842,8 +1875,8 @@ Each resolves the store handle from the attached catalog and the `table_id`
 from `ducklake_table`, then drives the same core verbs as the embedding API.
 The DDL functions commit autonomously — their own moraine commit, outside any
 enclosing DuckDB transaction — and race concurrent DuckLake commits through
-the ordinary `altered_table` conflict. Non-native syntax, explicit reads
-(below), but real without a DuckLake change.
+the ordinary `altered_table` conflict. Native DDL routes through the same
+implementation and rejects enclosing explicit transactions.
 
 The index read functions bind their arguments as constants, exactly as
 `moraine_index_in` binds `keys`, and resolve them against the snapshot the

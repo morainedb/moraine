@@ -95,10 +95,11 @@ Owner: [RFC 0013](rfcs/0013-partitioning-sorting-and-pruning.md).
 
 ### Provide supported native-index extension points
 
-DuckLake currently rejects `CREATE INDEX`, `PRIMARY KEY`, and `UNIQUE` in its
-binder and has no native index metadata. Moraine therefore exposes explicit
-`moraine_index_*` functions and performs index maintenance itself. Carrying a
-downstream binder and optimizer fork is not the intended integration path.
+DuckLake rejects `CREATE INDEX`, `PRIMARY KEY`, and `UNIQUE` in its binder and
+has no native index metadata. Moraine supplies `CREATE INDEX` / `CREATE UNIQUE
+INDEX` and `DROP INDEX` through DuckDB's existing operator and planner extension
+hooks, without patching DuckLake. Moraine owns index metadata and maintenance;
+the `moraine_index_*` functions remain available. Native DDL requires autocommit.
 
 The upstream request is a supported index contract covering:
 
@@ -111,8 +112,8 @@ The upstream request is a supported index contract covering:
 
 Once DuckLake defines that contract, moraine can map the upstream identifier
 through its reserved `ducklake_index_id` field and serve the same physical
-index through native syntax and optimizer pushdown. Index administration
-currently uses explicit SQL functions. Ordinary equality, `IN`, range, NULL,
+index through upstream metadata and optimizer pushdown. Native index DDL
+already routes to Moraine's implementation. Ordinary equality, `IN`, range, NULL,
 and composite-key predicates can already use Moraine indexes through its
 optimizer extension. Explicit lookup functions remain available, but application
 queries need not name the index.
