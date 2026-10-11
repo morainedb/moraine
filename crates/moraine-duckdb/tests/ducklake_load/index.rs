@@ -6,6 +6,7 @@ mod prepared;
 mod pushdown;
 mod schema_evolution;
 mod selective;
+mod verify;
 mod wide_filter;
 
 /// The equality-index SQL surface end to end: `moraine_index_create`

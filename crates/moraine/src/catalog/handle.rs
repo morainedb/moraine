@@ -6,6 +6,8 @@ mod index_build;
 mod index_lookup;
 mod index_probe_cache;
 mod index_read_scope;
+mod index_verify;
+pub use index_verify::IndexVerification;
 mod inline_scan;
 mod maintenance;
 mod revision_memo;

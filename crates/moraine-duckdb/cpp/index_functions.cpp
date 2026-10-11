@@ -886,6 +886,88 @@ bool IndexReadTable(const duckdb::TableFunction &function, const duckdb::Functio
 	return true;
 }
 
+// moraine_index_verify: recomputes the entries from the rows and reports the
+// difference. One row of counts; a clean index reports zeros for the last
+// three.
+
+struct IndexVerifyBindData : public duckdb::FunctionData {
+	std::string catalog_name;
+	std::string schema_name;
+	std::string table_name;
+	std::string index_name;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<IndexVerifyBindData>();
+		*result = *this;
+		return result;
+	}
+	bool Equals(const duckdb::FunctionData &other_p) const override {
+		auto &other = other_p.Cast<IndexVerifyBindData>();
+		return catalog_name == other.catalog_name && schema_name == other.schema_name &&
+		       table_name == other.table_name && index_name == other.index_name;
+	}
+};
+
+struct IndexVerifyGlobalState : public duckdb::GlobalTableFunctionState {
+	uint64_t stored = 0;
+	uint64_t expected = 0;
+	uint64_t missing = 0;
+	uint64_t dead = 0;
+	uint64_t mismatched = 0;
+	bool emitted = false;
+
+	duckdb::idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+// The pass runs once, at execution start, so a cancelled statement stops it
+// rather than a later chunk.
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexVerifyInitGlobal(
+    duckdb::ClientContext &context, duckdb::TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<IndexVerifyBindData>();
+	auto handle = ResolveHandle(context, bind_data.catalog_name);
+	auto state = duckdb::make_uniq<IndexVerifyGlobalState>();
+	MoraineError err {};
+	auto code = moraine_index_verify(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
+	                                 bind_data.index_name.c_str(), &state->stored, &state->expected,
+	                                 &state->missing, &state->dead, &state->mismatched,
+	                                 moraine_shim_is_interrupted, &context, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	return std::move(state);
+}
+
+void IndexVerifyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
+	auto &state = data.global_state->Cast<IndexVerifyGlobalState>();
+	if (state.emitted) {
+		output.SetChildCardinality(0);
+		return;
+	}
+	const uint64_t counts[] = {state.stored, state.expected, state.missing, state.dead, state.mismatched};
+	for (duckdb::idx_t column = 0; column < 5; column++) {
+		output.SetValue(column, 0, duckdb::Value::UBIGINT(counts[column]));
+	}
+	output.SetChildCardinality(1);
+	state.emitted = true;
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> VerifyBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
+                                                    duckdb::vector<duckdb::LogicalType> &return_types,
+                                                    duckdb::vector<duckdb::Identifier> &names) {
+	auto bind_data = duckdb::make_uniq<IndexVerifyBindData>();
+	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
+	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
+	bind_data->table_name = input.inputs[2].GetValue<std::string>();
+	bind_data->index_name = input.inputs[3].GetValue<std::string>();
+	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::UBIGINT};
+	names = {"stored", "expected", "missing", "dead", "mismatched"};
+	return bind_data;
+}
+
 void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	using duckdb::LogicalType;
 
@@ -932,6 +1014,12 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                         LookupImpl, InBind, LookupInitGlobal);
 	in.cardinality = ExactIndexCardinality<LookupBindData>;
 	loader.RegisterFunction(in);
+
+	duckdb::TableFunction verify("moraine_index_verify",
+	                             {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                              LogicalType::VARCHAR},
+	                             IndexVerifyImpl, VerifyBind, IndexVerifyInitGlobal);
+	loader.RegisterFunction(verify);
 
 	duckdb::TableFunction drop("moraine_index_drop",
 	                           {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
