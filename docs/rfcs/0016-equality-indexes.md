@@ -1413,6 +1413,10 @@ unless all of these hold, and leaves the ordinary plan alone when any fails:
 - nothing but projections sits between the delete and its scan. A filter,
   join or aggregate there is a predicate the index did not answer.
 
+The deletion-vector fallback preserves the existing operator; it does not
+add deletion-vector decoding to index upkeep, which currently requires
+Parquet delete files at commit.
+
 Positions are resolved against the scan's snapshot and the call names it, so
 DuckLake refuses them if its transaction has moved past that view.
 

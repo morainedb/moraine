@@ -38,6 +38,15 @@ fn a_certified_equality_delete_reads_nothing() {
     let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
     certified_table(&run);
 
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FROM duckdb_functions() WHERE function_name IN
+            ('moraine_rows_at', 'moraine_delete_located', 'moraine_update');"
+        )),
+        vec![vec!["0"]],
+        "the automatic rewrite must not restore public locator functions"
+    );
+
     let plan = run("EXPLAIN ANALYZE DELETE FROM lake.main.t WHERE a = 30001;");
     assert!(
         plan.contains("DUCKLAKE_DELETE_POSITIONS"),
@@ -290,7 +299,7 @@ fn deletes_preserve_existing_masks_and_local_rows() {
     );
 }
 
-/// Deletion-vector tables retain DuckLake's supported DELETE operator.
+/// Deletion-vector tables retain DuckLake's ordinary DELETE operator.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn deletion_vectors_keep_the_scan() {
@@ -305,9 +314,11 @@ fn deletion_vectors_keep_the_scan() {
     run("CALL ducklake_set_option('lake', 'write_deletion_vectors', true);");
     let plan = run("EXPLAIN DELETE FROM lake.main.t WHERE a = 30001;");
     assert!(!plan.contains("DUCKLAKE_DELETE_POSITIONS"), "{plan}");
+    // Index upkeep currently decodes Parquet delete files, so exercise
+    // the fallback before committing a deletion vector.
     assert_eq!(
-        csv_rows(&run("DELETE FROM lake.main.t WHERE a = 30001;
-        SELECT count(*) FROM lake.main.t WHERE a = 30001;")),
+        csv_rows(&run("BEGIN; DELETE FROM lake.main.t WHERE a = 30001;
+        SELECT count(*) FROM lake.main.t WHERE a = 30001; ROLLBACK;")),
         vec![vec!["0"]]
     );
 }

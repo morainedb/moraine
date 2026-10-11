@@ -20,9 +20,7 @@ fn the_row_scan_abi_is_one_arrow_cursor() {
         "moraine_rows_at_free(",
         "moraine_row_scan_next(",
         "moraine_rows_at_open(",
-        "moraine_locate_row_positions(",
         "moraine_commit_located_deletion(",
-        "MoraineLocatedFile",
     ] {
         assert!(!header.contains(removed), "withdrawn export: {removed}");
     }
@@ -30,6 +28,8 @@ fn the_row_scan_abi_is_one_arrow_cursor() {
         "moraine_row_scan_open(",
         "moraine_row_scan_next_arrow(",
         "moraine_row_scan_free(",
+        "moraine_locate_row_positions(",
+        "MoraineLocatedFile",
     ] {
         assert!(
             header.contains(retained),
