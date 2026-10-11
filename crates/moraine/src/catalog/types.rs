@@ -614,6 +614,11 @@ pub struct IndexInfo {
     pub maintenance: IndexMaintenance,
     /// The build lifecycle state.
     pub state: IndexState,
+    /// The snapshot a clean verifier pass agreed with the rows at. `None`
+    /// means no pass has agreed since the definition last changed — a
+    /// rebuild or a repair withdraws it, ordinary maintained writes do
+    /// not.
+    pub verified_at_snapshot: Option<SnapshotId>,
     /// Row-id watermark for manual steps and older builds. Streamed inline
     /// steps leave it unchanged until the inline leg completes, using a
     /// separate source checkpoint. Always `None` on a single-commit index.

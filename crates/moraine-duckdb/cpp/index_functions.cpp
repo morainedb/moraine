@@ -58,6 +58,8 @@ struct IndexesBindData : public duckdb::FunctionData {
 		bool unique;
 		bool building;
 		std::string state;
+		uint64_t certified_at;
+		bool has_certificate;
 	};
 	std::vector<Row> rows;
 
@@ -95,12 +97,13 @@ duckdb::unique_ptr<duckdb::FunctionData> IndexesBind(duckdb::ClientContext &cont
 	}
 	for (auto &desc : descs) {
 		bind_data->rows.push_back({static_cast<int64_t>(desc.index_id), std::string(desc.name), desc.unique,
-		                           desc.building, IndexStateName(desc.state)});
+		                           desc.building, IndexStateName(desc.state), desc.certified_at,
+		                           desc.has_certificate});
 	}
 
 	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN,
-	                duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::VARCHAR};
-	names = {"index_id", "index_name", "is_unique", "is_building", "state"};
+	                duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::UBIGINT};
+	names = {"index_id", "index_name", "is_unique", "is_building", "state", "certified_at"};
 	return bind_data;
 }
 
@@ -131,6 +134,8 @@ void IndexesImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 		output.SetValue(2, i, duckdb::Value::BOOLEAN(row.unique));
 		output.SetValue(3, i, duckdb::Value::BOOLEAN(row.building));
 		output.SetValue(4, i, duckdb::Value(row.state));
+		output.SetValue(5, i, row.has_certificate ? duckdb::Value::UBIGINT(row.certified_at)
+		                                          : duckdb::Value(duckdb::LogicalType::UBIGINT));
 	}
 	state.offset += count;
 	output.SetChildCardinality(count);
@@ -887,8 +892,10 @@ bool IndexReadTable(const duckdb::TableFunction &function, const duckdb::Functio
 }
 
 // moraine_index_verify: recomputes the entries from the rows and reports the
-// difference. One row of counts; a clean index reports zeros for the last
-// three.
+// difference. One row of counts, then the snapshot the index is certified
+// at, NULL when it is not. A clean index reports zeros for missing, dead
+// and mismatched. A read-write attach records the outcome; a read-only one
+// reports without writing.
 
 struct IndexVerifyBindData : public duckdb::FunctionData {
 	std::string catalog_name;
@@ -909,11 +916,7 @@ struct IndexVerifyBindData : public duckdb::FunctionData {
 };
 
 struct IndexVerifyGlobalState : public duckdb::GlobalTableFunctionState {
-	uint64_t stored = 0;
-	uint64_t expected = 0;
-	uint64_t missing = 0;
-	uint64_t dead = 0;
-	uint64_t mismatched = 0;
+	MoraineIndexVerification report {};
 	bool emitted = false;
 
 	duckdb::idx_t MaxThreads() const override {
@@ -930,8 +933,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexVerifyInitGlobal(
 	auto state = duckdb::make_uniq<IndexVerifyGlobalState>();
 	MoraineError err {};
 	auto code = moraine_index_verify(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
-	                                 bind_data.index_name.c_str(), &state->stored, &state->expected,
-	                                 &state->missing, &state->dead, &state->mismatched,
+	                                 bind_data.index_name.c_str(), &state->report,
 	                                 moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -945,10 +947,13 @@ void IndexVerifyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, 
 		output.SetChildCardinality(0);
 		return;
 	}
-	const uint64_t counts[] = {state.stored, state.expected, state.missing, state.dead, state.mismatched};
+	auto &report = state.report;
+	const uint64_t counts[] = {report.stored, report.expected, report.missing, report.dead, report.mismatched};
 	for (duckdb::idx_t column = 0; column < 5; column++) {
 		output.SetValue(column, 0, duckdb::Value::UBIGINT(counts[column]));
 	}
+	output.SetValue(5, 0, report.has_certificate ? duckdb::Value::UBIGINT(report.certified_at)
+	                                             : duckdb::Value(duckdb::LogicalType::UBIGINT));
 	output.SetChildCardinality(1);
 	state.emitted = true;
 }
@@ -963,8 +968,8 @@ duckdb::unique_ptr<duckdb::FunctionData> VerifyBind(duckdb::ClientContext &, duc
 	bind_data->index_name = input.inputs[3].GetValue<std::string>();
 	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
 	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
-	                duckdb::LogicalType::UBIGINT};
-	names = {"stored", "expected", "missing", "dead", "mismatched"};
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
+	names = {"stored", "expected", "missing", "dead", "mismatched", "certified_at"};
 	return bind_data;
 }
 

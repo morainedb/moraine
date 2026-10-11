@@ -134,3 +134,47 @@ fn an_absent_index_is_refused() {
     );
     assert!(refused.contains("index by_b"), "got: {refused}");
 }
+
+/// A read-write attach records what the pass found: a clean index carries a
+/// certificate naming the snapshot it agreed at, `moraine_indexes` reports
+/// it, and a rebuild withdraws it.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn a_clean_pass_certifies_and_a_rebuild_withdraws() {
+    let store = TempDir::new("verify-certify-store");
+    let data = TempDir::new("verify-certify-data");
+    let options = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let result = run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &options,
+        "CREATE TABLE lake.main.t AS SELECT i a FROM range(600) r(i);
+         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         SELECT 'fresh', certified_at IS NULL FROM moraine_indexes('lake','main','t');
+         SELECT 'pass', missing, dead, mismatched, certified_at IS NOT NULL
+           FROM moraine_index_verify('lake','main','t','by_a');
+         SELECT 'listed', certified_at IS NOT NULL FROM moraine_indexes('lake','main','t');
+         DELETE FROM lake.main.t WHERE a < 10;
+         SELECT 'after_dml', certified_at IS NOT NULL FROM moraine_indexes('lake','main','t');
+         CALL moraine_index_drop('lake','main','t','by_a');
+         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         SELECT 'rebuilt', certified_at IS NULL FROM moraine_indexes('lake','main','t');",
+    );
+    assert!(result.lines().any(|line| line == "fresh,true"), "{result}");
+    assert!(
+        result.lines().any(|line| line == "pass,0,0,0,true"),
+        "{result}"
+    );
+    assert!(result.lines().any(|line| line == "listed,true"), "{result}");
+    assert!(
+        result.lines().any(|line| line == "after_dml,true"),
+        "a maintained DELETE keeps the certificate: {result}"
+    );
+    assert!(
+        result.lines().any(|line| line == "rebuilt,true"),
+        "{result}"
+    );
+}

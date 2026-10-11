@@ -190,6 +190,10 @@ message IndexValue {
   optional bool deferred_maintenance = 17;
   // Inline source checkpoint; independent of the row-id watermark.
   optional InlineBuildCursorValue build_inline_cursor = 18;
+  // The snapshot a clean verifier pass agreed with the rows at. Absent
+  // means no pass has agreed since the definition last changed, which is
+  // what a plan that would trust the index reads.
+  optional uint64 verified_at_snapshot = 19;
 }
 
 message InlineBuildCursorValue {
