@@ -258,6 +258,9 @@ repeating an interrupted staged create without `IF NOT EXISTS` resumes it.
 Expression indexes and table-level key constraints are unsupported.
 Qualify DROP targets as `catalog.schema.index` when using multiple schemas or
 catalogs; unqualified Moraine index names use the current default schema.
+For tables containing Parquet files, configure `META_DATA_PATH` to match
+`DATA_PATH` on the initial attach; Moraine records that root for later builds
+and index maintenance.
 
 Ordinary predicates choose eligible indexes automatically. `moraine_indexes`
 lists them; `moraine_index_verify` checks their contents and certifies a clean

@@ -386,13 +386,22 @@ impl Transaction {
     /// exist.
     /// Returns [`Error::AlreadyExists`] if a table with the same name
     /// already exists in the target schema (including this table itself
-    /// when the target is its current schema).
+    /// when the target is its current schema), or an index name collides
+    /// with one in the target schema.
     pub fn set_table_schema(&mut self, table: TableId, new_schema: SchemaId) -> Result<()> {
         if !self.state.schemas.contains_key(&new_schema.get()) {
             return Err(Error::NotFound(format!("schema {new_schema}")));
         }
         let value = self.live_table(table)?;
         self.relation_name_free(new_schema.get(), &value.table_name)?;
+        for index in self.indexes_of(table) {
+            if self
+                .index_by_schema_name(new_schema, &index.name)?
+                .is_some()
+            {
+                return Err(Error::AlreadyExists(format!("index {}", index.name)));
+            }
+        }
         self.state.put_table(TableValue {
             schema_id: new_schema.get(),
             begin_snapshot: self.new_snapshot_id,
