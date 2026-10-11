@@ -344,3 +344,40 @@ fn an_indexed_update_maintains_keys_and_row_ids() {
         assert!(result.lines().any(|line| line == expected), "{result}");
     }
 }
+
+/// A non-unique equality deletes every matching row across multiple files.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn a_non_unique_delete_spans_files() {
+    let store = TempDir::new("delete-rewrite-multiple-store");
+    let data = TempDir::new("delete-rewrite-multiple-data");
+    let meta = format!(
+        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    run("CREATE TABLE lake.main.t AS SELECT (i*7919)%1000 AS a,
+             repeat(md5(i::VARCHAR),6) AS b FROM range(50000) r(i);
+         INSERT INTO lake.main.t SELECT (i*7919)%1000,
+             repeat(md5(i::VARCHAR),6) FROM range(50000,100000) r(i);
+         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         SELECT * FROM moraine_index_verify('lake','main','t','by_a');");
+    assert_eq!(
+        csv_rows(&run("SELECT count(*), count(DISTINCT data_file_id)
+        FROM lake.main.t WHERE a = 1;")),
+        vec![vec!["100", "2"]]
+    );
+    let plan = run("EXPLAIN ANALYZE DELETE FROM lake.main.t WHERE a = 1;");
+    assert!(plan.contains("DUCKLAKE_DELETE_POSITIONS"), "{plan}");
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*), count(*) FILTER (WHERE a = 1) FROM lake.main.t;"
+        )),
+        vec![vec!["99900", "0"]]
+    );
+    assert_eq!(
+        csv_rows(&run("SELECT stored, expected, missing, dead, mismatched
+        FROM moraine_index_verify('lake','main','t','by_a');")),
+        vec![vec!["99900", "99900", "0", "0", "0"]]
+    );
+}
