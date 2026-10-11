@@ -6,10 +6,10 @@
 #include "catalog.hpp"
 #include "index_functions.hpp"
 #include "owned_array.hpp"
-#include "rows_at.hpp"
 #include "transaction_manager.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -24,6 +24,48 @@
 #include <set>
 
 namespace moraine_duckdb {
+
+namespace {
+
+// Imports an Arrow batch the row scan exported as DuckDB chunks. Consumes
+// both structs, including when the import throws.
+std::vector<duckdb::unique_ptr<duckdb::DataChunk>> ImportLocatedBatch(duckdb::ClientContext &context,
+                                                                      ArrowSchema &c_schema, ArrowArray &c_array) {
+	duckdb::ArrowSchemaWrapper schema;
+	schema.arrow_schema = c_schema;
+	c_schema.release = nullptr;
+	auto chunk_wrapper = duckdb::make_uniq<duckdb::ArrowArrayWrapper>();
+	chunk_wrapper->arrow_array = c_array;
+	c_array.release = nullptr;
+
+	duckdb::ArrowTableSchema arrow_table;
+	duckdb::ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema.arrow_schema);
+	auto &columns = arrow_table.GetColumns();
+	duckdb::vector<duckdb::LogicalType> types;
+	for (duckdb::idx_t i = 0; i < columns.size(); i++) {
+		types.push_back(columns.at(i)->GetDuckType());
+	}
+	auto total = static_cast<duckdb::idx_t>(chunk_wrapper->arrow_array.length);
+	duckdb::ArrowScanLocalState scan_state(std::move(chunk_wrapper), context);
+	for (duckdb::idx_t i = 0; i < types.size(); i++) {
+		scan_state.column_ids.push_back(i);
+	}
+
+	std::vector<duckdb::unique_ptr<duckdb::DataChunk>> pieces;
+	while (scan_state.chunk_offset < total) {
+		auto size = std::min<duckdb::idx_t>(total - scan_state.chunk_offset, STANDARD_VECTOR_SIZE);
+		auto out = duckdb::make_uniq<duckdb::DataChunk>();
+		out->Initialize(context, types);
+		out->SetCardinality(size);
+		duckdb::ArrowTableFunction::ArrowToDuckDB(scan_state, columns, *out, /* arrow_scan_is_projected */ false);
+		pieces.push_back(std::move(out));
+		scan_state.chunk_offset += size;
+	}
+	return pieces;
+}
+
+} // namespace
+
 namespace {
 
 constexpr auto FILE_ID = duckdb::DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID;

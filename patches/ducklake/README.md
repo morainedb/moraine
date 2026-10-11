@@ -59,16 +59,14 @@ applies them) and then the series below, in file-name order:
    inlined file deletions below the inlining threshold, otherwise a new
    delete file that replaces the file's current one. `COMMIT` publishes
    these together with the transaction's other changes, and `ROLLBACK`
-   discards them and removes any file written. Moraine's
-   `moraine_delete_located` resolves row ids to positions through its
-   file-row summaries and rewrites itself into this call. The same patch
+   discards them and removes any file written. The same patch
    adds `ducklake_update_positions(catalog, schema, table, files,
    replacement, inlined_rows := [], snapshot := NULL)`: `replacement` is a
    `SELECT` producing the table's columns followed by each row's id, bound
    through DuckDB's binder and planned through the operators `UPDATE` uses
    in their row-id-writing mode, so the rows keep their ids, with the
    positional deletes staged once the rows are written, all in the current
-   transaction; `moraine_update` rewrites into it. Both functions also take
+   transaction. Both functions also take
    `positions_token`, an alternative to `files` and `inlined_rows` for a
    caller that would otherwise resolve positions while binding: the token is
    carried through the plan untouched and handed to the resolver an extension
@@ -90,6 +88,14 @@ output holds its rows' original ids under a start at the next free id, so
 either chains onto a neighbour and every row after a gap is renumbered
 onto ids other rows hold. The `merge_flushed_files_keep_row_ids` and
 `merge_updated_files_keep_row_ids` sqllogictests pin both shapes.
+
+`0005` currently has no caller: it was consumed by the located-change SQL
+verbs, and those were withdrawn in favour of a lookup joined to the table on
+`rowid` and `data_file_id`. It is retained rather than dropped because it is
+the capability DuckLake does not otherwise offer — naming rows by position
+from outside — and the planned rewrite of an indexed-equality `DELETE` into
+the positional path is its next consumer. Drop it only if that plan is
+abandoned.
 
 A later patch edits files an earlier one creates, so the series is applied in
 one `git apply` invocation rather than one per file.

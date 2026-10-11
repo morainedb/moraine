@@ -1190,4 +1190,6 @@ void MoraineCatalog::DropSchema(duckdb::ClientContext &, duckdb::DropInfo &) {
 	throw duckdb::NotImplementedException("moraine: dropping a schema is not supported (read-only catalog)");
 }
 
+
+
 } // namespace moraine_duckdb
