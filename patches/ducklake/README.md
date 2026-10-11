@@ -89,13 +89,11 @@ either chains onto a neighbour and every row after a gap is renumbered
 onto ids other rows hold. The `merge_flushed_files_keep_row_ids` and
 `merge_updated_files_keep_row_ids` sqllogictests pin both shapes.
 
-`0005` currently has no caller: it was consumed by the located-change SQL
-verbs, and those were withdrawn in favour of a lookup joined to the table on
-`rowid` and `data_file_id`. It is retained rather than dropped because it is
-the capability DuckLake does not otherwise offer — naming rows by position
-from outside — and the planned rewrite of an indexed-equality `DELETE` into
-the positional path is its next consumer. Drop it only if that plan is
-abandoned.
+`0005` supplies the positional DELETE used by the optimizer when a certified
+index answers the entire equality predicate. The public located-change SQL
+verbs remain withdrawn; ordinary `DELETE ... WHERE` selects this path without
+a caller naming row positions. UPDATE retains DuckLake's operator with
+index-derived scan filters.
 
 A later patch edits files an earlier one creates, so the series is applied in
 one `git apply` invocation rather than one per file.

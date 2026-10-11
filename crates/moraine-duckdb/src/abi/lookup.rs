@@ -347,19 +347,26 @@ pub unsafe extern "C" fn moraine_index_lookup_by_column(
     out_items: *mut *mut MoraineRowId,
     out_len: *mut usize,
     out_covered: *mut bool,
+    out_certified: *mut bool,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowId>, AbiError> {
-        if out_covered.is_null() {
-            return Err(AbiError::invalid_argument("`out_covered` is null"));
+        if out_covered.is_null() || out_certified.is_null() {
+            return Err(AbiError::invalid_argument(
+                "coverage output pointer is null",
+            ));
         }
         if value.is_null() {
             return Err(AbiError::invalid_argument("`value` is null"));
         }
-        // SAFETY: checked non-null above. Only a covered column raises it.
-        unsafe { *out_covered = false };
+        // SAFETY: checked non-null above. Only a covered column raises
+        // them, and only a verifier pass raises the second.
+        unsafe {
+            *out_covered = false;
+            *out_certified = false;
+        }
         // SAFETY: caller contract for the string pointers.
         let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
         // SAFETY: caller contract.
@@ -375,7 +382,10 @@ pub unsafe extern "C" fn moraine_index_lookup_by_column(
             return Ok(Vec::new());
         };
         // SAFETY: checked non-null above.
-        unsafe { *out_covered = true };
+        unsafe {
+            *out_covered = true;
+            *out_certified = index.verified_at_snapshot.is_some();
+        }
         let columns = snapshot.columns_of(table_id);
         // SAFETY: non-null checked; caller contract for the value's
         // string/bytes fields.

@@ -1371,6 +1371,68 @@ cancellation, and prepared-statement destruction. A deterministic concurrent
 commit between validation and execution must not mix scopes. Benchmarks report
 probe counts, validation time, prepare time, execution time, and retained bytes.
 
+### An indexed-equality DELETE needs no scan
+
+A `DELETE` whose whole predicate a certified index answers does not need to
+look at the table: the rows it would find are the rows the index reports. So
+the plan is replaced outright — `LOGICAL_DELETE` becomes a projection,
+carrying the delete's own table index so the parent's binding still
+resolves, over a `ducklake_delete_positions` call bound at post-optimize
+time. Physical planning never reaches DuckLake's delete operator, and no
+table scan survives. Position resolution can still read row-id or delete
+metadata; the absence of scan I/O is not a claim of zero object-store reads.
+
+Measured on 100,000 rows in two files, keys permuted so column statistics
+prune nothing, deleting one row by key:
+
+| how the row is named | files read | data read |
+| --- | --- | --- |
+| `WHERE a = k`, index not certified | 1 | 236.6 kB |
+| `WHERE a = k`, index certified | **0** | **nothing** |
+
+The second row's plan is a projection over `DUCKLAKE_DELETE_POSITIONS`, and
+`EXPLAIN ANALYZE` omits its `Data Read` line entirely, which it does only at
+zero scan bytes. It does not count reads made while resolving positions.
+
+This is the one rewrite that *replaces* predicate evaluation rather than
+narrowing it, which is why it reads the certificate (The certificate): a
+wrong entry here deletes a row rather than returning one. It declines
+unless all of these hold, and leaves the ordinary plan alone when any fails:
+
+- the index is certified, and `Ready`;
+- the scan pushed exactly one filter, so no residual predicate is lost —
+  there is nothing left to evaluate it;
+- the scan is at the transaction's snapshot, with no transaction-local
+  inserts, and the table is past the probe's size gate;
+- every resolved row sits in a committed file, since an inlined row's
+  deletion is counted in a second output column this projection does not
+  carry;
+- the table does not write deletion vectors, which the positional function
+  does not support;
+- there is no `RETURNING`, which DuckLake refuses on this path anyway;
+- nothing but projections sits between the delete and its scan. A filter,
+  join or aggregate there is a predicate the index did not answer.
+
+Positions are resolved against the scan's snapshot and the call names it, so
+DuckLake refuses them if its transaction has moved past that view.
+
+**UPDATE uses the automatic pushed-filter path.** DuckLake plans one
+as delete-plus-insert, so it must construct the replacement row; the
+pushed-filter rule narrows reads of the required columns to the holding file. On the
+same fixture, every form reads the same amount:
+
+| `UPDATE … SET b = 'z' WHERE a = k` | files read | data read |
+| --- | --- | --- |
+| predicate, index not certified | 1 | 236.6 kB |
+| predicate, index certified | 1 | 236.6 kB |
+| joined to a lookup on `rowid` — naming the row exactly | 1 | 236.6 kB |
+
+On this fixture, naming the row exactly reads what the predicate reads.
+This supports keeping the ordinary UPDATE operator, including its assignment
+and constraint semantics. It does not establish a lower bound for files with
+different page layouts; a positional UPDATE rewrite remains a possible future
+optimization for those files.
+
 ### Naming exact rows from SQL
 
 A lookup reports `(row_id, data_file_id)`, and both are columns a scan can
