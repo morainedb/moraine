@@ -1042,7 +1042,7 @@ impl Transaction {
         at: Option<SnapshotId>,
     ) -> Result<()> {
         let (table_id, mut value) = self.live_index(index)?;
-        if value.build_state.is_some() {
+        if value.build_state.is_some() || value.poisoned == Some(true) {
             return Err(Error::Constraint(format!(
                 "index {index} is not ready; only a ready index can be verified"
             )));

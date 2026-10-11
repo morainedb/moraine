@@ -636,6 +636,16 @@ async fn certifying_records_only_a_clean_pass() {
         .await
         .unwrap();
     assert!(report.is_clean());
+    assert_eq!(report.certified_at.map(crate::SnapshotId::get), Some(at));
+    let read_report = catalog
+        .verify_index(table, "by_a", Some(store.clone()), "/lake/")
+        .await
+        .unwrap();
+    assert_eq!(read_report.certified_at, report.certified_at);
+    assert_eq!(
+        read_report.verified_at,
+        Some(catalog.snapshot().await.unwrap().current_snapshot().id)
+    );
     assert_eq!(
         catalog
             .snapshot()
@@ -743,5 +753,105 @@ async fn a_certificate_survives_dml_and_not_a_rebuild() {
         .await
         .unwrap();
     assert!(!certified(&catalog).await, "a rebuild withdraws it");
+    catalog.close().await.unwrap();
+}
+
+/// A definition changed after verification cannot inherit that evidence.
+#[tokio::test]
+async fn a_replaced_definition_rejects_stale_verification() {
+    let (catalog, table, info, store) = indexed_table().await;
+    let report = catalog
+        .verify_index(table, "by_a", Some(store.clone()), "/lake/")
+        .await
+        .unwrap();
+    catalog
+        .commit(|tx| {
+            tx.drop_index(info.id)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    catalog
+        .create_index_staged(
+            table,
+            &IndexDef {
+                name: "by_a".into(),
+                columns: vec![column],
+                unique: true,
+            },
+            &[],
+            Some(store),
+            "/lake/",
+            None,
+        )
+        .await
+        .unwrap();
+    let replacement = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .index_by_name(table, "by_a")
+        .unwrap();
+    let result = catalog
+        .commit(|tx| {
+            tx.record_index_verification(
+                replacement.id,
+                report.definition.unwrap(),
+                report.verified_at,
+            )
+        })
+        .await;
+    assert!(
+        matches!(result, Err(crate::Error::Constraint(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .index_by_name(table, "by_a")
+            .unwrap()
+            .verified_at_snapshot,
+        None
+    );
+    catalog.close().await.unwrap();
+}
+
+/// A poisoned finished build cannot be certified through the transaction API.
+#[tokio::test]
+async fn poisoned_indexes_reject_certificates() {
+    let (catalog, table, info, store) = indexed_table().await;
+    let report = catalog
+        .verify_index(table, "by_a", Some(store), "/lake/")
+        .await
+        .unwrap();
+    let mut snapshot = (*catalog.snapshot().await.unwrap()).clone();
+    snapshot
+        .indexes
+        .get_mut(&table.get())
+        .unwrap()
+        .get_mut(&info.id.get())
+        .unwrap()
+        .poisoned = Some(true);
+    let next = snapshot.current_snapshot().id.get() + 1;
+    let mut tx = crate::transaction::Transaction::new(snapshot, next);
+    let result =
+        tx.record_index_verification(info.id, report.definition.unwrap(), report.verified_at);
+    assert!(
+        matches!(result, Err(crate::Error::Constraint(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .index_by_name(table, "by_a")
+            .unwrap()
+            .verified_at_snapshot,
+        None
+    );
     catalog.close().await.unwrap();
 }

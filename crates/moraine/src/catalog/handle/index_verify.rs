@@ -47,6 +47,8 @@ pub struct IndexVerification {
     /// The index definition's version when the pass read it. A certificate
     /// is refused if the definition moved after this.
     pub definition: Option<crate::SnapshotId>,
+    /// The certificate observed in the same snapshot as the verified entries.
+    pub certified_at: Option<crate::SnapshotId>,
 }
 
 impl IndexVerification {
@@ -223,6 +225,7 @@ impl ReadOnlyCatalog {
                 stored: u64::try_from(stored.len()).unwrap_or(u64::MAX),
                 verified_at: Some(read_at),
                 definition,
+                certified_at: info.verified_at_snapshot,
                 ..IndexVerification::default()
             },
             stored,
@@ -296,7 +299,7 @@ impl Catalog {
         data_store: Option<DataStore>,
         data_prefix: &str,
     ) -> Result<IndexVerification> {
-        let report = self
+        let mut report = self
             .verify_index(table, index, data_store, data_prefix)
             .await?;
         let snapshot = self.snapshot().await?;
@@ -305,6 +308,7 @@ impl Catalog {
             .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
         let at = report.is_clean().then_some(report.verified_at).flatten();
         if info.verified_at_snapshot == at {
+            report.certified_at = at;
             return Ok(report);
         }
         let Some(observed) = report.definition else {
@@ -313,6 +317,7 @@ impl Catalog {
         let index_id = info.id;
         self.commit(move |tx| tx.record_index_verification(index_id, observed, at))
             .await?;
+        report.certified_at = at;
         Ok(report)
     }
 }

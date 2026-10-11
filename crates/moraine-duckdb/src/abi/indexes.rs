@@ -556,7 +556,6 @@ pub unsafe extern "C" fn moraine_index_verify(
         let data_store = handle_ref.data_store.clone();
         let prefix = handle_ref.data_prefix.clone();
         // A read-only attach reports; a writer records what it found.
-        let writable = handle_ref.catalog.writer().is_ok();
         let report = match handle_ref.catalog.writer() {
             Ok(catalog) => {
                 // SAFETY: caller contract for `probe`/`probe_ctx`.
@@ -583,15 +582,7 @@ pub unsafe extern "C" fn moraine_index_verify(
             }
         };
 
-        // A writer's certificate is what this pass just recorded; a
-        // read-only attach reports whatever the definition already held.
-        let certified = if writable {
-            report.is_clean().then_some(report.verified_at).flatten()
-        } else {
-            snapshot
-                .index_by_name(table_id, name)
-                .and_then(|info| info.verified_at_snapshot)
-        };
+        let certified = report.certified_at;
         // SAFETY: checked non-null above, writable per the caller contract.
         unsafe {
             out.write(MoraineIndexVerification {

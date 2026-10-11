@@ -53,27 +53,38 @@ fn a_maintained_index_verifies_clean_through_dml() {
     );
 }
 
-/// Verification reads: it commits nothing, so the lake's newest snapshot is
-/// the same before and after.
+/// Read-only verification reports agreement without recording a certificate.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn verification_commits_no_snapshot() {
+fn read_only_verification_commits_no_snapshot() {
     let store = TempDir::new("verify-readonly-store");
     let data = TempDir::new("verify-readonly-data");
     let options = format!(
         ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
         data.path().display()
     );
-    let result = run_ducklake_sql_with_options(
+    run_ducklake_sql_with_options(
         store.path(),
         data.path(),
         &options,
         "CREATE TABLE lake.main.t AS SELECT i a FROM range(500) r(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
-         SELECT 'before', max(snapshot_id) FROM ducklake_snapshots('lake');
-         SELECT 'verify', * FROM moraine_index_verify('lake','main','t','by_a');
-         SELECT 'after', max(snapshot_id) FROM ducklake_snapshots('lake');",
+         CALL moraine_index_create('lake','main','t','by_a',['a'],true);",
     );
+    let output = run_session_with_env(
+        &Attach::Moraine {
+            store_dir: store.path(),
+            data_path: data.path(),
+            options: &options,
+            read_only: true,
+        },
+        "SELECT 'before', max(snapshot_id) FROM ducklake_snapshots('lake');
+         SELECT 'verify', stored, expected, missing, dead, mismatched, certified_at IS NULL
+           FROM moraine_index_verify('lake','main','t','by_a');
+         SELECT 'after', max(snapshot_id) FROM ducklake_snapshots('lake');",
+        &[],
+    );
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let result = combined_output(&output);
     let snapshot = |label: &str| {
         result
             .lines()
@@ -83,7 +94,7 @@ fn verification_commits_no_snapshot() {
     assert!(
         result
             .lines()
-            .any(|line| line.starts_with("verify,500,500,0,0,0,")),
+            .any(|line| line == "verify,500,500,0,0,0,true"),
         "{result}"
     );
     assert_eq!(
