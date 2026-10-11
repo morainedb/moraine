@@ -1439,8 +1439,9 @@ wrong entry here deletes a row rather than returning one. It declines
 unless all of these hold, and leaves the ordinary plan alone when any fails:
 
 - the index is certified, and `Ready`;
-- the scan pushed exactly one filter, so no residual predicate is lost —
-  there is nothing left to evaluate it;
+- the index answers every pushed predicate exactly, including every column
+  of a composite key; optional hints and residual predicates cannot replace
+  predicate evaluation;
 - the scan is at the transaction's snapshot, with no transaction-local
   inserts, and the table is past the probe's size gate;
 - every resolved row sits in a committed file, which is the positional
@@ -1821,7 +1822,7 @@ written `…` below for brevity.
 | `moraine_index_in(…, keys)` | table function: row ids for the union of complete equality keys in `keys`. A single-column index takes a list of scalar values; a composite index takes a list of `row(...)` values in index-column order. Duplicate keys are one predicate, a key containing NULL matches no row, and an empty list returns no rows |
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
 | `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
-| `moraine_index_verify(catalog, schema, table, index)` | table function: recompute the index's entries from the live rows and report the difference — `stored`, `expected`, `missing`, `dead`, `mismatched`, then `certified_at` (the snapshot the index now stands certified at, NULL when it does not). A read-write attach records the outcome (The certificate); a read-only one reports without writing. Reads every live data file of the table, so it costs what the build costs; writes nothing and takes no snapshot, so a read-only attach may run it. A clean index reports `stored = expected` and zeros for the last three. Only a `ready` index can be verified: a build's entries are incomplete by design |
+| `moraine_index_verify(catalog, schema, table, index)` | table function: recompute the index's entries from the live rows and report the difference — `stored`, `expected`, `missing`, `dead`, `mismatched`, then `certified_at` (the snapshot the index now stands certified at, NULL when it does not). A read-write attach records the outcome (The certificate); a read-only one reports without writing. Reads every live data file of the table, so it costs what the build costs. A clean index reports `stored = expected` and zeros for the last three. Only a `ready` index can be verified: a build's entries are incomplete by design |
 | `moraine_indexes(catalog, schema, table)` | table function: index introspection — `index_id`, `index_name`, `is_unique`, `is_building`, `state` (`ready`\|`building`\|`maintaining`\|`poisoned`), and `certified_at` (The certificate) |
 
 `moraine_index_in` binds `keys` as one constant list value (including a
@@ -2122,11 +2123,10 @@ value, so an entry can be present under the right value and still point
 somewhere else — neither missing nor dead, and the one case a key-only diff
 would call clean.
 
-The pass reads, and only reads: no commit, no snapshot, and a read-only
-attach may run it. Its cost is the build's cost, and it holds the stored
-entry set in memory, which is the bound a single-commit backfill already
-accepts. A `building` index is refused rather than reported against, since
-its entries are incomplete by design.
+A read-write attach records certification after verification; a read-only
+attach reports counts without writing. Verification costs as much as a build
+and holds the stored entry set in memory. A `building` index is refused
+because its entries are incomplete by design.
 
 Three properties the counts give that nothing else does: a maintained index
 stays clean across insert, delete, update and compaction; a rebuild that
