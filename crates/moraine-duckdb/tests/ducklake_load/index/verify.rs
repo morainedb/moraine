@@ -28,21 +28,27 @@ fn a_maintained_index_verifies_clean_through_dml() {
     );
     // stored, expected, missing, dead, mismatched
     assert!(
-        result.lines().any(|line| line == "built,2000,2000,0,0,0"),
-        "{result}"
-    );
-    assert!(
-        result.lines().any(|line| line == "deleted,1900,1900,0,0,0"),
+        result
+            .lines()
+            .any(|line| line.starts_with("built,2000,2000,0,0,0,")),
         "{result}"
     );
     assert!(
         result
             .lines()
-            .any(|line| line == "inserted,1950,1950,0,0,0"),
+            .any(|line| line.starts_with("deleted,1900,1900,0,0,0,")),
         "{result}"
     );
     assert!(
-        result.lines().any(|line| line == "updated,1950,1950,0,0,0"),
+        result
+            .lines()
+            .any(|line| line.starts_with("inserted,1950,1950,0,0,0,")),
+        "{result}"
+    );
+    assert!(
+        result
+            .lines()
+            .any(|line| line.starts_with("updated,1950,1950,0,0,0,")),
         "{result}"
     );
 }
@@ -75,7 +81,9 @@ fn verification_commits_no_snapshot() {
             .unwrap_or_else(|| panic!("no {label} line in {result}"))
     };
     assert!(
-        result.lines().any(|line| line == "verify,500,500,0,0,0"),
+        result
+            .lines()
+            .any(|line| line.starts_with("verify,500,500,0,0,0,")),
         "{result}"
     );
     assert_eq!(
@@ -109,7 +117,9 @@ fn compaction_leaves_the_index_agreeing_with_the_rows() {
          SELECT 'compacted', * FROM moraine_index_verify('lake','main','t','by_a');",
     );
     assert!(
-        result.lines().any(|line| line == "compacted,600,600,0,0,0"),
+        result
+            .lines()
+            .any(|line| line.starts_with("compacted,600,600,0,0,0,")),
         "{result}"
     );
 }
