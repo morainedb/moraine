@@ -17,22 +17,57 @@ fn quoted(value: &str) -> String {
 }
 
 fn execute(cli: &Path, preamble: &str, sql: &str) -> anyhow::Result<String> {
-    let mut child = Command::new(cli)
+    let child = Command::new(cli)
         .args(["-unsigned", "-csv", "-bail"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut input = child.stdin.take().context("DuckDB stdin is unavailable")?;
-    writeln!(input, "{preamble}\n{sql}")?;
-    drop(input);
-    let output = child.wait_with_output()?;
+    let output = communicate(child, &format!("{preamble}\n{sql}\n"))?;
     ensure!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(String::from_utf8(output.stdout)?)
+}
+
+fn communicate(mut child: std::process::Child, sql: &str) -> anyhow::Result<std::process::Output> {
+    let mut input = child.stdin.take().context("DuckDB stdin is unavailable")?;
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || input.write_all(sql.as_bytes()));
+        let output = child.wait_with_output();
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("DuckDB stdin writer panicked"))??;
+        Ok(output?)
+    })
+}
+
+#[cfg(test)]
+mod pipe_tests {
+    use super::*;
+
+    #[test]
+    fn large_input_and_both_output_pipes_are_drained_together() {
+        let child = Command::new("tee")
+            .arg("/dev/stderr")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let sql = "x".repeat(1024 * 1024);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(communicate(child, &sql)).unwrap());
+        let output = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 1024 * 1024);
+        assert_eq!(output.stderr, output.stdout);
+    }
 }
 
 pub fn run(arguments: &[String]) -> anyhow::Result<()> {

@@ -12,6 +12,7 @@ pub(super) enum Probe {
     Many(Vec<CanonicalKey>),
     Range(Bound<CanonicalKey>, Bound<CanonicalKey>, bool),
     Nulls(CanonicalKey, bool),
+    Limited(Box<Self>, usize),
 }
 
 impl Probe {
@@ -27,6 +28,7 @@ impl Probe {
             }
             Self::Range(lower, upper, _) => bound_size(lower) + bound_size(upper),
             Self::Nulls(key, _) => key.retained_bytes(),
+            Self::Limited(probe, _) => size_of::<Self>() + probe.bytes(),
         }
     }
 }

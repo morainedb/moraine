@@ -901,9 +901,16 @@ pub(crate) async fn reclaim_entries_from(
 
 /// Drains a scan over `multi` entries into their row ids, which live in
 /// the key. `context` names the scan in a corruption error.
-async fn collect_multi_row_ids(iter: &mut slatedb::DbIterator, context: &str) -> Result<Vec<u64>> {
+async fn collect_multi_row_ids(
+    iter: &mut slatedb::DbIterator,
+    context: &str,
+    limit: usize,
+) -> Result<Vec<u64>> {
     let mut row_ids = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
+    while row_ids.len() < limit {
+        let Some(entry) = iter.next().await.map_err(Error::from)? else {
+            break;
+        };
         match Key::decode(&entry.key)? {
             Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
             other => {
@@ -925,6 +932,20 @@ pub(crate) async fn lookup_row_ids(
     unique: bool,
     key: &CanonicalKey,
 ) -> Result<Vec<u64>> {
+    lookup_row_ids_limited(reader, index_id, unique, key, usize::MAX).await
+}
+
+/// Reads at most `limit` entries for an optimizer equality probe.
+pub(crate) async fn lookup_row_ids_limited(
+    reader: ReadHandle<'_>,
+    index_id: u64,
+    unique: bool,
+    key: &CanonicalKey,
+    limit: usize,
+) -> Result<Vec<u64>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     if unique {
         let entry_key = encode_index_entry(index_id, true, key, 0);
         return match reader.get(entry_key).await.map_err(Error::from)? {
@@ -939,7 +960,7 @@ pub(crate) async fn lookup_row_ids(
         .await
         .map_err(Error::from)?;
 
-    collect_multi_row_ids(&mut iter, "index scan").await
+    collect_multi_row_ids(&mut iter, "index scan", limit).await
 }
 
 /// The row ids whose indexed value falls between `lower` and `upper`, in the
@@ -953,6 +974,28 @@ pub(crate) async fn range_row_ids(
     lower: Bound<CanonicalKey>,
     upper: Bound<CanonicalKey>,
     order: ScanOrder,
+) -> Result<Vec<u64>> {
+    range_row_ids_limited(
+        reader,
+        index_id,
+        unique,
+        leading_nulls,
+        (lower, upper),
+        order,
+        usize::MAX,
+    )
+    .await
+}
+
+/// Reads at most `limit` entries in a comparison range.
+pub(crate) async fn range_row_ids_limited(
+    reader: ReadHandle<'_>,
+    index_id: u64,
+    unique: bool,
+    leading_nulls: NullOrder,
+    (lower, upper): (Bound<CanonicalKey>, Bound<CanonicalKey>),
+    order: ScanOrder,
+    limit: usize,
 ) -> Result<Vec<u64>> {
     let kind = if unique {
         IndexKind::Unique
@@ -993,10 +1036,13 @@ pub(crate) async fn range_row_ids(
         .await
         .map_err(Error::from)?;
     if !unique {
-        return collect_multi_row_ids(&mut iter, "index range scan").await;
+        return collect_multi_row_ids(&mut iter, "index range scan", limit).await;
     }
     let mut row_ids = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
+    while row_ids.len() < limit {
+        let Some(entry) = iter.next().await.map_err(Error::from)? else {
+            break;
+        };
         row_ids.push(decode_row_id(entry.value.as_ref())?);
     }
 
@@ -1013,6 +1059,17 @@ pub(crate) async fn null_prefix_row_ids(
     prefix: &CanonicalKey,
     order: ScanOrder,
 ) -> Result<Vec<u64>> {
+    null_prefix_row_ids_limited(reader, index_id, prefix, order, usize::MAX).await
+}
+
+/// Reads at most `limit` entries from a NULL-bearing prefix.
+pub(crate) async fn null_prefix_row_ids_limited(
+    reader: ReadHandle<'_>,
+    index_id: u64,
+    prefix: &CanonicalKey,
+    order: ScanOrder,
+    limit: usize,
+) -> Result<Vec<u64>> {
     let mut scan_prefix = index_multi_value_prefix(index_id, prefix);
     // Dropping the exact-value terminator turns the bytes into a true
     // leading prefix.
@@ -1023,7 +1080,7 @@ pub(crate) async fn null_prefix_row_ids(
         .await
         .map_err(Error::from)?;
 
-    collect_multi_row_ids(&mut iter, "null-prefix scan").await
+    collect_multi_row_ids(&mut iter, "null-prefix scan", limit).await
 }
 
 #[cfg(test)]

@@ -6,6 +6,8 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "storage/ducklake_table_entry.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
@@ -191,6 +193,46 @@ bool TupleChoices(duckdb::ClientContext &context, const duckdb::Expression &expr
 }
 
 } // namespace
+
+void ExtractTuplePredicates(duckdb::ClientContext &context, const duckdb::Expression &expression,
+                            const duckdb::LogicalGet &get, const duckdb::DuckLakeTableEntry &table,
+                            PredicateArena &output) {
+	if (expression.GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : expression.Cast<duckdb::BoundConjunctionExpression>().GetChildren()) {
+			ExtractTuplePredicates(context, *child, get, table, output);
+		}
+		return;
+	}
+	const duckdb::Expression *subject = nullptr;
+	duckdb::vector<duckdb::Value> choices;
+	if (!TupleChoices(context, expression, subject, choices)) {
+		return;
+	}
+	auto &columns = subject->Cast<duckdb::BoundFunctionExpression>().GetChildren();
+	auto &column_ids = get.GetColumnIds();
+	for (duckdb::idx_t position = 0; position < columns.size(); position++) {
+		auto &binding = columns[position]->Cast<duckdb::BoundColumnRefExpression>().Binding();
+		if (binding.table_index != get.table_index || binding.column_index >= column_ids.size()) {
+			continue;
+		}
+		auto column = column_ids[binding.column_index].GetPrimaryIndex();
+		if (column >= table.GetColumns().PhysicalColumnCount()) {
+			continue;
+		}
+		duckdb::vector<duckdb::Value> values;
+		for (auto &choice : choices) {
+			auto &value = duckdb::StructValue::GetChildren(choice)[position];
+			if (value.IsNull()) {
+				values.clear();
+				break;
+			}
+			values.push_back(value);
+		}
+		if (!values.empty()) {
+			output.Add(table.GetFieldId(duckdb::PhysicalIndex(column)).GetFieldIndex().index, 0, values);
+		}
+	}
+}
 
 void ExposeTuplePredicates(duckdb::ClientContext &context, duckdb::LogicalOperator &plan) {
 	for (auto &child : plan.children) {

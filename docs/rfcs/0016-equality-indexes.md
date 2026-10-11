@@ -960,7 +960,9 @@ A certified full-key probe can also feed positional DELETE, but only if the
 entire scan predicate was translated and no residual operator survives.
 Tuple equality and tuple `IN` first expose implied per-column choices before
 DuckDB rewrites lists into joins. The original tuple predicate remains, rejecting
-cross-products and preserving row-NULL semantics.
+cross-products and preserving row-NULL semantics. A residual tuple filter directly
+above a scan also supplies its choices after optimization, so dense leading-column
+choices simplified to a range can still probe later composite columns.
 
 Range and NULL-prefix probes retain predicate evaluation. Optional filters may
 prune reads but cannot certify a DELETE rewrite.
@@ -2124,7 +2126,8 @@ somewhere else — neither missing nor dead, and the one case a key-only diff
 would call clean.
 
 A read-write attach records certification after verification; a read-only
-attach reports counts without writing. Verification costs as much as a build
+attach reports counts and the certificate from the same pinned snapshot without
+writing. A read-write invocation may commit a new certificate snapshot. Verification costs as much as a build
 and holds the stored entry set in memory. A `building` index is refused
 because its entries are incomplete by design.
 
@@ -2166,6 +2169,11 @@ and is refused if the definition moved in between. A rebuild landing
 between a pass and its commit must not inherit the pass's agreement.
 
 **What reads it.** Positional DELETE requires a certified exact probe.
+Each optimizer probe reads at most 4,097 entries, with at most 32 equality
+probes in flight. A combined result above 4,096 candidates cancels pending
+probes and declines the optimization before row location; explicit lookup functions remain
+unbounded. The cap applies across equality keys, ranges, and NULL prefixes.
+
 Ordinary selective scans retain their predicates and do not require a
 certificate. Verification is optional for index use, but required to omit
 predicate evaluation on the positional DELETE path.

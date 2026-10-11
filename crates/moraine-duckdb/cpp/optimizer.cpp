@@ -468,7 +468,8 @@ struct ResolvedPredicate {
 // leaves the scan unchanged.
 std::optional<ResolvedPredicate> ResolveIndexedPredicate(duckdb::ClientContext &context,
                                                        duckdb::Optimizer &optimizer,
-                                                       duckdb::LogicalGet &get) {
+                                                       duckdb::LogicalGet &get,
+                                                       duckdb::optional_ptr<duckdb::LogicalFilter> residual = nullptr) {
 	if (!get.function.GetDefinition() || get.function.GetDefinition()->name != "ducklake_scan") {
 		return std::nullopt;
 	}
@@ -533,6 +534,19 @@ std::optional<ResolvedPredicate> ResolveIndexedPredicate(duckdb::ClientContext &
 		} catch (const std::exception &) {
 			predicates.predicates.resize(previous);
 			complete = false;
+		}
+	}
+	if (residual) {
+		// DuckDB can turn a tuple's dense choices into a broad prefix range.
+		// Recover its discrete choices while retaining the tuple filter.
+		complete = false;
+		for (auto &expression : residual->expressions) {
+			auto previous = predicates.predicates.size();
+			try {
+				ExtractTuplePredicates(context, *expression, get, table, predicates);
+			} catch (const std::exception &) {
+				predicates.predicates.resize(previous);
+			}
 		}
 	}
 	if (predicates.predicates.empty()) {
@@ -785,7 +799,8 @@ bool RewriteDeleteByIndexedPredicate(duckdb::ClientContext &context, duckdb::Opt
 }
 
 void OptimizeIndexedPredicates(duckdb::ClientContext &context, duckdb::Optimizer &optimizer,
-                               duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
+                               duckdb::unique_ptr<duckdb::LogicalOperator> &plan,
+                               duckdb::optional_ptr<duckdb::LogicalFilter> residual = nullptr) {
 	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_DELETE && plan->children.size() == 1) {
 		auto scan = DeleteSourceScan(*plan->children[0]);
 		if (scan && scan->children.empty()) {
@@ -797,11 +812,13 @@ void OptimizeIndexedPredicates(duckdb::ClientContext &context, duckdb::Optimizer
 		}
 	}
 	for (auto &child : plan->children) {
-		OptimizeIndexedPredicates(context, optimizer, child);
+		OptimizeIndexedPredicates(context, optimizer, child,
+		                          plan->type == duckdb::LogicalOperatorType::LOGICAL_FILTER
+		                              ? &plan->Cast<duckdb::LogicalFilter>() : nullptr);
 	}
 	if (plan->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
 		auto &get = plan->Cast<duckdb::LogicalGet>();
-		auto found = ResolveIndexedPredicate(context, optimizer, get);
+		auto found = ResolveIndexedPredicate(context, optimizer, get, residual);
 		if (found) {
 			PruneScanByIndexedPredicate(context, get, *found);
 		}

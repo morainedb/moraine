@@ -2,7 +2,11 @@
 
 use std::ops::Bound;
 
-use super::ReadOnlyCatalog;
+use super::{ReadOnlyCatalog, index_lookup::encode_range_bounds, index_probe_cache::Probe};
+use crate::store::index_encoding::encode_ordered_values;
+
+/// Maximum candidates worth collecting during query planning.
+const MAX_PREDICATE_ROWS: usize = 4096;
 use crate::{CatalogSnapshot, ColumnId, IndexInfo, IndexKeyValue, IndexState, Result, TableId};
 
 /// A supported predicate on one stored column.
@@ -142,7 +146,8 @@ fn range_bound(
 impl ReadOnlyCatalog {
     /// Selects a ready index for a conjunction, returning candidates or `None`.
     /// Retain the original predicates unless `certified_exact` is true.
-    /// Call on a pinned read scope with that scope's snapshot.
+    /// Call on a pinned read scope with that scope's snapshot. Probes that
+    /// exceed 4,096 entries decline before row location.
     ///
     ///
     /// ```no_run
@@ -186,36 +191,58 @@ impl ReadOnlyCatalog {
             });
         let certified_exact =
             full_keys && plan.used == predicates.len() && plan.index.verified_at_snapshot.is_some();
-        let rows = if full_keys {
-            let keys = plan
-                .prefixes
-                .into_iter()
-                .map(|prefix| prefix.into_iter().flatten().collect())
-                .collect::<Vec<_>>();
-            self.index_lookup_many(table, plan.index.id, &keys).await?
+        let probes = if full_keys {
+            vec![Probe::Many(
+                plan.prefixes
+                    .iter()
+                    .map(|prefix| {
+                        encode_ordered_values(prefix, &plan.index.directions, &plan.index.nulls)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )]
         } else {
-            let mut rows = Vec::new();
-            for prefix in plan.prefixes {
-                let found = if prefix.iter().any(Option::is_none) {
-                    self.index_nulls(table, plan.index.id, prefix, false)
-                        .await?
-                } else {
-                    let prefix = prefix.into_iter().flatten().collect::<Vec<_>>();
-                    self.index_range(
-                        table,
-                        plan.index.id,
-                        range_bound(&prefix, plan.lower.as_ref()),
-                        range_bound(&prefix, plan.upper.as_ref()),
-                        false,
-                    )
-                    .await?
-                };
-                rows.extend(found);
-            }
-            rows.sort_unstable();
-            rows.dedup();
-            rows
+            plan.prefixes
+                .into_iter()
+                .map(|prefix| {
+                    if prefix.iter().any(Option::is_none) {
+                        Ok(Probe::Nulls(
+                            encode_ordered_values(
+                                &prefix,
+                                &plan.index.directions,
+                                &plan.index.nulls,
+                            )?,
+                            false,
+                        ))
+                    } else {
+                        let prefix = prefix.into_iter().flatten().collect::<Vec<_>>();
+                        let (lower, upper) = encode_range_bounds(
+                            &plan.index,
+                            plan.index.id,
+                            range_bound(&prefix, plan.lower.as_ref()),
+                            range_bound(&prefix, plan.upper.as_ref()),
+                        )?;
+                        Ok(Probe::Range(lower, upper, false))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
         };
+        let mut rows = Vec::new();
+        for probe in probes {
+            rows.extend(
+                self.probe_limited(
+                    table,
+                    plan.index.id,
+                    probe,
+                    MAX_PREDICATE_ROWS + 1 - rows.len(),
+                )
+                .await?,
+            );
+            if rows.len() > MAX_PREDICATE_ROWS {
+                return Ok(None);
+            }
+        }
+        rows.sort_unstable();
+        rows.dedup();
         Ok(Some(IndexPredicateRows {
             rows,
             certified_exact,

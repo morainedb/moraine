@@ -170,3 +170,63 @@ async fn a_unique_prefix_does_not_omit_null_bearing_trailing_keys() {
     drop(scope);
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn broad_predicates_decline_instead_of_collecting_all_matches() {
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let (table, a, b) = seed(&catalog, false).await;
+    let info = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .indexes_of(table)
+        .remove(0);
+    let transaction = catalog.begin_write_tx().await.unwrap();
+    for value in [Some(number(1)), None] {
+        for row_id in 100..5100 {
+            let (key, _) = crate::store::index_encoding::encode_ordered_index_entry(
+                &[Some(number(0)), value.clone()],
+                &info.directions,
+                &info.nulls,
+                info.id.get(),
+                false,
+                row_id,
+            )
+            .unwrap();
+            transaction.put(key, []).unwrap();
+        }
+    }
+    transaction.commit().await.unwrap();
+    let scope = catalog.index_read_scope().await.unwrap().unwrap();
+    let reads = scope.reads();
+    let snapshot = reads.snapshot().await.unwrap();
+    for comparisons in [
+        vec![(a, Any(vec![number(0)])), (b, Any(vec![number(1)]))],
+        vec![(a, Lower(number(0), true))],
+        vec![(a, Any(vec![number(0)])), (b, IsNull)],
+    ] {
+        let predicates = comparisons
+            .into_iter()
+            .map(|(column, comparison)| IndexPredicate { column, comparison })
+            .collect::<Vec<_>>();
+        assert!(
+            reads
+                .index_predicate_rows(&snapshot, table, &predicates)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(
+        reads
+            .index_lookup(table, info.id, &[number(0), number(1)])
+            .await
+            .unwrap()
+            .len()
+            > 4096
+    );
+    drop(scope);
+    catalog.close().await.unwrap();
+}
