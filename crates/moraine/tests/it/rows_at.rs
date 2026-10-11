@@ -383,10 +383,10 @@ async fn selective_cursor_projects_and_streams_exact_rows() {
     let positions = catalog
         .locate_row_positions_at(
             &snapshot,
-            Some(DataStore::new(data.clone())),
+            &DataStore::new(data.clone()),
             "",
             table,
-            &[(1, Some(file)), (9999, Some(file))],
+            &[(1, file), (9999, file)],
         )
         .await;
     assert!(matches!(
@@ -842,21 +842,18 @@ async fn an_older_snapshot_still_serves_a_row_deleted_later() {
     .await
     .unwrap();
     let positions_pinned = catalog
-        .locate_row_positions_at(&pinned, Some(store.clone()), "", table, &[(0, Some(file))])
+        .locate_row_positions_at(&pinned, &store, "", table, &[(0, file)])
         .await
         .unwrap();
     let positions_head = catalog
-        .locate_row_positions(Some(store), "", table, &[(0, Some(file))])
+        .locate_row_positions_at(&current, &store, "", table, &[(0, file)])
         .await
         .unwrap();
 
     assert_eq!(rows(&at_pinned), vec![(Some(10), 0, Some(file.get()))]);
     assert!(rows(&at_head).is_empty());
-    assert!(positions_pinned.deletions[0].existing_positions.is_none());
-    assert_eq!(
-        positions_head.deletions[0].existing_positions.clone(),
-        Some(vec![0])
-    );
+    assert!(positions_pinned[0].existing_positions.is_none());
+    assert_eq!(positions_head[0].existing_positions.clone(), Some(vec![0]));
     catalog.close().await.unwrap();
 }
 

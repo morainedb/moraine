@@ -14,6 +14,7 @@ fn the_row_scan_abi_is_one_arrow_cursor() {
     let header = include_str!("../../../cpp/moraine_abi.h");
     for removed in [
         "MoraineRowBatch",
+        "MorainePositionPair",
         "moraine_locate_row_positions_free_inlined(",
         "moraine_rows_at(",
         "moraine_rows_at_free(",

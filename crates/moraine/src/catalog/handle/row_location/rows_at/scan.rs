@@ -212,7 +212,7 @@ impl ReadOnlyCatalog {
         let requested = requested_columns(snapshot, table, columns)?;
         let read_metrics = self.data_read_metrics();
         let visible_at = snapshot.current_snapshot().id.get();
-        let (by_file, null_rows) = group_deduped_pairs(pairs);
+        let (by_file, null_rows) = group_deduped_pairs(pairs.iter().copied());
         let recent = self
             .requested_inline_recent_rows(table, &null_rows, Some(visible_at))
             .await?;

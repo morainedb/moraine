@@ -117,14 +117,9 @@ pub unsafe extern "C" fn moraine_locate_row_positions(
                 "positions require committed files",
             ));
         }
-        let pairs: Vec<(u64, Option<moraine::DataFileId>)> = raw_pairs
+        let pairs: Vec<_> = raw_pairs
             .iter()
-            .map(|pair| {
-                (
-                    pair.value,
-                    Some(moraine::DataFileId::new(pair.data_file_id)),
-                )
-            })
+            .map(|pair| (pair.value, moraine::DataFileId::new(pair.data_file_id)))
             .collect();
 
         let reads = handle_ref.catalog.reads();
@@ -132,7 +127,9 @@ pub unsafe extern "C" fn moraine_locate_row_positions(
         let view = unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, reads.snapshot()) }?;
         let table_id = resolve_table(&view, schema, table)?;
 
-        let data_store = handle_ref.data_store.clone();
+        let data_store = handle_ref.data_store.as_ref().ok_or_else(|| {
+            AbiError::invalid_argument("position resolution requires a data store")
+        })?;
         let locate = reads.locate_row_positions_at(
             &view,
             data_store,
@@ -141,9 +138,7 @@ pub unsafe extern "C" fn moraine_locate_row_positions(
             &pairs,
         );
         // SAFETY: caller contract for `probe`/`probe_ctx`.
-        let located = unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, locate) }?;
-
-        Ok(located.deletions)
+        unsafe { handle_ref.block_on_cancellable(probe, probe_ctx, locate) }
     };
 
     // SAFETY: `err` validity is this function's own safety contract.

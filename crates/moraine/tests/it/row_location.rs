@@ -609,7 +609,7 @@ async fn data_store_reads_land_in_the_handles_tally() {
     catalog.close().await.unwrap();
 }
 
-// `ReadOnlyCatalog::locate_row_positions`: exact-or-failed resolution of
+// `ReadOnlyCatalog::locate_row_positions_at`: exact-or-failed resolution of
 // located rows to `(data_file_id, position)`, for deletion without a scan.
 mod locate_row_positions {
     use super::*;
@@ -622,9 +622,7 @@ mod locate_row_positions {
     }
 
     /// A table with a dense file (row ids `0..3`) and a rewrite file whose
-    /// embedded ids form two ascending runs (`[50,51,52,10,11]`), plus 8
-    /// inlined rows allocated after both (ids `8..16`). Returns the two
-    /// data-file ids alongside the table.
+    /// embedded ids form two ascending runs (`[50,51,52,10,11]`).
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn fixture(catalog: &Catalog, data: &InMemory) -> (TableId, DataFileId, DataFileId) {
         let (dense_size, dense_footer) =
@@ -657,16 +655,6 @@ mod locate_row_positions {
                         file_size_bytes: rewrite_size,
                         footer_size: rewrite_footer,
                         ..datafile(5)
-                    },
-                    &[],
-                )?;
-                tx.inline_insert(
-                    table,
-                    &InlineChunk {
-                        schema_version: 0,
-                        arrow_schema: b"schema-v0".to_vec(),
-                        arrow_body: b"rows".to_vec(),
-                        row_count: 8,
                     },
                     &[],
                 )?;
@@ -753,11 +741,11 @@ mod locate_row_positions {
             .expect("a writer holds the store, so the scope pins a revision");
         let reads = scope.reads();
         let snapshot = reads.snapshot().await.unwrap();
-        let pairs = [(1, Some(dense_id)), (2, Some(dense_id))];
+        let pairs = [(1, dense_id), (2, dense_id)];
 
         // Resolve the pairs for the first time.
         reads
-            .locate_row_positions_at(&snapshot, Some(store.clone()), "", table, &pairs)
+            .locate_row_positions_at(&snapshot, &store, "", table, &pairs)
             .await
             .unwrap();
         assert_eq!(
@@ -768,7 +756,7 @@ mod locate_row_positions {
 
         // Resolve the same pairs again.
         reads
-            .locate_row_positions_at(&snapshot, Some(store), "", table, &pairs)
+            .locate_row_positions_at(&snapshot, &store, "", table, &pairs)
             .await
             .unwrap();
         assert_eq!(
@@ -794,7 +782,13 @@ mod locate_row_positions {
         assert_eq!(before.data_gets, 0, "nothing has read a data file yet");
 
         catalog
-            .locate_row_positions(Some(store), "", table, &[(1, Some(dense_id))])
+            .locate_row_positions_at(
+                &catalog.snapshot().await.unwrap(),
+                &store,
+                "",
+                table,
+                &[(1, dense_id)],
+            )
             .await
             .unwrap();
 
@@ -813,35 +807,33 @@ mod locate_row_positions {
     }
 
     #[tokio::test]
-    async fn a_dense_file_a_rewrite_file_and_an_inlined_row_all_position_exactly() {
+    async fn dense_and_rewritten_files_position_exactly() {
         let catalog = open_memory().await;
         let data = Arc::new(InMemory::new());
         let store = DataStore::new(data.clone());
         let (table, dense_id, rewrite_id) = fixture(&catalog, &data).await;
 
         // Row 1 is the dense file's second row (position 1); row 11 is the
-        // rewrite file's last embedded id (position 4); row 9 is inlined.
+        // rewrite file's last embedded id (position 4).
         let located = catalog
-            .locate_row_positions(
-                Some(store),
+            .locate_row_positions_at(
+                &catalog.snapshot().await.unwrap(),
+                &store,
                 "",
                 table,
-                &[(1, Some(dense_id)), (11, Some(rewrite_id)), (9, None)],
+                &[(1, dense_id), (11, rewrite_id)],
             )
             .await
             .unwrap();
 
-        assert_eq!(located.inlined_rows, vec![9]);
-        assert_eq!(located.deletions.len(), 2);
+        assert_eq!(located.len(), 2);
         let dense = located
-            .deletions
             .iter()
             .find(|deletion| deletion.data_file_id == dense_id)
             .unwrap();
         assert_eq!(dense.positions, vec![1]);
         assert!(dense.existing_positions.is_none());
         let rewrite = located
-            .deletions
             .iter()
             .find(|deletion| deletion.data_file_id == rewrite_id)
             .unwrap();
@@ -859,7 +851,13 @@ mod locate_row_positions {
 
         // Row 1 actually lives in the dense file, not the rewrite file.
         let result = catalog
-            .locate_row_positions(Some(store), "", table, &[(1, Some(rewrite_id))])
+            .locate_row_positions_at(
+                &catalog.snapshot().await.unwrap(),
+                &store,
+                "",
+                table,
+                &[(1, rewrite_id)],
+            )
             .await;
 
         assert!(
@@ -877,41 +875,17 @@ mod locate_row_positions {
         let (table, _dense_id, _rewrite_id) = fixture(&catalog, &data).await;
 
         let result = catalog
-            .locate_row_positions(
-                Some(store),
+            .locate_row_positions_at(
+                &catalog.snapshot().await.unwrap(),
+                &store,
                 "",
                 table,
-                &[(1, Some(DataFileId::new(999_999)))],
+                &[(1, DataFileId::new(999_999))],
             )
             .await;
 
         assert!(
             matches!(result, Err(Error::RowPosition { row_id: 1, .. })),
-            "expected a typed RowPosition error, got {result:?}"
-        );
-        catalog.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_null_pair_for_a_row_that_is_not_inlined_is_a_typed_error() {
-        let catalog = open_memory().await;
-        let data = Arc::new(InMemory::new());
-        let store = DataStore::new(data.clone());
-        let (table, _dense_id, _rewrite_id) = fixture(&catalog, &data).await;
-
-        let result = catalog
-            .locate_row_positions(Some(store), "", table, &[(9999, None)])
-            .await;
-
-        assert!(
-            matches!(
-                result,
-                Err(Error::RowPosition {
-                    row_id: 9999,
-                    data_file_id: None,
-                    ..
-                })
-            ),
             "expected a typed RowPosition error, got {result:?}"
         );
         catalog.close().await.unwrap();
@@ -925,18 +899,18 @@ mod locate_row_positions {
         let (table, dense_id, _rewrite_id) = fixture(&catalog, &data).await;
 
         let located = catalog
-            .locate_row_positions(
-                Some(store),
+            .locate_row_positions_at(
+                &catalog.snapshot().await.unwrap(),
+                &store,
                 "",
                 table,
-                &[(1, Some(dense_id)), (1, Some(dense_id))],
+                &[(1, dense_id), (1, dense_id)],
             )
             .await
             .unwrap();
 
-        assert!(located.inlined_rows.is_empty());
-        assert_eq!(located.deletions.len(), 1);
-        assert_eq!(located.deletions[0].positions, vec![1]);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].positions, vec![1]);
         catalog.close().await.unwrap();
     }
 
@@ -973,12 +947,18 @@ mod locate_row_positions {
             .unwrap();
 
         let located = catalog
-            .locate_row_positions(Some(store), "", table, &[(1, Some(dense_id))])
+            .locate_row_positions_at(
+                &catalog.snapshot().await.unwrap(),
+                &store,
+                "",
+                table,
+                &[(1, dense_id)],
+            )
             .await
             .unwrap();
 
-        assert_eq!(located.deletions.len(), 1);
-        let existing = located.deletions[0].existing_positions.as_ref().unwrap();
+        assert_eq!(located.len(), 1);
+        let existing = located[0].existing_positions.as_ref().unwrap();
         assert_eq!(existing, &vec![0]);
         catalog.close().await.unwrap();
     }

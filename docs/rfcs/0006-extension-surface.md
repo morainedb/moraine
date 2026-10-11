@@ -1264,8 +1264,10 @@ exactly once; at EOF or on error it acquires no structs. Buffers outlive the
 cursor. `moraine_row_scan_is_selective` costs projected page coverage,
 `moraine_row_scan_parallelism` configures prefetch before iteration, and
 `moraine_row_scan_metrics` samples cursor-local I/O and decode/worker counters.
-`moraine_row_scan_open` is the only cursor the ABI opens. The strict
-whole-row cursor and standalone deletion commit were removed with the
+`moraine_row_scan_open` is the only cursor the ABI opens. Index lookups,
+selective scans, and DELETE positioning share `MoraineRowId`; the duplicate
+`MorainePositionPair` and the scan-opening forwarding wrapper are removed.
+The strict whole-row cursor and standalone deletion commit were removed with the
 located SQL verbs. The internal `moraine_locate_row_positions` instead
 accepts index hits in committed files, using the handle's pinned revision,
 and returns exact positions plus existing deletion masks for the automatic

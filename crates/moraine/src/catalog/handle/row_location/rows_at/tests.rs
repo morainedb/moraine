@@ -256,10 +256,16 @@ async fn scan_positions_do_not_materialize_unfiltered_deletes() {
     );
 
     let located = catalog
-        .locate_row_positions(Some(store), "", table, &pairs)
+        .locate_row_positions_at(
+            &catalog.snapshot().await.unwrap(),
+            &store,
+            "",
+            table,
+            &[(0, file), (1, file), (2, file)],
+        )
         .await
         .unwrap();
-    let existing = located.deletions[0].existing_positions.as_ref().unwrap();
+    let existing = located[0].existing_positions.as_ref().unwrap();
     assert_eq!(existing, &vec![1]);
     catalog.close().await.unwrap();
 }

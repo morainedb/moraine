@@ -1204,7 +1204,7 @@ pools.
 Parallel output has no file-order guarantee; an SQL ORDER BY remains authoritative.
 `files_read` counts opened data files for query profiles. A verified summary
 may disprove a conservative candidate; the selective reader omits that pair,
-while strict located-position APIs continue to reject absent pairs. The cursor
+while exact file-position resolution rejects absent pairs. The cursor
 refuses partially visible historical files; ordinary time-travel queries retain
 DuckLake's per-row insertion-snapshot filtering.
 
@@ -1373,7 +1373,14 @@ probe counts, validation time, prepare time, execution time, and retained bytes.
 
 ### An indexed-equality DELETE needs no scan
 
-The core exposes selective reads and exact position resolution. The retired
+The core exposes selective reads and exact position resolution.
+`locate_row_positions_at(snapshot, store, data_prefix, table, pairs)` takes
+an explicit snapshot, a data store, and `(row_id, DataFileId)` pairs, returning
+`Vec<LocatedDeletion>`. The head-snapshot wrapper and `LocatedPositions`
+container are removed; file positioning accepts no inline-row inputs or outputs.
+Inline reads remain part of the selective cursor.
+
+The retired
 locator verbs' `scan_rows_at_strict`, `commit_located_deletion`,
 `DeleteFileRegistration`, and `table_write_directory` are removed. Resolved
 file positions carry only the data-file ID, requested offsets, and optional
@@ -1382,7 +1389,8 @@ file IDs. DuckLake owns deletion staging, writing, and commit.
 
 The DuckLake patch retains file-position DELETE only. Its unused positional
 UPDATE, inline-row mutation argument, and deferred position-token resolver
-are removed. The optimizer resolves an equality once, offering its result
+are removed, including the transaction-side request registry, token counter,
+and lock. The optimizer resolves an equality once, offering its result
 to the DELETE rewrite and reusing it for scan pruning when rewriting declines.
 
 A `DELETE` whose whole predicate a certified index answers does not need to

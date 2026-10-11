@@ -31,9 +31,7 @@ pub use maintenance::{
     MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep,
 };
 use object_store::ObjectStore;
-pub use row_location::{
-    ExcludedPositions, LocatedDeletion, LocatedPositions, LocatedRowScan, RowSummaryPublish,
-};
+pub use row_location::{ExcludedPositions, LocatedDeletion, LocatedRowScan, RowSummaryPublish};
 use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
 use tokio::sync::watch;
 use tracing::{info, warn};

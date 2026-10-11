@@ -475,19 +475,6 @@ typedef struct MoraineLocatedFile {
   size_t existing_positions_len;
 } MoraineLocatedFile;
 
-// One `(row_id, data_file_id)` pair naming a row to read by position, as
-// an index lookup reports it. `has_data_file_id` false means the row's
-// file id is NULL — a live inlined row.
-typedef struct MorainePositionPair {
-  // The row id to position.
-  uint64_t row_id;
-  // The data file it was located in; meaningful only when
-  // `has_data_file_id`.
-  uint64_t data_file_id;
-  // Whether `data_file_id` names a file.
-  bool has_data_file_id;
-} MorainePositionPair;
-
 // File positions a selective scan treats as deleted on top of the
 // snapshot's own delete files: the caller's uncommitted deletions.
 typedef struct MoraineExcludedPositions {
@@ -2195,7 +2182,7 @@ int32_t moraine_row_scan_open(struct MoraineCatalogHandle *handle,
                               struct MoraineSnapshotHandle *snapshot,
                               const char *schema,
                               const char *table,
-                              const struct MorainePositionPair *pairs,
+                              const struct MoraineRowId *pairs,
                               size_t pairs_len,
                               const char *const *columns,
                               size_t columns_len,

@@ -38,19 +38,7 @@ pub struct LocatedDeletion {
     pub existing_positions: Option<Vec<u64>>,
 }
 
-/// What [`ReadOnlyCatalog::locate_row_positions`] resolved: one
-/// [`LocatedDeletion`] per data file carrying a requested row, the row ids
-/// resolved as live inlined rows.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct LocatedPositions {
-    /// Per-data-file located positions and any delete file already
-    /// registered against it.
-    pub deletions: Vec<LocatedDeletion>,
-    /// Row ids resolved as live inlined rows.
-    pub inlined_rows: Vec<u64>,
-}
-
-/// What [`ReadOnlyCatalog::locate_row_positions`] needs to resolve one
+/// What [`ReadOnlyCatalog::locate_row_positions_at`] needs to resolve one
 /// table's files against the data store, bundled to keep its helpers under
 /// the argument-count lint.
 struct LocationScope<'a> {
@@ -71,12 +59,12 @@ pub(super) struct PositionedFile {
 /// Deduplicates `pairs`, splitting them into rows grouped by named file and
 /// rows naming no file.
 fn group_deduped_pairs(
-    pairs: &[(u64, Option<DataFileId>)],
+    pairs: impl IntoIterator<Item = (u64, Option<DataFileId>)>,
 ) -> (HashMap<DataFileId, Vec<u64>>, Vec<u64>) {
     let mut seen = HashSet::new();
     let mut by_file: HashMap<DataFileId, Vec<u64>> = HashMap::new();
     let mut null_rows = Vec::new();
-    for &(row_id, data_file_id) in pairs {
+    for (row_id, data_file_id) in pairs {
         if !seen.insert((row_id, data_file_id)) {
             continue;
         }
@@ -411,109 +399,73 @@ impl ReadOnlyCatalog {
         Ok(located)
     }
 
-    /// Resolves located rows — `(row_id, data_file_id)` pairs, as a lookup
-    /// returns them — to their exact file positions at the head, for
-    /// deletion without a scan. [`Self::locate_row_positions_at`] pins the
-    /// view instead.
+    /// Resolves committed file rows to exact positions at `snapshot`.
+    /// Duplicate pairs collapse; existing delete offsets are returned per file.
+    /// Use a pinned read scope when concurrent commits are possible.
     ///
-    /// Position resolution inverts locating's contract: locating may
-    /// broaden, but a position may not, since a wrong position deletes a
-    /// different row. Every pair is exact-or-failed: a row a named file
-    /// does not hold, a file id absent from the head view, an unreadable
-    /// file, or a `None` file id whose row is not a live inlined row, all
-    /// fail the whole call rather than guess. `None`-file pairs whose row
-    /// is live inlined are returned as inlined row ids instead. Duplicate
-    /// pairs collapse to one answer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::NotFound`] if the table does not exist, a store
-    /// error if the head view or a named file cannot be read, or
-    /// [`Error::RowPosition`] for the first pair that cannot be positioned
-    /// exactly.
-    pub async fn locate_row_positions(
-        &self,
-        data_store: Option<DataStore>,
-        data_prefix: &str,
-        table: TableId,
-        pairs: &[(u64, Option<DataFileId>)],
-    ) -> Result<LocatedPositions> {
-        let snapshot = self.snapshot().await?;
-        self.locate_row_positions_at(&snapshot, data_store, data_prefix, table, pairs)
-            .await
-    }
-
-    /// [`Self::locate_row_positions`] against `snapshot` rather than the
-    /// head: files, delete files, and inlined rows are those visible there,
-    /// so a caller pinned to an older view positions what it can see.
+    /// ```no_run
+    /// # async fn locate(reads: &moraine::ReadOnlyCatalog, snapshot: &moraine::CatalogSnapshot,
+    /// # store: &moraine::DataStore, table: moraine::TableId, file: moraine::DataFileId)
+    /// # -> Result<(), moraine::Error> {
+    /// let files = reads
+    ///     .locate_row_positions_at(snapshot, store, "", table, &[(42, file)])
+    ///     .await?;
+    /// assert_eq!(files.len(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
-    ///
-    /// As [`Self::locate_row_positions`].
+    /// Returns [`Error::NotFound`] for an unknown table, a store error if a
+    /// named file cannot be read, or [`Error::RowPosition`] if a row or file
+    /// cannot be positioned exactly.
     pub async fn locate_row_positions_at(
         &self,
         snapshot: &CatalogSnapshot,
-        data_store: Option<DataStore>,
+        data_store: &DataStore,
         data_prefix: &str,
         table: TableId,
-        pairs: &[(u64, Option<DataFileId>)],
-    ) -> Result<LocatedPositions> {
+        pairs: &[(u64, DataFileId)],
+    ) -> Result<Vec<LocatedDeletion>> {
         if pairs.is_empty() {
-            return Ok(LocatedPositions::default());
+            return Ok(Vec::new());
         }
 
         let started = Instant::now();
-        let visible_at = snapshot.current_snapshot().id.get();
-        let (by_file, null_rows) = group_deduped_pairs(pairs);
+        let (by_file, _) = group_deduped_pairs(pairs.iter().map(|&(row, file)| (row, Some(file))));
         let requested_files_count = by_file.len();
-        let inlined_rows = self.resolve_inlined(table, null_rows, visible_at).await?;
-        let inlined_ms = milliseconds(started.elapsed());
+        let table_prefix = snapshot.table_data_prefix(table)?;
+        let requested_files = current_files_for(snapshot, table, &by_file)?;
 
-        let mut positioning_ms = 0;
-        let mut existing_ms = 0;
-        let mut deletions = Vec::new();
+        let scope = LocationScope {
+            store: data_store,
+            data_prefix,
+            table_prefix: &table_prefix,
+            table,
+            snapshot,
+        };
 
-        if !by_file.is_empty() {
-            let table_prefix = snapshot.table_data_prefix(table)?;
-            let requested_files = current_files_for(snapshot, table, &by_file)?;
+        let positioning_started = Instant::now();
+        let (positioned, _) = self
+            .position_requested_files(&scope, by_file, requested_files, MissingRows::Reject)
+            .await?;
+        let positioning_ms = milliseconds(positioning_started.elapsed());
 
-            let Some(store) = data_store else {
-                return Err(first_row_error(
-                    &by_file,
-                    requested_files[0].id,
-                    "no data store was supplied to read the file",
-                ));
-            };
-            let scope = LocationScope {
-                store: &store,
-                data_prefix,
-                table_prefix: &table_prefix,
-                table,
-                snapshot,
-            };
+        let existing_started = Instant::now();
+        let existing_deletes = self.existing_delete_files(&scope, &positioned).await;
+        let existing_ms = milliseconds(existing_started.elapsed());
 
-            let positioning_started = Instant::now();
-            let (positioned, _) = self
-                .position_requested_files(&scope, by_file, requested_files, MissingRows::Reject)
-                .await?;
-            positioning_ms = milliseconds(positioning_started.elapsed());
-
-            let existing_started = Instant::now();
-            let existing_deletes = self.existing_delete_files(&scope, &positioned).await;
-            existing_ms = milliseconds(existing_started.elapsed());
-
-            deletions = positioned
-                .into_iter()
-                .zip(existing_deletes)
-                .map(|(file, existing_delete)| {
-                    Ok(LocatedDeletion {
-                        data_file_id: file.data_file_id,
-                        positions: file.positions,
-                        existing_positions: existing_delete?,
-                    })
+        let deletions = positioned
+            .into_iter()
+            .zip(existing_deletes)
+            .map(|(file, existing_delete)| {
+                Ok(LocatedDeletion {
+                    data_file_id: file.data_file_id,
+                    positions: file.positions,
+                    existing_positions: existing_delete?,
                 })
-                .collect::<Result<Vec<_>>>()?;
-        }
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // `existing_positions` is the deletion backlog this call had to read
         // back to rewrite: it grows with the table's history, not with the
@@ -529,48 +481,15 @@ impl ReadOnlyCatalog {
         info!(
             table_id = table.get(),
             pairs = pairs.len(),
-            inlined = inlined_rows.len(),
             files = requested_files_count,
             existing_positions,
-            inlined_ms,
             positioning_ms,
             existing_ms,
             total_ms = milliseconds(started.elapsed()),
             "located row positions"
         );
 
-        Ok(LocatedPositions {
-            deletions,
-            inlined_rows,
-        })
-    }
-
-    /// Confirms every row naming no file is an inlined row live at
-    /// `visible_at`, failing typed on the first that is neither.
-    async fn resolve_inlined(
-        &self,
-        table: TableId,
-        null_rows: Vec<u64>,
-        visible_at: u64,
-    ) -> Result<Vec<u64>> {
-        if null_rows.is_empty() {
-            return Ok(null_rows);
-        }
-
-        let live = self
-            .requested_inline_row_ids(table, &null_rows, Some(visible_at))
-            .await?;
-        for &row_id in &null_rows {
-            if !live.contains(&row_id) {
-                return Err(Error::RowPosition {
-                    row_id,
-                    data_file_id: None,
-                    reason: "row is not a live inlined row".to_owned(),
-                });
-            }
-        }
-
-        Ok(null_rows)
+        Ok(deletions)
     }
 
     /// Reads each requested file's summary and positions its rows, in

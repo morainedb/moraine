@@ -107,7 +107,7 @@ struct SummaryScanBindData : duckdb::FunctionData {
 	uint64_t snapshot_id;
 	uint64_t table_id = 0;
 	double costing_ms = 0;
-	std::vector<MorainePositionPair> pairs;
+	std::vector<MoraineRowId> pairs;
 	// DuckLake's path for every data file the pairs name, keyed by file id,
 	// and the inlined tables the scan covers: the keys the transaction's own
 	// deletions are recorded under.
@@ -151,7 +151,7 @@ struct SummaryScanState : duckdb::GlobalTableFunctionState {
 struct LocalExclusions {
 	std::vector<std::pair<uint64_t, std::vector<uint64_t>>> positions;
 	std::vector<MoraineExcludedPositions> entries;
-	std::vector<MorainePositionPair> pairs;
+	std::vector<MoraineRowId> pairs;
 };
 
 LocalExclusions CollectLocalExclusions(duckdb::ClientContext &context, duckdb::DuckLakeTransaction &transaction,
@@ -193,7 +193,7 @@ LocalExclusions CollectLocalExclusions(duckdb::ClientContext &context, duckdb::D
 		}
 	}
 	for (auto &pair : bound.pairs) {
-		if (!pair.has_data_file_id && deleted_inlined.count(pair.row_id)) {
+		if (!pair.has_data_file_id && deleted_inlined.count(pair.value)) {
 			continue;
 		}
 		result.pairs.push_back(pair);
@@ -413,9 +413,7 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	}
 	bound->types = scan.returned_types;
 	bound->virtual_columns = scan.virtual_columns;
-	for (auto &row : rows) {
-		bound->pairs.push_back({row.value, row.data_file_id, row.has_data_file_id});
-	}
+	bound->pairs = rows;
 	// Transaction-local rows are never index hits, so the scan may skip the
 	// files and inlined data the transaction added; its deletions are
 	// subtracted at execution, which needs every named file's DuckLake path.
@@ -431,7 +429,7 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 			return false;
 		}
 	}
-	std::vector<MorainePositionPair> file_pairs;
+	std::vector<MoraineRowId> file_pairs;
 	for (auto &pair : bound->pairs) {
 		if (pair.has_data_file_id) {
 			file_pairs.push_back(pair);
