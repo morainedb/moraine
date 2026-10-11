@@ -29,6 +29,7 @@
 #include "index_functions.hpp"
 #include "owned_array.hpp"
 #include "summary_scan.hpp"
+#include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_scan.hpp"
 #include "storage/ducklake_stats.hpp"
