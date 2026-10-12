@@ -1456,6 +1456,36 @@ async fn inline_row_delete(catalog: &Catalog, snapshot_id: u64, row_id: u64) -> 
     tx.commit().await.map(|_| ())
 }
 
+/// Updates one inlined row the way DuckLake does: a tombstone and a
+/// re-insert under the same `row_id` in one commit.
+async fn inline_update(catalog: &Catalog, snapshot_id: u64, row_id: u64, value: i64) -> Result<()> {
+    let (_, batch) = bigint_batch(&[value]);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(catalog, db_tx);
+    tx.stage(RowOperation::InlineInlineDelete {
+        table_id: 1,
+        row_id,
+        end_snapshot: snapshot_id,
+    });
+    tx.stage(RowOperation::InlineInsert {
+        table_id: 1,
+        schema_version: 0,
+        begin_snapshot: snapshot_id,
+        row_id_start: row_id,
+        row_count: 1,
+        arrow_body: inline_body(&batch).into(),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(snapshot_id, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(snapshot_id, "inlined_insert:1"),
+    });
+    tx.commit().await.map(|_| ())
+}
+
 /// Deleting an inlined row removes its unique index entry, so the value
 /// is free to be inserted again — entries are live-only.
 #[tokio::test]
@@ -1592,6 +1622,43 @@ async fn inline_delete_and_reinsert_in_one_commit_admits_the_same_unique_value()
         index_entry_count(&catalog, true, index_id).await,
         1,
         "the reinserted value holds exactly one entry"
+    );
+}
+
+/// The removal derived from an UPDATE's own staged re-insert names the
+/// new value, which another live row may hold; that row keeps its entry
+/// and the update fails the constraint.
+#[tokio::test]
+async fn an_inlined_update_cannot_take_a_unique_value_another_row_holds() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+
+    inline_insert(&catalog, 3, 0, &[5, 7], true).await;
+
+    let err = inline_update(&catalog, 4, 0, 7).await.unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        2,
+        "both rows keep their entries"
+    );
+}
+
+/// A row an UPDATE re-inlined is covered by two chunks. Its later delete
+/// derives from both, and the superseded version's value may by then be
+/// held by another row, whose entry must survive.
+#[tokio::test]
+async fn deleting_an_updated_inline_row_keeps_a_value_another_row_took() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+
+    inline_insert(&catalog, 3, 0, &[5], true).await;
+    inline_update(&catalog, 4, 0, 6).await.unwrap();
+    inline_insert(&catalog, 5, 1, &[5], false).await;
+    inline_row_delete(&catalog, 6, 0).await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        1,
+        "the entry for the value row 0 gave up is still held by row 1"
     );
 }
 
@@ -8382,6 +8449,68 @@ async fn column_mapping_delete_reclaims_the_record_and_its_embedded_rows() {
             .is_empty(),
         "no mapping row may survive its record"
     );
+    catalog.close().await.unwrap();
+}
+
+/// A view held from before a mapping delete replays it from the
+/// changelog like any other record removal.
+#[tokio::test]
+async fn a_held_view_refreshes_across_a_column_mapping_delete() {
+    let catalog = open().await;
+    stage_mapping_batch(
+        &catalog,
+        1,
+        vec![
+            (TableKind::ColumnMapping, column_mapping_row(21, 1)),
+            (
+                TableKind::NameMapping,
+                name_mapping_row(21, 0, "payload", 1, None, false),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let behind = commit::materialize(ReadHandle::Tx(&tx), None)
+        .await
+        .unwrap();
+    tx.rollback();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::Delete {
+        table: TableKind::ColumnMapping,
+        cells: vec![Cell::U64(21), Cell::U64(1)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 11),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let handle = ReadHandle::Tx(&tx);
+    let refreshed = commit::refresh(handle, &behind)
+        .await
+        .unwrap()
+        .expect("a one-commit gap replays");
+    let full = commit::materialize(handle, None).await.unwrap();
+    tx.rollback();
+
+    assert!(
+        refreshed
+            .mappings
+            .get(&1)
+            .is_none_or(|per_table| !per_table.contains_key(&21)),
+        "the replayed view must drop the mapping"
+    );
+    assert_eq!(refreshed.snapshot, full.snapshot);
+    assert_eq!(refreshed.live_entity_count(), full.live_entity_count());
     catalog.close().await.unwrap();
 }
 

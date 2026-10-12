@@ -355,10 +355,10 @@ fn staged_scoped_entries(
         .collect()
 }
 
-/// A derived deletion names a row live at the base snapshot, whose unique
-/// entry can be held by no other row while the index is ready; it is
-/// staged without the guard read. A building or poisoned index may still
-/// hold the value for another row, so its deletions keep the guard.
+/// A file-derived deletion names a row live at the base snapshot, whose
+/// unique entry can be held by no other row while the index is ready; it
+/// is staged without the guard read. A building or poisoned index may
+/// still hold the value for another row, so its deletions keep the guard.
 pub(super) fn staged_scoped_entry(
     indexes: &[IndexInfo],
     entry: data_file::ScopedIndexEntry,
@@ -893,7 +893,14 @@ impl InlineDecodePlan {
             Some(&self.columns),
         )?;
         let delete = self.held.is_some();
-        staged_scoped_entries(&self.indexes.indexes, scoped, delete)
+        let mut entries = staged_scoped_entries(&self.indexes.indexes, scoped, delete)?;
+        // A chunk is selected by row-id range, not liveness: a superseded
+        // version of a row, or the commit's own re-insert of it, derives a
+        // removal whose value another live row may hold. Keep the guard.
+        for entry in &mut entries {
+            entry.known_held = false;
+        }
+        Ok(entries)
     }
 }
 

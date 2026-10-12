@@ -1102,6 +1102,15 @@ impl CatalogSnapshot {
         );
     }
 
+    pub(crate) fn remove_mapping(&mut self, table_id: u64, mapping_id: u64) {
+        remove_nested(
+            &mut self.mappings,
+            &mut self.nested_entity_count,
+            table_id,
+            &mapping_id,
+        );
+    }
+
     pub(crate) fn remove_tag(&mut self, object_id: u64) {
         self.tags.remove(&object_id);
     }
