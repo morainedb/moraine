@@ -92,7 +92,7 @@ mod tests {
     use crate::store::{
         index_encoding::CanonicalKey,
         key::{EntityKey, IndexKey},
-        proto::TableStatsValue,
+        proto::{SchemaValue, TableStatsValue},
         value::encode_value,
     };
 
@@ -123,6 +123,12 @@ mod tests {
             record_count: 11,
             ..TableStatsValue::default()
         };
+        let schema = SchemaValue {
+            schema_id: 7,
+            begin_snapshot: 1,
+            end_snapshot: Some(3),
+            ..SchemaValue::default()
+        };
         let writes = vec![
             (
                 Key::Sys(SysKey::Head).encode(),
@@ -140,8 +146,8 @@ mod tests {
                 Some(encode_value(&stats)),
             ),
             (
-                Key::history(EntityKey::TableStats { table_id: 7 }, 3).encode(),
-                Some(encode_value(&stats)),
+                Key::history(EntityKey::Schema { schema_id: 7 }, 3).encode(),
+                Some(encode_value(&schema)),
             ),
             (locator.encode(), Some(encode_value(&range))),
             (
@@ -177,11 +183,11 @@ mod tests {
         );
         assert_eq!(
             decoded[3].value().unwrap(),
-            Some(DecodedValue::Record(EntityRecord::TableStats(stats)))
+            Some(DecodedValue::Record(EntityRecord::Schema(schema)))
         );
         assert_eq!(
             decoded[3].key(),
-            &Key::history(EntityKey::TableStats { table_id: 7 }, 3)
+            &Key::history(EntityKey::Schema { schema_id: 7 }, 3)
         );
         assert_eq!(
             decoded[4].value().unwrap(),
