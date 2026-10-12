@@ -13,13 +13,9 @@ on:
 jobs:
   build:
     name: Build the extension (extension-ci-tools)
-    # `duckdb_version` is omitted, so the build takes the `duckdb`
-    # submodule as checked out — the commit .github/duckdb-versions pins,
-    # which has no release to check out by tag. `duckdb_tag` stamps the
-    # version string that submodule's build reports, and `ci_tools_version`
-    # names this same ref: it decides which distribution matrix the build
-    # is generated from, and a matrix from another ref omits fields this
-    # one's jobs read. `cargo xtask check-pins` enforces both.
+    # Omit duckdb_version to build the pinned submodule. The Makefile stamps
+    # duckdb_tag explicitly; test_config forwards it into Linux containers.
+    # ci_tools_version must match the reusable workflow's ref.
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@969bc76276acec1c0a3922ff500d2ec3a1a3b037
     with:
       extension_name: moraine
@@ -40,4 +36,4 @@ jobs:
         build/release/extension/moraine/moraine.duckdb_extension
       # Point ccache at the directory the Linux container already mounts and
       # caches; without it every build recompiles DuckDB from scratch.
-      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir"}}'
+      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir", "DUCKDB_TAG": "v2.0.0-dev0"}}'
