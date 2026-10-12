@@ -842,15 +842,8 @@ fn a_flushed_inline_table_deregisters_but_still_resolves() {
     assert_eq!(rows, vec![vec!["1", "NULL"], vec!["2", "b"]]);
 }
 
-/// A deregistered version whose columns duplicate a live one's collapses
-/// onto it, and the name still binds through the reference.
-///
-/// Adding a column and dropping it again is what makes that shape
-/// reachable end to end: each column change mints an inlined table, and
-/// the third has exactly the columns the first had, so the first's
-/// record has a twin to collapse onto while the second's does not. The
-/// store's format is the SQL-visible proof — a collapse stamps it, and
-/// nothing else here does.
+/// Deregistered duplicate and distinct schema versions still bind after
+/// flushing, and the surviving table retains every row.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_flushed_duplicate_schema_collapses_and_still_binds() {
@@ -916,9 +909,7 @@ fn a_flushed_duplicate_schema_collapses_and_still_binds() {
         "the two superseded versions must leave the registry, got {after:?}"
     );
 
-    // The inline inserts above already carry the chunk-identity floor,
-    // which subsumes this one, so the stamp cannot move here; what it must
-    // not do is sit below the shape the collapse just wrote.
+    // The format required at attach already includes schema references.
     let after_format = format("after the flush");
     assert!(
         after_format >= SCHEMA_REFERENCE_FORMAT,

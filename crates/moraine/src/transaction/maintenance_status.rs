@@ -11,7 +11,7 @@ use crate::{
         proto::{MaintenanceStatusPassValue, MaintenanceStatusStepValue},
         read, value,
     },
-    transaction::commit::{self, FORMAT_WITH_MAINTENANCE_STATUS, MAX_COMMIT_ATTEMPTS, StagedWrite},
+    transaction::commit::{self, MAX_COMMIT_ATTEMPTS, StagedWrite},
 };
 
 const RETAINED_PASSES: usize = 16;
@@ -42,10 +42,7 @@ pub(crate) async fn record(catalog: &Catalog, pass: MaintenanceStatusPass) -> Re
         }
 
         let tx = catalog.begin_write_tx().await?;
-        let (status, stamp) = futures::try_join!(
-            read::read_maintenance_status(ReadHandle::Tx(&tx)),
-            commit::format_stamp_to(&tx, catalog.projections(), FORMAT_WITH_MAINTENANCE_STATUS),
-        )?;
+        let status = read::read_maintenance_status(ReadHandle::Tx(&tx)).await?;
         let mut status = status.unwrap_or_default();
         status.passes.push(encoded.clone());
         if status.passes.len() > RETAINED_PASSES {
@@ -53,11 +50,10 @@ pub(crate) async fn record(catalog: &Catalog, pass: MaintenanceStatusPass) -> Re
             status.passes.drain(..remove);
         }
 
-        let mut writes: Vec<StagedWrite> = vec![(
+        let writes: Vec<StagedWrite> = vec![(
             Key::Sys(SysKey::MaintenanceStatus).encode(),
             Some(value::encode_value(&status)),
         )];
-        writes.extend(stamp);
         let staged = commit::stage_writes(&tx, &writes)?;
 
         match commit::commit_durable(tx, "maintenance status", staged, &durability).await {

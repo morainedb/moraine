@@ -10,7 +10,7 @@ use std::{
 };
 
 use moraine_duckdb::{
-    abi::{MoraineS3Config, moraine_attach, moraine_detach},
+    abi::{MoraineS3Config, moraine_attach_with_wal_store, moraine_detach},
     error::MoraineError,
     logging::{moraine_register_log_sink, moraine_unregister_log_sink},
     runtime::MoraineCatalogHandle,
@@ -44,7 +44,7 @@ fn attach_memory() -> *mut MoraineCatalogHandle {
     // SAFETY: all pointers are valid for this call; null s3/cache_dir/
     // data_path are the documented "none" cases.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             path.as_ptr(),
             std::ptr::null::<MoraineS3Config>(),
             false,
@@ -57,6 +57,8 @@ fn attach_memory() -> *mut MoraineCatalogHandle {
             0,
             0,
             false,
+            false,
+            std::ptr::null(),
             std::ptr::null(),
             std::ptr::null(),
             0,

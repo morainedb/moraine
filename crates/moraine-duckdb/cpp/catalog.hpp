@@ -178,7 +178,7 @@ private:
 	void EnsureViewsLoaded();
 };
 
-// A moraine-backed Catalog: ATTACH opens the store via moraine_attach;
+// A moraine-backed Catalog: ATTACH opens the store via moraine_attach_with_wal_store;
 // DETACH (or database shutdown) closes it via moraine_detach. Schema
 // lookup/enumeration delegate to the active transaction's cached
 // MoraineSchemaEntry set; every write path throws

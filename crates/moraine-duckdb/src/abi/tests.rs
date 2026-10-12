@@ -635,7 +635,7 @@ fn attach_refuses_a_conflicting_data_path() {
     let mut bad_err = MoraineError::default();
     // SAFETY: all pointers are valid C strings / local slots.
     let bad_code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -648,7 +648,9 @@ fn attach_refuses_a_conflicting_data_path() {
             0,
             0,
             false,
+            false,
             c_bad.as_ptr(),
+            ptr::null(),
             ptr::null(),
             0,
             None,
@@ -677,7 +679,7 @@ fn attach_refuses_a_conflicting_data_path() {
     let mut good_err = MoraineError::default();
     // SAFETY: all pointers are valid C strings / local slots.
     let good_code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -690,7 +692,9 @@ fn attach_refuses_a_conflicting_data_path() {
             0,
             0,
             false,
+            false,
             c_good.as_ptr(),
+            ptr::null(),
             ptr::null(),
             0,
             None,
@@ -722,7 +726,7 @@ fn maintain_reports_through_the_out_parameters() {
     let mut err = MoraineError::default();
     // SAFETY: all pointers are valid C strings / local slots.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -735,6 +739,8 @@ fn maintain_reports_through_the_out_parameters() {
             0,
             0,
             false,
+            false,
+            ptr::null(),
             ptr::null(),
             ptr::null(),
             0,
@@ -872,7 +878,7 @@ fn census_reports_every_subspace_through_the_abi() {
     let mut err = MoraineError::default();
     // SAFETY: all pointers are valid C strings / local slots.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -885,6 +891,8 @@ fn census_reports_every_subspace_through_the_abi() {
             0,
             0,
             false,
+            false,
+            ptr::null(),
             ptr::null(),
             ptr::null(),
             0,
@@ -972,7 +980,7 @@ fn compact_store_reports_rows_and_refuses_unknown_subspaces() {
     let mut err = MoraineError::default();
     // SAFETY: all pointers are valid C strings / local slots.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -985,6 +993,8 @@ fn compact_store_reports_rows_and_refuses_unknown_subspaces() {
             0,
             0,
             false,
+            false,
+            ptr::null(),
             ptr::null(),
             ptr::null(),
             0,
@@ -1124,7 +1134,7 @@ fn attach_refuses_a_data_path_containing_the_store() {
     let mut err = MoraineError::default();
     // SAFETY: all pointers are valid C strings / local slots.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -1137,7 +1147,9 @@ fn attach_refuses_a_data_path_containing_the_store() {
             0,
             0,
             false,
+            false,
             c_data.as_ptr(),
+            ptr::null(),
             ptr::null(),
             0,
             None,
@@ -1168,7 +1180,7 @@ fn attach_refuses_a_data_path_containing_the_store() {
     let mut ok_err = MoraineError::default();
     // SAFETY: all pointers are valid C strings / local slots.
     let ok_code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -1181,7 +1193,9 @@ fn attach_refuses_a_data_path_containing_the_store() {
             0,
             0,
             false,
+            false,
             c_safe.as_ptr(),
+            ptr::null(),
             ptr::null(),
             0,
             None,
@@ -1214,7 +1228,7 @@ fn attach_records_a_missing_data_path_then_fixes_it() {
     let mut first_err = MoraineError::default();
     // SAFETY: all pointers are valid C strings / local slots.
     let first_code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -1227,7 +1241,9 @@ fn attach_records_a_missing_data_path_then_fixes_it() {
             0,
             0,
             false,
+            false,
             c_first.as_ptr(),
+            ptr::null(),
             ptr::null(),
             0,
             None,
@@ -1252,7 +1268,7 @@ fn attach_records_a_missing_data_path_then_fixes_it() {
     let mut other_err = MoraineError::default();
     // SAFETY: all pointers are valid C strings / local slots.
     let other_code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -1265,7 +1281,9 @@ fn attach_records_a_missing_data_path_then_fixes_it() {
             0,
             0,
             false,
+            false,
             c_other.as_ptr(),
+            ptr::null(),
             ptr::null(),
             0,
             None,
@@ -1299,7 +1317,7 @@ fn read_only_attach_of_fresh_store_hints_read_write() {
     let mut err = MoraineError::default();
     // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             true,
@@ -1312,6 +1330,8 @@ fn read_only_attach_of_fresh_store_hints_read_write() {
             0,
             0,
             false,
+            false,
+            ptr::null(),
             ptr::null(),
             ptr::null(),
             0,
@@ -1352,7 +1372,7 @@ fn attach_encrypted_is_fixed_at_bootstrap_and_reported() {
     let mut err = MoraineError::default();
     // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -1365,6 +1385,8 @@ fn attach_encrypted_is_fixed_at_bootstrap_and_reported() {
             0,
             0,
             false,
+            false,
+            ptr::null(),
             ptr::null(),
             ptr::null(),
             0,
@@ -1503,35 +1525,12 @@ fn attach_snapshot_and_list_round_trip() {
     let view_sql = unsafe { CStr::from_ptr((*views).sql) }.to_str().unwrap();
     assert_eq!(view_sql, "select * from orders");
 
-    let mut files: *mut MoraineDataFileDesc = ptr::null_mut();
-    let mut files_len: usize = 0;
-    // SAFETY: `snapshot` is live; outputs are valid local slots.
-    let code = unsafe {
-        moraine_snapshot_data_files_of(
-            snapshot,
-            table_id,
-            &raw mut files,
-            &raw mut files_len,
-            &raw mut err,
-        )
-    };
-    assert_eq!(code, codes::OK);
-    assert_eq!(files_len, 1);
-    // SAFETY: just populated by `moraine_snapshot_data_files_of` above.
-    let file_path = unsafe { CStr::from_ptr((*files).path) }.to_str().unwrap();
-    assert_eq!(file_path, "orders/data-1.parquet");
-    // SAFETY: same as above.
-    assert_eq!(unsafe { (*files).record_count }, 10);
-    // SAFETY: same as above.
-    assert_eq!(unsafe { (*files).row_id_start }, 0);
-
     // SAFETY: each from its matching allocator; freed exactly once.
     unsafe {
         moraine_snapshot_schemas_free(schemas, schemas_len);
         moraine_snapshot_tables_in_free(tables, tables_len);
         moraine_snapshot_columns_of_free(columns, columns_len);
         moraine_snapshot_views_in_free(views, views_len);
-        moraine_snapshot_data_files_of_free(files, files_len);
         moraine_snapshot_free(snapshot);
         moraine_detach(handle);
     }
@@ -1607,86 +1606,6 @@ fn embedded_nul_in_catalog_data_reports_corruption() {
 }
 
 #[test]
-fn empty_table_lists_no_data_files() {
-    let dir = TempDir::new("empty-table");
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("test setup: build tokio runtime");
-    rt.block_on(async {
-        let store = Arc::new(
-            LocalFileSystem::new_with_prefix(dir.path()).expect("test setup: open local store"),
-        );
-        let catalog = moraine::Catalog::open(store, moraine::CatalogOptions::default())
-            .await
-            .expect("test setup: open catalog");
-        catalog
-            .commit(|tx| {
-                let schema = tx.create_schema("s")?;
-                tx.create_table(
-                    schema,
-                    "empty",
-                    &[ColumnDef {
-                        name: "id".into(),
-                        column_type: "BIGINT".into(),
-                        nulls_allowed: false,
-                        default_value: None,
-                        children: Vec::new(),
-                    }],
-                )?;
-                Ok(())
-            })
-            .await
-            .expect("test setup: commit fixtures");
-        catalog.close().await.expect("test setup: close catalog");
-    });
-
-    let handle = attach_ok(dir.path());
-    let mut snap: *mut MoraineSnapshotHandle = ptr::null_mut();
-    let mut err = MoraineError::default();
-    // SAFETY: `handle` is attached; `snapshot`/`err` are valid local slots.
-    let code =
-        unsafe { moraine_snapshot(handle, &raw mut snap, None, ptr::null_mut(), &raw mut err) };
-    assert_eq!(code, codes::OK);
-
-    let mut tables: *mut MoraineTableDesc = ptr::null_mut();
-    let mut tables_len: usize = 0;
-    // Schema `s` has id 1: bootstrap's `main` schema holds id 0.
-    //
-    // SAFETY: `snapshot` is live; outputs are valid local slots.
-    let code = unsafe {
-        moraine_snapshot_tables_in(snap, 1, &raw mut tables, &raw mut tables_len, &raw mut err)
-    };
-    assert_eq!(code, codes::OK);
-    assert_eq!(tables_len, 1);
-    // SAFETY: just populated by `moraine_snapshot_tables_in` above.
-    let table_id = unsafe { (*tables).id };
-
-    let mut files: *mut MoraineDataFileDesc = ptr::null_mut();
-    let mut files_len: usize = 0;
-    // SAFETY: `snapshot` is live; outputs are valid local slots.
-    let code = unsafe {
-        moraine_snapshot_data_files_of(
-            snap,
-            table_id,
-            &raw mut files,
-            &raw mut files_len,
-            &raw mut err,
-        )
-    };
-    assert_eq!(code, codes::OK);
-    assert_eq!(files_len, 0);
-
-    // SAFETY: each from its matching allocator; freed exactly once.
-    unsafe {
-        moraine_snapshot_tables_in_free(tables, tables_len);
-        moraine_snapshot_data_files_of_free(files, files_len);
-        moraine_snapshot_free(snap);
-        moraine_detach(handle);
-    }
-}
-
-#[test]
 fn attach_on_unwritable_path_reports_invalid_argument() {
     // A path nested under a file (not a directory) can never be
     // created: `create_dir_all` fails with `NotADirectory`/`ENOTDIR`.
@@ -1701,7 +1620,7 @@ fn attach_on_unwritable_path_reports_invalid_argument() {
     // SAFETY: `c_path` is a valid NUL-terminated C string; `handle`/`err`
     // are valid, writable local slots.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -1714,6 +1633,8 @@ fn attach_on_unwritable_path_reports_invalid_argument() {
             0,
             0,
             false,
+            false,
+            ptr::null(),
             ptr::null(),
             ptr::null(),
             0,
@@ -1746,7 +1667,7 @@ fn attach_rejects_unknown_store_scheme() {
     // SAFETY: `c_path` is a valid NUL-terminated C string; `s3` is null
     // (env-only); `handle`/`err` are valid, writable local slots.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -1759,6 +1680,8 @@ fn attach_rejects_unknown_store_scheme() {
             0,
             0,
             false,
+            false,
+            ptr::null(),
             ptr::null(),
             ptr::null(),
             0,
@@ -1810,7 +1733,7 @@ fn attach_null_path_reports_invalid_argument_without_crashing() {
     // SAFETY: a null `path` is exactly the input this test exercises;
     // `handle`/`err` are valid, writable local slots.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             ptr::null(),
             ptr::null(),
             false,
@@ -1823,6 +1746,8 @@ fn attach_null_path_reports_invalid_argument_without_crashing() {
             0,
             0,
             false,
+            false,
+            ptr::null(),
             ptr::null(),
             ptr::null(),
             0,
@@ -1876,7 +1801,6 @@ fn detach_and_frees_tolerate_null() {
         moraine_snapshot_tables_in_free(ptr::null_mut(), 0);
         moraine_snapshot_columns_of_free(ptr::null_mut(), 0);
         moraine_snapshot_views_in_free(ptr::null_mut(), 0);
-        moraine_snapshot_data_files_of_free(ptr::null_mut(), 0);
     }
 }
 
@@ -2247,7 +2171,7 @@ fn attach_is_cancelled_by_a_firing_probe() {
     // SAFETY: `c_path` is a valid C string, the out-params are local
     // slots, and `probe_always` accepts a null context.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -2260,6 +2184,8 @@ fn attach_is_cancelled_by_a_firing_probe() {
             0,
             0,
             false,
+            false,
+            ptr::null(),
             ptr::null(),
             ptr::null(),
             0,
@@ -2402,7 +2328,7 @@ fn an_attach_takes_the_write_admission_flag() {
         // local slots; null s3/data_path/checkpoint are the documented
         // "none" cases.
         let code = unsafe {
-            moraine_attach_with_cache_policy(
+            moraine_attach_with_wal_store(
                 c_path.as_ptr(),
                 ptr::null(),
                 false,
@@ -2416,6 +2342,7 @@ fn an_attach_takes_the_write_admission_flag() {
                 0,
                 cache_puts,
                 cache_compaction_puts,
+                ptr::null(),
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -2447,7 +2374,7 @@ fn an_attach_takes_a_bounded_disk_cache() {
     // slots; null s3/data_path/checkpoint are the documented "none"
     // cases.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -2460,6 +2387,8 @@ fn an_attach_takes_a_bounded_disk_cache() {
             0,
             0,
             false,
+            false,
+            ptr::null(),
             ptr::null(),
             ptr::null(),
             0,
@@ -2491,7 +2420,7 @@ fn a_second_attach_outlives_the_cache_builders_runtime() {
         // local slots; null s3/data_path/checkpoint are the documented
         // "none" cases.
         let code = unsafe {
-            moraine_attach(
+            moraine_attach_with_wal_store(
                 path.as_ptr(),
                 ptr::null(),
                 false,
@@ -2504,6 +2433,8 @@ fn a_second_attach_outlives_the_cache_builders_runtime() {
                 0,
                 0,
                 false,
+                false,
+                ptr::null(),
                 ptr::null(),
                 ptr::null(),
                 0,

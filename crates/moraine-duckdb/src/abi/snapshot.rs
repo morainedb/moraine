@@ -5,9 +5,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
-use super::{
-    borrow_str, free_array, free_c_string, guard, resolve_table, snapshot_list, to_c_string,
-};
+use super::{free_array, free_c_string, guard, snapshot_list, to_c_string};
 use crate::{
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle},
@@ -23,11 +21,12 @@ use crate::{
 ///
 /// # Safety
 ///
-/// `handle` must be a pointer previously returned by [`super::moraine_attach`]
-/// and not yet detached. `out` must be a valid, writable
-/// `*mut *mut MoraineSnapshotHandle`. `probe`, if non-null, must be safe
-/// to call with `probe_ctx` from any thread. `err`, if non-null, must be
-/// a valid, writable [`MoraineError`]. All for the duration of this call.
+/// `handle` must be a pointer previously returned by
+/// [`super::moraine_attach_with_wal_store`] and not yet detached. `out` must be
+/// a valid, writable `*mut *mut MoraineSnapshotHandle`. `probe`, if non-null,
+/// must be safe to call with `probe_ctx` from any thread. `err`, if non-null,
+/// must be a valid, writable [`MoraineError`]. All for the duration of this
+/// call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_snapshot(
     handle: *mut MoraineCatalogHandle,
@@ -386,133 +385,6 @@ pub unsafe extern "C" fn moraine_snapshot_views_in_free(items: *mut MoraineViewD
         }
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
-}
-
-/// One live data file, as returned by [`moraine_snapshot_data_files_of`].
-#[repr(C)]
-pub struct MoraineDataFileDesc {
-    /// The file's id.
-    pub id: u64,
-    /// Object-store path, owned — free via
-    /// [`moraine_snapshot_data_files_of_free`].
-    pub path: *mut c_char,
-    /// Whether `path` is relative to the table's location.
-    pub path_is_relative: bool,
-    /// Number of rows in the file.
-    pub record_count: u64,
-    /// Whether `row_id_start` is present (absent when the file's rows
-    /// carry explicit per-row ids, e.g. compaction outputs).
-    pub has_row_id_start: bool,
-    /// First row id of the file's dense per-table row-id range, valid
-    /// iff `has_row_id_start`.
-    pub row_id_start: u64,
-    /// Total file size in bytes.
-    pub file_size_bytes: u64,
-    /// Footer size in bytes.
-    pub footer_size: u64,
-}
-
-/// Lists the live data files of table `table_id` into
-/// `*out_items`/`*out_len`. An unknown `table_id` yields an empty array,
-/// not an error.
-///
-/// # Safety
-///
-/// Same pointer contract as [`moraine_snapshot_schemas`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_snapshot_data_files_of(
-    snapshot: *mut MoraineSnapshotHandle,
-    table_id: u64,
-    out_items: *mut *mut MoraineDataFileDesc,
-    out_len: *mut usize,
-    err: *mut MoraineError,
-) -> i32 {
-    // SAFETY: caller contract for the pointers.
-    unsafe {
-        snapshot_list(snapshot, out_items, out_len, err, |snapshot| {
-            let owned: Vec<(CString, moraine::DataFileInfo)> = snapshot
-                .data_files_of(moraine::TableId::new(table_id))
-                .into_iter()
-                .map(|mut f| Ok((to_c_string(std::mem::take(&mut f.path))?, f)))
-                .collect::<Result<_, AbiError>>()?;
-            Ok(owned
-                .into_iter()
-                .map(|(path, f)| MoraineDataFileDesc {
-                    id: f.id.get(),
-                    path: path.into_raw(),
-                    path_is_relative: f.path_is_relative,
-                    record_count: f.record_count,
-                    has_row_id_start: f.row_id_start.is_some(),
-                    row_id_start: f.row_id_start.unwrap_or_default(),
-                    file_size_bytes: f.file_size_bytes,
-                    footer_size: f.footer_size,
-                })
-                .collect())
-        })
-    }
-}
-
-/// Frees an array returned by [`moraine_snapshot_data_files_of`].
-///
-/// # Safety
-///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_snapshot_data_files_of`] call, not yet freed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_snapshot_data_files_of_free(
-    items: *mut MoraineDataFileDesc,
-    len: usize,
-) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |d| free_c_string(d.path));
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
-}
-
-/// Resolves `schema_name.table_name` to its table id in `snapshot`, written
-/// to `*out_table_id`.
-///
-/// # Safety
-///
-/// `snapshot` must point to a live [`MoraineSnapshotHandle`]; the names must
-/// be valid NUL-terminated strings; `out_table_id` must be non-null and
-/// writable; `err`, if non-null, must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_snapshot_resolve_table(
-    snapshot: *mut MoraineSnapshotHandle,
-    schema_name: *const c_char,
-    table_name: *const c_char,
-    out_table_id: *mut u64,
-    err: *mut MoraineError,
-) -> i32 {
-    let attempt = || -> Result<u64, AbiError> {
-        if snapshot.is_null() {
-            return Err(AbiError::invalid_argument("`snapshot` is null"));
-        }
-        if out_table_id.is_null() {
-            return Err(AbiError::invalid_argument("`out_table_id` is null"));
-        }
-        // SAFETY: caller contract for `snapshot`.
-        let snapshot = unsafe { &*snapshot };
-        // SAFETY: caller contract for the string pointers.
-        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
-        // SAFETY: caller contract.
-        let table = unsafe { borrow_str(table_name, "table_name") }?;
-        Ok(resolve_table(&snapshot.snapshot, schema, table)?.get())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(table_id) => {
-            // SAFETY: caller contract for `out_table_id`.
-            unsafe { *out_table_id = table_id };
-            codes::OK
-        }
-        Err(code) => code,
-    }
 }
 
 /// Writes the store stamp `snapshot` stands at: the head snapshot id and

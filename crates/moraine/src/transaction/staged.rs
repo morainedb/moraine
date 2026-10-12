@@ -1477,9 +1477,6 @@ impl StagedTransaction {
                 "a flush staged more than a commit's ceiling and was let through"
             );
         }
-        let mut uses_inline_chunk_directory = ops
-            .iter()
-            .any(|operation| matches!(operation, RowOperation::InlineInsert { .. }));
         let mut phases = CommitPhases::default();
 
         // The premise everything below stages against: the view a read
@@ -1512,17 +1509,12 @@ impl StagedTransaction {
         // poisoned definition rides the writes it produces.)
         let inline = async {
             let phase_started = Instant::now();
-            let (writes, uses_schema_reference, drained) = reporting_phase(
+            let (writes, drained) = reporting_phase(
                 "translate-inline",
                 translate_inline(&db_tx, &projections, &ops),
             )
             .await?;
-            Ok::<_, Error>((
-                writes,
-                uses_schema_reference,
-                drained,
-                phase_started.elapsed(),
-            ))
+            Ok::<_, Error>((writes, drained, phase_started.elapsed()))
         };
         let maintenance = async {
             let phase_started = Instant::now();
@@ -1541,21 +1533,17 @@ impl StagedTransaction {
             .await?;
             Ok::<_, Error>((entries, phase_started.elapsed()))
         };
-        let (inline_writes, uses_inline_schema_reference, drained, entries) =
-            match futures::try_join!(inline, maintenance) {
-                Ok((
-                    (inline_writes, uses_schema_reference, drained, inline_elapsed),
-                    (entries, maintenance_elapsed),
-                )) => {
-                    phases.inline = inline_elapsed;
-                    phases.index_maintenance = maintenance_elapsed;
-                    (inline_writes, uses_schema_reference, drained, entries)
-                }
-                Err(err) => {
-                    commit::rollback(db_tx);
-                    return Err(err);
-                }
-            };
+        let (inline_writes, drained, entries) = match futures::try_join!(inline, maintenance) {
+            Ok(((inline_writes, drained, inline_elapsed), (entries, maintenance_elapsed))) => {
+                phases.inline = inline_elapsed;
+                phases.index_maintenance = maintenance_elapsed;
+                (inline_writes, drained, entries)
+            }
+            Err(err) => {
+                commit::rollback(db_tx);
+                return Err(err);
+            }
+        };
         // Neither a flush nor a compaction derives entries, so this is
         // where their files are held to the rows they re-home.
         let held = async {
@@ -1588,7 +1576,6 @@ impl StagedTransaction {
             metrics: index_metrics,
         } = entries;
         phases.index_metrics = index_metrics;
-        uses_inline_chunk_directory |= !locator_writes.is_empty();
 
         // A head-preserving commit never marks a definition maintaining.
         let deferred_indexes = if mints_snapshot {
@@ -1598,19 +1585,8 @@ impl StagedTransaction {
         };
 
         let phase_started = Instant::now();
-        let wrote_inline = commit::InlineShapes {
-            chunk_directory: uses_inline_chunk_directory,
-            schema_reference: uses_inline_schema_reference,
-        };
-        match translate_batch(
-            base_ref,
-            &ops,
-            &poisoned,
-            &deferred,
-            mints_snapshot,
-            wrote_inline,
-        ) {
-            Ok((result_id, mut writes, translated_head_view, target_format)) => {
+        match translate_batch(base_ref, &ops, &poisoned, &deferred, mints_snapshot) {
+            Ok((result_id, mut writes, translated_head_view)) => {
                 phases.translate = phase_started.elapsed();
                 let phase_started = Instant::now();
                 // Directory repairs go ahead of the inline writes, so a
@@ -1619,25 +1595,14 @@ impl StagedTransaction {
                 // A maintenance batch stamps the head too, reusing the
                 // standing snapshot id.
                 writes.push(commit::head_stamp(result_id, base_ref.batch_seq));
-                let staged_bytes = match reporting_phase(
-                    "stage-batch",
-                    stage_batch(
-                        &db_tx,
-                        &projections,
-                        &mut writes,
-                        inline_writes,
-                        entry_bytes,
-                        target_format,
-                    ),
-                )
-                .await
-                {
-                    Ok(staged) => staged,
-                    Err(err) => {
-                        commit::rollback(db_tx);
-                        return Err(err);
-                    }
-                };
+                let staged_bytes =
+                    match stage_batch(&db_tx, &mut writes, inline_writes, entry_bytes) {
+                        Ok(staged) => staged,
+                        Err(err) => {
+                            commit::rollback(db_tx);
+                            return Err(err);
+                        }
+                    };
                 phases.stage = phase_started.elapsed();
                 // Landed off-task: the write cannot be retracted once
                 // issued, so a host interrupt races the wait, not the write.
@@ -1733,27 +1698,18 @@ pub struct CommitReport {
     pub staged_bytes: u64,
 }
 
-/// The writes a batch carries, the snapshot id it results in, and the
-/// format floor that resulting state owes. A snapshot-minting commit
-/// translates its operations and appends its own snapshot record; a
-/// maintenance one reuses the standing id and leaves index state alone.
+/// The resulting snapshot id, batch writes, and optional head view.
+/// Maintenance reuses the standing id and leaves index state alone.
 fn translate_batch(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     poisoned: &[u64],
     deferred: &[u64],
     mints_snapshot: bool,
-    wrote: commit::InlineShapes,
-) -> Result<(u64, Vec<commit::StagedWrite>, Option<CatalogSnapshot>, u64)> {
+) -> Result<(u64, Vec<commit::StagedWrite>, Option<CatalogSnapshot>)> {
     if !mints_snapshot {
-        return translate_maintenance(base, ops).map(|writes| {
-            (
-                base.snapshot.snapshot_id,
-                writes,
-                None,
-                commit::index_format(base).max(commit::inline_format(wrote)),
-            )
-        });
+        return translate_maintenance(base, ops)
+            .map(|writes| (base.snapshot.snapshot_id, writes, None));
     }
 
     let Translated {
@@ -1761,9 +1717,7 @@ fn translate_batch(
         mut writes,
         snapshot: snap,
         head_view: translated_head_view,
-        index_format,
     } = translate(base, ops, poisoned, deferred)?;
-    let target_format = index_format.max(commit::inline_format(wrote));
     // Derived before the snapshot record joins the batch: the changelog
     // names `current` keys, and that record is not.
     let changelog = commit::changelog_writes(new_id, &writes);
@@ -1779,25 +1733,20 @@ fn translate_batch(
         view.batch_seq = base.batch_seq.saturating_add(1);
         view
     });
-    Ok((new_id, writes, translated_head_view, target_format))
+    Ok((new_id, writes, translated_head_view))
 }
 
 /// Folds in the inline writes and stages the whole batch onto `db_tx`,
 /// returning what the batch weighs (`entry_bytes` included, since index
-/// entries stage directly and never join `writes`), and raising the store's
-/// format stamp to `target_format`. The caller has already stamped the head.
-async fn stage_batch(
+/// entries stage directly and never join `writes`). The caller has already
+/// stamped the head.
+fn stage_batch(
     db_tx: &DbTransaction,
-    projections: &std::sync::RwLock<ProjectionCache>,
     writes: &mut Vec<commit::StagedWrite>,
     inline_writes: Vec<commit::StagedWrite>,
     entry_bytes: u64,
-    target_format: u64,
 ) -> Result<StagedBytes> {
     writes.extend(inline_writes);
-    if let Some(stamp) = commit::format_stamp_to(db_tx, projections, target_format).await? {
-        writes.push(stamp);
-    }
     let mut staged = commit::stage_writes(db_tx, writes)?;
     staged.0 = staged.0.saturating_add(entry_bytes);
     Ok(staged)
@@ -2018,14 +1967,12 @@ async fn staged_lost_race_against(
 }
 
 /// One translated batch: the writes it carries, the snapshot id it results
-/// in, the head view when it could be completed, and the floor its index
-/// records require.
+/// in, and the head view when it could be completed.
 struct Translated {
     new_id: u64,
     writes: Vec<commit::StagedWrite>,
     snapshot: proto::SnapshotValue,
     head_view: Option<CatalogSnapshot>,
-    index_format: u64,
 }
 
 /// Applies every op onto a clone of `base`, then diffs the two exactly as
@@ -2112,9 +2059,6 @@ fn translate(
         }
     }
     state.snapshot = snapshot.clone();
-    // Read before the state moves into the head view, which is dropped when
-    // that view cannot be completed.
-    let index_format = commit::index_format(&state);
 
     let mut writes = commit::diff_touched(base, &state, new_id, &touched);
     let translated_head_view = match commit::finish_translated_head_view(&mut state, &direct) {
@@ -2140,7 +2084,6 @@ fn translate(
         writes,
         snapshot,
         head_view: translated_head_view,
-        index_format,
     })
 }
 

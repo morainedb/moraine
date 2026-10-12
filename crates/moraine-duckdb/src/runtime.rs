@@ -42,7 +42,7 @@ const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// through `runtime`.
 ///
 /// Opaque to C — only ever seen as a `MoraineCatalogHandle*` obtained
-/// from [`moraine_attach`](crate::abi::moraine_attach) and released via
+/// from [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store) and released via
 /// [`moraine_detach`](crate::abi::moraine_detach).
 pub struct MoraineCatalogHandle {
     pub(crate) runtime: Arc<Runtime>,
@@ -488,7 +488,7 @@ mod tests {
 
     use super::{MAX_WORKER_THREADS, MIN_WORKER_THREADS, MoraineCatalogHandle, worker_threads};
     use crate::{
-        abi::{moraine_attach, moraine_detach},
+        abi::{moraine_attach_with_wal_store, moraine_detach},
         error::{MoraineError, codes},
         test_support::{TempDir, attach_ok, attach_with_data_path},
     };
@@ -530,7 +530,7 @@ mod tests {
         let mut err = MoraineError::default();
         // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
         let code = unsafe {
-            moraine_attach(
+            moraine_attach_with_wal_store(
                 c_path.as_ptr(),
                 ptr::null(),
                 false,
@@ -543,6 +543,8 @@ mod tests {
                 0,
                 1,
                 false,
+                false,
+                ptr::null(),
                 ptr::null(),
                 ptr::null(),
                 0,

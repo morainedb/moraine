@@ -24,9 +24,9 @@ use crate::{
         CatalogSnapshot, SnapshotId, Timestamp,
         projection::{
             ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch,
-            fold_replayed_writes, format_floor, held_head_view, install_head_view,
-            install_head_view_at, invalidate_head_view, migration_clear_at, note_migration_clear,
-            raise_format_floor, view_head,
+            fold_replayed_writes, held_head_view, install_head_view, install_head_view_at,
+            invalidate_head_view, migration_clear_at, note_migration_clear, raise_format_floor,
+            view_head,
         },
     },
     error::{Error, Result},
@@ -50,28 +50,8 @@ use crate::{
 
 /// The original structural layout; later rewrites raise the readable floor.
 pub(crate) const FORMAT_VERSION: u64 = 1;
-/// Format stamped the first time an equality index exists: adds the
-/// `index` subspace and kind.
-pub(crate) const FORMAT_WITH_INDEX: u64 = 2;
-/// Format stamped the first time a staged (multi-commit) index build
-/// exists: a `building` definition serves no lookups.
-pub(crate) const FORMAT_WITH_STAGED_INDEX: u64 = 3;
-/// Format stamped the first time an index defers SQL additions.
-pub(crate) const FORMAT_WITH_DEFERRED_INDEX: u64 = 4;
-/// Format stamped the first time durable maintenance status is recorded.
-pub(crate) const FORMAT_WITH_MAINTENANCE_STATUS: u64 = 5;
-/// Format stamped the first time an inline chunk row-range locator is
-/// written.
+/// The earliest format containing inline chunk row-range locators.
 pub(crate) const FORMAT_WITH_INLINE_CHUNK_DIRECTORY: u64 = 6;
-/// A deregistered inline schema may be a reference to another version of
-/// the same table rather than the Arrow bytes themselves, which a reader
-/// that predates the field would decode as a schema with no columns.
-pub(crate) const FORMAT_WITH_INLINE_SCHEMA_REFERENCE: u64 = 7;
-/// An inline chunk locator carries the chunk's identity, not its range end
-/// alone. A reader that predates it looks for the superseded key and finds
-/// no directory at all, so it must be locked out rather than left to serve
-/// reads from a directory it cannot see.
-pub(crate) const FORMAT_WITH_INLINE_CHUNK_IDENTITY: u64 = 8;
 /// Inline tombstones retain each deletion snapshot under its own key.
 pub(crate) const FORMAT_WITH_INLINE_TOMBSTONE_HISTORY: u64 = 9;
 /// The highest format this binary understands. It opens any store in
@@ -1083,112 +1063,6 @@ enum Prepared {
     },
 }
 
-/// The inline shapes a batch wrote. Each carries its own format floor, and
-/// neither subsumes the other.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct InlineShapes {
-    /// A locator carrying its chunk's identity.
-    pub(crate) chunk_directory: bool,
-    /// A schema recorded as a reference to another version.
-    pub(crate) schema_reference: bool,
-}
-
-/// The format floor `state`'s index records require: deferred upkeep
-/// implies [`FORMAT_WITH_DEFERRED_INDEX`], a `building` index
-/// [`FORMAT_WITH_STAGED_INDEX`], and any other index [`FORMAT_WITH_INDEX`].
-/// The floor is the highest term that applies, never the first.
-pub(crate) fn index_format(state: &CatalogSnapshot) -> u64 {
-    let indexes = || state.indexes.values().flat_map(imbl::OrdMap::values);
-
-    [
-        indexes()
-            .any(|index| index.deferred_maintenance == Some(true))
-            .then_some(FORMAT_WITH_DEFERRED_INDEX),
-        indexes()
-            .any(|index| index.build_state.is_some())
-            .then_some(FORMAT_WITH_STAGED_INDEX),
-        state
-            .indexes
-            .values()
-            .any(|per_table| !per_table.is_empty())
-            .then_some(FORMAT_WITH_INDEX),
-    ]
-    .into_iter()
-    .flatten()
-    .max()
-    .unwrap_or(FORMAT_VERSION)
-}
-
-/// The format floor the inline shapes `wrote` require. Neither shape
-/// subsumes the other, so a batch writing both owes the higher.
-pub(crate) fn inline_format(wrote: InlineShapes) -> u64 {
-    [
-        wrote
-            .schema_reference
-            .then_some(FORMAT_WITH_INLINE_SCHEMA_REFERENCE),
-        wrote
-            .chunk_directory
-            .then_some(FORMAT_WITH_INLINE_CHUNK_IDENTITY),
-    ]
-    .into_iter()
-    .flatten()
-    .max()
-    .unwrap_or(FORMAT_VERSION)
-}
-
-/// The store format `state` requires once `wrote` is folded in.
-pub(crate) fn target_format(state: &CatalogSnapshot, wrote: InlineShapes) -> u64 {
-    index_format(state).max(inline_format(wrote))
-}
-
-/// The format-stamp write this commit owes, if any. The stamp is forward-only.
-async fn format_stamp(
-    db_tx: &DbTransaction,
-    projections: &std::sync::RwLock<ProjectionCache>,
-    state: &CatalogSnapshot,
-    wrote: InlineShapes,
-) -> Result<Option<StagedWrite>> {
-    if format_floor(projections) >= MAX_FORMAT_VERSION {
-        return Ok(None);
-    }
-    format_stamp_to(db_tx, projections, target_format(state, wrote)).await
-}
-
-/// The forward-only format stamp write required to reach `target_format`.
-/// A target at or below the highest version this handle has seen owes no
-/// write and costs no read: the stamp only ever rises, so an observed
-/// version stays a valid floor.
-pub(crate) async fn format_stamp_to(
-    db_tx: &DbTransaction,
-    projections: &std::sync::RwLock<ProjectionCache>,
-    target_format: u64,
-) -> Result<Option<StagedWrite>> {
-    if target_format <= FORMAT_VERSION || format_floor(projections) >= target_format {
-        return Ok(None);
-    }
-    let current = read::read_format(ReadHandle::Tx(db_tx))
-        .await?
-        .map_or(FORMAT_VERSION, |format| format.format_version);
-    raise_format_floor(projections, current);
-    if current >= target_format {
-        return Ok(None);
-    }
-
-    info!(
-        from = current,
-        to = target_format,
-        "upgrading the store format stamp"
-    );
-
-    Ok(Some((
-        Key::Sys(SysKey::Format).encode(),
-        Some(value::encode_value(&proto::FormatValue {
-            format_version: target_format,
-            writer_version: env!("CARGO_PKG_VERSION").to_string(),
-        })),
-    )))
-}
-
 /// The `ducklake_schema_versions` record a schema-changing commit owes for
 /// one table. It outlives the snapshot record: an expired snapshot's data
 /// files still resolve their schema version through it.
@@ -1276,22 +1150,13 @@ where
     }
 
     // Entries stage before the entity diff so a poisoned definition rides
-    // that diff. The three reads touch disjoint subspaces, so they run
+    // that diff. The two reads touch disjoint subspaces, so they run
     // together.
     let index_entry_count = index_entries.len();
     let probe_scope = ProbeScope::of(&index_entries);
-    // This path records every schema whole; only the staged one writes a
-    // schema as a reference to another version.
-    let wrote_inline = InlineShapes {
-        chunk_directory: inline_ops
-            .iter()
-            .any(|operation| matches!(operation, inline::InlineStage::Insert { .. })),
-        schema_reference: false,
-    };
-    let (entries, inline_writes, format_write) = futures::try_join!(
+    let (entries, inline_writes) = futures::try_join!(
         index_maintenance::stage_index_entries(db_tx, index_entries),
         inline::stage_inline_writes(db_tx, projections, &inline_ops),
-        format_stamp(db_tx, projections, &state, wrote_inline),
     )?;
     probe_scope.report(&state, &entries.metrics);
     let poisoned = entries.poisoned;
@@ -1299,7 +1164,6 @@ where
 
     let mut writes = diff_writes(base, &state, new_id);
     writes.extend(inline_writes);
-    writes.extend(format_write);
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
     let schema_changed_table_ids: Vec<u64> = operations
         .iter()

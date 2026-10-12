@@ -1055,10 +1055,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
             }
         )]
     );
-    assert_eq!(
-        format.format_version,
-        commit::MIN_FORMAT_VERSION.max(commit::FORMAT_WITH_INLINE_CHUNK_IDENTITY)
-    );
+    assert_eq!(format.format_version, commit::MIN_FORMAT_VERSION);
     tx.rollback();
 }
 
@@ -5196,9 +5193,9 @@ async fn a_collapsing_deregistration_preserves_the_format_floor() {
     }
 }
 
-/// An inline insert leaves the store at or above the chunk-identity format.
+/// An inline insert leaves the store at or above the minimum readable format.
 #[tokio::test]
-async fn an_inline_insert_stamps_the_chunk_identity_format() {
+async fn an_inline_insert_preserves_a_readable_format() {
     let catalog = open().await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
@@ -5236,8 +5233,8 @@ async fn an_inline_insert_stamps_the_chunk_identity_format() {
     tx.rollback();
 
     assert!(
-        format >= crate::transaction::commit::FORMAT_WITH_INLINE_CHUNK_IDENTITY,
-        "a batch that writes a locator must stamp the identity format, got {format}"
+        format >= crate::transaction::commit::MIN_FORMAT_VERSION,
+        "a batch that writes a locator keeps the store at or above the minimum format, got {format}"
     );
 
     catalog.close().await.unwrap();

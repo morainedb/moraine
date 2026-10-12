@@ -131,7 +131,7 @@ pub(crate) fn data_file_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.
@@ -154,46 +154,6 @@ pub unsafe extern "C" fn moraine_dump_data_files(
             probe_ctx,
             err,
             moraine::ffi_support::dump_data_files,
-            data_file_rows,
-        )
-    }
-}
-
-/// As [`moraine_dump_data_files`], for a caller that keeps a row only
-/// while `filter_snapshot < end_snapshot` (or it is null) — the shape
-/// every DuckLake read of this table carries.
-///
-/// Once `filter_snapshot` reaches the head this call observes, no ended
-/// version can satisfy that, so the ended half is not read; the rows are
-/// the same ones either way. A bound behind the head is a time-travel
-/// read and gets the full set. Freed with
-/// [`moraine_dump_data_files_free`].
-///
-/// # Safety
-///
-/// As [`moraine_dump_data_files`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_dump_data_files_live_at(
-    handle: *mut MoraineCatalogHandle,
-    filter_snapshot: u64,
-    out_items: *mut *mut MoraineDataFileRow,
-    out_len: *mut usize,
-    probe: MoraineInterruptProbe,
-    probe_ctx: *mut c_void,
-    err: *mut MoraineError,
-) -> i32 {
-    // SAFETY: forwarded caller contract.
-    unsafe {
-        dump_rows(
-            handle,
-            out_items,
-            out_len,
-            probe,
-            probe_ctx,
-            err,
-            async |catalog| {
-                moraine::ffi_support::dump_data_files_live_at(catalog, filter_snapshot).await
-            },
             data_file_rows,
         )
     }
@@ -339,7 +299,7 @@ pub(crate) fn delete_file_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.
@@ -467,7 +427,7 @@ pub(crate) fn file_partition_value_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.
@@ -559,7 +519,7 @@ pub(crate) fn scheduled_deletion_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.

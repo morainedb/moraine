@@ -1135,17 +1135,12 @@ impl Catalog {
         }
     }
 
-    /// Raises the store's format to the newest purely additive one this
-    /// binary writes, ahead of the commit that would otherwise take it.
+    /// Reports the store's format and raises it to the supported additive
+    /// ceiling when needed. This build requires format 9 at open, so an
+    /// attached catalog already meets that ceiling and this call is a no-op.
     ///
-    /// One-way: a store that has taken the format can no longer be opened
-    /// by a binary that predates it, and a reader already attached on one
-    /// is not refused — it keeps running and may misread later commits.
-    /// Raise it only once every reader is on a binary that understands
-    /// it.
-    ///
-    /// `dry_run` reports the move it would make and stamps nothing — the
-    /// only way to read a store's format without moving it.
+    /// `dry_run` reports the result without writing. Structural upgrades
+    /// require [`Self::migrate`] instead.
     ///
     /// # Errors
     ///

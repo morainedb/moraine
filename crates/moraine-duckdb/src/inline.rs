@@ -196,10 +196,10 @@ impl MoraineInlineScanCursor {
 /// # Safety
 ///
 /// `handle` must be a pointer previously returned by
-/// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached.
-/// `out_cursor` must be a valid, writable pointer. `probe`, if non-null,
-/// must be safe to call with `probe_ctx` from any thread. `err`, if
-/// non-null, must be a valid, writable [`MoraineError`]. All for the
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store)
+/// and not yet detached. `out_cursor` must be a valid, writable pointer.
+/// `probe`, if non-null, must be safe to call with `probe_ctx` from any thread.
+/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All for the
 /// duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_inline_scan_open(

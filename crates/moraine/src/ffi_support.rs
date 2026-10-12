@@ -139,44 +139,24 @@ pub fn snapshot_stamp(view: &crate::catalog::CatalogSnapshot) -> HeadValue {
     crate::catalog::projection::view_head(view)
 }
 
-/// Whether a caller needs the ended half, and if it depends on the head,
-/// what decides it.
+/// Whether a caller needs ended records as well as current records.
 #[derive(Debug, Clone, Copy)]
 enum HistoryNeed {
-    /// The full set, whatever the head.
+    /// Both current and ended records.
     Always,
     /// `current` alone — the unversioned kinds, which have no ended half.
     Never,
-    /// The full set only while the head is past the reader's filter
-    /// snapshot; see [`crate::store::read::versions_for`].
-    UnlessLiveAt(u64),
 }
 
 impl HistoryNeed {
-    /// Resolved against the head this read observed. An unknown head is a
-    /// store with no commits, where neither half holds anything.
-    fn wants_history(self, head: Option<&HeadValue>) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Never => false,
-            Self::UnlessLiveAt(filter_snapshot) => {
-                crate::store::read::versions_for(
-                    Some(filter_snapshot),
-                    head.map(|head| head.snapshot_id),
-                ) == crate::store::read::Versions::LiveAndEnded
-            }
-        }
+    fn wants_history(self) -> bool {
+        matches!(self, Self::Always)
     }
 }
 
 /// The shared record set's two halves at the session head, each served
 /// from the projection cache when its stamp matches and scanned at most
 /// once otherwise.
-///
-/// Whether the ended half is read is settled against the head this call
-/// observes, never a head read earlier — a commit landing in between would
-/// otherwise let a bound that was at the head fall behind one, and the
-/// rows it ended would be dropped from a reader that still matches them.
 async fn entity_halves(
     catalog: &ReadOnlyCatalog,
     history: HistoryNeed,
@@ -184,7 +164,7 @@ async fn entity_halves(
     // A read-write handle's held view is at head, so a read served wholly
     // from the cache needs neither a session nor a head read.
     if let Some(head) = writer_head(catalog)? {
-        let want_history = history.wants_history(Some(&head));
+        let want_history = history.wants_history();
         let projections = projections_read(catalog);
         if let Some(current) = projections.current_entities_at(&head) {
             let held_history = projections.history_entities_at(&head);
@@ -199,7 +179,7 @@ async fn entity_halves(
 
     let session = catalog.begin_read().await?;
     let head = session_head(catalog, &session).await?;
-    let want_history = history.wants_history(head.as_ref());
+    let want_history = history.wants_history();
 
     let (held_current, held_history) = match &head {
         Some(head) => {
@@ -400,35 +380,6 @@ pub async fn dump_data_files(catalog: &ReadOnlyCatalog) -> Result<Vec<DataFileVa
         _ => None,
     })
     .await
-}
-
-/// As [`dump_data_files`], for a caller that keeps a row only while
-/// `filter_snapshot < end_snapshot` (or it is null) — the shape every
-/// DuckLake read of this table carries.
-///
-/// Once `filter_snapshot` reaches the head this call observes, no ended
-/// version can satisfy that, so the ended half is not read and the rows
-/// returned are the same ones. A bound behind the head is a time-travel
-/// read and gets the full set.
-///
-/// # Errors
-///
-/// As [`dump_data_files`].
-#[doc(hidden)]
-pub async fn dump_data_files_live_at(
-    catalog: &ReadOnlyCatalog,
-    filter_snapshot: u64,
-) -> Result<Vec<DataFileValue>> {
-    let (_, current, history) =
-        entity_halves(catalog, HistoryNeed::UnlessLiveAt(filter_snapshot)).await?;
-    Ok(current
-        .values()
-        .chain(history.values())
-        .filter_map(|r| match r.as_ref() {
-            EntityRecord::File(v) => Some(v.clone()),
-            _ => None,
-        })
-        .collect())
 }
 
 /// One table's `ducklake_data_file` rows, current and history, in the

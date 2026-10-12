@@ -856,8 +856,7 @@ impl Transaction {
     }
 
     /// Creates an equality index over a table, staging entries for the
-    /// writer-supplied backfill in the same commit. The first index on a
-    /// store stamps its format at 2.
+    /// writer-supplied backfill in the same commit.
     ///
     /// # Errors
     ///
@@ -1077,10 +1076,9 @@ impl Transaction {
     }
 
     /// Begins a staged (multi-commit) index build. The definition lands in
-    /// `building` state, serving no lookups and stamping the store format
-    /// at 3; the host streams backfill batches through
-    /// [`Self::build_index_step`] until a final step flips it ready.
-    /// Writers maintain entries from this commit forward.
+    /// `building` state, serving no lookups; the host streams backfill
+    /// batches through [`Self::build_index_step`] until a final step flips it
+    /// ready. Writers maintain entries from this commit forward.
     ///
     /// # Errors
     ///

@@ -1796,13 +1796,9 @@ counter at zero but names its durable starting cursor. A conflicting step
 emits a warning with the last durable count before the driver re-derives.
 Attempted but non-durable work is never reported as completed.
 
-**Format.** Staged builds stamp **format 3** at the first staged
-`create_index` — lazily, like format 2. A format-2 binary would ignore the
-unknown state field, see a `building` definition as a ready index, and
-serve lookups and enforcement from an under-covered entry set — precisely
-the silent corruption the gate exists to refuse. Single-commit-only stores
-stay format 2; completing or dropping the build does not downgrade the
-stamp, per the existing posture.
+**Format.** The minimum readable format is 9, which includes staged and
+deferred index state. Every supported reader understands these fields;
+creating, completing, or dropping an index needs no format-stamp write.
 
 ### Extension path: SQL surface and the scoped read
 
@@ -2109,18 +2105,12 @@ maintenance, and would be its own RFC.
 ### Format gate
 
 An older moraine writer committing to an indexed table would maintain no
-entries — silent index corruption. The gate is `sys/format`, bumped
-**lazily**: the first `create_index` writes format 2 in the same commit, and
-older binaries refuse to open a format-2 store (RFC 0002 bootstrap
-validation). Index-free stores stay format 1, byte-identical to today,
-compatible in both directions. Format 2 is format 1 plus the `index` subspace
-and `index` kind — no migration, no rewrite; dropping the last index does not
-downgrade the stamp. Staged builds bump once more, to format 3 (Staged
-builds), under the same lazy posture. Deferred upkeep bumps to format 4: a
-format-3 writer does not know the deferred marker and could otherwise rewrite
-a partially covered definition as ready. The `index` discriminant leaves the
-segment extractor ("first byte") untouched, so existing segments and the RFC
-0011 crash cases are unaffected.
+entries. The `sys/format` check at open excludes those writers: this build
+accepts only format 9, which already includes the index subspace, staged
+builds, and deferred upkeep. New stores start at that format, and older
+stores must migrate before opening. Index commits no longer stamp the
+format independently. The index discriminant leaves the segment extractor
+("first byte") unchanged.
 
 ### Reclamation
 
@@ -2272,11 +2262,8 @@ tests against real SlateDB on in-memory `object_store`:
   table → `CommitConflict` for one side; `drop_column`/type-change on an
   indexed column refused; rename unaffected; backfill validates uniqueness
   (duplicate in existing rows aborts the create).
-- **Format gate.** First `create_index` stamps format 2 atomically with the
-  definition; a format-1-only binary (simulated via the version check)
-  refuses the store; index-free stores remain format 1. First *staged*
-  create stamps format 3; a format-2-only binary refuses it;
-  single-commit-only stores remain format 2.
+- **Format gate.** Open rejects stores below the minimum readable format
+  until migration; index commits preserve the accepted format.
 - **Staged lifecycle.** A staged build over a table too large for one batch,
   under concurrent inserts, deletes, and updates: lookups fail typed while
   `building`; after the flip, the `index` range is byte-identical to a
