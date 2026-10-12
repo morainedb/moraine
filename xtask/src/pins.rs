@@ -118,6 +118,7 @@ pub fn check_pins() -> anyhow::Result<()> {
         problems.extend(tools_ref_problem(file, &contents));
         if BUILDING_WORKFLOWS.contains(&file) {
             problems.extend(smoke_problem(file, &contents, pin));
+            problems.extend(build_version_problem(file, &contents, pin));
         }
     }
 
@@ -193,6 +194,15 @@ fn smoke_problem(file: &str, contents: &str, pin: &str) -> Option<String> {
             "{file} builds the extension without a `post_build_command` running \
              `{invocation}`, so its build would pass unproven"
         )
+    })
+}
+
+/// Distribution builds must override the checkout hash exported as DuckDB's
+/// version.
+fn build_version_problem(file: &str, contents: &str, pin: &str) -> Option<String> {
+    let setting = format!("\"DUCKDB_TAG\": \"{pin}\"");
+    (!contents.contains(&setting)).then(|| {
+        format!("{file} must forward `{setting}` through test_config to the build container")
     })
 }
 
@@ -579,6 +589,48 @@ mod tests {
             let contents = read(file).expect("reading the workflow");
             assert_eq!(smoke_problem(file, &contents, duckdb_pin()), None);
         }
+    }
+
+    #[test]
+    fn distribution_builds_stamp_the_version_instead_of_the_checkout_hash() {
+        for file in BUILDING_WORKFLOWS {
+            let contents = read(file).expect("reading the workflow");
+            assert_eq!(build_version_problem(file, &contents, duckdb_pin()), None);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_build_tag_overrides_the_ci_checkout_version() {
+        // The pins job runs this with submodules; Rust-only checkouts omit them.
+        if !workspace_root()
+            .join("extension-ci-tools/makefiles/duckdb_extension.Makefile")
+            .is_file()
+        {
+            return;
+        }
+        let commit = primary_submodule_pins()
+            .into_iter()
+            .find(|(name, _)| name == "duckdb")
+            .expect("pinned DuckDB checkout")
+            .1;
+        let output = Command::new("make")
+            .args(["--dry-run", "release"])
+            .env("DUCKDB_VERSION", commit)
+            .env("DUCKDB_TAG", duckdb_pin())
+            .current_dir(workspace_root())
+            .output()
+            .expect("running make");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let command = String::from_utf8(output.stdout).expect("make command text");
+        assert!(
+            command.contains(&format!("-DDUCKDB_EXPLICIT_VERSION={}", duckdb_pin())),
+            "{command}"
+        );
     }
 
     /// The patch task targets the release the manifest calls primary.
