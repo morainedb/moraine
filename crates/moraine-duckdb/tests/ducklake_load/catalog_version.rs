@@ -183,6 +183,58 @@ fn a_raised_store_still_serves_the_lake() {
     );
 }
 
+/// Extended file columns survive every staged metadata reader.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extension"]
+fn staged_file_readers_preserve_row_group_counts() {
+    let store = TempDir::new("extended-staged-files");
+    let data = TempDir::new("extended-staged-data");
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(a BIGINT);",
+    );
+    raise(store.path(), ", confirm => true");
+
+    let mut sql = String::from(
+        "CREATE TEMP TABLE seen(position INTEGER, row_group_count BIGINT);
+         BEGIN;
+         INSERT INTO m.ducklake_data_file VALUES
+             (7, 1, 1, NULL, NULL, 'data.parquet', true, 'parquet', 10, 100, 20,
+              0, NULL, NULL, NULL, NULL, 3);
+         INSERT INTO m.ducklake_delete_file VALUES
+             (8, 1, 1, NULL, 7, 'delete.parquet', true, 'parquet', 1, 100, 20,
+              NULL, NULL, 4);",
+    );
+    for (position, filter) in [
+        "",
+        "WHERE end_snapshot IS NULL",
+        "WHERE end_snapshot > 1 OR end_snapshot IS NULL",
+        "WHERE table_id = 1",
+        "WHERE table_id = 1 AND end_snapshot IS NULL",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (kind, table) in ["ducklake_data_file", "ducklake_delete_file"]
+            .into_iter()
+            .enumerate()
+        {
+            let order = position * 2 + kind;
+            sql.push_str(&format!(
+                "INSERT INTO seen SELECT {order}, row_group_count FROM m.{table} {filter};"
+            ));
+        }
+    }
+    sql.push_str("SELECT row_group_count FROM seen ORDER BY position; ROLLBACK;");
+    assert_eq!(
+        csv_rows(&run_standalone_sql(store.path(), &sql)),
+        (0..5)
+            .flat_map(|_| [vec!["3"], vec!["4"]])
+            .collect::<Vec<_>>(),
+    );
+}
+
 /// A raise that would record refuses without an acknowledgement, and
 /// records nothing when it refuses. A dry run needs none: it is the
 /// pre-flight for the door.

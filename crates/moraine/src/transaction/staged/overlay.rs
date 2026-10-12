@@ -19,12 +19,19 @@ use super::{
     },
     proto,
 };
+use crate::store::read::{EntityRecord, EntityRecordKind};
 
 /// One versioned kind's overlay vocabulary: how a record names itself, how
 /// its lifecycle moves, and how a staged row becomes one.
 pub(super) trait Versioned: Sized {
     /// The staged-row kind whose rows apply to this record type.
     const KIND: TableKind;
+
+    /// The committed-record kind these rows are read from.
+    const RECORD: EntityRecordKind;
+
+    /// `record` as one of these rows, or `None` for another kind's.
+    fn from_record(record: &EntityRecord) -> Option<Self>;
 
     /// The entity a delete or a lifecycle update names.
     fn key(&self) -> EntityKey;
@@ -149,6 +156,12 @@ pub(super) trait Unversioned: Sized {
     /// The staged-row kind whose rows apply to this record type.
     const KIND: TableKind;
 
+    /// The committed-record kind these rows are read from.
+    const RECORD: EntityRecordKind;
+
+    /// `record` as one of these rows, or `None` for another kind's.
+    fn from_record(record: &EntityRecord) -> Option<Self>;
+
     /// What identifies a row for overwrite and for removal.
     type Key: Eq + std::hash::Hash + Copy;
 
@@ -221,6 +234,15 @@ fn staged_order<K: Eq + std::hash::Hash + Copy>(keys: Vec<K>) -> Vec<K> {
 impl Versioned for proto::DataFileValue {
     const KIND: TableKind = TableKind::DataFile;
 
+    const RECORD: EntityRecordKind = EntityRecordKind::File;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::File(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     fn key(&self) -> EntityKey {
         EntityKey::File {
             table_id: self.table_id,
@@ -251,6 +273,15 @@ impl Versioned for proto::DataFileValue {
 impl Versioned for proto::DeleteFileValue {
     const KIND: TableKind = TableKind::DeleteFile;
 
+    const RECORD: EntityRecordKind = EntityRecordKind::DeleteFile;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::DeleteFile(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     fn key(&self) -> EntityKey {
         EntityKey::DeleteFile {
             table_id: self.table_id,
@@ -274,6 +305,15 @@ impl Versioned for proto::DeleteFileValue {
 impl Versioned for proto::ColumnValue {
     const KIND: TableKind = TableKind::Column;
 
+    const RECORD: EntityRecordKind = EntityRecordKind::Column;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::Column(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     fn key(&self) -> EntityKey {
         EntityKey::Column {
             table_id: self.table_id,
@@ -296,6 +336,15 @@ impl Versioned for proto::ColumnValue {
 
 impl Versioned for proto::TableValue {
     const KIND: TableKind = TableKind::Table;
+
+    const RECORD: EntityRecordKind = EntityRecordKind::Table;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::Table(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
 
     fn key(&self) -> EntityKey {
         EntityKey::Table {
@@ -339,6 +388,15 @@ impl Versioned for proto::TableValue {
 impl Unversioned for proto::FileColumnStatsValue {
     const KIND: TableKind = TableKind::FileColumnStats;
 
+    const RECORD: EntityRecordKind = EntityRecordKind::FileColumnStats;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::FileColumnStats(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     type Key = (u64, u64, u64);
 
     fn key(&self) -> Self::Key {
@@ -362,6 +420,15 @@ impl Unversioned for proto::FileColumnStatsValue {
 impl Unversioned for proto::GcFileValue {
     const KIND: TableKind = TableKind::FilesScheduledForDeletion;
 
+    const RECORD: EntityRecordKind = EntityRecordKind::GcFile;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::GcFile(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     type Key = u64;
 
     fn key(&self) -> Self::Key {
@@ -382,6 +449,15 @@ impl Unversioned for proto::GcFileValue {
 
 impl Versioned for proto::SchemaValue {
     const KIND: TableKind = TableKind::Schema;
+
+    const RECORD: EntityRecordKind = EntityRecordKind::Schema;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::Schema(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
 
     fn key(&self) -> EntityKey {
         EntityKey::Schema {
@@ -405,6 +481,15 @@ impl Versioned for proto::SchemaValue {
 impl Versioned for proto::ViewValue {
     const KIND: TableKind = TableKind::View;
 
+    const RECORD: EntityRecordKind = EntityRecordKind::View;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::View(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     fn key(&self) -> EntityKey {
         EntityKey::View {
             view_id: self.view_id,
@@ -426,6 +511,15 @@ impl Versioned for proto::ViewValue {
 
 impl Versioned for proto::PartitionValue {
     const KIND: TableKind = TableKind::PartitionInfo;
+
+    const RECORD: EntityRecordKind = EntityRecordKind::Partition;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::Partition(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
 
     fn key(&self) -> EntityKey {
         EntityKey::Partition {
@@ -453,6 +547,15 @@ impl Versioned for proto::PartitionValue {
 impl Versioned for proto::SortValue {
     const KIND: TableKind = TableKind::SortInfo;
 
+    const RECORD: EntityRecordKind = EntityRecordKind::Sort;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::Sort(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     fn key(&self) -> EntityKey {
         EntityKey::Sort {
             table_id: self.table_id,
@@ -476,6 +579,15 @@ impl Versioned for proto::SortValue {
 impl Versioned for proto::MacroValue {
     const KIND: TableKind = TableKind::Macro;
 
+    const RECORD: EntityRecordKind = EntityRecordKind::Macro;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::Macro(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     fn key(&self) -> EntityKey {
         EntityKey::Macro {
             macro_id: self.macro_id,
@@ -498,6 +610,15 @@ impl Versioned for proto::MacroValue {
 impl Unversioned for proto::TableStatsValue {
     const KIND: TableKind = TableKind::TableStats;
 
+    const RECORD: EntityRecordKind = EntityRecordKind::TableStats;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::TableStats(value) => Some(*value),
+            _ => None,
+        }
+    }
+
     type Key = u64;
 
     fn key(&self) -> Self::Key {
@@ -518,6 +639,15 @@ impl Unversioned for proto::TableStatsValue {
 
 impl Unversioned for proto::TableColumnStatsValue {
     const KIND: TableKind = TableKind::TableColumnStats;
+
+    const RECORD: EntityRecordKind = EntityRecordKind::TableColumnStats;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::TableColumnStats(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
 
     type Key = (u64, u64);
 
@@ -540,6 +670,15 @@ impl Unversioned for proto::TableColumnStatsValue {
 impl Unversioned for proto::MappingValue {
     const KIND: TableKind = TableKind::ColumnMapping;
 
+    const RECORD: EntityRecordKind = EntityRecordKind::Mapping;
+
+    fn from_record(record: &EntityRecord) -> Option<Self> {
+        match record {
+            EntityRecord::Mapping(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
     type Key = u64;
 
     fn key(&self) -> Self::Key {
@@ -561,6 +700,30 @@ impl Unversioned for proto::MappingValue {
                 "column mapping delete decoded as {other:?}"
             ))),
         }
+    }
+}
+
+/// A kind keyed by table first, whose rows a reader may narrow to one
+/// table's.
+pub(super) trait TableScoped {
+    fn table_id(&self) -> u64;
+}
+
+impl TableScoped for proto::DataFileValue {
+    fn table_id(&self) -> u64 {
+        self.table_id
+    }
+}
+
+impl TableScoped for proto::DeleteFileValue {
+    fn table_id(&self) -> u64 {
+        self.table_id
+    }
+}
+
+impl TableScoped for proto::FileColumnStatsValue {
+    fn table_id(&self) -> u64 {
+        self.table_id
     }
 }
 
