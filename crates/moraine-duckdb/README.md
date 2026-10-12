@@ -337,7 +337,7 @@ build produces beside the extension.
 
 | What | Pinned at |
 |---|---|
-| DuckDB | **v2.0.0-dev0** (git hash `6b6099a3e9`, codename Cyanoptera) |
+| DuckDB | **v2.0.0-alpha46057** (git hash `b15358c371`, codename Cyanoptera) |
 | Toolchain | `duckdb/extension-ci-tools` at `969bc76276` |
 | C++ standard | C++17 |
 | Linux C++ compiler | GCC 14 |

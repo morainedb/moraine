@@ -14,7 +14,7 @@ use crate::duckdb::{self, command_output, optional_command_output};
 
 const DUCKLAKE_URL: &str = "https://github.com/duckdb/ducklake.git";
 const DUCKLAKE_REVISION: &str = "e8924cfc9ccbb9a1a148e8ff367b75d493ca9df5";
-const SUPPORTED_DUCKDB_PIN: &str = "v2.0.0-dev0";
+const SUPPORTED_DUCKDB_PIN: &str = "v2.0.0-alpha46057";
 /// DuckDB's own DuckLake patches, which it applies to the commit it pins
 /// before building the extension. The series here targets that patched
 /// source, so every application composes theirs first.

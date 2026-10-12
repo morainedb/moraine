@@ -2,11 +2,12 @@ name: Extension
 # Build the extension for every published platform and prove the bundled
 # DuckLake in the same container that built it.
 #
-# Publishing is absent on purpose: the primary pin in
-# .github/duckdb-versions is a development revision of DuckDB, and a
-# C++-ABI extension only loads into the exact version stamped in its
-# footer — so there is no DuckDB anyone could load a published build into.
-# The ext-v* release job returns with the first tagged DuckDB 2.0.
+# Publishing stays off here: a C++-ABI extension only loads into the exact
+# version stamped in its footer, and the primary pin in
+# .github/duckdb-versions is a development revision whose label moves with
+# DuckDB's own builds. A build from this workflow does load — DuckDB
+# publishes that label's libraries and CLI — so consumers take the artifact
+# from a run. Turning the ext-v* release job back on is its own decision.
 on:
   workflow_dispatch:
 
@@ -20,7 +21,7 @@ jobs:
     with:
       extension_name: moraine
       ci_tools_version: 969bc76276acec1c0a3922ff500d2ec3a1a3b037
-      duckdb_tag: v2.0.0-dev0
+      duckdb_tag: v2.0.0-alpha46057
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
@@ -32,8 +33,8 @@ jobs:
       # own because the only CLI that can load the artifact is the one this
       # container just built beside it.
       post_build_command: >-
-        cargo run -q -p xtask -- validate-release-artifact v2.0.0-dev0
+        cargo run -q -p xtask -- validate-release-artifact v2.0.0-alpha46057
         build/release/extension/moraine/moraine.duckdb_extension
       # Point ccache at the directory the Linux container already mounts and
       # caches; without it every build recompiles DuckDB from scratch.
-      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir", "DUCKDB_TAG": "v2.0.0-dev0"}}'
+      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir", "DUCKDB_TAG": "v2.0.0-alpha46057"}}'

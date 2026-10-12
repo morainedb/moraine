@@ -55,7 +55,7 @@ jobs:
     with:
       extension_name: moraine
       ci_tools_version: 969bc76276acec1c0a3922ff500d2ec3a1a3b037
-      duckdb_tag: v2.0.0-dev0
+      duckdb_tag: v2.0.0-alpha46057
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
@@ -67,7 +67,7 @@ jobs:
       # own because the only CLI that can load the artifact is the one this
       # container just built beside it.
       post_build_command: >-
-        cargo run -q -p xtask -- validate-release-artifact v2.0.0-dev0
+        cargo run -q -p xtask -- validate-release-artifact v2.0.0-alpha46057
         build/release/extension/moraine/moraine.duckdb_extension
       # The Linux builds run in a container with a ccache directory mounted
       # at /ccache_dir and cached between runs, but nothing points ccache at
@@ -75,7 +75,7 @@ jobs:
       # that dies with the container. `test_env_variables` is appended to
       # the env file that same container is built with, which is the one
       # hook this workflow gives us to set it.
-      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir", "DUCKDB_TAG": "v2.0.0-dev0"}}'
+      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir", "DUCKDB_TAG": "v2.0.0-alpha46057"}}'
 
   publish:
     needs: [should-release, build-extension]
