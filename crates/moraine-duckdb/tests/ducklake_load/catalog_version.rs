@@ -8,7 +8,7 @@
 //! and the lake still answering on the raised one are the properties under
 //! test.
 
-use std::path::Path;
+use std::{fmt::Write as _, path::Path};
 
 use crate::helpers::*;
 
@@ -221,9 +221,11 @@ fn staged_file_readers_preserve_row_group_counts() {
             .enumerate()
         {
             let order = position * 2 + kind;
-            sql.push_str(&format!(
+            write!(
+                sql,
                 "INSERT INTO seen SELECT {order}, row_group_count FROM m.{table} {filter};"
-            ));
+            )
+            .unwrap();
         }
     }
     sql.push_str("SELECT row_group_count FROM seen ORDER BY position; ROLLBACK;");
