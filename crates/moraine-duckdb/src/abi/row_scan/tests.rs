@@ -8,19 +8,26 @@ use arrow::{
 
 use super::*;
 
+/// The row-scan ABI is one Arrow cursor. The located verbs took the strict
+/// cursor and the positional-deletion calls with them, and the generated
+/// header is where that is observable.
 #[test]
-fn located_row_abi_exposes_only_arrow_results() {
+fn the_row_scan_abi_is_one_arrow_cursor() {
     let header = include_str!("../../../cpp/moraine_abi.h");
     for removed in [
         "MoraineRowBatch",
         "moraine_rows_at(",
         "moraine_rows_at_free(",
         "moraine_row_scan_next(",
+        "moraine_rows_at_open(",
+        "moraine_locate_row_positions(",
+        "moraine_commit_located_deletion(",
+        "MoraineLocatedFile",
     ] {
-        assert!(!header.contains(removed), "legacy IPC export: {removed}");
+        assert!(!header.contains(removed), "withdrawn export: {removed}");
     }
     for retained in [
-        "moraine_rows_at_open(",
+        "moraine_row_scan_open(",
         "moraine_row_scan_next_arrow(",
         "moraine_row_scan_free(",
     ] {

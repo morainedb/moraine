@@ -761,7 +761,7 @@ mod locate_row_positions {
         let snapshot = reads.snapshot().await.unwrap();
         let pairs = [(1, Some(dense_id)), (2, Some(dense_id))];
 
-        // The read half of a located update, as `moraine_rows_at` runs it.
+        // A strict whole-row read of the same pairs.
         reads
             .scan_rows_at_strict(&snapshot, Some(store.clone()), "", table, &pairs)
             .await

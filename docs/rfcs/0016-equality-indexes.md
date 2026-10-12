@@ -989,7 +989,6 @@ by key:
 | `WHERE a = k`, this trigger, filters pushed | 1 | 99,443 |
 | `WHERE a = k`, this trigger, summary scan | 1 | 96,532 (moraine's reader) |
 | `… USING moraine_index_lookup(…)`, the join trigger | 1 | 2,923 |
-| `moraine_delete_located(…)` | — | 0 |
 
 The file list is worth the file it drops; naming the rows is worth most of
 the rest. What this trigger still reads is the key column's chunk in the one
@@ -1372,219 +1371,41 @@ cancellation, and prepared-statement destruction. A deterministic concurrent
 commit between validation and execution must not mix scopes. Benchmarks report
 probe counts, validation time, prepare time, execution time, and retained bytes.
 
-### File-located deletion
+### Naming exact rows from SQL
 
-A caller holding located rows — `(row_id, data_file_id)` pairs from a
-lookup — can delete them without a scan: a DuckLake delete file is
-`(file_path, pos)` rows, and positions are what file-row summaries answer.
-The path exists for bulk deletion by key from the embedding surface, where
-per-statement SQL machinery is the cost being avoided; the extension path
-surfaces it as `moraine_delete_located` (SQL surface below). The SQL function
-retains direct positioning and stages its changes in DuckLake's transaction.
-The located `DELETE … USING` join remains available for ordinary SQL deletion.
-
-The split follows the repository's Parquet charter: the core never writes
-Parquet. `ReadOnlyCatalog::locate_row_positions` resolves located rows to
-`(data_file_id, position)` through the summaries, building on miss exactly
-as locating does; the caller writes the delete file's content and lands it through the
-verbs that already exist: `register_delete_file` for the new file,
-`expire_delete_file` for the one it replaces, `inline_delete` for rows whose
-file id is NULL. No new keys, no commit-protocol change, no new verb. The
-directory the caller writes the delete file into comes from
-`CatalogSnapshot::table_write_directory`, which types a refusal rather than
-guess a path for a table an operator has relocated to an absolute-path
-schema or table directory.
-
-Position resolution inverts the locating contract, and the inversion is the
-design's load-bearing clause. Locating may broaden — a degraded summary
-leaves every row a candidate, and the scan adjudicates. A position may not:
-a wrong position deletes a different row. `locate_row_positions` is
-therefore exact-or-failed. A summary miss rebuilds from the file's row-id
-column; a row the file does not hold, a file absent from the head view, or
-an unreadable column is a typed error naming the row, never a guess. The
-caller falls back to the SQL path or surfaces the failure.
-
-A data file may already carry a delete file. The writer reads the existing
-file's positions, unions them with the new deletions, writes one file
-holding both, and registers it while expiring the old — the same
-replace-not-amend shape DuckLake's own DELETE produces. Two transactions
-deleting from the same data file conflict on that expiry: the commit fails
-closed with a typed conflict rather than retrying, and it is the caller's
-re-issued call that re-locates and re-unions; a row deleted twice this way
-folds silently into the union. The written shape matches what DuckLake's
-DELETE writes, source-verified: `file_path VARCHAR` and `pos BIGINT` under
-DuckLake's reserved field ids. A lake configured for deletion vectors
-rather than Parquet delete files declines this path and keeps the SQL
-fallback.
-
-Embedding callers of `Catalog::commit_located_deletion` retain files on an
-uncertain commit outcome. SQL calls instead transfer file ownership to
-DuckLake's pending changes: rollback removes uncommitted files, while the
-unknown-outcome handling preserves files that a commit may have registered.
-
-The SQL surface splits the work along the same line. During binding the
-extension resolves the located rows through `locate_row_positions_at`
-against the transaction's snapshot and rewrites the call into the bundled
-DuckLake function
-`ducklake_delete_positions(catalog, schema, table, files, inlined_rows, snapshot)`,
-whose inputs are DuckLake's own identifiers: `(data_file_id, positions)` per
-file, row ids for inlined rows, and the snapshot the positions were resolved
-against. That function knows nothing about Moraine. It validates every file
-id and position against the transaction's snapshot, subtracts deletions the
-file already carries — the positions of its committed delete file, which the
-extension passes along as `existing_positions`, a BLOB of little-endian
-`u64`s from the resolution's own per-path cached decode, so the function
-need not read the file again on every statement nor unpack one SQL value per
-position; or its pending delete file when this transaction already wrote
-one; plus inlined file deletions — and stages the remainder
-exactly as `DELETE` would: inlined file deletions below the inlining
-threshold, otherwise a delete file replacing the file's current one. Inlined
-rows are resolved to their backing inlined table by a metadata query and
-staged as pending inline deletions. DuckDB registers the lake as modified,
-so `COMMIT` publishes the deletions with the transaction's other changes and
-`ROLLBACK` discards them and removes any file written; a prepared call binds
-again for each execution. A failure after staging begins aborts the
-enclosing transaction.
-
-The two sides hold separate views that must agree. The extension's
-transaction manager materializes one catalog view per DuckDB transaction,
-which is what the located functions resolve against; DuckLake's transaction
-loads its own snapshot lazily, through a metadata connection of its own,
-the first time the lake is touched. The located functions therefore touch
-the lake's table before taking the metadata catalog's view, so DuckLake's
-snapshot is pinned first and the view is the same or newer, never older;
-and the deletion names the snapshot it resolved against so DuckLake
-refuses an older one with a transaction error, since positions resolved
-in an older view could name rows the transaction already sees deleted. A
-newer view is safe: a row it no longer holds is one DuckLake still
-positions and stages, and the commit then fails with DuckLake's ordinary
-conflict on the file, exactly as an `UPDATE` of a row another writer
-deleted after the snapshot would. A row deleted before the snapshot is
-invisible to the resolution and stages nothing. Rows inserted into
-transaction-local storage are not addressable. Index lookups themselves
-read the head, so a locator list can name a row the snapshot does not
-hold; resolution then fails typed rather than guessing. Visibility remains
-DuckLake's delete and snapshot processing, and index maintenance uses the
-normal scoped reads when the transaction commits. No user-table scan is
-introduced.
-
-### Located rows and located updates
-
-A located update is a located deletion plus an insert of the replacement
-rows. The insert is DuckLake's own, which keeps inlining, partitioning,
-encryption, and statistics on their normal path; what a partial update
-lacks is the old values of the columns it does not change. The core
-supplies them without a scan: `ReadOnlyCatalog::scan_rows_at_strict` opens a
-whole-row cursor at a pinned snapshot. File rows are read at their exact
-positions through the row selection the file-row summaries already
-answer, so only the pages holding them are fetched. Execution uses the same
-bounded file/row-group readers as indexed summary scans. Inlined rows
-decode from their chunk through the inline lookup directory, touching
-only the store. Columns are matched by field id against the table's
-columns at the snapshot, so a file written before a column was added
-reads NULL for it and a widened type is cast to the current one. A row
-deleted at the snapshot — by a delete file, honoring the per-position
-snapshots a replaced one embeds, or by an inlined file deletion — is
-omitted, and a pair that cannot be positioned exactly fails the call under
-the same contract as deletion. Each batch is returned as owned Arrow arrays:
-the table's top-level columns under
-their current names, then `row_id` and `data_file_id`, NULL for an
-inlined row. Batches carry their own schemas because a
-file written under an older schema may carry a narrower physical type;
-the extension casts each column to the bound type as it imports Arrow buffers.
-There is no IPC-returning located-row interface. Rust callers use
-`scan_rows_at_strict` followed by `next_record_batch`, retaining batches or
-serializing them in their own transport layer if needed. This replaces
-`ReadOnlyCatalog::rows_at`, `LocatedRows`, and the IPC-returning cursor
-`next_batch` method; their removal is a breaking Rust API change.
-
-`moraine_rows_at` binds only the constant pairs and result schema; its execution
-state owns a strict cursor and imports batches through the Arrow C Data Interface.
-PREPARE and EXPLAIN do not position or decode requested rows. Invalid locations
-therefore fail at execution, not preparation. Each execution resolves positions
-and deletion visibility against its pinned transaction snapshot; dropping the
-state releases queued batches and cancels pending reads. Schema rebinding remains
-required between prepared executions, but carries no payload buffers. Both this
-function and indexed summary scans use `moraine_summary_scan_threads` for their
-shared bounded readers; only the strict cursor rejects absent candidate pairs.
-
-The extension surfaces this as `moraine_rows_at`. Spelled out, the update
-is one transaction:
+A lookup reports `(row_id, data_file_id)`, and both are columns a scan can
+be filtered on, so a statement names exact rows by joining the lookup to
+the table on them:
 
 ```sql
-BEGIN;
-SET VARIABLE located = (SELECT list({row_id: row_id, data_file_id: data_file_id})
-                        FROM moraine_index_in('lake', 'main', 't', 'by_a', [5, 100005]));
-CALL moraine_delete_located('lake', 'main', 't', getvariable('located'));
-INSERT INTO lake.t SELECT a, b + 1, c FROM moraine_rows_at('lake', 'main', 't', getvariable('located'));
-COMMIT;
+DELETE FROM lake.main.t
+USING moraine_index_lookup('lake', 'main', 't', 'by_a', 150) hits
+WHERE t.rowid = hits.row_id
+  AND t.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
 ```
 
-The `SET` clause of an update is ordinary SQL in the `SELECT`. Because the
-read and the deletion resolve against the same pinned snapshot, and the
-deletion is refused if DuckLake's transaction holds a newer one, the recipe
-has `UPDATE`'s semantics under concurrency: a row deleted before
-the snapshot is neither read nor reinserted, and a row deleted after it
-conflicts at commit. With inlining on, a small update is metadata-only
-before commit — local reads for the old rows, inlined rows for the new
-ones, inlined deletions for the old ones. The spelled-out recipe gives the rows new ids, since a plain `INSERT`
-has DuckLake assign them at commit; `moraine_update` below keeps them.
+The null-safe comparison on the file id is what admits an inlined row,
+whose file id is NULL. `UPDATE … FROM` takes the same shape, and carrying
+per-row new values is a join against a `VALUES` list on the same two
+columns. The optimizer rule recognises the join and pushes the resolved
+row ids and file ids as scan filters, so the read is the located row's row
+group rather than the table.
 
-`moraine_update` fuses the recipe into one statement:
+This replaced a set of dedicated verbs — `moraine_delete_located`,
+`moraine_rows_at` and `moraine_update` — that resolved the same pairs
+against the snapshot. The deletion read no row data; the read and update
+verbs fetched the positioned rows. They were withdrawn: the join form expresses every row set they addressed, the
+optimizer rule closes most of the gap on reads, and the automatic path is
+where the remaining difference belongs rather than a surface a caller has
+to know to reach for.
 
-```sql
-CALL moraine_update('lake', 'main', 't', getvariable('located'), 'b = b + 1, c = 0');
-```
-
-The last argument is `SET`-clause text: `column = expression` pairs, the
-expressions ordinary SQL over the table's columns; unassigned columns keep
-their values. The extension resolves the located rows exactly as the
-deletion does, composes the replacement query — every column in order,
-assigned ones replaced by their expression, read from `moraine_rows_at`
-over the same located rows — then the row id, and rewrites the call into the bundled
-`ducklake_update_positions(catalog, schema, table, files, replacement,
-inlined_rows, snapshot)`. That function binds `replacement` through
-DuckDB's binder, casts it to the table's columns, and plans it through the
-operators DuckLake's own `UPDATE` uses, in the mode that writes the row-id
-column back: the rows keep their ids, and inlining, partitioning,
-encryption, and statistics follow the update path. The positional deletes
-run as an operator once the rows have been written, in the same
-transaction; DuckDB's `bind_operator` hook lets a table function return
-that plan, as DuckLake's own inlined-data flush does. It reports the deleted, inlined, and written
-counts of the deletion and the number of rows inserted. Outside an
-explicit transaction DuckDB commits the statement on its own. The
-concurrency rules are the recipe's, since the same snapshot pinning and
-the same refusal of an older view apply.
-
-Assignments are one expression list applied to every located row, which
-suits a caller whose rows take the same new values — a patch clearing the
-same ids from many parents, say. A caller whose values differ per row
-supplies them in `rows`, which accepts named fields beyond `row_id` and
-`data_file_id`; `assignments` reaches them under the alias `new`:
-
-```sql
-CALL moraine_update('lake', 'main', 't',
-  [{row_id: 12::BIGINT, data_file_id: 3::UBIGINT, b: 40},
-   {row_id: 57::BIGINT, data_file_id: 3::UBIGINT, b: 41}],
-  'b = new.b');
-```
-
-The replacement query then joins `moraine_rows_at` to the payload on
-`row_id` rather than projecting over it alone. A located row's id is
-unique, so the join neither adds nor drops rows, and a `rows` list carrying
-only the two positional fields composes exactly the projection above. A
-`new` reference naming no payload field is rejected where every unresolved
-column is, in the binder. A repeated `row_id` is refused outright once a
-payload is present: without one the resolution dedups it, but two payloads
-for a row have no defined winner and the join would emit both.
-
-Without this a per-row caller writes a DuckLake `UPDATE … FROM (VALUES …)`,
-which reads whole files: DuckLake's DML scan projects the `filename`,
-`file_index`, and `file_row_number` columns that record delete positions,
-and the summary-driven scan produces only row and file ids, so that rewrite
-never applies to DML. Encoding the per-row values as a `CASE` per column
-keeps one statement but grows its text as rows times columns, and binding a
-wide located statement is already its dominant cost.
+What went with them is the one thing the join form cannot say: *these rows
+as I read them, or fail*. The verbs positioned against the pinned snapshot
+and refused a pair whose file no longer held it, so a caller that resolved
+a set in an earlier statement learned that it had moved. A join is
+last-write-wins — it operates on whatever matches now and silently changes
+fewer rows. A caller that needs the stricter contract has to compare the
+reported row count against what it resolved.
 
 ### Range and comparison queries
 
@@ -1898,9 +1719,6 @@ written `…` below for brevity.
 | `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
 | `moraine_index_verify(catalog, schema, table, index)` | table function: recompute the index's entries from the live rows and report the difference — `stored`, `expected`, `missing`, `dead`, `mismatched`. Reads every live data file of the table, so it costs what the build costs; writes nothing and takes no snapshot, so a read-only attach may run it. A clean index reports `stored = expected` and zeros for the last three. Only a `ready` index can be verified: a build's entries are incomplete by design |
 | `moraine_indexes(catalog, schema, table)` | table function: index introspection — `index_id`, `index_name`, `is_unique`, `is_building`, and `state` (`ready`\|`building`\|`maintaining`\|`poisoned`) |
-| `moraine_delete_located(catalog, schema, table, rows)` | table function: delete the located rows without a scan (File-located deletion). `rows` is a list of `row(row_id, data_file_id)` pairs as a lookup returned them, a NULL file id naming an inlined row. Returns one row of counts: file rows deleted, inline rows deleted, delete files written |
-| `moraine_rows_at(catalog, schema, table, rows)` | table function: the located rows read back whole without a scan (Located rows and located updates). Same `rows` shape. Returns the table's current columns, then `row_id` and `data_file_id` (NULL for an inlined row); a row deleted at the transaction's snapshot is omitted |
-| `moraine_update(catalog, schema, table, rows, assignments)` | table function: update the located rows without a scan in one statement (Located rows and located updates). Same `rows` shape, optionally carrying named payload fields beyond `row_id` and `data_file_id`; `assignments` is `SET`-clause text, `column = expression` pairs over the table's columns and, as `new.<field>`, the payload. Returns one row of counts: file rows deleted, inline rows deleted, delete files written, rows inserted |
 
 `moraine_index_in` binds `keys` as one constant list value (including a
 prepared-statement parameter), like the arguments of the other explicit
@@ -1920,21 +1738,11 @@ enclosing DuckDB transaction — and race concurrent DuckLake commits through
 the ordinary `altered_table` conflict. Non-native syntax, explicit reads
 (below), but real without a DuckLake change.
 
-`moraine_delete_located`, `moraine_rows_at`, and `moraine_update` bind
-`rows` as one constant list, exactly as `moraine_index_in` binds `keys`,
-and all resolve it against the snapshot the current DuckDB transaction
-pinned on the metadata catalog. `moraine_delete_located` and
-`moraine_update` participate in the current DuckLake transaction: an explicit `COMMIT` publishes its deletions together with
-other writes, and `ROLLBACK` discards them. Outside an explicit transaction,
-DuckDB commits the statement automatically. An empty or already-deleted
-request stages nothing. The SQL function requires the bundled DuckLake's
-`ducklake_delete_positions`; it never falls back to an autonomous commit.
-
-Every pair positions exactly or the call fails: a row the named file does not
-hold, a file absent from the snapshot, or a deletion-vector-configured lake
-each refuse. Duplicate pairs collapse, and pending deletions are considered
-when counting new work. A failed replacement insert can therefore roll back
-the preceding direct deletion without losing the original rows.
+The index read functions bind their arguments as constants, exactly as
+`moraine_index_in` binds `keys`, and resolve them against the snapshot the
+current DuckDB transaction pinned on the metadata catalog. They read; the
+statement that mutates is ordinary SQL joined to their result, so it
+transacts as any DuckLake statement does.
 
 **Coverage: intercept inline, read bulk.** Small inserts DuckLake stages
 inline; their values cross the ABI as an Arrow body (RFC 0005), and moraine
@@ -2262,14 +2070,7 @@ tests against real SlateDB on in-memory `object_store`:
   dense and row-id-column files; inlined rows decode from their chunk; a
   row deleted at the snapshot is omitted; a column added after a file was
   written reads NULL; an older snapshot still serves a row deleted later,
-  and a file the snapshot lacks is refused. Through DuckDB, the recipe
-  commits and rolls back as one transaction with inlining on and off, and
-  across two connections a read pinned before a concurrent delete still
-  sees the row while the commit reports the conflict, and a metadata view
-  pinned before DuckLake's own, hence older, is refused by the deletion.
-  `moraine_update` applies its assignments in one statement, keeps the
-  rows' ids, rolls back with its transaction, commits on its own outside
-  one, refuses an unknown column, and conflicts at commit like the recipe.
+  and a file the snapshot lacks is refused.
 - **Delete coverage.** Store-resident delete (self-sufficient) and
   writer-supplied delete both remove entries; delete-then-reinsert of a
   unique value succeeds; a `register_delete_file` omitting entries on an

@@ -80,15 +80,10 @@ fn indexes_materialize_added_columns_initial_defaults() {
                 "SELECT row_id, data_file_id FROM moraine_index_lookup('lake','main','t','by_b',20);",
             ));
             assert_eq!(location.len(), 1, "limit={limit}, staged={staged}");
-            let file = if location[0][1].is_empty() {
-                "NULL"
-            } else {
-                &location[0][1]
-            };
-            run(&format!(
-                "SELECT * FROM moraine_delete_located('lake','main','t',[{{row_id: {}, data_file_id: {file}}}]);",
-                location[0][0]
-            ));
+            run("DELETE FROM lake.main.t \
+                 USING moraine_index_lookup('lake','main','t','by_b',20) hits \
+                 WHERE t.rowid = hits.row_id \
+                   AND t.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
             assert_eq!(
                 csv_rows(&run(
                     "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_b',20);"

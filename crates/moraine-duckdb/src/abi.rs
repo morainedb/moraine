@@ -19,7 +19,6 @@
 //! [`CatalogSnapshot`]: moraine::CatalogSnapshot
 
 mod attach;
-mod deletion;
 mod fault;
 mod indexes;
 mod lookup;
@@ -42,7 +41,6 @@ use std::{
 
 pub use attach::*;
 pub use checkpoints::*;
-pub use deletion::*;
 pub use fault::*;
 pub use indexes::*;
 pub use lookup::*;

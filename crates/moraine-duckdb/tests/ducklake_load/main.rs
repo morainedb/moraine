@@ -32,11 +32,9 @@ mod commit_protocol;
 mod crash;
 mod ddl;
 #[cfg(unix)]
-mod delete_located;
 mod deletes;
 mod index;
 mod inline;
-mod located_rows;
 mod maintenance;
 mod migrate;
 mod move_wal;

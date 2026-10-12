@@ -1254,9 +1254,9 @@ Summary-driven indexed scans are selected automatically by eligibility and
 physical coverage. There is no SQL on/off setting for this rewrite. The
 `moraine_summary_scan` operator remains in query plans; only its former
 Boolean session setting is removed.
-`moraine_summary_scan_threads` defaults to four and limits file/row-group prefetch
-for both summary scans and `moraine_rows_at`; the
-effective count also respects DuckDB's thread count and the per-cursor ceiling.
+`moraine_summary_scan_threads` defaults to four and limits a summary scan's
+file/row-group prefetch; the effective count also respects DuckDB's thread
+count and the per-cursor ceiling.
 
 The additive `moraine_row_scan_next_arrow` exports an owned Arrow C Data pair
 and a `has_batch` flag. On success with a batch the caller releases both structs
@@ -1264,15 +1264,15 @@ exactly once; at EOF or on error it acquires no structs. Buffers outlive the
 cursor. `moraine_row_scan_is_selective` costs projected page coverage,
 `moraine_row_scan_parallelism` configures prefetch before iteration, and
 `moraine_row_scan_metrics` samples cursor-local I/O and decode/worker counters.
-The additive `moraine_rows_at_open` opens a whole-row strict cursor with the
-same ownership and next/free functions. Unlike optimizer candidate scans it
-rejects missing positions. SQL binds only pairs and schema and opens this cursor
-at execution. The IPC-returning C functions `moraine_rows_at`,
-`moraine_rows_at_free`, and `moraine_row_scan_next`, and their `MoraineRowBatch`
-result type, are removed. External callers must migrate to cursor open,
-`moraine_row_scan_next_arrow`, Arrow release callbacks, and `moraine_row_scan_free`.
-This is a C ABI break, not a removal of the SQL `moraine_rows_at` function.
-Durable inline chunk IPC encoding is unchanged.
+`moraine_row_scan_open` is the only cursor the ABI opens. The strict
+variant that rejected an unpositionable pair went with the located verbs it
+served — nothing else asked for that contract — and with it the positional
+ABI those verbs owned: `moraine_locate_row_positions` and its two free
+functions, and `moraine_commit_located_deletion`. The earlier
+IPC-returning `moraine_rows_at`, `moraine_rows_at_free` and
+`moraine_row_scan_next`, with their `MoraineRowBatch` type, were already
+withdrawn in favour of the Arrow pair. Durable inline chunk IPC encoding is
+unchanged.
 The planning estimate owns no payload batches and discards its temporary scope
 before storing the prepared plan. See RFC 0016 for the eligibility and cost rules.
 

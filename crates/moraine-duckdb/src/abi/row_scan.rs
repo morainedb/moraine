@@ -10,7 +10,7 @@ use arrow::{
     ffi::{FFI_ArrowArray, FFI_ArrowSchema, to_ffi},
 };
 
-use super::{MorainePositionPair, borrow_str, guard, resolve_table};
+use super::{borrow_str, guard, resolve_table};
 use crate::{
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle},
@@ -21,6 +21,20 @@ pub struct MoraineRowScan {
     // Abort readers before releasing the runtime that owns their tasks.
     scan: moraine::LocatedRowScan,
     handle: MoraineCatalogHandle,
+}
+
+/// One `(row_id, data_file_id)` pair naming a row to read by position, as
+/// an index lookup reports it. `has_data_file_id` false means the row's
+/// file id is NULL — a live inlined row.
+#[repr(C)]
+pub struct MorainePositionPair {
+    /// The row id to position.
+    pub row_id: u64,
+    /// The data file it was located in; meaningful only when
+    /// `has_data_file_id`.
+    pub data_file_id: u64,
+    /// Whether `data_file_id` names a file.
+    pub has_data_file_id: bool,
 }
 
 /// File positions a selective scan treats as deleted on top of the
@@ -74,50 +88,6 @@ pub unsafe extern "C" fn moraine_row_scan_open(
             columns_len,
             excluded,
             excluded_len,
-            false,
-            out,
-            probe,
-            probe_ctx,
-            err,
-        )
-    }
-}
-
-/// Opens a whole-row cursor that rejects every unpositionable pair.
-/// Payload batches are decoded by `moraine_row_scan_next_arrow`.
-///
-/// # Safety
-/// Handles must be live and share a pinned scope. Strings and pairs must be
-/// valid for their lengths, and `out` writable. Cancellation and error
-/// pointers follow the catalog ABI contract.
-#[unsafe(no_mangle)]
-#[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn moraine_rows_at_open(
-    handle: *mut MoraineCatalogHandle,
-    snapshot: *mut MoraineSnapshotHandle,
-    schema: *const c_char,
-    table: *const c_char,
-    pairs: *const MorainePositionPair,
-    pairs_len: usize,
-    out: *mut *mut MoraineRowScan,
-    probe: MoraineInterruptProbe,
-    probe_ctx: *mut c_void,
-    err: *mut MoraineError,
-) -> i32 {
-    // SAFETY: forwards the caller's contract; strict cursors resolve all columns.
-    unsafe {
-        open_scan(
-            handle,
-            snapshot,
-            schema,
-            table,
-            pairs,
-            pairs_len,
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            0,
-            true,
             out,
             probe,
             probe_ctx,
@@ -177,7 +147,6 @@ unsafe fn open_scan(
     columns_len: usize,
     excluded: *const MoraineExcludedPositions,
     excluded_len: usize,
-    strict: bool,
     out: *mut *mut MoraineRowScan,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
@@ -235,31 +204,15 @@ unsafe fn open_scan(
         let view = unsafe { super::pinned_or_head(handle, snapshot, probe, probe_ctx) }?;
         let table = resolve_table(&view, schema, table)?;
         let reads = handle.catalog.reads();
-        let open = async {
-            if strict {
-                reads
-                    .scan_rows_at_strict(
-                        &view,
-                        handle.data_store.clone(),
-                        &handle.data_prefix,
-                        table,
-                        &pairs,
-                    )
-                    .await
-            } else {
-                reads
-                    .scan_rows_at_excluding(
-                        &view,
-                        handle.data_store.clone(),
-                        &handle.data_prefix,
-                        table,
-                        &pairs,
-                        &columns,
-                        &excluded,
-                    )
-                    .await
-            }
-        };
+        let open = reads.scan_rows_at_excluding(
+            &view,
+            handle.data_store.clone(),
+            &handle.data_prefix,
+            table,
+            &pairs,
+            &columns,
+            &excluded,
+        );
         // SAFETY: caller supplies the cancellation callback's lifetime and thread
         // safety.
         let scan = unsafe { handle.block_on_cancellable(probe, probe_ctx, open) }?;

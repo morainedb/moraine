@@ -1,7 +1,6 @@
-//! A located update over rows that are still inlined: one commit
-//! tombstones every targeted row and re-inserts it under its preserved
-//! id, the shape `moraine_update` stages when its targets have not been
-//! flushed yet.
+//! An update over rows that are still inlined: one commit tombstones every
+//! targeted row and re-inserts it under its preserved id, the shape a
+//! staged update takes when its targets have not been flushed yet.
 
 use std::time::Duration;
 
