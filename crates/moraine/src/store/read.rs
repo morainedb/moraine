@@ -714,6 +714,38 @@ mod tests {
     use crate::store::open::StoreBuilder;
 
     #[tokio::test]
+    async fn history_key_visits_ignore_values_but_refuse_corrupt_keys() {
+        let (db, _) = StoreBuilder::new("history-keys", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let entity = EntityKey::File {
+            table_id: 1,
+            data_file_id: 2,
+        };
+        tx.put(Key::history(entity, 3).encode(), [0xff]).unwrap();
+        tx.put(history_entity_kind_prefix(EntityKind::Schema), [0xff])
+            .unwrap();
+
+        let mut keys = Vec::new();
+        visit_history_keys(ReadHandle::Tx(&tx), EntityKind::File, |key| keys.push(key))
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].entity, entity);
+
+        tx.put(history_entity_kind_prefix(EntityKind::File), [0xff])
+            .unwrap();
+        assert!(matches!(
+            visit_history_keys(ReadHandle::Tx(&tx), EntityKind::File, |_| {}).await,
+            Err(Error::Corruption(_))
+        ));
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn reads_decode_what_was_written() {
         let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
