@@ -211,6 +211,7 @@ unsafe fn create_index_in_one_commit(
 /// Every pointer must be valid per the ABI contract; `err`, if non-null,
 /// must be writable.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_lines)]
 pub unsafe extern "C" fn moraine_index_create(
     handle: *mut MoraineCatalogHandle,
     schema_name: *const c_char,
@@ -225,6 +226,7 @@ pub unsafe extern "C" fn moraine_index_create(
     staged: bool,
     step_entries: u64,
     step_bytes: u64,
+    if_not_exists: bool,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
@@ -249,6 +251,18 @@ pub unsafe extern "C" fn moraine_index_create(
             handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
+        let schema_id = snapshot
+            .table_by_id(table_id)
+            .ok_or_else(|| AbiError::from(moraine::Error::NotFound(format!("table {table}"))))?
+            .schema_id;
+        let existing = snapshot.index_by_schema_name(schema_id, name)?;
+        if if_not_exists && existing.is_some() {
+            return Ok(());
+        }
+        let name = existing
+            .as_ref()
+            .filter(|index| index.table_id == table_id)
+            .map_or(name, |index| index.name.as_str());
         let live_columns = snapshot.columns_of(table_id);
         let column_ids = columns
             .iter()
@@ -290,20 +304,14 @@ pub unsafe extern "C" fn moraine_index_create(
             moraine::IndexMaintenance::Synchronous
         };
 
-        if staged {
-            let default = moraine::BuildStep::default();
-            let step = moraine::BuildStep {
-                entries: if step_entries == 0 {
-                    default.entries
-                } else {
-                    usize::try_from(step_entries).unwrap_or(usize::MAX)
-                },
-                bytes: if step_bytes == 0 {
-                    default.bytes
-                } else {
-                    step_bytes
-                },
-            };
+        let result = if staged {
+            let mut step = moraine::BuildStep::default();
+            if step_entries != 0 {
+                step.entries = usize::try_from(step_entries).unwrap_or(usize::MAX);
+            }
+            if step_bytes != 0 {
+                step.bytes = step_bytes;
+            }
             // SAFETY: caller contract for `probe`/`probe_ctx`.
             unsafe {
                 handle_ref.block_on_commit(
@@ -322,22 +330,26 @@ pub unsafe extern "C" fn moraine_index_create(
                             Some(step),
                         ),
                 )
-            }?;
-            return Ok(());
-        }
-
-        // SAFETY: caller contract for `probe`/`probe_ctx`.
-        unsafe {
-            create_index_in_one_commit(
-                handle_ref,
-                table_id,
-                &def,
-                &orders,
-                maintenance,
-                data_store.filter(|_| holds_files),
-                probe,
-                probe_ctx,
-            )
+            }
+            .map(|_| ())
+        } else {
+            // SAFETY: caller contract for `probe`/`probe_ctx`.
+            unsafe {
+                create_index_in_one_commit(
+                    handle_ref,
+                    table_id,
+                    &def,
+                    &orders,
+                    maintenance,
+                    data_store.filter(|_| holds_files),
+                    probe,
+                    probe_ctx,
+                )
+            }
+        };
+        match result {
+            Err(error) if if_not_exists && error.code == codes::ALREADY_EXISTS => Ok(()),
+            result => result,
         }
     };
 
@@ -348,7 +360,8 @@ pub unsafe extern "C" fn moraine_index_create(
     }
 }
 
-/// Drops an equality index by name, committing autonomously.
+/// Drops an equality index by name, committing autonomously. A null
+/// `table_name` resolves within the schema; `if_exists` tolerates absence.
 ///
 /// # Safety
 ///
@@ -360,6 +373,7 @@ pub unsafe extern "C" fn moraine_index_drop(
     schema_name: *const c_char,
     table_name: *const c_char,
     index_name: *const c_char,
+    if_exists: bool,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
@@ -373,28 +387,42 @@ pub unsafe extern "C" fn moraine_index_drop(
         // SAFETY: caller contract for the string pointers.
         let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
         // SAFETY: caller contract.
-        let table = unsafe { borrow_str(table_name, "table_name") }?;
+        let table = if table_name.is_null() {
+            None
+        } else {
+            // SAFETY: non-null string satisfies the caller's contract.
+            Some(unsafe { borrow_str(table_name, "table_name") }?)
+        };
         // SAFETY: caller contract.
         let name = unsafe { borrow_str(index_name, "index_name") }?;
 
-        // SAFETY: caller contract for `probe`/`probe_ctx`.
-        let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
-        }?;
-        let table_id = resolve_table(&snapshot, schema, table)?;
-        let index = snapshot
-            .index_by_name(table_id, name)
-            .ok_or_else(|| AbiError::from(moraine::Error::NotFound(format!("index {name}"))))?;
-        let index_id = index.id;
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         unsafe {
             handle_ref.block_on_commit(
                 probe,
                 probe_ctx,
-                handle_ref
-                    .catalog
-                    .writer()?
-                    .commit(move |tx| tx.drop_index(index_id)),
+                handle_ref.catalog.writer()?.commit(|tx| {
+                    let Some(schema) = tx.schema_by_name(schema) else {
+                        return if if_exists && table.is_none() {
+                            Ok(())
+                        } else {
+                            Err(moraine::Error::NotFound(format!("schema {schema}")))
+                        };
+                    };
+                    let index = if let Some(table) = table {
+                        let table = tx
+                            .table_by_name(schema.id, table)
+                            .ok_or_else(|| moraine::Error::NotFound(format!("table {table}")))?;
+                        tx.index_by_name(table.id, name)
+                    } else {
+                        tx.index_by_schema_name(schema.id, name)?
+                    };
+                    match index {
+                        Some(index) => tx.drop_index(index.id),
+                        None if if_exists => Ok(()),
+                        None => Err(moraine::Error::NotFound(format!("index {name}"))),
+                    }
+                }),
             )
         }?;
         Ok(())

@@ -57,11 +57,11 @@ fn a_wide_sparse_probe_derives_row_pruning() {
         data.path(),
         &options,
         "CREATE TABLE lake.main.boundary AS SELECT i AS a FROM range(32768) t(i);
-         CALL moraine_index_create('lake','main','boundary','by_a',['a'],true);",
+         CALL moraine_index_create('lake','main','boundary','by_boundary_a',['a'],true);",
     );
     for (end, expected) in [(12048, "4096"), (12049, "4097")] {
         let query = format!("SELECT count(*) FROM lake.main.boundary data
-            JOIN moraine_index_in('lake','main','boundary','by_a',list_concat(range(2048),range(10000,{end}))) hits
+            JOIN moraine_index_in('lake','main','boundary','by_boundary_a',list_concat(range(2048),range(10000,{end}))) hits
             ON data.rowid IS NOT DISTINCT FROM hits.row_id
             AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id");
         let result = run_ducklake_sql_with_options(
@@ -83,10 +83,10 @@ fn a_wide_sparse_probe_derives_row_pruning() {
     let sparse = run_ducklake_sql_with_options(
         store.path(), data.path(), &options,
         "EXPLAIN SELECT count(*) FROM lake.main.boundary data
-         JOIN moraine_index_in('lake','main','boundary','by_a',list_transform(range(4096), lambda x: x * 7)) hits
+         JOIN moraine_index_in('lake','main','boundary','by_boundary_a',list_transform(range(4096), lambda x: x * 7)) hits
          ON data.rowid IS NOT DISTINCT FROM hits.row_id;
          SELECT count(*) FROM lake.main.boundary data
-         JOIN moraine_index_in('lake','main','boundary','by_a',list_transform(range(4096), lambda x: x * 7)) hits
+         JOIN moraine_index_in('lake','main','boundary','by_boundary_a',list_transform(range(4096), lambda x: x * 7)) hits
          ON data.rowid IS NOT DISTINCT FROM hits.row_id;",
     );
     assert!(

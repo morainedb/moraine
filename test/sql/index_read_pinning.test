@@ -27,7 +27,7 @@ statement ok
 INSERT INTO indexed.main.t VALUES (1);
 
 statement ok
-CALL moraine_index_create('indexed','main','t','by_a',['a'],false);
+CREATE INDEX by_a ON indexed.main.t(a);
 
 statement ok reader
 PREPARE probe AS SELECT count(*) FROM indexed.main.t data JOIN moraine_index_lookup('indexed','main','t','by_a',1) hits ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
@@ -67,7 +67,7 @@ EXECUTE probe;
 2
 
 statement ok writer
-CALL moraine_index_drop('indexed','main','t','by_a');
+DROP INDEX indexed.main.by_a;
 
 statement error reader
 EXECUTE probe;
@@ -75,7 +75,7 @@ EXECUTE probe;
 by_a
 
 statement ok writer
-CALL moraine_index_create('indexed','main','t','by_a',['a'],false);
+CREATE INDEX by_a ON indexed.main.t(a);
 
 query I reader
 EXECUTE probe;
@@ -91,10 +91,10 @@ statement ok
 CREATE TABLE indexed.main.deletions AS SELECT (i*7919)%100000 AS a, repeat(md5(i::VARCHAR),6) AS b FROM range(100000) r(i);
 
 statement ok
-CALL moraine_index_create('indexed','main','deletions','by_a',['a'],true);
+CREATE UNIQUE INDEX by_deletion_a ON indexed.main.deletions(a);
 
 query III
-SELECT missing, dead, mismatched FROM moraine_index_verify('indexed','main','deletions','by_a');
+SELECT missing, dead, mismatched FROM moraine_index_verify('indexed','main','deletions','by_deletion_a');
 ----
 0	0	0
 
@@ -128,6 +128,6 @@ SELECT count(*) FROM indexed.main.deletions WHERE a = 200000;
 1
 
 query III
-SELECT missing, dead, mismatched FROM moraine_index_verify('indexed','main','deletions','by_a');
+SELECT missing, dead, mismatched FROM moraine_index_verify('indexed','main','deletions','by_deletion_a');
 ----
 0	0	0

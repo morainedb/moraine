@@ -20,6 +20,12 @@
 //! projects (the [`dumps`] module). See `README.md`'s "Serving as
 //! DuckLake's metadata catalog" section.
 //!
+//! `CREATE INDEX`, `CREATE UNIQUE INDEX`, and `DROP INDEX` on Moraine-backed
+//! DuckLake tables use the existing index engine through DuckDB extension
+//! hooks. They require autocommit; ordinary predicates select indexes
+//! automatically. Index names are case-insensitively unique within a schema.
+//! `WITH (staged = true)` selects resumable bounded construction.
+//!
 //! **Secondary path — metadata-only inspection:** `ATTACH '<path>' AS m
 //! (TYPE moraine)`, or the bare `moraine:<path>` prefix (the same form
 //! DuckLake's nested attach uses internally). Schema/table/view listing

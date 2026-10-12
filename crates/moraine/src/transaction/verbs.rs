@@ -386,13 +386,22 @@ impl Transaction {
     /// exist.
     /// Returns [`Error::AlreadyExists`] if a table with the same name
     /// already exists in the target schema (including this table itself
-    /// when the target is its current schema).
+    /// when the target is its current schema), or an index name collides
+    /// with one in the target schema.
     pub fn set_table_schema(&mut self, table: TableId, new_schema: SchemaId) -> Result<()> {
         if !self.state.schemas.contains_key(&new_schema.get()) {
             return Err(Error::NotFound(format!("schema {new_schema}")));
         }
         let value = self.live_table(table)?;
         self.relation_name_free(new_schema.get(), &value.table_name)?;
+        for index in self.indexes_of(table) {
+            if self
+                .index_by_schema_name(new_schema, &index.name)?
+                .is_some()
+            {
+                return Err(Error::AlreadyExists(format!("index {}", index.name)));
+            }
+        }
         self.state.put_table(TableValue {
             schema_id: new_schema.get(),
             begin_snapshot: self.new_snapshot_id,
@@ -801,12 +810,8 @@ impl Transaction {
     }
 
     fn index_name_free(&self, table: TableId, name: &str) -> Result<()> {
-        let taken = self
-            .state
-            .indexes
-            .get(&table.get())
-            .is_some_and(|per_table| per_table.values().any(|i| i.index_name == name));
-        if taken {
+        let schema = SchemaId::new(self.live_table(table)?.schema_id);
+        if self.index_by_schema_name(schema, name)?.is_some() {
             return Err(Error::AlreadyExists(format!("index {name}")));
         }
         Ok(())
@@ -858,10 +863,10 @@ impl Transaction {
     ///
     /// Returns [`Error::NotFound`] if the table or any referenced column is
     /// not live. Returns [`Error::AlreadyExists`] if an index with that name
-    /// already exists on the table. Returns [`Error::Constraint`] if the
-    /// column list is empty, an entry's value count does not match the
-    /// column count, an indexed value exceeds the size cap, or the backfill
-    /// contains a duplicate of a unique value.
+    /// already exists in the schema (case-insensitive). Returns
+    /// [`Error::Constraint`] if the column list is empty, an entry's value
+    /// count does not match the column count, an indexed value exceeds the
+    /// size cap, or the backfill contains a duplicate of a unique value.
     pub fn create_index(
         &mut self,
         table: TableId,
