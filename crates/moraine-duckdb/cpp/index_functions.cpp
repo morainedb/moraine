@@ -398,15 +398,6 @@ duckdb::unique_ptr<duckdb::NodeStatistics> ExactIndexCardinality(duckdb::ClientC
 	return duckdb::make_uniq<duckdb::NodeStatistics>(count, count);
 }
 
-// Backing storage for a `MoraineLookupValue`'s string/bytes fields, which
-// point into these members and so must outlive any use of the value.
-struct LookupValueBacking {
-	std::string str;
-	std::vector<uint8_t> bytes;
-};
-
-using LookupValueArena = std::deque<LookupValueBacking>;
-
 // A value's text tagged by type and length, so that two different argument
 // lists cannot render alike: without the tag `('a', 'b,c')` and `('a,b', 'c')`
 // share a rendering, as do a NULL bound and the string `'NULL'`.
@@ -415,10 +406,8 @@ std::string ValueRepr(const duckdb::Value &value) {
 	return std::to_string(static_cast<int>(value.type().id())) + ":" + std::to_string(text.size()) + ":" + text;
 }
 
-// Translates a DuckDB `Value` into the tagged `MoraineLookupValue` the ABI
-// coerces to the indexed column's type. `caller` names the SQL function in
-// any error. Throws on a type equality indexes do not cover.
-//
+} // namespace
+
 // A NULL becomes the `IS NULL` predicate kind; which callers accept one is
 // the core's rule, so it is not judged here. Reading a typed NULL's payload
 // would raise an internal error, so the kind is set before the switch.
@@ -488,6 +477,8 @@ MoraineLookupValue BuildLookupValue(const duckdb::Value &value, LookupValueArena
 	}
 	return lookup;
 }
+
+namespace {
 
 // The variadic args after the index name are the equality key: one value per
 // indexed column, in the index's column order. The count must match the index

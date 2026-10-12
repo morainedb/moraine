@@ -920,6 +920,88 @@ The current DuckLake catalog view stays authoritative for file lifetime.
 Ended compaction inputs are simply absent, new outputs are cache misses, and
 nothing pairs sources with outputs or hooks catalog changes.
 
+### A plain predicate reaches the index through the rule
+
+The rule above needs a lookup in the query. An ordinary `WHERE key = 'x'`
+has none, and DuckLake's own column statistics prune nothing once the key is
+scattered — every file's min/max spans every key. So the same rule takes a
+second trigger: a `ducklake_scan` carrying a pushed equality against a
+constant on a column a ready index covers. It resolves the value once,
+through the same probe the join trigger uses — the metadata transaction's
+pinned view, the revision-keyed probe cache, the statement's dependency
+registration — and pushes the resolved `rowid` and `data_file_id` as scan
+filters, exactly as it would for the join. The scan still evaluates the
+predicate in full over whatever it reads, so a pushed filter can only narrow
+the reading; the one thing it rests on is that the index is complete for the
+snapshot the scan reads, which is the contract every pruning here rests on.
+
+The file filter prunes the file list through the metadata predicate the
+`data_file_id` column already has, and the row filter lets the reader skip to
+the row group holding the id. Neither needs the metadata manager to consult
+the index while it builds the file list — a design that was built, measured
+and retired, because it probed on every scan with no way to know whether a
+probe would pay and could narrow files but never rows.
+
+Where the rule declines, the scan is left as it was:
+
+- **A table below the probe's worth.** A probe costs about 3 ms, about what
+  scanning a megabyte does, so a table under `MIN_PRUNABLE_TABLE_BYTES`
+  (4 MiB of data files, from the statistics the planner has already loaded)
+  is scanned without asking. This is the gate the file-list design could not
+  have: at that point nothing says how big the table is.
+- **Another snapshot.** A scan at a snapshot other than the transaction's —
+  time travel — is a different cut than the index resolves against.
+- **Transaction-local inserts.** Rows this transaction inserted carry no
+  file id and no index entry yet; a file filter would drop them.
+- **No ready index on that column alone**, a NULL, a value of a type
+  equality indexes do not cover, or a read that failed, which is logged
+  rather than raised. An interrupt is raised, since the caller asked the
+  statement to stop.
+
+A value no row holds pushes a row-id range no row is in, so every file is
+pruned by its row-id statistics and inlined data passes nothing. A row the
+lookup could not place, or one living inlined, admits the rows with no file
+id beside the resolved files, as the join trigger's null-safe condition does.
+
+Measured on 100,000 rows in two files with keys permuted, counting one row
+by key:
+
+| how the row is named | files read | Parquet bytes read |
+| --- | --- | --- |
+| `WHERE a = k`, no index | 2 | 477,245 |
+| `WHERE a = k`, files pruned only | 1 | 238,622 |
+| `WHERE a = k`, this trigger, filters pushed | 1 | 99,443 |
+| `WHERE a = k`, this trigger, summary scan | 1 | 96,532 (moraine's reader) |
+| `… USING moraine_index_lookup(…)`, the join trigger | 1 | 2,923 |
+| `moraine_delete_located(…)` | — | 0 |
+
+The file list is worth the file it drops; naming the rows is worth most of
+the rest. What this trigger still reads is the key column's chunk in the one
+row group the located row sits in: the predicate it deliberately keeps has
+to be evaluated on something. The join form never pays it, because it
+carries no predicate on the column at all.
+
+A `SELECT` elects the summary scan the way the join trigger does — the scan
+is replaced in place, its pushed filters stay with it, and the summary scan
+evaluates them over what it reads — and that moves the read from DuckDB's
+reader to moraine's without shrinking it. DuckDB's Parquet writer starts a
+new data page only at 100 MiB uncompressed, so a column chunk is one page,
+and a read by position fetches the same chunk a read by row group does: on
+the fixture above, 993,508 bytes for `SELECT b … WHERE a = k` either way.
+The election would pay only on files whose chunks hold several pages, which
+DuckDB does not write. DML never elects it: a `DELETE` or `UPDATE` scan
+asks for `file_row_number`, which the summary scan does not produce.
+
+The last row reads nothing through DuckDB's reader because the positions
+come from moraine's file-row summaries, which that counter does not see; it
+needs the index to answer the predicate *exactly*, so it stays the explicit
+surface rather than a rewrite. Dropping the predicate from the scan would
+reach the same place for a `SELECT`, and the lookup contract is close to
+licensing it — entries are live-only and the summary scan subtracts the
+transaction's deletes — but every pruning here rests on the predicate being
+evaluated in full, and a stale entry would then surface as a wrong row
+rather than a slow one. That line is not crossed.
+
 ### Snapshot-validated index plans
 
 #### Contract
