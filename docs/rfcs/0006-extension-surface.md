@@ -291,7 +291,7 @@ store's block cache (RFC 0009) a disk device under that directory: blocks
 are written there at block grain as they are read, so repeat reads skip
 the GETs, and a new process recovers what the last one left, so a
 re-attach in the same order starts warm without a preload. It threads
-through the shim (`moraine_attach`'s `cache_dir`) into
+through the shim (`moraine_attach_with_wal_store`'s `cache_dir`) into
 `CatalogOptions::cache_dir` and `StoreBuilder`, applying to both the
 writer and the reader; unset (the default), only the memory tier applies.
 Redundant for local/`memory://` stores.
@@ -315,8 +315,8 @@ device: the first attach to name a `CACHE_DIR` settles it, and every
 store's device opens with that cap as a ceiling, filled only by what the
 store reads. Zero on the ABI means "not given", leaving the default
 cap (16 GiB); the option is inert without a `CACHE_DIR`, since there is no
-disk tier to bound. It threads through the shim (`moraine_attach`'s
-`cache_size_bytes`, and `moraine_migrate`'s) into
+disk tier to bound. It threads through the shim (`moraine_attach_with_wal_store`'s
+`cache_size_bytes`, and `moraine_migrate_with_wal_store`'s) into
 `CatalogOptions::cache_size` and `StoreBuilder`.
 
 **`CACHE_MEMORY` — how much memory the cache may take.** The same shape for
@@ -353,15 +353,11 @@ filling. Through DuckLake the names are `META_CACHE_PUTS` and
 `META_CACHE_COMPACTION_PUTS`.
 
 The core exposes `CatalogOptions::cache_puts` (default `true`) and
-`cache_compaction_puts` (default `true`). The shim uses the additive
-`moraine_attach_with_wal_store` entry point, whose cache flags and log store
-are explicit. Each earlier attach symbol keeps its signature and forwards:
-`moraine_attach_with_cache_policy` supplies no log store, and
-`moraine_attach` additionally maps its single cache flag to both policies,
-preserving existing binary callers. The migration ABI is additive the same
-way — `moraine_migrate_with_wal_store` reaches a lake whose log sits
-elsewhere, and `moraine_migrate` keeps its legacy signature and
-single-flag behavior.
+`cache_compaction_puts` (default `true`). The shim attaches through
+`moraine_attach_with_wal_store`, whose cache flags and log store are
+explicit, and migrates through `moraine_migrate_with_wal_store`. The shim
+is the ABI's only caller, so an entry point it stops calling is removed
+rather than kept as a forwarder.
 
 **`CACHE_PRELOAD` — fill it before the first query, not during it.** Both of
 the above leave a fresh process cold: the cache fills as queries ask for
@@ -378,7 +374,7 @@ writes data files against it; at any level but `'none'`, the extension also
 warms every table's probe ranges in the background after the open, so the
 first lookup on any table finds them cached (RFC 0009). The shim's option
 parsing owns the default; the level crosses the ABI as a code (`0`, `1`,
-`2`) on `moraine_attach` and `moraine_migrate`, and any other code is
+`2`) on the attach and migrate entry points, and any other code is
 refused rather than treated as "none", so a misspelled level surfaces as an
 error instead of an attach that merely feels slow.
 
@@ -914,7 +910,7 @@ What it buys is the test that a statement interrupted while its metadata
 read is blocked ends in that statement's failure rather than in the read
 finishing — the one assertion that fails if the hop above is removed.
 
-`moraine_attach` is cancellable too, and is the exception to
+`moraine_attach_with_wal_store` is cancellable too, and is the exception to
 "mutates nothing": the store open is the one long blocking call an attach
 makes, and against an unreachable endpoint it is the one a user is most
 likely to want out of. A cancelled attach writes no handle and leaves

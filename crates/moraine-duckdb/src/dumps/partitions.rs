@@ -60,7 +60,7 @@ pub(crate) fn partition_info_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.
@@ -155,7 +155,7 @@ pub(crate) fn partition_column_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.
@@ -251,7 +251,7 @@ pub(crate) fn sort_info_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.
@@ -354,7 +354,7 @@ pub(crate) fn sort_expression_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.

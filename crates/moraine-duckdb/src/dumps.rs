@@ -80,11 +80,11 @@ pub(crate) fn opt_into_raw(s: Option<CString>) -> *mut c_char {
 /// # Safety
 ///
 /// `handle` must be a pointer previously returned by
-/// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached.
-/// `out_items`/`out_len` must be valid, writable pointers. `probe`, if
-/// non-null, must be safe to call with `probe_ctx` from any thread.
-/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
-/// for the duration of the call.
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store)
+/// and not yet detached. `out_items`/`out_len` must be valid, writable
+/// pointers. `probe`, if non-null, must be safe to call with `probe_ctx` from
+/// any thread. `err`, if non-null, must be a valid, writable [`MoraineError`].
+/// All for the duration of the call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn dump_rows<Row, Rows>(
     handle: *mut MoraineCatalogHandle,

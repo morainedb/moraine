@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    abi::moraine_attach,
+    abi::moraine_attach_with_wal_store,
     error::{MoraineError, codes},
     runtime::MoraineCatalogHandle,
     staged::{MoraineCell, MoraineTxHandle, moraine_tx_begin, moraine_tx_commit, moraine_tx_stage},
@@ -50,7 +50,7 @@ pub(crate) fn attach_ok(dir: &Path) -> *mut MoraineCatalogHandle {
     let mut err = MoraineError::default();
     // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -63,6 +63,8 @@ pub(crate) fn attach_ok(dir: &Path) -> *mut MoraineCatalogHandle {
             0,
             0,
             false,
+            false,
+            ptr::null(),
             ptr::null(),
             ptr::null(),
             0,
@@ -94,7 +96,7 @@ pub(crate) fn attach_with_data_path(dir: &Path, data_dir: &Path) -> *mut Moraine
     let mut err = MoraineError::default();
     // SAFETY: both C strings are valid; outputs are valid local slots.
     let code = unsafe {
-        moraine_attach(
+        moraine_attach_with_wal_store(
             c_path.as_ptr(),
             ptr::null(),
             false,
@@ -107,7 +109,9 @@ pub(crate) fn attach_with_data_path(dir: &Path, data_dir: &Path) -> *mut Moraine
             0,
             0,
             false,
+            false,
             c_data.as_ptr(),
+            ptr::null(),
             ptr::null(),
             0,
             None,
