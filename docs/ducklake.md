@@ -111,8 +111,11 @@ The upstream request is a supported index contract covering:
 
 Once DuckLake defines that contract, moraine can map the upstream identifier
 through its reserved `ducklake_index_id` field and serve the same physical
-index through native syntax and optimizer pushdown. Until then, explicit SQL
-functions remain the supported surface.
+index through native syntax and optimizer pushdown. Index administration
+currently uses explicit SQL functions. Ordinary equality, `IN`, range, NULL,
+and composite-key predicates can already use Moraine indexes through its
+optimizer extension. Explicit lookup functions remain available, but application
+queries need not name the index.
 
 DuckLake currently documents indexes and enforced key constraints as
 unsupported features that are unlikely to be added. This request should

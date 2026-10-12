@@ -84,3 +84,50 @@ EXECUTE probe;
 
 statement ok reader
 DEALLOCATE probe;
+
+# A certified DELETE must use its transaction's index view after another
+# connection changes the indexed key, then conflict instead of losing that write.
+statement ok
+CREATE TABLE indexed.main.deletions AS SELECT (i*7919)%100000 AS a, repeat(md5(i::VARCHAR),6) AS b FROM range(100000) r(i);
+
+statement ok
+CALL moraine_index_create('indexed','main','deletions','by_a',['a'],true);
+
+query III
+SELECT missing, dead, mismatched FROM moraine_index_verify('indexed','main','deletions','by_a');
+----
+0	0	0
+
+statement ok reader
+BEGIN;
+
+query I reader
+SELECT count(*) FROM indexed.main.deletions WHERE a = 30001;
+----
+1
+
+statement ok writer
+UPDATE indexed.main.deletions SET a = 200000 WHERE a = 30001;
+
+statement ok reader
+DELETE FROM indexed.main.deletions WHERE a = 30001;
+
+query I reader
+SELECT count(*) FROM indexed.main.deletions WHERE a = 30001;
+----
+0
+
+statement error reader
+COMMIT;
+----
+<REGEX>:.*(Conflict|conflict|TransactionContext Error).*
+
+query I
+SELECT count(*) FROM indexed.main.deletions WHERE a = 200000;
+----
+1
+
+query III
+SELECT missing, dead, mismatched FROM moraine_index_verify('indexed','main','deletions','by_a');
+----
+0	0	0

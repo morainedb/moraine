@@ -259,6 +259,18 @@ typedef struct MoraineLookupKey {
   size_t values_len;
 } MoraineLookupKey;
 
+// One conjunctive comparison on a stored column.
+typedef struct MoraineIndexPredicate {
+  // Stable catalog field identifier.
+  uint64_t field_id;
+  // 0: equality list, 1: IS NULL, 2: >, 3: >=, 4: <, 5: <=.
+  uint8_t kind;
+  // Constants for the comparison; empty for IS NULL.
+  const struct MoraineLookupValue *values;
+  // Number of constants.
+  size_t values_len;
+} MoraineIndexPredicate;
+
 // One borrowed step supplied to [`moraine_maintenance_status_record`].
 typedef struct MoraineMaintenanceStatusStepInput {
   // Maintenance operation name.
@@ -453,18 +465,27 @@ typedef struct MoraineObjectStoreTally {
   uint64_t data_bytes;
 } MoraineObjectStoreTally;
 
-// One `(row_id, data_file_id)` pair naming a row to read by position, as
-// an index lookup reports it. `has_data_file_id` false means the row's
-// file id is NULL — a live inlined row.
-typedef struct MorainePositionPair {
-  // The row id to position.
-  uint64_t row_id;
-  // The data file it was located in; meaningful only when
-  // `has_data_file_id`.
+// One data file carrying located positions, as
+// [`moraine_locate_row_positions`] groups its answer. Free with
+// [`moraine_locate_row_positions_free_files`].
+typedef struct MoraineLocatedFile {
+  // The data file these positions are within.
   uint64_t data_file_id;
-  // Whether `data_file_id` names a file.
-  bool has_data_file_id;
-} MorainePositionPair;
+  // Newly requested positions within this file, ascending and
+  // duplicate-free, owned.
+  uint64_t *positions;
+  // Length of `positions`.
+  size_t positions_len;
+  // Whether a delete file is currently registered against this data
+  // file; `existing_positions` is
+  // meaningful only when set.
+  bool has_existing_delete;
+  // Positions the registered delete file already carries, ascending
+  // and duplicate-free, owned.
+  uint64_t *existing_positions;
+  // Length of `existing_positions`.
+  size_t existing_positions_len;
+} MoraineLocatedFile;
 
 // File positions a selective scan treats as deleted on top of the
 // snapshot's own delete files: the caller's uncommitted deletions.
@@ -1714,29 +1735,6 @@ int32_t moraine_index_lookup(struct MoraineCatalogHandle *handle,
 // matching [`moraine_index_lookup`] call, not yet freed.
 void moraine_index_lookup_free(struct MoraineRowId *items, size_t len);
 
-// As [`moraine_index_lookup`], addressing the index by the column it
-// covers rather than by name: the rows holding `value` in the column with
-// field id `field_id`, through whichever ready single-column index covers
-// it. `out_covered` is false, with no rows, when no such index exists —
-// which is a decline rather than an empty answer.
-//
-// # Safety
-//
-// Every pointer must be valid per the ABI contract; `value` points to one
-// value whose string/bytes fields (if used) are valid; `err`, if non-null,
-// must be writable.
-int32_t moraine_index_lookup_by_column(struct MoraineCatalogHandle *handle,
-                                       const char *schema_name,
-                                       const char *table_name,
-                                       uint64_t field_id,
-                                       const struct MoraineLookupValue *value,
-                                       struct MoraineRowId **out_items,
-                                       size_t *out_len,
-                                       bool *out_covered,
-                                       MoraineInterruptProbe probe,
-                                       void *probe_ctx,
-                                       struct MoraineError *err);
-
 // Resolves an `IN` lookup to the union of rows holding any complete key.
 // Each key is coerced to the indexed columns' canonical types. Duplicate
 // keys are probed once; a key containing NULL matches no row; an empty key
@@ -1835,6 +1833,28 @@ int32_t moraine_index_nulls(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written by a matching
 // [`moraine_index_nulls`] call, not yet freed.
 void moraine_index_nulls_free(struct MoraineRowId *items, size_t len);
+
+// Resolves a conjunction through a ready index, or declines via `out_covered`.
+// `out_certified` means every supplied predicate was answered exactly by a
+// certified index. Original residual predicates remain the caller's
+// responsibility.
+//
+// # Safety
+// All input arrays and their nested pointers must be readable for their
+// lengths. Output pointers must be writable; strings and interrupt callbacks
+// satisfy the ABI contract.
+int32_t moraine_index_predicate_rows(struct MoraineCatalogHandle *handle,
+                                     const char *schema_name,
+                                     const char *table_name,
+                                     const struct MoraineIndexPredicate *predicates,
+                                     size_t predicates_len,
+                                     struct MoraineRowId **out_items,
+                                     size_t *out_len,
+                                     bool *out_covered,
+                                     bool *out_certified,
+                                     MoraineInterruptProbe probe,
+                                     void *probe_ctx,
+                                     struct MoraineError *err);
 
 // Runs one moraine-owned maintenance pass, reclaiming the entry ranges
 // of indexes no longer live, the file column statistics of data files no
@@ -2103,6 +2123,35 @@ int32_t moraine_sweep_row_summaries(struct MoraineCatalogHandle *handle,
                                     void *probe_ctx,
                                     struct MoraineError *err);
 
+// Resolves index hits in committed files to exact positions for deletion.
+// The handle must pin the scan's catalog revision. Free the returned files
+// with [`moraine_locate_row_positions_free_files`].
+//
+// # Safety
+// Every pointer must satisfy the ABI contract; `pairs` points to `pairs_len`
+// hits, output pointers are non-null and writable, and `probe`/`probe_ctx`
+// satisfy the interrupt-probe contract.
+int32_t moraine_locate_row_positions(struct MoraineCatalogHandle *handle,
+                                     const char *schema_name,
+                                     const char *table_name,
+                                     const struct MoraineRowId *pairs,
+                                     size_t pairs_len,
+                                     struct MoraineLocatedFile **out_files,
+                                     size_t *out_files_len,
+                                     MoraineInterruptProbe probe,
+                                     void *probe_ctx,
+                                     struct MoraineError *err);
+
+// Frees the array [`moraine_locate_row_positions`] wrote to
+// `out_files`/`out_files_len`, including each file's nested positions
+// arrays.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written there by a
+// matching call, not yet freed.
+void moraine_locate_row_positions_free_files(struct MoraineLocatedFile *items, size_t len);
+
 // Opens a transaction snapshot with a pinned index/inline read surface when
 // supported. Readers without pinned revisions receive an ordinary snapshot
 // instead.
@@ -2143,7 +2192,7 @@ int32_t moraine_row_scan_open(struct MoraineCatalogHandle *handle,
                               struct MoraineSnapshotHandle *snapshot,
                               const char *schema,
                               const char *table,
-                              const struct MorainePositionPair *pairs,
+                              const struct MoraineRowId *pairs,
                               size_t pairs_len,
                               const char *const *columns,
                               size_t columns_len,

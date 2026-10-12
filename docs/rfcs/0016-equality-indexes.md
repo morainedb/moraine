@@ -936,20 +936,41 @@ The current DuckLake catalog view stays authoritative for file lifetime.
 Ended compaction inputs are simply absent, new outputs are cache misses, and
 nothing pairs sources with outputs or hooks catalog changes.
 
-### A plain predicate reaches the index through the rule
+### Ordinary predicates reach indexes through the rule
 
-The rule above needs a lookup in the query. An ordinary `WHERE key = 'x'`
-has none, and DuckLake's own column statistics prune nothing once the key is
-scattered — every file's min/max spans every key. So the same rule takes a
-second trigger: a `ducklake_scan` carrying a pushed equality against a
-constant on a column a ready index covers. It resolves the value once,
-through the same probe the join trigger uses — the metadata transaction's
-pinned view, the revision-keyed probe cache, the statement's dependency
-registration — and pushes the resolved `rowid` and `data_file_id` as scan
-filters, exactly as it would for the join. The scan still evaluates the
-predicate in full over whatever it reads, so a pushed filter can only narrow
-the reading; the one thing it rests on is that the index is complete for the
-snapshot the scan reads, which is the contract every pruning here rests on.
+The optimizer translates pushed constant predicates into conjunctive column
+comparisons: equality or `IN`, lower and upper bounds, and `IS NULL`. The
+core selects a ready index with the longest usable prefix, reorders predicates
+into index-column order, and expands independent equality lists into complete
+keys, bounded to 4096 combinations. Full keys use batched point probes; an
+incomplete equality prefix or a final range uses an ordered scan; a prefix
+containing `IS NULL` uses the NULL-prefix lookup. Unsupported predicates remain
+residuals. The original SQL predicate remains evaluated over candidate rows.
+
+`ReadOnlyCatalog::index_predicate_rows(snapshot, table, predicates)` accepts
+`IndexPredicate { column, comparison }`, where `IndexComparison` represents
+an equality list, NULL, or inclusive/exclusive lower/upper bound. It returns
+`None` when no ready index covers a leading predicate, otherwise candidate row
+IDs and whether a certified index answered every supplied predicate exactly.
+The call requires the pinned scope owning `snapshot`. The extension's internal
+`moraine_index_predicate_rows` ABI translates typed SQL constants to this API;
+it replaces the single-column equality-only ABI.
+
+A certified full-key probe can also feed positional DELETE, but only if the
+entire scan predicate was translated and no residual operator survives.
+Tuple equality and tuple `IN` first expose implied per-column choices before
+DuckDB rewrites lists into joins. The original tuple predicate remains, rejecting
+cross-products and preserving row-NULL semantics. A residual tuple filter directly
+above a scan also supplies its choices after optimization, so dense leading-column
+choices simplified to a range can still probe later composite columns.
+
+Range and NULL-prefix probes retain predicate evaluation. Optional filters may
+prune reads but cannot certify a DELETE rewrite.
+
+The metadata transaction's pinned view, revision-keyed probe cache, and
+statement dependencies are shared with direct lookups. Candidates feed the
+existing selective reader or row/file pruning, so SELECT, UPDATE, and DELETE
+all benefit without naming an index in SQL.
 
 The file filter prunes the file list through the metadata predicate the
 `data_file_id` column already has, and the row filter lets the reader skip to
@@ -969,7 +990,7 @@ Where the rule declines, the scan is left as it was:
   time travel — is a different cut than the index resolves against.
 - **Transaction-local inserts.** Rows this transaction inserted carry no
   file id and no index entry yet; a file filter would drop them.
-- **No ready index on that column alone**, a NULL, a value of a type
+- **No ready index on a usable leading prefix**, a value of a type
   equality indexes do not cover, or a read that failed, which is logged
   rather than raised. An interrupt is raised, since the caller asked the
   statement to stop.
@@ -1204,7 +1225,7 @@ pools.
 Parallel output has no file-order guarantee; an SQL ORDER BY remains authoritative.
 `files_read` counts opened data files for query profiles. A verified summary
 may disprove a conservative candidate; the selective reader omits that pair,
-while strict located-position APIs continue to reject absent pairs. The cursor
+while exact file-position resolution rejects absent pairs. The cursor
 refuses partially visible historical files; ordinary time-travel queries retain
 DuckLake's per-row insertion-snapshot filtering.
 
@@ -1370,6 +1391,92 @@ explicit transactions and rollback, reader polling, attach replacement,
 cancellation, and prepared-statement destruction. A deterministic concurrent
 commit between validation and execution must not mix scopes. Benchmarks report
 probe counts, validation time, prepare time, execution time, and retained bytes.
+
+### An indexed-equality DELETE needs no scan
+
+The core exposes selective reads and exact position resolution.
+`locate_row_positions_at(snapshot, store, data_prefix, table, pairs)` takes
+an explicit snapshot, a data store, and `(row_id, DataFileId)` pairs, returning
+`Vec<LocatedDeletion>`. The head-snapshot wrapper and `LocatedPositions`
+container are removed; file positioning accepts no inline-row inputs or outputs.
+Inline reads remain part of the selective cursor.
+
+The retired
+locator verbs' `scan_rows_at_strict`, `commit_located_deletion`,
+`DeleteFileRegistration`, and `table_write_directory` are removed. Resolved
+file positions carry only the data-file ID, requested offsets, and optional
+existing delete offsets; callers no longer receive unused paths or delete
+file IDs. DuckLake owns deletion staging, writing, and commit.
+
+The DuckLake patch retains file-position DELETE only. Its unused positional
+UPDATE, inline-row mutation argument, and deferred position-token resolver
+are removed, including the transaction-side request registry, token counter,
+and lock. The optimizer resolves an equality once, offering its result
+to the DELETE rewrite and reusing it for scan pruning when rewriting declines.
+
+A `DELETE` whose whole predicate a certified index answers does not need to
+look at the table: the rows it would find are the rows the index reports. So
+the plan is replaced outright — `LOGICAL_DELETE` becomes a projection,
+carrying the delete's own table index so the parent's binding still
+resolves, over a `ducklake_delete_positions` call bound at post-optimize
+time. Physical planning never reaches DuckLake's delete operator, and no
+table scan survives. Position resolution can still read row-id or delete
+metadata; the absence of scan I/O is not a claim of zero object-store reads.
+
+Measured on 100,000 rows in two files, keys permuted so column statistics
+prune nothing, deleting one row by key:
+
+| how the row is named | files read | data read |
+| --- | --- | --- |
+| `WHERE a = k`, index not certified | 1 | 236.6 kB |
+| `WHERE a = k`, index certified | **0** | **nothing** |
+
+The second row's plan is a projection over `DUCKLAKE_DELETE_POSITIONS`, and
+`EXPLAIN ANALYZE` omits its `Data Read` line entirely, which it does only at
+zero scan bytes. It does not count reads made while resolving positions.
+
+This is the one rewrite that *replaces* predicate evaluation rather than
+narrowing it, which is why it reads the certificate (The certificate): a
+wrong entry here deletes a row rather than returning one. It declines
+unless all of these hold, and leaves the ordinary plan alone when any fails:
+
+- the index is certified, and `Ready`;
+- the index answers every pushed predicate exactly, including every column
+  of a composite key; optional hints and residual predicates cannot replace
+  predicate evaluation;
+- the scan is at the transaction's snapshot, with no transaction-local
+  inserts, and the table is past the probe's size gate;
+- every resolved row sits in a committed file, which is the positional
+  writer's scope;
+- the table does not write deletion vectors, which the positional function
+  does not support;
+- there is no `RETURNING`, which DuckLake refuses on this path anyway;
+- nothing but projections sits between the delete and its scan. A filter,
+  join or aggregate there is a predicate the index did not answer.
+
+The deletion-vector fallback preserves the existing operator; it does not
+add deletion-vector decoding to index upkeep, which currently requires
+Parquet delete files at commit.
+
+Positions are resolved against the scan's snapshot and the call names it, so
+DuckLake refuses them if its transaction has moved past that view.
+
+**UPDATE uses the automatic pushed-filter path.** DuckLake plans one
+as delete-plus-insert, so it must construct the replacement row; the
+pushed-filter rule narrows reads of the required columns to the holding file. On the
+same fixture, every form reads the same amount:
+
+| `UPDATE … SET b = 'z' WHERE a = k` | files read | data read |
+| --- | --- | --- |
+| predicate, index not certified | 1 | 236.6 kB |
+| predicate, index certified | 1 | 236.6 kB |
+| joined to a lookup on `rowid` — naming the row exactly | 1 | 236.6 kB |
+
+On this fixture, naming the row exactly reads what the predicate reads.
+This supports keeping the ordinary UPDATE operator, including its assignment
+and constraint semantics. It does not establish a lower bound for files with
+different page layouts; a positional UPDATE rewrite remains a possible future
+optimization for those files.
 
 ### Naming exact rows from SQL
 
@@ -1717,7 +1824,7 @@ written `…` below for brevity.
 | `moraine_index_in(…, keys)` | table function: row ids for the union of complete equality keys in `keys`. A single-column index takes a list of scalar values; a composite index takes a list of `row(...)` values in index-column order. Duplicate keys are one predicate, a key containing NULL matches no row, and an empty list returns no rows |
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
 | `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
-| `moraine_index_verify(catalog, schema, table, index)` | table function: recompute the index's entries from the live rows and report the difference — `stored`, `expected`, `missing`, `dead`, `mismatched`, then `certified_at` (the snapshot the index now stands certified at, NULL when it does not). A read-write attach records the outcome (The certificate); a read-only one reports without writing. Reads every live data file of the table, so it costs what the build costs; writes nothing and takes no snapshot, so a read-only attach may run it. A clean index reports `stored = expected` and zeros for the last three. Only a `ready` index can be verified: a build's entries are incomplete by design |
+| `moraine_index_verify(catalog, schema, table, index)` | table function: recompute the index's entries from the live rows and report the difference — `stored`, `expected`, `missing`, `dead`, `mismatched`, then `certified_at` (the snapshot the index now stands certified at, NULL when it does not). A read-write attach records the outcome (The certificate); a read-only one reports without writing. Reads every live data file of the table, so it costs what the build costs. A clean index reports `stored = expected` and zeros for the last three. Only a `ready` index can be verified: a build's entries are incomplete by design |
 | `moraine_indexes(catalog, schema, table)` | table function: index introspection — `index_id`, `index_name`, `is_unique`, `is_building`, `state` (`ready`\|`building`\|`maintaining`\|`poisoned`), and `certified_at` (The certificate) |
 
 `moraine_index_in` binds `keys` as one constant list value (including a
@@ -1777,7 +1884,7 @@ Before deriving keys, old physical values are converted to the indexed
 column's current type with checked casts; an unsupported default or failed
 conversion returns a typed error. The same projection serves immediate and
 staged backfills, deferred repair, file registration, SQL deletes and updates,
-and located-delete removals. Projection bounds are checked before calling
+and delete-file removals. Projection bounds are checked before calling
 Arrow or Parquet APIs that assume valid positions.
 
 A value is indexable only if its Parquet form and its inline Arrow form
@@ -2018,11 +2125,11 @@ value, so an entry can be present under the right value and still point
 somewhere else — neither missing nor dead, and the one case a key-only diff
 would call clean.
 
-The pass reads, and only reads: no commit, no snapshot, and a read-only
-attach may run it. Its cost is the build's cost, and it holds the stored
-entry set in memory, which is the bound a single-commit backfill already
-accepts. A `building` index is refused rather than reported against, since
-its entries are incomplete by design.
+A read-write attach records certification after verification; a read-only
+attach reports counts and the certificate from the same pinned snapshot without
+writing. A read-write invocation may commit a new certificate snapshot. Verification costs as much as a build
+and holds the stored entry set in memory. A `building` index is refused
+because its entries are incomplete by design.
 
 Three properties the counts give that nothing else does: a maintained index
 stays clean across insert, delete, update and compaction; a rebuild that
@@ -2061,12 +2168,15 @@ another, so the recording names the definition version the pass observed
 and is refused if the definition moved in between. A rebuild landing
 between a pass and its commit must not inherit the pass's agreement.
 
-**What reads it.** Nothing yet. It exists so that a plan may stop
-re-checking what the index answered — dropping the key predicate from a
-scan, and rewriting an indexed-equality `DELETE` into the positional path —
-and both of those read the certificate rather than a setting, because the
-failure they trade for is a wrong row returned or deleted rather than a
-slow query.
+**What reads it.** Positional DELETE requires a certified exact probe.
+Each optimizer probe reads at most 4,097 entries, with at most 32 equality
+probes in flight. A combined result above 4,096 candidates cancels pending
+probes and declines the optimization before row location; explicit lookup functions remain
+unbounded. The cap applies across equality keys, ranges, and NULL prefixes.
+
+Ordinary selective scans retain their predicates and do not require a
+certificate. Verification is optional for index use, but required to omit
+predicate evaluation on the positional DELETE path.
 
 ### Test obligations
 
@@ -2350,3 +2460,24 @@ while the whole graph stays cache-resident, seconds when it does not.
 Equality (and the range upgrade) fits RFC 0009's read model; vector search
 does not, and that is the entire reason it is out. The boundary is read
 cost, not storability.
+
+### Automatic predicate coverage limits
+
+Index selection keeps the 4 MiB probe gate, pinned-snapshot check, and
+transaction-local-insert fallback. Independent key lists expand to at most
+4096 combinations. Full equality keys, non-unique equality prefixes, final
+comparison bounds, and NULL-bearing prefixes can supply candidates. A unique
+index's incomplete non-null prefix declines: trailing NULL-bearing keys live
+in the separate multi-entry region and must not be silently omitted.
+
+Explicit SQL lookup functions remain available for compatibility and benchmark
+comparisons. Ordinary SQL is the application-facing path; administrative index
+creation, verification, introspection, and dropping remain explicit operations.
+
+The selective reader builds its metadata file list from resolved file IDs,
+including inline tables when a candidate has no file ID. It retains required
+predicates but does not execute optional pruning hints a second time. On the
+524,288-row filter benchmark, the 192-key hole pattern's warm median fell
+from roughly 56 ms to 11 ms with the candidate file list, versus 9 ms for the
+explicit lookup join. Benchmarks exercise ordinary predicates and retain the
+explicit join as a comparison, with exact result checks for every run.

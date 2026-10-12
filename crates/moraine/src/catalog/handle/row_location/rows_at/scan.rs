@@ -134,40 +134,6 @@ impl LocatedRowScan {
 }
 
 impl ReadOnlyCatalog {
-    /// Opens a whole-row cursor at `snapshot`, rejecting unpositionable pairs.
-    /// Columns follow catalog order, then `row_id` and `data_file_id` (NULL for
-    /// inline rows). Deleted file rows are omitted; inline pairs must be live.
-    ///
-    /// # Errors
-    /// Returns a schema or store error, or [`Error::RowPosition`] for a pair
-    /// that cannot be positioned exactly.
-    pub async fn scan_rows_at_strict(
-        &self,
-        snapshot: &CatalogSnapshot,
-        data_store: Option<DataStore>,
-        data_prefix: &str,
-        table: TableId,
-        pairs: &[(u64, Option<DataFileId>)],
-    ) -> Result<LocatedRowScan> {
-        let columns = snapshot
-            .columns_of(table)
-            .iter()
-            .filter(|column| column.parent_column.is_none())
-            .map(|column| column.name.clone())
-            .collect::<Vec<_>>();
-        self.scan_rows_at_with_mode(
-            snapshot,
-            data_store,
-            data_prefix,
-            table,
-            pairs,
-            &columns,
-            MissingRows::Reject,
-            &[],
-        )
-        .await
-    }
-
     /// Opens an exact selective reader for located pairs at `snapshot`.
     /// `columns` names top-level columns in output order; row and file IDs
     /// follow them. Duplicate pairs are emitted once; deleted rows and file
@@ -200,9 +166,9 @@ impl ReadOnlyCatalog {
     /// ```
     ///
     /// # Errors
-    /// Returns a schema error for an unknown column, or the positioning and
-    /// visibility errors documented by [`Self::scan_rows_at_strict`]. Partially
-    /// visible historical files return [`Error::Unsupported`].
+    /// Returns a schema or store error, or [`Error::RowPosition`] for unknown
+    /// files or inline rows. Partially visible historical files return
+    /// [`Error::Unsupported`].
     #[allow(clippy::too_many_arguments)]
     pub async fn scan_rows_at(
         &self,
@@ -243,35 +209,10 @@ impl ReadOnlyCatalog {
         columns: &[String],
         excluded: &[ExcludedPositions],
     ) -> Result<LocatedRowScan> {
-        self.scan_rows_at_with_mode(
-            snapshot,
-            data_store,
-            data_prefix,
-            table,
-            pairs,
-            columns,
-            MissingRows::Omit,
-            excluded,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn scan_rows_at_with_mode(
-        &self,
-        snapshot: &CatalogSnapshot,
-        data_store: Option<DataStore>,
-        data_prefix: &str,
-        table: TableId,
-        pairs: &[(u64, Option<DataFileId>)],
-        columns: &[String],
-        missing: MissingRows,
-        excluded: &[ExcludedPositions],
-    ) -> Result<LocatedRowScan> {
         let requested = requested_columns(snapshot, table, columns)?;
         let read_metrics = self.data_read_metrics();
         let visible_at = snapshot.current_snapshot().id.get();
-        let (by_file, null_rows) = group_deduped_pairs(pairs);
+        let (by_file, null_rows) = group_deduped_pairs(pairs.iter().copied());
         let recent = self
             .requested_inline_recent_rows(table, &null_rows, Some(visible_at))
             .await?;
@@ -318,17 +259,16 @@ impl ReadOnlyCatalog {
                 snapshot,
             };
             let (located, _) = self
-                .position_requested_files(&scope, by_file, requested_files, missing)
+                .position_requested_files(&scope, by_file, requested_files, MissingRows::Omit)
                 .await?;
             for read in self
                 .file_reads(&scope, table, located, visible_at, excluded)
                 .await?
             {
-                if matches!(missing, MissingRows::Omit)
-                    && read
-                        .file
-                        .partial_max
-                        .is_some_and(|maximum| maximum.get() > visible_at)
+                if read
+                    .file
+                    .partial_max
+                    .is_some_and(|maximum| maximum.get() > visible_at)
                 {
                     return Err(Error::Unsupported(
                         "selective reads of partially visible historical files".to_owned(),

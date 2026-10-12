@@ -243,7 +243,7 @@ fn mixed(tables: usize, files: usize) -> Vec<Statement> {
 
 fn point_read(id: usize) -> String {
     format!(
-        "SELECT CASE WHEN count(*)=1 AND min(data.id)={id} THEN {id} ELSE error('incorrect point lookup') END FROM lake.main.items data JOIN moraine_index_lookup('lake','main','items','by_id',{id}) hits ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;"
+        "SELECT CASE WHEN count(*)=1 AND min(data.id)={id} THEN {id} ELSE error('incorrect point lookup') END FROM lake.main.items data WHERE data.id={id};"
     )
 }
 

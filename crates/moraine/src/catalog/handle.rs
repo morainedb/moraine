@@ -4,7 +4,9 @@
 mod backfill;
 mod index_build;
 mod index_lookup;
+mod index_predicate;
 mod index_probe_cache;
+pub use index_predicate::{IndexComparison, IndexPredicate, IndexPredicateRows};
 mod index_read_scope;
 mod index_verify;
 pub use index_verify::IndexVerification;
@@ -31,10 +33,7 @@ pub use maintenance::{
     MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep,
 };
 use object_store::ObjectStore;
-pub use row_location::{
-    DeleteFileRegistration, ExcludedPositions, ExistingDeleteFile, LocatedDeletion,
-    LocatedPositions, LocatedRowScan, RowSummaryPublish,
-};
+pub use row_location::{ExcludedPositions, LocatedDeletion, LocatedRowScan, RowSummaryPublish};
 use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
 use tokio::sync::watch;
 use tracing::{info, warn};

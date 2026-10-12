@@ -2,6 +2,8 @@ use std::fmt::Write;
 
 use crate::helpers::*;
 
+mod delete_rewrite;
+mod predicates;
 mod prepared;
 mod pushdown;
 mod schema_evolution;
