@@ -10,6 +10,7 @@
 // Defines duckdb::StorageExtensionInfo, named by
 // MoraineTransactionManager::Create's signature.
 #include "duckdb/storage/storage_extension.hpp"
+#include "duckdb/transaction/transaction_manager.hpp"
 
 #include "metadata_tables.hpp"
 #include "moraine_abi.h"

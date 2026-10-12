@@ -20,6 +20,7 @@
 
 mod attach;
 mod deletion;
+mod fault;
 mod indexes;
 mod lookup;
 mod maintenance;
@@ -42,6 +43,7 @@ use std::{
 pub use attach::*;
 pub use checkpoints::*;
 pub use deletion::*;
+pub use fault::*;
 pub use indexes::*;
 pub use lookup::*;
 pub use maintenance::*;

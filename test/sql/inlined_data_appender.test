@@ -17,19 +17,16 @@ require-env MORAINE_DUCKDB_EXT
 require-env MORAINE_EXTENSION_DIR
 
 statement ok
-SET extension_directory='${MORAINE_EXTENSION_DIR}';
-
-statement ok
-INSTALL parquet;
+SET extension_directory='{MORAINE_EXTENSION_DIR}';
 
 statement ok
 LOAD parquet;
 
 statement ok
-LOAD '${MORAINE_DUCKDB_EXT}';
+LOAD '{MORAINE_DUCKDB_EXT}';
 
 statement ok
-ATTACH 'ducklake:moraine:__TEST_DIR__/appender-store' AS lake (DATA_PATH '__TEST_DIR__/appender-data/', DATA_INLINING_ROW_LIMIT 5000);
+ATTACH 'ducklake:moraine:{TEST_DIR}/appender-store' AS lake (DATA_PATH '{TEST_DIR}/appender-data/', DATA_INLINING_ROW_LIMIT 5000);
 
 statement ok
 CREATE TABLE lake.main.t(a INTEGER, b VARCHAR, c DOUBLE, d INTEGER[]);

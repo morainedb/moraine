@@ -5,7 +5,7 @@ use crate::helpers::*;
 /// Scan selection is automatic and prepared reads need no public on/off
 /// control.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn summary_scan_is_automatic_without_a_public_switch() {
     let store = TempDir::new("selective-control-store");
     let data = TempDir::new("selective-control-data");
@@ -31,8 +31,8 @@ fn summary_scan_is_automatic_without_a_public_switch() {
     );
     assert!(result.lines().any(|line| line == "switches,0"), "{result}");
     assert_eq!(
-        result.matches("MORAINE_SUMMARY_SCAN").count(),
-        2,
+        result.matches("Moraine Summary Scan").count(),
+        1,
         "{result}"
     );
     assert_eq!(
@@ -44,7 +44,7 @@ fn summary_scan_is_automatic_without_a_public_switch() {
 
 /// Sparse rows spread over almost every row group keep the ordinary reader.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn summary_scan_uses_physical_coverage() {
     let store = TempDir::new("selective-coverage-store");
     let data = TempDir::new("selective-coverage-data");
@@ -57,14 +57,14 @@ fn summary_scan_uses_physical_coverage() {
          CREATE TABLE lake.main.t AS SELECT i a, md5(i::VARCHAR) payload FROM range(262144) r(i);
          CALL moraine_index_create('lake','main','t','by_a',['a'],true);
          EXPLAIN SELECT sum(length(data.payload)) FROM lake.main.t data
-         JOIN moraine_index_in('lake','main','t','by_a',list_transform(range(128),x -> x * 2048)) hits
+         JOIN moraine_index_in('lake','main','t','by_a',list_transform(range(128), lambda x: x * 2048)) hits
          ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
-    assert!(!result.contains("MORAINE_SUMMARY_SCAN"), "{result}");
+    assert!(!result.contains("Moraine Summary Scan"), "{result}");
 }
 
 /// Parallel cursors preserve nullable strings and early-stop ownership.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn summary_scan_parallel_files_match_serial_and_ordinary() {
     let store = TempDir::new("selective-parallel-store");
     let data = TempDir::new("selective-parallel-data");
@@ -109,7 +109,7 @@ fn summary_scan_parallel_files_match_serial_and_ordinary() {
 /// Exact indexed joins scan projected positions and retain their residual
 /// predicates.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn summary_driven_scan_keeps_join_and_filters() {
     let store = TempDir::new("selective-store");
     let data = TempDir::new("selective-data");
@@ -126,11 +126,11 @@ fn summary_driven_scan_keeps_join_and_filters() {
          CALL moraine_index_create('lake','main','t','by_a',['a'],false);
          EXPLAIN {query}; {query};"));
     assert!(
-        result.contains("MORAINE_SUMMARY_SCAN"),
+        result.contains("Moraine Summary Scan"),
         "no selective scan: {result}"
     );
     assert!(
-        result.contains("HASH_JOIN"),
+        result.contains("Hash Join"),
         "the join was removed: {result}"
     );
     assert!(
@@ -142,7 +142,7 @@ fn summary_driven_scan_keeps_join_and_filters() {
 /// Prepared selective scans follow commits and project evolved schemas on files
 /// and inline chunks.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn summary_driven_scan_handles_visibility_and_schema_changes() {
     for inline in [0, 1000] {
         let store = TempDir::new("selective-visibility-store");
@@ -189,7 +189,7 @@ fn summary_driven_scan_handles_visibility_and_schema_changes() {
 /// Joins missing location identity and unsupported projections keep DuckLake's
 /// scan.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn summary_driven_scan_declines_unsafe_rewrites() {
     let store = TempDir::new("selective-fallback-store");
     let data = TempDir::new("selective-fallback-data");
@@ -207,7 +207,7 @@ fn summary_driven_scan_declines_unsafe_rewrites() {
          EXPLAIN SELECT data.b FROM lake.main.t data JOIN moraine_index_lookup('lake','main','t','by_a',1) hits
          ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
     assert!(
-        !result.contains("MORAINE_SUMMARY_SCAN"),
+        !result.contains("Moraine Summary Scan"),
         "unsafe replacement: {result}"
     );
 }
@@ -215,7 +215,7 @@ fn summary_driven_scan_declines_unsafe_rewrites() {
 /// PREPARE opens no selective cursor; each execution opens one projected
 /// reader.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn summary_scan_prepare_defers_projected_reads() {
     let store = TempDir::new("selective-prepare-store");
     let data = TempDir::new("selective-prepare-data");
@@ -256,7 +256,7 @@ fn summary_scan_prepare_defers_projected_reads() {
 /// deletes vanish from it: pending delete files, inlined file deletions and
 /// inlined-data deletions alike.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn summary_scan_runs_inside_a_writing_transaction_minus_its_deletes() {
     let query = "SELECT 'sum', sum(data.b) FROM lake.main.t data
         JOIN moraine_index_in('lake','main','t','by_a',[1,3,7]) hits
@@ -300,8 +300,8 @@ fn summary_scan_runs_inside_a_writing_transaction_minus_its_deletes() {
             ),
         );
         assert_eq!(
-            result.matches("MORAINE_SUMMARY_SCAN").count(),
-            6,
+            result.matches("Moraine Summary Scan").count(),
+            3,
             "limit={limit}: {result}"
         );
         let sums: Vec<_> = csv_rows(&result)
@@ -315,7 +315,7 @@ fn summary_scan_runs_inside_a_writing_transaction_minus_its_deletes() {
 
 /// A `UUID` column the query filters and projects keeps the selective path.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn summary_scan_reads_uuid_columns() {
     let store = TempDir::new("selective-uuid-store");
     let data = TempDir::new("selective-uuid-data");
@@ -342,7 +342,7 @@ fn summary_scan_reads_uuid_columns() {
         ),
     );
     assert!(
-        result.contains("MORAINE_SUMMARY_SCAN"),
+        result.contains("Moraine Summary Scan"),
         "no selective scan: {result}"
     );
     assert!(

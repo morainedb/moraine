@@ -6,10 +6,14 @@ name: Debug build
 on:
   workflow_dispatch:
     inputs:
-      duckdb_version:
-        description: "DuckDB release to build against, e.g. v1.5.6"
+      duckdb_ref:
+        description: "DuckDB tag, branch or commit to build against; the default is the pinned v2.0.0-dev0 commit"
         required: true
-        default: "v1.5.6"
+        default: "6b6099a3e9787f1b32c59fab61fcdd1d3bc835cd"
+      duckdb_tag:
+        description: "Version string the build stamps, which the CLI loading it must report"
+        required: true
+        default: "v2.0.0-dev0"
       debug_level:
         description: "Rust debug info: line-tables-only names frames, full adds locals"
         required: true
@@ -21,7 +25,7 @@ on:
 
 jobs:
   build:
-    name: Build ${{ inputs.duckdb_version }} with ${{ inputs.debug_level }} symbols
+    name: Build ${{ inputs.duckdb_ref }} with ${{ inputs.debug_level }} symbols
     runs-on: ubuntu-latest
     # The extension compiles DuckDB itself; a cold build is most of an hour.
     timeout-minutes: 180
@@ -33,6 +37,10 @@ jobs:
       # artifact that gets loaded, not sit beside it in the build tree.
       CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: packed
       GEN: ninja
+      # The checkout below is by ref, so `git describe` has no tag to read:
+      # stamp the version string explicitly, since a loadable is refused by
+      # any DuckDB reporting a different one.
+      OVERRIDE_GIT_DESCRIBE: ${{ inputs.duckdb_tag }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -41,7 +49,7 @@ jobs:
       - name: Check out the requested DuckDB
         run: |
           cd duckdb
-          git fetch --depth 1 origin "${{ inputs.duckdb_version }}"
+          git fetch --depth 1 origin "${{ inputs.duckdb_ref }}"
           git checkout FETCH_HEAD
 
       - uses: Swatinem/rust-cache@v2
@@ -54,7 +62,9 @@ jobs:
 
       - name: Name the artifact after what produced it
         id: name
-        run: echo "name=moraine-${{ inputs.duckdb_version }}-${{ inputs.debug_level }}-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+        run: |
+          duckdb_commit=$(git -C duckdb rev-parse --short=12 HEAD)
+          echo "name=moraine-${duckdb_commit}-${{ inputs.debug_level }}-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v7
         with:

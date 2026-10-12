@@ -246,10 +246,10 @@ fn select_workloads<'workloads>(
 pub fn bench(arguments: &[String]) -> anyhow::Result<()> {
     let options = parse_options(arguments)?;
 
-    let cli = duckdb::ensure_duckdb_cli()?;
-    println!("ok: duckdb CLI at {}", cli.display());
     let extension = duckdb::build_and_package_extension(&ducklake_patch::prepare()?)?;
     println!("ok: packaged {}", extension.display());
+    let cli = duckdb::ensure_duckdb_cli()?;
+    println!("ok: duckdb CLI at {}", cli.display());
     let context = SessionContext { cli, extension };
 
     let work_root = std::env::temp_dir().join(format!("moraine-bench-{}", std::process::id()));

@@ -1,8 +1,8 @@
 diff --git a/src/storage/ducklake_transaction_state.cpp b/src/storage/ducklake_transaction_state.cpp
-index c8c09b9b..e5716116 100644
+index d1460897..e6aa92a9 100644
 --- a/src/storage/ducklake_transaction_state.cpp
 +++ b/src/storage/ducklake_transaction_state.cpp
-@@ -1742,6 +1742,16 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
+@@ -1990,6 +1990,16 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
  			break;
  		} catch (std::exception &ex) {
  			ErrorData error(ex);
@@ -18,4 +18,4 @@ index c8c09b9b..e5716116 100644
 +			}
  			// rollback if there is an active transaction
  			context.try_rollback();
- 			bool retry_on_error = DuckLakeTransaction::RetryOnError(error.Message());
+ 			retryable_metadata_error = retryable_metadata_error || context.is_retryable_metadata_error(error.Message());

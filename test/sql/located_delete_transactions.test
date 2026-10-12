@@ -9,19 +9,16 @@ statement ok
 SET threads=1;
 
 statement ok
-SET extension_directory='${MORAINE_EXTENSION_DIR}';
-
-statement ok
-INSTALL parquet;
+SET extension_directory='{MORAINE_EXTENSION_DIR}';
 
 statement ok
 LOAD parquet;
 
 statement ok
-LOAD '${MORAINE_DUCKDB_EXT}';
+LOAD '{MORAINE_DUCKDB_EXT}';
 
 statement ok
-ATTACH 'ducklake:moraine:__TEST_DIR__/located-store' AS lake (DATA_PATH '__TEST_DIR__/located-data/', META_DATA_PATH '__TEST_DIR__/located-data/', DATA_INLINING_ROW_LIMIT 0);
+ATTACH 'ducklake:moraine:{TEST_DIR}/located-store' AS lake (DATA_PATH '{TEST_DIR}/located-data/', META_DATA_PATH '{TEST_DIR}/located-data/', DATA_INLINING_ROW_LIMIT 0);
 
 statement ok
 CREATE TABLE lake.t(a BIGINT);

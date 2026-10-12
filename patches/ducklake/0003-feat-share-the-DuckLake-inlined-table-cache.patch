@@ -1,8 +1,8 @@
 diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/storage/ducklake_metadata_manager.hpp
-index ad3536f8..61dceb33 100644
+index 23cb9db5..ff9ca843 100644
 --- a/src/include/storage/ducklake_metadata_manager.hpp
 +++ b/src/include/storage/ducklake_metadata_manager.hpp
-@@ -487,10 +487,13 @@ private:
+@@ -650,10 +650,13 @@ private:
  	                                                                         DuckLakeSnapshot start_snapshot,
  	                                                                         DuckLakeSnapshot end_snapshot);
  

@@ -1720,6 +1720,10 @@ int32_t moraine_commit_located_deletion(struct MoraineCatalogHandle *handle,
                                         void *probe_ctx,
                                         struct MoraineError *err);
 
+// Arms a stall for the cancellable call entering on this thread.
+// The shim consumes its session-owned arm before making this handoff.
+void moraine_fault_stall_next_read(uint64_t milliseconds);
+
 // Creates an equality index, committing autonomously. With `staged`, runs
 // the multi-commit build — required when the table's backfill exceeds what
 // one commit may stage — and returns once the index is ready; interrupting

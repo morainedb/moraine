@@ -20,6 +20,25 @@ MoraineMetadataManager::MoraineMetadataManager(duckdb::DuckLakeTransaction &tran
     : duckdb::DuckLakeMetadataManager(transaction) {
 }
 
+void MoraineMetadataManager::RecordDrivingContext() {
+	auto &registered = *transaction.GetConnection().context->registered_state;
+	if (registered.Get<ParentContextState>(ParentContextState::KEY)) {
+		return;
+	}
+	registered.Insert(ParentContextState::KEY,
+	                  duckdb::make_shared_ptr<ParentContextState>(transaction.context));
+}
+
+duckdb::unique_ptr<duckdb::QueryResult> MoraineMetadataManager::Query(duckdb::string &query) {
+	RecordDrivingContext();
+	return duckdb::DuckLakeMetadataManager::Query(query);
+}
+
+duckdb::unique_ptr<duckdb::QueryResult> MoraineMetadataManager::AttachMetadata(const duckdb::string &attach_query) {
+	RecordDrivingContext();
+	return duckdb::DuckLakeMetadataManager::AttachMetadata(attach_query);
+}
+
 bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &commit_snapshot,
                                                  const duckdb::string &inlined_table_name,
                                                  const duckdb::DuckLakeInlinedDataInfo &entry,
@@ -49,7 +68,8 @@ bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &comm
 		append_types.push_back(type);
 	}
 
-	Appender appender(connection, catalog.MetadataDatabaseName(), schema_name, inlined_table_name);
+	Appender appender(connection, duckdb::Identifier(catalog.MetadataDatabaseName()),
+	                  duckdb::Identifier(schema_name), duckdb::Identifier(inlined_table_name));
 	DataChunk append_chunk;
 	append_chunk.Initialize(Allocator::DefaultAllocator(), append_types);
 
@@ -59,8 +79,8 @@ bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &comm
 	for (auto &chunk : collection.Chunks()) {
 		auto count = chunk.size();
 		append_chunk.Reset();
-		auto row_ids = FlatVector::GetData<int64_t>(append_chunk.data[0]);
-		auto snapshots = FlatVector::GetData<int64_t>(append_chunk.data[1]);
+		auto row_ids = FlatVector::GetDataMutable<int64_t>(append_chunk.data[0]);
+		auto snapshots = FlatVector::GetDataMutable<int64_t>(append_chunk.data[1]);
 		for (duckdb::idx_t r = 0; r < count; r++) {
 			int64_t emit_rid;
 			if (has_preserved_row_ids) {
@@ -79,7 +99,7 @@ bool MoraineMetadataManager::TryAppendInlinedData(duckdb::DuckLakeSnapshot &comm
 		for (duckdb::idx_t c = 0; c < chunk.ColumnCount(); c++) {
 			append_chunk.data[3 + c].Reference(chunk.data[c]);
 		}
-		append_chunk.SetCardinality(count);
+		append_chunk.SetChildCardinality(count);
 		appender.AppendDataChunk(append_chunk);
 	}
 	appender.Close();

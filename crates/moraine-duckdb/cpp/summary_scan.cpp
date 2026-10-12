@@ -1,5 +1,8 @@
+#include <atomic>
+#include <memory>
 #include "summary_scan.hpp"
 
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "catalog.hpp"
 #include "index_functions.hpp"
 #include "owned_array.hpp"
@@ -186,17 +189,18 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::Cli
 			state->projection.push_back(i);
 		}
 	}
-	if (input.filters && !input.filters->filters.empty()) {
+	if (input.filters && input.filters->HasFilters()) {
 		auto conjunction =
 		    duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
-		for (auto &filter : input.filters->filters) {
-			duckdb::BoundReferenceExpression column(state->types[filter.first], filter.first);
-			conjunction->children.push_back(filter.second->ToExpression(column));
+		for (auto filter : *input.filters) {
+			auto column_index = filter.GetIndex().GetIndex();
+			duckdb::BoundReferenceExpression column(state->types[column_index], column_index);
+			conjunction->GetChildrenMutable().push_back(filter.Filter().ToExpression(column));
 		}
 		state->predicate = std::move(conjunction);
 		state->executor = duckdb::make_uniq<duckdb::ExpressionExecutor>(context, *state->predicate);
 	}
-	auto &lake = duckdb::Catalog::GetCatalog(context, bound.lake).Cast<duckdb::DuckLakeCatalog>();
+	auto &lake = duckdb::Catalog::GetCatalog(context, duckdb::Identifier(bound.lake)).Cast<duckdb::DuckLakeCatalog>();
 	auto &transaction = duckdb::DuckLakeTransaction::Get(context, lake);
 	auto &catalog = ResolveMoraineCatalog(context, lake.MetadataDatabaseName());
 	auto metadata = catalog.GetCatalogTransaction(*transaction.GetConnection().context);
@@ -255,7 +259,7 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 			}
 			state.batch_ms += Milliseconds(started);
 			if (!has_batch) {
-				output.SetCardinality(0);
+				output.SetChildCardinality(0);
 				return;
 			}
 			started = ScanClock::now();
@@ -279,7 +283,7 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 		state.pending.pop_back();
 		duckdb::DataChunk projected;
 		projected.Initialize(context, state.types);
-		projected.SetCardinality(piece->size());
+		projected.SetChildCardinality(piece->size());
 		for (duckdb::idx_t i = 0; i < state.types.size(); i++) {
 			auto &source = piece->data[state.decoded_columns[i]];
 			if (source.GetType() == state.types[i]) {
@@ -299,7 +303,7 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 		for (duckdb::idx_t i = 0; i < state.projection.size(); i++) {
 			output.data[i].Reference(projected.data[state.projection[i]]);
 		}
-		output.SetCardinality(projected.size());
+		output.SetChildCardinality(projected.size());
 		return;
 	}
 }
@@ -308,7 +312,8 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 
 bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, const duckdb::LogicalGet &index,
                     const std::vector<MoraineRowId> &rows) {
-	if (scan.function.name != "ducklake_scan" || !scan.function.function_info || scan.row_group_order_options ||
+	if (scan.function.GetDefinition()->name != "ducklake_scan" || !scan.function.function_info ||
+	    scan.row_group_order_options ||
 	    scan.extra_info.sample_options) {
 		return false;
 	}
@@ -325,11 +330,11 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		return false;
 	}
 	std::string catalog_name, schema, table;
-	if (!IndexReadTable(index.function, index.bind_data.get(), catalog_name, schema, table) ||
+	if (!IndexReadTable(*index.function.GetDefinition(), index.bind_data.get(), catalog_name, schema, table) ||
 	    schema != info.table.schema.name || table != info.table.name) {
 		return false;
 	}
-	auto catalog = duckdb::Catalog::GetCatalogEntry(context, catalog_name);
+	auto catalog = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(catalog_name));
 	if (!catalog || (catalog->GetName() != lake.GetName() && catalog->GetName() != lake.MetadataDatabaseName())) {
 		return false;
 	}
@@ -349,12 +354,14 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		}
 	}
 	auto bound = duckdb::make_uniq<SummaryScanBindData>();
-	bound->lake = lake.GetName();
+	bound->lake = lake.GetName().GetIdentifierName();
 	bound->schema = schema;
 	bound->table = table;
 	bound->snapshot_id = info.snapshot.snapshot_id;
 	bound->table_id = info.table.GetTableId().index;
-	bound->names = scan.names;
+	for (auto &name : scan.names) {
+		bound->names.push_back(name.GetIdentifierName());
+	}
 	bound->types = scan.returned_types;
 	bound->virtual_columns = scan.virtual_columns;
 	for (auto &row : rows) {
@@ -421,23 +428,32 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	function.filter_pushdown = true;
 	function.filter_prune = true;
 	function.verify_serialization = false;
-	function.dynamic_to_string = [](duckdb::TableFunctionDynamicToStringInput &input) {
+	// Runtime counters go through the metrics hook, which is handed the
+	// scan's state after it has run; `to_string` renders before it reads.
+	function.get_metrics = [](duckdb::TableFunctionGetMetricsInput &input) {
+		if (!input.global_state) {
+			return;
+		}
+		auto &state = input.global_state->Cast<SummaryScanState>();
+		if (!state.scan) {
+			return;
+		}
+		auto metrics = moraine_row_scan_metrics(state.scan);
+		input.operator_metrics.AddExtraInfo("Total Files Read",
+		                                   std::to_string(moraine_row_scan_files_read(state.scan)));
+		input.operator_metrics.AddExtraInfo("Positioning ms", std::to_string(state.positioning_ms));
+		input.operator_metrics.AddExtraInfo("Read and decode ms", std::to_string(state.batch_ms));
+		input.operator_metrics.AddExtraInfo("Arrow import ms", std::to_string(state.conversion_ms));
+		input.operator_metrics.AddExtraInfo("Data bytes fetched", std::to_string(metrics.bytes_read));
+		input.operator_metrics.AddExtraInfo("Data ranges fetched", std::to_string(metrics.ranges_read));
+		input.operator_metrics.AddExtraInfo("Peak read workers", std::to_string(metrics.peak_workers));
+		input.operator_metrics.AddExtraInfo("Decode active ms", std::to_string(metrics.decode_seconds * 1000));
+		input.operator_metrics.AddExtraInfo("Data fetch ms", std::to_string(metrics.fetch_seconds * 1000));
+	};
+	function.to_string = [](duckdb::TableFunctionToStringInput &input) {
 		duckdb::InsertionOrderPreservingMap<std::string> result;
 		if (input.bind_data) {
 			result["Coverage costing ms"] = std::to_string(input.bind_data->Cast<SummaryScanBindData>().costing_ms);
-		}
-		if (input.global_state) {
-			auto &state = input.global_state->Cast<SummaryScanState>();
-			auto metrics = moraine_row_scan_metrics(state.scan);
-			result["Total Files Read"] = std::to_string(moraine_row_scan_files_read(state.scan));
-			result["Positioning ms"] = std::to_string(state.positioning_ms);
-			result["Read and decode ms"] = std::to_string(state.batch_ms);
-			result["Arrow import ms"] = std::to_string(state.conversion_ms);
-			result["Data bytes fetched"] = std::to_string(metrics.bytes_read);
-			result["Data ranges fetched"] = std::to_string(metrics.ranges_read);
-			result["Peak read workers"] = std::to_string(metrics.peak_workers);
-			result["Decode active ms"] = std::to_string(metrics.decode_seconds * 1000);
-			result["Data fetch ms"] = std::to_string(metrics.fetch_seconds * 1000);
 		}
 		return result;
 	};
@@ -445,7 +461,7 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		return data->Cast<SummaryScanBindData>().virtual_columns;
 	};
 	scan.bind_data = std::move(bound);
-	scan.function = std::move(function);
+	scan.function = duckdb::BoundTableFunction(function);
 	scan.extra_info.file_filters.clear();
 	return true;
 }

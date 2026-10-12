@@ -33,19 +33,16 @@ statement ok
 SET threads=1;
 
 statement ok
-SET extension_directory='${MORAINE_EXTENSION_DIR}';
-
-statement ok
-INSTALL parquet;
+SET extension_directory='{MORAINE_EXTENSION_DIR}';
 
 statement ok
 LOAD parquet;
 
 statement ok
-LOAD '${MORAINE_DUCKDB_EXT}';
+LOAD '{MORAINE_DUCKDB_EXT}';
 
 statement ok
-ATTACH 'ducklake:moraine:__TEST_DIR__/pin-store' AS lake (DATA_PATH '__TEST_DIR__/pin-data/');
+ATTACH 'ducklake:moraine:{TEST_DIR}/pin-store' AS lake (DATA_PATH '{TEST_DIR}/pin-data/');
 
 statement ok
 CREATE TABLE lake.main.t(a BIGINT);
@@ -266,6 +263,12 @@ true
 statement ok con1
 SET enable_external_file_cache = true;
 
+# DuckDB leaves local files to the OS page cache unless asked otherwise,
+# and this harness reads local files; a deployment's `s3://` path is cached
+# either way.
+statement ok con1
+SET cache_local_files = true;
+
 statement ok con1
 CREATE TABLE lake.main.wide AS SELECT range AS a FROM range(500);
 
@@ -293,20 +296,12 @@ WHERE path LIKE '%pin-data%';
 ----
 true
 
-# Second shape: data ranges are cached only when the Parquet reader
-# prefetches, which it does for remote files and not for local ones — so
-# this local harness has cached the footer and stopped there. Remember how
-# much that was, to compare against.
-statement ok con1
-CREATE TEMP TABLE footer_only_bytes AS
-SELECT coalesce(sum(nr_bytes), 0) AS bytes FROM duckdb_external_file_cache()
-WHERE path LIKE '%pin-data%';
-
-# Forcing the prefetch a deployment's `s3://` path takes anyway extends the
-# cache past the footer to the data ranges — the property that puts lake
-# data under `memory_limit`. Relative to the footer reading rather than a
-# byte count: how large DuckLake writes a 500-row file is not this test's
-# business, and a threshold would silently pass once it changed.
+# Second shape: what the cache holds is the whole file, not a reading to
+# compare against. A file this small is one cache block, so the read above
+# already holds all of it and forcing the prefetch a deployment's `s3://`
+# path takes anyway adds nothing. Against the size the catalog recorded
+# rather than a byte count: how large DuckLake writes a 500-row file is not
+# this test's business.
 statement ok con1
 SET prefetch_all_parquet_files = true;
 
@@ -316,7 +311,11 @@ SELECT sum(a) FROM lake.main.wide WHERE a % 11 = 5;
 query I con1
 SELECT (SELECT coalesce(sum(nr_bytes), 0) FROM duckdb_external_file_cache()
         WHERE path LIKE '%pin-data%')
-     > (SELECT bytes FROM footer_only_bytes);
+     = (SELECT sum(data_file.file_size_bytes)
+        FROM __ducklake_metadata_lake.ducklake_data_file AS data_file
+        JOIN __ducklake_metadata_lake.ducklake_table AS tables USING (table_id)
+        WHERE tables.table_name = 'wide' AND tables.end_snapshot IS NULL
+          AND data_file.end_snapshot IS NULL);
 ----
 true
 
@@ -326,8 +325,8 @@ true
 # serve another table's rows for them. Inlining off, so every insert writes
 # a data file for the narrowed scan to find.
 statement ok
-ATTACH 'ducklake:moraine:__TEST_DIR__/pin-scope-store' AS scoped (
-  DATA_PATH '__TEST_DIR__/pin-scope-data/', DATA_INLINING_ROW_LIMIT 0);
+ATTACH 'ducklake:moraine:{TEST_DIR}/pin-scope-store' AS scoped (
+  DATA_PATH '{TEST_DIR}/pin-scope-data/', DATA_INLINING_ROW_LIMIT 0);
 
 statement ok
 CREATE TABLE scoped.main.one(a BIGINT);

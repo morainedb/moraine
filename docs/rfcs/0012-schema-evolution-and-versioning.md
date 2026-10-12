@@ -365,16 +365,18 @@ newer build's, and the raise **refuses** it rather than lowering the shape
 a store serves, the same way RFC 0015's format raise refuses to move a
 store already at or above its ceiling.
 
-The raise is **one way, and out of an older DuckLake's reach entirely**.
-DuckLake's initializer compares the recorded tag against a bare `1.0`
+The raise is **one way, and out of an older DuckLake's reach**. The
+bundled DuckLake orders both versions (`DuckLakeVersion::V1_1_DEV_1`) and
+reads a store on either, so a raised store stays a usable lake here. One
+that predates `1.1-dev1` compares the recorded tag against a bare `1.0`
 literal and throws `InvalidInputException` on anything else; under
 `AUTOMATIC_MIGRATION` it instead walks a migration ladder whose rungs stop
 at `1.0` and throws `NotImplementedException`. Either way the refusal lands
-at DuckLake's own version check, before it reads a single wider table, so a
-raised store is not a lake with extra columns — it is a lake that DuckLake
-will not open. There is no route back: the recorded version is reserved
-from `set_option` and the raise will not lower it. Nor can moraine ask the
-loaded DuckLake what it wants, because that `1.0` is a literal and
+at that DuckLake's own version check, before it reads a single wider table,
+so a raised store is not a lake with extra columns — it is a lake that
+DuckLake will not open. There is no route back: the recorded version is
+reserved from `set_option` and the raise will not lower it. Nor can moraine
+ask the loaded DuckLake what it wants, because that `1.0` is a literal and
 DuckLake exposes no required-version surface to query.
 
 So the door takes an acknowledgement rather than a capability check: a
@@ -387,9 +389,7 @@ extension may not report at all. A check keyed on that would refuse every
 session that could legitimately raise while still passing a DuckLake that
 cannot read the result: a capability signal in form only. The dry run is
 exempt, because it records nothing and is how an operator reads the version
-a store serves. `1.1-dev1` is a pre-release marker, and DuckLake's ladder
-migrates `-dev1` rungs into their release (`0.3-dev1` to `0.3`), so a
-DuckLake that asks for `1.1` is expected to consume it.
+a store serves.
 
 ### Conflicts
 
@@ -447,10 +447,10 @@ SlateDB on in-memory `object_store` and against real DuckLake SQL in e2e:
   is idempotent; a session attaching after it finds the wider tables; a
   version this build cannot order is refused rather than lowered; and a
   raise that would record refuses without its acknowledgement, recording
-  nothing when it does. At the
-  e2e tier the pinned DuckLake's refusal of a raised store is pinned too —
-  the one-way door is a fact about DuckLake's code, so it is re-verified by
-  running (`catalog_version.rs`), like the other DuckLake pins in
+  nothing when it does. At the e2e tier the pinned DuckLake's reading and
+  writing of a raised store is pinned too — which versions it opens is a
+  fact about DuckLake's code, so it is re-verified by running
+  (`catalog_version.rs`), like the other DuckLake pins in
   `wire_contract.rs`.
 
 ## Alternatives considered

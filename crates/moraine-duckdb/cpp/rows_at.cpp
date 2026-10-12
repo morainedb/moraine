@@ -5,6 +5,8 @@
 // rows decode from their chunk. The output is the table's current columns
 // followed by `row_id` and `data_file_id`.
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -12,7 +14,9 @@
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/binder.hpp"
 
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "catalog.hpp"
 #include "moraine_abi.h"
 #include "owned_array.hpp"
@@ -28,9 +32,10 @@ PinnedSnapshot PinTransactionSnapshot(duckdb::ClientContext &context, const std:
 	// first pins that snapshot before the metadata catalog's own view is
 	// taken below, so the view can only be the same or newer; DuckLake
 	// refuses positions resolved against a newer one.
-	auto lake = duckdb::Catalog::GetCatalogEntry(context, catalog_name);
+	auto lake = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(catalog_name));
 	if (lake && lake->GetCatalogType() != "moraine") {
-		lake->GetEntry(context, duckdb::CatalogType::TABLE_ENTRY, schema_name, table_name,
+		duckdb::EntryLookupInfo lookup(duckdb::CatalogType::TABLE_ENTRY, duckdb::Identifier(table_name));
+		lake->GetEntry(context, duckdb::Identifier(schema_name), lookup,
 		               duckdb::OnEntryNotFound::THROW_EXCEPTION);
 	}
 
@@ -67,7 +72,7 @@ std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, co
 	duckdb::optional_idx row_id_index;
 	duckdb::optional_idx data_file_id_index;
 	for (duckdb::idx_t i = 0; i < children.size(); i++) {
-		auto name = duckdb::StringUtil::Lower(children[i].first);
+		auto &name = children[i].first;
 		if (name == "row_id") {
 			row_id_index = i;
 		} else if (name == "data_file_id") {
@@ -81,7 +86,7 @@ std::vector<MorainePositionPair> ParseLocatedPairs(const duckdb::Value &rows, co
 	if (payload) {
 		for (duckdb::idx_t i = 0; i < children.size(); i++) {
 			if (i != row_id_index.GetIndex() && i != data_file_id_index.GetIndex()) {
-				payload->push_back(children[i].first);
+				payload->push_back(children[i].first.GetIdentifierName());
 			}
 		}
 	}
@@ -213,7 +218,7 @@ void RegisterMorainePositionResolver() {
 }
 
 void TableColumns(MoraineSnapshotHandle *snapshot, const std::string &schema_name, const std::string &table_name,
-                  duckdb::vector<duckdb::LogicalType> &types, duckdb::vector<std::string> &names) {
+                  duckdb::vector<duckdb::LogicalType> &types, duckdb::vector<duckdb::Identifier> &names) {
 	uint64_t table_id = 0;
 	MoraineError error {};
 	if (moraine_snapshot_resolve_table(snapshot, schema_name.c_str(), table_name.c_str(), &table_id, &error) !=
@@ -271,7 +276,7 @@ struct RowsAtBindData : public duckdb::FunctionData {
 duckdb::unique_ptr<duckdb::FunctionData> RowsAtBind(duckdb::ClientContext &context,
                                                     duckdb::TableFunctionBindInput &input,
                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                    duckdb::vector<std::string> &names) {
+                                                    duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<RowsAtBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -377,7 +382,7 @@ void RowsAtImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data
 			ThrowMoraineError(error);
 		}
 		if (!has_batch) {
-			output.SetCardinality(0);
+			output.SetChildCardinality(0);
 			return;
 		}
 		auto pieces = ImportLocatedBatch(context, schema.arrow_schema, array.arrow_array);
@@ -401,7 +406,7 @@ void RowsAtImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data
 			duckdb::VectorOperations::DefaultCast(piece->data[i], output.data[i], piece->size());
 		}
 	}
-	output.SetCardinality(piece->size());
+	output.SetChildCardinality(piece->size());
 }
 
 } // namespace
@@ -415,14 +420,19 @@ void RegisterMoraineRowsAtFunction(duckdb::ExtensionLoader &loader) {
 	    "moraine_rows_at",
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
 	    RowsAtImpl, RowsAtBind, RowsAtInit);
-	rows_at.dynamic_to_string = [](duckdb::TableFunctionDynamicToStringInput &input) {
-		duckdb::InsertionOrderPreservingMap<std::string> result;
-		if (input.global_state) {
-			auto scan = input.global_state->Cast<RowsAtGlobalState>().scan;
-			result["Total Files Read"] = std::to_string(moraine_row_scan_files_read(scan));
-			result["Peak read workers"] = std::to_string(moraine_row_scan_metrics(scan).peak_workers);
+	// Runtime counters go through the metrics hook, which is handed the
+	// scan's state after it has run; `to_string` renders before it reads.
+	rows_at.get_metrics = [](duckdb::TableFunctionGetMetricsInput &input) {
+		if (!input.global_state) {
+			return;
 		}
-		return result;
+		auto scan = input.global_state->Cast<RowsAtGlobalState>().scan;
+		if (!scan) {
+			return;
+		}
+		input.operator_metrics.AddExtraInfo("Total Files Read", std::to_string(moraine_row_scan_files_read(scan)));
+		input.operator_metrics.AddExtraInfo("Peak read workers",
+		                                   std::to_string(moraine_row_scan_metrics(scan).peak_workers));
 	};
 	loader.RegisterFunction(rows_at);
 }

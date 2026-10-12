@@ -9,7 +9,7 @@ use crate::helpers::*;
 /// resolves the prefix before this shim ever sees the path. Proven
 /// standalone here, independent of DuckLake.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extension; run via `cargo xtask e2e`"]
+#[ignore = "needs the built DuckDB CLI and packaged extension; run via `cargo xtask e2e`"]
 fn moraine_prefix_attach_without_type_clause() {
     let dir = TempDir::new("prefix");
     // Never scanned by this test — placeholder stats are fine.
@@ -41,7 +41,7 @@ fn moraine_prefix_attach_without_type_clause() {
 /// The full `ducklake:moraine:` chain: attach, read through DuckLake's
 /// own reader, count (pushdown), time travel, `ducklake_snapshots()`.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_attach_reads_through_moraine_metadata() {
     let dir = TempDir::new("store");
     let data_dir = TempDir::new("data");
@@ -126,7 +126,7 @@ fn ducklake_attach_reads_through_moraine_metadata() {
 /// and no-fencing are pinned by the core `tests/catalog.rs` suite, and
 /// DuckDB enforces the outer `READ_ONLY` at the SQL layer.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_read_only_attach_reads_through_a_reader() {
     let dir = TempDir::new("ro-store");
     let data_dir = TempDir::new("ro-data");
@@ -176,7 +176,7 @@ fn ducklake_read_only_attach_reads_through_a_reader() {
 /// on either side surfaces here rather than as a mystery fence in the
 /// field.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_forwards_read_only_into_the_metadata_attach() {
     let dir = TempDir::new("ro-forward-store");
     let data_dir = TempDir::new("ro-forward-data");
@@ -231,7 +231,7 @@ fn ducklake_forwards_read_only_into_the_metadata_attach() {
 /// is accepted, commits land, and a plain re-attach (default spacing)
 /// reads them back.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_attach_flush_interval_option_is_applied() {
     let dir = TempDir::new("flush-store");
     let data_dir = TempDir::new("flush-data");
@@ -261,7 +261,7 @@ fn ducklake_attach_flush_interval_option_is_applied() {
 /// option regressing shows up as a minute for the second commit rather
 /// than as a wrong answer.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_attach_flush_on_commit_option_is_applied() {
     let dir = TempDir::new("flush-on-commit-store");
     let data_dir = TempDir::new("flush-on-commit-data");
@@ -292,7 +292,7 @@ fn ducklake_attach_flush_on_commit_option_is_applied() {
 /// assertion is that the four are accepted, commits land through the capped
 /// cache, and the cache directory fills.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_attach_cache_options_are_applied() {
     let dir = TempDir::new("cache-size-store");
     let data_dir = TempDir::new("cache-size-data");
@@ -336,7 +336,7 @@ fn ducklake_attach_cache_options_are_applied() {
 /// lake reads back through it, and an attach that omits it is refused —
 /// the log holds commits no sorted-string table carries yet.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_attach_writes_the_wal_to_the_store_it_names() {
     let dir = TempDir::new("wal-path-store");
     let data_dir = TempDir::new("wal-path-data");
@@ -388,7 +388,7 @@ fn ducklake_attach_writes_the_wal_to_the_store_it_names() {
 /// through the cache; how much the warm itself served is timing-dependent
 /// and not asserted.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_attach_cache_preload_warms_indexed_tables() {
     let dir = TempDir::new("preload-warm-store");
     let data_dir = TempDir::new("preload-warm-data");
@@ -418,7 +418,7 @@ fn ducklake_attach_cache_preload_warms_indexed_tables() {
 /// The memory tally separates per-catalog write buffers and projections
 /// from process-shared cache occupancy, and remembers the landed commit.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_attach_reports_attributed_memory() {
     let dir = TempDir::new("memory-tally-store");
     let data_dir = TempDir::new("memory-tally-data");
@@ -439,7 +439,7 @@ fn ducklake_attach_reports_attributed_memory() {
 /// the open-time warm reads through the cache, and its counters are settled
 /// by the time ATTACH returns.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_attach_preloads_by_default() {
     let dir = TempDir::new("preload-default-store");
     let data_dir = TempDir::new("preload-default-data");
@@ -463,7 +463,7 @@ fn ducklake_attach_preloads_by_default() {
 /// `META_CACHE_PRELOAD 'none'` turns the default preload off: the attach
 /// records no preload traffic and no preload failures.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_attach_cache_preload_none_preloads_nothing() {
     let dir = TempDir::new("preload-none-store");
     let data_dir = TempDir::new("preload-none-data");
@@ -497,18 +497,23 @@ const PRELOAD_TRAFFIC_SQL: &str = "SELECT preload_metadata_hits + preload_metada
 /// Parquet-encrypted data files and records their keys in catalog
 /// rows; a later plain attach adopts the stored flag and decrypts.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_encrypted_writes_encrypted_files_and_reads_back() {
     let dir = TempDir::new("enc-store");
     let data_dir = TempDir::new("enc-data");
 
     // Create and load in one encrypted session; 100 rows overflows
-    // the inlining limit, forcing a real data file.
+    // the inlining limit, forcing a real data file. DuckDB's built-in
+    // crypto module only decrypts — writing needs either `httpfs`, which
+    // publishes no build for an unreleased DuckDB, or this setting. What
+    // moraine owns here is the flag and the key material, neither of which
+    // the module choice touches.
     run_ducklake_sql_with_options(
         dir.path(),
         data_dir.path(),
         ", ENCRYPTED, META_ENCRYPTED true",
-        "CREATE TABLE lake.main.t(id BIGINT); \
+        "SET force_mbedtls_unsafe = 'true'; \
+         CREATE TABLE lake.main.t(id BIGINT); \
          INSERT INTO lake.main.t SELECT range FROM range(100);",
     );
 

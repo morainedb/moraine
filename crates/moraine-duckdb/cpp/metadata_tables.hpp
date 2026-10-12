@@ -203,6 +203,17 @@ public:
 private:
 	const MetadataTableSpec &spec_;
 	MoraineCatalogHandle *handle_;
+
+public:
+	// 2.0's `TableCatalogEntry` declares `GetColumns` pure and stores no
+	// columns of its own, so every entry owns its list.
+	const duckdb::ColumnList &GetColumns() const override {
+		return columns_;
+	}
+
+private:
+	duckdb::ColumnList columns_;
+
 };
 
 // Builds a `MoraineMetadataTableEntry` for every table in

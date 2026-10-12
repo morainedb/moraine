@@ -34,26 +34,28 @@ bool LiteralArgument(duckdb::ClientContext &context, const duckdb::ParsedExpress
 	}
 	if (expression.GetExpressionClass() == duckdb::ExpressionClass::CAST) {
 		auto &cast = expression.Cast<duckdb::CastExpression>();
-		auto type = duckdb::UnboundType::TryDefaultBind(cast.cast_type);
+		auto type = duckdb::UnboundType::TryDefaultBind(cast.TargetType());
 		return (type.IsIntegral() || type.id() == duckdb::LogicalTypeId::BOOLEAN) &&
-		       LiteralArgument(context, *cast.child);
+		       LiteralArgument(context, cast.Child());
 	}
 	if (expression.GetExpressionClass() != duckdb::ExpressionClass::FUNCTION) {
 		return false;
 	}
 	auto &function = expression.Cast<duckdb::FunctionExpression>();
-	if (function.function_name != "list_value" && function.function_name != "range" &&
-	    function.function_name != "row" && function.function_name != "struct_pack") {
+	auto &function_name = function.GetQualifiedName().Name();
+	if (function_name != "list_value" && function_name != "range" && function_name != "row" &&
+	    function_name != "struct_pack") {
 		return false;
 	}
-	duckdb::EntryLookupInfo lookup(duckdb::CatalogType::SCALAR_FUNCTION_ENTRY, function.function_name);
-	auto entry = duckdb::Catalog::GetEntry(context, function.catalog, function.schema, lookup,
+	duckdb::EntryLookupInfo lookup(duckdb::CatalogType::SCALAR_FUNCTION_ENTRY, function_name);
+	auto entry = duckdb::Catalog::GetEntry(context, function.GetQualifiedName().Catalog(),
+	                                       function.GetQualifiedName().Schema(), lookup,
 	                                       duckdb::OnEntryNotFound::RETURN_NULL);
 	if (!entry || entry->type != duckdb::CatalogType::SCALAR_FUNCTION_ENTRY || !entry->internal) {
 		return false;
 	}
-	for (auto &child : function.children) {
-		if (!LiteralArgument(context, *child)) {
+	for (auto &child : function.GetArguments()) {
+		if (!LiteralArgument(context, child.GetExpression())) {
 			return false;
 		}
 	}
@@ -74,19 +76,21 @@ bool LiteralIndexStatement(duckdb::ClientContext &context, duckdb::SQLStatement 
 	auto reference = [&](duckdb::TableRef &reference) {
 		if (reference.type == duckdb::TableReferenceType::TABLE_FUNCTION) {
 			auto &function = reference.Cast<duckdb::TableFunctionRef>().function->Cast<duckdb::FunctionExpression>();
-			if (!IsIndexRead(function.function_name)) {
+			if (!IsIndexRead(function.GetQualifiedName().Name().GetIdentifierName())) {
 				supported = false;
 				return;
 			}
-			duckdb::EntryLookupInfo lookup(duckdb::CatalogType::TABLE_FUNCTION_ENTRY, function.function_name);
-			auto entry = duckdb::Catalog::GetEntry(context, function.catalog, function.schema, lookup,
+			duckdb::EntryLookupInfo lookup(duckdb::CatalogType::TABLE_FUNCTION_ENTRY,
+			                               function.GetQualifiedName().Name());
+			auto entry = duckdb::Catalog::GetEntry(context, function.GetQualifiedName().Catalog(),
+			                                       function.GetQualifiedName().Schema(), lookup,
 			                                       duckdb::OnEntryNotFound::RETURN_NULL);
 			if (!entry || entry->type != duckdb::CatalogType::TABLE_FUNCTION_ENTRY) {
 				supported = false;
 			}
 			found = true;
-			for (auto &argument : function.children) {
-				auto literal = LiteralArgument(context, *argument);
+			for (auto &argument : function.GetArguments()) {
+				auto literal = LiteralArgument(context, argument.GetExpression());
 				if (!literal) {
 					WriteMoraineLog(duckdb::DatabaseInstance::GetDatabase(context), duckdb::LogLevel::LOG_DEBUG,
 					    "index plan requires argument rebinding");
@@ -95,8 +99,9 @@ bool LiteralIndexStatement(duckdb::ClientContext &context, duckdb::SQLStatement 
 			}
 		} else if (reference.type == duckdb::TableReferenceType::BASE_TABLE) {
 			auto &table = reference.Cast<duckdb::BaseTableRef>();
-			duckdb::EntryLookupInfo lookup(duckdb::CatalogType::TABLE_ENTRY, table.table_name);
-			auto entry = duckdb::Catalog::GetEntry(context, table.catalog_name, table.schema_name, lookup,
+			duckdb::EntryLookupInfo lookup(duckdb::CatalogType::TABLE_ENTRY, table.GetQualifiedName().Name());
+			auto entry = duckdb::Catalog::GetEntry(context, table.GetQualifiedName().Catalog(),
+			                                       table.GetQualifiedName().Schema(), lookup,
 			                                       duckdb::OnEntryNotFound::RETURN_NULL);
 			if (!entry || entry->type != duckdb::CatalogType::TABLE_ENTRY || table.at_clause) {
 				supported = false;
@@ -125,7 +130,7 @@ struct IndexDependencyState : public duckdb::ClientContextState {
 
 	void Prune(duckdb::ClientContext &context) {
 		for (auto entry = catalogs.begin(); entry != catalogs.end();) {
-			auto catalog = duckdb::Catalog::GetCatalogEntry(context, entry->first);
+			auto catalog = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(entry->first));
 			if (!catalog || catalog->GetOid() != entry->second.metadata_oid) {
 				entry = catalogs.erase(entry);
 			} else {
@@ -137,13 +142,13 @@ struct IndexDependencyState : public duckdb::ClientContextState {
 	duckdb::RebindQueryInfo Check(duckdb::ClientContext &context, duckdb::PreparedStatementData &prepared) {
 		bool dependent = false;
 		for (auto &read : prepared.properties.read_databases) {
-			dependent = dependent || catalogs.count(read.first) != 0;
+			dependent = dependent || catalogs.count(read.first.GetIdentifierName()) != 0;
 		}
 		if (dependent && (!prepared.unbound_statement || !LiteralIndexStatement(context, *prepared.unbound_statement))) {
 			return duckdb::RebindQueryInfo::ATTEMPT_TO_REBIND;
 		}
 		for (auto &read : prepared.properties.read_databases) {
-			auto association = catalogs.find(read.first);
+			auto association = catalogs.find(read.first.GetIdentifierName());
 			if (association == catalogs.end()) {
 				continue;
 			}
@@ -153,7 +158,7 @@ struct IndexDependencyState : public duckdb::ClientContextState {
 				return duckdb::RebindQueryInfo::ATTEMPT_TO_REBIND;
 			}
 			if (!association->second.lake.empty()) {
-				auto lake = duckdb::Catalog::GetCatalogEntry(context, association->second.lake);
+				auto lake = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(association->second.lake));
 				if (!lake || lake->GetCatalogType() != "ducklake" ||
 				    lake->Cast<duckdb::DuckLakeCatalog>().MetadataDatabaseName() != catalog->GetName()) {
 					return duckdb::RebindQueryInfo::ATTEMPT_TO_REBIND;
@@ -170,16 +175,14 @@ struct IndexDependencyState : public duckdb::ClientContextState {
 		return duckdb::RebindQueryInfo::DO_NOT_REBIND;
 	}
 
-	duckdb::RebindQueryInfo OnExecutePrepared(duckdb::ClientContext &context,
-	    duckdb::PreparedStatementCallbackInfo &info, duckdb::RebindQueryInfo) override {
+	duckdb::RebindQueryInfo OnRebindPreparedStatement(duckdb::ClientContext &context,
+	    duckdb::BindPreparedStatementCallbackInfo &info, duckdb::RebindQueryInfo) override {
+		// A PREPARE or EXECUTE statement reads no index itself, so neither
+		// one is a reason to rebind.
 		if (info.prepared_statement.statement_type == duckdb::StatementType::PREPARE_STATEMENT ||
 		    info.prepared_statement.statement_type == duckdb::StatementType::EXECUTE_STATEMENT) {
 			return duckdb::RebindQueryInfo::DO_NOT_REBIND;
 		}
-		return Check(context, info.prepared_statement);
-	}
-	duckdb::RebindQueryInfo OnRebindPreparedStatement(duckdb::ClientContext &context,
-	    duckdb::BindPreparedStatementCallbackInfo &info, duckdb::RebindQueryInfo) override {
 		return Check(context, info.prepared_statement);
 	}
 };
@@ -193,7 +196,7 @@ MoraineTransaction &ReadTransaction(duckdb::ClientContext &context, MoraineCatal
                                     const std::string &lake_name, bool &clean) {
 	auto *metadata_context = &context;
 	if (!lake_name.empty()) {
-		auto &lake = duckdb::Catalog::GetCatalog(context, lake_name).Cast<duckdb::DuckLakeCatalog>();
+		auto &lake = duckdb::Catalog::GetCatalog(context, duckdb::Identifier(lake_name)).Cast<duckdb::DuckLakeCatalog>();
 		auto &transaction = duckdb::DuckLakeTransaction::Get(context, lake);
 		clean = !lake.CatalogSnapshot();
 		metadata_context = transaction.GetConnection().context.get();
@@ -209,7 +212,7 @@ duckdb::optional_idx IndexCatalogVersion(duckdb::ClientContext &context, Moraine
 	if (!state) {
 		return {};
 	}
-	auto association = state->catalogs.find(catalog.GetName());
+	auto association = state->catalogs.find(catalog.GetName().GetIdentifierName());
 	if (association == state->catalogs.end() || association->second.metadata_oid != catalog.GetOid() ||
 	    association->second.ambiguous) {
 		return {};
@@ -226,7 +229,7 @@ duckdb::optional_idx IndexCatalogVersion(duckdb::ClientContext &context, Moraine
 MoraineCatalogHandle *BindIndexRead(duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
                                     bool &cacheable) {
 	auto name = input.inputs[0].GetValue<std::string>();
-	auto named = duckdb::Catalog::GetCatalogEntry(context, name);
+	auto named = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(name));
 	auto &catalog = named && named->GetCatalogType() == "ducklake"
 	    ? ResolveMoraineCatalog(context, named->Cast<duckdb::DuckLakeCatalog>().MetadataDatabaseName())
 	    : ResolveMoraineCatalog(context, name);
@@ -237,14 +240,14 @@ MoraineCatalogHandle *BindIndexRead(duckdb::ClientContext &context, duckdb::Tabl
 		if (lake.MetadataDatabaseName() != catalog.GetName()) {
 			throw duckdb::InvalidInputException("moraine: index metadata catalog does not match the lake");
 		}
-		lake_name = named->GetName();
+		lake_name = named->GetName().GetIdentifierName();
 	} else {
 		for (auto &database : duckdb::DatabaseManager::Get(context).GetDatabases(context)) {
 			auto &candidate = database->GetCatalog();
 			if (candidate.GetCatalogType() == "ducklake" &&
 			    candidate.Cast<duckdb::DuckLakeCatalog>().MetadataDatabaseName() == catalog.GetName()) {
 				ambiguous = ambiguous || !lake_name.empty();
-				lake_name = candidate.GetName();
+				lake_name = candidate.GetName().GetIdentifierName();
 			}
 		}
 		if (ambiguous) {
@@ -253,16 +256,16 @@ MoraineCatalogHandle *BindIndexRead(duckdb::ClientContext &context, duckdb::Tabl
 	}
 	auto state = context.registered_state->GetOrCreate<IndexDependencyState>(STATE_KEY);
 	state->Prune(context);
-	auto existing = state->catalogs.find(catalog.GetName());
+	auto existing = state->catalogs.find(catalog.GetName().GetIdentifierName());
 	if (existing == state->catalogs.end() || existing->second.metadata_oid != catalog.GetOid()) {
-		state->catalogs[catalog.GetName()] = {catalog.GetOid(), lake_name, ambiguous};
+		state->catalogs[catalog.GetName().GetIdentifierName()] = {catalog.GetOid(), lake_name, ambiguous};
 	} else if (existing->second.lake != lake_name) {
 		existing->second.ambiguous = true;
 	}
 	bool clean = true;
 	auto &transaction = ReadTransaction(context, catalog, lake_name, clean);
 	uint64_t revision = 0;
-	cacheable = clean && input.binder && !state->catalogs.at(catalog.GetName()).ambiguous &&
+	cacheable = clean && input.binder && !state->catalogs.at(catalog.GetName().GetIdentifierName()).ambiguous &&
 	            moraine_snapshot_read_revision(transaction.Snapshot(), &revision);
 	if (input.binder) {
 		auto &properties = input.binder->GetStatementProperties();
@@ -275,7 +278,8 @@ MoraineCatalogHandle *BindIndexRead(duckdb::ClientContext &context, duckdb::Tabl
 		}
 		properties.read_databases[catalog.GetName()] = identity;
 		if (!lake_name.empty()) {
-			input.binder->GetStatementProperties().RegisterDBRead(duckdb::Catalog::GetCatalog(context, lake_name), context);
+			input.binder->GetStatementProperties().RegisterDBRead(
+			    duckdb::Catalog::GetCatalog(context, duckdb::Identifier(lake_name)), context);
 		}
 	}
 	return clean ? transaction.IndexReadHandle() : catalog.Handle();

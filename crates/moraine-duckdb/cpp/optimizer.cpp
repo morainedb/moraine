@@ -1,3 +1,5 @@
+#include "duckdb/planner/filter/list.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb.hpp"
 #include "duckdb/optimizer/filter_pushdown.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
@@ -34,7 +36,7 @@ void ReplaceEmptyIndexReads(duckdb::ClientContext &context, duckdb::unique_ptr<d
 		return;
 	}
 	auto &get = plan->Cast<duckdb::LogicalGet>();
-	if (!IsIndexRead(get.function.name) || !get.function.cardinality) {
+	if (!IsIndexRead(get.function.GetDefinition()->name.GetIdentifierName()) || !get.function.cardinality) {
 		return;
 	}
 	auto cardinality = get.function.cardinality(context, get.bind_data.get());
@@ -81,7 +83,7 @@ duckdb::LogicalGet *IndexReadGet(duckdb::LogicalOperator &op) {
 		return nullptr;
 	}
 	auto &get = op.Cast<duckdb::LogicalGet>();
-	return IsIndexRead(get.function.name) ? &get : nullptr;
+	return IsIndexRead(get.function.GetDefinition()->name.GetIdentifierName()) ? &get : nullptr;
 }
 
 // The index read beneath `op`, looked through projections and filters — a
@@ -102,15 +104,28 @@ bool ReferencedColumn(const duckdb::Expression &expression, const duckdb::Logica
 		return false;
 	}
 	auto &reference = expression.Cast<duckdb::BoundColumnRefExpression>();
-	if (reference.binding.table_index != get.table_index) {
+	if (reference.Binding().table_index != get.table_index) {
 		return false;
 	}
 	auto &column_ids = get.GetColumnIds();
-	if (reference.binding.column_index >= column_ids.size()) {
+	if (reference.Binding().column_index >= column_ids.size()) {
 		return false;
 	}
-	column = column_ids[reference.binding.column_index].GetPrimaryIndex();
+	column = column_ids[reference.Binding().column_index].GetPrimaryIndex();
 	return true;
+}
+
+// Where `column` sits in this scan's projection. A pushed filter is keyed by
+// that position, and the scan resolves it back through its own column list,
+// so a key carrying the table's column index names the wrong column.
+duckdb::optional_idx ProjectedColumn(const duckdb::LogicalGet &get, duckdb::idx_t column) {
+	auto &column_ids = get.GetColumnIds();
+	for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
+		if (column_ids[i].GetPrimaryIndex() == column) {
+			return duckdb::optional_idx(i);
+		}
+	}
+	return duckdb::optional_idx();
 }
 
 // As `ReferencedColumn`, but resolving `expression` through the projections
@@ -126,11 +141,11 @@ bool ReferencedColumnBeneath(const duckdb::Expression &expression, duckdb::Logic
 		}
 		auto &reference = expression.Cast<duckdb::BoundColumnRefExpression>();
 		auto &projection = op.Cast<duckdb::LogicalProjection>();
-		if (reference.binding.table_index != projection.table_index ||
-		    reference.binding.column_index >= projection.expressions.size()) {
+		if (reference.Binding().table_index != projection.table_index ||
+		    reference.Binding().column_index >= projection.expressions.size()) {
 			return false;
 		}
-		return ReferencedColumnBeneath(*projection.expressions[reference.binding.column_index], *op.children[0], get,
+		return ReferencedColumnBeneath(*projection.expressions[reference.Binding().column_index], *op.children[0], get,
 		                               column);
 	}
 	return ReferencedColumn(expression, get, column);
@@ -177,16 +192,16 @@ duckdb::unique_ptr<duckdb::Expression> DerivedFilter(const duckdb::Expression &e
 	if (!values.empty()) {
 		auto in_list = duckdb::make_uniq<duckdb::BoundOperatorExpression>(duckdb::ExpressionType::COMPARE_IN,
 		                                                                  duckdb::LogicalType::BOOLEAN);
-		in_list->children.push_back(expression.Copy());
+		in_list->GetChildrenMutable().push_back(expression.Copy());
 		for (auto &value : values) {
-			in_list->children.push_back(duckdb::make_uniq<duckdb::BoundConstantExpression>(value));
+			in_list->GetChildrenMutable().push_back(duckdb::make_uniq<duckdb::BoundConstantExpression>(value));
 		}
 		disjuncts.push_back(std::move(in_list));
 	}
 	if (any_null && comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 		auto is_null = duckdb::make_uniq<duckdb::BoundOperatorExpression>(duckdb::ExpressionType::OPERATOR_IS_NULL,
 		                                                                  duckdb::LogicalType::BOOLEAN);
-		is_null->children.push_back(expression.Copy());
+		is_null->GetChildrenMutable().push_back(expression.Copy());
 		disjuncts.push_back(std::move(is_null));
 	}
 
@@ -228,13 +243,13 @@ duckdb::unique_ptr<duckdb::TableFilter> RowRangeFilter(const duckdb::vector<duck
 		ends.insert(gap.second);
 	}
 	ends.insert(sorted.size());
-	auto result = duckdb::make_uniq<duckdb::ConjunctionOrFilter>();
+	auto result = duckdb::make_uniq<duckdb::LegacyConjunctionOrFilter>();
 	duckdb::idx_t start = 0;
 	for (auto end : ends) {
-		auto range = duckdb::make_uniq<duckdb::ConjunctionAndFilter>();
-		range->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+		auto range = duckdb::make_uniq<duckdb::LegacyConjunctionAndFilter>();
+		range->child_filters.push_back(duckdb::make_uniq<duckdb::LegacyConstantFilter>(
 		    duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, duckdb::Value::BIGINT(sorted[start])));
-		range->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+		range->child_filters.push_back(duckdb::make_uniq<duckdb::LegacyConstantFilter>(
 		    duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO, duckdb::Value::BIGINT(sorted[end - 1])));
 		result->child_filters.push_back(std::move(range));
 		start = end;
@@ -258,13 +273,23 @@ void PushRowPruning(duckdb::LogicalOperator &op, RowPruning &pruning) {
 	}
 	auto &get = scan->Cast<duckdb::LogicalGet>();
 	duckdb::idx_t column = 0;
-	if (get.function.name != "ducklake_scan" || !get.function.filter_pushdown ||
+	if (get.function.GetDefinition()->name != "ducklake_scan" || !get.function.filter_pushdown ||
 	    !ReferencedColumnBeneath(*pruning.expression, op, get, column) ||
-	    pruning.expression->return_type != duckdb::LogicalType::BIGINT) {
+	    pruning.expression->GetReturnType() != duckdb::LogicalType::BIGINT) {
 		return;
 	}
-	get.table_filters.PushFilter(duckdb::ColumnIndex(column),
-	    duckdb::make_uniq<duckdb::OptionalFilter>(RowRangeFilter(pruning.values)));
+	auto projected = ProjectedColumn(get, column);
+	if (!projected.IsValid()) {
+		return;
+	}
+	// A pushed filter is an expression now, and carries no "optional" mark:
+	// the ranges cover every located row id, so requiring it drops nothing.
+	auto ranges = RowRangeFilter(pruning.values);
+	auto expression = duckdb::ExpressionFilter::FromTableFilter(*ranges, duckdb::LogicalType::BIGINT);
+	if (!expression || !expression->expr) {
+		return;
+	}
+	get.table_filters.PushFilter(duckdb::ProjectionIndex(projected.GetIndex()), std::move(expression));
 }
 
 duckdb::LogicalGet *ScanBeneath(duckdb::LogicalOperator &op) {
@@ -281,10 +306,10 @@ bool TrySummaryJoin(duckdb::ClientContext &context, duckdb::LogicalComparisonJoi
 	if (!scan) { return false; }
 	bool row_id = false, file_id = false;
 	for (auto &condition : join.conditions) {
-		if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-		    condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) { continue; }
-		auto &index_expression = index_side == 0 ? *condition.left : *condition.right;
-		auto &scan_expression = index_side == 0 ? *condition.right : *condition.left;
+		if (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL &&
+		    condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) { continue; }
+		auto &index_expression = index_side == 0 ? condition.GetLHS() : condition.GetRHS();
+		auto &scan_expression = index_side == 0 ? condition.GetRHS() : condition.GetLHS();
 		duckdb::idx_t index_column, scan_column;
 		if (!ReferencedColumnBeneath(index_expression, *join.children[index_side], index, index_column) ||
 		    !ReferencedColumnBeneath(scan_expression, other, *scan, scan_column)) { continue; }
@@ -328,7 +353,7 @@ void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimi
 	if (!index_get) {
 		return;
 	}
-	auto *rows = IndexReadRows(index_get->function, index_get->bind_data.get());
+	auto *rows = IndexReadRows(*index_get->function.GetDefinition(), index_get->bind_data.get());
 	if (!rows || rows->empty()) {
 		return;
 	}
@@ -337,12 +362,12 @@ void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimi
 	duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filters;
 	std::vector<RowPruning> row_pruning;
 	for (auto &condition : join.conditions) {
-		if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-		    condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		if (condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_EQUAL &&
+		    condition.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			continue;
 		}
-		auto &index_expression = index_side == 0 ? *condition.left : *condition.right;
-		auto &other_expression = index_side == 0 ? *condition.right : *condition.left;
+		auto &index_expression = index_side == 0 ? condition.GetLHS() : condition.GetRHS();
+		auto &other_expression = index_side == 0 ? condition.GetRHS() : condition.GetLHS();
 
 		duckdb::idx_t column = 0;
 		if (!ReferencedColumnBeneath(index_expression, *join.children[index_side], *index_get, column)) {
@@ -363,7 +388,7 @@ void FilterJoinsAgainstIndexReads(duckdb::ClientContext &context, duckdb::Optimi
 			row_pruning.push_back({other_expression.Copy(), std::move(values)});
 			continue;
 		}
-		if (auto filter = DerivedFilter(other_expression, condition.comparison, values, any_null)) {
+		if (auto filter = DerivedFilter(other_expression, condition.GetComparisonType(), values, any_null)) {
 			filters.push_back(std::move(filter));
 		}
 	}

@@ -1,9 +1,9 @@
 diff --git a/src/include/storage/ducklake_metadata_manager.hpp b/src/include/storage/ducklake_metadata_manager.hpp
-index 211622d2..615c5bee 100644
+index ff9ca843..1f3e006a 100644
 --- a/src/include/storage/ducklake_metadata_manager.hpp
 +++ b/src/include/storage/ducklake_metadata_manager.hpp
-@@ -296,7 +296,8 @@ public:
- 	static string InlinedTableDdlSql(const string &table_name, const string &column_defs);
+@@ -410,7 +410,8 @@ public:
+ 	DuckLakeInlinedColNames InlinedColNames() const;
  	static string InlinedTableRegistrationTuple(idx_t table_id, const string &table_name, idx_t schema_version);
  	static string LatestInlinedTableQuery(idx_t table_id);
 -	static string DropDataFiles(const set<DataFileIndex> &dropped_files);
@@ -13,13 +13,13 @@ index 211622d2..615c5bee 100644
  	//! Caller supplies one resolved path per overwritten file, in the same order.
  	static string DeleteOverwrittenDeleteFiles(const vector<DuckLakeOverwrittenDeleteFile> &overwritten_files,
 diff --git a/src/storage/ducklake_metadata_manager.cpp b/src/storage/ducklake_metadata_manager.cpp
-index 6890c152..6c1cae84 100644
+index 1dfedd4d..cb74df26 100644
 --- a/src/storage/ducklake_metadata_manager.cpp
 +++ b/src/storage/ducklake_metadata_manager.cpp
-@@ -4002,8 +4002,21 @@ string DuckLakeMetadataManager::WriteNewDataFilesSqlBatch(const vector<DuckLakeF
+@@ -4548,8 +4548,21 @@ string DuckLakeMetadataManager::WriteNewDataFilesSqlBatch(const vector<DuckLakeF
  	return batch_query;
  }
-
+ 
 -string DuckLakeMetadataManager::DropDataFiles(const set<DataFileIndex> &dropped_files) {
 -	return FlushDrop("ducklake_data_file", "data_file_id", dropped_files);
 +string DuckLakeMetadataManager::DropDataFiles(const set<DataFileIndex> &dropped_files, optional_idx table_id) {
@@ -38,13 +38,13 @@ index 6890c152..6c1cae84 100644
 +	    R"(UPDATE {METADATA_CATALOG}.ducklake_data_file SET end_snapshot = {SNAPSHOT_ID} WHERE table_id = %d AND end_snapshot IS NULL AND data_file_id IN (%s);)",
 +	    table_id.GetIndex(), dropped_id_list);
  }
-
+ 
  string DuckLakeMetadataManager::DropDeleteFiles(const set<DataFileIndex> &dropped_files) {
 diff --git a/src/storage/ducklake_transaction_state.cpp b/src/storage/ducklake_transaction_state.cpp
-index e5716116..a67e584a 100644
+index e6aa92a9..47db027b 100644
 --- a/src/storage/ducklake_transaction_state.cpp
 +++ b/src/storage/ducklake_transaction_state.cpp
-@@ -1503,7 +1503,14 @@ string DuckLakeTransactionState::CommitChanges(DuckLakeCommitState &commit_state
+@@ -1753,7 +1753,14 @@ string DuckLakeTransactionState::CommitChanges(DuckLakeCommitState &commit_state
  		for (auto &entry : dropped_files) {
  			dropped_indexes.insert(entry.second);
  		}
@@ -57,6 +57,6 @@ index e5716116..a67e584a 100644
 +			dropped_table = tables_deleted_from.begin()->index;
 +		}
 +		batch_queries += DuckLakeMetadataManager::DropDataFiles(dropped_indexes, dropped_table);
+ 		batch_queries += UpdateStatsForDroppedFiles(stats, context, attempt_dropped_file_stats);
  	}
-
- 	if (has_table_data_changes) {
+ 

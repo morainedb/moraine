@@ -20,7 +20,7 @@ const DUCKDB_LOAD_TEST_NAME: &str = "attach_lists_and_scans_through_real_duckdb"
 /// `--exact`, since there are many). Adding a test there means bumping this
 /// count, or `e2e` fails — deliberate, so a silently-filtered test can never
 /// pass.
-const DUCKLAKE_LOAD_TEST_COUNT: &str = "209 passed";
+const DUCKLAKE_LOAD_TEST_COUNT: &str = "210 passed";
 
 /// Every file under `test/sql`, run together through DuckDB's own
 /// sqllogictest runner. Adding one means bumping this count, exactly as for
@@ -29,12 +29,9 @@ const DUCKLAKE_LOAD_TEST_COUNT: &str = "209 passed";
 /// silent skip fails the gate instead of looking like a pass.
 const SQLLOGIC_TEST_COUNT: &str = "8 test cases";
 
-/// Downloads/caches the pinned DuckDB CLI, builds Moraine and patched
-/// DuckLake, then runs every repository test against those artifacts.
+/// Builds Moraine and patched DuckLake, then runs every repository test
+/// against those artifacts and the CLI the same build produces.
 pub fn e2e() -> anyhow::Result<()> {
-    let cli = duckdb::ensure_duckdb_cli()?;
-    println!("ok: duckdb CLI at {}", cli.display());
-
     let patched = ducklake_patch::prepare()?;
     println!(
         "ok: patched DuckLake checkout at {}",
@@ -45,6 +42,9 @@ pub fn e2e() -> anyhow::Result<()> {
 
     let extension = duckdb::build_and_package_extension(&patched)?;
     println!("ok: packaged {}", extension.display());
+
+    let cli = duckdb::ensure_duckdb_cli()?;
+    println!("ok: duckdb CLI at {}", cli.display());
 
     ducklake_patch::run_row_id_regression(&patched, &extension)?;
     println!("ok: the bundled DuckLake carries the patch series");
@@ -110,6 +110,12 @@ fn run_sqllogictests(extension: &Path) -> anyhow::Result<()> {
     let output = Command::new(&runner)
         .arg("--test-dir")
         .arg(&root)
+        // The runner roots its per-test scratch at the working directory,
+        // which is the repository: keep it under `target/` and reap it, or a
+        // run leaves stores and data files behind in the tree.
+        .arg("--temp-dir-root")
+        .arg(root.join("target/duckdb-unittest-tempdir"))
+        .args(["--temp-dir-destroy", "always"])
         .arg("test/sql/*")
         .env("MORAINE_DUCKDB_EXT", extension.as_os_str())
         .env("MORAINE_EXTENSION_DIR", extension_dir.as_os_str())

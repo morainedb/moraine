@@ -55,7 +55,7 @@ struct MoveWalGlobalState : public duckdb::GlobalTableFunctionState {
 
 duckdb::unique_ptr<duckdb::FunctionData> MoveWalBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                      duckdb::vector<duckdb::LogicalType> &return_types,
-                                                     duckdb::vector<duckdb::string> &names) {
+                                                     duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<MoveWalBindData>();
 	if (input.inputs[0].IsNull()) {
 		throw duckdb::BinderException("moraine_move_wal: the store path must not be NULL");
@@ -66,12 +66,12 @@ duckdb::unique_ptr<duckdb::FunctionData> MoveWalBind(duckdb::ClientContext &, du
 	}
 	bool to_given = false;
 	for (auto &option : input.named_parameters) {
-		if (duckdb::StringUtil::CIEquals(option.first, "wal_path")) {
+		if (option.first == "wal_path") {
 			to_given = true;
 			if (!option.second.IsNull()) {
 				bind_data->to_wal_path = option.second.GetValue<std::string>();
 			}
-		} else if (duckdb::StringUtil::CIEquals(option.first, "from_wal_path")) {
+		} else if (option.first == "from_wal_path") {
 			if (!option.second.IsNull()) {
 				bind_data->from_wal_path = option.second.GetValue<std::string>();
 			}
@@ -143,7 +143,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MoveWalInitGlobal(duckdb::C
 void MoveWalImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<MoveWalGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	auto store = [](const std::string &path) {
@@ -153,7 +153,7 @@ void MoveWalImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 	output.SetValue(1, 0, store(state.to_wal_path));
 	output.SetValue(2, 0, duckdb::Value::BOOLEAN(state.moved));
 	state.emitted = true;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 } // namespace
@@ -161,8 +161,10 @@ void MoveWalImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 void RegisterMoraineMoveWalFunction(duckdb::ExtensionLoader &loader) {
 	duckdb::TableFunction move_wal("moraine_move_wal", {duckdb::LogicalType::VARCHAR}, MoveWalImpl, MoveWalBind,
 	                               MoveWalInitGlobal);
-	move_wal.named_parameters["wal_path"] = duckdb::LogicalType::VARCHAR;
-	move_wal.named_parameters["from_wal_path"] = duckdb::LogicalType::VARCHAR;
+	move_wal.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		options.Add("wal_path", duckdb::LogicalType::VARCHAR);
+		options.Add("from_wal_path", duckdb::LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(move_wal);
 }
 

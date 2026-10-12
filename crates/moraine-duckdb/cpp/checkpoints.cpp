@@ -83,7 +83,7 @@ std::string RequireArgument(const std::string &function, const std::string &what
 	return value;
 }
 
-void CheckpointReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names) {
+void CheckpointReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::Identifier> &names) {
 	return_types = {duckdb::LogicalType::VARCHAR};
 	names = {"checkpoint_id"};
 }
@@ -92,7 +92,7 @@ void CheckpointReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, du
 // which says how far behind the live state it is, and its expiry, which
 // separates a reader's refreshed lease from a mint that holds until
 // someone releases it.
-void ListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names) {
+void ListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::Identifier> &names) {
 	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::UBIGINT,
 	                duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::TIMESTAMP_TZ};
 	names = {"checkpoint_id", "manifest_id", "created_at", "expires_at"};
@@ -100,11 +100,11 @@ void ListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::
 
 duckdb::unique_ptr<duckdb::FunctionData> CreateBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                    duckdb::vector<duckdb::string> &names) {
+                                                    duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<CheckpointBindData>();
 	bind_data->target = RequireArgument("moraine_create_checkpoint", "catalog name", input, 0);
 	for (auto &option : input.named_parameters) {
-		if (duckdb::StringUtil::CIEquals(option.first, "lifetime")) {
+		if (option.first == "lifetime") {
 			// An interval, not a timestamp: the checkpoint's expiry is
 			// relative to when it is minted, and SlateDB stamps it from its
 			// own clock.
@@ -122,7 +122,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CreateBind(duckdb::ClientContext &, duc
 
 duckdb::unique_ptr<duckdb::FunctionData> ListBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                   duckdb::vector<duckdb::LogicalType> &return_types,
-                                                  duckdb::vector<duckdb::string> &names) {
+                                                  duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<CheckpointBindData>();
 	bind_data->target = RequireArgument("moraine_checkpoints", "store path", input, 0);
 	ListReturnTypes(return_types, names);
@@ -131,7 +131,7 @@ duckdb::unique_ptr<duckdb::FunctionData> ListBind(duckdb::ClientContext &, duckd
 
 duckdb::unique_ptr<duckdb::FunctionData> DeleteBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                    duckdb::vector<duckdb::string> &names) {
+                                                    duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<CheckpointBindData>();
 	bind_data->target = RequireArgument("moraine_delete_checkpoint", "store path", input, 0);
 	if (input.inputs[1].IsNull()) {
@@ -224,7 +224,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DeleteInitGlobal(duckdb::Cl
 void CheckpointImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<CheckpointGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t row_index = 0;
@@ -233,13 +233,13 @@ void CheckpointImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, d
 		row_index++;
 	}
 	state.emitted = true;
-	output.SetCardinality(row_index);
+	output.SetChildCardinality(row_index);
 }
 
 void ListImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<CheckpointGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t row_index = 0;
@@ -256,7 +256,7 @@ void ListImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb:
 		row_index++;
 	}
 	state.emitted = true;
-	output.SetCardinality(row_index);
+	output.SetChildCardinality(row_index);
 }
 
 // The delete function returns only the released id, so it projects one
@@ -264,12 +264,12 @@ void ListImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb:
 void DeleteImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &state = data.global_state->Cast<CheckpointGlobalState>();
 	if (state.emitted) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	output.SetValue(0, 0, duckdb::Value(state.rows.front().id));
 	state.emitted = true;
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 } // namespace
@@ -277,7 +277,9 @@ void DeleteImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 void RegisterMoraineCheckpointFunctions(duckdb::ExtensionLoader &loader) {
 	duckdb::TableFunction create("moraine_create_checkpoint", {duckdb::LogicalType::VARCHAR}, CheckpointImpl,
 	                             CreateBind, CreateInitGlobal);
-	create.named_parameters["lifetime"] = duckdb::LogicalType::INTERVAL;
+	create.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		options.Add("lifetime", duckdb::LogicalType::INTERVAL);
+	});
 	loader.RegisterFunction(create);
 
 	loader.RegisterFunction(duckdb::TableFunction("moraine_checkpoints", {duckdb::LogicalType::VARCHAR}, ListImpl,

@@ -49,7 +49,7 @@ impl Fixture {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn located_rows_prepare_defers_strict_position_checks() {
     let fixture = Fixture::new(0);
     let prepare = "PREPARE located AS SELECT * FROM moraine_rows_at('lake','main','t',
@@ -69,7 +69,7 @@ fn located_rows_prepare_defers_strict_position_checks() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn located_rows_and_summary_scans_parallelize_one_files_row_groups() {
     for inline_limit in [0, 100_000] {
         let fixture = Fixture::new(inline_limit);
@@ -109,7 +109,12 @@ fn located_rows_and_summary_scans_parallelize_one_files_row_groups() {
             answers,
             vec![vec!["answer", "8192", "409600", "33550336", "8192"]; 5]
         );
-        if std::thread::available_parallelism().is_ok_and(|cores| cores.get() >= 4) {
+        // Flushing inlined data writes the table as one row group, which
+        // leaves a located scan one work unit to read serially; only the
+        // directly written file splits across workers.
+        if inline_limit == 0
+            && std::thread::available_parallelism().is_ok_and(|cores| cores.get() >= 4)
+        {
             assert!(
                 result.contains("Peak read workers: 1") || result.contains("Peak read workers: 2"),
                 "{result}"
@@ -120,7 +125,7 @@ fn located_rows_and_summary_scans_parallelize_one_files_row_groups() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn located_rows_read_back_whole_with_their_locators() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -138,7 +143,7 @@ fn located_rows_read_back_whole_with_their_locators() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_partial_update_recipe_commits_as_one_transaction() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -164,7 +169,7 @@ fn a_partial_update_recipe_commits_as_one_transaction() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_rolled_back_recipe_leaves_the_rows_untouched() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -184,7 +189,7 @@ fn a_rolled_back_recipe_leaves_the_rows_untouched() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_column_added_after_the_rows_were_written_reads_null() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -199,7 +204,7 @@ fn a_column_added_after_the_rows_were_written_reads_null() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_located_update_applies_its_assignments_in_one_statement() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -229,7 +234,7 @@ fn a_located_update_applies_its_assignments_in_one_statement() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_located_update_rolls_back_with_its_transaction() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -247,7 +252,7 @@ fn a_located_update_rolls_back_with_its_transaction() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn an_assignment_to_an_unknown_column_is_refused() {
     let fixture = Fixture::new(0);
     let output = run_ducklake_sql_output(
@@ -273,7 +278,7 @@ fn an_assignment_to_an_unknown_column_is_refused() {
 /// than with the rows being deleted. At `info`, so a caller reads it without
 /// turning on the per-request chatter `debug` carries.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn locating_positions_reports_its_phases_and_backlog() {
     let fixture = Fixture::new(0);
     fixture.run(&format!(
@@ -307,7 +312,7 @@ fn locating_positions_reports_its_phases_and_backlog() {
 /// Payload fields in `rows` give each located row its own new value, under
 /// a field named for the column it assigns.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_located_update_takes_per_row_values_from_the_payload() {
     for inline_limit in [0, 1024] {
         let fixture = Fixture::new(inline_limit);
@@ -336,7 +341,7 @@ fn a_located_update_takes_per_row_values_from_the_payload() {
 
 /// Two payloads for one row have no defined winner.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_payload_naming_one_row_twice_is_refused() {
     let fixture = Fixture::new(0);
     let output = run_ducklake_sql_output(
@@ -363,7 +368,7 @@ fn a_payload_naming_one_row_twice_is_refused() {
 /// coalesces its rows can reach it, and rendering the list back into the
 /// replacement query is where the element type would otherwise be lost.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn an_empty_selection_updates_nothing() {
     let fixture = Fixture::new(0);
     for rows in [
@@ -393,7 +398,7 @@ fn an_empty_selection_updates_nothing() {
 /// lookup and turning its row ids into file candidates — report at `info`,
 /// where a caller reads them without the per-request chatter `debug` carries.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn an_index_read_reports_both_halves_of_its_bind() {
     let fixture = Fixture::new(0);
     let output = run_session_with_env(
@@ -428,7 +433,7 @@ fn an_index_read_reports_both_halves_of_its_bind() {
 /// the same row ids where they live; at one store revision the answer is the
 /// same, so it is located once.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_rebind_locates_its_rows_once() {
     let fixture = Fixture::new(0);
     let output = run_session_with_env(
@@ -469,7 +474,7 @@ fn a_rebind_locates_its_rows_once() {
 /// Every scan a statement opens subtracts the table's committed inlined
 /// deletions; at one store revision that ledger is read once, not per open.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_statement_reads_the_inlined_deletion_ledger_once() {
     let fixture = Fixture::new(0);
     // Rows live in a file; deletions of them inline into the ledger.

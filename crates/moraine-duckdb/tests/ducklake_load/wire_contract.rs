@@ -19,7 +19,7 @@ use crate::helpers::*;
 
 /// The exact DuckLake commit whose behaviour these pins describe and that
 /// the repository patch is applied to.
-const DUCKLAKE_SOURCE_COMMIT: &str = "ac7595b0a1305bea3d4cfaca763b0ce964c763a2";
+const DUCKLAKE_SOURCE_COMMIT: &str = "e8924cfc9ccbb9a1a148e8ff367b75d493ca9df5";
 
 /// Git's default lower bound for an abbreviated object name.
 const MINIMUM_GIT_ABBREVIATION_LENGTH: usize = 7;
@@ -75,7 +75,7 @@ fn query_log(store: &Path, data_path: &Path, alias: &str, statements: &[&str]) -
 /// and the `HIDDEN true` that keeps the nested database out of
 /// `duckdb_databases()` while leaving it addressable by name.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_nests_a_hidden_moraine_attach_named_for_its_alias() {
     let dir = TempDir::new("nest-store");
     let data_dir = TempDir::new("nest-data");
@@ -160,7 +160,7 @@ fn ducklake_nests_a_hidden_moraine_attach_named_for_its_alias() {
 /// `DELETE`, and `CREATE`, so a table marked `RW` is both read and
 /// mutated somewhere in the workload.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 #[allow(clippy::too_many_lines)]
 fn ducklakes_catalog_access_set_is_pinned() {
     let dir = TempDir::new("access-store");
@@ -227,7 +227,7 @@ fn ducklakes_catalog_access_set_is_pinned() {
     // happens to allocate.
     let expected = [
         "ducklake_column RW",
-        "ducklake_column_mapping W",
+        "ducklake_column_mapping RW",
         "ducklake_column_tag R",
         "ducklake_data_file RW",
         "ducklake_delete_file RW",
@@ -242,7 +242,7 @@ fn ducklakes_catalog_access_set_is_pinned() {
         "ducklake_macro_impl RW",
         "ducklake_macro_parameters RW",
         "ducklake_metadata R",
-        "ducklake_name_mapping W",
+        "ducklake_name_mapping RW",
         "ducklake_partition_column R",
         "ducklake_partition_info R",
         "ducklake_schema RW",
@@ -311,7 +311,7 @@ fn ducklake_tables_named_in(statement: &str) -> Vec<String> {
 /// instead of racing it. What moraine owes is that this read works and
 /// reports the truth while a transaction is open, which is what this pins.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_serves_the_conflict_resolution_read_inside_a_transaction() {
     let dir = TempDir::new("conflict-store");
     let data_dir = TempDir::new("conflict-data");
@@ -379,13 +379,14 @@ fn moraine_serves_the_conflict_resolution_read_inside_a_transaction() {
 /// The DuckDB/DuckLake build pair the loadable is linked against, checked
 /// by running rather than assumed.
 ///
-/// moraine statically links DuckDB v1.5.6 and bundles the patched DuckLake
-/// built against the same release. ABI friction would show up as a load
-/// failure, a crash, or a wrong answer at the boundary where DuckLake hands
-/// moraine C++ objects by pointer — so the pin is: the bundle loads, reports
-/// DuckLake as the pinned revision, and the full chain answers correctly.
+/// moraine statically links the DuckDB `.github/duckdb-versions` names as
+/// primary and bundles the patched DuckLake built against it. ABI friction
+/// would show up as a load failure, a crash, or a wrong answer at the
+/// boundary where DuckLake hands moraine C++ objects by pointer — so the
+/// pin is: the bundle loads, reports DuckLake as the pinned revision, and
+/// the full chain answers correctly.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn the_pinned_duckdb_and_ducklake_builds_interoperate() {
     let dir = TempDir::new("pin-store");
     let data_dir = TempDir::new("pin-data");
@@ -469,7 +470,7 @@ fn duckdb_pin() -> &'static str {
 /// attempt count makes a false alarm vanishingly unlikely while staying
 /// cheap.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn the_upstream_ducklake_listing_race_still_needs_threads_1() {
     const ATTEMPTS: usize = 15;
 
