@@ -2576,6 +2576,7 @@ mod tests {
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
             deleted_data_file_ids: Vec::new(),
+            deletes_untargeted_files: false,
         };
         Transaction::new(CatalogSnapshot::build(snapshot, &[], &[], None), 5)
     }
@@ -3101,6 +3102,7 @@ mod tests {
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
             deleted_data_file_ids: Vec::new(),
+            deletes_untargeted_files: false,
         };
         let table = TableValue {
             table_id: 1,
@@ -3499,6 +3501,7 @@ mod tests {
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
             deleted_data_file_ids: Vec::new(),
+            deletes_untargeted_files: false,
         };
         let main = SchemaValue {
             schema_id: 0,

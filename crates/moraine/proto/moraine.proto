@@ -382,6 +382,10 @@ message SnapshotValue {
   // it checks at file grain. Empty on a DuckLake-authored snapshot, which
   // is read back as "deletes from the whole table".
   repeated uint64 deleted_data_file_ids = 12;
+  // Whether the commit also deleted rows no delete file names (an inlined
+  // delete), which puts it at table grain despite the file list. Read only
+  // when deleted_data_file_ids is non-empty.
+  bool deletes_untargeted_files = 13;
 }
 
 // changelog/<snapshot_id>: the `current` keys one commit's batch wrote,
