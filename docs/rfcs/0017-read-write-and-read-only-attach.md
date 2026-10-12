@@ -67,7 +67,7 @@ by DuckDB's ordinary attach dispatch to moraine's registered storage
 extension. Whether the outer attach's `READ_ONLY` rides that nested attach is
 the question this RFC has to answer.
 
-**Implemented.** `moraine_attach` now takes a `read_only` bit, `Catalog`
+**Implemented.** `moraine_attach_with_wal_store` takes a `read_only` bit, `Catalog`
 exposes `open`/`open_read_only` over a `Store::{Writer(Db), Reader(DbReader)}`
 split, and every typed read runs through a `ReadHandle` that dispatches to a
 transaction (read-write) or the reader (read-only). The shim reads DuckDB's
@@ -113,8 +113,7 @@ The bit travels one path, whichever entry point produced it:
 
 1. **The C++ shim reads DuckDB's access mode** for the moraine attach —
    `READ_ONLY` versus `READ_WRITE`/`AUTOMATIC` — and passes a `read_only`
-   bit across the C ABI. `moraine_attach` gains that parameter; it takes
-   none today.
+   bit across the C ABI through `moraine_attach_with_wal_store`.
 2. **`Catalog::open` opens by mode.** Read-write opens the one SlateDB `Db`
    (the RFC 0004 writer); read-only opens `DbReader`. The finished handle's
    *shape* — which operations it offers — is RFC 0003's concern; this RFC

@@ -814,7 +814,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// ABI's sentinel (UINT64_MAX). `FLUSH_ON_COMMIT` is the same as a zero
 	// spacing, kept for attach lines that set it.
 	// `CACHE_DIR` is a local directory for the block cache's disk tier; it
-	// must outlive the moraine_attach call, so it lives in this scope.
+	// must outlive the attach call, so it lives in this scope.
 	// `CACHE_SIZE` bounds that directory and `CACHE_MEMORY` bounds the
 	// cache's memory; 0 on the ABI means "not given" for either. All three
 	// configure a cache the process shares rather than this attach's, so
@@ -905,7 +905,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			checkpoint = option.second.GetValue<std::string>();
 		}
 	}
-	// The backing strings must outlive the moraine_attach call, so they live
+	// The backing strings must outlive the attach call, so they live
 	// in this scope rather than inside the resolver.
 	MoraineS3Config s3 {};
 	S3SecretStrings s3_strings;
