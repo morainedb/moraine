@@ -1791,6 +1791,26 @@ int32_t moraine_indexes(struct MoraineCatalogHandle *handle,
 // matching [`moraine_indexes`] call, not yet freed.
 void moraine_indexes_free(struct MoraineIndexDesc *items, size_t len);
 
+// Recomputes an index's entries from the table's rows and reports how they
+// differ from the entries the index holds. Writes nothing.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; `err`, if non-null,
+// must be writable, and every `out_*` pointer must be writable.
+int32_t moraine_index_verify(struct MoraineCatalogHandle *handle,
+                             const char *schema_name,
+                             const char *table_name,
+                             const char *index_name,
+                             uint64_t *out_stored,
+                             uint64_t *out_expected,
+                             uint64_t *out_missing,
+                             uint64_t *out_dead,
+                             uint64_t *out_mismatched,
+                             MoraineInterruptProbe probe,
+                             void *probe_ctx,
+                             struct MoraineError *err);
+
 // Resolves an equality lookup to the rows currently holding `values` — one
 // [`MoraineLookupValue`] per indexed column, in the index's column order,
 // each coerced to its column's type. The count must equal the index's

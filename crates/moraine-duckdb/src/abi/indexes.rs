@@ -473,3 +473,89 @@ pub unsafe extern "C" fn moraine_indexes_free(items: *mut MoraineIndexDesc, len:
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
+
+/// Recomputes an index's entries from the table's rows and reports how they
+/// differ from the entries the index holds. Writes nothing.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `err`, if non-null,
+/// must be writable, and every `out_*` pointer must be writable.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn moraine_index_verify(
+    handle: *mut MoraineCatalogHandle,
+    schema_name: *const c_char,
+    table_name: *const c_char,
+    index_name: *const c_char,
+    out_stored: *mut u64,
+    out_expected: *mut u64,
+    out_missing: *mut u64,
+    out_dead: *mut u64,
+    out_mismatched: *mut u64,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        for (pointer, name) in [
+            (out_stored, "out_stored"),
+            (out_expected, "out_expected"),
+            (out_missing, "out_missing"),
+            (out_dead, "out_dead"),
+            (out_mismatched, "out_mismatched"),
+        ] {
+            if pointer.is_null() {
+                return Err(AbiError::invalid_argument(format!("`{name}` is null")));
+            }
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for the string pointers.
+        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+        // SAFETY: caller contract.
+        let table = unsafe { borrow_str(table_name, "table_name") }?;
+        // SAFETY: caller contract.
+        let name = unsafe { borrow_str(index_name, "index_name") }?;
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+        }?;
+        let table_id = resolve_table(&snapshot, schema, table)?;
+        let data_store = handle_ref.data_store.clone();
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let report = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref.catalog.reads().verify_index(
+                    table_id,
+                    name,
+                    data_store,
+                    &handle_ref.data_prefix,
+                ),
+            )
+        }?;
+
+        // SAFETY: each pointer is non-null per the check above, and
+        // writable per the caller contract.
+        unsafe {
+            out_stored.write(report.stored);
+            out_expected.write(report.expected);
+            out_missing.write(report.missing);
+            out_dead.write(report.dead);
+            out_mismatched.write(report.mismatched);
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}

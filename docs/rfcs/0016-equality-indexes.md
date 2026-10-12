@@ -229,15 +229,16 @@ Hash-overflow is rejected for v1.
 ### Coverage — who writes entries, and when
 
 Coverage is total over live rows, maintained at the three moments rows
-enter, and the two moments they die:
+enter, and the two moments they die. Who computes an entry depends on who
+wrote the rows, which differs between the two paths:
 
-| Moment | Who has the rows | Entry source |
-|---|---|---|
-| `inline_insert` | moraine (rows arrive through the API) | computed by moraine, staged in the same batch |
-| flush (RFC 0005) | moraine (it writes the Parquet) | **nothing to do** — entries point at row ids, which flush preserves |
-| `register_data_file` | the writer | **writer-supplied**: `(row ordinal, key values)` pairs alongside the file, mapped to row ids at commit (`row_id_start + ordinal`) — or `(row_id, key values)` for rewrite files that preserve row ids — like the file column stats the writer already computes |
-| `inline_delete` of a store-resident row | moraine (the chunk is in the store) | moraine recomputes the key values from the chunk and stages the entry delete |
-| `register_delete_file`, or `inline_delete` against flushed rows | the writer (it read the rows to produce positions) | **writer-supplied**: `(row_id, key values)` per deleted row; moraine deletes the named entries |
+| Moment | Who has the rows | Embedding API | Extension path |
+|---|---|---|---|
+| `inline_insert` | moraine (rows arrive through the API) | computed by moraine, staged in the same batch | same |
+| flush (RFC 0005) | moraine (it writes the Parquet) | **nothing to do** — entries point at row ids, which flush preserves | same |
+| `register_data_file` | the writer | **writer-supplied**: `(row ordinal, key values)` pairs alongside the file, mapped to row ids at commit (`row_id_start + ordinal`) — or `(row_id, key values)` for rewrite files that preserve row ids — like the file column stats the writer already computes | **moraine reads the file** |
+| `inline_delete` of a store-resident row | moraine (the chunk is in the store) | moraine recomputes the key values from the chunk and stages the entry delete | same |
+| `register_delete_file`, or `inline_delete` against flushed rows | the writer (it read the rows to produce positions) | **writer-supplied**: `(row_id, key values)` per deleted row; moraine deletes the named entries | **moraine reads the delete file** |
 
 The embedding-path rule generalizing the last two: any operation that kills
 rows moraine cannot read from the store must name their indexed key values —
@@ -256,6 +257,21 @@ DuckLake staged registration carries no entries by construction, so on any
 indexed table moraine derives them by the scoped read (Extension path) —
 however the index was created. Reject-vs-read splits by who writes, not by
 which API made the index.
+
+So on the extension path every entry is moraine's own work: it opens the
+registered data file, or the delete file and then the rows it names, and
+computes the key values from the rows themselves. Nothing a writer asserts
+is taken on trust, because no writer asserts anything.
+
+**A data store is mandatory for an indexed table on that path.** Deriving
+entries needs the file, so a commit registering a data or delete file on a
+table that carries a maintained index fails `Constraint` when the attach
+supplied no `DATA_PATH` store, naming the file it could not read. The index
+is never quietly left short: the commit does not happen. `create_index` is
+fail-closed at the other end for the same reason — a table that already
+holds files cannot be indexed without a store to backfill from. So an attach
+with no `META_DATA_PATH` can carry an indexed table only while its rows stay
+inlined, and a test written that way exercises none of the file reads above.
 
 An UPDATE on the verb path (expire + register preserving row ids) composes:
 the delete side removes old entries, the insert side adds new — same commit,
@@ -1880,6 +1896,7 @@ written `…` below for brevity.
 | `moraine_index_in(…, keys)` | table function: row ids for the union of complete equality keys in `keys`. A single-column index takes a list of scalar values; a composite index takes a list of `row(...)` values in index-column order. Duplicate keys are one predicate, a key containing NULL matches no row, and an empty list returns no rows |
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
 | `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
+| `moraine_index_verify(catalog, schema, table, index)` | table function: recompute the index's entries from the live rows and report the difference — `stored`, `expected`, `missing`, `dead`, `mismatched`. Reads every live data file of the table, so it costs what the build costs; writes nothing and takes no snapshot, so a read-only attach may run it. A clean index reports `stored = expected` and zeros for the last three. Only a `ready` index can be verified: a build's entries are incomplete by design |
 | `moraine_indexes(catalog, schema, table)` | table function: index introspection — `index_id`, `index_name`, `is_unique`, `is_building`, and `state` (`ready`\|`building`\|`maintaining`\|`poisoned`) |
 | `moraine_delete_located(catalog, schema, table, rows)` | table function: delete the located rows without a scan (File-located deletion). `rows` is a list of `row(row_id, data_file_id)` pairs as a lookup returned them, a NULL file id naming an inlined row. Returns one row of counts: file rows deleted, inline rows deleted, delete files written |
 | `moraine_rows_at(catalog, schema, table, rows)` | table function: the located rows read back whole without a scan (Located rows and located updates). Same `rows` shape. Returns the table's current columns, then `row_id` and `data_file_id` (NULL for an inlined row); a row deleted at the transaction's snapshot is omitted |
@@ -2165,6 +2182,45 @@ head-preserving batches. It runs as one step of the maintenance pass. Batched
 scan-and-delete is the binding design. A SlateDB range delete could optimize
 the mechanism without changing its semantics; that upstream request is
 tracked in [`../slatedb.md`](../slatedb.md).
+
+### Verification
+
+Nothing checks an index against the rows it covers. The entries are
+moraine's own work on the extension path, and the predicate the pruning
+keeps is what makes a wrong entry cost a read rather than an answer — but a
+dead or missing entry is invisible until something trips over it. Production
+has found them by their cost: an index whose rebuild left 24.8 million dead
+entries swept them once per batch for hours before anyone noticed.
+
+`moraine_index_verify(catalog, schema, table, index)` recomputes the entry
+set at the current snapshot through the same scoped reads the backfill uses —
+inline chunks, then every live data file, with the snapshot's delete files
+applied — and diffs it against what the index holds:
+
+| count | meaning |
+|---|---|
+| `stored` | entries the index holds |
+| `expected` | entries the live rows require |
+| `missing` | an entry the rows require that the index does not hold |
+| `dead` | an entry the index holds that no live row requires |
+| `mismatched` | a unique entry under the right value naming another row |
+
+`mismatched` is separate because a unique key stores its row id as the
+value, so an entry can be present under the right value and still point
+somewhere else — neither missing nor dead, and the one case a key-only diff
+would call clean.
+
+The pass reads, and only reads: no commit, no snapshot, and a read-only
+attach may run it. Its cost is the build's cost, and it holds the stored
+entry set in memory, which is the bound a single-commit backfill already
+accepts. A `building` index is refused rather than reported against, since
+its entries are incomplete by design.
+
+Three properties the counts give that nothing else does: a maintained index
+stays clean across insert, delete, update and compaction; a rebuild that
+loses entries is visible before a query pays for them; and the entry-source
+split above becomes testable rather than asserted, since a verifier pass is
+the last line an index test can assert.
 
 ### Test obligations
 
