@@ -610,7 +610,7 @@ fn maintenance_sweeps_a_dropped_index() {
         &meta,
         "CREATE TABLE lake.main.t(a BIGINT);\
          INSERT INTO lake.main.t SELECT i FROM range(25) t(i);\
-         SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],false);",
+         CREATE INDEX by_a ON lake.main.t(a);",
     );
 
     // A live index is spared.
@@ -624,7 +624,7 @@ fn maintenance_sweeps_a_dropped_index() {
         store.path(),
         data.path(),
         &meta,
-        "SELECT * FROM moraine_index_drop('lake','main','t','by_a');",
+        "DROP INDEX lake.main.by_a;",
     );
 
     let swept =
@@ -1081,8 +1081,8 @@ fn maintenance_status_survives_restart_and_retains_earlier_passes() {
         &meta,
         "CREATE TABLE lake.main.t(a BIGINT);\
          INSERT INTO lake.main.t SELECT i FROM range(7) t(i);\
-         SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],false);\
-         SELECT * FROM moraine_index_drop('lake','main','t','by_a');\
+         CREATE INDEX by_a ON lake.main.t(a);\
+         DROP INDEX lake.main.by_a;\
          SELECT count(*) FROM moraine_maintenance('lake');\
          SELECT count(*) FROM moraine_maintenance('lake');",
     );
@@ -1162,8 +1162,8 @@ fn maintenance_sweeps_even_when_a_ducklake_step_fails() {
         &options,
         "CREATE TABLE lake.main.t(a BIGINT);\
          INSERT INTO lake.main.t SELECT i FROM range(9) t(i);\
-         SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],false);\
-         SELECT * FROM moraine_index_drop('lake','main','t','by_a');\
+         CREATE INDEX by_a ON lake.main.t(a);\
+         DROP INDEX lake.main.by_a;\
          SELECT step, status, detail FROM moraine_maintenance('lake');",
     ));
     let by_step: std::collections::HashMap<_, _> = rows
@@ -1211,8 +1211,8 @@ fn scheduler_runs_a_pass_unattended() {
         &meta,
         "CREATE TABLE lake.main.t(a BIGINT);\
          INSERT INTO lake.main.t SELECT i FROM range(11) t(i);\
-         SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],false);\
-         SELECT * FROM moraine_index_drop('lake','main','t','by_a');",
+         CREATE INDEX by_a ON lake.main.t(a);\
+         DROP INDEX lake.main.by_a;",
     );
 
     let scheduled = format!("{meta}, META_MAINTENANCE_INTERVAL INTERVAL '200 milliseconds'");
@@ -1268,8 +1268,8 @@ fn orphaned_range(store: &TempDir, data: &TempDir, entries: u64) {
         &format!(
             "CREATE TABLE lake.main.t(a BIGINT);\
              INSERT INTO lake.main.t SELECT i FROM range({entries}) t(i);\
-             SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],false);\
-             SELECT * FROM moraine_index_drop('lake','main','t','by_a');"
+             CREATE INDEX by_a ON lake.main.t(a);\
+             DROP INDEX lake.main.by_a;"
         ),
     );
 }

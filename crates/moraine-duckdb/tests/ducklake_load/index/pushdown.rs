@@ -62,7 +62,7 @@ fn an_indexed_equality_reads_only_the_rows_holding_its_value() {
         store.path(),
         data.path(),
         &options,
-        "CALL moraine_index_create('lake','main','t','by_a',['a'],false);",
+        "CREATE INDEX by_a ON lake.main.t(a);",
     );
     let after = run_ducklake_sql_with_options(
         store.path(),
@@ -130,7 +130,7 @@ fn equalities_the_index_cannot_answer_cheaply_leave_the_scan_alone() {
         store.path(),
         data.path(),
         &options,
-        "CALL moraine_index_create('lake','main','t','by_a',['a'],false);",
+        "CREATE INDEX by_a ON lake.main.t(a);",
     );
 
     let declines = [
@@ -171,7 +171,7 @@ fn equalities_the_index_cannot_answer_cheaply_leave_the_scan_alone() {
         },
         "CREATE TABLE lake.main.t(a BIGINT);
          INSERT INTO lake.main.t VALUES (1),(2),(3),(4);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         CREATE INDEX by_a ON lake.main.t(a);
          CALL enable_logging(level => 'debug', storage => 'memory');
          SELECT count(*) FROM lake.main.t WHERE a = 2;
          SELECT 'lookups', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%index lookup resolved%';",

@@ -128,7 +128,7 @@ Verbs on `Transaction`:
 checked inside the creation commit for both SQL and embedding callers.
 The physical definition remains table-scoped. Older catalogs with duplicate
 names remain readable; schema-level resolution refuses ambiguity, and the
-existing table-qualified operations can remove the duplicates.
+table-qualified Rust API can remove the ambiguous definitions.
 
 **Commit classification.** Index DDL is recorded in `changes_made` as
 `altered_table:<table_id>` — DuckLake's parser throws on unknown kinds
@@ -285,7 +285,7 @@ same batch, uniqueness checked against the post-image.
 **Backfill at `create_index`.** Rows moraine holds (inlined, any schema
 version) are backfilled by scanning the chunks. Rows in external files need
 writer-supplied backfill entries passed to `create_index` — except through
-`moraine_create_index`, which has no writer and backfills by scoped-reading
+`CREATE INDEX`, which has no writer and backfills by scoped-reading
 **every live data file** of the table, so its build cost is the table's
 indexed columns, and the one-commit bound bites hardest exactly there. The
 reader overlaps a fixed number of immutable files and sends bounded Arrow
@@ -1767,11 +1767,11 @@ obligation.
 once the definition commits; the host advances the build with a
 `build_index_step(index)` verb — one bounded batch per call, returning the
 cursor position or terminal state — and loops at its own pace. The
-extension path's `moraine_index_create(…, staged := true)` drives the loop
-internally in the same autonomous-commit style as the other DDL functions,
+extension path's `CREATE INDEX … WITH (staged = true)` drives the loop
+internally through autonomous commits,
 returning once the index is `ready` or the build has failed. A cancelled
 or crashed call leaves the definition `building`: re-issuing the same call
-resumes from the cursor, and `moraine_index_drop` abandons the build.
+resumes from the cursor, and `DROP INDEX` abandons the build.
 `moraine_indexes` exposes the state for progress: `is_building` for the
 binary question, and `state` for which of `ready`, `building`,
 `maintaining`, or `poisoned` it is. A caller gating writes on readiness
@@ -1811,8 +1811,8 @@ moraine is DuckLake's metadata catalog, not the catalog that owns user tables
 `OperatorExtension`. Moraine handles `CREATE INDEX`, `CREATE UNIQUE INDEX`,
 and `DROP INDEX` there for Moraine-backed lakes. A `PlannerExtension`
 post-bind callback handles `DROP INDEX IF EXISTS`, which can otherwise bind
-successfully without finding an index. Both paths use the same execution
-callbacks as the existing SQL functions; no DuckLake patch is added.
+successfully without finding an index. Both paths use execution callbacks
+backed by the core build/drop engine; no DuckLake patch is added.
 
 ```sql
 CREATE UNIQUE INDEX by_id ON lake.main.users(id);
@@ -1824,17 +1824,20 @@ DROP INDEX IF EXISTS lake.main.by_region;
 Native DDL requires autocommit and a writable lake. The existing build engine
 commits independently; rejecting explicit transactions prevents a SQL rollback
 from falsely appearing to undo index DDL. Binding and ordinary `EXPLAIN` do
-not mutate indexes. Native DDL returns no result rows. `IF NOT EXISTS` tests
-the schema-level name and leaves an existing definition unchanged; repeating
+not mutate indexes. Native DDL returns no result rows. `step_entries` and
+`step_bytes` must be positive and bound each staged build step. Deferred `maintenance` is available
+only to non-unique indexes. `IF NOT EXISTS` tests the schema-level name and leaves an existing definition unchanged; repeating
 an interrupted staged create without that clause resumes its build.
 Use `catalog.schema.index` for DROP when a search path spans multiple schemas
 or catalogs; an unqualified Moraine index uses the current default schema.
 
 Native indexes accept stored column references and the options `staged`,
-`step_entries`, `step_bytes`, and `maintenance`. Expression and partial indexes
-are unsupported. DuckDB's parser currently discards per-column `ASC`/`DESC`
-and NULL-placement clauses, so native creation uses ascending / NULLS LAST;
-the table-qualified creation function remains available for explicit orders.
+`step_entries`, `step_bytes`, `maintenance`, `directions`, and `nulls`.
+Expression and partial indexes are unsupported. DuckDB's parser currently discards per-column `ASC`/`DESC`
+and NULL-placement clauses, so explicit ordering uses
+`WITH (directions = '[desc, asc]', nulls = '[first, last]')`. These string-encoded lists have one entry per indexed
+column; omitted options default to ascending / NULLS LAST. List elements must
+be non-null and name a valid direction or placement.
 `PRIMARY KEY` and table-level `UNIQUE` constraints remain unsupported.
 
 Rebuild currently means dropping and recreating the definition. It temporarily
@@ -1842,8 +1845,16 @@ removes query acceleration and uniqueness enforcement, and the recreated index
 needs a new verification pass for certified optimizations. An online rebuild
 with an atomic replacement is separate from native DDL and is not implemented.
 
-**The table-qualified SQL surface.** Existing administration, introspection,
-verification, and explicit lookup functions remain available:
+The former `moraine_index_create` and `moraine_index_drop` SQL functions are
+removed. Callers use native DDL, which requires autocommit even where the old
+functions committed independently inside an explicit SQL transaction. The Rust
+creation and table-qualified lookup/drop APIs remain available. A legacy
+schema with duplicate index names must use that Rust API to remove the
+ambiguous definitions before issuing SQL DROP: resolve the table, call
+`Transaction::index_by_name(table.id, name)`, and pass its id to `drop_index`.
+
+**The table-qualified SQL surface.** Introspection, verification, and explicit
+lookup functions remain available:
 
 Every function names its target by four leading positional strings —
 `catalog, schema, table, index` (`moraine_indexes` stops at the table) —
@@ -1851,8 +1862,6 @@ written `…` below for brevity.
 
 | Function | Effect |
 |---|---|
-| `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'], staged := b, maintenance := 'synchronous'\|'deferred', step_entries := n, step_bytes := n)` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST. `staged := true` runs the multi-commit build (Staged builds) — required past the single-commit bound, resumable by re-issuing the call. `maintenance := 'deferred'` opts a non-unique index into bounded post-commit SQL-write upkeep; unique indexes refuse it. `step_entries`/`step_bytes` bound one staged build step (Two bounds on a step); each must be positive |
-| `moraine_index_drop(…)` | end the definition (Reclamation) |
 | `moraine_index_lookup(…, v…)` | table function: row ids for the equality key `v…` — one variadic value per indexed column, in the index's column order (a single value for a single-column index); the count must equal the index width |
 | `moraine_index_in(…, keys)` | table function: row ids for the union of complete equality keys in `keys`. A single-column index takes a list of scalar values; a composite index takes a list of `row(...)` values in index-column order. Duplicate keys are one predicate, a key containing NULL matches no row, and an empty list returns no rows |
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
@@ -1873,10 +1882,9 @@ values and differ only in the last. Other shapes are refused.
 
 Each resolves the store handle from the attached catalog and the `table_id`
 from `ducklake_table`, then drives the same core verbs as the embedding API.
-The DDL functions commit autonomously — their own moraine commit, outside any
-enclosing DuckDB transaction — and race concurrent DuckLake commits through
-the ordinary `altered_table` conflict. Native DDL routes through the same
-implementation and rejects enclosing explicit transactions.
+Native index DDL commits autonomously and races concurrent DuckLake commits
+through the ordinary `altered_table` conflict. It rejects enclosing explicit
+transactions.
 
 The index read functions bind their arguments as constants, exactly as
 `moraine_index_in` binds `keys`, and resolve them against the snapshot the
@@ -2238,7 +2246,7 @@ tests against real SlateDB on in-memory `object_store`:
   high-value first; a leading-equality prefix plus a trailing range uses the
   index; a bare non-leading range is refused; equality stays a point-get on a
   unique index. `moraine_index_range` and a `directions`/`nulls`-carrying
-  `moraine_create_index` drive these end to end.
+  `CREATE INDEX` drive these end to end.
 - **Unique race.** Two concurrent commits inserting the same unique value:
   exactly one lands; the other returns `Constraint` after its closure re-run
   — never two entries, never a lost insert.
@@ -2347,20 +2355,20 @@ tests against real SlateDB on in-memory `object_store`:
   existing unique value aborts with `Constraint`, message free of the four
   retry substrings — no retry storm; a non-duplicate registration lands and
   the next colliding one aborts.
-- **Function surface.** The four registered functions resolve the store
-  handle and `table_id` from an attached catalog and drive the same core
-  verbs as the embedding API; `moraine_create_index` backfills existing
+- **SQL surface.** Native DDL and the introspection, verification, and lookup
+  functions resolve the store handle and table from an attached catalog
+  and drive the same core operations as the embedding API; `CREATE INDEX` backfills existing
   external files via the scoped read; a lookup joins back to the table under
   merge-on-read.
 - **E2E.** DuckLake flows over non-indexed tables are unaffected end to end;
-  a `CALL moraine_create_index` then a bulk `INSERT` that duplicates a
+  a `CREATE UNIQUE INDEX` then a bulk `INSERT` that duplicates a
   unique value fails the `INSERT` without a retry storm (message-text
   contract), and one that does not duplicate lands and is found by
   `moraine_index_lookup`. Over an indexed table: `UPDATE`, then
   `rewrite_data_files`, then `merge_adjacent_files` (one adjacent merge,
   one not — dense and per-row-id outputs) all commit; lookups stay
   correct after each; a `DELETE` against the rewritten file removes its
-  entries; `moraine_create_index` on a table already holding rewrite
+  entries; `CREATE INDEX` on a table already holding rewrite
   files backfills them.
 - **File-located lookups.** Each summary representation is chosen and
   intersected correctly — dense range, Roaring, and sorted vector — and the

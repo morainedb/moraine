@@ -212,10 +212,7 @@ fn build_lake(cli: &Path, preamble: &str, options: &Options) -> anyhow::Result<(
             start + options.rows_per_file
         );
     }
-    let _ = writeln!(
-        script,
-        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);"
-    );
+    let _ = writeln!(script, "CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     run_sql(cli, &script)?;
     Ok(())
 }

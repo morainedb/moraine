@@ -28,7 +28,7 @@ fn prepared_index_reads_reuse_scoped_probes() {
                     let result = run_session_with_env(&Attach::Moraine { store_dir: store.path(), data_path: data.path(), options: &options, read_only: false }, &format!(
             "CREATE TABLE lake.main.t(a BIGINT);
              {insert}
-             CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+             CREATE INDEX by_a ON lake.main.t(a);
              CALL enable_logging(level => 'debug', storage => 'memory');
              PREPARE probe AS SELECT 'hits', count(*) FROM {from};
              SELECT 'resolutions', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%index probe resolved%';
@@ -88,7 +88,7 @@ fn prepared_index_arguments_depending_on_session_state_are_rebound() {
     let output = run_ducklake_sql_with_options(store.path(), data.path(), &options,
         "CREATE TABLE lake.main.t(a BIGINT);
          INSERT INTO lake.main.t VALUES (1),(2);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         CREATE INDEX by_a ON lake.main.t(a);
          SET VARIABLE key=1;
          CREATE MACRO current_key() AS getvariable('key');
          CREATE VIEW dynamic_hits AS SELECT * FROM moraine_index_lookup('lake','main','t','by_a',getvariable('key'));
@@ -125,7 +125,7 @@ fn prepared_index_reads_invalidate_on_reattach_and_refuse_reader_caching() {
     let output = run_ducklake_sql_with_options(store.path(), data.path(), &options, &format!(
         "CREATE TABLE lake.main.t(a BIGINT);
          INSERT INTO lake.main.t VALUES (2);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         CREATE INDEX by_a ON lake.main.t(a);
          PREPARE probe AS SELECT 'hits', count(*) FROM moraine_index_lookup('lake','main','t','by_a',2);
          EXECUTE probe;
          DETACH lake;
@@ -208,7 +208,7 @@ fn prepared_index_reads_refresh_after_inserts_updates_and_deletes() {
                     &format!(
                         "CREATE TABLE lake.main.t(a BIGINT);
                          INSERT INTO lake.main.t VALUES (1);
-                         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+                         CREATE INDEX by_a ON lake.main.t(a);
                          PREPARE probe AS SELECT 'probe' AS phase, count(*) AS hits FROM {read};
                          EXECUTE probe{arguments};
                          INSERT INTO lake.main.t VALUES (2),(NULL);
@@ -270,7 +270,7 @@ fn prepared_located_joins_refresh_rows_and_file_filters() {
                     &format!(
                         "CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);
                          INSERT INTO lake.main.t VALUES (1,'unrelated');
-                         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+                         CREATE INDEX by_a ON lake.main.t(a);
                          PREPARE located AS
                            SELECT 'probe' AS phase, coalesce(string_agg(data.b,',' ORDER BY data.b),'missing') AS matched
                            FROM lake.main.t data JOIN {read} hits
@@ -356,7 +356,7 @@ fn prepared_index_reads_reuse_probes_inside_a_writing_transaction() {
             &format!(
                 "CREATE TABLE lake.main.t(a BIGINT);
                  INSERT INTO lake.main.t VALUES (1),(2),(3);
-                 CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+                 CREATE INDEX by_a ON lake.main.t(a);
                  CALL enable_logging(level => 'debug', storage => 'memory');
                  BEGIN;
                  INSERT INTO lake.main.t VALUES (9);

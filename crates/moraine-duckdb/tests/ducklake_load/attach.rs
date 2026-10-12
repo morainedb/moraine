@@ -397,7 +397,7 @@ fn ducklake_attach_cache_preload_warms_indexed_tables() {
     let create = |sql: &str| run_ducklake_sql_with_options(dir.path(), data_dir.path(), &meta, sql);
     create("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     create("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    create("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    create("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     let rows = csv_rows(&run_ducklake_sql_with_options(
         dir.path(),

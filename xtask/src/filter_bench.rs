@@ -114,11 +114,7 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
                 execute(&cli, &preamble, "CALL ducklake_flush_inlined_data('lake');")?;
             }
         }
-        execute(
-            &cli,
-            &preamble,
-            "CALL moraine_index_create('lake','main','t','by_a',['a'],false);",
-        )?;
+        execute(&cli, &preamble, "CREATE INDEX by_a ON lake.main.t(a);")?;
     }
     let preamble = if parallel {
         format!("{preamble} SET threads=4;")

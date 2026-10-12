@@ -22,7 +22,7 @@ fn summary_scan_is_automatic_without_a_public_switch() {
         &options,
         &format!(
             "CREATE TABLE lake.main.t AS SELECT i a, i * 2 b FROM range(10000) r(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          SELECT 'switches',count(*) FROM duckdb_settings() WHERE name='moraine_summary_scan';
          EXPLAIN {query}; {query};
          SELECT sum(b) FROM lake.main.t WHERE a IN (1,3,7);
@@ -55,7 +55,7 @@ fn summary_scan_uses_physical_coverage() {
     let result = run_ducklake_sql_with_options(store.path(), data.path(), &options,
         "CALL ducklake_set_option('lake','parquet_row_group_size','2048');
          CREATE TABLE lake.main.t AS SELECT i a, md5(i::VARCHAR) payload FROM range(262144) r(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          EXPLAIN SELECT sum(length(data.payload)) FROM lake.main.t data
          JOIN moraine_index_in('lake','main','t','by_a',list_transform(range(128), lambda x: x * 2048)) hits
          ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;");
@@ -81,7 +81,7 @@ fn summary_scan_parallel_files_match_serial_and_ordinary() {
     for _ in 0..4 {
         sql.push_str("INSERT INTO lake.main.t SELECT i // 1024, CASE WHEN i % 2=0 THEN repeat('x',100) END FROM range(65536) r(i);");
     }
-    sql.push_str("CALL moraine_index_create('lake','main','t','by_a',['a'],false); SET threads=4;");
+    sql.push_str("CREATE INDEX by_a ON lake.main.t(a); SET threads=4;");
     sql.push_str("SELECT 'answer',count(*),sum(length(payload)) FROM lake.main.t WHERE a=0;");
     for setting in [
         "SET moraine_summary_scan_threads=1",
@@ -123,7 +123,7 @@ fn summary_driven_scan_keeps_join_and_filters() {
         WHERE data.b % 2 = 1 AND data.b > 10";
     let result = run_ducklake_sql_with_options(store.path(), data.path(), &options, &format!(
         "CREATE TABLE lake.main.t AS SELECT i % 10 a, i b, repeat('wide',1000) unused FROM range(10000) r(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         CREATE INDEX by_a ON lake.main.t(a);
          EXPLAIN {query}; {query};"));
     assert!(
         result.contains("Moraine Summary Scan"),
@@ -157,7 +157,7 @@ fn summary_driven_scan_handles_visibility_and_schema_changes() {
             &options,
             "CREATE TABLE lake.main.t(a INTEGER, b INTEGER);
              INSERT INTO lake.main.t VALUES (1,10),(1,20),(2,30);
-             CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+             CREATE INDEX by_a ON lake.main.t(a);
              ALTER TABLE lake.main.t ADD COLUMN c BIGINT DEFAULT 7;
              ALTER TABLE lake.main.t RENAME COLUMN b TO renamed;
              PREPARE p AS SELECT 'answer', sum(data.renamed + data.c) FROM lake.main.t data
@@ -200,7 +200,7 @@ fn summary_driven_scan_declines_unsafe_rewrites() {
     let result = run_ducklake_sql_with_options(store.path(), data.path(), &options,
         "CREATE TABLE lake.main.t AS SELECT 1::BIGINT a, 2::DECIMAL(10,2) b;
          CREATE TABLE lake.main.other AS SELECT 1::BIGINT a;
-         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          EXPLAIN SELECT data.a FROM lake.main.t data JOIN moraine_index_lookup('lake','main','t','by_a',1) hits ON data.rowid=hits.row_id;
          EXPLAIN SELECT data.a FROM lake.main.other data JOIN moraine_index_lookup('lake','main','t','by_a',1) hits
          ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
@@ -225,7 +225,7 @@ fn summary_scan_prepare_defers_projected_reads() {
     );
     let output = run_session_with_env(&Attach::Moraine { store_dir: store.path(), data_path: data.path(), options: &options, read_only: false },
         "CREATE TABLE lake.main.t AS SELECT i a, i * 2 b FROM range(1000) r(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          CALL enable_logging(level => 'debug', storage => 'memory');
          PREPARE p AS SELECT data.b FROM lake.main.t data JOIN moraine_index_lookup('lake','main','t','by_a',2) hits
          ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;
@@ -287,7 +287,7 @@ fn summary_scan_runs_inside_a_writing_transaction_minus_its_deletes() {
             &options,
             &format!(
                 "{table}
-                 CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+                 CREATE UNIQUE INDEX by_a ON lake.main.t(a);
                  BEGIN;
                  INSERT INTO lake.main.t VALUES (20000, 1);
                  EXPLAIN {query}; {query};
@@ -337,7 +337,7 @@ fn summary_scan_reads_uuid_columns() {
         &format!(
             "CREATE TABLE lake.main.t AS
                SELECT i a, '{owner}'::UUID owner_id FROM range(10000) r(i);
-             CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+             CREATE UNIQUE INDEX by_a ON lake.main.t(a);
              EXPLAIN {query}; {query};"
         ),
     );

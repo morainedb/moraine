@@ -360,8 +360,8 @@ pub unsafe extern "C" fn moraine_index_create(
     }
 }
 
-/// Drops an equality index by name, committing autonomously. A null
-/// `table_name` resolves within the schema; `if_exists` tolerates absence.
+/// Drops an equality index by its schema-level name, committing autonomously.
+/// `if_exists` tolerates a missing schema or index.
 ///
 /// # Safety
 ///
@@ -371,7 +371,6 @@ pub unsafe extern "C" fn moraine_index_create(
 pub unsafe extern "C" fn moraine_index_drop(
     handle: *mut MoraineCatalogHandle,
     schema_name: *const c_char,
-    table_name: *const c_char,
     index_name: *const c_char,
     if_exists: bool,
     probe: MoraineInterruptProbe,
@@ -387,13 +386,6 @@ pub unsafe extern "C" fn moraine_index_drop(
         // SAFETY: caller contract for the string pointers.
         let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
         // SAFETY: caller contract.
-        let table = if table_name.is_null() {
-            None
-        } else {
-            // SAFETY: non-null string satisfies the caller's contract.
-            Some(unsafe { borrow_str(table_name, "table_name") }?)
-        };
-        // SAFETY: caller contract.
         let name = unsafe { borrow_str(index_name, "index_name") }?;
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
@@ -403,20 +395,13 @@ pub unsafe extern "C" fn moraine_index_drop(
                 probe_ctx,
                 handle_ref.catalog.writer()?.commit(|tx| {
                     let Some(schema) = tx.schema_by_name(schema) else {
-                        return if if_exists && table.is_none() {
+                        return if if_exists {
                             Ok(())
                         } else {
                             Err(moraine::Error::NotFound(format!("schema {schema}")))
                         };
                     };
-                    let index = if let Some(table) = table {
-                        let table = tx
-                            .table_by_name(schema.id, table)
-                            .ok_or_else(|| moraine::Error::NotFound(format!("table {table}")))?;
-                        tx.index_by_name(table.id, name)
-                    } else {
-                        tx.index_by_schema_name(schema.id, name)?
-                    };
+                    let index = tx.index_by_schema_name(schema.id, name)?;
                     match index {
                         Some(index) => tx.drop_index(index.id),
                         None if if_exists => Ok(()),
