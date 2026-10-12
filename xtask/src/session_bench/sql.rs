@@ -208,9 +208,7 @@ fn mixed(tables: usize, files: usize) -> Vec<Statement> {
             .ok();
         }
     }
-    setup.push_str(
-        "COMMIT;\nCALL moraine_index_create('lake','main','items','by_id',['id'],true);\n",
-    );
+    setup.push_str("COMMIT;\nCREATE UNIQUE INDEX by_id ON lake.main.items(id);\n");
     writeln!(setup, "SELECT CASE WHEN sum(file_count)={} THEN 'fixture_verified' ELSE error('unexpected seeded file count') END FROM ducklake_table_info('lake');", files + tables * 2).ok();
     let mut statements = vec![Statement::setup(setup)];
     // Record the first lookup separately from subsequent reads.

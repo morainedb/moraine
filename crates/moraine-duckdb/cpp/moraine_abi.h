@@ -1649,8 +1649,8 @@ int32_t moraine_index_create(struct MoraineCatalogHandle *handle,
                              void *probe_ctx,
                              struct MoraineError *err);
 
-// Drops an equality index by name, committing autonomously. A null
-// `table_name` resolves within the schema; `if_exists` tolerates absence.
+// Drops an equality index by its schema-level name, committing autonomously.
+// `if_exists` tolerates a missing schema or index.
 //
 // # Safety
 //
@@ -1658,7 +1658,6 @@ int32_t moraine_index_create(struct MoraineCatalogHandle *handle,
 // must be writable.
 int32_t moraine_index_drop(struct MoraineCatalogHandle *handle,
                            const char *schema_name,
-                           const char *table_name,
                            const char *index_name,
                            bool if_exists,
                            MoraineInterruptProbe probe,

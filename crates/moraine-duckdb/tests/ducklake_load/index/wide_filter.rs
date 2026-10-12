@@ -21,7 +21,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
         &options,
         &format!(
             "CREATE TABLE lake.main.t AS SELECT i // 17 AS a FROM range(32768) t(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         CREATE INDEX by_a ON lake.main.t(a);
          EXPLAIN {query}; {query};"
         ),
     );
@@ -57,7 +57,7 @@ fn a_wide_sparse_probe_derives_row_pruning() {
         data.path(),
         &options,
         "CREATE TABLE lake.main.boundary AS SELECT i AS a FROM range(32768) t(i);
-         CALL moraine_index_create('lake','main','boundary','by_boundary_a',['a'],true);",
+         CREATE UNIQUE INDEX by_boundary_a ON lake.main.boundary(a);",
     );
     for (end, expected) in [(12048, "4096"), (12049, "4097")] {
         let query = format!("SELECT count(*) FROM lake.main.boundary data
@@ -120,7 +120,7 @@ fn a_wide_probe_skips_embedded_row_groups() {
         "CALL ducklake_set_option('lake','parquet_row_group_size','2048');
          CREATE TABLE lake.main.t AS SELECT i // 17 AS a FROM range(32768) t(i);
          CALL ducklake_flush_inlined_data('lake');
-         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         CREATE INDEX by_a ON lake.main.t(a);
          EXPLAIN ANALYZE SELECT count(*) FROM lake.main.t data
          JOIN moraine_index_in('lake','main','t','by_a',range(192)) hits
          ON data.rowid IS NOT DISTINCT FROM hits.row_id

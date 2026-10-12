@@ -17,6 +17,8 @@ fn native_index_ddl_creates_probes_and_drops() {
          INSERT INTO lake.main.t VALUES (1, 'a'), (2, 'b');
          CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          CREATE INDEX IF NOT EXISTS by_a ON lake.main.t(b);
+         SELECT 'wrappers', count(*) FROM duckdb_functions()
+         WHERE function_name IN ('moraine_index_create','moraine_index_drop');
          SELECT index_name, is_unique FROM moraine_indexes('lake','main','t');
          SELECT 'hit', row_id FROM moraine_index_lookup('lake','main','t','by_a',2);
          DROP INDEX IF EXISTS lake.main.by_a;
@@ -26,7 +28,7 @@ fn native_index_ddl_creates_probes_and_drops() {
          DROP INDEX IF EXISTS lake.missing_schema.by_a;
          DROP INDEX lake.main.by_b;",
     );
-    for expected in ["by_a,true", "hit,1", "remaining,0"] {
+    for expected in ["wrappers,0", "by_a,true", "hit,1", "remaining,0"] {
         assert!(result.lines().any(|line| line == expected), "{result}");
     }
 }
@@ -134,6 +136,22 @@ fn native_indexes_validate_definitions_and_enforce_uniqueness() {
         (
             "CREATE UNIQUE INDEX bad ON lake.main.t(a) WITH (maintenance='deferred');",
             "non-unique",
+        ),
+        (
+            "CREATE INDEX bad ON lake.main.t(a,b) WITH (directions='[desc]');",
+            "one entry per column",
+        ),
+        (
+            "CREATE INDEX bad ON lake.main.t(a) WITH (directions='[sideways]');",
+            "entries must be",
+        ),
+        (
+            "CREATE INDEX bad ON lake.main.t(a) WITH (nulls='[NULL]');",
+            "cannot be NULL",
+        ),
+        (
+            "CREATE INDEX bad ON lake.main.t(a) WITH (nulls='[]');",
+            "one entry per column",
         ),
         ("CREATE INDEX bad ON lake.main.t(missing);", "missing"),
         ("DROP INDEX lake.main.missing;", "missing"),

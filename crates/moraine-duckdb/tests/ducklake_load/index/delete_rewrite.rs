@@ -8,7 +8,7 @@ fn indexed_table(run: &dyn Fn(&str) -> String) {
              repeat(md5(i::VARCHAR),6) AS b FROM range(50000) r(i);
          INSERT INTO lake.main.t SELECT (i*7919)%100000,
              repeat(md5(i::VARCHAR),6) FROM range(50000,100000) r(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 }
 
 /// The same, with the index certified — the state the rewrite requires.
@@ -379,7 +379,7 @@ fn a_non_unique_delete_spans_files() {
              repeat(md5(i::VARCHAR),6) AS b FROM range(50000) r(i);
          INSERT INTO lake.main.t SELECT (i*7919)%1000,
              repeat(md5(i::VARCHAR),6) FROM range(50000,100000) r(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         CREATE INDEX by_a ON lake.main.t(a);
          SELECT * FROM moraine_index_verify('lake','main','t','by_a');");
     assert_eq!(
         csv_rows(&run("SELECT count(*), count(DISTINCT data_file_id)

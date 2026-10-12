@@ -99,7 +99,7 @@ DuckLake rejects `CREATE INDEX`, `PRIMARY KEY`, and `UNIQUE` in its binder and
 has no native index metadata. Moraine supplies `CREATE INDEX` / `CREATE UNIQUE
 INDEX` and `DROP INDEX` through DuckDB's existing operator and planner extension
 hooks, without patching DuckLake. Moraine owns index metadata and maintenance;
-the `moraine_index_*` functions remain available. Native DDL requires autocommit.
+introspection, verification, and explicit lookup functions remain available. Native DDL requires autocommit.
 
 The upstream request is a supported index contract covering:
 

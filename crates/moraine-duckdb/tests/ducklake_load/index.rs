@@ -12,15 +12,10 @@ mod selective;
 mod verify;
 mod wide_filter;
 
-/// The equality-index SQL surface end to end: `moraine_index_create`
-/// backfills an index over existing data by scoped-reading the table's
-/// Parquet from `DATA_PATH` (autonomous commit), `moraine_indexes` lists it,
-/// `moraine_index_lookup` resolves a value to its row, and
-/// `moraine_index_drop` removes it — each through a fresh attach, so the
-/// definition and entries round-trip through the persisted store.
+/// Native DDL backfills, persists, and drops an index across fresh attaches.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn moraine_index_functions_create_list_lookup_and_drop() {
+fn native_index_ddl_backfills_persists_and_drops() {
     let store = TempDir::new("index-fns-store");
     let data = TempDir::new("index-fns-data");
     // DATA_PATH is declared once, at attach: DuckLake's own `DATA_PATH`
@@ -35,7 +30,7 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
 
     // Create a unique index over the existing rows — backfilled by the
     // scoped read of the DATA_PATH files, no DATA_PATH argument.
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     let listed = csv_rows(&run(
         "SELECT index_name, is_unique FROM moraine_indexes('lake', 'main', 't');",
@@ -69,7 +64,7 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
          moraine_index_lookup('lake', 'main', 't', 'by_a', 9999);"));
     assert_eq!(miss, vec![vec!["0".to_string()]], "value 9999 is absent");
 
-    run("CALL moraine_index_drop('lake', 'main', 't', 'by_a');");
+    run("DROP INDEX lake.main.by_a;");
     let after = csv_rows(&run(
         "SELECT count(*) FROM moraine_indexes('lake', 'main', 't');",
     ));
@@ -95,7 +90,7 @@ fn absent_index_lookup_eliminates_the_ducklake_scan() {
     // More than DuckLake's inline threshold, so a scan would have to open a
     // real Parquet file and report it in the analyzed plan.
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // Prepared callers supply a different key on each execution. The rewrite
     // must therefore see the execution-time bind, not rely on a literal in
@@ -130,7 +125,7 @@ fn moraine_index_lookup_resolves_a_composite_key() {
     // Rows 0 and 1 share a=5; only (a, b) together are unique.
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t VALUES (5, 'x'), (5, 'y'), (7, 'x');");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_ab', ['a', 'b'], true);");
+    run("CREATE UNIQUE INDEX by_ab ON lake.main.t(a,b);");
 
     // The full key (5, 'y') pins exactly the second row.
     assert_eq!(
@@ -170,8 +165,8 @@ fn moraine_index_in_resolves_a_list_of_keys() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t VALUES (5, 'x'), (5, 'y'), (7, 'x');");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], false);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_ab', ['a', 'b'], true);");
+    run("CREATE INDEX by_a ON lake.main.t(a);");
+    run("CREATE UNIQUE INDEX by_ab ON lake.main.t(a,b);");
 
     assert_eq!(
         csv_rows(&run("SELECT row_id FROM moraine_index_in(\
@@ -211,7 +206,7 @@ fn moraine_index_range_spans_a_composite_window() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t VALUES (5, 'x'), (5, 'y'), (7, 'x');");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_ab', ['a', 'b'], true);");
+    run("CREATE UNIQUE INDEX by_ab ON lake.main.t(a,b);");
 
     // a = 5 as a one-field tuple bound: both rows sharing the leading value.
     assert_eq!(
@@ -252,7 +247,7 @@ fn moraine_index_range_selects_a_comparison_window() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // BETWEEN 10 AND 20, both inclusive: values 10..=20 -> 11 rows.
     assert_eq!(
@@ -309,12 +304,10 @@ fn moraine_index_range_selects_a_comparison_window() {
     );
 }
 
-/// A descending index created via the `directions := ['desc']` named
-/// parameter answers both a range window and an equality lookup — the
-/// per-column direction rides `moraine_index_create` into the stored order.
+/// Native direction options preserve range and equality lookups.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn moraine_index_create_descending_answers_range_and_lookup() {
+fn native_index_create_descending_answers_range_and_lookup() {
     let store = TempDir::new("index-desc-store");
     let data = TempDir::new("index-desc-data");
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
@@ -323,9 +316,13 @@ fn moraine_index_create_descending_answers_range_and_lookup() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run(
-        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, \
-         directions := ['desc']);",
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a) \
+         WITH (directions = '[desc]');");
+
+    assert_eq!(
+        count("SELECT row_id FROM moraine_index_range('lake','main','t','by_a',10,12,true,true);"),
+        vec![vec!["12"], vec!["11"], vec!["10"]],
+        "native options persist descending key order"
     );
 
     // A descending index answers a closed value window: 10..=20 -> 11 rows.
@@ -347,13 +344,10 @@ fn moraine_index_create_descending_answers_range_and_lookup() {
     );
 }
 
-/// A NULLS FIRST index created via `nulls := ['first']`: the placement rides
-/// into the stored key's null flag, and the same flag is used when encoding a
-/// query bound — so values still resolve, proving the parameter threads
-/// through both the entry and the query paths.
+/// Native NULL-placement options preserve value lookups.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn moraine_index_create_nulls_first_still_resolves_values() {
+fn native_index_create_nulls_first_still_resolves_values() {
     let store = TempDir::new("index-nulls-store");
     let data = TempDir::new("index-nulls-data");
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
@@ -362,14 +356,20 @@ fn moraine_index_create_nulls_first_still_resolves_values() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run(
-        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, \
-         directions := ['desc'], nulls := ['first']);",
-    );
+    run("INSERT INTO lake.main.t VALUES (NULL, 'x');");
+    run("CREATE INDEX by_a ON lake.main.t(b,a) \
+         WITH (directions = '[asc,desc]', nulls = '[last,first]');");
 
     assert_eq!(
         count(
-            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"
+            "SELECT row_id FROM moraine_index_range('lake','main','t','by_a','x','x',true,true) LIMIT 2;"
+        ),
+        vec![vec!["100"], vec!["99"]],
+        "native options place NULL before descending non-null keys"
+    );
+    assert_eq!(
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 'x', 42);"
         ),
         vec![vec!["1".to_string()]],
         "a NULLS FIRST index still resolves an equality lookup"
@@ -377,7 +377,7 @@ fn moraine_index_create_nulls_first_still_resolves_values() {
     assert_eq!(
         count(
             "SELECT count(DISTINCT row_id) FROM \
-             moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, true, true);"
+             moraine_index_range('lake', 'main', 't', 'by_a', row('x',10), row('x',20), true, true);"
         ),
         vec![vec!["11".to_string()]],
         "a NULLS FIRST index still answers a range window"
@@ -402,7 +402,7 @@ fn moraine_index_nulls_finds_null_rows() {
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(98) t(i);");
     run("INSERT INTO lake.main.t VALUES (NULL, 'n1'), (NULL, 'n2');");
     // A unique index must accept the two NULL rows (SQL treats NULLs distinct).
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // a IS NULL resolves to exactly the two NULL rows.
     assert_eq!(
@@ -444,7 +444,7 @@ fn moraine_index_maintained_on_bulk_insert() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // A bulk INSERT after create is maintained by the staged commit.
     run("INSERT INTO lake.main.t SELECT i, 'y' FROM range(100, 200) t(i);");
@@ -519,7 +519,7 @@ fn moraine_index_entries_are_removed_by_delete() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // A row in the flushed Parquet file: deleting it frees its value.
     run("DELETE FROM lake.main.t WHERE a = 42;");
@@ -598,7 +598,7 @@ fn moraine_index_data_path_persists_across_attach() {
     let create = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
     create("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     create("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    create("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    create("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // Re-attach with DATA_PATH only (no META_DATA_PATH): a bulk INSERT
     // (a Parquet file, not inline) is maintained by scoped-reading it from
@@ -660,7 +660,7 @@ fn moraine_index_functions_reject_a_non_moraine_catalog() {
         store.path(),
         data.path(),
         "",
-        "CALL moraine_index_create('memory', 'main', 't', 'by_a', ['a'], true);",
+        "SELECT * FROM moraine_indexes('memory', 'main', 't');",
     );
     assert!(
         !out.status.success(),
@@ -697,7 +697,7 @@ fn moraine_index_uuid_across_paths_and_lookup() {
              CASE WHEN i = 0 THEN '{KNOWN}'::UUID ELSE gen_random_uuid() END, 'x' \
          FROM range(20) t(i);"
     ));
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_id', ['id'], true);");
+    run("CREATE UNIQUE INDEX by_id ON lake.main.t(id);");
 
     // The Parquet-stored UUID is found by an equality lookup.
     let hit = csv_rows(&run(&format!(
@@ -753,7 +753,7 @@ fn moraine_index_millisecond_timestamp() {
          FROM range(20) t(i);");
     // Before the fix this failed: the scoped read downcast the millisecond
     // column as microseconds.
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_ts', ['ts'], true);");
+    run("CREATE UNIQUE INDEX by_ts ON lake.main.t(ts);");
 
     // An inline (single-row) INSERT duplicating row 0's timestamp is
     // rejected: the inline path derives the same millisecond key.
@@ -789,7 +789,7 @@ fn moraine_index_rejects_hugeint() {
         store.path(),
         data.path(),
         &meta,
-        "CALL moraine_index_create('lake', 'main', 't', 'by_big', ['big'], true);",
+        "CREATE UNIQUE INDEX by_big ON lake.main.t(big);",
     );
     assert!(
         !out.status.success(),
@@ -819,7 +819,7 @@ fn moraine_index_bulk_insert_without_a_data_store_is_refused() {
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     // An index on the still-empty table needs no scoped read, so it is
     // created fine.
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // A bulk INSERT registers a Parquet file that would need scoped-reading
     // to maintain the index; with no store, the commit is refused.
@@ -859,7 +859,7 @@ fn moraine_index_survives_update_and_compaction() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // UPDATE writes a per-row-id file (delete plus re-insert under
     // preserved ids); the unchanged key still resolves exactly once.
@@ -913,8 +913,8 @@ fn moraine_index_survives_update_and_compaction() {
     assert_eq!(lookup_count(7), vec![vec!["1".to_string()]]);
 
     // Rebuild: backfill must read the per-row-id files.
-    run("CALL moraine_index_drop('lake', 'main', 't', 'by_a');");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("DROP INDEX lake.main.by_a;");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     assert_eq!(lookup_count(150), vec![vec!["1".to_string()]]);
     assert_eq!(
         lookup_count(1),
@@ -1013,7 +1013,7 @@ fn a_located_join_follows_a_row_updated_out_of_its_file() {
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'from-file' FROM range(100) t(i);");
     run("CALL ducklake_flush_inlined_data('lake');");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     run("UPDATE lake.main.t SET b = 'now-inlined' WHERE a = 42;");
 
     assert_eq!(
@@ -1063,7 +1063,7 @@ fn a_prepared_located_join_resolves_each_key_it_is_executed_with() {
             start + 100
         ));
     }
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     // Update files spanning the whole id range, so a plan that resolved
     // nothing would have every file to read.
     for key in [10, 11, 12] {
@@ -1123,7 +1123,7 @@ fn populate_files_spanning_row_ids(run: &dyn Fn(&str) -> String) {
             start + 100
         ));
     }
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     for key in [10, 11, 12] {
         run(&format!(
             "UPDATE lake.main.t SET b = 'updated' WHERE a IN ({key}, {}, {});",
@@ -1256,7 +1256,7 @@ fn a_wide_located_probe_still_prunes_by_file_id() {
         write!(inserts, "INSERT INTO lake.main.t VALUES ({i}, 'x');").unwrap();
     }
     run(&inserts);
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // The keys span the whole table with a gap in the middle, so a min/max
     // row-id filter admits every file and only file identity can exclude
@@ -1303,7 +1303,7 @@ fn moraine_index_functions_resolve_a_custom_metadata_catalog() {
 
     run("CREATE TABLE lake.main.t(a BIGINT);\
          INSERT INTO lake.main.t SELECT i FROM range(6) t(i);\
-         SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],true);");
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // Addressed by the lake name, whose metadata catalog shares no name
     // with it.
@@ -1328,7 +1328,7 @@ fn moraine_index_functions_resolve_a_custom_metadata_catalog() {
         vec![vec!["by_a".to_string()]]
     );
 
-    run("SELECT * FROM moraine_index_drop('lake','main','t','by_a');");
+    run("DROP INDEX lake.main.by_a;");
     assert!(
         csv_rows(&run(
             "SELECT index_name FROM moraine_indexes('lake','main','t');"
@@ -1344,7 +1344,7 @@ fn moraine_index_functions_resolve_a_custom_metadata_catalog() {
 /// exactly as a single-commit build's index would refuse it.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn moraine_index_create_staged_builds_over_existing_data() {
+fn native_index_create_staged_builds_over_existing_data() {
     let store = TempDir::new("index-staged-store");
     let data = TempDir::new("index-staged-data");
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
@@ -1352,7 +1352,7 @@ fn moraine_index_create_staged_builds_over_existing_data() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(500) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, staged := true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a) WITH (staged = true);");
 
     // The build finished: not building, and the backfilled rows resolve.
     assert_eq!(
@@ -1426,7 +1426,7 @@ fn flushing_an_indexed_table_with_deleted_inlined_rows() {
     let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // Under the inlining limit, so these land as inlined rows rather than
     // a Parquet file.
@@ -1506,7 +1506,7 @@ fn moraine_index_entries_survive_the_data_file_lifecycle() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     run("DELETE FROM lake.main.t WHERE a IN (1, 2, 3);");
 
     // The rewrite ends the source into history and writes a replacement
@@ -1551,7 +1551,7 @@ fn moraine_index_entries_survive_the_data_file_lifecycle() {
 /// Observed through the snapshot count: each step is its own commit.
 #[test]
 #[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn moraine_index_create_takes_a_step_size() {
+fn native_index_create_takes_a_step_size() {
     let store = TempDir::new("index-step-store");
     let data = TempDir::new("index-step-data");
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
@@ -1567,10 +1567,7 @@ fn moraine_index_create_takes_a_step_size() {
     run("INSERT INTO lake.main.t SELECT i FROM range(400) t(i);");
     let before = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
 
-    run(
-        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, \
-         staged := true, step_entries := 100);",
-    );
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a) WITH (staged = true, step_entries = 100);");
     let after = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
 
     // The definition commit, then 400 entries in steps of 100.
@@ -1595,10 +1592,7 @@ fn moraine_index_create_takes_a_step_size() {
     run("CREATE TABLE lake.main.u(a BIGINT);");
     run("INSERT INTO lake.main.u SELECT i FROM range(5) t(i);");
     let before = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
-    run(
-        "CALL moraine_index_create('lake', 'main', 'u', 'by_u', ['a'], true, \
-         staged := true, step_bytes := 1);",
-    );
+    run("CREATE UNIQUE INDEX by_u ON lake.main.u(a) WITH (staged = true, step_bytes = 1);");
     let after = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
     assert_eq!(after - before, 1 + 5, "one commit per entry");
 
@@ -1607,8 +1601,7 @@ fn moraine_index_create_takes_a_step_size() {
         store.path(),
         data.path(),
         &meta,
-        "CALL moraine_index_create('lake', 'main', 't', 'by_b', ['a'], true, \
-         staged := true, step_entries := 0);",
+        "CREATE UNIQUE INDEX by_b ON lake.main.t(a) WITH (staged = true, step_entries = 0);",
     );
     assert!(!out.status.success(), "a zero step must fail");
     let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
@@ -1630,10 +1623,7 @@ fn moraine_index_deferred_maintenance_catches_up_after_sql_insert() {
     let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
 
     run("CREATE TABLE lake.main.t(a BIGINT);");
-    run(
-        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], false, \
-         maintenance := 'deferred');",
-    );
+    run("CREATE INDEX by_a ON lake.main.t(a) WITH (maintenance = 'deferred');");
     let schema_rows = csv_rows(&run(
         "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_schema_versions;",
     ));
@@ -1684,8 +1674,7 @@ fn moraine_index_deferred_maintenance_catches_up_after_sql_insert() {
         store.path(),
         data.path(),
         &meta,
-        "CALL moraine_index_create('lake', 'main', 't', 'unique_by_a', ['a'], true, \
-         maintenance := 'deferred');",
+        "CREATE UNIQUE INDEX unique_by_a ON lake.main.t(a) WITH (maintenance = 'deferred');",
     );
     assert!(
         stderr.contains("non-unique"),

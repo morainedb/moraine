@@ -253,8 +253,8 @@ DROP INDEX IF EXISTS lake.main.by_region;
 
 Index DDL requires autocommit and a writable attach. Index names are
 case-insensitively unique within a schema. The `staged`, `step_entries`,
-`step_bytes`, and `maintenance` options use the existing build engine;
-repeating an interrupted staged create without `IF NOT EXISTS` resumes it.
+`step_bytes`, `maintenance`, `directions`, and `nulls` options use the existing
+build engine; repeating an interrupted staged create without `IF NOT EXISTS` resumes it.
 Expression indexes and table-level key constraints are unsupported.
 Qualify DROP targets as `catalog.schema.index` when using multiple schemas or
 catalogs; unqualified Moraine index names use the current default schema.
@@ -265,9 +265,15 @@ and index maintenance.
 Ordinary predicates choose eligible indexes automatically. `moraine_indexes`
 lists them; `moraine_index_verify` checks their contents and certifies a clean
 index for optimizations such as scan-free DELETE. Verification is not required
-for ordinary indexed queries. The existing table-qualified administration and
-lookup functions remain available, including explicit per-column sort orders
-that DuckDB's native index parser currently discards.
+for ordinary indexed queries. Introspection and lookup functions remain
+available. Explicit ordering uses
+`WITH (directions = '[desc, asc]', nulls = '[first, last]')`, with one entry per
+column. DuckDB currently discards the standard per-column sort clauses.
+
+The `moraine_index_create` and `moraine_index_drop` SQL functions have been
+removed; use native DDL instead. The Rust API remains available, including
+table-qualified lookup/drop for repairing legacy catalogs with duplicate
+index names within a schema.
 
 Rebuild currently uses drop followed by create, then a fresh verification pass
 when certification is wanted. During that gap, the index provides neither query

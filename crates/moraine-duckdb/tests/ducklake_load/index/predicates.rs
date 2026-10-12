@@ -13,7 +13,7 @@ fn ordinary_predicates_probe_single_and_composite_indexes() {
     );
     for (columns, predicates) in [
         (
-            "['a']",
+            "a",
             vec![
                 "a IN (30000,37919,45838)",
                 "a IN (30000,30000,NULL,7777777)",
@@ -27,7 +27,7 @@ fn ordinary_predicates_probe_single_and_composite_indexes() {
             ],
         ),
         (
-            "['c','a']",
+            "c,a",
             vec![
                 "c = 0 AND a = 30000",
                 "a = 30000 AND c = 0",
@@ -56,9 +56,7 @@ fn ordinary_predicates_probe_single_and_composite_indexes() {
                 )))
             })
             .collect();
-        run(&format!(
-            "CALL moraine_index_create('lake','main','t','by_key',{columns},false);"
-        ));
+        run(&format!("CREATE INDEX by_key ON lake.main.t({columns});"));
         for (predicate, expected) in predicates.iter().zip(expected) {
             let query = format!("SELECT count(*),sum(c) FROM lake.main.t WHERE {predicate};");
             assert_eq!(csv_rows(&run(&query)), expected, "{predicate}");
@@ -115,13 +113,13 @@ fn automatic_predicates_preserve_nulls_ordering_and_residuals() {
             )))
         })
         .collect();
-    for (columns, directions) in [("['a']", "['desc']"), ("['c','a']", "['asc','desc']")] {
+    for (columns, directions) in [("a", "[desc]"), ("c,a", "[asc,desc]")] {
         run(&format!(
-            "CALL moraine_index_create('lake','main','t','by_key',{columns},false,directions := {directions},nulls := {});",
-            if columns == "['a']" {
-                "['first']"
+            "CREATE INDEX by_key ON lake.main.t({columns}) WITH (directions = '{directions}', nulls = '{}');",
+            if columns == "a" {
+                "[first]"
             } else {
-                "['last','first']"
+                "[last,first]"
             }
         ));
         for (predicate, expected) in predicates.iter().zip(&expected) {
@@ -133,7 +131,7 @@ fn automatic_predicates_preserve_nulls_ordering_and_residuals() {
                 "{columns}: {predicate}"
             );
         }
-        run("CALL moraine_index_drop('lake','main','t','by_key');");
+        run("DROP INDEX lake.main.by_key;");
     }
 }
 
@@ -148,10 +146,8 @@ fn prepared_predicates_refresh_and_writes_keep_residuals() {
     );
     let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &options, sql);
     fixture(&run);
-    run(
-        "CALL moraine_index_create('lake','main','t','by_a',['a'],false);
-         SELECT * FROM moraine_index_verify('lake','main','t','by_a');",
-    );
+    run("CREATE INDEX by_a ON lake.main.t(a);
+         SELECT * FROM moraine_index_verify('lake','main','t','by_a');");
     let output = run("PREPARE points AS SELECT 'points',count(*) FROM lake.main.t WHERE a IN ($1,$2);
          PREPARE bounds AS SELECT 'bounds',count(*) FROM lake.main.t WHERE a BETWEEN $1 AND $2;
          EXECUTE points(30000,37919); EXECUTE bounds(30000,30002);
@@ -198,10 +194,8 @@ fn certified_composite_equalities_delete_without_a_scan() {
     );
     let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &options, sql);
     fixture(&run);
-    run(
-        "CALL moraine_index_create('lake','main','t','by_key',['c','a'],false);
-         SELECT * FROM moraine_index_verify('lake','main','t','by_key');",
-    );
+    run("CREATE INDEX by_key ON lake.main.t(c,a);
+         SELECT * FROM moraine_index_verify('lake','main','t','by_key');");
     let plan = run("EXPLAIN DELETE FROM lake.main.t WHERE a=37919 AND c=1;");
     assert!(plan.contains("DUCKLAKE_DELETE_POSITIONS"), "{plan}");
     run("DELETE FROM lake.main.t WHERE a=37919 AND c=1;");

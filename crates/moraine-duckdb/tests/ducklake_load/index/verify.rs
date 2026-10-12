@@ -17,7 +17,7 @@ fn a_maintained_index_verifies_clean_through_dml() {
         data.path(),
         &options,
         "CREATE TABLE lake.main.t AS SELECT i a, i * 2 b FROM range(2000) r(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          SELECT 'built', * FROM moraine_index_verify('lake','main','t','by_a');
          DELETE FROM lake.main.t WHERE a < 100;
          SELECT 'deleted', * FROM moraine_index_verify('lake','main','t','by_a');
@@ -68,7 +68,7 @@ fn read_only_verification_commits_no_snapshot() {
         data.path(),
         &options,
         "CREATE TABLE lake.main.t AS SELECT i a FROM range(500) r(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],true);",
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);",
     );
     let output = run_session_with_env(
         &Attach::Moraine {
@@ -122,7 +122,7 @@ fn compaction_leaves_the_index_agreeing_with_the_rows() {
         "CREATE TABLE lake.main.t(a BIGINT, b BIGINT);
          INSERT INTO lake.main.t SELECT i, i FROM range(400) r(i);
          INSERT INTO lake.main.t SELECT i, i FROM range(400, 800) r(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          DELETE FROM lake.main.t WHERE a % 4 = 0;
          CALL ducklake_merge_adjacent_files('lake');
          SELECT 'compacted', * FROM moraine_index_verify('lake','main','t','by_a');",
@@ -150,7 +150,7 @@ fn an_absent_index_is_refused() {
         data.path(),
         &options,
         "CREATE TABLE lake.main.t AS SELECT i a FROM range(100) r(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          CALL moraine_index_verify('lake','main','t','by_b');",
     );
     assert!(refused.contains("index by_b"), "got: {refused}");
@@ -173,15 +173,15 @@ fn a_clean_pass_certifies_and_a_rebuild_withdraws() {
         data.path(),
         &options,
         "CREATE TABLE lake.main.t AS SELECT i a FROM range(600) r(i);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          SELECT 'fresh', certified_at IS NULL FROM moraine_indexes('lake','main','t');
          SELECT 'pass', missing, dead, mismatched, certified_at IS NOT NULL
            FROM moraine_index_verify('lake','main','t','by_a');
          SELECT 'listed', certified_at IS NOT NULL FROM moraine_indexes('lake','main','t');
          DELETE FROM lake.main.t WHERE a < 10;
          SELECT 'after_dml', certified_at IS NOT NULL FROM moraine_indexes('lake','main','t');
-         CALL moraine_index_drop('lake','main','t','by_a');
-         CALL moraine_index_create('lake','main','t','by_a',['a'],true);
+         DROP INDEX lake.main.by_a;
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);
          SELECT 'rebuilt', certified_at IS NULL FROM moraine_indexes('lake','main','t');",
     );
     assert!(result.lines().any(|line| line == "fresh,true"), "{result}");

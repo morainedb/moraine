@@ -7,15 +7,10 @@
 #include <vector>
 
 #include "duckdb.hpp"
-#include "duckdb/planner/bound_statement.hpp"
 
 #include "moraine_abi.h"
 
 namespace moraine_duckdb {
-
-duckdb::BoundStatement BindNativeIndexDdl(duckdb::ClientContext &context, duckdb::Binder &binder,
-                                         bool create, duckdb::vector<duckdb::Value> arguments,
-                                         duckdb::named_argument_map_t options, bool ignore_missing_or_existing);
 
 // Backing storage for a `MoraineLookupValue`'s string/bytes fields, which
 // point into these members and so must outlive any use of the value.

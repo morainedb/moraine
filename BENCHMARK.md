@@ -78,9 +78,9 @@ Do not read across those pairs: `covering` needs a partitioned table to be
 partition-aligned, so it is not comparable to `bulk`.
 
 The two `indexed` workloads are their twins' seeds plus one
-`moraine_index_create`, so subtracting the twin gives what maintaining
-index entries costs a delete. They call a moraine-only function, so the
-other backends sit them out and the report leaves their cells empty.
+`CREATE INDEX`, so subtracting the twin gives what maintaining index entries
+costs a delete. The other DuckLake backends do not support indexes, so they
+sit these workloads out and the report leaves their cells empty.
 
 Every backend runs the byte-identical SQL through the same DuckDB binary, one
 statement timed at a time via `.timer on`, so differences come only from the
