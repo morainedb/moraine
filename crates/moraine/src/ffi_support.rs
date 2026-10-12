@@ -139,11 +139,10 @@ pub fn snapshot_stamp(view: &crate::catalog::CatalogSnapshot) -> HeadValue {
     crate::catalog::projection::view_head(view)
 }
 
-/// Whether a caller needs the ended half, and if it depends on the head,
-/// what decides it.
+/// Whether a caller needs ended records as well as current records.
 #[derive(Debug, Clone, Copy)]
 enum HistoryNeed {
-    /// The full set, whatever the head.
+    /// Both current and ended records.
     Always,
     /// `current` alone — the unversioned kinds, which have no ended half.
     Never,
@@ -158,11 +157,6 @@ impl HistoryNeed {
 /// The shared record set's two halves at the session head, each served
 /// from the projection cache when its stamp matches and scanned at most
 /// once otherwise.
-///
-/// Whether the ended half is read is settled against the head this call
-/// observes, never a head read earlier — a commit landing in between would
-/// otherwise let a bound that was at the head fall behind one, and the
-/// rows it ended would be dropped from a reader that still matches them.
 async fn entity_halves(
     catalog: &ReadOnlyCatalog,
     history: HistoryNeed,

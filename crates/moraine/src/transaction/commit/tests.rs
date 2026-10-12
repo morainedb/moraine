@@ -699,7 +699,7 @@ async fn read_format_version(catalog: &crate::catalog::Catalog) -> u64 {
 }
 
 #[tokio::test]
-async fn create_index_persists_definition_stamps_format_and_lands_entries() {
+async fn create_index_persists_definition_and_entries_without_changing_format() {
     use crate::{
         catalog::{ColumnId, IndexDef, IndexState},
         store::key::{IndexKind, index_index_prefix},
@@ -758,7 +758,7 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
 }
 
 #[tokio::test]
-async fn deferred_index_is_non_unique_and_stamps_its_format() {
+async fn deferred_index_is_non_unique_and_preserves_the_format() {
     use crate::catalog::{ColumnId, IndexDef, IndexMaintenance};
     let (catalog, table) = catalog_with_two_column_table().await;
 
@@ -829,7 +829,7 @@ async fn duplicate_unique_value_in_backfill_aborts_create() {
         .unwrap_err();
     assert!(matches!(err, Error::Constraint(_)), "{err}");
 
-    // The aborted commit left no index and did not stamp the format.
+    // The aborted commit left no index and preserved the format.
     assert!(
         catalog
             .snapshot()

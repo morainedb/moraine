@@ -50,8 +50,7 @@ use crate::{
 
 /// The original structural layout; later rewrites raise the readable floor.
 pub(crate) const FORMAT_VERSION: u64 = 1;
-/// Format stamped the first time an inline chunk row-range locator is
-/// written.
+/// The earliest format containing inline chunk row-range locators.
 pub(crate) const FORMAT_WITH_INLINE_CHUNK_DIRECTORY: u64 = 6;
 /// Inline tombstones retain each deletion snapshot under its own key.
 pub(crate) const FORMAT_WITH_INLINE_TOMBSTONE_HISTORY: u64 = 9;

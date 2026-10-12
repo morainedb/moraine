@@ -5193,9 +5193,9 @@ async fn a_collapsing_deregistration_preserves_the_format_floor() {
     }
 }
 
-/// An inline insert leaves the store at or above the chunk-identity format.
+/// An inline insert leaves the store at or above the minimum readable format.
 #[tokio::test]
-async fn an_inline_insert_stamps_the_chunk_identity_format() {
+async fn an_inline_insert_preserves_a_readable_format() {
     let catalog = open().await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();

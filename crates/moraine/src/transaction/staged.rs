@@ -1698,10 +1698,8 @@ pub struct CommitReport {
     pub staged_bytes: u64,
 }
 
-/// The writes a batch carries, the snapshot id it results in, and the
-/// format floor that resulting state owes. A snapshot-minting commit
-/// translates its operations and appends its own snapshot record; a
-/// maintenance one reuses the standing id and leaves index state alone.
+/// The resulting snapshot id, batch writes, and optional head view.
+/// Maintenance reuses the standing id and leaves index state alone.
 fn translate_batch(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
