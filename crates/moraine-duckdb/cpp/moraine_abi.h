@@ -186,9 +186,34 @@ typedef struct MoraineIndexDesc {
   bool building;
   // The index's build lifecycle.
   MoraineIndexState state;
+  // The snapshot a clean verifier pass agreed at; meaningful only when
+  // `has_certificate`.
+  uint64_t certified_at;
+  // Whether a verifier pass has agreed with the rows since the
+  // definition last changed.
+  bool has_certificate;
   // The index name, owned — free via [`moraine_indexes_free`].
   char *name;
 } MoraineIndexDesc;
+
+// One verifier pass's counts, and the certificate it left.
+typedef struct MoraineIndexVerification {
+  // Entries the index holds.
+  uint64_t stored;
+  // Entries the live rows require.
+  uint64_t expected;
+  // Entries the rows require that the index does not hold.
+  uint64_t missing;
+  // Entries the index holds that no live row requires.
+  uint64_t dead;
+  // Unique entries under the right value naming another row.
+  uint64_t mismatched;
+  // The snapshot the index is certified at; meaningful only when
+  // `has_certificate`.
+  uint64_t certified_at;
+  // Whether the index now carries a certificate.
+  bool has_certificate;
+} MoraineIndexVerification;
 
 // A value passed to [`moraine_index_lookup`], tagged by kind. The shim
 // fills the field matching `kind`; the ABI coerces it to the indexed
@@ -1640,21 +1665,20 @@ int32_t moraine_indexes(struct MoraineCatalogHandle *handle,
 void moraine_indexes_free(struct MoraineIndexDesc *items, size_t len);
 
 // Recomputes an index's entries from the table's rows and reports how they
-// differ from the entries the index holds. Writes nothing.
+// differ from the entries the index holds. A read-write attach records the
+// outcome on the definition — a clean pass certifies, a discrepancy
+// withdraws an earlier certificate — and a read-only attach reports
+// without writing.
 //
 // # Safety
 //
 // Every pointer must be valid per the ABI contract; `err`, if non-null,
-// must be writable, and every `out_*` pointer must be writable.
+// must be writable, and `out` must be writable.
 int32_t moraine_index_verify(struct MoraineCatalogHandle *handle,
                              const char *schema_name,
                              const char *table_name,
                              const char *index_name,
-                             uint64_t *out_stored,
-                             uint64_t *out_expected,
-                             uint64_t *out_missing,
-                             uint64_t *out_dead,
-                             uint64_t *out_mismatched,
+                             struct MoraineIndexVerification *out,
                              MoraineInterruptProbe probe,
                              void *probe_ctx,
                              struct MoraineError *err);

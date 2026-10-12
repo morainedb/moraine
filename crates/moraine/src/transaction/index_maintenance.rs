@@ -784,6 +784,10 @@ pub(crate) fn apply_deferred_maintenance(
         if value.build_state.is_none() {
             value.begin_snapshot = new_snapshot;
             value.build_state = Some("maintaining".to_owned());
+            // Additions land before the repair that places them, so the
+            // index is briefly short of the rows and any certificate it
+            // held is withdrawn.
+            value.verified_at_snapshot = None;
             value.build_cursor_row_id = base
                 .table_stats
                 .get(&table_id)

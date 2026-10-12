@@ -1002,6 +1002,7 @@ impl Transaction {
             poisoned: None,
             ducklake_index_id: None,
             deferred_maintenance: (maintenance == IndexMaintenance::Deferred).then_some(true),
+            verified_at_snapshot: None,
         });
         Ok(index_id)
     }
@@ -1020,6 +1021,44 @@ impl Transaction {
     }
 
     /// The owning table id and definition of a live index.
+    /// Records that a verifier pass agreed with the rows at `at`, or
+    /// withdraws an earlier agreement when `at` is `None`. A plan that
+    /// would let the index answer a predicate without the scan re-checking
+    /// it reads this.
+    ///
+    /// `observed` is the definition version the pass read, and the call is
+    /// refused if the definition has moved since — a rebuild landing
+    /// between the pass and this commit must not inherit its agreement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the index is not live, or
+    /// [`Error::Constraint`] if it is not ready — a building or repairing
+    /// index is short of the rows by design — or if the definition moved.
+    pub fn record_index_verification(
+        &mut self,
+        index: IndexId,
+        observed: SnapshotId,
+        at: Option<SnapshotId>,
+    ) -> Result<()> {
+        let (table_id, mut value) = self.live_index(index)?;
+        if value.build_state.is_some() || value.poisoned == Some(true) {
+            return Err(Error::Constraint(format!(
+                "index {index} is not ready; only a ready index can be verified"
+            )));
+        }
+        if value.begin_snapshot != observed.get() {
+            return Err(Error::Constraint(format!(
+                "index {index} changed while it was being verified"
+            )));
+        }
+        value.begin_snapshot = self.new_snapshot_id;
+        value.verified_at_snapshot = at.map(SnapshotId::get);
+        self.state.put_index(value);
+        self.mark_altered(table_id);
+        Ok(())
+    }
+
     fn live_index(&self, index: IndexId) -> Result<(u64, IndexValue)> {
         self.state
             .indexes
@@ -1219,6 +1258,9 @@ impl Transaction {
     ) -> IndexState {
         let maintenance_repair = value.build_state.as_deref() == Some("maintaining");
         value.begin_snapshot = self.new_snapshot_id;
+        // This step rewrote entries, so whatever a verifier pass agreed
+        // with no longer describes the index.
+        value.verified_at_snapshot = None;
         // Unordered inline sources must not advance the older row watermark.
         if !empty && inline.is_none_or(|cursor| cursor.complete) {
             value.build_cursor_row_id = Some(cursor);

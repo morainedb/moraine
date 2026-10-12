@@ -39,6 +39,12 @@ pub struct MoraineIndexDesc {
     pub building: bool,
     /// The index's build lifecycle.
     pub state: MoraineIndexState,
+    /// The snapshot a clean verifier pass agreed at; meaningful only when
+    /// `has_certificate`.
+    pub certified_at: u64,
+    /// Whether a verifier pass has agreed with the rows since the
+    /// definition last changed.
+    pub has_certificate: bool,
     /// The index name, owned — free via [`moraine_indexes_free`].
     pub name: *mut c_char,
 }
@@ -429,7 +435,13 @@ pub unsafe extern "C" fn moraine_indexes(
             handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
-        let owned: Vec<(u64, bool, moraine::IndexState, CString)> = snapshot
+        let owned: Vec<(
+            u64,
+            bool,
+            moraine::IndexState,
+            Option<moraine::SnapshotId>,
+            CString,
+        )> = snapshot
             .indexes_of(table_id)
             .into_iter()
             .map(|index| {
@@ -437,19 +449,24 @@ pub unsafe extern "C" fn moraine_indexes(
                     index.id.get(),
                     index.unique,
                     index.state,
+                    index.verified_at_snapshot,
                     to_c_string(index.name)?,
                 ))
             })
             .collect::<Result<_, AbiError>>()?;
         Ok(owned
             .into_iter()
-            .map(|(index_id, unique, state, name)| MoraineIndexDesc {
-                index_id,
-                unique,
-                building: state != moraine::IndexState::Ready,
-                state: state.into(),
-                name: name.into_raw(),
-            })
+            .map(
+                |(index_id, unique, state, certified, name)| MoraineIndexDesc {
+                    index_id,
+                    unique,
+                    building: state != moraine::IndexState::Ready,
+                    state: state.into(),
+                    certified_at: certified.map_or(0, moraine::SnapshotId::get),
+                    has_certificate: certified.is_some(),
+                    name: name.into_raw(),
+                },
+            )
             .collect())
     };
 
@@ -474,25 +491,43 @@ pub unsafe extern "C" fn moraine_indexes_free(items: *mut MoraineIndexDesc, len:
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
+/// One verifier pass's counts, and the certificate it left.
+#[repr(C)]
+pub struct MoraineIndexVerification {
+    /// Entries the index holds.
+    pub stored: u64,
+    /// Entries the live rows require.
+    pub expected: u64,
+    /// Entries the rows require that the index does not hold.
+    pub missing: u64,
+    /// Entries the index holds that no live row requires.
+    pub dead: u64,
+    /// Unique entries under the right value naming another row.
+    pub mismatched: u64,
+    /// The snapshot the index is certified at; meaningful only when
+    /// `has_certificate`.
+    pub certified_at: u64,
+    /// Whether the index now carries a certificate.
+    pub has_certificate: bool,
+}
+
 /// Recomputes an index's entries from the table's rows and reports how they
-/// differ from the entries the index holds. Writes nothing.
+/// differ from the entries the index holds. A read-write attach records the
+/// outcome on the definition — a clean pass certifies, a discrepancy
+/// withdraws an earlier certificate — and a read-only attach reports
+/// without writing.
 ///
 /// # Safety
 ///
 /// Every pointer must be valid per the ABI contract; `err`, if non-null,
-/// must be writable, and every `out_*` pointer must be writable.
+/// must be writable, and `out` must be writable.
 #[unsafe(no_mangle)]
-#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn moraine_index_verify(
     handle: *mut MoraineCatalogHandle,
     schema_name: *const c_char,
     table_name: *const c_char,
     index_name: *const c_char,
-    out_stored: *mut u64,
-    out_expected: *mut u64,
-    out_missing: *mut u64,
-    out_dead: *mut u64,
-    out_mismatched: *mut u64,
+    out: *mut MoraineIndexVerification,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
@@ -501,16 +536,8 @@ pub unsafe extern "C" fn moraine_index_verify(
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
-        for (pointer, name) in [
-            (out_stored, "out_stored"),
-            (out_expected, "out_expected"),
-            (out_missing, "out_missing"),
-            (out_dead, "out_dead"),
-            (out_mismatched, "out_mismatched"),
-        ] {
-            if pointer.is_null() {
-                return Err(AbiError::invalid_argument(format!("`{name}` is null")));
-            }
+        if out.is_null() {
+            return Err(AbiError::invalid_argument("`out` is null"));
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
@@ -527,28 +554,46 @@ pub unsafe extern "C" fn moraine_index_verify(
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
         let data_store = handle_ref.data_store.clone();
-        // SAFETY: caller contract for `probe`/`probe_ctx`.
-        let report = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                handle_ref.catalog.reads().verify_index(
-                    table_id,
-                    name,
-                    data_store,
-                    &handle_ref.data_prefix,
-                ),
-            )
-        }?;
+        let prefix = handle_ref.data_prefix.clone();
+        // A read-only attach reports; a writer records what it found.
+        let report = match handle_ref.catalog.writer() {
+            Ok(catalog) => {
+                // SAFETY: caller contract for `probe`/`probe_ctx`.
+                unsafe {
+                    handle_ref.block_on_commit(
+                        probe,
+                        probe_ctx,
+                        catalog.certify_index(table_id, name, data_store, &prefix),
+                    )
+                }?
+            }
+            Err(_) => {
+                // SAFETY: caller contract for `probe`/`probe_ctx`.
+                unsafe {
+                    handle_ref.block_on_cancellable(
+                        probe,
+                        probe_ctx,
+                        handle_ref
+                            .catalog
+                            .reads()
+                            .verify_index(table_id, name, data_store, &prefix),
+                    )
+                }?
+            }
+        };
 
-        // SAFETY: each pointer is non-null per the check above, and
-        // writable per the caller contract.
+        let certified = report.certified_at;
+        // SAFETY: checked non-null above, writable per the caller contract.
         unsafe {
-            out_stored.write(report.stored);
-            out_expected.write(report.expected);
-            out_missing.write(report.missing);
-            out_dead.write(report.dead);
-            out_mismatched.write(report.mismatched);
+            out.write(MoraineIndexVerification {
+                stored: report.stored,
+                expected: report.expected,
+                missing: report.missing,
+                dead: report.dead,
+                mismatched: report.mismatched,
+                certified_at: certified.map_or(0, moraine::SnapshotId::get),
+                has_certificate: certified.is_some(),
+            });
         }
         Ok(())
     };

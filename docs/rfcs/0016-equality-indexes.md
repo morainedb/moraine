@@ -1717,8 +1717,8 @@ written `…` below for brevity.
 | `moraine_index_in(…, keys)` | table function: row ids for the union of complete equality keys in `keys`. A single-column index takes a list of scalar values; a composite index takes a list of `row(...)` values in index-column order. Duplicate keys are one predicate, a key containing NULL matches no row, and an empty list returns no rows |
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
 | `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
-| `moraine_index_verify(catalog, schema, table, index)` | table function: recompute the index's entries from the live rows and report the difference — `stored`, `expected`, `missing`, `dead`, `mismatched`. Reads every live data file of the table, so it costs what the build costs; writes nothing and takes no snapshot, so a read-only attach may run it. A clean index reports `stored = expected` and zeros for the last three. Only a `ready` index can be verified: a build's entries are incomplete by design |
-| `moraine_indexes(catalog, schema, table)` | table function: index introspection — `index_id`, `index_name`, `is_unique`, `is_building`, and `state` (`ready`\|`building`\|`maintaining`\|`poisoned`) |
+| `moraine_index_verify(catalog, schema, table, index)` | table function: recompute the index's entries from the live rows and report the difference — `stored`, `expected`, `missing`, `dead`, `mismatched`, then `certified_at` (the snapshot the index now stands certified at, NULL when it does not). A read-write attach records the outcome (The certificate); a read-only one reports without writing. Reads every live data file of the table, so it costs what the build costs; writes nothing and takes no snapshot, so a read-only attach may run it. A clean index reports `stored = expected` and zeros for the last three. Only a `ready` index can be verified: a build's entries are incomplete by design |
+| `moraine_indexes(catalog, schema, table)` | table function: index introspection — `index_id`, `index_name`, `is_unique`, `is_building`, `state` (`ready`\|`building`\|`maintaining`\|`poisoned`), and `certified_at` (The certificate) |
 
 `moraine_index_in` binds `keys` as one constant list value (including a
 prepared-statement parameter), like the arguments of the other explicit
@@ -2029,6 +2029,44 @@ stays clean across insert, delete, update and compaction; a rebuild that
 loses entries is visible before a query pays for them; and the entry-source
 split above becomes testable rather than asserted, since a verifier pass is
 the last line an index test can assert.
+
+### The certificate
+
+A pass through a read-write attach records what it found on the definition:
+a clean pass writes the snapshot it agreed at, and a pass that found any
+discrepancy clears an earlier agreement rather than leaving a stale one
+standing. `moraine_indexes` reports it as `certified_at`, NULL when absent.
+A read-only attach reports without writing.
+
+This is not a fifth `IndexState`. `Ready` already means "serving lookups
+and enforcing uniqueness", and whether something has *checked* the index is
+an orthogonal fact; a variant would force every existing match site to
+decide something it has no opinion on. It is a separate field, and the only
+state coupling is that a certificate requires `Ready` — a building or
+repairing index is short of the rows by design.
+
+**What withdraws it.** Any write that changes the entry set: a staged build
+step, a rebuild, a deferred repair entering `maintaining`. A new definition
+starts without one. Ordinary maintained writes do **not** withdraw it, and
+that is the whole of what the certificate extends — trust in the
+maintenance path between the pass and now. Stated plainly: a certificate
+says *at snapshot V the index matched the rows*, and reading it at a later
+snapshot trusts every commit since V to have maintained the index exactly.
+That trust is bounded by how recently the verifier ran, so a deployment
+that wants a tighter bound runs it more often; it is not an argument the
+index is correct forever.
+
+**The race it closes.** A pass reads at one snapshot and records at
+another, so the recording names the definition version the pass observed
+and is refused if the definition moved in between. A rebuild landing
+between a pass and its commit must not inherit the pass's agreement.
+
+**What reads it.** Nothing yet. It exists so that a plan may stop
+re-checking what the index answered — dropping the key predicate from a
+scan, and rewriting an indexed-equality `DELETE` into the positional path —
+and both of those read the certificate rather than a setting, because the
+failure they trade for is a wrong row returned or deleted rather than a
+slow query.
 
 ### Test obligations
 

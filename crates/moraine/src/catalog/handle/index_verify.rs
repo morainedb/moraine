@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use tracing::info;
 
 use super::{
-    ReadOnlyCatalog, backfill,
+    Catalog, ReadOnlyCatalog, backfill,
     index_build::{EntrySink, IndexEncoder},
 };
 use crate::{
@@ -42,6 +42,13 @@ pub struct IndexVerification {
     pub sample_missing: Vec<u64>,
     /// A bounded sample of row ids named by an entry no live row requires.
     pub sample_dead: Vec<u64>,
+    /// The snapshot the pass read, which a certificate names.
+    pub verified_at: Option<crate::SnapshotId>,
+    /// The index definition's version when the pass read it. A certificate
+    /// is refused if the definition moved after this.
+    pub definition: Option<crate::SnapshotId>,
+    /// The certificate observed in the same snapshot as the verified entries.
+    pub certified_at: Option<crate::SnapshotId>,
 }
 
 impl IndexVerification {
@@ -205,11 +212,20 @@ impl ReadOnlyCatalog {
             )));
         }
 
+        let read_at = snapshot.current_snapshot().id;
+        let definition = snapshot
+            .indexes
+            .get(&table.get())
+            .and_then(|indexes| indexes.get(&info.id.get()))
+            .map(|value| crate::SnapshotId::new(value.begin_snapshot));
         let stored = stored_entries(session.handle(), &info).await?;
         let mut sink = VerifySink {
             encoder: IndexEncoder::of(&info),
             report: IndexVerification {
                 stored: u64::try_from(stored.len()).unwrap_or(u64::MAX),
+                verified_at: Some(read_at),
+                definition,
+                certified_at: info.verified_at_snapshot,
                 ..IndexVerification::default()
             },
             stored,
@@ -259,6 +275,50 @@ impl ReadOnlyCatalog {
             "index verified"
         );
         Ok(sink.report)
+    }
+}
+
+impl Catalog {
+    /// Verifies `index` and records the outcome on its definition: a clean
+    /// pass certifies the snapshot it agreed at, and a pass that found any
+    /// discrepancy withdraws an earlier certificate rather than leaving a
+    /// stale one standing.
+    ///
+    /// The certificate survives ordinary maintained writes, which is the
+    /// trust it extends, and is withdrawn by a rebuild or a deferred
+    /// repair. Nothing is written when the outcome already matches what
+    /// the definition records.
+    ///
+    /// # Errors
+    ///
+    /// As [`ReadOnlyCatalog::verify_index`], plus a commit error.
+    pub async fn certify_index(
+        &self,
+        table: TableId,
+        index: &str,
+        data_store: Option<DataStore>,
+        data_prefix: &str,
+    ) -> Result<IndexVerification> {
+        let mut report = self
+            .verify_index(table, index, data_store, data_prefix)
+            .await?;
+        let snapshot = self.snapshot().await?;
+        let info = snapshot
+            .index_by_name(table, index)
+            .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
+        let at = report.is_clean().then_some(report.verified_at).flatten();
+        if info.verified_at_snapshot == at {
+            report.certified_at = at;
+            return Ok(report);
+        }
+        let Some(observed) = report.definition else {
+            return Ok(report);
+        };
+        let index_id = info.id;
+        self.commit(move |tx| tx.record_index_verification(index_id, observed, at))
+            .await?;
+        report.certified_at = at;
+        Ok(report)
     }
 }
 
