@@ -428,6 +428,13 @@ a shared file and the comparison needs no table key; the file ids ride the
 snapshot record as moraine-internal state, exactly as
 `schema_changed_table_ids` does, and are invisible to DuckLake.
 
+The snapshot also persists `deletes_untargeted_files`: a mixed commit that
+targets files and deletes inlined rows still requires the table-grain
+fallback after replay. With a non-empty file list the flag controls that
+fallback; with an empty list it applies regardless of the flag. Older
+records default the flag to false, so readers cannot recover mixed-delete
+information omitted by older writers.
+
 **Name collisions are invisible to id-set comparison.** Two concurrent
 commits each creating a table named `orders` in the same schema allocate
 fresh, *disjoint* table ids — the set comparison classifies the race
@@ -690,6 +697,11 @@ the projections, before it is durable: the store then admits the next
 batch, which forms and submits while the first awaits its flush, and the
 two share that flush under the pacing below. Every member still returns
 only once its own batch is durable.
+
+A member that stages no writes still shares the batch's outcome if its
+premise includes uncommitted writes. It must wait for durability or retry
+the lost batch before reporting that premise's snapshot id. A no-op against
+committed state alone may return immediately.
 
 Steps 1–3 run once per member, against a premise folded forward from the
 member before it (the same fold that refreshes the cached head view), so

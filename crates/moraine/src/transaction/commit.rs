@@ -337,6 +337,7 @@ fn stage_bootstrap(
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
             deleted_data_file_ids: Vec::new(),
+            deletes_untargeted_files: false,
         }),
     );
     stage(
@@ -946,9 +947,9 @@ where
 {
     let staged = coalescer.stage(db, members).await?;
 
-    // A caller that staged nothing is not riding the batch and does not
-    // wait on it.
-    if !staged.contributed {
+    // A caller that staged nothing against committed state alone is not
+    // riding the batch and does not wait on it.
+    if !staged.rides {
         return Ok(CommitOutcome::Committed(staged.ids));
     }
 
@@ -1208,6 +1209,31 @@ pub(crate) fn schema_version_write(
     )
 }
 
+/// The snapshot record a verb commit mints, carrying the change set in
+/// DuckLake's grammar plus the file-grain facts that grammar cannot name.
+fn snapshot_record(
+    snapshot_id: u64,
+    schema_version: u64,
+    (next_catalog_id, next_file_id): (u64, u64),
+    schema_changed_table_ids: Vec<u64>,
+    ours: &ChangeSet,
+) -> proto::SnapshotValue {
+    proto::SnapshotValue {
+        snapshot_id,
+        snapshot_time_micros: now_micros(),
+        schema_version,
+        next_catalog_id,
+        next_file_id,
+        changes_made: ours.to_changes_made(),
+        author: None,
+        commit_message: None,
+        commit_extra_info: None,
+        schema_changed_table_ids,
+        deleted_data_file_ids: ours.deleted_data_file_ids.iter().copied().collect(),
+        deletes_untargeted_files: ours.deletes_untargeted_files,
+    }
+}
+
 /// Runs the closure against `base` and stages the resulting writes.
 /// Options-only commits stage no snapshot record and no head advance.
 async fn prepare_and_stage<F>(
@@ -1288,19 +1314,13 @@ where
     let ours = ChangeSet::from_operations(&operations);
     let changelog = changelog_writes(new_id, &writes);
 
-    let snapshot = proto::SnapshotValue {
-        snapshot_id: new_id,
-        snapshot_time_micros: now_micros(),
+    let snapshot = snapshot_record(
+        new_id,
         schema_version,
-        next_catalog_id,
-        next_file_id,
-        changes_made: ours.to_changes_made(),
-        author: None,
-        commit_message: None,
-        commit_extra_info: None,
+        (next_catalog_id, next_file_id),
         schema_changed_table_ids,
-        deleted_data_file_ids: ours.deleted_data_file_ids.iter().copied().collect(),
-    };
+        &ours,
+    );
     writes.extend(changelog);
     writes.push((
         Key::Snapshot {
@@ -1771,11 +1791,12 @@ async fn read_intervening_change(db: &Db, snapshot_id: u64) -> Result<(u64, Chan
             let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
             let mut change_set = ChangeSet::parse(&snapshot.changes_made);
             // `changes_made` names the tables deleted from; the record names
-            // the files, which classifies deletes at file grain.
+            // the files, which classifies deletes at file grain unless the
+            // commit also deleted rows no file names.
             if !snapshot.deleted_data_file_ids.is_empty() {
                 change_set.deleted_data_file_ids =
                     snapshot.deleted_data_file_ids.iter().copied().collect();
-                change_set.deletes_untargeted_files = false;
+                change_set.deletes_untargeted_files = snapshot.deletes_untargeted_files;
             }
             change_set
         }

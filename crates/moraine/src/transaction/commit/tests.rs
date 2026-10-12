@@ -302,6 +302,7 @@ fn renaming_one_column_stages_no_write_for_any_sibling() {
         commit_extra_info: None,
         schema_changed_table_ids: Vec::new(),
         deleted_data_file_ids: Vec::new(),
+        deletes_untargeted_files: false,
     };
     let mut setup = Transaction::new(CatalogSnapshot::build(snap0, &[], &[], None), 1);
     let schema = setup.create_schema("s").unwrap();
@@ -369,6 +370,7 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
         commit_extra_info: None,
         schema_changed_table_ids: Vec::new(),
         deleted_data_file_ids: Vec::new(),
+        deletes_untargeted_files: false,
     };
     let empty = CatalogSnapshot::build(snap0, &[], &[], None);
     let mut setup = Transaction::new(empty, 1);
@@ -4962,6 +4964,60 @@ async fn a_retry_across_a_reclaimed_snapshot_conflicts_rather_than_corrupting() 
     assert!(crate::transaction::operations::conflicts(&ours, reclaimed));
 
     db.close().await.unwrap();
+}
+
+/// A commit that deletes both by file and by inlined row falls back to
+/// table grain, and a later committer classifying it from its record sees
+/// that fallback rather than the file list alone.
+#[tokio::test]
+async fn a_mixed_delete_commit_classifies_at_table_grain_from_its_record() {
+    use crate::transaction::operations::{Operation, conflicts};
+
+    let (catalog, tables) = seeded_catalog(1).await;
+    let table = tables[0];
+    let file = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            file.set(Some(tx.register_data_file(
+                table,
+                bulk_file("f0.parquet", 3),
+                &[],
+            )?));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let file = file.get().unwrap();
+    let head_before = catalog.snapshot().await.unwrap().snapshot.snapshot_id;
+
+    catalog
+        .commit(|tx| {
+            tx.register_delete_file(table, delete_file(file), &[])?;
+            tx.inline_delete(table, 0, &[])
+        })
+        .await
+        .unwrap();
+
+    let store = catalog.store();
+    let intervening = intervening_changes(store.writer_db().unwrap(), head_before)
+        .await
+        .unwrap();
+    let (_, theirs) = &intervening[0];
+    assert!(theirs.deleted_data_file_ids.contains(&file.get()));
+    assert!(
+        theirs.deletes_untargeted_files,
+        "the inlined delete names no file, so the commit deletes at table grain"
+    );
+
+    let ours = ChangeSet::from_operations(&[Operation::RegisterDeleteFile {
+        table_id: table.get(),
+        data_file_id: file.get() + 1,
+    }]);
+    assert!(
+        conflicts(&ours, theirs),
+        "a delete of another file conflicts with rows the record cannot name"
+    );
+    catalog.close().await.unwrap();
 }
 
 /// The other half of that path. An expiry is head-preserving, so it clears

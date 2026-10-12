@@ -1335,5 +1335,6 @@ pub(super) fn build_snapshot_value(ops: &[RowOperation]) -> Result<proto::Snapsh
         // DuckLake names only the tables it deleted from; a later commit
         // classifies against this snapshot at table grain.
         deleted_data_file_ids: Vec::new(),
+        deletes_untargeted_files: false,
     })
 }

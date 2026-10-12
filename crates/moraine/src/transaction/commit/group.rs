@@ -66,8 +66,9 @@ pub(crate) struct Staged {
     pub(crate) ours: Vec<ChangeSet>,
     /// The head the batch's premise was read at.
     pub(crate) head_before: u64,
-    /// Whether this caller put anything in the batch.
-    pub(crate) contributed: bool,
+    /// Whether this caller's answer depends on the batch landing: it
+    /// staged writes, or staged against writes already in it.
+    pub(crate) rides: bool,
     /// The batch's outcome, once it lands.
     pub(crate) outcome: watch::Receiver<BatchState>,
 }
@@ -262,7 +263,6 @@ impl Coalescer {
             Some(batch) => batch,
             None => reporting_phase("open", Batch::open(db, &self.projections)).await?,
         };
-        let staged_before = batch.writes.len();
 
         let staged = match reporting_phase("stage", batch.stage(members, &self.projections)).await {
             Ok(staged) => staged,
@@ -277,7 +277,7 @@ impl Coalescer {
 
         let outcome = batch.outcome.subscribe();
         let head_before = batch.head_before;
-        let contributed = batch.writes.len() > staged_before;
+        let rides = !batch.writes.is_empty();
 
         let alone = arrival.settle() == 0;
         let full = batch.members >= MAX_BATCH_MEMBERS;
@@ -295,7 +295,7 @@ impl Coalescer {
             ids,
             ours,
             head_before,
-            contributed,
+            rides,
             outcome,
         })
     }
@@ -588,6 +588,70 @@ mod tests {
         assert!(
             matches!(landed, Outcome::Committed),
             "the waiter must seal and land the batch it is riding, got {landed:?}"
+        );
+        catalog.close().await.unwrap();
+    }
+
+    /// A caller that stages nothing against a forming batch's uncommitted
+    /// writes takes the batch's fate: its answer came from those writes,
+    /// and the id it would report names a commit that can still lose.
+    #[tokio::test]
+    async fn a_no_op_member_rides_the_batch_it_read() {
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        let store = catalog.store();
+        let db = store.writer_db().unwrap();
+        let coalescer = Arc::new(Coalescer::new(
+            Arc::clone(catalog.projections()),
+            store.commit_durability(),
+        ));
+
+        // Left forming for a caller still on its way in.
+        let pending = coalescer.arrive();
+        let first = coalescer
+            .stage(
+                db,
+                &[|tx: &mut Transaction| tx.create_schema("a").map(|_| ())],
+            )
+            .await
+            .unwrap();
+
+        // Another writer lands ahead of the batch.
+        let rival = Arc::new(Coalescer::new(
+            Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
+            store.commit_durability(),
+        ));
+        super::super::commit_cycle(
+            db,
+            &[|tx: &mut Transaction| tx.create_schema("rival").map(|_| ())],
+            &rival,
+        )
+        .await
+        .unwrap();
+
+        // The pending caller finds its schema already in the batch and
+        // stages nothing.
+        pending.settle();
+        let outcome = super::super::attempt_group(
+            db,
+            &[|tx: &mut Transaction| {
+                tx.schema_by_name("a")
+                    .map(|_| ())
+                    .ok_or_else(|| Error::NotFound("a".into()))
+            }],
+            &coalescer,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, super::super::CommitOutcome::LostRace { .. }),
+            "a member that read the batch's writes must share its lost race"
+        );
+        assert_eq!(
+            await_outcome_sealing(&coalescer, first.outcome).await,
+            Outcome::LostRace
         );
         catalog.close().await.unwrap();
     }
