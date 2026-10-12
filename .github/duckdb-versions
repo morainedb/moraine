@@ -19,9 +19,11 @@
 # they all agree. Dropping an old line only stops future releases from
 # carrying it; published assets stay.
 #
-# The current pin is a development revision: DuckDB 2.0 has no tag and no
-# release assets, so there is no CLI to download and nothing to publish
-# against. The version string is the one both the local build and CI stamp
-# onto the checkout the `duckdb` submodule pins, and the CLI the e2e suites
-# run is the one that build produces.
-v2.0.0-dev0 duckdb=6b6099a3e9787f1b32c59fab61fcdd1d3bc835cd extension-ci-tools=969bc76276acec1c0a3922ff500d2ec3a1a3b037
+# The current pin is a development revision: DuckDB 2.0 carries no tag, so
+# CI checks the `duckdb` submodule out by commit and stamps the version
+# string this file names onto it. DuckDB publishes that label even so — its
+# shared libraries and CLI on `duckdb-staging.duckdb.org`, its core
+# extensions on `extensions.duckdb.org` — so pin only a label it publishes.
+# An extension stamped with any other string has no DuckDB to load it, and
+# `INSTALL httpfs` no build to resolve.
+v2.0.0-alpha46057 duckdb=b15358c371daf10dad799a43b6167f6ccdce84d8 extension-ci-tools=969bc76276acec1c0a3922ff500d2ec3a1a3b037
