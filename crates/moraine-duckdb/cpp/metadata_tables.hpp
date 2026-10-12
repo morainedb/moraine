@@ -6,6 +6,7 @@
 // dump ABI (see metadata_tables.cpp).
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -65,10 +66,42 @@ constexpr uint64_t kEveryVersion = UINT64_MAX;
 // double-register; it lands here as a no-op instead.
 constexpr int32_t kVoidInsertable = -2;
 
+// As `MetadataRowProvider`, through an open staged transaction: the rows it
+// sees at its pinned read point, its own staged rows overlaid. `handle` and
+// the probe pair reach only `ducklake_metadata`'s provider, whose fixed rows
+// are store facts no transaction stages.
+using MetadataTxRowProvider = std::function<MetadataRows(MoraineTxHandle *tx, MoraineCatalogHandle *handle,
+                                                         MoraineInterruptProbe probe, void *probe_ctx)>;
+
+// As `MetadataTxRowProvider`, for a reader that keeps a row only while
+// `live_bound < end_snapshot` (or it is null): the ended half is skipped
+// once `live_bound` reaches the transaction's read point.
+using MetadataTxLiveRowProvider = std::function<MetadataRows(MoraineTxHandle *tx, uint64_t live_bound)>;
+
+// As `MetadataTxRowProvider`, narrowed to one table and, unless
+// `filter_snapshot` is `kEveryVersion`, to the versions live at it.
+using MetadataTxScopedRowProvider =
+    std::function<MetadataRows(MoraineTxHandle *tx, uint64_t table_id, uint64_t filter_snapshot)>;
+
+// The readers a staged transaction goes through, built by `TxProviders`
+// (metadata_tables.cpp) over one free function and one shape so that no
+// reader of a table can shape rows differently from its others. A reader is
+// empty where the core exposes no such dump; `provider` is empty only for a
+// table no transaction can write.
+struct MetadataTxProviders {
+	MetadataTxRowProvider provider;
+	MetadataTxLiveRowProvider live_provider;
+	MetadataTxScopedRowProvider scoped_provider;
+};
+
 struct MetadataTableSpec {
 	const char *name;
 	std::vector<MetadataColumnSpec> columns;
 	MetadataRowProvider provider;
+	// The readers a scan inside a write transaction goes through, so it
+	// observes the rows that transaction has staged: DuckLake's expiry and
+	// cleanup cascades re-read these tables after staging their own deletes.
+	MetadataTxProviders tx;
 	// `moraine_tx_stage`'s `table_kind` for this table, or `kNotWritable`
 	// for the always-empty stand-ins and `ducklake_metadata` (writes to
 	// those are out of scope this slice — DDL/unsupported-DML naming the
