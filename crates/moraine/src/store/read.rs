@@ -758,6 +758,7 @@ mod tests {
             mapping_id: None,
             partial_max: None,
             partition_values: vec![],
+            row_group_count: None,
         };
         tx.put(
             Key::current(EntityKey::File {
@@ -779,6 +780,7 @@ mod tests {
             dialect: "duckdb".into(),
             sql: "SELECT 1".into(),
             column_aliases: None,
+            column_tags: Vec::new(),
         };
         tx.put(
             Key::current(EntityKey::View { view_id: 4 }).encode(),

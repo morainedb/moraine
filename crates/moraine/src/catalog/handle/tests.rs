@@ -622,3 +622,37 @@ async fn forgetting_the_head_view_resolves_it_from_the_store_again() {
     );
     catalog.close().await.unwrap();
 }
+
+/// A version this build cannot order is a newer build's: raising refuses it
+/// rather than lowering the shape the store serves.
+#[tokio::test]
+async fn raising_refuses_a_catalog_version_this_build_does_not_serve() {
+    let catalog = open().await;
+    catalog
+        .commit(|tx| {
+            tx.set_catalog_version("1.2");
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let error = catalog.raise_catalog_version(false).await.unwrap_err();
+    assert!(
+        matches!(&error, crate::Error::Migration(message) if message.contains("1.2")),
+        "the refusal names the version the store records, got: {error}"
+    );
+
+    // A dry run refuses too: there is no move to report.
+    assert!(catalog.raise_catalog_version(true).await.is_err());
+    assert_eq!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .option(crate::catalog::OptionScope::Global, "version")
+            .as_deref(),
+        Some("1.2"),
+        "a refused raise leaves the recorded version alone"
+    );
+    catalog.close().await.unwrap();
+}

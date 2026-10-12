@@ -278,20 +278,21 @@ mod telemetry;
 mod transaction;
 
 pub use catalog::{
-    BuildStep, CachePreload, Catalog, CatalogOptions, CatalogSnapshot, CensusRequest,
-    ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats, CommitMember,
-    CompactStoreReport, CompactStoreRequest, CompactionTarget, DataFile, DataFileId, DataFileInfo,
-    DeleteFile, DeleteFileId, DeleteFileInfo, DeleteFileRegistration, ExcludedPositions,
-    ExistingDeleteFile, FileColumnStats, FileIndexEntry, FileIndexRemoval, FileRowCandidate,
-    FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexReadIdentity,
-    IndexReadScope, IndexState, InlineChunk, LiveCount, LocatedDeletion, LocatedPositions,
-    LocatedRowScan, MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef,
-    MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep, MappingId,
-    MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef,
-    PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow, RowSummaryPublish, ScheduledDeletion,
-    SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus,
-    StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo,
-    TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo, store_paths_overlap,
+    BuildStep, CATALOG_VERSION, CachePreload, Catalog, CatalogOptions, CatalogSnapshot,
+    CensusRequest, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats,
+    CommitMember, CompactStoreReport, CompactStoreRequest, CompactionTarget, DataFile, DataFileId,
+    DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, DeleteFileRegistration,
+    ExcludedPositions, ExistingDeleteFile, FileColumnStats, FileIndexEntry, FileIndexRemoval,
+    FileRowCandidate, FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexMaintenance,
+    IndexReadIdentity, IndexReadScope, IndexState, InlineChunk, LiveCount, LocatedDeletion,
+    LocatedPositions, LocatedRowScan, MAX_CATALOG_VERSION, MacroId, MacroImplementationDef,
+    MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass,
+    MaintenanceStatusStep, MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef,
+    OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow,
+    RowSummaryPublish, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId,
+    SortKeyDef, SortSpec, StoreCensus, StoreCheckpoint, StoreObjects, SubspaceCensus,
+    SubspaceMerge, SubspaceName, TableId, TableInfo, TableStats, TagEntry, TagTarget, Timestamp,
+    ViewId, ViewInfo, store_paths_overlap,
 };
 pub use data_file::{DataStore, SidecarSweep, SidecarTally, sidecar_tally};
 pub use error::{Error, Result};

@@ -165,9 +165,14 @@ std::shared_ptr<const MetadataRows> ScopedMetadataRowsFor(duckdb::ClientContext 
                                                           const MetadataTableSpec &spec, uint64_t table_id,
                                                           duckdb::optional_idx live_bound = duckdb::optional_idx());
 
-// The fixed list of synthesized tables, in the order they're registered.
-// Built once; returns the same static instance every call.
-const std::vector<MetadataTableSpec> &MoraineMetadataTableSpecs();
+// Whether this store records the catalog version whose shape adds
+// 1.1-dev1's columns and tables. One read of the store's recorded version.
+bool MoraineServesExtendedCatalog(MoraineCatalogHandle *handle);
+
+// The synthesized tables, in the order they're registered. `extended`
+// selects the shape catalog version 1.1-dev1 declares. Built once per
+// shape; returns the same static instance every call for a given shape.
+const std::vector<MetadataTableSpec> &MoraineMetadataTableSpecs(bool extended = false);
 
 // A synthesized `ducklake_*` table entry: pure read, materializes every row
 // up front (metadata-sized, not data-sized) at scan time via `spec`'s

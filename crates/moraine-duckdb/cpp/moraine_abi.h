@@ -795,6 +795,10 @@ typedef struct MoraineDataFileRow {
   bool has_partial_max;
   // `partial_max`, valid iff `has_partial_max`.
   uint64_t partial_max;
+  // Whether `row_group_count` is present.
+  bool has_row_group_count;
+  // `row_group_count`, valid iff `has_row_group_count`.
+  uint64_t row_group_count;
 } MoraineDataFileRow;
 
 // One `ducklake_delete_file` row, as returned by
@@ -830,6 +834,10 @@ typedef struct MoraineDeleteFileRow {
   bool has_partial_max;
   // `partial_max`, valid iff `has_partial_max`.
   uint64_t partial_max;
+  // Whether `row_group_count` is present.
+  bool has_row_group_count;
+  // `row_group_count`, valid iff `has_row_group_count`.
+  uint64_t row_group_count;
 } MoraineDeleteFileRow;
 
 // One `ducklake_file_partition_value` row, as returned by
@@ -1095,6 +1103,14 @@ typedef struct MoraineTableColumnStatsRow {
   char *max_value;
   // `extra_stats`, owned, null if absent.
   char *extra_stats;
+  // Whether `min_is_exact` is present.
+  bool has_min_is_exact;
+  // `min_is_exact`, valid iff `has_min_is_exact`.
+  bool min_is_exact;
+  // Whether `max_is_exact` is present.
+  bool has_max_is_exact;
+  // `max_is_exact`, valid iff `has_max_is_exact`.
+  bool max_is_exact;
 } MoraineTableColumnStatsRow;
 
 // One `ducklake_file_column_stats` row, as returned by
@@ -1124,6 +1140,14 @@ typedef struct MoraineFileColumnStatsRow {
   bool contains_nan;
   // `extra_stats`, owned, null if absent.
   char *extra_stats;
+  // Whether `min_is_exact` is present.
+  bool has_min_is_exact;
+  // `min_is_exact`, valid iff `has_min_is_exact`.
+  bool min_is_exact;
+  // Whether `max_is_exact` is present.
+  bool has_max_is_exact;
+  // `max_is_exact`, valid iff `has_max_is_exact`.
+  bool max_is_exact;
 } MoraineFileColumnStatsRow;
 
 // One `ducklake_tag` row, as returned by [`moraine_dump_tags`] —
@@ -1164,6 +1188,27 @@ typedef struct MoraineColumnTagRow {
   // `value`, owned.
   char *value;
 } MoraineColumnTagRow;
+
+// One `ducklake_view_column_tag` row, as returned by
+// [`moraine_dump_view_column_tags`] — flattened from the view's latest
+// record, as column tags are from their column's.
+typedef struct MoraineViewColumnTagRow {
+  // `view_id`.
+  uint64_t view_id;
+  // `column_name`, owned. A view's columns are named rather than given
+  // ids, so the name is the key within the view.
+  char *column_name;
+  // `begin_snapshot`.
+  uint64_t begin_snapshot;
+  // Whether `end_snapshot` is present.
+  bool has_end_snapshot;
+  // `end_snapshot`, valid iff `has_end_snapshot`.
+  uint64_t end_snapshot;
+  // `key`, owned.
+  char *key;
+  // `value`, owned.
+  char *value;
+} MoraineViewColumnTagRow;
 
 // One inlined row, as returned by [`moraine_inline_scan_next`]:
 // `chunk_index` names the owning chunk in the window's parallel
@@ -1426,6 +1471,37 @@ int32_t moraine_data_path(struct MoraineCatalogHandle *handle,
                           void *probe_ctx,
                           char **out,
                           struct MoraineError *err);
+
+// Writes the DuckLake catalog version this store serves to `*out`, as a
+// NUL-terminated string to free exactly once with [`moraine_string_free`].
+//
+// # Safety
+// `handle` is live and exclusively accessed; `out` is writable; `err` is
+// writable when non-null.
+int32_t moraine_catalog_version(struct MoraineCatalogHandle *handle,
+                                MoraineInterruptProbe probe,
+                                void *probe_ctx,
+                                char **out,
+                                struct MoraineError *err);
+
+// Raises the catalog version this store records to the newest shape this
+// build serves, writing the move to `*out_from`/`*out_to` as
+// NUL-terminated strings to free exactly once each with
+// [`moraine_string_free`].
+//
+// `dry_run` reports the move it would make and records nothing. Equal
+// values mean there was nothing to raise.
+//
+// # Safety
+// `handle` is live and exclusively accessed; `out_from`/`out_to` are
+// writable; `err` is writable when non-null.
+int32_t moraine_raise_catalog_version(struct MoraineCatalogHandle *handle,
+                                      bool dry_run,
+                                      MoraineInterruptProbe probe,
+                                      void *probe_ctx,
+                                      char **out_from,
+                                      char **out_to,
+                                      struct MoraineError *err);
 
 // Applies every structural format migration this binary carries that the
 // store at `path` still needs. Opens the store itself; a store carrying a
@@ -3337,6 +3413,31 @@ int32_t moraine_dump_column_tags(struct MoraineCatalogHandle *handle,
 // [`moraine_dump_column_tags`] call wrote, not yet freed.
 void moraine_dump_column_tags_free(struct MoraineColumnTagRow *items, size_t len);
 
+// Dumps every `ducklake_view_column_tag` row into
+// `*out_items`/`*out_len`.
+//
+// # Safety
+//
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
+int32_t moraine_dump_view_column_tags(struct MoraineCatalogHandle *handle,
+                                      struct MoraineViewColumnTagRow **out_items,
+                                      size_t *out_len,
+                                      MoraineInterruptProbe probe,
+                                      void *probe_ctx,
+                                      struct MoraineError *err);
+
+// Frees the array returned by [`moraine_dump_view_column_tags`].
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_view_column_tags`] call wrote, not yet freed.
+void moraine_dump_view_column_tags_free(struct MoraineViewColumnTagRow *items, size_t len);
+
 // Opens a scan of `table_id`'s inlined rows under the `scan_kind`
 // variant (`0` = `SCAN_TABLE`, `1` = `SCAN_INSERTIONS`, `2` =
 // `SCAN_DELETIONS`, `3` = `SCAN_FOR_FLUSH`) at `snapshot`, windowed from
@@ -4078,6 +4179,22 @@ int32_t moraine_tx_dump_column_tags(struct MoraineTxHandle *tx,
                                     struct MoraineColumnTagRow **out_items,
                                     size_t *out_len,
                                     struct MoraineError *err);
+
+// Dumps every `ducklake_view_column_tag` row as this transaction sees it:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_view_column_tags_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_view_column_tags(struct MoraineTxHandle *tx,
+                                         struct MoraineViewColumnTagRow **out_items,
+                                         size_t *out_len,
+                                         struct MoraineError *err);
 
 // Dumps every `ducklake_macro_impl` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over

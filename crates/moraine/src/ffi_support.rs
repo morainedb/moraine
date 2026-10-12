@@ -35,7 +35,7 @@ use crate::{
             ColumnTag, ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue,
             GcFileValue, HeadValue, MacroValue, MappingValue, OptionScopeValue, PartitionValue,
             SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue,
-            TableValue, TagValue, ViewValue,
+            TableValue, TagValue, ViewColumnTag, ViewValue,
         },
         read::{
             EntityRecord, RecordSet, read_head, scan_current_records, scan_history_records,
@@ -989,6 +989,105 @@ pub async fn dump_column_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<ColumnTag
     .await?;
 
     Ok(column_tag_rows_from(columns))
+}
+
+/// One `ducklake_view_column_tag` row, flattened from its view's record.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewColumnTagRow {
+    /// The tagged column's view.
+    pub view_id: u64,
+    /// The tagged column, named rather than given an id.
+    pub column_name: String,
+    /// Snapshot at which this tag value became visible.
+    pub begin_snapshot: u64,
+    /// Snapshot at which it was superseded, if it has been.
+    pub end_snapshot: Option<u64>,
+    /// Tag key.
+    pub key: String,
+    /// Tag value.
+    pub value: String,
+}
+
+/// The tags one view record carries, with what places the record among
+/// its view's versions.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewColumnTags {
+    /// The tagged view.
+    pub view_id: u64,
+    /// Snapshot at which this view record was superseded, if it has been.
+    pub end_snapshot: Option<u64>,
+    /// The record's tags.
+    pub tags: Vec<ViewColumnTag>,
+}
+
+impl From<&ViewValue> for ViewColumnTags {
+    fn from(view: &ViewValue) -> Self {
+        Self {
+            view_id: view.view_id,
+            end_snapshot: view.end_snapshot,
+            tags: view.column_tags.clone(),
+        }
+    }
+}
+
+/// The `ducklake_view_column_tag` rows carried by `views`, flattened from
+/// each view's latest record only, which carries the authoritative
+/// entries.
+#[doc(hidden)]
+#[must_use]
+pub fn view_column_tag_rows_from(
+    views: impl IntoIterator<Item = ViewColumnTags>,
+) -> Vec<ViewColumnTagRow> {
+    let mut latest: BTreeMap<u64, ViewColumnTags> = BTreeMap::new();
+    for view in views {
+        match latest.entry(view.view_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(view);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                // Later than the incumbent: live beats ended, higher end
+                // beats lower.
+                let newer = match (view.end_snapshot, entry.get().end_snapshot) {
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                    (Some(a), Some(b)) => a > b,
+                };
+                if newer {
+                    entry.insert(view);
+                }
+            }
+        }
+    }
+
+    latest
+        .into_values()
+        .flat_map(|view| {
+            let view_id = view.view_id;
+            view.tags.into_iter().map(move |t| ViewColumnTagRow {
+                view_id,
+                column_name: t.column_name,
+                begin_snapshot: t.begin_snapshot,
+                end_snapshot: t.end_snapshot,
+                key: t.key,
+                value: t.value,
+            })
+        })
+        .collect()
+}
+
+/// Every `ducklake_view_column_tag` row, emitted from each view's latest
+/// record only.
+#[doc(hidden)]
+pub async fn dump_view_column_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<ViewColumnTagRow>> {
+    let views = dump_entities(catalog, |r| match r {
+        EntityRecord::View(v) => Some(ViewColumnTags::from(v)),
+        _ => None,
+    })
+    .await?;
+
+    Ok(view_column_tag_rows_from(views))
 }
 
 /// One `ducklake_macro_impl` row, flattened from its macro's record.

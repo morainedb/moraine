@@ -1,0 +1,71 @@
+# name: test/sql/inlined_data_append_retry.test
+# group: [moraine]
+#
+# A losing concurrent inlined insert retries without losing or duplicating
+# appended rows.
+#
+# Two connections over one instance are the only way to make one commit lose
+# the race and retry, which is what this runner gives and the CLI cannot.
+#
+# Needs the built extension, which `cargo xtask e2e` supplies.
+
+require-env MORAINE_DUCKDB_EXT
+
+require-env MORAINE_EXTENSION_DIR
+
+# Pin one thread so the connections, not the scheduler, are the concurrency.
+statement ok
+SET threads=1;
+
+statement ok
+SET extension_directory='${MORAINE_EXTENSION_DIR}';
+
+statement ok
+INSTALL parquet;
+
+statement ok
+LOAD parquet;
+
+statement ok
+LOAD '${MORAINE_DUCKDB_EXT}';
+
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/retry-store' AS lake (DATA_PATH '__TEST_DIR__/retry-data/', DATA_INLINING_ROW_LIMIT 5000);
+
+statement ok
+CREATE TABLE lake.main.t(a INTEGER, b VARCHAR);
+
+# Seed so the inlined table exists and both writers below take the appender path.
+statement ok
+INSERT INTO lake.main.t VALUES (-1, 'seed');
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+INSERT INTO lake.main.t SELECT i, 'one' FROM range(1000) t(i);
+
+statement ok con2
+INSERT INTO lake.main.t SELECT i, 'two' FROM range(1000, 2000) t(i);
+
+statement ok con1
+COMMIT
+
+# con2 lost the race, so this commit retries; its appended rows must survive
+# exactly once.
+statement ok con2
+COMMIT
+
+query III
+SELECT count(*), count(*) FILTER (WHERE b = 'one'), count(*) FILTER (WHERE b = 'two') FROM lake.main.t
+----
+2001	1000	1000
+
+# No row id was reused across the two writers.
+query I
+SELECT count(DISTINCT rowid) FROM lake.main.t
+----
+2001

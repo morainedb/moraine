@@ -291,13 +291,33 @@ DecodeInlineChunkPieces(duckdb::ClientContext &context, const DecodedInlineSchem
 
 namespace {
 
+// The lifecycle column names an inlined table declares. Catalog version
+// 1.1-dev1 moves them behind the prefix DuckLake reserves for its own
+// columns, so a user column can never collide with one.
+struct InlinedColumnNames {
+	static constexpr const char *PREFIX = "_ducklake_";
+
+	explicit InlinedColumnNames(bool prefixed) {
+		if (prefixed) {
+			row_id = PREFIX + row_id;
+			begin_snapshot = PREFIX + begin_snapshot;
+			end_snapshot = PREFIX + end_snapshot;
+		}
+	}
+
+	std::string row_id = "row_id";
+	std::string begin_snapshot = "begin_snapshot";
+	std::string end_snapshot = "end_snapshot";
+};
+
 duckdb::CreateTableInfo BuildInlineDataTableInfo(duckdb::SchemaCatalogEntry &schema, uint64_t table_id,
                                                  uint64_t schema_version,
-                                                 const std::vector<DecodedInlineColumn> &user_columns) {
+                                                 const std::vector<DecodedInlineColumn> &user_columns,
+                                                 const InlinedColumnNames &names) {
 	duckdb::CreateTableInfo info(schema, InlinedDataTableName(table_id, schema_version));
-	info.columns.AddColumn(duckdb::ColumnDefinition("row_id", duckdb::LogicalType::BIGINT));
-	info.columns.AddColumn(duckdb::ColumnDefinition("begin_snapshot", duckdb::LogicalType::BIGINT));
-	info.columns.AddColumn(duckdb::ColumnDefinition("end_snapshot", duckdb::LogicalType::BIGINT));
+	info.columns.AddColumn(duckdb::ColumnDefinition(names.row_id, duckdb::LogicalType::BIGINT));
+	info.columns.AddColumn(duckdb::ColumnDefinition(names.begin_snapshot, duckdb::LogicalType::BIGINT));
+	info.columns.AddColumn(duckdb::ColumnDefinition(names.end_snapshot, duckdb::LogicalType::BIGINT));
 	for (auto &col : user_columns) {
 		info.columns.AddColumn(duckdb::ColumnDefinition(col.name, col.type));
 	}
@@ -774,7 +794,8 @@ duckdb::unique_ptr<MoraineInlineDataTableEntry>
 MakeInlineDataTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, MoraineCatalogHandle *handle,
                          uint64_t table_id, uint64_t schema_version,
                          const std::vector<DecodedInlineColumn> &user_columns) {
-	auto info = BuildInlineDataTableInfo(schema, table_id, schema_version, user_columns);
+	InlinedColumnNames names(catalog.Cast<MoraineCatalog>().ServesExtendedCatalog());
+	auto info = BuildInlineDataTableInfo(schema, table_id, schema_version, user_columns, names);
 	return duckdb::make_uniq<MoraineInlineDataTableEntry>(catalog, schema, info, handle, table_id, schema_version);
 }
 
@@ -782,10 +803,11 @@ duckdb::unique_ptr<MoraineInlineDeleteTableEntry> MakeInlineDeleteTableEntry(duc
                                                                              duckdb::SchemaCatalogEntry &schema,
                                                                              MoraineCatalogHandle *handle,
                                                                              uint64_t table_id) {
+	InlinedColumnNames names(catalog.Cast<MoraineCatalog>().ServesExtendedCatalog());
 	duckdb::CreateTableInfo info(schema, InlinedDeleteTableName(table_id));
 	info.columns.AddColumn(duckdb::ColumnDefinition("file_id", duckdb::LogicalType::BIGINT));
-	info.columns.AddColumn(duckdb::ColumnDefinition("row_id", duckdb::LogicalType::BIGINT));
-	info.columns.AddColumn(duckdb::ColumnDefinition("begin_snapshot", duckdb::LogicalType::BIGINT));
+	info.columns.AddColumn(duckdb::ColumnDefinition(names.row_id, duckdb::LogicalType::BIGINT));
+	info.columns.AddColumn(duckdb::ColumnDefinition(names.begin_snapshot, duckdb::LogicalType::BIGINT));
 	return duckdb::make_uniq<MoraineInlineDeleteTableEntry>(catalog, schema, info, handle, table_id);
 }
 
@@ -1227,8 +1249,13 @@ duckdb::PhysicalOperator &PlanInlineDataUpdate(duckdb::PhysicalPlanGenerator &pl
 		throw duckdb::NotImplementedException("moraine: UPDATE ... RETURNING is not supported on \"%s\"",
 		                                      op.table.name);
 	}
-	if (op.columns.size() != 1 ||
-	    !duckdb::StringUtil::CIEquals(table_entry.GetColumns().GetColumn(op.columns[0]).GetName(), "end_snapshot")) {
+	// Catalog version 1.0 declares `end_snapshot`, 1.1-dev1 the prefixed
+	// name; a table carries one or the other, never both.
+	const auto is_end_snapshot = [&](const duckdb::string &name) {
+		return duckdb::StringUtil::CIEquals(name, "end_snapshot") ||
+		       duckdb::StringUtil::CIEquals(name, std::string(InlinedColumnNames::PREFIX) + "end_snapshot");
+	};
+	if (op.columns.size() != 1 || !is_end_snapshot(table_entry.GetColumns().GetColumn(op.columns[0]).GetName())) {
 		throw duckdb::NotImplementedException(
 		    "moraine: the only UPDATE supported on \"%s\" is SET end_snapshot (the staged-row lifecycle "
 		    "convention)",

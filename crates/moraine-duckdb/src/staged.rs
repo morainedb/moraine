@@ -35,12 +35,13 @@ use crate::{
         MoraineOptionRow, MorainePartitionColumnRow, MorainePartitionInfoRow,
         MoraineScheduledDeletionRow, MoraineSchemaRow, MoraineSchemaVersionRow, MoraineSnapshotRow,
         MoraineSortExpressionRow, MoraineSortInfoRow, MoraineTableColumnStatsRow, MoraineTableRow,
-        MoraineTableStatsRow, MoraineTagRow, MoraineViewRow, column_rows, column_tag_rows,
-        data_file_rows, delete_file_rows, file_column_stats_rows, file_partition_value_rows,
-        macro_impl_rows, macro_parameter_rows, macro_rows, mapping_rows, name_mapping_rows,
-        option_rows, partition_column_rows, partition_info_rows, scheduled_deletion_rows,
-        schema_rows, schema_version_rows, snapshot_rows, sort_expression_rows, sort_info_rows,
-        table_column_stats_rows, table_rows, table_stats_rows, tag_rows, view_rows,
+        MoraineTableStatsRow, MoraineTagRow, MoraineViewColumnTagRow, MoraineViewRow, column_rows,
+        column_tag_rows, data_file_rows, delete_file_rows, file_column_stats_rows,
+        file_partition_value_rows, macro_impl_rows, macro_parameter_rows, macro_rows, mapping_rows,
+        name_mapping_rows, option_rows, partition_column_rows, partition_info_rows,
+        scheduled_deletion_rows, schema_rows, schema_version_rows, snapshot_rows,
+        sort_expression_rows, sort_info_rows, table_column_stats_rows, table_rows,
+        table_stats_rows, tag_rows, view_column_tag_rows, view_rows,
     },
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
@@ -1147,6 +1148,34 @@ pub unsafe extern "C" fn moraine_tx_dump_column_tags(
         err,
         staged::visible_column_tag_rows,
         column_tag_rows
+    )
+}
+
+/// Dumps every `ducklake_view_column_tag` row as this transaction sees it:
+/// committed rows at the transaction's read point with its own staged rows over
+/// them. Freed with `moraine_dump_view_column_tags_free`.
+///
+/// # Safety
+///
+/// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+/// not yet committed or rolled back; its catalog must still be attached.
+/// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+/// non-null, must be a valid, writable [`MoraineError`]. All for the
+/// duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_view_column_tags(
+    tx: *mut MoraineTxHandle,
+    out_items: *mut *mut MoraineViewColumnTagRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        staged::visible_view_column_tag_rows,
+        view_column_tag_rows
     )
 }
 

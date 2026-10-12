@@ -1394,6 +1394,7 @@ impl Transaction {
             mapping_id: None,
             partial_max: None,
             partition_values: file_partition_values(&file.partition_values),
+            row_group_count: None,
         });
         for entry in file.column_stats {
             self.state.put_file_column_stats(FileColumnStatsValue {
@@ -1408,6 +1409,8 @@ impl Transaction {
                 contains_nan: entry.contains_nan,
                 extra_stats: entry.extra_stats,
                 variant_stats: vec![],
+                min_is_exact: None,
+                max_is_exact: None,
             });
         }
         self.stage_file_index_entries(table, row_id_start, index_entries)?;
@@ -1586,6 +1589,7 @@ impl Transaction {
             footer_size: file.footer_size,
             encryption_key: file.encryption_key,
             partial_max: None,
+            row_group_count: None,
         });
 
         self.stage_delete_file_index_entries(table, index_entries)?;
@@ -1709,6 +1713,8 @@ impl Transaction {
             min_value: stats.min_value,
             max_value: stats.max_value,
             extra_stats: stats.extra_stats,
+            min_is_exact: None,
+            max_is_exact: None,
         });
         self.ops.push(Operation::UpdateStats {
             table_id: table.get(),
@@ -1749,6 +1755,7 @@ impl Transaction {
             dialect: dialect.to_owned(),
             sql: sql.to_owned(),
             column_aliases: None,
+            column_tags: Vec::new(),
         });
         self.ops.push(Operation::CreateView {
             schema_id: schema.get(),
@@ -1908,14 +1915,40 @@ impl Transaction {
         Ok(())
     }
 
+    /// The catalog version this transaction sees, absent when the store
+    /// records none.
+    pub(crate) fn catalog_version(&self) -> Option<String> {
+        self.state
+            .options
+            .get(&OptionScope::Global.key_components())
+            .and_then(|record| record.options.get("version").cloned())
+    }
+
+    /// Records the catalog version this store serves. Reserved from
+    /// `set_option`, because the shape moraine serves follows it; only a
+    /// raise moves it.
+    pub(crate) fn set_catalog_version(&mut self, version: &str) {
+        let components = OptionScope::Global.key_components();
+        let mut record = self
+            .state
+            .options
+            .get(&components)
+            .cloned()
+            .unwrap_or_default();
+        record
+            .options
+            .insert("version".to_owned(), version.to_owned());
+        self.state.set_option_record(components, record);
+    }
+
     /// Sets an option in a scope. Last-write-wins; an options-only
     /// commit mints no snapshot.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if the scope's schema or table does
-    /// not exist, or [`Error::Constraint`] for the reserved global
-    /// `encrypted` key.
+    /// not exist, or [`Error::Constraint`] for a reserved global key
+    /// (`encrypted`, `version`).
     pub fn set_option(&mut self, scope: OptionScope, key: &str, value: &str) -> Result<()> {
         nonempty_name("option key", key)?;
         self.live_scope(scope)?;
@@ -2343,6 +2376,7 @@ impl Transaction {
             mapping_id: None,
             partial_max: flush.partial_max.map(SnapshotId::get),
             partition_values: file_partition_values(&flush.file.partition_values),
+            row_group_count: None,
         });
         for entry in &flush.file.column_stats {
             self.state.put_file_column_stats(FileColumnStatsValue {
@@ -2357,6 +2391,8 @@ impl Transaction {
                 contains_nan: entry.contains_nan,
                 extra_stats: entry.extra_stats.clone(),
                 variant_stats: vec![],
+                min_is_exact: None,
+                max_is_exact: None,
             });
         }
 
@@ -2369,14 +2405,23 @@ impl Transaction {
     }
 }
 
-/// Refuses the global `encrypted` key, which is fixed at catalog creation.
+/// Refuses the global keys that are store facts rather than settings:
+/// `encrypted` is fixed at catalog creation, and `version` names the
+/// catalog shape, which only a catalog-version raise moves.
 fn reserved_option(scope: OptionScope, key: &str) -> Result<()> {
-    if scope == OptionScope::Global && key == "encrypted" {
-        return Err(Error::Constraint(
-            "the global `encrypted` option is fixed at catalog creation".to_string(),
-        ));
+    if scope != OptionScope::Global {
+        return Ok(());
     }
-    Ok(())
+    match key {
+        "encrypted" => Err(Error::Constraint(
+            "the global `encrypted` option is fixed at catalog creation".to_string(),
+        )),
+        "version" => Err(Error::Constraint(
+            "the global `version` option names the catalog shape; only a migration moves it"
+                .to_string(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Refuses an empty name; `what` names the rejected item in the error.
@@ -3498,6 +3543,27 @@ mod tests {
 
     /// The global `encrypted` option is fixed at catalog creation: set and
     /// unset both refuse it, while a non-global `encrypted` key (or any
+    #[test]
+    fn global_version_option_is_reserved() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+
+        assert!(matches!(
+            transaction.set_option(OptionScope::Global, "version", "1.1-dev1"),
+            Err(Error::Constraint(_))
+        ));
+        assert!(matches!(
+            transaction.unset_option(OptionScope::Global, "version"),
+            Err(Error::Constraint(_))
+        ));
+
+        // Table scope is a user setting of the same name, not the fact.
+        transaction
+            .set_option(OptionScope::Table(t), "version", "x")
+            .unwrap();
+    }
+
     /// other global key) stays writable.
     #[test]
     fn global_encrypted_option_is_reserved() {
@@ -3559,6 +3625,7 @@ mod tests {
             mapping_id: None,
             partial_max: None,
             partition_values: vec![],
+            row_group_count: None,
         });
     }
 
@@ -3766,6 +3833,7 @@ mod tests {
             mapping_id: None,
             partial_max: None,
             partition_values: vec![],
+            row_group_count: None,
         });
 
         let err = transaction

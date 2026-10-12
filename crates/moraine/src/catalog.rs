@@ -53,12 +53,13 @@ pub(crate) fn resolve_data_path(
         .map_err(|error| crate::error::Error::Corruption(format!("invalid data path: {error}")))
 }
 pub use types::{
-    BuildStep, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats,
-    DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats,
-    FileIndexEntry, FileIndexRemoval, FileRowCandidate, FlushedDataFile, IndexDef, IndexEntry,
-    IndexId, IndexInfo, IndexMaintenance, IndexState, InlineChunk, MacroId, MacroImplementationDef,
-    MacroInfo, MacroParameterDef, MappingId, MappingInfo, NameMappingDef, OptionScope,
-    PartitionColumnDef, PartitionId, PartitionSpec, RecentRow, ScheduledDeletion, SchemaId,
-    SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCheckpoint, TableId,
-    TableInfo, TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo,
+    BuildStep, CATALOG_VERSION, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder,
+    ColumnStats, DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo,
+    FileColumnStats, FileIndexEntry, FileIndexRemoval, FileRowCandidate, FlushedDataFile, IndexDef,
+    IndexEntry, IndexId, IndexInfo, IndexMaintenance, IndexState, InlineChunk, MAX_CATALOG_VERSION,
+    MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, MappingId, MappingInfo,
+    NameMappingDef, OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, RecentRow,
+    ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef,
+    SortSpec, StoreCheckpoint, TableId, TableInfo, TableStats, TagEntry, TagTarget, Timestamp,
+    ViewId, ViewInfo,
 };

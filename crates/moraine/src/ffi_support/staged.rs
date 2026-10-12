@@ -164,6 +164,30 @@ pub async fn visible_column_tag_rows(
     Ok(rows)
 }
 
+/// `ducklake_view_column_tag` rows as `tx` sees them.
+///
+/// # Errors
+///
+/// Returns an error if the scan fails or a staged row is malformed.
+#[doc(hidden)]
+pub async fn visible_view_column_tag_rows(
+    tx: &StagedTransaction,
+) -> Result<Vec<crate::ffi_support::ViewColumnTagRow>> {
+    Ok(tx
+        .visible_view_column_tags()
+        .await?
+        .into_iter()
+        .map(|(view_id, tag)| crate::ffi_support::ViewColumnTagRow {
+            view_id,
+            column_name: tag.column_name,
+            begin_snapshot: tag.begin_snapshot,
+            end_snapshot: tag.end_snapshot,
+            key: tag.key,
+            value: tag.value,
+        })
+        .collect())
+}
+
 /// `ducklake_macro_impl` rows as `tx` sees them.
 ///
 /// # Errors

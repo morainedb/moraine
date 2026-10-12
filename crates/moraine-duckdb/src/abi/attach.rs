@@ -960,6 +960,104 @@ pub unsafe extern "C" fn moraine_data_path(
     }
 }
 
+/// Writes the DuckLake catalog version this store serves to `*out`, as a
+/// NUL-terminated string to free exactly once with [`moraine_string_free`].
+///
+/// # Safety
+/// `handle` is live and exclusively accessed; `out` is writable; `err` is
+/// writable when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_catalog_version(
+    handle: *mut MoraineCatalogHandle,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    out: *mut *mut c_char,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out.is_null() {
+            return Err(AbiError::invalid_argument("`out` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+        }?;
+        let version = snapshot
+            .option(moraine::OptionScope::Global, "version")
+            .unwrap_or_else(|| moraine::CATALOG_VERSION.to_string());
+        let version_ptr = to_c_string(version)?.into_raw();
+        // SAFETY: `out` is non-null and writable per the caller contract.
+        unsafe { *out = version_ptr };
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Raises the catalog version this store records to the newest shape this
+/// build serves, writing the move to `*out_from`/`*out_to` as
+/// NUL-terminated strings to free exactly once each with
+/// [`moraine_string_free`].
+///
+/// `dry_run` reports the move it would make and records nothing. Equal
+/// values mean there was nothing to raise.
+///
+/// # Safety
+/// `handle` is live and exclusively accessed; `out_from`/`out_to` are
+/// writable; `err` is writable when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_raise_catalog_version(
+    handle: *mut MoraineCatalogHandle,
+    dry_run: bool,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    out_from: *mut *mut c_char,
+    out_to: *mut *mut c_char,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_from.is_null() || out_to.is_null() {
+            return Err(AbiError::invalid_argument("`out_from`/`out_to` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let raised = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref.catalog.writer()?.raise_catalog_version(dry_run),
+            )
+        }?;
+        let from = to_c_string(raised.from)?.into_raw();
+        let to = to_c_string(raised.to)?.into_raw();
+        // SAFETY: both checked non-null above; caller contract.
+        unsafe {
+            *out_from = from;
+            *out_to = to;
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
 /// What one [`moraine_migrate`] call did.
 #[repr(C)]
 pub struct MoraineMigrationReport {

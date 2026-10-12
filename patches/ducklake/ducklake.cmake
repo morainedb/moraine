@@ -34,7 +34,7 @@ else()
             ${GIT_EXECUTABLE} apply
             ${CMAKE_CURRENT_LIST_DIR}/0001-perf-prune-DuckLake-files-by-row-id.patch
             ${CMAKE_CURRENT_LIST_DIR}/0002-feat-expose-DuckLake-data-file-ids-to-scans.patch
-            ${CMAKE_CURRENT_LIST_DIR}/0003-perf-append-DuckLake-inlined-data-rows.patch
+            ${CMAKE_CURRENT_LIST_DIR}/0003-feat-share-the-DuckLake-inlined-table-cache.patch
             ${CMAKE_CURRENT_LIST_DIR}/0004-fix-retain-files-after-unknown-commit-outcomes.patch
             ${CMAKE_CURRENT_LIST_DIR}/0005-feat-change-DuckLake-rows-by-position.patch
             ${CMAKE_CURRENT_LIST_DIR}/0006-perf-name-the-table-a-dropped-file-belongs-to.patch

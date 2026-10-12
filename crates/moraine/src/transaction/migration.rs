@@ -71,6 +71,22 @@ pub struct FormatRaise {
     pub to_format: u64,
 }
 
+/// What one catalog-version raise did.
+///
+/// A separate axis from [`FormatRaise`]: the store format is how moraine
+/// writes bytes, while the catalog version is the shape it serves
+/// DuckLake. They move on their own schedules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CatalogVersionRaise {
+    /// The catalog version the store recorded when the call began.
+    pub from: String,
+    /// The newest version this build serves. A dry run reports the move
+    /// it would make without recording it; equal to `from` when there was
+    /// nothing to raise.
+    pub to: String,
+}
+
 /// The highest format `current` can reach without a structural rewrite:
 /// this binary's newest, stopped below the first format some migration
 /// unit reads. Past that one the keys have moved, and only that unit puts

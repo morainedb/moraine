@@ -351,10 +351,18 @@ fn stage_bootstrap(
             path_is_relative: true,
         }),
     );
-    let mut options = std::collections::HashMap::from([(
-        "encrypted".to_string(),
-        if encrypted { "true" } else { "false" }.to_string(),
-    )]);
+    let mut options = std::collections::HashMap::from([
+        (
+            "encrypted".to_string(),
+            if encrypted { "true" } else { "false" }.to_string(),
+        ),
+        // The catalog shape this store serves. A store written before this
+        // was recorded has no row, which reads as the same version.
+        (
+            "version".to_string(),
+            crate::catalog::CATALOG_VERSION.to_string(),
+        ),
+    ]);
     if let Some(path) = data_path {
         options.insert("data_path".to_string(), path.to_string());
     }

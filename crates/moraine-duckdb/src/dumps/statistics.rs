@@ -118,6 +118,14 @@ pub struct MoraineTableColumnStatsRow {
     pub max_value: *mut c_char,
     /// `extra_stats`, owned, null if absent.
     pub extra_stats: *mut c_char,
+    /// Whether `min_is_exact` is present.
+    pub has_min_is_exact: bool,
+    /// `min_is_exact`, valid iff `has_min_is_exact`.
+    pub min_is_exact: bool,
+    /// Whether `max_is_exact` is present.
+    pub has_max_is_exact: bool,
+    /// `max_is_exact`, valid iff `has_max_is_exact`.
+    pub max_is_exact: bool,
 }
 
 /// Converts core `ducklake_table_column_stats` records into the C row shape.
@@ -140,6 +148,8 @@ pub(crate) fn table_column_stats_rows(
         .map(|(v, min_value, max_value, extra_stats)| {
             let (has_null, contains_null) = opt_bool(v.contains_null);
             let (has_nan, contains_nan) = opt_bool(v.contains_nan);
+            let (has_min_is_exact, min_is_exact) = opt_bool(v.min_is_exact);
+            let (has_max_is_exact, max_is_exact) = opt_bool(v.max_is_exact);
             MoraineTableColumnStatsRow {
                 table_id: v.table_id,
                 column_id: v.column_id,
@@ -150,6 +160,10 @@ pub(crate) fn table_column_stats_rows(
                 min_value: opt_into_raw(min_value),
                 max_value: opt_into_raw(max_value),
                 extra_stats: opt_into_raw(extra_stats),
+                has_min_is_exact,
+                min_is_exact,
+                has_max_is_exact,
+                max_is_exact,
             }
         })
         .collect())
@@ -238,6 +252,14 @@ pub struct MoraineFileColumnStatsRow {
     pub contains_nan: bool,
     /// `extra_stats`, owned, null if absent.
     pub extra_stats: *mut c_char,
+    /// Whether `min_is_exact` is present.
+    pub has_min_is_exact: bool,
+    /// `min_is_exact`, valid iff `has_min_is_exact`.
+    pub min_is_exact: bool,
+    /// Whether `max_is_exact` is present.
+    pub has_max_is_exact: bool,
+    /// `max_is_exact`, valid iff `has_max_is_exact`.
+    pub max_is_exact: bool,
 }
 
 /// Converts core `ducklake_file_column_stats` records into the C row shape.
@@ -259,6 +281,8 @@ pub(crate) fn file_column_stats_rows(
         .into_iter()
         .map(|(v, min_value, max_value, extra_stats)| {
             let (has_nan, contains_nan) = opt_bool(v.contains_nan);
+            let (has_min_is_exact, min_is_exact) = opt_bool(v.min_is_exact);
+            let (has_max_is_exact, max_is_exact) = opt_bool(v.max_is_exact);
             MoraineFileColumnStatsRow {
                 data_file_id: v.data_file_id,
                 table_id: v.table_id,
@@ -271,6 +295,10 @@ pub(crate) fn file_column_stats_rows(
                 has_contains_nan: has_nan,
                 contains_nan,
                 extra_stats: opt_into_raw(extra_stats),
+                has_min_is_exact,
+                min_is_exact,
+                has_max_is_exact,
+                max_is_exact,
             }
         })
         .collect())
