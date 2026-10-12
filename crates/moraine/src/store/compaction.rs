@@ -17,7 +17,10 @@ use slatedb::{
     config::CompactorOptions,
 };
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    store::key::{Subspace, subspace_prefix},
+};
 
 /// How often a wait re-reads the compactions file (SlateDB's compactor
 /// poll cadence).
@@ -42,15 +45,15 @@ pub(crate) enum MergeEnd {
     Pending,
 }
 
-/// Plans and submits a full merge of `segment` (of every segment, when
-/// `None`), returning one entry per merge to wait on. A tree with no
-/// compacted sorted runs yields none. A tree already being merged is
-/// adopted: its in-flight compaction is returned instead of a second
+/// Plans and submits a full merge of `subspace`'s segment (of every
+/// segment, when `None`), returning one entry per merge to wait on. A tree
+/// with no compacted sorted runs yields none. A tree already being merged
+/// is adopted: its in-flight compaction is returned instead of a second
 /// submission, which the executor would refuse.
 pub(crate) async fn submit_full_merge(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
-    segment: Option<&[u8]>,
+    subspace: Option<Subspace>,
 ) -> Result<Vec<SubmittedMerge>> {
     let admin = AdminBuilder::new(path, object_store).build();
     let state = admin
@@ -58,7 +61,8 @@ pub(crate) async fn submit_full_merge(
         .await
         .map_err(Error::from)?;
 
-    let request = match segment {
+    let segment = subspace.map(subspace_prefix);
+    let request = match &segment {
         Some(prefix) => CompactionRequest::FullSegment {
             segment: Bytes::copy_from_slice(prefix),
         },
@@ -159,7 +163,7 @@ mod tests {
     use super::*;
     use crate::store::{
         census::{ManifestCensus, read_manifest_census},
-        key::{EntityKey, Key, Subspace, subspace_prefix},
+        key::{EntityKey, Key},
         segment::TagSegmentExtractor,
     };
 
@@ -180,7 +184,7 @@ mod tests {
             .unwrap();
         assert!(whole.is_empty(), "{whole:?}");
 
-        let named = submit_full_merge("merge/fresh", store, Some(&current_prefix()))
+        let named = submit_full_merge("merge/fresh", store, Some(Subspace::Current))
             .await
             .unwrap();
         assert!(named.is_empty(), "{named:?}");
@@ -195,16 +199,16 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let rounds = 8;
         let before = churned_store("merge/reclaim", Arc::clone(&store), rounds).await;
-        let before = before.segment(&current_prefix()).cloned().expect("current");
+        let before = before.segment(Subspace::Current).cloned().expect("current");
         assert!(before.sorted_runs > 1, "{before:?}");
 
         let db = open_writer("merge/reclaim", Arc::clone(&store)).await;
-        merge_and_wait("merge/reclaim", Arc::clone(&store), Some(&current_prefix())).await;
+        merge_and_wait("merge/reclaim", Arc::clone(&store), Some(Subspace::Current)).await;
 
         let after = read_manifest_census("merge/reclaim", Arc::clone(&store), None)
             .await
             .unwrap();
-        let after = after.segment(&current_prefix()).cloned().expect("current");
+        let after = after.segment(Subspace::Current).cloned().expect("current");
 
         assert!(
             after.bytes < before.bytes,
@@ -243,14 +247,14 @@ mod tests {
         merge_and_wait(
             "merge/tombstone",
             Arc::clone(&store),
-            Some(&current_prefix()),
+            Some(Subspace::Current),
         )
         .await;
 
         let census = read_manifest_census("merge/tombstone", Arc::clone(&store), None)
             .await
             .unwrap();
-        let current = census.segment(&current_prefix()).cloned().expect("current");
+        let current = census.segment(Subspace::Current).cloned().expect("current");
 
         // Every key of the subspace was deleted, so a merge that dropped the
         // tombstones leaves the bottom run holding no SST at all.
@@ -272,22 +276,24 @@ mod tests {
     #[tokio::test]
     async fn merging_one_subspace_leaves_the_others_alone() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let snapshots = subspace_prefix(Subspace::Snapshot);
         let before = churned_store("merge/isolated", Arc::clone(&store), 8).await;
-        let before = before.segment(&snapshots).cloned().expect("snapshot");
+        let before = before
+            .segment(Subspace::Snapshot)
+            .cloned()
+            .expect("snapshot");
 
         let _db = open_writer("merge/isolated", Arc::clone(&store)).await;
         merge_and_wait(
             "merge/isolated",
             Arc::clone(&store),
-            Some(&current_prefix()),
+            Some(Subspace::Current),
         )
         .await;
 
         let after = read_manifest_census("merge/isolated", store, None)
             .await
             .unwrap();
-        assert_eq!(after.segment(&snapshots), Some(&before));
+        assert_eq!(after.segment(Subspace::Snapshot), Some(&before));
     }
 
     /// A tree already being merged is adopted: the second caller waits on
@@ -297,12 +303,12 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         churned_store("merge/busy", Arc::clone(&store), 8).await;
 
-        let first = submit_full_merge("merge/busy", Arc::clone(&store), Some(&current_prefix()))
+        let first = submit_full_merge("merge/busy", Arc::clone(&store), Some(Subspace::Current))
             .await
             .unwrap();
         assert_eq!(first.len(), 1, "{first:?}");
 
-        let second = submit_full_merge("merge/busy", store, Some(&current_prefix()))
+        let second = submit_full_merge("merge/busy", store, Some(Subspace::Current))
             .await
             .unwrap();
         assert_eq!(second.len(), 1, "{second:?}");
@@ -435,9 +441,9 @@ mod tests {
     async fn merge_and_wait(
         path: &str,
         object_store: Arc<dyn ObjectStore>,
-        segment: Option<&[u8]>,
+        subspace: Option<Subspace>,
     ) {
-        let submitted = submit_full_merge(path, Arc::clone(&object_store), segment)
+        let submitted = submit_full_merge(path, Arc::clone(&object_store), subspace)
             .await
             .unwrap();
         assert!(!submitted.is_empty(), "nothing submitted");

@@ -12,7 +12,7 @@ use crate::{
     store::{
         handle::{ReadHandle, ScanShape},
         key::{
-            CurrentKey, EntityKey, EntityKind, Key, SPLIT_SCAN_KINDS, Subspace, SysKey,
+            CurrentKey, EntityKey, EntityKind, HistoryKey, Key, SPLIT_SCAN_KINDS, Subspace, SysKey,
             TableScopedKind, current_entity_kind_prefix, current_gc_file_prefix,
             current_table_prefix, history_entity_kind_prefix, history_table_prefix,
             subspace_prefix,
@@ -239,6 +239,30 @@ pub(crate) async fn scan_keys<T>(
     }
 
     Ok(records)
+}
+
+/// Calls `visit` with every ended-version key of `kind`, in key order. The
+/// values are never decoded.
+pub(crate) async fn visit_history_keys(
+    handle: ReadHandle<'_>,
+    kind: EntityKind,
+    mut visit: impl FnMut(HistoryKey),
+) -> Result<()> {
+    let mut iter = handle
+        .scan_prefix(history_entity_kind_prefix(kind), .., ScanShape::Bulk)
+        .await?;
+    while let Some(entry) = iter.next().await? {
+        match Key::decode(&entry.key)? {
+            Key::History(history) => visit(history),
+            other => {
+                return Err(Error::Corruption(format!(
+                    "non-history key in history scan: {other:?}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// As [`scan_decode`], splitting each of `splits` (the data-scaled kinds'

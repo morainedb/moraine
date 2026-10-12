@@ -17,7 +17,8 @@ use crate::{
     store::{
         handle::ScanShape,
         index_encoding::{Direction, IndexKeyValue, NullOrder, encode_ordered_index_entry},
-        key::{IndexKind, index_index_prefix},
+        index_entries::scan_index_entries,
+        key::IndexKind,
         proto::{DataFileValue, DeleteFileValue, InlineBuildCursorValue},
     },
     telemetry::reporting_phase,
@@ -987,13 +988,8 @@ async fn establish_filter(
     filter: &mut BuildFilter,
 ) -> Result<()> {
     let started = Instant::now();
-    let mut keys = handle
-        .scan_prefix(
-            index_index_prefix(IndexKind::Unique, index.get()),
-            ..,
-            ScanShape::Bulk,
-        )
-        .await?;
+    let mut keys =
+        scan_index_entries(handle, IndexKind::Unique, index.get(), ScanShape::Bulk).await?;
     let mut scanned = 0u64;
     while let Some(entry) = keys.next().await? {
         filter.insert(&entry.key);

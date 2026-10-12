@@ -28,6 +28,7 @@ use crate::{
         StagedBytes,
         handle::{ReadHandle, ScanOrder, ScanShape},
         index_encoding::{CanonicalKey, NullOrder, non_null_flag_key},
+        index_entries::{decode_row_id, encode_row_id},
         key::{
             IndexKey, IndexKind, Key, encode_index_entry, index_index_prefix,
             index_multi_value_prefix, index_value_above, index_value_body, index_value_suffix,
@@ -62,17 +63,6 @@ pub(crate) struct StagedIndexEntry {
     /// The caller established the entry names this row in committed state,
     /// so a unique delete needs no read before it.
     pub(crate) known_held: bool,
-}
-
-/// A unique entry's value is the holding row id, big-endian.
-fn decode_row_id(bytes: &[u8]) -> Result<u64> {
-    let array: [u8; 8] = bytes.try_into().map_err(|_| {
-        Error::Corruption(format!(
-            "index entry value is {} bytes, expected 8",
-            bytes.len()
-        ))
-    })?;
-    Ok(u64::from_be_bytes(array))
 }
 
 /// Uniqueness probes in flight at once; sized for a remote object store.
@@ -504,7 +494,7 @@ fn stage_probe_put(
     let value_bytes = row_id.map_or(0, |_| size_of::<u64>());
     staged.add(key.len(), value_bytes);
     match row_id {
-        Some(row_id) => db_tx.put(key, row_id.to_be_bytes()),
+        Some(row_id) => db_tx.put(key, encode_row_id(row_id)),
         None => db_tx.put(key, []),
     }
     .map_err(Error::from)
