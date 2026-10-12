@@ -13,11 +13,7 @@ use crate::{
     catalog::{IndexState, TableId},
     data_file::DataStore,
     error::{Error, Result},
-    store::{
-        handle::ScanShape,
-        key::{IndexKey, IndexKind, Key, index_index_prefix},
-        proto::InlineBuildCursorValue,
-    },
+    store::{index_entries::stored_index_entries, proto::InlineBuildCursorValue},
     transaction::EncodedIndexEntry,
 };
 
@@ -111,44 +107,22 @@ impl VerifySink {
 }
 
 /// Every entry the index holds, keyed by its encoded bytes.
-///
-/// Both keyspaces are scanned whatever the index's uniqueness, because a
-/// NULL is collision-exempt: an entry carrying one takes the multi shape
-/// even on a unique index, so a unique index holds entries of both kinds.
-/// Only a unique-shaped entry names its row in the value; a multi-shaped
-/// one carries the row id in the key.
 async fn stored_entries(
     handle: crate::store::handle::ReadHandle<'_>,
     info: &crate::IndexInfo,
 ) -> Result<HashMap<Vec<u8>, StoredEntry>> {
     let mut stored = HashMap::new();
-    for kind in [IndexKind::Unique, IndexKind::Multi] {
-        let mut entries = handle
-            .scan_prefix(index_index_prefix(kind, info.id.get()), .., ScanShape::Bulk)
-            .await?;
-        while let Some(entry) = entries.next().await? {
-            let row_id = match Key::decode(&entry.key)? {
-                Key::Index(IndexKey::Unique { .. }) => <[u8; 8]>::try_from(entry.value.as_ref())
-                    .map(u64::from_be_bytes)
-                    .map_err(|_| {
-                        Error::Corruption(format!(
-                            "unique index {} holds a {}-byte row id",
-                            info.name,
-                            entry.value.len()
-                        ))
-                    })?,
-                Key::Index(IndexKey::Multi { row_id, .. }) => row_id,
-                _ => return Err(Error::Corruption("unexpected index entry key".into())),
-            };
-            stored.insert(
-                entry.key.to_vec(),
-                StoredEntry {
-                    row_id,
-                    claimed: false,
-                },
-            );
-        }
+    let mut entries = stored_index_entries(handle, info.id.get());
+    while let Some(entry) = entries.next().await? {
+        stored.insert(
+            entry.key.to_vec(),
+            StoredEntry {
+                row_id: entry.row_id,
+                claimed: false,
+            },
+        );
     }
+
     Ok(stored)
 }
 

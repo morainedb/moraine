@@ -420,14 +420,7 @@ fn warn_if_caches_cannot_hold(path: &str, manifest: Option<&census::ManifestByte
     warn_if_metadata_cache_cannot_hold(path, manifest.map(|manifest| manifest.metadata_bytes));
     warn_if_block_cache_cannot_hold_index(
         path,
-        manifest.and_then(|manifest| {
-            let index = crate::store::key::subspace_prefix(crate::store::key::Subspace::Index);
-            manifest
-                .segments
-                .iter()
-                .find(|segment| segment.prefix == index)
-                .map(|segment| segment.bytes)
-        }),
+        manifest.and_then(|manifest| manifest.subspace_bytes(crate::store::key::Subspace::Index)),
     );
 }
 

@@ -86,13 +86,16 @@ pub(crate) struct ManifestCensus {
 }
 
 impl ManifestCensus {
-    /// The recorded size of the segment named by `prefix`, if the manifest
-    /// carries one.
-    pub(crate) fn segment(&self, prefix: &[u8]) -> Option<&SegmentSize> {
-        self.segments
-            .iter()
-            .find(|segment| segment.prefix == prefix)
+    /// The recorded size of `subspace`'s segment, if the manifest carries
+    /// one.
+    pub(crate) fn segment(&self, subspace: Subspace) -> Option<&SegmentSize> {
+        segment_of(&self.segments, subspace)
     }
+}
+
+fn segment_of(segments: &[SegmentSize], subspace: Subspace) -> Option<&SegmentSize> {
+    let prefix = subspace_prefix(subspace);
+    segments.iter().find(|segment| segment.prefix == prefix)
 }
 
 /// Live keys and bytes of one subspace, as a scan finds them.
@@ -139,6 +142,14 @@ pub(crate) struct ManifestBytes {
     pub(crate) store_bytes: u64,
     pub(crate) metadata_bytes: u64,
     pub(crate) segments: Vec<SegmentSize>,
+}
+
+impl ManifestBytes {
+    /// The physical bytes of `subspace`'s segment, if the manifest carries
+    /// one.
+    pub(crate) fn subspace_bytes(&self, subspace: Subspace) -> Option<u64> {
+        segment_of(&self.segments, subspace).map(|segment| segment.bytes)
+    }
 }
 
 /// The manifest's byte totals, from one manifest read.
@@ -361,9 +372,7 @@ mod tests {
             .await
             .unwrap();
 
-        let current = census
-            .segment(&subspace_prefix(Subspace::Current))
-            .expect("current segment");
+        let current = census.segment(Subspace::Current).expect("current segment");
         assert!(current.bytes > 0, "current: {current:?}");
         assert!(current.index_bytes > 0, "current: {current:?}");
         assert!(
@@ -372,16 +381,18 @@ mod tests {
         );
         assert!(current.stats_bytes <= current.bytes, "current: {current:?}");
         assert_eq!(current.l0_ssts, 1, "current: {current:?}");
-        assert!(
-            census
-                .segment(&subspace_prefix(Subspace::Snapshot))
-                .is_some()
-        );
-        assert!(census.segment(&subspace_prefix(Subspace::Index)).is_none());
+        assert!(census.segment(Subspace::Snapshot).is_some());
+        assert!(census.segment(Subspace::Index).is_none());
 
         // The root tree stays empty under an extractor-configured store, so
         // it is reported not at all rather than as a zero row.
-        assert!(census.segment(&[]).is_none(), "{census:?}");
+        assert!(
+            census
+                .segments
+                .iter()
+                .all(|segment| !segment.prefix.is_empty()),
+            "{census:?}"
+        );
     }
 
     /// The shorthand agrees with the full census, across every segment and

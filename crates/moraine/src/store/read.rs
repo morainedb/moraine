@@ -12,7 +12,7 @@ use crate::{
     store::{
         handle::{ReadHandle, ScanShape},
         key::{
-            CurrentKey, EntityKey, EntityKind, Key, SPLIT_SCAN_KINDS, Subspace, SysKey,
+            CurrentKey, EntityKey, EntityKind, HistoryKey, Key, SPLIT_SCAN_KINDS, Subspace, SysKey,
             TableScopedKind, current_entity_kind_prefix, current_gc_file_prefix,
             current_table_prefix, history_entity_kind_prefix, history_table_prefix,
             subspace_prefix,
@@ -239,6 +239,30 @@ pub(crate) async fn scan_keys<T>(
     }
 
     Ok(records)
+}
+
+/// Calls `visit` with every ended-version key of `kind`, in key order. The
+/// values are never decoded.
+pub(crate) async fn visit_history_keys(
+    handle: ReadHandle<'_>,
+    kind: EntityKind,
+    mut visit: impl FnMut(HistoryKey),
+) -> Result<()> {
+    let mut iter = handle
+        .scan_prefix(history_entity_kind_prefix(kind), .., ScanShape::Bulk)
+        .await?;
+    while let Some(entry) = iter.next().await? {
+        match Key::decode(&entry.key)? {
+            Key::History(history) => visit(history),
+            other => {
+                return Err(Error::Corruption(format!(
+                    "non-history key in history scan: {other:?}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// As [`scan_decode`], splitting each of `splits` (the data-scaled kinds'
@@ -688,6 +712,38 @@ mod tests {
 
     use super::*;
     use crate::store::open::StoreBuilder;
+
+    #[tokio::test]
+    async fn history_key_visits_ignore_values_but_refuse_corrupt_keys() {
+        let (db, _) = StoreBuilder::new("history-keys", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let entity = EntityKey::File {
+            table_id: 1,
+            data_file_id: 2,
+        };
+        tx.put(Key::history(entity, 3).encode(), [0xff]).unwrap();
+        tx.put(history_entity_kind_prefix(EntityKind::Schema), [0xff])
+            .unwrap();
+
+        let mut keys = Vec::new();
+        visit_history_keys(ReadHandle::Tx(&tx), EntityKind::File, |key| keys.push(key))
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].entity, entity);
+
+        tx.put(history_entity_kind_prefix(EntityKind::File), [0xff])
+            .unwrap();
+        assert!(matches!(
+            visit_history_keys(ReadHandle::Tx(&tx), EntityKind::File, |_| {}).await,
+            Err(Error::Corruption(_))
+        ));
+        tx.rollback();
+        db.close().await.unwrap();
+    }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]

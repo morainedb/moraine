@@ -13,14 +13,13 @@ use bytes::Bytes;
 
 use crate::{
     catalog::CatalogSnapshot,
+    error::{Error, Result},
     store::{
+        batch::{BatchWrite, DecodedValue, decode_batch},
         inline::InlineChunkLocator,
         key::{CurrentKey, EntityKey, InlineKey, InlineOperation, Key, SysKey},
-        proto::{
-            HeadValue, InlineChunkRangeValue, SnapshotValue, TableColumnStatsValue, TableStatsValue,
-        },
-        read::{EntityRecord, RecordSet, decode_current_record, decode_history_record},
-        value,
+        proto::{HeadValue, SnapshotValue, TableColumnStatsValue, TableStatsValue},
+        read::{EntityRecord, RecordSet},
     },
     transaction::commit::StagedWrite,
 };
@@ -40,8 +39,8 @@ struct InlineFold {
 }
 
 impl InlineFold {
-    fn observe(&mut self, key: &Key, bytes: Option<&[u8]>) {
-        match key {
+    fn observe(&mut self, write: &BatchWrite<'_>) {
+        match write.key() {
             Key::Inline(InlineKey::ChunkLocator {
                 table_id,
                 row_id_end,
@@ -55,18 +54,18 @@ impl InlineFold {
                     begin_snapshot: *begin_snapshot,
                     chunk_seq: *chunk_seq,
                 };
-                let located = bytes
-                    .map(|bytes| {
-                        value::decode_owned::<InlineChunkRangeValue>(Bytes::copy_from_slice(bytes))
-                            .and_then(|range| {
-                                InlineChunkLocator::from_directory(
-                                    operation,
-                                    range.row_id_start,
-                                    *row_id_end,
-                                )
-                            })
-                    })
-                    .transpose();
+                let located = write.value().and_then(|value| match value {
+                    None => Ok(None),
+                    Some(DecodedValue::InlineChunkRange(range)) => {
+                        InlineChunkLocator::from_directory(
+                            operation,
+                            range.row_id_start,
+                            *row_id_end,
+                        )
+                        .map(Some)
+                    }
+                    Some(_) => Err(unexpected_value(write.key())),
+                });
                 match located {
                     Ok(locator) => self.writes.push((*table_id, operation, locator)),
                     Err(_) => {
@@ -125,14 +124,35 @@ struct Maintained<K: Ord, V> {
 /// The head record a batch leaves behind: the last head write in the
 /// batch, since a group commit stages one per member and the store keeps
 /// the final write of a key.
-fn head_stamp(writes: &[StagedWrite]) -> Option<HeadValue> {
-    let head_key = Key::Sys(SysKey::Head).encode();
-    writes.iter().rev().find_map(|(key, bytes)| {
-        (key == &head_key)
-            .then_some(bytes.as_ref())
-            .flatten()
-            .and_then(|bytes| value::decode_value::<HeadValue>(bytes).ok())
-    })
+fn head_stamp(writes: &[BatchWrite<'_>]) -> Option<HeadValue> {
+    writes
+        .iter()
+        .rev()
+        .filter(|write| matches!(write.key(), Key::Sys(SysKey::Head)))
+        .find_map(|write| match write.value() {
+            Ok(Some(DecodedValue::Head(head))) => Some(head),
+            _ => None,
+        })
+}
+
+/// A value decoded as a kind its key does not hold; unreachable through
+/// the store's own decoder, so reported as corruption.
+fn unexpected_value(key: &Key) -> Error {
+    Error::Corruption(format!("value at {key:?} decoded as another kind"))
+}
+
+/// The value of `write` as the row a maintained projection holds, `None`
+/// for a delete.
+fn projected<V>(
+    write: &BatchWrite<'_>,
+    pick: impl FnOnce(DecodedValue) -> Option<V>,
+) -> Result<Option<V>> {
+    match write.value()? {
+        None => Ok(None),
+        Some(value) => pick(value)
+            .map(Some)
+            .ok_or_else(|| unexpected_value(write.key())),
+    }
 }
 
 /// Copies a served projection's rows out. Called after the cache lock is
@@ -155,35 +175,29 @@ enum Half {
 
 /// Folds one write into `half`: a put replaces the record at its key, a
 /// delete removes it. A value this binary cannot decode drops the half.
-fn fold_record(
-    half: &mut RecordHalf,
-    encoded_key: &[u8],
-    bytes: Option<&[u8]>,
-    decode: impl FnOnce(&[u8]) -> crate::error::Result<EntityRecord>,
-) {
+fn fold_record(half: &mut RecordHalf, write: &BatchWrite<'_>) {
     let Some((_, records)) = half else {
         return;
     };
-    match bytes {
-        None => {
-            records.remove(encoded_key);
+    match write.value() {
+        Ok(None) => {
+            records.remove(write.encoded_key());
         }
-        Some(bytes) => match decode(bytes) {
-            Ok(record) => {
-                records.insert(Bytes::copy_from_slice(encoded_key), Arc::new(record));
-            }
-            Err(_) => *half = None,
-        },
+        Ok(Some(DecodedValue::Record(record))) => {
+            records.insert(
+                Bytes::copy_from_slice(write.encoded_key()),
+                Arc::new(record),
+            );
+        }
+        _ => *half = None,
     }
 }
 
 /// Folds one `current` write into `half`, or ignores a key outside that
 /// subspace.
-fn fold_current_write(half: &mut RecordHalf, key: &Key, encoded_key: &[u8], bytes: Option<&[u8]>) {
-    if let Key::Current(_) = key {
-        fold_record(half, encoded_key, bytes, |bytes| {
-            decode_current_record(key.clone(), bytes)
-        });
+fn fold_current_write(half: &mut RecordHalf, write: &BatchWrite<'_>) {
+    if let Key::Current(_) = write.key() {
+        fold_record(half, write);
     }
 }
 
@@ -266,25 +280,19 @@ impl<K: Ord, V> Maintained<K, V> {
     ///
     /// Copies the rows away from any serve still holding them, so a reader
     /// materializing off the lock never sees a batch half-applied.
-    fn fold(&mut self, key: K, bytes: Option<&[u8]>)
+    fn fold(&mut self, key: K, decode: impl FnOnce() -> Result<Option<V>>)
     where
         K: Clone,
-        V: prost::Message + Default + Clone,
+        V: Clone,
     {
         if self.head.is_none() {
             return;
         }
         // Decoded before the rows are copied away from any outstanding
         // serve, so a corrupt value clears without paying for the copy.
-        let decoded = match bytes {
-            None => None,
-            Some(bytes) => {
-                let Ok(decoded) = value::decode_value(bytes) else {
-                    self.clear();
-                    return;
-                };
-                Some(decoded)
-            }
+        let Ok(decoded) = decode() else {
+            self.clear();
+            return;
         };
 
         let rows = Arc::make_mut(&mut self.rows);
@@ -827,38 +835,50 @@ impl ProjectionCache {
     /// a batch with no head write matching `new_head`, clears everything.
     pub(crate) fn apply_batch(&mut self, writes: &[StagedWrite], new_head: u64) {
         self.drop_what_lags_behind();
+        let Ok(writes) = decode_batch(writes) else {
+            self.clear_folded();
+            return;
+        };
         let mut current = self.take_half(Half::Current);
         let mut history = self.take_half(Half::History);
         let mut inline = InlineFold::default();
-        for (encoded_key, write) in writes {
-            let bytes = write.as_deref();
-            let Ok(key) = Key::decode(encoded_key) else {
-                self.clear_folded();
-                return;
-            };
-            inline.observe(&key, bytes);
-            match key {
-                Key::Snapshot { snapshot_id } => self.snapshots.fold(snapshot_id, bytes),
+        for write in &writes {
+            inline.observe(write);
+            match write.key() {
+                Key::Snapshot { snapshot_id } => self.snapshots.fold(*snapshot_id, || {
+                    projected(write, |value| match value {
+                        DecodedValue::Snapshot(snapshot) => Some(snapshot),
+                        _ => None,
+                    })
+                }),
                 Key::Current(CurrentKey::Entity(EntityKey::TableStats { table_id })) => {
-                    self.table_stats.fold(table_id, bytes);
+                    self.table_stats.fold(*table_id, || {
+                        projected(write, |value| match value {
+                            DecodedValue::Record(EntityRecord::TableStats(stats)) => Some(stats),
+                            _ => None,
+                        })
+                    });
                 }
                 Key::Current(CurrentKey::Entity(EntityKey::TableColumnStats {
                     table_id,
                     column_id,
-                })) => self.table_column_stats.fold((table_id, column_id), bytes),
+                })) => self.table_column_stats.fold((*table_id, *column_id), || {
+                    projected(write, |value| match value {
+                        DecodedValue::Record(EntityRecord::TableColumnStats(stats)) => Some(stats),
+                        _ => None,
+                    })
+                }),
                 _ => {}
             }
-            match &key {
-                Key::Current(_) => fold_current_write(&mut current, &key, encoded_key, bytes),
-                Key::History(_) => fold_record(&mut history, encoded_key, bytes, |bytes| {
-                    decode_history_record(key.clone(), bytes)
-                }),
+            match write.key() {
+                Key::Current(_) => fold_current_write(&mut current, write),
+                Key::History(_) => fold_record(&mut history, write),
                 _ => {}
             }
         }
         // Cleared rather than asserted: this runs under the projection write
         // lock inside a spawned commit, where a panic strands the joiner.
-        let Some(stamp) = head_stamp(writes).filter(|stamp| stamp.snapshot_id == new_head) else {
+        let Some(stamp) = head_stamp(&writes).filter(|stamp| stamp.snapshot_id == new_head) else {
             self.clear_folded();
             return;
         };
@@ -888,11 +908,11 @@ impl ProjectionCache {
         {
             return;
         }
-        for (encoded_key, write) in writes {
-            match Key::decode(encoded_key) {
-                Ok(key) => fold_current_write(&mut current, &key, encoded_key, write.as_deref()),
-                Err(_) => return,
-            }
+        let Ok(writes) = decode_batch(writes) else {
+            return;
+        };
+        for write in &writes {
+            fold_current_write(&mut current, write);
         }
         self.current_entities = current.map(|(_, records)| (head, Arc::new(records)));
     }

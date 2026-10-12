@@ -9,10 +9,7 @@ use crate::{
     error::Result,
     store::{
         handle::{ReadHandle, ScanShape},
-        key::{
-            IndexKind, InlineOperationKind, index_index_prefix, inline_chunk_range_table_prefix,
-            inline_live_table_prefix, inline_schema_table_prefix,
-        },
+        key::{IndexKind, table_probe_prefixes},
     },
 };
 
@@ -22,27 +19,16 @@ const WARM_RANGE_CONCURRENCY: usize = 32;
 /// The prefixes a lookup on `table` probes: each of its indexes' entries and
 /// its inlined data.
 fn probe_prefixes(view: &CatalogSnapshot, table: TableId) -> Vec<Vec<u8>> {
-    let table_id = table.get();
-    let mut prefixes = view
-        .indexes_of(table)
-        .into_iter()
-        .map(|index| {
-            let kind = if index.unique {
-                IndexKind::Unique
-            } else {
-                IndexKind::Multi
-            };
-            index_index_prefix(kind, index.id.get())
-        })
-        .collect::<Vec<_>>();
-    prefixes.extend([
-        inline_live_table_prefix(InlineOperationKind::Insert, table_id),
-        inline_live_table_prefix(InlineOperationKind::InlineDelete, table_id),
-        inline_live_table_prefix(InlineOperationKind::FileDelete, table_id),
-        inline_schema_table_prefix(table_id),
-        inline_chunk_range_table_prefix(table_id),
-    ]);
-    prefixes
+    let indexes = view.indexes_of(table).into_iter().map(|index| {
+        let kind = if index.unique {
+            IndexKind::Unique
+        } else {
+            IndexKind::Multi
+        };
+        (kind, index.id.get())
+    });
+
+    table_probe_prefixes(table.get(), indexes)
 }
 
 /// Reads the first entry under `prefix` in seek shape, admitting the SST
