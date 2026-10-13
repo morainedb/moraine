@@ -18,7 +18,16 @@ this file is the operational summary.
 - `test/sql` — sqllogictest files run by DuckDB's own runner, for what the
   CLI cannot express: several connections over one instance (concurrent
   DuckLake transactions). Driven by `cargo xtask e2e`.
-- `xtask` — automation (`cargo xtask e2e`). Rust, not shell scripts.
+- `xtask` — automation (`cargo xtask e2e`). Rust, not shell scripts. One
+  exception: `xtask/cpp/concurrent_writers.c` links DuckDB directly, because
+  the CLI holds one connection and so cannot overlap two DuckLake
+  transactions.
+- `benchmark/clickbench` — a ClickBench system entry: the `install`/`load`/
+  `query` contract that benchmark's own driver calls, so moraine's numbers
+  come out of the same driver as every published system's. Shell by
+  necessity — the contract is a set of executables. Its queries are *not*
+  vendored (CC BY-NC-SA); `cargo xtask clickbench` stages them from a
+  ClickBench checkout.
 
 ## Rules
 

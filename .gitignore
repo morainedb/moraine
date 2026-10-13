@@ -19,5 +19,16 @@
 # macOS
 .DS_Store
 
+# ClickBench entry: env.sh and the lake are build output, and the suite
+# itself is staged in from a ClickBench checkout — it is CC BY-NC-SA and
+# must not land in this tree.
+/benchmark/clickbench/env.sh
+/benchmark/clickbench/catalog
+/benchmark/clickbench/data
+/benchmark/clickbench/create.sql
+/benchmark/clickbench/queries.sql
+/benchmark/clickbench/hits.parquet
+/benchmark/clickbench/result.csv
+
 # Project
 /docs/plans

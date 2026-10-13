@@ -1,0 +1,3 @@
+#!/bin/bash
+# Embedded engine: there is no daemon to start. benchmark.sh sets
+# BENCH_RESTARTABLE=no, so the driver never expects this to do anything.

@@ -1,0 +1,30 @@
+#!/bin/bash
+# Builds the moraine extension and the DuckDB CLI that can load it, and
+# writes env.sh naming both for the other scripts to source.
+#
+# The DuckDB pin is a development revision with no published CLI, so the
+# CLI is the one the extension build produces: an extension carries its
+# DuckDB version string in its metadata footer and no other binary will
+# load it.
+#
+# MORAINE_REPO points at the moraine checkout to build from. `cargo xtask
+# clickbench run` sets it; a standalone run inside a ClickBench checkout
+# falls back to a sibling clone.
+set -e
+
+repo="${MORAINE_REPO:-../../moraine}"
+if [ ! -f "$repo/Cargo.toml" ]; then
+    echo "install: no moraine checkout at $repo; set MORAINE_REPO" >&2
+    exit 1
+fi
+
+cargo run --manifest-path "$repo/Cargo.toml" -p xtask -- \
+    clickbench prepare --env-file "$PWD/env.sh"
+
+. ./env.sh
+for required in "$MORAINE_EXTENSION" "$DUCKDB_CLI"; do
+    if [ ! -f "$required" ]; then
+        echo "install: clickbench prepare named $required, which does not exist" >&2
+        exit 1
+    fi
+done

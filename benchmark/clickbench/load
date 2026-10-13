@@ -1,0 +1,26 @@
+#!/bin/bash
+# Loads hits.parquet into a moraine-backed DuckLake: the SlateDB catalog
+# under ./catalog, the Parquet data files it registers under ./data.
+#
+# The REPLACE list is the one every DuckDB-family entry uses: the
+# Athena-compatible Parquet stores the four time columns as integers.
+set -e
+. ./lake.sh
+
+rm -rf catalog data
+mkdir -p data
+
+"$DUCKDB_CLI" "${lake_flags[@]}" \
+    -c ".read create.sql" \
+    -c "INSERT INTO hits
+        SELECT * REPLACE (
+            make_date(EventDate) AS EventDate,
+            epoch_ms(EventTime * 1000) AS EventTime,
+            epoch_ms(ClientEventTime * 1000) AS ClientEventTime,
+            epoch_ms(LocalEventTime * 1000) AS LocalEventTime)
+        FROM read_parquet('hits.parquet', binary_as_string=True)"
+
+# The driver has already synced the download, and the queries read the
+# lake rather than the source.
+rm -f hits.parquet
+sync

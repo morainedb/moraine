@@ -7,6 +7,9 @@
 //!   `e2e.rs`).
 //! - `bench` compares DuckLake metadata catalogs — moraine's SlateDB store, a
 //!   stock DuckDB file, and Postgres — on identical workloads (see `bench.rs`).
+//! - `clickbench` runs ClickBench against a moraine-backed DuckLake through
+//!   upstream's own driver and ranks the result against the numbers published
+//!   at <https://benchmark.clickhouse.com> (see `clickbench.rs`).
 //! - `commit-bench` breaks an S3-backed DuckLake commit into DuckLake metadata
 //!   statements, Moraine core time, and physical object-store requests (see
 //!   `commit_bench.rs`).
@@ -33,6 +36,7 @@ use anyhow::bail;
 mod bench;
 mod bump;
 mod catalog_target;
+mod clickbench;
 mod commit_bench;
 mod duckdb;
 mod ducklake_patch;
@@ -51,6 +55,7 @@ fn main() -> anyhow::Result<()> {
     match task.as_deref() {
         Some("e2e") => e2e::e2e(),
         Some("bench") => bench::bench(&arguments),
+        Some("clickbench") => clickbench::run(&arguments),
         Some("commit-bench") => commit_bench::run(&arguments),
         Some("locate-bench") => locate_bench::run(&arguments),
         Some("filter-bench") => filter_bench::run(&arguments),
@@ -65,13 +70,13 @@ fn main() -> anyhow::Result<()> {
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
         Some(other) => {
             bail!(
-                "unknown task `{other}`; available: e2e, bench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
+                "unknown task `{other}`; available: e2e, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
                  check-patch-pins, check-release-assets, validate-release-artifact, \
                  bump-duckdb, ducklake-patch"
             )
         }
         None => bail!(
-            "usage: cargo xtask <task>; available: e2e, bench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
+            "usage: cargo xtask <task>; available: e2e, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
              check-patch-pins, check-release-assets, validate-release-artifact, \
              bump-duckdb, ducklake-patch"
         ),
