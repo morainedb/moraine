@@ -29,8 +29,12 @@ pub(super) struct Rebase {
     /// The member allocated file ids from here.
     pub(super) base_next_file_id: u64,
     pub(super) file_delta: u64,
-    /// The premise's counters, which a data-only member leaves alone.
+    /// The counters the member read and the counters it lands on: what it
+    /// changed between the two is carried across as a delta, which for a
+    /// data-only member is nothing.
+    pub(super) base_next_catalog_id: u64,
     pub(super) next_catalog_id: u64,
+    pub(super) base_schema_version: u64,
     pub(super) schema_version: u64,
     /// Per table the premise appended to since the member's base.
     pub(super) rows: BTreeMap<u64, RowShift>,
@@ -79,7 +83,9 @@ impl Rebase {
                 .snapshot
                 .next_file_id
                 .saturating_sub(base.snapshot.next_file_id),
+            base_next_catalog_id: base.snapshot.next_catalog_id,
             next_catalog_id: premise.snapshot.next_catalog_id,
+            base_schema_version: base.snapshot.schema_version,
             schema_version: premise.snapshot.schema_version,
             rows,
             base_table_stats: base.table_stats.clone(),
@@ -98,7 +104,9 @@ impl Rebase {
             snapshot_delta: 0,
             base_next_file_id: u64::MAX,
             file_delta: 0,
+            base_next_catalog_id: 0,
             next_catalog_id: 0,
+            base_schema_version: 0,
             schema_version: 0,
             rows: BTreeMap::new(),
             base_table_stats: OrdMap::new(),
@@ -141,12 +149,20 @@ impl Rebase {
         }
     }
 
-    /// The snapshot record: its own id moved, the counters the premise's
-    /// plus whatever the member allocated.
+    /// The snapshot record: its own id moved, each counter the premise's
+    /// plus whatever the member advanced it by.
     pub(super) fn snapshot_value(&self, value: &mut proto::SnapshotValue) {
         value.snapshot_id = self.snapshot(value.snapshot_id);
-        value.schema_version = self.schema_version;
-        value.next_catalog_id = self.next_catalog_id;
+        value.schema_version = self.schema_version.saturating_add(
+            value
+                .schema_version
+                .saturating_sub(self.base_schema_version),
+        );
+        value.next_catalog_id = self.next_catalog_id.saturating_add(
+            value
+                .next_catalog_id
+                .saturating_sub(self.base_next_catalog_id),
+        );
         value.next_file_id = self.file_id(value.next_file_id);
         for id in &mut value.deleted_data_file_ids {
             *id = self.file_id(*id);
@@ -521,7 +537,9 @@ mod tests {
             snapshot_delta: 3,
             base_next_file_id: 100,
             file_delta: 7,
+            base_next_catalog_id: 40,
             next_catalog_id: 50,
+            base_schema_version: 2,
             schema_version: 4,
             rows: [(
                 1,
@@ -618,6 +636,26 @@ mod tests {
         assert_eq!(snapshot.schema_version, 4);
         assert_eq!(snapshot.next_catalog_id, 50);
         assert_eq!(snapshot.next_file_id, 110);
+    }
+
+    /// What a commit advanced a counter by survives the move: a lone DDL
+    /// commit under the identity rebase keeps the bump it authored.
+    #[test]
+    fn a_counter_the_member_advanced_stays_advanced() {
+        let mut rebase = rebase();
+        rebase.snapshot_delta = 0;
+        rebase.next_catalog_id = rebase.base_next_catalog_id;
+        rebase.schema_version = rebase.base_schema_version;
+        let mut ddl = proto::SnapshotValue {
+            snapshot_id: 11,
+            schema_version: 3,
+            next_catalog_id: 42,
+            ..Default::default()
+        };
+        rebase.snapshot_value(&mut ddl);
+        assert_eq!(ddl.snapshot_id, 11);
+        assert_eq!(ddl.schema_version, 3);
+        assert_eq!(ddl.next_catalog_id, 42);
     }
 
     #[test]

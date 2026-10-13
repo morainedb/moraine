@@ -267,6 +267,9 @@ duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientCon
 	// Cancellation before polling submits nothing. Once the call starts,
 	// cancellation reports COMMIT_OUTCOME_UNKNOWN and the write may still land.
 	auto code = moraine_tx_commit(staged, &new_snapshot_id, moraine_shim_is_interrupted, &context, &err);
+	if (code == MORAINE_OK) {
+		catalog_.RecordCommittedSnapshot(new_snapshot_id);
+	}
 	MoraineMemoryTally memory {};
 	auto measured = code == MORAINE_OK &&
 	                moraine_catalog_memory_tally(catalog_.Handle(), &memory) == MORAINE_OK;
