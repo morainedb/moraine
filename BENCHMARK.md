@@ -169,6 +169,41 @@ sixteen: every concurrent commit was its own transaction racing on the head,
 half of them lost at least once, and each loss paid DuckLake's retry sleep
 and a further flush, holding commits per flush near three.
 
+An equality index on every writer's table changes nothing: each commit
+also derives and stages its index entries, under the same rebase, and the
+curve is the same within noise (`--indexed`, moraine only, since the other
+backends have no equality index):
+
+| writers | moraine, indexed |
+|---|---|
+| 1 | 12.95s |
+| 2 | 6.47s |
+| 4 | 3.24s |
+| 8 | 1.82s |
+| 16 | 1.52s |
+
+Past sixteen writers the burst is 512 commits, since 128 split 64 ways is
+too short to time:
+
+| writers | moraine | duckdb | postgres |
+|---|---|---|---|
+| 16 | 7.48s | failed | 8.31s |
+| 32 | 5.79s | failed | 9.91s |
+| 64 | 4.5s–5.4s | failed | 10.14s |
+
+DuckDB-file exhausts DuckLake's retry budget at sixteen: its commits
+serialize on the file lock, and the loser of every round re-stamps the
+same snapshot id until it has lost ten times. Postgres gets slower with
+every doubling. moraine keeps getting faster, though the batches are not
+full: 64 writers land 512 commits in about eight flush windows' worth of
+members per batch, against a ceiling of 64 members, because members that
+arrive while a batch is landing start the next one rather than joining it.
+Overlapping the land with the next batch's forming is the remaining lever
+there. One of forty-one 64-writer runs failed, a member reporting
+moraine's own retry budget spent on ten batches abandoned in a row; it
+did not reproduce in forty further runs with the catalog's warnings
+captured, and the driver now prints those on any failure.
+
 Pin the spacing low and there is nothing left to coalesce (measured before
 staged commits joined the batch; the spacing, not the batching, is what
 this table varies):

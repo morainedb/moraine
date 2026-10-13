@@ -41,6 +41,27 @@ static int run(duckdb_connection connection, const char *sql, char *error) {
     return 0;
 }
 
+// Prints every warning the catalog logged during the burst.
+static void report_catalog_warnings(duckdb_connection connection) {
+    duckdb_result result;
+    if (duckdb_query(connection,
+                     "SELECT message FROM duckdb_logs WHERE type = 'moraine' "
+                     "AND log_level IN ('WARN', 'ERROR', 'FATAL') ORDER BY timestamp;",
+                     &result) == DuckDBError) {
+        duckdb_destroy_result(&result);
+        return;
+    }
+    idx_t rows = duckdb_row_count(&result);
+    for (idx_t row = 0; row < rows; ++row) {
+        char *message = duckdb_value_varchar(&result, 0, row);
+        if (message) {
+            fprintf(stderr, "catalog: %.600s\n", message);
+            duckdb_free(message);
+        }
+    }
+    duckdb_destroy_result(&result);
+}
+
 // One writer: connect, wait for the others, then commit `commits` times.
 // Each insert autocommits, so each is one DuckLake transaction.
 static void *commit_loop(void *argument) {
@@ -73,12 +94,14 @@ static double seconds_between(struct timespec start, struct timespec end) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 6) {
+    if (argc != 6 && argc != 7) {
         fprintf(stderr,
-                "usage: %s <extension-dir> <extension> <attach-sql> <writers> <commits-each>\n",
+                "usage: %s <extension-dir> <extension> <attach-sql> <writers> <commits-each> "
+                "[indexed]\n",
                 argv[0]);
         return 2;
     }
+    int indexed = argc == 7 && strcmp(argv[6], "indexed") == 0;
     const char *extension_dir = argv[1];
     const char *extension = argv[2];
     const char *attach = argv[3];
@@ -123,10 +146,20 @@ int main(int argc, char **argv) {
         snprintf(statement, sizeof(statement), "LOAD '%s';", extension);
         failed = run(setup, statement, error) || run(setup, attach, error);
     }
+    if (!failed) {
+        // Warnings only: a failed burst reports what the catalog saw.
+        char ignored[STATEMENT_MAX];
+        run(setup, "CALL enable_logging('moraine', level => 'warn', storage => 'memory');", ignored);
+    }
     for (int writer = 0; !failed && writer < writers; ++writer) {
         snprintf(statement, sizeof(statement),
                  "CREATE TABLE lake.main.writer_%d (id BIGINT);", writer);
         failed = run(setup, statement, error);
+        if (!failed && indexed) {
+            snprintf(statement, sizeof(statement),
+                     "CREATE INDEX writer_%d_by_id ON lake.main.writer_%d(id);", writer, writer);
+            failed = run(setup, statement, error);
+        }
     }
     if (failed) {
         fprintf(stderr, "setup: %s\n", error);
@@ -159,11 +192,16 @@ int main(int argc, char **argv) {
     struct timespec ended;
     clock_gettime(CLOCK_MONOTONIC, &ended);
 
+    int any_failed = 0;
     for (int writer = 0; writer < writers; ++writer) {
         if (tasks[writer].error[0]) {
             fprintf(stderr, "writer %d: %s\n", writer, tasks[writer].error);
-            return 1;
+            any_failed = 1;
         }
+    }
+    if (any_failed) {
+        report_catalog_warnings(setup);
+        return 1;
     }
     printf("elapsed_seconds=%.6f\n", seconds_between(started, ended));
 

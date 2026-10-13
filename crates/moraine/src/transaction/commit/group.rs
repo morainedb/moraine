@@ -359,7 +359,13 @@ impl Coalescer {
             Ok(staging) => staging,
             Err(err) => {
                 // The batch is poisoned; its members learn that nothing
-                // landed when the outcome sender drops.
+                // landed when the outcome sender drops. Named here because
+                // the error reaches only the member that raised it.
+                tracing::warn!(
+                    members = batch.members,
+                    error = %err,
+                    "a member failed to stage and took the forming batch with it"
+                );
                 super::rollback(batch.db_tx);
                 return Err(err);
             }

@@ -1398,7 +1398,6 @@ impl StagedTransaction {
                 .ok()
                 .map(|snapshot| ChangeSet::parse(&snapshot.changes_made))
                 .filter(ChangeSet::is_data_only)
-                .filter(|_| !rebase::indexed(&base, &rebase::tables_touched(&ops)))
         } else {
             None
         };
@@ -1614,6 +1613,7 @@ async fn stage_rows(
                 &context.data_prefix,
                 read_metrics,
                 projections,
+                rebase,
             ),
         )
         .await?;
@@ -1737,11 +1737,6 @@ impl commit::StageOnto for StagedMember {
         {
             return Ok(commit::Staging::Declined(staged_declined(
                 "a commit ahead of it in the same batch touched the same state",
-            )));
-        }
-        if rebase::indexed(batch.premise(), &rebase::tables_touched(&self.ops)) {
-            return Ok(commit::Staging::Declined(staged_declined(
-                "an index was created on a table it writes",
             )));
         }
 

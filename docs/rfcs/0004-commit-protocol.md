@@ -657,10 +657,12 @@ verb path:
   so the rule covers that shape entirely; what it cannot re-derive — a
   catalog id, a schema version — is exactly what makes a commit not
   data-only. The rebase is therefore **refused** for every other shape,
-  and for a commit touching a table under an equality index, whose
-  entries are derived from the row and file ids the member stamped rather
-  than moved with them. A refused member does not join a batch: it
-  commits alone, and a lost race there surfaces as `CommitConflict`.
+  and for a member that appends rows to a table without carrying that
+  table's statistics row, since the row-id counter the shift is taken
+  from lives there and nowhere else. A refused member does not join a
+  batch: it commits alone, and a lost race there surfaces as
+  `CommitConflict`. Index upkeep derives a member's entries from the
+  moved values, so an indexed table is no exception.
 - **Same classifier, same outcomes.** A staged member's change set is
   parsed from the `changes_made` DuckLake authors, so the table-level
   classifier that decides benign against true for verb members decides it
