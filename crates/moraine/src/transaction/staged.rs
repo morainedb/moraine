@@ -1477,6 +1477,15 @@ impl StagedTransaction {
             {
                 Ok(staged) => staged,
                 Err(err) => {
+                    // A minting commit whose rows already read as a lost
+                    // race goes back to DuckLake too; the batch yields
+                    // the same.
+                    if mints_snapshot
+                        && matches!(err, Error::CommitConflict(_))
+                        && let Some(commits) = commits.as_ref()
+                    {
+                        commits.yield_to_retry();
+                    }
                     commit::rollback(db_tx);
                     return Err(err);
                 }
@@ -1574,6 +1583,12 @@ impl StagedTransaction {
                     }
                     // Re-derived rather than threaded: this runs only on the
                     // losing path.
+                    // DuckLake re-drives this from outside; the batch yields
+                    // so the retry is not beaten by a session that never
+                    // pauses.
+                    if let Some(commits) = commits.as_ref() {
+                        commits.yield_to_retry();
+                    }
                     let snapshot = build_snapshot_value(&ops).ok();
                     return Err(reporting_phase(
                         "lost-race",

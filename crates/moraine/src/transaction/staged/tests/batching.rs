@@ -524,3 +524,75 @@ async fn a_head_preserving_commit_re_drives_its_own_lost_race() {
         "the winner's file is untouched"
     );
 }
+
+/// A commit the batch cannot take loses its race and goes back to DuckLake
+/// for a retry; the batch yields to that retry, holding its own arrivals,
+/// or a session committing without pause would beat it every time.
+#[tokio::test]
+async fn the_batch_yields_to_a_commit_it_could_not_take_after_it_lost() {
+    let catalog = catalog_with_two_tables().await;
+
+    // DDL, authored against head 1, on a transaction opened at head 1.
+    let mut ddl = begin(&catalog).await;
+    ddl.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(3, 0, "w", 2, None),
+    });
+    ddl.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row_allocating(2, 4, 1),
+    });
+    ddl.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, r#"created_table:"main"."w""#),
+    });
+
+    let mut winner = begin(&catalog).await;
+    stage_append(&mut winner, 1, 1, 1, 0);
+    assert_eq!(winner.commit().await.unwrap().get(), 2);
+    assert!(matches!(
+        ddl.commit().await.unwrap_err(),
+        Error::CommitConflict(_)
+    ));
+
+    // The next data commit waits out the yield before it stages.
+    let started = std::time::Instant::now();
+    let mut next = begin(&catalog).await;
+    stage_append(&mut next, 2, 2, 2, 0);
+    assert_eq!(next.commit().await.unwrap().get(), 3);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(200),
+        "the batch yielded only {:?}",
+        started.elapsed()
+    );
+
+    // The same DDL on a transaction opened after the winner: its rows read
+    // as a lost race before anything is staged, and the batch yields to
+    // that too.
+    let mut late = begin(&catalog).await;
+    late.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(3, 0, "w", 3, None),
+    });
+    late.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row_allocating(3, 4, 2),
+    });
+    late.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, r#"created_table:"main"."w""#),
+    });
+    assert!(matches!(
+        late.commit().await.unwrap_err(),
+        Error::CommitConflict(_)
+    ));
+    let started = std::time::Instant::now();
+    let mut next = begin(&catalog).await;
+    stage_append(&mut next, 1, 3, 3, 10);
+    assert_eq!(next.commit().await.unwrap().get(), 4);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(200),
+        "the batch yielded only {:?} to a loss found while staging",
+        started.elapsed()
+    );
+}
