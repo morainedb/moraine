@@ -53,24 +53,23 @@ async fn a_lone_commit_waits_only_for_its_own_flush() {
     catalog.close().await.unwrap();
 }
 
+/// Commits arriving within the floor behind a lone writer's flush share
+/// the one flush the floor holds back, and wait the floor, not the
+/// spacing.
 #[tokio::test]
-async fn commits_inside_the_spacing_share_one_flush() {
+async fn commits_inside_the_floor_share_one_flush() {
     let store = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     let spacing = Duration::from_millis(400);
     let catalog = Arc::new(open(&store, spacing, false).await);
-    // A first commit flushes at once and opens the spacing window.
+    // A first commit flushes at once and opens the floor.
     commit_schema(&catalog, "first").await;
     store.take_wal_puts();
-
-    // Commits arriving inside the window while the first is awaiting its
-    // deferred flush: they form the next batch, submit behind it, and ride
-    // on the same flush.
     let started = Instant::now();
     let mut commits = Vec::new();
     for i in 0..4 {
         let catalog = Arc::clone(&catalog);
         commits.push(tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20 * i)).await;
+            tokio::time::sleep(Duration::from_millis(3 * i)).await;
             commit_schema(&catalog, &format!("burst{i}")).await;
         }));
     }
@@ -78,22 +77,27 @@ async fn commits_inside_the_spacing_share_one_flush() {
         commit.await.unwrap();
     }
     let elapsed = started.elapsed();
-
-    assert_eq!(store.take_wal_puts(), 1, "the burst rode on one flush");
+    let puts = store.take_wal_puts();
     assert!(
-        elapsed < spacing + Duration::from_millis(500),
-        "the burst waited {elapsed:?} against a {spacing:?} spacing"
+        puts <= 2,
+        "the burst rode on the floor's one flush, {puts} flushes"
+    );
+    assert!(
+        elapsed < spacing / 2,
+        "the burst waited {elapsed:?} against a {spacing:?} spacing: the floor, not the spacing"
     );
     let catalog = Arc::try_unwrap(catalog).unwrap_or_else(|_| panic!("no other handle"));
     catalog.close().await.unwrap();
 }
 
+/// A lone writer in a tight loop flushes once per commit, but never
+/// faster than the floor, a tenth of the spacing: the rate cap it keeps.
 #[tokio::test]
-async fn flushes_never_exceed_one_per_spacing() {
+async fn a_lone_writer_flushes_at_most_once_per_floor() {
     let store = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     let spacing = Duration::from_millis(100);
+    let floor = spacing / 10;
     let catalog = open(&store, spacing, false).await;
-
     let started = Instant::now();
     let mut commits = 0;
     while started.elapsed() < Duration::from_millis(650) {
@@ -101,12 +105,15 @@ async fn flushes_never_exceed_one_per_spacing() {
         commits += 1;
     }
     let elapsed = started.elapsed();
-
     let puts = store.take_wal_puts();
-    let allowed = elapsed.as_millis() / spacing.as_millis() + 2;
+    let allowed = elapsed.as_millis() / floor.as_millis() + 2;
     assert!(
         u128::from(puts) <= allowed,
-        "{puts} flushes in {elapsed:?} exceed one per {spacing:?} (allowed {allowed})"
+        "{puts} flushes in {elapsed:?} exceed one per {floor:?} (allowed {allowed})"
+    );
+    assert!(
+        u128::from(puts) > elapsed.as_millis() / spacing.as_millis() + 2,
+        "{puts} flushes in {elapsed:?}: a lone writer no longer waits the whole spacing"
     );
     assert!(commits >= 2, "the loop committed {commits} times");
     catalog.close().await.unwrap();

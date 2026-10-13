@@ -428,6 +428,7 @@ impl Coalescer {
             writes,
             staged_bytes,
             outcome,
+            members,
             ..
         } = batch;
 
@@ -456,7 +457,7 @@ impl Coalescer {
             Ok(Ok(Submission::Submitted(submitted))) => {
                 match std::panic::AssertUnwindSafe(reporting_phase(
                     "durable",
-                    await_submitted(submitted, &self.projections, &self.durability),
+                    await_submitted(submitted, &self.projections, &self.durability, members),
                 ))
                 .catch_unwind()
                 .await

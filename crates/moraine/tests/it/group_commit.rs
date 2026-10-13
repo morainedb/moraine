@@ -609,3 +609,44 @@ async fn concurrent_staged_commits_coalesce_without_being_asked() {
     assert_eq!(head.current_snapshot().id.get(), TABLES + 1);
     catalog.close().await.unwrap();
 }
+
+/// A writer without siblings pays no flush spacing: each commit flushes at
+/// once, and one flush per commit is what it cost before too.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn a_writer_without_siblings_pays_no_spacing() {
+    use std::time::{Duration, Instant};
+
+    let spacing = Duration::from_millis(100);
+    let (catalog, store) = {
+        let store = Arc::new(FreezingStore::thawed(Arc::new(InMemory::new())));
+        let mut options = CatalogOptions::default();
+        options.flush_interval = spacing;
+        let catalog = Catalog::open(store.clone(), options).await.unwrap();
+        (catalog, store)
+    };
+
+    let started = Instant::now();
+    let before = store.writes_attempted();
+    for index in 0..5 {
+        catalog
+            .commit(|tx| {
+                tx.create_schema(&format!("s{index}"))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    let elapsed = started.elapsed();
+    let writes = store.writes_attempted() - before;
+
+    assert!(
+        elapsed < spacing * 3,
+        "five lone commits took {elapsed:?}; each waiting the spacing out would be 400ms+"
+    );
+    assert!(
+        writes <= 5 * 3,
+        "a lone commit costs one flush, not a burst of writes: {writes} for five"
+    );
+    catalog.close().await.unwrap();
+}

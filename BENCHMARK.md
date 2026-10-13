@@ -142,36 +142,58 @@ from any of these catalogs.
 ### Within one process
 
 This is where parallel DuckLake transactions actually run, and all three
-backends take them. Same burst, same machine:
+backends take them. Same burst, same machine, 128 commits:
 
-| writers | moraine | duckdb | postgres |
-|---|---|---|---|
-| 1 | 12.95s | 1.22s | 715ms |
-| 2 | 6.47s | 1.35s | 850ms |
-| 4 | 3.24s | 1.50s | 1.14s |
-| 8 | 1.62s | 1.89s | 1.27s |
-| 16 | 814ms | 2.15s | 1.30s |
+| writers | moraine | duckdb | postgres | moraine WAL objects |
+|---|---|---|---|---|
+| 1 | 1.44s | 1.25s | 889ms | 131 |
+| 2 | 832ms | 1.40s | 801ms | 68 |
+| 4 | 489ms | 1.74s | 1.16s | 39 |
+| 8 | 413ms | 2.19s | 1.28s | 28 |
+| 16 | 437ms | 2.44s | 1.39s | 27–35 |
 
-**moraine is the only one that gets faster, and it gets faster linearly:
-sixteen writers are sixteen times one.** 128 commits in 814 ms is eight
-flush windows of sixteen commits each, against an ideal of 800 ms. It
-passes DuckDB-file at eight writers and Postgres at sixteen, both of which
-lose ground over the same range.
+**moraine is the only one that gets faster with writers, and from four
+writers up it is the fastest catalog here.** The last column is what the
+burst cost in object-store PUTs, every write-ahead-log object the catalog
+put including the setup commits (one table per writer, the attach): one
+per commit for a lone writer, one per round of writers under concurrency.
 
-What moraine converts into that speedup is the WAL flush spacing. At the
-100 ms default, one writer waits a full spacing per commit — 128 commits in
-12.9 s is exactly that — and concurrent commits coalesce into the flush the
-first of them is already waiting for: staged-row commits, which are what
-DuckLake's own DML is, join the same batch as verb commits and are rebased
-onto whatever landed ahead of them, so a lost race costs nothing. Two
-things had to be true for the batches to fill. The rows DuckLake stamps
-are measured against the snapshot its own transaction read, not against
-the catalog transaction that opens later — measured against the latter,
-every commit that followed another by a few milliseconds read as a lost
-race, and the batches held a member and a half. And a member's own lost
-race leaves the batch rather than poisoning it. Before either, the same
-burst took 4.15 s at eight writers and ran out of DuckLake's retry budget
-at sixteen.
+What makes that possible is how the writer paces its WAL flushes. Every
+flush is one PUT, and the spacing, `META_FLUSH_INTERVAL_MS` at 100 ms by
+default, is the longest a commit waits for one. Three rules decide when a
+flush closes sooner:
+
+- A writer without siblings waits only the floor, a tenth of the spacing.
+  Nothing rode its last flushes, so nobody is coming whom waiting would
+  coalesce with. One flush per commit is what it cost waiting the whole
+  spacing out, too; it now gets them ten times sooner.
+- Under concurrency the flush closes once as many commits have joined as a
+  recent flush carried: the known population has arrived, and waiting
+  longer coalesces nothing. The coalescer's batches count by their
+  members, since one batch is one handle carrying many commits.
+- One flush in ten spacings waits the spacing out regardless, carrying
+  every writer, which is how the population is measured and how the mark
+  grows when writers arrive.
+
+Measured against the same tree with the spacing as the only rule, the
+objects are the same to within noise at every count, up to a third more at
+sixteen writers, and the latency is nine times better at one writer, four
+to eight times at two to eight, and twice at sixteen:
+
+| writers | spacing only | population-paced |
+|---|---|---|
+| 1 | 12.94s | 1.44s |
+| 2 | 6.47s | 832ms |
+| 4 | 3.24s | 489ms |
+| 8 | 1.62s | 413ms |
+| 16 | 810ms | 437ms |
+
+Staged-row commits, which are what DuckLake's own DML is, join the same
+batch as verb commits and are rebased onto whatever landed ahead of them,
+so a lost race costs nothing; the rows are measured against the snapshot
+DuckLake read, not the catalog transaction that opens later. Before that,
+the same burst took 4.15 s at eight writers and ran out of DuckLake's
+retry budget at sixteen.
 
 An equality index on every writer's table changes nothing: each commit
 also derives and stages its index entries, under the same rebase, and the
@@ -179,7 +201,8 @@ curve is the same within noise (`--indexed`, moraine only, since the other
 backends have no equality index).
 
 Past sixteen writers the burst is 512 commits, since 128 split 64 ways is
-too short to time:
+too short to time (measured before the pacing rules above, with the
+spacing as the only rule):
 
 | writers | moraine | duckdb | postgres |
 |---|---|---|---|
@@ -190,34 +213,12 @@ too short to time:
 DuckDB-file exhausts DuckLake's retry budget at sixteen: its commits
 serialize on the file lock, and the loser of every round re-stamps the
 same snapshot id until it has lost ten times. Postgres gets slower with
-every doubling. moraine holds 16 per flush through 32 writers and then
-flattens: at 64 the batches average nine members against a ceiling of 64,
-because a batch launches as soon as its last arrival finds nobody else
-mid-arrival, and the members that arrive while it lands start the next
-one. Holding the forming batch open until the one in flight has landed is
-the lever there; the ceiling itself is not binding.
+every doubling. At 64 writers on this eight-vCPU machine the catalog sees
+only part of the population in any one window, and CPU contention in the
+DuckLake path is the likelier bound; the 64-member batch ceiling is not.
 
-Pin the spacing low and there is nothing left to coalesce (measured before
-staged commits joined the batch; the spacing, not the batching, is what
-this table varies):
-
-| writers | moraine | duckdb | postgres |
-|---|---|---|---|
-| 1 | 1.30s | 1.38s | 892ms |
-| 2 | 1.37s | 1.79s | 1.09s |
-| 4 | 1.84s | 1.84s | 1.11s |
-| 8 | 2.57s | 2.45s | 1.26s |
-
-*(`--flush-interval-ms 1`, the spacing the latency workloads pin.)*
-
-At 1ms moraine is competitive per commit and concurrency buys nothing; at
-100ms it is ten times slower at one writer and the only catalog that
-scales. The spacing chooses the regime, and `META_FLUSH_INTERVAL_MS` is
-how an application chooses it — the same knob, read as a throughput
-control rather than a latency one.
-
-The concurrency workloads therefore run at the 100ms default rather than
-the pinned 1ms: the spacing is the mechanism under test, not noise to be
+The concurrency workloads run at the 100 ms default rather than a pinned
+1 ms spacing: the pacing is the mechanism under test, not noise to be
 removed. `--flush-interval-ms` moves it. Correctness under these races —
 a loser rebased and landed, a true conflict refused — is
 `test/sql/commit_concurrency.test` and the core's `staged::tests::batching`,

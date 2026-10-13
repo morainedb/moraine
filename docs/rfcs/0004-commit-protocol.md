@@ -671,6 +671,16 @@ verb path:
   that the transaction's own view. Measured against the transaction's
   view instead, every such commit read as a lost race: half of all
   commits at eight writers, each re-driven by DuckLake after its backoff.
+- **A head-preserving commit re-drives its own lost race.** Expiry,
+  cleanup and the deletion schedule mint no snapshot and derive nothing
+  from the head: their rows are as good against the head they find as
+  against the one they read. Losing the head race to a session that
+  commits without pause is therefore moraine's to re-drive, a bounded
+  number of times with the batch cycle's backoff, re-staged against the
+  head it finds; surfaced instead, DuckLake's retry would sleep into the
+  same session and the pass would never land. A minting commit's rows are
+  DuckLake's, stamped against the head it read, and its race stays
+  DuckLake's.
 - **A member's own lost race declines, never poisons.** A `CommitConflict`
   raised while a member stages — its stamped snapshot at or below the head
   it is measured against — is that member's to re-drive. It leaves the
@@ -910,14 +920,44 @@ timer off and paces the flushes itself, under one setting,
 
 - A commit that finds the spacing elapsed since the last flush flushes at
   once and waits only on its own PUT.
-- A commit that finds the spacing running joins one flush deferred to the
-  moment it elapses; the first such commit performs it, the rest await
-  their handles on it.
+- A commit that finds no recent flush carried another commit waits only
+  the **floor**, a tenth of the spacing, since the last flush started:
+  nothing rode those flushes, so nobody is coming whom waiting longer
+  would coalesce with. A writer without siblings pays no spacing. The
+  floor is the rate cap that remains — ten flushes per spacing at most
+  from one writer — and the window in which commits arriving just behind
+  a lone one still share a flush.
+- A commit that finds the spacing running behind a flush that carried
+  riders joins one flush deferred to the moment it elapses, or to the
+  moment as many commits have joined it as the most a recent flush
+  carried, whichever comes first; the first such commit performs it, the
+  rest await their handles on it. The spacing is the longest a flush
+  waits, not the only time it closes: once the population a recent flush
+  saw has arrived, waiting longer coalesces nothing. The population is
+  counted in commits: a coalescer batch is one handle carrying many, and
+  weighs its members. No early close
+  starts a flush before the floor, and none happens without a recent
+  **measurement**: a flush that waited the whole spacing out carries every
+  writer and so measures the population, where an early close carries
+  only the mark and measures nothing; a measurement is trusted for ten
+  spacings, after which the next flush waits the spacing out again. That
+  is how the mark grows to the population and what the latency of the
+  scheme costs, one spacing in ten at most. The mark is the most
+  of the last few flushes, so a flush that closed early, carrying fewer
+  than there are, cannot lower it; only flushes that waited the spacing
+  out and still carried less do, a few in a row, which is how a writer
+  left alone gets its lone rule back.
 - A commit that finds a flush in the air, and so not carrying it, schedules
   the next flush for when the spacing elapses from that flush's start.
 
-So a lone commit costs one PUT of latency, a burst costs at most the
-spacing plus one PUT, and PUTs never exceed one per spacing. The timer is
+So a lone commit costs one PUT of latency and one PUT, which is what it
+cost waiting the spacing out; a burst costs at most the spacing plus one
+PUT, and usually only the time its writers take to arrive; and the objects
+a burst costs are one per round of its writers either way. What the rules
+give up is nine tenths of the PUT *rate* cap: flushes never exceed one per
+floor rather than one per spacing, so a writer population can flush as
+fast as it commits in rounds, down to the floor — the same objects,
+sooner. The timer is
 off rather than kept as a ceiling because a tick landing inside a spacing
 window would carry the pending commits early, one extra PUT per tick, and
 the cap would only be approximate; it is safe to turn off because every

@@ -487,3 +487,40 @@ async fn a_member_rebases_from_the_view_it_read_not_the_one_its_transaction_open
     ));
     assert_eq!(catalog.snapshot().await.unwrap().snapshot.snapshot_id, 3);
 }
+
+/// A head-preserving commit derives nothing from the head, so a race it
+/// loses is moraine's own to re-drive: it lands behind the winner rather
+/// than surfacing a conflict for DuckLake to retry into a session that
+/// never stops committing.
+#[tokio::test]
+async fn a_head_preserving_commit_re_drives_its_own_lost_race() {
+    let catalog = catalog_with_two_tables().await;
+
+    // Opened before the winner lands.
+    let mut maintenance = begin(&catalog).await;
+    maintenance.stage(RowOperation::Insert {
+        table: TableKind::FilesScheduledForDeletion,
+        cells: vec![
+            Cell::U64(77),
+            Cell::Str("gone.parquet".to_string()),
+            Cell::Bool(true),
+            Cell::I64(7),
+        ],
+    });
+
+    let mut winner = begin(&catalog).await;
+    stage_append(&mut winner, 1, 1, 1, 0);
+    assert_eq!(winner.commit().await.unwrap().get(), 2);
+
+    assert_eq!(
+        maintenance.commit().await.unwrap().get(),
+        2,
+        "head-preserving: it lands on the head it finds"
+    );
+    let head = catalog.snapshot().await.unwrap();
+    assert_eq!(head.scheduled_deletions().len(), 1);
+    assert!(
+        head.data_files[&1].contains_key(&1),
+        "the winner's file is untouched"
+    );
+}

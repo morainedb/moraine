@@ -1458,102 +1458,135 @@ impl StagedTransaction {
             });
         }
 
-        let base_ref: &CatalogSnapshot = &base;
-        let rebase = Rebase::identity(base_ref);
-        let staged = match stage_rows(
-            &db_tx,
-            base_ref,
-            &ops,
-            &rebase,
-            &context,
-            mints_snapshot,
-            &mut phases,
-        )
-        .await
-        {
-            Ok(staged) => staged,
-            Err(err) => {
-                commit::rollback(db_tx);
-                return Err(err);
-            }
-        };
-        let RowsStaged {
-            result_id,
-            writes,
-            staged_bytes,
-            head_view: translated_head_view,
-            deferred_indexes,
-        } = staged;
-        let size = StagedSize {
-            bytes: staged_bytes,
-            ..size
-        };
-
-        // Landed off-task: the write cannot be retracted once issued, so a
-        // host interrupt races the wait, not the write.
-        let head_before = proto::HeadValue {
-            snapshot_id: base_ref.snapshot.snapshot_id,
-            batch_seq: base_ref.batch_seq,
-        };
-        let head_view_update = translated_head_view.map_or_else(
-            || commit::HeadViewUpdate::Rebuild(Arc::clone(&base)),
-            |view| commit::HeadViewUpdate::Prepared(Arc::new(view)),
-        );
-        let phase_started = Instant::now();
-        let landed = reporting_phase(
-            "commit-batch",
-            commit::commit_batch_off_task(
-                db_tx,
-                commit::HeadTransition {
-                    before: head_before.snapshot_id,
-                    after: result_id,
-                },
+        let mut db_tx = db_tx;
+        let mut base = base;
+        let mut attempt = 0_usize;
+        loop {
+            let base_ref: &CatalogSnapshot = &base;
+            let rebase = Rebase::identity(base_ref);
+            let staged = match stage_rows(
+                &db_tx,
+                base_ref,
+                &ops,
+                &rebase,
+                &context,
+                mints_snapshot,
+                &mut phases,
+            )
+            .await
+            {
+                Ok(staged) => staged,
+                Err(err) => {
+                    commit::rollback(db_tx);
+                    return Err(err);
+                }
+            };
+            let RowsStaged {
+                result_id,
                 writes,
                 staged_bytes,
-                head_view_update,
-                projections,
-                durability,
-            ),
-        )
-        .await?;
-        phases.land = phase_started.elapsed();
-        match landed {
-            commit::Landed::Committed(commit_timings) => {
-                let index_entries = phases
-                    .index_metrics
-                    .additions
-                    .saturating_add(phases.index_metrics.deletions);
-                memory.record_commit(index_entries, staged_bytes.0);
-                staged_landed(
-                    diagnostic_id,
-                    result_id,
-                    size,
-                    &phases,
-                    commit_timings,
-                    started,
-                );
-                Ok(CommitReport {
-                    snapshot_id: SnapshotId::new(result_id),
-                    deferred_indexes,
-                    index_entries,
-                    staged_bytes: staged_bytes.0,
-                })
-            }
-            commit::Landed::LostRace => {
-                // Re-derived rather than threaded: this runs only on the
-                // losing path.
-                let snapshot = build_snapshot_value(&ops).ok();
-                Err(reporting_phase(
-                    "lost-race",
-                    staged_lost_race_against(
-                        catalog_store.as_deref(),
-                        head_before,
-                        snapshot.as_ref().map(|s| s.changes_made.as_str()),
+                head_view: translated_head_view,
+                deferred_indexes,
+            } = staged;
+            let size = StagedSize {
+                bytes: staged_bytes,
+                ..size
+            };
+
+            // Landed off-task: the write cannot be retracted once issued, so a
+            // host interrupt races the wait, not the write.
+            let head_before = proto::HeadValue {
+                snapshot_id: base_ref.snapshot.snapshot_id,
+                batch_seq: base_ref.batch_seq,
+            };
+            let head_view_update = translated_head_view.map_or_else(
+                || commit::HeadViewUpdate::Rebuild(Arc::clone(&base)),
+                |view| commit::HeadViewUpdate::Prepared(Arc::new(view)),
+            );
+            let phase_started = Instant::now();
+            let landed = reporting_phase(
+                "commit-batch",
+                commit::commit_batch_off_task(
+                    db_tx,
+                    commit::HeadTransition {
+                        before: head_before.snapshot_id,
+                        after: result_id,
+                    },
+                    writes,
+                    staged_bytes,
+                    head_view_update,
+                    Arc::clone(&projections),
+                    durability.clone(),
+                ),
+            )
+            .await?;
+            phases.land = phase_started.elapsed();
+            match landed {
+                commit::Landed::Committed(commit_timings) => {
+                    let index_entries = phases
+                        .index_metrics
+                        .additions
+                        .saturating_add(phases.index_metrics.deletions);
+                    memory.record_commit(index_entries, staged_bytes.0);
+                    staged_landed(
+                        diagnostic_id,
                         result_id,
-                        staged_rows,
-                    ),
-                )
-                .await)
+                        size,
+                        &phases,
+                        commit_timings,
+                        started,
+                    );
+                    return Ok(CommitReport {
+                        snapshot_id: SnapshotId::new(result_id),
+                        deferred_indexes,
+                        index_entries,
+                        staged_bytes: staged_bytes.0,
+                    });
+                }
+                commit::Landed::LostRace => {
+                    // A head-preserving commit derives nothing from the head:
+                    // its rows are as good against the head it finds now, so
+                    // the race is moraine's own to re-drive. A minting commit's
+                    // rows are DuckLake's, and the race is DuckLake's.
+                    if !mints_snapshot && attempt < MAX_HEAD_PRESERVING_ATTEMPTS {
+                        attempt += 1;
+                        let Some(db) = catalog_store.as_deref().and_then(Store::writer_db) else {
+                            return Err(staged_lost_race(result_id, staged_rows));
+                        };
+                        tokio::time::sleep(commit::retry_backoff(attempt)).await;
+                        db_tx = Arc::new(
+                            db.begin(slatedb::IsolationLevel::Snapshot)
+                                .await
+                                .map_err(Error::from)?,
+                        );
+                        base = reporting_phase(
+                            "head-view",
+                            commit::head_view_for(&db_tx, &projections),
+                        )
+                        .await?;
+                        debug!(
+                            transaction_id = diagnostic_id,
+                            attempt,
+                            head = base.snapshot.snapshot_id,
+                            "head-preserving commit lost the head race; re-driving"
+                        );
+                        continue;
+                    }
+                    // Re-derived rather than threaded: this runs only on the
+                    // losing path.
+                    let snapshot = build_snapshot_value(&ops).ok();
+                    return Err(reporting_phase(
+                        "lost-race",
+                        staged_lost_race_against(
+                            catalog_store.as_deref(),
+                            head_before,
+                            snapshot.as_ref().map(|s| s.changes_made.as_str()),
+                            result_id,
+                            staged_rows,
+                        ),
+                    )
+                    .await);
+                }
             }
         }
     }
@@ -1967,6 +2000,11 @@ fn index_upkeep_landed(transaction_id: u64, result_id: u64, phases: &CommitPhase
 /// object-store PUT, so an oversized one is refused up front rather than
 /// discovered as a slow commit.
 const MAX_STAGED_COST_PER_COMMIT: usize = 100_000;
+
+/// How many times a head-preserving commit re-drives a lost head race
+/// before giving up: a session committing without pause moves the head
+/// every few milliseconds, and the commit must land between two of them.
+const MAX_HEAD_PRESERVING_ATTEMPTS: usize = 10;
 
 /// Whether `ops` may exceed [`MAX_STAGED_COST_PER_COMMIT`].
 ///
