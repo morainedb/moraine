@@ -144,8 +144,9 @@ so "run one long-lived committer process and route commits through it" is
 an escape hatch for embedding hosts, not something a fleet of independent
 DuckDB clients gets for free. This constraint is stated here once,
 surfaced in README-level documentation, and holds for the only implemented
-topology. RFC 0022 specifies an unimplemented replacement
-topology; no multi-writer mode exists in the current implementation.
+topology. A replacement topology is specified with the separate
+commit-log library; no multi-writer mode exists in the current
+implementation.
 
 ### Submission outcomes
 
