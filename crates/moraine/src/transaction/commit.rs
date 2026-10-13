@@ -878,8 +878,8 @@ mod fold;
 mod group;
 use diff::diff_options;
 pub(crate) use diff::{Touched, diff_touched, diff_writes};
-pub(crate) use group::Coalescer;
 use group::Outcome;
+pub(crate) use group::{Batch, Coalescer, StageOnto, Staging};
 
 /// What a batch's durable write did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -917,13 +917,9 @@ enum CommitOutcome {
 /// Runs one attempt: stages every member onto whichever batch the store is
 /// forming, and takes that batch's fate as this attempt's. Members stage
 /// one at a time, each against the state the members before it left.
-async fn attempt_group<F>(
-    db: &Db,
-    members: &[F],
-    coalescer: &Arc<Coalescer>,
-) -> Result<CommitOutcome>
+async fn attempt_group<M>(db: &Db, members: &M, coalescer: &Arc<Coalescer>) -> Result<CommitOutcome>
 where
-    F: Fn(&mut Transaction) -> Result<()>,
+    M: group::StageOnto + ?Sized,
 {
     let staged = coalescer.stage(db, members).await?;
 
@@ -1553,13 +1549,13 @@ impl ProbeScope {
 ///
 /// Returns one snapshot id per member, in member order. A group of one is
 /// the ordinary commit path.
-pub(crate) async fn commit_cycle<F>(
+pub(crate) async fn commit_cycle<M>(
     db: &Db,
-    members: &[F],
+    members: &M,
     coalescer: &Arc<Coalescer>,
 ) -> Result<Vec<SnapshotId>>
 where
-    F: Fn(&mut Transaction) -> Result<()>,
+    M: group::StageOnto + ?Sized,
 {
     let started = std::time::Instant::now();
     let mut first_head = None;
@@ -1576,7 +1572,7 @@ where
             CommitOutcome::Committed(ids) => {
                 tracing::debug!(
                     snapshot = ids.last().map(|id| id.get()),
-                    members = members.len(),
+                    members = ids.len(),
                     attempt,
                     elapsed_ms = crate::telemetry::milliseconds(started.elapsed()),
                     "commit landed"

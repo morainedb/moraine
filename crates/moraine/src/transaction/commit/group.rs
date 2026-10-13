@@ -75,8 +75,8 @@ pub(crate) struct Staged {
 
 /// A batch being formed: one open transaction carrying every member's
 /// writes, and the premise the next member stages against.
-struct Batch {
-    db_tx: Arc<DbTransaction>,
+pub(crate) struct Batch {
+    pub(crate) db_tx: Arc<DbTransaction>,
     /// The head view the batch opened at.
     base: Arc<CatalogSnapshot>,
     /// `base` folded forward through the members staged so far; `None`
@@ -91,9 +91,66 @@ struct Batch {
     /// Commits staged onto the batch, against [`MAX_BATCH_MEMBERS`].
     members: usize,
     writes: Vec<StagedWrite>,
+    /// What every member staged so far changed, for a later member to
+    /// classify itself against.
+    change_sets: Vec<ChangeSet>,
     /// What the members have staged onto `db_tx`, index entries included.
     staged_bytes: StagedBytes,
     outcome: watch::Sender<BatchState>,
+}
+
+/// What staging onto a batch did.
+pub(crate) enum Staging {
+    /// One snapshot id per logical commit, and the change set of each
+    /// that staged writes.
+    Staged {
+        ids: Vec<SnapshotId>,
+        ours: Vec<ChangeSet>,
+    },
+    /// The member found it cannot ride this batch — a conflict with what
+    /// is already on it — and left it untouched. The batch goes on; only
+    /// this caller gets the error.
+    Declined(Error),
+}
+
+/// Something that can stage itself onto a forming batch: a slice of verb
+/// closures, or a staged-row member.
+pub(crate) trait StageOnto {
+    async fn stage_onto(
+        &self,
+        batch: &mut Batch,
+        db: &Db,
+        projections: &std::sync::RwLock<ProjectionCache>,
+    ) -> Result<Staging>;
+}
+
+impl<F> StageOnto for [F]
+where
+    F: Fn(&mut Transaction) -> Result<()>,
+{
+    async fn stage_onto(
+        &self,
+        batch: &mut Batch,
+        _db: &Db,
+        projections: &std::sync::RwLock<ProjectionCache>,
+    ) -> Result<Staging> {
+        let (ids, ours) = batch.stage(self, projections).await?;
+        Ok(Staging::Staged { ids, ours })
+    }
+}
+
+impl<F, const N: usize> StageOnto for [F; N]
+where
+    F: Fn(&mut Transaction) -> Result<()>,
+{
+    async fn stage_onto(
+        &self,
+        batch: &mut Batch,
+        db: &Db,
+        projections: &std::sync::RwLock<ProjectionCache>,
+    ) -> Result<Staging> {
+        self.as_slice().stage_onto(batch, db, projections).await
+    }
 }
 
 impl Batch {
@@ -120,6 +177,7 @@ impl Batch {
             head: head_before,
             members: 0,
             writes: Vec::new(),
+            change_sets: Vec::new(),
             staged_bytes: StagedBytes::default(),
             outcome: watch::Sender::new(BatchState::Forming),
         })
@@ -127,7 +185,7 @@ impl Batch {
 
     /// Brings the premise up to date with everything staged since it was
     /// last folded.
-    fn refold(&mut self) -> Result<()> {
+    pub(crate) fn refold(&mut self) -> Result<()> {
         if self.folded == self.writes.len() {
             return Ok(());
         }
@@ -136,6 +194,36 @@ impl Batch {
         self.folded = self.writes.len();
         self.premise = Some(premise);
         Ok(())
+    }
+
+    /// The state the next member stages against: the base folded forward
+    /// through every member so far. Call [`Self::refold`] first.
+    pub(crate) fn premise(&self) -> &CatalogSnapshot {
+        self.premise.as_ref().unwrap_or(&self.base)
+    }
+
+    /// What every member so far changed, in staging order.
+    pub(crate) fn change_sets(&self) -> &[ChangeSet] {
+        &self.change_sets
+    }
+
+    /// Records one more member's staged writes on the batch.
+    pub(crate) fn admit_member(
+        &mut self,
+        commits: u64,
+        ours: ChangeSet,
+        writes: Vec<StagedWrite>,
+        staged_bytes: StagedBytes,
+    ) {
+        self.head = commits;
+        self.writes.extend(writes);
+        self.change_sets.push(ours);
+        self.staged_bytes.0 = self.staged_bytes.0.saturating_add(staged_bytes.0);
+    }
+
+    /// Counts a member against the batch's ceiling.
+    pub(crate) fn count_member(&mut self) {
+        self.members += 1;
     }
 
     /// Runs every member's closure in turn and stages the result. An error
@@ -152,10 +240,10 @@ impl Batch {
         let mut ours = Vec::new();
 
         for member in members {
-            self.members += 1;
+            self.count_member();
             self.refold()?;
-            let premise = self.premise.as_ref().unwrap_or(&self.base);
-            let prepared = prepare_and_stage(&self.db_tx, projections, member, premise).await?;
+            let db_tx = Arc::clone(&self.db_tx);
+            let prepared = prepare_and_stage(&db_tx, projections, member, self.premise()).await?;
             match prepared {
                 Prepared::Nothing { head } => ids.push(SnapshotId::new(head)),
                 Prepared::Staged {
@@ -165,10 +253,8 @@ impl Batch {
                     staged_bytes,
                 } => {
                     ids.push(SnapshotId::new(commits));
-                    ours.push(*theirs);
-                    self.head = commits;
-                    self.writes.extend(writes);
-                    self.staged_bytes.0 = self.staged_bytes.0.saturating_add(staged_bytes.0);
+                    ours.push((*theirs).clone());
+                    self.admit_member(commits, *theirs, writes, staged_bytes);
                 }
             }
         }
@@ -250,9 +336,9 @@ impl Coalescer {
 
     /// Stages `members` onto whichever batch is forming, opening one if
     /// none is, and seals the batch if this caller is the last one in.
-    pub(crate) async fn stage<F>(self: &Arc<Self>, db: &Db, members: &[F]) -> Result<Staged>
+    pub(crate) async fn stage<M>(self: &Arc<Self>, db: &Db, members: &M) -> Result<Staged>
     where
-        F: Fn(&mut Transaction) -> Result<()>,
+        M: StageOnto + ?Sized,
     {
         let arrival = self.arrive();
         // Each await below is named, because none of them can be read from
@@ -264,8 +350,13 @@ impl Coalescer {
             None => reporting_phase("open", Batch::open(db, &self.projections)).await?,
         };
 
-        let staged = match reporting_phase("stage", batch.stage(members, &self.projections)).await {
-            Ok(staged) => staged,
+        let staging = match reporting_phase(
+            "stage",
+            members.stage_onto(&mut batch, db, &self.projections),
+        )
+        .await
+        {
+            Ok(staging) => staging,
             Err(err) => {
                 // The batch is poisoned; its members learn that nothing
                 // landed when the outcome sender drops.
@@ -273,7 +364,6 @@ impl Coalescer {
                 return Err(err);
             }
         };
-        let (ids, ours) = staged;
 
         let outcome = batch.outcome.subscribe();
         let head_before = batch.head_before;
@@ -291,13 +381,18 @@ impl Coalescer {
             shared.forming = Some(batch);
         }
 
-        Ok(Staged {
-            ids,
-            ours,
-            head_before,
-            rides,
-            outcome,
-        })
+        // Sealing ran either way: a member that declined still counted as
+        // an arrival, and the batch it left must not wait on it.
+        match staging {
+            Staging::Staged { ids, ours } => Ok(Staged {
+                ids,
+                ours,
+                head_before,
+                rides,
+                outcome,
+            }),
+            Staging::Declined(err) => Err(err),
+        }
     }
 
     /// Commits `batch` on a task of its own, so the caller that sealed it

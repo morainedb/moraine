@@ -554,6 +554,29 @@ impl ChangeSet {
     }
 
     /// True when the set records no changes at all.
+    /// Whether this commit only moved data: no schema, table, view or
+    /// macro created, altered or dropped, no maintenance that replaces
+    /// files, and nothing it could not name. The shape a batch can rebase.
+    pub(crate) fn is_data_only(&self) -> bool {
+        !self.has_unknown
+            && self.created_schemas.is_empty()
+            && self.dropped_schemas.is_empty()
+            && self.created_tables.is_empty()
+            && self.altered_tables.is_empty()
+            && self.dropped_tables.is_empty()
+            && self.created_views.is_empty()
+            && self.altered_views.is_empty()
+            && self.dropped_views.is_empty()
+            && self.created_scalar_macros.is_empty()
+            && self.created_table_macros.is_empty()
+            && self.dropped_scalar_macros.is_empty()
+            && self.dropped_table_macros.is_empty()
+            && self.merge_adjacent_tables.is_empty()
+            && self.rewrite_delete_tables.is_empty()
+            && self.compacted_tables.is_empty()
+            && self.inline_flush_tables.is_empty()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         *self == Self::default()
     }

@@ -605,10 +605,10 @@ default — before generating them again against a fresh snapshot. On the
 `ExecuteRetrialsServerSide()`, DuckLake hands the commit to the manager's
 `FlushChangesServerSide` and adopts what comes back: the manager calls
 `SetCommittedSnapshotId` with the snapshot id the catalog landed and
-`ApplyServerSideCommit` with the schema version, and DuckLake's loop, its
-sleep and its conflict re-check are never entered. Only on this route does
-DuckLake adopt an id the catalog assigned; on the client-side route it
-keeps the one it minted.
+`ApplyServerSideCommit` with the schema version; a backend that finishes
+the commit itself never enters the loop. Only on this route does DuckLake
+adopt an id the catalog assigned; on the client-side route it keeps the one
+it minted.
 
 moraine's metadata manager takes the server-side route for **data-only**
 commits — no created, altered or dropped schema, table, view or macro, the
@@ -617,15 +617,18 @@ for everything else. The split is RFC 0004's, and the two gates are one
 predicate: a data-only commit is the shape whose head-derived values the
 batch rebases exactly, so it can be re-driven inside the catalog; the rest
 cannot be, and DuckLake's loop is the right re-driver for them. A commit
-the shim routes server-side is never one the rebase refuses. Inside `FlushChangesServerSide` the shim runs
-one generation of DuckLake's commit rows through the ordinary DML hooks —
-the rows the client-side route would stage — commits the staged
-transaction, and reports the id it landed. That id may exceed the one
-DuckLake stamped when it generated the rows, because the batch rebased it;
-`SetCommittedSnapshotId` is the contract by which DuckLake learns the
-difference. A true conflict on this route is terminal to the application,
-as a serialization failure is: no loop above the catalog re-drives it, and
-none is needed, because every benign race was re-driven inside.
+the shim routes server-side is never one the rebase refuses. Inside
+`FlushChangesServerSide` the shim runs DuckLake's own generation of the
+commit's rows through the ordinary DML hooks — the rows the client-side
+route stages — under DuckLake's own retry budget, then reports the id the
+catalog landed. The budget is kept as the safety net, not the mechanism: a
+data-only commit never spends it, because the batch re-drives its benign
+races inside, and what still reaches the loop is a true conflict, which
+DuckLake's own re-check throws on the first retry without sleeping again.
+The landed id may exceed the one DuckLake stamped when it generated the
+rows, because the batch rebased it; `SetCommittedSnapshotId` is the
+contract by which DuckLake learns the difference, called after the loop,
+which would otherwise have recorded the stamped id.
 
 This is why the staged path's commit returns a snapshot id at all
 (`moraine_tx_commit(tx) -> snapshot_id`, below), and why the shim treats

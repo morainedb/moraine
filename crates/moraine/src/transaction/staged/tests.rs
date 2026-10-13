@@ -17,6 +17,7 @@ use tracing_subscriber::{layer::Context, prelude::*};
 use super::{inline::inline_schema_collapse_target, *};
 use crate::catalog::{Catalog, CatalogOptions, inline::InlineScanKind};
 
+mod batching;
 mod body_ownership;
 mod data_path;
 mod inline_commit_bench;
@@ -900,7 +901,7 @@ async fn rename_survives_insert_before_end_order() {
 /// the literal substring `conflict`, and the store is left exactly as
 /// the winner left it.
 #[tokio::test]
-async fn lost_race_is_not_retried_and_carries_conflict_text() {
+async fn a_schema_creating_commit_commits_alone_and_surfaces_its_lost_race() {
     let catalog = open().await;
 
     let tx_a = catalog.begin_write_tx().await.unwrap();
@@ -1952,6 +1953,7 @@ async fn commit_reports_the_deferred_indexes_it_leaves_maintaining() {
         String::new(),
         Arc::default(),
         catalog.cache_counters(),
+        Some(Arc::clone(catalog.commits())),
     );
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
