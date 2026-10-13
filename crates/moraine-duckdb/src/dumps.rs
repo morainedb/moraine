@@ -301,7 +301,7 @@ pub(crate) mod test_support {
 
             // Schema `sales` took global id 1, table `orders` id 2; its
             // first column has per-table field id 1.
-            let mut tx = staged_begin(&catalog, None, String::new())
+            let mut tx = staged_begin(&catalog, None, String::new(), None)
                 .await
                 .expect("test setup: begin staged tx");
             tx.stage(RowOperation::Insert {

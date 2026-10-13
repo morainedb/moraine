@@ -332,8 +332,6 @@ impl Rebase {
 /// Whether a staged commit's shape is one the rebase re-derives exactly: a
 /// snapshot-minting, data-only commit. Anything that names a catalog id or
 /// a schema version — DDL, an inline table's creation, maintenance — is not.
-/// A member appending rows must also carry the table's statistics row,
-/// which is where the row-id counter the rebase shifts by lives.
 pub(super) fn joinable(ops: &[RowOperation]) -> bool {
     let mut mints = false;
     let mut appends_to = BTreeSet::new();

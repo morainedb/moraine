@@ -1134,7 +1134,10 @@ build-time discovery, are recorded in `crates/moraine-duckdb/README.md`.
 
 DuckLake's own `INSERT`/`UPDATE`/`DELETE` against `ducklake_*` tables
 reach moraine through four C-ABI entry points (`moraine_abi.h`):
-`moraine_tx_begin(catalog) -> tx`, `moraine_tx_stage(tx, table_kind,
+`moraine_tx_begin(catalog, snapshot) -> tx` (the snapshot the DuckLake
+transaction read at, which is the view its rows are stamped against and
+the one a batch rebases them from; the catalog transaction itself may
+open later), `moraine_tx_stage(tx, table_kind,
 operation_kind, cells)` (accumulates one typed row operation — `insert`, `delete`,
 or `update_set_end` — without touching the store), `moraine_tx_commit(tx)
 -> snapshot_id` (translates every staged operation, joins the forming

@@ -146,63 +146,56 @@ backends take them. Same burst, same machine:
 
 | writers | moraine | duckdb | postgres |
 |---|---|---|---|
-| 1 | 12.94s | 1.16s | 793ms |
-| 2 | 6.47s | 1.29s | 1.08s |
-| 4 | 3.44s | 1.39s | 973ms |
-| 8 | 1.82s | 2.89s | 1.29s |
-| 16 | 1.92s | 2.47s | 1.58s |
+| 1 | 12.95s | 1.22s | 715ms |
+| 2 | 6.47s | 1.35s | 850ms |
+| 4 | 3.24s | 1.50s | 1.14s |
+| 8 | 1.62s | 1.89s | 1.27s |
+| 16 | 814ms | 2.15s | 1.30s |
 
-**moraine is the only one that gets faster, and it gets faster linearly
-until the flush spacing binds.** 7.1x from one writer to eight — 128
-commits in 1.82s against an ideal of 1.6s, sixteen commits per flush — and
-past DuckDB-file at eight, which loses 2.5x over the same range while
-Postgres loses 1.6x.
+**moraine is the only one that gets faster, and it gets faster linearly:
+sixteen writers are sixteen times one.** 128 commits in 814 ms is eight
+flush windows of sixteen commits each, against an ideal of 800 ms. It
+passes DuckDB-file at eight writers and Postgres at sixteen, both of which
+lose ground over the same range.
 
 What moraine converts into that speedup is the WAL flush spacing. At the
-100ms default, one writer waits a full spacing per commit — 128 commits in
-12.9s is exactly that — and concurrent commits coalesce into the flush the
+100 ms default, one writer waits a full spacing per commit — 128 commits in
+12.9 s is exactly that — and concurrent commits coalesce into the flush the
 first of them is already waiting for: staged-row commits, which are what
 DuckLake's own DML is, join the same batch as verb commits and are rebased
-onto whatever landed ahead of them, so a lost race costs nothing. Before
-they did, the same burst took 4.15s at eight writers and failed outright at
-sixteen: every concurrent commit was its own transaction racing on the head,
-half of them lost at least once, and each loss paid DuckLake's retry sleep
-and a further flush, holding commits per flush near three.
+onto whatever landed ahead of them, so a lost race costs nothing. Two
+things had to be true for the batches to fill. The rows DuckLake stamps
+are measured against the snapshot its own transaction read, not against
+the catalog transaction that opens later — measured against the latter,
+every commit that followed another by a few milliseconds read as a lost
+race, and the batches held a member and a half. And a member's own lost
+race leaves the batch rather than poisoning it. Before either, the same
+burst took 4.15 s at eight writers and ran out of DuckLake's retry budget
+at sixteen.
 
 An equality index on every writer's table changes nothing: each commit
 also derives and stages its index entries, under the same rebase, and the
 curve is the same within noise (`--indexed`, moraine only, since the other
-backends have no equality index):
-
-| writers | moraine, indexed |
-|---|---|
-| 1 | 12.95s |
-| 2 | 6.47s |
-| 4 | 3.24s |
-| 8 | 1.82s |
-| 16 | 1.52s |
+backends have no equality index).
 
 Past sixteen writers the burst is 512 commits, since 128 split 64 ways is
 too short to time:
 
 | writers | moraine | duckdb | postgres |
 |---|---|---|---|
-| 16 | 7.48s | failed | 8.31s |
-| 32 | 5.79s | failed | 9.91s |
-| 64 | 4.5s–5.4s | failed | 10.14s |
+| 16 | 3.34s | failed | 4.64s |
+| 32 | 1.92s | failed | 6.04s |
+| 64 | 2.10s (1.22s…2.23s) | failed | 7.31s |
 
 DuckDB-file exhausts DuckLake's retry budget at sixteen: its commits
 serialize on the file lock, and the loser of every round re-stamps the
 same snapshot id until it has lost ten times. Postgres gets slower with
-every doubling. moraine keeps getting faster, though the batches are not
-full: 64 writers land 512 commits in about eight flush windows' worth of
-members per batch, against a ceiling of 64 members, because members that
-arrive while a batch is landing start the next one rather than joining it.
-Overlapping the land with the next batch's forming is the remaining lever
-there. One of forty-one 64-writer runs failed, a member reporting
-moraine's own retry budget spent on ten batches abandoned in a row; it
-did not reproduce in forty further runs with the catalog's warnings
-captured, and the driver now prints those on any failure.
+every doubling. moraine holds 16 per flush through 32 writers and then
+flattens: at 64 the batches average nine members against a ceiling of 64,
+because a batch launches as soon as its last arrival finds nobody else
+mid-arrival, and the members that arrive while it lands start the next
+one. Holding the forming batch open until the one in flight has landed is
+the lever there; the ceiling itself is not binding.
 
 Pin the spacing low and there is nothing left to coalesce (measured before
 staged commits joined the batch; the spacing, not the batching, is what

@@ -204,7 +204,9 @@ async fn a_staged_commit_interrupted_during_its_write_still_lands() {
     let view = catalog.snapshot().await.unwrap();
     let next_catalog_id = view.schemas().last().map_or(1, |s| s.id.get() + 1);
 
-    let mut tx = staged_begin(&catalog, None, String::new()).await.unwrap();
+    let mut tx = staged_begin(&catalog, None, String::new(), None)
+        .await
+        .unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
         cells: vec![

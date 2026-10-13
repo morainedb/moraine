@@ -663,6 +663,19 @@ verb path:
   batch: it commits alone, and a lost race there surfaces as
   `CommitConflict`. Index upkeep derives a member's entries from the
   moved values, so an indexed table is no exception.
+- **The base is the view the rows were authored against.** DuckLake
+  stamps its rows from the snapshot its own transaction read, and the
+  catalog transaction those rows reach may open later, after other
+  commits landed. The member's base for the rebase is therefore the view
+  the caller read, handed in when the transaction opens, and only absent
+  that the transaction's own view. Measured against the transaction's
+  view instead, every such commit read as a lost race: half of all
+  commits at eight writers, each re-driven by DuckLake after its backoff.
+- **A member's own lost race declines, never poisons.** A `CommitConflict`
+  raised while a member stages — its stamped snapshot at or below the head
+  it is measured against — is that member's to re-drive. It leaves the
+  forming batch as it found it; any other error a member raises still
+  poisons the batch, since a half-staged member cannot be unstaged.
 - **Same classifier, same outcomes.** A staged member's change set is
   parsed from the `changes_made` DuckLake authors, so the table-level
   classifier that decides benign against true for verb members decides it

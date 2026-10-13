@@ -177,6 +177,7 @@ unsafe fn decode_cells(cells: *const MoraineCell, len: usize) -> Result<Vec<Cell
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_tx_begin(
     handle: *mut MoraineCatalogHandle,
+    snapshot: *const crate::runtime::MoraineSnapshotHandle,
     out: *mut *mut MoraineTxHandle,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
@@ -191,6 +192,9 @@ pub unsafe extern "C" fn moraine_tx_begin(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for `snapshot`: null, or a live handle.
+        let read_view =
+            unsafe { snapshot.as_ref() }.map(|snapshot| std::sync::Arc::clone(&snapshot.snapshot));
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let tx = unsafe {
@@ -201,6 +205,7 @@ pub unsafe extern "C" fn moraine_tx_begin(
                     handle_ref.catalog.writer()?,
                     handle_ref.data_store.clone(),
                     handle_ref.data_prefix.clone(),
+                    read_view,
                 ),
             )
         }?;
@@ -2420,6 +2425,7 @@ mod tests {
         let code = unsafe {
             moraine_tx_begin(
                 handle,
+                ptr::null(),
                 &raw mut tx,
                 Some(probe_always),
                 ptr::null_mut(),
@@ -2438,6 +2444,7 @@ mod tests {
         let code2 = unsafe {
             moraine_tx_begin(
                 handle,
+                ptr::null(),
                 &raw mut tx2,
                 Some(probe_never),
                 ptr::null_mut(),
@@ -2463,6 +2470,7 @@ mod tests {
         let code = unsafe {
             moraine_tx_begin(
                 ptr::null_mut(),
+                ptr::null(),
                 &raw mut tx,
                 None,
                 ptr::null_mut(),

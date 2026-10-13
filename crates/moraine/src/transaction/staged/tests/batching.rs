@@ -448,3 +448,42 @@ async fn a_burst_of_sixty_four_members_all_land() {
     let head = catalog.snapshot().await.unwrap();
     assert!(head.snapshot.snapshot_id > 3 * WRITERS);
 }
+
+/// DuckLake stamps its rows against the snapshot it read when its own
+/// transaction began, which may predate the catalog transaction the rows
+/// reach. The member rebases from the view it read; the transaction's own
+/// view would call the same rows a lost race.
+#[tokio::test]
+async fn a_member_rebases_from_the_view_it_read_not_the_one_its_transaction_opened_at() {
+    let catalog = catalog_with_two_tables().await;
+    let read = catalog.snapshot().await.unwrap();
+    assert_eq!(read.snapshot.snapshot_id, 1);
+
+    let mut other = begin(&catalog).await;
+    stage_append(&mut other, 2, 1, 1, 0);
+    assert_eq!(other.commit().await.unwrap().get(), 2);
+
+    // Rows authored against head 1 on a transaction opened at head 2.
+    let mut tx =
+        crate::ffi_support::staged::staged_begin(&catalog, None, String::new(), Some(read))
+            .await
+            .unwrap();
+    stage_append(&mut tx, 1, 1, 1, 0);
+    assert_eq!(tx.commit().await.unwrap().get(), 3);
+    let head = catalog.snapshot().await.unwrap();
+    assert_eq!(head.snapshot.next_file_id, 3);
+    assert!(
+        head.data_files[&1].contains_key(&2),
+        "the file id moved past the other's"
+    );
+
+    // Without the view it read, the same shape is a lost race for DuckLake
+    // to re-drive, and nothing else's batch pays for it.
+    let mut late = begin(&catalog).await;
+    stage_append(&mut late, 2, 2, 2, 10);
+    assert!(matches!(
+        late.commit().await.unwrap_err(),
+        Error::CommitConflict(_)
+    ));
+    assert_eq!(catalog.snapshot().await.unwrap().snapshot.snapshot_id, 3);
+}

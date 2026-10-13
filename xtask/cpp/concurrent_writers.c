@@ -147,9 +147,17 @@ int main(int argc, char **argv) {
         failed = run(setup, statement, error) || run(setup, attach, error);
     }
     if (!failed) {
-        // Warnings only: a failed burst reports what the catalog saw.
+        // Warnings only, unless CONCURRENT_WRITERS_LOG names a level: a
+        // failed burst reports what the catalog saw; a diagnostic run keeps
+        // everything and writes it where CONCURRENT_WRITERS_LOG_FILE points.
+        // Enabled for every type, since the catalog's is not one DuckDB
+        // knows by name; the readers below filter on it.
+        const char *level = getenv("CONCURRENT_WRITERS_LOG");
         char ignored[STATEMENT_MAX];
-        run(setup, "CALL enable_logging('moraine', level => 'warn', storage => 'memory');", ignored);
+        snprintf(statement, sizeof(statement),
+                 "CALL enable_logging(level => '%s', storage => 'memory');",
+                 level ? level : "warn");
+        run(setup, statement, ignored);
     }
     for (int writer = 0; !failed && writer < writers; ++writer) {
         snprintf(statement, sizeof(statement),
@@ -198,6 +206,15 @@ int main(int argc, char **argv) {
             fprintf(stderr, "writer %d: %s\n", writer, tasks[writer].error);
             any_failed = 1;
         }
+    }
+    const char *log_file = getenv("CONCURRENT_WRITERS_LOG_FILE");
+    if (log_file) {
+        char ignored[STATEMENT_MAX];
+        snprintf(statement, sizeof(statement),
+                 "COPY (SELECT timestamp, log_level, message FROM duckdb_logs WHERE type = 'moraine' "
+                 "ORDER BY timestamp) TO '%s' (FORMAT csv);",
+                 log_file);
+        run(setup, statement, ignored);
     }
     if (any_failed) {
         report_catalog_warnings(setup);

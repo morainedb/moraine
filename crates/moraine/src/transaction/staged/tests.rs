@@ -1954,6 +1954,7 @@ async fn commit_reports_the_deferred_indexes_it_leaves_maintaining() {
         Arc::default(),
         catalog.cache_counters(),
         Some(Arc::clone(catalog.commits())),
+        None,
     );
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,

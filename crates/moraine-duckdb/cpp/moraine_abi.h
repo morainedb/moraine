@@ -3465,6 +3465,7 @@ void moraine_unregister_log_sink(const struct MoraineCatalogHandle *handle);
 // `probe_ctx` from any thread. `err`, if non-null, must be a valid, writable
 // [`MoraineError`]. All for the duration of this call.
 int32_t moraine_tx_begin(struct MoraineCatalogHandle *handle,
+                         const struct MoraineSnapshotHandle *snapshot,
                          struct MoraineTxHandle **out,
                          MoraineInterruptProbe probe,
                          void *probe_ctx,

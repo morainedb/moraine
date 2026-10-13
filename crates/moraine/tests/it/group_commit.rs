@@ -522,9 +522,10 @@ mod staged_rows {
     #[allow(clippy::unwrap_used)]
     pub(super) async fn seeded_tables() -> (Catalog, Arc<FreezingStore>) {
         let (catalog, store) = counted().await;
-        let mut tx = moraine::ffi_support::staged::staged_begin(&catalog, None, String::new())
-            .await
-            .unwrap();
+        let mut tx =
+            moraine::ffi_support::staged::staged_begin(&catalog, None, String::new(), None)
+                .await
+                .unwrap();
         let mut created = Vec::new();
         for table_id in 1..=TABLES {
             tx.stage(RowOperation::Insert {
@@ -559,9 +560,10 @@ async fn concurrent_staged_commits_coalesce_without_being_asked() {
     let (catalog, store) = seeded_tables().await;
     let before_separate = store.writes_attempted();
     for table_id in 1..=TABLES {
-        let mut tx = moraine::ffi_support::staged::staged_begin(&catalog, None, String::new())
-            .await
-            .unwrap();
+        let mut tx =
+            moraine::ffi_support::staged::staged_begin(&catalog, None, String::new(), None)
+                .await
+                .unwrap();
         stage_append(&mut tx, table_id, table_id, table_id);
         tx.commit().await.unwrap();
     }
@@ -577,9 +579,10 @@ async fn concurrent_staged_commits_coalesce_without_being_asked() {
     let before_together = store.writes_attempted();
     let mut transactions = Vec::new();
     for table_id in 1..=TABLES {
-        let mut tx = moraine::ffi_support::staged::staged_begin(&catalog, None, String::new())
-            .await
-            .unwrap();
+        let mut tx =
+            moraine::ffi_support::staged::staged_begin(&catalog, None, String::new(), None)
+                .await
+                .unwrap();
         stage_append(&mut tx, table_id, 1, 1);
         transactions.push(tx);
     }
