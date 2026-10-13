@@ -280,8 +280,11 @@ either way the batching is invisible in what is returned here.
 This closure/verb surface is the **embedding API** — one of RFC 0004's two
 commit front doors. The DuckDB extension (RFC 0006) does not call it: that
 path commits DuckLake-authored row mutations through RFC 0004's staged-row
-protocol, which never retries internally. The retry contract described here
-is a verb-path property.
+protocol, which joins the same batch and re-drives a benign lost race by
+rebasing the head-derived values DuckLake stamped — for data-only commits;
+every other shape surfaces its lost race to DuckLake. The closure re-run
+described here is a verb-path property; the bounded budget and the typed
+outcomes are shared by both doors.
 
 ### Error taxonomy
 
