@@ -1,0 +1,5 @@
+#!/bin/bash
+# Bytes the loaded lake occupies: the SlateDB catalog and the Parquet
+# data files it registers.
+set -e
+du -scb catalog data | tail -n1 | cut -f1

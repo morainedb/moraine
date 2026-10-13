@@ -1,0 +1,8 @@
+#!/bin/bash
+# Readiness probe. The driver runs it before the load too, so it proves
+# the CLI can load the extension rather than that the lake holds data —
+# a load that died halfway is caught by `data-size` instead.
+set -e
+. ./env.sh
+"$DUCKDB_CLI" -unsigned -batch -no-agent -noheader -list \
+    -c "LOAD '$MORAINE_EXTENSION'" -c "SELECT 1" > /dev/null

@@ -24,6 +24,7 @@
 #include "metadata_tables.hpp"
 #include "moraine_abi.h"
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 
@@ -271,10 +272,22 @@ public:
 	// outside both moraine's budgets and DuckDB's memory limit.
 	uint64_t HeldMetadataBytes() const;
 
+	// The snapshot id the most recent commit on this catalog landed. The
+	// batch may land a commit above the id DuckLake stamped on it, and
+	// DuckLake adopts a catalog-assigned id only through its server-side
+	// commit route; this is what that route reports.
+	void RecordCommittedSnapshot(uint64_t snapshot_id) {
+		last_committed_snapshot_.store(snapshot_id, std::memory_order_release);
+	}
+	uint64_t LastCommittedSnapshot() const {
+		return last_committed_snapshot_.load(std::memory_order_acquire);
+	}
+
 private:
 	MoraineCatalogHandle *handle_;
 	std::string path_;
 	bool extended_catalog_ = false;
+	std::atomic<uint64_t> last_committed_snapshot_ {0};
 	duckdb::shared_ptr<MaintenanceScheduler> scheduler_;
 
 	// One dumped row set per synthesized table, stamped with the store

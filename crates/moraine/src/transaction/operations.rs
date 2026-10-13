@@ -531,10 +531,12 @@ impl ChangeSet {
                 "created_table_macro" => pair(&mut set.created_table_macros),
                 "dropped_scalar_macro" => id(&mut set.dropped_scalar_macros),
                 "dropped_table_macro" => id(&mut set.dropped_table_macros),
-                "inserted_into_table" => id(&mut set.inserted_tables),
+                // An inlined insert appends to the table like a file does.
+                "inserted_into_table" | "inlined_insert" => id(&mut set.inserted_tables),
                 // The grammar names the table, never the files; the caller
                 // may supply file ids after parsing.
-                "deleted_from_table" => {
+                // An inlined delete marks rows at table grain.
+                "deleted_from_table" | "inlined_delete" => {
                     set.deletes_untargeted_files = true;
                     id(&mut set.deleted_from_tables)
                 }
@@ -554,6 +556,29 @@ impl ChangeSet {
     }
 
     /// True when the set records no changes at all.
+    /// Whether this commit only moved data: no schema, table, view or
+    /// macro created, altered or dropped, no maintenance that replaces
+    /// files, and nothing it could not name. The shape a batch can rebase.
+    pub(crate) fn is_data_only(&self) -> bool {
+        !self.has_unknown
+            && self.created_schemas.is_empty()
+            && self.dropped_schemas.is_empty()
+            && self.created_tables.is_empty()
+            && self.altered_tables.is_empty()
+            && self.dropped_tables.is_empty()
+            && self.created_views.is_empty()
+            && self.altered_views.is_empty()
+            && self.dropped_views.is_empty()
+            && self.created_scalar_macros.is_empty()
+            && self.created_table_macros.is_empty()
+            && self.dropped_scalar_macros.is_empty()
+            && self.dropped_table_macros.is_empty()
+            && self.merge_adjacent_tables.is_empty()
+            && self.rewrite_delete_tables.is_empty()
+            && self.compacted_tables.is_empty()
+            && self.inline_flush_tables.is_empty()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -749,6 +774,18 @@ mod tests {
             expect.deletes_untargeted_files = true;
             expect
         });
+    }
+
+    /// DuckLake names inlined DML with tokens of its own; they classify as
+    /// the append and the table-grain delete they are, not as unknown.
+    #[test]
+    fn inlined_dml_tokens_classify_as_data_changes() {
+        let set = ChangeSet::parse("inlined_insert:7,inlined_delete:8");
+        assert!(!set.has_unknown);
+        assert!(set.is_data_only());
+        assert!(set.inserted_tables.contains(&7));
+        assert!(set.deleted_from_tables.contains(&8));
+        assert!(set.deletes_untargeted_files);
     }
 
     #[test]

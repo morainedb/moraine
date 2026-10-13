@@ -18,6 +18,7 @@ use super::{
         decode_view_column_tag_row, table_value,
     },
     proto,
+    rebase::Rebase,
 };
 
 /// Child-table rows collected before the insert pass: each is folded
@@ -63,7 +64,7 @@ pub(super) fn collect_hard_deletes(ops: &[RowOperation]) -> Result<BTreeSet<Enti
         .collect()
 }
 
-pub(super) fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
+pub(super) fn collect_child_rows(ops: &[RowOperation], rebase: &Rebase) -> Result<ChildRows> {
     let mut children = ChildRows::default();
 
     for op in ops {
@@ -86,7 +87,8 @@ pub(super) fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
                         .push(expression);
                 }
                 TableKind::FilePartitionValue => {
-                    let (file, value) = decode_file_partition_value(cells)?;
+                    let ((table_id, data_file_id), value) = decode_file_partition_value(cells)?;
+                    let file = (table_id, rebase.file_id(data_file_id));
                     children
                         .file_partition_values
                         .entry(file)
@@ -158,6 +160,7 @@ pub(super) fn apply_op(
     state: &mut CatalogSnapshot,
     op: &RowOperation,
     new_id: u64,
+    rebase: &Rebase,
     children: &mut ChildRows,
     direct: &mut Vec<commit::StagedWrite>,
     hard_deleted: &BTreeSet<EntityKey>,
@@ -165,13 +168,13 @@ pub(super) fn apply_op(
 ) -> Result<()> {
     match op {
         RowOperation::Insert { table, cells } => {
-            apply_insert(base, state, *table, cells, children, touched)
+            apply_insert(base, state, *table, cells, rebase, children, touched)
         }
         RowOperation::UpdateSetEnd { table, cells } => {
-            apply_update_set_end(state, *table, cells, new_id, touched)
+            apply_update_set_end(state, *table, cells, new_id, rebase, touched)
         }
         RowOperation::UpdateSetBegin { table, cells } => {
-            apply_update_set_begin(base, state, *table, cells, new_id, touched)
+            apply_update_set_begin(base, state, *table, cells, new_id, rebase, touched)
         }
         RowOperation::Delete { table, cells } => {
             apply_delete(state, *table, cells, direct, hard_deleted, touched)
@@ -356,10 +359,12 @@ fn apply_schema_insert(
 fn apply_data_file_insert(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
+    rebase: &Rebase,
     children: &mut ChildRows,
     touched: &mut Touched,
 ) -> Result<()> {
     let mut value = decode_data_file(cells)?;
+    rebase.data_file(&mut value);
     refuse_live_id(
         TableKind::DataFile,
         state
@@ -383,9 +388,11 @@ fn apply_data_file_insert(
 fn apply_delete_file_insert(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
+    rebase: &Rebase,
     touched: &mut Touched,
 ) -> Result<()> {
-    let value = decode_delete_file(cells)?;
+    let mut value = decode_delete_file(cells)?;
+    rebase.delete_file(&mut value);
     refuse_live_id(
         TableKind::DeleteFile,
         state
@@ -462,18 +469,21 @@ fn apply_stats_insert(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
+    rebase: &Rebase,
     touched: &mut Touched,
 ) -> Result<()> {
     match table {
         TableKind::TableStats => {
-            let value = decode_table_stats(cells)?;
+            let mut value = decode_table_stats(cells)?;
+            rebase.table_stats(&mut value);
             touched.touch(EntityKey::TableStats {
                 table_id: value.table_id,
             });
             state.put_table_stats(value);
         }
         TableKind::TableColumnStats => {
-            let value = decode_table_column_stats(cells)?;
+            let mut value = decode_table_column_stats(cells)?;
+            rebase.table_column_stats(&mut value);
             touched.touch(EntityKey::TableColumnStats {
                 table_id: value.table_id,
                 column_id: value.column_id,
@@ -481,7 +491,8 @@ fn apply_stats_insert(
             state.put_table_column_stats(value);
         }
         TableKind::FileColumnStats => {
-            let value = decode_file_column_stats(cells)?;
+            let mut value = decode_file_column_stats(cells)?;
+            rebase.file_column_stats(&mut value);
             touched.touch(EntityKey::FileColumnStats {
                 table_id: value.table_id,
                 data_file_id: value.data_file_id,
@@ -499,6 +510,7 @@ pub(super) fn apply_insert(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
+    rebase: &Rebase,
     children: &mut ChildRows,
     touched: &mut Touched,
 ) -> Result<()> {
@@ -564,8 +576,8 @@ pub(super) fn apply_insert(
             });
             state.put_column(value);
         }
-        TableKind::DataFile => apply_data_file_insert(state, cells, children, touched)?,
-        TableKind::DeleteFile => apply_delete_file_insert(state, cells, touched)?,
+        TableKind::DataFile => apply_data_file_insert(state, cells, rebase, children, touched)?,
+        TableKind::DeleteFile => apply_delete_file_insert(state, cells, rebase, touched)?,
         TableKind::PartitionInfo => {
             let mut value = decode_partition_info(cells)?;
             value.columns = children
@@ -593,7 +605,7 @@ pub(super) fn apply_insert(
         TableKind::Macro => apply_macro_insert(state, cells, children, touched)?,
         TableKind::ColumnMapping => apply_mapping_insert(state, cells, children, touched)?,
         TableKind::TableStats | TableKind::TableColumnStats | TableKind::FileColumnStats => {
-            apply_stats_insert(state, table, cells, touched)?;
+            apply_stats_insert(state, table, cells, rebase, touched)?;
         }
         TableKind::FilesScheduledForDeletion => {
             let value = decode_gc_file_row(cells)?;
@@ -749,6 +761,7 @@ pub(super) fn apply_update_set_end(
     table: TableKind,
     cells: &[Cell],
     new_id: u64,
+    rebase: &Rebase,
     touched: &mut Touched,
 ) -> Result<()> {
     match table {
@@ -761,6 +774,8 @@ pub(super) fn apply_update_set_end(
     }
 
     let (key, end_snapshot) = decode_end(table, cells)?;
+    let key = rebase.entity_key(key);
+    let end_snapshot = rebase.snapshot(end_snapshot);
     check_end_snapshot(table, end_snapshot, new_id)?;
     touched.touch(key);
     // End only the one row named, never a cascade: a rename ends the table
@@ -837,6 +852,7 @@ pub(super) fn apply_update_set_begin(
     table: TableKind,
     cells: &[Cell],
     new_id: u64,
+    rebase: &Rebase,
     touched: &mut Touched,
 ) -> Result<()> {
     if table != TableKind::DataFile {
@@ -846,8 +862,8 @@ pub(super) fn apply_update_set_begin(
     }
     let mut c = Cursor::new(table, cells);
     let table_id = c.u64()?;
-    let data_file_id = c.u64()?;
-    let begin_snapshot = c.u64()?;
+    let data_file_id = rebase.file_id(c.u64()?);
+    let begin_snapshot = rebase.snapshot(c.u64()?);
     c.finish()?;
     if begin_snapshot != new_id {
         return Err(corrupt_row(

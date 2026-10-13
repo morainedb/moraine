@@ -27,7 +27,7 @@ use crate::{
 
 /// Mapping parents and children authored by this commit, before publication.
 fn pending_mappings(ops: &[RowOperation]) -> Result<HashMap<(u64, u64), proto::MappingValue>> {
-    let mut children = super::apply::collect_child_rows(ops)?;
+    let mut children = super::apply::collect_child_rows(ops, &super::rebase::Rebase::none())?;
     let mut mappings = HashMap::new();
     for operation in ops {
         if let RowOperation::Insert {

@@ -1,5 +1,7 @@
 #include "metadata_manager.hpp"
 
+#include "catalog.hpp"
+
 #include "common/ducklake_util.hpp"
 #include "common/index.hpp"
 #include "storage/ducklake_catalog.hpp"
@@ -18,6 +20,29 @@ namespace moraine_duckdb {
 
 MoraineMetadataManager::MoraineMetadataManager(duckdb::DuckLakeTransaction &transaction)
     : duckdb::DuckLakeMetadataManager(transaction) {
+	// Every commit finishes through FlushChangesServerSide below, which
+	// is where the id the catalog landed can reach DuckLake.
+	transaction.GetCatalog().SetRetrialsServerSide(true);
+}
+
+void MoraineMetadataManager::FlushChangesServerSide(duckdb::DuckLakeTransaction &flush_transaction,
+                                                    duckdb::DuckLakeSnapshot transaction_snapshot,
+                                                    const duckdb::TransactionChangeInformation &transaction_changes,
+                                                    const duckdb::DuckLakeRetryConfig &retry_config) {
+	// Resolved while the metadata connection's transaction is still open:
+	// the loop commits it, and a catalog lookup needs one.
+	auto &lake = transaction.GetCatalog();
+	auto &catalog = ResolveMoraineCatalog(*transaction.GetConnection().context, lake.MetadataDatabaseName());
+	flush_transaction.RunCommitLoop(transaction_snapshot, transaction_changes, retry_config);
+	// The loop recorded the id it stamped; the catalog's is authoritative.
+	// Monotone: the value is the catalog's last commit, which another
+	// connection may already have moved past this one.
+	auto landed = catalog.LastCommittedSnapshot();
+	auto recorded = lake.GetLastCommittedSnapshotId();
+	auto current = recorded.IsNull() ? 0 : recorded.GetValue<uint64_t>();
+	if (landed > current) {
+		lake.SetCommittedSnapshotId(static_cast<duckdb::idx_t>(landed));
+	}
 }
 
 void MoraineMetadataManager::RecordDrivingContext() {

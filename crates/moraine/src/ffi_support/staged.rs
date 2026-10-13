@@ -32,6 +32,7 @@ pub async fn staged_begin(
         data_prefix,
         catalog.data_reads(),
         catalog.cache_counters(),
+        Some(std::sync::Arc::clone(catalog.commits())),
     ))
 }
 

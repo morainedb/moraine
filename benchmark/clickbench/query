@@ -1,0 +1,26 @@
+#!/bin/bash
+# Reads one SQL query from stdin and runs it against the lake.
+# Stdout: the query result. Stderr: runtime in fractional seconds on the
+# last line. Exit non-zero on error.
+#
+# Loading the extension and attaching the lake happen before `.timer on`,
+# so the reported time is the query's — the same split every embedded
+# entry makes between opening its database and running a statement.
+set -e
+. ./lake.sh
+
+query=$(cat)
+
+out=$("$DUCKDB_CLI" "${lake_flags[@]}" \
+    -c ".timer on" \
+    -c "$query" 2>/tmp/moraine.err.$$) && status=0 || status=$?
+
+if [ "$status" -ne 0 ]; then
+    cat /tmp/moraine.err.$$ >&2
+    rm -f /tmp/moraine.err.$$
+    exit "$status"
+fi
+rm -f /tmp/moraine.err.$$
+
+printf '%s\n' "$out" | grep -v '^Run Time '
+printf '%s\n' "$out" | awk '/^Run Time/ { print $5 }' | tail -n1 >&2

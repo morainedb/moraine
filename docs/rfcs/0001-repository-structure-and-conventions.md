@@ -61,11 +61,21 @@ moraine/
 │       └── tests/                # e2e tests
 ├── xtask/
 │   └── src/main.rs
+├── benchmark/
+│   └── clickbench/               # a ClickBench system entry, run by `cargo xtask clickbench`
 └── docs/
     └── rfcs/
         ├── README.md             # the RFC process
         └── 0000-template.md
 ```
+
+`benchmark/` holds benchmark suites that are not ours: a third-party
+benchmark defines a contract its own driver calls, and a directory per suite
+keeps that shape intact instead of bending it into an xtask. The automation
+around one — building what it needs, scoring its output — stays in `xtask`.
+A suite's own queries are **not** vendored: ClickBench is CC BY-NC-SA, which
+does not mix with this repository's licensing, so they are read out of a
+checkout at run time.
 
 Document roles: **README** = what this is and how to use it. **ROADMAP** = where it's going. **RFCs** = why it is the way it is. **AGENTS.md** = how to work in it.
 

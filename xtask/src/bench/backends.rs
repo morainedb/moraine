@@ -57,15 +57,22 @@ pub struct SessionPaths {
 /// moraine attaches with `META_DATA_PATH` so equality-index workloads can
 /// scoped-read their data files. It is inert without an index: the delete
 /// workloads time the same with and without it.
+///
+/// `flush_interval_ms` is moraine's WAL flush spacing, and the other
+/// backends ignore it. The suite pins it low so a latency workload
+/// measures catalog work rather than the wait for the next flush; the
+/// concurrency workloads raise it, because that spacing is what commits
+/// coalesce into.
 pub fn attach_sql(
     kind: BackendKind,
     paths: &SessionPaths,
     postgres_dsn: Option<&str>,
+    flush_interval_ms: u64,
 ) -> anyhow::Result<String> {
     let data = paths.data_dir.display();
     Ok(match kind {
         BackendKind::Moraine => format!(
-            "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{data}', META_DATA_PATH '{data}', META_FLUSH_INTERVAL_MS 1);",
+            "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{data}', META_DATA_PATH '{data}', META_FLUSH_INTERVAL_MS {flush_interval_ms});",
             paths.catalog_dir.display()
         ),
         BackendKind::DuckdbFile => format!(
@@ -286,7 +293,7 @@ mod tests {
     #[test]
     fn moraine_attach_uses_the_nested_prefix() {
         assert_eq!(
-            attach_sql(BackendKind::Moraine, &paths(), None).unwrap(),
+            attach_sql(BackendKind::Moraine, &paths(), None, 1).unwrap(),
             "ATTACH 'ducklake:moraine:/tmp/cat' AS lake \
              (DATA_PATH '/tmp/data', META_DATA_PATH '/tmp/data', META_FLUSH_INTERVAL_MS 1);"
         );
@@ -295,7 +302,7 @@ mod tests {
     #[test]
     fn duckdb_attach_points_at_a_catalog_file() {
         assert_eq!(
-            attach_sql(BackendKind::DuckdbFile, &paths(), None).unwrap(),
+            attach_sql(BackendKind::DuckdbFile, &paths(), None, 1).unwrap(),
             "ATTACH 'ducklake:/tmp/cat/meta.ducklake' AS lake (DATA_PATH '/tmp/data');"
         );
     }
@@ -303,10 +310,19 @@ mod tests {
     #[test]
     fn postgres_attach_embeds_the_dsn_and_requires_one() {
         assert_eq!(
-            attach_sql(BackendKind::Postgres, &paths(), Some("dbname=b host=/s")).unwrap(),
+            attach_sql(BackendKind::Postgres, &paths(), Some("dbname=b host=/s"), 1).unwrap(),
             "ATTACH 'ducklake:postgres:dbname=b host=/s' AS lake (DATA_PATH '/tmp/data');"
         );
-        assert!(attach_sql(BackendKind::Postgres, &paths(), None).is_err());
+        assert!(attach_sql(BackendKind::Postgres, &paths(), None, 1).is_err());
+    }
+
+    #[test]
+    fn the_flush_spacing_reaches_moraines_attach_and_no_others() {
+        let moraine = attach_sql(BackendKind::Moraine, &paths(), None, 100).unwrap();
+        assert!(moraine.contains("META_FLUSH_INTERVAL_MS 100"), "{moraine}");
+
+        let duckdb = attach_sql(BackendKind::DuckdbFile, &paths(), None, 100).unwrap();
+        assert!(!duckdb.contains("FLUSH"), "{duckdb}");
     }
 
     #[test]

@@ -617,6 +617,11 @@ impl ReadOnlyCatalog {
         &self.projections
     }
 
+    /// Where this catalog's concurrent commits meet.
+    pub(crate) fn commits(&self) -> &Arc<commit::Coalescer> {
+        &self.commits
+    }
+
     /// What the process-wide block cache has served for **this catalog**
     /// since it attached, metadata and data blocks counted apart;
     /// [`cache_tally`](crate::cache_tally) is the same counts for the

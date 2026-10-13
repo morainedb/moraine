@@ -28,7 +28,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use slatedb::DbTransaction;
+use slatedb::{Db, DbTransaction};
 use tracing::{debug, warn};
 
 use crate::{
@@ -59,6 +59,10 @@ mod decode;
 mod index_upkeep;
 pub(crate) mod inline;
 mod overlay;
+mod rebase;
+use rebase::Rebase;
+
+use crate::transaction::operations::ChangeSet;
 mod row_id_invariants;
 #[cfg(test)]
 mod tests;
@@ -439,6 +443,8 @@ pub struct StagedTransaction {
     data_prefix: String,
     data_reads: Arc<data_file::DataStoreCounters>,
     memory: Arc<crate::store::cache::CacheCounters>,
+    /// Where the commit joins concurrent ones; `None` commits alone.
+    commits: Option<Arc<commit::Coalescer>>,
 }
 
 impl StagedTransaction {
@@ -446,6 +452,7 @@ impl StagedTransaction {
     /// yet; [`stage`](Self::stage) accumulates rows in memory only. A
     /// successful commit folds its batch into `projections` (a catalog's
     /// shared maintained-projection state).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         db_tx: DbTransaction,
         projections: Arc<std::sync::RwLock<ProjectionCache>>,
@@ -454,6 +461,7 @@ impl StagedTransaction {
         data_prefix: String,
         data_reads: Arc<data_file::DataStoreCounters>,
         memory: Arc<crate::store::cache::CacheCounters>,
+        commits: Option<Arc<commit::Coalescer>>,
     ) -> Self {
         Self {
             diagnostic_id: next_diagnostic_id(),
@@ -469,12 +477,16 @@ impl StagedTransaction {
             data_prefix,
             data_reads,
             memory,
+            commits,
         }
     }
 
     /// As [`begin`](Self::begin), but with a throwaway, never-served
     /// projection state and no `DATA_PATH` store — for tests that drive a
     /// `StagedTransaction` directly without a `Catalog`.
+    /// A transaction over a projection cache of its own, so it commits
+    /// alone: a batch folds into the catalog's cache, which this one would
+    /// never read.
     #[cfg(test)]
     pub(crate) fn begin_detached(catalog: &crate::Catalog, db_tx: DbTransaction) -> Self {
         Self::begin(
@@ -485,6 +497,7 @@ impl StagedTransaction {
             String::new(),
             Arc::default(),
             Arc::default(),
+            None,
         )
     }
 
@@ -501,6 +514,7 @@ impl StagedTransaction {
             String::new(),
             Arc::default(),
             catalog.cache_counters(),
+            Some(Arc::clone(catalog.commits())),
         )
     }
 
@@ -520,6 +534,7 @@ impl StagedTransaction {
             String::new(),
             Arc::default(),
             Arc::default(),
+            None,
         )
     }
 
@@ -1319,6 +1334,7 @@ impl StagedTransaction {
             data_prefix,
             data_reads,
             memory,
+            commits,
         } = self;
         let durability = catalog_store
             .as_deref()
@@ -1358,192 +1374,418 @@ impl StagedTransaction {
             }
         };
         phases.head_view = phase_started.elapsed();
-        let base_ref: &CatalogSnapshot = &base;
-
         let mints_snapshot = mints_snapshot(&ops);
-        let store = data_store.as_ref();
-        let read_metrics = Arc::new(data_file::ScopedReadMetrics::reporting_to(data_reads));
+        let context = StagingContext {
+            diagnostic_id,
+            projections: Arc::clone(&projections),
+            data_store,
+            data_prefix,
+            data_reads,
+        };
+        let size = StagedSize {
+            rows: staged_rows,
+            cost: staged_cost,
+            bytes: StagedBytes::default(),
+        };
 
-        // Both read `db_tx`'s pre-commit cut, so they run together.
-        // Maintenance stages only `index/*` keys as it streams — a subspace
-        // the inline translation never reads — and hands its directory
-        // repairs back unstaged; the translation stages nothing at all.
-        // (Index maintenance still runs before `translate_batch`, so a
-        // poisoned definition rides the writes it produces.)
-        let inline = async {
-            let phase_started = Instant::now();
-            let (writes, drained) = reporting_phase(
-                "translate-inline",
-                translate_inline(&db_tx, &projections, &ops),
-            )
-            .await?;
-            Ok::<_, Error>((writes, drained, phase_started.elapsed()))
+        // A data-only commit rides the batch, rebased onto whatever lands
+        // ahead of it; every other shape commits alone, where a lost race
+        // is DuckLake's to re-drive. Data-only by its rows and by what it
+        // declares: a snapshot-only commit can still say it altered a
+        // table.
+        let ours = if mints_snapshot && rebase::joinable(&ops) {
+            build_snapshot_value(&ops)
+                .ok()
+                .map(|snapshot| ChangeSet::parse(&snapshot.changes_made))
+                .filter(ChangeSet::is_data_only)
+                .filter(|_| !rebase::indexed(&base, &rebase::tables_touched(&ops)))
+        } else {
+            None
         };
-        let maintenance = async {
-            let phase_started = Instant::now();
-            let entries = reporting_phase(
-                "index-maintenance",
-                stage_index_maintenance(
-                    &db_tx,
-                    base_ref,
-                    &ops,
-                    store,
-                    &data_prefix,
-                    read_metrics,
-                    &projections,
-                ),
-            )
-            .await?;
-            Ok::<_, Error>((entries, phase_started.elapsed()))
-        };
-        let (inline_writes, drained, entries) = match futures::try_join!(inline, maintenance) {
-            Ok(((inline_writes, drained, inline_elapsed), (entries, maintenance_elapsed))) => {
-                phases.inline = inline_elapsed;
-                phases.index_maintenance = maintenance_elapsed;
-                (inline_writes, drained, entries)
-            }
+        let writer = catalog_store.as_deref().and_then(Store::writer_db);
+        if let (Some(ours), Some(commits), Some(db)) = (ours, commits.as_ref(), writer) {
+            // The transaction's own read view is spent: the batch's carries
+            // the writes.
+            commit::rollback(db_tx);
+            let member = StagedMember {
+                ours,
+                base_head: proto::HeadValue {
+                    snapshot_id: base.snapshot.snapshot_id,
+                    batch_seq: base.batch_seq,
+                },
+                base,
+                ops,
+                context,
+                report: std::sync::Mutex::new(None),
+            };
+            let ids = reporting_phase("batch", commit::commit_cycle(db, &member, commits)).await?;
+            let report = member
+                .report
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .ok_or_else(|| {
+                    Error::Corruption("a batched staged commit landed without a report".into())
+                })?;
+            let snapshot_id = ids.first().copied().ok_or_else(|| {
+                Error::Corruption("a batched staged commit reported no snapshot".into())
+            })?;
+            memory.record_commit(report.index_entries, report.staged_bytes.0);
+            debug!(
+                transaction_id = diagnostic_id,
+                snapshot = snapshot_id.get(),
+                staged_rows,
+                staged_bytes = report.staged_bytes.0,
+                elapsed_ms = crate::telemetry::milliseconds(started.elapsed()),
+                "staged commit landed with its batch"
+            );
+            return Ok(CommitReport {
+                snapshot_id,
+                deferred_indexes: report.deferred_indexes,
+                index_entries: report.index_entries,
+                staged_bytes: report.staged_bytes.0,
+            });
+        }
+
+        let base_ref: &CatalogSnapshot = &base;
+        let rebase = Rebase::identity(base_ref);
+        let staged = match stage_rows(
+            &db_tx,
+            base_ref,
+            &ops,
+            &rebase,
+            &context,
+            mints_snapshot,
+            &mut phases,
+        )
+        .await
+        {
+            Ok(staged) => staged,
             Err(err) => {
                 commit::rollback(db_tx);
                 return Err(err);
             }
         };
-        // Neither a flush nor a compaction derives entries, so this is
-        // where their files are held to the rows they re-home.
-        let held = async {
-            reporting_phase(
-                "flushed-row-ids",
-                row_id_invariants::verify_flushed_row_ids(
-                    base_ref,
-                    &ops,
-                    &drained,
-                    store,
-                    &data_prefix,
-                ),
-            )
-            .await?;
-            reporting_phase(
-                "compacted-row-ids",
-                row_id_invariants::verify_compacted_row_ids(base_ref, &ops, store, &data_prefix),
-            )
-            .await
-        };
-        if let Err(err) = held.await {
-            commit::rollback(db_tx);
-            return Err(err);
-        }
-        let StagedEntries {
-            poisoned,
-            deferred,
-            bytes: entry_bytes,
-            locator_writes,
-            metrics: index_metrics,
-        } = entries;
-        phases.index_metrics = index_metrics;
-
-        // A head-preserving commit never marks a definition maintaining.
-        let deferred_indexes = if mints_snapshot {
-            deferred.iter().copied().map(IndexId::new).collect()
-        } else {
-            Vec::new()
+        let RowsStaged {
+            result_id,
+            writes,
+            staged_bytes,
+            head_view: translated_head_view,
+            deferred_indexes,
+        } = staged;
+        let size = StagedSize {
+            bytes: staged_bytes,
+            ..size
         };
 
+        // Landed off-task: the write cannot be retracted once issued, so a
+        // host interrupt races the wait, not the write.
+        let head_before = proto::HeadValue {
+            snapshot_id: base_ref.snapshot.snapshot_id,
+            batch_seq: base_ref.batch_seq,
+        };
+        let head_view_update = translated_head_view.map_or_else(
+            || commit::HeadViewUpdate::Rebuild(Arc::clone(&base)),
+            |view| commit::HeadViewUpdate::Prepared(Arc::new(view)),
+        );
         let phase_started = Instant::now();
-        match translate_batch(base_ref, &ops, &poisoned, &deferred, mints_snapshot) {
-            Ok((result_id, mut writes, translated_head_view)) => {
-                phases.translate = phase_started.elapsed();
-                let phase_started = Instant::now();
-                // Directory repairs go ahead of the inline writes, so a
-                // flush draining a repaired chunk still deletes its locator.
-                writes.extend(locator_writes);
-                // A maintenance batch stamps the head too, reusing the
-                // standing snapshot id.
-                writes.push(commit::head_stamp(result_id, base_ref.batch_seq));
-                let staged_bytes =
-                    match stage_batch(&db_tx, &mut writes, inline_writes, entry_bytes) {
-                        Ok(staged) => staged,
-                        Err(err) => {
-                            commit::rollback(db_tx);
-                            return Err(err);
-                        }
-                    };
-                phases.stage = phase_started.elapsed();
-                // Landed off-task: the write cannot be retracted once
-                // issued, so a host interrupt races the wait, not the write.
-                let head_before = proto::HeadValue {
-                    snapshot_id: base_ref.snapshot.snapshot_id,
-                    batch_seq: base_ref.batch_seq,
-                };
-                let head_view_update = translated_head_view.map_or_else(
-                    || commit::HeadViewUpdate::Rebuild(Arc::clone(&base)),
-                    |view| commit::HeadViewUpdate::Prepared(Arc::new(view)),
+        let landed = reporting_phase(
+            "commit-batch",
+            commit::commit_batch_off_task(
+                db_tx,
+                commit::HeadTransition {
+                    before: head_before.snapshot_id,
+                    after: result_id,
+                },
+                writes,
+                staged_bytes,
+                head_view_update,
+                projections,
+                durability,
+            ),
+        )
+        .await?;
+        phases.land = phase_started.elapsed();
+        match landed {
+            commit::Landed::Committed(commit_timings) => {
+                let index_entries = phases
+                    .index_metrics
+                    .additions
+                    .saturating_add(phases.index_metrics.deletions);
+                memory.record_commit(index_entries, staged_bytes.0);
+                staged_landed(
+                    diagnostic_id,
+                    result_id,
+                    size,
+                    &phases,
+                    commit_timings,
+                    started,
                 );
-                let phase_started = Instant::now();
-                let landed = reporting_phase(
-                    "commit-batch",
-                    commit::commit_batch_off_task(
-                        db_tx,
-                        commit::HeadTransition {
-                            before: head_before.snapshot_id,
-                            after: result_id,
-                        },
-                        writes,
-                        staged_bytes,
-                        head_view_update,
-                        projections,
-                        durability,
+                Ok(CommitReport {
+                    snapshot_id: SnapshotId::new(result_id),
+                    deferred_indexes,
+                    index_entries,
+                    staged_bytes: staged_bytes.0,
+                })
+            }
+            commit::Landed::LostRace => {
+                // Re-derived rather than threaded: this runs only on the
+                // losing path.
+                let snapshot = build_snapshot_value(&ops).ok();
+                Err(reporting_phase(
+                    "lost-race",
+                    staged_lost_race_against(
+                        catalog_store.as_deref(),
+                        head_before,
+                        snapshot.as_ref().map(|s| s.changes_made.as_str()),
+                        result_id,
+                        staged_rows,
                     ),
                 )
-                .await?;
-                phases.land = phase_started.elapsed();
-                match landed {
-                    commit::Landed::Committed(commit_timings) => {
-                        let index_entries = phases
-                            .index_metrics
-                            .additions
-                            .saturating_add(phases.index_metrics.deletions);
-                        memory.record_commit(index_entries, staged_bytes.0);
-                        staged_landed(
-                            diagnostic_id,
-                            result_id,
-                            StagedSize {
-                                rows: staged_rows,
-                                cost: staged_cost,
-                                bytes: staged_bytes,
-                            },
-                            &phases,
-                            commit_timings,
-                            started,
-                        );
-                        Ok(CommitReport {
-                            snapshot_id: SnapshotId::new(result_id),
-                            deferred_indexes,
-                            index_entries,
-                            staged_bytes: staged_bytes.0,
-                        })
-                    }
-                    commit::Landed::LostRace => {
-                        // Re-derived rather than threaded: this runs only on
-                        // the losing path.
-                        let snapshot = build_snapshot_value(&ops).ok();
-                        Err(reporting_phase(
-                            "lost-race",
-                            staged_lost_race_against(
-                                catalog_store.as_deref(),
-                                head_before,
-                                snapshot.as_ref().map(|s| s.changes_made.as_str()),
-                                result_id,
-                                staged_rows,
-                            ),
-                        )
-                        .await)
-                    }
-                }
-            }
-            Err(err) => {
-                commit::rollback(db_tx);
-                Err(err)
+                .await)
             }
         }
+    }
+}
+
+/// What staging a commit's rows needs beside the rows: the catalog's
+/// projections and the data store its index upkeep reads.
+struct StagingContext {
+    diagnostic_id: u64,
+    projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    data_store: Option<DataStore>,
+    data_prefix: String,
+    data_reads: Arc<data_file::DataStoreCounters>,
+}
+
+/// One commit's rows translated and staged onto a transaction.
+struct RowsStaged {
+    result_id: u64,
+    writes: Vec<commit::StagedWrite>,
+    staged_bytes: StagedBytes,
+    head_view: Option<CatalogSnapshot>,
+    deferred_indexes: Vec<IndexId>,
+}
+
+/// Translates `ops` against `base` under `rebase` and stages the result
+/// onto `db_tx`: inline translation and index upkeep side by side, then
+/// the entity diff, the head stamp, and the batch. Nothing is rolled back
+/// on an error; the transaction is the caller's.
+async fn stage_rows(
+    db_tx: &Arc<DbTransaction>,
+    base: &CatalogSnapshot,
+    ops: &[RowOperation],
+    rebase: &Rebase,
+    context: &StagingContext,
+    mints_snapshot: bool,
+    phases: &mut CommitPhases,
+) -> Result<RowsStaged> {
+    let ops = rebase.inline_ops(ops);
+    let store = context.data_store.as_ref();
+    let read_metrics = Arc::new(data_file::ScopedReadMetrics::reporting_to(Arc::clone(
+        &context.data_reads,
+    )));
+    let projections = &context.projections;
+
+    // Both read `db_tx`'s pre-commit cut, so they run together.
+    // Maintenance stages only `index/*` keys as it streams — a subspace
+    // the inline translation never reads — and hands its directory
+    // repairs back unstaged; the translation stages nothing at all.
+    // (Index maintenance still runs before `translate_batch`, so a
+    // poisoned definition rides the writes it produces.)
+    let inline = async {
+        let phase_started = Instant::now();
+        let (writes, drained) = reporting_phase(
+            "translate-inline",
+            translate_inline(db_tx, projections, &ops),
+        )
+        .await?;
+        Ok::<_, Error>((writes, drained, phase_started.elapsed()))
+    };
+    let maintenance = async {
+        let phase_started = Instant::now();
+        let entries = reporting_phase(
+            "index-maintenance",
+            stage_index_maintenance(
+                db_tx,
+                base,
+                &ops,
+                store,
+                &context.data_prefix,
+                read_metrics,
+                projections,
+            ),
+        )
+        .await?;
+        Ok::<_, Error>((entries, phase_started.elapsed()))
+    };
+    let ((inline_writes, drained, inline_elapsed), (entries, maintenance_elapsed)) =
+        futures::try_join!(inline, maintenance)?;
+    phases.inline = inline_elapsed;
+    phases.index_maintenance = maintenance_elapsed;
+
+    // Neither a flush nor a compaction derives entries, so this is where
+    // their files are held to the rows they re-home.
+    reporting_phase(
+        "flushed-row-ids",
+        row_id_invariants::verify_flushed_row_ids(
+            base,
+            &ops,
+            &drained,
+            store,
+            &context.data_prefix,
+        ),
+    )
+    .await?;
+    reporting_phase(
+        "compacted-row-ids",
+        row_id_invariants::verify_compacted_row_ids(base, &ops, store, &context.data_prefix),
+    )
+    .await?;
+
+    let StagedEntries {
+        poisoned,
+        deferred,
+        bytes: entry_bytes,
+        locator_writes,
+        metrics: index_metrics,
+    } = entries;
+    phases.index_metrics = index_metrics;
+
+    // A head-preserving commit never marks a definition maintaining.
+    let deferred_indexes = if mints_snapshot {
+        deferred.iter().copied().map(IndexId::new).collect()
+    } else {
+        Vec::new()
+    };
+
+    let phase_started = Instant::now();
+    let (result_id, mut writes, head_view) =
+        translate_batch(base, &ops, &poisoned, &deferred, mints_snapshot, rebase)?;
+    phases.translate = phase_started.elapsed();
+    let phase_started = Instant::now();
+    // Directory repairs go ahead of the inline writes, so a flush
+    // draining a repaired chunk still deletes its locator.
+    writes.extend(locator_writes);
+    // A maintenance batch stamps the head too, reusing the standing
+    // snapshot id.
+    writes.push(commit::head_stamp(result_id, base.batch_seq));
+    let staged_bytes = stage_batch(db_tx, &mut writes, inline_writes, entry_bytes)?;
+    phases.stage = phase_started.elapsed();
+
+    Ok(RowsStaged {
+        result_id,
+        writes,
+        staged_bytes,
+        head_view,
+        deferred_indexes,
+    })
+}
+
+/// A staged commit riding the batch: its rows and the head it authored
+/// them against, re-staged against each premise it is offered.
+struct StagedMember {
+    ops: Vec<RowOperation>,
+    base: Arc<CatalogSnapshot>,
+    base_head: proto::HeadValue,
+    ours: ChangeSet,
+    context: StagingContext,
+    /// What the last attempt staged, for the report once it lands.
+    report: std::sync::Mutex<Option<MemberReport>>,
+}
+
+struct MemberReport {
+    deferred_indexes: Vec<IndexId>,
+    index_entries: u64,
+    staged_bytes: StagedBytes,
+}
+
+/// The refusal for a member that cannot ride the batch forming. Its text
+/// must contain `conflict`: DuckLake's retry loop scans for it.
+fn staged_declined(detail: &str) -> Error {
+    Error::CommitConflict(format!(
+        "commit conflict: a concurrent commit changed state this one read or wrote ({detail})"
+    ))
+}
+
+impl commit::StageOnto for StagedMember {
+    async fn stage_onto(
+        &self,
+        batch: &mut commit::Batch,
+        db: &Db,
+        _projections: &std::sync::RwLock<ProjectionCache>,
+    ) -> Result<commit::Staging> {
+        batch.count_member();
+        batch.refold()?;
+
+        // The premise may be past the head this member read: commits that
+        // landed in between, and members ahead of it on this batch. Either
+        // is benign unless it touched what this member did.
+        if batch.premise().snapshot.snapshot_id > self.base_head.snapshot_id {
+            let (conflict, _, _) =
+                commit::conflicting_intervening_change(db, &self.base_head, &self.ours).await?;
+            if let Some(winner) = conflict {
+                return Ok(commit::Staging::Declined(staged_declined(&format!(
+                    "snapshot {winner} changed state this one read or wrote"
+                ))));
+            }
+        }
+        if batch
+            .change_sets()
+            .iter()
+            .any(|theirs| crate::transaction::operations::conflicts(&self.ours, theirs))
+        {
+            return Ok(commit::Staging::Declined(staged_declined(
+                "a commit ahead of it in the same batch touched the same state",
+            )));
+        }
+        if rebase::indexed(batch.premise(), &rebase::tables_touched(&self.ops)) {
+            return Ok(commit::Staging::Declined(staged_declined(
+                "an index was created on a table it writes",
+            )));
+        }
+
+        let rebase = Rebase::between(&self.base, batch.premise());
+        let mut phases = CommitPhases::default();
+        let staged = stage_rows(
+            &batch.db_tx,
+            batch.premise(),
+            &self.ops,
+            &rebase,
+            &self.context,
+            true,
+            &mut phases,
+        )
+        .await?;
+        let index_entries = phases
+            .index_metrics
+            .additions
+            .saturating_add(phases.index_metrics.deletions);
+        debug!(
+            transaction_id = self.context.diagnostic_id,
+            snapshot = staged.result_id,
+            rebased = !rebase.is_identity(),
+            "staged commit staged onto its batch"
+        );
+        batch.admit_member(
+            staged.result_id,
+            self.ours.clone(),
+            staged.writes,
+            staged.staged_bytes,
+        );
+        *self
+            .report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(MemberReport {
+            deferred_indexes: staged.deferred_indexes,
+            index_entries,
+            staged_bytes: staged.staged_bytes,
+        });
+
+        Ok(commit::Staging::Staged {
+            ids: vec![SnapshotId::new(staged.result_id)],
+            ours: vec![self.ours.clone()],
+        })
     }
 }
 
@@ -1569,6 +1811,7 @@ fn translate_batch(
     poisoned: &[u64],
     deferred: &[u64],
     mints_snapshot: bool,
+    rebase: &Rebase,
 ) -> Result<(u64, Vec<commit::StagedWrite>, Option<CatalogSnapshot>)> {
     if !mints_snapshot {
         return translate_maintenance(base, ops)
@@ -1580,7 +1823,7 @@ fn translate_batch(
         mut writes,
         snapshot: snap,
         head_view: translated_head_view,
-    } = translate(base, ops, poisoned, deferred)?;
+    } = translate(base, ops, poisoned, deferred, rebase)?;
     // Derived before the snapshot record joins the batch: the changelog
     // names `current` keys, and that record is not.
     let changelog = commit::changelog_writes(new_id, &writes);
@@ -1845,22 +2088,25 @@ fn translate(
     ops: &[RowOperation],
     poisoned: &[u64],
     deferred: &[u64],
+    rebase: &Rebase,
 ) -> Result<Translated> {
-    let snapshot = build_snapshot_value(ops)?;
-    let new_id = snapshot.snapshot_id;
+    let mut snapshot = build_snapshot_value(ops)?;
 
-    // DuckLake mints the id from the head it read; an id at or below the
-    // head means another commit landed in between, a lost race.
-    if new_id <= base.snapshot.snapshot_id {
-        return Err(staged_lost_race(new_id, ops.len()));
+    // DuckLake mints the id from the head it read; an id at or below that
+    // head means another commit landed in between, a lost race. Checked
+    // before the rebase moves it onto the head the commit lands on.
+    if snapshot.snapshot_id <= rebase.base_head {
+        return Err(staged_lost_race(snapshot.snapshot_id, ops.len()));
     }
+    rebase.snapshot_value(&mut snapshot);
+    let new_id = snapshot.snapshot_id;
 
     // Ends and deletes apply before inserts regardless of emit order (a
     // rename ends and re-inserts under one id, and the insert must win the
     // shared `current` key); begin-rebases apply last, targeting rows this
     // commit inserted. Inline ops are translated by `translate_inline`.
     let mut state = base.clone();
-    let mut children = collect_child_rows(ops)?;
+    let mut children = collect_child_rows(ops, rebase)?;
     let mut direct = Vec::new();
     let hard_deleted = collect_hard_deletes(ops)?;
     let mut touched = commit::Touched::default();
@@ -1883,6 +2129,7 @@ fn translate(
                 &mut state,
                 op,
                 new_id,
+                rebase,
                 &mut children,
                 &mut direct,
                 &hard_deleted,
@@ -2003,6 +2250,7 @@ fn translate_maintenance(
     ops: &[RowOperation],
 ) -> Result<Vec<commit::StagedWrite>> {
     let head = base.snapshot.snapshot_id;
+    let rebase = Rebase::identity(base);
 
     let mut state = base.clone();
     let mut children = ChildRows::default();
@@ -2031,6 +2279,7 @@ fn translate_maintenance(
             &mut state,
             op,
             head,
+            &rebase,
             &mut children,
             &mut direct,
             &hard_deleted,
