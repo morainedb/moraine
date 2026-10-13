@@ -18,7 +18,9 @@ use super::{
     TableId, TableKind, commit, data_file,
     decode::{Cursor, decode_data_file, decode_delete_file},
     inline::inline_chunk_range_write,
-    proto, stage_index_entry_stream, store_inline,
+    proto,
+    rebase::Rebase,
+    stage_index_entry_stream, store_inline,
 };
 use crate::{
     catalog::projection::{self, ProjectionCache},
@@ -27,7 +29,7 @@ use crate::{
 
 /// Mapping parents and children authored by this commit, before publication.
 fn pending_mappings(ops: &[RowOperation]) -> Result<HashMap<(u64, u64), proto::MappingValue>> {
-    let mut children = super::apply::collect_child_rows(ops, &super::rebase::Rebase::none())?;
+    let mut children = super::apply::collect_child_rows(ops, &Rebase::none())?;
     let mut mappings = HashMap::new();
     for operation in ops {
         if let RowOperation::Insert {
@@ -151,6 +153,8 @@ pub(super) struct FileContext<'a> {
     /// The handle's projection cache, for the inline locator scan's width
     /// bound.
     projections: &'a std::sync::RwLock<ProjectionCache>,
+    /// Where the commit's stamped file and snapshot references land.
+    rebase: &'a Rebase,
 }
 
 impl FileContext<'_> {
@@ -258,7 +262,8 @@ async fn stream_data_file_index_entries(
     killed: Option<&TargetDeletes>,
     context: &FileContext<'_>,
 ) -> Result<IndexEntryStream<'static>> {
-    let file = decode_data_file(cells)?;
+    let mut file = decode_data_file(cells)?;
+    context.rebase.data_file(&mut file);
     let table = TableId::new(file.table_id);
     let indexes = Arc::clone(&context.indexing(base, table)?.maintained);
     if indexes.indexes.is_empty() {
@@ -384,7 +389,7 @@ pub(super) fn staged_scoped_entry(
 /// Stages the commit's index entry adds and removals, returning the ids of
 /// any building indexes a duplicate poisoned with the bytes the entries
 /// put on the batch.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) async fn stage_index_maintenance(
     db_tx: &Arc<DbTransaction>,
     base: &CatalogSnapshot,
@@ -393,6 +398,7 @@ pub(super) async fn stage_index_maintenance(
     data_prefix: &str,
     metrics: Arc<data_file::ScopedReadMetrics>,
     projections: &std::sync::RwLock<ProjectionCache>,
+    rebase: &Rebase,
 ) -> Result<StagedEntries> {
     let pending_schemas = pending_inline_schemas(ops);
     let inline_schemas = InlineSchemaCache::new(&pending_schemas);
@@ -421,6 +427,7 @@ pub(super) async fn stage_index_maintenance(
             })
             .collect::<Result<_>>()?,
         projections,
+        rebase,
     };
 
     let DeletePlan {
@@ -545,7 +552,8 @@ fn plan_deletes(
                 table: TableKind::DeleteFile,
                 cells,
             } => {
-                let delete_file = decode_delete_file(cells)?;
+                let mut delete_file = decode_delete_file(cells)?;
+                context.rebase.delete_file(&mut delete_file);
                 let table = TableId::new(delete_file.table_id);
                 if !context.compacted.contains(&delete_file.table_id)
                     && !context.indexing(base, table)?.all.indexes.is_empty()
@@ -598,6 +606,7 @@ fn plan_deletes(
                 // re-home rows under their own ids and must keep every
                 // entry.
                 let (table_id, data_file_id) = ended_data_file(cells)?;
+                let data_file_id = context.rebase.file_id(data_file_id);
                 if context.deleted_from.contains(&table_id)
                     && !context.compacted.contains(&table_id)
                     && !context
@@ -645,7 +654,8 @@ fn plan_adds<'a>(
                 table: TableKind::DataFile,
                 cells,
             } => {
-                let file = decode_data_file(cells)?;
+                let mut file = decode_data_file(cells)?;
+                context.rebase.data_file(&mut file);
                 // A compacted file's entries are already stored under the
                 // same keys; it is left out of `registered` too, since the
                 // commit stages no delete against it.

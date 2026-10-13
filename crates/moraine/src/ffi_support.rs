@@ -1792,7 +1792,7 @@ mod tests {
         use crate::transaction::staged::{Cell, RowOperation, TableKind};
 
         let head = catalog.snapshot().await.unwrap().current_snapshot().id;
-        let mut tx = staged::staged_begin(catalog, None, String::new())
+        let mut tx = staged::staged_begin(catalog, None, String::new(), None)
             .await
             .unwrap();
         for snapshot in dump_snapshots(catalog).await.unwrap() {

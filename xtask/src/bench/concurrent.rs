@@ -26,6 +26,9 @@ use anyhow::{Context, bail, ensure};
 pub struct Burst {
     pub writers: usize,
     pub commits_each: u64,
+    /// Whether each writer's table carries an equality index, so every
+    /// commit also maintains index entries.
+    pub indexed: bool,
 }
 
 impl Burst {
@@ -43,7 +46,13 @@ impl Burst {
         Ok(Self {
             writers,
             commits_each: commits / count,
+            indexed: false,
         })
+    }
+
+    /// The same burst over indexed tables.
+    pub fn with_index(self, indexed: bool) -> Self {
+        Self { indexed, ..self }
     }
 
     /// Commits the whole burst performs.
@@ -54,7 +63,13 @@ impl Burst {
     /// The table each writer appends to, created before any of them start.
     pub fn setup_sql(self) -> Vec<String> {
         (0..self.writers)
-            .map(|writer| format!("CREATE TABLE lake.main.writer_{writer} (id BIGINT);"))
+            .flat_map(|writer| {
+                let table = format!("CREATE TABLE lake.main.writer_{writer} (id BIGINT);");
+                let index = self.indexed.then(|| {
+                    format!("CREATE INDEX writer_{writer}_by_id ON lake.main.writer_{writer}(id);")
+                });
+                std::iter::once(table).chain(index)
+            })
             .collect()
     }
 
@@ -74,7 +89,11 @@ impl Burst {
 
     /// The report phase this burst fills.
     pub fn phase(self) -> String {
-        format!("writers_{}", self.writers)
+        if self.indexed {
+            format!("writers_{}_indexed", self.writers)
+        } else {
+            format!("writers_{}", self.writers)
+        }
     }
 }
 

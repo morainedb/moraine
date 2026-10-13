@@ -657,10 +657,25 @@ verb path:
   so the rule covers that shape entirely; what it cannot re-derive — a
   catalog id, a schema version — is exactly what makes a commit not
   data-only. The rebase is therefore **refused** for every other shape,
-  and for a commit touching a table under an equality index, whose
-  entries are derived from the row and file ids the member stamped rather
-  than moved with them. A refused member does not join a batch: it
-  commits alone, and a lost race there surfaces as `CommitConflict`.
+  and for a member that appends rows to a table without carrying that
+  table's statistics row, since the row-id counter the shift is taken
+  from lives there and nowhere else. A refused member does not join a
+  batch: it commits alone, and a lost race there surfaces as
+  `CommitConflict`. Index upkeep derives a member's entries from the
+  moved values, so an indexed table is no exception.
+- **The base is the view the rows were authored against.** DuckLake
+  stamps its rows from the snapshot its own transaction read, and the
+  catalog transaction those rows reach may open later, after other
+  commits landed. The member's base for the rebase is therefore the view
+  the caller read, handed in when the transaction opens, and only absent
+  that the transaction's own view. Measured against the transaction's
+  view instead, every such commit read as a lost race: half of all
+  commits at eight writers, each re-driven by DuckLake after its backoff.
+- **A member's own lost race declines, never poisons.** A `CommitConflict`
+  raised while a member stages — its stamped snapshot at or below the head
+  it is measured against — is that member's to re-drive. It leaves the
+  forming batch as it found it; any other error a member raises still
+  poisons the batch, since a half-staged member cannot be unstaged.
 - **Same classifier, same outcomes.** A staged member's change set is
   parsed from the `changes_made` DuckLake authors, so the table-level
   classifier that decides benign against true for verb members decides it

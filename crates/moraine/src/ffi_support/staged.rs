@@ -22,6 +22,7 @@ pub async fn staged_begin(
     catalog: &Catalog,
     data_store: Option<DataStore>,
     data_prefix: String,
+    read_view: Option<std::sync::Arc<crate::catalog::CatalogSnapshot>>,
 ) -> Result<StagedTransaction> {
     let db_tx = catalog.begin_write_tx().await?;
     Ok(StagedTransaction::begin(
@@ -33,6 +34,7 @@ pub async fn staged_begin(
         catalog.data_reads(),
         catalog.cache_counters(),
         Some(std::sync::Arc::clone(catalog.commits())),
+        read_view,
     ))
 }
 

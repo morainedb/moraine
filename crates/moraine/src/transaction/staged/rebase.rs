@@ -334,10 +334,23 @@ impl Rebase {
 /// a schema version — DDL, an inline table's creation, maintenance — is not.
 pub(super) fn joinable(ops: &[RowOperation]) -> bool {
     let mut mints = false;
+    let mut appends_to = BTreeSet::new();
+    let mut stats_for = BTreeSet::new();
     for op in ops {
         let allowed = match op {
-            RowOperation::Insert { table, .. } => {
+            RowOperation::Insert { table, cells } => {
                 mints |= *table == TableKind::Snapshot;
+                match table {
+                    TableKind::DataFile => match decode::decode_data_file(cells) {
+                        Ok(file) => appends_to.insert(file.table_id),
+                        Err(_) => return false,
+                    },
+                    TableKind::TableStats => match decode::decode_table_stats(cells) {
+                        Ok(stats) => stats_for.insert(stats.table_id),
+                        Err(_) => return false,
+                    },
+                    _ => false,
+                };
                 matches!(
                     table,
                     TableKind::Snapshot
@@ -354,8 +367,11 @@ pub(super) fn joinable(ops: &[RowOperation]) -> bool {
             RowOperation::UpdateSetEnd { table, .. } => {
                 matches!(table, TableKind::DataFile | TableKind::DeleteFile)
             }
-            RowOperation::InlineInsert { .. }
-            | RowOperation::InlineInlineDelete { .. }
+            RowOperation::InlineInsert { table_id, .. } => {
+                appends_to.insert(*table_id);
+                true
+            }
+            RowOperation::InlineInlineDelete { .. }
             | RowOperation::InlineFileDelete { .. }
             | RowOperation::InlineFileDeleteRemove { .. } => true,
             _ => false,
@@ -364,36 +380,7 @@ pub(super) fn joinable(ops: &[RowOperation]) -> bool {
             return false;
         }
     }
-    mints
-}
-
-/// The tables a commit's rows write.
-pub(super) fn tables_touched(ops: &[RowOperation]) -> BTreeSet<u64> {
-    ops.iter()
-        .filter_map(|op| match op {
-            RowOperation::Insert { table, cells } => match table {
-                TableKind::DataFile => decode::decode_data_file(cells).ok().map(|f| f.table_id),
-                TableKind::DeleteFile => decode::decode_delete_file(cells).ok().map(|f| f.table_id),
-                TableKind::TableStats => decode::decode_table_stats(cells).ok().map(|s| s.table_id),
-                _ => None,
-            },
-            RowOperation::InlineInsert { table_id, .. }
-            | RowOperation::InlineInlineDelete { table_id, .. }
-            | RowOperation::InlineFileDelete { table_id, .. }
-            | RowOperation::InlineFileDeleteRemove { table_id, .. } => Some(*table_id),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Whether any of `tables` carries an equality index in `snapshot`.
-pub(super) fn indexed(snapshot: &CatalogSnapshot, tables: &BTreeSet<u64>) -> bool {
-    tables.iter().any(|table_id| {
-        snapshot
-            .indexes
-            .get(table_id)
-            .is_some_and(|indexes| !indexes.is_empty())
-    })
+    mints && appends_to.is_subset(&stats_for)
 }
 
 /// Which end of a column's range a bound is.
@@ -529,7 +516,7 @@ fn merge_exact(premise: Option<bool>, member: Option<bool>) -> Option<bool> {
 mod tests {
     use bytes::Bytes;
 
-    use super::*;
+    use super::{super::Cell, *};
 
     fn rebase() -> Rebase {
         Rebase {
@@ -775,9 +762,9 @@ mod tests {
         assert!(joinable(&[
             data(TableKind::Snapshot),
             data(TableKind::SnapshotChanges),
-            data(TableKind::DataFile),
+            data_file(1),
             data(TableKind::DeleteFile),
-            data(TableKind::TableStats),
+            table_stats(1),
             data(TableKind::TableColumnStats),
             data(TableKind::FileColumnStats),
             data(TableKind::FilePartitionValue),
@@ -806,5 +793,65 @@ mod tests {
             },
         ]));
         assert!(!joinable(&[]), "nothing to mint a snapshot with");
+    }
+
+    /// The row-id counter lives in the statistics row; a member that
+    /// appends rows without one has nothing the rebase can shift by.
+    #[test]
+    fn an_append_without_its_tables_statistics_commits_alone() {
+        let snapshot = RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: Vec::new(),
+        };
+        assert!(!joinable(&[snapshot.clone(), data_file(1)]));
+        assert!(!joinable(&[snapshot.clone(), data_file(1), table_stats(2)]));
+        assert!(joinable(&[snapshot.clone(), data_file(1), table_stats(1)]));
+
+        let inline = RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 2,
+            row_id_start: 0,
+            row_count: 1,
+            arrow_body: Bytes::new(),
+        };
+        assert!(!joinable(&[snapshot.clone(), inline.clone()]));
+        assert!(joinable(&[snapshot, inline, table_stats(1)]));
+    }
+
+    fn data_file(table_id: u64) -> RowOperation {
+        RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: vec![
+                Cell::U64(1),
+                Cell::U64(table_id),
+                Cell::U64(2),
+                Cell::Null,
+                Cell::Null,
+                Cell::Str("data.parquet".into()),
+                Cell::Bool(true),
+                Cell::Str("parquet".into()),
+                Cell::U64(10),
+                Cell::U64(1024),
+                Cell::U64(64),
+                Cell::U64(0),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        }
+    }
+
+    fn table_stats(table_id: u64) -> RowOperation {
+        RowOperation::Insert {
+            table: TableKind::TableStats,
+            cells: vec![
+                Cell::U64(table_id),
+                Cell::U64(10),
+                Cell::U64(10),
+                Cell::U64(1024),
+            ],
+        }
     }
 }

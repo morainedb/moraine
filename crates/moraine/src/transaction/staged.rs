@@ -445,6 +445,10 @@ pub struct StagedTransaction {
     memory: Arc<crate::store::cache::CacheCounters>,
     /// Where the commit joins concurrent ones; `None` commits alone.
     commits: Option<Arc<commit::Coalescer>>,
+    /// The view the caller authored its rows against, when it read one
+    /// before this transaction opened. A batch rebases the rows from it;
+    /// absent, the transaction's own view stands in.
+    read_view: Option<Arc<CatalogSnapshot>>,
 }
 
 impl StagedTransaction {
@@ -462,6 +466,7 @@ impl StagedTransaction {
         data_reads: Arc<data_file::DataStoreCounters>,
         memory: Arc<crate::store::cache::CacheCounters>,
         commits: Option<Arc<commit::Coalescer>>,
+        read_view: Option<Arc<CatalogSnapshot>>,
     ) -> Self {
         Self {
             diagnostic_id: next_diagnostic_id(),
@@ -478,6 +483,7 @@ impl StagedTransaction {
             data_reads,
             memory,
             commits,
+            read_view,
         }
     }
 
@@ -498,6 +504,7 @@ impl StagedTransaction {
             Arc::default(),
             Arc::default(),
             None,
+            None,
         )
     }
 
@@ -515,6 +522,7 @@ impl StagedTransaction {
             Arc::default(),
             catalog.cache_counters(),
             Some(Arc::clone(catalog.commits())),
+            None,
         )
     }
 
@@ -534,6 +542,7 @@ impl StagedTransaction {
             String::new(),
             Arc::default(),
             Arc::default(),
+            None,
             None,
         )
     }
@@ -1335,6 +1344,7 @@ impl StagedTransaction {
             data_reads,
             memory,
             commits,
+            read_view,
         } = self;
         let durability = catalog_store
             .as_deref()
@@ -1398,22 +1408,23 @@ impl StagedTransaction {
                 .ok()
                 .map(|snapshot| ChangeSet::parse(&snapshot.changes_made))
                 .filter(ChangeSet::is_data_only)
-                .filter(|_| !rebase::indexed(&base, &rebase::tables_touched(&ops)))
         } else {
             None
         };
         let writer = catalog_store.as_deref().and_then(Store::writer_db);
         if let (Some(ours), Some(commits), Some(db)) = (ours, commits.as_ref(), writer) {
             // The transaction's own read view is spent: the batch's carries
-            // the writes.
+            // the writes. The rows were stamped against the view the caller
+            // read, which may predate this transaction's own.
             commit::rollback(db_tx);
+            let authored = read_view.unwrap_or(base);
             let member = StagedMember {
                 ours,
                 base_head: proto::HeadValue {
-                    snapshot_id: base.snapshot.snapshot_id,
-                    batch_seq: base.batch_seq,
+                    snapshot_id: authored.snapshot.snapshot_id,
+                    batch_seq: authored.batch_seq,
                 },
-                base,
+                base: authored,
                 ops,
                 context,
                 report: std::sync::Mutex::new(None),
@@ -1614,6 +1625,7 @@ async fn stage_rows(
                 &context.data_prefix,
                 read_metrics,
                 projections,
+                rebase,
             ),
         )
         .await?;
@@ -1739,15 +1751,10 @@ impl commit::StageOnto for StagedMember {
                 "a commit ahead of it in the same batch touched the same state",
             )));
         }
-        if rebase::indexed(batch.premise(), &rebase::tables_touched(&self.ops)) {
-            return Ok(commit::Staging::Declined(staged_declined(
-                "an index was created on a table it writes",
-            )));
-        }
 
         let rebase = Rebase::between(&self.base, batch.premise());
         let mut phases = CommitPhases::default();
-        let staged = stage_rows(
+        let staged = match stage_rows(
             &batch.db_tx,
             batch.premise(),
             &self.ops,
@@ -1756,7 +1763,14 @@ impl commit::StageOnto for StagedMember {
             true,
             &mut phases,
         )
-        .await?;
+        .await
+        {
+            Ok(staged) => staged,
+            // A race the rows themselves lost is this member's to re-drive;
+            // the batch it would have joined goes on without it.
+            Err(err @ Error::CommitConflict(_)) => return Ok(commit::Staging::Declined(err)),
+            Err(err) => return Err(err),
+        };
         let index_entries = phases
             .index_metrics
             .additions
@@ -1765,6 +1779,10 @@ impl commit::StageOnto for StagedMember {
             transaction_id = self.context.diagnostic_id,
             snapshot = staged.result_id,
             rebased = !rebase.is_identity(),
+            inline_ms = crate::telemetry::milliseconds(phases.inline),
+            index_ms = crate::telemetry::milliseconds(phases.index_maintenance),
+            translate_ms = crate::telemetry::milliseconds(phases.translate),
+            stage_ms = crate::telemetry::milliseconds(phases.stage),
             "staged commit staged onto its batch"
         );
         batch.admit_member(

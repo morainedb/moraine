@@ -137,8 +137,16 @@ pub(crate) fn begin(handle: *mut MoraineCatalogHandle) -> *mut MoraineTxHandle {
     let mut tx: *mut MoraineTxHandle = ptr::null_mut();
     let mut err = MoraineError::default();
     // SAFETY: `handle` is attached; outputs are valid local slots.
-    let code =
-        unsafe { moraine_tx_begin(handle, &raw mut tx, None, ptr::null_mut(), &raw mut err) };
+    let code = unsafe {
+        moraine_tx_begin(
+            handle,
+            ptr::null(),
+            &raw mut tx,
+            None,
+            ptr::null_mut(),
+            &raw mut err,
+        )
+    };
     // SAFETY: `err.message` is null or was just written by `moraine_tx_begin`.
     assert_eq!(code, codes::OK, "begin failed: {:?}", unsafe {
         err.message.as_ref()

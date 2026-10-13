@@ -78,6 +78,8 @@ struct Options {
     concurrency: Vec<usize>,
     commits: u64,
     flush_interval_ms: u64,
+    /// Whether the concurrency workloads write to indexed tables.
+    indexed: bool,
 }
 
 fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
@@ -91,6 +93,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
     // coalescing is what the concurrency workloads are there to measure,
     // and a 1 ms spacing leaves nothing to coalesce.
     let mut flush_interval_ms = 100u64;
+    let mut indexed = false;
 
     let mut iterator = arguments.iter();
     while let Some(flag) = iterator.next() {
@@ -118,6 +121,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
                     .parse()
                     .with_context(|| "parsing --flush-interval-ms".to_owned())?;
             }
+            "--indexed" => indexed = true,
             "--commits" => {
                 commits = value()?
                     .parse()
@@ -146,6 +150,7 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
         concurrency,
         commits,
         flush_interval_ms,
+        indexed,
     })
 }
 
@@ -342,7 +347,13 @@ fn run_burst_once(
         // The driver does its own setup: the tables have to be created on
         // the instance the writers then share.
         BurstMode::Connections => in_process::driver().and_then(|driver| {
-            in_process::run(&driver, &attach, burst.writers, burst.commits_each)
+            in_process::run(
+                &driver,
+                &attach,
+                burst.writers,
+                burst.commits_each,
+                burst.indexed,
+            )
         }),
     };
 
@@ -400,9 +411,18 @@ fn sweep_concurrency(
     rows: &mut Vec<Row>,
 ) -> anyhow::Result<()> {
     for &backend in backends {
+        if options.indexed && backend != BackendKind::Moraine {
+            println!(
+                "notice: {} skipped on {} — an equality index is moraine's own",
+                backend.name(),
+                mode.workload()
+            );
+            continue;
+        }
         let mut one_writer_worked = false;
         for &writers in &options.concurrency {
-            let burst = concurrent::Burst::plan(options.commits, writers)?;
+            let burst =
+                concurrent::Burst::plan(options.commits, writers)?.with_index(options.indexed);
             let mut seconds: Vec<f64> = Vec::new();
 
             for repeat in 0..options.repeat {
@@ -731,6 +751,12 @@ mod tests {
         let options =
             parse_options(&to_arguments(&["--concurrency", "3", "--commits", "9"])).unwrap();
         assert!(concurrent::Burst::plan(options.commits, 3).is_ok());
+        assert!(
+            parse_options(&to_arguments(&["--indexed"]))
+                .unwrap()
+                .indexed
+        );
+        assert!(!options.indexed);
         assert!(parse_options(&to_arguments(&["--concurrency", "0"])).is_err());
         assert!(parse_options(&to_arguments(&["--commits", "many"])).is_err());
     }

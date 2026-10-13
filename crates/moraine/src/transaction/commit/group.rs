@@ -341,9 +341,11 @@ impl Coalescer {
         M: StageOnto + ?Sized,
     {
         let arrival = self.arrive();
+        let arrived = std::time::Instant::now();
         // Each await below is named, because none of them can be read from
         // a thread dump once the commit parks on it.
         let mut shared = reporting_phase("admit", self.admit()).await;
+        let admitted = std::time::Instant::now();
 
         let mut batch = match shared.forming.take() {
             Some(batch) => batch,
@@ -359,12 +361,24 @@ impl Coalescer {
             Ok(staging) => staging,
             Err(err) => {
                 // The batch is poisoned; its members learn that nothing
-                // landed when the outcome sender drops.
+                // landed when the outcome sender drops. Named here because
+                // the error reaches only the member that raised it.
+                tracing::warn!(
+                    members = batch.members,
+                    error = %err,
+                    "a member failed to stage and took the forming batch with it"
+                );
                 super::rollback(batch.db_tx);
                 return Err(err);
             }
         };
 
+        tracing::debug!(
+            members = batch.members,
+            admit_ms = crate::telemetry::milliseconds(admitted.duration_since(arrived)),
+            stage_ms = crate::telemetry::milliseconds(admitted.elapsed()),
+            "member staged onto the forming batch"
+        );
         let outcome = batch.outcome.subscribe();
         let head_before = batch.head_before;
         let rides = !batch.writes.is_empty();

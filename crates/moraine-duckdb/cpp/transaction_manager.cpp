@@ -55,7 +55,8 @@ MoraineTxHandle *MoraineTransaction::OpenStagedTx() {
 		// cancellable; a gone context degrades to a non-cancellable call.
 		auto client = context.lock();
 		auto code =
-		    moraine_tx_begin(catalog_handle_, &tx, client ? moraine_shim_is_interrupted : nullptr, client.get(), &err);
+		    moraine_tx_begin(catalog_handle_, snapshot_, &tx, client ? moraine_shim_is_interrupted : nullptr,
+		                     client.get(), &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
 		}
