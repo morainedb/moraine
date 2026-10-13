@@ -45,3 +45,4 @@ directly here as RFCs; there is no separate specs directory.
 | [0021](0021-maintenance-model.md) | Maintenance orchestration |
 | [0022](0022-commit-log-and-leader-role.md) | The commit log and the leader role |
 | [0023](0023-published-row-summaries.md) | Published file row summaries |
+| [0024](0024-commit-log-plug-boundary.md) | Commit-log plug boundary |

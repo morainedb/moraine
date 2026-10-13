@@ -74,6 +74,10 @@ pub(crate) const FORMAT_WITH_INLINE_SCHEMA_REFERENCE: u64 = 7;
 pub(crate) const FORMAT_WITH_INLINE_CHUNK_IDENTITY: u64 = 8;
 /// Inline tombstones retain each deletion snapshot under its own key.
 pub(crate) const FORMAT_WITH_INLINE_TOMBSTONE_HISTORY: u64 = 9;
+/// The store's commits are slot objects in a bucket-resident commit log, and
+/// the store is their fold. Opening one needs the commit-log library's plugs;
+/// a binary without them must refuse rather than commit past the log.
+pub(crate) const FORMAT_WITH_COMMIT_LOG: u64 = 10;
 /// The highest format this binary understands. It opens any store in
 /// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
 pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_INLINE_TOMBSTONE_HISTORY;
@@ -217,6 +221,12 @@ pub(crate) async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::
         ));
     }
     match format {
+        Some(format) if format.format_version == FORMAT_WITH_COMMIT_LOG => {
+            Err(Error::Migration(format!(
+                "store format {FORMAT_WITH_COMMIT_LOG} keeps its commits in a bucket-resident \
+                 commit log; opening it needs the commit-log library linked in and registered"
+            )))
+        }
         Some(format) if format.format_version > MAX_FORMAT_VERSION => {
             Err(Error::Migration(format!(
                 "store format {} is newer than this binary understands (max {MAX_FORMAT_VERSION}); \
