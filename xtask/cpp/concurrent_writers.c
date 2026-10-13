@@ -20,6 +20,8 @@
 
 #define STATEMENT_MAX 4096
 
+static double seconds_between(struct timespec start, struct timespec end);
+
 typedef struct {
     duckdb_database database;
     pthread_barrier_t *barrier;
@@ -60,6 +62,43 @@ static void report_catalog_warnings(duckdb_connection connection) {
         }
     }
     duckdb_destroy_result(&result);
+}
+
+// A DDL session beside the writers, when CONCURRENT_WRITERS_DDL names a
+// count: that many CREATE TABLE statements, one after another, each timed
+// and reported on stderr as `ddl_seconds=<seconds>`. What a schema change
+// costs while a session commits without pause.
+typedef struct {
+    duckdb_database database;
+    pthread_barrier_t *barrier;
+    int statements;
+    char error[STATEMENT_MAX];
+} ddl_task;
+
+static void *ddl_loop(void *argument) {
+    ddl_task *task = (ddl_task *)argument;
+    duckdb_connection connection = NULL;
+    int failed = duckdb_connect(task->database, &connection) == DuckDBError;
+    if (failed) {
+        snprintf(task->error, STATEMENT_MAX, "the ddl session could not connect");
+    }
+    pthread_barrier_wait(task->barrier);
+    // Let the writers get going before the first schema change.
+    struct timespec pause = {0, 300 * 1000 * 1000};
+    nanosleep(&pause, NULL);
+    for (int statement = 0; !failed && statement < task->statements; ++statement) {
+        char sql[STATEMENT_MAX];
+        snprintf(sql, sizeof(sql), "CREATE TABLE lake.main.ddl_%d (a BIGINT);", statement);
+        struct timespec started, ended;
+        clock_gettime(CLOCK_MONOTONIC, &started);
+        failed = run(connection, sql, task->error);
+        clock_gettime(CLOCK_MONOTONIC, &ended);
+        fprintf(stderr, "ddl_seconds=%.6f\n", seconds_between(started, ended));
+    }
+    if (connection) {
+        duckdb_disconnect(&connection);
+    }
+    return NULL;
 }
 
 // One writer: connect, wait for the others, then commit `commits` times.
@@ -174,8 +213,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    const char *ddl_env = getenv("CONCURRENT_WRITERS_DDL");
+    int ddl_statements = ddl_env ? atoi(ddl_env) : 0;
     pthread_barrier_t barrier;
-    pthread_barrier_init(&barrier, NULL, (unsigned)writers + 1);
+    pthread_barrier_init(&barrier, NULL, (unsigned)writers + 1 + (ddl_statements > 0 ? 1 : 0));
+    ddl_task ddl = {database, &barrier, ddl_statements, {0}};
+    pthread_t ddl_thread;
+    if (ddl_statements > 0) {
+        pthread_create(&ddl_thread, NULL, ddl_loop, &ddl);
+    }
     writer_task *tasks = calloc((size_t)writers, sizeof(writer_task));
     pthread_t *threads = calloc((size_t)writers, sizeof(pthread_t));
     if (!tasks || !threads) {
@@ -199,6 +245,12 @@ int main(int argc, char **argv) {
     }
     struct timespec ended;
     clock_gettime(CLOCK_MONOTONIC, &ended);
+    if (ddl_statements > 0) {
+        pthread_join(ddl_thread, NULL);
+        if (ddl.error[0]) {
+            fprintf(stderr, "ddl: %s\n", ddl.error);
+        }
+    }
 
     int any_failed = 0;
     for (int writer = 0; writer < writers; ++writer) {
