@@ -357,6 +357,19 @@ fn run_burst_once(
         }),
     };
 
+    // What the burst cost in objects: every write-ahead log object the
+    // catalog put. The setup commits (one table per writer, the attach) are
+    // in the count too, so read it against `commits + writers + 1`.
+    if backend == BackendKind::Moraine {
+        let wal_objects = fs::read_dir(paths.catalog_dir.join("wal"))
+            .map_or(0, |entries| entries.filter_map(Result::ok).count());
+        println!(
+            "ok: {} wal objects for {} commits plus setup with {} writers on moraine",
+            wal_objects,
+            burst.commits(),
+            burst.writers
+        );
+    }
     if let (BackendKind::Postgres, Some(handle)) = (backend, postgres) {
         handle.drop_database(&database)?;
     }

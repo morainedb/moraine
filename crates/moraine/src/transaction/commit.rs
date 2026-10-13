@@ -131,7 +131,7 @@ pub(crate) async fn commit_durable(
     durability: &CommitDurability,
 ) -> std::result::Result<Option<slatedb::WriteHandle>, slatedb::Error> {
     let handle = reporting_stalls(operation, staged, tx.commit()).await?;
-    await_durable(handle.clone(), operation, staged, durability).await?;
+    await_durable(handle.clone(), operation, staged, durability, 1).await?;
     Ok(handle)
 }
 
@@ -143,6 +143,7 @@ pub(crate) async fn await_durable(
     operation: &'static str,
     staged: StagedBytes,
     durability: &CommitDurability,
+    commits: usize,
 ) -> std::result::Result<(), slatedb::Error> {
     let Some(handle) = handle else {
         return Ok(());
@@ -154,7 +155,7 @@ pub(crate) async fn await_durable(
         // The flush the pacer performs or waits for is what puts the
         // batch in object storage.
         CommitDurability::Paced(pacer) => {
-            reporting_stalls(operation, staged, pacer.await_durable(handle)).await
+            reporting_stalls(operation, staged, pacer.await_durable(handle, commits)).await
         }
     }
 }
@@ -1366,6 +1367,7 @@ pub(crate) async fn await_submitted(
     submitted: Submitted,
     projections: &std::sync::RwLock<ProjectionCache>,
     durability: &CommitDurability,
+    commits: usize,
 ) -> Result<Landed> {
     let Submitted {
         handle,
@@ -1374,7 +1376,7 @@ pub(crate) async fn await_submitted(
         durable_started,
         projection,
     } = submitted;
-    match await_durable(handle, "commit", staged_bytes, durability).await {
+    match await_durable(handle, "commit", staged_bytes, durability, commits).await {
         Ok(()) => {
             let durable = durable_started.elapsed();
             debug!(
@@ -1427,7 +1429,7 @@ pub(crate) async fn commit_batch(
     {
         Submission::LostRace => Ok(Landed::LostRace),
         Submission::Submitted(submitted) => {
-            await_submitted(submitted, projections, durability).await
+            await_submitted(submitted, projections, durability, 1).await
         }
     }
 }
