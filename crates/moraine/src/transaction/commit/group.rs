@@ -15,7 +15,10 @@ use std::sync::{
 
 use futures::FutureExt;
 use slatedb::{Db, DbTransaction, IsolationLevel};
-use tokio::sync::{Mutex, MutexGuard, watch};
+use tokio::{
+    sync::{Mutex, MutexGuard, watch},
+    time::Instant,
+};
 
 use super::{
     CommitDurability, HeadTransition, HeadViewUpdate, Landed, Prepared, StagedWrite, Submission,
@@ -284,7 +287,16 @@ pub(crate) struct Coalescer {
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     /// How a sealed batch reaches object storage.
     durability: CommitDurability,
+    /// Until when arrivals hold before staging, so a commit that lost the
+    /// head race on its own and is being re-driven from outside finds the
+    /// head where it left it. A session committing without pause would
+    /// otherwise beat every retry.
+    yielding_until: std::sync::Mutex<Option<Instant>>,
 }
+
+/// How long the batch yields to a commit re-driven from outside: past
+/// DuckLake's first retry backoff and the re-read behind it.
+const RETRY_YIELD: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl Coalescer {
     pub(crate) fn new(
@@ -298,6 +310,33 @@ impl Coalescer {
             flights: watch::Sender::new(0),
             projections,
             durability,
+            yielding_until: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// A commit that cannot join the batch lost the head race and is
+    /// being re-driven from outside: the batch yields to it.
+    pub(crate) fn yield_to_retry(&self) {
+        let until = Instant::now() + RETRY_YIELD;
+        let mut yielding = self
+            .yielding_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if yielding.is_none_or(|current| current < until) {
+            *yielding = Some(until);
+        }
+    }
+
+    /// Waits out a yield in progress.
+    async fn hold_for_yield(&self) {
+        let until = *self
+            .yielding_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(until) = until
+            && until > Instant::now()
+        {
+            tokio::time::sleep_until(until).await;
         }
     }
 
@@ -341,6 +380,7 @@ impl Coalescer {
         M: StageOnto + ?Sized,
     {
         let arrival = self.arrive();
+        reporting_phase("yield", self.hold_for_yield()).await;
         let arrived = std::time::Instant::now();
         // Each await below is named, because none of them can be read from
         // a thread dump once the commit parks on it.

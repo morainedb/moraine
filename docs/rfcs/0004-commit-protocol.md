@@ -681,6 +681,21 @@ verb path:
   same session and the pass would never land. A minting commit's rows are
   DuckLake's, stamped against the head it read, and its race stays
   DuckLake's.
+- **The batch yields to a commit it could not take.** A minting commit
+  the rebase refuses — DDL, an inline table's creation, a flush — commits
+  alone, and a race it loses is DuckLake's to re-drive, after a backoff
+  of at least fifty milliseconds and a fresh read. A session committing
+  without pause moves the head every few milliseconds and would beat
+  every retry, where under a spacing-paced flush it left gaps the retry
+  landed in. So a lone commit that loses tells the coalescer, and
+  arrivals hold for a quarter second before staging: one hiccup for the
+  writers per schema change, against a schema change that never lands.
+  Measured: a `CREATE TABLE` under a session inserting every twelve
+  milliseconds took the whole session's length, 5.1 s, to land before
+  the yield, and 63 to 200 ms with it, against 45 ms idle; the session
+  paid half a second over five of them. A loss is found either while the
+  rows are staged, when the transaction's view is already past the head
+  the rows were stamped from, or at the head swap, and both yield.
 - **A member's own lost race declines, never poisons.** A `CommitConflict`
   raised while a member stages — its stamped snapshot at or below the head
   it is measured against — is that member's to re-drive. It leaves the
