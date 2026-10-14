@@ -209,6 +209,67 @@ provider all three are ignored. The folder is a designated process, never
 an attach by default: a fleet of sessions that each took the writer would
 fence one another.
 
+### The sequence a committer races
+
+**Open defect.** A committer over a reader races the sequence after the
+last slot its plug reports served, and the plug reports a slot served when
+it hands the rows to SlateDB, a moment before SlateDB applies them to the
+reader's memory. A commit prepared in that moment reads a head that
+predates the served slot, races the sequence after it, and wins a slot
+that carries a snapshot built without the previous slot's changes: two
+snapshots with one id, and the peer's commit overwritten. The race cannot
+catch it, because the race only checks that the sequence is free; the
+guard was skipping the sequence it should have lost at. The folder has no
+such window: it applies a slot into its own store before it marks the
+slot folded.
+
+**The rule.** The sequence to race is derived from the state the commit
+was prepared against, never from the plug. Every slot carries exactly one
+`sys/head` stamp, and the head's batch counter advances by one per slot,
+so a committer that prepared against a head at batch counter *b* races
+the slot that counter implies. A stale head then races a taken slot and
+loses, which re-prepares correctly. The served signal stays as a hint for
+when to re-read after a loss; it carries no safety.
+
+**The invariant that makes the rule hold**, to be verified against the
+code and then enforced: one head stamp per slot, with the batch counter
+contiguous from adoption, which records the counter the first slot
+stands on. Writes the folder makes for itself outside a slot — the
+format raise, maintenance status, the sweep's tombstones — do not stamp
+the head and so do not disturb the count. A slot found carrying no head
+stamp, or two, is corruption.
+
+### What remains
+
+In order; each item is small, and the first is required before the
+committer role is sound.
+
+1. **Race by head counter.** The rule above, replacing the served-based
+   sequence; a test that lands a peer slot between a committer's prepare
+   and its offer and shows the loss.
+2. **Prefetching replay.** The plug reads slots one at a time; a
+   thousand-slot tail is tens of seconds on S3. Read a bounded window
+   ahead.
+3. **Flush after N folded slots.** The folder's paced flush writes nothing
+   under the plug, so its memtable reaches the tree only at 64 MB, which
+   on a quiet lake is days of slots. A cold open costs one GET per slot,
+   so the bound is a slot count, not bytes or time: flush when N slots
+   have folded since the last flush.
+4. **Idle tail poll on the folder,** so it folds peers' slots without
+   waiting to lose to them, and **the collector at flush,** truncating the
+   log below what manifests reference with a retention margin.
+5. **The sprint.** A committer takes the store — open as the folder,
+   replay, flush, collect, close — when the tail is past a threshold,
+   checked on a loss and at detach; a holder keeps the store until fenced.
+   The threshold sits well above N, so a folder doing its job is never
+   fenced by a committer. With this, no standing process is required.
+6. **Chunked sweep.** The folder's own rows take sequence numbers in the
+   gap between slots, one million per slot. A sweep larger than that
+   overruns the next slot's number, so it folds between chunks.
+7. **End to end.** Two DuckDB processes on one bucket, one as the folder
+   and one as a committer, and the attach option's C++ side, which has
+   compiled only by inspection.
+
 ## Alternatives considered
 
 - **A cargo feature with an optional dependency on the library.** The
