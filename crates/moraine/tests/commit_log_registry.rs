@@ -7,10 +7,13 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use moraine::{Catalog, CatalogOptions, CommitLogProvider, Error, register_commit_log};
+use moraine::{
+    Catalog, CatalogOptions, CommitLogProvider, Error, SlotAdoption, SlotCommit, SlotCommitter,
+    SlotOffer, register_commit_log,
+};
 use object_store::{ObjectStore, memory::InMemory};
 use slatedb::wal::{
-    WalError, WalFileRange, WalIterator, WalReader, WalRows, WriterInit, WriterInitResult,
+    WalError, WalFileRange, WalGc, WalIterator, WalReader, WalRows, WriterInit, WriterInitResult,
     WriterManifest,
 };
 
@@ -31,9 +34,82 @@ impl CommitLogProvider for Counting {
         Box::new(RefusingWriter)
     }
 
-    fn reader(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn WalReader> {
+    fn reader(
+        &self,
+        _log_store: Arc<dyn ObjectStore>,
+        _path: &str,
+        _tail: bool,
+    ) -> Arc<dyn WalReader> {
         *self.readers.lock().unwrap() += 1;
         Arc::new(EmptyLog)
+    }
+
+    fn committer(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn SlotCommitter> {
+        Arc::new(NoCommits)
+    }
+
+    fn garbage_collector(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn WalGc> {
+        Arc::new(NoGc)
+    }
+}
+
+/// A collector that deletes nothing.
+struct NoGc;
+
+#[async_trait]
+impl WalGc for NoGc {
+    async fn collect(
+        &self,
+        _referenced_ranges: Vec<WalFileRange>,
+        _min_age: std::time::Duration,
+        _dry_run: bool,
+    ) -> Result<(), WalError> {
+        Ok(())
+    }
+}
+
+/// A committer over a log nothing commits to.
+#[derive(Debug)]
+struct NoCommits;
+
+#[async_trait]
+impl SlotCommitter for NoCommits {
+    async fn offer(&self, _sequence: u64, _commits: Vec<SlotCommit>) -> moraine::Result<SlotOffer> {
+        Err(Error::Configuration(
+            "the test log takes no commits".to_string(),
+        ))
+    }
+
+    async fn adopted(&self) -> moraine::Result<bool> {
+        Ok(false)
+    }
+
+    async fn tail(&self) -> moraine::Result<Vec<(u64, moraine::SlotEnvelope)>> {
+        Ok(Vec::new())
+    }
+
+    async fn unfolded(&self, _replay_point: u64) -> moraine::Result<u64> {
+        Ok(0)
+    }
+
+    async fn adopt(&self, _stamp: SlotCommit) -> moraine::Result<SlotAdoption> {
+        Err(Error::Configuration(
+            "the test log takes no commits".to_string(),
+        ))
+    }
+
+    fn rows_per_slot(&self) -> u64 {
+        u64::MAX
+    }
+
+    fn headroom(&self) -> u64 {
+        u64::MAX
+    }
+
+    fn mark_folded(&self, _sequence: u64) {}
+
+    async fn await_served(&self, _sequence: u64, _timeout: std::time::Duration) -> bool {
+        false
     }
 }
 
@@ -75,8 +151,8 @@ impl WalIterator for Drained {
 
 #[tokio::test]
 async fn one_registration_serves_opens_without_a_provider_and_yields_to_one_with() {
-    // Bootstrap before registering: a read-write open with a provider is
-    // refused in this version, registered or not.
+    // Bootstrap before registering: once a provider is registered, a
+    // read-write open adopts the log through it.
     let object_store = Arc::new(InMemory::new());
     let writer = Catalog::open(object_store.clone(), CatalogOptions::default())
         .await
@@ -94,8 +170,8 @@ async fn one_registration_serves_opens_without_a_provider_and_yields_to_one_with
 
     let refused = Catalog::open(object_store.clone(), CatalogOptions::default()).await;
     assert!(
-        matches!(refused, Err(Error::Configuration(_))),
-        "a read-write open reaches the registered provider and is refused: {refused:?}"
+        refused.is_err(),
+        "a read-write open reaches the registered provider, whose writer plug refuses to open"
     );
 
     // An open carrying no provider builds its reader over the registered one.

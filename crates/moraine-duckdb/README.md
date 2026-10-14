@@ -175,6 +175,22 @@ in flight is lost; `from_wal_path => '…'` names the log store as it stands
 when the lake already has one, and `wal_path => NULL` moves the log back
 into the catalog store.
 
+
+**`COMMIT_LOG_ROLE` — the attach's part in a commit log.** When the
+process has a commit-log provider registered, every commit is a slot in a
+log beside the catalog, and a read-write attach plays one of two parts.
+`'committer'`, the default, commits over a tailing reader: any number of
+processes may attach this way, and none holds the store's writer. `'folder'`
+holds the store's one writer, applies every slot as it lands, flushes on the
+paced cadence, and adopts a store not yet on the log; run exactly one, as a
+long-lived process. A committer needs an adopted log, so the folder attaches
+first. `COMMIT_LOG_TAIL true` makes a read-only attach tail the log and see a
+commit the moment its slot lands, at a listing per poll, rather than follow
+the folded store. `COMMIT_LOG_POLL_INTERVAL_MS` is how often a committer's
+reader polls for slots other committers landed; it also bounds how long a
+commit waits to see its own. All three are ignored without a registered
+provider.
+
 **`CACHE_DIR` — on-disk object cache for S3 catalogs.** Each query reads the
 catalog metadata from the store; on S3 that is network latency every time, and
 the in-memory caches start empty in each new process. Point SlateDB's disk

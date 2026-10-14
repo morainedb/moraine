@@ -14,7 +14,6 @@ use std::sync::{
 };
 
 use futures::FutureExt;
-use slatedb::{Db, DbTransaction, IsolationLevel};
 use tokio::sync::{Mutex, MutexGuard, watch};
 
 use super::{
@@ -22,11 +21,12 @@ use super::{
     await_submitted, fold, head_view_for, prepare_and_stage, submit_batch,
 };
 use crate::{
-    catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
+    catalog::{CatalogSnapshot, SnapshotId, Store, projection::ProjectionCache},
+    commit_log::LogCommitter,
     error::{Error, Result},
     store::StagedBytes,
     telemetry::{STALL_INTERVAL, reporting_phase},
-    transaction::{operations::ChangeSet, verbs::Transaction},
+    transaction::{operations::ChangeSet, session::CommitSession, verbs::Transaction},
 };
 
 /// The most commits one batch carries; a full batch seals even while
@@ -75,7 +75,7 @@ pub(crate) struct Staged {
 /// A batch being formed: one open transaction carrying every member's
 /// writes, and the premise the next member stages against.
 struct Batch {
-    db_tx: Arc<DbTransaction>,
+    db_tx: Arc<CommitSession>,
     /// The head view the batch opened at.
     base: Arc<CatalogSnapshot>,
     /// `base` folded forward through the members staged so far; `None`
@@ -96,12 +96,9 @@ struct Batch {
 }
 
 impl Batch {
-    async fn open(db: &Db, projections: &std::sync::RwLock<ProjectionCache>) -> Result<Self> {
-        let db_tx = db
-            .begin(IsolationLevel::Snapshot)
-            .await
-            .map_err(Error::from)?;
-        let base = match head_view_for(&db_tx, projections).await {
+    async fn open(db: &Store, projections: &std::sync::RwLock<ProjectionCache>) -> Result<Self> {
+        let db_tx = db.begin_commit_session().await?;
+        let base = match head_view_for(db_tx.handle(), projections).await {
             Ok(base) => base,
             Err(err) => {
                 db_tx.rollback();
@@ -197,12 +194,15 @@ pub(crate) struct Coalescer {
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     /// How a sealed batch reaches object storage.
     durability: CommitDurability,
+    /// The commit log a sealed batch is offered to, when commits are slots.
+    commit_log: Option<LogCommitter>,
 }
 
 impl Coalescer {
     pub(crate) fn new(
         projections: Arc<std::sync::RwLock<ProjectionCache>>,
         durability: CommitDurability,
+        commit_log: Option<LogCommitter>,
     ) -> Self {
         Self {
             shared: Mutex::new(Shared { forming: None }),
@@ -211,6 +211,7 @@ impl Coalescer {
             flights: watch::Sender::new(0),
             projections,
             durability,
+            commit_log,
         }
     }
 
@@ -249,7 +250,7 @@ impl Coalescer {
 
     /// Stages `members` onto whichever batch is forming, opening one if
     /// none is, and seals the batch if this caller is the last one in.
-    pub(crate) async fn stage<F>(self: &Arc<Self>, db: &Db, members: &[F]) -> Result<Staged>
+    pub(crate) async fn stage<F>(self: &Arc<Self>, db: &Store, members: &[F]) -> Result<Staged>
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
@@ -334,7 +335,10 @@ impl Coalescer {
                 &writes,
                 staged_bytes,
                 HeadViewUpdate::Rebuild(base),
-                &self.projections,
+                super::Landing {
+                    projections: &self.projections,
+                    log: self.commit_log.as_ref(),
+                },
             ),
         ))
         .catch_unwind()
@@ -518,8 +522,7 @@ mod tests {
             .await
             .unwrap();
         let store = catalog.store();
-        let db = store.writer_db().unwrap();
-        let mut batch = Batch::open(db, catalog.projections()).await.unwrap();
+        let mut batch = Batch::open(&store, catalog.projections()).await.unwrap();
         batch
             .stage(
                 &[|tx: &mut Transaction| {
@@ -535,6 +538,7 @@ mod tests {
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
             catalog.store().commit_durability(),
+            None,
         ));
         let flight = coalescer.enter_flight();
         Arc::clone(&coalescer).land(batch, flight).await;
@@ -553,7 +557,6 @@ mod tests {
             .await
             .unwrap();
         let store = catalog.store();
-        let db = store.writer_db().unwrap();
         // The store opens with no flush timer, so a durability wait has to
         // be paired with an explicit flush. That is what the store's own
         // pacer does; `OnFlushInterval` would wait for a timer that does
@@ -561,11 +564,12 @@ mod tests {
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
             store.commit_durability(),
+            None,
         ));
 
         // Staged, not sealed: exactly what a caller leaves behind when it is
         // not the last arrival in.
-        let mut batch = Batch::open(db, catalog.projections()).await.unwrap();
+        let mut batch = Batch::open(&store, catalog.projections()).await.unwrap();
         batch
             .stage(
                 &[|tx: &mut Transaction| {
@@ -602,6 +606,7 @@ mod tests {
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
             catalog.store().commit_durability(),
+            None,
         ));
 
         // The slot is claimed and its holder vanishes without landing.
@@ -626,6 +631,7 @@ mod tests {
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
             catalog.store().commit_durability(),
+            None,
         ));
 
         let flight = coalescer.enter_flight();

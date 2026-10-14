@@ -140,6 +140,21 @@ typedef struct MoraineWalStore {
   const struct MoraineS3Config *s3;
 } MoraineWalStore;
 
+// Mirrors the C `MoraineCommitLog`: how an attach takes part in a commit
+// log, when a provider is registered for the process. Ignored without
+// one.
+typedef struct MoraineCommitLog {
+  // `0` commits over a tailing reader; `1` holds the store's one writer,
+  // the folder, which adopts a store not yet on the log.
+  uint8_t role;
+  // Whether a read-only attach tails the log rather than following the
+  // folded store.
+  bool tail;
+  // How often a committer's reader polls for slots, in milliseconds;
+  // `0` keeps the catalog's default.
+  uint64_t poll_interval_ms;
+} MoraineCommitLog;
+
 // A C-side cancellation probe polled while a cancellable call's core
 // future is pending; returning `true` cancels the call. `None` disables
 // the pull channel for that call. Mirrors `MoraineInterruptProbe` in
@@ -1329,6 +1344,37 @@ void moraine_error_free(char *message);
 // from any thread. `out` must be a valid, writable `*mut *mut
 // MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
 // [`MoraineError`]. All for the duration of this call.
+int32_t moraine_attach_with_commit_log(const char *path,
+                                       const struct MoraineS3Config *s3,
+                                       bool read_only,
+                                       bool encrypted,
+                                       uint64_t flush_interval_ms,
+                                       bool flush_on_commit,
+                                       const char *cache_dir,
+                                       uint64_t cache_size_bytes,
+                                       uint64_t cache_memory_bytes,
+                                       uint32_t cache_auxiliary_percent,
+                                       uint8_t cache_preload,
+                                       bool cache_puts,
+                                       bool cache_compaction_puts,
+                                       const char *data_path,
+                                       const struct MoraineWalStore *wal,
+                                       const struct MoraineCommitLog *commit_log,
+                                       const char *checkpoint,
+                                       uint64_t host_threads,
+                                       MoraineInterruptProbe probe,
+                                       void *probe_ctx,
+                                       struct MoraineCatalogHandle **out,
+                                       struct MoraineError *err);
+
+// Opens a catalog that takes no part in a commit log beyond the process
+// default. New callers use [`moraine_attach_with_commit_log`], whose
+// `commit_log` argument names the attach's role.
+//
+// # Safety
+//
+// All pointer and callback requirements are identical to
+// [`moraine_attach_with_commit_log`].
 int32_t moraine_attach_with_wal_store(const char *path,
                                       const struct MoraineS3Config *s3,
                                       bool read_only,
