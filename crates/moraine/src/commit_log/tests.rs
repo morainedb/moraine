@@ -786,6 +786,64 @@ async fn a_committer_takes_the_store_when_the_tail_is_long_or_the_log_unadopted(
     folded_only.close().await.unwrap();
 }
 
+/// A holder that first meets its fence at close closes cleanly: every
+/// slot it folded is durable in the log, so there is nothing to report.
+#[tokio::test]
+async fn a_holder_fenced_unseen_closes_quietly() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+
+    let holder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(holder.holds_store());
+    holder
+        .commit(|tx| tx.create_schema("h").map(|_| ()))
+        .await
+        .unwrap();
+
+    // Another process takes the store; the holder has not flushed since.
+    let usurper = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(Arc::new(provider.sharing())),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(usurper.take_store().await.unwrap());
+
+    holder.close().await.unwrap();
+    usurper.close().await.unwrap();
+
+    let reader = Catalog::open_read_only(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(Arc::new(provider.sharing())),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        reader
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("h")
+            .is_some()
+    );
+    reader.close().await.unwrap();
+}
+
 /// A holder fenced by another process gives the store up and keeps
 /// committing through its reader.
 #[tokio::test]
