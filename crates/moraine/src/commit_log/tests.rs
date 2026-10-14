@@ -1,20 +1,15 @@
-//! The plug boundary: a provider's reader reaches a read-only open, a
-//! read-write open with a provider is refused, and a store stamped for the
-//! log is refused without one. The process-wide registry is covered by its
-//! own test binary, since it is global.
+//! The plug boundary over the in-tree log: readers tail it, a folder adopts
+//! it and commits through it, a lost race folds the winner, and a store
+//! stamped for the log is refused without a provider. The process-wide
+//! registry is covered by its own test binary, since it is global.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use async_trait::async_trait;
-use object_store::{ObjectStore, memory::InMemory};
-use slatedb::wal::{
-    WalError, WalFileRange, WalIterator, WalReader, WalRows, WriterInit, WriterInitResult,
-    WriterManifest,
-};
+use object_store::memory::InMemory;
 
 use crate::{
-    Catalog, CatalogOptions, Error,
-    commit_log::CommitLogProvider,
+    Catalog, CatalogOptions,
+    commit_log::{CommitLogProvider, SlotCommit, SlotEnvelope, SlotWrite, test_log::TestProvider},
     store::{
         key::{Key, SysKey},
         open::StoreBuilder,
@@ -22,76 +17,6 @@ use crate::{
     },
     transaction::commit::FORMAT_WITH_COMMIT_LOG,
 };
-
-/// A provider over an empty log that records what the catalog asked of it.
-#[derive(Debug, Default)]
-struct Recording {
-    reader_paths: Mutex<Vec<String>>,
-    tail_reads: Arc<Mutex<u64>>,
-}
-
-impl Recording {
-    fn reader_paths(&self) -> Vec<String> {
-        self.reader_paths.lock().unwrap().clone()
-    }
-
-    fn tail_reads(&self) -> u64 {
-        *self.tail_reads.lock().unwrap()
-    }
-}
-
-impl CommitLogProvider for Recording {
-    fn writer_init(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Box<dyn WriterInit> {
-        Box::new(RefusingWriter)
-    }
-
-    fn reader(&self, _log_store: Arc<dyn ObjectStore>, path: &str) -> Arc<dyn WalReader> {
-        self.reader_paths.lock().unwrap().push(path.to_string());
-        Arc::new(EmptyLog {
-            tail_reads: Arc::clone(&self.tail_reads),
-        })
-    }
-}
-
-struct RefusingWriter;
-
-#[async_trait]
-impl WriterInit for RefusingWriter {
-    async fn fence_and_init(
-        &self,
-        _manifest: &mut WriterManifest,
-    ) -> Result<WriterInitResult, WalError> {
-        Err(WalError::Unavailable(Arc::new(std::io::Error::other(
-            "the test log has no writer",
-        ))))
-    }
-}
-
-/// A log with no slots: every tail read finds the fold current.
-struct EmptyLog {
-    tail_reads: Arc<Mutex<u64>>,
-}
-
-#[async_trait]
-impl WalReader for EmptyLog {
-    async fn iterator(&self, _range: WalFileRange) -> Result<Box<dyn WalIterator>, WalError> {
-        Ok(Box::new(Drained))
-    }
-
-    async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError> {
-        *self.tail_reads.lock().unwrap() += 1;
-        Ok(replay_after_wal_id)
-    }
-}
-
-struct Drained;
-
-#[async_trait]
-impl WalIterator for Drained {
-    async fn next(&mut self) -> Result<Option<WalRows>, WalError> {
-        Ok(None)
-    }
-}
 
 fn options_at(path: &str) -> CatalogOptions {
     CatalogOptions {
@@ -106,16 +31,17 @@ async fn bootstrapped(object_store: Arc<InMemory>, path: &str) {
     writer.close().await.unwrap();
 }
 
-/// A read-only open builds its store over the provider's reader, asking
-/// for it by the catalog's path, and the store tails the log through it.
+/// A tailing read-only open builds its store over the provider's reader
+/// and is served the slots the log holds past the fold.
 #[tokio::test]
-async fn a_read_only_open_tails_the_log_through_the_provider() {
+async fn a_tailing_read_only_open_is_served_the_logs_slots() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
 
-    let provider = Arc::new(Recording::default());
-    let reader = Catalog::open_read_only(
-        object_store,
+    // A folder adopts the log, so slots count from the store's own WAL.
+    let provider = Arc::new(TestProvider::default());
+    let folder = Catalog::open(
+        object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
             ..options_at("lake")
@@ -123,11 +49,40 @@ async fn a_read_only_open_tails_the_log_through_the_provider() {
     )
     .await
     .unwrap();
+    folder.close().await.unwrap();
 
-    assert_eq!(provider.reader_paths(), vec!["lake".to_string()]);
+    provider.log.land(
+        2,
+        SlotEnvelope {
+            commits: vec![SlotCommit {
+                transaction_id: [1; 16],
+                validated_head: 0,
+                changes_made: String::new(),
+                writes: vec![SlotWrite {
+                    key: b"\xffpeer".to_vec(),
+                    value: Some(b"landed".to_vec()),
+                }],
+            }],
+        },
+    );
+
+    let reader = Catalog::open_read_only(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            commit_log_tail: true,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+
     assert!(
-        provider.tail_reads() >= 1,
-        "the store resolves the log's end through the plug"
+        provider
+            .committer(Arc::new(InMemory::new()), "lake")
+            .await_served(2, std::time::Duration::from_secs(5))
+            .await,
+        "the tailing reader replayed the slot"
     );
     assert_eq!(
         reader.snapshot().await.unwrap().current_snapshot().id.get(),
@@ -136,30 +91,168 @@ async fn a_read_only_open_tails_the_log_through_the_provider() {
     reader.close().await.unwrap();
 }
 
-/// A read-write open with a provider is refused before any store opens:
-/// the committer that writes slots is not in this version.
+/// A read-write open with a provider adopts the log — its format stamp is
+/// the first slot — and from then on each commit is a slot, which a
+/// tailing reader of the same log serves before the folder has flushed.
 #[tokio::test]
-async fn a_read_write_open_with_a_provider_is_refused() {
+async fn a_folder_adopts_the_log_and_commits_through_it() {
     let object_store = Arc::new(InMemory::new());
-    let provider = Arc::new(Recording::default());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
 
-    let refused = Catalog::open(
-        object_store,
+    let folder = Catalog::open(
+        object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
             ..options_at("lake")
         },
     )
-    .await;
-
-    match refused {
-        Err(Error::Configuration(message)) => assert!(message.contains("commit log"), "{message}"),
-        other => panic!("expected a configuration refusal, got {other:?}"),
-    }
+    .await
+    .unwrap();
+    let stamp = Key::Sys(SysKey::Format).encode();
+    let slots = provider.log.slots();
+    assert_eq!(slots.len(), 1, "{slots:?}");
     assert!(
-        provider.reader_paths().is_empty(),
-        "a refused open asks the provider for nothing"
+        slots[0].1.writes().any(|write| write.key == stamp),
+        "the first slot is the format stamp"
     );
+    assert_eq!(provider.log.folded_sequence(), 1);
+
+    folder
+        .commit(|tx| tx.create_schema("s").map(|_| ()))
+        .await
+        .unwrap();
+    let slots = provider.log.slots();
+    assert_eq!(slots.len(), 2, "{slots:?}");
+    let head = Key::Sys(SysKey::Head).encode();
+    assert!(
+        slots[1].1.writes().any(|write| write.key == head),
+        "the commit's batch rode the second slot"
+    );
+    assert_eq!(provider.log.folded_sequence(), 2);
+
+    let reader = Catalog::open_read_only(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            commit_log_tail: true,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        reader
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("s")
+            .is_some(),
+        "a tailing reader serves the slot before any flush"
+    );
+    reader.close().await.unwrap();
+    folder.close().await.unwrap();
+}
+
+/// A commit that loses its slot race folds what beat it into the store and
+/// retries, landing after the winner.
+#[tokio::test]
+async fn a_lost_race_folds_the_winner_before_the_retry_lands() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+
+    let folder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+
+    // A peer lands a slot this folder has not seen.
+    provider.log.land(
+        2,
+        SlotEnvelope {
+            commits: vec![SlotCommit {
+                transaction_id: [7; 16],
+                validated_head: 0,
+                changes_made: String::new(),
+                writes: vec![SlotWrite {
+                    key: b"\xffpeer".to_vec(),
+                    value: Some(b"landed".to_vec()),
+                }],
+            }],
+        },
+    );
+
+    folder
+        .commit(|tx| tx.create_schema("s").map(|_| ()))
+        .await
+        .unwrap();
+    let slots = provider.log.slots();
+    assert_eq!(
+        slots
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the retry landed after the peer's slot"
+    );
+    assert_eq!(provider.log.folded_sequence(), 3);
+    folder.close().await.unwrap();
+
+    // The peer's write was folded into this store before the retry.
+    let (db, _counters) = StoreBuilder::new("lake", object_store)
+        .commit_log(Some(provider.clone()))
+        .open_writer()
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get(b"\xffpeer").await.unwrap().as_deref(),
+        Some(&b"landed"[..])
+    );
+    db.close().await.unwrap();
+}
+
+/// An adopted store opens read-only through a provider and is refused
+/// without one.
+#[tokio::test]
+async fn an_adopted_store_needs_a_provider_to_open() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+
+    let folder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    folder.close().await.unwrap();
+
+    let reader = Catalog::open_read_only(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    reader.close().await.unwrap();
+
+    let refused = Catalog::open_read_only(object_store, options_at("lake"))
+        .await
+        .err()
+        .map(|err| err.to_string())
+        .unwrap_or_default();
+    assert!(refused.contains("commit-log library"), "{refused}");
 }
 
 /// A store stamped for the commit log is refused by every open that has no

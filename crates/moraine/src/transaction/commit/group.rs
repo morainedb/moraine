@@ -23,6 +23,7 @@ use super::{
 };
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
+    commit_log::LogCommitter,
     error::{Error, Result},
     store::StagedBytes,
     telemetry::{STALL_INTERVAL, reporting_phase},
@@ -197,12 +198,15 @@ pub(crate) struct Coalescer {
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
     /// How a sealed batch reaches object storage.
     durability: CommitDurability,
+    /// The commit log a sealed batch is offered to, when commits are slots.
+    commit_log: Option<LogCommitter>,
 }
 
 impl Coalescer {
     pub(crate) fn new(
         projections: Arc<std::sync::RwLock<ProjectionCache>>,
         durability: CommitDurability,
+        commit_log: Option<LogCommitter>,
     ) -> Self {
         Self {
             shared: Mutex::new(Shared { forming: None }),
@@ -211,6 +215,7 @@ impl Coalescer {
             flights: watch::Sender::new(0),
             projections,
             durability,
+            commit_log,
         }
     }
 
@@ -334,7 +339,10 @@ impl Coalescer {
                 &writes,
                 staged_bytes,
                 HeadViewUpdate::Rebuild(base),
-                &self.projections,
+                super::Landing {
+                    projections: &self.projections,
+                    log: self.commit_log.as_ref(),
+                },
             ),
         ))
         .catch_unwind()
@@ -535,6 +543,7 @@ mod tests {
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
             catalog.store().commit_durability(),
+            None,
         ));
         let flight = coalescer.enter_flight();
         Arc::clone(&coalescer).land(batch, flight).await;
@@ -561,6 +570,7 @@ mod tests {
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
             store.commit_durability(),
+            None,
         ));
 
         // Staged, not sealed: exactly what a caller leaves behind when it is
@@ -602,6 +612,7 @@ mod tests {
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
             catalog.store().commit_durability(),
+            None,
         ));
 
         // The slot is claimed and its holder vanishes without landing.
@@ -626,6 +637,7 @@ mod tests {
         let coalescer = Arc::new(Coalescer::new(
             Arc::clone(catalog.projections()),
             catalog.store().commit_durability(),
+            None,
         ));
 
         let flight = coalescer.enter_flight();

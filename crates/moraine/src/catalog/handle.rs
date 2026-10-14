@@ -46,6 +46,7 @@ use crate::{
             view_head,
         },
     },
+    commit_log::LogCommitter,
     data_file,
     error::{Error, Result},
     store::{
@@ -133,12 +134,23 @@ pub(crate) enum Store {
     Writer {
         db: Db,
         pacer: Arc<commit::FlushPacer>,
+        /// The log the writer's commits are slots of, when they are.
+        commit_log: Option<LogCommitter>,
     },
     /// A read-only reader following the manifest, shared into read sessions.
     Reader(Arc<DbReader>),
 }
 
 impl Store {
+    /// The commit log this store commits through, when its commits are
+    /// slots.
+    pub(crate) fn commit_log(&self) -> Option<&LogCommitter> {
+        match self {
+            Self::Writer { commit_log, .. } => commit_log.as_ref(),
+            Self::Reader(_) => None,
+        }
+    }
+
     /// The writer behind this store, for a caller that needs to read after
     /// its own transaction is spent — a lost staged commit, deciding what
     /// it lost to.
@@ -213,6 +225,10 @@ pub struct CatalogOptions {
     /// the process. `None` (the default) falls back to the registered
     /// provider, and to the store's own log when none is registered.
     pub commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
+    /// Whether a read-only open over a commit log tails the log, seeing a
+    /// commit the moment its slot lands at a listing per poll, rather than
+    /// following the folded store. Defaults to `false`.
+    pub commit_log_tail: bool,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -303,6 +319,7 @@ impl Default for CatalogOptions {
             flush_on_commit: false,
             wal_store: None,
             commit_log: None,
+            commit_log_tail: false,
             cache_dir: None,
             cache_identity: None,
             cache_size: None,
@@ -332,6 +349,91 @@ pub enum CachePreload {
 }
 
 /// The object store `options` names for the write-ahead log, if any.
+/// What a read-write open brings up: the store, its cache counters, its
+/// format after any adoption, its pacer, and the log it commits through.
+struct OpenedWriter {
+    db: Db,
+    cache: Arc<crate::store::cache::CacheCounters>,
+    format: u64,
+    pacer: Arc<commit::FlushPacer>,
+    commit_log: Option<LogCommitter>,
+}
+
+/// Opens the writer's store over the commit log when a provider is present,
+/// draining the store's own log first if the commit log is not yet adopted
+/// and adopting it once the store is open.
+async fn open_writer_store(
+    object_store: Arc<dyn ObjectStore>,
+    options: &CatalogOptions,
+    wal_object_store: Option<Arc<dyn ObjectStore>>,
+    warm_segments: Vec<census::SegmentSize>,
+) -> Result<OpenedWriter> {
+    let provider = commit_log_provider(options);
+    // The writer paces its own flushes; the store's timer stays off so the
+    // pacing is exact.
+    let store_builder = |provider: Option<Arc<dyn crate::CommitLogProvider>>| {
+        StoreBuilder::new(&options.path, Arc::clone(&object_store))
+            .wal_object_store(wal_object_store.clone())
+            .commit_log(provider)
+            .without_flush_timer()
+            .cache_dir(options.cache_dir.clone())
+            .cache_identity(options.cache_identity)
+            .cache_size(options.cache_size)
+            .cache_memory(options.cache_memory)
+            .cache_auxiliary_percent(options.cache_auxiliary_percent)
+            .cache_preload(options.cache_preload)
+            .warm_segments(warm_segments.clone())
+            .cache_puts(options.cache_puts)
+            .cache_compaction_puts(options.cache_compaction_puts)
+    };
+    let committer = match &provider {
+        Some(provider) => {
+            let committer = provider.committer(store_builder(None).log_store(), &options.path);
+            // The plug replays the log in place of the store's own, so a
+            // store not yet adopted drains its own log into the tree first;
+            // nothing a crashed writer left there is skipped.
+            if !committer.adopted().await? {
+                commit::drain_own_log(store_builder(None)).await?;
+            }
+            Some(committer)
+        }
+        None => None,
+    };
+    let flush_spacing = if options.flush_on_commit {
+        Duration::ZERO
+    } else {
+        options.flush_interval
+    };
+    let (db, cache, mut format, pacer) = commit::open_initialized(
+        store_builder(provider.clone()),
+        options.encrypted,
+        options.data_path.as_deref(),
+        options.wal_store.as_ref().map(crate::WalStore::name),
+        flush_spacing,
+        provider.is_some(),
+    )
+    .await?;
+    let commit_log = match committer {
+        Some(committer) => {
+            let log = LogCommitter {
+                committer,
+                db: db.clone(),
+            };
+            format = commit::adopt_commit_log(&log, format).await?;
+            Some(log)
+        }
+        None => None,
+    };
+
+    Ok(OpenedWriter {
+        db,
+        cache,
+        format,
+        pacer,
+        commit_log,
+    })
+}
+
 /// The commit-log provider an open builds its store over: the options' own,
 /// else the process's registered one.
 fn commit_log_provider(options: &CatalogOptions) -> Option<Arc<dyn crate::CommitLogProvider>> {
@@ -1228,37 +1330,20 @@ impl Catalog {
             .wal_store
             .as_ref()
             .map(|wal| Arc::clone(wal.object_store()));
-        // The writer paces its own flushes; the store's timer stays off so
-        // the pacing is exact.
-        let store = StoreBuilder::new(&options.path, object_store)
-            .wal_object_store(wal_object_store.clone())
-            .commit_log(commit_log_provider(&options))
-            .without_flush_timer()
-            .cache_dir(options.cache_dir.clone())
-            .cache_identity(options.cache_identity)
-            .cache_size(options.cache_size)
-            .cache_memory(options.cache_memory)
-            .cache_auxiliary_percent(options.cache_auxiliary_percent)
-            .cache_preload(options.cache_preload)
-            .warm_segments(
-                manifest
-                    .as_ref()
-                    .map(|manifest| manifest.segments.clone())
-                    .unwrap_or_default(),
-            )
-            .cache_puts(options.cache_puts)
-            .cache_compaction_puts(options.cache_compaction_puts);
-        let flush_spacing = if options.flush_on_commit {
-            Duration::ZERO
-        } else {
-            options.flush_interval
-        };
-        let (db, cache, format, pacer) = commit::open_initialized(
-            store,
-            options.encrypted,
-            options.data_path.as_deref(),
-            options.wal_store.as_ref().map(crate::WalStore::name),
-            flush_spacing,
+        let OpenedWriter {
+            db,
+            cache,
+            format,
+            pacer,
+            commit_log,
+        } = open_writer_store(
+            Arc::clone(&object_store),
+            &options,
+            wal_object_store.clone(),
+            manifest
+                .as_ref()
+                .map(|manifest| manifest.segments.clone())
+                .unwrap_or_default(),
         )
         .await?;
         warn_if_caches_cannot_hold(&options.path, manifest.as_ref());
@@ -1280,7 +1365,11 @@ impl Catalog {
             inner: ReadOnlyCatalog {
                 pinned: None,
                 writer_status: Some(db.subscribe()),
-                store: Arc::new(Store::Writer { db, pacer }),
+                store: Arc::new(Store::Writer {
+                    db,
+                    pacer,
+                    commit_log: commit_log.clone(),
+                }),
                 location: Arc::new(StoreLocation {
                     path: options.path,
                     object_store: located,
@@ -1303,7 +1392,11 @@ impl Catalog {
                     LEDGER_MEMO_BYTES,
                     MEMO_ENTRIES,
                 )),
-                commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections), durability)),
+                commits: Arc::new(commit::Coalescer::new(
+                    Arc::clone(&projections),
+                    durability,
+                    commit_log,
+                )),
                 projections,
             },
         })
@@ -1370,6 +1463,7 @@ impl Catalog {
         let store = StoreBuilder::new(&options.path, object_store)
             .wal_object_store(wal_object_store.clone())
             .commit_log(commit_log_provider(&options))
+            .commit_log_tail(options.commit_log_tail)
             .cache_dir(options.cache_dir.clone())
             .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
@@ -1390,6 +1484,7 @@ impl Catalog {
         let (reader, cache, format) = commit::open_reader_initialized(
             store,
             options.wal_store.as_ref().map(crate::WalStore::name),
+            commit_log_provider(&options).is_some(),
         )
         .await?;
         warn_if_caches_cannot_hold(&options.path, manifest.as_ref());
@@ -1432,6 +1527,7 @@ impl Catalog {
             commits: Arc::new(commit::Coalescer::new(
                 Arc::clone(&projections),
                 commit::CommitDurability::OnFlushInterval,
+                None,
             )),
             projections,
         })

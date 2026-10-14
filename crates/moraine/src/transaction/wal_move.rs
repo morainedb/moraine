@@ -92,7 +92,7 @@ async fn drain_recorded_log(
         .await
         .map_err(Error::from)?;
     let read = async {
-        let format = commit::validate_format(ReadHandle::Tx(&tx)).await?;
+        let format = commit::validate_format(ReadHandle::Tx(&tx), false).await?;
         if format.is_none() {
             return Err(Error::Corruption(
                 "store is not an initialized moraine catalog; there is no write-ahead log to \

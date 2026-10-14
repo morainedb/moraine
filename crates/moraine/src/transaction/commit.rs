@@ -29,6 +29,9 @@ use crate::{
             raise_format_floor, view_head,
         },
     },
+    commit_log::{
+        LogCommitter, SlotAdoption, SlotCommit, SlotOffer, SlotWrite, mint_transaction_id,
+    },
     error::{Error, Result},
     store::{
         StagedBytes,
@@ -207,10 +210,14 @@ async fn reporting_stalls<T>(
     }
 }
 
-/// Refuses a store this binary must not touch: mid-migration, or a
-/// format newer/older than it understands. `None` format means the store
-/// is empty and needs bootstrap.
-pub(crate) async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue>> {
+/// Refuses a store this binary must not touch: mid-migration, a format
+/// newer/older than it understands, or one whose commits live in a commit
+/// log when `log_resident` says no provider is present. `None` format
+/// means the store is empty and needs bootstrap.
+pub(crate) async fn validate_format(
+    tx: ReadHandle<'_>,
+    log_resident: bool,
+) -> Result<Option<proto::FormatValue>> {
     let (migration, format) = futures::try_join!(read::read_migration(tx), read::read_format(tx))?;
     if migration.is_some() {
         return Err(Error::Migration(
@@ -222,10 +229,14 @@ pub(crate) async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::
     }
     match format {
         Some(format) if format.format_version == FORMAT_WITH_COMMIT_LOG => {
-            Err(Error::Migration(format!(
-                "store format {FORMAT_WITH_COMMIT_LOG} keeps its commits in a bucket-resident \
-                 commit log; opening it needs the commit-log library linked in and registered"
-            )))
+            if log_resident {
+                Ok(Some(format))
+            } else {
+                Err(Error::Migration(format!(
+                    "store format {FORMAT_WITH_COMMIT_LOG} keeps its commits in a bucket-resident \
+                     commit log; opening it needs the commit-log library linked in and registered"
+                )))
+            }
         }
         Some(format) if format.format_version > MAX_FORMAT_VERSION => {
             Err(Error::Migration(format!(
@@ -414,10 +425,20 @@ pub(crate) async fn open_initialized(
     data_path: Option<&str>,
     wal_path: Option<&str>,
     flush_spacing: Duration,
+    log_resident: bool,
 ) -> Result<(Db, Arc<CacheCounters>, u64, Arc<FlushPacer>)> {
     let mut attempt = 1;
     loop {
-        match open_attempt(&store, encrypted, data_path, wal_path, flush_spacing).await {
+        match open_attempt(
+            &store,
+            encrypted,
+            data_path,
+            wal_path,
+            flush_spacing,
+            log_resident,
+        )
+        .await
+        {
             Ok(opened) => return Ok(opened),
             Err(OpenFailure::Fatal(err)) => return Err(err),
             Err(OpenFailure::FencedAtGenesis(err)) => {
@@ -443,6 +464,7 @@ async fn open_attempt(
     data_path: Option<&str>,
     wal_path: Option<&str>,
     flush_spacing: Duration,
+    log_resident: bool,
 ) -> std::result::Result<(Db, Arc<CacheCounters>, u64, Arc<FlushPacer>), OpenFailure> {
     let started = Instant::now();
     let (db, counters) = store.open_writer().await.map_err(OpenFailure::Fatal)?;
@@ -453,7 +475,7 @@ async fn open_attempt(
     );
     let tx = begin_snapshot(&db).await?;
 
-    match validate_format(ReadHandle::Tx(&tx)).await {
+    match validate_format(ReadHandle::Tx(&tx), log_resident).await {
         Ok(Some(format)) => {
             let agreed = validate_wal_store(ReadHandle::Tx(&tx), wal_path).await;
             tx.rollback();
@@ -495,7 +517,7 @@ async fn open_attempt(
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
             let tx = begin_snapshot(&db).await?;
-            let validated = validate_format(ReadHandle::Tx(&tx)).await;
+            let validated = validate_format(ReadHandle::Tx(&tx), log_resident).await;
             let agreed = validate_wal_store(ReadHandle::Tx(&tx), wal_path).await;
             tx.rollback();
             match validated {
@@ -524,19 +546,110 @@ async fn begin_snapshot(db: &Db) -> std::result::Result<DbTransaction, OpenFailu
         .map_err(|err| OpenFailure::Fatal(Error::from(err)))
 }
 
+/// Opens the store on its own log, replaying whatever that log holds, and
+/// flushes it into the tree, so a plug that replaces the log afterwards
+/// skips nothing a crashed writer left behind.
+pub(crate) async fn drain_own_log(store: StoreBuilder<'_>) -> Result<()> {
+    let (db, _counters) = store.open_writer().await?;
+    flush_memtable(&db).await?;
+    db.close().await.map_err(Error::from)?;
+    info!("drained the store's own log ahead of adopting the commit log");
+
+    Ok(())
+}
+
+/// Adopts the log for a store below the log-resident format: flushes what
+/// the store holds, races the format stamp at the first slot, and applies
+/// whichever stamp holds it. Returns the format the store is at after.
+pub(crate) async fn adopt_commit_log(log: &LogCommitter, format: u64) -> Result<u64> {
+    if format >= FORMAT_WITH_COMMIT_LOG {
+        return Ok(format);
+    }
+
+    // The plug acknowledges the store's own rows, the bootstrap included,
+    // before they are durable; the flush makes them so.
+    flush_memtable(&log.db).await?;
+    let head = read::read_head(ReadHandle::Writer(&log.db))
+        .await?
+        .map_or(0, |head| head.snapshot_id);
+    let stamp = SlotWrite {
+        key: Key::Sys(SysKey::Format).encode(),
+        value: Some(value::encode_value(&proto::FormatValue {
+            format_version: FORMAT_WITH_COMMIT_LOG,
+            writer_version: env!("CARGO_PKG_VERSION").to_string(),
+        })),
+    };
+
+    let writes = match log
+        .committer
+        .adopt(SlotCommit {
+            transaction_id: mint_transaction_id(),
+            validated_head: head,
+            changes_made: String::new(),
+            writes: vec![stamp.clone()],
+        })
+        .await?
+    {
+        SlotAdoption::Adopted => vec![stamp],
+        SlotAdoption::AdoptedByPeer(envelope) => envelope.writes().cloned().collect(),
+    };
+    log.fold(1, writes.iter()).await?;
+    info!("adopted the commit log");
+
+    Ok(FORMAT_WITH_COMMIT_LOG)
+}
+
+/// Offers a batch as one slot, validated against `head_before`.
+async fn offer_slot(
+    log: &LogCommitter,
+    head_before: u64,
+    head_after: u64,
+    writes: &[StagedWrite],
+) -> Result<SlotOffer> {
+    log.committer
+        .offer(vec![SlotCommit {
+            transaction_id: mint_transaction_id(),
+            validated_head: head_before,
+            changes_made: staged_changes_made(writes, head_after),
+            writes: writes
+                .iter()
+                .map(|(key, value)| SlotWrite {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }])
+        .await
+}
+
+/// The `changes_made` of the snapshot a batch mints, or empty when it mints
+/// none.
+fn staged_changes_made(writes: &[StagedWrite], snapshot_id: u64) -> String {
+    let encoded = Key::Snapshot { snapshot_id }.encode();
+    writes
+        .iter()
+        .rev()
+        .find(|(key, _)| *key == encoded)
+        .and_then(|(_, write)| write.as_ref())
+        .and_then(|bytes| value::decode_value::<proto::SnapshotValue>(bytes).ok())
+        .map(|snapshot| snapshot.changes_made)
+        .unwrap_or_default()
+}
+
 /// Opens the store read-only as a [`DbReader`], validating the format it
 /// finds and returning it. Never fences a live writer and never
 /// bootstraps: an uninitialized store is refused.
 pub(crate) async fn open_reader_initialized(
     store: StoreBuilder<'_>,
     wal_path: Option<&str>,
+    log_resident: bool,
 ) -> Result<(DbReader, Arc<CacheCounters>, u64)> {
     let started = Instant::now();
     let (reader, counters) = store.open_reader().await?;
     let opened = started.elapsed();
 
     let started = Instant::now();
-    let format = validate_format(ReadHandle::Reader(&reader)).await?;
+    let format = validate_format(ReadHandle::Reader(&reader), log_resident).await?;
     info!(
         reader_open_ms = crate::telemetry::milliseconds(opened),
         validate_ms = crate::telemetry::milliseconds(started.elapsed()),
@@ -1401,6 +1514,29 @@ pub(crate) fn rollback(db_tx: Arc<DbTransaction>) {
     drop(db_tx);
 }
 
+/// Where a batch lands: the projections it folds into and, when commits
+/// are slots, the log it is offered to first.
+#[derive(Clone, Copy)]
+pub(crate) struct Landing<'a> {
+    pub(crate) projections: &'a std::sync::RwLock<ProjectionCache>,
+    pub(crate) log: Option<&'a LogCommitter>,
+}
+
+/// [`Landing`] owned, for a submission that runs on a task of its own.
+pub(crate) struct OwnedLanding {
+    pub(crate) projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    pub(crate) log: Option<LogCommitter>,
+}
+
+impl OwnedLanding {
+    fn borrow(&self) -> Landing<'_> {
+        Landing {
+            projections: &self.projections,
+            log: self.log.as_ref(),
+        }
+    }
+}
+
 /// Commits the batch's write and folds it into the projections, without
 /// waiting for the flush. Winning `sys/head` settles the race, so the
 /// projections may fold before the bytes are durable; a flush that then
@@ -1411,8 +1547,9 @@ pub(crate) async fn submit_batch(
     writes: &[StagedWrite],
     staged_bytes: StagedBytes,
     head_view_update: HeadViewUpdate,
-    projections: &std::sync::RwLock<ProjectionCache>,
+    landing: Landing<'_>,
 ) -> Result<Submission> {
+    let Landing { projections, log } = landing;
     // The probes read the transaction from their own tasks, so it is
     // shared; every one is awaited before staging returns, leaving this
     // the last reference.
@@ -1429,6 +1566,26 @@ pub(crate) async fn submit_batch(
     if !head_advanced {
         invalidate_head_view(projections);
     }
+
+    // With a commit log the slot is the commit point: win it first, and
+    // fold what beat the batch before the retry re-prepares.
+    let won_sequence = match log {
+        None => None,
+        Some(log) => match offer_slot(log, heads.before, head, writes).await {
+            Ok(SlotOffer::Won { sequence }) => Some(sequence),
+            Ok(SlotOffer::Lost { slots }) => {
+                db_tx.rollback();
+                log.fold_slots(slots).await?;
+                invalidate_head_view(projections);
+                return Ok(Submission::LostRace);
+            }
+            Err(err) => {
+                db_tx.rollback();
+                invalidate_head_view(projections);
+                return Err(err);
+            }
+        },
+    };
     let durable_started = Instant::now();
     // Bounded, unlike the durability wait below it: this write holds the
     // store's flight slot, so stalling here stalls every later commit.
@@ -1462,6 +1619,9 @@ pub(crate) async fn submit_batch(
             if head_advanced {
                 install_committed_head_view(projections, head_view_update, writes);
             }
+            if let (Some(log), Some(sequence)) = (log, won_sequence) {
+                log.committer.mark_folded(sequence);
+            }
             Ok(Submission::Submitted(Submitted {
                 handle,
                 staged_bytes,
@@ -1469,6 +1629,16 @@ pub(crate) async fn submit_batch(
                 durable_started,
                 projection: projection_started.elapsed(),
             }))
+        }
+        Err(err) if won_sequence.is_some() => {
+            // The slot is committed and durable; only this store missed it.
+            // A reopen replays the slot, so nothing is marked folded.
+            invalidate_head_view(projections);
+            Err(Error::CommitOutcomeUnknown(format!(
+                "slot {} is committed but the store did not take its batch ({err}); reopen to \
+                 fold it",
+                won_sequence.unwrap_or_default()
+            )))
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(Submission::LostRace),
         Err(err) if err.kind() == slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced) => {
@@ -1534,7 +1704,7 @@ pub(crate) async fn commit_batch(
     writes: &[StagedWrite],
     staged_bytes: StagedBytes,
     head_view_update: HeadViewUpdate,
-    projections: &std::sync::RwLock<ProjectionCache>,
+    landing: Landing<'_>,
     durability: &CommitDurability,
 ) -> Result<Landed> {
     match submit_batch(
@@ -1543,13 +1713,13 @@ pub(crate) async fn commit_batch(
         writes,
         staged_bytes,
         head_view_update,
-        projections,
+        landing,
     )
     .await?
     {
         Submission::LostRace => Ok(Landed::LostRace),
         Submission::Submitted(submitted) => {
-            await_submitted(submitted, projections, durability).await
+            await_submitted(submitted, landing.projections, durability).await
         }
     }
 }
@@ -1565,24 +1735,22 @@ pub(crate) async fn commit_batch_off_task(
     writes: Vec<StagedWrite>,
     staged_bytes: StagedBytes,
     head_view_update: HeadViewUpdate,
-    projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    landing: OwnedLanding,
     durability: CommitDurability,
 ) -> Result<Landed> {
-    let task = {
-        let projections = Arc::clone(&projections);
-        tokio::spawn(async move {
-            commit_batch(
-                db_tx,
-                heads,
-                &writes,
-                staged_bytes,
-                head_view_update,
-                &projections,
-                &durability,
-            )
-            .await
-        })
-    };
+    let projections = Arc::clone(&landing.projections);
+    let task = tokio::spawn(async move {
+        commit_batch(
+            db_tx,
+            heads,
+            &writes,
+            staged_bytes,
+            head_view_update,
+            landing.borrow(),
+            &durability,
+        )
+        .await
+    });
 
     match task.await {
         Ok(landed) => landed,

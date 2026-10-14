@@ -1436,6 +1436,10 @@ impl StagedTransaction {
             .as_deref()
             .map(Store::commit_durability)
             .unwrap_or_default();
+        let commit_log = catalog_store
+            .as_deref()
+            .and_then(Store::commit_log)
+            .cloned();
         let staged_rows = ops.len();
         let staged_cost = staged_cost(&ops);
         if staged_cost > MAX_STAGED_COST_PER_COMMIT {
@@ -1636,7 +1640,10 @@ impl StagedTransaction {
                         writes,
                         staged_bytes,
                         head_view_update,
-                        projections,
+                        commit::OwnedLanding {
+                            projections,
+                            log: commit_log,
+                        },
                         durability,
                     ),
                 )

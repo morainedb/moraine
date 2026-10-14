@@ -104,6 +104,7 @@ async fn a_store_with_an_unreadable_manifest_refuses_to_open() {
         None,
         None,
         std::time::Duration::ZERO,
+        false,
     )
     .await
     .err()
@@ -139,6 +140,7 @@ async fn unknown_format_is_refused() {
         None,
         None,
         std::time::Duration::ZERO,
+        false,
     )
     .await
     .err()
@@ -172,6 +174,7 @@ async fn migration_marker_is_refused() {
         None,
         None,
         std::time::Duration::ZERO,
+        false,
     )
     .await
     .err()
@@ -210,6 +213,7 @@ async fn older_format_refuses_toward_migrate() {
         None,
         None,
         std::time::Duration::ZERO,
+        false,
     )
     .await
     .err()
@@ -4708,7 +4712,10 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
         &staged,
         staged_bytes,
         HeadViewUpdate::Rebuild(Arc::clone(&base)),
-        catalog.projections(),
+        Landing {
+            projections: catalog.projections(),
+            log: None,
+        },
         &CommitDurability::OnFlushInterval,
     )
     .await
@@ -4903,6 +4910,7 @@ async fn catalog_with_a_reclaimed_snapshot()
         None,
         None,
         std::time::Duration::ZERO,
+        false,
     )
     .await
     .unwrap();
@@ -4910,6 +4918,7 @@ async fn catalog_with_a_reclaimed_snapshot()
     let coalescer = Arc::new(Coalescer::new(
         Arc::clone(&projections),
         CommitDurability::OnFlushInterval,
+        None,
     ));
 
     for name in ["a", "b", "c"] {

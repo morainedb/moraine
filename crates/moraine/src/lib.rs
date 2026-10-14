@@ -296,7 +296,10 @@ pub use catalog::{
     StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo,
     TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo, store_paths_overlap,
 };
-pub use commit_log::{CommitLogProvider, register_commit_log};
+pub use commit_log::{
+    CommitLogProvider, SlotAdoption, SlotCommit, SlotCommitter, SlotEnvelope, SlotOffer, SlotWrite,
+    register_commit_log,
+};
 pub use data_file::{DataStore, SidecarSweep, SidecarTally, sidecar_tally};
 pub use error::{Error, Result};
 /// Fault injection for the migration driver. Unstable and not part of the
