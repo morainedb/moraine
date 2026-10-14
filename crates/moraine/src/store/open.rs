@@ -110,6 +110,7 @@ pub(crate) struct StoreBuilder<'a> {
     path: &'a str,
     object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
+    commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
     flush_interval: Option<Duration>,
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
@@ -136,6 +137,7 @@ impl<'a> StoreBuilder<'a> {
             path,
             object_store: retry::Store::wrap(object_store),
             wal_object_store: None,
+            commit_log: None,
             flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
@@ -161,6 +163,26 @@ impl<'a> StoreBuilder<'a> {
     ) -> Self {
         self.wal_object_store = wal_object_store.map(retry::Store::wrap);
         self
+    }
+
+    /// Opens the store over `provider`'s write-ahead-log plugs, so a
+    /// bucket-resident commit log is the store's log. A reader tails it
+    /// through the plug; a writer open is refused until the committer that
+    /// writes slots exists.
+    pub(crate) fn commit_log(
+        mut self,
+        provider: Option<Arc<dyn crate::CommitLogProvider>>,
+    ) -> Self {
+        self.commit_log = provider;
+        self
+    }
+
+    /// The store the log lives on: the separate log store when one is
+    /// configured, else the store itself.
+    fn log_store(&self) -> Arc<dyn ObjectStore> {
+        self.wal_object_store
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.object_store), Arc::clone)
     }
 
     /// Sets how often a read-only handle polls for new state. Reader only —
@@ -267,6 +289,14 @@ impl<'a> StoreBuilder<'a> {
     /// Opens (or creates) the store as a read-write [`Db`], with the
     /// per-store counters its reads tally into.
     pub(crate) async fn open_writer(&self) -> Result<(Db, Arc<cache::CacheCounters>)> {
+        if self.commit_log.is_some() {
+            return Err(Error::Configuration(
+                "a commit log cannot be opened read-write by this version: commits still go \
+                 through the store's own log, which would bypass the slots every other process \
+                 reads; open it read-only"
+                    .to_string(),
+            ));
+        }
         let settings = self.settings();
         let counters = cache::store_counters();
         let mut builder = Db::builder(self.path, Arc::clone(&self.object_store))
@@ -330,6 +360,9 @@ impl<'a> StoreBuilder<'a> {
         }
         if let Some(checkpoint) = self.checkpoint {
             builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
+        }
+        if let Some(provider) = &self.commit_log {
+            builder = builder.with_wal_reader(provider.reader(self.log_store(), self.path));
         }
 
         let reader = builder.build().await.map_err(Error::from)?;

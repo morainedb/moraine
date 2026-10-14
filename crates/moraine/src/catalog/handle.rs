@@ -208,6 +208,11 @@ pub struct CatalogOptions {
     /// log over live state. `None` (the default) keeps the log in the
     /// catalog store.
     pub wal_store: Option<crate::WalStore>,
+    /// The commit-log provider this open builds its store over, outranking
+    /// the one [`register_commit_log`](crate::register_commit_log) holds for
+    /// the process. `None` (the default) falls back to the registered
+    /// provider, and to the store's own log when none is registered.
+    pub commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -297,6 +302,7 @@ impl Default for CatalogOptions {
             flush_interval: Duration::from_millis(100),
             flush_on_commit: false,
             wal_store: None,
+            commit_log: None,
             cache_dir: None,
             cache_identity: None,
             cache_size: None,
@@ -326,6 +332,15 @@ pub enum CachePreload {
 }
 
 /// The object store `options` names for the write-ahead log, if any.
+/// The commit-log provider an open builds its store over: the options' own,
+/// else the process's registered one.
+fn commit_log_provider(options: &CatalogOptions) -> Option<Arc<dyn crate::CommitLogProvider>> {
+    options
+        .commit_log
+        .clone()
+        .or_else(crate::commit_log::registered_commit_log)
+}
+
 fn wal_object_store(options: &CatalogOptions) -> Option<Arc<dyn ObjectStore>> {
     options
         .wal_store
@@ -1217,6 +1232,7 @@ impl Catalog {
         // the pacing is exact.
         let store = StoreBuilder::new(&options.path, object_store)
             .wal_object_store(wal_object_store.clone())
+            .commit_log(commit_log_provider(&options))
             .without_flush_timer()
             .cache_dir(options.cache_dir.clone())
             .cache_identity(options.cache_identity)
@@ -1353,6 +1369,7 @@ impl Catalog {
             .map(|wal| Arc::clone(wal.object_store()));
         let store = StoreBuilder::new(&options.path, object_store)
             .wal_object_store(wal_object_store.clone())
+            .commit_log(commit_log_provider(&options))
             .cache_dir(options.cache_dir.clone())
             .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)

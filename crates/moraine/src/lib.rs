@@ -264,10 +264,13 @@
 //!   about DuckLake semantics.
 //! - `transaction` — the commit protocol turning a catalog transaction into an
 //!   atomic store write.
+//! - `commit_log` — the plug boundary a bucket-resident commit log library
+//!   supplies SlateDB write-ahead-log plugs through. Holds no log of its own.
 
 #![forbid(unsafe_code)]
 
 mod catalog;
+mod commit_log;
 mod data_file;
 mod error;
 mod fault;
@@ -293,6 +296,7 @@ pub use catalog::{
     StoreCheckpoint, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo,
     TableStats, TagEntry, TagTarget, Timestamp, ViewId, ViewInfo, store_paths_overlap,
 };
+pub use commit_log::{CommitLogProvider, register_commit_log};
 pub use data_file::{DataStore, SidecarSweep, SidecarTally, sidecar_tally};
 pub use error::{Error, Result};
 /// Fault injection for the migration driver. Unstable and not part of the
