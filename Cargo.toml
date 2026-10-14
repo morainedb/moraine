@@ -27,7 +27,7 @@ foyer = { version = "0.22.6", features = ["serde"] }
 object_store = "0.14"
 prost = "0.14"
 prost-build = "0.14"
-protox = "0.9"
+protox = "0.10"
 proptest = "1"
 proptest-derive = "0.8"
 roaring = "0.11"
