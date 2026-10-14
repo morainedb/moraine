@@ -643,7 +643,7 @@ pub(super) fn cache_preload_option(
 /// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
 /// [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_attach_with_wal_store(
+pub unsafe extern "C" fn moraine_attach_with_commit_log(
     path: *const c_char,
     s3: *const MoraineS3Config,
     read_only: bool,
@@ -659,6 +659,7 @@ pub unsafe extern "C" fn moraine_attach_with_wal_store(
     cache_compaction_puts: bool,
     data_path: *const c_char,
     wal: *const MoraineWalStore,
+    commit_log: *const MoraineCommitLog,
     checkpoint: *const c_char,
     host_threads: u64,
     probe: MoraineInterruptProbe,
@@ -734,6 +735,9 @@ pub unsafe extern "C" fn moraine_attach_with_wal_store(
         options.checkpoint = checkpoint.map(str::to_owned);
         options.data_path.clone_from(&data_path_arg);
         options.wal_store.clone_from(&wal_store);
+        // SAFETY: `commit_log` validity is this function's own safety
+        // contract.
+        apply_commit_log(&mut options, unsafe { commit_log.as_ref() })?;
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let opened = unsafe {
@@ -789,6 +793,113 @@ pub unsafe extern "C" fn moraine_attach_with_wal_store(
             codes::OK
         }
         Err(code) => code,
+    }
+}
+
+/// Mirrors the C `MoraineCommitLog`: how an attach takes part in a commit
+/// log, when a provider is registered for the process. Ignored without
+/// one.
+#[repr(C)]
+pub struct MoraineCommitLog {
+    /// `0` commits over a tailing reader; `1` holds the store's one writer,
+    /// the folder, which adopts a store not yet on the log.
+    pub role: u8,
+    /// Whether a read-only attach tails the log rather than following the
+    /// folded store.
+    pub tail: bool,
+    /// How often a committer's reader polls for slots, in milliseconds;
+    /// `0` keeps the catalog's default.
+    pub poll_interval_ms: u64,
+}
+
+/// Applies `commit_log` to `options`. Without one, a read-write attach that
+/// finds a registered provider commits over a reader: the folder is a
+/// designated process, never an attach by default.
+fn apply_commit_log(
+    options: &mut CatalogOptions,
+    commit_log: Option<&MoraineCommitLog>,
+) -> Result<(), AbiError> {
+    let Some(commit_log) = commit_log else {
+        options.commit_log_role = moraine::CommitLogRole::Committer;
+        return Ok(());
+    };
+    options.commit_log_role = match commit_log.role {
+        0 => moraine::CommitLogRole::Committer,
+        1 => moraine::CommitLogRole::Folder,
+        other => {
+            return Err(AbiError::invalid_argument(format!(
+                "moraine_attach: commit-log role {other} is neither 0 (committer) nor 1 (folder)"
+            )));
+        }
+    };
+    options.commit_log_tail = commit_log.tail;
+    if commit_log.poll_interval_ms > 0 {
+        options.commit_log_poll_interval =
+            std::time::Duration::from_millis(commit_log.poll_interval_ms);
+    }
+
+    Ok(())
+}
+
+/// Opens a catalog that takes no part in a commit log beyond the process
+/// default. New callers use [`moraine_attach_with_commit_log`], whose
+/// `commit_log` argument names the attach's role.
+///
+/// # Safety
+///
+/// All pointer and callback requirements are identical to
+/// [`moraine_attach_with_commit_log`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_attach_with_wal_store(
+    path: *const c_char,
+    s3: *const MoraineS3Config,
+    read_only: bool,
+    encrypted: bool,
+    flush_interval_ms: u64,
+    flush_on_commit: bool,
+    cache_dir: *const c_char,
+    cache_size_bytes: u64,
+    cache_memory_bytes: u64,
+    cache_auxiliary_percent: u32,
+    cache_preload: u8,
+    cache_puts: bool,
+    cache_compaction_puts: bool,
+    data_path: *const c_char,
+    wal: *const MoraineWalStore,
+    checkpoint: *const c_char,
+    host_threads: u64,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    out: *mut *mut MoraineCatalogHandle,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: forwards every pointer and callback unchanged under the same
+    // contract.
+    unsafe {
+        moraine_attach_with_commit_log(
+            path,
+            s3,
+            read_only,
+            encrypted,
+            flush_interval_ms,
+            flush_on_commit,
+            cache_dir,
+            cache_size_bytes,
+            cache_memory_bytes,
+            cache_auxiliary_percent,
+            cache_preload,
+            cache_puts,
+            cache_compaction_puts,
+            data_path,
+            wal,
+            ptr::null(),
+            checkpoint,
+            host_threads,
+            probe,
+            probe_ctx,
+            out,
+            err,
+        )
     }
 }
 

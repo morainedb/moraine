@@ -166,10 +166,9 @@ that **one commit = exactly one SlateDB `WriteBatch`**.
   changes it, draining the old log before recording the new store.
 
 The commit point remains SlateDB's durable WAL. Moraine has no conditional-PUT
-commit log, log folder, leader forwarding, or automatic multi-writer migration.
-[RFC 0022](docs/rfcs/0022-commit-log-and-leader-role.md) specifies the unimplemented
-replacement topology;
-[ROADMAP](ROADMAP.md) tracks independent writers as unimplemented.
+commit log, log folder, or automatic multi-writer migration. The replacement
+topology is designed and implemented in a separate commit-log library;
+[ROADMAP](ROADMAP.md) tracks independent writers as unimplemented here.
 
 Unacknowledged submissions return `CommitOutcomeUnknown` without automatic
 replay. Cancellation after a C commit call starts has the same conservative

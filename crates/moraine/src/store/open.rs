@@ -110,6 +110,8 @@ pub(crate) struct StoreBuilder<'a> {
     path: &'a str,
     object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
+    commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
+    commit_log_tail: bool,
     flush_interval: Option<Duration>,
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
@@ -136,6 +138,8 @@ impl<'a> StoreBuilder<'a> {
             path,
             object_store: retry::Store::wrap(object_store),
             wal_object_store: None,
+            commit_log: None,
+            commit_log_tail: false,
             flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
@@ -161,6 +165,33 @@ impl<'a> StoreBuilder<'a> {
     ) -> Self {
         self.wal_object_store = wal_object_store.map(retry::Store::wrap);
         self
+    }
+
+    /// Opens the store over `provider`'s write-ahead-log plugs, so a
+    /// bucket-resident commit log is the store's log: a writer replays it
+    /// on open and reports its folds through the plug, and a reader follows
+    /// the folded store or tails the log.
+    pub(crate) fn commit_log(
+        mut self,
+        provider: Option<Arc<dyn crate::CommitLogProvider>>,
+    ) -> Self {
+        self.commit_log = provider;
+        self
+    }
+
+    /// Makes a reader over a commit log tail the log rather than follow the
+    /// folded store. Reader only.
+    pub(crate) fn commit_log_tail(mut self, tail: bool) -> Self {
+        self.commit_log_tail = tail;
+        self
+    }
+
+    /// The store the log lives on: the separate log store when one is
+    /// configured, else the store itself.
+    pub(crate) fn log_store(&self) -> Arc<dyn ObjectStore> {
+        self.wal_object_store
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.object_store), Arc::clone)
     }
 
     /// Sets how often a read-only handle polls for new state. Reader only —
@@ -279,6 +310,9 @@ impl<'a> StoreBuilder<'a> {
         if let Some(wal) = &self.wal_object_store {
             builder = builder.with_wal_object_store(Arc::clone(wal));
         }
+        if let Some(provider) = &self.commit_log {
+            builder = builder.with_wal_writer(provider.writer_init(self.log_store(), self.path));
+        }
 
         let location = self.location();
         let cache_id = location.cache_id();
@@ -330,6 +364,13 @@ impl<'a> StoreBuilder<'a> {
         }
         if let Some(checkpoint) = self.checkpoint {
             builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
+        }
+        if let Some(provider) = &self.commit_log {
+            builder = builder.with_wal_reader(provider.reader(
+                self.log_store(),
+                self.path,
+                self.commit_log_tail,
+            ));
         }
 
         let reader = builder.build().await.map_err(Error::from)?;

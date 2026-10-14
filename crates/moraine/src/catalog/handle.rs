@@ -46,6 +46,7 @@ use crate::{
             view_head,
         },
     },
+    commit_log::LogCommitter,
     data_file,
     error::{Error, Result},
     store::{
@@ -58,7 +59,10 @@ use crate::{
         open::{self, StoreBuilder},
         proto::HeadValue,
     },
-    transaction::{MigrationReport, Transaction, commit, migration},
+    transaction::{
+        MigrationReport, Transaction, commit, commit::FORMAT_WITH_COMMIT_LOG, migration,
+        session::CommitSession,
+    },
 };
 
 /// Tables warmed concurrently, sized for a remote object store.
@@ -133,19 +137,104 @@ pub(crate) enum Store {
     Writer {
         db: Db,
         pacer: Arc<commit::FlushPacer>,
+        /// The log the writer's commits are slots of, when they are.
+        commit_log: Option<LogCommitter>,
+        /// The idle poll folding peers' slots, stopped at close.
+        fold_poll: Option<FoldPoll>,
     },
     /// A read-only reader following the manifest, shared into read sessions.
     Reader(Arc<DbReader>),
+    /// A committer over a tailing reader: reads what the log has served it
+    /// and commits through the log alone.
+    Committer {
+        reader: Arc<DbReader>,
+        commit_log: LogCommitter,
+        /// What a sprint reopens with: the committer's own store and options.
+        sprint: Box<Sprint>,
+    },
+}
+
+/// What a committer needs to take the store for a sprint.
+pub(crate) struct Sprint {
+    object_store: Arc<dyn ObjectStore>,
+    options: CatalogOptions,
+}
+
+/// The folder's idle poll task and the switch that stops it.
+pub(crate) struct FoldPoll {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl FoldPoll {
+    fn spawn(log: LogCommitter, interval: Duration) -> Self {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(log.poll_folds(interval, stopped));
+        Self {
+            stop,
+            task: std::sync::Mutex::new(Some(task)),
+        }
+    }
+
+    async fn stop(&self) {
+        let _ = self.stop.send(true);
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
 }
 
 impl Store {
+    /// A read side over the store itself, each read atomic on its own.
+    pub(crate) fn read_handle(&self) -> ReadHandle<'_> {
+        match self {
+            Self::Writer { db, .. } => ReadHandle::Writer(db),
+            Self::Reader(reader) | Self::Committer { reader, .. } => ReadHandle::Reader(reader),
+        }
+    }
+
+    /// Opens the session one batch stages against and commits through.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Constraint`] for a read-only store; the store's error if its
+    /// transaction cannot begin.
+    pub(crate) async fn begin_commit_session(&self) -> Result<CommitSession> {
+        match self {
+            Self::Writer { db, .. } => Ok(CommitSession::folder(
+                db.begin(IsolationLevel::Snapshot)
+                    .await
+                    .map_err(Error::from)?,
+            )),
+            Self::Committer { reader, .. } => Ok(CommitSession::committer(Arc::clone(reader))),
+            Self::Reader(_) => Err(Error::Constraint(
+                "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+        }
+    }
+
+    /// The commit log this store commits through, when its commits are
+    /// slots.
+    pub(crate) fn commit_log(&self) -> Option<&LogCommitter> {
+        match self {
+            Self::Writer { commit_log, .. } => commit_log.as_ref(),
+            Self::Committer { commit_log, .. } => Some(commit_log),
+            Self::Reader(_) => None,
+        }
+    }
+
     /// The writer behind this store, for a caller that needs to read after
     /// its own transaction is spent — a lost staged commit, deciding what
     /// it lost to.
     pub(crate) fn writer_db(&self) -> Option<&Db> {
         match self {
             Self::Writer { db, .. } => Some(db),
-            Self::Reader(_) => None,
+            Self::Reader(_) | Self::Committer { .. } => None,
         }
     }
 
@@ -154,7 +243,8 @@ impl Store {
     pub(crate) fn commit_durability(&self) -> commit::CommitDurability {
         match self {
             Self::Writer { pacer, .. } => commit::CommitDurability::Paced(Arc::clone(pacer)),
-            Self::Reader(_) => commit::CommitDurability::OnFlushInterval,
+            // A committer's batch is durable at its slot; it awaits no flush.
+            Self::Reader(_) | Self::Committer { .. } => commit::CommitDurability::OnFlushInterval,
         }
     }
 }
@@ -208,6 +298,40 @@ pub struct CatalogOptions {
     /// log over live state. `None` (the default) keeps the log in the
     /// catalog store.
     pub wal_store: Option<crate::WalStore>,
+    /// The commit-log provider this open builds its store over, outranking
+    /// the one [`register_commit_log`](crate::register_commit_log) holds for
+    /// the process. `None` (the default) falls back to the registered
+    /// provider, and to the store's own log when none is registered.
+    pub commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
+    /// Whether a read-only open over a commit log tails the log, seeing a
+    /// commit the moment its slot lands at a listing per poll, rather than
+    /// following the folded store. Defaults to `false`.
+    pub commit_log_tail: bool,
+    /// Which part a read-write open plays in a commit log: the one folder,
+    /// or a committer over a tailing reader. Ignored without a provider.
+    /// Defaults to the folder.
+    pub commit_log_role: crate::CommitLogRole,
+    /// How often a committer's reader polls for slots other committers
+    /// landed; it also bounds how long a commit waits to see its own slot.
+    /// Defaults to 50ms.
+    pub commit_log_poll_interval: Duration,
+    /// How many slots the folder folds before it writes its memtable out
+    /// and truncates the log below the replay point. A cold open replays
+    /// at most this many slots. Defaults to 256.
+    pub commit_log_flush_slots: u64,
+    /// How often the folder looks for slots other committers landed, when
+    /// it is not losing races to them. One listing per poll. Defaults to
+    /// two seconds.
+    pub commit_log_fold_poll: Duration,
+    /// How old a slot must be before truncation may delete it, so a reader
+    /// mid-replay is not pulled out from under. Defaults to five minutes.
+    pub commit_log_retention: Duration,
+    /// How long the unfolded tail may grow before a committer, on closing,
+    /// takes the store and folds it: a sprint. Well above
+    /// [`commit_log_flush_slots`](Self::commit_log_flush_slots), so a folder
+    /// doing its job is never fenced by one. Zero never sprints. Defaults
+    /// to 1024.
+    pub commit_log_sprint_slots: u64,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -297,6 +421,14 @@ impl Default for CatalogOptions {
             flush_interval: Duration::from_millis(100),
             flush_on_commit: false,
             wal_store: None,
+            commit_log: None,
+            commit_log_tail: false,
+            commit_log_role: crate::CommitLogRole::default(),
+            commit_log_poll_interval: Duration::from_millis(50),
+            commit_log_flush_slots: 256,
+            commit_log_fold_poll: Duration::from_secs(2),
+            commit_log_retention: Duration::from_mins(5),
+            commit_log_sprint_slots: 1024,
             cache_dir: None,
             cache_identity: None,
             cache_size: None,
@@ -326,6 +458,119 @@ pub enum CachePreload {
 }
 
 /// The object store `options` names for the write-ahead log, if any.
+/// What a read-write open brings up: the store, its cache counters, its
+/// format after any adoption, its pacer, and the log it commits through.
+struct OpenedWriter {
+    db: Db,
+    cache: Arc<crate::store::cache::CacheCounters>,
+    format: u64,
+    pacer: Arc<commit::FlushPacer>,
+    commit_log: Option<LogCommitter>,
+}
+
+/// Opens the writer's store over the commit log when a provider is present,
+/// draining the store's own log first if the commit log is not yet adopted
+/// and adopting it once the store is open.
+async fn open_writer_store(
+    object_store: Arc<dyn ObjectStore>,
+    options: &CatalogOptions,
+    wal_object_store: Option<Arc<dyn ObjectStore>>,
+    warm_segments: Vec<census::SegmentSize>,
+) -> Result<OpenedWriter> {
+    let provider = commit_log_provider(options);
+    // The writer paces its own flushes; the store's timer stays off so the
+    // pacing is exact.
+    let store_builder = |provider: Option<Arc<dyn crate::CommitLogProvider>>| {
+        StoreBuilder::new(&options.path, Arc::clone(&object_store))
+            .wal_object_store(wal_object_store.clone())
+            .commit_log(provider)
+            .without_flush_timer()
+            .cache_dir(options.cache_dir.clone())
+            .cache_identity(options.cache_identity)
+            .cache_size(options.cache_size)
+            .cache_memory(options.cache_memory)
+            .cache_auxiliary_percent(options.cache_auxiliary_percent)
+            .cache_preload(options.cache_preload)
+            .warm_segments(warm_segments.clone())
+            .cache_puts(options.cache_puts)
+            .cache_compaction_puts(options.cache_compaction_puts)
+    };
+    let log_store = store_builder(None).log_store();
+    let committer = match &provider {
+        Some(provider) => {
+            let committer = provider.committer(Arc::clone(&log_store), &options.path);
+            // The plug replays the log in place of the store's own, so a
+            // store not yet adopted drains its own log into the tree first;
+            // nothing a crashed writer left there is skipped.
+            if !committer.adopted().await? {
+                commit::drain_own_log(store_builder(None)).await?;
+            }
+            Some(committer)
+        }
+        None => None,
+    };
+    let flush_spacing = if options.flush_on_commit {
+        Duration::ZERO
+    } else {
+        options.flush_interval
+    };
+    let (db, cache, mut format, pacer) = commit::open_initialized(
+        store_builder(provider.clone()),
+        options.encrypted,
+        options.data_path.as_deref(),
+        options.wal_store.as_ref().map(crate::WalStore::name),
+        flush_spacing,
+        provider.is_some(),
+    )
+    .await?;
+    let commit_log = match (committer, &provider) {
+        (Some(committer), Some(provider)) => {
+            let mut log = LogCommitter {
+                committer,
+                db: Some(db.clone()),
+                batch_origin: 0,
+                guard: Arc::new(tokio::sync::Mutex::new(())),
+                folds_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                own_rows_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                flushing: Some(crate::commit_log::Flushing {
+                    every: options.commit_log_flush_slots.max(1),
+                    folded_since: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    collector: crate::commit_log::Collector {
+                        path: options.path.clone(),
+                        object_store: Arc::clone(&object_store),
+                        log_store: Arc::clone(&log_store),
+                        wal_gc: provider.garbage_collector(Arc::clone(&log_store), &options.path),
+                        min_age: options.commit_log_retention,
+                    },
+                }),
+            };
+            if format >= FORMAT_WITH_COMMIT_LOG {
+                log.batch_origin = commit::batch_origin(ReadHandle::Writer(&db)).await?;
+            }
+            format = commit::adopt_commit_log(&mut log, format).await?;
+            Some(log)
+        }
+        _ => None,
+    };
+
+    Ok(OpenedWriter {
+        db,
+        cache,
+        format,
+        pacer,
+        commit_log,
+    })
+}
+
+/// The commit-log provider an open builds its store over: the options' own,
+/// else the process's registered one.
+fn commit_log_provider(options: &CatalogOptions) -> Option<Arc<dyn crate::CommitLogProvider>> {
+    options
+        .commit_log
+        .clone()
+        .or_else(crate::commit_log::registered_commit_log)
+}
+
 fn wal_object_store(options: &CatalogOptions) -> Option<Arc<dyn ObjectStore>> {
     options
         .wal_store
@@ -809,7 +1054,9 @@ impl ReadOnlyCatalog {
         }
         match self.store.as_ref() {
             Store::Writer { db, .. } => OwnedReadHandle::Writer(db.clone()),
-            Store::Reader(reader) => OwnedReadHandle::Reader(reader.clone()),
+            Store::Reader(reader) | Store::Committer { reader, .. } => {
+                OwnedReadHandle::Reader(reader.clone())
+            }
         }
     }
 
@@ -1089,7 +1336,9 @@ impl ReadOnlyCatalog {
                         .map_err(Error::from)?,
                 )
             }
-            Store::Reader(reader) => ReadSession::Reader(reader.clone()),
+            Store::Reader(reader) | Store::Committer { reader, .. } => {
+                ReadSession::Reader(reader.clone())
+            }
         };
 
         let refused = async {
@@ -1116,8 +1365,44 @@ impl ReadOnlyCatalog {
     /// Returns an error if the underlying store fails to close cleanly.
     pub async fn close(&self) -> Result<()> {
         match self.store.as_ref() {
-            Store::Writer { db, .. } => db.close().await.map_err(Error::from),
+            Store::Writer { db, fold_poll, .. } => {
+                if let Some(fold_poll) = fold_poll {
+                    fold_poll.stop().await;
+                }
+                db.close().await.map_err(Error::from)
+            }
             Store::Reader(reader) => reader.close().await.map_err(Error::from),
+            Store::Committer {
+                reader,
+                commit_log,
+                sprint,
+            } => {
+                reader.close().await.map_err(Error::from)?;
+                // The last one out leaves the tail short for the next in.
+                let threshold = sprint.options.commit_log_sprint_slots;
+                if threshold > 0
+                    && commit_log
+                        .committer
+                        .unfolded(
+                            census::replay_point(
+                                &sprint.options.path,
+                                Arc::clone(&sprint.object_store),
+                            )
+                            .await?,
+                        )
+                        .await?
+                        > threshold
+                {
+                    // Boxed: the sprint opens and closes a catalog of its own.
+                    let folded = Box::pin(Catalog::fold_sprint(
+                        Arc::clone(&sprint.object_store),
+                        sprint.options.clone(),
+                    ))
+                    .await?;
+                    info!(folded, "sprinted at close");
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1130,6 +1415,10 @@ impl Catalog {
             Store::Writer { db, .. } => Ok(db),
             Store::Reader(_) => Err(Error::Constraint(
                 "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+            Store::Committer { .. } => Err(Error::Constraint(
+                "catalog opened as a commit-log committer; this operation needs the folder"
+                    .to_string(),
             )),
         }
     }
@@ -1202,6 +1491,11 @@ impl Catalog {
                     .to_string(),
             ));
         }
+        if options.commit_log_role == crate::CommitLogRole::Committer
+            && let Some(provider) = commit_log_provider(&options)
+        {
+            return Self::open_as_committer(object_store, options, provider).await;
+        }
         let started = Instant::now();
         let located = Arc::clone(&object_store);
         // One manifest read serves both diagnostics, before the open.
@@ -1213,36 +1507,20 @@ impl Catalog {
             .wal_store
             .as_ref()
             .map(|wal| Arc::clone(wal.object_store()));
-        // The writer paces its own flushes; the store's timer stays off so
-        // the pacing is exact.
-        let store = StoreBuilder::new(&options.path, object_store)
-            .wal_object_store(wal_object_store.clone())
-            .without_flush_timer()
-            .cache_dir(options.cache_dir.clone())
-            .cache_identity(options.cache_identity)
-            .cache_size(options.cache_size)
-            .cache_memory(options.cache_memory)
-            .cache_auxiliary_percent(options.cache_auxiliary_percent)
-            .cache_preload(options.cache_preload)
-            .warm_segments(
-                manifest
-                    .as_ref()
-                    .map(|manifest| manifest.segments.clone())
-                    .unwrap_or_default(),
-            )
-            .cache_puts(options.cache_puts)
-            .cache_compaction_puts(options.cache_compaction_puts);
-        let flush_spacing = if options.flush_on_commit {
-            Duration::ZERO
-        } else {
-            options.flush_interval
-        };
-        let (db, cache, format, pacer) = commit::open_initialized(
-            store,
-            options.encrypted,
-            options.data_path.as_deref(),
-            options.wal_store.as_ref().map(crate::WalStore::name),
-            flush_spacing,
+        let OpenedWriter {
+            db,
+            cache,
+            format,
+            pacer,
+            commit_log,
+        } = open_writer_store(
+            Arc::clone(&object_store),
+            &options,
+            wal_object_store.clone(),
+            manifest
+                .as_ref()
+                .map(|manifest| manifest.segments.clone())
+                .unwrap_or_default(),
         )
         .await?;
         warn_if_caches_cannot_hold(&options.path, manifest.as_ref());
@@ -1264,7 +1542,14 @@ impl Catalog {
             inner: ReadOnlyCatalog {
                 pinned: None,
                 writer_status: Some(db.subscribe()),
-                store: Arc::new(Store::Writer { db, pacer }),
+                store: Arc::new(Store::Writer {
+                    db,
+                    pacer,
+                    fold_poll: commit_log
+                        .clone()
+                        .map(|log| FoldPoll::spawn(log, options.commit_log_fold_poll)),
+                    commit_log: commit_log.clone(),
+                }),
                 location: Arc::new(StoreLocation {
                     path: options.path,
                     object_store: located,
@@ -1287,10 +1572,230 @@ impl Catalog {
                     LEDGER_MEMO_BYTES,
                     MEMO_ENTRIES,
                 )),
-                commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections), durability)),
+                commits: Arc::new(commit::Coalescer::new(
+                    Arc::clone(&projections),
+                    durability,
+                    commit_log,
+                )),
                 projections,
             },
         })
+    }
+
+    /// Opens the catalog as a commit-log committer: a tailing reader that
+    /// polls at the commit-log poll interval, with every commit a slot. The
+    /// log must have been adopted by a folder.
+    async fn open_as_committer(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+        provider: Arc<dyn crate::CommitLogProvider>,
+    ) -> Result<Self> {
+        let log_store = StoreBuilder::new(&options.path, Arc::clone(&object_store))
+            .wal_object_store(
+                options
+                    .wal_store
+                    .as_ref()
+                    .map(|wal| Arc::clone(wal.object_store())),
+            )
+            .log_store();
+        let committer = provider.committer(log_store, &options.path);
+        if !committer.adopted().await? {
+            return Err(Error::Configuration(
+                "the commit log is not adopted; open the lake as the folder first".to_string(),
+            ));
+        }
+
+        let mut inner = Self::open_read_only(
+            Arc::clone(&object_store),
+            CatalogOptions {
+                commit_log_tail: true,
+                reader_poll_interval: options.commit_log_poll_interval,
+                ..options.clone()
+            },
+        )
+        .await?;
+        let Some(Store::Reader(reader)) = Arc::into_inner(inner.store) else {
+            return Err(Error::Corruption(
+                "a fresh read-only open must hold its reader alone".to_string(),
+            ));
+        };
+        let batch_origin = commit::batch_origin(ReadHandle::Reader(&reader)).await?;
+        let log = LogCommitter {
+            committer,
+            db: None,
+            batch_origin,
+            guard: Arc::new(tokio::sync::Mutex::new(())),
+            folds_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            own_rows_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            flushing: None,
+        };
+        inner.store = Arc::new(Store::Committer {
+            reader,
+            commit_log: log.clone(),
+            sprint: Box::new(Sprint {
+                object_store,
+                options,
+            }),
+        });
+        inner.commits = Arc::new(commit::Coalescer::new(
+            Arc::clone(&inner.projections),
+            commit::CommitDurability::OnFlushInterval,
+            Some(log),
+        ));
+        info!(
+            path = inner.location.path,
+            "opened catalog as a commit-log committer"
+        );
+
+        Ok(Self { inner })
+    }
+
+    /// Makes room for `rows` the folder is about to write for itself outside
+    /// a slot. Such rows take sequence numbers between the last replayed
+    /// slot and the next, and a replay skips rows below what the tree
+    /// already holds, so when the headroom runs short this commits an empty
+    /// head-preserving slot first, which moves the next slot's number up by
+    /// one slot's worth. Nothing to do on a store with no commit log.
+    pub(crate) async fn reserve_own_rows(&self, rows: u64) -> Result<()> {
+        let Some(log) = self.store.commit_log().filter(|log| log.db.is_some()) else {
+            return Ok(());
+        };
+        let mut advanced = 0;
+        while !log.has_headroom(rows) {
+            self.advance_log_slot().await?;
+            advanced += 1;
+        }
+        if advanced > 0 {
+            info!(
+                rows,
+                advanced, "advanced the commit log ahead of the folder's own rows"
+            );
+        }
+        log.note_own_rows(rows);
+
+        Ok(())
+    }
+
+    /// Commits an empty head-preserving batch as a slot: the head keeps its
+    /// snapshot and its batch counter moves by one, so every committer's
+    /// next offer races past it.
+    async fn advance_log_slot(&self) -> Result<()> {
+        for _ in 0..commit::MAX_COMMIT_ATTEMPTS {
+            let session = self.store.begin_commit_session().await?;
+            let base = commit::head_view_for(session.handle(), &self.projections).await?;
+            let head = base.snapshot.snapshot_id;
+            let writes = vec![commit::head_stamp(head, base.batch_seq)];
+            let staged = commit::stage_writes_on(&session, &writes)?;
+            let landed = commit::commit_batch(
+                Arc::new(session),
+                commit::HeadTransition {
+                    before: head,
+                    after: head,
+                },
+                &writes,
+                staged,
+                commit::HeadViewUpdate::Rebuild(base),
+                commit::Landing {
+                    projections: &self.projections,
+                    log: self.store.commit_log(),
+                },
+                &self.store.commit_durability(),
+            )
+            .await?;
+            if matches!(landed, commit::Landed::Committed(_)) {
+                return Ok(());
+            }
+        }
+
+        Err(Error::RetryBudgetExhausted(
+            "could not advance the commit log past the folder's own rows".to_string(),
+        ))
+    }
+
+    /// Takes the store for one fold: opens it as the folder, which replays
+    /// every unfolded slot, folds whatever lands meanwhile, writes the
+    /// memtable out, truncates the log, and closes. Returns how many slots
+    /// the store was behind. A committer runs this on closing when the tail
+    /// is past [`CatalogOptions::commit_log_sprint_slots`]; a scheduled job
+    /// runs it on a timer; a lake with a standing folder never needs it.
+    /// Fences a folder that is running, so run it only where none is
+    /// expected.
+    ///
+    /// # Errors
+    ///
+    /// As [`Catalog::open`], or the store's error on the flush.
+    pub async fn fold_sprint(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+    ) -> Result<u64> {
+        let Some(provider) = commit_log_provider(&options) else {
+            return Err(Error::Configuration(
+                "a fold sprint needs a commit-log provider".to_string(),
+            ));
+        };
+        let log_store = StoreBuilder::new(&options.path, Arc::clone(&object_store))
+            .wal_object_store(
+                options
+                    .wal_store
+                    .as_ref()
+                    .map(|wal| Arc::clone(wal.object_store())),
+            )
+            .log_store();
+        let replay_point = census::replay_point(&options.path, Arc::clone(&object_store)).await?;
+        let behind = provider
+            .committer(log_store, &options.path)
+            .unfolded(replay_point)
+            .await?;
+
+        let folder = Self::open(
+            object_store,
+            CatalogOptions {
+                commit_log_role: crate::CommitLogRole::Folder,
+                ..options
+            },
+        )
+        .await?;
+        if let Some(log) = folder.store.commit_log() {
+            let _held = log.guard.lock().await;
+            log.fold_tail().await?;
+            log.flush_now().await?;
+        }
+        folder.close().await?;
+
+        Ok(behind)
+    }
+
+    /// Sprints now if the unfolded tail is past the threshold, for a host
+    /// that just lost a race and would rather fold than let the next
+    /// arrival pay. Only a committer sprints; the folder is already folding.
+    ///
+    /// # Errors
+    ///
+    /// As [`Catalog::fold_sprint`].
+    pub async fn sprint_if_stalled(&self) -> Result<Option<u64>> {
+        let Store::Committer {
+            commit_log, sprint, ..
+        } = self.store.as_ref()
+        else {
+            return Ok(None);
+        };
+        let threshold = sprint.options.commit_log_sprint_slots;
+        if threshold == 0 {
+            return Ok(None);
+        }
+        let replay_point =
+            census::replay_point(&sprint.options.path, Arc::clone(&sprint.object_store)).await?;
+        if commit_log.committer.unfolded(replay_point).await? <= threshold {
+            return Ok(None);
+        }
+
+        // Boxed: the sprint opens and closes a catalog of its own.
+        Box::pin(Self::fold_sprint(
+            Arc::clone(&sprint.object_store),
+            sprint.options.clone(),
+        ))
+        .await
+        .map(Some)
     }
 
     /// Opens the catalog **read-only** in `object_store` at `options.path`,
@@ -1353,6 +1858,8 @@ impl Catalog {
             .map(|wal| Arc::clone(wal.object_store()));
         let store = StoreBuilder::new(&options.path, object_store)
             .wal_object_store(wal_object_store.clone())
+            .commit_log(commit_log_provider(&options))
+            .commit_log_tail(options.commit_log_tail)
             .cache_dir(options.cache_dir.clone())
             .cache_identity(options.cache_identity)
             .cache_size(options.cache_size)
@@ -1373,6 +1880,7 @@ impl Catalog {
         let (reader, cache, format) = commit::open_reader_initialized(
             store,
             options.wal_store.as_ref().map(crate::WalStore::name),
+            commit_log_provider(&options).is_some(),
         )
         .await?;
         warn_if_caches_cannot_hold(&options.path, manifest.as_ref());
@@ -1415,6 +1923,7 @@ impl Catalog {
             commits: Arc::new(commit::Coalescer::new(
                 Arc::clone(&projections),
                 commit::CommitDurability::OnFlushInterval,
+                None,
             )),
             projections,
         })
@@ -1676,6 +2185,16 @@ impl Catalog {
             .map_err(Error::from)
     }
 
+    /// Opens the session one staged commit stages against and commits
+    /// through.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::begin_commit_session`].
+    pub(crate) async fn begin_commit_session(&self) -> Result<CommitSession> {
+        self.store.begin_commit_session().await
+    }
+
     /// Writes the memtable out as a sorted-string table, so a test can put
     /// what it committed behind block reads.
     #[cfg(test)]
@@ -1761,7 +2280,7 @@ impl Catalog {
         F: Fn(&mut Transaction) -> Result<()>,
     {
         let ids =
-            commit::commit_cycle(self.writer()?, std::slice::from_ref(&f), &self.commits).await?;
+            commit::commit_cycle(&self.store, std::slice::from_ref(&f), &self.commits).await?;
         ids.first().copied().ok_or_else(|| {
             Error::Corruption("a commit of one member reported no snapshot".to_string())
         })
@@ -1811,6 +2330,6 @@ impl Catalog {
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn commit_group(&self, members: &[CommitMember<'_>]) -> Result<Vec<SnapshotId>> {
-        commit::commit_cycle(self.writer()?, members, &self.commits).await
+        commit::commit_cycle(&self.store, members, &self.commits).await
     }
 }

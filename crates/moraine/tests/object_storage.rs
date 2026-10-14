@@ -351,13 +351,15 @@ async fn measure_attach_latency_against_endpoint() {
     for merged in [false, true] {
         let state = if merged { "merged" } else { "churned" };
         let options = options_at(&attach_case_path(state));
-        seed_attach_measurement(
+        // Boxed: the seed drives whole catalog opens, whose futures outgrow
+        // the stack budget the lint allows.
+        Box::pin(seed_attach_measurement(
             store.clone(),
             &options,
             ATTACH_TABLES,
             ATTACH_COLUMNS_PER_TABLE,
             ATTACH_ROUNDS,
-        )
+        ))
         .await;
         if merged {
             let completed = compact_attach_store(store.clone(), &options).await;
@@ -738,7 +740,7 @@ async fn measure_index_lookup_latency_against_the_endpoint() {
     let options = options_at("index-lookup-latency");
     let target = endpoint_label();
 
-    let fixture = seed_index_lookup_measurement(store.clone(), &options).await;
+    let fixture = Box::pin(seed_index_lookup_measurement(store.clone(), &options)).await;
 
     let census_reader = Catalog::open_read_only(store.clone(), options.clone())
         .await
