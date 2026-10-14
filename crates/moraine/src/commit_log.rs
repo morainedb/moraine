@@ -139,6 +139,14 @@ pub trait SlotCommitter: fmt::Debug + Send + Sync + 'static {
     /// As [`offer`](Self::offer); a hole in the tail is [`Error::Corruption`].
     async fn tail(&self) -> Result<Vec<(u64, SlotEnvelope)>>;
 
+    /// How many slots lie past `replay_point`, the manifest's last folded
+    /// WAL id: what a cold open of the store would replay. One listing.
+    ///
+    /// # Errors
+    ///
+    /// As [`offer`](Self::offer).
+    async fn unfolded(&self, replay_point: u64) -> Result<u64>;
+
     /// Reports that the store has applied every slot through `sequence`.
     /// Apply before reporting: the store's next memtable freeze records the
     /// reported sequence as the replay point.
@@ -311,6 +319,19 @@ impl LogCommitter {
         if flushing.folded_since.fetch_add(1, Ordering::AcqRel) + 1 < flushing.every {
             return Ok(());
         }
+        crate::transaction::commit::flush_memtable(db).await?;
+        flushing.folded_since.store(0, Ordering::Release);
+        flushing.collector.run().await;
+
+        Ok(())
+    }
+
+    /// Writes the folder's memtable out and truncates the log, whatever the
+    /// count since the last flush; the sprint's last act.
+    pub(crate) async fn flush_now(&self) -> Result<()> {
+        let (Some(db), Some(flushing)) = (&self.db, &self.flushing) else {
+            return Ok(());
+        };
         crate::transaction::commit::flush_memtable(db).await?;
         flushing.folded_since.store(0, Ordering::Release);
         flushing.collector.run().await;

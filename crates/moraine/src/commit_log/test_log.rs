@@ -300,6 +300,14 @@ impl SlotCommitter for TestCommitter {
         Ok(self.log.wal_base().is_some())
     }
 
+    async fn unfolded(&self, replay_point: u64) -> crate::Result<u64> {
+        let folded = self
+            .log
+            .wal_base()
+            .map_or(0, |base| replay_point.saturating_sub(base));
+        Ok(self.log.last_sequence().saturating_sub(folded))
+    }
+
     async fn tail(&self) -> crate::Result<Vec<(u64, SlotEnvelope)>> {
         let known = self
             .cursor

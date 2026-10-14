@@ -211,64 +211,57 @@ fence one another.
 
 ### The sequence a committer races
 
-**Open defect.** A committer over a reader races the sequence after the
-last slot its plug reports served, and the plug reports a slot served when
-it hands the rows to SlateDB, a moment before SlateDB applies them to the
-reader's memory. A commit prepared in that moment reads a head that
-predates the served slot, races the sequence after it, and wins a slot
-that carries a snapshot built without the previous slot's changes: two
-snapshots with one id, and the peer's commit overwritten. The race cannot
-catch it, because the race only checks that the sequence is free; the
-guard was skipping the sequence it should have lost at. The folder has no
-such window: it applies a slot into its own store before it marks the
-slot folded.
+A committer's plug reports a slot served when it hands the rows to
+SlateDB, a moment before SlateDB applies them to the reader's memory, so
+"the sequence after the last slot served" can name a free slot while the
+head the commit was prepared against predates a taken one. The sequence
+to race is therefore derived from the state the commit was prepared
+against, never from the plug: every slot past the first carries exactly
+one `sys/head` stamp, the head's batch counter advances by one per slot,
+adoption records the counter the first slot stands on in the format
+stamp, and a batch races the slot its own stamp's counter implies. A
+stale head names a taken slot and loses, which re-prepares correctly.
+The served signal remains a hint for when to read again. A folded slot
+carrying any other number of head stamps is refused as corruption.
+Direct writes the folder makes for itself — the format raise,
+maintenance status, the sweep's tombstones — stamp no head, and
+migration refuses a log-resident store, so nothing moves the counter
+outside a slot.
 
-**The rule.** The sequence to race is derived from the state the commit
-was prepared against, never from the plug. Every slot carries exactly one
-`sys/head` stamp, and the head's batch counter advances by one per slot,
-so a committer that prepared against a head at batch counter *b* races
-the slot that counter implies. A stale head then races a taken slot and
-loses, which re-prepares correctly. The served signal stays as a hint for
-when to re-read after a loss; it carries no safety.
+### Folding, flushing, truncation, and the sprint
 
-**The invariant that makes the rule hold**, to be verified against the
-code and then enforced: one head stamp per slot, with the batch counter
-contiguous from adoption, which records the counter the first slot
-stands on. Writes the folder makes for itself outside a slot — the
-format raise, maintenance status, the sweep's tombstones — do not stamp
-the head and so do not disturb the count. A slot found carrying no head
-stamp, or two, is corruption.
+- **Flush by slot count.** Under the plug the folder's paced flush writes
+  nothing, so the folder writes its memtable out after
+  `commit_log_flush_slots` folded slots and then runs SlateDB's collector
+  through the provider's plug, truncating the log below the replay point
+  (the collector keeps the slot at the replay point itself) once slots
+  are older than `commit_log_retention`. A cold open replays at most
+  that many slots. The bound is a count because a cold open costs one
+  GET per slot, whatever the bytes.
+- **The idle poll.** Every `commit_log_fold_poll` the folder lists the
+  tail and folds what peers landed, under a guard that also spans the
+  folder's own offer and local commit, so the poll never folds a slot the
+  folder is in the middle of committing itself.
+- **The sprint.** `Catalog::fold_sprint` takes the store as the folder,
+  which replays the tail, folds what lands meanwhile, flushes, truncates,
+  and closes. A committer runs it on closing when the unfolded tail —
+  counted past the manifest's replay point, which moraine reads itself,
+  since the reader plug sees only its own in-memory watermark — is past
+  `commit_log_sprint_slots`, and a host may run `sprint_if_stalled` after
+  a loss. The threshold sits well above the flush count, so a folder
+  doing its job is never fenced by a committer. A holder keeps the store
+  until fenced. With this, a lake needs no standing process.
 
 ### What remains
 
-In order; each item is small, and the first is required before the
-committer role is sound.
-
-1. **Race by head counter.** The rule above, replacing the served-based
-   sequence; a test that lands a peer slot between a committer's prepare
-   and its offer and shows the loss.
-2. **Prefetching replay.** The plug reads slots one at a time; a
-   thousand-slot tail is tens of seconds on S3. Read a bounded window
-   ahead.
-3. **Flush after N folded slots.** The folder's paced flush writes nothing
-   under the plug, so its memtable reaches the tree only at 64 MB, which
-   on a quiet lake is days of slots. A cold open costs one GET per slot,
-   so the bound is a slot count, not bytes or time: flush when N slots
-   have folded since the last flush.
-4. **Idle tail poll on the folder,** so it folds peers' slots without
-   waiting to lose to them, and **the collector at flush,** truncating the
-   log below what manifests reference with a retention margin.
-5. **The sprint.** A committer takes the store — open as the folder,
-   replay, flush, collect, close — when the tail is past a threshold,
-   checked on a loss and at detach; a holder keeps the store until fenced.
-   The threshold sits well above N, so a folder doing its job is never
-   fenced by a committer. With this, no standing process is required.
-6. **Chunked sweep.** The folder's own rows take sequence numbers in the
-   gap between slots, one million per slot. A sweep larger than that
-   overruns the next slot's number, so it folds between chunks.
-7. **End to end.** Two DuckDB processes on one bucket, one as the folder
+1. **Chunked sweep.** After an open that replayed, the folder's own rows
+   take sequence numbers between the last replayed slot and the next,
+   one million per slot; rows past that are skipped by the next replay.
+   A sweep larger than the headroom advances a slot between chunks.
+2. **End to end.** Two DuckDB processes on one bucket, one as the folder
    and one as a committer, and the attach option's C++ side, which has
-   compiled only by inspection.
+   compiled only by inspection. The new options reach the library API
+   only; the extension's attach exposes the role, tailing, and poll.
 
 ## Alternatives considered
 

@@ -88,6 +88,10 @@ impl SlotCommitter for NoCommits {
         Ok(Vec::new())
     }
 
+    async fn unfolded(&self, _replay_point: u64) -> moraine::Result<u64> {
+        Ok(0)
+    }
+
     async fn adopt(&self, _stamp: SlotCommit) -> moraine::Result<SlotAdoption> {
         Err(Error::Configuration(
             "the test log takes no commits".to_string(),

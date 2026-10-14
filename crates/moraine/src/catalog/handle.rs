@@ -149,7 +149,15 @@ pub(crate) enum Store {
     Committer {
         reader: Arc<DbReader>,
         commit_log: LogCommitter,
+        /// What a sprint reopens with: the committer's own store and options.
+        sprint: Sprint,
     },
+}
+
+/// What a committer needs to take the store for a sprint.
+pub(crate) struct Sprint {
+    object_store: Arc<dyn ObjectStore>,
+    options: CatalogOptions,
 }
 
 /// The folder's idle poll task and the switch that stops it.
@@ -318,6 +326,12 @@ pub struct CatalogOptions {
     /// How old a slot must be before truncation may delete it, so a reader
     /// mid-replay is not pulled out from under. Defaults to five minutes.
     pub commit_log_retention: Duration,
+    /// How long the unfolded tail may grow before a committer, on closing,
+    /// takes the store and folds it: a sprint. Well above
+    /// [`commit_log_flush_slots`](Self::commit_log_flush_slots), so a folder
+    /// doing its job is never fenced by one. Zero never sprints. Defaults
+    /// to 1024.
+    pub commit_log_sprint_slots: u64,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -414,6 +428,7 @@ impl Default for CatalogOptions {
             commit_log_flush_slots: 256,
             commit_log_fold_poll: Duration::from_secs(2),
             commit_log_retention: Duration::from_secs(300),
+            commit_log_sprint_slots: 1024,
             cache_dir: None,
             cache_identity: None,
             cache_size: None,
@@ -1354,8 +1369,37 @@ impl ReadOnlyCatalog {
                 }
                 db.close().await.map_err(Error::from)
             }
-            Store::Reader(reader) | Store::Committer { reader, .. } => {
-                reader.close().await.map_err(Error::from)
+            Store::Reader(reader) => reader.close().await.map_err(Error::from),
+            Store::Committer {
+                reader,
+                commit_log,
+                sprint,
+            } => {
+                reader.close().await.map_err(Error::from)?;
+                // The last one out leaves the tail short for the next in.
+                let threshold = sprint.options.commit_log_sprint_slots;
+                if threshold > 0
+                    && commit_log
+                        .committer
+                        .unfolded(
+                            census::replay_point(
+                                &sprint.options.path,
+                                Arc::clone(&sprint.object_store),
+                            )
+                            .await?,
+                        )
+                        .await?
+                        > threshold
+                {
+                    // Boxed: the sprint opens and closes a catalog of its own.
+                    let folded = Box::pin(Catalog::fold_sprint(
+                        Arc::clone(&sprint.object_store),
+                        sprint.options.clone(),
+                    ))
+                    .await?;
+                    info!(folded, "sprinted at close");
+                }
+                Ok(())
             }
         }
     }
@@ -1560,11 +1604,11 @@ impl Catalog {
         }
 
         let mut inner = Self::open_read_only(
-            object_store,
+            Arc::clone(&object_store),
             CatalogOptions {
                 commit_log_tail: true,
                 reader_poll_interval: options.commit_log_poll_interval,
-                ..options
+                ..options.clone()
             },
         )
         .await?;
@@ -1584,6 +1628,10 @@ impl Catalog {
         inner.store = Arc::new(Store::Committer {
             reader,
             commit_log: log.clone(),
+            sprint: Sprint {
+                object_store,
+                options,
+            },
         });
         inner.commits = Arc::new(commit::Coalescer::new(
             Arc::clone(&inner.projections),
@@ -1596,6 +1644,88 @@ impl Catalog {
         );
 
         Ok(Self { inner })
+    }
+
+    /// Takes the store for one fold: opens it as the folder, which replays
+    /// every unfolded slot, folds whatever lands meanwhile, writes the
+    /// memtable out, truncates the log, and closes. Returns how many slots
+    /// the store was behind. A committer runs this on closing when the tail
+    /// is past [`CatalogOptions::commit_log_sprint_slots`]; a scheduled job
+    /// runs it on a timer; a lake with a standing folder never needs it.
+    /// Fences a folder that is running, so run it only where none is
+    /// expected.
+    ///
+    /// # Errors
+    ///
+    /// As [`Catalog::open`], or the store's error on the flush.
+    pub async fn fold_sprint(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+    ) -> Result<u64> {
+        let Some(provider) = commit_log_provider(&options) else {
+            return Err(Error::Configuration(
+                "a fold sprint needs a commit-log provider".to_string(),
+            ));
+        };
+        let log_store = StoreBuilder::new(&options.path, Arc::clone(&object_store))
+            .wal_object_store(
+                options
+                    .wal_store
+                    .as_ref()
+                    .map(|wal| Arc::clone(wal.object_store())),
+            )
+            .log_store();
+        let replay_point = census::replay_point(&options.path, Arc::clone(&object_store)).await?;
+        let behind = provider
+            .committer(log_store, &options.path)
+            .unfolded(replay_point)
+            .await?;
+
+        let folder = Self::open(
+            object_store,
+            CatalogOptions {
+                commit_log_role: crate::CommitLogRole::Folder,
+                ..options
+            },
+        )
+        .await?;
+        if let Some(log) = folder.store.commit_log() {
+            let _held = log.guard.lock().await;
+            log.fold_tail().await?;
+            log.flush_now().await?;
+        }
+        folder.close().await?;
+
+        Ok(behind)
+    }
+
+    /// Sprints now if the unfolded tail is past the threshold, for a host
+    /// that just lost a race and would rather fold than let the next
+    /// arrival pay. Only a committer sprints; the folder is already folding.
+    ///
+    /// # Errors
+    ///
+    /// As [`Catalog::fold_sprint`].
+    pub async fn sprint_if_stalled(&self) -> Result<Option<u64>> {
+        let Store::Committer {
+            commit_log, sprint, ..
+        } = self.store.as_ref()
+        else {
+            return Ok(None);
+        };
+        let threshold = sprint.options.commit_log_sprint_slots;
+        if threshold == 0 {
+            return Ok(None);
+        }
+        let replay_point =
+            census::replay_point(&sprint.options.path, Arc::clone(&sprint.object_store)).await?;
+        if commit_log.committer.unfolded(replay_point).await? <= threshold {
+            return Ok(None);
+        }
+
+        Self::fold_sprint(Arc::clone(&sprint.object_store), sprint.options.clone())
+            .await
+            .map(Some)
     }
 
     /// Opens the catalog **read-only** in `object_store` at `options.path`,

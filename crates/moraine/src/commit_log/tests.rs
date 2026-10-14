@@ -504,6 +504,74 @@ async fn an_idle_folder_polls_and_folds_peers_slots() {
     folder.close().await.unwrap();
 }
 
+/// A committer closing on a tail past the sprint threshold takes the store,
+/// folds it, and leaves the folded state current for the next arrival.
+#[tokio::test]
+async fn a_committer_sprints_at_close_when_the_tail_is_long() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+
+    let folder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    folder
+        .commit(|tx| tx.create_schema("a").map(|_| ()))
+        .await
+        .unwrap();
+    folder.close().await.unwrap();
+
+    let committer_provider = Arc::new(provider.sharing());
+    let committer = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(committer_provider.clone()),
+            commit_log_role: CommitLogRole::Committer,
+            commit_log_poll_interval: std::time::Duration::from_millis(10),
+            commit_log_sprint_slots: 1,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    for name in ["b", "c"] {
+        committer
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+    assert!(
+        committer_provider.folded_sequence() < 4,
+        "a committer folds nothing itself"
+    );
+    committer.close().await.unwrap();
+    assert_eq!(
+        committer_provider.folded_sequence(),
+        4,
+        "the sprint at close folded the tail"
+    );
+
+    let folded_only = Catalog::open_read_only(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(provider),
+            commit_log_tail: false,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    let snapshot = folded_only.snapshot().await.unwrap();
+    assert!(snapshot.schema_by_name("b").is_some() && snapshot.schema_by_name("c").is_some());
+    folded_only.close().await.unwrap();
+}
+
 /// A committer needs an adopted log: before any folder has adopted it,
 /// the open is refused rather than left with nothing to commit against.
 #[tokio::test]
