@@ -137,8 +137,11 @@ format 10, it only recognizes it.
 - Two processes over one in-tree log, each with a cursor of its own: a
   committer over a reader lands its batch as a slot and sees it once
   served, the folder's next commit loses to it, folds it, and lands after
-  it, and the committer is served the folder's slot in turn. A committer
-  opened before adoption is refused.
+  it, and the committer is served the folder's slot in turn.
+- A committer arriving at an unadopted log adopts it and holds the store;
+  one arriving at a long tail takes the store at attach and has replayed
+  it; a holder fenced by another process gives the store up and its next
+  commit lands through the log.
 - A committer's session records every write it is handed and commits none
   of it into the store it reads.
 - No test in the unit-test binary registers a provider, since every other
@@ -242,15 +245,24 @@ outside a slot.
   tail and folds what peers landed, under a guard that also spans the
   folder's own offer and local commit, so the poll never folds a slot the
   folder is in the middle of committing itself.
-- **The sprint.** `Catalog::fold_sprint` takes the store as the folder,
-  which replays the tail, folds what lands meanwhile, flushes, truncates,
-  and closes. A committer runs it on closing when the unfolded tail —
-  counted past the manifest's replay point, which moraine reads itself,
-  since the reader plug sees only its own in-memory watermark — is past
-  `commit_log_sprint_slots`, and a host may run `sprint_if_stalled` after
-  a loss. The threshold sits well above the flush count, so a folder
-  doing its job is never fenced by a committer. A holder keeps the store
-  until fenced. With this, a lake needs no standing process.
+- **Taking and holding the store.** Every attach is a committer. A
+  committer that finds the unfolded tail — counted past the manifest's
+  replay point, which moraine reads itself, since the reader plug sees
+  only its own in-memory watermark — past `commit_log_sprint_slots` takes
+  the store: it opens it as the folder, which replays the tail, and keeps
+  it, folding its own wins and peers' slots into it while still reading
+  through its tailing reader. It checks at attach and after every loss,
+  where the tail's length is already known. A holder that another process
+  fences gives the store up and carries on committing; nothing is lost,
+  since every slot is durable, and the fence shows at the holder's next
+  flush. The first committer to find an unadopted log takes the store and
+  adopts it. The threshold sits well above the flush count, so a holder
+  doing its job is never taken from. `CatalogOptions::commit_log_role =
+  Folder` remains as a hint for a process that should take the store at
+  attach regardless of the tail, which a scheduled job wants; nothing
+  else needs it. `Catalog::fold_sprint` takes the store for one fold and
+  closes, for a job with no session to keep, and a committer that never
+  took the store sprints at close if the tail is long.
 
 ### The folder's own rows
 

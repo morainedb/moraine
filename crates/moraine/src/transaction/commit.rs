@@ -567,10 +567,9 @@ pub(crate) async fn adopt_commit_log(log: &mut LogCommitter, format: u64) -> Res
     if format >= FORMAT_WITH_COMMIT_LOG {
         return Ok(format);
     }
-    let Some(db) = log.db.clone() else {
+    let Some(db) = log.db() else {
         return Err(Error::Configuration(
-            "a committer over a reader cannot adopt the commit log; open a folder first"
-                .to_string(),
+            "a process holding no store cannot adopt the commit log".to_string(),
         ));
     };
 
@@ -621,6 +620,79 @@ pub(crate) async fn batch_origin(handle: ReadHandle<'_>) -> Result<u64> {
                     .to_string(),
             )
         })
+}
+
+/// Marks a won slot folded. The folder's local commit applied the batch
+/// already; a process reading through its reader folds the batch into the
+/// store it holds, if it holds one, and waits to be served it, since the
+/// reader is where it reads.
+async fn settle_win(
+    log: &LogCommitter,
+    sequence: u64,
+    folder: bool,
+    staged_writes: &[StagedWrite],
+    projections: &std::sync::RwLock<ProjectionCache>,
+) -> Result<()> {
+    if folder {
+        return log.folded(sequence).await;
+    }
+    let writes: Vec<SlotWrite> = staged_writes
+        .iter()
+        .map(|(key, value)| SlotWrite {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect();
+    log.fold(sequence, writes.iter()).await?;
+    if !log.await_served(sequence).await {
+        invalidate_head_view(projections);
+    }
+
+    Ok(())
+}
+
+/// How offering a batch to the log went.
+enum Offered {
+    /// Commits are not slots here.
+    NoLog,
+    /// The batch holds this slot.
+    Won(u64),
+    /// Other committers' slots beat it; they are folded, and the held view
+    /// is dropped, so the retry re-prepares against them.
+    Lost,
+    /// The log could not say.
+    Failed(Error),
+}
+
+/// Offers the batch to the log, folding what beat it on a loss and taking
+/// the store if the tail has grown long.
+async fn offer_batch(
+    log: Option<&LogCommitter>,
+    head_before: u64,
+    head_after: u64,
+    staged_writes: &[StagedWrite],
+    projections: &std::sync::RwLock<ProjectionCache>,
+) -> Offered {
+    let Some(log) = log else {
+        return Offered::NoLog;
+    };
+    match offer_slot(log, head_before, head_after, staged_writes).await {
+        Ok(SlotOffer::Won { sequence }) => Offered::Won(sequence),
+        Ok(SlotOffer::Lost { slots }) => {
+            if let Err(err) = log.fold_slots(slots).await {
+                invalidate_head_view(projections);
+                return Offered::Failed(err);
+            }
+            invalidate_head_view(projections);
+            // A loss is where the tail's length is known for free.
+            log.take_if_stalled().await;
+            Offered::Lost
+        }
+        Err(err) => {
+            invalidate_head_view(projections);
+            Offered::Failed(err)
+        }
+    }
 }
 
 /// Offers a batch as the slot its head stamp implies, validated against
@@ -1627,28 +1699,27 @@ pub(crate) async fn submit_batch(
     // fold what beat the batch before the retry re-prepares. The slot
     // carries what the session recorded, which is every write staged on it.
     let folder = db_tx.is_folder();
+    // Everything the session staged, index entries included: what the slot
+    // carries, and what a holder reading through its reader folds itself.
+    let staged_writes = db_tx.staged();
     // Held through the local commit below, so the folder's idle poll cannot
     // fold the slot this batch wins before the batch itself lands locally.
     let _held = match log {
         Some(log) => Some(Arc::clone(&log.guard).lock_owned().await),
         None => None,
     };
-    let won_sequence = match log {
-        None => None,
-        Some(log) => match offer_slot(log, heads.before, head, &db_tx.staged()).await {
-            Ok(SlotOffer::Won { sequence }) => Some(sequence),
-            Ok(SlotOffer::Lost { slots }) => {
-                db_tx.rollback();
-                log.fold_slots(slots).await?;
-                invalidate_head_view(projections);
-                return Ok(Submission::LostRace);
-            }
-            Err(err) => {
-                db_tx.rollback();
-                invalidate_head_view(projections);
-                return Err(err);
-            }
-        },
+    let won_sequence = match offer_batch(log, heads.before, head, &staged_writes, projections).await
+    {
+        Offered::NoLog => None,
+        Offered::Won(sequence) => Some(sequence),
+        Offered::Lost => {
+            db_tx.rollback();
+            return Ok(Submission::LostRace);
+        }
+        Offered::Failed(err) => {
+            db_tx.rollback();
+            return Err(err);
+        }
     };
     let durable_started = Instant::now();
     // Bounded, unlike the durability wait below it: this write holds the
@@ -1684,11 +1755,7 @@ pub(crate) async fn submit_batch(
                 install_committed_head_view(projections, head_view_update, writes);
             }
             if let (Some(log), Some(sequence)) = (log, won_sequence) {
-                if folder {
-                    log.folded(sequence).await?;
-                } else if !log.await_served(sequence).await {
-                    invalidate_head_view(projections);
-                }
+                settle_win(log, sequence, folder, &staged_writes, projections).await?;
             }
             Ok(Submission::Submitted(Submitted {
                 handle,
