@@ -8,9 +8,10 @@ suite. Unchecked items are implementation gaps, not supported attach modes.
 ## Next capabilities
 
 - [ ] Independent multi-process writers. The current topology is one fenced
-  SlateDB writer with many readers. A conditional-PUT log, replay/folder,
-  leader forwarding, durable operation-id resolution, and a topology migration
-  are not implemented. RFC 0022 specifies that replacement topology.
+  SlateDB writer with many readers. A conditional-PUT log, its fold through
+  SlateDB's pluggable write-ahead log, durable transaction-id resolution, and
+  a topology migration are not implemented. The replacement topology and
+  the log itself live in a separate library.
 - [ ] `VARIANT` inlining and variant statistics.
 - [ ] Signed community-extension distribution.
 
