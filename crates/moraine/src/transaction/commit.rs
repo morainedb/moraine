@@ -623,27 +623,24 @@ pub(crate) async fn batch_origin(handle: ReadHandle<'_>) -> Result<u64> {
 }
 
 /// Marks a won slot folded. The folder's local commit applied the batch
-/// already; a process reading through its reader folds the batch into the
-/// store it holds, if it holds one, and waits to be served it, since the
-/// reader is where it reads.
+/// already; a process reading through its reader folds everything up to
+/// and including the win into the store it holds, if it holds one, and
+/// waits to be served the win, since the reader is where it reads.
 async fn settle_win(
     log: &LogCommitter,
     sequence: u64,
     folder: bool,
-    staged_writes: &[StagedWrite],
     projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Result<()> {
     if folder {
         return log.folded(sequence).await;
     }
-    let writes: Vec<SlotWrite> = staged_writes
-        .iter()
-        .map(|(key, value)| SlotWrite {
-            key: key.clone(),
-            value: value.clone(),
-        })
-        .collect();
-    log.fold(sequence, writes.iter()).await?;
+    // A holder reading through its reader may stand on slots the store it
+    // holds has not folded, so the win is folded with everything before
+    // it, read back from the log, rather than from the staged writes.
+    if log.holds_store() {
+        log.fold_tail().await?;
+    }
     if !log.await_served(sequence).await {
         invalidate_head_view(projections);
     }
@@ -679,7 +676,7 @@ async fn offer_batch(
     match offer_slot(log, head_before, head_after, staged_writes).await {
         Ok(SlotOffer::Won { sequence }) => Offered::Won(sequence),
         Ok(SlotOffer::Lost { slots }) => {
-            if let Err(err) = log.fold_slots(slots).await {
+            if let Err(err) = log.fold_after_loss(slots).await {
                 invalidate_head_view(projections);
                 return Offered::Failed(err);
             }
@@ -1755,7 +1752,7 @@ pub(crate) async fn submit_batch(
                 install_committed_head_view(projections, head_view_update, writes);
             }
             if let (Some(log), Some(sequence)) = (log, won_sequence) {
-                settle_win(log, sequence, folder, &staged_writes, projections).await?;
+                settle_win(log, sequence, folder, projections).await?;
             }
             Ok(Submission::Submitted(Submitted {
                 handle,

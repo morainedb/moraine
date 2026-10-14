@@ -131,8 +131,9 @@ pub trait SlotCommitter: fmt::Debug + Send + Sync + 'static {
     /// As [`offer`](Self::offer).
     async fn adopt(&self, stamp: SlotCommit) -> Result<SlotAdoption>;
 
-    /// The slots landed past the last this process has folded or been
-    /// served, in order: what a loss would hand back, without offering.
+    /// The slots landed past the last this process has folded, in order,
+    /// whatever its reader has been served: what the store it holds still
+    /// lacks.
     ///
     /// # Errors
     ///
@@ -197,20 +198,6 @@ pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
     /// The plug SlateDB's garbage collector truncates the log through: it
     /// deletes slots below every range a live manifest still references.
     fn garbage_collector(&self, log_store: Arc<dyn ObjectStore>, path: &str) -> Arc<dyn WalGc>;
-}
-
-/// Which part a read-write open plays in a commit log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CommitLogRole {
-    /// Holds the store's one writer: replays the log on open, applies every
-    /// slot as it lands, flushes on the paced cadence, and adopts a store
-    /// not yet on the log. One per lake.
-    #[default]
-    Folder,
-    /// Commits over a tailing reader: prepares against the reader, offers
-    /// to the log, and waits to be served what lands. Any number per lake;
-    /// needs an adopted log.
-    Committer,
 }
 
 static REGISTERED: OnceLock<Arc<dyn CommitLogProvider>> = OnceLock::new();
@@ -328,6 +315,18 @@ impl FoldPoll {
             let _ = task.await;
         }
     }
+
+    /// Tells the task to stop without waiting for it: what the task itself
+    /// calls, since it cannot wait for its own end.
+    fn stop_from_within(&self) {
+        let _ = self.stop.send(true);
+        drop(
+            self.task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
 }
 
 /// The folder's flush policy: after `every` folded slots, write the
@@ -440,10 +439,21 @@ impl LogCommitter {
     /// journals nothing; the folds made in memory before it are discarded
     /// with the store.
     async fn fenced(&self) {
-        if let Some(db) = self.demote().await {
-            tracing::warn!("another process took the store; back to committing");
-            let _ = db.close().await;
+        // The poll task may be the one here, so the poll is told to stop
+        // rather than waited for.
+        let holder = self
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(holder) = holder else {
+            return;
+        };
+        if let Some(fold_poll) = holder.fold_poll {
+            fold_poll.stop_from_within();
         }
+        tracing::warn!("another process took the store; back to committing");
+        let _ = holder.db.close().await;
     }
 
     /// Takes the store if the tail is long and this process can: a process
@@ -624,6 +634,20 @@ impl LogCommitter {
         self.folded(sequence).await?;
 
         Ok(())
+    }
+
+    /// Folds what beat a batch: everything past the fold cursor when this
+    /// process holds the store, since its reader may have been served slots
+    /// the store has not folded, else the slots the loss handed back.
+    pub(crate) async fn fold_after_loss(&self, slots: Vec<(u64, SlotEnvelope)>) -> Result<()> {
+        if self.holds_store() {
+            self.fold_tail().await?;
+            if let Some((last, _)) = slots.last() {
+                self.await_served(*last).await;
+            }
+            return Ok(());
+        }
+        self.fold_slots(slots).await
     }
 
     /// Folds `slots` in order; a committer over a reader waits to be served

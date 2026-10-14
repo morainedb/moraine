@@ -737,7 +737,7 @@ pub unsafe extern "C" fn moraine_attach_with_commit_log(
         options.wal_store.clone_from(&wal_store);
         // SAFETY: `commit_log` validity is this function's own safety
         // contract.
-        apply_commit_log(&mut options, unsafe { commit_log.as_ref() })?;
+        apply_commit_log(&mut options, unsafe { commit_log.as_ref() });
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let opened = unsafe {
@@ -801,9 +801,6 @@ pub unsafe extern "C" fn moraine_attach_with_commit_log(
 /// one.
 #[repr(C)]
 pub struct MoraineCommitLog {
-    /// `0` commits over a tailing reader; `1` holds the store's one writer,
-    /// the folder, which adopts a store not yet on the log.
-    pub role: u8,
     /// Whether a read-only attach tails the log rather than following the
     /// folded store.
     pub tail: bool,
@@ -812,38 +809,23 @@ pub struct MoraineCommitLog {
     pub poll_interval_ms: u64,
 }
 
-/// Applies `commit_log` to `options`. Without one, a read-write attach that
-/// finds a registered provider commits over a reader: the folder is a
-/// designated process, never an attach by default.
-fn apply_commit_log(
-    options: &mut CatalogOptions,
-    commit_log: Option<&MoraineCommitLog>,
-) -> Result<(), AbiError> {
+/// Applies `commit_log` to `options`. A read-write attach that finds a
+/// registered provider is a committer, which takes the store itself when
+/// the tail is long; a read-only attach is a reader.
+fn apply_commit_log(options: &mut CatalogOptions, commit_log: Option<&MoraineCommitLog>) {
     let Some(commit_log) = commit_log else {
-        options.commit_log_role = moraine::CommitLogRole::Committer;
-        return Ok(());
-    };
-    options.commit_log_role = match commit_log.role {
-        0 => moraine::CommitLogRole::Committer,
-        1 => moraine::CommitLogRole::Folder,
-        other => {
-            return Err(AbiError::invalid_argument(format!(
-                "moraine_attach: commit-log role {other} is neither 0 (committer) nor 1 (folder)"
-            )));
-        }
+        return;
     };
     options.commit_log_tail = commit_log.tail;
     if commit_log.poll_interval_ms > 0 {
         options.commit_log_poll_interval =
             std::time::Duration::from_millis(commit_log.poll_interval_ms);
     }
-
-    Ok(())
 }
 
 /// Opens a catalog that takes no part in a commit log beyond the process
 /// default. New callers use [`moraine_attach_with_commit_log`], whose
-/// `commit_log` argument names the attach's role.
+/// `commit_log` argument tunes its reading of a commit log.
 ///
 /// # Safety
 ///

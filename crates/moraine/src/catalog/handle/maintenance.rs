@@ -934,7 +934,8 @@ impl Catalog {
         // One scan for the whole range. Its snapshot predates every delete
         // below, so it never revisits a key; a scan per batch would pay a
         // seek and a fresh read-ahead for every commit.
-        let mut entries = ReadHandle::Writer(self.writer()?)
+        let db = self.writer()?;
+        let mut entries = ReadHandle::Writer(&db)
             .scan_prefix(index_index_prefix(kind, index_id), .., ScanShape::Bulk)
             .await?;
 
