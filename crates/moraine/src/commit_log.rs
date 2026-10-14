@@ -298,12 +298,14 @@ impl Collector {
             min_age: self.min_age,
             dry_run: false,
         };
-        let mut options = slatedb::config::GarbageCollectorOptions::default();
-        options.manifest_options = Some(directory.clone());
-        options.wal_options = Some(directory);
-        options.wal_fence_options = None;
-        options.compacted_options = None;
-        options.compactions_options = None;
+        let options = slatedb::config::GarbageCollectorOptions {
+            manifest_options: Some(directory),
+            wal_options: Some(directory),
+            wal_fence_options: None,
+            compacted_options: None,
+            compactions_options: None,
+            ..Default::default()
+        };
         slatedb::GarbageCollectorBuilder::new(self.path.clone(), Arc::clone(&self.object_store))
             .with_wal_object_store(Arc::clone(&self.log_store))
             .with_wal_gc(Arc::clone(&self.wal_gc))
@@ -397,7 +399,7 @@ impl LogCommitter {
     ) {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                () = tokio::time::sleep(interval) => {}
                 _ = stop.changed() => return,
             }
             if *stop.borrow() {

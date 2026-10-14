@@ -150,7 +150,7 @@ pub(crate) enum Store {
         reader: Arc<DbReader>,
         commit_log: LogCommitter,
         /// What a sprint reopens with: the committer's own store and options.
-        sprint: Sprint,
+        sprint: Box<Sprint>,
     },
 }
 
@@ -427,7 +427,7 @@ impl Default for CatalogOptions {
             commit_log_poll_interval: Duration::from_millis(50),
             commit_log_flush_slots: 256,
             commit_log_fold_poll: Duration::from_secs(2),
-            commit_log_retention: Duration::from_secs(300),
+            commit_log_retention: Duration::from_mins(5),
             commit_log_sprint_slots: 1024,
             cache_dir: None,
             cache_identity: None,
@@ -1632,10 +1632,10 @@ impl Catalog {
         inner.store = Arc::new(Store::Committer {
             reader,
             commit_log: log.clone(),
-            sprint: Sprint {
+            sprint: Box::new(Sprint {
                 object_store,
                 options,
-            },
+            }),
         });
         inner.commits = Arc::new(commit::Coalescer::new(
             Arc::clone(&inner.projections),
@@ -1789,9 +1789,13 @@ impl Catalog {
             return Ok(None);
         }
 
-        Self::fold_sprint(Arc::clone(&sprint.object_store), sprint.options.clone())
-            .await
-            .map(Some)
+        // Boxed: the sprint opens and closes a catalog of its own.
+        Box::pin(Self::fold_sprint(
+            Arc::clone(&sprint.object_store),
+            sprint.options.clone(),
+        ))
+        .await
+        .map(Some)
     }
 
     /// Opens the catalog **read-only** in `object_store` at `options.path`,
