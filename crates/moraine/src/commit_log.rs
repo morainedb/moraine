@@ -16,13 +16,16 @@
 
 use std::{
     fmt,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use async_trait::async_trait;
 use object_store::ObjectStore;
-use slatedb::wal::{WalReader, WriterInit};
+use slatedb::wal::{WalGc, WalReader, WriterInit};
 
 use crate::error::{Error, Result};
 
@@ -128,6 +131,14 @@ pub trait SlotCommitter: fmt::Debug + Send + Sync + 'static {
     /// As [`offer`](Self::offer).
     async fn adopt(&self, stamp: SlotCommit) -> Result<SlotAdoption>;
 
+    /// The slots landed past the last this process has folded or been
+    /// served, in order: what a loss would hand back, without offering.
+    ///
+    /// # Errors
+    ///
+    /// As [`offer`](Self::offer); a hole in the tail is [`Error::Corruption`].
+    async fn tail(&self) -> Result<Vec<(u64, SlotEnvelope)>>;
+
     /// Reports that the store has applied every slot through `sequence`.
     /// Apply before reporting: the store's next memtable freeze records the
     /// reported sequence as the replay point.
@@ -164,6 +175,10 @@ pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
 
     /// The commit side for the store at `path`.
     fn committer(&self, log_store: Arc<dyn ObjectStore>, path: &str) -> Arc<dyn SlotCommitter>;
+
+    /// The plug SlateDB's garbage collector truncates the log through: it
+    /// deletes slots below every range a live manifest still references.
+    fn garbage_collector(&self, log_store: Arc<dyn ObjectStore>, path: &str) -> Arc<dyn WalGc>;
 }
 
 /// Which part a read-write open plays in a commit log.
@@ -221,6 +236,58 @@ pub(crate) struct LogCommitter {
     /// The head's batch counter when the log was adopted; slot `k` carries
     /// the stamp at `batch_origin + k - 1`.
     pub(crate) batch_origin: u64,
+    /// Serializes the folder's offers, the local commits that follow them,
+    /// and the idle poll's folds, so the poll never folds a slot the
+    /// folder is in the middle of committing itself.
+    pub(crate) guard: Arc<tokio::sync::Mutex<()>>,
+    /// How the folder flushes and truncates; `None` for a committer.
+    pub(crate) flushing: Option<Flushing>,
+}
+
+/// The folder's flush policy: after `every` folded slots, write the
+/// memtable out so the replay point moves, then run the collector so the
+/// log is truncated below it.
+#[derive(Clone)]
+pub(crate) struct Flushing {
+    pub(crate) every: u64,
+    pub(crate) folded_since: Arc<AtomicU64>,
+    pub(crate) collector: Collector,
+}
+
+/// What builds SlateDB's garbage collector for one store; built per run,
+/// since the collector is configuration and holds nothing.
+#[derive(Clone)]
+pub(crate) struct Collector {
+    pub(crate) path: String,
+    pub(crate) object_store: Arc<dyn ObjectStore>,
+    pub(crate) log_store: Arc<dyn ObjectStore>,
+    pub(crate) wal_gc: Arc<dyn WalGc>,
+    /// How old a slot must be before truncation may delete it.
+    pub(crate) min_age: Duration,
+}
+
+impl Collector {
+    /// Runs the manifest and WAL collectors once.
+    async fn run(&self) {
+        let directory = slatedb::config::GarbageCollectorDirectoryOptions {
+            interval: None,
+            min_age: self.min_age,
+            dry_run: false,
+        };
+        let mut options = slatedb::config::GarbageCollectorOptions::default();
+        options.manifest_options = Some(directory.clone());
+        options.wal_options = Some(directory);
+        options.wal_fence_options = None;
+        options.compacted_options = None;
+        options.compactions_options = None;
+        slatedb::GarbageCollectorBuilder::new(self.path.clone(), Arc::clone(&self.object_store))
+            .with_wal_object_store(Arc::clone(&self.log_store))
+            .with_wal_gc(Arc::clone(&self.wal_gc))
+            .with_options(options)
+            .build()
+            .run_gc_once()
+            .await;
+    }
 }
 
 impl fmt::Debug for LogCommitter {
@@ -233,6 +300,58 @@ impl fmt::Debug for LogCommitter {
 }
 
 impl LogCommitter {
+    /// Reports `sequence` folded, and on the folder flushes and truncates
+    /// once enough slots have folded since the last flush: the replay point
+    /// moves, so a cold open replays at most that many slots.
+    pub(crate) async fn folded(&self, sequence: u64) -> Result<()> {
+        self.committer.mark_folded(sequence);
+        let (Some(db), Some(flushing)) = (&self.db, &self.flushing) else {
+            return Ok(());
+        };
+        if flushing.folded_since.fetch_add(1, Ordering::AcqRel) + 1 < flushing.every {
+            return Ok(());
+        }
+        crate::transaction::commit::flush_memtable(db).await?;
+        flushing.folded_since.store(0, Ordering::Release);
+        flushing.collector.run().await;
+
+        Ok(())
+    }
+
+    /// Folds whatever has landed past this process's cursor. The folder's
+    /// idle poll, and the sprint's catch-up.
+    pub(crate) async fn fold_tail(&self) -> Result<u64> {
+        let slots = self.committer.tail().await?;
+        let count = u64::try_from(slots.len()).unwrap_or(u64::MAX);
+        self.fold_slots(slots).await?;
+
+        Ok(count)
+    }
+
+    /// Runs the idle poll until `stop` says so: every `interval`, under the
+    /// guard, fold whatever peers have landed.
+    pub(crate) async fn poll_folds(
+        self,
+        interval: Duration,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = stop.changed() => return,
+            }
+            if *stop.borrow() {
+                return;
+            }
+            let _held = self.guard.lock().await;
+            match self.fold_tail().await {
+                Ok(0) => {}
+                Ok(count) => tracing::debug!(count, "folded peers' slots"),
+                Err(error) => tracing::warn!(%error, "the idle fold failed; it retries next poll"),
+            }
+        }
+    }
+
     /// The slot a batch stamping the head at `batch_seq` belongs to.
     pub(crate) fn sequence_of(&self, batch_seq: u64) -> u64 {
         batch_seq
@@ -288,7 +407,7 @@ impl LogCommitter {
                     .map_err(Error::from)?,
             );
         }
-        self.committer.mark_folded(sequence);
+        self.folded(sequence).await?;
 
         Ok(())
     }

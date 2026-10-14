@@ -393,6 +393,117 @@ async fn a_committer_told_of_a_slot_it_has_not_applied_still_loses_to_it() {
     committer.close().await.unwrap();
 }
 
+/// After the configured number of folded slots the folder writes its
+/// memtable out and truncates the log: a reader following the folded store
+/// alone sees the commits, and the slots below the replay point are gone.
+#[tokio::test]
+async fn the_folder_flushes_and_truncates_after_enough_folded_slots() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+
+    let folder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            commit_log_flush_slots: 2,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    // Adoption is the first fold; this commit is the second, so it flushes.
+    folder
+        .commit(|tx| tx.create_schema("a").map(|_| ()))
+        .await
+        .unwrap();
+
+    let folded_only = Catalog::open_read_only(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            commit_log_tail: false,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        folded_only
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("a")
+            .is_some(),
+        "the flush carried the commit into the manifest"
+    );
+    folded_only.close().await.unwrap();
+    // The collector keeps the slot at the replay point itself and deletes
+    // everything below it.
+    assert_eq!(
+        provider
+            .log
+            .slots()
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .collect::<Vec<_>>(),
+        vec![2],
+        "slots below the replay point were truncated"
+    );
+    folder.close().await.unwrap();
+}
+
+/// An idle folder folds what peers land without losing a race to them.
+#[tokio::test]
+async fn an_idle_folder_polls_and_folds_peers_slots() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+
+    let folder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            commit_log_fold_poll: std::time::Duration::from_millis(10),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    provider
+        .log
+        .land(2, peer_slot(&provider, 2, b"\xffpeer", b"landed"));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while provider.folded_sequence() < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        provider.folded_sequence(),
+        2,
+        "the poll folded the peer's slot"
+    );
+    assert_eq!(
+        folder
+            .store()
+            .writer_db()
+            .unwrap()
+            .get(b"\xffpeer")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"landed"[..])
+    );
+
+    // And the folder's next commit lands after it without a loss.
+    folder
+        .commit(|tx| tx.create_schema("c").map(|_| ()))
+        .await
+        .unwrap();
+    assert_eq!(provider.log.slots().len(), 3);
+    folder.close().await.unwrap();
+}
+
 /// A committer needs an adopted log: before any folder has adopted it,
 /// the open is refused rather than left with nothing to commit against.
 #[tokio::test]

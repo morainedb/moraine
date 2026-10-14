@@ -19,8 +19,8 @@ use object_store::ObjectStore;
 use slatedb::{
     RowEntry, ValueDeletable,
     wal::{
-        FlushResultFuture, WalError, WalEvent, WalFileRange, WalIterator, WalObserver, WalReader,
-        WalRows, WalStatus, WalStatusListener, WalWriter, WriterInit, WriterInitResult,
+        FlushResultFuture, WalError, WalEvent, WalFileRange, WalGc, WalIterator, WalObserver,
+        WalReader, WalRows, WalStatus, WalStatusListener, WalWriter, WriterInit, WriterInitResult,
         WriterManifest,
     },
 };
@@ -218,6 +218,50 @@ impl CommitLogProvider for TestProvider {
             cursor: Arc::clone(&self.cursor),
         })
     }
+
+    fn garbage_collector(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn WalGc> {
+        Arc::new(TestGc {
+            log: Arc::clone(&self.log),
+        })
+    }
+}
+
+/// Truncation over the test log: deletes every slot below the lowest
+/// referenced range, ignoring age, since the log keeps no clock.
+struct TestGc {
+    log: Arc<TestLog>,
+}
+
+#[async_trait]
+impl WalGc for TestGc {
+    async fn collect(
+        &self,
+        referenced_ranges: Vec<WalFileRange>,
+        _min_age: Duration,
+        dry_run: bool,
+    ) -> Result<(), WalError> {
+        let Some(horizon) = referenced_ranges
+            .iter()
+            .map(|range| match range.0 {
+                Bound::Included(start) => start,
+                Bound::Excluded(start) => start.saturating_add(1),
+                Bound::Unbounded => 0,
+            })
+            .min()
+        else {
+            return Ok(());
+        };
+        let horizon = horizon.saturating_sub(self.log.wal_base().unwrap_or(0));
+        if !dry_run {
+            self.log
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|sequence, _| *sequence >= horizon);
+        }
+
+        Ok(())
+    }
 }
 
 struct TestCommitter {
@@ -254,6 +298,22 @@ impl SlotCommitter for TestCommitter {
 
     async fn adopted(&self) -> crate::Result<bool> {
         Ok(self.log.wal_base().is_some())
+    }
+
+    async fn tail(&self) -> crate::Result<Vec<(u64, SlotEnvelope)>> {
+        let known = self
+            .cursor
+            .folded
+            .load(Ordering::Acquire)
+            .max(*self.cursor.served.borrow());
+        Ok(self
+            .log
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .range(known.saturating_add(1)..)
+            .map(|(sequence, envelope)| (*sequence, envelope.clone()))
+            .collect())
     }
 
     async fn adopt(&self, stamp: SlotCommit) -> crate::Result<SlotAdoption> {

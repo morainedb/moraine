@@ -13,7 +13,7 @@ use moraine::{
 };
 use object_store::{ObjectStore, memory::InMemory};
 use slatedb::wal::{
-    WalError, WalFileRange, WalIterator, WalReader, WalRows, WriterInit, WriterInitResult,
+    WalError, WalFileRange, WalGc, WalIterator, WalReader, WalRows, WriterInit, WriterInitResult,
     WriterManifest,
 };
 
@@ -47,6 +47,25 @@ impl CommitLogProvider for Counting {
     fn committer(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn SlotCommitter> {
         Arc::new(NoCommits)
     }
+
+    fn garbage_collector(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn WalGc> {
+        Arc::new(NoGc)
+    }
+}
+
+/// A collector that deletes nothing.
+struct NoGc;
+
+#[async_trait]
+impl WalGc for NoGc {
+    async fn collect(
+        &self,
+        _referenced_ranges: Vec<WalFileRange>,
+        _min_age: std::time::Duration,
+        _dry_run: bool,
+    ) -> Result<(), WalError> {
+        Ok(())
+    }
 }
 
 /// A committer over a log nothing commits to.
@@ -63,6 +82,10 @@ impl SlotCommitter for NoCommits {
 
     async fn adopted(&self) -> moraine::Result<bool> {
         Ok(false)
+    }
+
+    async fn tail(&self) -> moraine::Result<Vec<(u64, moraine::SlotEnvelope)>> {
+        Ok(Vec::new())
     }
 
     async fn adopt(&self, _stamp: SlotCommit) -> moraine::Result<SlotAdoption> {

@@ -139,6 +139,8 @@ pub(crate) enum Store {
         pacer: Arc<commit::FlushPacer>,
         /// The log the writer's commits are slots of, when they are.
         commit_log: Option<LogCommitter>,
+        /// The idle poll folding peers' slots, stopped at close.
+        fold_poll: Option<FoldPoll>,
     },
     /// A read-only reader following the manifest, shared into read sessions.
     Reader(Arc<DbReader>),
@@ -148,6 +150,35 @@ pub(crate) enum Store {
         reader: Arc<DbReader>,
         commit_log: LogCommitter,
     },
+}
+
+/// The folder's idle poll task and the switch that stops it.
+pub(crate) struct FoldPoll {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl FoldPoll {
+    fn spawn(log: LogCommitter, interval: Duration) -> Self {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(log.poll_folds(interval, stopped));
+        Self {
+            stop,
+            task: std::sync::Mutex::new(Some(task)),
+        }
+    }
+
+    async fn stop(&self) {
+        let _ = self.stop.send(true);
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
 }
 
 impl Store {
@@ -276,6 +307,17 @@ pub struct CatalogOptions {
     /// landed; it also bounds how long a commit waits to see its own slot.
     /// Defaults to 50ms.
     pub commit_log_poll_interval: Duration,
+    /// How many slots the folder folds before it writes its memtable out
+    /// and truncates the log below the replay point. A cold open replays
+    /// at most this many slots. Defaults to 256.
+    pub commit_log_flush_slots: u64,
+    /// How often the folder looks for slots other committers landed, when
+    /// it is not losing races to them. One listing per poll. Defaults to
+    /// two seconds.
+    pub commit_log_fold_poll: Duration,
+    /// How old a slot must be before truncation may delete it, so a reader
+    /// mid-replay is not pulled out from under. Defaults to five minutes.
+    pub commit_log_retention: Duration,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -369,6 +411,9 @@ impl Default for CatalogOptions {
             commit_log_tail: false,
             commit_log_role: crate::CommitLogRole::default(),
             commit_log_poll_interval: Duration::from_millis(50),
+            commit_log_flush_slots: 256,
+            commit_log_fold_poll: Duration::from_secs(2),
+            commit_log_retention: Duration::from_secs(300),
             cache_dir: None,
             cache_identity: None,
             cache_size: None,
@@ -435,9 +480,10 @@ async fn open_writer_store(
             .cache_puts(options.cache_puts)
             .cache_compaction_puts(options.cache_compaction_puts)
     };
+    let log_store = store_builder(None).log_store();
     let committer = match &provider {
         Some(provider) => {
-            let committer = provider.committer(store_builder(None).log_store(), &options.path);
+            let committer = provider.committer(Arc::clone(&log_store), &options.path);
             // The plug replays the log in place of the store's own, so a
             // store not yet adopted drains its own log into the tree first;
             // nothing a crashed writer left there is skipped.
@@ -462,12 +508,24 @@ async fn open_writer_store(
         provider.is_some(),
     )
     .await?;
-    let commit_log = match committer {
-        Some(committer) => {
+    let commit_log = match (committer, &provider) {
+        (Some(committer), Some(provider)) => {
             let mut log = LogCommitter {
                 committer,
                 db: Some(db.clone()),
                 batch_origin: 0,
+                guard: Arc::new(tokio::sync::Mutex::new(())),
+                flushing: Some(crate::commit_log::Flushing {
+                    every: options.commit_log_flush_slots.max(1),
+                    folded_since: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    collector: crate::commit_log::Collector {
+                        path: options.path.clone(),
+                        object_store: Arc::clone(&object_store),
+                        log_store: Arc::clone(&log_store),
+                        wal_gc: provider.garbage_collector(Arc::clone(&log_store), &options.path),
+                        min_age: options.commit_log_retention,
+                    },
+                }),
             };
             if format >= FORMAT_WITH_COMMIT_LOG {
                 log.batch_origin = commit::batch_origin(ReadHandle::Writer(&db)).await?;
@@ -475,7 +533,7 @@ async fn open_writer_store(
             format = commit::adopt_commit_log(&mut log, format).await?;
             Some(log)
         }
-        None => None,
+        _ => None,
     };
 
     Ok(OpenedWriter {
@@ -1290,7 +1348,12 @@ impl ReadOnlyCatalog {
     /// Returns an error if the underlying store fails to close cleanly.
     pub async fn close(&self) -> Result<()> {
         match self.store.as_ref() {
-            Store::Writer { db, .. } => db.close().await.map_err(Error::from),
+            Store::Writer { db, fold_poll, .. } => {
+                if let Some(fold_poll) = fold_poll {
+                    fold_poll.stop().await;
+                }
+                db.close().await.map_err(Error::from)
+            }
             Store::Reader(reader) | Store::Committer { reader, .. } => {
                 reader.close().await.map_err(Error::from)
             }
@@ -1436,6 +1499,9 @@ impl Catalog {
                 store: Arc::new(Store::Writer {
                     db,
                     pacer,
+                    fold_poll: commit_log
+                        .clone()
+                        .map(|log| FoldPoll::spawn(log, options.commit_log_fold_poll)),
                     commit_log: commit_log.clone(),
                 }),
                 location: Arc::new(StoreLocation {
@@ -1512,6 +1578,8 @@ impl Catalog {
             committer,
             db: None,
             batch_origin,
+            guard: Arc::new(tokio::sync::Mutex::new(())),
+            flushing: None,
         };
         inner.store = Arc::new(Store::Committer {
             reader,

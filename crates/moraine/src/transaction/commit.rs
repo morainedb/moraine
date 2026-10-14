@@ -1627,6 +1627,12 @@ pub(crate) async fn submit_batch(
     // fold what beat the batch before the retry re-prepares. The slot
     // carries what the session recorded, which is every write staged on it.
     let folder = db_tx.is_folder();
+    // Held through the local commit below, so the folder's idle poll cannot
+    // fold the slot this batch wins before the batch itself lands locally.
+    let _held = match log {
+        Some(log) => Some(Arc::clone(&log.guard).lock_owned().await),
+        None => None,
+    };
     let won_sequence = match log {
         None => None,
         Some(log) => match offer_slot(log, heads.before, head, &db_tx.staged()).await {
@@ -1679,7 +1685,7 @@ pub(crate) async fn submit_batch(
             }
             if let (Some(log), Some(sequence)) = (log, won_sequence) {
                 if folder {
-                    log.committer.mark_folded(sequence);
+                    log.folded(sequence).await?;
                 } else if !log.await_served(sequence).await {
                     invalidate_head_view(projections);
                 }
