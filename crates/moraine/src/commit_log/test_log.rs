@@ -38,15 +38,21 @@ fn slot_sequence(ordinal: u64) -> u64 {
     SEQUENCE_BASE.saturating_add(ordinal.saturating_mul(SEQUENCE_STRIDE))
 }
 
-/// One log, shared by every plug and committer its provider hands out.
+/// One log: what the bucket would hold, shared by every process over it.
 #[derive(Default)]
 pub(crate) struct TestLog {
     slots: Mutex<BTreeMap<u64, SlotEnvelope>>,
+    /// The WAL id slot 1 counts from, fixed at adoption.
+    base: Mutex<Option<u64>>,
+}
+
+/// One process's view of the log: what it has folded or been served, the
+/// base an adoption would fix, and the writer its folds notify.
+#[derive(Default)]
+struct Cursor {
     folded: AtomicU64,
     served: tokio::sync::watch::Sender<u64>,
     writer: Mutex<Option<Arc<Mutex<WriterState>>>>,
-    /// The WAL id slot 1 counts from, fixed at adoption.
-    base: Mutex<Option<u64>>,
     /// The base an adoption would fix: past the store's own WAL, as the
     /// last writer open saw it.
     candidate: AtomicU64,
@@ -56,18 +62,11 @@ impl std::fmt::Debug for TestLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TestLog")
             .field("slots", &self.slots())
-            .field("folded", &self.folded_sequence())
-            .field("served", &*self.served.borrow())
             .finish_non_exhaustive()
     }
 }
 
 impl TestLog {
-    /// The last sequence the folder reported applied.
-    pub(crate) fn folded_sequence(&self) -> u64 {
-        self.folded.load(Ordering::Acquire)
-    }
-
     /// The slots landed so far, in order.
     pub(crate) fn slots(&self) -> Vec<(u64, SlotEnvelope)> {
         self.slots
@@ -87,7 +86,6 @@ impl TestLog {
             "slot {sequence} was already taken"
         );
         drop(slots);
-        self.served.send_if_modified(|_| false);
     }
 
     /// The WAL id slot 1 counts from: fixed at adoption, zero for a log
@@ -95,14 +93,6 @@ impl TestLog {
     fn wal_base(&self) -> Option<u64> {
         let fixed = *self.base.lock().unwrap_or_else(PoisonError::into_inner);
         fixed.or_else(|| (self.last_sequence() > 0).then_some(0))
-    }
-
-    /// The sequence the next offer races: after everything folded or served.
-    fn next_sequence(&self) -> u64 {
-        self.folded
-            .load(Ordering::Acquire)
-            .max(*self.served.borrow())
-            .saturating_add(1)
     }
 
     fn last_sequence(&self) -> u64 {
@@ -140,9 +130,19 @@ impl TestLog {
             })
             .collect()
     }
+}
 
-    fn status(&self, state: &WriterState) -> WalStatus {
-        let base = self
+impl Cursor {
+    /// The sequence the next offer races: after everything folded or served.
+    fn next_sequence(&self) -> u64 {
+        self.folded
+            .load(Ordering::Acquire)
+            .max(*self.served.borrow())
+            .saturating_add(1)
+    }
+
+    fn status(&self, log: &TestLog, state: &WriterState) -> WalStatus {
+        let base = log
             .wal_base()
             .unwrap_or_else(|| self.candidate.load(Ordering::Acquire));
         let last_flushed_wal_id = base.saturating_add(self.folded.load(Ordering::Acquire));
@@ -156,16 +156,42 @@ impl TestLog {
     }
 }
 
-/// A provider over one [`TestLog`], whatever store or path it is asked for.
-#[derive(Debug, Default)]
+/// One process over a [`TestLog`], whatever store or path it is asked for.
+#[derive(Default)]
 pub(crate) struct TestProvider {
     pub(crate) log: Arc<TestLog>,
+    cursor: Arc<Cursor>,
+}
+
+impl std::fmt::Debug for TestProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestProvider")
+            .field("log", &self.log)
+            .field("folded", &self.folded_sequence())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TestProvider {
+    /// Another process over the same log, with a cursor of its own.
+    pub(crate) fn sharing(&self) -> Self {
+        Self {
+            log: Arc::clone(&self.log),
+            cursor: Arc::new(Cursor::default()),
+        }
+    }
+
+    /// The last sequence this process reported applied.
+    pub(crate) fn folded_sequence(&self) -> u64 {
+        self.cursor.folded.load(Ordering::Acquire)
+    }
 }
 
 impl CommitLogProvider for TestProvider {
     fn writer_init(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Box<dyn WriterInit> {
         Box::new(TestWriterInit {
             log: Arc::clone(&self.log),
+            cursor: Arc::clone(&self.cursor),
         })
     }
 
@@ -177,6 +203,7 @@ impl CommitLogProvider for TestProvider {
     ) -> Arc<dyn WalReader> {
         Arc::new(TestReader {
             log: Arc::clone(&self.log),
+            cursor: Arc::clone(&self.cursor),
             tail,
         })
     }
@@ -184,19 +211,26 @@ impl CommitLogProvider for TestProvider {
     fn committer(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Arc<dyn SlotCommitter> {
         Arc::new(TestCommitter {
             log: Arc::clone(&self.log),
+            cursor: Arc::clone(&self.cursor),
         })
     }
 }
 
-#[derive(Debug)]
 struct TestCommitter {
     log: Arc<TestLog>,
+    cursor: Arc<Cursor>,
+}
+
+impl std::fmt::Debug for TestCommitter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestCommitter").finish_non_exhaustive()
+    }
 }
 
 #[async_trait]
 impl SlotCommitter for TestCommitter {
     async fn offer(&self, commits: Vec<SlotCommit>) -> crate::Result<SlotOffer> {
-        let sequence = self.log.next_sequence();
+        let sequence = self.cursor.next_sequence();
         let mut slots = self
             .log
             .slots
@@ -230,7 +264,7 @@ impl SlotCommitter for TestCommitter {
         }
         let mut base = self.log.base.lock().unwrap_or_else(PoisonError::into_inner);
         if base.is_none() {
-            *base = Some(self.log.candidate.load(Ordering::Acquire));
+            *base = Some(self.cursor.candidate.load(Ordering::Acquire));
         }
         drop(base);
         slots.insert(
@@ -244,12 +278,12 @@ impl SlotCommitter for TestCommitter {
     }
 
     fn mark_folded(&self, sequence: u64) {
-        let before = self.log.folded.fetch_max(sequence, Ordering::AcqRel);
+        let before = self.cursor.folded.fetch_max(sequence, Ordering::AcqRel);
         if sequence <= before {
             return;
         }
         let writer = self
-            .log
+            .cursor
             .writer
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -257,7 +291,10 @@ impl SlotCommitter for TestCommitter {
         if let Some(state) = writer {
             let (status, listeners) = {
                 let state = state.lock().unwrap_or_else(PoisonError::into_inner);
-                (self.log.status(&state), state.listeners.clone())
+                (
+                    self.cursor.status(&self.log, &state),
+                    state.listeners.clone(),
+                )
             };
             for listener in &listeners {
                 listener(WalEvent::WalFlushed(status.clone()));
@@ -266,7 +303,7 @@ impl SlotCommitter for TestCommitter {
     }
 
     async fn await_served(&self, sequence: u64, timeout: Duration) -> bool {
-        let mut served = self.log.served.subscribe();
+        let mut served = self.cursor.served.subscribe();
         tokio::time::timeout(timeout, served.wait_for(|reached| *reached >= sequence))
             .await
             .is_ok_and(|waited| waited.is_ok())
@@ -275,6 +312,7 @@ impl SlotCommitter for TestCommitter {
 
 struct TestWriterInit {
     log: Arc<TestLog>,
+    cursor: Arc<Cursor>,
 }
 
 #[async_trait]
@@ -285,7 +323,7 @@ impl WriterInit for TestWriterInit {
     ) -> Result<WriterInitResult, WalError> {
         let replay_after = manifest.replay_after_wal_id();
         let next_wal = manifest.manifest().next_wal_sst_id();
-        self.log.candidate.fetch_max(
+        self.cursor.candidate.fetch_max(
             replay_after.max(next_wal.saturating_sub(1)),
             Ordering::AcqRel,
         );
@@ -294,7 +332,7 @@ impl WriterInit for TestWriterInit {
             Some(base) => {
                 let folded = replay_after.saturating_sub(base);
                 let end = self.log.last_sequence();
-                self.log.folded.fetch_max(end, Ordering::AcqRel);
+                self.cursor.folded.fetch_max(end, Ordering::AcqRel);
                 (folded.saturating_add(1), end)
             }
             None => (1, 0),
@@ -302,7 +340,7 @@ impl WriterInit for TestWriterInit {
 
         let state = Arc::new(Mutex::new(WriterState::default()));
         *self
-            .log
+            .cursor
             .writer
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&state));
@@ -310,11 +348,13 @@ impl WriterInit for TestWriterInit {
         Ok(WriterInitResult {
             replay_iterator: Box::new(TestIterator {
                 log: Arc::clone(&self.log),
+                cursor: Arc::clone(&self.cursor),
                 next: first,
                 end: Bound::Included(end),
             }),
             wal_writer: Box::new(TestWriter {
                 log: Arc::clone(&self.log),
+                cursor: Arc::clone(&self.cursor),
                 state,
             }),
         })
@@ -330,11 +370,16 @@ struct WriterState {
 
 struct TestWriter {
     log: Arc<TestLog>,
+    cursor: Arc<Cursor>,
     state: Arc<Mutex<WriterState>>,
 }
 
-fn reported(log: &TestLog, state: &Arc<Mutex<WriterState>>) -> Result<WalStatus, WalStatus> {
-    let status = log.status(&state.lock().unwrap_or_else(PoisonError::into_inner));
+fn reported(
+    log: &TestLog,
+    cursor: &Cursor,
+    state: &Arc<Mutex<WriterState>>,
+) -> Result<WalStatus, WalStatus> {
+    let status = cursor.status(log, &state.lock().unwrap_or_else(PoisonError::into_inner));
     match status.closed_reason {
         Some(_) => Err(status),
         None => Ok(status),
@@ -350,7 +395,10 @@ impl WalWriter for TestWriter {
         let (status, listeners) = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.acknowledged = Some(state.acknowledged.map_or(last, |seen| seen.max(last)));
-            (self.log.status(&state), state.listeners.clone())
+            (
+                self.cursor.status(&self.log, &state),
+                state.listeners.clone(),
+            )
         };
         for listener in &listeners {
             listener(WalEvent::WalFlushed(status.clone()));
@@ -366,12 +414,13 @@ impl WalWriter for TestWriter {
     fn observer(&self) -> Box<dyn WalObserver> {
         Box::new(TestObserver {
             log: Arc::clone(&self.log),
+            cursor: Arc::clone(&self.cursor),
             state: Arc::clone(&self.state),
         })
     }
 
     fn status(&self) -> Result<WalStatus, WalStatus> {
-        reported(&self.log, &self.state)
+        reported(&self.log, &self.cursor, &self.state)
     }
 
     async fn close(&mut self) -> Result<(), WalError> {
@@ -379,7 +428,7 @@ impl WalWriter for TestWriter {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.closed_reason = Some(WalError::Closed);
             (
-                self.log.status(&state),
+                self.cursor.status(&self.log, &state),
                 std::mem::take(&mut state.listeners),
             )
         };
@@ -387,7 +436,7 @@ impl WalWriter for TestWriter {
             listener(WalEvent::WalClosed(closed.clone()));
         }
         let mut registered = self
-            .log
+            .cursor
             .writer
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -404,20 +453,21 @@ impl WalWriter for TestWriter {
 
 struct TestObserver {
     log: Arc<TestLog>,
+    cursor: Arc<Cursor>,
     state: Arc<Mutex<WriterState>>,
 }
 
 #[async_trait]
 impl WalObserver for TestObserver {
     fn status(&self) -> Result<WalStatus, WalStatus> {
-        reported(&self.log, &self.state)
+        reported(&self.log, &self.cursor, &self.state)
     }
 
     fn subscribe(&self, listener: WalStatusListener) -> Result<(), WalError> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match state.closed_reason {
             Some(_) => {
-                let closed = self.log.status(&state);
+                let closed = self.cursor.status(&self.log, &state);
                 drop(state);
                 listener(WalEvent::WalClosed(closed));
             }
@@ -430,6 +480,7 @@ impl WalObserver for TestObserver {
 
 struct TestReader {
     log: Arc<TestLog>,
+    cursor: Arc<Cursor>,
     tail: bool,
 }
 
@@ -451,6 +502,7 @@ impl WalReader for TestReader {
 
         Ok(Box::new(TestIterator {
             log: Arc::clone(&self.log),
+            cursor: Arc::clone(&self.cursor),
             next: next.saturating_sub(base).max(1),
             end,
         }))
@@ -468,6 +520,7 @@ impl WalReader for TestReader {
 
 struct TestIterator {
     log: Arc<TestLog>,
+    cursor: Arc<Cursor>,
     next: u64,
     end: Bound<u64>,
 }
@@ -501,7 +554,7 @@ impl WalIterator for TestIterator {
 
         let sequence = self.next;
         self.next = self.next.saturating_add(1);
-        self.log.served.send_if_modified(|served| {
+        self.cursor.served.send_if_modified(|served| {
             let advanced = sequence > *served;
             if advanced {
                 *served = sequence;

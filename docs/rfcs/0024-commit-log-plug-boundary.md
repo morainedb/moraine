@@ -134,6 +134,13 @@ format 10, it only recognizes it.
   reader serves it before any flush, a lost race folds the peer's slot
   before the retry lands after it, and an adopted store needs a provider
   to open.
+- Two processes over one in-tree log, each with a cursor of its own: a
+  committer over a reader lands its batch as a slot and sees it once
+  served, the folder's next commit loses to it, folds it, and lands after
+  it, and the committer is served the folder's slot in turn. A committer
+  opened before adoption is refused.
+- A committer's session records every write it is handed and commits none
+  of it into the store it reads.
 - No test in the unit-test binary registers a provider, since every other
   test's reader would inherit it.
 
@@ -175,20 +182,32 @@ and the race stay the library's.
    on, unchanged. A local failure after a won slot is reported as an
    unknown outcome: the slot is committed, and a reopen folds it.
 
-**Not yet implemented, and specified here so the boundary holds:**
+**Committers over a reader.** SlateDB fences its `Db`, so only the
+folder holds one. Every other read-write process opens with
+`CatalogOptions::commit_log_role = Committer`: a tailing `DbReader`
+polled at `commit_log_poll_interval`, with a committer from the provider,
+and the log must already be adopted. Every batch, on either role, stages
+against a **commit session** — the folder's snapshot transaction, or the
+committer's reader — and every write it stages passes through that
+session, index entries included, so the slot the batch becomes carries all
+of it. The session is also where the two roles differ at commit: the
+folder's commits into the store and marks the sequence folded; the
+committer's commits nothing locally and waits, bounded, for its reader to
+be served the sequence, so its next read sees its own commit. A loss
+folds the winners into the folder's store, or waits for the committer's
+reader to be served them, before the existing lost-race outcome returns.
+Folder-only operations — maintenance, migration, the log-store move —
+refuse a committer.
 
-- **Committers over a reader.** SlateDB fences its `Db`, so only the
-  folder holds one. Every other read-write process runs over a tailing
-  `DbReader` opened with a short poll interval, prepares and validates
-  against the reader, commits directly to the log, and after a win or a
-  loss waits for its reader to be served the sequence before it reads
-  again. The library commit path needs a session that is either the
-  writer's transaction or the reader; the DuckDB path hands moraine a
-  writer transaction per DuckDB transaction and needs the same session
-  threaded through its staged commit.
-- **The extension's attach option** for the folder role, defaulting to
-  committer-over-reader once that exists. Until then a read-write attach
-  with a registered provider is the folder.
+**The extension.** `COMMIT_LOG_ROLE` names the attach's part when a
+provider is registered: `'committer'`, the default, or `'folder'`.
+`COMMIT_LOG_TAIL` makes a read-only attach tail the log, and
+`COMMIT_LOG_POLL_INTERVAL_MS` sets the committer's poll. They reach the
+core through `moraine_attach_with_commit_log`, whose `commit_log`
+argument the older attach entry points pass as null. Without a registered
+provider all three are ignored. The folder is a designated process, never
+an attach by default: a fleet of sessions that each took the writer would
+fence one another.
 
 ## Alternatives considered
 

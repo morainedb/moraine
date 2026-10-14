@@ -8,7 +8,7 @@ use std::sync::Arc;
 use object_store::memory::InMemory;
 
 use crate::{
-    Catalog, CatalogOptions,
+    Catalog, CatalogOptions, CommitLogRole,
     commit_log::{CommitLogProvider, SlotCommit, SlotEnvelope, SlotWrite, test_log::TestProvider},
     store::{
         key::{Key, SysKey},
@@ -116,7 +116,7 @@ async fn a_folder_adopts_the_log_and_commits_through_it() {
         slots[0].1.writes().any(|write| write.key == stamp),
         "the first slot is the format stamp"
     );
-    assert_eq!(provider.log.folded_sequence(), 1);
+    assert_eq!(provider.folded_sequence(), 1);
 
     folder
         .commit(|tx| tx.create_schema("s").map(|_| ()))
@@ -129,7 +129,7 @@ async fn a_folder_adopts_the_log_and_commits_through_it() {
         slots[1].1.writes().any(|write| write.key == head),
         "the commit's batch rode the second slot"
     );
-    assert_eq!(provider.log.folded_sequence(), 2);
+    assert_eq!(provider.folded_sequence(), 2);
 
     let reader = Catalog::open_read_only(
         object_store,
@@ -201,7 +201,7 @@ async fn a_lost_race_folds_the_winner_before_the_retry_lands() {
         vec![1, 2, 3],
         "the retry landed after the peer's slot"
     );
-    assert_eq!(provider.log.folded_sequence(), 3);
+    assert_eq!(provider.folded_sequence(), 3);
     folder.close().await.unwrap();
 
     // The peer's write was folded into this store before the retry.
@@ -215,6 +215,128 @@ async fn a_lost_race_folds_the_winner_before_the_retry_lands() {
         Some(&b"landed"[..])
     );
     db.close().await.unwrap();
+}
+
+/// A second read-write process commits over a tailing reader: it needs no
+/// store of its own, lands its batch as a slot, sees it once its reader is
+/// served, and the folder folds it before the folder's next commit lands.
+#[tokio::test]
+async fn a_committer_over_a_reader_commits_through_the_log() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+
+    let folder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    folder
+        .commit(|tx| tx.create_schema("a").map(|_| ()))
+        .await
+        .unwrap();
+
+    // Another process over the same log: its own cursor, the same slots.
+    let committer_provider = Arc::new(provider.sharing());
+    let committer = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(committer_provider.clone()),
+            commit_log_role: CommitLogRole::Committer,
+            commit_log_poll_interval: std::time::Duration::from_millis(10),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    committer
+        .commit(|tx| tx.create_schema("b").map(|_| ()))
+        .await
+        .unwrap();
+    assert_eq!(
+        provider
+            .log
+            .slots()
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the committer's batch is the third slot"
+    );
+    let seen = committer.snapshot().await.unwrap();
+    assert!(
+        seen.schema_by_name("a").is_some(),
+        "the folder's commit, served"
+    );
+    assert!(seen.schema_by_name("b").is_some(), "its own commit, served");
+
+    // The folder has not seen slot 3: its next commit loses and folds it.
+    // Both commits touch the schema list, so the loss is a conflict, which
+    // surfaces after the fold rather than being retried past.
+    let conflict = folder.commit(|tx| tx.create_schema("c").map(|_| ())).await;
+    assert!(
+        matches!(conflict, Err(crate::Error::CommitConflict(_))),
+        "{conflict:?}"
+    );
+    assert_eq!(provider.folded_sequence(), 3);
+    let after_fold = folder.snapshot().await.unwrap();
+    assert!(
+        after_fold.schema_by_name("b").is_some(),
+        "the committer's slot was folded"
+    );
+
+    // Re-driven against the folded state, it lands after the peer's slot.
+    folder
+        .commit(|tx| tx.create_schema("c").map(|_| ()))
+        .await
+        .unwrap();
+    assert_eq!(provider.log.slots().len(), 4);
+    assert_eq!(provider.folded_sequence(), 4);
+
+    // And the committer is served the folder's slot in turn.
+    assert!(
+        committer_provider
+            .committer(Arc::new(InMemory::new()), "lake")
+            .await_served(4, std::time::Duration::from_secs(5))
+            .await
+    );
+    assert!(
+        committer
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("c")
+            .is_some()
+    );
+
+    committer.close().await.unwrap();
+    folder.close().await.unwrap();
+}
+
+/// A committer needs an adopted log: before any folder has adopted it,
+/// the open is refused rather than left with nothing to commit against.
+#[tokio::test]
+async fn a_committer_is_refused_before_adoption() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+
+    let refused = Catalog::open(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(Arc::new(TestProvider::default())),
+            commit_log_role: CommitLogRole::Committer,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .err()
+    .map(|err| err.to_string())
+    .unwrap_or_default();
+    assert!(refused.contains("folder"), "{refused}");
 }
 
 /// An adopted store opens read-only through a provider and is refused

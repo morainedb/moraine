@@ -59,7 +59,7 @@ use crate::{
         open::{self, StoreBuilder},
         proto::HeadValue,
     },
-    transaction::{MigrationReport, Transaction, commit, migration},
+    transaction::{MigrationReport, Transaction, commit, migration, session::CommitSession},
 };
 
 /// Tables warmed concurrently, sized for a remote object store.
@@ -139,14 +139,49 @@ pub(crate) enum Store {
     },
     /// A read-only reader following the manifest, shared into read sessions.
     Reader(Arc<DbReader>),
+    /// A committer over a tailing reader: reads what the log has served it
+    /// and commits through the log alone.
+    Committer {
+        reader: Arc<DbReader>,
+        commit_log: LogCommitter,
+    },
 }
 
 impl Store {
+    /// A read side over the store itself, each read atomic on its own.
+    pub(crate) fn read_handle(&self) -> ReadHandle<'_> {
+        match self {
+            Self::Writer { db, .. } => ReadHandle::Writer(db),
+            Self::Reader(reader) | Self::Committer { reader, .. } => ReadHandle::Reader(reader),
+        }
+    }
+
+    /// Opens the session one batch stages against and commits through.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Constraint`] for a read-only store; the store's error if its
+    /// transaction cannot begin.
+    pub(crate) async fn begin_commit_session(&self) -> Result<CommitSession> {
+        match self {
+            Self::Writer { db, .. } => Ok(CommitSession::folder(
+                db.begin(IsolationLevel::Snapshot)
+                    .await
+                    .map_err(Error::from)?,
+            )),
+            Self::Committer { reader, .. } => Ok(CommitSession::committer(Arc::clone(reader))),
+            Self::Reader(_) => Err(Error::Constraint(
+                "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+        }
+    }
+
     /// The commit log this store commits through, when its commits are
     /// slots.
     pub(crate) fn commit_log(&self) -> Option<&LogCommitter> {
         match self {
             Self::Writer { commit_log, .. } => commit_log.as_ref(),
+            Self::Committer { commit_log, .. } => Some(commit_log),
             Self::Reader(_) => None,
         }
     }
@@ -157,7 +192,7 @@ impl Store {
     pub(crate) fn writer_db(&self) -> Option<&Db> {
         match self {
             Self::Writer { db, .. } => Some(db),
-            Self::Reader(_) => None,
+            Self::Reader(_) | Self::Committer { .. } => None,
         }
     }
 
@@ -166,7 +201,8 @@ impl Store {
     pub(crate) fn commit_durability(&self) -> commit::CommitDurability {
         match self {
             Self::Writer { pacer, .. } => commit::CommitDurability::Paced(Arc::clone(pacer)),
-            Self::Reader(_) => commit::CommitDurability::OnFlushInterval,
+            // A committer's batch is durable at its slot; it awaits no flush.
+            Self::Reader(_) | Self::Committer { .. } => commit::CommitDurability::OnFlushInterval,
         }
     }
 }
@@ -229,6 +265,14 @@ pub struct CatalogOptions {
     /// commit the moment its slot lands at a listing per poll, rather than
     /// following the folded store. Defaults to `false`.
     pub commit_log_tail: bool,
+    /// Which part a read-write open plays in a commit log: the one folder,
+    /// or a committer over a tailing reader. Ignored without a provider.
+    /// Defaults to the folder.
+    pub commit_log_role: crate::CommitLogRole,
+    /// How often a committer's reader polls for slots other committers
+    /// landed; it also bounds how long a commit waits to see its own slot.
+    /// Defaults to 50ms.
+    pub commit_log_poll_interval: Duration,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -320,6 +364,8 @@ impl Default for CatalogOptions {
             wal_store: None,
             commit_log: None,
             commit_log_tail: false,
+            commit_log_role: crate::CommitLogRole::default(),
+            commit_log_poll_interval: Duration::from_millis(50),
             cache_dir: None,
             cache_identity: None,
             cache_size: None,
@@ -417,7 +463,7 @@ async fn open_writer_store(
         Some(committer) => {
             let log = LogCommitter {
                 committer,
-                db: db.clone(),
+                db: Some(db.clone()),
             };
             format = commit::adopt_commit_log(&log, format).await?;
             Some(log)
@@ -926,7 +972,9 @@ impl ReadOnlyCatalog {
         }
         match self.store.as_ref() {
             Store::Writer { db, .. } => OwnedReadHandle::Writer(db.clone()),
-            Store::Reader(reader) => OwnedReadHandle::Reader(reader.clone()),
+            Store::Reader(reader) | Store::Committer { reader, .. } => {
+                OwnedReadHandle::Reader(reader.clone())
+            }
         }
     }
 
@@ -1206,7 +1254,9 @@ impl ReadOnlyCatalog {
                         .map_err(Error::from)?,
                 )
             }
-            Store::Reader(reader) => ReadSession::Reader(reader.clone()),
+            Store::Reader(reader) | Store::Committer { reader, .. } => {
+                ReadSession::Reader(reader.clone())
+            }
         };
 
         let refused = async {
@@ -1234,7 +1284,9 @@ impl ReadOnlyCatalog {
     pub async fn close(&self) -> Result<()> {
         match self.store.as_ref() {
             Store::Writer { db, .. } => db.close().await.map_err(Error::from),
-            Store::Reader(reader) => reader.close().await.map_err(Error::from),
+            Store::Reader(reader) | Store::Committer { reader, .. } => {
+                reader.close().await.map_err(Error::from)
+            }
         }
     }
 }
@@ -1247,6 +1299,10 @@ impl Catalog {
             Store::Writer { db, .. } => Ok(db),
             Store::Reader(_) => Err(Error::Constraint(
                 "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+            Store::Committer { .. } => Err(Error::Constraint(
+                "catalog opened as a commit-log committer; this operation needs the folder"
+                    .to_string(),
             )),
         }
     }
@@ -1318,6 +1374,11 @@ impl Catalog {
                  state and cannot be opened against one"
                     .to_string(),
             ));
+        }
+        if options.commit_log_role == crate::CommitLogRole::Committer
+            && let Some(provider) = commit_log_provider(&options)
+        {
+            return Self::open_as_committer(object_store, options, provider).await;
         }
         let started = Instant::now();
         let located = Arc::clone(&object_store);
@@ -1400,6 +1461,64 @@ impl Catalog {
                 projections,
             },
         })
+    }
+
+    /// Opens the catalog as a commit-log committer: a tailing reader that
+    /// polls at the commit-log poll interval, with every commit a slot. The
+    /// log must have been adopted by a folder.
+    async fn open_as_committer(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+        provider: Arc<dyn crate::CommitLogProvider>,
+    ) -> Result<Self> {
+        let log_store = StoreBuilder::new(&options.path, Arc::clone(&object_store))
+            .wal_object_store(
+                options
+                    .wal_store
+                    .as_ref()
+                    .map(|wal| Arc::clone(wal.object_store())),
+            )
+            .log_store();
+        let committer = provider.committer(log_store, &options.path);
+        if !committer.adopted().await? {
+            return Err(Error::Configuration(
+                "the commit log is not adopted; open the lake as the folder first".to_string(),
+            ));
+        }
+
+        let mut inner = Self::open_read_only(
+            object_store,
+            CatalogOptions {
+                commit_log_tail: true,
+                reader_poll_interval: options.commit_log_poll_interval,
+                ..options
+            },
+        )
+        .await?;
+        let Some(Store::Reader(reader)) = Arc::into_inner(inner.store) else {
+            return Err(Error::Corruption(
+                "a fresh read-only open must hold its reader alone".to_string(),
+            ));
+        };
+        let log = LogCommitter {
+            committer,
+            db: None,
+        };
+        inner.store = Arc::new(Store::Committer {
+            reader,
+            commit_log: log.clone(),
+        });
+        inner.commits = Arc::new(commit::Coalescer::new(
+            Arc::clone(&inner.projections),
+            commit::CommitDurability::OnFlushInterval,
+            Some(log),
+        ));
+        info!(
+            path = inner.location.path,
+            "opened catalog as a commit-log committer"
+        );
+
+        Ok(Self { inner })
     }
 
     /// Opens the catalog **read-only** in `object_store` at `options.path`,
@@ -1789,6 +1908,16 @@ impl Catalog {
             .map_err(Error::from)
     }
 
+    /// Opens the session one staged commit stages against and commits
+    /// through.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::begin_commit_session`].
+    pub(crate) async fn begin_commit_session(&self) -> Result<CommitSession> {
+        self.store.begin_commit_session().await
+    }
+
     /// Writes the memtable out as a sorted-string table, so a test can put
     /// what it committed behind block reads.
     #[cfg(test)]
@@ -1874,7 +2003,7 @@ impl Catalog {
         F: Fn(&mut Transaction) -> Result<()>,
     {
         let ids =
-            commit::commit_cycle(self.writer()?, std::slice::from_ref(&f), &self.commits).await?;
+            commit::commit_cycle(&self.store, std::slice::from_ref(&f), &self.commits).await?;
         ids.first().copied().ok_or_else(|| {
             Error::Corruption("a commit of one member reported no snapshot".to_string())
         })
@@ -1924,6 +2053,6 @@ impl Catalog {
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn commit_group(&self, members: &[CommitMember<'_>]) -> Result<Vec<SnapshotId>> {
-        commit::commit_cycle(self.writer()?, members, &self.commits).await
+        commit::commit_cycle(&self.store, members, &self.commits).await
     }
 }

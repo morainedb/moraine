@@ -21,7 +21,7 @@ pub(crate) use pacer::FlushPacer;
 
 use crate::{
     catalog::{
-        CatalogSnapshot, SnapshotId, Timestamp,
+        CatalogSnapshot, SnapshotId, Store, Timestamp,
         projection::{
             ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch,
             fold_replayed_writes, format_floor, held_head_view, install_head_view,
@@ -47,6 +47,7 @@ use crate::{
     transaction::{
         index_maintenance, inline,
         operations::{ChangeSet, Operation},
+        session::CommitSession,
         verbs::{Transaction, TransactionParts},
     },
 };
@@ -565,11 +566,17 @@ pub(crate) async fn adopt_commit_log(log: &LogCommitter, format: u64) -> Result<
     if format >= FORMAT_WITH_COMMIT_LOG {
         return Ok(format);
     }
+    let Some(db) = &log.db else {
+        return Err(Error::Configuration(
+            "a committer over a reader cannot adopt the commit log; open a folder first"
+                .to_string(),
+        ));
+    };
 
     // The plug acknowledges the store's own rows, the bootstrap included,
     // before they are durable; the flush makes them so.
-    flush_memtable(&log.db).await?;
-    let head = read::read_head(ReadHandle::Writer(&log.db))
+    flush_memtable(db).await?;
+    let head = read::read_head(ReadHandle::Writer(db))
         .await?
         .map_or(0, |head| head.snapshot_id);
     let stamp = SlotWrite {
@@ -1052,7 +1059,7 @@ enum CommitOutcome {
 /// forming, and takes that batch's fate as this attempt's. Members stage
 /// one at a time, each against the state the members before it left.
 async fn attempt_group<F>(
-    db: &Db,
+    db: &Store,
     members: &[F],
     coalescer: &Arc<Coalescer>,
 ) -> Result<CommitOutcome>
@@ -1094,11 +1101,10 @@ where
 /// sequence; the install is compare-and-set against an epoch captured
 /// first.
 pub(crate) async fn head_view_for(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
     projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Result<Arc<CatalogSnapshot>> {
     let epoch = cache_epoch(projections);
-    let handle = ReadHandle::Tx(db_tx);
     // Checked here because a warm cache returns before `materialize`'s
     // own check. Head comes first because it keys the migration stamp; a
     // stamped head spends no read at all, an unstamped one spends the same
@@ -1257,7 +1263,7 @@ pub(crate) fn target_format(state: &CatalogSnapshot, wrote: InlineShapes) -> u64
 
 /// The format-stamp write this commit owes, if any. The stamp is forward-only.
 async fn format_stamp(
-    db_tx: &DbTransaction,
+    db_tx: &CommitSession,
     projections: &std::sync::RwLock<ProjectionCache>,
     state: &CatalogSnapshot,
     wrote: InlineShapes,
@@ -1265,7 +1271,7 @@ async fn format_stamp(
     if format_floor(projections) >= MAX_FORMAT_VERSION {
         return Ok(None);
     }
-    format_stamp_to(db_tx, projections, target_format(state, wrote)).await
+    format_stamp_to(db_tx.handle(), projections, target_format(state, wrote)).await
 }
 
 /// The forward-only format stamp write required to reach `target_format`.
@@ -1273,14 +1279,14 @@ async fn format_stamp(
 /// write and costs no read: the stamp only ever rises, so an observed
 /// version stays a valid floor.
 pub(crate) async fn format_stamp_to(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
     projections: &std::sync::RwLock<ProjectionCache>,
     target_format: u64,
 ) -> Result<Option<StagedWrite>> {
     if target_format <= FORMAT_VERSION || format_floor(projections) >= target_format {
         return Ok(None);
     }
-    let current = read::read_format(ReadHandle::Tx(db_tx))
+    let current = read::read_format(handle)
         .await?
         .map_or(FORMAT_VERSION, |format| format.format_version);
     raise_format_floor(projections, current);
@@ -1326,7 +1332,7 @@ pub(crate) fn schema_version_write(
 /// Runs the closure against `base` and stages the resulting writes.
 /// Options-only commits stage no snapshot record and no head advance.
 async fn prepare_and_stage<F>(
-    db_tx: &Arc<DbTransaction>,
+    db_tx: &Arc<CommitSession>,
     projections: &std::sync::RwLock<ProjectionCache>,
     f: &F,
     base: &CatalogSnapshot,
@@ -1355,7 +1361,7 @@ where
         }
         // The unchanged head is re-put as the conflict anchor.
         writes.push(head_stamp(head, base.batch_seq));
-        let staged_bytes = stage_writes(db_tx, &writes)?;
+        let staged_bytes = stage_writes_on(db_tx, &writes)?;
         return Ok(Prepared::Staged {
             ours: Box::default(),
             commits: head,
@@ -1425,7 +1431,7 @@ where
         Some(value::encode_value(&snapshot)),
     ));
     writes.push(head_stamp(new_id, base.batch_seq));
-    let mut staged_bytes = stage_writes(db_tx, &writes)?;
+    let mut staged_bytes = stage_writes_on(db_tx, &writes)?;
     staged_bytes.0 = staged_bytes.0.saturating_add(entries.bytes);
     tracing::debug!(
         snapshot = new_id,
@@ -1445,6 +1451,25 @@ where
     })
 }
 
+/// Stages `writes` on a batch's session, which records them for the slot
+/// the batch becomes.
+pub(crate) fn stage_writes_on(
+    session: &CommitSession,
+    writes: &[StagedWrite],
+) -> Result<StagedBytes> {
+    let mut staged = StagedBytes::default();
+    for (key, write) in writes {
+        staged.add(key.len(), write.as_ref().map_or(0, Vec::len));
+        match write {
+            Some(bytes) => session.put(key, bytes),
+            None => session.delete(key),
+        }?;
+    }
+    Ok(staged)
+}
+
+/// Stages `writes` on a raw store transaction: the bootstrap, the format
+/// raise, and maintenance, none of which is a slot.
 pub(crate) fn stage_writes(db_tx: &DbTransaction, writes: &[StagedWrite]) -> Result<StagedBytes> {
     let mut staged = StagedBytes::default();
     for (key, write) in writes {
@@ -1510,8 +1535,10 @@ pub(crate) enum Submission {
 /// Discards everything staged on the transaction. Rolling back is dropping
 /// it, so this takes the last reference: the probes that shared it are all
 /// awaited before staging returns.
-pub(crate) fn rollback(db_tx: Arc<DbTransaction>) {
-    drop(db_tx);
+pub(crate) fn rollback(db_tx: Arc<CommitSession>) {
+    if let Some(session) = Arc::into_inner(db_tx) {
+        session.rollback();
+    }
 }
 
 /// Where a batch lands: the projections it folds into and, when commits
@@ -1542,7 +1569,7 @@ impl OwnedLanding {
 /// projections may fold before the bytes are durable; a flush that then
 /// fails invalidates them.
 pub(crate) async fn submit_batch(
-    db_tx: Arc<DbTransaction>,
+    db_tx: Arc<CommitSession>,
     heads: HeadTransition,
     writes: &[StagedWrite],
     staged_bytes: StagedBytes,
@@ -1568,10 +1595,12 @@ pub(crate) async fn submit_batch(
     }
 
     // With a commit log the slot is the commit point: win it first, and
-    // fold what beat the batch before the retry re-prepares.
+    // fold what beat the batch before the retry re-prepares. The slot
+    // carries what the session recorded, which is every write staged on it.
+    let folder = db_tx.is_folder();
     let won_sequence = match log {
         None => None,
-        Some(log) => match offer_slot(log, heads.before, head, writes).await {
+        Some(log) => match offer_slot(log, heads.before, head, &db_tx.staged()).await {
             Ok(SlotOffer::Won { sequence }) => Some(sequence),
             Ok(SlotOffer::Lost { slots }) => {
                 db_tx.rollback();
@@ -1620,7 +1649,11 @@ pub(crate) async fn submit_batch(
                 install_committed_head_view(projections, head_view_update, writes);
             }
             if let (Some(log), Some(sequence)) = (log, won_sequence) {
-                log.committer.mark_folded(sequence);
+                if folder {
+                    log.committer.mark_folded(sequence);
+                } else if !log.await_served(sequence).await {
+                    invalidate_head_view(projections);
+                }
             }
             Ok(Submission::Submitted(Submitted {
                 handle,
@@ -1699,7 +1732,7 @@ pub(crate) async fn await_submitted(
 /// Commits one batch and waits for it to reach object storage:
 /// [`submit_batch`] then [`await_submitted`].
 pub(crate) async fn commit_batch(
-    db_tx: Arc<DbTransaction>,
+    db_tx: Arc<CommitSession>,
     heads: HeadTransition,
     writes: &[StagedWrite],
     staged_bytes: StagedBytes,
@@ -1730,7 +1763,7 @@ pub(crate) async fn commit_batch(
 /// [`Error::CommitOutcomeUnknown`]; the caller must reconcile the operation
 /// before resubmitting.
 pub(crate) async fn commit_batch_off_task(
-    db_tx: Arc<DbTransaction>,
+    db_tx: Arc<CommitSession>,
     heads: HeadTransition,
     writes: Vec<StagedWrite>,
     staged_bytes: StagedBytes,
@@ -1840,7 +1873,7 @@ impl ProbeScope {
 /// Returns one snapshot id per member, in member order. A group of one is
 /// the ordinary commit path.
 pub(crate) async fn commit_cycle<F>(
-    db: &Db,
+    db: &Store,
     members: &[F],
     coalescer: &Arc<Coalescer>,
 ) -> Result<Vec<SnapshotId>>
@@ -1921,21 +1954,21 @@ struct InterveningClassification {
     snapshot_ids: Vec<u64>,
 }
 
-async fn read_head_snapshot_id(db: &Db) -> Result<u64> {
+async fn read_head_snapshot_id(db: &Store) -> Result<u64> {
     let head_bytes = db
+        .read_handle()
         .get(Key::Sys(SysKey::Head).encode())
-        .await
-        .map_err(Error::from)?
+        .await?
         .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?;
     let head: proto::HeadValue = value::decode_value(&head_bytes)?;
     Ok(head.snapshot_id)
 }
 
-async fn read_intervening_change(db: &Db, snapshot_id: u64) -> Result<(u64, ChangeSet)> {
+async fn read_intervening_change(db: &Store, snapshot_id: u64) -> Result<(u64, ChangeSet)> {
     let change_set = match db
+        .read_handle()
         .get(Key::Snapshot { snapshot_id }.encode())
-        .await
-        .map_err(Error::from)?
+        .await?
     {
         Some(bytes) => {
             let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
@@ -1958,7 +1991,7 @@ async fn read_intervening_change(db: &Db, snapshot_id: u64) -> Result<(u64, Chan
 }
 
 fn intervening_change_stream(
-    db: &Db,
+    db: &Store,
     first: u64,
     last: u64,
 ) -> impl futures::Stream<Item = Result<(u64, ChangeSet)>> + '_ {
@@ -1982,7 +2015,7 @@ fn intervening_change_stream(
 /// Exposed for the staged path, which cannot re-run its caller and so
 /// reports the conflict rather than retrying past it.
 pub(crate) async fn conflicting_intervening_change(
-    db: &Db,
+    db: &Store,
     head_before: &proto::HeadValue,
     ours: &ChangeSet,
 ) -> Result<(Option<u64>, Vec<u64>, bool)> {
@@ -1998,16 +2031,16 @@ pub(crate) async fn conflicting_intervening_change(
 }
 
 /// The whole head stamp, or `None` when the store carries no head yet.
-async fn read_head_stamp(db: &Db) -> Result<Option<proto::HeadValue>> {
-    db.get(Key::Sys(SysKey::Head).encode())
-        .await
-        .map_err(Error::from)?
+async fn read_head_stamp(db: &Store) -> Result<Option<proto::HeadValue>> {
+    db.read_handle()
+        .get(Key::Sys(SysKey::Head).encode())
+        .await?
         .map(|bytes| value::decode_value(&bytes))
         .transpose()
 }
 
 async fn classify_intervening_changes(
-    db: &Db,
+    db: &Store,
     head_before: u64,
     ours: &[ChangeSet],
 ) -> Result<InterveningClassification> {
@@ -2047,7 +2080,7 @@ async fn classify_intervening_changes(
 /// The change sets of every commit above `head_before`. An expired record
 /// classifies as an unknowable change, never as corruption.
 #[cfg(test)]
-async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, ChangeSet)>> {
+async fn intervening_changes(db: &Store, head_before: u64) -> Result<Vec<(u64, ChangeSet)>> {
     let head = read_head_snapshot_id(db).await?;
     if head_before >= head {
         return Ok(Vec::new());

@@ -4,6 +4,7 @@ use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
 
 use super::*;
+use crate::{store::handle::ReadHandle, transaction::session::CommitSession};
 
 mod allocation;
 mod durability;
@@ -3908,7 +3909,7 @@ async fn a_format_target_under_the_observed_floor_costs_no_read() {
     raise_format_floor(projections, MAX_FORMAT_VERSION + 1);
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let stamp = format_stamp_to(&db_tx, projections, MAX_FORMAT_VERSION + 1)
+    let stamp = format_stamp_to(ReadHandle::Tx(&db_tx), projections, MAX_FORMAT_VERSION + 1)
         .await
         .unwrap();
 
@@ -3925,7 +3926,7 @@ async fn a_format_target_above_the_floor_reads_and_raises_it() {
     let projections = catalog.projections();
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let stamp = format_stamp_to(&db_tx, projections, MIN_FORMAT_VERSION + 1)
+    let stamp = format_stamp_to(ReadHandle::Tx(&db_tx), projections, MIN_FORMAT_VERSION + 1)
         .await
         .unwrap();
 
@@ -4668,7 +4669,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
 
     // The attempt opens and reads its premises.
     let attempt = catalog.begin_write_tx().await.unwrap();
-    let base = head_view_for(&attempt, catalog.projections())
+    let base = head_view_for(ReadHandle::Tx(&attempt), catalog.projections())
         .await
         .unwrap();
     let head_before = base.snapshot.snapshot_id;
@@ -4684,7 +4685,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
         .await
         .unwrap();
 
-    let reread = head_view_for(&attempt, catalog.projections())
+    let reread = head_view_for(ReadHandle::Tx(&attempt), catalog.projections())
         .await
         .unwrap();
     assert_eq!(
@@ -4704,7 +4705,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
     staged.push(head_stamp(head_before + 1, base.batch_seq));
     let staged_bytes = stage_writes(&attempt, &staged).unwrap();
     let landed = commit_batch(
-        Arc::new(attempt),
+        Arc::new(CommitSession::folder(attempt)),
         HeadTransition {
             before: head_before,
             after: head_before + 1,
@@ -4730,7 +4731,9 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
     // And a fresh attempt does see it, so the loss is the only outcome the
     // interleaving admits — not a permanent wedge.
     let retry = catalog.begin_write_tx().await.unwrap();
-    let fresh = head_view_for(&retry, catalog.projections()).await.unwrap();
+    let fresh = head_view_for(ReadHandle::Tx(&retry), catalog.projections())
+        .await
+        .unwrap();
     assert_eq!(fresh.snapshot.snapshot_id, head_before + 1);
     assert_eq!(
         fresh
@@ -4901,10 +4904,14 @@ async fn a_read_only_pass_that_straddles_a_commit_is_discarded_and_re_run() {
 /// The store state a retry meets when its base predates an expiry: three
 /// commits, with the middle one's snapshot record reclaimed as expiry past
 /// the retention horizon leaves it.
-async fn catalog_with_a_reclaimed_snapshot()
--> (Db, Arc<std::sync::RwLock<ProjectionCache>>, Arc<Coalescer>) {
+async fn catalog_with_a_reclaimed_snapshot() -> (
+    Store,
+    Db,
+    Arc<std::sync::RwLock<ProjectionCache>>,
+    Arc<Coalescer>,
+) {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let (db, _, _, _) = open_initialized(
+    let (db, _, _, pacer) = open_initialized(
         StoreBuilder::new("", object_store),
         false,
         None,
@@ -4920,10 +4927,15 @@ async fn catalog_with_a_reclaimed_snapshot()
         CommitDurability::OnFlushInterval,
         None,
     ));
+    let store = Store::Writer {
+        db: db.clone(),
+        pacer,
+        commit_log: None,
+    };
 
     for name in ["a", "b", "c"] {
         commit_cycle(
-            &db,
+            &store,
             &[|tx: &mut Transaction| tx.create_schema(name).map(|_| ())],
             &coalescer,
         )
@@ -4936,7 +4948,7 @@ async fn catalog_with_a_reclaimed_snapshot()
         .unwrap();
     tx.commit().await.unwrap();
 
-    (db, projections, coalescer)
+    (store, db, projections, coalescer)
 }
 
 /// A retry whose base predates a concurrent expiry classifies against a
@@ -4947,11 +4959,11 @@ async fn catalog_with_a_reclaimed_snapshot()
 /// damaged store.
 #[tokio::test]
 async fn a_retry_across_a_reclaimed_snapshot_conflicts_rather_than_corrupting() {
-    let (db, _projections, _coalescer) = catalog_with_a_reclaimed_snapshot().await;
+    let (store, db, _projections, _coalescer) = catalog_with_a_reclaimed_snapshot().await;
 
     // What a losing attempt that read head 1 classifies: everything that
     // landed above it, reclaimed record included.
-    let intervening = intervening_changes(&db, 1).await.unwrap();
+    let intervening = intervening_changes(&store, 1).await.unwrap();
     let ids: Vec<u64> = intervening.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids, vec![2, 3]);
 
@@ -4979,11 +4991,11 @@ async fn a_retry_across_a_reclaimed_snapshot_conflicts_rather_than_corrupting() 
 /// materialization resolves head, and head is not what expiry reclaimed.
 #[tokio::test]
 async fn a_verb_commit_rematerializes_over_a_reclaimed_snapshot() {
-    let (db, projections, coalescer) = catalog_with_a_reclaimed_snapshot().await;
+    let (store, db, projections, coalescer) = catalog_with_a_reclaimed_snapshot().await;
     invalidate_head_view(&projections);
 
     commit_cycle(
-        &db,
+        &store,
         &[|tx: &mut Transaction| tx.create_schema("d").map(|_| ())],
         &coalescer,
     )
@@ -5108,7 +5120,9 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
     };
 
     let base = catalog.snapshot().await.unwrap();
-    let db_tx = Arc::new(catalog.begin_write_tx().await.unwrap());
+    let db_tx = Arc::new(CommitSession::folder(
+        catalog.begin_write_tx().await.unwrap(),
+    ));
     let prepared = prepare_and_stage(
         &db_tx,
         catalog.projections(),

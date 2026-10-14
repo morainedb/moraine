@@ -6,14 +6,14 @@ use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
-use slatedb::DbTransaction;
 
 use crate::{
     catalog::projection::ProjectionCache,
     error::{Error, Result},
-    store::{handle::ReadHandle, inline as store_inline},
+    store::inline as store_inline,
     transaction::{
         commit::StagedWrite,
+        session::CommitSession,
         staged::inline::{
             inline_chunk_range_write, inline_inline_delete_write, inline_insert_write,
             inline_schema_write, translate_inline_flush_delete,
@@ -65,7 +65,7 @@ const FLUSH_SCAN_CONCURRENCY: usize = 8;
 /// for, keyed by `(table_id, schema_version)`; read concurrently since the
 /// key set is known up front.
 async fn recorded_schemas(
-    db_tx: &DbTransaction,
+    db_tx: &CommitSession,
     ops: &[InlineStage],
 ) -> Result<HashMap<(u64, u64), Option<Bytes>>> {
     let mut versions = Vec::new();
@@ -85,8 +85,7 @@ async fn recorded_schemas(
     stream::iter(versions)
         .map(|(table_id, schema_version)| async move {
             let recorded =
-                store_inline::read_inline_schema(ReadHandle::Tx(db_tx), table_id, schema_version)
-                    .await?;
+                store_inline::read_inline_schema(db_tx.handle(), table_id, schema_version).await?;
             Ok::<_, Error>(((table_id, schema_version), recorded))
         })
         .buffered(SCHEMA_READ_CONCURRENCY)
@@ -98,7 +97,7 @@ async fn recorded_schemas(
 /// ids it drains. Flushes only read `db_tx`, so their table scans run
 /// concurrently.
 async fn translated_flushes(
-    db_tx: &DbTransaction,
+    db_tx: &CommitSession,
     projections: &std::sync::RwLock<ProjectionCache>,
     ops: &[InlineStage],
 ) -> Result<Vec<(Vec<StagedWrite>, HashSet<u64>)>> {
@@ -183,7 +182,7 @@ fn refuse_tombstones_of_drained_rows(
 /// read at its pre-commit state, so a drain sees the store as it stood
 /// before this commit.
 pub(crate) async fn stage_inline_writes(
-    db_tx: &DbTransaction,
+    db_tx: &CommitSession,
     projections: &std::sync::RwLock<ProjectionCache>,
     ops: &[InlineStage],
 ) -> Result<Vec<StagedWrite>> {
@@ -324,7 +323,7 @@ mod tests {
             schema(3, b"v3"),
         ];
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = CommitSession::folder(db.begin(IsolationLevel::Snapshot).await.unwrap());
         let projections = std::sync::RwLock::new(ProjectionCache::empty());
         let writes = stage_inline_writes(&tx, &projections, &ops).await.unwrap();
         assert_eq!(

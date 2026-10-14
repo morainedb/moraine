@@ -163,6 +163,20 @@ pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
     fn committer(&self, log_store: Arc<dyn ObjectStore>, path: &str) -> Arc<dyn SlotCommitter>;
 }
 
+/// Which part a read-write open plays in a commit log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommitLogRole {
+    /// Holds the store's one writer: replays the log on open, applies every
+    /// slot as it lands, flushes on the paced cadence, and adopts a store
+    /// not yet on the log. One per lake.
+    #[default]
+    Folder,
+    /// Commits over a tailing reader: prepares against the reader, offers
+    /// to the log, and waits to be served what lands. Any number per lake;
+    /// needs an adopted log.
+    Committer,
+}
+
 static REGISTERED: OnceLock<Arc<dyn CommitLogProvider>> = OnceLock::new();
 
 /// Registers the process's commit-log provider, for opens that carry no
@@ -190,12 +204,17 @@ pub(crate) fn mint_transaction_id() -> [u8; 16] {
     *uuid::Uuid::new_v4().as_bytes()
 }
 
-/// The log's commit side bound to the folder's store: offers go to the
-/// committer, and slots other committers won are applied to `db`.
+/// How long a committer over a tailing reader waits for the reader to be
+/// served a sequence before it reads again.
+pub(crate) const READER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The log's commit side bound to a process's store: offers go to the
+/// committer, and slots other committers won are applied to `db` when this
+/// process is the folder, or awaited from the tailing reader when it is not.
 #[derive(Clone)]
 pub(crate) struct LogCommitter {
     pub(crate) committer: Arc<dyn SlotCommitter>,
-    pub(crate) db: slatedb::Db,
+    pub(crate) db: Option<slatedb::Db>,
 }
 
 impl fmt::Debug for LogCommitter {
@@ -207,13 +226,37 @@ impl fmt::Debug for LogCommitter {
 }
 
 impl LogCommitter {
+    /// Waits for this process's reader to be served every slot through
+    /// `sequence`; a folder has no reader to wait on. A timeout is reported
+    /// and survived: the next read may lag, and the next offer re-validates.
+    pub(crate) async fn await_served(&self, sequence: u64) -> bool {
+        if self.db.is_some() {
+            return true;
+        }
+        let served = self
+            .committer
+            .await_served(sequence, READER_CATCHUP_TIMEOUT)
+            .await;
+        if !served {
+            tracing::warn!(
+                sequence,
+                "the reader was not served the slot within the catch-up timeout"
+            );
+        }
+        served
+    }
+
     /// Applies one slot's writes to the store, waiting on no durability — a
-    /// slot is durable already — then reports `sequence` folded.
+    /// slot is durable already — then reports `sequence` folded. A committer
+    /// over a reader applies nothing: its reader is served the slot.
     pub(crate) async fn fold<'a>(
         &self,
         sequence: u64,
         writes: impl Iterator<Item = &'a SlotWrite>,
     ) -> Result<()> {
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
         let mut batch = slatedb::WriteBatch::new();
         let mut any = false;
         for write in writes {
@@ -226,8 +269,7 @@ impl LogCommitter {
         if any {
             // The handle is the durability wait; a slot is durable already.
             drop(
-                self.db
-                    .write_with_options(batch, &slatedb::config::WriteOptions::default())
+                db.write_with_options(batch, &slatedb::config::WriteOptions::default())
                     .await
                     .map_err(Error::from)?,
             );
@@ -237,10 +279,15 @@ impl LogCommitter {
         Ok(())
     }
 
-    /// Folds `slots` in order.
+    /// Folds `slots` in order; a committer over a reader waits to be served
+    /// the last of them instead.
     pub(crate) async fn fold_slots(&self, slots: Vec<(u64, SlotEnvelope)>) -> Result<()> {
+        let last = slots.last().map(|(sequence, _)| *sequence);
         for (sequence, envelope) in slots {
             self.fold(sequence, envelope.writes()).await?;
+        }
+        if let Some(last) = last {
+            self.await_served(last).await;
         }
 
         Ok(())
