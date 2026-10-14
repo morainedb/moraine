@@ -18,7 +18,6 @@ use futures::{
     Stream, StreamExt, TryStreamExt,
     stream::{self, FuturesUnordered},
 };
-use slatedb::DbTransaction;
 use tracing::warn;
 
 use crate::{
@@ -33,6 +32,7 @@ use crate::{
             index_multi_value_prefix, index_value_above, index_value_body, index_value_suffix,
         },
     },
+    transaction::session::CommitSession,
 };
 
 /// One index-entry mutation accumulated during a commit closure, resolved
@@ -307,9 +307,9 @@ fn collision(
     }
 }
 
-async fn resolve_probe(transaction: &DbTransaction, probe: PendingProbe) -> Result<CompletedProbe> {
+async fn resolve_probe(transaction: &CommitSession, probe: PendingProbe) -> Result<CompletedProbe> {
     let started = Instant::now();
-    let present = transaction.get(&probe.key).await?;
+    let present = transaction.handle().get(&probe.key).await?;
     Ok(CompletedProbe {
         probe,
         present,
@@ -324,7 +324,7 @@ async fn resolve_probe(transaction: &DbTransaction, probe: PendingProbe) -> Resu
 /// task the batch runs serially, and the shards are what let the runtime's
 /// workers take a share each.
 async fn resolve_probes(
-    transaction: Arc<DbTransaction>,
+    transaction: Arc<CommitSession>,
     probes: Vec<PendingProbe>,
 ) -> Result<Vec<CompletedProbe>> {
     let shard_size = probes.len().div_ceil(PROBE_SHARDS).max(1);
@@ -496,7 +496,7 @@ where
 }
 
 fn stage_probe_put(
-    db_tx: &DbTransaction,
+    db_tx: &CommitSession,
     staged: &mut StagedBytes,
     key: Bytes,
     row_id: Option<u64>,
@@ -507,7 +507,6 @@ fn stage_probe_put(
         Some(row_id) => db_tx.put(key, row_id.to_be_bytes()),
         None => db_tx.put(key, []),
     }
-    .map_err(Error::from)
 }
 
 /// Resolves accumulated entries onto `db_tx`, enforcing uniqueness at
@@ -516,7 +515,7 @@ fn stage_probe_put(
 /// → no-op; absent → staged. Duplicates within the commit are caught in
 /// memory.
 pub(crate) async fn stage_index_entries(
-    db_tx: &Arc<DbTransaction>,
+    db_tx: &Arc<CommitSession>,
     entries: Vec<StagedIndexEntry>,
 ) -> Result<StagedEntries> {
     let entry_count = entries.len();
@@ -554,7 +553,7 @@ pub(crate) async fn stage_index_entries(
 /// windows bound what is launched, never what is polled.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn stage_index_entry_stream<D, S>(
-    db_tx: &Arc<DbTransaction>,
+    db_tx: &Arc<CommitSession>,
     deletes: D,
     entries: S,
     prior_entry_count: usize,
@@ -567,7 +566,7 @@ where
     let mut staged = StagedBytes::default();
     let mut deleted_unique = HashSet::new();
     let mut budget = IndexCommitBudget::with_entries(prior_entry_count)?;
-    let reader = ReadHandle::Tx(db_tx);
+    let reader = db_tx.handle();
     let guard_reads = AtomicU64::new(0);
     let mut deletes = std::pin::pin!(guarded_deletions(reader, deletes, &guard_reads));
     let mut entries = std::pin::pin!(entries.ready_chunks(PROBE_BATCH_SIZE));
@@ -628,7 +627,7 @@ where
         metrics.deletions = metrics.deletions.saturating_add(1);
         let stage_started = Instant::now();
         staged.add(entry.key.len(), 0);
-        db_tx.delete(entry.key).map_err(Error::from)?;
+        db_tx.delete(entry.key)?;
         metrics.staging = metrics.staging.saturating_add(stage_started.elapsed());
     }
     metrics.deletion_derivation = started.elapsed();
@@ -1040,7 +1039,9 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = Arc::new(CommitSession::folder(
+            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+        ));
         let key = Bytes::from_static(b"absent value");
         let entries = stream::once(async {
             Ok(StagedIndexEntry {
@@ -1062,7 +1063,7 @@ mod tests {
         assert_eq!(staged.metrics.unique_probes, 0);
         assert_eq!(staged.metrics.known_absent, 1);
         assert_eq!(
-            tx.get(&key).await.unwrap().as_deref(),
+            tx.handle().get(&key).await.unwrap().as_deref(),
             Some(&7u64.to_be_bytes()[..])
         );
         drop(tx);
@@ -1077,7 +1078,9 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = Arc::new(CommitSession::folder(
+            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+        ));
 
         // More than one shard's worth, so the window spawns.
         let entries = stream::iter((0..PROBE_BATCH_SIZE as u64 * 3).map(|row_id| {
@@ -1110,7 +1113,9 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = Arc::new(CommitSession::folder(
+            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+        ));
         let entries = stream::iter([3u64, 4].map(|row_id| {
             Ok(StagedIndexEntry {
                 index_id: 9,
@@ -1159,7 +1164,9 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = Arc::new(CommitSession::folder(
+            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+        ));
         let entries = stream::iter((0..ENTRIES).map(|position| {
             let row_id = u64::try_from(position).unwrap();
             Ok(StagedIndexEntry {
@@ -1197,7 +1204,9 @@ mod tests {
             .unwrap();
         let key = Bytes::from_static(b"one value");
 
-        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = Arc::new(CommitSession::folder(
+            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+        ));
         tx.put(key.clone(), 3u64.to_be_bytes()).unwrap();
         Arc::into_inner(tx).unwrap().commit().await.unwrap();
 
@@ -1216,7 +1225,9 @@ mod tests {
             })
         };
 
-        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = Arc::new(CommitSession::folder(
+            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+        ));
         let staged = stage_index_entry_stream(&tx, deletion(0, key.clone()), stream::empty(), 0)
             .await
             .unwrap();
@@ -1224,13 +1235,11 @@ mod tests {
         assert_eq!(staged.metrics.guard_reads, 1);
         Arc::into_inner(tx).unwrap().commit().await.unwrap();
 
-        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = Arc::new(CommitSession::folder(
+            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+        ));
         assert!(
-            ReadHandle::Tx(&tx)
-                .get(key.clone())
-                .await
-                .unwrap()
-                .is_some(),
+            tx.handle().get(key.clone()).await.unwrap().is_some(),
             "row 3's entry survives a deletion derived for row 0"
         );
         let staged = stage_index_entry_stream(&tx, deletion(3, key.clone()), stream::empty(), 0)
@@ -1239,8 +1248,10 @@ mod tests {
         assert_eq!(staged.metrics.deletions, 1);
         Arc::into_inner(tx).unwrap().commit().await.unwrap();
 
-        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
-        assert!(ReadHandle::Tx(&tx).get(key).await.unwrap().is_none());
+        let tx = Arc::new(CommitSession::folder(
+            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+        ));
+        assert!(tx.handle().get(key).await.unwrap().is_none());
         drop(tx);
 
         db.close().await.unwrap();
@@ -1256,11 +1267,15 @@ mod tests {
             .unwrap();
         let key = Bytes::from_static(b"held value");
 
-        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = Arc::new(CommitSession::folder(
+            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+        ));
         tx.put(key.clone(), 3u64.to_be_bytes()).unwrap();
         Arc::into_inner(tx).unwrap().commit().await.unwrap();
 
-        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = Arc::new(CommitSession::folder(
+            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+        ));
         let deletion_key = key.clone();
         let deletion = stream::once(async move {
             Ok(StagedIndexEntry {
@@ -1279,7 +1294,7 @@ mod tests {
             .unwrap();
         assert_eq!(staged.metrics.deletions, 1);
         assert_eq!(staged.metrics.guard_reads, 0);
-        assert!(tx.get(&key).await.unwrap().is_none());
+        assert!(tx.handle().get(&key).await.unwrap().is_none());
         drop(tx);
 
         db.close().await.unwrap();
@@ -1300,7 +1315,9 @@ mod tests {
         seed.put(key.clone(), 7_u64.to_be_bytes()).unwrap();
         seed.commit().await.unwrap();
 
-        let tx = Arc::new(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = Arc::new(CommitSession::folder(
+            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+        ));
         let (release_deletion, deletion_released) = tokio::sync::oneshot::channel();
         let deletion_key = key.clone();
         let deletions = stream::once(async move {
@@ -1355,7 +1372,7 @@ mod tests {
         }
 
         assert_eq!(
-            tx.get(&key).await.unwrap(),
+            tx.handle().get(&key).await.unwrap(),
             Some(Bytes::copy_from_slice(&7_u64.to_be_bytes()))
         );
         drop(tx);

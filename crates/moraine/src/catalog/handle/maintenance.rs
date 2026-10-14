@@ -456,6 +456,8 @@ impl Catalog {
             )));
         }
 
+        self.reserve_own_rows(u64::try_from(limit).unwrap_or(u64::MAX))
+            .await?;
         let tx = self.begin_write_tx().await?;
         let mut staged = StagedBytes::default();
         let deleted =
@@ -849,6 +851,7 @@ impl Catalog {
             }
 
             for batch in keys.chunks(batch_size) {
+                self.reserve_own_rows(batch.len() as u64).await?;
                 let tx = self.begin_write_tx().await?;
                 for key in batch {
                     tx.delete(key.clone()).map_err(Error::from)?;
@@ -897,6 +900,7 @@ impl Catalog {
 
         let mut total = 0u64;
         for batch in victims.chunks(batch_size) {
+            self.reserve_own_rows(batch.len() as u64).await?;
             let tx = self.begin_write_tx().await?;
             for entity in batch {
                 tx.delete(Key::current(*entity).encode())
@@ -937,6 +941,7 @@ impl Catalog {
         let mut total = 0u64;
         let mut batches = 0u64;
         loop {
+            self.reserve_own_rows(batch_size as u64).await?;
             let tx = self.begin_write_tx().await?;
             let mut deleted = 0usize;
             while deleted < batch_size {

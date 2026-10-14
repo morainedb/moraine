@@ -46,6 +46,7 @@ async fn seeded_store() -> Arc<InMemory> {
         value::encode_value(&proto::FormatValue {
             format_version: FORMAT_VERSION,
             writer_version: "synthetic-source".to_owned(),
+            commit_log_batch_origin: None,
         }),
     )
     .unwrap();

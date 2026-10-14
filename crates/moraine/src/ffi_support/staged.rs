@@ -23,7 +23,7 @@ pub async fn staged_begin(
     data_store: Option<DataStore>,
     data_prefix: String,
 ) -> Result<StagedTransaction> {
-    let db_tx = catalog.begin_write_tx().await?;
+    let db_tx = catalog.begin_commit_session().await?;
     Ok(StagedTransaction::begin(
         db_tx,
         catalog.projections().clone(),
