@@ -262,7 +262,8 @@ outside a slot.
   where the tail's length is already known. A holder that another process
   fences gives the store up and carries on committing; nothing is lost,
   since every slot is durable, and the fence shows at the holder's next
-  flush, whether its own commit's or the idle poll's. The first committer
+  flush, whether its own commit's, the idle poll's, or the one at close,
+  which then demotes and reports nothing. The first committer
   to find an unadopted log takes the store and adopts it. The threshold sits well above the flush count, so a holder
   doing its job is never taken from. There is no role to select:
   `Catalog::take_store` takes the store now for a process about to run
