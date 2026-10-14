@@ -144,9 +144,6 @@ typedef struct MoraineWalStore {
 // log, when a provider is registered for the process. Ignored without
 // one.
 typedef struct MoraineCommitLog {
-  // `0` commits over a tailing reader; `1` holds the store's one writer,
-  // the folder, which adopts a store not yet on the log.
-  uint8_t role;
   // Whether a read-only attach tails the log rather than following the
   // folded store.
   bool tail;
@@ -1369,7 +1366,7 @@ int32_t moraine_attach_with_commit_log(const char *path,
 
 // Opens a catalog that takes no part in a commit log beyond the process
 // default. New callers use [`moraine_attach_with_commit_log`], whose
-// `commit_log` argument names the attach's role.
+// `commit_log` argument tunes its reading of a commit log.
 //
 // # Safety
 //

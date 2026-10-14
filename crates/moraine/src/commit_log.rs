@@ -131,8 +131,9 @@ pub trait SlotCommitter: fmt::Debug + Send + Sync + 'static {
     /// As [`offer`](Self::offer).
     async fn adopt(&self, stamp: SlotCommit) -> Result<SlotAdoption>;
 
-    /// The slots landed past the last this process has folded or been
-    /// served, in order: what a loss would hand back, without offering.
+    /// The slots landed past the last this process has folded, in order,
+    /// whatever its reader has been served: what the store it holds still
+    /// lacks.
     ///
     /// # Errors
     ///
@@ -199,20 +200,6 @@ pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
     fn garbage_collector(&self, log_store: Arc<dyn ObjectStore>, path: &str) -> Arc<dyn WalGc>;
 }
 
-/// Which part a read-write open plays in a commit log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CommitLogRole {
-    /// Holds the store's one writer: replays the log on open, applies every
-    /// slot as it lands, flushes on the paced cadence, and adopts a store
-    /// not yet on the log. One per lake.
-    #[default]
-    Folder,
-    /// Commits over a tailing reader: prepares against the reader, offers
-    /// to the log, and waits to be served what lands. Any number per lake;
-    /// needs an adopted log.
-    Committer,
-}
-
 static REGISTERED: OnceLock<Arc<dyn CommitLogProvider>> = OnceLock::new();
 
 /// Registers the process's commit-log provider, for opens that carry no
@@ -250,7 +237,14 @@ pub(crate) const READER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub(crate) struct LogCommitter {
     pub(crate) committer: Arc<dyn SlotCommitter>,
-    pub(crate) db: Option<slatedb::Db>,
+    /// The store this process folds into, while it holds one. A process
+    /// takes the store when the tail is long and keeps it until fenced.
+    pub(crate) holder: Arc<std::sync::Mutex<Option<Holder>>>,
+    /// Where this process reads: the store it holds, or a tailing reader.
+    pub(crate) reads: ReadSide,
+    /// How this process takes the store when the tail is long; `None` for
+    /// a process that holds it from its open.
+    pub(crate) taker: Option<Arc<dyn StoreTaker>>,
     /// The head's batch counter when the log was adopted; slot `k` carries
     /// the stamp at `batch_origin + k - 1`.
     pub(crate) batch_origin: u64,
@@ -264,8 +258,75 @@ pub(crate) struct LogCommitter {
     /// Rows the folder has written for itself since this open, outside any
     /// slot: the sweeps.
     pub(crate) own_rows_since_open: Arc<AtomicU64>,
-    /// How the folder flushes and truncates; `None` for a committer.
-    pub(crate) flushing: Option<Flushing>,
+    /// How a holder flushes and truncates.
+    pub(crate) flushing: Flushing,
+}
+
+/// The store a process holds, and the idle poll folding into it.
+pub(crate) struct Holder {
+    pub(crate) db: slatedb::Db,
+    pub(crate) fold_poll: Option<FoldPoll>,
+}
+
+/// Where a process reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadSide {
+    /// Through the store it holds; its own commits land there directly.
+    Store,
+    /// Through a tailing reader, which is served every slot, its own
+    /// included, once the reader polls.
+    Reader,
+}
+
+/// Opens the store for a process that found the tail long, so it can hold
+/// and fold it. Implemented by the catalog, which owns the open.
+#[async_trait]
+pub(crate) trait StoreTaker: Send + Sync {
+    /// Takes the store if the unfolded tail is past the threshold, handing
+    /// it to `log` through [`LogCommitter::promote`]. Returns whether it
+    /// did.
+    async fn take_if_stalled(&self, log: &LogCommitter) -> Result<bool>;
+}
+
+/// The idle poll task and the switch that stops it.
+pub(crate) struct FoldPoll {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl FoldPoll {
+    pub(crate) fn spawn(log: LogCommitter, interval: Duration) -> Self {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(log.poll_folds(interval, stopped));
+        Self {
+            stop,
+            task: std::sync::Mutex::new(Some(task)),
+        }
+    }
+
+    pub(crate) async fn stop(&self) {
+        let _ = self.stop.send(true);
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    /// Tells the task to stop without waiting for it: what the task itself
+    /// calls, since it cannot wait for its own end.
+    fn stop_from_within(&self) {
+        let _ = self.stop.send(true);
+        drop(
+            self.task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
 }
 
 /// The folder's flush policy: after `every` folded slots, write the
@@ -321,24 +382,116 @@ impl fmt::Debug for LogCommitter {
         f.debug_struct("LogCommitter")
             .field("committer", &self.committer)
             .field("batch_origin", &self.batch_origin)
+            .field("holds_store", &self.holds_store())
+            .field("reads", &self.reads)
             .finish_non_exhaustive()
     }
 }
 
 impl LogCommitter {
+    /// The store this process holds, if it does.
+    pub(crate) fn db(&self) -> Option<slatedb::Db> {
+        self.holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|holder| holder.db.clone())
+    }
+
+    /// Whether this process holds the store.
+    pub(crate) fn holds_store(&self) -> bool {
+        self.db().is_some()
+    }
+
+    /// Takes `db` as the store this process folds into, polling for peers'
+    /// slots every `poll`.
+    pub(crate) fn promote(&self, db: slatedb::Db, poll: Duration) {
+        let fold_poll = FoldPoll::spawn(self.clone(), poll);
+        *self
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Holder {
+            db,
+            fold_poll: Some(fold_poll),
+        });
+        self.folds_since_open.store(0, Ordering::Release);
+        self.own_rows_since_open.store(0, Ordering::Release);
+        tracing::info!("took the store");
+    }
+
+    /// Gives the store up: stops the poll and hands the store back for the
+    /// caller to close. `None` when this process held none.
+    pub(crate) async fn demote(&self) -> Option<slatedb::Db> {
+        let holder = self
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()?;
+        if let Some(fold_poll) = holder.fold_poll {
+            fold_poll.stop().await;
+        }
+        Some(holder.db)
+    }
+
+    /// Drops back to committing after another process took the store:
+    /// nothing is lost, since every slot is durable and this process reads
+    /// through its reader. A fence shows at the next flush, since the plug
+    /// journals nothing; the folds made in memory before it are discarded
+    /// with the store.
+    async fn fenced(&self) {
+        // The poll task may be the one here, so the poll is told to stop
+        // rather than waited for.
+        let holder = self
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(holder) = holder else {
+            return;
+        };
+        if let Some(fold_poll) = holder.fold_poll {
+            fold_poll.stop_from_within();
+        }
+        tracing::warn!("another process took the store; back to committing");
+        let _ = holder.db.close().await;
+    }
+
+    /// Takes the store if the tail is long and this process can: a process
+    /// that already holds it, or opened without a taker, does nothing.
+    pub(crate) async fn take_if_stalled(&self) {
+        let Some(taker) = &self.taker else {
+            return;
+        };
+        if self.holds_store() {
+            return;
+        }
+        match taker.take_if_stalled(self).await {
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "could not take the store; committing on"),
+        }
+    }
+
     /// Reports `sequence` folded, and on the folder flushes and truncates
     /// once enough slots have folded since the last flush: the replay point
     /// moves, so a cold open replays at most that many slots.
     pub(crate) async fn folded(&self, sequence: u64) -> Result<()> {
         self.committer.mark_folded(sequence);
         self.folds_since_open.fetch_add(1, Ordering::AcqRel);
-        let (Some(db), Some(flushing)) = (&self.db, &self.flushing) else {
+        let Some(db) = self.db() else {
             return Ok(());
         };
+        let flushing = &self.flushing;
         if flushing.folded_since.fetch_add(1, Ordering::AcqRel) + 1 < flushing.every {
             return Ok(());
         }
-        crate::transaction::commit::flush_memtable(db).await?;
+        match crate::transaction::commit::flush_memtable(&db).await {
+            Ok(()) => {}
+            Err(Error::Fenced(_)) => {
+                self.fenced().await;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         flushing.folded_since.store(0, Ordering::Release);
         flushing.collector.run().await;
 
@@ -370,12 +523,12 @@ impl LogCommitter {
     /// Writes the folder's memtable out and truncates the log, whatever the
     /// count since the last flush; the sprint's last act.
     pub(crate) async fn flush_now(&self) -> Result<()> {
-        let (Some(db), Some(flushing)) = (&self.db, &self.flushing) else {
+        let Some(db) = self.db() else {
             return Ok(());
         };
-        crate::transaction::commit::flush_memtable(db).await?;
-        flushing.folded_since.store(0, Ordering::Release);
-        flushing.collector.run().await;
+        crate::transaction::commit::flush_memtable(&db).await?;
+        self.flushing.folded_since.store(0, Ordering::Release);
+        self.flushing.collector.run().await;
 
         Ok(())
     }
@@ -425,7 +578,7 @@ impl LogCommitter {
     /// `sequence`; a folder has no reader to wait on. A timeout is reported
     /// and survived: the next read may lag, and the next offer re-validates.
     pub(crate) async fn await_served(&self, sequence: u64) -> bool {
-        if self.db.is_some() {
+        if self.reads == ReadSide::Store {
             return true;
         }
         let served = self
@@ -441,15 +594,17 @@ impl LogCommitter {
         served
     }
 
-    /// Applies one slot's writes to the store, waiting on no durability — a
-    /// slot is durable already — then reports `sequence` folded. A committer
-    /// over a reader applies nothing: its reader is served the slot.
+    /// Applies one slot's writes to the store this process holds, waiting
+    /// on no durability — a slot is durable already — then reports
+    /// `sequence` folded. A process holding no store applies nothing: its
+    /// reader is served the slot. One fenced by another holder gives the
+    /// store up and carries on the same way.
     pub(crate) async fn fold<'a>(
         &self,
         sequence: u64,
         writes: impl Iterator<Item = &'a SlotWrite>,
     ) -> Result<()> {
-        let Some(db) = &self.db else {
+        let Some(db) = self.db() else {
             return Ok(());
         };
         let mut batch = slatedb::WriteBatch::new();
@@ -463,15 +618,36 @@ impl LogCommitter {
         }
         if any {
             // The handle is the durability wait; a slot is durable already.
-            drop(
-                db.write_with_options(batch, &slatedb::config::WriteOptions::default())
-                    .await
-                    .map_err(Error::from)?,
-            );
+            match db
+                .write_with_options(batch, &slatedb::config::WriteOptions::default())
+                .await
+                .map_err(Error::from)
+            {
+                Ok(handle) => drop(handle),
+                Err(Error::Fenced(_)) => {
+                    self.fenced().await;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
         }
         self.folded(sequence).await?;
 
         Ok(())
+    }
+
+    /// Folds what beat a batch: everything past the fold cursor when this
+    /// process holds the store, since its reader may have been served slots
+    /// the store has not folded, else the slots the loss handed back.
+    pub(crate) async fn fold_after_loss(&self, slots: Vec<(u64, SlotEnvelope)>) -> Result<()> {
+        if self.holds_store() {
+            self.fold_tail().await?;
+            if let Some((last, _)) = slots.last() {
+                self.await_served(*last).await;
+            }
+            return Ok(());
+        }
+        self.fold_slots(slots).await
     }
 
     /// Folds `slots` in order; a committer over a reader waits to be served

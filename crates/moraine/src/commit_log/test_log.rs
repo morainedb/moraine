@@ -59,6 +59,8 @@ struct Cursor {
     /// Rows the store may write before the next replayed slot's number, as
     /// of the last writer open.
     headroom: AtomicU64,
+    /// How many times a reader over this cursor has asked for the log's end.
+    polls: AtomicU64,
 }
 
 impl std::fmt::Debug for TestLog {
@@ -199,6 +201,13 @@ impl TestProvider {
         self.cursor.folded.load(Ordering::Acquire)
     }
 
+    /// How many times this process's reader has polled the log's end: once
+    /// at open, once at its first manifest poll, which fires at once on a
+    /// background task, and once per interval after.
+    pub(crate) fn polls(&self) -> u64 {
+        self.cursor.polls.load(Ordering::Acquire)
+    }
+
     /// Reports `sequence` served before this process's reader has applied
     /// it: the window a real plug opens for a moment, held open.
     pub(crate) fn report_served(&self, sequence: u64) {
@@ -334,11 +343,9 @@ impl SlotCommitter for TestCommitter {
     }
 
     async fn tail(&self) -> crate::Result<Vec<(u64, SlotEnvelope)>> {
-        let known = self
-            .cursor
-            .folded
-            .load(Ordering::Acquire)
-            .max(*self.cursor.served.borrow());
+        // Past the fold, never past the served point: a reader is served a
+        // slot before the store it reads beside has folded it.
+        let known = self.cursor.folded.load(Ordering::Acquire);
         Ok(self
             .log
             .slots
@@ -628,6 +635,7 @@ impl WalReader for TestReader {
     }
 
     async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError> {
+        self.cursor.polls.fetch_add(1, Ordering::AcqRel);
         Ok(match (self.tail, self.log.wal_base()) {
             (true, Some(base)) => base
                 .saturating_add(self.log.last_sequence())

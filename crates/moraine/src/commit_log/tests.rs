@@ -8,7 +8,7 @@ use std::sync::Arc;
 use object_store::memory::InMemory;
 
 use crate::{
-    Catalog, CatalogOptions, CommitLogRole,
+    Catalog, CatalogOptions,
     commit_log::{CommitLogProvider, SlotCommit, SlotEnvelope, SlotWrite, test_log::TestProvider},
     store::{
         key::{Key, SysKey},
@@ -34,15 +34,29 @@ async fn bootstrapped(object_store: Arc<InMemory>, path: &str) {
 /// A peer's slot at `sequence`: one write under `key`, with the head stamp
 /// every slot carries, at the counter `sequence` implies.
 fn peer_slot(provider: &TestProvider, sequence: u64, key: &[u8], value: &[u8]) -> SlotEnvelope {
+    // The adoption stamp records the origin; once truncation has taken it,
+    // any slot's head stamp implies it, since slot k stamps origin + k - 1.
     let format_key = Key::Sys(SysKey::Format).encode();
-    let origin = provider.log.slots()[0]
-        .1
-        .writes()
+    let head_key = Key::Sys(SysKey::Head).encode();
+    let slots = provider.log.slots();
+    let origin = slots
+        .iter()
+        .flat_map(|(_, envelope)| envelope.writes())
         .find(|write| write.key == format_key)
         .and_then(|write| write.value.as_deref())
         .and_then(|bytes| value::decode_value::<proto::FormatValue>(bytes).ok())
         .and_then(|format| format.commit_log_batch_origin)
-        .expect("the first slot records the batch origin");
+        .or_else(|| {
+            slots.iter().find_map(|(at, envelope)| {
+                envelope
+                    .writes()
+                    .find(|write| write.key == head_key)
+                    .and_then(|write| write.value.as_deref())
+                    .and_then(|bytes| value::decode_value::<proto::HeadValue>(bytes).ok())
+                    .map(|head| head.batch_seq + 1 - at)
+            })
+        })
+        .expect("some slot records or implies the batch origin");
     let (head_key, head_value) = crate::transaction::commit::head_stamp(0, origin + sequence - 2);
 
     SlotEnvelope {
@@ -213,6 +227,20 @@ async fn a_lost_race_folds_the_winner_before_the_retry_lands() {
         "the retry landed after the peer's slot"
     );
     assert_eq!(provider.folded_sequence(), 3);
+    assert!(folder.holds_store(), "the adopter holds the store");
+    assert_eq!(
+        folder
+            .store()
+            .commit_log()
+            .and_then(crate::commit_log::LogCommitter::db)
+            .unwrap()
+            .get(b"\xffpeer")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"landed"[..]),
+        "the peer's write is in the held store before close"
+    );
     folder.close().await.unwrap();
 
     // The peer's write was folded into this store before the retry.
@@ -257,7 +285,6 @@ async fn a_committer_over_a_reader_commits_through_the_log() {
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
-            commit_log_role: CommitLogRole::Committer,
             commit_log_poll_interval: std::time::Duration::from_millis(10),
             ..options_at("lake")
         },
@@ -353,19 +380,31 @@ async fn a_committer_told_of_a_slot_it_has_not_applied_still_loses_to_it() {
     folder.close().await.unwrap();
 
     // The committer's reader never polls again, so it never applies what
-    // lands after its open.
+    // lands after its open; and it never takes the store, so the rule under
+    // test is the only thing that can save it.
     let committer_provider = Arc::new(provider.sharing());
     let committer = Catalog::open(
         object_store,
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
-            commit_log_role: CommitLogRole::Committer,
             commit_log_poll_interval: std::time::Duration::from_secs(200),
+            commit_log_sprint_slots: 0,
             ..options_at("lake")
         },
     )
     .await
     .unwrap();
+
+    // The reader's first manifest poll fires at once on its own task; let it
+    // pass, or it would legitimately apply the peer's slot.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while committer_provider.polls() < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        committer_provider.polls() >= 2,
+        "the reader's first poll ran"
+    );
 
     // A peer lands slot 3 and the plug reports it served, applied or not.
     provider
@@ -378,16 +417,23 @@ async fn a_committer_told_of_a_slot_it_has_not_applied_still_loses_to_it() {
         .await;
     assert!(
         outcome.is_err(),
-        "a stale committer must not win: {outcome:?}"
-    );
-    assert_eq!(
+        "a stale committer must not win: {outcome:?}; holds={} folded={} slots={:?} head={:?}",
+        committer.holds_store(),
+        committer_provider.folded_sequence(),
         provider
             .log
             .slots()
             .iter()
             .map(|(sequence, _)| *sequence)
             .collect::<Vec<_>>(),
-        vec![1, 2, 3],
+        committer
+            .snapshot()
+            .await
+            .map(|s| s.current_snapshot().id.get()),
+    );
+    assert_eq!(
+        provider.log.slots().last().map(|(sequence, _)| *sequence),
+        Some(3),
         "nothing landed past the slot the committer had not applied"
     );
     committer.close().await.unwrap();
@@ -412,11 +458,27 @@ async fn the_folder_flushes_and_truncates_after_enough_folded_slots() {
     )
     .await
     .unwrap();
-    // Adoption is the first fold; this commit is the second, so it flushes.
-    folder
-        .commit(|tx| tx.create_schema("a").map(|_| ()))
-        .await
-        .unwrap();
+    // Two folds of this handle's own: the adoption was folded by the open.
+    for name in ["a", "b"] {
+        folder
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+    // This process's own tailing reader pins the log through its checkpoint
+    // until its next poll moves the checkpoint past the flush, so the
+    // collector truncates at the flush after that one.
+    let polls = provider.polls();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while provider.polls() < polls + 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    for name in ["c", "d"] {
+        folder
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
 
     let folded_only = Catalog::open_read_only(
         object_store.clone(),
@@ -433,22 +495,22 @@ async fn the_folder_flushes_and_truncates_after_enough_folded_slots() {
             .snapshot()
             .await
             .unwrap()
-            .schema_by_name("a")
+            .schema_by_name("d")
             .is_some(),
-        "the flush carried the commit into the manifest"
+        "the flush carried the commits into the manifest"
     );
     folded_only.close().await.unwrap();
     // The collector keeps the slot at the replay point itself and deletes
     // everything below it.
-    assert_eq!(
-        provider
-            .log
-            .slots()
-            .iter()
-            .map(|(sequence, _)| *sequence)
-            .collect::<Vec<_>>(),
-        vec![2],
-        "slots below the replay point were truncated"
+    let remaining: Vec<u64> = provider
+        .log
+        .slots()
+        .iter()
+        .map(|(sequence, _)| *sequence)
+        .collect();
+    assert!(
+        remaining.iter().all(|sequence| *sequence >= 4) && remaining.last() == Some(&5),
+        "slots below the previous flush point were truncated: {remaining:?}"
     );
     folder.close().await.unwrap();
 }
@@ -486,7 +548,8 @@ async fn an_idle_folder_polls_and_folds_peers_slots() {
     assert_eq!(
         folder
             .store()
-            .writer_db()
+            .commit_log()
+            .and_then(crate::commit_log::LogCommitter::db)
             .unwrap()
             .get(b"\xffpeer")
             .await
@@ -532,7 +595,6 @@ async fn a_committer_sprints_at_close_when_the_tail_is_long() {
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
-            commit_log_role: CommitLogRole::Committer,
             commit_log_poll_interval: std::time::Duration::from_millis(10),
             commit_log_sprint_slots: 1,
             ..options_at("lake")
@@ -540,11 +602,16 @@ async fn a_committer_sprints_at_close_when_the_tail_is_long() {
     )
     .await
     .unwrap();
-    for name in ["b", "c"] {
-        committer
-            .commit(|tx| tx.create_schema(name).map(|_| ()))
-            .await
-            .unwrap();
+    assert!(
+        !committer.holds_store(),
+        "a short tail at attach is not taken"
+    );
+    // Peers land while the committer is attached; nothing it does checks.
+    for sequence in [3, 4] {
+        provider.log.land(
+            sequence,
+            peer_slot(&provider, sequence, b"\xffpeer", b"landed"),
+        );
     }
     assert!(
         committer_provider.folded_sequence() < 4,
@@ -568,7 +635,7 @@ async fn a_committer_sprints_at_close_when_the_tail_is_long() {
     .await
     .unwrap();
     let snapshot = folded_only.snapshot().await.unwrap();
-    assert!(snapshot.schema_by_name("b").is_some() && snapshot.schema_by_name("c").is_some());
+    assert!(snapshot.schema_by_name("a").is_some());
     folded_only.close().await.unwrap();
 }
 
@@ -610,6 +677,7 @@ async fn the_folder_advances_the_log_ahead_of_its_own_rows() {
     )
     .await
     .unwrap();
+    assert!(folder.take_store().await.unwrap(), "taken on request");
     let before = provider.log.slots().len();
     let head_before = folder.snapshot().await.unwrap().current_snapshot().id;
 
@@ -640,26 +708,150 @@ async fn the_folder_advances_the_log_ahead_of_its_own_rows() {
     folder.close().await.unwrap();
 }
 
-/// A committer needs an adopted log: before any folder has adopted it,
-/// the open is refused rather than left with nothing to commit against.
+/// A committer arriving at an unadopted log adopts it itself, taking the
+/// store, and a committer arriving at a long tail takes the store at once;
+/// either way it folds its own wins and peers' slots from then on.
 #[tokio::test]
-async fn a_committer_is_refused_before_adoption() {
+async fn a_committer_takes_the_store_when_the_tail_is_long_or_the_log_unadopted() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
 
-    let refused = Catalog::open(
-        object_store,
+    // Unadopted: the committer adopts and holds.
+    let first = Catalog::open(
+        object_store.clone(),
         CatalogOptions {
-            commit_log: Some(Arc::new(TestProvider::default())),
-            commit_log_role: CommitLogRole::Committer,
+            commit_log: Some(provider.clone()),
+            commit_log_poll_interval: std::time::Duration::from_millis(10),
             ..options_at("lake")
         },
     )
     .await
-    .err()
-    .map(|err| err.to_string())
-    .unwrap_or_default();
-    assert!(refused.contains("folder"), "{refused}");
+    .unwrap();
+    assert!(first.holds_store(), "adopting takes the store");
+    assert_eq!(provider.log.slots().len(), 1);
+    first
+        .commit(|tx| tx.create_schema("a").map(|_| ()))
+        .await
+        .unwrap();
+    assert_eq!(provider.folded_sequence(), 2, "a holder folds its own win");
+    first.close().await.unwrap();
+
+    // A long tail at attach: two peers landed past the flushed point.
+    for sequence in [3, 4] {
+        provider.log.land(
+            sequence,
+            peer_slot(&provider, sequence, b"\xffpeer", b"landed"),
+        );
+    }
+    let late = Arc::new(provider.sharing());
+    let second = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(late.clone()),
+            commit_log_poll_interval: std::time::Duration::from_millis(10),
+            commit_log_sprint_slots: 1,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(second.holds_store(), "a long tail is taken at attach");
+    assert_eq!(
+        late.folded_sequence(),
+        4,
+        "taking the store replays the tail"
+    );
+    second.close().await.unwrap();
+
+    // Neither process left anything unflushed.
+    let folded_only = Catalog::open_read_only(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(provider),
+            commit_log_tail: false,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        folded_only
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("a")
+            .is_some()
+    );
+    folded_only.close().await.unwrap();
+}
+
+/// A holder fenced by another process gives the store up and keeps
+/// committing through its reader.
+#[tokio::test]
+async fn a_fenced_holder_drops_back_to_committing() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+
+    let holder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            commit_log_poll_interval: std::time::Duration::from_millis(10),
+            commit_log_fold_poll: std::time::Duration::from_millis(10),
+            // A holder learns it was fenced at its next flush; flush every
+            // fold so the fence surfaces at once.
+            commit_log_flush_slots: 1,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(holder.holds_store());
+
+    // Another process takes the store outright, then commits past it.
+    let usurper_provider = Arc::new(provider.sharing());
+    let usurper = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(usurper_provider.clone()),
+            commit_log_poll_interval: std::time::Duration::from_millis(10),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(usurper.take_store().await.unwrap());
+    usurper
+        .commit(|tx| tx.create_schema("u").map(|_| ()))
+        .await
+        .unwrap();
+
+    // The holder meets the fence at its next fold, whether its poll folds
+    // the usurper's slot first or its own commit loses to it; either way it
+    // demotes. A loss surfaces as a conflict, since both commits touch the
+    // schema list, and the re-driven commit lands through the log.
+    match holder.commit(|tx| tx.create_schema("h").map(|_| ())).await {
+        Ok(_) => {}
+        Err(crate::Error::CommitConflict(_)) => {
+            holder
+                .commit(|tx| tx.create_schema("h").map(|_| ()))
+                .await
+                .unwrap();
+        }
+        Err(other) => panic!("{other:?}"),
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while holder.holds_store() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!holder.holds_store(), "fenced: back to committing");
+    let seen = holder.snapshot().await.unwrap();
+    assert!(seen.schema_by_name("u").is_some() && seen.schema_by_name("h").is_some());
+
+    holder.close().await.unwrap();
+    usurper.close().await.unwrap();
 }
 
 /// An adopted store opens read-only through a provider and is refused

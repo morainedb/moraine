@@ -844,15 +844,12 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// the catalog records it: a later attach naming a different store, or
 	// none, is refused.
 	std::string wal_path;
-	// `COMMIT_LOG_ROLE` names the attach's part in a commit log when the
-	// process has a commit-log provider registered: 'committer' (the
-	// default) commits over a tailing reader, 'folder' holds the store's
-	// one writer and adopts a store not yet on the log. `COMMIT_LOG_TAIL`
-	// makes a read-only attach tail the log; `COMMIT_LOG_POLL_INTERVAL_MS`
-	// is how often a committer's reader polls for slots. All three are
-	// ignored without a registered provider.
+	// When the process has a commit-log provider registered, a read-write
+	// attach is a committer and a read-only attach is a reader.
+	// `COMMIT_LOG_TAIL` makes a read-only attach tail the log;
+	// `COMMIT_LOG_POLL_INTERVAL_MS` is how often a committer's reader polls
+	// for slots. Both are ignored without a registered provider.
 	MoraineCommitLog commit_log {};
-	commit_log.role = 0;
 	commit_log.tail = false;
 	commit_log.poll_interval_ms = 0;
 	bool commit_log_given = false;
@@ -910,17 +907,6 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			}
 		} else if (name == "checkpoint") {
 			checkpoint = option.second.GetValue<std::string>();
-		} else if (name == "commit_log_role") {
-			auto role = duckdb::StringUtil::Lower(option.second.GetValue<std::string>());
-			if (role == "committer") {
-				commit_log.role = 0;
-			} else if (role == "folder") {
-				commit_log.role = 1;
-			} else {
-				throw duckdb::InvalidInputException(
-				    "moraine: COMMIT_LOG_ROLE must be 'committer' or 'folder'; got \"%s\"", role);
-			}
-			commit_log_given = true;
 		} else if (name == "commit_log_tail") {
 			commit_log.tail = option.second.GetValue<bool>();
 			commit_log_given = true;

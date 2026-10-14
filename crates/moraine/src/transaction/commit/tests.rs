@@ -4933,7 +4933,6 @@ async fn catalog_with_a_reclaimed_snapshot() -> (
         db: db.clone(),
         pacer,
         commit_log: None,
-        fold_poll: None,
     };
 
     for name in ["a", "b", "c"] {
