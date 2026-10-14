@@ -340,6 +340,7 @@ fn stage_bootstrap(
         value::encode_value(&proto::FormatValue {
             format_version: MIN_FORMAT_VERSION,
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
+            commit_log_batch_origin: None,
         }),
     );
     // Bootstrap's snapshot records minting `main`.
@@ -562,11 +563,11 @@ pub(crate) async fn drain_own_log(store: StoreBuilder<'_>) -> Result<()> {
 /// Adopts the log for a store below the log-resident format: flushes what
 /// the store holds, races the format stamp at the first slot, and applies
 /// whichever stamp holds it. Returns the format the store is at after.
-pub(crate) async fn adopt_commit_log(log: &LogCommitter, format: u64) -> Result<u64> {
+pub(crate) async fn adopt_commit_log(log: &mut LogCommitter, format: u64) -> Result<u64> {
     if format >= FORMAT_WITH_COMMIT_LOG {
         return Ok(format);
     }
-    let Some(db) = &log.db else {
+    let Some(db) = log.db.clone() else {
         return Err(Error::Configuration(
             "a committer over a reader cannot adopt the commit log; open a folder first"
                 .to_string(),
@@ -575,15 +576,16 @@ pub(crate) async fn adopt_commit_log(log: &LogCommitter, format: u64) -> Result<
 
     // The plug acknowledges the store's own rows, the bootstrap included,
     // before they are durable; the flush makes them so.
-    flush_memtable(db).await?;
-    let head = read::read_head(ReadHandle::Writer(db))
+    flush_memtable(&db).await?;
+    let head = read::read_head(ReadHandle::Writer(&db))
         .await?
-        .map_or(0, |head| head.snapshot_id);
+        .unwrap_or_default();
     let stamp = SlotWrite {
         key: Key::Sys(SysKey::Format).encode(),
         value: Some(value::encode_value(&proto::FormatValue {
             format_version: FORMAT_WITH_COMMIT_LOG,
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
+            commit_log_batch_origin: Some(head.batch_seq),
         })),
     };
 
@@ -591,7 +593,7 @@ pub(crate) async fn adopt_commit_log(log: &LogCommitter, format: u64) -> Result<
         .committer
         .adopt(SlotCommit {
             transaction_id: mint_transaction_id(),
-            validated_head: head,
+            validated_head: head.snapshot_id,
             changes_made: String::new(),
             writes: vec![stamp.clone()],
         })
@@ -601,31 +603,57 @@ pub(crate) async fn adopt_commit_log(log: &LogCommitter, format: u64) -> Result<
         SlotAdoption::AdoptedByPeer(envelope) => envelope.writes().cloned().collect(),
     };
     log.fold(1, writes.iter()).await?;
-    info!("adopted the commit log");
+    log.batch_origin = batch_origin(ReadHandle::Writer(&db)).await?;
+    info!(batch_origin = log.batch_origin, "adopted the commit log");
 
     Ok(FORMAT_WITH_COMMIT_LOG)
 }
 
-/// Offers a batch as one slot, validated against `head_before`.
+/// The batch counter the commit log's first slot stands on, from the format
+/// stamp the adoption folded.
+pub(crate) async fn batch_origin(handle: ReadHandle<'_>) -> Result<u64> {
+    read::read_format(handle)
+        .await?
+        .and_then(|format| format.commit_log_batch_origin)
+        .ok_or_else(|| {
+            Error::Corruption(
+                "the store is on the commit log but its format stamp records no batch origin"
+                    .to_string(),
+            )
+        })
+}
+
+/// Offers a batch as the slot its head stamp implies, validated against
+/// `head_before`. The stamp's batch counter names the slot, so a batch
+/// prepared against a stale head names a taken slot and loses.
 async fn offer_slot(
     log: &LogCommitter,
     head_before: u64,
     head_after: u64,
     writes: &[StagedWrite],
 ) -> Result<SlotOffer> {
+    let Some(stamp) = staged_head_value(writes) else {
+        return Err(Error::Corruption(
+            "a batch with no head stamp cannot be a slot".to_string(),
+        ));
+    };
+    let sequence = log.sequence_of(stamp.batch_seq);
     log.committer
-        .offer(vec![SlotCommit {
-            transaction_id: mint_transaction_id(),
-            validated_head: head_before,
-            changes_made: staged_changes_made(writes, head_after),
-            writes: writes
-                .iter()
-                .map(|(key, value)| SlotWrite {
-                    key: key.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
-        }])
+        .offer(
+            sequence,
+            vec![SlotCommit {
+                transaction_id: mint_transaction_id(),
+                validated_head: head_before,
+                changes_made: staged_changes_made(writes, head_after),
+                writes: writes
+                    .iter()
+                    .map(|(key, value)| SlotWrite {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+            }],
+        )
         .await
 }
 
@@ -1305,6 +1333,7 @@ pub(crate) async fn format_stamp_to(
         Some(value::encode_value(&proto::FormatValue {
             format_version: target_format,
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
+            commit_log_batch_origin: None,
         })),
     )))
 }

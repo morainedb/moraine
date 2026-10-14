@@ -127,6 +127,7 @@ async fn unknown_format_is_refused() {
         &value::encode_value(&proto::FormatValue {
             format_version: MAX_FORMAT_VERSION + 1,
             writer_version: "future".into(),
+            commit_log_batch_origin: None,
         }),
     )
     .await
@@ -202,6 +203,7 @@ async fn older_format_refuses_toward_migrate() {
         &value::encode_value(&proto::FormatValue {
             format_version: 0,
             writer_version: "t".into(),
+            commit_log_batch_origin: None,
         }),
     )
     .await

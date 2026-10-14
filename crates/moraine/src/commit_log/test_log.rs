@@ -133,14 +133,6 @@ impl TestLog {
 }
 
 impl Cursor {
-    /// The sequence the next offer races: after everything folded or served.
-    fn next_sequence(&self) -> u64 {
-        self.folded
-            .load(Ordering::Acquire)
-            .max(*self.served.borrow())
-            .saturating_add(1)
-    }
-
     fn status(&self, log: &TestLog, state: &WriterState) -> WalStatus {
         let base = log
             .wal_base()
@@ -184,6 +176,18 @@ impl TestProvider {
     /// The last sequence this process reported applied.
     pub(crate) fn folded_sequence(&self) -> u64 {
         self.cursor.folded.load(Ordering::Acquire)
+    }
+
+    /// Reports `sequence` served before this process's reader has applied
+    /// it: the window a real plug opens for a moment, held open.
+    pub(crate) fn report_served(&self, sequence: u64) {
+        self.cursor.served.send_if_modified(|served| {
+            let advanced = sequence > *served;
+            if advanced {
+                *served = sequence;
+            }
+            advanced
+        });
     }
 }
 
@@ -229,8 +233,7 @@ impl std::fmt::Debug for TestCommitter {
 
 #[async_trait]
 impl SlotCommitter for TestCommitter {
-    async fn offer(&self, commits: Vec<SlotCommit>) -> crate::Result<SlotOffer> {
-        let sequence = self.cursor.next_sequence();
+    async fn offer(&self, sequence: u64, commits: Vec<SlotCommit>) -> crate::Result<SlotOffer> {
         let mut slots = self
             .log
             .slots

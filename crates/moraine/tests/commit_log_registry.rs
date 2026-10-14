@@ -55,7 +55,7 @@ struct NoCommits;
 
 #[async_trait]
 impl SlotCommitter for NoCommits {
-    async fn offer(&self, _commits: Vec<SlotCommit>) -> moraine::Result<SlotOffer> {
+    async fn offer(&self, _sequence: u64, _commits: Vec<SlotCommit>) -> moraine::Result<SlotOffer> {
         Err(Error::Configuration(
             "the test log takes no commits".to_string(),
         ))

@@ -160,6 +160,7 @@ pub(crate) async fn raise_format(
     let value = value::encode_value(&proto::FormatValue {
         format_version: to_format,
         writer_version: env!("CARGO_PKG_VERSION").to_string(),
+        commit_log_batch_origin: None,
     });
     let mut staged = StagedBytes::default();
     staged.add(key.len(), value.len());
@@ -346,6 +347,7 @@ async fn finish(db: &Db, unit: &MigrationUnit) -> Result<()> {
     let stamp = value::encode_value(&proto::FormatValue {
         format_version: unit.to_format,
         writer_version: env!("CARGO_PKG_VERSION").to_string(),
+        commit_log_batch_origin: None,
     });
     let marker = Key::Sys(SysKey::Migration).encode();
     let mut staged = StagedBytes::default();

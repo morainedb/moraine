@@ -59,7 +59,10 @@ use crate::{
         open::{self, StoreBuilder},
         proto::HeadValue,
     },
-    transaction::{MigrationReport, Transaction, commit, migration, session::CommitSession},
+    transaction::{
+        MigrationReport, Transaction, commit, commit::FORMAT_WITH_COMMIT_LOG, migration,
+        session::CommitSession,
+    },
 };
 
 /// Tables warmed concurrently, sized for a remote object store.
@@ -461,11 +464,15 @@ async fn open_writer_store(
     .await?;
     let commit_log = match committer {
         Some(committer) => {
-            let log = LogCommitter {
+            let mut log = LogCommitter {
                 committer,
                 db: Some(db.clone()),
+                batch_origin: 0,
             };
-            format = commit::adopt_commit_log(&log, format).await?;
+            if format >= FORMAT_WITH_COMMIT_LOG {
+                log.batch_origin = commit::batch_origin(ReadHandle::Writer(&db)).await?;
+            }
+            format = commit::adopt_commit_log(&mut log, format).await?;
             Some(log)
         }
         None => None,
@@ -1500,9 +1507,11 @@ impl Catalog {
                 "a fresh read-only open must hold its reader alone".to_string(),
             ));
         };
+        let batch_origin = commit::batch_origin(ReadHandle::Reader(&reader)).await?;
         let log = LogCommitter {
             committer,
             db: None,
+            batch_origin,
         };
         inner.store = Arc::new(Store::Committer {
             reader,

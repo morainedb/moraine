@@ -75,8 +75,7 @@ pub enum SlotOffer {
         sequence: u64,
     },
     /// Other committers hold the sequence raced and possibly more beyond it.
-    /// Fold every slot into the store, in order, before offering again; the
-    /// next offer races the sequence after the last of them.
+    /// Fold every slot into the store, in order, before offering again.
     Lost {
         /// The slots landed from the sequence raced, in order.
         slots: Vec<(u64, SlotEnvelope)>,
@@ -99,14 +98,16 @@ pub enum SlotAdoption {
 /// and a lost race hands back what to fold before the next.
 #[async_trait]
 pub trait SlotCommitter: fmt::Debug + Send + Sync + 'static {
-    /// Offers `commits` as one slot.
+    /// Offers `commits` as the slot at `sequence`, which the caller derives
+    /// from the state the commits were prepared against: a stale state
+    /// names a taken slot and loses, so the race is what guards it.
     ///
     /// # Errors
     ///
     /// [`Error::CommitOutcomeUnknown`] when the library could not reach the
     /// log or resolve a put whose outcome it could not attribute;
     /// [`Error::Corruption`] when a slot is not a valid envelope.
-    async fn offer(&self, commits: Vec<SlotCommit>) -> Result<SlotOffer>;
+    async fn offer(&self, sequence: u64, commits: Vec<SlotCommit>) -> Result<SlotOffer>;
 
     /// Whether the log has been adopted: a store's stamp holds its first
     /// slot. A store not yet adopted keeps its commits in its own log,
@@ -134,7 +135,9 @@ pub trait SlotCommitter: fmt::Debug + Send + Sync + 'static {
 
     /// Waits until the store has been handed every slot through `sequence`
     /// by its reader-side plug, or until `timeout` passes. Returns whether
-    /// it was reached. A reader catches up once per manifest poll.
+    /// it was reached. A reader catches up once per manifest poll. A hint
+    /// for when to read again, never a guard: the plug reports a slot
+    /// served before the reader has applied it.
     async fn await_served(&self, sequence: u64, timeout: Duration) -> bool;
 }
 
@@ -215,17 +218,28 @@ pub(crate) const READER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct LogCommitter {
     pub(crate) committer: Arc<dyn SlotCommitter>,
     pub(crate) db: Option<slatedb::Db>,
+    /// The head's batch counter when the log was adopted; slot `k` carries
+    /// the stamp at `batch_origin + k - 1`.
+    pub(crate) batch_origin: u64,
 }
 
 impl fmt::Debug for LogCommitter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LogCommitter")
             .field("committer", &self.committer)
+            .field("batch_origin", &self.batch_origin)
             .finish_non_exhaustive()
     }
 }
 
 impl LogCommitter {
+    /// The slot a batch stamping the head at `batch_seq` belongs to.
+    pub(crate) fn sequence_of(&self, batch_seq: u64) -> u64 {
+        batch_seq
+            .saturating_sub(self.batch_origin)
+            .saturating_add(1)
+    }
+
     /// Waits for this process's reader to be served every slot through
     /// `sequence`; a folder has no reader to wait on. A timeout is reported
     /// and survived: the next read may lag, and the next offer re-validates.
@@ -280,10 +294,23 @@ impl LogCommitter {
     }
 
     /// Folds `slots` in order; a committer over a reader waits to be served
-    /// the last of them instead.
+    /// the last of them instead. Every slot past the first carries exactly
+    /// one head stamp, which is what lets a stamp name its slot; one that
+    /// does not is corruption.
     pub(crate) async fn fold_slots(&self, slots: Vec<(u64, SlotEnvelope)>) -> Result<()> {
         let last = slots.last().map(|(sequence, _)| *sequence);
         for (sequence, envelope) in slots {
+            let head_key = crate::store::key::Key::Sys(crate::store::key::SysKey::Head).encode();
+            let stamps = envelope
+                .writes()
+                .filter(|write| write.key == head_key)
+                .count();
+            if sequence > 1 && stamps != 1 {
+                return Err(Error::Corruption(format!(
+                    "slot {sequence} carries {stamps} head stamps; every slot past the first \
+                     carries one"
+                )));
+            }
             self.fold(sequence, envelope.writes()).await?;
         }
         if let Some(last) = last {

@@ -384,6 +384,10 @@ message GcFileValue {
 message FormatValue {
   uint64 format_version = 1;
   string writer_version = 2;
+  // The head's batch counter when the store adopted the commit log: slot k
+  // carries the head stamp at counter origin + k - 1, so a committer races
+  // the slot the counter it prepared against implies. Set on format 10.
+  optional uint64 commit_log_batch_origin = 3;
 }
 
 // sys/head: latest committed snapshot id, and the count of batches that
