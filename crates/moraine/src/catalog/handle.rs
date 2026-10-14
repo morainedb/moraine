@@ -530,6 +530,8 @@ async fn open_writer_store(
                 db: Some(db.clone()),
                 batch_origin: 0,
                 guard: Arc::new(tokio::sync::Mutex::new(())),
+                folds_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                own_rows_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 flushing: Some(crate::commit_log::Flushing {
                     every: options.commit_log_flush_slots.max(1),
                     folded_since: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1623,6 +1625,8 @@ impl Catalog {
             db: None,
             batch_origin,
             guard: Arc::new(tokio::sync::Mutex::new(())),
+            folds_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            own_rows_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             flushing: None,
         };
         inner.store = Arc::new(Store::Committer {
@@ -1644,6 +1648,68 @@ impl Catalog {
         );
 
         Ok(Self { inner })
+    }
+
+    /// Makes room for `rows` the folder is about to write for itself outside
+    /// a slot. Such rows take sequence numbers between the last replayed
+    /// slot and the next, and a replay skips rows below what the tree
+    /// already holds, so when the headroom runs short this commits an empty
+    /// head-preserving slot first, which moves the next slot's number up by
+    /// one slot's worth. Nothing to do on a store with no commit log.
+    pub(crate) async fn reserve_own_rows(&self, rows: u64) -> Result<()> {
+        let Some(log) = self.store.commit_log().filter(|log| log.db.is_some()) else {
+            return Ok(());
+        };
+        let mut advanced = 0;
+        while !log.has_headroom(rows) {
+            self.advance_log_slot().await?;
+            advanced += 1;
+        }
+        if advanced > 0 {
+            info!(
+                rows,
+                advanced, "advanced the commit log ahead of the folder's own rows"
+            );
+        }
+        log.note_own_rows(rows);
+
+        Ok(())
+    }
+
+    /// Commits an empty head-preserving batch as a slot: the head keeps its
+    /// snapshot and its batch counter moves by one, so every committer's
+    /// next offer races past it.
+    async fn advance_log_slot(&self) -> Result<()> {
+        for _ in 0..commit::MAX_COMMIT_ATTEMPTS {
+            let session = self.store.begin_commit_session().await?;
+            let base = commit::head_view_for(session.handle(), &self.projections).await?;
+            let head = base.snapshot.snapshot_id;
+            let writes = vec![commit::head_stamp(head, base.batch_seq)];
+            let staged = commit::stage_writes_on(&session, &writes)?;
+            let landed = commit::commit_batch(
+                Arc::new(session),
+                commit::HeadTransition {
+                    before: head,
+                    after: head,
+                },
+                &writes,
+                staged,
+                commit::HeadViewUpdate::Rebuild(base),
+                commit::Landing {
+                    projections: &self.projections,
+                    log: self.store.commit_log(),
+                },
+                &self.store.commit_durability(),
+            )
+            .await?;
+            if matches!(landed, commit::Landed::Committed(_)) {
+                return Ok(());
+            }
+        }
+
+        Err(Error::RetryBudgetExhausted(
+            "could not advance the commit log past the folder's own rows".to_string(),
+        ))
     }
 
     /// Takes the store for one fold: opens it as the folder, which replays

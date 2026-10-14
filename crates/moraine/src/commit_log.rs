@@ -147,6 +147,16 @@ pub trait SlotCommitter: fmt::Debug + Send + Sync + 'static {
     /// As [`offer`](Self::offer).
     async fn unfolded(&self, replay_point: u64) -> Result<u64>;
 
+    /// The row sequence numbers one slot reserves when replayed: a replayed
+    /// slot's rows take `base + k * rows_per_slot` for slot `k`.
+    fn rows_per_slot(&self) -> u64;
+
+    /// How many rows the folder's store may write for itself before they
+    /// reach the number the next replayed slot would take, as of the
+    /// writer plug's open; rows past it are skipped by the next replay.
+    /// Every slot folded since adds another `rows_per_slot`.
+    fn headroom(&self) -> u64;
+
     /// Reports that the store has applied every slot through `sequence`.
     /// Apply before reporting: the store's next memtable freeze records the
     /// reported sequence as the replay point.
@@ -248,6 +258,12 @@ pub(crate) struct LogCommitter {
     /// and the idle poll's folds, so the poll never folds a slot the
     /// folder is in the middle of committing itself.
     pub(crate) guard: Arc<tokio::sync::Mutex<()>>,
+    /// Slots folded since this open, each buying the folder's own rows
+    /// another slot's worth of sequence numbers.
+    pub(crate) folds_since_open: Arc<AtomicU64>,
+    /// Rows the folder has written for itself since this open, outside any
+    /// slot: the sweeps.
+    pub(crate) own_rows_since_open: Arc<AtomicU64>,
     /// How the folder flushes and truncates; `None` for a committer.
     pub(crate) flushing: Option<Flushing>,
 }
@@ -313,6 +329,7 @@ impl LogCommitter {
     /// moves, so a cold open replays at most that many slots.
     pub(crate) async fn folded(&self, sequence: u64) -> Result<()> {
         self.committer.mark_folded(sequence);
+        self.folds_since_open.fetch_add(1, Ordering::AcqRel);
         let (Some(db), Some(flushing)) = (&self.db, &self.flushing) else {
             return Ok(());
         };
@@ -324,6 +341,28 @@ impl LogCommitter {
         flushing.collector.run().await;
 
         Ok(())
+    }
+
+    /// Whether the folder may write `rows` more rows for itself before they
+    /// reach the number the next replayed slot takes, keeping an eighth of
+    /// a slot in hand.
+    pub(crate) fn has_headroom(&self, rows: u64) -> bool {
+        let stride = self.committer.rows_per_slot();
+        let available = self
+            .committer
+            .headroom()
+            .saturating_add(
+                self.folds_since_open
+                    .load(Ordering::Acquire)
+                    .saturating_mul(stride),
+            )
+            .saturating_sub(self.own_rows_since_open.load(Ordering::Acquire));
+        available > rows.saturating_add(stride / 8)
+    }
+
+    /// Counts `rows` the folder wrote for itself.
+    pub(crate) fn note_own_rows(&self, rows: u64) {
+        self.own_rows_since_open.fetch_add(rows, Ordering::AcqRel);
     }
 
     /// Writes the folder's memtable out and truncates the log, whatever the

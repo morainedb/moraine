@@ -252,16 +252,26 @@ outside a slot.
   doing its job is never fenced by a committer. A holder keeps the store
   until fenced. With this, a lake needs no standing process.
 
+### The folder's own rows
+
+A replayed slot's rows take the sequence numbers `base + k × rows_per_slot`
+for slot `k`, and a replay skips rows below what the tree already holds.
+So once an open has replayed a slot, the rows the folder writes for
+itself outside any slot — the sweeps — must stay below the next slot's
+number, or the next replay after a crash would skip that slot. The plug
+reports the headroom as of the writer's open, every fold since buys
+another slot's worth, and the sweeps reserve their batch before writing
+it: when the headroom runs short the folder commits an empty
+head-preserving slot first. Before any replay the headroom is the whole
+distance to the first slot's number, which no sweep reaches.
+
 ### What remains
 
-1. **Chunked sweep.** After an open that replayed, the folder's own rows
-   take sequence numbers between the last replayed slot and the next,
-   one million per slot; rows past that are skipped by the next replay.
-   A sweep larger than the headroom advances a slot between chunks.
-2. **End to end.** Two DuckDB processes on one bucket, one as the folder
-   and one as a committer, and the attach option's C++ side, which has
-   compiled only by inspection. The new options reach the library API
-   only; the extension's attach exposes the role, tailing, and poll.
+**End to end.** Two DuckDB processes on one bucket, one as the folder and
+one as a committer, and the attach option's C++ side, which has compiled
+only by inspection. The flush, poll, retention, and sprint thresholds
+reach the library API only; the extension's attach exposes the role,
+tailing, and poll.
 
 ## Alternatives considered
 

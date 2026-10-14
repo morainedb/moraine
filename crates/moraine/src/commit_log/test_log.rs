@@ -30,12 +30,12 @@ use super::{CommitLogProvider, SlotAdoption, SlotCommit, SlotCommitter, SlotEnve
 /// The row sequence the first slot takes, above anything a store wrote
 /// before adopting the log.
 const SEQUENCE_BASE: u64 = 1 << 32;
-/// The row sequences one slot reserves.
+/// The row sequences one slot reserves, unless a test shrinks it.
 const SEQUENCE_STRIDE: u64 = 1 << 20;
 
 /// The row sequence slot `ordinal` writes at.
-fn slot_sequence(ordinal: u64) -> u64 {
-    SEQUENCE_BASE.saturating_add(ordinal.saturating_mul(SEQUENCE_STRIDE))
+fn slot_sequence(stride: u64, ordinal: u64) -> u64 {
+    SEQUENCE_BASE.saturating_add(ordinal.saturating_mul(stride))
 }
 
 /// One log: what the bucket would hold, shared by every process over it.
@@ -56,6 +56,9 @@ struct Cursor {
     /// The base an adoption would fix: past the store's own WAL, as the
     /// last writer open saw it.
     candidate: AtomicU64,
+    /// Rows the store may write before the next replayed slot's number, as
+    /// of the last writer open.
+    headroom: AtomicU64,
 }
 
 impl std::fmt::Debug for TestLog {
@@ -105,7 +108,7 @@ impl TestLog {
             .unwrap_or(0)
     }
 
-    fn rows(sequence: u64, envelope: &SlotEnvelope) -> Vec<RowEntry> {
+    fn rows(stride: u64, sequence: u64, envelope: &SlotEnvelope) -> Vec<RowEntry> {
         let mut folded: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
         for write in envelope.writes() {
             folded.insert(write.key.clone(), write.value.clone());
@@ -124,7 +127,7 @@ impl TestLog {
                 value: value.map_or(ValueDeletable::Tombstone, |value| {
                     ValueDeletable::Value(Bytes::from(value))
                 }),
-                seq: slot_sequence(sequence),
+                seq: slot_sequence(stride, sequence),
                 create_ts: Some(read_at),
                 expire_ts: None,
             })
@@ -149,10 +152,21 @@ impl Cursor {
 }
 
 /// One process over a [`TestLog`], whatever store or path it is asked for.
-#[derive(Default)]
 pub(crate) struct TestProvider {
     pub(crate) log: Arc<TestLog>,
     cursor: Arc<Cursor>,
+    /// The row sequences one slot reserves.
+    stride: u64,
+}
+
+impl Default for TestProvider {
+    fn default() -> Self {
+        Self {
+            log: Arc::default(),
+            cursor: Arc::default(),
+            stride: SEQUENCE_STRIDE,
+        }
+    }
 }
 
 impl std::fmt::Debug for TestProvider {
@@ -170,7 +184,14 @@ impl TestProvider {
         Self {
             log: Arc::clone(&self.log),
             cursor: Arc::new(Cursor::default()),
+            stride: self.stride,
         }
+    }
+
+    /// A process whose slots reserve `stride` row sequences each, so a test
+    /// can run the folder out of headroom without a million rows.
+    pub(crate) fn with_rows_per_slot(self, stride: u64) -> Self {
+        Self { stride, ..self }
     }
 
     /// The last sequence this process reported applied.
@@ -196,6 +217,7 @@ impl CommitLogProvider for TestProvider {
         Box::new(TestWriterInit {
             log: Arc::clone(&self.log),
             cursor: Arc::clone(&self.cursor),
+            stride: self.stride,
         })
     }
 
@@ -208,6 +230,7 @@ impl CommitLogProvider for TestProvider {
         Arc::new(TestReader {
             log: Arc::clone(&self.log),
             cursor: Arc::clone(&self.cursor),
+            stride: self.stride,
             tail,
         })
     }
@@ -216,6 +239,7 @@ impl CommitLogProvider for TestProvider {
         Arc::new(TestCommitter {
             log: Arc::clone(&self.log),
             cursor: Arc::clone(&self.cursor),
+            stride: self.stride,
         })
     }
 
@@ -267,6 +291,7 @@ impl WalGc for TestGc {
 struct TestCommitter {
     log: Arc<TestLog>,
     cursor: Arc<Cursor>,
+    stride: u64,
 }
 
 impl std::fmt::Debug for TestCommitter {
@@ -348,6 +373,14 @@ impl SlotCommitter for TestCommitter {
         Ok(SlotAdoption::Adopted)
     }
 
+    fn rows_per_slot(&self) -> u64 {
+        self.stride
+    }
+
+    fn headroom(&self) -> u64 {
+        self.cursor.headroom.load(Ordering::Acquire)
+    }
+
     fn mark_folded(&self, sequence: u64) {
         let before = self.cursor.folded.fetch_max(sequence, Ordering::AcqRel);
         if sequence <= before {
@@ -384,6 +417,7 @@ impl SlotCommitter for TestCommitter {
 struct TestWriterInit {
     log: Arc<TestLog>,
     cursor: Arc<Cursor>,
+    stride: u64,
 }
 
 #[async_trait]
@@ -408,6 +442,17 @@ impl WriterInit for TestWriterInit {
             }
             None => (1, 0),
         };
+        // The store's own rows run from the last row in the tree, or the
+        // last slot replayed, up to the next slot's number.
+        let last_row = manifest.manifest().last_l0_seq().max(if end >= first {
+            slot_sequence(self.stride, end)
+        } else {
+            0
+        });
+        self.cursor.headroom.store(
+            slot_sequence(self.stride, end.saturating_add(1)).saturating_sub(last_row),
+            Ordering::Release,
+        );
 
         let state = Arc::new(Mutex::new(WriterState::default()));
         *self
@@ -420,6 +465,7 @@ impl WriterInit for TestWriterInit {
             replay_iterator: Box::new(TestIterator {
                 log: Arc::clone(&self.log),
                 cursor: Arc::clone(&self.cursor),
+                stride: self.stride,
                 next: first,
                 end: Bound::Included(end),
             }),
@@ -552,6 +598,7 @@ impl WalObserver for TestObserver {
 struct TestReader {
     log: Arc<TestLog>,
     cursor: Arc<Cursor>,
+    stride: u64,
     tail: bool,
 }
 
@@ -574,6 +621,7 @@ impl WalReader for TestReader {
         Ok(Box::new(TestIterator {
             log: Arc::clone(&self.log),
             cursor: Arc::clone(&self.cursor),
+            stride: self.stride,
             next: next.saturating_sub(base).max(1),
             end,
         }))
@@ -592,6 +640,7 @@ impl WalReader for TestReader {
 struct TestIterator {
     log: Arc<TestLog>,
     cursor: Arc<Cursor>,
+    stride: u64,
     next: u64,
     end: Bound<u64>,
 }
@@ -636,7 +685,7 @@ impl WalIterator for TestIterator {
         // Rows are handed back in WAL ids: the slot counted from the base.
         let base = self.log.wal_base().unwrap_or(0);
         Ok(Some(WalRows {
-            rows: TestLog::rows(sequence, &envelope),
+            rows: TestLog::rows(self.stride, sequence, &envelope),
             last_consumed_wal_file_id: base.saturating_add(sequence),
         }))
     }

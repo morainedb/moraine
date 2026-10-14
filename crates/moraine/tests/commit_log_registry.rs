@@ -98,6 +98,14 @@ impl SlotCommitter for NoCommits {
         ))
     }
 
+    fn rows_per_slot(&self) -> u64 {
+        u64::MAX
+    }
+
+    fn headroom(&self) -> u64 {
+        u64::MAX
+    }
+
     fn mark_folded(&self, _sequence: u64) {}
 
     async fn await_served(&self, _sequence: u64, _timeout: std::time::Duration) -> bool {
