@@ -622,3 +622,76 @@ async fn forgetting_the_head_view_resolves_it_from_the_store_again() {
     );
     catalog.close().await.unwrap();
 }
+
+/// The objects under the store's compactions prefix, which only a
+/// compaction coordinator writes.
+async fn compactions_objects(object_store: &Arc<InMemory>, path: &str) -> usize {
+    use futures::TryStreamExt;
+    use object_store::ObjectStore;
+
+    object_store
+        .list(Some(&object_store::path::Path::from(format!(
+            "{path}/compactions"
+        ))))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .len()
+}
+
+/// A writer under external compaction leaves compaction to another
+/// process: it never starts a coordinator, so nothing of one reaches the
+/// store, where a default writer's coordinator claims the store at open.
+#[tokio::test]
+async fn external_compaction_starts_no_coordinator() {
+    let object_store = Arc::new(InMemory::new());
+    let options = CatalogOptions {
+        path: "external".to_string(),
+        external_compaction: true,
+        ..CatalogOptions::default()
+    };
+    let catalog = Catalog::open(object_store.clone(), options.clone())
+        .await
+        .unwrap();
+    catalog
+        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .await
+        .unwrap();
+    catalog.close().await.unwrap();
+    assert_eq!(compactions_objects(&object_store, "external").await, 0);
+
+    let options = CatalogOptions {
+        path: "default".to_string(),
+        ..CatalogOptions::default()
+    };
+    let catalog = Catalog::open(object_store.clone(), options).await.unwrap();
+    catalog.close().await.unwrap();
+    assert!(compactions_objects(&object_store, "default").await > 0);
+}
+
+/// A provider may declare that its deployment compacts elsewhere; a writer
+/// opened over it starts no coordinator, like one asked to on its options.
+#[tokio::test]
+async fn a_provider_can_declare_external_compaction() {
+    use crate::commit_log::test_log::TestProvider;
+
+    let object_store = Arc::new(InMemory::new());
+    let options = CatalogOptions {
+        path: "declared".to_string(),
+        commit_log: Some(Arc::new(TestProvider::default().externally_compacted())),
+        ..CatalogOptions::default()
+    };
+    let catalog = Catalog::open(object_store.clone(), options).await.unwrap();
+    assert!(catalog.holds_store(), "the first open adopts and holds");
+    catalog.close().await.unwrap();
+    assert_eq!(compactions_objects(&object_store, "declared").await, 0);
+
+    let options = CatalogOptions {
+        path: "undeclared".to_string(),
+        commit_log: Some(Arc::new(TestProvider::default())),
+        ..CatalogOptions::default()
+    };
+    let catalog = Catalog::open(object_store.clone(), options).await.unwrap();
+    catalog.close().await.unwrap();
+    assert!(compactions_objects(&object_store, "undeclared").await > 0);
+}

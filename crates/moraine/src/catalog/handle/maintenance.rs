@@ -3,10 +3,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{StreamExt, TryStreamExt, stream};
+use object_store::ObjectStore;
 use tracing::info;
 
 use super::{Catalog, ReadOnlyCatalog};
@@ -21,7 +22,6 @@ use crate::{
     },
     error::{Error, Result},
     store::{
-        StagedBytes,
         census::{self as store_census, SegmentSize},
         compaction::{self as store_compaction, MergeEnd},
         handle::{ReadHandle, ScanShape},
@@ -32,9 +32,7 @@ use crate::{
         },
     },
     telemetry::milliseconds,
-    transaction::{
-        commit, index_maintenance, maintenance_status, staged::inline::inline_schema_undrop_write,
-    },
+    transaction::{commit, maintenance_status, staged::inline::inline_schema_undrop_write},
 };
 
 /// Batches between two progress records of one dead-range sweep.
@@ -133,6 +131,10 @@ pub struct MaintenanceRequest {
     pub sweep_orphaned_inline_tables: bool,
     /// Maximum entries deleted per commit. Must be nonzero.
     pub batch_size: usize,
+    /// Time between two batches when they commit through a commit log,
+    /// where each is a slot every other committer races against. Ignored
+    /// on a store without one.
+    pub pace: Duration,
 }
 
 impl Default for MaintenanceRequest {
@@ -141,7 +143,8 @@ impl Default for MaintenanceRequest {
             sweep_orphaned_index_entries: true,
             sweep_orphaned_file_column_stats: true,
             sweep_orphaned_inline_tables: true,
-            batch_size: 8192,
+            batch_size: 65_536,
+            pace: Duration::from_secs(1),
         }
     }
 }
@@ -191,6 +194,7 @@ impl MaintenanceStatusStep {
 
 /// One completed maintenance pass in the catalog's durable status history.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MaintenanceStatusPass {
     /// When the pass began.
     pub started_at: Timestamp,
@@ -198,6 +202,15 @@ pub struct MaintenanceStatusPass {
     pub trigger: String,
     /// Steps in execution order.
     pub steps: Vec<MaintenanceStatusStep>,
+    /// The head snapshot the pass was recorded against. Set when recorded.
+    pub head_snapshot_id: u64,
+    /// The head's batch counter when the pass was recorded, which on a
+    /// commit log is what the record's slot sequence derives from. Set when
+    /// recorded.
+    pub head_batch_seq: u64,
+    /// Whether the pass left work for a later one: files scheduled for
+    /// deletion still inside their grace period, or a merge still pending.
+    pub work_pending: bool,
 }
 
 impl MaintenanceStatusPass {
@@ -212,7 +225,17 @@ impl MaintenanceStatusPass {
             started_at,
             trigger: trigger.into(),
             steps,
+            head_snapshot_id: 0,
+            head_batch_seq: 0,
+            work_pending: false,
         }
+    }
+
+    /// Marks whether the pass left work for a later one.
+    #[must_use]
+    pub fn with_work_pending(mut self, pending: bool) -> Self {
+        self.work_pending = pending;
+        self
     }
 }
 
@@ -339,8 +362,17 @@ impl ReadOnlyCatalog {
         };
         let (physical, live) = futures::try_join!(physical, live)?;
 
-        // Every subspace is reported, whether or not the manifest carries a
-        // segment for it, so two censuses stay comparable row by row.
+        Ok(assemble_census(&physical, &live))
+    }
+}
+
+/// Lays a census out: every subspace reported, whether or not the manifest
+/// carries a segment for it, so two censuses stay comparable row by row.
+fn assemble_census(
+    physical: &store_census::ManifestCensus,
+    live: &[(Subspace, LiveCount)],
+) -> StoreCensus {
+    {
         let mut subspaces: Vec<SubspaceCensus> = Subspace::ALL
             .into_iter()
             .map(|subspace| {
@@ -366,10 +398,10 @@ impl ReadOnlyCatalog {
                 .map(|segment| measure(SubspaceName::of_prefix(&segment.prefix), Some(segment))),
         );
 
-        Ok(StoreCensus {
+        StoreCensus {
             manifest_id: physical.manifest_id,
             subspaces,
-            objects: physical.objects.map(|totals| StoreObjects {
+            objects: physical.objects.as_ref().map(|totals| StoreObjects {
                 total_objects: totals.total_objects,
                 total_bytes: totals.total_bytes,
                 wal_objects: totals.wal_objects,
@@ -381,9 +413,37 @@ impl ReadOnlyCatalog {
                 other_objects: totals.other_objects,
                 other_bytes: totals.other_bytes,
             }),
-        })
+        }
     }
+}
 
+impl Catalog {
+    /// The manifest leg of a store census, read without opening the
+    /// catalog: what the store weighs per subspace as of its latest
+    /// manifest, in two object reads plus one listing. The live leg needs
+    /// an open handle; see [`ReadOnlyCatalog::store_census`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be read.
+    pub async fn store_census_of(
+        object_store: Arc<dyn ObjectStore>,
+        options: &super::CatalogOptions,
+    ) -> Result<StoreCensus> {
+        let object_store = crate::store::retry::Store::wrap(object_store);
+        let wal_object_store = options
+            .wal_store
+            .as_ref()
+            .map(|wal| crate::store::retry::Store::wrap(Arc::clone(wal.object_store())));
+        let physical =
+            store_census::read_manifest_census(&options.path, object_store, wal_object_store)
+                .await?;
+
+        Ok(assemble_census(&physical, &[]))
+    }
+}
+
+impl ReadOnlyCatalog {
     /// The lowest index id at or after `from` holding an entry of `kind`,
     /// or `None` past the last one. The scan stops at the first live key
     /// but must read ahead: a swept index leaves its whole range as
@@ -437,8 +497,8 @@ impl Catalog {
     }
 
     /// Deletes up to `limit` orphaned entries of a dropped index, in one
-    /// bounded batch outside the commit protocol. Returns the number
-    /// deleted; a host loops until it returns 0.
+    /// bounded head-preserving batch, durable before it returns. Returns
+    /// the number deleted; a host loops until it returns 0.
     ///
     /// # Errors
     ///
@@ -456,22 +516,33 @@ impl Catalog {
             )));
         }
 
-        self.reserve_own_rows(u64::try_from(limit).unwrap_or(u64::MAX))
-            .await?;
-        let tx = self.begin_write_tx().await?;
-        let mut staged = StagedBytes::default();
-        let deleted =
-            index_maintenance::reclaim_entries(&tx, index.get(), limit, &mut staged).await?;
-        commit::commit_durable(
-            tx,
-            "entry reclamation",
-            staged,
-            &self.store().commit_durability(),
-        )
-        .await
-        .map_err(Error::from)?;
+        let mut deletes: Vec<commit::StagedWrite> = Vec::new();
+        let session = self.begin_read().await?;
+        for kind in [IndexKind::Unique, IndexKind::Multi] {
+            if deletes.len() >= limit {
+                break;
+            }
+            let mut entries = session
+                .handle()
+                .scan_prefix(index_index_prefix(kind, index.get()), .., ScanShape::Bulk)
+                .await?;
+            while deletes.len() < limit {
+                match entries.next().await? {
+                    Some(entry) => deletes.push((entry.key.to_vec(), None)),
+                    None => break,
+                }
+            }
+        }
+        session.finish();
 
-        Ok(deleted)
+        let reclaimed = deletes.len();
+        if reclaimed > 0 {
+            // Durable before returning: a host resumes from this batch, so
+            // a crash after it must not take it back.
+            self.commit_own_rows_durably(deletes).await?;
+        }
+
+        Ok(reclaimed)
     }
 
     /// Runs one maintenance pass, reclaiming what only moraine knows is
@@ -498,7 +569,7 @@ impl Catalog {
     /// ```
     pub async fn maintain(&self, request: MaintenanceRequest) -> Result<MaintenanceReport> {
         // Refused before the nothing-to-do shortcut too.
-        self.writer()?;
+        self.require_writes()?;
         if request.batch_size == 0 {
             return Err(Error::Configuration(
                 "batch_size must be nonzero; zero would reclaim nothing and never terminate"
@@ -509,12 +580,12 @@ impl Catalog {
         let mut report = MaintenanceReport::default();
         if request.sweep_orphaned_file_column_stats {
             report.file_column_stats_reclaimed = self
-                .reclaim_orphaned_file_column_stats(request.batch_size)
+                .reclaim_orphaned_file_column_stats(request.batch_size, request.pace)
                 .await?;
         }
         if request.sweep_orphaned_inline_tables {
             let (tables, records) = self
-                .reclaim_orphaned_inline_tables(request.batch_size)
+                .reclaim_orphaned_inline_tables(request.batch_size, request.pace)
                 .await?;
             report.inline_tables_swept = tables;
             report.inline_records_reclaimed = records;
@@ -538,7 +609,7 @@ impl Catalog {
             while let Some(index_id) = self.first_index_id_from(kind, from).await? {
                 if !live.contains(&index_id) {
                     let reclaimed = self
-                        .reclaim_dead_range(kind, index_id, request.batch_size)
+                        .reclaim_dead_range(kind, index_id, request.batch_size, request.pace)
                         .await?;
                     if reclaimed > 0 {
                         report.indexes_swept += 1;
@@ -647,7 +718,7 @@ impl Catalog {
         reason = "the method keeps one ordered submit, await, classify, and measure protocol"
     )]
     pub async fn compact_store(&self, request: CompactStoreRequest) -> Result<CompactStoreReport> {
-        self.writer()?;
+        self.require_writes()?;
         if request.require_completed && request.wait.is_none() {
             return Err(Error::Configuration(
                 "require_completed needs a nonzero wait budget".to_owned(),
@@ -827,7 +898,11 @@ impl Catalog {
     /// Deletes every `inline/*` record of a table the catalog records
     /// nowhere, `batch_size` keys per commit. Returns the tables swept and
     /// the keys deleted.
-    async fn reclaim_orphaned_inline_tables(&self, batch_size: usize) -> Result<(u64, u64)> {
+    async fn reclaim_orphaned_inline_tables(
+        &self,
+        batch_size: usize,
+        pace: Duration,
+    ) -> Result<(u64, u64)> {
         let session = self.begin_read().await?;
         let registered = store_inline::scan_all_inline_schema_keys(session.handle()).await;
         session.finish();
@@ -851,18 +926,13 @@ impl Catalog {
             }
 
             for batch in keys.chunks(batch_size) {
-                self.reserve_own_rows(batch.len() as u64).await?;
-                let tx = self.begin_write_tx().await?;
-                for key in batch {
-                    tx.delete(key.clone()).map_err(Error::from)?;
-                }
-                // Non-durable: the deletes are idempotent, so a batch lost
-                // to a crash leaves records a later pass rediscovers.
-                tx.commit().await.map_err(Error::from)?;
+                self.commit_own_rows(batch.iter().map(|key| (key.clone(), None)).collect())
+                    .await?;
                 reclaimed += batch.len() as u64;
+                self.pace_own_rows(pace).await;
             }
-            // The batches bypassed the commit protocol, so the maintained
-            // projections still hold what they removed.
+            // Inlined keys fold into no projection, so the maintained ones
+            // still hold what the batches removed.
             invalidate_current_state(&self.projections);
             swept += 1;
             info!(
@@ -878,7 +948,11 @@ impl Catalog {
     /// Deletes the statistics of every data file absent from both live
     /// state and history, `batch_size` per commit, and returns how many
     /// records went.
-    async fn reclaim_orphaned_file_column_stats(&self, batch_size: usize) -> Result<u64> {
+    async fn reclaim_orphaned_file_column_stats(
+        &self,
+        batch_size: usize,
+        pace: Duration,
+    ) -> Result<u64> {
         let snapshot = self.snapshot().await?;
         let historical = self.historical_data_files().await?;
 
@@ -900,24 +974,28 @@ impl Catalog {
 
         let mut total = 0u64;
         for batch in victims.chunks(batch_size) {
-            self.reserve_own_rows(batch.len() as u64).await?;
-            let tx = self.begin_write_tx().await?;
-            for entity in batch {
-                tx.delete(Key::current(*entity).encode())
-                    .map_err(Error::from)?;
-            }
-            // Non-durable: the deletes are idempotent, so a batch lost to a
-            // crash leaves records a later pass rediscovers.
-            tx.commit().await.map_err(Error::from)?;
-            // This batch bypassed the commit protocol, so nothing folded it
-            // into the maintained projections and the head stamp they key on
-            // did not move. Unless they are dropped here, the writer keeps
-            // serving the records the batch removed — and every later pass
-            // rediscovers the same victims.
-            invalidate_current_state(&self.projections);
+            // A head-preserving commit: the deletes fold into the maintained
+            // projections like any commit's, and the head stamp moves.
+            self.commit_own_rows(
+                batch
+                    .iter()
+                    .map(|entity| (Key::current(*entity).encode(), None))
+                    .collect(),
+            )
+            .await?;
             total += batch.len() as u64;
+            self.pace_own_rows(pace).await;
         }
         Ok(total)
+    }
+
+    /// Waits `pace` between two batches of this handle's own rows when they
+    /// commit through a commit log, where each is a slot every other
+    /// committer races against. Direct writes contend with nobody.
+    async fn pace_own_rows(&self, pace: Duration) {
+        if self.commits_through_log() && !pace.is_zero() {
+            tokio::time::sleep(pace).await;
+        }
     }
 
     /// Deletes every entry of one dead index: one streaming scan of the
@@ -929,39 +1007,37 @@ impl Catalog {
         kind: IndexKind,
         index_id: u64,
         batch_size: usize,
+        pace: Duration,
     ) -> Result<u64> {
         let started = Instant::now();
         // One scan for the whole range. Its snapshot predates every delete
         // below, so it never revisits a key; a scan per batch would pay a
         // seek and a fresh read-ahead for every commit.
-        let db = self.writer()?;
-        let mut entries = ReadHandle::Writer(&db)
+        let session = self.begin_read().await?;
+        let mut entries = session
+            .handle()
             .scan_prefix(index_index_prefix(kind, index_id), .., ScanShape::Bulk)
             .await?;
 
         let mut total = 0u64;
         let mut batches = 0u64;
         loop {
-            self.reserve_own_rows(batch_size as u64).await?;
-            let tx = self.begin_write_tx().await?;
-            let mut deleted = 0usize;
-            while deleted < batch_size {
+            let mut deletes: Vec<commit::StagedWrite> = Vec::with_capacity(batch_size);
+            while deletes.len() < batch_size {
                 match entries.next().await? {
-                    Some(entry) => {
-                        tx.delete(entry.key)?;
-                        deleted = deleted.saturating_add(1);
-                    }
+                    Some(entry) => deletes.push((entry.key.to_vec(), None)),
                     None => break,
                 }
             }
-            if deleted == 0 {
-                tx.rollback();
+            if deletes.is_empty() {
                 break;
             }
-            // Non-durable: the deletes are idempotent, so a batch lost to a
-            // crash leaves entries a later pass rediscovers.
-            tx.commit().await.map_err(Error::from)?;
-            total = total.saturating_add(deleted as u64);
+            let batch = deletes.len() as u64;
+            // A head-preserving commit per batch; the deletes are
+            // idempotent, so a batch lost to a crash leaves entries a later
+            // pass rediscovers.
+            self.commit_own_rows(deletes).await?;
+            total = total.saturating_add(batch);
             batches = batches.saturating_add(1);
             if batches.is_multiple_of(SWEEP_PROGRESS_BATCHES) {
                 info!(
@@ -973,7 +1049,10 @@ impl Catalog {
                     "reclaiming a dead index's entries"
                 );
             }
+            self.pace_own_rows(pace).await;
         }
+        drop(entries);
+        session.finish();
 
         info!(
             kind = ?kind,

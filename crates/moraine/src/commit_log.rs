@@ -198,6 +198,17 @@ pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
     /// The plug SlateDB's garbage collector truncates the log through: it
     /// deletes slots below every range a live manifest still references.
     fn garbage_collector(&self, log_store: Arc<dyn ObjectStore>, path: &str) -> Arc<dyn WalGc>;
+
+    /// Whether another process compacts and collects the stores opened
+    /// over this provider. A writer then starts neither SlateDB's
+    /// compactor nor its collector, as [`CatalogOptions::external_compaction`]
+    /// would make it; the two fence each other otherwise. Defaults to
+    /// `false`.
+    ///
+    /// [`CatalogOptions::external_compaction`]: crate::CatalogOptions::external_compaction
+    fn external_compaction(&self) -> bool {
+        false
+    }
 }
 
 static REGISTERED: OnceLock<Arc<dyn CommitLogProvider>> = OnceLock::new();
@@ -255,9 +266,6 @@ pub(crate) struct LogCommitter {
     /// Slots folded since this open, each buying the folder's own rows
     /// another slot's worth of sequence numbers.
     pub(crate) folds_since_open: Arc<AtomicU64>,
-    /// Rows the folder has written for itself since this open, outside any
-    /// slot: the sweeps.
-    pub(crate) own_rows_since_open: Arc<AtomicU64>,
     /// How a holder flushes and truncates.
     pub(crate) flushing: Flushing,
 }
@@ -415,7 +423,6 @@ impl LogCommitter {
             fold_poll: Some(fold_poll),
         });
         self.folds_since_open.store(0, Ordering::Release);
-        self.own_rows_since_open.store(0, Ordering::Release);
         tracing::info!("took the store");
     }
 
@@ -496,28 +503,6 @@ impl LogCommitter {
         flushing.collector.run().await;
 
         Ok(())
-    }
-
-    /// Whether the folder may write `rows` more rows for itself before they
-    /// reach the number the next replayed slot takes, keeping an eighth of
-    /// a slot in hand.
-    pub(crate) fn has_headroom(&self, rows: u64) -> bool {
-        let stride = self.committer.rows_per_slot();
-        let available = self
-            .committer
-            .headroom()
-            .saturating_add(
-                self.folds_since_open
-                    .load(Ordering::Acquire)
-                    .saturating_mul(stride),
-            )
-            .saturating_sub(self.own_rows_since_open.load(Ordering::Acquire));
-        available > rows.saturating_add(stride / 8)
-    }
-
-    /// Counts `rows` the folder wrote for itself.
-    pub(crate) fn note_own_rows(&self, rows: u64) {
-        self.own_rows_since_open.fetch_add(rows, Ordering::AcqRel);
     }
 
     /// Writes the folder's memtable out and truncates the log, whatever the

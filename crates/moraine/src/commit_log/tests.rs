@@ -639,20 +639,16 @@ async fn a_committer_sprints_at_close_when_the_tail_is_long() {
     folded_only.close().await.unwrap();
 }
 
-/// The folder's own rows outside a slot must stay below the next replayed
-/// slot's number: when they would not, the folder commits empty
-/// head-preserving slots first, each buying another slot's worth.
+/// Rows a handle writes for itself, the sweeps and the status record,
+/// land as head-preserving slots: one slot each, carrying the rows and
+/// exactly one head stamp at the standing snapshot.
 #[tokio::test]
-async fn the_folder_advances_the_log_ahead_of_its_own_rows() {
+async fn a_handles_own_rows_land_as_head_preserving_slots() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
-    let provider = Arc::new(TestProvider::default().with_rows_per_slot(64));
-
-    // Before any replay the store's own rows sit far below the first
-    // slot's number; the headroom only tightens once an open has replayed
-    // a slot at its number. So: adopt, close, let a peer land, reopen.
+    let provider = Arc::new(TestProvider::default());
     let folder = Catalog::open(
-        object_store.clone(),
+        object_store,
         CatalogOptions {
             commit_log: Some(provider.clone()),
             ..options_at("lake")
@@ -664,43 +660,29 @@ async fn the_folder_advances_the_log_ahead_of_its_own_rows() {
         .commit(|tx| tx.create_schema("a").map(|_| ()))
         .await
         .unwrap();
-    folder.close().await.unwrap();
-    provider
-        .log
-        .land(3, peer_slot(&provider, 3, b"\xffpeer", b"landed"));
-    let folder = Catalog::open(
-        object_store,
-        CatalogOptions {
-            commit_log: Some(provider.clone()),
-            ..options_at("lake")
-        },
-    )
-    .await
-    .unwrap();
-    assert!(folder.take_store().await.unwrap(), "taken on request");
     let before = provider.log.slots().len();
     let head_before = folder.snapshot().await.unwrap().current_snapshot().id;
 
-    // Three slots' worth of rows, in one reservation.
-    folder.reserve_own_rows(200).await.unwrap();
+    folder
+        .commit_own_rows(vec![(b"\xffown".to_vec(), Some(b"row".to_vec()))])
+        .await
+        .unwrap();
 
     let slots = provider.log.slots();
-    assert!(
-        slots.len() >= before + 3,
-        "advanced by empty slots: {} -> {}",
-        before,
-        slots.len()
-    );
+    assert_eq!(slots.len(), before + 1, "one slot per batch of own rows");
     let head_key = Key::Sys(SysKey::Head).encode();
-    for (_, envelope) in &slots[before..] {
-        let stamps: Vec<proto::HeadValue> = envelope
-            .writes()
-            .filter(|write| write.key == head_key)
-            .map(|write| value::decode_value(write.value.as_ref().unwrap()).unwrap())
-            .collect();
-        assert_eq!(stamps.len(), 1);
-        assert_eq!(stamps[0].snapshot_id, head_before.get(), "head-preserving");
-    }
+    let (_, envelope) = &slots[before];
+    let stamps: Vec<proto::HeadValue> = envelope
+        .writes()
+        .filter(|write| write.key == head_key)
+        .map(|write| value::decode_value(write.value.as_ref().unwrap()).unwrap())
+        .collect();
+    assert_eq!(stamps.len(), 1);
+    assert_eq!(stamps[0].snapshot_id, head_before.get(), "head-preserving");
+    assert!(
+        envelope.writes().any(|write| write.key == b"\xffown"),
+        "the slot carries the rows"
+    );
     assert_eq!(
         folder.snapshot().await.unwrap().current_snapshot().id,
         head_before

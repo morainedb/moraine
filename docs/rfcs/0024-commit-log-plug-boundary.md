@@ -199,8 +199,9 @@ committer's commits nothing locally and waits, bounded, for its reader to
 be served the sequence, so its next read sees its own commit. A loss
 folds the winners into the folder's store, or waits for the committer's
 reader to be served them, before the existing lost-race outcome returns.
-Folder-only operations — maintenance, migration, the log-store move —
-refuse a committer.
+Migration and the log-store move refuse a committer; maintenance runs on
+one, since its sweeps and status record are head-preserving slots and its
+merge is a submission.
 
 **The extension.** A read-write attach with a registered provider is a
 committer; a read-only attach is a reader. `COMMIT_LOG_TAIL` makes a
@@ -224,10 +225,9 @@ stamp, and a batch races the slot its own stamp's counter implies. A
 stale head names a taken slot and loses, which re-prepares correctly.
 The served signal remains a hint for when to read again. A folded slot
 carrying any other number of head stamps is refused as corruption.
-Direct writes the folder makes for itself — the format raise,
-maintenance status, the sweep's tombstones — stamp no head, and
-migration refuses a log-resident store, so nothing moves the counter
-outside a slot.
+The one direct write a holder still makes for itself, the format raise,
+stamps no head, and migration refuses a log-resident store, so nothing
+moves the counter outside a slot.
 
 ### Folding, flushing, truncation, and the sprint
 
@@ -266,33 +266,32 @@ outside a slot.
   which then demotes and reports nothing. The first committer
   to find an unadopted log takes the store and adopts it. The threshold sits well above the flush count, so a holder
   doing its job is never taken from. There is no role to select:
-  `Catalog::take_store` takes the store now for a process about to run
-  maintenance, which writes into the store directly, and
+  `Catalog::take_store` takes the store on request, and
   `Catalog::fold_sprint` takes it for one fold and closes, for a job with
-  no session to keep. A committer that never took the store sprints at
-  close if the tail is long. A read-only open is a reader and never
-  commits.
+  no session to keep. Maintenance takes nothing: its batches are slots. A
+  committer that never took the store sprints at close if the tail is
+  long. A read-only open is a reader and never commits.
 
 ### The folder's own rows
 
 A replayed slot's rows take the sequence numbers `base + k × rows_per_slot`
 for slot `k`, and a replay skips rows below what the tree already holds.
-So once an open has replayed a slot, the rows the folder writes for
-itself outside any slot — the sweeps — must stay below the next slot's
-number, or the next replay after a crash would skip that slot. The plug
-reports the headroom as of the writer's open, every fold since buys
-another slot's worth, and the sweeps reserve their batch before writing
-it: when the headroom runs short the folder commits an empty
-head-preserving slot first. Before any replay the headroom is the whole
-distance to the first slot's number, which no sweep reaches.
+So once an open has replayed a slot, any row the folder wrote for itself
+outside a slot would have to stay below the next slot's number, or the
+next replay after a crash would skip that slot. The folder writes none:
+the sweeps and the status record are head-preserving slots, and the
+format raise, the one direct write left, is a single row from an
+operator's verb, well inside the headroom any fold leaves.
 
 ### What remains
 
-**End to end.** Two DuckDB processes on one bucket, one as the folder and
-one as a committer, and the attach option's C++ side, which has compiled
-only by inspection. The flush, poll, retention, and sprint thresholds
-reach the library API only; the extension's attach exposes tailing and
-the poll.
+**End to end.** Two DuckDB processes on one local store, one holding and
+one committing, each seeing the other's slots and a pass from the second
+fencing neither, run in the library's repository against the extension it
+builds. The same against a bucket, and the attach option's C++ side, which
+has compiled only by inspection, remain. The flush, poll, retention, and
+sprint thresholds reach the library API only; the extension's attach
+exposes tailing and the poll.
 
 ## Alternatives considered
 

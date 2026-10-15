@@ -339,6 +339,8 @@ typedef struct MoraineMaintenanceStatusRow {
   char *status;
   // Human-readable outcome detail, owned.
   char *detail;
+  // Whether the pass left work for a later one.
+  bool work_pending;
 } MoraineMaintenanceStatusRow;
 
 // One subspace's row of a store census, as returned by
@@ -1909,7 +1911,9 @@ int32_t moraine_maintain(struct MoraineCatalogHandle *handle,
                          void *probe_ctx,
                          struct MoraineError *err);
 
-// Durably records one completed maintenance pass.
+// Durably records one completed maintenance pass. `work_pending` says
+// whether the pass left work for a later one: a step that failed, or a
+// merge still pending.
 //
 // # Safety
 //
@@ -1922,6 +1926,7 @@ int32_t moraine_maintenance_status_record(struct MoraineCatalogHandle *handle,
                                           const char *trigger,
                                           const struct MoraineMaintenanceStatusStepInput *steps,
                                           size_t steps_len,
+                                          bool work_pending,
                                           struct MoraineError *err);
 
 // Lists durable maintenance status, newest pass first and step order within

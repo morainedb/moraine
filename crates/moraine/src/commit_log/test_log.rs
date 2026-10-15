@@ -157,6 +157,7 @@ impl Cursor {
 pub(crate) struct TestProvider {
     pub(crate) log: Arc<TestLog>,
     cursor: Arc<Cursor>,
+    external_compaction: bool,
     /// The row sequences one slot reserves.
     stride: u64,
 }
@@ -166,6 +167,7 @@ impl Default for TestProvider {
         Self {
             log: Arc::default(),
             cursor: Arc::default(),
+            external_compaction: false,
             stride: SEQUENCE_STRIDE,
         }
     }
@@ -186,14 +188,17 @@ impl TestProvider {
         Self {
             log: Arc::clone(&self.log),
             cursor: Arc::new(Cursor::default()),
+            external_compaction: self.external_compaction,
             stride: self.stride,
         }
     }
 
-    /// A process whose slots reserve `stride` row sequences each, so a test
-    /// can run the folder out of headroom without a million rows.
-    pub(crate) fn with_rows_per_slot(self, stride: u64) -> Self {
-        Self { stride, ..self }
+    /// A provider whose deployment compacts in another process.
+    pub(crate) fn externally_compacted(self) -> Self {
+        Self {
+            external_compaction: true,
+            ..self
+        }
     }
 
     /// The last sequence this process reported applied.
@@ -222,6 +227,10 @@ impl TestProvider {
 }
 
 impl CommitLogProvider for TestProvider {
+    fn external_compaction(&self) -> bool {
+        self.external_compaction
+    }
+
     fn writer_init(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Box<dyn WriterInit> {
         Box::new(TestWriterInit {
             log: Arc::clone(&self.log),
