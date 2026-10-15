@@ -1820,6 +1820,25 @@ impl Catalog {
     /// [`MAX_COMMIT_ATTEMPTS`](commit::MAX_COMMIT_ATTEMPTS) lost races, or
     /// the store's error.
     pub(crate) async fn commit_own_rows(&self, writes: Vec<commit::StagedWrite>) -> Result<()> {
+        self.commit_own_rows_with(writes, false).await
+    }
+
+    /// As [`commit_own_rows`](Self::commit_own_rows), returning once the
+    /// store has made the batch durable, for a batch a crash must not take
+    /// back: the per-index reclamation a host resumes from where it
+    /// stopped.
+    pub(crate) async fn commit_own_rows_durably(
+        &self,
+        writes: Vec<commit::StagedWrite>,
+    ) -> Result<()> {
+        self.commit_own_rows_with(writes, true).await
+    }
+
+    async fn commit_own_rows_with(
+        &self,
+        writes: Vec<commit::StagedWrite>,
+        await_durable: bool,
+    ) -> Result<()> {
         for _ in 0..commit::MAX_COMMIT_ATTEMPTS {
             let session = self.store.begin_commit_session().await?;
             let base = commit::head_view_for(session.handle(), &self.projections).await?;
@@ -1846,6 +1865,15 @@ impl Catalog {
             .await?;
             match submitted {
                 commit::Submission::LostRace => {}
+                commit::Submission::Submitted(submitted) if await_durable => {
+                    commit::await_submitted(
+                        submitted,
+                        &self.projections,
+                        &self.store.commit_durability(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 // The batch is in the store; nothing waits on its flush.
                 commit::Submission::Submitted(_) => return Ok(()),
             }

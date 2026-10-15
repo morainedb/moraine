@@ -497,8 +497,8 @@ impl Catalog {
     }
 
     /// Deletes up to `limit` orphaned entries of a dropped index, in one
-    /// bounded batch outside the commit protocol. Returns the number
-    /// deleted; a host loops until it returns 0.
+    /// bounded head-preserving batch, durable before it returns. Returns
+    /// the number deleted; a host loops until it returns 0.
     ///
     /// # Errors
     ///
@@ -537,7 +537,9 @@ impl Catalog {
 
         let reclaimed = deletes.len();
         if reclaimed > 0 {
-            self.commit_own_rows(deletes).await?;
+            // Durable before returning: a host resumes from this batch, so
+            // a crash after it must not take it back.
+            self.commit_own_rows_durably(deletes).await?;
         }
 
         Ok(reclaimed)
