@@ -827,9 +827,13 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
 	// time, so the open writes nothing at all; the ABI refuses it on a
 	// read-write attach.
+	// `READER_POLL_INTERVAL_MS` is how often a read-only attach looks for
+	// what a writer has committed, and so how stale its reads may be.
+	// Longer is cheaper and staler, for a dashboard attached for the day.
 	bool encrypted = false;
 	uint64_t flush_interval_ms = 0;
 	bool flush_on_commit = false;
+	uint64_t reader_poll_interval_ms = 0;
 	std::string cache_dir;
 	uint64_t cache_size_bytes = 0;
 	uint64_t cache_memory_bytes = 0;
@@ -853,10 +857,12 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// attach is a committer and a read-only attach is a reader.
 	// `COMMIT_LOG_TAIL` makes a read-only attach tail the log;
 	// `COMMIT_LOG_POLL_INTERVAL_MS` is how often a committer's reader polls
-	// for slots. Both are ignored without a registered provider.
+	// for slots; `COMMIT_LOG_HOLD false` keeps a committer from taking the
+	// store while attached. All are ignored without a registered provider.
 	MoraineCommitLog commit_log {};
 	commit_log.tail = false;
 	commit_log.poll_interval_ms = 0;
+	commit_log.hold = true;
 	bool commit_log_given = false;
 	// `MAINTENANCE_*` configures the scheduled pass: the cadence, and
 	// which of DuckLake's own maintenance functions it runs. Every step
@@ -884,6 +890,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			flush_interval_ms = requested == 0 ? UINT64_MAX : requested;
 		} else if (name == "flush_on_commit") {
 			flush_on_commit = option.second.GetValue<bool>();
+		} else if (name == "reader_poll_interval_ms") {
+			reader_poll_interval_ms = option.second.GetValue<uint64_t>();
 		} else if (name == "cache_dir") {
 			cache_dir = option.second.GetValue<std::string>();
 		} else if (name == "cache_size") {
@@ -918,6 +926,9 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 		} else if (name == "commit_log_poll_interval_ms") {
 			commit_log.poll_interval_ms = option.second.GetValue<uint64_t>();
 			commit_log_given = true;
+		} else if (name == "commit_log_hold") {
+			commit_log.hold = option.second.GetValue<bool>();
+			commit_log_given = true;
 		}
 	}
 	// The backing strings must outlive the attach call, so they live
@@ -939,7 +950,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
 	auto code = moraine_attach_with_commit_log(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted,
-	                                           flush_interval_ms, flush_on_commit,
+	                                           flush_interval_ms, flush_on_commit, reader_poll_interval_ms,
 	                                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes,
 	                                           cache_memory_bytes, static_cast<uint32_t>(cache_auxiliary_percent),
 	                                           cache_preload, cache_puts, cache_compaction_puts,

@@ -47,7 +47,7 @@ use crate::{
             view_head,
         },
     },
-    commit_log::LogCommitter,
+    commit_log::{LogCommitter, demand::ReadDemand},
     data_file,
     error::{Error, Result},
     store::{
@@ -274,12 +274,17 @@ pub struct CatalogOptions {
     /// provider, and to the store's own log when none is registered.
     pub commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
     /// Whether a read-only open over a commit log tails the log, seeing a
-    /// commit the moment its slot lands at a listing per poll, rather than
-    /// following the folded store. Defaults to `false`.
+    /// commit once its slot lands rather than once a folder has folded it,
+    /// at a listing per
+    /// [`reader_poll_interval`](Self::reader_poll_interval). Defaults to
+    /// `false`.
     pub commit_log_tail: bool,
-    /// How often a committer's reader polls for slots other committers
-    /// landed; it also bounds how long a commit waits to see its own slot.
-    /// Defaults to 50ms.
+    /// How often a committer's reader polls; it bounds how long a commit
+    /// waits to see its own slot, and so is far shorter than any read
+    /// needs. The poll lists the log only while a commit waits or a read
+    /// has asked, which reads do no more often than
+    /// [`reader_poll_interval`](Self::reader_poll_interval); an idle
+    /// committer lists nothing. Defaults to 50ms.
     pub commit_log_poll_interval: Duration,
     /// How many slots the folder folds before it writes its memtable out
     /// and truncates the log below the replay point. A cold open replays
@@ -298,6 +303,12 @@ pub struct CatalogOptions {
     /// doing its job is never fenced by one. Zero never sprints. Defaults
     /// to 1024.
     pub commit_log_sprint_slots: u64,
+    /// Whether a committer holds the store while open: takes it when the
+    /// tail is past [`commit_log_sprint_slots`](Self::commit_log_sprint_slots)
+    /// or the log is unadopted, and folds peers' slots into it on a poll.
+    /// `false` gives an adopted store straight back and leaves a long tail
+    /// to the sprint at close. Defaults to `true`.
+    pub commit_log_hold: bool,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -370,8 +381,18 @@ pub struct CatalogOptions {
     /// This is a reader's freshness bound: nothing pushes a commit to it,
     /// so a read-only catalog can be one poll interval behind the writer,
     /// and its cached view is served for exactly that long. Shorter means
-    /// fresher reads and more (on S3, billed) manifest and WAL listings.
-    /// Defaults to 10 seconds. Ignored by [`Catalog::open`], which reads
+    /// fresher reads and more (on S3, billed) manifest and log reads.
+    /// Defaults to 10 seconds.
+    ///
+    /// It is a committer's bound too, though a committer polls at
+    /// [`commit_log_poll_interval`](Self::commit_log_poll_interval): the
+    /// faster poll is for a commit to see its own slot, and the log is
+    /// listed for a read only once this long has passed since the last
+    /// listing. A read that finds the last listing older than that waits
+    /// for a fresh one rather than be served what it left, so an idle
+    /// committer costs nothing and still reads within the bound.
+    ///
+    /// Ignored by a [`Catalog::open`] without a commit log, which reads
     /// its own writes, and by a catalog pinned to a
     /// [`checkpoint`](Self::checkpoint), which polls for nothing.
     pub reader_poll_interval: Duration,
@@ -402,6 +423,7 @@ impl Default for CatalogOptions {
             commit_log_fold_poll: Duration::from_secs(2),
             commit_log_retention: Duration::from_mins(5),
             commit_log_sprint_slots: 1024,
+            commit_log_hold: true,
             cache_dir: None,
             cache_identity: None,
             cache_size: None,
@@ -512,6 +534,8 @@ async fn open_writer_store(
                 guard: Arc::new(tokio::sync::Mutex::new(())),
                 folds_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 flushing: flushing_for(provider.as_ref(), options, &object_store, &log_store),
+                // A folder reads through the store it holds; nothing lists.
+                demand: ReadDemand::new(Duration::ZERO),
             };
             if format >= FORMAT_WITH_COMMIT_LOG {
                 log.batch_origin = commit::batch_origin(ReadHandle::Writer(&db)).await?;
@@ -574,7 +598,7 @@ struct Taker {
 impl crate::commit_log::StoreTaker for Taker {
     async fn take_if_stalled(&self, log: &LogCommitter) -> Result<bool> {
         let threshold = self.options.commit_log_sprint_slots;
-        if threshold == 0 {
+        if threshold == 0 || !self.options.commit_log_hold {
             return Ok(false);
         }
         let replay_point =
@@ -898,6 +922,9 @@ pub struct ReadOnlyCatalog {
     commits: Arc<commit::Coalescer>,
     // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
+    /// What a committer's reader lists the commit log for; `None` on
+    /// every other store, whose reader lists on its own clock.
+    demand: Option<Arc<ReadDemand>>,
 }
 
 impl std::fmt::Debug for ReadOnlyCatalog {
@@ -1426,6 +1453,11 @@ impl ReadOnlyCatalog {
                 )
             }
             Store::Reader(reader) | Store::Committer { reader, .. } => {
+                if let Some(demand) = &self.demand {
+                    demand
+                        .catch_up(crate::commit_log::READER_CATCHUP_TIMEOUT)
+                        .await;
+                }
                 ReadSession::Reader(reader.clone())
             }
         };
@@ -1739,6 +1771,7 @@ impl Catalog {
                     commit_log,
                 )),
                 projections,
+                demand: None,
             },
         })
     }
@@ -1768,13 +1801,18 @@ impl Catalog {
             Some(Box::pin(take_store_only(Arc::clone(&object_store), &options)).await?)
         };
 
-        let mut inner = Self::open_read_only(
+        // The reader ticks at the commit-log poll, so a commit sees its slot
+        // within it; reads alone list no more often than the reader
+        // interval, and wait for a listing when the last is older than it.
+        let demand = ReadDemand::new(options.reader_poll_interval);
+        let mut inner = Self::open_reader_catalog(
             Arc::clone(&object_store),
             CatalogOptions {
                 commit_log_tail: true,
                 reader_poll_interval: options.commit_log_poll_interval,
                 ..options.clone()
             },
+            Some(Arc::clone(&demand)),
         )
         .await?;
         let Some(Store::Reader(reader)) = Arc::into_inner(inner.store) else {
@@ -1795,9 +1833,13 @@ impl Catalog {
             guard: Arc::new(tokio::sync::Mutex::new(())),
             folds_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             flushing: flushing_for(provider.as_ref(), &options, &object_store, &log_store),
+            demand,
         };
         if let Some(db) = adopting {
             log.promote(db, options.commit_log_fold_poll);
+            if !options.commit_log_hold {
+                release_held_store(&log).await?;
+            }
         }
         inner.store = Arc::new(Store::Committer {
             reader,
@@ -2075,6 +2117,17 @@ impl Catalog {
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
     ) -> Result<ReadOnlyCatalog> {
+        Self::open_reader_catalog(object_store, options, None).await
+    }
+
+    /// [`open_read_only`](Self::open_read_only) over `demand`, which decides
+    /// when the reader's plug lists a commit log. Without one the plug
+    /// lists on every poll, which is what a reader's poll interval is for.
+    async fn open_reader_catalog(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+        demand: Option<Arc<ReadDemand>>,
+    ) -> Result<ReadOnlyCatalog> {
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
         let started = Instant::now();
         let located = Arc::clone(&object_store);
@@ -2107,6 +2160,7 @@ impl Catalog {
             .cache_compaction_puts(options.cache_compaction_puts)
             .external_compaction(external_compaction(&options))
             .poll_interval(options.reader_poll_interval)
+            .read_demand(demand.clone())
             .checkpoint(checkpoint);
 
         let (reader, cache, format) = commit::open_reader_initialized(
@@ -2158,6 +2212,7 @@ impl Catalog {
                 None,
             )),
             projections,
+            demand,
         })
     }
 

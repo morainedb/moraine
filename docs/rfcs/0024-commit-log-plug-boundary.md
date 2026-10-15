@@ -205,11 +205,13 @@ merge is a submission.
 
 **The extension.** A read-write attach with a registered provider is a
 committer; a read-only attach is a reader. `COMMIT_LOG_TAIL` makes a
-read-only attach tail the log, and
-`COMMIT_LOG_POLL_INTERVAL_MS` sets the committer's poll. They reach the
-core through `moraine_attach_with_commit_log`, whose `commit_log`
-argument the older attach entry points pass as null. Without a registered
-provider both are ignored.
+read-only attach tail the log, `COMMIT_LOG_POLL_INTERVAL_MS` sets the
+committer's poll, and `COMMIT_LOG_HOLD false` keeps a committer from
+taking the store while attached. They reach the core through
+`moraine_attach_with_commit_log`, whose `commit_log` argument the older
+attach entry points pass as null. Without a registered provider all three
+are ignored. `READER_POLL_INTERVAL_MS`, beside them, is the freshness
+bound both roles read within, and applies with no provider at all.
 
 ### The sequence a committer races
 
@@ -246,6 +248,26 @@ moves the counter outside a slot.
   tail past its fold cursor and folds what peers landed, under a guard
   that also spans its own offer and local commit, so the poll never folds
   a slot it is in the middle of committing itself.
+- **A committer lists on demand, and waits when it must.** A committer's
+  reader is polled at `commit_log_poll_interval`, tens of milliseconds, so
+  that a commit sees its own slot promptly — far faster than any read
+  needs a peer's. Listing on every such poll is the expensive part, and
+  the clock is the wrong thing to drive it, so the plug lists only when
+  something wants what a listing finds: a commit waiting to see its slot,
+  which keeps every poll listing until it is served, or a read that has
+  asked. Reads ask no more often than `reader_poll_interval`, and a read
+  that finds the last listing older than that holds the demand urgent and
+  waits for a fresh one, so `reader_poll_interval` is the staleness bound
+  it is on a reader, whatever the commit poll is and however long the
+  catalog sat idle. A read within the bound waits for nothing, and an idle
+  committer lists nothing at all. Between listings the plug reports the
+  end it last saw, which the reader has replayed already; each poll
+  publishes the previous poll's listing as replayed, the reader running
+  its polls one after another. The gate is moraine's, wrapped around the
+  provider's reader, so the boundary is unchanged, and it is a committer's
+  alone: a read-only reader polls at its own interval, which is its
+  freshness bound already, and lists on the clock as before. SlateDB's own
+  manifest read on each poll is not gated here.
 - **The fold cursor, not the served point.** A holder that reads through
   its own tailing reader is served a slot before the store it holds has
   folded it, so everything it folds starts at the fold cursor, never at
@@ -265,7 +287,11 @@ moves the counter outside a slot.
   flush, whether its own commit's, the idle poll's, or the one at close,
   which then demotes and reports nothing. The first committer
   to find an unadopted log takes the store and adopts it. The threshold sits well above the flush count, so a holder
-  doing its job is never taken from. There is no role to select:
+  doing its job is never taken from. A committer opened with
+  `commit_log_hold` off never takes the store while open: it adopts an
+  unadopted log and gives the store straight back, and a long tail is left
+  to the sprint at close or to maintenance, for a process that should not
+  carry a store and its poll. There is no role to select:
   `Catalog::take_store` takes the store on request, and
   `Catalog::fold_sprint` takes it for one fold and closes, for a job with
   no session to keep. Maintenance takes nothing: its batches are slots. A
@@ -289,9 +315,9 @@ operator's verb, well inside the headroom any fold leaves.
 one committing, each seeing the other's slots and a pass from the second
 fencing neither, run in the library's repository against the extension it
 builds. The same against a bucket, and the attach option's C++ side, which
-has compiled only by inspection, remain. The flush, poll, retention, and
-sprint thresholds reach the library API only; the extension's attach
-exposes tailing and the poll.
+has compiled only by inspection, remain. The flush, retention, and sprint
+thresholds reach the library API only; the extension's attach exposes
+tailing, both polls, and holding.
 
 ## Alternatives considered
 

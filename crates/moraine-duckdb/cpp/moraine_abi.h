@@ -150,6 +150,9 @@ typedef struct MoraineCommitLog {
   // How often a committer's reader polls for slots, in milliseconds;
   // `0` keeps the catalog's default.
   uint64_t poll_interval_ms;
+  // Whether a committer holds the store while attached, taking it when
+  // the tail is long; `false` leaves folding to the sprint at detach.
+  bool hold;
 } MoraineCommitLog;
 
 // A C-side cancellation probe polled while a cancellable call's core
@@ -1325,6 +1328,12 @@ void moraine_error_free(char *message);
 // serves a fixed cut. Null or empty follows the latest manifest; a non-null
 // value with `read_only` false is [`codes::INVALID_ARGUMENT`].
 //
+// `reader_poll_interval_ms` is how often a read-only attach polls object
+// storage for what a writer has committed since it last looked, and so
+// its freshness bound; `0` keeps the catalog's default. Longer is
+// cheaper and staler, for a dashboard that attaches for the day. A
+// `checkpoint` attach polls for nothing and ignores it.
+//
 // `host_threads` is how many execution threads the calling host runs;
 // the handle's worker pool is that count clamped to `[2, 8]`, with `0`
 // taking the floor. The size is fixed for the handle's life.
@@ -1348,10 +1357,10 @@ void moraine_error_free(char *message);
 // `path` is null or a NUL-terminated C string and whose `s3` is null or a
 // valid [`MoraineS3Config`].
 // `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
-// `cache_compaction_puts`, `flush_on_commit`, and `host_threads` are
-// unconstrained. `probe`, if non-null, must be safe to call with `probe_ctx`
-// from any thread. `out` must be a valid, writable `*mut *mut
-// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
+// `cache_compaction_puts`, `flush_on_commit`, `reader_poll_interval_ms`,
+// and `host_threads` are unconstrained. `probe`, if non-null, must be safe to
+// call with `probe_ctx` from any thread. `out` must be a valid, writable `*mut
+// *mut MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
 // [`MoraineError`]. All for the duration of this call.
 int32_t moraine_attach_with_commit_log(const char *path,
                                        const struct MoraineS3Config *s3,
@@ -1359,6 +1368,7 @@ int32_t moraine_attach_with_commit_log(const char *path,
                                        bool encrypted,
                                        uint64_t flush_interval_ms,
                                        bool flush_on_commit,
+                                       uint64_t reader_poll_interval_ms,
                                        const char *cache_dir,
                                        uint64_t cache_size_bytes,
                                        uint64_t cache_memory_bytes,

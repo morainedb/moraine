@@ -286,6 +286,7 @@ async fn a_committer_over_a_reader_commits_through_the_log() {
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
             commit_log_poll_interval: std::time::Duration::from_millis(10),
+            reader_poll_interval: std::time::Duration::from_millis(10),
             ..options_at("lake")
         },
     )
@@ -335,7 +336,9 @@ async fn a_committer_over_a_reader_commits_through_the_log() {
     assert_eq!(provider.log.slots().len(), 4);
     assert_eq!(provider.folded_sequence(), 4);
 
-    // And the committer is served the folder's slot in turn.
+    // And the committer is served the folder's slot in turn: a read asks,
+    // and the listing it causes serves the slot.
+    committer.snapshot().await.unwrap();
     assert!(
         committer_provider
             .committer(Arc::new(InMemory::new()), "lake")
@@ -395,16 +398,10 @@ async fn a_committer_told_of_a_slot_it_has_not_applied_still_loses_to_it() {
     .await
     .unwrap();
 
-    // The reader's first manifest poll fires at once on its own task; let it
-    // pass, or it would legitimately apply the peer's slot.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while committer_provider.polls() < 2 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert!(
-        committer_provider.polls() >= 2,
-        "the reader's first poll ran"
-    );
+    // The open's replay is the reader's only listing: nothing asks, and
+    // the poll is too slow for the commit's wait to list within the test.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(committer_provider.polls(), 1, "only the open listed");
 
     // A peer lands slot 3 and the plug reports it served, applied or not.
     provider
@@ -969,4 +966,266 @@ async fn a_store_stamped_for_the_log_is_refused_without_a_provider() {
         let message = refused.expect("an open of a commit-log store must be refused");
         assert!(message.contains("commit-log library"), "{message}");
     }
+}
+
+/// A read-only tailing reader follows its own clock, listing for a peer's
+/// slot with nothing having asked: the gate is a committer's alone.
+#[tokio::test]
+async fn a_tailing_reader_follows_its_clock_unasked() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+    let folder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    folder.close().await.unwrap();
+
+    let reader_provider = Arc::new(provider.sharing());
+    let reader = Catalog::open_read_only(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(reader_provider.clone()),
+            commit_log_tail: true,
+            reader_poll_interval: std::time::Duration::from_millis(10),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+
+    provider
+        .log
+        .land(2, peer_slot(&provider, 2, b"\xffpeer", b"landed"));
+    assert!(
+        reader_provider
+            .committer(Arc::new(InMemory::new()), "lake")
+            .await_served(2, std::time::Duration::from_secs(5))
+            .await,
+        "the clock served the slot, unasked"
+    );
+    reader.close().await.unwrap();
+}
+
+/// A committer idle longer than its reader interval lists before it reads,
+/// so a read is served state no staler than that interval however long the
+/// catalog went unused.
+#[tokio::test]
+async fn a_committer_idle_past_its_interval_lists_before_it_reads() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+    let folder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    folder.close().await.unwrap();
+
+    let options = |provider: Arc<TestProvider>| CatalogOptions {
+        commit_log: Some(provider),
+        // The poll is slow enough that a read served before the listing it
+        // asked for would miss the peer's commit.
+        commit_log_poll_interval: std::time::Duration::from_millis(100),
+        reader_poll_interval: std::time::Duration::from_millis(50),
+        ..options_at("lake")
+    };
+    let idle_provider = Arc::new(provider.sharing());
+    let idle = Catalog::open(object_store.clone(), options(idle_provider.clone()))
+        .await
+        .unwrap();
+    idle.snapshot().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let listings = idle_provider.polls();
+
+    let peer = Catalog::open(object_store, options(Arc::new(provider.sharing())))
+        .await
+        .unwrap();
+    peer.commit(|tx| tx.create_schema("landed").map(|_| ()))
+        .await
+        .unwrap();
+
+    assert!(
+        idle.snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("landed")
+            .is_some(),
+        "the read waited for the listing it asked for"
+    );
+    assert!(
+        idle_provider.polls() > listings,
+        "which it would not have found without listing"
+    );
+    peer.close().await.unwrap();
+    idle.close().await.unwrap();
+}
+
+/// A committer's plug lists every tick while a commit waits to see its
+/// slot, so the wait is bounded by the poll, and rests once it is served.
+#[tokio::test]
+async fn a_committer_lists_while_a_commit_awaits_its_slot_then_rests() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+    let folder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    folder.close().await.unwrap();
+
+    let committer_provider = Arc::new(provider.sharing());
+    let committer = Catalog::open(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(committer_provider.clone()),
+            commit_log_poll_interval: std::time::Duration::from_millis(10),
+            // Reads alone may not list more often than this.
+            reader_poll_interval: std::time::Duration::from_mins(1),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let idle = committer_provider.polls();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        committer_provider.polls(),
+        idle,
+        "an idle committer never lists the log"
+    );
+
+    committer
+        .commit(|tx| tx.create_schema("b").map(|_| ()))
+        .await
+        .unwrap();
+    assert!(
+        committer_provider.polls() > idle,
+        "the commit's wait listed until its slot was served"
+    );
+    assert!(
+        committer
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("b")
+            .is_some(),
+        "the committer reads its own commit"
+    );
+
+    let settled = committer_provider.polls();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        committer_provider.polls(),
+        settled,
+        "served, the committer rests"
+    );
+    committer.close().await.unwrap();
+}
+
+/// A committer opened without holding never takes the store while open: it
+/// adopts an unadopted log and gives the store straight back, leaves a long
+/// tail to the sprint at close, and commits throughout, lost races included.
+#[tokio::test]
+async fn a_committer_that_does_not_hold_leaves_folding_to_the_sprint() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+    let unheld = |provider: Arc<TestProvider>| CatalogOptions {
+        commit_log: Some(provider),
+        commit_log_hold: false,
+        commit_log_poll_interval: std::time::Duration::from_millis(10),
+        reader_poll_interval: std::time::Duration::from_millis(10),
+        commit_log_sprint_slots: 1,
+        ..options_at("lake")
+    };
+
+    // Adopting takes the store and gives it straight back; the tail of
+    // three commits is left for a sprint, not folded.
+    let first = Catalog::open(object_store.clone(), unheld(provider.clone()))
+        .await
+        .unwrap();
+    assert!(
+        !first.holds_store(),
+        "adopting gives the store back at once"
+    );
+    assert_eq!(provider.log.slots().len(), 1, "the log was adopted");
+    for name in ["a", "b", "c"] {
+        first
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+        assert!(!first.holds_store());
+    }
+    assert_eq!(
+        provider.folded_sequence(),
+        1,
+        "nothing folded past the adoption"
+    );
+
+    // A long tail at attach is not taken; a lost race to a peer's commit is
+    // folded through the reader, and still not taken.
+    let late = Arc::new(provider.sharing());
+    let second = Catalog::open(object_store.clone(), unheld(late.clone()))
+        .await
+        .unwrap();
+    assert!(!second.holds_store(), "a long tail is not taken at attach");
+    let peer = Arc::new(provider.sharing());
+    let third = Catalog::open(object_store.clone(), unheld(peer.clone()))
+        .await
+        .unwrap();
+    third
+        .commit(|tx| tx.create_schema("d").map(|_| ()))
+        .await
+        .unwrap();
+    // The loss folds the peer's slot through the reader and surfaces as a
+    // conflict, since both touch the schema list; re-driven, it lands.
+    let conflict = second.commit(|tx| tx.create_schema("e").map(|_| ())).await;
+    assert!(
+        matches!(conflict, Err(crate::Error::CommitConflict(_))),
+        "{conflict:?}"
+    );
+    second
+        .commit(|tx| tx.create_schema("e").map(|_| ()))
+        .await
+        .unwrap();
+    assert!(!second.holds_store(), "nor after a lost race");
+    assert!(!third.holds_store());
+    assert_eq!(provider.log.slots().len(), 6);
+
+    // The first close past the threshold sprints; the folded store is
+    // current for a reader that follows it alone.
+    third.close().await.unwrap();
+    second.close().await.unwrap();
+    first.close().await.unwrap();
+    let folded_only = Catalog::open_read_only(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(provider),
+            commit_log_tail: false,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    let snapshot = folded_only.snapshot().await.unwrap();
+    for name in ["a", "b", "c", "d", "e"] {
+        assert!(snapshot.schema_by_name(name).is_some(), "{name} was folded");
+    }
+    folded_only.close().await.unwrap();
 }

@@ -113,6 +113,9 @@ pub(crate) struct StoreBuilder<'a> {
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
     commit_log_tail: bool,
+    /// What a committer lists the log for; without one the plug lists on
+    /// every poll, as a read-only reader's clock wants.
+    read_demand: Option<Arc<crate::commit_log::demand::ReadDemand>>,
     flush_interval: Option<Duration>,
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
@@ -142,6 +145,7 @@ impl<'a> StoreBuilder<'a> {
             wal_object_store: None,
             commit_log: None,
             commit_log_tail: false,
+            read_demand: None,
             flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
@@ -186,6 +190,16 @@ impl<'a> StoreBuilder<'a> {
     /// folded store. Reader only.
     pub(crate) fn commit_log_tail(mut self, tail: bool) -> Self {
         self.commit_log_tail = tail;
+        self
+    }
+
+    /// Lists the log through the reader plug only when `demand` wants it;
+    /// `None` lists on every poll.
+    pub(crate) fn read_demand(
+        mut self,
+        demand: Option<Arc<crate::commit_log::demand::ReadDemand>>,
+    ) -> Self {
+        self.read_demand = demand;
         self
     }
 
@@ -376,11 +390,15 @@ impl<'a> StoreBuilder<'a> {
             builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
         }
         if let Some(provider) = &self.commit_log {
-            builder = builder.with_wal_reader(provider.reader(
-                self.log_store(),
-                self.path,
-                self.commit_log_tail,
-            ));
+            let reader = provider.reader(self.log_store(), self.path, self.commit_log_tail);
+            let reader: Arc<dyn slatedb::wal::WalReader> = match &self.read_demand {
+                Some(demand) => Arc::new(crate::commit_log::demand::DemandedReader::new(
+                    reader,
+                    Arc::clone(demand),
+                )),
+                None => reader,
+            };
+            builder = builder.with_wal_reader(reader);
         }
 
         let reader = builder.build().await.map_err(Error::from)?;

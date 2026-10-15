@@ -268,6 +268,9 @@ pub(crate) struct LogCommitter {
     pub(crate) folds_since_open: Arc<AtomicU64>,
     /// How a holder flushes and truncates.
     pub(crate) flushing: Flushing,
+    /// What this process's reader lists the log for; a commit awaiting its
+    /// slot holds it urgent.
+    pub(crate) demand: Arc<demand::ReadDemand>,
 }
 
 /// The store a process holds, and the idle poll folding into it.
@@ -566,6 +569,8 @@ impl LogCommitter {
         if self.reads == ReadSide::Store {
             return true;
         }
+        // The reader's plug lists every tick until the slot is served.
+        let _urgent = self.demand.urgent();
         let served = self
             .committer
             .await_served(sequence, READER_CATCHUP_TIMEOUT)
@@ -663,6 +668,7 @@ impl LogCommitter {
     }
 }
 
+pub(crate) mod demand;
 #[cfg(test)]
 pub(crate) mod test_log;
 #[cfg(test)]
