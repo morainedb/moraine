@@ -14,10 +14,25 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Corrosion)
 
-corrosion_import_crate(
-    MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/crates/moraine-duckdb/Cargo.toml
-    CRATE_TYPES staticlib
-)
+# A wrapping crate may supply the static library instead: one that links
+# this core with pieces kept outside this repository and exports
+# `moraine_enterprise_init`, which the entry point calls on load. Its cargo
+# lib must be named `moraine_duckdb_enterprise`.
+set(MORAINE_ENTERPRISE_MANIFEST "" CACHE FILEPATH
+    "Cargo manifest of a crate wrapping moraine-duckdb; empty builds the open core")
+if(MORAINE_ENTERPRISE_MANIFEST)
+    corrosion_import_crate(
+        MANIFEST_PATH ${MORAINE_ENTERPRISE_MANIFEST}
+        CRATE_TYPES staticlib
+    )
+    set(MORAINE_RUST_LIBRARY moraine_duckdb_enterprise-static)
+else()
+    corrosion_import_crate(
+        MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/crates/moraine-duckdb/Cargo.toml
+        CRATE_TYPES staticlib
+    )
+    set(MORAINE_RUST_LIBRARY moraine_duckdb-static)
+endif()
 
 set(CPP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/crates/moraine-duckdb/cpp)
 set(EXTENSION_SOURCES
@@ -91,7 +106,10 @@ foreach(EXT_TARGET ${TARGET_NAME}_extension ${TARGET_NAME}_loadable_extension)
     # (underscores), not the package name, and exposes the imported static
     # library as `<lib>-static` (GLOBAL, with the cargo build dependency and
     # forwarded native libs).
-    target_link_libraries(${EXT_TARGET} moraine_duckdb-static ${RUST_PLATFORM_LIBS})
+    target_link_libraries(${EXT_TARGET} ${MORAINE_RUST_LIBRARY} ${RUST_PLATFORM_LIBS})
+    if(MORAINE_ENTERPRISE_MANIFEST)
+        target_compile_definitions(${EXT_TARGET} PRIVATE MORAINE_ENTERPRISE)
+    endif()
     # The patched DuckLake rides in the same binary: its static extension
     # library (with its roaring dependency) links in, and the entry point
     # registers it before moraine.

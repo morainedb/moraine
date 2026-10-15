@@ -88,6 +88,18 @@ pub fn e2e() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Builds and packages the extension without running the suites, and
+/// prints the loadable's path last: for a build that links a wrapping crate
+/// and runs its own tests against the artifact.
+pub fn build_extension() -> anyhow::Result<()> {
+    let patched = ducklake_patch::prepare()?;
+    ducklake_patch::check_pin_sources(&duckdb::workspace_root(), &patched.source)?;
+    let extension = duckdb::build_and_package_extension(&patched)?;
+    println!("{}", extension.display());
+
+    Ok(())
+}
+
 /// Runs `test/sql/*.test` through DuckDB's own sqllogictest runner, built
 /// alongside the extension.
 ///
