@@ -186,7 +186,11 @@ true` makes a read-only attach tail the log and see a commit the moment its
 slot lands, at a listing per poll, rather than follow the folded store.
 `COMMIT_LOG_POLL_INTERVAL_MS` is how often a committer's reader polls for
 slots other committers landed; it also bounds how long a commit waits to
-see its own. Both are ignored without a registered provider.
+see its own. Both are ignored without a registered provider. This
+repository registers none; a build that links a wrapping crate in place of
+the open core (`MORAINE_ENTERPRISE_MANIFEST` to cmake, or the same name in
+the environment of `cargo xtask build-extension`) has that crate register
+one when the extension loads.
 **`CACHE_DIR` — on-disk object cache for S3 catalogs.** Each query reads the
 catalog metadata from the store; on S3 that is network latency every time, and
 the in-memory caches start empty in each new process. Point SlateDB's disk
