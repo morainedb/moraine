@@ -3295,7 +3295,10 @@ async fn maintain_resumes_each_batch_where_the_last_one_stopped() {
 }
 
 /// A dead range is scanned once however small the batch: a scan per
-/// batch pays a seek and a fresh read-ahead for every commit.
+/// batch pays a seek and a fresh read-ahead for every commit, dozens of
+/// reads per batch over this range. Each batch is a head-preserving
+/// commit that reads the head once, served from the memtable or the cache
+/// except under eviction, so the bound allows one read per batch.
 #[tokio::test]
 async fn maintain_streams_a_dead_range_in_one_scan() {
     use crate::catalog::{Catalog, CatalogOptions, ColumnDef, MaintenanceRequest};
@@ -3343,11 +3346,11 @@ async fn maintain_streams_a_dead_range_in_one_scan() {
     catalog.close().await.unwrap();
 
     assert_eq!(report.index_entries_reclaimed, DEAD_ENTRIES);
-    let bound = DEAD_ENTRIES / 32;
+    let bound = DEAD_ENTRIES + DEAD_ENTRIES / 32;
     assert!(
         reads < bound,
         "a sweep in {DEAD_ENTRIES} batches issued {reads} reads over a range of a few dozen \
-         blocks: the range is being scanned once per batch"
+         blocks, more than one per batch: the range is being scanned once per batch"
     );
 }
 
