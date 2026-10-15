@@ -409,6 +409,78 @@ impl ReadOnlyCatalog {
         null_prefix_row_ids
     }
 
+    /// A bounded optimizer probe; a full buffer signals possible overflow.
+    pub(super) async fn probe_limited(
+        &self,
+        table: TableId,
+        index: IndexId,
+        probe: Probe,
+        limit: usize,
+    ) -> Result<Vec<u64>> {
+        let mut session = None;
+        let rows = self
+            .lookup_at_head(&mut session, table, index, async |handle, info| {
+                self.scoped_probe(
+                    table,
+                    index,
+                    Probe::Limited(Box::new(probe.clone()), limit),
+                    async || match &probe {
+                        Probe::Many(keys) => {
+                            let mut probes = futures::stream::iter(keys)
+                                .map(|key| {
+                                    index_maintenance::lookup_row_ids_limited(
+                                        handle,
+                                        index.get(),
+                                        info.unique,
+                                        key,
+                                        limit,
+                                    )
+                                })
+                                .buffer_unordered(probe_tasks());
+                            let mut rows = Vec::new();
+                            while let Some(found) = probes.next().await {
+                                let found = found?;
+                                rows.extend(found.into_iter().take(limit - rows.len()));
+                                if rows.len() == limit {
+                                    break;
+                                }
+                            }
+                            Ok(rows)
+                        }
+                        Probe::Range(lower, upper, reverse) => {
+                            index_maintenance::range_row_ids_limited(
+                                handle,
+                                index.get(),
+                                info.unique,
+                                info.nulls.first().copied().unwrap_or(NullOrder::Last),
+                                (lower.clone(), upper.clone()),
+                                ScanOrder::from_reverse(*reverse),
+                                limit,
+                            )
+                            .await
+                        }
+                        Probe::Nulls(prefix, reverse) => {
+                            index_maintenance::null_prefix_row_ids_limited(
+                                handle,
+                                index.get(),
+                                prefix,
+                                ScanOrder::from_reverse(*reverse),
+                                limit,
+                            )
+                            .await
+                        }
+                        Probe::Limited(..) => {
+                            Err(Error::Constraint("nested limited index probe".into()))
+                        }
+                    },
+                )
+                .await
+            })
+            .await;
+        finish_session(session);
+        rows
+    }
+
     /// Resolves `index` at the head and runs `lookup` over its entries. A
     /// warm read-write handle serves the definition from its held view and
     /// probes without a transaction; a pass the view moved under, and every
@@ -494,7 +566,7 @@ fn ready_index(view: &CatalogSnapshot, table: TableId, index: IndexId) -> Result
 }
 
 /// Maps a value window onto the byte bounds one index scan answers.
-fn encode_range_bounds(
+pub(super) fn encode_range_bounds(
     info: &IndexInfo,
     index: IndexId,
     lower: Bound<Vec<IndexKeyValue>>,

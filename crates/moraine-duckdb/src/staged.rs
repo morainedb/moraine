@@ -26,7 +26,7 @@ use moraine::ffi_support::staged::{
 use tracing::warn;
 
 use crate::{
-    abi::{borrow_bytes, borrow_str, guard, write_array},
+    abi::{borrow_str, guard, write_array},
     arrow_ipc::MoraineArrowBytes,
     dumps::{
         MoraineColumnMappingRow, MoraineColumnRow, MoraineColumnTagRow, MoraineDataFileRow,
@@ -35,12 +35,13 @@ use crate::{
         MoraineOptionRow, MorainePartitionColumnRow, MorainePartitionInfoRow,
         MoraineScheduledDeletionRow, MoraineSchemaRow, MoraineSchemaVersionRow, MoraineSnapshotRow,
         MoraineSortExpressionRow, MoraineSortInfoRow, MoraineTableColumnStatsRow, MoraineTableRow,
-        MoraineTableStatsRow, MoraineTagRow, MoraineViewRow, column_rows, column_tag_rows,
-        data_file_rows, delete_file_rows, file_column_stats_rows, file_partition_value_rows,
-        macro_impl_rows, macro_parameter_rows, macro_rows, mapping_rows, name_mapping_rows,
-        option_rows, partition_column_rows, partition_info_rows, scheduled_deletion_rows,
-        schema_rows, schema_version_rows, snapshot_rows, sort_expression_rows, sort_info_rows,
-        table_column_stats_rows, table_rows, table_stats_rows, tag_rows, view_rows,
+        MoraineTableStatsRow, MoraineTagRow, MoraineViewColumnTagRow, MoraineViewRow, column_rows,
+        column_tag_rows, data_file_rows, delete_file_rows, file_column_stats_rows,
+        file_partition_value_rows, macro_impl_rows, macro_parameter_rows, macro_rows, mapping_rows,
+        name_mapping_rows, option_rows, partition_column_rows, partition_info_rows,
+        scheduled_deletion_rows, schema_rows, schema_version_rows, snapshot_rows,
+        sort_expression_rows, sort_info_rows, table_column_stats_rows, table_rows,
+        table_stats_rows, tag_rows, view_column_tag_rows, view_rows,
     },
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
@@ -166,16 +167,17 @@ unsafe fn decode_cells(cells: *const MoraineCell, len: usize) -> Result<Vec<Cell
 /// # Safety
 ///
 /// `handle` must be a pointer previously returned by
-/// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached,
-/// and must outlive every operation on the returned transaction handle
-/// (through [`moraine_tx_commit`] or [`moraine_tx_rollback`]). `out`
-/// must be a valid, writable `*mut *mut MoraineTxHandle`. `probe`, if
-/// non-null, must be safe to call with `probe_ctx` from any thread.
-/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
-/// for the duration of this call.
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store)
+/// and not yet detached, and must outlive every operation on the returned
+/// transaction handle (through [`moraine_tx_commit`] or
+/// [`moraine_tx_rollback`]). `out` must be a valid, writable `*mut *mut
+/// MoraineTxHandle`. `probe`, if non-null, must be safe to call with
+/// `probe_ctx` from any thread. `err`, if non-null, must be a valid, writable
+/// [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_tx_begin(
     handle: *mut MoraineCatalogHandle,
+    snapshot: *const crate::runtime::MoraineSnapshotHandle,
     out: *mut *mut MoraineTxHandle,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
@@ -190,6 +192,9 @@ pub unsafe extern "C" fn moraine_tx_begin(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for `snapshot`: null, or a live handle.
+        let read_view =
+            unsafe { snapshot.as_ref() }.map(|snapshot| std::sync::Arc::clone(&snapshot.snapshot));
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let tx = unsafe {
@@ -200,6 +205,7 @@ pub unsafe extern "C" fn moraine_tx_begin(
                     handle_ref.catalog.writer()?,
                     handle_ref.data_store.clone(),
                     handle_ref.data_prefix.clone(),
+                    read_view,
                 ),
             )
         }?;
@@ -1150,6 +1156,34 @@ pub unsafe extern "C" fn moraine_tx_dump_column_tags(
     )
 }
 
+/// Dumps every `ducklake_view_column_tag` row as this transaction sees it:
+/// committed rows at the transaction's read point with its own staged rows over
+/// them. Freed with `moraine_dump_view_column_tags_free`.
+///
+/// # Safety
+///
+/// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+/// not yet committed or rolled back; its catalog must still be attached.
+/// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+/// non-null, must be a valid, writable [`MoraineError`]. All for the
+/// duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_view_column_tags(
+    tx: *mut MoraineTxHandle,
+    out_items: *mut *mut MoraineViewColumnTagRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        staged::visible_view_column_tag_rows,
+        view_column_tag_rows
+    )
+}
+
 /// Dumps every `ducklake_macro_impl` row as this transaction sees it:
 /// committed rows at the transaction's read point with its own staged rows over
 /// them. Freed with `moraine_dump_macro_impls_free`.
@@ -1472,55 +1506,16 @@ pub unsafe extern "C" fn moraine_tx_rollback(tx: *mut MoraineTxHandle) {
 }
 
 /// Stages `inline/schema`: the Arrow IPC schema for one `(table_id,
-/// schema_version)`, written once at inline-table creation.
+/// schema_version)`, written once at inline-table creation, consuming the
+/// encoded buffer.
 ///
 /// # Safety
 ///
-/// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
-/// and not yet committed or rolled back. `arrow_schema`, if
-/// `arrow_schema_len` is nonzero, must point to `arrow_schema_len` valid
-/// bytes. `err`, if non-null, must be a valid, writable [`MoraineError`].
-/// All for the duration of this call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_tx_stage_inline_schema(
-    tx: *mut MoraineTxHandle,
-    table_id: u64,
-    schema_version: u64,
-    arrow_schema: *const u8,
-    arrow_schema_len: usize,
-    err: *mut MoraineError,
-) -> i32 {
-    let attempt = || -> Result<(), AbiError> {
-        if tx.is_null() {
-            return Err(AbiError::invalid_argument("`tx` is null"));
-        }
-        // SAFETY: caller contract above.
-        let bytes = unsafe { borrow_bytes(arrow_schema, arrow_schema_len, "arrow_schema") }?;
-        // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &*tx };
-        tx_ref.lock()?.stage(RowOperation::InlineSchema {
-            table_id,
-            schema_version,
-            arrow_schema: bytes.to_vec(),
-        });
-
-        Ok(())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(()) => codes::OK,
-        Err(code) => code,
-    }
-}
-
-/// Consumes an encoded Arrow schema buffer directly into the staged row.
-///
-/// # Safety
-///
-/// Same `tx`/`err` contract as [`moraine_tx_stage_inline_schema`].
-/// `arrow_schema` must be an unconsumed value returned by
-/// [`crate::arrow_ipc::moraine_arrow_encode_schema`].
+/// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+/// not yet committed or rolled back. `arrow_schema` must be an unconsumed
+/// value returned by [`crate::arrow_ipc::moraine_arrow_encode_schema`].
+/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All for
+/// the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_tx_stage_inline_schema_owned(
     tx: *mut MoraineTxHandle,
@@ -1553,61 +1548,13 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_schema_owned(
     }
 }
 
-/// Stages `inline/insert`: one Arrow record-batch chunk of inlined rows.
-///
-/// # Safety
-///
-/// Same `tx` contract as [`moraine_tx_stage_inline_schema`].
-/// `arrow_body`, if `arrow_body_len` is nonzero, must point to
-/// `arrow_body_len` valid bytes. `err`, if non-null, must be a valid,
-/// writable [`MoraineError`]. All for the duration of this call.
-#[unsafe(no_mangle)]
-#[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn moraine_tx_stage_inline_insert(
-    tx: *mut MoraineTxHandle,
-    table_id: u64,
-    schema_version: u64,
-    begin_snapshot: u64,
-    row_id_start: u64,
-    row_count: u64,
-    arrow_body: *const u8,
-    arrow_body_len: usize,
-    err: *mut MoraineError,
-) -> i32 {
-    let attempt = || -> Result<(), AbiError> {
-        if tx.is_null() {
-            return Err(AbiError::invalid_argument("`tx` is null"));
-        }
-        // SAFETY: caller contract above.
-        let bytes = unsafe { borrow_bytes(arrow_body, arrow_body_len, "arrow_body") }?;
-        // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &*tx };
-        tx_ref.lock()?.stage(RowOperation::InlineInsert {
-            table_id,
-            schema_version,
-            begin_snapshot,
-            row_id_start,
-            row_count,
-            arrow_body: bytes.to_vec().into(),
-        });
-
-        Ok(())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(()) => codes::OK,
-        Err(code) => code,
-    }
-}
-
 /// Consumes an encoded Arrow chunk body directly into the staged row.
 ///
 /// # Safety
 ///
-/// Same metadata and `tx`/`err` contract as
-/// [`moraine_tx_stage_inline_insert`]. `arrow_body` must be an unconsumed
-/// value returned by [`crate::arrow_ipc::moraine_arrow_encode_chunk`].
+/// Same `tx`/`err` contract as [`moraine_tx_stage_inline_schema_owned`].
+/// `arrow_body` must be an unconsumed value returned by
+/// [`crate::arrow_ipc::moraine_arrow_encode_chunk`].
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn moraine_tx_stage_inline_insert_owned(
@@ -1832,50 +1779,15 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete_clear(
     }
 }
 
-/// Stages a table drop: removes every `inline/*` record for `table_id`.
-///
-/// **Unused by the shim.** DuckLake ends the `ducklake_table` row itself,
-/// so no `DROP TABLE` reaches this. A dropped table's inline records are
-/// reclaimed by the maintenance sweep once the table is absent from live
-/// state and history — which is what keeps a read below the drop able to
-/// resolve them, as this entry point would not.
+/// Stages a schema-version-scoped deregistration: removes only the
+/// `inline/schema` record for `(table_id, schema_version)`, leaving any
+/// other schema version's `inline/*` records untouched.
 ///
 /// # Safety
 ///
 /// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
 /// and not yet committed or rolled back. `err`, if non-null, must be a
 /// valid, writable [`MoraineError`]. Both for the duration of this call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_tx_stage_inline_drop(
-    tx: *mut MoraineTxHandle,
-    table_id: u64,
-    err: *mut MoraineError,
-) -> i32 {
-    let attempt = || -> Result<(), AbiError> {
-        if tx.is_null() {
-            return Err(AbiError::invalid_argument("`tx` is null"));
-        }
-        // SAFETY: caller contract for `tx`.
-        let tx_ref = unsafe { &*tx };
-        tx_ref.lock()?.stage(RowOperation::InlineDrop { table_id });
-        Ok(())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(()) => codes::OK,
-        Err(code) => code,
-    }
-}
-
-/// Stages a schema-version-scoped deregistration: removes only the
-/// `inline/schema` record for `(table_id, schema_version)`, leaving any
-/// other schema version's `inline/*` records untouched (unlike
-/// [`moraine_tx_stage_inline_drop`], which is table-wide).
-///
-/// # Safety
-///
-/// Same contract as [`moraine_tx_stage_inline_drop`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_tx_stage_inline_schema_drop(
     tx: *mut MoraineTxHandle,
@@ -2513,6 +2425,7 @@ mod tests {
         let code = unsafe {
             moraine_tx_begin(
                 handle,
+                ptr::null(),
                 &raw mut tx,
                 Some(probe_always),
                 ptr::null_mut(),
@@ -2531,6 +2444,7 @@ mod tests {
         let code2 = unsafe {
             moraine_tx_begin(
                 handle,
+                ptr::null(),
                 &raw mut tx2,
                 Some(probe_never),
                 ptr::null_mut(),
@@ -2556,6 +2470,7 @@ mod tests {
         let code = unsafe {
             moraine_tx_begin(
                 ptr::null_mut(),
+                ptr::null(),
                 &raw mut tx,
                 None,
                 ptr::null_mut(),

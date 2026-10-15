@@ -239,11 +239,12 @@ fn delete_workload(
 
 /// The same workload with an equality index over the deleted column, so
 /// each delete also maintains index entries. Renamed with an `indexed_`
-/// infix and moraine-only, since no other backend has the function.
+/// infix and moraine-only, since the other DuckLake backends do not support
+/// indexes.
 fn indexed(mut workload: Workload, name: &'static str) -> Workload {
     workload.name = name;
     workload.seed.push(format!(
-        "SELECT * FROM moraine_index_create('lake','main','{DELETE_TARGET}','by_id',['id'],false);"
+        "CREATE INDEX by_id ON lake.main.{DELETE_TARGET}(id);"
     ));
     workload.moraine_only = true;
     workload
@@ -479,7 +480,7 @@ mod tests {
 
             let (added, shared) = with_index.seed.split_last().unwrap();
             assert_eq!(shared, plain.seed.as_slice(), "{name}");
-            assert!(added.contains("moraine_index_create"), "{name}");
+            assert!(added.contains("CREATE INDEX by_id ON lake.main."), "{name}");
         }
     }
 

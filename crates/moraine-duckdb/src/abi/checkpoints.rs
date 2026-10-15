@@ -1,6 +1,6 @@
 //! The checkpoint lifecycle as C-ABI entry points: mint, list, and
 //! release the checkpoints a zero-write read-only attach
-//! (`moraine_attach`'s `checkpoint`) pins itself to.
+//! (`moraine_attach_with_wal_store`'s `checkpoint`) pins itself to.
 //!
 //! Minting takes an attached handle (the core mints through the writer
 //! that attach opened). Listing and releasing take a store path: they
@@ -22,8 +22,8 @@ use crate::{
 /// One checkpoint the store's manifest carries.
 #[repr(C)]
 pub struct MoraineCheckpoint {
-    /// The checkpoint's id, in the form `moraine_attach`'s `checkpoint`
-    /// takes. Owned by the array.
+    /// The checkpoint's id, in the form `moraine_attach_with_wal_store`'s
+    /// `checkpoint` takes. Owned by the array.
     pub id: *mut c_char,
     /// The manifest version it pins against garbage collection.
     pub manifest_id: u64,
@@ -75,9 +75,10 @@ fn resolve(
 /// # Safety
 ///
 /// `handle` must be a live handle from
-/// [`moraine_attach`](super::moraine_attach). `out_id` must be a valid,
-/// writable `*mut *mut c_char`. `err`, if non-null, must be a valid, writable
-/// [`MoraineError`]. All for the duration of this call.
+/// [`moraine_attach_with_wal_store`](super::moraine_attach_with_wal_store).
+/// `out_id` must be a valid, writable `*mut *mut c_char`. `err`, if non-null,
+/// must be a valid, writable [`MoraineError`]. All for the duration of this
+/// call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_create_checkpoint(
     handle: *mut MoraineCatalogHandle,

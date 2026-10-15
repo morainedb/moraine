@@ -6,7 +6,9 @@
 
 #include "duckdb.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/logging/logging.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
@@ -22,6 +24,7 @@
 #include "metadata_tables.hpp"
 #include "moraine_abi.h"
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 
@@ -96,6 +99,17 @@ public:
 private:
 	MoraineSnapshotHandle *snapshot_;
 	uint64_t table_id_;
+
+public:
+	// 2.0's `TableCatalogEntry` declares `GetColumns` pure and stores no
+	// columns of its own, so every entry owns its list.
+	const duckdb::ColumnList &GetColumns() const override {
+		return columns_;
+	}
+
+private:
+	duckdb::ColumnList columns_;
+
 };
 
 // A moraine-backed view entry. Cataloging (name/schema lookup, `DESCRIBE`)
@@ -165,7 +179,7 @@ private:
 	void EnsureViewsLoaded();
 };
 
-// A moraine-backed Catalog: ATTACH opens the store via moraine_attach;
+// A moraine-backed Catalog: ATTACH opens the store via moraine_attach_with_wal_store;
 // DETACH (or database shutdown) closes it via moraine_detach. Schema
 // lookup/enumeration delegate to the active transaction's cached
 // MoraineSchemaEntry set; every write path throws
@@ -224,6 +238,15 @@ public:
 		return path_;
 	}
 
+	// Whether this attach serves the shape catalog version 1.1-dev1
+	// declares, read once when it attached. Every entry the attach
+	// registers declares that one shape, so a raise under a live attach
+	// moves the store without mixing shapes in a session that is already
+	// reading one.
+	bool ServesExtendedCatalog() const {
+		return extended_catalog_;
+	}
+
 	// The maintenance driver for this attach. Always present — it serves
 	// the on-demand trigger even when no interval was configured.
 	MaintenanceScheduler &Scheduler() const {
@@ -249,9 +272,22 @@ public:
 	// outside both moraine's budgets and DuckDB's memory limit.
 	uint64_t HeldMetadataBytes() const;
 
+	// The snapshot id the most recent commit on this catalog landed. The
+	// batch may land a commit above the id DuckLake stamped on it, and
+	// DuckLake adopts a catalog-assigned id only through its server-side
+	// commit route; this is what that route reports.
+	void RecordCommittedSnapshot(uint64_t snapshot_id) {
+		last_committed_snapshot_.store(snapshot_id, std::memory_order_release);
+	}
+	uint64_t LastCommittedSnapshot() const {
+		return last_committed_snapshot_.load(std::memory_order_acquire);
+	}
+
 private:
 	MoraineCatalogHandle *handle_;
 	std::string path_;
+	bool extended_catalog_ = false;
+	std::atomic<uint64_t> last_committed_snapshot_ {0};
 	duckdb::shared_ptr<MaintenanceScheduler> scheduler_;
 
 	// One dumped row set per synthesized table, stamped with the store
@@ -291,5 +327,6 @@ private:
 // reports `<store path>`, so the fallback matches on that. Throws
 // `InvalidInputException` when neither names a moraine catalog.
 MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const std::string &catalog_name);
+
 
 } // namespace moraine_duckdb

@@ -62,6 +62,10 @@ pub struct MoraineDataFileRow {
     pub has_partial_max: bool,
     /// `partial_max`, valid iff `has_partial_max`.
     pub partial_max: u64,
+    /// Whether `row_group_count` is present.
+    pub has_row_group_count: bool,
+    /// `row_group_count`, valid iff `has_row_group_count`.
+    pub row_group_count: u64,
 }
 
 /// Converts core `ducklake_data_file` records into the C row shape.
@@ -89,6 +93,7 @@ pub(crate) fn data_file_rows(
             let (has_mapping, mapping) = opt_u64(v.mapping_id);
             let (has_partial_max, partial_max) = opt_u64(v.partial_max);
             let (has_row_id_start, row_id_start) = opt_u64(v.row_id_start);
+            let (has_row_group_count, row_group_count) = opt_u64(v.row_group_count);
 
             MoraineDataFileRow {
                 data_file_id: v.data_file_id,
@@ -113,6 +118,8 @@ pub(crate) fn data_file_rows(
                 mapping_id: mapping,
                 has_partial_max,
                 partial_max,
+                has_row_group_count,
+                row_group_count,
             }
         })
         .collect())
@@ -124,7 +131,7 @@ pub(crate) fn data_file_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.
@@ -147,46 +154,6 @@ pub unsafe extern "C" fn moraine_dump_data_files(
             probe_ctx,
             err,
             moraine::ffi_support::dump_data_files,
-            data_file_rows,
-        )
-    }
-}
-
-/// As [`moraine_dump_data_files`], for a caller that keeps a row only
-/// while `filter_snapshot < end_snapshot` (or it is null) — the shape
-/// every DuckLake read of this table carries.
-///
-/// Once `filter_snapshot` reaches the head this call observes, no ended
-/// version can satisfy that, so the ended half is not read; the rows are
-/// the same ones either way. A bound behind the head is a time-travel
-/// read and gets the full set. Freed with
-/// [`moraine_dump_data_files_free`].
-///
-/// # Safety
-///
-/// As [`moraine_dump_data_files`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_dump_data_files_live_at(
-    handle: *mut MoraineCatalogHandle,
-    filter_snapshot: u64,
-    out_items: *mut *mut MoraineDataFileRow,
-    out_len: *mut usize,
-    probe: MoraineInterruptProbe,
-    probe_ctx: *mut c_void,
-    err: *mut MoraineError,
-) -> i32 {
-    // SAFETY: forwarded caller contract.
-    unsafe {
-        dump_rows(
-            handle,
-            out_items,
-            out_len,
-            probe,
-            probe_ctx,
-            err,
-            async |catalog| {
-                moraine::ffi_support::dump_data_files_live_at(catalog, filter_snapshot).await
-            },
             data_file_rows,
         )
     }
@@ -276,6 +243,10 @@ pub struct MoraineDeleteFileRow {
     pub has_partial_max: bool,
     /// `partial_max`, valid iff `has_partial_max`.
     pub partial_max: u64,
+    /// Whether `row_group_count` is present.
+    pub has_row_group_count: bool,
+    /// `row_group_count`, valid iff `has_row_group_count`.
+    pub row_group_count: u64,
 }
 
 /// Converts core `ducklake_delete_file` records into the C row shape. Shared by
@@ -298,6 +269,7 @@ pub(crate) fn delete_file_rows(
         .map(|(v, path, format, encryption_key)| {
             let (has_end, end) = opt_u64(v.end_snapshot);
             let (has_partial_max, partial_max) = opt_u64(v.partial_max);
+            let (has_row_group_count, row_group_count) = opt_u64(v.row_group_count);
             MoraineDeleteFileRow {
                 delete_file_id: v.delete_file_id,
                 table_id: v.table_id,
@@ -314,6 +286,8 @@ pub(crate) fn delete_file_rows(
                 encryption_key: opt_into_raw(encryption_key),
                 has_partial_max,
                 partial_max,
+                has_row_group_count,
+                row_group_count,
             }
         })
         .collect())
@@ -325,7 +299,7 @@ pub(crate) fn delete_file_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.
@@ -453,7 +427,7 @@ pub(crate) fn file_partition_value_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.
@@ -545,7 +519,7 @@ pub(crate) fn scheduled_deletion_rows(
 /// # Safety
 ///
 /// The shared dump-entry contract (`dump_rows`): a live `handle` from
-/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 /// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 /// thread, and a null-or-writable `err`, all for the duration of the
 /// call.

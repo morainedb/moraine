@@ -79,8 +79,6 @@ pub fn duckdb_pin() -> &'static str {
         .unwrap_or_default()
 }
 
-const DUCKDB_RELEASE_BASE_URL: &str = "https://github.com/duckdb/duckdb/releases/download";
-
 /// Runs `cmd`, failing with its exact invocation and exit status if it
 /// didn't succeed. Stdio is inherited, so the child's own output (e.g.
 /// `curl`'s error text) reaches the caller.
@@ -179,13 +177,6 @@ pub fn workspace_root() -> PathBuf {
 /// Cache root for the downloaded CLI, gitignored (`/target`) and never
 /// committed.
 ///
-/// Keyed by version: a CLI only loads an extension built for its own
-/// version string, so a pin bump must miss the cache rather than serve
-/// the release it downloaded before.
-fn duckdb_cli_root_for(pin: &str) -> PathBuf {
-    workspace_root().join("target/duckdb-cli").join(pin)
-}
-
 /// Cache root for `INSTALL ducklake`-style downloaded extensions,
 /// gitignored under `target/`.
 pub fn extension_install_directory() -> PathBuf {
@@ -200,60 +191,35 @@ fn cli_binary_name() -> &'static str {
     }
 }
 
-/// Downloads and unpacks the pinned DuckDB CLI for the host platform into
-/// the gitignored cache, skipping both the download and the unpack if the
-/// binary is already cached there. Returns the CLI's path.
+/// The CLI for the primary pin: the one `make release` builds beside the
+/// extension, verified to report the pinned version.
 ///
-/// The cache is keyed by the pinned version, so a bump downloads afresh
-/// instead of handing back the previous release — which would build the
-/// extension for the new version and then fail to load it into the old
-/// CLI, reported as a load error rather than a stale cache.
+/// The pin is a development revision with no release assets, so there is
+/// nothing to download — and no other binary carries its version string,
+/// which is what decides whether the extension loads at all. Callers build
+/// the extension first.
 pub fn ensure_duckdb_cli() -> anyhow::Result<PathBuf> {
-    ensure_duckdb_cli_for(duckdb_pin())
-}
-
-/// Downloads or reuses a DuckDB CLI for an explicitly supported release.
-pub fn ensure_duckdb_cli_for(pin: &str) -> anyhow::Result<PathBuf> {
+    let cli = workspace_root()
+        .join("build/release")
+        .join(cli_binary_name());
     ensure!(
-        supported_duckdb_versions()
-            .iter()
-            .any(|supported| supported == pin),
-        "DuckDB {pin} is not listed in .github/duckdb-versions"
+        cli.exists(),
+        "the DuckDB {} CLI is missing at {}; it is built alongside the extension, so run \
+         `cargo xtask e2e` (or `make release`) first",
+        duckdb_pin(),
+        cli.display()
     );
-    let duckdb_root = duckdb_cli_root_for(pin);
-    let cli_dir = duckdb_root.join("cli");
-    let cli_path = cli_dir.join(cli_binary_name());
-    if cli_path.exists() {
-        return Ok(cli_path);
-    }
-
-    let platform = cli_download_platform(pin)?;
-    let zip_name = format!("duckdb_cli-{platform}.zip");
-    let zip_path = duckdb_root.join(&zip_name);
-    if !zip_path.exists() {
-        fs::create_dir_all(&duckdb_root)
-            .with_context(|| format!("creating {}", duckdb_root.display()))?;
-        let url = format!("{DUCKDB_RELEASE_BASE_URL}/{pin}/{zip_name}");
-        download(&url, &zip_path)?;
-    }
-
-    fs::create_dir_all(&cli_dir).with_context(|| format!("creating {}", cli_dir.display()))?;
-    run(Command::new("unzip")
-        .args(["-o", "-q"])
-        .arg(&zip_path)
-        .arg("-d")
-        .arg(&cli_dir))?;
+    let reported =
+        command_output(Command::new(&cli).args(["-csv", "-noheader", "-c", "SELECT version();"]))?;
     ensure!(
-        cli_path.exists(),
-        "unzipped {} but {} is still missing",
-        zip_path.display(),
-        cli_path.display()
+        reported.trim() == duckdb_pin(),
+        "{} reports DuckDB {}, but .github/duckdb-versions pins {}; rebuild with \
+         `cargo xtask e2e`",
+        cli.display(),
+        reported.trim(),
+        duckdb_pin()
     );
-
-    #[cfg(unix)]
-    make_executable(&cli_path)?;
-
-    Ok(cli_path)
+    Ok(cli)
 }
 
 /// Builds the extension through DuckDB's extension toolchain (`make
@@ -355,22 +321,29 @@ pub fn make_executable(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `duckdb_cli-<platform>.zip` platform tag for the host, matching
-/// the URL scheme in `crates/moraine-duckdb/README.md`. Scoped to macOS
-/// and Linux, the platforms the extension supports.
-fn cli_download_platform(pin: &str) -> anyhow::Result<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Ok("osx-arm64"),
-        // No standalone macOS x86_64 asset is published; the universal
-        // binary covers both architectures.
-        ("macos", "x86_64") => Ok("osx-universal"),
-        ("linux", "x86_64") => Ok("linux-amd64"),
-        ("linux", "aarch64") => Ok("linux-arm64"),
-        (os, arch) => bail!(
-            "no pinned DuckDB {pin} CLI mapping for {os}/{arch}; add one in \
-             xtask/src/duckdb.rs (see crates/moraine-duckdb/README.md's CLI URL list)"
-        ),
+pub(crate) fn command_output(command: &mut Command) -> anyhow::Result<String> {
+    let output = command
+        .output()
+        .with_context(|| format!("spawning {command:?}"))?;
+    ensure!(
+        output.status.success(),
+        "{command:?} exited with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8(output.stdout).context("command output was not UTF-8")
+}
+
+pub(crate) fn optional_command_output(command: &mut Command) -> anyhow::Result<Option<String>> {
+    let output = command
+        .output()
+        .with_context(|| format!("spawning {command:?}"))?;
+    if !output.status.success() {
+        return Ok(None);
     }
+    String::from_utf8(output.stdout)
+        .map(Some)
+        .context("command output was not UTF-8")
 }
 
 #[cfg(test)]

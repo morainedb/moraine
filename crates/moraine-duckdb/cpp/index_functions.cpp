@@ -1,8 +1,4 @@
-// The equality-index SQL surface: autonomous-commit DDL, introspection, and
-// explicit point, IN, range, and NULL-prefix lookups. These are the first
-// user-callable functions this extension registers; every other TableFunction
-// in the shim is reached through a catalog-entry override, not a global
-// registration.
+// Index introspection, verification, and explicit lookups.
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -58,6 +54,8 @@ struct IndexesBindData : public duckdb::FunctionData {
 		bool unique;
 		bool building;
 		std::string state;
+		uint64_t certified_at;
+		bool has_certificate;
 	};
 	std::vector<Row> rows;
 
@@ -79,7 +77,7 @@ struct IndexesBindData : public duckdb::FunctionData {
 duckdb::unique_ptr<duckdb::FunctionData> IndexesBind(duckdb::ClientContext &context,
                                                      duckdb::TableFunctionBindInput &input,
                                                      duckdb::vector<duckdb::LogicalType> &return_types,
-                                                     duckdb::vector<duckdb::string> &names) {
+                                                     duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<IndexesBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -95,12 +93,13 @@ duckdb::unique_ptr<duckdb::FunctionData> IndexesBind(duckdb::ClientContext &cont
 	}
 	for (auto &desc : descs) {
 		bind_data->rows.push_back({static_cast<int64_t>(desc.index_id), std::string(desc.name), desc.unique,
-		                           desc.building, IndexStateName(desc.state)});
+		                           desc.building, IndexStateName(desc.state), desc.certified_at,
+		                           desc.has_certificate});
 	}
 
 	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN,
-	                duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::VARCHAR};
-	names = {"index_id", "index_name", "is_unique", "is_building", "state"};
+	                duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::UBIGINT};
+	names = {"index_id", "index_name", "is_unique", "is_building", "state", "certified_at"};
 	return bind_data;
 }
 
@@ -120,7 +119,7 @@ void IndexesImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 	auto &bind_data = data.bind_data->Cast<IndexesBindData>();
 	auto &state = data.global_state->Cast<IndexesGlobalState>();
 	if (state.offset >= bind_data.rows.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
@@ -131,213 +130,11 @@ void IndexesImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 		output.SetValue(2, i, duckdb::Value::BOOLEAN(row.unique));
 		output.SetValue(3, i, duckdb::Value::BOOLEAN(row.building));
 		output.SetValue(4, i, duckdb::Value(row.state));
+		output.SetValue(5, i, row.has_certificate ? duckdb::Value::UBIGINT(row.certified_at)
+		                                          : duckdb::Value(duckdb::LogicalType::UBIGINT));
 	}
 	state.offset += count;
-	output.SetCardinality(count);
-}
-
-// moraine_index_create / moraine_index_drop: autonomous-commit DDL.
-
-struct IndexDdlBindData : public duckdb::FunctionData {
-	bool is_create = false;
-	std::string catalog_name;
-	std::string schema_name;
-	std::string table_name;
-	std::string index_name;
-	std::vector<std::string> columns;
-	// Per-column direction: 1 = descending, parallel to `columns`. Empty
-	// leaves the index ascending.
-	std::vector<uint8_t> descending;
-	// Per-column NULL placement: 1 = NULLS FIRST, parallel to `columns`.
-	// Empty leaves the index NULLS LAST.
-	std::vector<uint8_t> nulls_first;
-	bool unique = false;
-	// Commit additions after the data snapshot in bounded repair steps.
-	bool deferred_maintenance = false;
-	// Run the multi-commit build instead of backfilling in one commit.
-	bool staged = false;
-	// Bounds on one step of that build, 0 for moraine's default. Only
-	// meaningful with `staged`.
-	uint64_t step_entries = 0;
-	uint64_t step_bytes = 0;
-
-	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
-		auto result = duckdb::make_uniq<IndexDdlBindData>();
-		*result = *this;
-		return result;
-	}
-	bool Equals(const duckdb::FunctionData &other_p) const override {
-		auto &other = other_p.Cast<IndexDdlBindData>();
-		return is_create == other.is_create && catalog_name == other.catalog_name &&
-		       schema_name == other.schema_name && table_name == other.table_name &&
-		       index_name == other.index_name && columns == other.columns &&
-		       descending == other.descending && nulls_first == other.nulls_first &&
-		       unique == other.unique && deferred_maintenance == other.deferred_maintenance &&
-		       staged == other.staged &&
-		       step_entries == other.step_entries && step_bytes == other.step_bytes;
-	}
-};
-
-struct IndexDdlGlobalState : public duckdb::GlobalTableFunctionState {
-	bool emitted = false;
-	duckdb::idx_t MaxThreads() const override {
-		return 1;
-	}
-};
-
-// The DDL is applied once, at execution start.
-duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexDdlInitGlobal(duckdb::ClientContext &context,
-                                                                        duckdb::TableFunctionInitInput &input) {
-	auto &bind_data = input.bind_data->Cast<IndexDdlBindData>();
-	auto handle = ResolveHandle(context, bind_data.catalog_name);
-	MoraineError err {};
-	int32_t code;
-	if (bind_data.is_create) {
-		std::vector<const char *> column_ptrs;
-		column_ptrs.reserve(bind_data.columns.size());
-		for (auto &column : bind_data.columns) {
-			column_ptrs.push_back(column.c_str());
-		}
-		// `descending`/`nulls_first` store one 0/1 byte per column; the ABI
-		// takes `uint8_t` arrays (not `bool`, which is UB to alias here), so
-		// pass the vector storage directly, or null to default that axis.
-		const uint8_t *directions = bind_data.descending.empty() ? nullptr : bind_data.descending.data();
-		const uint8_t *nulls_first = bind_data.nulls_first.empty() ? nullptr : bind_data.nulls_first.data();
-		code = moraine_index_create(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
-		                            bind_data.index_name.c_str(), column_ptrs.data(), column_ptrs.size(),
-		                            directions, nulls_first, bind_data.unique,
-		                            bind_data.deferred_maintenance, bind_data.staged,
-		                            bind_data.step_entries, bind_data.step_bytes,
-		                            moraine_shim_is_interrupted, &context, &err);
-	} else {
-		code = moraine_index_drop(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
-		                          bind_data.index_name.c_str(), moraine_shim_is_interrupted, &context, &err);
-	}
-	if (code != MORAINE_OK) {
-		ThrowMoraineError(err);
-	}
-	return duckdb::make_uniq<IndexDdlGlobalState>();
-}
-
-void IndexDdlImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
-	auto &state = data.global_state->Cast<IndexDdlGlobalState>();
-	auto &bind_data = data.bind_data->Cast<IndexDdlBindData>();
-	if (state.emitted) {
-		output.SetCardinality(0);
-		return;
-	}
-	std::string message = (bind_data.is_create ? "created index " : "dropped index ") + bind_data.index_name;
-	output.SetValue(0, 0, duckdb::Value(message));
-	output.SetCardinality(1);
-	state.emitted = true;
-}
-
-duckdb::unique_ptr<duckdb::FunctionData> CreateBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
-                                                    duckdb::vector<duckdb::LogicalType> &return_types,
-                                                    duckdb::vector<duckdb::string> &names) {
-	auto bind_data = duckdb::make_uniq<IndexDdlBindData>();
-	bind_data->is_create = true;
-	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
-	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
-	bind_data->table_name = input.inputs[2].GetValue<std::string>();
-	bind_data->index_name = input.inputs[3].GetValue<std::string>();
-	for (auto &child : duckdb::ListValue::GetChildren(input.inputs[4])) {
-		bind_data->columns.push_back(child.GetValue<std::string>());
-	}
-	bind_data->unique = input.inputs[5].GetValue<bool>();
-	auto maintenance = input.named_parameters.find("maintenance");
-	if (maintenance != input.named_parameters.end() && !maintenance->second.IsNull()) {
-		const std::string mode = maintenance->second.GetValue<std::string>();
-		if (mode == "deferred" || mode == "DEFERRED") {
-			bind_data->deferred_maintenance = true;
-		} else if (mode != "synchronous" && mode != "SYNCHRONOUS") {
-			throw duckdb::InvalidInputException(
-			    "moraine_index_create: maintenance must be 'synchronous' or 'deferred', got \"%s\"", mode);
-		}
-	}
-	if (bind_data->deferred_maintenance && bind_data->unique) {
-		throw duckdb::InvalidInputException(
-		    "moraine_index_create: deferred maintenance is supported only for non-unique indexes");
-	}
-	// Optional `directions := ['asc'|'desc', ...]`, parallel to the columns.
-	auto directions = input.named_parameters.find("directions");
-	if (directions != input.named_parameters.end() && !directions->second.IsNull()) {
-		for (auto &child : duckdb::ListValue::GetChildren(directions->second)) {
-			const std::string dir = child.GetValue<std::string>();
-			if (dir == "desc" || dir == "DESC") {
-				bind_data->descending.push_back(1);
-			} else if (dir == "asc" || dir == "ASC") {
-				bind_data->descending.push_back(0);
-			} else {
-				throw duckdb::InvalidInputException(
-				    "moraine_index_create: direction must be 'asc' or 'desc', got \"%s\"", dir);
-			}
-		}
-		if (bind_data->descending.size() != bind_data->columns.size()) {
-			throw duckdb::InvalidInputException(
-			    "moraine_index_create: `directions` must have one entry per column");
-		}
-	}
-	// Optional `nulls := ['first'|'last', ...]`, parallel to the columns.
-	auto nulls = input.named_parameters.find("nulls");
-	if (nulls != input.named_parameters.end() && !nulls->second.IsNull()) {
-		for (auto &child : duckdb::ListValue::GetChildren(nulls->second)) {
-			const std::string placement = child.GetValue<std::string>();
-			if (placement == "first" || placement == "FIRST") {
-				bind_data->nulls_first.push_back(1);
-			} else if (placement == "last" || placement == "LAST") {
-				bind_data->nulls_first.push_back(0);
-			} else {
-				throw duckdb::InvalidInputException(
-				    "moraine_index_create: nulls placement must be 'first' or 'last', got \"%s\"", placement);
-			}
-		}
-		if (bind_data->nulls_first.size() != bind_data->columns.size()) {
-			throw duckdb::InvalidInputException(
-			    "moraine_index_create: `nulls` must have one entry per column");
-		}
-	}
-	// Optional `staged := true`: build across several commits, for a table
-	// whose backfill exceeds what one commit may stage.
-	auto staged = input.named_parameters.find("staged");
-	if (staged != input.named_parameters.end() && !staged->second.IsNull()) {
-		bind_data->staged = staged->second.GetValue<bool>();
-	}
-	// Optional bounds on one step of that build. Rejected here rather than
-	// in the core so the message names the parameter the user typed, and so
-	// nothing is committed before the refusal.
-	auto positive = [&input](const char *name) -> uint64_t {
-		auto found = input.named_parameters.find(name);
-		if (found == input.named_parameters.end() || found->second.IsNull()) {
-			return 0;
-		}
-		const int64_t value = found->second.GetValue<int64_t>();
-		if (value <= 0) {
-			throw duckdb::InvalidInputException(
-			    "moraine_index_create: `%s` must be greater than zero, got %lld", name,
-			    static_cast<long long>(value));
-		}
-		return static_cast<uint64_t>(value);
-	};
-	bind_data->step_entries = positive("step_entries");
-	bind_data->step_bytes = positive("step_bytes");
-	return_types = {duckdb::LogicalType::VARCHAR};
-	names = {"result"};
-	return bind_data;
-}
-
-duckdb::unique_ptr<duckdb::FunctionData> DropBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
-                                                  duckdb::vector<duckdb::LogicalType> &return_types,
-                                                  duckdb::vector<duckdb::string> &names) {
-	auto bind_data = duckdb::make_uniq<IndexDdlBindData>();
-	bind_data->is_create = false;
-	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
-	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
-	bind_data->table_name = input.inputs[2].GetValue<std::string>();
-	bind_data->index_name = input.inputs[3].GetValue<std::string>();
-	return_types = {duckdb::LogicalType::VARCHAR};
-	names = {"result"};
-	return bind_data;
+	output.SetChildCardinality(count);
 }
 
 // moraine_index_lookup: resolves an equality key to the rows holding it. The
@@ -398,15 +195,6 @@ duckdb::unique_ptr<duckdb::NodeStatistics> ExactIndexCardinality(duckdb::ClientC
 	return duckdb::make_uniq<duckdb::NodeStatistics>(count, count);
 }
 
-// Backing storage for a `MoraineLookupValue`'s string/bytes fields, which
-// point into these members and so must outlive any use of the value.
-struct LookupValueBacking {
-	std::string str;
-	std::vector<uint8_t> bytes;
-};
-
-using LookupValueArena = std::deque<LookupValueBacking>;
-
 // A value's text tagged by type and length, so that two different argument
 // lists cannot render alike: without the tag `('a', 'b,c')` and `('a,b', 'c')`
 // share a rendering, as do a NULL bound and the string `'NULL'`.
@@ -415,10 +203,8 @@ std::string ValueRepr(const duckdb::Value &value) {
 	return std::to_string(static_cast<int>(value.type().id())) + ":" + std::to_string(text.size()) + ":" + text;
 }
 
-// Translates a DuckDB `Value` into the tagged `MoraineLookupValue` the ABI
-// coerces to the indexed column's type. `caller` names the SQL function in
-// any error. Throws on a type equality indexes do not cover.
-//
+} // namespace
+
 // A NULL becomes the `IS NULL` predicate kind; which callers accept one is
 // the core's rule, so it is not judged here. Reading a typed NULL's payload
 // would raise an internal error, so the kind is set before the switch.
@@ -489,13 +275,15 @@ MoraineLookupValue BuildLookupValue(const duckdb::Value &value, LookupValueArena
 	return lookup;
 }
 
+namespace {
+
 // The variadic args after the index name are the equality key: one value per
 // indexed column, in the index's column order. The count must match the index
 // width — the core refuses a partial key.
 duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &context,
                                                     duckdb::TableFunctionBindInput &input,
                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                    duckdb::vector<duckdb::string> &names) {
+                                                    duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<LookupBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -537,7 +325,7 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context,
                                                 duckdb::TableFunctionBindInput &input,
                                                 duckdb::vector<duckdb::LogicalType> &return_types,
-                                                duckdb::vector<duckdb::string> &names) {
+                                                duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<LookupBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -553,11 +341,11 @@ duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context,
 		for (auto &key : keys) {
 			// A whole NULL row cannot make an IN predicate true. Skipping it
 			// here also avoids asking StructValue for a NULL payload.
-			if (key.IsNull() && key.type().id() == duckdb::LogicalTypeId::STRUCT) {
+			if (key.IsNull() && duckdb::StructType::IsStruct(key.type())) {
 				continue;
 			}
 			auto &values = key_values.emplace_back();
-			if (key.type().id() == duckdb::LogicalTypeId::STRUCT) {
+			if (duckdb::StructType::IsStruct(key.type())) {
 				auto &children = duckdb::StructValue::GetChildren(key);
 				values.reserve(children.size());
 				for (auto &child : children) {
@@ -611,7 +399,7 @@ void LookupImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 	auto &bind_data = data.bind_data->Cast<LookupBindData>();
 	auto &state = data.global_state->Cast<LookupGlobalState>();
 	if (state.offset >= bind_data.rows.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
@@ -620,7 +408,7 @@ void LookupImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 		SetRowId(output, i, row);
 	}
 	state.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 struct RangeBindData : public IndexReadBindData {
@@ -652,7 +440,7 @@ struct RangeBindData : public IndexReadBindData {
 duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &context,
                                                    duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
-                                                   duckdb::vector<duckdb::string> &names) {
+                                                   duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<RangeBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -677,7 +465,7 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 			return;
 		}
 		duckdb::vector<duckdb::Value> columns;
-		if (value.type().id() == duckdb::LogicalTypeId::STRUCT) {
+		if (duckdb::StructType::IsStruct(value.type())) {
 			columns = duckdb::StructValue::GetChildren(value);
 		} else {
 			columns.push_back(value);
@@ -733,7 +521,7 @@ void RangeImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 	auto &bind_data = data.bind_data->Cast<RangeBindData>();
 	auto &state = data.global_state->Cast<RangeGlobalState>();
 	if (state.offset >= bind_data.rows.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
@@ -742,7 +530,7 @@ void RangeImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 		SetRowId(output, i, row);
 	}
 	state.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 struct NullsBindData : public IndexReadBindData {
@@ -771,7 +559,7 @@ struct NullsBindData : public IndexReadBindData {
 duckdb::unique_ptr<duckdb::FunctionData> NullsBind(duckdb::ClientContext &context,
                                                    duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
-                                                   duckdb::vector<duckdb::string> &names) {
+                                                   duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = duckdb::make_uniq<NullsBindData>();
 	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
@@ -834,7 +622,7 @@ void NullsImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 	auto &bind_data = data.bind_data->Cast<NullsBindData>();
 	auto &state = data.global_state->Cast<NullsGlobalState>();
 	if (state.offset >= bind_data.rows.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
@@ -843,7 +631,7 @@ void NullsImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 		SetRowId(output, i, row);
 	}
 	state.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace
@@ -895,6 +683,88 @@ bool IndexReadTable(const duckdb::TableFunction &function, const duckdb::Functio
 	return true;
 }
 
+// moraine_index_verify: recomputes the entries from the rows and reports the
+// difference. One row of counts, then the snapshot the index is certified
+// at, NULL when it is not. A clean index reports zeros for missing, dead
+// and mismatched. A read-write attach records the outcome; a read-only one
+// reports without writing.
+
+struct IndexVerifyBindData : public duckdb::FunctionData {
+	std::string catalog_name;
+	std::string schema_name;
+	std::string table_name;
+	std::string index_name;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<IndexVerifyBindData>();
+		*result = *this;
+		return result;
+	}
+	bool Equals(const duckdb::FunctionData &other_p) const override {
+		auto &other = other_p.Cast<IndexVerifyBindData>();
+		return catalog_name == other.catalog_name && schema_name == other.schema_name &&
+		       table_name == other.table_name && index_name == other.index_name;
+	}
+};
+
+struct IndexVerifyGlobalState : public duckdb::GlobalTableFunctionState {
+	MoraineIndexVerification report {};
+	bool emitted = false;
+
+	duckdb::idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+// The pass runs once, at execution start, so a cancelled statement stops it
+// rather than a later chunk.
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexVerifyInitGlobal(
+    duckdb::ClientContext &context, duckdb::TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<IndexVerifyBindData>();
+	auto handle = ResolveHandle(context, bind_data.catalog_name);
+	auto state = duckdb::make_uniq<IndexVerifyGlobalState>();
+	MoraineError err {};
+	auto code = moraine_index_verify(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
+	                                 bind_data.index_name.c_str(), &state->report,
+	                                 moraine_shim_is_interrupted, &context, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	return std::move(state);
+}
+
+void IndexVerifyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
+	auto &state = data.global_state->Cast<IndexVerifyGlobalState>();
+	if (state.emitted) {
+		output.SetChildCardinality(0);
+		return;
+	}
+	auto &report = state.report;
+	const uint64_t counts[] = {report.stored, report.expected, report.missing, report.dead, report.mismatched};
+	for (duckdb::idx_t column = 0; column < 5; column++) {
+		output.SetValue(column, 0, duckdb::Value::UBIGINT(counts[column]));
+	}
+	output.SetValue(5, 0, report.has_certificate ? duckdb::Value::UBIGINT(report.certified_at)
+	                                             : duckdb::Value(duckdb::LogicalType::UBIGINT));
+	output.SetChildCardinality(1);
+	state.emitted = true;
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> VerifyBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
+                                                    duckdb::vector<duckdb::LogicalType> &return_types,
+                                                    duckdb::vector<duckdb::Identifier> &names) {
+	auto bind_data = duckdb::make_uniq<IndexVerifyBindData>();
+	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
+	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
+	bind_data->table_name = input.inputs[2].GetValue<std::string>();
+	bind_data->index_name = input.inputs[3].GetValue<std::string>();
+	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT,
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT};
+	names = {"stored", "expected", "missing", "dead", "mismatched", "certified_at"};
+	return bind_data;
+}
+
 void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	using duckdb::LogicalType;
 
@@ -903,31 +773,13 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                           IndexesBind, IndexesInitGlobal);
 	loader.RegisterFunction(list);
 
-	duckdb::TableFunction create(
-	    "moraine_index_create",
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	     LogicalType::LIST(LogicalType::VARCHAR), LogicalType::BOOLEAN},
-	    IndexDdlImpl, CreateBind, IndexDdlInitGlobal);
-	// Optional per-column sort directions ['asc'|'desc', ...] and NULL
-	// placement ['first'|'last', ...], each parallel to the columns.
-	create.named_parameters["directions"] = LogicalType::LIST(LogicalType::VARCHAR);
-	create.named_parameters["nulls"] = LogicalType::LIST(LogicalType::VARCHAR);
-	create.named_parameters["maintenance"] = LogicalType::VARCHAR;
-	// Multi-commit build, for a backfill too large for one commit, and the
-	// bounds on one step of it — each step is one object-store request, so a
-	// slow link wants them smaller than the default.
-	create.named_parameters["staged"] = LogicalType::BOOLEAN;
-	create.named_parameters["step_entries"] = LogicalType::BIGINT;
-	create.named_parameters["step_bytes"] = LogicalType::BIGINT;
-	loader.RegisterFunction(create);
-
 	// (catalog, schema, table, index, then the equality key as variadic args
 	// — one value per indexed column, in the index's column order.)
 	duckdb::TableFunction lookup("moraine_index_lookup",
 	                             {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                              LogicalType::VARCHAR},
 	                             LookupImpl, LookupBind, LookupInitGlobal);
-	lookup.varargs = LogicalType::ANY;
+	lookup.GetSignature().AddArgs("keys", LogicalType::ANY);
 	lookup.cardinality = ExactIndexCardinality<LookupBindData>;
 	loader.RegisterFunction(lookup);
 
@@ -940,11 +792,11 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	in.cardinality = ExactIndexCardinality<LookupBindData>;
 	loader.RegisterFunction(in);
 
-	duckdb::TableFunction drop("moraine_index_drop",
-	                           {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                            LogicalType::VARCHAR},
-	                           IndexDdlImpl, DropBind, IndexDdlInitGlobal);
-	loader.RegisterFunction(drop);
+	duckdb::TableFunction verify("moraine_index_verify",
+	                             {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                              LogicalType::VARCHAR},
+	                             IndexVerifyImpl, VerifyBind, IndexVerifyInitGlobal);
+	loader.RegisterFunction(verify);
 
 	// (catalog, schema, table, index, lower, upper, lower_inclusive,
 	// upper_inclusive); a NULL bound is an open side.
@@ -953,7 +805,9 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                             LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY,
 	                             LogicalType::BOOLEAN, LogicalType::BOOLEAN},
 	                            RangeImpl, RangeBind, RangeInitGlobal);
-	range.named_parameters["reverse"] = LogicalType::BOOLEAN;
+	range.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		options.Add("reverse", LogicalType::BOOLEAN);
+	});
 	range.cardinality = ExactIndexCardinality<RangeBindData>;
 	loader.RegisterFunction(range);
 
@@ -963,8 +817,10 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                            {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                             LogicalType::VARCHAR},
 	                            NullsImpl, NullsBind, NullsInitGlobal);
-	nulls.varargs = LogicalType::ANY;
-	nulls.named_parameters["reverse"] = LogicalType::BOOLEAN;
+	nulls.GetSignature().AddArgs("keys", LogicalType::ANY);
+	nulls.GetSignature().WithTypedKwargs("options", [](duckdb::TypedKwargs &options) {
+		options.Add("reverse", LogicalType::BOOLEAN);
+	});
 	nulls.cardinality = ExactIndexCardinality<NullsBindData>;
 	loader.RegisterFunction(nulls);
 }

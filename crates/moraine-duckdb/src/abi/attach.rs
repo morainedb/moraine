@@ -824,8 +824,7 @@ fn apply_commit_log(options: &mut CatalogOptions, commit_log: Option<&MoraineCom
 }
 
 /// Opens a catalog that takes no part in a commit log beyond the process
-/// default. New callers use [`moraine_attach_with_commit_log`], whose
-/// `commit_log` argument tunes its reading of a commit log.
+/// default: [`moraine_attach_with_commit_log`] with no `commit_log`.
 ///
 /// # Safety
 ///
@@ -885,124 +884,6 @@ pub unsafe extern "C" fn moraine_attach_with_wal_store(
     }
 }
 
-/// Opens a catalog whose write-ahead log is in the catalog store. New
-/// callers use [`moraine_attach_with_wal_store`], whose `wal` argument
-/// places the log elsewhere.
-///
-/// # Safety
-///
-/// All pointer and callback requirements are identical to
-/// [`moraine_attach_with_wal_store`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_attach_with_cache_policy(
-    path: *const c_char,
-    s3: *const MoraineS3Config,
-    read_only: bool,
-    encrypted: bool,
-    flush_interval_ms: u64,
-    flush_on_commit: bool,
-    cache_dir: *const c_char,
-    cache_size_bytes: u64,
-    cache_memory_bytes: u64,
-    cache_auxiliary_percent: u32,
-    cache_preload: u8,
-    cache_puts: bool,
-    cache_compaction_puts: bool,
-    data_path: *const c_char,
-    checkpoint: *const c_char,
-    host_threads: u64,
-    probe: MoraineInterruptProbe,
-    probe_ctx: *mut c_void,
-    out: *mut *mut MoraineCatalogHandle,
-    err: *mut MoraineError,
-) -> i32 {
-    // SAFETY: forwards every pointer and callback unchanged under the same
-    // contract.
-    unsafe {
-        moraine_attach_with_wal_store(
-            path,
-            s3,
-            read_only,
-            encrypted,
-            flush_interval_ms,
-            flush_on_commit,
-            cache_dir,
-            cache_size_bytes,
-            cache_memory_bytes,
-            cache_auxiliary_percent,
-            cache_preload,
-            cache_puts,
-            cache_compaction_puts,
-            data_path,
-            ptr::null(),
-            checkpoint,
-            host_threads,
-            probe,
-            probe_ctx,
-            out,
-            err,
-        )
-    }
-}
-
-/// Opens a catalog with one legacy flag controlling both flush and compaction
-/// admission. New callers use [`moraine_attach_with_cache_policy`] for
-/// independent policies.
-///
-/// # Safety
-///
-/// All pointer and callback requirements are identical to
-/// [`moraine_attach_with_cache_policy`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_attach(
-    path: *const c_char,
-    s3: *const MoraineS3Config,
-    read_only: bool,
-    encrypted: bool,
-    flush_interval_ms: u64,
-    flush_on_commit: bool,
-    cache_dir: *const c_char,
-    cache_size_bytes: u64,
-    cache_memory_bytes: u64,
-    cache_auxiliary_percent: u32,
-    cache_preload: u8,
-    cache_puts: bool,
-    data_path: *const c_char,
-    checkpoint: *const c_char,
-    host_threads: u64,
-    probe: MoraineInterruptProbe,
-    probe_ctx: *mut c_void,
-    out: *mut *mut MoraineCatalogHandle,
-    err: *mut MoraineError,
-) -> i32 {
-    // SAFETY: forwards every pointer and callback unchanged under the same
-    // contract.
-    unsafe {
-        moraine_attach_with_cache_policy(
-            path,
-            s3,
-            read_only,
-            encrypted,
-            flush_interval_ms,
-            flush_on_commit,
-            cache_dir,
-            cache_size_bytes,
-            cache_memory_bytes,
-            cache_auxiliary_percent,
-            cache_preload,
-            cache_puts,
-            cache_puts,
-            data_path,
-            checkpoint,
-            host_threads,
-            probe,
-            probe_ctx,
-            out,
-            err,
-        )
-    }
-}
-
 /// Writes the lake's recorded data root (the stored global `data_path`
 /// option) to `*out` as an owned C string, or null when none was recorded.
 /// Free a non-null result exactly once with [`moraine_string_free`].
@@ -1012,9 +893,9 @@ pub unsafe extern "C" fn moraine_attach(
 ///
 /// # Safety
 ///
-/// `handle` must be a live handle from [`moraine_attach`]. `out` must be a
-/// valid, writable `*mut *mut c_char`. `probe`/`probe_ctx` follow the ABI
-/// cancellation contract. `err`, if non-null, must be writable. All for the
+/// `handle` must be a live handle from [`moraine_attach_with_wal_store`]. `out`
+/// must be a valid, writable `*mut *mut c_char`. `probe`/`probe_ctx` follow the
+/// ABI cancellation contract. `err`, if non-null, must be writable. All for the
 /// duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_data_path(
@@ -1053,7 +934,105 @@ pub unsafe extern "C" fn moraine_data_path(
     }
 }
 
-/// What one [`moraine_migrate`] call did.
+/// Writes the DuckLake catalog version this store serves to `*out`, as a
+/// NUL-terminated string to free exactly once with [`moraine_string_free`].
+///
+/// # Safety
+/// `handle` is live and exclusively accessed; `out` is writable; `err` is
+/// writable when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_catalog_version(
+    handle: *mut MoraineCatalogHandle,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    out: *mut *mut c_char,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out.is_null() {
+            return Err(AbiError::invalid_argument("`out` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+        }?;
+        let version = snapshot
+            .option(moraine::OptionScope::Global, "version")
+            .unwrap_or_else(|| moraine::CATALOG_VERSION.to_string());
+        let version_ptr = to_c_string(version)?.into_raw();
+        // SAFETY: `out` is non-null and writable per the caller contract.
+        unsafe { *out = version_ptr };
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Raises the catalog version this store records to the newest shape this
+/// build serves, writing the move to `*out_from`/`*out_to` as
+/// NUL-terminated strings to free exactly once each with
+/// [`moraine_string_free`].
+///
+/// `dry_run` reports the move it would make and records nothing. Equal
+/// values mean there was nothing to raise.
+///
+/// # Safety
+/// `handle` is live and exclusively accessed; `out_from`/`out_to` are
+/// writable; `err` is writable when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_raise_catalog_version(
+    handle: *mut MoraineCatalogHandle,
+    dry_run: bool,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    out_from: *mut *mut c_char,
+    out_to: *mut *mut c_char,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_from.is_null() || out_to.is_null() {
+            return Err(AbiError::invalid_argument("`out_from`/`out_to` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let raised = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref.catalog.writer()?.raise_catalog_version(dry_run),
+            )
+        }?;
+        let from = to_c_string(raised.from)?.into_raw();
+        let to = to_c_string(raised.to)?.into_raw();
+        // SAFETY: both checked non-null above; caller contract.
+        unsafe {
+            *out_from = from;
+            *out_to = to;
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// What one [`moraine_migrate_with_wal_store`] call did.
 #[repr(C)]
 pub struct MoraineMigrationReport {
     /// The structural format the store carried when the call began.
@@ -1182,44 +1161,6 @@ pub unsafe extern "C" fn moraine_migrate_with_wal_store(
     }
 }
 
-/// Migrates a store whose write-ahead log is in the store itself. New
-/// callers use [`moraine_migrate_with_wal_store`].
-///
-/// # Safety
-///
-/// All pointer requirements are identical to
-/// [`moraine_migrate_with_wal_store`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_migrate(
-    path: *const c_char,
-    s3: *const MoraineS3Config,
-    flush_interval_ms: u64,
-    cache_dir: *const c_char,
-    cache_size_bytes: u64,
-    cache_preload: u8,
-    cache_puts: bool,
-    checkpoint: bool,
-    out: *mut MoraineMigrationReport,
-    err: *mut MoraineError,
-) -> i32 {
-    // SAFETY: forwards every pointer unchanged under the same contract.
-    unsafe {
-        moraine_migrate_with_wal_store(
-            path,
-            s3,
-            ptr::null(),
-            flush_interval_ms,
-            cache_dir,
-            cache_size_bytes,
-            cache_preload,
-            cache_puts,
-            checkpoint,
-            out,
-            err,
-        )
-    }
-}
-
 /// Raises the store `handle` names to the newest purely additive format
 /// this binary writes, opening the record shapes gated behind it, and
 /// reports the formats either side of the move.
@@ -1234,8 +1175,8 @@ pub unsafe extern "C" fn moraine_migrate(
 ///
 /// # Safety
 ///
-/// `handle` must be a pointer previously returned by [`moraine_attach`]
-/// and not yet detached.
+/// `handle` must be a pointer previously returned by
+/// [`moraine_attach_with_wal_store`] and not yet detached.
 /// `out_from`/`out_to` must be valid, writable pointers, and `err`, if
 /// non-null, a valid, writable [`MoraineError`], for the duration of the
 /// call.
@@ -1297,7 +1238,7 @@ pub unsafe extern "C" fn moraine_string_free(ptr: *mut c_char) {
 ///
 /// # Safety
 ///
-/// `handle` must be a live handle from [`moraine_attach`].
+/// `handle` must be a live handle from [`moraine_attach_with_wal_store`].
 /// `out_encrypted` must be a valid, writable `*mut bool`. `probe`, if
 /// non-null, must be safe to call with `probe_ctx` from any thread.
 /// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
@@ -1350,7 +1291,7 @@ pub unsafe extern "C" fn moraine_catalog_encrypted(
 /// # Safety
 ///
 /// `handle`, if non-null, must be a pointer previously returned by
-/// [`moraine_attach`] and not yet passed to `moraine_detach`.
+/// [`moraine_attach_with_wal_store`] and not yet passed to `moraine_detach`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_detach(handle: *mut MoraineCatalogHandle) {
     if handle.is_null() {

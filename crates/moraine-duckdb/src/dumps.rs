@@ -80,11 +80,11 @@ pub(crate) fn opt_into_raw(s: Option<CString>) -> *mut c_char {
 /// # Safety
 ///
 /// `handle` must be a pointer previously returned by
-/// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached.
-/// `out_items`/`out_len` must be valid, writable pointers. `probe`, if
-/// non-null, must be safe to call with `probe_ctx` from any thread.
-/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
-/// for the duration of the call.
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store)
+/// and not yet detached. `out_items`/`out_len` must be valid, writable
+/// pointers. `probe`, if non-null, must be safe to call with `probe_ctx` from
+/// any thread. `err`, if non-null, must be a valid, writable [`MoraineError`].
+/// All for the duration of the call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn dump_rows<Row, Rows>(
     handle: *mut MoraineCatalogHandle,
@@ -301,7 +301,7 @@ pub(crate) mod test_support {
 
             // Schema `sales` took global id 1, table `orders` id 2; its
             // first column has per-table field id 1.
-            let mut tx = staged_begin(&catalog, None, String::new())
+            let mut tx = staged_begin(&catalog, None, String::new(), None)
                 .await
                 .expect("test setup: begin staged tx");
             tx.stage(RowOperation::Insert {

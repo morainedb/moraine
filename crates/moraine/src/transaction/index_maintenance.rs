@@ -27,6 +27,7 @@ use crate::{
         StagedBytes,
         handle::{ReadHandle, ScanOrder, ScanShape},
         index_encoding::{CanonicalKey, NullOrder, non_null_flag_key},
+        index_entries::{decode_row_id, encode_row_id},
         key::{
             IndexKey, IndexKind, Key, encode_index_entry, index_index_prefix,
             index_multi_value_prefix, index_value_above, index_value_body, index_value_suffix,
@@ -62,17 +63,6 @@ pub(crate) struct StagedIndexEntry {
     /// The caller established the entry names this row in committed state,
     /// so a unique delete needs no read before it.
     pub(crate) known_held: bool,
-}
-
-/// A unique entry's value is the holding row id, big-endian.
-fn decode_row_id(bytes: &[u8]) -> Result<u64> {
-    let array: [u8; 8] = bytes.try_into().map_err(|_| {
-        Error::Corruption(format!(
-            "index entry value is {} bytes, expected 8",
-            bytes.len()
-        ))
-    })?;
-    Ok(u64::from_be_bytes(array))
 }
 
 /// Uniqueness probes in flight at once; sized for a remote object store.
@@ -504,7 +494,7 @@ fn stage_probe_put(
     let value_bytes = row_id.map_or(0, |_| size_of::<u64>());
     staged.add(key.len(), value_bytes);
     match row_id {
-        Some(row_id) => db_tx.put(key, row_id.to_be_bytes()),
+        Some(row_id) => db_tx.put(key, encode_row_id(row_id)),
         None => db_tx.put(key, []),
     }
 }
@@ -783,6 +773,10 @@ pub(crate) fn apply_deferred_maintenance(
         if value.build_state.is_none() {
             value.begin_snapshot = new_snapshot;
             value.build_state = Some("maintaining".to_owned());
+            // Additions land before the repair that places them, so the
+            // index is briefly short of the rows and any certificate it
+            // held is withdrawn.
+            value.verified_at_snapshot = None;
             value.build_cursor_row_id = base
                 .table_stats
                 .get(&table_id)
@@ -837,9 +831,16 @@ fn unique_violation(index_id: u64, claimant: u64, holder: u64, collided: Collide
 
 /// Drains a scan over `multi` entries into their row ids, which live in
 /// the key. `context` names the scan in a corruption error.
-async fn collect_multi_row_ids(iter: &mut slatedb::DbIterator, context: &str) -> Result<Vec<u64>> {
+async fn collect_multi_row_ids(
+    iter: &mut slatedb::DbIterator,
+    context: &str,
+    limit: usize,
+) -> Result<Vec<u64>> {
     let mut row_ids = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
+    while row_ids.len() < limit {
+        let Some(entry) = iter.next().await.map_err(Error::from)? else {
+            break;
+        };
         match Key::decode(&entry.key)? {
             Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
             other => {
@@ -861,6 +862,20 @@ pub(crate) async fn lookup_row_ids(
     unique: bool,
     key: &CanonicalKey,
 ) -> Result<Vec<u64>> {
+    lookup_row_ids_limited(reader, index_id, unique, key, usize::MAX).await
+}
+
+/// Reads at most `limit` entries for an optimizer equality probe.
+pub(crate) async fn lookup_row_ids_limited(
+    reader: ReadHandle<'_>,
+    index_id: u64,
+    unique: bool,
+    key: &CanonicalKey,
+    limit: usize,
+) -> Result<Vec<u64>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     if unique {
         let entry_key = encode_index_entry(index_id, true, key, 0);
         return match reader.get(entry_key).await.map_err(Error::from)? {
@@ -875,7 +890,7 @@ pub(crate) async fn lookup_row_ids(
         .await
         .map_err(Error::from)?;
 
-    collect_multi_row_ids(&mut iter, "index scan").await
+    collect_multi_row_ids(&mut iter, "index scan", limit).await
 }
 
 /// The row ids whose indexed value falls between `lower` and `upper`, in the
@@ -889,6 +904,28 @@ pub(crate) async fn range_row_ids(
     lower: Bound<CanonicalKey>,
     upper: Bound<CanonicalKey>,
     order: ScanOrder,
+) -> Result<Vec<u64>> {
+    range_row_ids_limited(
+        reader,
+        index_id,
+        unique,
+        leading_nulls,
+        (lower, upper),
+        order,
+        usize::MAX,
+    )
+    .await
+}
+
+/// Reads at most `limit` entries in a comparison range.
+pub(crate) async fn range_row_ids_limited(
+    reader: ReadHandle<'_>,
+    index_id: u64,
+    unique: bool,
+    leading_nulls: NullOrder,
+    (lower, upper): (Bound<CanonicalKey>, Bound<CanonicalKey>),
+    order: ScanOrder,
+    limit: usize,
 ) -> Result<Vec<u64>> {
     let kind = if unique {
         IndexKind::Unique
@@ -929,10 +966,13 @@ pub(crate) async fn range_row_ids(
         .await
         .map_err(Error::from)?;
     if !unique {
-        return collect_multi_row_ids(&mut iter, "index range scan").await;
+        return collect_multi_row_ids(&mut iter, "index range scan", limit).await;
     }
     let mut row_ids = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
+    while row_ids.len() < limit {
+        let Some(entry) = iter.next().await.map_err(Error::from)? else {
+            break;
+        };
         row_ids.push(decode_row_id(entry.value.as_ref())?);
     }
 
@@ -949,6 +989,17 @@ pub(crate) async fn null_prefix_row_ids(
     prefix: &CanonicalKey,
     order: ScanOrder,
 ) -> Result<Vec<u64>> {
+    null_prefix_row_ids_limited(reader, index_id, prefix, order, usize::MAX).await
+}
+
+/// Reads at most `limit` entries from a NULL-bearing prefix.
+pub(crate) async fn null_prefix_row_ids_limited(
+    reader: ReadHandle<'_>,
+    index_id: u64,
+    prefix: &CanonicalKey,
+    order: ScanOrder,
+    limit: usize,
+) -> Result<Vec<u64>> {
     let mut scan_prefix = index_multi_value_prefix(index_id, prefix);
     // Dropping the exact-value terminator turns the bytes into a true
     // leading prefix.
@@ -959,7 +1010,7 @@ pub(crate) async fn null_prefix_row_ids(
         .await
         .map_err(Error::from)?;
 
-    collect_multi_row_ids(&mut iter, "null-prefix scan").await
+    collect_multi_row_ids(&mut iter, "null-prefix scan", limit).await
 }
 
 #[cfg(test)]

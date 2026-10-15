@@ -71,6 +71,22 @@ pub struct FormatRaise {
     pub to_format: u64,
 }
 
+/// What one catalog-version raise did.
+///
+/// A separate axis from [`FormatRaise`]: the store format is how moraine
+/// writes bytes, while the catalog version is the shape it serves
+/// DuckLake. They move on their own schedules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CatalogVersionRaise {
+    /// The catalog version the store recorded when the call began.
+    pub from: String,
+    /// The newest version this build serves. A dry run reports the move
+    /// it would make without recording it; equal to `from` when there was
+    /// nothing to raise.
+    pub to: String,
+}
+
 /// The highest format `current` can reach without a structural rewrite:
 /// this binary's newest, stopped below the first format some migration
 /// unit reads. Past that one the keys have moved, and only that unit puts
@@ -86,26 +102,12 @@ fn additive_ceiling(current: u64) -> u64 {
         })
 }
 
-/// Raises the store's `sys/format` to the newest purely additive format
-/// this binary writes, and reports what moved.
+/// Raises `sys/format` to the additive ceiling without crossing a structural
+/// migration, refusing stores mid-migration. An attached catalog already
+/// requires format 9, the current ceiling, so this reports no change.
 ///
-/// The formats it reaches add record shapes that an older binary would
-/// misread rather than refuse — an inline schema reference decoding as a
-/// no-column schema, say — so this is **one-way**: a store that takes one
-/// can no longer be opened by a binary that predates it. Commits reach
-/// these formats on their own, when they first write such a shape; this
-/// is for an operator who would rather take the step deliberately than
-/// have the first such commit take it.
-///
-/// A reader that is *already attached* on an older binary is not refused
-/// by anything here; it keeps running and may misread what later commits
-/// write. Raise the format only once every reader of the store is on a
-/// binary that understands it.
-///
-/// Refuses a store mid-migration, whose keyspace is in motion, and stops
-/// below any format reached by a structural rewrite instead of stamping
-/// past it. `dry_run` reports the move it would make and stamps nothing,
-/// which is the only way to read a store's format without changing it.
+/// `dry_run` reports the result without writing; ordinary commits do not
+/// raise the format.
 pub(crate) async fn raise_format(
     db: &Db,
     durability: &CommitDurability,

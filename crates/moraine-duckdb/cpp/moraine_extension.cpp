@@ -18,15 +18,16 @@ void RegisterMoraineStorageExtension(duckdb::DBConfig &config);
 void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader);
 // Defined in index_functions.cpp.
 void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader);
-// Defined in delete_located.cpp.
-void RegisterMoraineDeleteLocatedFunction(duckdb::ExtensionLoader &loader);
-void RegisterMoraineRowsAtFunction(duckdb::ExtensionLoader &loader);
-void RegisterMorainePositionResolver();
-void RegisterMoraineUpdateFunction(duckdb::ExtensionLoader &loader);
+void RegisterMoraineIndexDdl(duckdb::DBConfig &config);
 // Defined in optimizer.cpp.
 void RegisterMoraineOptimizer(duckdb::DBConfig &config);
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader);
+void RegisterMoraineFaultFunctions(duckdb::ExtensionLoader &loader);
 void RegisterMoraineMigrateFunction(duckdb::ExtensionLoader &loader);
+// Defined in metadata_manager.cpp.
+void RegisterMoraineMetadataManager();
+// Defined in raise_catalog_version.cpp.
+void RegisterMoraineRaiseCatalogVersionFunction(duckdb::ExtensionLoader &loader);
 // Defined in move_wal.cpp.
 void RegisterMoraineMoveWalFunction(duckdb::ExtensionLoader &loader);
 // Defined in checkpoints.cpp.
@@ -45,7 +46,7 @@ namespace duckdb {
 // registration. A standalone DuckLake loaded earlier lacks the patches and
 // collides on its log type, so it is refused.
 static void LoadBundledDuckLake(ExtensionLoader &loader) {
-	auto load = ExtensionManager::Get(loader.GetDatabaseInstance()).BeginLoad("ducklake");
+	auto load = ExtensionManager::Get(loader.GetDatabaseInstance()).BeginLoad(ExtensionLoadOptions("ducklake"));
 	if (!load) {
 		throw InvalidInputException("moraine bundles its own DuckLake; LOAD moraine without loading ducklake");
 	}
@@ -71,16 +72,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// it registers.
 	LoadBundledDuckLake(loader);
 	loader.SetDescription("moraine: a SlateDB-backed DuckLake catalog, DuckLake bundled");
+	moraine_duckdb::RegisterMoraineMetadataManager();
 	moraine_duckdb::RegisterMoraineStorageExtension(loader.GetDatabaseInstance().config);
 	moraine_duckdb::RegisterMoraineOptimizer(loader.GetDatabaseInstance().config);
 	moraine_duckdb::RegisterMoraineCensusFunctions(loader);
 	moraine_duckdb::RegisterMoraineIndexFunctions(loader);
-	moraine_duckdb::RegisterMoraineDeleteLocatedFunction(loader);
-	moraine_duckdb::RegisterMoraineRowsAtFunction(loader);
-	moraine_duckdb::RegisterMorainePositionResolver();
-	moraine_duckdb::RegisterMoraineUpdateFunction(loader);
+	moraine_duckdb::RegisterMoraineIndexDdl(loader.GetDatabaseInstance().config);
 	moraine_duckdb::RegisterMoraineMaintenanceFunctions(loader);
 	moraine_duckdb::RegisterMoraineMigrateFunction(loader);
+	moraine_duckdb::RegisterMoraineFaultFunctions(loader);
+	moraine_duckdb::RegisterMoraineRaiseCatalogVersionFunction(loader);
 	moraine_duckdb::RegisterMoraineMoveWalFunction(loader);
 	moraine_duckdb::RegisterMoraineCheckpointFunctions(loader);
 }

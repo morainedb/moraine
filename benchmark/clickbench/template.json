@@ -1,0 +1,16 @@
+{
+    "system": "DuckLake (moraine)",
+    "cluster_size": 1,
+    "proprietary": "no",
+    "hardware": "cpu",
+    "tuned": "no",
+    "tags": [
+        "Rust",
+        "C++",
+        "column-oriented",
+        "DuckDB derivative",
+        "embedded",
+        "data lake"
+    ],
+    "storage": "datalake"
+}

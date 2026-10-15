@@ -1,116 +1,40 @@
 name: Extension
-# Build the extension for every supported DuckDB release × platform and
-# publish an UNSIGNED ext-v* release from a dispatched tag.
+# Build the extension for every published platform and prove the bundled
+# DuckLake in the same container that built it.
+#
+# Publishing stays off here: a C++-ABI extension only loads into the exact
+# version stamped in its footer, and the primary pin in
+# .github/duckdb-versions is a development revision whose label moves with
+# DuckDB's own builds. A build from this workflow does load — DuckDB
+# publishes that label's libraries and CLI — so consumers take the artifact
+# from a run. Turning the ext-v* release job back on is its own decision.
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Extension release tag, e.g. ext-v0.1.0 or ext-v0.1.0-build.2"
-        required: true
 
 jobs:
-  # A C++-ABI extension only loads into the exact DuckDB version stamped in
-  # its footer, so every supported release gets its own build. The list lives
-  # in .github/duckdb-versions; `cargo xtask check-pins` keeps it and every
-  # other mention of a version in step.
-  versions:
-    name: Read the DuckDB version matrix
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.read.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v7
-      - id: read
-        run: echo "matrix=$(cargo run -q -p xtask -- version-matrix)" >> "$GITHUB_OUTPUT"
-
   build:
-    name: Build ${{ matrix.duckdb_version }} (extension-ci-tools)
-    needs: versions
-    strategy:
-      fail-fast: false
-      matrix:
-        duckdb_version: ${{ fromJson(needs.versions.outputs.matrix) }}
-    # Pinned to the primary release; `duckdb_version`, not this ref, selects
-    # which DuckDB each matrix entry checks out. `ci_tools_version` names the
-    # same ref for the reason release.yml gives: a matrix generated from an
-    # older ref silently drops the platforms its config cannot describe.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.6
+    name: Build the extension (extension-ci-tools)
+    # Omit duckdb_version to build the pinned submodule. The Makefile stamps
+    # duckdb_tag explicitly; test_config forwards it into Linux containers.
+    # ci_tools_version must match the reusable workflow's ref.
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@969bc76276acec1c0a3922ff500d2ec3a1a3b037
     with:
       extension_name: moraine
-      duckdb_version: ${{ matrix.duckdb_version }}
-      ci_tools_version: v1.5.6
+      ci_tools_version: 969bc76276acec1c0a3922ff500d2ec3a1a3b037
+      duckdb_tag: v2.0.0-alpha46057
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes
       # the same set.
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
+      # The bundled DuckLake carries the patch series: prove the build
+      # records row-ID statistics, prunes a scan by row id, and takes
+      # existing delete positions. It runs here rather than in a job of its
+      # own because the only CLI that can load the artifact is the one this
+      # container just built beside it.
+      post_build_command: >-
+        cargo run -q -p xtask -- validate-release-artifact v2.0.0-alpha46057
+        build/release/extension/moraine/moraine.duckdb_extension
       # Point ccache at the directory the Linux container already mounts and
-      # caches; without it every build recompiles DuckDB from scratch. See
-      # release.yml, which passes the same thing for the same reason.
-      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir"}}'
-
-  # The bundled DuckLake carries the patch series: prove a published build
-  # records row-ID statistics, prunes a scan by row id, and takes existing
-  # delete positions, on one Linux and one macOS build of every version,
-  # before anything is released.
-  validate:
-    name: Validate ${{ matrix.duckdb_version }} on ${{ matrix.runner }}
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            platform: linux_amd64
-            duckdb_version: v1.5.6
-          - runner: ubuntu-24.04
-            platform: linux_amd64
-            duckdb_version: v1.5.5
-          - runner: ubuntu-24.04
-            platform: linux_amd64
-            duckdb_version: v1.5.4
-          - runner: macos-15
-            platform: osx_arm64
-            duckdb_version: v1.5.6
-          - runner: macos-15
-            platform: osx_arm64
-            duckdb_version: v1.5.5
-          - runner: macos-15
-            platform: osx_arm64
-            duckdb_version: v1.5.4
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          name: moraine-${{ matrix.duckdb_version }}-extension-${{ matrix.platform }}
-          path: artifact
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v6
-        with:
-          path: target/duckdb-cli
-          key: duckdb-cli-${{ matrix.platform }}-${{ matrix.duckdb_version }}
-      - run: >-
-          cargo xtask validate-release-artifact
-          ${{ matrix.duckdb_version }}
-          artifact/moraine.duckdb_extension
-
-  release:
-    needs: [build, validate]
-    runs-on: ubuntu-latest
-    # Bounded because the upload below has hung for tens of minutes on a
-    # payload it moves in seconds, with nothing failing and nothing to read.
-    # A release that cannot finish should say so rather than hold a runner.
-    timeout-minutes: 30
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      - uses: ./.github/actions/publish-extension-release
-        with:
-          tag: ${{ inputs.tag }}
-          target: ${{ github.sha }}
-          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      # caches; without it every build recompiles DuckDB from scratch.
+      test_config: '{"test_env_variables": {"CCACHE_DIR": "/ccache_dir", "DUCKDB_TAG": "v2.0.0-alpha46057"}}'

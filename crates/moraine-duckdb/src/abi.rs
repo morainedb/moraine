@@ -19,10 +19,11 @@
 //! [`CatalogSnapshot`]: moraine::CatalogSnapshot
 
 mod attach;
-mod deletion;
+mod fault;
 mod indexes;
 mod lookup;
 mod maintenance;
+mod positions;
 mod read_scope;
 mod row_scan;
 mod snapshot;
@@ -41,10 +42,11 @@ use std::{
 
 pub use attach::*;
 pub use checkpoints::*;
-pub use deletion::*;
+pub use fault::*;
 pub use indexes::*;
 pub use lookup::*;
 pub use maintenance::*;
+pub use positions::*;
 pub use read_scope::*;
 pub use row_scan::*;
 pub use snapshot::*;

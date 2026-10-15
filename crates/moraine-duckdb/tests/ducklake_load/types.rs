@@ -33,7 +33,7 @@ use crate::helpers::*;
 /// through the standalone projection, so a type that reads back but
 /// mis-names itself (a dropped `DECIMAL` suffix) is caught too.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 #[allow(clippy::too_many_lines)]
 fn ducklake_scalar_type_matrix_round_trip_through_flush() {
     let dir = TempDir::new("scalars-store");
@@ -162,13 +162,15 @@ fn ducklake_scalar_type_matrix_round_trip_through_flush() {
     assert_eq!(csv_rows(&run_ducklake_sql(store, data_path, select)), want);
 }
 
-/// A `GEOMETRY` column round-trips through moraine + DuckLake with the
-/// `spatial` extension loaded: DuckDB's Arrow inline encoding supports
-/// geometry (spatial registers it), the stored `column_type` reads back as
-/// DuckLake's `geometry`, and values survive both the inline keyspace and
-/// the Parquet flush. A `NULL` row proves null handling.
+/// A `GEOMETRY` column round-trips through moraine + DuckLake: DuckDB's
+/// Arrow inline encoding supports geometry, the stored `column_type` reads
+/// back as DuckLake's `geometry`, and values survive both the inline
+/// keyspace and the Parquet flush. A `NULL` row proves null handling.
+///
+/// The type and its text casts are DuckDB's own; only the `ST_*` functions
+/// need `spatial`, and the casts say everything this pins.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI, packaged Moraine extension, and network access to INSTALL spatial"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_geometry_round_trip_through_flush() {
     let dir = TempDir::new("geom-store");
     let data_dir = TempDir::new("geom-data");
@@ -178,15 +180,15 @@ fn ducklake_geometry_round_trip_through_flush() {
     run_ducklake_sql(
         store,
         data_path,
-        "INSTALL spatial; LOAD spatial; CREATE TABLE lake.main.g (id BIGINT, geom GEOMETRY);",
+        "CREATE TABLE lake.main.g (id BIGINT, geom GEOMETRY);",
     );
     run_ducklake_sql(
         store,
         data_path,
-        "LOAD spatial; INSERT INTO lake.main.g VALUES (1, ST_Point(1, 2)), (2, NULL);",
+        "INSERT INTO lake.main.g VALUES (1, 'POINT(1 2)'::GEOMETRY), (2, NULL);",
     );
 
-    let select = "LOAD spatial; SELECT id::VARCHAR, coalesce(ST_AsText(geom), 'NULL') \
+    let select = "SELECT id::VARCHAR, coalesce(geom::VARCHAR, 'NULL') \
          FROM lake.main.g ORDER BY id;";
     let want = vec![vec!["1", "POINT (1 2)"], vec!["2", "NULL"]];
 
@@ -214,10 +216,10 @@ fn ducklake_geometry_round_trip_through_flush() {
 
 /// A `VARIANT` column is rejected with an actionable moraine error: its
 /// inline data is serialized through Arrow, and DuckDB's Arrow format has
-/// no VARIANT support (unlike GEOMETRY, which spatial registers). Vanilla
+/// no VARIANT support (unlike GEOMETRY, which it carries). Vanilla
 /// DuckLake accepts VARIANT, so the error names the moraine-specific cause.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_variant_column_rejected_with_clear_error() {
     let dir = TempDir::new("variant-store");
     let data_dir = TempDir::new("variant-data");
@@ -243,7 +245,7 @@ fn ducklake_variant_column_rejected_with_clear_error() {
 /// `uint128` alike — as `DOUBLE`, losing precision beyond ~17 significant
 /// digits (a DuckDB limitation, not moraine's, unchanged by this mapping).
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn ducklake_extended_scalar_types_map_through_probe() {
     let dir = TempDir::new("exttypes-store");
     let data_dir = TempDir::new("exttypes-data");

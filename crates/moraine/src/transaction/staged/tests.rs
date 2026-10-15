@@ -20,6 +20,7 @@ use crate::{
     transaction::session::CommitSession,
 };
 
+mod batching;
 mod body_ownership;
 mod data_path;
 mod inline_commit_bench;
@@ -112,9 +113,12 @@ fn file_column_stats_row(
 }
 
 async fn open() -> Catalog {
-    Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap()
+    Box::pin(Catalog::open(
+        Arc::new(InMemory::new()),
+        CatalogOptions::default(),
+    ))
+    .await
+    .unwrap()
 }
 
 #[derive(Clone, Default)]
@@ -903,7 +907,7 @@ async fn rename_survives_insert_before_end_order() {
 /// the literal substring `conflict`, and the store is left exactly as
 /// the winner left it.
 #[tokio::test]
-async fn lost_race_is_not_retried_and_carries_conflict_text() {
+async fn a_schema_creating_commit_commits_alone_and_surfaces_its_lost_race() {
     let catalog = open().await;
 
     let tx_a = catalog.begin_write_tx().await.unwrap();
@@ -1058,10 +1062,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
             }
         )]
     );
-    assert_eq!(
-        format.format_version,
-        commit::MIN_FORMAT_VERSION.max(commit::FORMAT_WITH_INLINE_CHUNK_IDENTITY)
-    );
+    assert_eq!(format.format_version, commit::MIN_FORMAT_VERSION);
     tx.rollback();
 }
 
@@ -1459,6 +1460,36 @@ async fn inline_row_delete(catalog: &Catalog, snapshot_id: u64, row_id: u64) -> 
     tx.commit().await.map(|_| ())
 }
 
+/// Updates one inlined row the way DuckLake does: a tombstone and a
+/// re-insert under the same `row_id` in one commit.
+async fn inline_update(catalog: &Catalog, snapshot_id: u64, row_id: u64, value: i64) -> Result<()> {
+    let (_, batch) = bigint_batch(&[value]);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(catalog, db_tx);
+    tx.stage(RowOperation::InlineInlineDelete {
+        table_id: 1,
+        row_id,
+        end_snapshot: snapshot_id,
+    });
+    tx.stage(RowOperation::InlineInsert {
+        table_id: 1,
+        schema_version: 0,
+        begin_snapshot: snapshot_id,
+        row_id_start: row_id,
+        row_count: 1,
+        arrow_body: inline_body(&batch).into(),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(snapshot_id, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(snapshot_id, "inlined_insert:1"),
+    });
+    tx.commit().await.map(|_| ())
+}
+
 /// Deleting an inlined row removes its unique index entry, so the value
 /// is free to be inserted again — entries are live-only.
 #[tokio::test]
@@ -1595,6 +1626,43 @@ async fn inline_delete_and_reinsert_in_one_commit_admits_the_same_unique_value()
         index_entry_count(&catalog, true, index_id).await,
         1,
         "the reinserted value holds exactly one entry"
+    );
+}
+
+/// The removal derived from an UPDATE's own staged re-insert names the
+/// new value, which another live row may hold; that row keeps its entry
+/// and the update fails the constraint.
+#[tokio::test]
+async fn an_inlined_update_cannot_take_a_unique_value_another_row_holds() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+
+    inline_insert(&catalog, 3, 0, &[5, 7], true).await;
+
+    let err = inline_update(&catalog, 4, 0, 7).await.unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        2,
+        "both rows keep their entries"
+    );
+}
+
+/// A row an UPDATE re-inlined is covered by two chunks. Its later delete
+/// derives from both, and the superseded version's value may by then be
+/// held by another row, whose entry must survive.
+#[tokio::test]
+async fn deleting_an_updated_inline_row_keeps_a_value_another_row_took() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+
+    inline_insert(&catalog, 3, 0, &[5], true).await;
+    inline_update(&catalog, 4, 0, 6).await.unwrap();
+    inline_insert(&catalog, 5, 1, &[5], false).await;
+    inline_row_delete(&catalog, 6, 0).await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        1,
+        "the entry for the value row 0 gave up is still held by row 1"
     );
 }
 
@@ -1891,6 +1959,8 @@ async fn commit_reports_the_deferred_indexes_it_leaves_maintaining() {
         String::new(),
         Arc::default(),
         catalog.cache_counters(),
+        Some(Arc::clone(catalog.commits())),
+        None,
     );
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
@@ -5132,9 +5202,9 @@ async fn a_collapsing_deregistration_preserves_the_format_floor() {
     }
 }
 
-/// An inline insert leaves the store at or above the chunk-identity format.
+/// An inline insert leaves the store at or above the minimum readable format.
 #[tokio::test]
-async fn an_inline_insert_stamps_the_chunk_identity_format() {
+async fn an_inline_insert_preserves_a_readable_format() {
     let catalog = open().await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
@@ -5172,8 +5242,8 @@ async fn an_inline_insert_stamps_the_chunk_identity_format() {
     tx.rollback();
 
     assert!(
-        format >= crate::transaction::commit::FORMAT_WITH_INLINE_CHUNK_IDENTITY,
-        "a batch that writes a locator must stamp the identity format, got {format}"
+        format >= crate::transaction::commit::MIN_FORMAT_VERSION,
+        "a batch that writes a locator keeps the store at or above the minimum format, got {format}"
     );
 
     catalog.close().await.unwrap();
@@ -5324,6 +5394,76 @@ fn file_partition_value_row(
         Cell::U64(index),
         Cell::Str(value.to_string()),
     ]
+}
+
+/// A `ducklake_view_column_tag` row decodes to its view and the tag it
+/// carries, keyed within the view by column name rather than a column id.
+#[test]
+fn a_view_column_tag_row_decodes_to_its_view_and_tag() {
+    let cells = vec![
+        Cell::U64(7),
+        Cell::Str("amount".into()),
+        Cell::U64(3),
+        Cell::Null,
+        Cell::Str("unit".into()),
+        Cell::Str("cents".into()),
+    ];
+
+    let (view_id, tag) = decode::decode_view_column_tag_row(&cells).unwrap();
+
+    assert_eq!(view_id, 7);
+    assert_eq!(tag.column_name, "amount");
+    assert_eq!(tag.begin_snapshot, 3);
+    assert_eq!(tag.end_snapshot, None);
+    assert_eq!((tag.key.as_str(), tag.value.as_str()), ("unit", "cents"));
+}
+
+/// Every column catalog version 1.1-dev1 appends decodes whether the
+/// writer sends it or not, so one build serves a writer on either version.
+#[test]
+fn appended_catalog_columns_decode_from_either_writer() {
+    let delete_cells = delete_file_row(4, 1, 3, 1);
+    let without = decode::decode_delete_file(&delete_cells).unwrap();
+    assert_eq!(without.row_group_count, None);
+    let mut appended = delete_cells;
+    appended.push(Cell::U64(5));
+    assert_eq!(
+        decode::decode_delete_file(&appended)
+            .unwrap()
+            .row_group_count,
+        Some(5)
+    );
+
+    let stats_cells = file_column_stats_row(3, 1, 0, "1", "9");
+    let without = decode::decode_file_column_stats(&stats_cells).unwrap();
+    assert_eq!((without.min_is_exact, without.max_is_exact), (None, None));
+    let mut appended = stats_cells;
+    appended.push(Cell::Bool(true));
+    appended.push(Cell::Bool(false));
+    let with = decode::decode_file_column_stats(&appended).unwrap();
+    assert_eq!(
+        (with.min_is_exact, with.max_is_exact),
+        (Some(true), Some(false))
+    );
+}
+
+/// A writer on catalog version 1.0 omits `row_group_count`; one on
+/// 1.1-dev1 appends it. Both shapes decode, and only the later one carries
+/// a count.
+#[test]
+fn a_data_file_row_decodes_with_or_without_its_row_group_count() {
+    let without = decode::decode_data_file(&data_file_row(3, 1, 1)).unwrap();
+    assert_eq!(without.row_group_count, None);
+
+    let mut appended = data_file_row(3, 1, 1);
+    appended.push(Cell::U64(7));
+    let with = decode::decode_data_file(&appended).unwrap();
+    assert_eq!(with.row_group_count, Some(7));
+
+    // Appending the column leaves every earlier one where it was.
+    assert_eq!(with.data_file_id, without.data_file_id);
+    assert_eq!(with.footer_size, without.footer_size);
+    assert_eq!(with.path, without.path);
 }
 
 fn data_file_row(data_file_id: u64, table_id: u64, begin: u64) -> Vec<Cell> {
@@ -5724,6 +5864,52 @@ async fn tag_rows_land_and_a_recomment_ends_the_old_entry() {
         (tags[1].value.as_str(), tags[1].end_snapshot),
         ("second", None)
     );
+    catalog.close().await.unwrap();
+}
+
+/// A staged `ducklake_view_column_tag` row is visible to the transaction
+/// that staged it. DuckLake re-reads this table after staging its own
+/// writes, so committed-only state would make it re-author them.
+#[tokio::test]
+async fn staged_view_column_tags_are_visible_to_their_own_transaction() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+    assert!(
+        crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing staged, nothing committed"
+    );
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::ViewColumnTag,
+        cells: vec![
+            Cell::U64(7),
+            Cell::Str("amount".into()),
+            Cell::U64(3),
+            Cell::Null,
+            Cell::Str("unit".into()),
+            Cell::Str("cents".into()),
+        ],
+    });
+
+    let rows = crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the staged row is visible before any commit");
+    assert_eq!(
+        (rows[0].view_id, rows[0].column_name.as_str()),
+        (7, "amount")
+    );
+    assert_eq!(
+        (rows[0].key.as_str(), rows[0].value.as_str()),
+        ("unit", "cents")
+    );
+
+    tx.rollback();
     catalog.close().await.unwrap();
 }
 
@@ -7024,7 +7210,7 @@ fn table_kind_wire_order_is_pinned() {
         assert_eq!(*kind as usize, index, "{kind:?}");
         assert_eq!(TableKind::try_from(*kind as i32), Ok(*kind));
     }
-    assert_eq!(TableKind::try_from(26), Err(26));
+    assert_eq!(TableKind::try_from(27), Err(27));
     assert_eq!(TableKind::try_from(-1), Err(-1));
 
     for kind in TableKind::ALL {
@@ -7054,7 +7240,8 @@ fn table_kind_wire_order_is_pinned() {
             | TableKind::MacroParameters
             | TableKind::ColumnMapping
             | TableKind::NameMapping
-            | TableKind::Metadata => {}
+            | TableKind::Metadata
+            | TableKind::ViewColumnTag => {}
         }
     }
 }
@@ -8273,6 +8460,68 @@ async fn column_mapping_delete_reclaims_the_record_and_its_embedded_rows() {
     catalog.close().await.unwrap();
 }
 
+/// A view held from before a mapping delete replays it from the
+/// changelog like any other record removal.
+#[tokio::test]
+async fn a_held_view_refreshes_across_a_column_mapping_delete() {
+    let catalog = open().await;
+    stage_mapping_batch(
+        &catalog,
+        1,
+        vec![
+            (TableKind::ColumnMapping, column_mapping_row(21, 1)),
+            (
+                TableKind::NameMapping,
+                name_mapping_row(21, 0, "payload", 1, None, false),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let behind = commit::materialize(ReadHandle::Tx(&tx), None)
+        .await
+        .unwrap();
+    tx.rollback();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::Delete {
+        table: TableKind::ColumnMapping,
+        cells: vec![Cell::U64(21), Cell::U64(1)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 11),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let handle = ReadHandle::Tx(&tx);
+    let refreshed = commit::refresh(handle, &behind)
+        .await
+        .unwrap()
+        .expect("a one-commit gap replays");
+    let full = commit::materialize(handle, None).await.unwrap();
+    tx.rollback();
+
+    assert!(
+        refreshed
+            .mappings
+            .get(&1)
+            .is_none_or(|per_table| !per_table.contains_key(&21)),
+        "the replayed view must drop the mapping"
+    );
+    assert_eq!(refreshed.snapshot, full.snapshot);
+    assert_eq!(refreshed.live_entity_count(), full.live_entity_count());
+    catalog.close().await.unwrap();
+}
+
 /// DuckLake follows the mapping delete with an orphan sweep over
 /// `ducklake_name_mapping`. In this keyspace those rows are embedded in
 /// the record just deleted, so the sweep has nothing left to remove — it
@@ -8867,4 +9116,94 @@ fn only_a_flush_s_own_operations_may_exceed_the_ceiling() {
         !exempt_from_staged_cost(&per_record),
         "a filtered delete is the caller's to split"
     );
+}
+
+/// View-column tags end in place and expose their staged lifecycle.
+#[tokio::test]
+async fn view_column_tags_end_in_place() {
+    let catalog = open().await;
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").unwrap().id;
+            tx.create_view(schema, "v", "duckdb", "SELECT 1 AS amount")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let view = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .views
+        .values()
+        .next()
+        .unwrap()
+        .view_id;
+    for (snapshot, value) in [(2, "cents"), (3, "dollars")] {
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+        if snapshot == 3 {
+            tx.stage(RowOperation::UpdateSetEnd {
+                table: TableKind::ViewColumnTag,
+                cells: vec![
+                    Cell::U64(view),
+                    Cell::Str("amount".into()),
+                    Cell::Str("unit".into()),
+                    Cell::U64(snapshot),
+                ],
+            });
+            let rows = crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+                .await
+                .unwrap();
+            assert_eq!(rows[0].end_snapshot, Some(3));
+        }
+        tx.stage(RowOperation::Insert {
+            table: TableKind::ViewColumnTag,
+            cells: vec![
+                Cell::U64(view),
+                Cell::Str("amount".into()),
+                Cell::U64(snapshot),
+                Cell::Null,
+                Cell::Str("unit".into()),
+                Cell::Str(value.into()),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(snapshot, 1, view + 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(snapshot, "altered_view:1"),
+        });
+        tx.commit().await.unwrap();
+    }
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(snapshot.views[&view].begin_snapshot, 1);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let reader = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    assert_eq!(reader.visible_views().await.unwrap().len(), 1);
+    reader.rollback();
+    let tags = &snapshot.views[&view].column_tags;
+    assert_eq!(tags.len(), 2);
+    assert_eq!(tags[0].end_snapshot, Some(3));
+    assert_eq!(tags[1].end_snapshot, None);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
+    tx.stage(RowOperation::Delete {
+        table: TableKind::ViewColumnTag,
+        cells: vec![
+            Cell::U64(view),
+            Cell::Str("amount".into()),
+            Cell::Str("unit".into()),
+            Cell::U64(2),
+        ],
+    });
+    let rows = crate::ffi_support::staged::visible_view_column_tag_rows(&tx)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value, "dollars");
+    tx.rollback();
+    catalog.close().await.unwrap();
 }

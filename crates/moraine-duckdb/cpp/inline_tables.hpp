@@ -145,6 +145,17 @@ private:
 	MoraineCatalogHandle *handle_;
 	uint64_t table_id_;
 	uint64_t schema_version_;
+
+public:
+	// 2.0's `TableCatalogEntry` declares `GetColumns` pure and stores no
+	// columns of its own, so every entry owns its list.
+	const duckdb::ColumnList &GetColumns() const override {
+		return columns_;
+	}
+
+private:
+	duckdb::ColumnList columns_;
+
 };
 
 // A synthesized `ducklake_inlined_delete_<t>` entry: fixed columns
@@ -176,6 +187,17 @@ public:
 private:
 	MoraineCatalogHandle *handle_;
 	uint64_t table_id_;
+
+public:
+	// 2.0's `TableCatalogEntry` declares `GetColumns` pure and stores no
+	// columns of its own, so every entry owns its list.
+	const duckdb::ColumnList &GetColumns() const override {
+		return columns_;
+	}
+
+private:
+	duckdb::ColumnList columns_;
+
 };
 
 // Builds a fresh data-table entry's full column list (system three +

@@ -1,10 +1,13 @@
 //! Index key conversion and row lookups.
 
+mod predicate;
 use std::{
     ffi::{c_char, c_void},
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
 };
+
+pub use predicate::*;
 
 use super::{borrow_bytes, borrow_str, free_array, handle_list, resolve_table};
 use crate::{

@@ -386,13 +386,22 @@ impl Transaction {
     /// exist.
     /// Returns [`Error::AlreadyExists`] if a table with the same name
     /// already exists in the target schema (including this table itself
-    /// when the target is its current schema).
+    /// when the target is its current schema), or an index name collides
+    /// with one in the target schema.
     pub fn set_table_schema(&mut self, table: TableId, new_schema: SchemaId) -> Result<()> {
         if !self.state.schemas.contains_key(&new_schema.get()) {
             return Err(Error::NotFound(format!("schema {new_schema}")));
         }
         let value = self.live_table(table)?;
         self.relation_name_free(new_schema.get(), &value.table_name)?;
+        for index in self.indexes_of(table) {
+            if self
+                .index_by_schema_name(new_schema, &index.name)?
+                .is_some()
+            {
+                return Err(Error::AlreadyExists(format!("index {}", index.name)));
+            }
+        }
         self.state.put_table(TableValue {
             schema_id: new_schema.get(),
             begin_snapshot: self.new_snapshot_id,
@@ -801,12 +810,8 @@ impl Transaction {
     }
 
     fn index_name_free(&self, table: TableId, name: &str) -> Result<()> {
-        let taken = self
-            .state
-            .indexes
-            .get(&table.get())
-            .is_some_and(|per_table| per_table.values().any(|i| i.index_name == name));
-        if taken {
+        let schema = SchemaId::new(self.live_table(table)?.schema_id);
+        if self.index_by_schema_name(schema, name)?.is_some() {
             return Err(Error::AlreadyExists(format!("index {name}")));
         }
         Ok(())
@@ -851,17 +856,16 @@ impl Transaction {
     }
 
     /// Creates an equality index over a table, staging entries for the
-    /// writer-supplied backfill in the same commit. The first index on a
-    /// store stamps its format at 2.
+    /// writer-supplied backfill in the same commit.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if the table or any referenced column is
     /// not live. Returns [`Error::AlreadyExists`] if an index with that name
-    /// already exists on the table. Returns [`Error::Constraint`] if the
-    /// column list is empty, an entry's value count does not match the
-    /// column count, an indexed value exceeds the size cap, or the backfill
-    /// contains a duplicate of a unique value.
+    /// already exists in the schema (case-insensitive). Returns
+    /// [`Error::Constraint`] if the column list is empty, an entry's value
+    /// count does not match the column count, an indexed value exceeds the
+    /// size cap, or the backfill contains a duplicate of a unique value.
     pub fn create_index(
         &mut self,
         table: TableId,
@@ -1002,6 +1006,7 @@ impl Transaction {
             poisoned: None,
             ducklake_index_id: None,
             deferred_maintenance: (maintenance == IndexMaintenance::Deferred).then_some(true),
+            verified_at_snapshot: None,
         });
         Ok(index_id)
     }
@@ -1020,6 +1025,44 @@ impl Transaction {
     }
 
     /// The owning table id and definition of a live index.
+    /// Records that a verifier pass agreed with the rows at `at`, or
+    /// withdraws an earlier agreement when `at` is `None`. A plan that
+    /// would let the index answer a predicate without the scan re-checking
+    /// it reads this.
+    ///
+    /// `observed` is the definition version the pass read, and the call is
+    /// refused if the definition has moved since — a rebuild landing
+    /// between the pass and this commit must not inherit its agreement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the index is not live, or
+    /// [`Error::Constraint`] if it is not ready — a building or repairing
+    /// index is short of the rows by design — or if the definition moved.
+    pub fn record_index_verification(
+        &mut self,
+        index: IndexId,
+        observed: SnapshotId,
+        at: Option<SnapshotId>,
+    ) -> Result<()> {
+        let (table_id, mut value) = self.live_index(index)?;
+        if value.build_state.is_some() || value.poisoned == Some(true) {
+            return Err(Error::Constraint(format!(
+                "index {index} is not ready; only a ready index can be verified"
+            )));
+        }
+        if value.begin_snapshot != observed.get() {
+            return Err(Error::Constraint(format!(
+                "index {index} changed while it was being verified"
+            )));
+        }
+        value.begin_snapshot = self.new_snapshot_id;
+        value.verified_at_snapshot = at.map(SnapshotId::get);
+        self.state.put_index(value);
+        self.mark_altered(table_id);
+        Ok(())
+    }
+
     fn live_index(&self, index: IndexId) -> Result<(u64, IndexValue)> {
         self.state
             .indexes
@@ -1033,10 +1076,9 @@ impl Transaction {
     }
 
     /// Begins a staged (multi-commit) index build. The definition lands in
-    /// `building` state, serving no lookups and stamping the store format
-    /// at 3; the host streams backfill batches through
-    /// [`Self::build_index_step`] until a final step flips it ready.
-    /// Writers maintain entries from this commit forward.
+    /// `building` state, serving no lookups; the host streams backfill
+    /// batches through [`Self::build_index_step`] until a final step flips it
+    /// ready. Writers maintain entries from this commit forward.
     ///
     /// # Errors
     ///
@@ -1219,6 +1261,9 @@ impl Transaction {
     ) -> IndexState {
         let maintenance_repair = value.build_state.as_deref() == Some("maintaining");
         value.begin_snapshot = self.new_snapshot_id;
+        // This step rewrote entries, so whatever a verifier pass agreed
+        // with no longer describes the index.
+        value.verified_at_snapshot = None;
         // Unordered inline sources must not advance the older row watermark.
         if !empty && inline.is_none_or(|cursor| cursor.complete) {
             value.build_cursor_row_id = Some(cursor);
@@ -1394,6 +1439,7 @@ impl Transaction {
             mapping_id: None,
             partial_max: None,
             partition_values: file_partition_values(&file.partition_values),
+            row_group_count: None,
         });
         for entry in file.column_stats {
             self.state.put_file_column_stats(FileColumnStatsValue {
@@ -1408,6 +1454,8 @@ impl Transaction {
                 contains_nan: entry.contains_nan,
                 extra_stats: entry.extra_stats,
                 variant_stats: vec![],
+                min_is_exact: None,
+                max_is_exact: None,
             });
         }
         self.stage_file_index_entries(table, row_id_start, index_entries)?;
@@ -1586,6 +1634,7 @@ impl Transaction {
             footer_size: file.footer_size,
             encryption_key: file.encryption_key,
             partial_max: None,
+            row_group_count: None,
         });
 
         self.stage_delete_file_index_entries(table, index_entries)?;
@@ -1709,6 +1758,8 @@ impl Transaction {
             min_value: stats.min_value,
             max_value: stats.max_value,
             extra_stats: stats.extra_stats,
+            min_is_exact: None,
+            max_is_exact: None,
         });
         self.ops.push(Operation::UpdateStats {
             table_id: table.get(),
@@ -1749,6 +1800,7 @@ impl Transaction {
             dialect: dialect.to_owned(),
             sql: sql.to_owned(),
             column_aliases: None,
+            column_tags: Vec::new(),
         });
         self.ops.push(Operation::CreateView {
             schema_id: schema.get(),
@@ -1908,14 +1960,40 @@ impl Transaction {
         Ok(())
     }
 
+    /// The catalog version this transaction sees, absent when the store
+    /// records none.
+    pub(crate) fn catalog_version(&self) -> Option<String> {
+        self.state
+            .options
+            .get(&OptionScope::Global.key_components())
+            .and_then(|record| record.options.get("version").cloned())
+    }
+
+    /// Records the catalog version this store serves. Reserved from
+    /// `set_option`, because the shape moraine serves follows it; only a
+    /// raise moves it.
+    pub(crate) fn set_catalog_version(&mut self, version: &str) {
+        let components = OptionScope::Global.key_components();
+        let mut record = self
+            .state
+            .options
+            .get(&components)
+            .cloned()
+            .unwrap_or_default();
+        record
+            .options
+            .insert("version".to_owned(), version.to_owned());
+        self.state.set_option_record(components, record);
+    }
+
     /// Sets an option in a scope. Last-write-wins; an options-only
     /// commit mints no snapshot.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if the scope's schema or table does
-    /// not exist, or [`Error::Constraint`] for the reserved global
-    /// `encrypted` key.
+    /// not exist, or [`Error::Constraint`] for a reserved global key
+    /// (`encrypted`, `version`).
     pub fn set_option(&mut self, scope: OptionScope, key: &str, value: &str) -> Result<()> {
         nonempty_name("option key", key)?;
         self.live_scope(scope)?;
@@ -2343,6 +2421,7 @@ impl Transaction {
             mapping_id: None,
             partial_max: flush.partial_max.map(SnapshotId::get),
             partition_values: file_partition_values(&flush.file.partition_values),
+            row_group_count: None,
         });
         for entry in &flush.file.column_stats {
             self.state.put_file_column_stats(FileColumnStatsValue {
@@ -2357,6 +2436,8 @@ impl Transaction {
                 contains_nan: entry.contains_nan,
                 extra_stats: entry.extra_stats.clone(),
                 variant_stats: vec![],
+                min_is_exact: None,
+                max_is_exact: None,
             });
         }
 
@@ -2369,14 +2450,23 @@ impl Transaction {
     }
 }
 
-/// Refuses the global `encrypted` key, which is fixed at catalog creation.
+/// Refuses the global keys that are store facts rather than settings:
+/// `encrypted` is fixed at catalog creation, and `version` names the
+/// catalog shape, which only a catalog-version raise moves.
 fn reserved_option(scope: OptionScope, key: &str) -> Result<()> {
-    if scope == OptionScope::Global && key == "encrypted" {
-        return Err(Error::Constraint(
-            "the global `encrypted` option is fixed at catalog creation".to_string(),
-        ));
+    if scope != OptionScope::Global {
+        return Ok(());
     }
-    Ok(())
+    match key {
+        "encrypted" => Err(Error::Constraint(
+            "the global `encrypted` option is fixed at catalog creation".to_string(),
+        )),
+        "version" => Err(Error::Constraint(
+            "the global `version` option names the catalog shape; only a migration moves it"
+                .to_string(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Refuses an empty name; `what` names the rejected item in the error.
@@ -2484,6 +2574,7 @@ mod tests {
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
             deleted_data_file_ids: Vec::new(),
+            deletes_untargeted_files: false,
         };
         Transaction::new(CatalogSnapshot::build(snapshot, &[], &[], None), 5)
     }
@@ -3009,6 +3100,7 @@ mod tests {
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
             deleted_data_file_ids: Vec::new(),
+            deletes_untargeted_files: false,
         };
         let table = TableValue {
             table_id: 1,
@@ -3407,6 +3499,7 @@ mod tests {
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
             deleted_data_file_ids: Vec::new(),
+            deletes_untargeted_files: false,
         };
         let main = SchemaValue {
             schema_id: 0,
@@ -3498,6 +3591,27 @@ mod tests {
 
     /// The global `encrypted` option is fixed at catalog creation: set and
     /// unset both refuse it, while a non-global `encrypted` key (or any
+    #[test]
+    fn global_version_option_is_reserved() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+
+        assert!(matches!(
+            transaction.set_option(OptionScope::Global, "version", "1.1-dev1"),
+            Err(Error::Constraint(_))
+        ));
+        assert!(matches!(
+            transaction.unset_option(OptionScope::Global, "version"),
+            Err(Error::Constraint(_))
+        ));
+
+        // Table scope is a user setting of the same name, not the fact.
+        transaction
+            .set_option(OptionScope::Table(t), "version", "x")
+            .unwrap();
+    }
+
     /// other global key) stays writable.
     #[test]
     fn global_encrypted_option_is_reserved() {
@@ -3559,6 +3673,7 @@ mod tests {
             mapping_id: None,
             partial_max: None,
             partition_values: vec![],
+            row_group_count: None,
         });
     }
 
@@ -3766,6 +3881,7 @@ mod tests {
             mapping_id: None,
             partial_max: None,
             partition_values: vec![],
+            row_group_count: None,
         });
 
         let err = transaction

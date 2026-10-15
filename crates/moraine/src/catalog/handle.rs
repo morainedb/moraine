@@ -4,8 +4,12 @@
 mod backfill;
 mod index_build;
 mod index_lookup;
+mod index_predicate;
 mod index_probe_cache;
+pub use index_predicate::{IndexComparison, IndexPredicate, IndexPredicateRows};
 mod index_read_scope;
+mod index_verify;
+pub use index_verify::IndexVerification;
 mod inline_scan;
 mod maintenance;
 mod revision_memo;
@@ -29,10 +33,7 @@ pub use maintenance::{
     MaintenanceReport, MaintenanceRequest, MaintenanceStatusPass, MaintenanceStatusStep,
 };
 use object_store::ObjectStore;
-pub use row_location::{
-    DeleteFileRegistration, ExcludedPositions, ExistingDeleteFile, LocatedDeletion,
-    LocatedPositions, LocatedRowScan, RowSummaryPublish,
-};
+pub use row_location::{ExcludedPositions, LocatedDeletion, LocatedRowScan, RowSummaryPublish};
 use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -754,14 +755,7 @@ fn warn_if_caches_cannot_hold(path: &str, manifest: Option<&census::ManifestByte
     warn_if_metadata_cache_cannot_hold(path, manifest.map(|manifest| manifest.metadata_bytes));
     warn_if_block_cache_cannot_hold_index(
         path,
-        manifest.and_then(|manifest| {
-            let index = crate::store::key::subspace_prefix(crate::store::key::Subspace::Index);
-            manifest
-                .segments
-                .iter()
-                .find(|segment| segment.prefix == index)
-                .map(|segment| segment.bytes)
-        }),
+        manifest.and_then(|manifest| manifest.subspace_bytes(crate::store::key::Subspace::Index)),
     );
 }
 
@@ -956,6 +950,11 @@ impl ReadOnlyCatalog {
 
     pub(crate) fn projections(&self) -> &Arc<std::sync::RwLock<ProjectionCache>> {
         &self.projections
+    }
+
+    /// Where this catalog's concurrent commits meet.
+    pub(crate) fn commits(&self) -> &Arc<commit::Coalescer> {
+        &self.commits
     }
 
     /// What the process-wide block cache has served for **this catalog**
@@ -1529,17 +1528,12 @@ impl Catalog {
         }
     }
 
-    /// Raises the store's format to the newest purely additive one this
-    /// binary writes, ahead of the commit that would otherwise take it.
+    /// Reports the store's format and raises it to the supported additive
+    /// ceiling when needed. This build requires format 9 at open, so an
+    /// attached catalog already meets that ceiling and this call is a no-op.
     ///
-    /// One-way: a store that has taken the format can no longer be opened
-    /// by a binary that predates it, and a reader already attached on one
-    /// is not refused — it keeps running and may misread later commits.
-    /// Raise it only once every reader is on a binary that understands
-    /// it.
-    ///
-    /// `dry_run` reports the move it would make and stamps nothing — the
-    /// only way to read a store's format without moving it.
+    /// `dry_run` reports the result without writing. Structural upgrades
+    /// require [`Self::migrate`] instead.
     ///
     /// # Errors
     ///
@@ -1559,6 +1553,70 @@ impl Catalog {
             crate::catalog::projection::raise_format_floor(self.projections(), raised.to_format);
         }
         Ok(raised)
+    }
+
+    /// Raises the catalog version this store records to the newest shape
+    /// this build serves, and reports what moved.
+    ///
+    /// The shape moraine synthesizes follows that version, so this is
+    /// **one-way in practice**: a DuckLake that requires the older version
+    /// refuses the store outright at its own catalog-version check, before
+    /// it reads a table. Raise only alongside the DuckLake that asks for
+    /// the wider shape.
+    ///
+    /// `dry_run` reports the move it would make and records nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Migration`] if the store records a version this
+    /// build does not serve — a newer build wrote it, and lowering it
+    /// would move a shape this one cannot read — or an error if the move
+    /// cannot be committed.
+    pub async fn raise_catalog_version(
+        &self,
+        dry_run: bool,
+    ) -> Result<crate::transaction::migration::CatalogVersionRaise> {
+        let from = self
+            .snapshot()
+            .await?
+            .option(crate::catalog::OptionScope::Global, "version")
+            .unwrap_or_else(|| crate::catalog::CATALOG_VERSION.to_owned());
+        let to = crate::catalog::MAX_CATALOG_VERSION.to_owned();
+
+        // Never lower a store: a version this build cannot order is one a
+        // newer build recorded, and that shape is not ours to move.
+        if from != crate::catalog::CATALOG_VERSION && from != crate::catalog::MAX_CATALOG_VERSION {
+            return Err(Error::Migration(format!(
+                "store records catalog version {from}, which this build does not serve"
+            )));
+        }
+
+        if dry_run || from == to {
+            return Ok(crate::transaction::migration::CatalogVersionRaise { from, to });
+        }
+
+        let target = to.clone();
+        self.commit(move |tx| {
+            // Re-read inside the commit. Recording the version is
+            // last-write-wins, so a check made against the snapshot above
+            // could be overtaken between that read and this write; this is
+            // the one that holds the never-lower invariant.
+            let recorded = tx
+                .catalog_version()
+                .unwrap_or_else(|| crate::catalog::CATALOG_VERSION.to_owned());
+            if recorded != crate::catalog::CATALOG_VERSION
+                && recorded != crate::catalog::MAX_CATALOG_VERSION
+            {
+                return Err(Error::Migration(format!(
+                    "store records catalog version {recorded}, which this build does not serve"
+                )));
+            }
+
+            tx.set_catalog_version(&target);
+            Ok(())
+        })
+        .await?;
+        Ok(crate::transaction::migration::CatalogVersionRaise { from, to })
     }
 
     /// Opens (creating and initializing if empty) the catalog in
@@ -1870,6 +1928,7 @@ impl Catalog {
                         submitted,
                         &self.projections,
                         &self.store.commit_durability(),
+                        1,
                     )
                     .await?;
                     return Ok(());

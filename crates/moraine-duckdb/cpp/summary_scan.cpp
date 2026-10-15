@@ -1,15 +1,19 @@
+#include <atomic>
+#include <memory>
 #include "summary_scan.hpp"
 
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "catalog.hpp"
 #include "index_functions.hpp"
 #include "owned_array.hpp"
-#include "rows_at.hpp"
 #include "transaction_manager.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_delete_filter.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
@@ -21,12 +25,74 @@
 #include <set>
 
 namespace moraine_duckdb {
+
+namespace {
+
+// Imports an Arrow batch the row scan exported as DuckDB chunks. Consumes
+// both structs, including when the import throws.
+std::vector<duckdb::unique_ptr<duckdb::DataChunk>> ImportLocatedBatch(duckdb::ClientContext &context,
+                                                                      ArrowSchema &c_schema, ArrowArray &c_array) {
+	duckdb::ArrowSchemaWrapper schema;
+	schema.arrow_schema = c_schema;
+	c_schema.release = nullptr;
+	auto chunk_wrapper = duckdb::make_uniq<duckdb::ArrowArrayWrapper>();
+	chunk_wrapper->arrow_array = c_array;
+	c_array.release = nullptr;
+
+	duckdb::ArrowTableSchema arrow_table;
+	duckdb::ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema.arrow_schema);
+	auto &columns = arrow_table.GetColumns();
+	duckdb::vector<duckdb::LogicalType> types;
+	for (duckdb::idx_t i = 0; i < columns.size(); i++) {
+		types.push_back(columns.at(i)->GetDuckType());
+	}
+	auto total = static_cast<duckdb::idx_t>(chunk_wrapper->arrow_array.length);
+	duckdb::ArrowScanLocalState scan_state(std::move(chunk_wrapper), context);
+	for (duckdb::idx_t i = 0; i < types.size(); i++) {
+		scan_state.column_ids.push_back(i);
+	}
+
+	std::vector<duckdb::unique_ptr<duckdb::DataChunk>> pieces;
+	while (scan_state.chunk_offset < total) {
+		auto size = std::min<duckdb::idx_t>(total - scan_state.chunk_offset, STANDARD_VECTOR_SIZE);
+		auto out = duckdb::make_uniq<duckdb::DataChunk>();
+		out->Initialize(context, types);
+		out->SetCardinality(size);
+		duckdb::ArrowTableFunction::ArrowToDuckDB(scan_state, columns, *out, /* arrow_scan_is_projected */ false);
+		pieces.push_back(std::move(out));
+		scan_state.chunk_offset += size;
+	}
+	return pieces;
+}
+
+} // namespace
+
 namespace {
 
 constexpr auto FILE_ID = duckdb::DuckLakeMultiFileReader::COLUMN_IDENTIFIER_DATA_FILE_ID;
 using ScanClock = std::chrono::steady_clock;
 double Milliseconds(ScanClock::time_point start) {
 	return std::chrono::duration<double, std::milli>(ScanClock::now() - start).count();
+}
+
+// Optional filters are pruning hints; their exact predicates remain above
+// the scan. Re-evaluating a wide IN hint here repeats the hash join's work.
+duckdb::unique_ptr<duckdb::Expression> RequiredPredicate(const duckdb::Expression &expression) {
+    if (duckdb::ExpressionFilter::IsRootOptionalExpression(expression)) { return nullptr; }
+	if (expression.GetExpressionType() != duckdb::ExpressionType::CONJUNCTION_AND) {
+		return expression.Copy();
+	}
+	auto result = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
+	for (auto &child : expression.Cast<duckdb::BoundConjunctionExpression>().GetChildren()) {
+		auto required = RequiredPredicate(*child);
+		if (required) {
+			result->GetChildrenMutable().push_back(std::move(required));
+		}
+	}
+	if (result->GetChildren().empty()) {
+		return nullptr;
+	}
+	return std::move(result);
 }
 
 bool SupportedType(const duckdb::LogicalType &type) {
@@ -62,7 +128,7 @@ struct SummaryScanBindData : duckdb::FunctionData {
 	uint64_t snapshot_id;
 	uint64_t table_id = 0;
 	double costing_ms = 0;
-	std::vector<MorainePositionPair> pairs;
+	std::vector<MoraineRowId> pairs;
 	// DuckLake's path for every data file the pairs name, keyed by file id,
 	// and the inlined tables the scan covers: the keys the transaction's own
 	// deletions are recorded under.
@@ -106,7 +172,7 @@ struct SummaryScanState : duckdb::GlobalTableFunctionState {
 struct LocalExclusions {
 	std::vector<std::pair<uint64_t, std::vector<uint64_t>>> positions;
 	std::vector<MoraineExcludedPositions> entries;
-	std::vector<MorainePositionPair> pairs;
+	std::vector<MoraineRowId> pairs;
 };
 
 LocalExclusions CollectLocalExclusions(duckdb::ClientContext &context, duckdb::DuckLakeTransaction &transaction,
@@ -148,7 +214,7 @@ LocalExclusions CollectLocalExclusions(duckdb::ClientContext &context, duckdb::D
 		}
 	}
 	for (auto &pair : bound.pairs) {
-		if (!pair.has_data_file_id && deleted_inlined.count(pair.row_id)) {
+		if (!pair.has_data_file_id && deleted_inlined.count(pair.value)) {
 			continue;
 		}
 		result.pairs.push_back(pair);
@@ -186,17 +252,24 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InitSummaryScan(duckdb::Cli
 			state->projection.push_back(i);
 		}
 	}
-	if (input.filters && !input.filters->filters.empty()) {
+	if (input.filters && input.filters->HasFilters()) {
 		auto conjunction =
 		    duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
-		for (auto &filter : input.filters->filters) {
-			duckdb::BoundReferenceExpression column(state->types[filter.first], filter.first);
-			conjunction->children.push_back(filter.second->ToExpression(column));
+		for (auto filter : *input.filters) {
+			auto column_index = filter.GetIndex().GetIndex();
+			duckdb::BoundReferenceExpression column(state->types[column_index], column_index);
+			auto expression = filter.Filter().ToExpression(column);
+			auto required = RequiredPredicate(*expression);
+			if (required) {
+				conjunction->GetChildrenMutable().push_back(std::move(required));
+			}
 		}
-		state->predicate = std::move(conjunction);
-		state->executor = duckdb::make_uniq<duckdb::ExpressionExecutor>(context, *state->predicate);
+		if (!conjunction->GetChildren().empty()) {
+			state->predicate = std::move(conjunction);
+			state->executor = duckdb::make_uniq<duckdb::ExpressionExecutor>(context, *state->predicate);
+		}
 	}
-	auto &lake = duckdb::Catalog::GetCatalog(context, bound.lake).Cast<duckdb::DuckLakeCatalog>();
+	auto &lake = duckdb::Catalog::GetCatalog(context, duckdb::Identifier(bound.lake)).Cast<duckdb::DuckLakeCatalog>();
 	auto &transaction = duckdb::DuckLakeTransaction::Get(context, lake);
 	auto &catalog = ResolveMoraineCatalog(context, lake.MetadataDatabaseName());
 	auto metadata = catalog.GetCatalogTransaction(*transaction.GetConnection().context);
@@ -255,7 +328,7 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 			}
 			state.batch_ms += Milliseconds(started);
 			if (!has_batch) {
-				output.SetCardinality(0);
+				output.SetChildCardinality(0);
 				return;
 			}
 			started = ScanClock::now();
@@ -279,7 +352,7 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 		state.pending.pop_back();
 		duckdb::DataChunk projected;
 		projected.Initialize(context, state.types);
-		projected.SetCardinality(piece->size());
+		projected.SetChildCardinality(piece->size());
 		for (duckdb::idx_t i = 0; i < state.types.size(); i++) {
 			auto &source = piece->data[state.decoded_columns[i]];
 			if (source.GetType() == state.types[i]) {
@@ -299,7 +372,7 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 		for (duckdb::idx_t i = 0; i < state.projection.size(); i++) {
 			output.data[i].Reference(projected.data[state.projection[i]]);
 		}
-		output.SetCardinality(projected.size());
+		output.SetChildCardinality(projected.size());
 		return;
 	}
 }
@@ -308,14 +381,22 @@ void ScanSummary(duckdb::ClientContext &context, duckdb::TableFunctionInput &inp
 
 bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, const duckdb::LogicalGet &index,
                     const std::vector<MoraineRowId> &rows) {
-	if (scan.function.name != "ducklake_scan" || !scan.function.function_info || scan.row_group_order_options ||
-	    scan.extra_info.sample_options) {
+	std::string catalog_name, schema, table;
+	if (!IndexReadTable(*index.function.GetDefinition(), index.bind_data.get(), catalog_name, schema, table)) {
+		return false;
+	}
+	return UseSummaryScan(context, scan, catalog_name, schema, table, rows);
+}
+
+bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, const std::string &catalog_name,
+                    const std::string &schema, const std::string &table, const std::vector<MoraineRowId> &rows) {
+	if (scan.function.GetDefinition()->name != "ducklake_scan" || !scan.function.function_info ||
+	    scan.row_group_order_options || scan.table_filters.HasMultiColumnFilters() || scan.extra_info.sample_options) {
 		return false;
 	}
 	auto &info = scan.function.function_info->Cast<duckdb::DuckLakeFunctionInfo>();
 	auto &lake = info.table.catalog.Cast<duckdb::DuckLakeCatalog>();
 	auto transaction = info.GetTransaction();
-	auto &files = scan.bind_data->Cast<duckdb::MultiFileBindData>().file_list->Cast<duckdb::DuckLakeMultiFileList>();
 	auto statistics = info.table.GetTableStats(context);
 	if (statistics && rows.size() > 4096 && rows.size() > statistics->record_count / 4) {
 		return false;
@@ -324,12 +405,10 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	    info.snapshot.snapshot_id != transaction->GetSnapshot().snapshot_id) {
 		return false;
 	}
-	std::string catalog_name, schema, table;
-	if (!IndexReadTable(index.function, index.bind_data.get(), catalog_name, schema, table) ||
-	    schema != info.table.schema.name || table != info.table.name) {
+	if (schema != info.table.schema.name || table != info.table.name) {
 		return false;
 	}
-	auto catalog = duckdb::Catalog::GetCatalogEntry(context, catalog_name);
+	auto catalog = duckdb::Catalog::GetCatalogEntry(context, duckdb::Identifier(catalog_name));
 	if (!catalog || (catalog->GetName() != lake.GetName() && catalog->GetName() != lake.MetadataDatabaseName())) {
 		return false;
 	}
@@ -349,20 +428,50 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		}
 	}
 	auto bound = duckdb::make_uniq<SummaryScanBindData>();
-	bound->lake = lake.GetName();
+	bound->lake = lake.GetName().GetIdentifierName();
 	bound->schema = schema;
 	bound->table = table;
 	bound->snapshot_id = info.snapshot.snapshot_id;
 	bound->table_id = info.table.GetTableId().index;
-	bound->names = scan.names;
+	for (auto &name : scan.names) {
+		bound->names.push_back(name.GetIdentifierName());
+	}
 	bound->types = scan.returned_types;
 	bound->virtual_columns = scan.virtual_columns;
+	bound->pairs = rows;
+	// Fetch candidate file paths for transaction-local deletion masks. Using
+	// file IDs avoids expanding the original key predicate in metadata SQL.
+	std::set<uint64_t> file_ids;
+	bool includes_inline = false;
 	for (auto &row : rows) {
-		bound->pairs.push_back({row.value, row.data_file_id, row.has_data_file_id});
+		if (row.has_data_file_id) {
+			file_ids.insert(row.data_file_id);
+		} else {
+			includes_inline = true;
+		}
 	}
-	// Transaction-local rows are never index hits, so the scan may skip the
-	// files and inlined data the transaction added; its deletions are
-	// subtracted at execution, which needs every named file's DuckLake path.
+	duckdb::vector<duckdb::Value> values;
+	for (auto file_id : file_ids) {
+		values.push_back(duckdb::Value::UBIGINT(file_id));
+	}
+	auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::UBIGINT, 0);
+	duckdb::unique_ptr<duckdb::Expression> file_filter;
+	if (!values.empty()) {
+		file_filter = duckdb::ExpressionFilter::CreateInExpression(column->Copy(), std::move(values));
+	}
+	if (includes_inline) {
+		auto nulls = duckdb::ExpressionFilter::CreateNullCheckExpression(column->Copy(),
+		                                                                 duckdb::ExpressionType::OPERATOR_IS_NULL);
+		file_filter = file_filter
+		                  ? duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
+		                        duckdb::ExpressionType::CONJUNCTION_OR, std::move(file_filter), std::move(nulls))
+		                  : std::move(nulls);
+	}
+	auto filters = duckdb::make_uniq<duckdb::FilterPushdownInfo>();
+	if (file_filter) {
+		filters->data_file_id_filter = duckdb::make_shared_ptr<duckdb::ExpressionFilter>(std::move(file_filter));
+	}
+	duckdb::DuckLakeMultiFileList files(info, duckdb::vector<duckdb::DuckLakeDataFile> {}, nullptr, std::move(filters));
 	for (auto &entry : files.GetFiles()) {
 		if (entry.data_type == duckdb::DuckLakeDataType::INLINED_DATA) {
 			bound->inlined_tables.push_back(entry.file.path);
@@ -375,7 +484,7 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 			return false;
 		}
 	}
-	std::vector<MorainePositionPair> file_pairs;
+	std::vector<MoraineRowId> file_pairs;
 	for (auto &pair : bound->pairs) {
 		if (pair.has_data_file_id) {
 			file_pairs.push_back(pair);
@@ -421,23 +530,32 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 	function.filter_pushdown = true;
 	function.filter_prune = true;
 	function.verify_serialization = false;
-	function.dynamic_to_string = [](duckdb::TableFunctionDynamicToStringInput &input) {
+	// Runtime counters go through the metrics hook, which is handed the
+	// scan's state after it has run; `to_string` renders before it reads.
+	function.get_metrics = [](duckdb::TableFunctionGetMetricsInput &input) {
+		if (!input.global_state) {
+			return;
+		}
+		auto &state = input.global_state->Cast<SummaryScanState>();
+		if (!state.scan) {
+			return;
+		}
+		auto metrics = moraine_row_scan_metrics(state.scan);
+		input.operator_metrics.AddExtraInfo("Total Files Read",
+		                                   std::to_string(moraine_row_scan_files_read(state.scan)));
+		input.operator_metrics.AddExtraInfo("Positioning ms", std::to_string(state.positioning_ms));
+		input.operator_metrics.AddExtraInfo("Read and decode ms", std::to_string(state.batch_ms));
+		input.operator_metrics.AddExtraInfo("Arrow import ms", std::to_string(state.conversion_ms));
+		input.operator_metrics.AddExtraInfo("Data bytes fetched", std::to_string(metrics.bytes_read));
+		input.operator_metrics.AddExtraInfo("Data ranges fetched", std::to_string(metrics.ranges_read));
+		input.operator_metrics.AddExtraInfo("Peak read workers", std::to_string(metrics.peak_workers));
+		input.operator_metrics.AddExtraInfo("Decode active ms", std::to_string(metrics.decode_seconds * 1000));
+		input.operator_metrics.AddExtraInfo("Data fetch ms", std::to_string(metrics.fetch_seconds * 1000));
+	};
+	function.to_string = [](duckdb::TableFunctionToStringInput &input) {
 		duckdb::InsertionOrderPreservingMap<std::string> result;
 		if (input.bind_data) {
 			result["Coverage costing ms"] = std::to_string(input.bind_data->Cast<SummaryScanBindData>().costing_ms);
-		}
-		if (input.global_state) {
-			auto &state = input.global_state->Cast<SummaryScanState>();
-			auto metrics = moraine_row_scan_metrics(state.scan);
-			result["Total Files Read"] = std::to_string(moraine_row_scan_files_read(state.scan));
-			result["Positioning ms"] = std::to_string(state.positioning_ms);
-			result["Read and decode ms"] = std::to_string(state.batch_ms);
-			result["Arrow import ms"] = std::to_string(state.conversion_ms);
-			result["Data bytes fetched"] = std::to_string(metrics.bytes_read);
-			result["Data ranges fetched"] = std::to_string(metrics.ranges_read);
-			result["Peak read workers"] = std::to_string(metrics.peak_workers);
-			result["Decode active ms"] = std::to_string(metrics.decode_seconds * 1000);
-			result["Data fetch ms"] = std::to_string(metrics.fetch_seconds * 1000);
 		}
 		return result;
 	};
@@ -445,7 +563,7 @@ bool UseSummaryScan(duckdb::ClientContext &context, duckdb::LogicalGet &scan, co
 		return data->Cast<SummaryScanBindData>().virtual_columns;
 	};
 	scan.bind_data = std::move(bound);
-	scan.function = std::move(function);
+	scan.function = duckdb::BoundTableFunction(function);
 	scan.extra_info.file_filters.clear();
 	return true;
 }

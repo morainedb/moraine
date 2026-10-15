@@ -1,17 +1,17 @@
 diff --git a/src/functions/ducklake_compaction_functions.cpp b/src/functions/ducklake_compaction_functions.cpp
-index 860e4dfd..ebb8310b 100644
+index a5146222..7446d622 100644
 --- a/src/functions/ducklake_compaction_functions.cpp
 +++ b/src/functions/ducklake_compaction_functions.cpp
-@@ -469,8 +469,6 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+@@ -544,8 +544,6 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
  	auto partition_id = source_files[0].file.partition_id;
  	auto partition_values = source_files[0].file.partition_values;
-
+ 
 -	bool files_are_adjacent = true;
 -	optional_idx prev_row_id;
  	// set the files to scan as only the files we are trying to compact
  	vector<DuckLakeFileListEntry> files_to_scan;
  	vector<DuckLakeCompactionFileEntry> actionable_source_files;
-@@ -503,17 +501,6 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+@@ -578,17 +576,6 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
  			throw InternalException("Invalid Compaction Type");
  		}
  		actionable_source_files.push_back(source);
@@ -29,7 +29,7 @@ index 860e4dfd..ebb8310b 100644
  		files_to_scan.push_back(std::move(result));
  	}
  	if (actionable_source_files.empty()) {
-@@ -553,8 +540,10 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
+@@ -625,8 +612,10 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
  	bool write_snapshot_id = false;
  	switch (type) {
  	case CompactionType::MERGE_ADJACENT_TABLES: {

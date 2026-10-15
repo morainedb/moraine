@@ -208,9 +208,7 @@ fn mixed(tables: usize, files: usize) -> Vec<Statement> {
             .ok();
         }
     }
-    setup.push_str(
-        "COMMIT;\nCALL moraine_index_create('lake','main','items','by_id',['id'],true);\n",
-    );
+    setup.push_str("COMMIT;\nCREATE UNIQUE INDEX by_id ON lake.main.items(id);\n");
     writeln!(setup, "SELECT CASE WHEN sum(file_count)={} THEN 'fixture_verified' ELSE error('unexpected seeded file count') END FROM ducklake_table_info('lake');", files + tables * 2).ok();
     let mut statements = vec![Statement::setup(setup)];
     // Record the first lookup separately from subsequent reads.
@@ -243,7 +241,7 @@ fn mixed(tables: usize, files: usize) -> Vec<Statement> {
 
 fn point_read(id: usize) -> String {
     format!(
-        "SELECT CASE WHEN count(*)=1 AND min(data.id)={id} THEN {id} ELSE error('incorrect point lookup') END FROM lake.main.items data JOIN moraine_index_lookup('lake','main','items','by_id',{id}) hits ON data.rowid=hits.row_id AND data.data_file_id IS NOT DISTINCT FROM hits.data_file_id;"
+        "SELECT CASE WHEN count(*)=1 AND min(data.id)={id} THEN {id} ELSE error('incorrect point lookup') END FROM lake.main.items data WHERE data.id={id};"
     )
 }
 

@@ -14,6 +14,9 @@ cargo xtask bench [--backends moraine,duckdb,postgres]
                   [--workloads <name>,...]
                   [--scale small|medium|large]
                   [--repeat N]
+                  [--concurrency 1,2,4,8]
+                  [--commits N]
+                  [--flush-interval-ms N]
 ```
 
 Defaults: all backends, all workloads, `--scale small`, `--repeat 3`. It
@@ -53,6 +56,8 @@ deletes) as (100k, 20, 10, 20) / (1M, 50, 25, 50) / (10M, 200, 100, 200).
 | `deletes_partial` | `deletes_covering`'s control — same file, not covered |
 | `deletes_indexed_repeated` | `deletes_repeated` against an equality index |
 | `deletes_indexed_covering` | `deletes_covering` against an equality index |
+| `concurrent_processes` | N writer processes committing at once |
+| `concurrent_connections` | N connections over one instance — parallel DuckLake transactions |
 
 The four delete workloads bracket what statement shape costs. Delete cost
 rises with how many tables the lake holds, whether or not they hold rows or
@@ -78,15 +83,146 @@ Do not read across those pairs: `covering` needs a partitioned table to be
 partition-aligned, so it is not comparable to `bulk`.
 
 The two `indexed` workloads are their twins' seeds plus one
-`moraine_index_create`, so subtracting the twin gives what maintaining
-index entries costs a delete. They call a moraine-only function, so the
-other backends sit them out and the report leaves their cells empty.
+`CREATE INDEX`, so subtracting the twin gives what maintaining index entries
+costs a delete. The other DuckLake backends do not support indexes, so they
+sit these workloads out and the report leaves their cells empty.
 
 Every backend runs the byte-identical SQL through the same DuckDB binary, one
 statement timed at a time via `.timer on`, so differences come only from the
 catalog backend. `ATTACH` is a timed phase, so catalog-open cost is measured
 too. Each (workload, repeat) runs in fresh directories, so repeats are
 independent.
+
+## Concurrent writers
+
+Every other workload is one connection issuing one statement at a time, so
+it measures commit *latency*. These two measure contention: `--commits`
+single-row inserts spread evenly over N writers, each appending to a table
+of its own. They differ only in how the writers are arranged.
+
+| workload | writers are |
+|---|---|
+| `concurrent_processes` | N processes, each attaching the lake itself |
+| `concurrent_connections` | N connections over one DuckDB instance and one attach |
+
+Both release their writers together on a barrier, with extension loading,
+`ATTACH` and table creation finished beforehand, so the window times
+commits and nothing else. `concurrent_connections` runs through
+`xtask/cpp/concurrent_writers.c`, linked against the DuckDB the extension
+was built for: the CLI holds one connection, so it cannot make two DuckLake
+transactions overlap at all.
+
+A backend that takes one writer and refuses more is reported as such; its
+cells stay empty and higher counts are not attempted.
+
+### Across processes
+
+**128 commits, three repeats, 8-vCPU x86-64 Linux, local `DATA_PATH`.**
+
+| writers | moraine | duckdb | postgres |
+|---|---|---|---|
+| 1 | 12.90s | 1.30s | 819ms |
+| 2 | refused | refused | 853ms |
+| 4 | refused | refused | 996ms |
+| 8 | refused | refused | 1.29s |
+
+Both embedded catalogs are single-writer across processes, and they say so
+differently. moraine fences: the newest read-write attach takes over, and
+the previous writer's next commit fails with `writer fenced: another
+process attached this catalog read-write and took over as the writer; this
+handle can no longer commit — re-attach to write`. The DuckDB file catalog
+never gets that far — the second process cannot take the file lock. A
+deliberate protocol with a diagnosable error against the filesystem
+refusing.
+
+Postgres accepts the writers and gets nothing for it: throughput *falls*
+as they are added. Spreading commits across processes buys no throughput
+from any of these catalogs.
+
+### Within one process
+
+This is where parallel DuckLake transactions actually run, and all three
+backends take them. Same burst, same machine, 128 commits:
+
+| writers | moraine | duckdb | postgres | moraine WAL objects |
+|---|---|---|---|---|
+| 1 | 1.44s | 1.25s | 889ms | 131 |
+| 2 | 832ms | 1.40s | 801ms | 68 |
+| 4 | 489ms | 1.74s | 1.16s | 39 |
+| 8 | 413ms | 2.19s | 1.28s | 28 |
+| 16 | 437ms | 2.44s | 1.39s | 27–35 |
+
+**moraine is the only one that gets faster with writers, and from four
+writers up it is the fastest catalog here.** The last column is what the
+burst cost in object-store PUTs, every write-ahead-log object the catalog
+put including the setup commits (one table per writer, the attach): one
+per commit for a lone writer, one per round of writers under concurrency.
+
+What makes that possible is how the writer paces its WAL flushes. Every
+flush is one PUT, and the spacing, `META_FLUSH_INTERVAL_MS` at 100 ms by
+default, is the longest a commit waits for one. Three rules decide when a
+flush closes sooner:
+
+- A writer without siblings waits only the floor, a tenth of the spacing.
+  Nothing rode its last flushes, so nobody is coming whom waiting would
+  coalesce with. One flush per commit is what it cost waiting the whole
+  spacing out, too; it now gets them ten times sooner.
+- Under concurrency the flush closes once as many commits have joined as a
+  recent flush carried: the known population has arrived, and waiting
+  longer coalesces nothing. The coalescer's batches count by their
+  members, since one batch is one handle carrying many commits.
+- One flush in ten spacings waits the spacing out regardless, carrying
+  every writer, which is how the population is measured and how the mark
+  grows when writers arrive.
+
+Measured against the same tree with the spacing as the only rule, the
+objects are the same to within noise at every count, up to a third more at
+sixteen writers, and the latency is nine times better at one writer, four
+to eight times at two to eight, and twice at sixteen:
+
+| writers | spacing only | population-paced |
+|---|---|---|
+| 1 | 12.94s | 1.44s |
+| 2 | 6.47s | 832ms |
+| 4 | 3.24s | 489ms |
+| 8 | 1.62s | 413ms |
+| 16 | 810ms | 437ms |
+
+Staged-row commits, which are what DuckLake's own DML is, join the same
+batch as verb commits and are rebased onto whatever landed ahead of them,
+so a lost race costs nothing; the rows are measured against the snapshot
+DuckLake read, not the catalog transaction that opens later. Before that,
+the same burst took 4.15 s at eight writers and ran out of DuckLake's
+retry budget at sixteen.
+
+An equality index on every writer's table changes nothing: each commit
+also derives and stages its index entries, under the same rebase, and the
+curve is the same within noise (`--indexed`, moraine only, since the other
+backends have no equality index).
+
+Past sixteen writers the burst is 512 commits, since 128 split 64 ways is
+too short to time (measured before the pacing rules above, with the
+spacing as the only rule):
+
+| writers | moraine | duckdb | postgres |
+|---|---|---|---|
+| 16 | 3.34s | failed | 4.64s |
+| 32 | 1.92s | failed | 6.04s |
+| 64 | 2.10s (1.22s…2.23s) | failed | 7.31s |
+
+DuckDB-file exhausts DuckLake's retry budget at sixteen: its commits
+serialize on the file lock, and the loser of every round re-stamps the
+same snapshot id until it has lost ten times. Postgres gets slower with
+every doubling. At 64 writers on this eight-vCPU machine the catalog sees
+only part of the population in any one window, and CPU contention in the
+DuckLake path is the likelier bound; the 64-member batch ceiling is not.
+
+The concurrency workloads run at the 100 ms default rather than a pinned
+1 ms spacing: the pacing is the mechanism under test, not noise to be
+removed. `--flush-interval-ms` moves it. Correctness under these races —
+a loser rebased and landed, a true conflict refused — is
+`test/sql/commit_concurrency.test` and the core's `staged::tests::batching`,
+not this.
 
 ## Results
 
@@ -95,8 +231,8 @@ backends, cells are `median (min…max)`, plus a ratio column against moraine.
 The same data lands in `target/bench/report.json` for diffing across
 checkouts.
 
-Not covered: concurrency/contention, remote object stores, cross-machine
-reproducibility, or statistical rigor beyond median/min/max. It's a local
+Not covered: concurrent writers sharing one process, remote object stores,
+cross-machine reproducibility, or statistical rigor beyond median/min/max. It's a local
 tool; CI runs `e2e`, not this.
 
 ## Located lookups
@@ -145,6 +281,38 @@ row-id range; with location it stays at one file regardless of history —
 the same answer a constant-id predicate gets, without knowing the file. Real
 endpoint numbers for the summary build live in the located-lookup measurement
 below.
+
+# ClickBench
+
+[ClickBench](https://benchmark.clickhouse.com) ranks analytical databases on
+43 queries over one 100-million-row table. `benchmark/clickbench` is a
+ClickBench system entry for a moraine-backed DuckLake, and
+`cargo xtask clickbench` runs it and ranks the result against the published
+numbers:
+
+```sh
+git clone https://github.com/ClickHouse/ClickBench.git
+cargo xtask clickbench run --clickbench ./ClickBench --machine c6a.4xlarge
+cargo xtask clickbench report --clickbench ./ClickBench
+```
+
+The suite is upstream's and so is the driver: `run` stages the entry into
+the checkout and executes `lib/benchmark-common.sh`, the same script every
+other system's numbers come out of, then writes
+`benchmark/clickbench/results/<date>/<machine>.json` in the published
+format. `report` scores that file against the newest published run of every
+system on the same machine, using ClickBench's own arithmetic — a 10 ms
+offset on each side of every ratio, geometric mean across the queries,
+unanswered queries charged twice the system's worst time. Comparisons hold
+only within one machine, which is why `--machine` has no default.
+
+ClickBench is a read benchmark: its queries spend their time scanning and
+aggregating Parquet, and a scan touches the catalog once. It therefore says
+what the metadata layer costs a read — little — and nothing about the
+commit path, which is what the rest of this file measures. See
+[`benchmark/clickbench/README.md`](benchmark/clickbench/README.md) for the
+methodology and the two timing choices it inherits from the other embedded
+entries.
 
 # Core measurements
 

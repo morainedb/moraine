@@ -55,7 +55,8 @@ MoraineTxHandle *MoraineTransaction::OpenStagedTx() {
 		// cancellable; a gone context degrades to a non-cancellable call.
 		auto client = context.lock();
 		auto code =
-		    moraine_tx_begin(catalog_handle_, &tx, client ? moraine_shim_is_interrupted : nullptr, client.get(), &err);
+		    moraine_tx_begin(catalog_handle_, snapshot_, &tx, client ? moraine_shim_is_interrupted : nullptr,
+		                     client.get(), &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
 		}
@@ -123,30 +124,6 @@ void MoraineTransaction::DropMetadataRowsFor(const MetadataTableSpec &spec) {
 		it = std::get<0>(it->first) == &spec ? metadata_rows_.erase(it) : std::next(it);
 	}
 	metadata_rows_epoch_++;
-}
-
-// Enough for the binds one statement can mint, far below what holding a
-// long transaction's worth of abandoned requests would cost.
-static constexpr size_t MAX_LOCATED_REQUESTS = 64;
-
-uint64_t MoraineTransaction::RegisterLocatedRequest(LocatedRequest request) {
-	std::lock_guard<std::mutex> guard(located_requests_lock_);
-	auto token = next_located_token_++;
-	located_requests_.emplace(token, std::move(request));
-	while (located_requests_.size() > MAX_LOCATED_REQUESTS) {
-		located_requests_.erase(located_requests_.begin());
-	}
-	return token;
-}
-
-bool MoraineTransaction::LocatedRequestFor(uint64_t token, LocatedRequest &request) const {
-	std::lock_guard<std::mutex> guard(located_requests_lock_);
-	auto found = located_requests_.find(token);
-	if (found == located_requests_.end()) {
-		return false;
-	}
-	request = found->second;
-	return true;
 }
 
 uint64_t MoraineTransaction::RegisterScannedRows(const MetadataTableSpec &spec,
@@ -291,6 +268,9 @@ duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientCon
 	// Cancellation before polling submits nothing. Once the call starts,
 	// cancellation reports COMMIT_OUTCOME_UNKNOWN and the write may still land.
 	auto code = moraine_tx_commit(staged, &new_snapshot_id, moraine_shim_is_interrupted, &context, &err);
+	if (code == MORAINE_OK) {
+		catalog_.RecordCommittedSnapshot(new_snapshot_id);
+	}
 	MoraineMemoryTally memory {};
 	auto measured = code == MORAINE_OK &&
 	                moraine_catalog_memory_tally(catalog_.Handle(), &memory) == MORAINE_OK;

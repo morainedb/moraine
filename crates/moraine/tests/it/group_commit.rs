@@ -401,3 +401,252 @@ async fn a_group_losing_a_disjoint_race_retries_every_member() {
     assert_eq!(head.columns_of(b).len(), 2);
     catalog.close().await.unwrap();
 }
+
+mod staged_rows {
+    //! The `ducklake_*` rows DuckLake would author for the burst below,
+    //! in column order, and one catalog seeded with tables to append to.
+
+    use std::sync::Arc;
+
+    use moraine::Catalog;
+    pub(super) use moraine::ffi_support::staged::{
+        Cell, RowOperation, StagedTransaction, TableKind,
+    };
+
+    use super::counted;
+    use crate::crash_recovery::freezing_store::FreezingStore;
+
+    pub(super) const TABLES: u64 = 8;
+
+    // The `ducklake_*` rows DuckLake would author, in column order.
+    fn table_row(id: u64, name: &str) -> Vec<Cell> {
+        vec![
+            Cell::U64(id),
+            Cell::Str(format!("uuid-{id}")),
+            Cell::U64(1),
+            Cell::Null,
+            Cell::U64(0),
+            Cell::Str(name.to_owned()),
+            Cell::Str(format!("{name}/")),
+            Cell::Bool(true),
+        ]
+    }
+    fn column_row(table_id: u64) -> Vec<Cell> {
+        vec![
+            Cell::U64(1),
+            Cell::U64(1),
+            Cell::Null,
+            Cell::U64(table_id),
+            Cell::U64(0),
+            Cell::Str("v".to_owned()),
+            Cell::Str("BIGINT".to_owned()),
+            Cell::Null,
+            Cell::Null,
+            Cell::Bool(true),
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+        ]
+    }
+    fn snapshot_rows(
+        id: u64,
+        next_catalog_id: u64,
+        next_file_id: u64,
+        changes: &str,
+    ) -> [RowOperation; 2] {
+        [
+            RowOperation::Insert {
+                table: TableKind::Snapshot,
+                cells: vec![
+                    Cell::U64(id),
+                    Cell::I64(1),
+                    Cell::U64(1),
+                    Cell::U64(next_catalog_id),
+                    Cell::U64(next_file_id),
+                ],
+            },
+            RowOperation::Insert {
+                table: TableKind::SnapshotChanges,
+                cells: vec![
+                    Cell::U64(id),
+                    Cell::Str(changes.to_owned()),
+                    Cell::Null,
+                    Cell::Null,
+                    Cell::Null,
+                ],
+            },
+        ]
+    }
+    /// One ten-row file appended to `table_id`, authored against `head`
+    /// with the next file id `file_id`.
+    pub(super) fn stage_append(tx: &mut StagedTransaction, table_id: u64, head: u64, file_id: u64) {
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: vec![
+                Cell::U64(file_id),
+                Cell::U64(table_id),
+                Cell::U64(head + 1),
+                Cell::Null,
+                Cell::Null,
+                Cell::Str("data.parquet".to_owned()),
+                Cell::Bool(true),
+                Cell::Str("parquet".to_owned()),
+                Cell::U64(10),
+                Cell::U64(1024),
+                Cell::U64(64),
+                Cell::U64(0),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::TableStats,
+            cells: vec![
+                Cell::U64(table_id),
+                Cell::U64(10),
+                Cell::U64(10),
+                Cell::U64(1024),
+            ],
+        });
+        for row in snapshot_rows(
+            head + 1,
+            TABLES + 1,
+            file_id + 1,
+            &format!("inserted_into_table:{table_id}"),
+        ) {
+            tx.stage(row);
+        }
+    }
+    #[allow(clippy::unwrap_used)]
+    pub(super) async fn seeded_tables() -> (Catalog, Arc<FreezingStore>) {
+        let (catalog, store) = counted().await;
+        let mut tx =
+            moraine::ffi_support::staged::staged_begin(&catalog, None, String::new(), None)
+                .await
+                .unwrap();
+        let mut created = Vec::new();
+        for table_id in 1..=TABLES {
+            tx.stage(RowOperation::Insert {
+                table: TableKind::Table,
+                cells: table_row(table_id, &format!("t{table_id}")),
+            });
+            tx.stage(RowOperation::Insert {
+                table: TableKind::Column,
+                cells: column_row(table_id),
+            });
+            created.push(format!(r#"created_table:"main"."t{table_id}""#));
+        }
+        for row in snapshot_rows(1, TABLES + 1, 1, &created.join(",")) {
+            tx.stage(row);
+        }
+        tx.commit().await.unwrap();
+        (catalog, store)
+    }
+}
+
+/// Staged-row commits — DuckLake's own DML — coalesce the same way: a
+/// burst of concurrent data-only commits costs fewer object-store writes
+/// than the same commits one at a time, each still minting its own
+/// snapshot, with the losers rebased onto the winners rather than refused.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::unwrap_used)]
+async fn concurrent_staged_commits_coalesce_without_being_asked() {
+    use staged_rows::{StagedTransaction, TABLES, seeded_tables, stage_append};
+
+    // The baseline: the same appends one at a time, each authored against
+    // the head it finds, each its own flush.
+    let (catalog, store) = seeded_tables().await;
+    let before_separate = store.writes_attempted();
+    for table_id in 1..=TABLES {
+        let mut tx =
+            moraine::ffi_support::staged::staged_begin(&catalog, None, String::new(), None)
+                .await
+                .unwrap();
+        stage_append(&mut tx, table_id, table_id, table_id);
+        tx.commit().await.unwrap();
+    }
+    let separate = store.writes_attempted() - before_separate;
+    catalog.close().await.unwrap();
+
+    // The burst: every append authored against head 1, as concurrent
+    // DuckLake transactions are. Driven on one task, as the extension
+    // drives them — one blocked thread per connection — rather than
+    // spawned: the commit future borrows across its awaits the way the
+    // DuckLake rows do.
+    let (catalog, store) = seeded_tables().await;
+    let before_together = store.writes_attempted();
+    let mut transactions = Vec::new();
+    for table_id in 1..=TABLES {
+        let mut tx =
+            moraine::ffi_support::staged::staged_begin(&catalog, None, String::new(), None)
+                .await
+                .unwrap();
+        stage_append(&mut tx, table_id, 1, 1);
+        transactions.push(tx);
+    }
+    let mut ids: Vec<u64> =
+        futures::future::join_all(transactions.into_iter().map(StagedTransaction::commit))
+            .await
+            .into_iter()
+            .map(|committed| committed.unwrap().get())
+            .collect();
+    let together = store.writes_attempted() - before_together;
+
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (2..=TABLES + 1).collect::<Vec<_>>(),
+        "every coalesced commit still mints a consecutive snapshot of its own"
+    );
+    assert!(
+        together < separate,
+        "{TABLES} concurrent staged commits wrote {together} objects, the same {TABLES} one \
+         at a time wrote {separate}; staged commits are supposed to share batches"
+    );
+    let head = catalog.snapshot().await.unwrap();
+    assert_eq!(head.current_snapshot().id.get(), TABLES + 1);
+    catalog.close().await.unwrap();
+}
+
+/// A writer without siblings pays no flush spacing: each commit flushes at
+/// once, and one flush per commit is what it cost before too.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn a_writer_without_siblings_pays_no_spacing() {
+    use std::time::{Duration, Instant};
+
+    let spacing = Duration::from_millis(100);
+    let (catalog, store) = {
+        let store = Arc::new(FreezingStore::thawed(Arc::new(InMemory::new())));
+        let mut options = CatalogOptions::default();
+        options.flush_interval = spacing;
+        let catalog = Catalog::open(store.clone(), options).await.unwrap();
+        (catalog, store)
+    };
+
+    let started = Instant::now();
+    let before = store.writes_attempted();
+    for index in 0..5 {
+        catalog
+            .commit(|tx| {
+                tx.create_schema(&format!("s{index}"))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    let elapsed = started.elapsed();
+    let writes = store.writes_attempted() - before;
+
+    assert!(
+        elapsed < spacing * 3,
+        "five lone commits took {elapsed:?}; each waiting the spacing out would be 400ms+"
+    );
+    assert!(
+        writes <= 5 * 3,
+        "a lone commit costs one flush, not a burst of writes: {writes} for five"
+    );
+    catalog.close().await.unwrap();
+}

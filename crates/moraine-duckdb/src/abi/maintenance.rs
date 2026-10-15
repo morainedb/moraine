@@ -844,8 +844,9 @@ pub unsafe extern "C" fn moraine_catalog_cache_tally_tiers(
 ///
 /// # Safety
 ///
-/// `handle` must be a live handle from [`super::moraine_attach`]. Every
-/// out-pointer must be valid and writable for the duration of the call.
+/// `handle` must be a live handle from
+/// [`super::moraine_attach_with_wal_store`]. Every out-pointer must be valid
+/// and writable for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_catalog_cache_tally(
     handle: *mut MoraineCatalogHandle,
@@ -960,8 +961,8 @@ pub unsafe extern "C" fn moraine_sidecar_tally(out_tally: *mut MoraineSidecarTal
 ///
 /// # Safety
 ///
-/// `handle` must be a live handle from [`super::moraine_attach`] and
-/// `out_tally` must be valid and writable for the duration of the call.
+/// `handle` must be a live handle from [`super::moraine_attach_with_wal_store`]
+/// and `out_tally` must be valid and writable for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_catalog_memory_tally(
     handle: *mut MoraineCatalogHandle,
@@ -998,8 +999,8 @@ pub unsafe extern "C" fn moraine_catalog_memory_tally(
 ///
 /// # Safety
 ///
-/// `handle` must be a live handle from [`super::moraine_attach`] and
-/// `out_tally` must be valid and writable for the duration of the call.
+/// `handle` must be a live handle from [`super::moraine_attach_with_wal_store`]
+/// and `out_tally` must be valid and writable for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_catalog_object_store_tally(
     handle: *mut MoraineCatalogHandle,
@@ -1027,11 +1028,12 @@ pub unsafe extern "C" fn moraine_catalog_object_store_tally(
 ///
 /// # Safety
 ///
-/// `handle` must be a pointer previously returned by [`super::moraine_attach`]
-/// and not yet detached. `out_snapshot_id`, `out_batch_seq`, and
-/// `out_present` must be valid, writable pointers. `probe`, if non-null,
-/// must be safe to call with `probe_ctx` from any thread. `err`, if
-/// non-null, must be a valid, writable [`MoraineError`].
+/// `handle` must be a pointer previously returned by
+/// [`super::moraine_attach_with_wal_store`] and not yet detached.
+/// `out_snapshot_id`, `out_batch_seq`, and `out_present` must be valid,
+/// writable pointers. `probe`, if non-null, must be safe to call with
+/// `probe_ctx` from any thread. `err`, if non-null, must be a valid, writable
+/// [`MoraineError`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_head_stamp(
     handle: *mut MoraineCatalogHandle,
@@ -1129,9 +1131,9 @@ pub(super) const KNOWN_SUBSPACES: [moraine::SubspaceName; 8] = [
 ///
 /// # Safety
 ///
-/// `handle` must be a live handle from `moraine_attach`. Each non-null out
-/// pointer must be writable. `probe`/`probe_ctx` follow the interrupt
-/// contract, and `err` must be writable.
+/// `handle` must be a live handle from `moraine_attach_with_wal_store`. Each
+/// non-null out pointer must be writable. `probe`/`probe_ctx` follow the
+/// interrupt contract, and `err` must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_sweep_row_summaries(
     handle: *mut MoraineCatalogHandle,

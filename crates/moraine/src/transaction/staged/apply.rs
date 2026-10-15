@@ -15,9 +15,10 @@ use super::{
         decode_metadata, decode_metadata_key, decode_name_mapping, decode_partition_column,
         decode_partition_info, decode_schema, decode_sort_expression, decode_sort_info,
         decode_table, decode_table_column_stats, decode_table_stats, decode_tag_row, decode_view,
-        table_value,
+        decode_view_column_tag_row, table_value,
     },
     proto,
+    rebase::Rebase,
 };
 
 /// Child-table rows collected before the insert pass: each is folded
@@ -63,7 +64,7 @@ pub(super) fn collect_hard_deletes(ops: &[RowOperation]) -> Result<BTreeSet<Enti
         .collect()
 }
 
-pub(super) fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
+pub(super) fn collect_child_rows(ops: &[RowOperation], rebase: &Rebase) -> Result<ChildRows> {
     let mut children = ChildRows::default();
 
     for op in ops {
@@ -86,7 +87,8 @@ pub(super) fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
                         .push(expression);
                 }
                 TableKind::FilePartitionValue => {
-                    let (file, value) = decode_file_partition_value(cells)?;
+                    let ((table_id, data_file_id), value) = decode_file_partition_value(cells)?;
+                    let file = (table_id, rebase.file_id(data_file_id));
                     children
                         .file_partition_values
                         .entry(file)
@@ -158,6 +160,7 @@ pub(super) fn apply_op(
     state: &mut CatalogSnapshot,
     op: &RowOperation,
     new_id: u64,
+    rebase: &Rebase,
     children: &mut ChildRows,
     direct: &mut Vec<commit::StagedWrite>,
     hard_deleted: &BTreeSet<EntityKey>,
@@ -165,13 +168,13 @@ pub(super) fn apply_op(
 ) -> Result<()> {
     match op {
         RowOperation::Insert { table, cells } => {
-            apply_insert(base, state, *table, cells, children, touched)
+            apply_insert(base, state, *table, cells, rebase, children, touched)
         }
         RowOperation::UpdateSetEnd { table, cells } => {
-            apply_update_set_end(state, *table, cells, new_id, touched)
+            apply_update_set_end(state, *table, cells, new_id, rebase, touched)
         }
         RowOperation::UpdateSetBegin { table, cells } => {
-            apply_update_set_begin(base, state, *table, cells, new_id, touched)
+            apply_update_set_begin(base, state, *table, cells, new_id, rebase, touched)
         }
         RowOperation::Delete { table, cells } => {
             apply_delete(state, *table, cells, direct, hard_deleted, touched)
@@ -356,10 +359,12 @@ fn apply_schema_insert(
 fn apply_data_file_insert(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
+    rebase: &Rebase,
     children: &mut ChildRows,
     touched: &mut Touched,
 ) -> Result<()> {
     let mut value = decode_data_file(cells)?;
+    rebase.data_file(&mut value);
     refuse_live_id(
         TableKind::DataFile,
         state
@@ -383,9 +388,11 @@ fn apply_data_file_insert(
 fn apply_delete_file_insert(
     state: &mut CatalogSnapshot,
     cells: &[Cell],
+    rebase: &Rebase,
     touched: &mut Touched,
 ) -> Result<()> {
-    let value = decode_delete_file(cells)?;
+    let mut value = decode_delete_file(cells)?;
+    rebase.delete_file(&mut value);
     refuse_live_id(
         TableKind::DeleteFile,
         state
@@ -425,6 +432,19 @@ fn apply_tag_insert(
         return Ok(());
     }
 
+    if table == TableKind::ViewColumnTag {
+        let (view_id, tag) = decode_view_column_tag_row(cells)?;
+        let Some(view) = state.views.get_mut(&view_id) else {
+            return Err(corrupt_row(
+                table,
+                format!("view column tag names an absent view ({view_id})"),
+            ));
+        };
+        view.column_tags.push(tag);
+        touched.touch(EntityKey::View { view_id });
+        return Ok(());
+    }
+
     let ((table_id, column_id), tag) = decode_column_tag_row(cells)?;
     let Some(column) = state
         .columns
@@ -449,18 +469,21 @@ fn apply_stats_insert(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
+    rebase: &Rebase,
     touched: &mut Touched,
 ) -> Result<()> {
     match table {
         TableKind::TableStats => {
-            let value = decode_table_stats(cells)?;
+            let mut value = decode_table_stats(cells)?;
+            rebase.table_stats(&mut value);
             touched.touch(EntityKey::TableStats {
                 table_id: value.table_id,
             });
             state.put_table_stats(value);
         }
         TableKind::TableColumnStats => {
-            let value = decode_table_column_stats(cells)?;
+            let mut value = decode_table_column_stats(cells)?;
+            rebase.table_column_stats(&mut value);
             touched.touch(EntityKey::TableColumnStats {
                 table_id: value.table_id,
                 column_id: value.column_id,
@@ -468,7 +491,8 @@ fn apply_stats_insert(
             state.put_table_column_stats(value);
         }
         TableKind::FileColumnStats => {
-            let value = decode_file_column_stats(cells)?;
+            let mut value = decode_file_column_stats(cells)?;
+            rebase.file_column_stats(&mut value);
             touched.touch(EntityKey::FileColumnStats {
                 table_id: value.table_id,
                 data_file_id: value.data_file_id,
@@ -486,6 +510,7 @@ pub(super) fn apply_insert(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
+    rebase: &Rebase,
     children: &mut ChildRows,
     touched: &mut Touched,
 ) -> Result<()> {
@@ -551,8 +576,8 @@ pub(super) fn apply_insert(
             });
             state.put_column(value);
         }
-        TableKind::DataFile => apply_data_file_insert(state, cells, children, touched)?,
-        TableKind::DeleteFile => apply_delete_file_insert(state, cells, touched)?,
+        TableKind::DataFile => apply_data_file_insert(state, cells, rebase, children, touched)?,
+        TableKind::DeleteFile => apply_delete_file_insert(state, cells, rebase, touched)?,
         TableKind::PartitionInfo => {
             let mut value = decode_partition_info(cells)?;
             value.columns = children
@@ -580,14 +605,16 @@ pub(super) fn apply_insert(
         TableKind::Macro => apply_macro_insert(state, cells, children, touched)?,
         TableKind::ColumnMapping => apply_mapping_insert(state, cells, children, touched)?,
         TableKind::TableStats | TableKind::TableColumnStats | TableKind::FileColumnStats => {
-            apply_stats_insert(state, table, cells, touched)?;
+            apply_stats_insert(state, table, cells, rebase, touched)?;
         }
         TableKind::FilesScheduledForDeletion => {
             let value = decode_gc_file_row(cells)?;
             touched.touch_gc_file(value.data_file_id);
             state.put_gc_file(value);
         }
-        TableKind::Tag | TableKind::ColumnTag => apply_tag_insert(state, table, cells, touched)?,
+        TableKind::Tag | TableKind::ColumnTag | TableKind::ViewColumnTag => {
+            apply_tag_insert(state, table, cells, touched)?;
+        }
     }
     Ok(())
 }
@@ -698,20 +725,57 @@ pub(super) fn apply_column_tag_set_end(
     }
 }
 
+/// Ends a live view-column tag without ending its containing view.
+fn apply_view_column_tag_set_end(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    new_id: u64,
+    touched: &mut Touched,
+) -> Result<()> {
+    let mut cursor = Cursor::new(TableKind::ViewColumnTag, cells);
+    let view_id = cursor.u64()?;
+    let column_name = cursor.string()?;
+    let key = cursor.string()?;
+    let end_snapshot = cursor.u64()?;
+    cursor.finish()?;
+    check_end_snapshot(TableKind::ViewColumnTag, end_snapshot, new_id)?;
+    let ended = state.views.get_mut(&view_id).is_some_and(|view| {
+        end_live_entry(
+            &mut view.column_tags,
+            |tag| tag.column_name == column_name && tag.key == key && tag.end_snapshot.is_none(),
+            |tag| tag.end_snapshot = Some(end_snapshot),
+        )
+    });
+    if !ended {
+        return Err(corrupt_row(
+            TableKind::ViewColumnTag,
+            format!("no live view column tag ({view_id}, {column_name:?}, {key:?}) to end"),
+        ));
+    }
+    touched.touch(EntityKey::View { view_id });
+    Ok(())
+}
+
 pub(super) fn apply_update_set_end(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
     new_id: u64,
+    rebase: &Rebase,
     touched: &mut Touched,
 ) -> Result<()> {
     match table {
         TableKind::Tag => return apply_tag_set_end(state, cells, new_id, touched),
         TableKind::ColumnTag => return apply_column_tag_set_end(state, cells, new_id, touched),
+        TableKind::ViewColumnTag => {
+            return apply_view_column_tag_set_end(state, cells, new_id, touched);
+        }
         _ => {}
     }
 
     let (key, end_snapshot) = decode_end(table, cells)?;
+    let key = rebase.entity_key(key);
+    let end_snapshot = rebase.snapshot(end_snapshot);
     check_end_snapshot(table, end_snapshot, new_id)?;
     touched.touch(key);
     // End only the one row named, never a cascade: a rename ends the table
@@ -788,6 +852,7 @@ pub(super) fn apply_update_set_begin(
     table: TableKind,
     cells: &[Cell],
     new_id: u64,
+    rebase: &Rebase,
     touched: &mut Touched,
 ) -> Result<()> {
     if table != TableKind::DataFile {
@@ -797,8 +862,8 @@ pub(super) fn apply_update_set_begin(
     }
     let mut c = Cursor::new(table, cells);
     let table_id = c.u64()?;
-    let data_file_id = c.u64()?;
-    let begin_snapshot = c.u64()?;
+    let data_file_id = rebase.file_id(c.u64()?);
+    let begin_snapshot = rebase.snapshot(c.u64()?);
     c.finish()?;
     if begin_snapshot != new_id {
         return Err(corrupt_row(
@@ -1001,6 +1066,7 @@ pub(super) fn apply_delete(
             }
             Ok(())
         }
+        TableKind::ViewColumnTag => apply_view_column_tag_delete(state, cells, touched),
         TableKind::PartitionColumn
         | TableKind::SortExpression
         | TableKind::FilePartitionValue
@@ -1009,6 +1075,32 @@ pub(super) fn apply_delete(
         | TableKind::NameMapping => apply_embedded_delete(state, table, cells, hard_deleted),
         TableKind::SchemaVersions => apply_schema_version_delete(cells, direct),
     }
+}
+
+/// Removes a dead `ducklake_view_column_tag` entry. An entry on a
+/// still-current view rewrites the view in place; on a pruned view there
+/// is nothing to rewrite.
+fn apply_view_column_tag_delete(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
+    let mut c = Cursor::new(TableKind::ViewColumnTag, cells);
+    let view_id = c.u64()?;
+    let column_name = c.string()?;
+    let key = c.string()?;
+    let begin_snapshot = c.u64()?;
+    c.finish()?;
+
+    touched.touch(EntityKey::View { view_id });
+    if let Some(view) = state.views.get_mut(&view_id) {
+        view.column_tags.retain(|tag| {
+            !(tag.column_name == column_name
+                && tag.key == key
+                && tag.begin_snapshot == begin_snapshot)
+        });
+    }
+    Ok(())
 }
 
 /// Removes a dead `ducklake_tag` entry from its container; a container
@@ -1259,5 +1351,6 @@ pub(super) fn build_snapshot_value(ops: &[RowOperation]) -> Result<proto::Snapsh
         // DuckLake names only the tables it deleted from; a later commit
         // classifies against this snapshot at table grain.
         deleted_data_file_ids: Vec::new(),
+        deletes_untargeted_files: false,
     })
 }

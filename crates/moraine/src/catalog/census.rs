@@ -5,7 +5,7 @@
 
 use std::{fmt, time::Duration};
 
-use crate::store::key::{Subspace, subspace_prefix};
+use crate::store::key::Subspace;
 
 /// One subspace of the keyspace, as a census names it. A segment this
 /// build does not recognize is reported as [`Unknown`](Self::Unknown)
@@ -39,10 +39,7 @@ pub enum SubspaceName {
 impl SubspaceName {
     /// The subspace whose keys carry `prefix`.
     pub(crate) fn of_prefix(prefix: &[u8]) -> Self {
-        Subspace::ALL
-            .into_iter()
-            .find(|subspace| subspace_prefix(*subspace) == prefix)
-            .map_or_else(|| Self::Unknown(prefix.to_vec()), Self::from)
+        Subspace::of_prefix(prefix).map_or_else(|| Self::Unknown(prefix.to_vec()), Self::from)
     }
 
     /// The subspace this name refers to, or `None` for an unknown one,
@@ -282,6 +279,7 @@ pub struct CompactStoreReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::key::subspace_prefix;
 
     /// Every subspace round-trips through its prefix, and an unrecognized
     /// prefix is named rather than lost.

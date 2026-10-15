@@ -5,14 +5,14 @@
 //! (user-table data is served only through DuckLake); this suite asserts
 //! that too.
 //!
-//! Ignored by default: needs the downloaded DuckDB CLI and the packaged
+//! Ignored by default: needs the built DuckDB CLI and the packaged
 //! `.duckdb_extension`, which only `cargo xtask e2e` produces (it sets
 //! `MORAINE_DUCKDB_CLI`/`MORAINE_DUCKDB_EXT` and runs this test un-ignored).
 //!
 //! Run manually after `cargo xtask e2e` has produced the artifacts once:
 //!
 //! ```text
-//! MORAINE_DUCKDB_CLI=target/duckdb-cli/cli/duckdb \
+//! MORAINE_DUCKDB_CLI=build/release/duckdb \
 //! MORAINE_DUCKDB_EXT=build/release/extension/moraine/moraine.duckdb_extension \
 //! cargo test -p moraine-duckdb --release --test duckdb_load -- --ignored
 //! ```
@@ -255,7 +255,7 @@ fn csv_rows(output: &str) -> Vec<Vec<String>> {
 /// Run via `cargo xtask e2e`, or manually — see this module's doc
 /// comment.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extension; run via `cargo xtask e2e`"]
+#[ignore = "needs the built DuckDB CLI and packaged extension; run via `cargo xtask e2e`"]
 fn attach_lists_and_scans_through_real_duckdb() {
     let dir = TempDir::new("attach");
     seed(dir.path());

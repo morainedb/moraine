@@ -6,7 +6,7 @@ use futures::TryStreamExt;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use super::{BACKFILL_FILE_READ_CONCURRENCY, Catalog, backfill};
+use super::{BACKFILL_FILE_READ_CONCURRENCY, Catalog, ReadOnlyCatalog, backfill};
 use crate::{
     catalog::{
         BuildStep, CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, IndexDef, IndexId,
@@ -17,7 +17,8 @@ use crate::{
     store::{
         handle::ScanShape,
         index_encoding::{Direction, IndexKeyValue, NullOrder, encode_ordered_index_entry},
-        key::{IndexKind, index_index_prefix},
+        index_entries::scan_index_entries,
+        key::IndexKind,
         proto::{DataFileValue, DeleteFileValue, InlineBuildCursorValue},
     },
     telemetry::reporting_phase,
@@ -68,7 +69,7 @@ fn requested_orders(orders: &[ColumnOrder], columns: usize) -> (Vec<Direction>, 
 
 /// Encodes derived values to physical keys under one definition.
 #[derive(Clone)]
-struct IndexEncoder {
+pub(super) struct IndexEncoder {
     index_id: u64,
     unique: bool,
     directions: Vec<Direction>,
@@ -76,7 +77,7 @@ struct IndexEncoder {
 }
 
 impl IndexEncoder {
-    fn of(info: &IndexInfo) -> Self {
+    pub(super) fn of(info: &IndexInfo) -> Self {
         Self {
             index_id: info.id.get(),
             unique: info.unique,
@@ -129,34 +130,48 @@ struct PendingStep {
     inline_cursor: Option<InlineBuildCursorValue>,
 }
 
-/// The derivation side of one pass: fills one bounded step at a time and
-/// hands each full step to the committer.
-struct StepBuffer<'a> {
-    encoder: IndexEncoder,
-    /// Every key this build has staged; a unique key it has not seen is
-    /// staged without a probe.
-    filter: &'a mut BuildFilter,
-    bound: BuildStep,
-    entries: Vec<EncodedIndexEntry>,
-    staged_bytes: u64,
-    pending_source: Option<(u64, u64)>,
-    inline_cursor: Option<InlineBuildCursorValue>,
-    /// `None` once derivation has handed off its final step.
-    steps: Option<mpsc::Sender<Result<PendingStep>>>,
-    peak_buffered_entries: usize,
-    peak_inline_body_bytes: usize,
-    peak_inline_decoded_bytes: usize,
+/// Where a derivation pass sends the entries it reads out of the rows. A
+/// build buffers them into steps; a verifier diffs them against the index.
+pub(super) trait EntrySink {
+    /// The definition the derived keys are encoded under.
+    fn encoder(&self) -> &IndexEncoder;
+
+    /// Takes one derived entry and the file position it came from.
+    fn push(
+        &mut self,
+        entry: EncodedIndexEntry,
+        source: Option<(u64, u64)>,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Records that `file_id` is derived through `position`.
+    fn cover_source(&mut self, file_id: u64, position: u64);
+
+    /// Where inline traversal resumes, and where it reached.
+    fn inline_cursor(&self) -> Option<InlineBuildCursorValue>;
+    fn set_inline_cursor(&mut self, cursor: InlineBuildCursorValue);
+
+    /// The widest inline chunk this pass held, for the build's log.
+    fn record_inline_peaks(&mut self, body_bytes: usize, decoded_bytes: usize);
+
+    /// Encodes and takes an entry the caller derived itself.
+    fn push_values(
+        &mut self,
+        row_id: u64,
+        values: &[Option<IndexKeyValue>],
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        Self: Sized + Send,
+    {
+        async move {
+            let entry = self.encoder().encode(row_id, values)?;
+            self.push(entry, None).await
+        }
+    }
 }
 
-impl StepBuffer<'_> {
-    fn cover_source(&mut self, file_id: u64, position: u64) {
-        self.pending_source = Some((file_id, position));
-    }
-
-    /// Encodes and buffers an entry the driver derived itself.
-    async fn push_values(&mut self, row_id: u64, values: &[Option<IndexKeyValue>]) -> Result<()> {
-        let entry = self.encoder.encode(row_id, values)?;
-        self.push(entry, None).await
+impl EntrySink for StepBuffer<'_> {
+    fn encoder(&self) -> &IndexEncoder {
+        &self.encoder
     }
 
     async fn push(
@@ -177,12 +192,50 @@ impl StepBuffer<'_> {
         self.staged_bytes = self.staged_bytes.saturating_add(entry_bytes);
         self.entries.push(entry);
         if let Some((file_id, position)) = source {
-            self.cover_source(file_id, position);
+            self.pending_source = Some((file_id, position));
         }
         self.peak_buffered_entries = self.peak_buffered_entries.max(self.entries.len());
         Ok(())
     }
 
+    fn cover_source(&mut self, file_id: u64, position: u64) {
+        self.pending_source = Some((file_id, position));
+    }
+
+    fn inline_cursor(&self) -> Option<InlineBuildCursorValue> {
+        self.inline_cursor
+    }
+
+    fn set_inline_cursor(&mut self, cursor: InlineBuildCursorValue) {
+        self.inline_cursor = Some(cursor);
+    }
+
+    fn record_inline_peaks(&mut self, body_bytes: usize, decoded_bytes: usize) {
+        self.peak_inline_body_bytes = self.peak_inline_body_bytes.max(body_bytes);
+        self.peak_inline_decoded_bytes = self.peak_inline_decoded_bytes.max(decoded_bytes);
+    }
+}
+
+/// The derivation side of one pass: fills one bounded step at a time and
+/// hands each full step to the committer.
+struct StepBuffer<'a> {
+    encoder: IndexEncoder,
+    /// Every key this build has staged; a unique key it has not seen is
+    /// staged without a probe.
+    filter: &'a mut BuildFilter,
+    bound: BuildStep,
+    entries: Vec<EncodedIndexEntry>,
+    staged_bytes: u64,
+    pending_source: Option<(u64, u64)>,
+    inline_cursor: Option<InlineBuildCursorValue>,
+    /// `None` once derivation has handed off its final step.
+    steps: Option<mpsc::Sender<Result<PendingStep>>>,
+    peak_buffered_entries: usize,
+    peak_inline_body_bytes: usize,
+    peak_inline_decoded_bytes: usize,
+}
+
+impl StepBuffer<'_> {
     /// Hands the buffered step to the committer, waiting while it still
     /// holds the previous one.
     async fn hand_off(&mut self, is_final: bool) -> Result<()> {
@@ -574,7 +627,7 @@ impl Catalog {
 
     /// Commits the `building` definition, or adopts the one already there.
     /// A ready definition of the same name belongs to a finished index.
-    async fn begin_staged_index(
+    pub(super) async fn begin_staged_index(
         &self,
         table: TableId,
         def: &IndexDef,
@@ -817,13 +870,15 @@ impl Catalog {
              the table is under concurrent write"
         )))
     }
+}
 
-    /// Streams the external-file leg of a build into `buffer` in file and
-    /// position order, excluding rows already dead at this pass's pinned
-    /// snapshot. Files are planned and row groups read ahead of the
-    /// position being consumed.
+impl ReadOnlyCatalog {
+    /// Streams the external-file leg of a derivation into `sink` in file and
+    /// position order, excluding rows already dead at the pinned snapshot.
+    /// Files are planned and row groups read ahead of the position being
+    /// consumed.
     #[allow(clippy::too_many_arguments)]
-    async fn stream_backfill_files(
+    pub(super) async fn stream_backfill_files(
         &self,
         object_store: DataStore,
         data_prefix: &str,
@@ -832,15 +887,15 @@ impl Catalog {
         file_cursor: Option<u64>,
         position_cursor: Option<u64>,
         legacy_row_cursor: Option<u64>,
-        buffer: &mut StepBuffer<'_>,
+        sink: &mut (impl EntrySink + Send),
     ) -> Result<()> {
         let backfill::BackfillSource {
             snapshot,
             table,
             handle,
         } = source;
-        let projection = buffer
-            .encoder
+        let projection = sink
+            .encoder()
             .projection(snapshot.column_positions(table, columns)?);
 
         let table_prefix = snapshot.table_data_prefix(table)?;
@@ -898,23 +953,22 @@ impl Catalog {
                         let covered =
                             legacy_row_cursor.is_some_and(|cursor| entry.row_id <= cursor);
                         if covered {
-                            buffer.cover_source(unit.file_id, entry.ordinal);
+                            sink.cover_source(unit.file_id, entry.ordinal);
                             continue;
                         }
-                        buffer
-                            .push(
-                                EncodedIndexEntry {
-                                    row_id: entry.row_id,
-                                    key: entry.key,
-                                    unique: entry.unique,
-                                    known_absent: false,
-                                },
-                                Some((unit.file_id, entry.ordinal)),
-                            )
-                            .await?;
+                        sink.push(
+                            EncodedIndexEntry {
+                                row_id: entry.row_id,
+                                key: entry.key,
+                                unique: entry.unique,
+                                known_absent: false,
+                            },
+                            Some((unit.file_id, entry.ordinal)),
+                        )
+                        .await?;
                     }
                 }
-                buffer.cover_source(unit.file_id, unit.end.saturating_sub(1));
+                sink.cover_source(unit.file_id, unit.end.saturating_sub(1));
                 drop(unit.task);
             }
             Ok(())
@@ -934,13 +988,8 @@ async fn establish_filter(
     filter: &mut BuildFilter,
 ) -> Result<()> {
     let started = Instant::now();
-    let mut keys = handle
-        .scan_prefix(
-            index_index_prefix(IndexKind::Unique, index.get()),
-            ..,
-            ScanShape::Bulk,
-        )
-        .await?;
+    let mut keys =
+        scan_index_entries(handle, IndexKind::Unique, index.get(), ScanShape::Bulk).await?;
     let mut scanned = 0u64;
     while let Some(entry) = keys.next().await? {
         filter.insert(&entry.key);
@@ -1040,7 +1089,7 @@ async fn plan_file(
 }
 
 /// A build must be able to read every registered file before it can publish.
-fn require_data_store(
+pub(super) fn require_data_store(
     snapshot: &CatalogSnapshot,
     table: TableId,
     has_data_store: bool,
@@ -1059,10 +1108,10 @@ fn require_data_store(
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::catalog::handle) mod tests;
 
 mod feeder;
 mod filter;
-mod inline_sources;
+pub(super) mod inline_sources;
 use filter::BuildFilter;
 use inline_sources::stream_inline_sources;

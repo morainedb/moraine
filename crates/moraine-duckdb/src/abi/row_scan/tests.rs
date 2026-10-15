@@ -8,21 +8,28 @@ use arrow::{
 
 use super::*;
 
+/// The row-scan ABI is one Arrow cursor, with file positioning for DELETE.
 #[test]
-fn located_row_abi_exposes_only_arrow_results() {
+fn the_row_scan_abi_is_one_arrow_cursor() {
     let header = include_str!("../../../cpp/moraine_abi.h");
     for removed in [
         "MoraineRowBatch",
+        "MorainePositionPair",
+        "moraine_locate_row_positions_free_inlined(",
         "moraine_rows_at(",
         "moraine_rows_at_free(",
         "moraine_row_scan_next(",
+        "moraine_rows_at_open(",
+        "moraine_commit_located_deletion(",
     ] {
-        assert!(!header.contains(removed), "legacy IPC export: {removed}");
+        assert!(!header.contains(removed), "withdrawn export: {removed}");
     }
     for retained in [
-        "moraine_rows_at_open(",
+        "moraine_row_scan_open(",
         "moraine_row_scan_next_arrow(",
         "moraine_row_scan_free(",
+        "moraine_locate_row_positions(",
+        "MoraineLocatedFile",
     ] {
         assert!(
             header.contains(retained),

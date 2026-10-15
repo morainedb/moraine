@@ -309,6 +309,7 @@ fn renaming_one_column_stages_no_write_for_any_sibling() {
         commit_extra_info: None,
         schema_changed_table_ids: Vec::new(),
         deleted_data_file_ids: Vec::new(),
+        deletes_untargeted_files: false,
     };
     let mut setup = Transaction::new(CatalogSnapshot::build(snap0, &[], &[], None), 1);
     let schema = setup.create_schema("s").unwrap();
@@ -376,6 +377,7 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
         commit_extra_info: None,
         schema_changed_table_ids: Vec::new(),
         deleted_data_file_ids: Vec::new(),
+        deletes_untargeted_files: false,
     };
     let empty = CatalogSnapshot::build(snap0, &[], &[], None);
     let mut setup = Transaction::new(empty, 1);
@@ -704,7 +706,7 @@ async fn read_format_version(catalog: &crate::catalog::Catalog) -> u64 {
 }
 
 #[tokio::test]
-async fn create_index_persists_definition_stamps_format_and_lands_entries() {
+async fn create_index_persists_definition_and_entries_without_changing_format() {
     use crate::{
         catalog::{ColumnId, IndexDef, IndexState},
         store::key::{IndexKind, index_index_prefix},
@@ -741,10 +743,7 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
     assert_eq!(infos[0].columns, vec![ColumnId::new(1)]);
     assert!(infos[0].unique);
     assert_eq!(infos[0].state, IndexState::Ready);
-    assert_eq!(
-        read_format_version(&catalog).await,
-        FORMAT_WITH_INDEX.max(MIN_FORMAT_VERSION)
-    );
+    assert_eq!(read_format_version(&catalog).await, MIN_FORMAT_VERSION);
 
     // Both backfill rows produced a stored entry.
     let tx = catalog.begin_write_tx().await.unwrap();
@@ -766,7 +765,7 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
 }
 
 #[tokio::test]
-async fn deferred_index_is_non_unique_and_stamps_its_format() {
+async fn deferred_index_is_non_unique_and_preserves_the_format() {
     use crate::catalog::{ColumnId, IndexDef, IndexMaintenance};
     let (catalog, table) = catalog_with_two_column_table().await;
 
@@ -793,10 +792,7 @@ async fn deferred_index_is_non_unique_and_stamps_its_format() {
         snapshot.indexes_of(table)[0].maintenance,
         IndexMaintenance::Deferred
     );
-    assert_eq!(
-        read_format_version(&catalog).await,
-        FORMAT_WITH_DEFERRED_INDEX.max(MIN_FORMAT_VERSION)
-    );
+    assert_eq!(read_format_version(&catalog).await, MIN_FORMAT_VERSION);
 
     let error = catalog
         .commit(|tx| {
@@ -840,7 +836,7 @@ async fn duplicate_unique_value_in_backfill_aborts_create() {
         .unwrap_err();
     assert!(matches!(err, Error::Constraint(_)), "{err}");
 
-    // The aborted commit left no index and did not stamp the format.
+    // The aborted commit left no index and preserved the format.
     assert!(
         catalog
             .snapshot()
@@ -2641,11 +2637,8 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     // keys can be compared directly.
     assert_eq!(single_index, staged_index);
 
-    // While building: format 3, lookups fail typed.
-    assert_eq!(
-        read_format_version(&staged).await,
-        FORMAT_WITH_STAGED_INDEX.max(MIN_FORMAT_VERSION)
-    );
+    // While building, lookups fail typed.
+    assert_eq!(read_format_version(&staged).await, MIN_FORMAT_VERSION);
     assert!(matches!(
         staged
             .index_lookup(table_staged, staged_index, &[int_value(20)])
@@ -3689,10 +3682,7 @@ async fn drop_index_ends_definition_and_keeps_format() {
             .is_empty()
     );
     // Dropping the last index does not downgrade the stamp.
-    assert_eq!(
-        read_format_version(&catalog).await,
-        FORMAT_WITH_INDEX.max(MIN_FORMAT_VERSION)
-    );
+    assert_eq!(read_format_version(&catalog).await, MIN_FORMAT_VERSION);
     catalog.close().await.unwrap();
 }
 
@@ -3901,43 +3891,6 @@ async fn the_migration_marker_refuses_a_commit_with_a_warm_cache() {
         .unwrap();
 
     assert!(matches!(err, Error::Migration(_)), "{err:?}");
-    catalog.close().await.unwrap();
-}
-
-/// A target at or below the observed floor is answered from the floor. The
-/// store here is stamped below the target, so an answer of `None` can only
-/// mean the read was skipped.
-#[tokio::test]
-async fn a_format_target_under_the_observed_floor_costs_no_read() {
-    let (catalog, _) = seeded_catalog(1).await;
-    let projections = catalog.projections();
-    raise_format_floor(projections, MAX_FORMAT_VERSION + 1);
-
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let stamp = format_stamp_to(ReadHandle::Tx(&db_tx), projections, MAX_FORMAT_VERSION + 1)
-        .await
-        .unwrap();
-
-    assert!(stamp.is_none(), "the floor already covers the target");
-    drop(db_tx);
-    catalog.close().await.unwrap();
-}
-
-/// A target above the floor reads, stamps, and raises the floor to what it
-/// found, so the same question is not asked twice.
-#[tokio::test]
-async fn a_format_target_above_the_floor_reads_and_raises_it() {
-    let (catalog, _) = seeded_catalog(1).await;
-    let projections = catalog.projections();
-
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let stamp = format_stamp_to(ReadHandle::Tx(&db_tx), projections, MIN_FORMAT_VERSION + 1)
-        .await
-        .unwrap();
-
-    assert!(stamp.is_some(), "a higher target requires a stamp");
-    assert_eq!(format_floor(projections), MIN_FORMAT_VERSION);
-    drop(db_tx);
     catalog.close().await.unwrap();
 }
 
@@ -4990,6 +4943,58 @@ async fn a_retry_across_a_reclaimed_snapshot_conflicts_rather_than_corrupting() 
     db.close().await.unwrap();
 }
 
+/// A commit that deletes both by file and by inlined row falls back to
+/// table grain, and a later committer classifying it from its record sees
+/// that fallback rather than the file list alone.
+#[tokio::test]
+async fn a_mixed_delete_commit_classifies_at_table_grain_from_its_record() {
+    use crate::transaction::operations::{Operation, conflicts};
+
+    let (catalog, tables) = seeded_catalog(1).await;
+    let table = tables[0];
+    let file = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            file.set(Some(tx.register_data_file(
+                table,
+                bulk_file("f0.parquet", 3),
+                &[],
+            )?));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let file = file.get().unwrap();
+    let head_before = catalog.snapshot().await.unwrap().snapshot.snapshot_id;
+
+    catalog
+        .commit(|tx| {
+            tx.register_delete_file(table, delete_file(file), &[])?;
+            tx.inline_delete(table, 0, &[])
+        })
+        .await
+        .unwrap();
+
+    let store = catalog.store();
+    let intervening = intervening_changes(&store, head_before).await.unwrap();
+    let (_, theirs) = &intervening[0];
+    assert!(theirs.deleted_data_file_ids.contains(&file.get()));
+    assert!(
+        theirs.deletes_untargeted_files,
+        "the inlined delete names no file, so the commit deletes at table grain"
+    );
+
+    let ours = ChangeSet::from_operations(&[Operation::RegisterDeleteFile {
+        table_id: table.get(),
+        data_file_id: file.get() + 1,
+    }]);
+    assert!(
+        conflicts(&ours, theirs),
+        "a delete of another file conflicts with rows the record cannot name"
+    );
+    catalog.close().await.unwrap();
+}
+
 /// The other half of that path. An expiry is head-preserving, so it clears
 /// the cached view, and the next verb commit rematerializes over a keyspace
 /// whose intervening snapshot records are gone. It must land: a
@@ -5172,57 +5177,6 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
 
     drop(db_tx);
     catalog.close().await.unwrap();
-}
-
-/// The format floor is the highest term that applies, never the first.
-#[test]
-fn the_format_floor_takes_the_highest_term_that_applies() {
-    let index_at = |value: proto::IndexValue| {
-        let mut state = CatalogSnapshot::default();
-        state.put_index(value);
-        state
-    };
-
-    let building = index_at(proto::IndexValue {
-        build_state: Some("maintaining".to_owned()),
-        ..proto::IndexValue::default()
-    });
-    let deferred = index_at(proto::IndexValue {
-        deferred_maintenance: Some(true),
-        ..proto::IndexValue::default()
-    });
-
-    assert_eq!(index_format(&CatalogSnapshot::default()), FORMAT_VERSION);
-    assert_eq!(index_format(&building), FORMAT_WITH_STAGED_INDEX);
-    assert_eq!(index_format(&deferred), FORMAT_WITH_DEFERRED_INDEX);
-
-    let both = InlineShapes {
-        chunk_directory: true,
-        schema_reference: true,
-    };
-    assert_eq!(inline_format(InlineShapes::default()), FORMAT_VERSION);
-    assert_eq!(
-        inline_format(InlineShapes {
-            schema_reference: true,
-            ..InlineShapes::default()
-        }),
-        FORMAT_WITH_INLINE_SCHEMA_REFERENCE
-    );
-    assert_eq!(
-        inline_format(both),
-        FORMAT_WITH_INLINE_CHUNK_IDENTITY,
-        "a locator outranks a schema reference written beside it"
-    );
-
-    assert_eq!(
-        target_format(&deferred, both),
-        FORMAT_WITH_INLINE_CHUNK_IDENTITY,
-        "an inline shape outranks the index state it commits beside"
-    );
-    assert_eq!(
-        target_format(&deferred, InlineShapes::default()),
-        FORMAT_WITH_DEFERRED_INDEX
-    );
 }
 
 /// A folder holding the store, with a two-column table, over `provider`.

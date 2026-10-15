@@ -63,15 +63,25 @@ pub fn check_release_assets(arguments: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Loads one published build and proves that its bundled DuckLake backfills
-/// row-ID statistics and prunes a three-file scan to one file.
+/// Loads one build and proves that its bundled DuckLake backfills row-ID
+/// statistics and prunes a three-file scan to one file.
+///
+/// `version` names the DuckDB the build is for, so a bump that leaves a
+/// stale invocation behind fails here instead of smoke-testing the wrong
+/// artifact.
 pub fn validate_release_artifact(arguments: &[String]) -> anyhow::Result<()> {
     let [version, artifact] = arguments else {
         bail!("usage: cargo xtask validate-release-artifact <duckdb-version> <artifact>");
     };
+    ensure!(
+        version == duckdb::duckdb_pin(),
+        "this build is for DuckDB {}, not {version}: only the pinned version has a CLI \
+         that can load it",
+        duckdb::duckdb_pin()
+    );
     let artifact = fs::canonicalize(artifact)
         .with_context(|| format!("resolving the extension artifact {artifact}"))?;
-    let cli = duckdb::ensure_duckdb_cli_for(version)?;
+    let cli = duckdb::ensure_duckdb_cli()?;
     let script_path = duckdb::workspace_root().join(RELEASE_SMOKE);
     let script = fs::read_to_string(&script_path)
         .with_context(|| format!("reading {}", script_path.display()))?;

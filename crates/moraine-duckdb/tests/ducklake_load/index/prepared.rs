@@ -1,7 +1,7 @@
 use crate::helpers::*;
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_index_reads_reuse_scoped_probes() {
     for parameterized in [false, true] {
         for joined in [false, true] {
@@ -28,7 +28,7 @@ fn prepared_index_reads_reuse_scoped_probes() {
                     let result = run_session_with_env(&Attach::Moraine { store_dir: store.path(), data_path: data.path(), options: &options, read_only: false }, &format!(
             "CREATE TABLE lake.main.t(a BIGINT);
              {insert}
-             CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+             CREATE INDEX by_a ON lake.main.t(a);
              CALL enable_logging(level => 'debug', storage => 'memory');
              PREPARE probe AS SELECT 'hits', count(*) FROM {from};
              SELECT 'resolutions', count(*) FROM duckdb_logs WHERE type='moraine' AND message LIKE '%index probe resolved%';
@@ -55,8 +55,12 @@ fn prepared_index_reads_reuse_scoped_probes() {
                         "{kind}, joined={joined}, present={present}, parameterized={parameterized}: {output}"
                     );
                     if !joined && !parameterized {
+                        // DuckDB rebinds every execution of a plan that reads
+                        // an attached database, so this counts one bind per
+                        // execution; probe reuse is what the resolutions
+                        // above pin.
                         assert!(
-                            csv_rows(&output).contains(&vec!["binds".into(), "1".into()]),
+                            csv_rows(&output).contains(&vec!["binds".into(), "3".into()]),
                             "{output}"
                         );
                     }
@@ -76,7 +80,7 @@ fn prepared_index_reads_reuse_scoped_probes() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_index_arguments_depending_on_session_state_are_rebound() {
     let store = TempDir::new("index-prepared-dynamic");
     let data = TempDir::new("index-prepared-dynamic-data");
@@ -84,7 +88,7 @@ fn prepared_index_arguments_depending_on_session_state_are_rebound() {
     let output = run_ducklake_sql_with_options(store.path(), data.path(), &options,
         "CREATE TABLE lake.main.t(a BIGINT);
          INSERT INTO lake.main.t VALUES (1),(2);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         CREATE INDEX by_a ON lake.main.t(a);
          SET VARIABLE key=1;
          CREATE MACRO current_key() AS getvariable('key');
          CREATE VIEW dynamic_hits AS SELECT * FROM moraine_index_lookup('lake','main','t','by_a',getvariable('key'));
@@ -113,7 +117,7 @@ fn prepared_index_arguments_depending_on_session_state_are_rebound() {
 /// Replacement attachments invalidate plans; manifest readers conservatively
 /// rebind.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_index_reads_invalidate_on_reattach_and_refuse_reader_caching() {
     let store = TempDir::new("index-prepared-reattach");
     let data = TempDir::new("index-prepared-reattach-data");
@@ -121,7 +125,7 @@ fn prepared_index_reads_invalidate_on_reattach_and_refuse_reader_caching() {
     let output = run_ducklake_sql_with_options(store.path(), data.path(), &options, &format!(
         "CREATE TABLE lake.main.t(a BIGINT);
          INSERT INTO lake.main.t VALUES (2);
-         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+         CREATE INDEX by_a ON lake.main.t(a);
          PREPARE probe AS SELECT 'hits', count(*) FROM moraine_index_lookup('lake','main','t','by_a',2);
          EXECUTE probe;
          DETACH lake;
@@ -186,7 +190,7 @@ fn reads(parameterized: bool) -> [(&'static str, String, &'static str); 4] {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_index_reads_refresh_after_inserts_updates_and_deletes() {
     for limit in [0, 10] {
         for parameterized in [false, true] {
@@ -204,7 +208,7 @@ fn prepared_index_reads_refresh_after_inserts_updates_and_deletes() {
                     &format!(
                         "CREATE TABLE lake.main.t(a BIGINT);
                          INSERT INTO lake.main.t VALUES (1);
-                         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+                         CREATE INDEX by_a ON lake.main.t(a);
                          PREPARE probe AS SELECT 'probe' AS phase, count(*) AS hits FROM {read};
                          EXECUTE probe{arguments};
                          INSERT INTO lake.main.t VALUES (2),(NULL);
@@ -248,7 +252,7 @@ fn prepared_index_reads_refresh_after_inserts_updates_and_deletes() {
 }
 
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_located_joins_refresh_rows_and_file_filters() {
     for limit in [0, 10] {
         for parameterized in [false, true] {
@@ -266,7 +270,7 @@ fn prepared_located_joins_refresh_rows_and_file_filters() {
                     &format!(
                         "CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);
                          INSERT INTO lake.main.t VALUES (1,'unrelated');
-                         CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+                         CREATE INDEX by_a ON lake.main.t(a);
                          PREPARE located AS
                            SELECT 'probe' AS phase, coalesce(string_agg(data.b,',' ORDER BY data.b),'missing') AS matched
                            FROM lake.main.t data JOIN {read} hits
@@ -330,7 +334,7 @@ fn prepared_located_joins_refresh_rows_and_file_filters() {
 /// A transaction that has already written keeps its index probes pinned at
 /// the revision it started on, so prepared reads reuse them until commit.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged extensions"]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
 fn prepared_index_reads_reuse_probes_inside_a_writing_transaction() {
     for limit in [0, 10] {
         let store = TempDir::new("index-prepared-writing-tx");
@@ -352,7 +356,7 @@ fn prepared_index_reads_reuse_probes_inside_a_writing_transaction() {
             &format!(
                 "CREATE TABLE lake.main.t(a BIGINT);
                  INSERT INTO lake.main.t VALUES (1),(2),(3);
-                 CALL moraine_index_create('lake','main','t','by_a',['a'],false);
+                 CREATE INDEX by_a ON lake.main.t(a);
                  CALL enable_logging(level => 'debug', storage => 'memory');
                  BEGIN;
                  INSERT INTO lake.main.t VALUES (9);

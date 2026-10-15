@@ -14,27 +14,40 @@ commits race on the head pointer under SlateDB's transactional write-write
 conflict detection, disjoint concurrent commits retry internally, and
 genuine conflicts surface as a typed error for the caller — DuckLake or the
 application — to re-drive. The protocol has **two front doors** over one
-commit core: the verb/closure API of RFC 0003 (retryable internally,
-because moraine authors the mutations) and the staged-row path of RFC 0006
-(never retried internally, because DuckLake authors the rows — a lost race
-surfaces to DuckLake). The two paths have different retry rights, and
-keeping them distinct is load-bearing; this RFC specifies both.
+commit core: the verb/closure API of RFC 0003, whose members are closures
+moraine re-runs, and the staged-row path of RFC 0006, whose members are
+rows DuckLake authored against the head it read. Both join the same batch,
+and both are re-driven internally when they lose a benign race — a verb
+member by re-running its closure, a staged member by rebasing the
+head-derived values DuckLake stamped on it, which is the re-derivation
+DuckLake's own retry would perform one layer up. A true conflict does the
+same on both: a typed error to whoever authored the operation. This RFC
+specifies both doors and the rebase that lets them share one batch.
 
-**Implemented.** Both front doors land commits as one atomic SlateDB batch
-over the shared core. Multi-statement, cross-table ACID transactions work
-end to end through DuckLake: a `BEGIN … COMMIT` spanning tables stages every
+Both front doors land commits as one atomic SlateDB batch over the shared
+core. Multi-statement, cross-table ACID transactions work end to end
+through DuckLake: a `BEGIN … COMMIT` spanning tables stages every
 statement's writes into one moraine staged tx (opened lazily on the first
 write, reused across the transaction) and commits them as one snapshot;
-`ROLLBACK` discards them and mints none. A lost write-write race aborts
-without internal retry on the staged-row path, the loser's error carrying
-the `conflict` substring DuckLake's retry loop scans for. Verified live
-(`ducklake_load.rs`'s `ducklake_multi_statement_transaction_commits_atomically`,
-which pins that two writes across two tables advance the head by exactly one
-snapshot) and at the core (`staged.rs`'s
-`lost_race_is_not_retried_and_carries_conflict_text`). A genuine concurrent
-race is not reachable through DuckLake's single serialized metadata
-connection — a second read-write attach fences rather than races (the
-single-writer topology below) — so that path is pinned at the core, not live.
+`ROLLBACK` discards them and mints none (`ducklake_load.rs`'s
+`ducklake_multi_statement_transaction_commits_atomically` pins that two
+writes across two tables advance the head by exactly one snapshot).
+
+Concurrent DuckLake transactions are reachable, and they race: several
+connections on one DuckDB instance each hold a DuckLake transaction over
+one attached lake, and their commits overlap
+(`test/sql/commit_concurrency.test`). A second read-write *process* does
+not race — it fences (Topology). The staged-row path once surfaced every
+lost race to DuckLake, whose loop re-drives after a jittered sleep from
+100 ms. Measured end to end (`cargo xtask bench --workloads
+concurrent_connections`), that composition forfeited most of the batching
+the verb path gets: at eight writers half the commits lost at least one
+race, each loss paid the sleep and a further flush, and commits per flush
+saturated near three where the verb path reaches the writer count.
+Removing the sleep alone livelocks at sixteen writers — per-commit races on
+one key with instant retry starve writers until DuckLake's budget runs out.
+The design below batches staged commits and re-drives them inside the
+catalog, so the sleep is never entered for them.
 
 ## Goals
 
@@ -43,10 +56,13 @@ single-writer topology below) — so that path is pinned at the core, not live.
   fit inside that envelope — no read-modify-write spanning batches.
 - Inlined inserts/deletes (RFC 0005) ride the same batch as their catalog
   metadata. Inlining adds no round trips to the commit path.
-- On the verb path (RFC 0003), concurrent commits touching disjoint tables
-  — and concurrent pure appends to the *same* table — both succeed without
-  caller involvement; incompatible commits resolve to a typed conflict. On
-  the staged-row path (RFC 0006), every lost race surfaces to DuckLake.
+- On both front doors, concurrent commits touching disjoint tables — and
+  concurrent pure appends to the *same* table — both succeed without caller
+  involvement; incompatible commits resolve to a typed conflict. The
+  staged-row path (RFC 0006) reaches this by rebasing DuckLake's
+  head-derived values rather than re-running anything of DuckLake's, and
+  only for the commit shapes the rebase re-derives exactly; every other
+  shape surfaces its lost race to DuckLake as before.
 - Commit latency floor is one durable WAL flush; the protocol enables group
   commit so throughput under a funnel of concurrent transactions is not
   one-flush-per-commit.
@@ -429,6 +445,13 @@ a shared file and the comparison needs no table key; the file ids ride the
 snapshot record as moraine-internal state, exactly as
 `schema_changed_table_ids` does, and are invisible to DuckLake.
 
+The snapshot also persists `deletes_untargeted_files`: a mixed commit that
+targets files and deletes inlined rows still requires the table-grain
+fallback after replay. With a non-empty file list the flag controls that
+fallback; with an empty list it applies regardless of the flag. Older
+records default the flag to false, so readers cannot recover mixed-delete
+information omitted by older writers.
+
 **Name collisions are invisible to id-set comparison.** Two concurrent
 commits each creating a table named `orders` in the same schema allocate
 fresh, *disjoint* table ids — the set comparison classifies the race
@@ -506,9 +529,11 @@ hang.
   tables share no row-id counter, so they never contend; two inserting into
   the same table overlap on that `table_id` — and resolve under the
   **append-append refinement** above: the shared counter read is
-  re-derivable, so on the verb path both commits land via benign-race retry
-  (the loser re-allocates its row ids from the winner's advanced
-  `next_row_id`). Row ids stay dense per table for RFC 0005's inlined
+  re-derivable, so both commits land via benign-race retry: on the verb path
+  the loser re-allocates its row ids from the winner's advanced
+  `next_row_id`, and on the staged-row path the rebase moves the loser's
+  `row_id_start`/`row_id` values and its `next_row_id` by the same advance
+  (Staged-row commits). Row ids stay dense per table for RFC 0005's inlined
   chunks. Verified against the DuckLake spec; the e2e suite validates the
   increment mechanics (`next_row_id += record_count`) and DuckLake's own
   behavior under concurrent same-table inserts.
@@ -607,30 +632,88 @@ verb path:
 - **Same commit core.** The translated records land through steps 3–4
   above: one transaction, one atomic batch, head conflict detection.
   Nothing about atomicity or durability differs between the paths.
-- **No internal benign-race retry.** A retry on the verb path re-runs the
-  closure and re-stamps ids moraine allocated. On this path there is
-  nothing moraine can safely re-run: the snapshot id, `begin_snapshot`,
-  counter values, and `schema_version` are DuckLake-authored and embedded
-  in row values moraine must carry faithfully — re-stamping them would be
-  semantic surgery on another system's data, the exact re-modeling RFC
-  0006 forbids. Therefore **every lost head on the staged-row path
-  surfaces as a typed `CommitConflict`** to DuckLake — benign-shaped or
-  not — and this is exactly the composition DuckLake expects of its
-  catalog, verified in its source: DuckLake's `RunCommitLoop` wraps every
-  metadata-catalog commit in its own bounded retry (default
-  `ducklake_max_retry_count = 10`, jittered exponential backoff from
-  `ducklake_retry_wait_ms = 100` × `ducklake_retry_backoff = 1.5`),
-  re-checking its own conflict matrix against `ducklake_snapshot_changes`
-  before each re-attempt and re-staging with freshly derived ids. Those
-  re-checks are catalog reads moraine must serve *between* attempts —
-  DuckLake queries the snapshot list and `ducklake_snapshot_changes` for
-  everything committed after its transaction snapshot, so the read surface
-  stays live while a commit of its own is in flight. Benign races are
-  absorbed by *DuckLake's* loop; true conflicts throw its
-  `TransactionException` to the application. The "disjoint concurrent
-  commits both succeed without caller involvement" goal is thus a
-  **verb-path** property; on the extension path the equivalent behavior
-  is provided by DuckLake, one layer up, where it belongs.
+- **Rebase, then retry — for the shapes the rebase re-derives exactly.** A
+  retry on the verb path re-runs the closure and re-allocates ids moraine
+  minted. On this path there is no closure, and the snapshot id,
+  `begin_snapshot`, counters and `schema_version` are DuckLake's values
+  embedded in the rows. But each is a function of the head DuckLake read,
+  and for a **data-only** commit — one that creates, alters or drops no
+  schema, table, view or macro, so it allocates no catalog id and carries
+  `schema_version` forward unchanged — that function is arithmetic moraine
+  reapplies against the head the commit actually lands on:
+  - the snapshot id, and every `snapshot_id`/`begin_snapshot` the member
+    stamped equal to it, moves to the premise's head plus one;
+  - file ids allocated from `next_file_id` move by the premise's advance
+    of that counter, in every row that names them;
+  - for a table an earlier commit also appended to, `row_id_start` on the
+    member's data files, `row_id` on its inlined rows and the
+    `next_row_id` it writes move by that table's advance, and the
+    `ducklake_table_stats` row it overwrites is re-derived as the member's
+    delta over the premise, column stats merged by min and max.
+
+  This is the re-derivation DuckLake performs when its own loop re-drives
+  such a commit, done without the round trip: it rewrites nothing of
+  DuckLake's semantics, only the values DuckLake would itself recompute.
+  Every value a data-only commit derives from the head is one of these,
+  so the rule covers that shape entirely; what it cannot re-derive — a
+  catalog id, a schema version — is exactly what makes a commit not
+  data-only. The rebase is therefore **refused** for every other shape,
+  and for a member that appends rows to a table without carrying that
+  table's statistics row, since the row-id counter the shift is taken
+  from lives there and nowhere else. A refused member does not join a
+  batch: it commits alone, and a lost race there surfaces as
+  `CommitConflict`. Index upkeep derives a member's entries from the
+  moved values, so an indexed table is no exception.
+- **The base is the view the rows were authored against.** DuckLake
+  stamps its rows from the snapshot its own transaction read, and the
+  catalog transaction those rows reach may open later, after other
+  commits landed. The member's base for the rebase is therefore the view
+  the caller read, handed in when the transaction opens, and only absent
+  that the transaction's own view. Measured against the transaction's
+  view instead, every such commit read as a lost race: half of all
+  commits at eight writers, each re-driven by DuckLake after its backoff.
+- **A head-preserving commit re-drives its own lost race.** Expiry,
+  cleanup and the deletion schedule mint no snapshot and derive nothing
+  from the head: their rows are as good against the head they find as
+  against the one they read. Losing the head race to a session that
+  commits without pause is therefore moraine's to re-drive, a bounded
+  number of times with the batch cycle's backoff, re-staged against the
+  head it finds; surfaced instead, DuckLake's retry would sleep into the
+  same session and the pass would never land. A minting commit's rows are
+  DuckLake's, stamped against the head it read, and its race stays
+  DuckLake's.
+- **The batch yields to a commit it could not take.** A minting commit
+  the rebase refuses — DDL, an inline table's creation, a flush — commits
+  alone, and a race it loses is DuckLake's to re-drive, after a backoff
+  of at least fifty milliseconds and a fresh read. A session committing
+  without pause moves the head every few milliseconds and would beat
+  every retry, where under a spacing-paced flush it left gaps the retry
+  landed in. So a lone commit that loses tells the coalescer, and
+  arrivals hold for a quarter second before staging: one hiccup for the
+  writers per schema change, against a schema change that never lands.
+  Measured: a `CREATE TABLE` under a session inserting every twelve
+  milliseconds took the whole session's length, 5.1 s, to land before
+  the yield, and 63 to 200 ms with it, against 45 ms idle; the session
+  paid half a second over five of them. A loss is found either while the
+  rows are staged, when the transaction's view is already past the head
+  the rows were stamped from, or at the head swap, and both yield.
+- **A member's own lost race declines, never poisons.** A `CommitConflict`
+  raised while a member stages — its stamped snapshot at or below the head
+  it is measured against — is that member's to re-drive. It leaves the
+  forming batch as it found it; any other error a member raises still
+  poisons the batch, since a half-staged member cannot be unstaged.
+- **Same classifier, same outcomes.** A staged member's change set is
+  parsed from the `changes_made` DuckLake authors, so the table-level
+  classifier that decides benign against true for verb members decides it
+  for staged members by the same matrix: a race lost to disjoint commits or
+  to same-table appends is rebased and re-driven under the same bounded
+  budget; a race lost to an incompatible commit, or one the rebase cannot
+  absorb, returns `CommitConflict` carrying the text DuckLake re-drives on.
+  DuckLake's `RunCommitLoop` remains the re-driver for every commit the
+  shim keeps on its client-side path (RFC 0006: DDL, and anything not
+  data-only), re-checking its own matrix against
+  `ducklake_snapshot_changes` before each attempt — so the read surface
+  stays live while a commit is in flight, as before.
 
 Two of the staged path's read phases dominate its latency — the inline
 translation (chunk walks for flush-deletes and drops) and equality-index
@@ -649,10 +732,10 @@ batch's own inline writes, so a flush draining a repaired chunk still
 deletes the locator the repair added.
 
 The two front doors share the commit core (staging, one-batch atomicity,
-head conflict detection, durability) and differ only in who authors the
-mutations and therefore who may retry. Keeping that split explicit is what
-lets the verb path be aggressive (closure re-run, append-append benign)
-without ever risking a silent rewrite of DuckLake-authored state.
+head conflict detection, durability, the batch) and differ in what a retry
+re-runs: a closure on one, a rebase on the other. Holding the rebase to
+values DuckLake itself re-derives is what lets the staged path be re-driven
+at all without risking a silent rewrite of DuckLake-authored state.
 
 ### Inlined writes as commit participants
 
@@ -691,6 +774,11 @@ the projections, before it is durable: the store then admits the next
 batch, which forms and submits while the first awaits its flush, and the
 two share that flush under the pacing below. Every member still returns
 only once its own batch is durable.
+
+A member that stages no writes still shares the batch's outcome if its
+premise includes uncommitted writes. It must wait for durability or retry
+the lost batch before reporting that premise's snapshot id. A no-op against
+committed state alone may return immediately.
 
 Steps 1–3 run once per member, against a premise folded forward from the
 member before it (the same fold that refreshes the cached head view), so
@@ -746,7 +834,10 @@ with no overhead visible at any level, up to the member ceiling — where 128
 concurrent commits land as two full batches at the same rate 64 do
 (`BENCHMARK.md`, "Commit throughput vs. concurrency"). The ceiling, not the
 flush cadence, is what binds first under saturation, and it is the lever if
-a workload ever needs past it.
+a workload ever needs past it. End to end through DuckDB the same burst is
+measured by `cargo xtask bench --workloads concurrent_connections`; with
+staged commits outside the batch it saturates near three commits per flush,
+half the commits losing a race — the gap the rebase exists to close.
 
 The single-commit floor is measured against AWS S3 as well as the local and
 injected-latency stores. From a worker in the bucket's `us-west-2` region,
@@ -763,24 +854,26 @@ rather than on whichever caller sealed it, because a host interrupt drops
 that caller's future (RFC 0010) and the other members are owed an answer.
 
 Both front doors land through one function, so the durable write, the
-head-race classification, and the projection bookkeeping exist once. What
-the staged-row path does not do is *join* a batch: it commits its own
-transaction, because DuckLake authors its snapshot id against the head it
-read, and no fold onto a preceding member can re-derive that id. The id is
-therefore checked rather than trusted — a staged commit whose id does not
-advance the head it lands on is refused, where before it relied on the
-head-pointer race to catch the same disagreement. That refusal is a lost
-race and must be reported as one: it carries `CommitConflict`'s text, the
+head-race classification and the projection bookkeeping exist once — and
+both **join the forming batch**. A verb member stages by running its
+closure against the premise folded forward from the member before it; a
+staged member stages by translating its rows against that same premise,
+rebasing the head-derived values DuckLake stamped on them (Staged-row
+commits) so member *i*'s snapshot id, file ids and row ids sit above
+everything members *1..i* allocated. The rebase stands in for the fold's
+re-allocation; the fold itself is unchanged. A staged member the rebase
+refuses — one that is not data-only — does not join: it commits as a batch of one, its id checked rather than
+trusted, and a staged commit whose id does not advance the head it lands
+on is refused as the lost race it is, with `CommitConflict`'s text — the
 substring DuckLake re-drives on. Reporting it as corruption instead would
-be a wire-contract bug, not a wording one — DuckLake would abandon a
-transaction it could have re-run against the head that won.
+be a wire-contract bug, not a wording one.
 
-So batching is a verb-path property, and SQL through DuckLake reaches it
-only where a statement runs a verb (index DDL, maintenance). DuckLake's own
-DML and DDL do not batch, and would gain nothing if they did: its metadata
-connection is serialized, so successive SQL transactions never overlap and
-there is nothing to batch them with. A `BEGIN … COMMIT` still lands as one
-snapshot, but that is statements merged, not commits batched.
+Batching therefore reaches DuckLake's own DML: several connections on one
+instance, each holding a DuckLake transaction, commit into one batch, one
+WAL object, one flush. It does not reach its DDL, which stays on the
+client-side path and commits alone. A `BEGIN … COMMIT` still lands as one
+snapshot — statements merged — and several such transactions committing at
+once land as one batch — commits batched.
 
 ### Sequence numbers are the store's, not moraine's
 
@@ -843,14 +936,44 @@ timer off and paces the flushes itself, under one setting,
 
 - A commit that finds the spacing elapsed since the last flush flushes at
   once and waits only on its own PUT.
-- A commit that finds the spacing running joins one flush deferred to the
-  moment it elapses; the first such commit performs it, the rest await
-  their handles on it.
+- A commit that finds no recent flush carried another commit waits only
+  the **floor**, a tenth of the spacing, since the last flush started:
+  nothing rode those flushes, so nobody is coming whom waiting longer
+  would coalesce with. A writer without siblings pays no spacing. The
+  floor is the rate cap that remains — ten flushes per spacing at most
+  from one writer — and the window in which commits arriving just behind
+  a lone one still share a flush.
+- A commit that finds the spacing running behind a flush that carried
+  riders joins one flush deferred to the moment it elapses, or to the
+  moment as many commits have joined it as the most a recent flush
+  carried, whichever comes first; the first such commit performs it, the
+  rest await their handles on it. The spacing is the longest a flush
+  waits, not the only time it closes: once the population a recent flush
+  saw has arrived, waiting longer coalesces nothing. The population is
+  counted in commits: a coalescer batch is one handle carrying many, and
+  weighs its members. No early close
+  starts a flush before the floor, and none happens without a recent
+  **measurement**: a flush that waited the whole spacing out carries every
+  writer and so measures the population, where an early close carries
+  only the mark and measures nothing; a measurement is trusted for ten
+  spacings, after which the next flush waits the spacing out again. That
+  is how the mark grows to the population and what the latency of the
+  scheme costs, one spacing in ten at most. The mark is the most
+  of the last few flushes, so a flush that closed early, carrying fewer
+  than there are, cannot lower it; only flushes that waited the spacing
+  out and still carried less do, a few in a row, which is how a writer
+  left alone gets its lone rule back.
 - A commit that finds a flush in the air, and so not carrying it, schedules
   the next flush for when the spacing elapses from that flush's start.
 
-So a lone commit costs one PUT of latency, a burst costs at most the
-spacing plus one PUT, and PUTs never exceed one per spacing. The timer is
+So a lone commit costs one PUT of latency and one PUT, which is what it
+cost waiting the spacing out; a burst costs at most the spacing plus one
+PUT, and usually only the time its writers take to arrive; and the objects
+a burst costs are one per round of its writers either way. What the rules
+give up is nine tenths of the PUT *rate* cap: flushes never exceed one per
+floor rather than one per spacing, so a writer population can flush as
+fast as it commits in rounds, down to the floor — the same objects,
+sooner. The timer is
 off rather than kept as a ceiling because a tick landing inside a spacing
 window would carry the pending commits early, one extra PUT per tick, and
 the cap would only be approximate; it is safe to turn off because every
@@ -952,8 +1075,19 @@ SlateDB on in-memory `object_store` — no mocks of the store:
   name.
 - Incompatible overlapping concurrent commits: one wins, the other returns
   `CommitConflict`.
-- Staged-row commits never retry internally: a lost head on the extension
-  path returns `CommitConflict` with the store unchanged by the loser.
+- Staged-row commits rebase and re-drive: a data-only staged commit that
+  loses a benign race lands with its snapshot id, file ids and row ids
+  moved above the winner's, every stamped `begin_snapshot` moved with the
+  id, and its table stats equal to what a sequential commit of the same
+  rows after the winner writes — differential against that sequential run.
+  A staged commit the rebase refuses (DDL, a catalog id, a schema change)
+  returns `CommitConflict` with the store unchanged by the loser, its text
+  carrying `conflict`.
+- Staged members batch: a burst of concurrent data-only staged commits
+  lands in fewer WAL objects than the same commits made one at a time,
+  each minting its own consecutive snapshot; same-table appenders in one
+  batch leave row ids dense with no collision; a member the rebase refuses
+  lands alone without stranding the batch it declined.
 - Crash-shaped sequences: owned by RFC 0011 rather than restated here.
   `CommitNotDurable` covers the batch whose flush never landed — the head
   does not move and no record of it is visible — and
@@ -989,7 +1123,8 @@ SlateDB on in-memory `object_store` — no mocks of the store:
   and for comments and tags, and is carried forward by inserts (file and
   inlined) and by name-mapping registration; and DuckLake's retry budget
   (`ducklake_max_retry_count` 10, `ducklake_retry_wait_ms` 100,
-  `ducklake_retry_backoff` 1.5) is what the composed budget above assumes.
+  `ducklake_retry_backoff` 1.5) is what the composed budget above assumes
+  for the commits the shim keeps on DuckLake's client-side path.
   A genuine concurrent DuckLake race needs more than one connection on one
   DuckDB instance, which the CLI cannot give: `test/sql` drives DuckDB's
   own sqllogictest runner for that, and pins the loop end to end — two
@@ -1025,6 +1160,10 @@ E2E testing validates the protocol against real DuckLake SQL.
   are never re-checked against the commits that won the race, so two
   concurrent same-name creates would both land. The closure re-run costs one
   in-memory pass and is the only retry form that is correct by construction.
+  The staged-row rebase is not this alternative: it re-stamps nothing a
+  closure established — DuckLake's logical premises are its conflict
+  matrix, which the classifier re-checks on every retry — and it moves
+  only the values DuckLake's own re-drive recomputes, refusing the rest.
 - **Internal rebase of true conflicts (replay staged mutations against the
   new head).** Rejected: replaying a true conflict requires re-running the
   DuckLake operation, which lives above the DuckLake-agnostic core. It
@@ -1053,6 +1192,26 @@ E2E testing validates the protocol against real DuckLake SQL.
   make every insert into any table contend on one counter, turning benign
   cross-table concurrency into counter churn. Per-table placement aligns
   allocation with conflict granularity.
+- **Leave staged commits to DuckLake's retry loop** (the design until
+  concurrent connections were measured). Rejected: the loop sleeps a
+  jittered 100 ms × 1.5ⁱ before every re-drive, tuned for SQL catalogs
+  whose commits take milliseconds; against a commit whose floor is one
+  flush, every lost race costs the sleep and a further flush, and because
+  staged commits did not batch, every concurrent commit raced. At eight
+  writers half the commits lost and commits per flush saturated near
+  three.
+- **Shorten or remove DuckLake's retry sleep** (`ducklake_retry_wait_ms`,
+  or a patch skipping the sleep on a benign-race marker). Rejected on
+  measurement: zero wait recovers most of the loss at eight writers and
+  livelocks at sixteen — per-commit optimistic races on one key with
+  instant retry starve writers until `ducklake_max_retry_count` runs out,
+  and that budget is what bounds the storm. The sleep is load-bearing for a
+  loop that races per commit; the fix is not to race per commit.
+- **Rebase every staged shape, DDL included.** Rejected: a catalog id or a
+  schema version embedded across a member's rows and inlined-table names
+  is not a delta against the head but an identity other rows reference;
+  moving it is the re-modeling of DuckLake-authored state RFC 0006 forbids.
+  Data-only commits are the shape that batches, and the shape under load.
 - **Pessimistic locking (a lease/lock record in `system` a writer must hold).**
   Rejected: reintroduces coordination state and a liveness problem (crashed
   lock-holder) that the optimistic head-CAS avoids. SlateDB fencing already

@@ -65,7 +65,7 @@ fn indexed_parquet_mutations_reopen_roots_with_trailing_separators() {
             Some(&recorded),
             "CALL ducklake_set_option('lake', 'data_inlining_row_limit', 0);
              CREATE TABLE lake.main.probe(a BIGINT);
-             CALL moraine_index_create('lake', 'main', 'probe', 'by_a', ['a'], true);
+             CREATE UNIQUE INDEX by_a ON lake.main.probe(a);
              INSERT INTO lake.main.probe SELECT i FROM range(10) t(i);",
         );
         assert_eq!(

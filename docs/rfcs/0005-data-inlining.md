@@ -163,9 +163,9 @@ The identity-carrying locator takes its own key kind rather than widening
 the old one. The format-9 tombstone migration leaves those directory keys
 for the existing repair path: its superseded keys decode as `inline/chunk_range`, sit outside the
 directory's prefix, and the repair that already heals a missing locator
-rebuilds the directory and sweeps them. Writing a locator stamps
-`FORMAT_WITH_INLINE_CHUNK_IDENTITY`, which shuts out a binary that would
-look for the superseded key and conclude the table has no directory.
+rebuilds the directory and sweeps them. The minimum readable format is 9,
+which already excludes binaries that only understand the superseded
+directory keys; writing a locator needs no additional format stamp.
 
 Each inline row version ends at the earliest tombstone snapshot strictly
 greater than its `begin_snapshot`. An update's deletion ends the old version
@@ -237,30 +237,12 @@ carrying bytes: a version that is already a reference, and a version some
 other reference resolves through, are both left whole. A reference naming
 a version that carries no bytes is corruption, not an empty schema.
 
-This is the one part of the design with a store-format floor. A reader
-that predates the field decodes a reference as a schema with no columns,
-which is wrong rather than merely stale, so the batch that writes one
-carries the store to the format that shuts those readers out — the same
-way a live index carries it to `FORMAT_WITH_INDEX` and an inline chunk
-locator to `FORMAT_WITH_INLINE_CHUNK_DIRECTORY`. A deregistration that
-collapses nothing stamps nothing, so a store takes the floor exactly when
-duplicate versions first accumulate, and never before.
-
-The stamp is one-way: a store that has taken the format cannot be opened
-by a binary that predates it, and a reader *already attached* on such a
-binary is not refused — it keeps running and may misread what later
-commits write. That is the same exposure every earlier format carries,
-and the same discipline answers it: upgrade every reader of a store
-before the writers start producing shapes the readers do not know.
-`moraine_raise_format` takes the format deliberately for an operator who
-would rather not wait for the first collapse to take it, and
-`dry_run := true` reports a store's format without moving it — the only
-way to read it.
-
-A structural migration is the wrong instrument for a purely additive
-format: the registry's floor invariant ties `MIN_FORMAT_VERSION` to the
-newest unit's target, so a unit here would refuse every un-migrated store
-at attach.
+Schema references require a reader that understands `same_as_version`.
+The minimum readable format is now 9, above the format that introduced
+references, so every supported reader understands them. Deregistration
+therefore needs no format-stamp write. Older stores must complete the
+structural migration before opening, and every reader must be upgraded
+before a writer produces shapes that reader cannot understand.
 
 The registration read is keys-only for the same reason: it needs the
 `(table, version)` pairs, not the columns, and a scan that decoded every

@@ -517,8 +517,8 @@ pub unsafe extern "C" fn moraine_drain_logs(sink: MoraineLogSink, sink_ctx: *mut
 ///
 /// # Safety
 ///
-/// `handle` must be a live pointer from `moraine_attach`. `sink`, if
-/// non-null, must be callable with `ctx` from any thread until
+/// `handle` must be a live pointer from `moraine_attach_with_wal_store`.
+/// `sink`, if non-null, must be callable with `ctx` from any thread until
 /// unregistration returns, must not unwind, must not emit `tracing`
 /// events, and must not re-enter any `moraine_*` entry point.
 #[unsafe(no_mangle)]
@@ -574,8 +574,8 @@ pub(crate) unsafe fn register_sink(handle: HandleId, sink: LogSinkFunction, ctx:
 ///
 /// # Safety
 ///
-/// `handle` must be a live pointer from `moraine_attach`. Must not be
-/// called from inside a sink.
+/// `handle` must be a live pointer from `moraine_attach_with_wal_store`. Must
+/// not be called from inside a sink.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_unregister_log_sink(handle: *const MoraineCatalogHandle) {
     // SAFETY: caller contract — `handle` is a live attach handle.

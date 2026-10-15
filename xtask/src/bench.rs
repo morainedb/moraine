@@ -10,6 +10,8 @@
 //! seeding are excluded, and `ATTACH` is itself a timed phase.
 
 pub mod backends;
+pub mod concurrent;
+pub mod in_process;
 pub mod report;
 pub mod timing;
 pub mod workloads;
@@ -29,12 +31,55 @@ use timing::{Statement, phase_seconds};
 
 use crate::{duckdb, ducklake_patch};
 
+/// The WAL flush spacing the latency workloads pin moraine to, so they
+/// measure catalog work rather than the wait for the next flush.
+const LATENCY_FLUSH_INTERVAL_MS: u64 = 1;
+
+/// How concurrent writers are arranged. Neither is a
+/// [`workloads::Workload`] — both run several writers rather than one
+/// statement stream — but both fill the same report rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BurstMode {
+    /// Separate operating-system processes, each attaching the lake.
+    Processes,
+    /// Separate connections over one DuckDB instance and one attach.
+    Connections,
+}
+
+/// One cell of a concurrency sweep.
+#[derive(Debug, Clone, Copy)]
+struct BurstRun {
+    burst: concurrent::Burst,
+    repeat: usize,
+    mode: BurstMode,
+    flush_interval_ms: u64,
+}
+
+impl BurstMode {
+    /// The report workload this mode fills.
+    fn workload(self) -> &'static str {
+        match self {
+            Self::Processes => "concurrent_processes",
+            Self::Connections => "concurrent_connections",
+        }
+    }
+
+    fn all() -> [Self; 2] {
+        [Self::Processes, Self::Connections]
+    }
+}
+
 /// Parsed `cargo xtask bench` arguments.
 struct Options {
     backends: Vec<BackendKind>,
     workloads: Option<Vec<String>>,
     scale: workloads::Scale,
     repeat: usize,
+    concurrency: Vec<usize>,
+    commits: u64,
+    flush_interval_ms: u64,
+    /// Whether the concurrency workloads write to indexed tables.
+    indexed: bool,
 }
 
 fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
@@ -42,6 +87,13 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
     let mut selected_workloads: Option<Vec<String>> = None;
     let mut scale = "small".to_owned();
     let mut repeat = 3usize;
+    let mut concurrency = vec![1usize, 2, 4, 8];
+    let mut commits = 128u64;
+    // The default spacing, not the pinned one the latency workloads use:
+    // coalescing is what the concurrency workloads are there to measure,
+    // and a 1 ms spacing leaves nothing to coalesce.
+    let mut flush_interval_ms = 100u64;
+    let mut indexed = false;
 
     let mut iterator = arguments.iter();
     while let Some(flag) = iterator.next() {
@@ -63,6 +115,18 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
                 selected_workloads = Some(value()?.split(',').map(str::to_owned).collect());
             }
             "--scale" => value()?.clone_into(&mut scale),
+            "--concurrency" => concurrency = concurrent::parse_sweep(value()?)?,
+            "--flush-interval-ms" => {
+                flush_interval_ms = value()?
+                    .parse()
+                    .with_context(|| "parsing --flush-interval-ms".to_owned())?;
+            }
+            "--indexed" => indexed = true,
+            "--commits" => {
+                commits = value()?
+                    .parse()
+                    .with_context(|| "parsing --commits".to_owned())?;
+            }
             "--repeat" => {
                 repeat = value()?
                     .parse()
@@ -70,7 +134,10 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
                 ensure!(repeat >= 1, "--repeat must be at least 1");
             }
             other => {
-                bail!("unknown flag `{other}`; valid: --backends, --workloads, --scale, --repeat")
+                bail!(
+                    "unknown flag `{other}`; valid: --backends, --workloads, --scale, \
+                     --repeat, --concurrency, --commits, --flush-interval-ms"
+                )
             }
         }
     }
@@ -80,6 +147,10 @@ fn parse_options(arguments: &[String]) -> anyhow::Result<Options> {
         workloads: selected_workloads,
         scale: workloads::Scale::parse(&scale)?,
         repeat,
+        concurrency,
+        commits,
+        flush_interval_ms,
+        indexed,
     })
 }
 
@@ -190,7 +261,7 @@ fn run_once(
         }
         _ => None,
     };
-    let attach = attach_sql(backend, &paths, dsn.as_deref())?;
+    let attach = attach_sql(backend, &paths, dsn.as_deref(), LATENCY_FLUSH_INTERVAL_MS)?;
 
     if !workload.seed.is_empty() {
         let seed_statements =
@@ -218,6 +289,95 @@ fn run_once(
     Ok(phases)
 }
 
+/// Whether the concurrent burst was asked for: by default, or by name.
+fn burst_selected(names: Option<&Vec<String>>, mode: BurstMode) -> bool {
+    names.is_none_or(|names| names.iter().any(|name| name == mode.workload()))
+}
+
+/// One (backend, burst, repeat) run in fresh directories: create the
+/// writers' tables, then time the released window.
+fn run_burst_once(
+    context: &SessionContext,
+    work_root: &std::path::Path,
+    backend: BackendKind,
+    postgres: Option<&PostgresHandle>,
+    run: BurstRun,
+) -> anyhow::Result<f64> {
+    let BurstRun {
+        burst,
+        repeat,
+        mode,
+        flush_interval_ms,
+    } = run;
+    let run_dir = work_root.join(format!(
+        "{}-{}-{}-{repeat}",
+        mode.workload(),
+        burst.writers,
+        backend.name()
+    ));
+    let paths = SessionPaths {
+        catalog_dir: run_dir.join("catalog"),
+        data_dir: run_dir.join("data"),
+    };
+    let scratch = run_dir.join("scratch");
+    for directory in [&paths.catalog_dir, &paths.data_dir, &scratch] {
+        fs::create_dir_all(directory)
+            .with_context(|| format!("creating {}", directory.display()))?;
+    }
+
+    let database = format!("bench_burst_{}_{repeat}", burst.writers);
+    let dsn = match (backend, postgres) {
+        (BackendKind::Postgres, Some(handle)) => {
+            handle.create_database(&database)?;
+            Some(handle.dsn(&database))
+        }
+        _ => None,
+    };
+    let attach = attach_sql(backend, &paths, dsn.as_deref(), flush_interval_ms)?;
+    let writer_context = concurrent::WriterContext {
+        cli: &context.cli,
+        extension: &context.extension,
+        attach: &attach,
+        scratch: &scratch,
+    };
+
+    let outcome = match mode {
+        BurstMode::Processes => concurrent::create_tables(&writer_context, burst)
+            .and_then(|()| concurrent::run(&writer_context, burst)),
+        // The driver does its own setup: the tables have to be created on
+        // the instance the writers then share.
+        BurstMode::Connections => in_process::driver().and_then(|driver| {
+            in_process::run(
+                &driver,
+                &attach,
+                burst.writers,
+                burst.commits_each,
+                burst.indexed,
+            )
+        }),
+    };
+
+    // What the burst cost in objects: every write-ahead log object the
+    // catalog put. The setup commits (one table per writer, the attach) are
+    // in the count too, so read it against `commits + writers + 1`.
+    if backend == BackendKind::Moraine {
+        let wal_objects = fs::read_dir(paths.catalog_dir.join("wal"))
+            .map_or(0, |entries| entries.filter_map(Result::ok).count());
+        println!(
+            "ok: {} wal objects for {} commits plus setup with {} writers on moraine",
+            wal_objects,
+            burst.commits(),
+            burst.writers
+        );
+    }
+    if let (BackendKind::Postgres, Some(handle)) = (backend, postgres) {
+        handle.drop_database(&database)?;
+    }
+    let _ = fs::remove_dir_all(&run_dir);
+
+    Ok(outcome?.as_secs_f64())
+}
+
 /// Selects workloads by `--workloads`, rejecting unknown names.
 fn select_workloads<'workloads>(
     all: &'workloads [workloads::Workload],
@@ -228,10 +388,16 @@ fn select_workloads<'workloads>(
     };
     for name in names {
         ensure!(
-            all.iter().any(|workload| workload.name == name),
-            "unknown workload `{name}`; valid: {}",
+            BurstMode::all().iter().any(|mode| mode.workload() == name)
+                || all.iter().any(|workload| workload.name == name),
+            "unknown workload `{name}`; valid: {}, {}",
             all.iter()
                 .map(|workload| workload.name)
+                .collect::<Vec<_>>()
+                .join(", "),
+            BurstMode::all()
+                .iter()
+                .map(|mode| mode.workload())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -242,14 +408,125 @@ fn select_workloads<'workloads>(
         .collect())
 }
 
+/// The concurrent burst at every requested writer count, for every
+/// backend, appending its rows to `rows`.
+///
+/// A backend that cannot take a given number of concurrent writers leaves
+/// that cell empty rather than failing the suite: refusing the second
+/// writer is a property of the catalog, and the report should say so.
+fn sweep_concurrency(
+    context: &SessionContext,
+    work_root: &std::path::Path,
+    backends: &[BackendKind],
+    postgres: Option<&PostgresHandle>,
+    options: &Options,
+    mode: BurstMode,
+    rows: &mut Vec<Row>,
+) -> anyhow::Result<()> {
+    for &backend in backends {
+        if options.indexed && backend != BackendKind::Moraine {
+            println!(
+                "notice: {} skipped on {} — an equality index is moraine's own",
+                backend.name(),
+                mode.workload()
+            );
+            continue;
+        }
+        let mut one_writer_worked = false;
+        for &writers in &options.concurrency {
+            let burst =
+                concurrent::Burst::plan(options.commits, writers)?.with_index(options.indexed);
+            let mut seconds: Vec<f64> = Vec::new();
+
+            for repeat in 0..options.repeat {
+                let run = BurstRun {
+                    burst,
+                    repeat,
+                    mode,
+                    flush_interval_ms: options.flush_interval_ms,
+                };
+                match run_burst_once(context, work_root, backend, postgres, run) {
+                    Ok(elapsed) => {
+                        println!(
+                            "ok: {} with {writers} writers on {} \
+                             ({:.1} commits/s, repeat {}/{})",
+                            mode.workload(),
+                            backend.name(),
+                            burst.commits_per_second(std::time::Duration::from_secs_f64(elapsed)),
+                            repeat + 1,
+                            options.repeat
+                        );
+                        seconds.push(elapsed);
+                    }
+                    Err(error) => {
+                        println!(
+                            "notice: {}",
+                            burst_refusal(
+                                backend.name(),
+                                mode.workload(),
+                                writers,
+                                one_writer_worked,
+                                &error
+                            )
+                        );
+                        seconds.clear();
+                        break;
+                    }
+                }
+            }
+
+            if seconds.is_empty() {
+                // Higher counts cannot succeed where this one failed, and
+                // the cells stay empty: refusing concurrent writers is a
+                // property of the catalog, which the report should show
+                // rather than hide behind an aborted run.
+                break;
+            }
+            if writers == 1 {
+                one_writer_worked = true;
+            }
+            rows.push(Row {
+                workload: mode.workload().to_owned(),
+                phase: burst.phase(),
+                backend: backend.name().to_owned(),
+                seconds,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// How to describe a burst a backend would not run.
+///
+/// A catalog that takes one writer process but not two is single-writer,
+/// which is a design property worth naming; anything else is reported as
+/// the failure it is.
+fn burst_refusal(
+    backend: &str,
+    workload: &str,
+    writers: usize,
+    one_writer_worked: bool,
+    error: &anyhow::Error,
+) -> String {
+    if one_writer_worked && writers > 1 {
+        format!(
+            "{backend} takes one writer but refused {writers} on {workload}, so its cells \
+             there stay empty — {error:#}"
+        )
+    } else {
+        format!("{backend} could not run {writers} writers on {workload} — {error:#}")
+    }
+}
+
 /// Runs the whole suite and prints/writes the report.
 pub fn bench(arguments: &[String]) -> anyhow::Result<()> {
     let options = parse_options(arguments)?;
 
-    let cli = duckdb::ensure_duckdb_cli()?;
-    println!("ok: duckdb CLI at {}", cli.display());
     let extension = duckdb::build_and_package_extension(&ducklake_patch::prepare()?)?;
     println!("ok: packaged {}", extension.display());
+    let cli = duckdb::ensure_duckdb_cli()?;
+    println!("ok: duckdb CLI at {}", cli.display());
     let context = SessionContext { cli, extension };
 
     let work_root = std::env::temp_dir().join(format!("moraine-bench-{}", std::process::id()));
@@ -315,6 +592,20 @@ pub fn bench(arguments: &[String]) -> anyhow::Result<()> {
                     options.repeat
                 );
             }
+        }
+    }
+
+    for mode in BurstMode::all() {
+        if burst_selected(options.workloads.as_ref(), mode) {
+            sweep_concurrency(
+                &context,
+                &work_root,
+                &backends,
+                postgres.as_ref(),
+                &options,
+                mode,
+                &mut rows,
+            )?;
         }
     }
 
@@ -402,5 +693,84 @@ mod tests {
         let names: Vec<&str> = picked.iter().map(|workload| workload.name).collect();
         assert_eq!(names, ["bulk_load", "scan"]);
         assert!(select_workloads(&all, Some(&vec!["nope".to_owned()])).is_err());
+    }
+
+    #[test]
+    fn the_burst_sweeps_four_concurrency_levels_by_default() {
+        let options = parse_options(&[]).unwrap();
+        assert_eq!(options.concurrency, [1, 2, 4, 8]);
+        assert_eq!(options.commits, 128);
+        // The default spacing, not the pinned one: concurrency workloads
+        // measure what commits coalesce into.
+        assert_eq!(options.flush_interval_ms, 100);
+        assert_ne!(options.flush_interval_ms, LATENCY_FLUSH_INTERVAL_MS);
+    }
+
+    #[test]
+    fn the_burst_runs_by_default_and_whenever_it_is_named() {
+        for mode in BurstMode::all() {
+            assert!(burst_selected(None, mode));
+            assert!(burst_selected(
+                Some(&vec![mode.workload().to_owned()]),
+                mode
+            ));
+            assert!(!burst_selected(Some(&vec!["bulk_load".to_owned()]), mode));
+        }
+        // Naming one burst does not select the other.
+        assert!(!burst_selected(
+            Some(&vec![BurstMode::Processes.workload().to_owned()]),
+            BurstMode::Connections
+        ));
+    }
+
+    /// The burst is not a statement workload, so naming it selects none
+    /// of them — but it is still a name the suite accepts.
+    #[test]
+    fn the_burst_is_a_selectable_workload_name() {
+        let scale = workloads::Scale::parse("small").unwrap();
+        let all = workloads::workloads(&scale);
+        for mode in BurstMode::all() {
+            assert!(
+                select_workloads(&all, Some(&vec![mode.workload().to_owned()]))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(select_workloads(&all, Some(&vec!["nonsense".to_owned()])).is_err());
+    }
+
+    #[test]
+    fn refusing_a_second_writer_is_reported_as_a_property_not_a_crash() {
+        let error = anyhow::anyhow!("writer fenced");
+        let workload = BurstMode::Processes.workload();
+        let single = burst_refusal("moraine", workload, 2, true, &error);
+        assert!(
+            single.contains("takes one writer but refused 2"),
+            "{single}"
+        );
+        assert!(single.contains(workload), "{single}");
+        assert!(single.contains("writer fenced"), "{single}");
+
+        // One writer failing is not a concurrency property.
+        let broken = burst_refusal("moraine", workload, 1, false, &error);
+        assert!(!broken.contains("takes one writer"), "{broken}");
+    }
+
+    #[test]
+    fn a_commit_count_no_concurrency_level_divides_is_rejected_up_front() {
+        let to_arguments = |slice: &[&str]| -> Vec<String> {
+            slice.iter().map(|&argument| argument.to_owned()).collect()
+        };
+        let options =
+            parse_options(&to_arguments(&["--concurrency", "3", "--commits", "9"])).unwrap();
+        assert!(concurrent::Burst::plan(options.commits, 3).is_ok());
+        assert!(
+            parse_options(&to_arguments(&["--indexed"]))
+                .unwrap()
+                .indexed
+        );
+        assert!(!options.indexed);
+        assert!(parse_options(&to_arguments(&["--concurrency", "0"])).is_err());
+        assert!(parse_options(&to_arguments(&["--commits", "many"])).is_err());
     }
 }

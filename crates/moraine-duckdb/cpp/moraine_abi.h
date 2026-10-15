@@ -80,7 +80,7 @@ typedef struct MoraineArrowSchema MoraineArrowSchema;
 // through `runtime`.
 //
 // Opaque to C — only ever seen as a `MoraineCatalogHandle*` obtained
-// from [`moraine_attach`](crate::abi::moraine_attach) and released via
+// from [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store) and released via
 // [`moraine_detach`](crate::abi::moraine_detach).
 typedef struct MoraineCatalogHandle MoraineCatalogHandle;
 
@@ -172,7 +172,7 @@ typedef struct MoraineError {
   char *message;
 } MoraineError;
 
-// What one [`moraine_migrate`] call did.
+// What one [`moraine_migrate_with_wal_store`] call did.
 typedef struct MoraineMigrationReport {
   // The structural format the store carried when the call began.
   uint64_t from_format;
@@ -187,77 +187,6 @@ typedef struct MoraineMigrationReport {
   char *units_run;
 } MoraineMigrationReport;
 
-// One `(row_id, data_file_id)` pair to resolve to an exact file position,
-// as [`moraine_locate_row_positions`] takes them. `has_data_file_id` false
-// means the row's file id is NULL — a lookup's report of a live inlined
-// row.
-typedef struct MorainePositionPair {
-  // The row id to position.
-  uint64_t row_id;
-  // The data file it was located in; meaningful only when
-  // `has_data_file_id`.
-  uint64_t data_file_id;
-  // Whether `data_file_id` names a file.
-  bool has_data_file_id;
-} MorainePositionPair;
-
-// One data file carrying located positions, as
-// [`moraine_locate_row_positions`] groups its answer. Free with
-// [`moraine_locate_row_positions_free_files`].
-typedef struct MoraineLocatedFile {
-  // The data file these positions are within.
-  uint64_t data_file_id;
-  // The file's recorded path, owned.
-  char *file_path;
-  // Newly requested positions within this file, ascending and
-  // duplicate-free, owned.
-  uint64_t *positions;
-  // Length of `positions`.
-  size_t positions_len;
-  // Whether a delete file is currently registered against this data
-  // file; `existing_delete_file_id` and `existing_positions` are
-  // meaningful only when set.
-  bool has_existing_delete;
-  // The registered delete file's id — the `expires` a later
-  // [`moraine_commit_located_deletion`] call names to replace it.
-  uint64_t existing_delete_file_id;
-  // Positions the registered delete file already carries, ascending
-  // and duplicate-free, owned.
-  uint64_t *existing_positions;
-  // Length of `existing_positions`.
-  size_t existing_positions_len;
-} MoraineLocatedFile;
-
-// One delete file to land through [`moraine_commit_located_deletion`], as
-// [`moraine::DeleteFileRegistration`] takes it.
-typedef struct MorainePositionedDeleteFile {
-  // The data file this delete file's positions apply to.
-  uint64_t data_file_id;
-  // The delete file's bare file name (no path components) within the
-  // table's own data directory, where the caller already wrote it.
-  // Borrowed for the duration of the call.
-  const char *path;
-  // Total file size in bytes.
-  uint64_t file_size;
-  // Parquet footer size in bytes.
-  uint64_t footer_size;
-  // Number of positions the file records.
-  uint64_t delete_count;
-  // The delete file this one replaces; meaningful only when
-  // `has_expires`.
-  uint64_t expires;
-  // Whether `expires` names a delete file to expire in the same commit.
-  bool has_expires;
-  // Physical positions within the data file that this registration
-  // newly marks dead, borrowed for the duration of the call — the
-  // positions a `moraine_locate_row_positions` call resolved for this
-  // file, used only to derive index entry removals for the table's
-  // live equality indexes.
-  const uint64_t *new_positions;
-  // Length of `new_positions`.
-  size_t new_positions_len;
-} MorainePositionedDeleteFile;
-
 // One index, as returned by [`moraine_indexes`].
 typedef struct MoraineIndexDesc {
   // The index's id.
@@ -269,9 +198,34 @@ typedef struct MoraineIndexDesc {
   bool building;
   // The index's build lifecycle.
   MoraineIndexState state;
+  // The snapshot a clean verifier pass agreed at; meaningful only when
+  // `has_certificate`.
+  uint64_t certified_at;
+  // Whether a verifier pass has agreed with the rows since the
+  // definition last changed.
+  bool has_certificate;
   // The index name, owned — free via [`moraine_indexes_free`].
   char *name;
 } MoraineIndexDesc;
+
+// One verifier pass's counts, and the certificate it left.
+typedef struct MoraineIndexVerification {
+  // Entries the index holds.
+  uint64_t stored;
+  // Entries the live rows require.
+  uint64_t expected;
+  // Entries the rows require that the index does not hold.
+  uint64_t missing;
+  // Entries the index holds that no live row requires.
+  uint64_t dead;
+  // Unique entries under the right value naming another row.
+  uint64_t mismatched;
+  // The snapshot the index is certified at; meaningful only when
+  // `has_certificate`.
+  uint64_t certified_at;
+  // Whether the index now carries a certificate.
+  bool has_certificate;
+} MoraineIndexVerification;
 
 // A value passed to [`moraine_index_lookup`], tagged by kind. The shim
 // fills the field matching `kind`; the ABI coerces it to the indexed
@@ -316,6 +270,18 @@ typedef struct MoraineLookupKey {
   // Number of entries in `values`.
   size_t values_len;
 } MoraineLookupKey;
+
+// One conjunctive comparison on a stored column.
+typedef struct MoraineIndexPredicate {
+  // Stable catalog field identifier.
+  uint64_t field_id;
+  // 0: equality list, 1: IS NULL, 2: >, 3: >=, 4: <, 5: <=.
+  uint8_t kind;
+  // Constants for the comparison; empty for IS NULL.
+  const struct MoraineLookupValue *values;
+  // Number of constants.
+  size_t values_len;
+} MoraineIndexPredicate;
 
 // One borrowed step supplied to [`moraine_maintenance_status_record`].
 typedef struct MoraineMaintenanceStatusStepInput {
@@ -513,6 +479,28 @@ typedef struct MoraineObjectStoreTally {
   uint64_t data_bytes;
 } MoraineObjectStoreTally;
 
+// One data file carrying located positions, as
+// [`moraine_locate_row_positions`] groups its answer. Free with
+// [`moraine_locate_row_positions_free_files`].
+typedef struct MoraineLocatedFile {
+  // The data file these positions are within.
+  uint64_t data_file_id;
+  // Newly requested positions within this file, ascending and
+  // duplicate-free, owned.
+  uint64_t *positions;
+  // Length of `positions`.
+  size_t positions_len;
+  // Whether a delete file is currently registered against this data
+  // file; `existing_positions` is
+  // meaningful only when set.
+  bool has_existing_delete;
+  // Positions the registered delete file already carries, ascending
+  // and duplicate-free, owned.
+  uint64_t *existing_positions;
+  // Length of `existing_positions`.
+  size_t existing_positions_len;
+} MoraineLocatedFile;
+
 // File positions a selective scan treats as deleted on top of the
 // snapshot's own delete files: the caller's uncommitted deletions.
 typedef struct MoraineExcludedPositions {
@@ -594,33 +582,10 @@ typedef struct MoraineViewDesc {
   char *sql;
 } MoraineViewDesc;
 
-// One live data file, as returned by [`moraine_snapshot_data_files_of`].
-typedef struct MoraineDataFileDesc {
-  // The file's id.
-  uint64_t id;
-  // Object-store path, owned — free via
-  // [`moraine_snapshot_data_files_of_free`].
-  char *path;
-  // Whether `path` is relative to the table's location.
-  bool path_is_relative;
-  // Number of rows in the file.
-  uint64_t record_count;
-  // Whether `row_id_start` is present (absent when the file's rows
-  // carry explicit per-row ids, e.g. compaction outputs).
-  bool has_row_id_start;
-  // First row id of the file's dense per-table row-id range, valid
-  // iff `has_row_id_start`.
-  uint64_t row_id_start;
-  // Total file size in bytes.
-  uint64_t file_size_bytes;
-  // Footer size in bytes.
-  uint64_t footer_size;
-} MoraineDataFileDesc;
-
 // One checkpoint the store's manifest carries.
 typedef struct MoraineCheckpoint {
-  // The checkpoint's id, in the form `moraine_attach`'s `checkpoint`
-  // takes. Owned by the array.
+  // The checkpoint's id, in the form `moraine_attach_with_wal_store`'s
+  // `checkpoint` takes. Owned by the array.
   char *id;
   // The manifest version it pins against garbage collection.
   uint64_t manifest_id;
@@ -809,6 +774,10 @@ typedef struct MoraineDataFileRow {
   bool has_partial_max;
   // `partial_max`, valid iff `has_partial_max`.
   uint64_t partial_max;
+  // Whether `row_group_count` is present.
+  bool has_row_group_count;
+  // `row_group_count`, valid iff `has_row_group_count`.
+  uint64_t row_group_count;
 } MoraineDataFileRow;
 
 // One `ducklake_delete_file` row, as returned by
@@ -844,6 +813,10 @@ typedef struct MoraineDeleteFileRow {
   bool has_partial_max;
   // `partial_max`, valid iff `has_partial_max`.
   uint64_t partial_max;
+  // Whether `row_group_count` is present.
+  bool has_row_group_count;
+  // `row_group_count`, valid iff `has_row_group_count`.
+  uint64_t row_group_count;
 } MoraineDeleteFileRow;
 
 // One `ducklake_file_partition_value` row, as returned by
@@ -1109,6 +1082,14 @@ typedef struct MoraineTableColumnStatsRow {
   char *max_value;
   // `extra_stats`, owned, null if absent.
   char *extra_stats;
+  // Whether `min_is_exact` is present.
+  bool has_min_is_exact;
+  // `min_is_exact`, valid iff `has_min_is_exact`.
+  bool min_is_exact;
+  // Whether `max_is_exact` is present.
+  bool has_max_is_exact;
+  // `max_is_exact`, valid iff `has_max_is_exact`.
+  bool max_is_exact;
 } MoraineTableColumnStatsRow;
 
 // One `ducklake_file_column_stats` row, as returned by
@@ -1138,6 +1119,14 @@ typedef struct MoraineFileColumnStatsRow {
   bool contains_nan;
   // `extra_stats`, owned, null if absent.
   char *extra_stats;
+  // Whether `min_is_exact` is present.
+  bool has_min_is_exact;
+  // `min_is_exact`, valid iff `has_min_is_exact`.
+  bool min_is_exact;
+  // Whether `max_is_exact` is present.
+  bool has_max_is_exact;
+  // `max_is_exact`, valid iff `has_max_is_exact`.
+  bool max_is_exact;
 } MoraineFileColumnStatsRow;
 
 // One `ducklake_tag` row, as returned by [`moraine_dump_tags`] —
@@ -1178,6 +1167,27 @@ typedef struct MoraineColumnTagRow {
   // `value`, owned.
   char *value;
 } MoraineColumnTagRow;
+
+// One `ducklake_view_column_tag` row, as returned by
+// [`moraine_dump_view_column_tags`] — flattened from the view's latest
+// record, as column tags are from their column's.
+typedef struct MoraineViewColumnTagRow {
+  // `view_id`.
+  uint64_t view_id;
+  // `column_name`, owned. A view's columns are named rather than given
+  // ids, so the name is the key within the view.
+  char *column_name;
+  // `begin_snapshot`.
+  uint64_t begin_snapshot;
+  // Whether `end_snapshot` is present.
+  bool has_end_snapshot;
+  // `end_snapshot`, valid iff `has_end_snapshot`.
+  uint64_t end_snapshot;
+  // `key`, owned.
+  char *key;
+  // `value`, owned.
+  char *value;
+} MoraineViewColumnTagRow;
 
 // One inlined row, as returned by [`moraine_inline_scan_next`]:
 // `chunk_index` names the owning chunk in the window's parallel
@@ -1367,8 +1377,7 @@ int32_t moraine_attach_with_commit_log(const char *path,
                                        struct MoraineError *err);
 
 // Opens a catalog that takes no part in a commit log beyond the process
-// default. New callers use [`moraine_attach_with_commit_log`], whose
-// `commit_log` argument tunes its reading of a commit log.
+// default: [`moraine_attach_with_commit_log`] with no `commit_log`.
 //
 // # Safety
 //
@@ -1396,63 +1405,6 @@ int32_t moraine_attach_with_wal_store(const char *path,
                                       struct MoraineCatalogHandle **out,
                                       struct MoraineError *err);
 
-// Opens a catalog whose write-ahead log is in the catalog store. New
-// callers use [`moraine_attach_with_wal_store`], whose `wal` argument
-// places the log elsewhere.
-//
-// # Safety
-//
-// All pointer and callback requirements are identical to
-// [`moraine_attach_with_wal_store`].
-int32_t moraine_attach_with_cache_policy(const char *path,
-                                         const struct MoraineS3Config *s3,
-                                         bool read_only,
-                                         bool encrypted,
-                                         uint64_t flush_interval_ms,
-                                         bool flush_on_commit,
-                                         const char *cache_dir,
-                                         uint64_t cache_size_bytes,
-                                         uint64_t cache_memory_bytes,
-                                         uint32_t cache_auxiliary_percent,
-                                         uint8_t cache_preload,
-                                         bool cache_puts,
-                                         bool cache_compaction_puts,
-                                         const char *data_path,
-                                         const char *checkpoint,
-                                         uint64_t host_threads,
-                                         MoraineInterruptProbe probe,
-                                         void *probe_ctx,
-                                         struct MoraineCatalogHandle **out,
-                                         struct MoraineError *err);
-
-// Opens a catalog with one legacy flag controlling both flush and compaction
-// admission. New callers use [`moraine_attach_with_cache_policy`] for
-// independent policies.
-//
-// # Safety
-//
-// All pointer and callback requirements are identical to
-// [`moraine_attach_with_cache_policy`].
-int32_t moraine_attach(const char *path,
-                       const struct MoraineS3Config *s3,
-                       bool read_only,
-                       bool encrypted,
-                       uint64_t flush_interval_ms,
-                       bool flush_on_commit,
-                       const char *cache_dir,
-                       uint64_t cache_size_bytes,
-                       uint64_t cache_memory_bytes,
-                       uint32_t cache_auxiliary_percent,
-                       uint8_t cache_preload,
-                       bool cache_puts,
-                       const char *data_path,
-                       const char *checkpoint,
-                       uint64_t host_threads,
-                       MoraineInterruptProbe probe,
-                       void *probe_ctx,
-                       struct MoraineCatalogHandle **out,
-                       struct MoraineError *err);
-
 // Writes the lake's recorded data root (the stored global `data_path`
 // option) to `*out` as an owned C string, or null when none was recorded.
 // Free a non-null result exactly once with [`moraine_string_free`].
@@ -1462,15 +1414,46 @@ int32_t moraine_attach(const char *path,
 //
 // # Safety
 //
-// `handle` must be a live handle from [`moraine_attach`]. `out` must be a
-// valid, writable `*mut *mut c_char`. `probe`/`probe_ctx` follow the ABI
-// cancellation contract. `err`, if non-null, must be writable. All for the
+// `handle` must be a live handle from [`moraine_attach_with_wal_store`]. `out`
+// must be a valid, writable `*mut *mut c_char`. `probe`/`probe_ctx` follow the
+// ABI cancellation contract. `err`, if non-null, must be writable. All for the
 // duration of this call.
 int32_t moraine_data_path(struct MoraineCatalogHandle *handle,
                           MoraineInterruptProbe probe,
                           void *probe_ctx,
                           char **out,
                           struct MoraineError *err);
+
+// Writes the DuckLake catalog version this store serves to `*out`, as a
+// NUL-terminated string to free exactly once with [`moraine_string_free`].
+//
+// # Safety
+// `handle` is live and exclusively accessed; `out` is writable; `err` is
+// writable when non-null.
+int32_t moraine_catalog_version(struct MoraineCatalogHandle *handle,
+                                MoraineInterruptProbe probe,
+                                void *probe_ctx,
+                                char **out,
+                                struct MoraineError *err);
+
+// Raises the catalog version this store records to the newest shape this
+// build serves, writing the move to `*out_from`/`*out_to` as
+// NUL-terminated strings to free exactly once each with
+// [`moraine_string_free`].
+//
+// `dry_run` reports the move it would make and records nothing. Equal
+// values mean there was nothing to raise.
+//
+// # Safety
+// `handle` is live and exclusively accessed; `out_from`/`out_to` are
+// writable; `err` is writable when non-null.
+int32_t moraine_raise_catalog_version(struct MoraineCatalogHandle *handle,
+                                      bool dry_run,
+                                      MoraineInterruptProbe probe,
+                                      void *probe_ctx,
+                                      char **out_from,
+                                      char **out_to,
+                                      struct MoraineError *err);
 
 // Applies every structural format migration this binary carries that the
 // store at `path` still needs. Opens the store itself; a store carrying a
@@ -1512,24 +1495,6 @@ int32_t moraine_migrate_with_wal_store(const char *path,
                                        struct MoraineMigrationReport *out,
                                        struct MoraineError *err);
 
-// Migrates a store whose write-ahead log is in the store itself. New
-// callers use [`moraine_migrate_with_wal_store`].
-//
-// # Safety
-//
-// All pointer requirements are identical to
-// [`moraine_migrate_with_wal_store`].
-int32_t moraine_migrate(const char *path,
-                        const struct MoraineS3Config *s3,
-                        uint64_t flush_interval_ms,
-                        const char *cache_dir,
-                        uint64_t cache_size_bytes,
-                        uint8_t cache_preload,
-                        bool cache_puts,
-                        bool checkpoint,
-                        struct MoraineMigrationReport *out,
-                        struct MoraineError *err);
-
 // Raises the store `handle` names to the newest purely additive format
 // this binary writes, opening the record shapes gated behind it, and
 // reports the formats either side of the move.
@@ -1544,8 +1509,8 @@ int32_t moraine_migrate(const char *path,
 //
 // # Safety
 //
-// `handle` must be a pointer previously returned by [`moraine_attach`]
-// and not yet detached.
+// `handle` must be a pointer previously returned by
+// [`moraine_attach_with_wal_store`] and not yet detached.
 // `out_from`/`out_to` must be valid, writable pointers, and `err`, if
 // non-null, a valid, writable [`MoraineError`], for the duration of the
 // call.
@@ -1573,7 +1538,7 @@ void moraine_string_free(char *ptr);
 //
 // # Safety
 //
-// `handle` must be a live handle from [`moraine_attach`].
+// `handle` must be a live handle from [`moraine_attach_with_wal_store`].
 // `out_encrypted` must be a valid, writable `*mut bool`. `probe`, if
 // non-null, must be safe to call with `probe_ctx` from any thread.
 // `err`, if non-null, must be a valid, writable [`MoraineError`]. All
@@ -1592,102 +1557,12 @@ int32_t moraine_catalog_encrypted(struct MoraineCatalogHandle *handle,
 // # Safety
 //
 // `handle`, if non-null, must be a pointer previously returned by
-// [`moraine_attach`] and not yet passed to `moraine_detach`.
+// [`moraine_attach_with_wal_store`] and not yet passed to `moraine_detach`.
 void moraine_detach(struct MoraineCatalogHandle *handle);
 
-// Resolves located rows to exact file positions for deletion without a
-// scan. `pairs` are `(row_id, data_file_id)` as a lookup reports them,
-// `has_data_file_id` false naming a live inlined row. Resolution is
-// against `snapshot` when non-null, else the catalog head.
-//
-// Writes `out_files` (one entry per data file carrying a requested
-// position, each with its own positions and whatever delete file is
-// already registered against it) and `out_inlined` (row ids resolved as
-// live inlined rows, from `pairs` entries naming no file). Both arrays are
-// written even when empty, and each must be freed with its own matching
-// `_free` function exactly once.
-//
-// Also writes `out_write_directory`: the absolute directory a new delete
-// file for this table belongs in (see
-// [`moraine::CatalogSnapshot::table_write_directory`]), owned — free with
-// [`super::moraine_string_free`]. Resolved from the same snapshot `out_files`
-// was positioned against, so a concurrent table relocation cannot name a
-// directory a moved table no longer writes under. Written only when
-// `out_files` is non-empty, since only then does a caller need to write
-// anything; null otherwise. A caller that does need to write a file and
-// receives null has a typed error instead: an absent `DATA_PATH`, or a
-// table relocated to an absolute path, both fail the whole call.
-//
-// # Safety
-//
-// Every pointer must be valid per the ABI contract; `snapshot`, if
-// non-null, must be a live snapshot of `handle`'s catalog; `pairs` points
-// to `pairs_len` pairs; every `out_*` pointer must be non-null and
-// writable; `probe`/`probe_ctx` must satisfy the interrupt-probe contract;
-// `err`, if non-null, must be writable.
-int32_t moraine_locate_row_positions(struct MoraineCatalogHandle *handle,
-                                     struct MoraineSnapshotHandle *snapshot,
-                                     const char *schema_name,
-                                     const char *table_name,
-                                     const struct MorainePositionPair *pairs,
-                                     size_t pairs_len,
-                                     struct MoraineLocatedFile **out_files,
-                                     size_t *out_files_len,
-                                     uint64_t **out_inlined,
-                                     size_t *out_inlined_len,
-                                     char **out_write_directory,
-                                     MoraineInterruptProbe probe,
-                                     void *probe_ctx,
-                                     struct MoraineError *err);
-
-// Frees the array [`moraine_locate_row_positions`] wrote to
-// `out_files`/`out_files_len`, including each file's nested positions
-// arrays.
-//
-// # Safety
-//
-// `items`/`len` must be exactly the pointer and length written there by a
-// matching call, not yet freed.
-void moraine_locate_row_positions_free_files(struct MoraineLocatedFile *items, size_t len);
-
-// Frees the array [`moraine_locate_row_positions`] wrote to
-// `out_inlined`/`out_inlined_len`.
-//
-// # Safety
-//
-// `items`/`len` must be exactly the pointer and length written there by a
-// matching call, not yet freed.
-void moraine_locate_row_positions_free_inlined(uint64_t *items, size_t len);
-
-// Lands located deletions through the register/expire/inline-delete
-// verbs in one autonomous commit — see
-// [`moraine::Catalog::commit_located_deletion`]. `registrations` are the
-// delete files the caller already wrote; `inlined_rows` are row ids to
-// tombstone directly. Writes the minted snapshot id to `out_snapshot_id`.
-//
-// An interrupted call can leave its commit running in the background.
-// On failure, retain the supplied files for orphan cleanup: the error
-// does not establish that no catalog references were committed.
-//
-// # Safety
-//
-// Every pointer must be valid per the ABI contract; `registrations`
-// points to `registrations_len` descriptors, each with a valid `path` and
-// a `new_positions` valid for `new_positions_len` entries; `inlined_rows`
-// points to `inlined_rows_len` row ids; `out_snapshot_id` must be
-// writable; `probe`/`probe_ctx` must satisfy the interrupt-probe
-// contract; `err`, if non-null, must be writable.
-int32_t moraine_commit_located_deletion(struct MoraineCatalogHandle *handle,
-                                        const char *schema_name,
-                                        const char *table_name,
-                                        const struct MorainePositionedDeleteFile *registrations,
-                                        size_t registrations_len,
-                                        const uint64_t *inlined_rows,
-                                        size_t inlined_rows_len,
-                                        uint64_t *out_snapshot_id,
-                                        MoraineInterruptProbe probe,
-                                        void *probe_ctx,
-                                        struct MoraineError *err);
+// Arms a stall for the cancellable call entering on this thread.
+// The shim consumes its session-owned arm before making this handoff.
+void moraine_fault_stall_next_read(uint64_t milliseconds);
 
 // Creates an equality index, committing autonomously. With `staged`, runs
 // the multi-commit build — required when the table's backfill exceeds what
@@ -1715,11 +1590,13 @@ int32_t moraine_index_create(struct MoraineCatalogHandle *handle,
                              bool staged,
                              uint64_t step_entries,
                              uint64_t step_bytes,
+                             bool if_not_exists,
                              MoraineInterruptProbe probe,
                              void *probe_ctx,
                              struct MoraineError *err);
 
-// Drops an equality index by name, committing autonomously.
+// Drops an equality index by its schema-level name, committing autonomously.
+// `if_exists` tolerates a missing schema or index.
 //
 // # Safety
 //
@@ -1727,8 +1604,8 @@ int32_t moraine_index_create(struct MoraineCatalogHandle *handle,
 // must be writable.
 int32_t moraine_index_drop(struct MoraineCatalogHandle *handle,
                            const char *schema_name,
-                           const char *table_name,
                            const char *index_name,
+                           bool if_exists,
                            MoraineInterruptProbe probe,
                            void *probe_ctx,
                            struct MoraineError *err);
@@ -1755,6 +1632,25 @@ int32_t moraine_indexes(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written by a
 // matching [`moraine_indexes`] call, not yet freed.
 void moraine_indexes_free(struct MoraineIndexDesc *items, size_t len);
+
+// Recomputes an index's entries from the table's rows and reports how they
+// differ from the entries the index holds. A read-write attach records the
+// outcome on the definition — a clean pass certifies, a discrepancy
+// withdraws an earlier certificate — and a read-only attach reports
+// without writing.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; `err`, if non-null,
+// must be writable, and `out` must be writable.
+int32_t moraine_index_verify(struct MoraineCatalogHandle *handle,
+                             const char *schema_name,
+                             const char *table_name,
+                             const char *index_name,
+                             struct MoraineIndexVerification *out,
+                             MoraineInterruptProbe probe,
+                             void *probe_ctx,
+                             struct MoraineError *err);
 
 // Resolves an equality lookup to the rows currently holding `values` — one
 // [`MoraineLookupValue`] per indexed column, in the index's column order,
@@ -1885,6 +1781,28 @@ int32_t moraine_index_nulls(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written by a matching
 // [`moraine_index_nulls`] call, not yet freed.
 void moraine_index_nulls_free(struct MoraineRowId *items, size_t len);
+
+// Resolves a conjunction through a ready index, or declines via `out_covered`.
+// `out_certified` means every supplied predicate was answered exactly by a
+// certified index. Original residual predicates remain the caller's
+// responsibility.
+//
+// # Safety
+// All input arrays and their nested pointers must be readable for their
+// lengths. Output pointers must be writable; strings and interrupt callbacks
+// satisfy the ABI contract.
+int32_t moraine_index_predicate_rows(struct MoraineCatalogHandle *handle,
+                                     const char *schema_name,
+                                     const char *table_name,
+                                     const struct MoraineIndexPredicate *predicates,
+                                     size_t predicates_len,
+                                     struct MoraineRowId **out_items,
+                                     size_t *out_len,
+                                     bool *out_covered,
+                                     bool *out_certified,
+                                     MoraineInterruptProbe probe,
+                                     void *probe_ctx,
+                                     struct MoraineError *err);
 
 // Runs one moraine-owned maintenance pass, reclaiming the entry ranges
 // of indexes no longer live, the file column statistics of data files no
@@ -2061,8 +1979,9 @@ int32_t moraine_catalog_cache_tally_tiers(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `handle` must be a live handle from [`super::moraine_attach`]. Every
-// out-pointer must be valid and writable for the duration of the call.
+// `handle` must be a live handle from
+// [`super::moraine_attach_with_wal_store`]. Every out-pointer must be valid
+// and writable for the duration of the call.
 int32_t moraine_catalog_cache_tally(struct MoraineCatalogHandle *handle,
                                     uint64_t *out_metadata_hits,
                                     uint64_t *out_metadata_misses,
@@ -2094,8 +2013,8 @@ int32_t moraine_sidecar_tally(struct MoraineSidecarTally *out_tally);
 //
 // # Safety
 //
-// `handle` must be a live handle from [`super::moraine_attach`] and
-// `out_tally` must be valid and writable for the duration of the call.
+// `handle` must be a live handle from [`super::moraine_attach_with_wal_store`]
+// and `out_tally` must be valid and writable for the duration of the call.
 int32_t moraine_catalog_memory_tally(struct MoraineCatalogHandle *handle,
                                      struct MoraineMemoryTally *out_tally);
 
@@ -2107,8 +2026,8 @@ int32_t moraine_catalog_memory_tally(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `handle` must be a live handle from [`super::moraine_attach`] and
-// `out_tally` must be valid and writable for the duration of the call.
+// `handle` must be a live handle from [`super::moraine_attach_with_wal_store`]
+// and `out_tally` must be valid and writable for the duration of the call.
 int32_t moraine_catalog_object_store_tally(struct MoraineCatalogHandle *handle,
                                            struct MoraineObjectStoreTally *out_tally);
 
@@ -2119,11 +2038,12 @@ int32_t moraine_catalog_object_store_tally(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `handle` must be a pointer previously returned by [`super::moraine_attach`]
-// and not yet detached. `out_snapshot_id`, `out_batch_seq`, and
-// `out_present` must be valid, writable pointers. `probe`, if non-null,
-// must be safe to call with `probe_ctx` from any thread. `err`, if
-// non-null, must be a valid, writable [`MoraineError`].
+// `handle` must be a pointer previously returned by
+// [`super::moraine_attach_with_wal_store`] and not yet detached.
+// `out_snapshot_id`, `out_batch_seq`, and `out_present` must be valid,
+// writable pointers. `probe`, if non-null, must be safe to call with
+// `probe_ctx` from any thread. `err`, if non-null, must be a valid, writable
+// [`MoraineError`].
 int32_t moraine_head_stamp(struct MoraineCatalogHandle *handle,
                            uint64_t *out_snapshot_id,
                            uint64_t *out_batch_seq,
@@ -2145,9 +2065,9 @@ char *moraine_subspace_names(void);
 //
 // # Safety
 //
-// `handle` must be a live handle from `moraine_attach`. Each non-null out
-// pointer must be writable. `probe`/`probe_ctx` follow the interrupt
-// contract, and `err` must be writable.
+// `handle` must be a live handle from `moraine_attach_with_wal_store`. Each
+// non-null out pointer must be writable. `probe`/`probe_ctx` follow the
+// interrupt contract, and `err` must be writable.
 int32_t moraine_sweep_row_summaries(struct MoraineCatalogHandle *handle,
                                     uint64_t *considered,
                                     uint64_t *reclaimed,
@@ -2155,6 +2075,35 @@ int32_t moraine_sweep_row_summaries(struct MoraineCatalogHandle *handle,
                                     MoraineInterruptProbe probe,
                                     void *probe_ctx,
                                     struct MoraineError *err);
+
+// Resolves index hits in committed files to exact positions for deletion.
+// The handle must pin the scan's catalog revision. Free the returned files
+// with [`moraine_locate_row_positions_free_files`].
+//
+// # Safety
+// Every pointer must satisfy the ABI contract; `pairs` points to `pairs_len`
+// hits, output pointers are non-null and writable, and `probe`/`probe_ctx`
+// satisfy the interrupt-probe contract.
+int32_t moraine_locate_row_positions(struct MoraineCatalogHandle *handle,
+                                     const char *schema_name,
+                                     const char *table_name,
+                                     const struct MoraineRowId *pairs,
+                                     size_t pairs_len,
+                                     struct MoraineLocatedFile **out_files,
+                                     size_t *out_files_len,
+                                     MoraineInterruptProbe probe,
+                                     void *probe_ctx,
+                                     struct MoraineError *err);
+
+// Frees the array [`moraine_locate_row_positions`] wrote to
+// `out_files`/`out_files_len`, including each file's nested positions
+// arrays.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written there by a
+// matching call, not yet freed.
+void moraine_locate_row_positions_free_files(struct MoraineLocatedFile *items, size_t len);
 
 // Opens a transaction snapshot with a pinned index/inline read surface when
 // supported. Readers without pinned revisions receive an ordinary snapshot
@@ -2196,7 +2145,7 @@ int32_t moraine_row_scan_open(struct MoraineCatalogHandle *handle,
                               struct MoraineSnapshotHandle *snapshot,
                               const char *schema,
                               const char *table,
-                              const struct MorainePositionPair *pairs,
+                              const struct MoraineRowId *pairs,
                               size_t pairs_len,
                               const char *const *columns,
                               size_t columns_len,
@@ -2206,24 +2155,6 @@ int32_t moraine_row_scan_open(struct MoraineCatalogHandle *handle,
                               MoraineInterruptProbe probe,
                               void *probe_ctx,
                               struct MoraineError *err);
-
-// Opens a whole-row cursor that rejects every unpositionable pair.
-// Payload batches are decoded by `moraine_row_scan_next_arrow`.
-//
-// # Safety
-// Handles must be live and share a pinned scope. Strings and pairs must be
-// valid for their lengths, and `out` writable. Cancellation and error
-// pointers follow the catalog ABI contract.
-int32_t moraine_rows_at_open(struct MoraineCatalogHandle *handle,
-                             struct MoraineSnapshotHandle *snapshot,
-                             const char *schema,
-                             const char *table,
-                             const struct MorainePositionPair *pairs,
-                             size_t pairs_len,
-                             struct MoraineRowScan **out,
-                             MoraineInterruptProbe probe,
-                             void *probe_ctx,
-                             struct MoraineError *err);
 
 // Estimates projected page coverage without reading payload columns.
 //
@@ -2291,11 +2222,12 @@ void moraine_row_scan_free(struct MoraineRowScan *scan);
 //
 // # Safety
 //
-// `handle` must be a pointer previously returned by [`super::moraine_attach`]
-// and not yet detached. `out` must be a valid, writable
-// `*mut *mut MoraineSnapshotHandle`. `probe`, if non-null, must be safe
-// to call with `probe_ctx` from any thread. `err`, if non-null, must be
-// a valid, writable [`MoraineError`]. All for the duration of this call.
+// `handle` must be a pointer previously returned by
+// [`super::moraine_attach_with_wal_store`] and not yet detached. `out` must be
+// a valid, writable `*mut *mut MoraineSnapshotHandle`. `probe`, if non-null,
+// must be safe to call with `probe_ctx` from any thread. `err`, if non-null,
+// must be a valid, writable [`MoraineError`]. All for the duration of this
+// call.
 int32_t moraine_snapshot(struct MoraineCatalogHandle *handle,
                          struct MoraineSnapshotHandle **out,
                          MoraineInterruptProbe probe,
@@ -2396,41 +2328,6 @@ int32_t moraine_snapshot_views_in(struct MoraineSnapshotHandle *snapshot,
 // matching [`moraine_snapshot_views_in`] call, not yet freed.
 void moraine_snapshot_views_in_free(struct MoraineViewDesc *items, size_t len);
 
-// Lists the live data files of table `table_id` into
-// `*out_items`/`*out_len`. An unknown `table_id` yields an empty array,
-// not an error.
-//
-// # Safety
-//
-// Same pointer contract as [`moraine_snapshot_schemas`].
-int32_t moraine_snapshot_data_files_of(struct MoraineSnapshotHandle *snapshot,
-                                       uint64_t table_id,
-                                       struct MoraineDataFileDesc **out_items,
-                                       size_t *out_len,
-                                       struct MoraineError *err);
-
-// Frees an array returned by [`moraine_snapshot_data_files_of`].
-//
-// # Safety
-//
-// `items`/`len` must be exactly the pointer and length written by a
-// matching [`moraine_snapshot_data_files_of`] call, not yet freed.
-void moraine_snapshot_data_files_of_free(struct MoraineDataFileDesc *items, size_t len);
-
-// Resolves `schema_name.table_name` to its table id in `snapshot`, written
-// to `*out_table_id`.
-//
-// # Safety
-//
-// `snapshot` must point to a live [`MoraineSnapshotHandle`]; the names must
-// be valid NUL-terminated strings; `out_table_id` must be non-null and
-// writable; `err`, if non-null, must be writable.
-int32_t moraine_snapshot_resolve_table(struct MoraineSnapshotHandle *snapshot,
-                                       const char *schema_name,
-                                       const char *table_name,
-                                       uint64_t *out_table_id,
-                                       struct MoraineError *err);
-
 // Writes the store stamp `snapshot` stands at: the head snapshot id and
 // batch count, as `moraine_head_stamp` would report them at the moment
 // the snapshot was taken.
@@ -2462,11 +2359,11 @@ int32_t moraine_snapshot_id(struct MoraineSnapshotHandle *snapshot,
 // log changed stores — `false` means it was already on `to`.
 //
 // Takes the store's writer twice, so no attach may hold it: an attach
-// that does is fenced, exactly as by [`super::moraine_migrate`]. The
-// first open drains the log it finds into a sorted-string table, so an
-// interrupted move leaves the catalog openable — against one store or the
-// other, with nothing lost — and can be run again. Every attach after a
-// move names `to`.
+// that does is fenced, exactly as by
+// [`super::moraine_migrate_with_wal_store`]. The first open drains the log it
+// finds into a sorted-string table, so an interrupted move leaves the catalog
+// openable — against one store or the other, with nothing lost — and can be
+// run again. Every attach after a move names `to`.
 //
 // `from` naming a store other than the recorded one is refused, and the
 // message names the recorded one, which is how an operator who has lost
@@ -2506,9 +2403,10 @@ int32_t moraine_move_wal_store(const char *path,
 // # Safety
 //
 // `handle` must be a live handle from
-// [`moraine_attach`](super::moraine_attach). `out_id` must be a valid,
-// writable `*mut *mut c_char`. `err`, if non-null, must be a valid, writable
-// [`MoraineError`]. All for the duration of this call.
+// [`moraine_attach_with_wal_store`](super::moraine_attach_with_wal_store).
+// `out_id` must be a valid, writable `*mut *mut c_char`. `err`, if non-null,
+// must be a valid, writable [`MoraineError`]. All for the duration of this
+// call.
 int32_t moraine_create_checkpoint(struct MoraineCatalogHandle *handle,
                                   uint64_t lifetime_ms,
                                   char **out_id,
@@ -2584,7 +2482,7 @@ int32_t moraine_arrow_encode_schema(ArrowSchema *schema,
 // little-endian `u32` message length, the record-batch flatbuffer
 // message, then the arrow data buffers, without a schema message (stored
 // once per version by [`moraine_arrow_encode_schema`] and supplied back
-// at decode by [`moraine_arrow_decode_body`]).
+// at decode by [`moraine_arrow_decode_inline_chunk_with_schema`]).
 //
 // Dictionary-encoded columns are rejected: the body carries no dictionary
 // messages.
@@ -2596,24 +2494,6 @@ int32_t moraine_arrow_encode_chunk(ArrowSchema *schema,
                                    ArrowArray *array,
                                    struct MoraineArrowBytes *out,
                                    struct MoraineError *err);
-
-// Decodes a chunk body from [`moraine_arrow_encode_chunk`] against the
-// schema stored for its version (`schema_ipc` is that version's schema-only
-// IPC stream). Produces exported C Data Interface structs the shim feeds to
-// DuckDB's Arrow import; the caller (via DuckDB's importer) owns releasing
-// them.
-//
-// # Safety
-// `schema_ipc`/`body` point to `schema_ipc_len`/`body_len` readable bytes;
-// `out_schema`/`out_array` are writable slots the caller releases; `err` is
-// writable.
-int32_t moraine_arrow_decode_body(const uint8_t *schema_ipc,
-                                  size_t schema_ipc_len,
-                                  const uint8_t *body,
-                                  size_t body_len,
-                                  ArrowSchema *out_schema,
-                                  ArrowArray *out_array,
-                                  struct MoraineError *err);
 
 // Parses a version's schema-only IPC stream (from
 // [`moraine_arrow_encode_schema`]) into a handle that
@@ -2637,24 +2517,10 @@ int32_t moraine_arrow_schema_decode(const uint8_t *schema_ipc,
 void moraine_arrow_schema_free(struct MoraineArrowSchema *schema);
 
 // Decodes and consumes one chunk returned by
-// [`crate::inline::moraine_inline_scan_next`]; its store-backed allocation
-// becomes Arrow's data buffer without a copy.
-//
-// # Safety
-//
-// `schema_ipc` points to `schema_ipc_len` readable bytes. `chunk` points to
-// one unconsumed [`MoraineInlineChunk`]. `out_schema`/`out_array` are writable
-// slots the caller releases; `err` is writable.
-int32_t moraine_arrow_decode_inline_chunk(const uint8_t *schema_ipc,
-                                          size_t schema_ipc_len,
-                                          struct MoraineInlineChunk *chunk,
-                                          ArrowSchema *out_schema,
-                                          ArrowArray *out_array,
-                                          struct MoraineError *err);
-
-// [`moraine_arrow_decode_inline_chunk`] against a schema parsed once by
-// [`moraine_arrow_schema_decode`]; the handle stays owned by the caller
-// and may be reused for every chunk of that schema version.
+// [`crate::inline::moraine_inline_scan_next`] against a schema parsed once
+// by [`moraine_arrow_schema_decode`]; the handle stays owned by the caller
+// and may be reused for every chunk of that schema version. The chunk's
+// store-backed allocation becomes Arrow's data buffer without a copy.
 //
 // # Safety
 //
@@ -2687,7 +2553,7 @@ int32_t moraine_arrow_decode_stream(const uint8_t *body,
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -2712,7 +2578,7 @@ void moraine_dump_schemas_free(struct MoraineSchemaRow *items, size_t len);
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -2737,7 +2603,7 @@ void moraine_dump_tables_free(struct MoraineTableRow *items, size_t len);
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -2762,7 +2628,7 @@ void moraine_dump_views_free(struct MoraineViewRow *items, size_t len);
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -2787,7 +2653,7 @@ void moraine_dump_columns_free(struct MoraineColumnRow *items, size_t len);
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -2797,27 +2663,6 @@ int32_t moraine_dump_data_files(struct MoraineCatalogHandle *handle,
                                 MoraineInterruptProbe probe,
                                 void *probe_ctx,
                                 struct MoraineError *err);
-
-// As [`moraine_dump_data_files`], for a caller that keeps a row only
-// while `filter_snapshot < end_snapshot` (or it is null) — the shape
-// every DuckLake read of this table carries.
-//
-// Once `filter_snapshot` reaches the head this call observes, no ended
-// version can satisfy that, so the ended half is not read; the rows are
-// the same ones either way. A bound behind the head is a time-travel
-// read and gets the full set. Freed with
-// [`moraine_dump_data_files_free`].
-//
-// # Safety
-//
-// As [`moraine_dump_data_files`].
-int32_t moraine_dump_data_files_live_at(struct MoraineCatalogHandle *handle,
-                                        uint64_t filter_snapshot,
-                                        struct MoraineDataFileRow **out_items,
-                                        size_t *out_len,
-                                        MoraineInterruptProbe probe,
-                                        void *probe_ctx,
-                                        struct MoraineError *err);
 
 // Dumps one table's `ducklake_data_file` rows into
 // `*out_items`/`*out_len`, in the order [`moraine_dump_data_files`] would
@@ -2848,7 +2693,7 @@ void moraine_dump_data_files_free(struct MoraineDataFileRow *items, size_t len);
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -2889,7 +2734,7 @@ void moraine_dump_delete_files_free(struct MoraineDeleteFileRow *items, size_t l
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -2915,7 +2760,7 @@ void moraine_dump_file_partition_values_free(struct MoraineFilePartitionValueRow
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -2940,7 +2785,7 @@ void moraine_dump_scheduled_deletions_free(struct MoraineScheduledDeletionRow *i
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -2967,7 +2812,7 @@ void moraine_dump_macros_free(struct MoraineMacroRow *items, size_t len);
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -2994,7 +2839,7 @@ void moraine_dump_macro_impls_free(struct MoraineMacroImplRow *items, size_t len
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3020,7 +2865,7 @@ void moraine_dump_macro_parameters_free(struct MoraineMacroParameterRow *items, 
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3046,7 +2891,7 @@ void moraine_dump_column_mappings_free(struct MoraineColumnMappingRow *items, si
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3071,7 +2916,7 @@ void moraine_dump_name_mappings_free(struct MoraineNameMappingRow *items, size_t
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3096,7 +2941,7 @@ void moraine_dump_options_free(struct MoraineOptionRow *items, size_t len);
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3122,7 +2967,7 @@ void moraine_dump_partition_info_free(struct MorainePartitionInfoRow *items, siz
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3147,7 +2992,7 @@ void moraine_dump_partition_columns_free(struct MorainePartitionColumnRow *items
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3173,7 +3018,7 @@ void moraine_dump_sort_info_free(struct MoraineSortInfoRow *items, size_t len);
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3199,7 +3044,7 @@ void moraine_dump_sort_expressions_free(struct MoraineSortExpressionRow *items, 
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3224,7 +3069,7 @@ void moraine_dump_snapshots_free(struct MoraineSnapshotRow *items, size_t len);
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3249,7 +3094,7 @@ void moraine_dump_schema_versions_free(struct MoraineSchemaVersionRow *items, si
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3274,7 +3119,7 @@ void moraine_dump_table_stats_free(struct MoraineTableStatsRow *items, size_t le
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3299,7 +3144,7 @@ void moraine_dump_table_column_stats_free(struct MoraineTableColumnStatsRow *ite
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3318,7 +3163,7 @@ int32_t moraine_dump_file_column_stats(struct MoraineCatalogHandle *handle,
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the call.
 int32_t moraine_dump_file_column_stats_of(struct MoraineCatalogHandle *handle,
@@ -3342,7 +3187,7 @@ void moraine_dump_file_column_stats_free(struct MoraineFileColumnStatsRow *items
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3366,7 +3211,7 @@ void moraine_dump_tags_free(struct MoraineTagRow *items, size_t len);
 // # Safety
 //
 // The shared dump-entry contract (`dump_rows`): a live `handle` from
-// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
 // `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
 // thread, and a null-or-writable `err`, all for the duration of the
 // call.
@@ -3384,6 +3229,31 @@ int32_t moraine_dump_column_tags(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pair a matching
 // [`moraine_dump_column_tags`] call wrote, not yet freed.
 void moraine_dump_column_tags_free(struct MoraineColumnTagRow *items, size_t len);
+
+// Dumps every `ducklake_view_column_tag` row into
+// `*out_items`/`*out_len`.
+//
+// # Safety
+//
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
+int32_t moraine_dump_view_column_tags(struct MoraineCatalogHandle *handle,
+                                      struct MoraineViewColumnTagRow **out_items,
+                                      size_t *out_len,
+                                      MoraineInterruptProbe probe,
+                                      void *probe_ctx,
+                                      struct MoraineError *err);
+
+// Frees the array returned by [`moraine_dump_view_column_tags`].
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_view_column_tags`] call wrote, not yet freed.
+void moraine_dump_view_column_tags_free(struct MoraineViewColumnTagRow *items, size_t len);
 
 // Opens a scan of `table_id`'s inlined rows under the `scan_kind`
 // variant (`0` = `SCAN_TABLE`, `1` = `SCAN_INSERTIONS`, `2` =
@@ -3408,10 +3278,10 @@ void moraine_dump_column_tags_free(struct MoraineColumnTagRow *items, size_t len
 // # Safety
 //
 // `handle` must be a pointer previously returned by
-// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached.
-// `out_cursor` must be a valid, writable pointer. `probe`, if non-null,
-// must be safe to call with `probe_ctx` from any thread. `err`, if
-// non-null, must be a valid, writable [`MoraineError`]. All for the
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store)
+// and not yet detached. `out_cursor` must be a valid, writable pointer.
+// `probe`, if non-null, must be safe to call with `probe_ctx` from any thread.
+// `err`, if non-null, must be a valid, writable [`MoraineError`]. All for the
 // duration of this call.
 int32_t moraine_inline_scan_open(struct MoraineCatalogHandle *handle,
                                  uint64_t table_id,
@@ -3605,8 +3475,8 @@ void moraine_drain_logs(MoraineLogSink sink, void *sink_ctx);
 //
 // # Safety
 //
-// `handle` must be a live pointer from `moraine_attach`. `sink`, if
-// non-null, must be callable with `ctx` from any thread until
+// `handle` must be a live pointer from `moraine_attach_with_wal_store`.
+// `sink`, if non-null, must be callable with `ctx` from any thread until
 // unregistration returns, must not unwind, must not emit `tracing`
 // events, and must not re-enter any `moraine_*` entry point.
 void moraine_register_log_sink(const struct MoraineCatalogHandle *handle,
@@ -3619,8 +3489,8 @@ void moraine_register_log_sink(const struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `handle` must be a live pointer from `moraine_attach`. Must not be
-// called from inside a sink.
+// `handle` must be a live pointer from `moraine_attach_with_wal_store`. Must
+// not be called from inside a sink.
 void moraine_unregister_log_sink(const struct MoraineCatalogHandle *handle);
 
 // Opens a staged-row transaction at the current head and writes the
@@ -3634,14 +3504,15 @@ void moraine_unregister_log_sink(const struct MoraineCatalogHandle *handle);
 // # Safety
 //
 // `handle` must be a pointer previously returned by
-// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached,
-// and must outlive every operation on the returned transaction handle
-// (through [`moraine_tx_commit`] or [`moraine_tx_rollback`]). `out`
-// must be a valid, writable `*mut *mut MoraineTxHandle`. `probe`, if
-// non-null, must be safe to call with `probe_ctx` from any thread.
-// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
-// for the duration of this call.
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store)
+// and not yet detached, and must outlive every operation on the returned
+// transaction handle (through [`moraine_tx_commit`] or
+// [`moraine_tx_rollback`]). `out` must be a valid, writable `*mut *mut
+// MoraineTxHandle`. `probe`, if non-null, must be safe to call with
+// `probe_ctx` from any thread. `err`, if non-null, must be a valid, writable
+// [`MoraineError`]. All for the duration of this call.
 int32_t moraine_tx_begin(struct MoraineCatalogHandle *handle,
+                         const struct MoraineSnapshotHandle *snapshot,
                          struct MoraineTxHandle **out,
                          MoraineInterruptProbe probe,
                          void *probe_ctx,
@@ -4127,6 +3998,22 @@ int32_t moraine_tx_dump_column_tags(struct MoraineTxHandle *tx,
                                     size_t *out_len,
                                     struct MoraineError *err);
 
+// Dumps every `ducklake_view_column_tag` row as this transaction sees it:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_view_column_tags_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_view_column_tags(struct MoraineTxHandle *tx,
+                                         struct MoraineViewColumnTagRow **out_items,
+                                         size_t *out_len,
+                                         struct MoraineError *err);
+
 // Dumps every `ducklake_macro_impl` row as this transaction sees it:
 // committed rows at the transaction's read point with its own staged rows over
 // them. Freed with `moraine_dump_macro_impls_free`.
@@ -4270,60 +4157,29 @@ int32_t moraine_tx_commit(struct MoraineTxHandle *tx,
 void moraine_tx_rollback(struct MoraineTxHandle *tx);
 
 // Stages `inline/schema`: the Arrow IPC schema for one `(table_id,
-// schema_version)`, written once at inline-table creation.
+// schema_version)`, written once at inline-table creation, consuming the
+// encoded buffer.
 //
 // # Safety
 //
-// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
-// and not yet committed or rolled back. `arrow_schema`, if
-// `arrow_schema_len` is nonzero, must point to `arrow_schema_len` valid
-// bytes. `err`, if non-null, must be a valid, writable [`MoraineError`].
-// All for the duration of this call.
-int32_t moraine_tx_stage_inline_schema(struct MoraineTxHandle *tx,
-                                       uint64_t table_id,
-                                       uint64_t schema_version,
-                                       const uint8_t *arrow_schema,
-                                       size_t arrow_schema_len,
-                                       struct MoraineError *err);
-
-// Consumes an encoded Arrow schema buffer directly into the staged row.
-//
-// # Safety
-//
-// Same `tx`/`err` contract as [`moraine_tx_stage_inline_schema`].
-// `arrow_schema` must be an unconsumed value returned by
-// [`crate::arrow_ipc::moraine_arrow_encode_schema`].
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back. `arrow_schema` must be an unconsumed
+// value returned by [`crate::arrow_ipc::moraine_arrow_encode_schema`].
+// `err`, if non-null, must be a valid, writable [`MoraineError`]. All for
+// the duration of this call.
 int32_t moraine_tx_stage_inline_schema_owned(struct MoraineTxHandle *tx,
                                              uint64_t table_id,
                                              uint64_t schema_version,
                                              struct MoraineArrowBytes arrow_schema,
                                              struct MoraineError *err);
 
-// Stages `inline/insert`: one Arrow record-batch chunk of inlined rows.
-//
-// # Safety
-//
-// Same `tx` contract as [`moraine_tx_stage_inline_schema`].
-// `arrow_body`, if `arrow_body_len` is nonzero, must point to
-// `arrow_body_len` valid bytes. `err`, if non-null, must be a valid,
-// writable [`MoraineError`]. All for the duration of this call.
-int32_t moraine_tx_stage_inline_insert(struct MoraineTxHandle *tx,
-                                       uint64_t table_id,
-                                       uint64_t schema_version,
-                                       uint64_t begin_snapshot,
-                                       uint64_t row_id_start,
-                                       uint64_t row_count,
-                                       const uint8_t *arrow_body,
-                                       size_t arrow_body_len,
-                                       struct MoraineError *err);
-
 // Consumes an encoded Arrow chunk body directly into the staged row.
 //
 // # Safety
 //
-// Same metadata and `tx`/`err` contract as
-// [`moraine_tx_stage_inline_insert`]. `arrow_body` must be an unconsumed
-// value returned by [`crate::arrow_ipc::moraine_arrow_encode_chunk`].
+// Same `tx`/`err` contract as [`moraine_tx_stage_inline_schema_owned`].
+// `arrow_body` must be an unconsumed value returned by
+// [`crate::arrow_ipc::moraine_arrow_encode_chunk`].
 int32_t moraine_tx_stage_inline_insert_owned(struct MoraineTxHandle *tx,
                                              uint64_t table_id,
                                              uint64_t schema_version,
@@ -4400,31 +4256,15 @@ int32_t moraine_tx_stage_inline_file_delete_clear(struct MoraineTxHandle *tx,
                                                   uint64_t table_id,
                                                   struct MoraineError *err);
 
-// Stages a table drop: removes every `inline/*` record for `table_id`.
-//
-// **Unused by the shim.** DuckLake ends the `ducklake_table` row itself,
-// so no `DROP TABLE` reaches this. A dropped table's inline records are
-// reclaimed by the maintenance sweep once the table is absent from live
-// state and history — which is what keeps a read below the drop able to
-// resolve them, as this entry point would not.
+// Stages a schema-version-scoped deregistration: removes only the
+// `inline/schema` record for `(table_id, schema_version)`, leaving any
+// other schema version's `inline/*` records untouched.
 //
 // # Safety
 //
 // `tx` must be a pointer previously returned by [`moraine_tx_begin`]
 // and not yet committed or rolled back. `err`, if non-null, must be a
 // valid, writable [`MoraineError`]. Both for the duration of this call.
-int32_t moraine_tx_stage_inline_drop(struct MoraineTxHandle *tx,
-                                     uint64_t table_id,
-                                     struct MoraineError *err);
-
-// Stages a schema-version-scoped deregistration: removes only the
-// `inline/schema` record for `(table_id, schema_version)`, leaving any
-// other schema version's `inline/*` records untouched (unlike
-// [`moraine_tx_stage_inline_drop`], which is table-wide).
-//
-// # Safety
-//
-// Same contract as [`moraine_tx_stage_inline_drop`].
 int32_t moraine_tx_stage_inline_schema_drop(struct MoraineTxHandle *tx,
                                             uint64_t table_id,
                                             uint64_t schema_version,

@@ -547,6 +547,14 @@ impl Subspace {
         Self::Changelog,
     ];
 
+    /// The subspace whose keys carry exactly `prefix`, or `None` for a
+    /// prefix no subspace this build knows derives.
+    pub(crate) fn of_prefix(prefix: &[u8]) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|subspace| subspace_prefix(*subspace) == prefix)
+    }
+
     /// A minimal key inside this subspace, for prefix derivation.
     const fn sample(self) -> Key {
         match self {
@@ -919,6 +927,33 @@ pub(crate) fn index_index_prefix(kind: IndexKind, index_id: u64) -> Vec<u8> {
         }),
     };
     prefix_of(&key, INDEX_ENTRY_PREFIX_LEN)
+}
+
+/// The index id as it follows [`index_kind_prefix`] in every entry of the
+/// index: the suffix a scan of one kind bounds against to start at
+/// `index_id`.
+pub(crate) fn index_id_suffix(kind: IndexKind, index_id: u64) -> Vec<u8> {
+    index_index_prefix(kind, index_id).split_off(INDEX_KIND_PREFIX_LEN)
+}
+
+/// The prefixes a lookup on `table_id` probes: each of its indexes'
+/// entries and its inlined data.
+pub(crate) fn table_probe_prefixes(
+    table_id: u64,
+    indexes: impl IntoIterator<Item = (IndexKind, u64)>,
+) -> Vec<Vec<u8>> {
+    let mut prefixes: Vec<Vec<u8>> = indexes
+        .into_iter()
+        .map(|(kind, index_id)| index_index_prefix(kind, index_id))
+        .collect();
+    prefixes.extend([
+        inline_live_table_prefix(InlineOperationKind::Insert, table_id),
+        inline_live_table_prefix(InlineOperationKind::InlineDelete, table_id),
+        inline_live_table_prefix(InlineOperationKind::FileDelete, table_id),
+        inline_schema_table_prefix(table_id),
+        inline_chunk_range_table_prefix(table_id),
+    ]);
+    prefixes
 }
 
 /// Byte prefix of every non-unique entry sharing one `(index_id, value)`:
@@ -2114,6 +2149,53 @@ mod tests {
             bytes[position] = byte;
             let _ = Key::decode(&bytes);
         }
+    }
+
+    proptest! {
+        /// The kind prefix and the id suffix together are the index's own
+        /// prefix, for either kind.
+        #[test]
+        fn index_id_suffix_extends_the_kind_prefix(index_id in any::<u64>(), unique in any::<bool>()) {
+            let kind = if unique { IndexKind::Unique } else { IndexKind::Multi };
+            let mut joined = index_kind_prefix(kind);
+            joined.extend(index_id_suffix(kind, index_id));
+            prop_assert_eq!(joined, index_index_prefix(kind, index_id));
+        }
+    }
+
+    #[test]
+    fn every_subspace_is_recovered_from_its_prefix() {
+        for subspace in Subspace::ALL {
+            assert_eq!(
+                Subspace::of_prefix(&subspace_prefix(subspace)),
+                Some(subspace)
+            );
+        }
+        assert_eq!(Subspace::of_prefix(&[]), None);
+        assert_eq!(Subspace::of_prefix(&[0xfe]), None);
+        // A longer key is not a subspace prefix, even inside a subspace.
+        assert_eq!(
+            Subspace::of_prefix(&Key::Snapshot { snapshot_id: 1 }.encode()),
+            None
+        );
+    }
+
+    #[test]
+    fn table_probe_prefixes_cover_every_index_and_the_inline_ranges() {
+        let prefixes = table_probe_prefixes(7, [(IndexKind::Unique, 3), (IndexKind::Multi, 4)]);
+        assert_eq!(
+            prefixes,
+            vec![
+                index_index_prefix(IndexKind::Unique, 3),
+                index_index_prefix(IndexKind::Multi, 4),
+                inline_live_table_prefix(InlineOperationKind::Insert, 7),
+                inline_live_table_prefix(InlineOperationKind::InlineDelete, 7),
+                inline_live_table_prefix(InlineOperationKind::FileDelete, 7),
+                inline_schema_table_prefix(7),
+                inline_chunk_range_table_prefix(7),
+            ]
+        );
+        assert_eq!(table_probe_prefixes(7, []).len(), 5);
     }
 
     mod index_value_bounds {

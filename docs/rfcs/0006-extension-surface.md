@@ -291,7 +291,7 @@ store's block cache (RFC 0009) a disk device under that directory: blocks
 are written there at block grain as they are read, so repeat reads skip
 the GETs, and a new process recovers what the last one left, so a
 re-attach in the same order starts warm without a preload. It threads
-through the shim (`moraine_attach`'s `cache_dir`) into
+through the shim (`moraine_attach_with_wal_store`'s `cache_dir`) into
 `CatalogOptions::cache_dir` and `StoreBuilder`, applying to both the
 writer and the reader; unset (the default), only the memory tier applies.
 Redundant for local/`memory://` stores.
@@ -315,8 +315,8 @@ device: the first attach to name a `CACHE_DIR` settles it, and every
 store's device opens with that cap as a ceiling, filled only by what the
 store reads. Zero on the ABI means "not given", leaving the default
 cap (16 GiB); the option is inert without a `CACHE_DIR`, since there is no
-disk tier to bound. It threads through the shim (`moraine_attach`'s
-`cache_size_bytes`, and `moraine_migrate`'s) into
+disk tier to bound. It threads through the shim (`moraine_attach_with_wal_store`'s
+`cache_size_bytes`, and `moraine_migrate_with_wal_store`'s) into
 `CatalogOptions::cache_size` and `StoreBuilder`.
 
 **`CACHE_MEMORY` — how much memory the cache may take.** The same shape for
@@ -353,15 +353,11 @@ filling. Through DuckLake the names are `META_CACHE_PUTS` and
 `META_CACHE_COMPACTION_PUTS`.
 
 The core exposes `CatalogOptions::cache_puts` (default `true`) and
-`cache_compaction_puts` (default `true`). The shim uses the additive
-`moraine_attach_with_wal_store` entry point, whose cache flags and log store
-are explicit. Each earlier attach symbol keeps its signature and forwards:
-`moraine_attach_with_cache_policy` supplies no log store, and
-`moraine_attach` additionally maps its single cache flag to both policies,
-preserving existing binary callers. The migration ABI is additive the same
-way — `moraine_migrate_with_wal_store` reaches a lake whose log sits
-elsewhere, and `moraine_migrate` keeps its legacy signature and
-single-flag behavior.
+`cache_compaction_puts` (default `true`). The shim attaches through
+`moraine_attach_with_wal_store`, whose cache flags and log store are
+explicit, and migrates through `moraine_migrate_with_wal_store`. The shim
+is the ABI's only caller, so an entry point it stops calling is removed
+rather than kept as a forwarder.
 
 **`CACHE_PRELOAD` — fill it before the first query, not during it.** Both of
 the above leave a fresh process cold: the cache fills as queries ask for
@@ -378,7 +374,7 @@ writes data files against it; at any level but `'none'`, the extension also
 warms every table's probe ranges in the background after the open, so the
 first lookup on any table finds them cached (RFC 0009). The shim's option
 parsing owns the default; the level crosses the ABI as a code (`0`, `1`,
-`2`) on `moraine_attach` and `moraine_migrate`, and any other code is
+`2`) on the attach and migrate entry points, and any other code is
 refused rather than treated as "none", so a misspelled level surfaces as an
 error instead of an attach that merely feels slow.
 
@@ -527,15 +523,17 @@ schema, and implements:
 - **Insert / Update / Delete** — apply row mutations to the store.
 - **Transactions** — `begin`/`commit`/`rollback` mapped onto RFC 0004's
   **staged-row commit path**: a transaction stages row mutations; commit
-  drives them through the single fenced atomic batch under head conflict
-  detection. On this path moraine performs **no internal retry** — DuckLake
-  authored the ids, counters, and snapshot values embedded in the staged
-  rows, so any lost race (benign-shaped or not) aborts with the typed
-  `CommitConflict`, surfaced to DuckLake as a transaction failure. DuckLake
-  then re-drives it: its `RunCommitLoop` (source-verified) retries
-  metadata-catalog commit failures with bounded jittered backoff,
-  re-checking its own conflict matrix first. Two wire-contract consequences
-  for the shim, both load-bearing: **(a) the error message matters** —
+  drives them through the shared batch under head conflict detection. A
+  **data-only** commit takes DuckLake's **server-side commit** route
+  (below): moraine joins the batch, rebases the head-derived values
+  DuckLake stamped, re-drives a benign lost race itself, and reports the
+  snapshot id it landed, which DuckLake adopts. Every other commit — not
+  data-only, the shape RFC 0004's rebase refuses — stays on DuckLake's
+  **client-side** route: moraine performs no internal retry, a lost race
+  aborts with the typed `CommitConflict`, and DuckLake's `RunCommitLoop`
+  (source-verified) re-drives it with bounded jittered backoff after
+  re-checking its own conflict matrix. Two wire-contract consequences hold
+  on that route, both load-bearing: **(a) the error message matters** —
   DuckLake's `RetryOnError` decides retryability by substring match on the
   lowercased message (`"primary key"`, `"unique"`, `"conflict"`,
   `"concurrent"`), so the text moraine surfaces for a lost commit must
@@ -594,6 +592,47 @@ convention is deliberately minimal — lifecycle columns only, everything
 else opaque — and the e2e suite pins it against every lifecycle transition
 real DuckLake SQL produces. The contract is not zero interpretation; it is
 exactly one, tested.
+
+### Server-side commit: the catalog re-drives and assigns the id
+
+DuckLake defines two ways a metadata catalog may finish a commit, chosen in
+`DuckLakeTransaction::FlushChanges` (source-verified). On the **client-side**
+route, `RunCommitLoop` generates the commit's rows against the snapshot it
+read, executes them, and on a retryable failure sleeps a jittered
+`ducklake_retry_wait_ms` × `ducklake_retry_backoff`ⁱ — 100 ms × 1.5ⁱ by
+default — before generating them again against a fresh snapshot. On the
+**server-side** route, taken when the metadata manager reports
+`ExecuteRetrialsServerSide()`, DuckLake hands the commit to the manager's
+`FlushChangesServerSide` and adopts what comes back: the manager calls
+`SetCommittedSnapshotId` with the snapshot id the catalog landed and
+`ApplyServerSideCommit` with the schema version; a backend that finishes
+the commit itself never enters the loop. Only on this route does DuckLake
+adopt an id the catalog assigned; on the client-side route it keeps the one
+it minted.
+
+moraine's metadata manager takes the server-side route for **data-only**
+commits — no created, altered or dropped schema, table, view or macro, the
+gate DuckLake's own server-side backend applies — and the client-side route
+for everything else. The split is RFC 0004's, and the two gates are one
+predicate: a data-only commit is the shape whose head-derived values the
+batch rebases exactly, so it can be re-driven inside the catalog; the rest
+cannot be, and DuckLake's loop is the right re-driver for them. A commit
+the shim routes server-side is never one the rebase refuses. Inside
+`FlushChangesServerSide` the shim runs DuckLake's own generation of the
+commit's rows through the ordinary DML hooks — the rows the client-side
+route stages — under DuckLake's own retry budget, then reports the id the
+catalog landed. The budget is kept as the safety net, not the mechanism: a
+data-only commit never spends it, because the batch re-drives its benign
+races inside, and what still reaches the loop is a true conflict, which
+DuckLake's own re-check throws on the first retry without sleeping again.
+The landed id may exceed the one DuckLake stamped when it generated the
+rows, because the batch rebased it; `SetCommittedSnapshotId` is the
+contract by which DuckLake learns the difference, called after the loop,
+which would otherwise have recorded the stamped id.
+
+This is why the staged path's commit returns a snapshot id at all
+(`moraine_tx_commit(tx) -> snapshot_id`, below), and why the shim treats
+that value as authoritative over anything DuckLake computed before commit.
 
 ### Scoping the file and file-statistics scans
 
@@ -756,7 +795,9 @@ an unwind into C++. The shim translates codes to DuckDB exceptions:
 Wire contract: the `COMMIT_CONFLICT` message always contains the literal
 substring `conflict` — DuckLake's `RetryOnError` keys its retry decision on
 that substring (see the Transactions bullet above) — so the message text
-is part of the ABI contract, not incidental diagnostics.
+is part of the ABI contract, not incidental diagnostics. It binds on the
+client-side commit route; on the server-side route the same error is
+terminal and its text is diagnostics.
 
 The contract runs both ways. `RETRY_EXHAUSTED` is terminal, so its message
 carries **none** of the four substrings DuckLake retries on (`conflict`,
@@ -866,6 +907,17 @@ leak past the call that observed it: the probe is only consulted while a
 call is in flight, and DuckDB clears the flag before the next query
 issues one.
 
+One hop is needed before that load. DuckLake runs its metadata SQL on a
+connection it creates and never hands out, so that context's flag is one
+nobody can set, and a commit stalled in this catalog could not be
+cancelled at all. The registered metadata manager records the driving
+context on that connection — in its `Query` override, which every metadata
+read funnels through, and in `AttachMetadata`, the nested attach that does
+not — and the probe reads the driver's flag when the connection's own is
+clear. Registering where the queries are issued rather than where the
+connection is built is what lets this live in the shim instead of in a
+DuckLake patch.
+
 Per-call is what the deployment shape requires, and it is why the earlier
 per-handle `Notify` and its `moraine_interrupt(handle)` push channel are
 gone rather than merely unused. DuckDB's flag is per *connection*, and
@@ -889,7 +941,21 @@ snapshot listing calls (`moraine_snapshot_schemas`/`tables_in`/
 `columns_of`/`views_in`/`data_files_of`) walk the already-materialized
 snapshot in memory and take no probe.
 
-`moraine_attach` is cancellable too, and is the exception to
+**Proving it takes a seam.** A cancellation only means something while a
+read is blocked, and nothing makes a local store block on command — so the
+extension carries one fault seam:
+`moraine_fault_stall_next_read(milliseconds)`, whose ABI entry point of the
+same name arms a stall the next cancellable call awaits *inside* the
+`select!` that polls its probe, in place of a slow store. One arming stalls
+one call. It ships rather than hiding behind a build feature because the
+only harness that can drive it is a real DuckDB session, and that session
+loads the artifact a release publishes; dormant, it is one relaxed atomic
+load per cancellable call, and nothing on a lake's data path can arm it.
+What it buys is the test that a statement interrupted while its metadata
+read is blocked ends in that statement's failure rather than in the read
+finishing — the one assertion that fails if the hop above is removed.
+
+`moraine_attach_with_wal_store` is cancellable too, and is the exception to
 "mutates nothing": the store open is the one long blocking call an attach
 makes, and against an unreachable endpoint it is the one a user is most
 likely to want out of. A cancelled attach writes no handle and leaves
@@ -939,8 +1005,8 @@ separately, and the distribution unit is a DuckDB *release*, not a series.
 
 **One manifest owns the pin.** `.github/duckdb-versions` lists the releases
 moraine builds for, newest first, the first line carrying the commit each
-submodule must sit on. `xtask` reads it, both release workflows build a
-matrix from it, assets are published as
+submodule must sit on. `xtask` reads it, both build workflows take their
+version from it, assets are published as
 `moraine.<duckdb-version>.<platform>.duckdb_extension` so several versions
 coexist in one release, and `cargo xtask check-pins` fails if any other place
 naming a version disagrees. That check exists because the failure mode is
@@ -950,6 +1016,12 @@ bump-duckdb <version>` writes those places, so the check guards a
 transcription no one has to make by hand. It covers the DuckLake commit
 too, which DuckDB chooses rather than moraine — otherwise a DuckDB bump
 moves it silently and only e2e says so.
+
+**A development pin publishes nothing.** The current entry names a DuckDB
+commit rather than a release: 2.0 has no tag and no assets, so no released
+DuckDB reports the version string a build of it carries, and nothing could
+load one. The workflows still build and smoke every platform, which is what
+says the pin is whole; the publishing steps return when the tag does.
 
 **Which releases are listed** is a judgement, and a short list is the default.
 Each entry multiplies the release build by five platforms, and only the
@@ -975,23 +1047,22 @@ workflow publishes unsigned, every e2e harness starts the CLI with
 `description.yml` — is the only route to a signed build. That is a
 consequence of DuckDB's design rather than an unbuilt piece of moraine's.
 
-**The pin, tracking latest stable:**
+**The pin, tracking the DuckDB series DuckLake targets:**
 
 | What | Pinned at | Notes |
 |---|---|---|
-| DuckDB | **v1.5.6** | the primary entry of `.github/duckdb-versions`; both submodules sit on it, and it is the version the e2e suite proves the chain against |
-| DuckLake extension | **`ac7595b0`** | the DuckLake source moraine bundles, with the `patches/ducklake` series applied: what `INSTALL ducklake` resolves to against the pinned CLI, since DuckDB v1.5.6 hard-codes the commit in `.github/config/extensions/ducklake.cmake`, so the pair moves only when the DuckDB pin does. Verified by running, not assumed |
-| DuckLake branch | **`v1.5-variegata`** | DuckLake publishes no release tags — it versions by DuckDB-series branches (`v1.3-ossivalis`, `v1.4-andium`, `v1.5-variegata`); `main` is development |
-| DuckLake catalog format | **`1.0`** (`DuckLakeVersion::V1_0`) | the highest version the stable branch writes (its migration chain ends at `'1.0'`); `V1_1_DEV_1` exists on `main` only and is not targeted |
+| DuckDB | **v2.0.0-alpha46057** | the only entry of `.github/duckdb-versions`; both submodules sit on the commits it names, and it is the version the e2e suite proves the chain against. A development revision: DuckDB 2.0 carries no tag, so the build stamps the version string onto the pinned commit -- but DuckDB publishes that label's shared libraries, CLI and core extensions, which is why the pin follows its labels rather than naming one of ours |
+| DuckLake extension | **`e8924cfc`** | the DuckLake source moraine bundles: what `INSTALL ducklake` resolves to against the pinned DuckDB, which hard-codes the commit in `.github/config/extensions/ducklake.cmake`, so the pair moves only when the DuckDB pin does. DuckDB patches that commit itself before building it, and moraine's build applies those patches before the `patches/ducklake` series. Verified by running, not assumed |
+| DuckLake branch | **`main`** | DuckLake publishes no release tags — it versions by DuckDB-series branches (`v1.3-ossivalis`, `v1.4-andium`, `v1.5-variegata`), and the 2.0 series has none yet, so the commit DuckDB pins is on `main` |
+| DuckLake catalog format | **`1.0`** by default, **`1.1-dev1`** on a raised store | `DuckLakeVersion::V1_0` and `V1_1_DEV_1`; a store records which it serves and `moraine_raise_catalog_version` moves it, as RFC 0012 describes |
 
-**Patch-level ABI friction between the two does not appear.** DuckDB's own CI
-builds the DuckLake extension against v1.5.3 while moraine statically links
-v1.5.6, and the concern was that objects crossing the extension↔host boundary
-by pointer between those two builds might disagree. They do not: the bundled
-DuckLake loads with moraine and the full chain answers correctly, pinned by
+**ABI friction between the two does not appear.** The concern was that
+objects crossing the extension↔host boundary by pointer between a DuckLake
+built by DuckDB's own CI and a moraine statically linking another build of
+the same DuckDB might disagree. They do not: the bundled DuckLake loads
+with moraine and the full chain answers correctly, pinned by
 `wire_contract.rs` alongside the version strings, so a bump that introduces
-friction fails there rather than in the field. The fallback to v1.5.3 an
-earlier revision of this RFC held open is therefore not needed and not taken.
+friction fails there rather than in the field.
 
 The source-verified behaviors this RFC suite cites (conflict matrix, commit
 retry loop, `SchemaChangesMade` classification, per-table column-id
@@ -1063,11 +1134,16 @@ build-time discovery, are recorded in `crates/moraine-duckdb/README.md`.
 
 DuckLake's own `INSERT`/`UPDATE`/`DELETE` against `ducklake_*` tables
 reach moraine through four C-ABI entry points (`moraine_abi.h`):
-`moraine_tx_begin(catalog) -> tx`, `moraine_tx_stage(tx, table_kind,
+`moraine_tx_begin(catalog, snapshot) -> tx` (the snapshot the DuckLake
+transaction read at, which is the view its rows are stamped against and
+the one a batch rebases them from; the catalog transaction itself may
+open later), `moraine_tx_stage(tx, table_kind,
 operation_kind, cells)` (accumulates one typed row operation — `insert`, `delete`,
 or `update_set_end` — without touching the store), `moraine_tx_commit(tx)
--> snapshot_id` (translates every staged operation into one atomic SlateDB
-batch and returns the new head), and `moraine_tx_rollback(tx)` (discards
+-> snapshot_id` (translates every staged operation, joins the forming
+batch, and returns the snapshot id the commit landed — which the shim
+reports back to DuckLake, since on the server-side route it may exceed the
+id DuckLake stamped), and `moraine_tx_rollback(tx)` (discards
 the accumulated operations, no store access). The C++ shim's `PlanInsert`/
 `PlanUpdate`/`PlanDelete` (`cpp/catalog.cpp`, `cpp/staged_write.cpp`)
 recognize exactly one target: a `ducklake_*` metadata table entry whose
@@ -1078,9 +1154,10 @@ author nothing else" scope above. Per the staged-row rules: DuckLake
 authors every id/counter/`schema_version`/`begin_snapshot` value, carried
 across the ABI verbatim; the one interpreted convention is an `UPDATE`
 setting `end_snapshot`, translated to a `current`-key delete plus `history`-key
-write; a lost race at commit returns an error whose message contains the
-literal substring `conflict` (never retried internally, per the C ABI
-error mapping table above).
+write; a benign lost race at commit is rebased and re-driven inside the
+batch for a data-only commit, and a lost race the rebase refuses returns an
+error whose message contains the literal substring `conflict`, for
+DuckLake's client-side loop to re-drive (C ABI error mapping above).
 
 ### `data_inlining_row_limit` is deliberately not synthesized, and dynamic inline-table interception
 
@@ -1224,9 +1301,9 @@ Summary-driven indexed scans are selected automatically by eligibility and
 physical coverage. There is no SQL on/off setting for this rewrite. The
 `moraine_summary_scan` operator remains in query plans; only its former
 Boolean session setting is removed.
-`moraine_summary_scan_threads` defaults to four and limits file/row-group prefetch
-for both summary scans and `moraine_rows_at`; the
-effective count also respects DuckDB's thread count and the per-cursor ceiling.
+`moraine_summary_scan_threads` defaults to four and limits a summary scan's
+file/row-group prefetch; the effective count also respects DuckDB's thread
+count and the per-cursor ceiling.
 
 The additive `moraine_row_scan_next_arrow` exports an owned Arrow C Data pair
 and a `has_batch` flag. On success with a batch the caller releases both structs
@@ -1234,15 +1311,18 @@ exactly once; at EOF or on error it acquires no structs. Buffers outlive the
 cursor. `moraine_row_scan_is_selective` costs projected page coverage,
 `moraine_row_scan_parallelism` configures prefetch before iteration, and
 `moraine_row_scan_metrics` samples cursor-local I/O and decode/worker counters.
-The additive `moraine_rows_at_open` opens a whole-row strict cursor with the
-same ownership and next/free functions. Unlike optimizer candidate scans it
-rejects missing positions. SQL binds only pairs and schema and opens this cursor
-at execution. The IPC-returning C functions `moraine_rows_at`,
-`moraine_rows_at_free`, and `moraine_row_scan_next`, and their `MoraineRowBatch`
-result type, are removed. External callers must migrate to cursor open,
-`moraine_row_scan_next_arrow`, Arrow release callbacks, and `moraine_row_scan_free`.
-This is a C ABI break, not a removal of the SQL `moraine_rows_at` function.
-Durable inline chunk IPC encoding is unchanged.
+`moraine_row_scan_open` is the only cursor the ABI opens. Index lookups,
+selective scans, and DELETE positioning share `MoraineRowId`; the duplicate
+`MorainePositionPair` and the scan-opening forwarding wrapper are removed.
+The strict whole-row cursor and standalone deletion commit were removed with the
+located SQL verbs. The internal `moraine_locate_row_positions` instead
+accepts index hits in committed files, using the handle's pinned revision,
+and returns exact positions plus existing deletion masks for the automatic
+DELETE rewrite. Its single free function releases the nested file arrays;
+there is no inline-row output or separate snapshot argument.
+The earlier IPC-returning `moraine_rows_at`, `moraine_rows_at_free` and
+`moraine_row_scan_next`, with their `MoraineRowBatch` type, are withdrawn in
+favour of the Arrow pair. Durable inline chunk IPC encoding is unchanged.
 The planning estimate owns no payload batches and discards its temporary scope
 before storing the prepared plan. See RFC 0016 for the eligibility and cost rules.
 
@@ -1266,6 +1346,17 @@ before storing the prepared plan. See RFC 0016 for the eligibility and cost rule
   expensive because of the row-faithful layout itself — not because the
   catalog is large, which is 0009's lazy-materialization question, and not
   because a scan clones, which is 0009's `dump_entities` item.
+- **Keep every DuckLake commit on its client-side retry loop** (the first
+  design). Rejected on measurement: the loop's sleep, tuned for
+  millisecond SQL commits, costs a flush-bound catalog a further flush per
+  lost race, and DuckLake's DML — one staged transaction per commit,
+  racing on the head — lost a race on half its commits at eight concurrent
+  connections. DuckLake's server-side route exists for a catalog that can
+  finish a commit itself; moraine is one.
+- **Patch the sleep out of DuckLake's loop for moraine.** Rejected: the
+  sleep bounds a per-commit race storm — without it the loop livelocks at
+  sixteen writers — and the patch series carries correctness fixes, not a
+  retry policy the server-side route makes unnecessary.
 - **Raw-SQL interception.** moraine parses and answers the SQL DuckLake emits.
   Rejected: reimplements a query engine for no benefit; DuckDB's executor
   already does this over moraine's table scans.

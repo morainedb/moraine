@@ -20,6 +20,12 @@
 //! projects (the [`dumps`] module). See `README.md`'s "Serving as
 //! DuckLake's metadata catalog" section.
 //!
+//! `CREATE INDEX`, `CREATE UNIQUE INDEX`, and `DROP INDEX` on Moraine-backed
+//! DuckLake tables use the existing index engine through DuckDB extension
+//! hooks. They require autocommit; ordinary predicates select indexes
+//! automatically. Index names are case-insensitively unique within a schema.
+//! `WITH (staged = true)` selects resumable bounded construction.
+//!
 //! **Secondary path — metadata-only inspection:** `ATTACH '<path>' AS m
 //! (TYPE moraine)`, or the bare `moraine:<path>` prefix (the same form
 //! DuckLake's nested attach uses internally). Schema/table/view listing
@@ -151,35 +157,22 @@
 //!
 //! # Store format
 //!
-//! A store's format rises on its own, stamped by the commit that first
-//! writes a record shape needing it — a live index, an inline chunk
-//! locator, a collapsed inline schema. Each step is one-way: a store that
-//! has taken a format can no longer be opened by a binary that predates
-//! it, and a reader already attached on such a binary is not refused, so
-//! it keeps running and may misread later commits. Upgrade every reader
-//! of a store before its writers start producing shapes the readers do
-//! not know.
+//! This build opens format 9 stores and initializes new stores at that
+//! format. Index and inline writes do not change it. Older stores require
+//! a structural upgrade through `moraine_migrate` before attaching.
 //!
-//! `moraine_raise_format` takes the newest purely additive format
-//! deliberately, for an operator who would rather not wait for the first
-//! commit that needs it, and reports the move.
+//! `moraine_raise_format` reports the stored format and the supported
+//! additive ceiling. Both are 9 for an attached store, so the call is a
+//! no-op in this build, with or without `dry_run`.
 //!
 //! ```sql
-//! -- What format is this store, and where would a raise take it?
+//! -- Inspect the format without writing; both columns report 9.
 //! SELECT from_format, to_format
 //! FROM moraine_raise_format('lake', dry_run := true);
-//!
-//! -- Take it, once every reader is on a binary that understands it.
-//! SELECT from_format, to_format FROM moraine_raise_format('lake');
 //! ```
 //!
-//! `dry_run := true` reports the move without making it — the only way
-//! to read a store's format without moving it, and the way to check
-//! where a store sits before an upgrade.
-//!
-//! It is distinct from `moraine_migrate`, which rewrites a keyspace to
-//! make a store readable by this binary at all, and it stops below any
-//! format such a rewrite targets.
+//! The raise operation does not rewrite keys or cross structural migration
+//! boundaries; it cannot make an older store readable by this build.
 //!
 //! # Diagnostics
 //!

@@ -453,8 +453,8 @@ pub fn run(arguments: &[String]) -> anyhow::Result<()> {
         fs::create_dir_all(&local_root)
             .with_context(|| format!("creating {}", local_root.display()))?;
     }
-    let cli = duckdb::ensure_duckdb_cli()?;
     let moraine = duckdb::build_and_package_extension(&ducklake_patch::prepare()?)?;
+    let cli = duckdb::ensure_duckdb_cli()?;
     let artifacts = Artifacts {
         cli: &cli,
         moraine: &moraine,

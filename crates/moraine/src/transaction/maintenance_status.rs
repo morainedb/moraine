@@ -10,7 +10,7 @@ use crate::{
         proto::{MaintenanceStatusPassValue, MaintenanceStatusStepValue},
         read, value,
     },
-    transaction::commit::{self, FORMAT_WITH_MAINTENANCE_STATUS, MAX_COMMIT_ATTEMPTS, StagedWrite},
+    transaction::commit::{self, MAX_COMMIT_ATTEMPTS, StagedWrite},
 };
 
 const RETAINED_PASSES: usize = 16;
@@ -43,14 +43,7 @@ pub(crate) async fn record(catalog: &Catalog, mut pass: MaintenanceStatusPass) -
 
         let session = store.begin_commit_session().await?;
         let base = commit::head_view_for(session.handle(), catalog.projections()).await?;
-        let (status, stamp) = futures::try_join!(
-            read::read_maintenance_status(session.handle()),
-            commit::format_stamp_to(
-                session.handle(),
-                catalog.projections(),
-                FORMAT_WITH_MAINTENANCE_STATUS
-            ),
-        )?;
+        let status = read::read_maintenance_status(session.handle()).await?;
         pass.head_snapshot_id = base.snapshot.snapshot_id;
         pass.head_batch_seq = base.batch_seq;
         let mut status = status.unwrap_or_default();
@@ -65,7 +58,6 @@ pub(crate) async fn record(catalog: &Catalog, mut pass: MaintenanceStatusPass) -
             Key::Sys(SysKey::MaintenanceStatus).encode(),
             Some(value::encode_value(&status)),
         )];
-        writes.extend(stamp);
         writes.push(commit::head_stamp(head, base.batch_seq));
         let staged = commit::stage_writes_on(&session, &writes)?;
 

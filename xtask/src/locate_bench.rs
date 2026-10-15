@@ -212,10 +212,7 @@ fn build_lake(cli: &Path, preamble: &str, options: &Options) -> anyhow::Result<(
             start + options.rows_per_file
         );
     }
-    let _ = writeln!(
-        script,
-        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);"
-    );
+    let _ = writeln!(script, "CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     run_sql(cli, &script)?;
     Ok(())
 }
@@ -354,8 +351,8 @@ fn files_read(
 /// Builds a lake, then reports what locating its rows costs and saves.
 pub fn run(arguments: &[String]) -> anyhow::Result<()> {
     let options = parse_options(arguments)?;
-    let cli = duckdb::ensure_duckdb_cli()?;
     let moraine = duckdb::build_and_package_extension(&ducklake_patch::prepare()?)?;
+    let cli = duckdb::ensure_duckdb_cli()?;
 
     let temp = TempDir::new("lake")?;
     let preamble = preamble(&moraine, &temp);

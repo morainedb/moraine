@@ -24,9 +24,9 @@ use crate::{
         CatalogSnapshot, SnapshotId, Store, Timestamp,
         projection::{
             ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch,
-            fold_replayed_writes, format_floor, held_head_view, install_head_view,
-            install_head_view_at, invalidate_head_view, migration_clear_at, note_migration_clear,
-            raise_format_floor, view_head,
+            fold_replayed_writes, held_head_view, install_head_view, install_head_view_at,
+            invalidate_head_view, migration_clear_at, note_migration_clear, raise_format_floor,
+            view_head,
         },
     },
     commit_log::{
@@ -54,28 +54,8 @@ use crate::{
 
 /// The original structural layout; later rewrites raise the readable floor.
 pub(crate) const FORMAT_VERSION: u64 = 1;
-/// Format stamped the first time an equality index exists: adds the
-/// `index` subspace and kind.
-pub(crate) const FORMAT_WITH_INDEX: u64 = 2;
-/// Format stamped the first time a staged (multi-commit) index build
-/// exists: a `building` definition serves no lookups.
-pub(crate) const FORMAT_WITH_STAGED_INDEX: u64 = 3;
-/// Format stamped the first time an index defers SQL additions.
-pub(crate) const FORMAT_WITH_DEFERRED_INDEX: u64 = 4;
-/// Format stamped the first time durable maintenance status is recorded.
-pub(crate) const FORMAT_WITH_MAINTENANCE_STATUS: u64 = 5;
-/// Format stamped the first time an inline chunk row-range locator is
-/// written.
+/// The earliest format containing inline chunk row-range locators.
 pub(crate) const FORMAT_WITH_INLINE_CHUNK_DIRECTORY: u64 = 6;
-/// A deregistered inline schema may be a reference to another version of
-/// the same table rather than the Arrow bytes themselves, which a reader
-/// that predates the field would decode as a schema with no columns.
-pub(crate) const FORMAT_WITH_INLINE_SCHEMA_REFERENCE: u64 = 7;
-/// An inline chunk locator carries the chunk's identity, not its range end
-/// alone. A reader that predates it looks for the superseded key and finds
-/// no directory at all, so it must be locked out rather than left to serve
-/// reads from a directory it cannot see.
-pub(crate) const FORMAT_WITH_INLINE_CHUNK_IDENTITY: u64 = 8;
 /// Inline tombstones retain each deletion snapshot under its own key.
 pub(crate) const FORMAT_WITH_INLINE_TOMBSTONE_HISTORY: u64 = 9;
 /// The store's commits are slot objects in a bucket-resident commit log, and
@@ -159,7 +139,7 @@ pub(crate) async fn commit_durable(
     durability: &CommitDurability,
 ) -> std::result::Result<Option<slatedb::WriteHandle>, slatedb::Error> {
     let handle = reporting_stalls(operation, staged, tx.commit()).await?;
-    await_durable(handle.clone(), operation, staged, durability).await?;
+    await_durable(handle.clone(), operation, staged, durability, 1).await?;
     Ok(handle)
 }
 
@@ -171,6 +151,7 @@ pub(crate) async fn await_durable(
     operation: &'static str,
     staged: StagedBytes,
     durability: &CommitDurability,
+    commits: usize,
 ) -> std::result::Result<(), slatedb::Error> {
     let Some(handle) = handle else {
         return Ok(());
@@ -182,7 +163,7 @@ pub(crate) async fn await_durable(
         // The flush the pacer performs or waits for is what puts the
         // batch in object storage.
         CommitDurability::Paced(pacer) => {
-            reporting_stalls(operation, staged, pacer.await_durable(handle)).await
+            reporting_stalls(operation, staged, pacer.await_durable(handle, commits)).await
         }
     }
 }
@@ -360,6 +341,7 @@ fn stage_bootstrap(
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
             deleted_data_file_ids: Vec::new(),
+            deletes_untargeted_files: false,
         }),
     );
     stage(
@@ -374,10 +356,18 @@ fn stage_bootstrap(
             path_is_relative: true,
         }),
     );
-    let mut options = std::collections::HashMap::from([(
-        "encrypted".to_string(),
-        if encrypted { "true" } else { "false" }.to_string(),
-    )]);
+    let mut options = std::collections::HashMap::from([
+        (
+            "encrypted".to_string(),
+            if encrypted { "true" } else { "false" }.to_string(),
+        ),
+        // The catalog shape this store serves. A store written before this
+        // was recorded has no row, which reads as the same version.
+        (
+            "version".to_string(),
+            crate::catalog::CATALOG_VERSION.to_string(),
+        ),
+    ]);
     if let Some(path) = data_path {
         options.insert("data_path".to_string(), path.to_string());
     }
@@ -1116,8 +1106,8 @@ mod fold;
 mod group;
 use diff::diff_options;
 pub(crate) use diff::{Touched, diff_touched, diff_writes};
-pub(crate) use group::Coalescer;
 use group::Outcome;
+pub(crate) use group::{Batch, Coalescer, StageOnto, Staging};
 
 /// What a batch's durable write did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1155,19 +1145,19 @@ enum CommitOutcome {
 /// Runs one attempt: stages every member onto whichever batch the store is
 /// forming, and takes that batch's fate as this attempt's. Members stage
 /// one at a time, each against the state the members before it left.
-async fn attempt_group<F>(
+async fn attempt_group<M>(
     db: &Store,
-    members: &[F],
+    members: &M,
     coalescer: &Arc<Coalescer>,
 ) -> Result<CommitOutcome>
 where
-    F: Fn(&mut Transaction) -> Result<()>,
+    M: group::StageOnto + ?Sized,
 {
     let staged = coalescer.stage(db, members).await?;
 
-    // A caller that staged nothing is not riding the batch and does not
-    // wait on it.
-    if !staged.contributed {
+    // A caller that staged nothing against committed state alone is not
+    // riding the batch and does not wait on it.
+    if !staged.rides {
         return Ok(CommitOutcome::Committed(staged.ids));
     }
 
@@ -1300,113 +1290,6 @@ enum Prepared {
     },
 }
 
-/// The inline shapes a batch wrote. Each carries its own format floor, and
-/// neither subsumes the other.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct InlineShapes {
-    /// A locator carrying its chunk's identity.
-    pub(crate) chunk_directory: bool,
-    /// A schema recorded as a reference to another version.
-    pub(crate) schema_reference: bool,
-}
-
-/// The format floor `state`'s index records require: deferred upkeep
-/// implies [`FORMAT_WITH_DEFERRED_INDEX`], a `building` index
-/// [`FORMAT_WITH_STAGED_INDEX`], and any other index [`FORMAT_WITH_INDEX`].
-/// The floor is the highest term that applies, never the first.
-pub(crate) fn index_format(state: &CatalogSnapshot) -> u64 {
-    let indexes = || state.indexes.values().flat_map(imbl::OrdMap::values);
-
-    [
-        indexes()
-            .any(|index| index.deferred_maintenance == Some(true))
-            .then_some(FORMAT_WITH_DEFERRED_INDEX),
-        indexes()
-            .any(|index| index.build_state.is_some())
-            .then_some(FORMAT_WITH_STAGED_INDEX),
-        state
-            .indexes
-            .values()
-            .any(|per_table| !per_table.is_empty())
-            .then_some(FORMAT_WITH_INDEX),
-    ]
-    .into_iter()
-    .flatten()
-    .max()
-    .unwrap_or(FORMAT_VERSION)
-}
-
-/// The format floor the inline shapes `wrote` require. Neither shape
-/// subsumes the other, so a batch writing both owes the higher.
-pub(crate) fn inline_format(wrote: InlineShapes) -> u64 {
-    [
-        wrote
-            .schema_reference
-            .then_some(FORMAT_WITH_INLINE_SCHEMA_REFERENCE),
-        wrote
-            .chunk_directory
-            .then_some(FORMAT_WITH_INLINE_CHUNK_IDENTITY),
-    ]
-    .into_iter()
-    .flatten()
-    .max()
-    .unwrap_or(FORMAT_VERSION)
-}
-
-/// The store format `state` requires once `wrote` is folded in.
-pub(crate) fn target_format(state: &CatalogSnapshot, wrote: InlineShapes) -> u64 {
-    index_format(state).max(inline_format(wrote))
-}
-
-/// The format-stamp write this commit owes, if any. The stamp is forward-only.
-async fn format_stamp(
-    db_tx: &CommitSession,
-    projections: &std::sync::RwLock<ProjectionCache>,
-    state: &CatalogSnapshot,
-    wrote: InlineShapes,
-) -> Result<Option<StagedWrite>> {
-    if format_floor(projections) >= MAX_FORMAT_VERSION {
-        return Ok(None);
-    }
-    format_stamp_to(db_tx.handle(), projections, target_format(state, wrote)).await
-}
-
-/// The forward-only format stamp write required to reach `target_format`.
-/// A target at or below the highest version this handle has seen owes no
-/// write and costs no read: the stamp only ever rises, so an observed
-/// version stays a valid floor.
-pub(crate) async fn format_stamp_to(
-    handle: ReadHandle<'_>,
-    projections: &std::sync::RwLock<ProjectionCache>,
-    target_format: u64,
-) -> Result<Option<StagedWrite>> {
-    if target_format <= FORMAT_VERSION || format_floor(projections) >= target_format {
-        return Ok(None);
-    }
-    let current = read::read_format(handle)
-        .await?
-        .map_or(FORMAT_VERSION, |format| format.format_version);
-    raise_format_floor(projections, current);
-    if current >= target_format {
-        return Ok(None);
-    }
-
-    info!(
-        from = current,
-        to = target_format,
-        "upgrading the store format stamp"
-    );
-
-    Ok(Some((
-        Key::Sys(SysKey::Format).encode(),
-        Some(value::encode_value(&proto::FormatValue {
-            format_version: target_format,
-            writer_version: env!("CARGO_PKG_VERSION").to_string(),
-            commit_log_batch_origin: None,
-        })),
-    )))
-}
-
 /// The `ducklake_schema_versions` record a schema-changing commit owes for
 /// one table. It outlives the snapshot record: an expired snapshot's data
 /// files still resolve their schema version through it.
@@ -1425,6 +1308,31 @@ pub(crate) fn schema_version_write(
             schema_version,
         })),
     )
+}
+
+/// The snapshot record a verb commit mints, carrying the change set in
+/// DuckLake's grammar plus the file-grain facts that grammar cannot name.
+fn snapshot_record(
+    snapshot_id: u64,
+    schema_version: u64,
+    (next_catalog_id, next_file_id): (u64, u64),
+    schema_changed_table_ids: Vec<u64>,
+    ours: &ChangeSet,
+) -> proto::SnapshotValue {
+    proto::SnapshotValue {
+        snapshot_id,
+        snapshot_time_micros: now_micros(),
+        schema_version,
+        next_catalog_id,
+        next_file_id,
+        changes_made: ours.to_changes_made(),
+        author: None,
+        commit_message: None,
+        commit_extra_info: None,
+        schema_changed_table_ids,
+        deleted_data_file_ids: ours.deleted_data_file_ids.iter().copied().collect(),
+        deletes_untargeted_files: ours.deletes_untargeted_files,
+    }
 }
 
 /// Runs the closure against `base` and stages the resulting writes.
@@ -1469,22 +1377,13 @@ where
     }
 
     // Entries stage before the entity diff so a poisoned definition rides
-    // that diff. The three reads touch disjoint subspaces, so they run
+    // that diff. The two reads touch disjoint subspaces, so they run
     // together.
     let index_entry_count = index_entries.len();
     let probe_scope = ProbeScope::of(&index_entries);
-    // This path records every schema whole; only the staged one writes a
-    // schema as a reference to another version.
-    let wrote_inline = InlineShapes {
-        chunk_directory: inline_ops
-            .iter()
-            .any(|operation| matches!(operation, inline::InlineStage::Insert { .. })),
-        schema_reference: false,
-    };
-    let (entries, inline_writes, format_write) = futures::try_join!(
+    let (entries, inline_writes) = futures::try_join!(
         index_maintenance::stage_index_entries(db_tx, index_entries),
         inline::stage_inline_writes(db_tx, projections, &inline_ops),
-        format_stamp(db_tx, projections, &state, wrote_inline),
     )?;
     probe_scope.report(&state, &entries.metrics);
     let poisoned = entries.poisoned;
@@ -1492,7 +1391,6 @@ where
 
     let mut writes = diff_writes(base, &state, new_id);
     writes.extend(inline_writes);
-    writes.extend(format_write);
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
     let schema_changed_table_ids: Vec<u64> = operations
         .iter()
@@ -1507,19 +1405,13 @@ where
     let ours = ChangeSet::from_operations(&operations);
     let changelog = changelog_writes(new_id, &writes);
 
-    let snapshot = proto::SnapshotValue {
-        snapshot_id: new_id,
-        snapshot_time_micros: now_micros(),
+    let snapshot = snapshot_record(
+        new_id,
         schema_version,
-        next_catalog_id,
-        next_file_id,
-        changes_made: ours.to_changes_made(),
-        author: None,
-        commit_message: None,
-        commit_extra_info: None,
+        (next_catalog_id, next_file_id),
         schema_changed_table_ids,
-        deleted_data_file_ids: ours.deleted_data_file_ids.iter().copied().collect(),
-    };
+        &ours,
+    );
     writes.extend(changelog);
     writes.push((
         Key::Snapshot {
@@ -1790,6 +1682,7 @@ pub(crate) async fn await_submitted(
     submitted: Submitted,
     projections: &std::sync::RwLock<ProjectionCache>,
     durability: &CommitDurability,
+    commits: usize,
 ) -> Result<Landed> {
     let Submitted {
         handle,
@@ -1798,7 +1691,7 @@ pub(crate) async fn await_submitted(
         durable_started,
         projection,
     } = submitted;
-    match await_durable(handle, "commit", staged_bytes, durability).await {
+    match await_durable(handle, "commit", staged_bytes, durability, commits).await {
         Ok(()) => {
             let durable = durable_started.elapsed();
             debug!(
@@ -1851,7 +1744,7 @@ pub(crate) async fn commit_batch(
     {
         Submission::LostRace => Ok(Landed::LostRace),
         Submission::Submitted(submitted) => {
-            await_submitted(submitted, landing.projections, durability).await
+            await_submitted(submitted, landing.projections, durability, 1).await
         }
     }
 }
@@ -1971,13 +1864,13 @@ impl ProbeScope {
 ///
 /// Returns one snapshot id per member, in member order. A group of one is
 /// the ordinary commit path.
-pub(crate) async fn commit_cycle<F>(
+pub(crate) async fn commit_cycle<M>(
     db: &Store,
-    members: &[F],
+    members: &M,
     coalescer: &Arc<Coalescer>,
 ) -> Result<Vec<SnapshotId>>
 where
-    F: Fn(&mut Transaction) -> Result<()>,
+    M: group::StageOnto + ?Sized,
 {
     let started = std::time::Instant::now();
     let mut first_head = None;
@@ -1994,7 +1887,7 @@ where
             CommitOutcome::Committed(ids) => {
                 tracing::debug!(
                     snapshot = ids.last().map(|id| id.get()),
-                    members = members.len(),
+                    members = ids.len(),
                     attempt,
                     elapsed_ms = crate::telemetry::milliseconds(started.elapsed()),
                     "commit landed"
@@ -2073,11 +1966,12 @@ async fn read_intervening_change(db: &Store, snapshot_id: u64) -> Result<(u64, C
             let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
             let mut change_set = ChangeSet::parse(&snapshot.changes_made);
             // `changes_made` names the tables deleted from; the record names
-            // the files, which classifies deletes at file grain.
+            // the files, which classifies deletes at file grain unless the
+            // commit also deleted rows no file names.
             if !snapshot.deleted_data_file_ids.is_empty() {
                 change_set.deleted_data_file_ids =
                     snapshot.deleted_data_file_ids.iter().copied().collect();
-                change_set.deletes_untargeted_files = false;
+                change_set.deletes_untargeted_files = snapshot.deletes_untargeted_files;
             }
             change_set
         }

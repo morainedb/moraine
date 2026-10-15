@@ -51,9 +51,9 @@ const WORKFLOWS: [&str; 3] = [
     ".github/workflows/debug-build.yml",
 ];
 
-/// The workflows whose hand-written `validate` matrix must cover every
-/// supported release.
-const VALIDATING_WORKFLOWS: [&str; 2] = [
+/// The workflows that build the extension, and so have to prove the build
+/// they produce.
+const BUILDING_WORKFLOWS: [&str; 2] = [
     ".github/workflows/extension.yml",
     ".github/workflows/release.yml",
 ];
@@ -116,8 +116,9 @@ pub fn check_pins() -> anyhow::Result<()> {
             ));
         }
         problems.extend(tools_ref_problem(file, &contents));
-        if VALIDATING_WORKFLOWS.contains(&file) {
-            problems.extend(validation_problems(file, &contents, &supported));
+        if BUILDING_WORKFLOWS.contains(&file) {
+            problems.extend(smoke_problem(file, &contents, pin));
+            problems.extend(build_version_problem(file, &contents, pin));
         }
     }
 
@@ -178,76 +179,31 @@ pub fn check_pins() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One entry of a workflow's `validate` matrix: the platform whose artifact
-/// it downloads, and the DuckDB version it smoke-tests.
-#[derive(Debug, PartialEq, Eq)]
-struct ValidationLeg<'a> {
-    platform: &'a str,
-    version: &'a str,
+/// The complaint that a workflow builds the extension without proving the
+/// build it produces.
+///
+/// The smoke runs inside the build rather than in a job of its own: the only
+/// CLI that can load the artifact is the one that build produces beside it,
+/// and no release carries the pinned version to download. A build that skips
+/// it says nothing about the bundled DuckLake.
+fn smoke_problem(file: &str, contents: &str, pin: &str) -> Option<String> {
+    let invocation = format!("validate-release-artifact {pin}");
+    let runs_smoke = contents.contains("post_build_command:") && contents.contains(&invocation);
+    (!runs_smoke).then(|| {
+        format!(
+            "{file} builds the extension without a `post_build_command` running \
+             `{invocation}`, so its build would pass unproven"
+        )
+    })
 }
 
-/// The legs a workflow's `validate` matrix lists.
-///
-/// An entry opens with `- runner:`, which only that matrix's `include` block
-/// writes; the build job names its version through a matrix expression
-/// rather than a literal, so it is not one of these.
-fn validation_legs(contents: &str) -> Vec<ValidationLeg<'_>> {
-    let mut legs: Vec<ValidationLeg> = Vec::new();
-    let mut platform = None;
-    for line in contents.lines().map(str::trim) {
-        if line.starts_with("- runner:") {
-            platform = None;
-        }
-        if let Some(value) = line.strip_prefix("platform:") {
-            platform = Some(value.trim());
-        }
-        if let Some(value) = line.strip_prefix("duckdb_version:") {
-            let version = value.trim();
-            if let (Some(platform), true) = (platform, version.starts_with('v')) {
-                legs.push(ValidationLeg { platform, version });
-            }
-        }
-    }
-    legs
-}
-
-/// Every supported release the `validate` matrix leaves out.
-///
-/// The build matrix is generated from the manifest but this one is written
-/// by hand, so adding a release publishes builds for it that the
-/// backfill-and-prune smoke never runs on — green, and unproven.
-fn validation_problems(file: &str, contents: &str, supported: &[String]) -> Vec<String> {
-    let legs = validation_legs(contents);
-    let mut platforms: Vec<&str> = Vec::new();
-    for leg in &legs {
-        if !platforms.contains(&leg.platform) {
-            platforms.push(leg.platform);
-        }
-    }
-
-    let mut problems = Vec::new();
-    for version in supported {
-        let validated: Vec<&str> = legs
-            .iter()
-            .filter(|leg| leg.version == version)
-            .map(|leg| leg.platform)
-            .collect();
-        if validated.is_empty() {
-            problems.push(format!(
-                "{file}'s validate matrix has no leg for DuckDB `{version}`, so its builds \
-                 would publish unproven"
-            ));
-            continue;
-        }
-        for platform in &platforms {
-            if !validated.contains(platform) {
-                problems.push(format!(
-                    "{file}'s validate matrix has no `{platform}` leg for DuckDB `{version}`"
-                ));
-            }
-        }
-    }
-    problems
+/// Distribution builds must override the checkout hash exported as DuckDB's
+/// version.
+fn build_version_problem(file: &str, contents: &str, pin: &str) -> Option<String> {
+    let setting = format!("\"DUCKDB_TAG\": \"{pin}\"");
+    (!contents.contains(&setting)).then(|| {
+        format!("{file} must forward `{setting}` through test_config to the build container")
+    })
 }
 
 /// The release build patches its bundled DuckLake from the list in
@@ -535,16 +491,6 @@ fn stale_versions(contents: &str, supported: &[String]) -> Vec<String> {
     found
 }
 
-/// The versions manifest as the JSON array the release workflows feed to
-/// their build matrix, printed to stdout.
-pub fn print_version_matrix() {
-    let entries: Vec<String> = supported_duckdb_versions()
-        .iter()
-        .map(|version| format!("\"{version}\""))
-        .collect();
-    println!("[{}]", entries.join(","));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,17 +582,55 @@ mod tests {
         assert!(!ducklake_commit_matches(commit, "not-a-commit"));
     }
 
-    /// The checked-in workflows validate every release the manifest lists.
+    /// Every checked-in workflow that builds the extension proves the build.
     #[test]
-    fn every_supported_release_has_a_validate_leg() {
-        let supported = supported_duckdb_versions();
-        for file in VALIDATING_WORKFLOWS {
+    fn every_building_workflow_runs_the_release_smoke() {
+        for file in BUILDING_WORKFLOWS {
             let contents = read(file).expect("reading the workflow");
-            assert_eq!(
-                validation_problems(file, &contents, &supported),
-                Vec::<String>::new()
-            );
+            assert_eq!(smoke_problem(file, &contents, duckdb_pin()), None);
         }
+    }
+
+    #[test]
+    fn distribution_builds_stamp_the_version_instead_of_the_checkout_hash() {
+        for file in BUILDING_WORKFLOWS {
+            let contents = read(file).expect("reading the workflow");
+            assert_eq!(build_version_problem(file, &contents, duckdb_pin()), None);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_build_tag_overrides_the_ci_checkout_version() {
+        // The pins job runs this with submodules; Rust-only checkouts omit them.
+        if !workspace_root()
+            .join("extension-ci-tools/makefiles/duckdb_extension.Makefile")
+            .is_file()
+        {
+            return;
+        }
+        let commit = primary_submodule_pins()
+            .into_iter()
+            .find(|(name, _)| name == "duckdb")
+            .expect("pinned DuckDB checkout")
+            .1;
+        let output = Command::new("make")
+            .args(["--dry-run", "release"])
+            .env("DUCKDB_VERSION", commit)
+            .env("DUCKDB_TAG", duckdb_pin())
+            .current_dir(workspace_root())
+            .output()
+            .expect("running make");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let command = String::from_utf8(output.stdout).expect("make command text");
+        assert!(
+            command.contains(&format!("-DDUCKDB_EXPLICIT_VERSION={}", duckdb_pin())),
+            "{command}"
+        );
     }
 
     /// The patch task targets the release the manifest calls primary.
@@ -693,62 +677,24 @@ mod tests {
         assert!(problem.contains("`v1.5.5`"), "{problem}");
     }
 
-    fn validate_matrix(versions: &[&str]) -> String {
-        let mut lines = vec![
-            "  validate:".to_owned(),
-            "    strategy:".to_owned(),
-            "      matrix:".to_owned(),
-            "        include:".to_owned(),
-        ];
-        for platform in ["linux_amd64", "osx_arm64"] {
-            for version in versions {
-                lines.push("          - runner: a-runner".to_owned());
-                lines.push(format!("            platform: {platform}"));
-                lines.push(format!("            duckdb_version: {version}"));
-            }
-        }
-        // The build job, whose version is a matrix expression.
-        lines.push("      duckdb_version: ${{ matrix.duckdb_version }}".to_owned());
-        format!("{}\n", lines.join("\n"))
-    }
-
     #[test]
-    fn a_validate_matrix_covering_every_release_on_every_platform_is_accepted() {
-        let supported = vec!["v1.5.6".to_string(), "v1.5.5".to_string()];
-        let workflow = validate_matrix(&["v1.5.6", "v1.5.5"]);
-        assert_eq!(validation_legs(&workflow).len(), 4);
-        assert_eq!(
-            validation_problems("w.yml", &workflow, &supported),
-            Vec::<String>::new()
-        );
-    }
+    fn a_build_without_the_smoke_is_a_problem() {
+        let with_smoke = "      post_build_command: >-\n        cargo run -q -p xtask -- \
+                          validate-release-artifact v9.9.9 build/x\n";
+        assert_eq!(smoke_problem("w.yml", with_smoke, "v9.9.9"), None);
 
-    /// The failure this exists for: a bump moves the primary into the
-    /// hand-written matrix and the release it replaced keeps no leg.
-    #[test]
-    fn a_release_the_validate_matrix_leaves_out_is_a_problem() {
-        let supported = vec!["v1.5.6".to_string(), "v1.5.5".to_string()];
-        let problems = validation_problems("w.yml", &validate_matrix(&["v1.5.6"]), &supported);
-        assert_eq!(problems.len(), 1);
+        let problem = smoke_problem("w.yml", "      enable_rust: true\n", "v9.9.9")
+            .expect("a build with no smoke is a problem");
         assert!(
-            problems[0].contains("no leg for DuckDB `v1.5.5`"),
-            "{problems:?}"
+            problem.contains("validate-release-artifact v9.9.9"),
+            "{problem}"
         );
-    }
 
-    /// One platform's leg missing is not covered by the other's.
-    #[test]
-    fn a_release_validated_on_one_platform_only_is_a_problem() {
-        let supported = vec!["v1.5.6".to_string()];
-        let workflow = "        include:\n          - runner: a-runner\n            \
-                        platform: linux_amd64\n            duckdb_version: v1.5.6\n          \
-                        - runner: another\n            platform: osx_arm64\n            \
-                        duckdb_version: v1.5.5\n";
-        let problems = validation_problems("w.yml", workflow, &supported);
-        assert_eq!(
-            problems,
-            vec!["w.yml's validate matrix has no `osx_arm64` leg for DuckDB `v1.5.6`".to_string()]
-        );
+        // The smoke names the version it loads, so a stale invocation left
+        // behind by a bump reads as missing rather than passing.
+        let problem = smoke_problem("w.yml", with_smoke, "v9.9.10")
+            .expect("a smoke for another version is a problem");
+        assert!(problem.contains("v9.9.10"), "{problem}");
     }
 
     #[test]

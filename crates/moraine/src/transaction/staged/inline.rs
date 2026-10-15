@@ -660,30 +660,23 @@ pub(super) fn inline_schema_collapse_target(
 /// are retained for as long as their table lives, and a mint that changed
 /// no column writes the same bytes again, so this is what keeps the
 /// retention from growing with every mint.
-///
-/// A reference is a shape an older reader would decode as a schema with
-/// no columns, so the batch that writes one carries the store to the
-/// format that shuts those readers out — the same way a live index or an
-/// inline chunk locator carries it to theirs. Reports whether it wrote
-/// one, which is what owes that stamp.
 async fn translate_inline_schema_drop(
     db_tx: &CommitSession,
     table_id: u64,
     schema_version: u64,
     writes: &mut Vec<commit::StagedWrite>,
-) -> Result<bool> {
+) -> Result<()> {
     writes.push(inline_schema_drop_write(table_id, schema_version));
 
     let schemas = store_inline::scan_inline_schemas(db_tx.handle(), table_id).await?;
-    let Some(target) = inline_schema_collapse_target(&schemas, schema_version) else {
-        return Ok(false);
-    };
-    writes.push(inline_schema_reference_write(
-        table_id,
-        schema_version,
-        target,
-    ));
-    Ok(true)
+    if let Some(target) = inline_schema_collapse_target(&schemas, schema_version) {
+        writes.push(inline_schema_reference_write(
+            table_id,
+            schema_version,
+            target,
+        ));
+    }
+    Ok(())
 }
 
 /// Clears a version's drop marker, so registering it again cannot leave
@@ -760,7 +753,7 @@ pub(super) async fn translate_inline(
     db_tx: &CommitSession,
     projections: &std::sync::RwLock<ProjectionCache>,
     ops: &[RowOperation],
-) -> Result<(Vec<commit::StagedWrite>, bool, DrainedRows)> {
+) -> Result<(Vec<commit::StagedWrite>, DrainedRows)> {
     let mut writes = Vec::new();
     let mut chunk_seqs = ChunkSeqAllocator::default();
     // One existence marker per table per commit.
@@ -800,7 +793,6 @@ pub(super) async fn translate_inline(
         .collect();
     let scoped = stream::iter(table_scoped.into_iter().map(|op| async move {
         let mut writes = Vec::new();
-        let mut referenced = false;
         let mut drained = None;
         match op {
             RowOperation::InlineFlushDelete {
@@ -829,13 +821,12 @@ pub(super) async fn translate_inline(
                 table_id,
                 schema_version,
             } => {
-                referenced =
-                    translate_inline_schema_drop(db_tx, *table_id, *schema_version, &mut writes)
-                        .await?;
+                translate_inline_schema_drop(db_tx, *table_id, *schema_version, &mut writes)
+                    .await?;
             }
             _ => {}
         }
-        Ok::<_, Error>((writes, referenced, drained))
+        Ok::<_, Error>((writes, drained))
     }))
     .buffer_unordered(INLINE_TRANSLATION_CONCURRENCY)
     .try_collect::<Vec<_>>();
@@ -930,11 +921,9 @@ pub(super) async fn translate_inline(
         }
     }
 
-    let mut uses_schema_reference = false;
     let mut drained: DrainedRows = DrainedRows::new();
-    for (scoped, referenced, flushed) in scoped_writes {
+    for (scoped, flushed) in scoped_writes {
         writes.extend(scoped);
-        uses_schema_reference |= referenced;
         // DuckLake names a drain twice, once as the flush finalizes and
         // once more at commit; the fuller of the two stands.
         if let Some((version, rows)) = flushed {
@@ -945,5 +934,5 @@ pub(super) async fn translate_inline(
         }
     }
 
-    Ok((writes, uses_schema_reference, drained))
+    Ok((writes, drained))
 }

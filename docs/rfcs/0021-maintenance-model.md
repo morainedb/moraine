@@ -428,8 +428,8 @@ Three properties the scheduler must hold:
   overflow, and overwrites it. The status write is a separate durable SlateDB
   transaction after the pass: it mints no DuckLake snapshot, does not move
   `sys/head`, and therefore neither invalidates a catalog view nor appears in
-  time travel. The first write lazily stamps additive format 5 so older
-  binaries, which would otherwise silently omit the record, refuse the store.
+  time travel. The minimum readable format already includes this record,
+  so status writes do not stamp the format.
   A status-write failure is logged and does not rewrite the outcome of the
   maintenance work that already completed.
 

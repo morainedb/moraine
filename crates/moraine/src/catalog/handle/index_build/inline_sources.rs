@@ -2,7 +2,7 @@
 
 use arrow::datatypes::SchemaRef;
 
-use super::{ColumnId, Error, InlineBuildCursorValue, Result, StepBuffer, backfill};
+use super::{ColumnId, EntrySink, Error, InlineBuildCursorValue, Result, backfill};
 use crate::{
     catalog::TableId,
     data_file,
@@ -16,11 +16,11 @@ use crate::{
     },
 };
 
-pub(super) async fn stream_inline_sources(
+pub(in crate::catalog::handle) async fn stream_inline_sources(
     source: backfill::BackfillSource<'_>,
     columns: &[ColumnId],
     legacy_cursor: Option<u64>,
-    buffer: &mut StepBuffer<'_>,
+    sink: &mut (impl EntrySink + Send),
 ) -> Result<()> {
     let backfill::BackfillSource {
         snapshot,
@@ -28,7 +28,7 @@ pub(super) async fn stream_inline_sources(
         handle,
     } = source;
     let positions = snapshot.column_positions(table, columns)?;
-    let initial_cursor = buffer.inline_cursor;
+    let initial_cursor = sink.inline_cursor();
     let mut chunks = InlineChunks::open(handle, table.get(), initial_cursor.as_ref()).await?;
     let mut schema = None;
     while let Some((operation, chunk)) = chunks.next().await? {
@@ -68,9 +68,7 @@ pub(super) async fn stream_inline_sources(
                 "inline chunk row count disagrees with its body".into(),
             ));
         }
-        buffer.peak_inline_body_bytes = buffer.peak_inline_body_bytes.max(chunk.body.len());
-        buffer.peak_inline_decoded_bytes =
-            buffer.peak_inline_decoded_bytes.max(rows.decoded_bytes());
+        sink.record_inline_peaks(chunk.body.len(), rows.decoded_bytes());
         let end = chunk
             .row_id_start
             .checked_add(chunk.row_count.saturating_sub(1))
@@ -84,9 +82,9 @@ pub(super) async fn stream_inline_sources(
                 .await?
                 .is_some_and(|end| begin_snapshot < end);
             if !dead && legacy_cursor.is_none_or(|cursor| entry.row_id > cursor) {
-                buffer.push_values(entry.row_id, &entry.values).await?;
+                sink.push_values(entry.row_id, &entry.values).await?;
             }
-            buffer.inline_cursor = Some(InlineBuildCursorValue {
+            sink.set_inline_cursor(InlineBuildCursorValue {
                 schema_version,
                 begin_snapshot,
                 chunk_seq,

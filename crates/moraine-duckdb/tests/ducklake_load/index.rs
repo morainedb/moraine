@@ -2,20 +2,20 @@ use std::fmt::Write;
 
 use crate::helpers::*;
 
+mod delete_rewrite;
+mod native_ddl;
+mod predicates;
 mod prepared;
+mod pushdown;
 mod schema_evolution;
 mod selective;
+mod verify;
 mod wide_filter;
 
-/// The equality-index SQL surface end to end: `moraine_index_create`
-/// backfills an index over existing data by scoped-reading the table's
-/// Parquet from `DATA_PATH` (autonomous commit), `moraine_indexes` lists it,
-/// `moraine_index_lookup` resolves a value to its row, and
-/// `moraine_index_drop` removes it — each through a fresh attach, so the
-/// definition and entries round-trip through the persisted store.
+/// Native DDL backfills, persists, and drops an index across fresh attaches.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_index_functions_create_list_lookup_and_drop() {
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn native_index_ddl_backfills_persists_and_drops() {
     let store = TempDir::new("index-fns-store");
     let data = TempDir::new("index-fns-data");
     // DATA_PATH is declared once, at attach: DuckLake's own `DATA_PATH`
@@ -30,7 +30,7 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
 
     // Create a unique index over the existing rows — backfilled by the
     // scoped read of the DATA_PATH files, no DATA_PATH argument.
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     let listed = csv_rows(&run(
         "SELECT index_name, is_unique FROM moraine_indexes('lake', 'main', 't');",
@@ -64,7 +64,7 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
          moraine_index_lookup('lake', 'main', 't', 'by_a', 9999);"));
     assert_eq!(miss, vec![vec!["0".to_string()]], "value 9999 is absent");
 
-    run("CALL moraine_index_drop('lake', 'main', 't', 'by_a');");
+    run("DROP INDEX lake.main.by_a;");
     let after = csv_rows(&run(
         "SELECT count(*) FROM moraine_indexes('lake', 'main', 't');",
     ));
@@ -79,7 +79,7 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
 /// must turn that exact zero-row input into an empty result before DuckLake
 /// opens the table's Parquet files for the surrounding row-id join.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn absent_index_lookup_eliminates_the_ducklake_scan() {
     let store = TempDir::new("index-empty-result-store");
     let data = TempDir::new("index-empty-result-data");
@@ -90,7 +90,7 @@ fn absent_index_lookup_eliminates_the_ducklake_scan() {
     // More than DuckLake's inline threshold, so a scan would have to open a
     // real Parquet file and report it in the analyzed plan.
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // Prepared callers supply a different key on each execution. The rewrite
     // must therefore see the execution-time bind, not rely on a literal in
@@ -101,7 +101,7 @@ fn absent_index_lookup_eliminates_the_ducklake_scan() {
            ON hits.row_id = data.rowid; \
          EXPLAIN ANALYZE EXECUTE absent_lookup(9999);");
     assert!(
-        plan.contains("EMPTY_RESULT"),
+        plan.contains("Empty Result"),
         "the known-empty lookup did not eliminate the join:\n{plan}"
     );
     assert!(
@@ -114,7 +114,7 @@ fn absent_index_lookup_eliminates_the_ducklake_scan() {
 /// from SQL: the variadic values, in the index's column order, pin the one
 /// matching row, and an absent key resolves to none.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_lookup_resolves_a_composite_key() {
     let store = TempDir::new("index-composite-store");
     let data = TempDir::new("index-composite-data");
@@ -125,7 +125,7 @@ fn moraine_index_lookup_resolves_a_composite_key() {
     // Rows 0 and 1 share a=5; only (a, b) together are unique.
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t VALUES (5, 'x'), (5, 'y'), (7, 'x');");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_ab', ['a', 'b'], true);");
+    run("CREATE UNIQUE INDEX by_ab ON lake.main.t(a,b);");
 
     // The full key (5, 'y') pins exactly the second row.
     assert_eq!(
@@ -156,7 +156,7 @@ fn moraine_index_lookup_resolves_a_composite_key() {
 /// The batched equality surface implements SQL `IN` over one-column and
 /// composite indexes, including duplicate, absent, NULL, and empty keys.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_in_resolves_a_list_of_keys() {
     let store = TempDir::new("index-in-store");
     let data = TempDir::new("index-in-data");
@@ -165,8 +165,8 @@ fn moraine_index_in_resolves_a_list_of_keys() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t VALUES (5, 'x'), (5, 'y'), (7, 'x');");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], false);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_ab', ['a', 'b'], true);");
+    run("CREATE INDEX by_a ON lake.main.t(a);");
+    run("CREATE UNIQUE INDEX by_ab ON lake.main.t(a,b);");
 
     assert_eq!(
         csv_rows(&run("SELECT row_id FROM moraine_index_in(\
@@ -197,7 +197,7 @@ fn moraine_index_in_resolves_a_list_of_keys() {
 /// its leading columns: a leading-column equality window (a one-field tuple),
 /// a full-tuple window, and a half-open window with a NULL open side.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_range_spans_a_composite_window() {
     let store = TempDir::new("index-composite-range-store");
     let data = TempDir::new("index-composite-range-data");
@@ -206,7 +206,7 @@ fn moraine_index_range_spans_a_composite_window() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t VALUES (5, 'x'), (5, 'y'), (7, 'x');");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_ab', ['a', 'b'], true);");
+    run("CREATE UNIQUE INDEX by_ab ON lake.main.t(a,b);");
 
     // a = 5 as a one-field tuple bound: both rows sharing the leading value.
     assert_eq!(
@@ -237,7 +237,7 @@ fn moraine_index_range_spans_a_composite_window() {
 /// window over the same index the lookup uses — closed, open, and half-open
 /// (a NULL bound is an open side).
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_range_selects_a_comparison_window() {
     let store = TempDir::new("index-range-store");
     let data = TempDir::new("index-range-data");
@@ -247,7 +247,7 @@ fn moraine_index_range_selects_a_comparison_window() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // BETWEEN 10 AND 20, both inclusive: values 10..=20 -> 11 rows.
     assert_eq!(
@@ -304,12 +304,10 @@ fn moraine_index_range_selects_a_comparison_window() {
     );
 }
 
-/// A descending index created via the `directions := ['desc']` named
-/// parameter answers both a range window and an equality lookup — the
-/// per-column direction rides `moraine_index_create` into the stored order.
+/// Native direction options preserve range and equality lookups.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_index_create_descending_answers_range_and_lookup() {
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn native_index_create_descending_answers_range_and_lookup() {
     let store = TempDir::new("index-desc-store");
     let data = TempDir::new("index-desc-data");
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
@@ -318,9 +316,13 @@ fn moraine_index_create_descending_answers_range_and_lookup() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run(
-        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, \
-         directions := ['desc']);",
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a) \
+         WITH (directions = '[desc]');");
+
+    assert_eq!(
+        count("SELECT row_id FROM moraine_index_range('lake','main','t','by_a',10,12,true,true);"),
+        vec![vec!["12"], vec!["11"], vec!["10"]],
+        "native options persist descending key order"
     );
 
     // A descending index answers a closed value window: 10..=20 -> 11 rows.
@@ -342,13 +344,10 @@ fn moraine_index_create_descending_answers_range_and_lookup() {
     );
 }
 
-/// A NULLS FIRST index created via `nulls := ['first']`: the placement rides
-/// into the stored key's null flag, and the same flag is used when encoding a
-/// query bound — so values still resolve, proving the parameter threads
-/// through both the entry and the query paths.
+/// Native NULL-placement options preserve value lookups.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_index_create_nulls_first_still_resolves_values() {
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn native_index_create_nulls_first_still_resolves_values() {
     let store = TempDir::new("index-nulls-store");
     let data = TempDir::new("index-nulls-data");
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
@@ -357,14 +356,20 @@ fn moraine_index_create_nulls_first_still_resolves_values() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run(
-        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, \
-         directions := ['desc'], nulls := ['first']);",
-    );
+    run("INSERT INTO lake.main.t VALUES (NULL, 'x');");
+    run("CREATE INDEX by_a ON lake.main.t(b,a) \
+         WITH (directions = '[asc,desc]', nulls = '[last,first]');");
 
     assert_eq!(
         count(
-            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"
+            "SELECT row_id FROM moraine_index_range('lake','main','t','by_a','x','x',true,true) LIMIT 2;"
+        ),
+        vec![vec!["100"], vec!["99"]],
+        "native options place NULL before descending non-null keys"
+    );
+    assert_eq!(
+        count(
+            "SELECT count(DISTINCT row_id) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 'x', 42);"
         ),
         vec![vec!["1".to_string()]],
         "a NULLS FIRST index still resolves an equality lookup"
@@ -372,7 +377,7 @@ fn moraine_index_create_nulls_first_still_resolves_values() {
     assert_eq!(
         count(
             "SELECT count(DISTINCT row_id) FROM \
-             moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, true, true);"
+             moraine_index_range('lake', 'main', 't', 'by_a', row('x',10), row('x',20), true, true);"
         ),
         vec![vec!["11".to_string()]],
         "a NULLS FIRST index still answers a range window"
@@ -384,7 +389,7 @@ fn moraine_index_create_nulls_first_still_resolves_values() {
 /// a unique index admits multiple NULL rows — both a bulk (Parquet) and an
 /// inline NULL are covered.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_nulls_finds_null_rows() {
     let store = TempDir::new("index-isnull-store");
     let data = TempDir::new("index-isnull-data");
@@ -397,7 +402,7 @@ fn moraine_index_nulls_finds_null_rows() {
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(98) t(i);");
     run("INSERT INTO lake.main.t VALUES (NULL, 'n1'), (NULL, 'n2');");
     // A unique index must accept the two NULL rows (SQL treats NULLs distinct).
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // a IS NULL resolves to exactly the two NULL rows.
     assert_eq!(
@@ -430,7 +435,7 @@ fn moraine_index_nulls_finds_null_rows() {
 /// maintained by the staged commit scoped-reading the new Parquet from
 /// `DATA_PATH`, and a duplicate INSERT is rejected on the unique index.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_maintained_on_bulk_insert() {
     let store = TempDir::new("index-maint-store");
     let data = TempDir::new("index-maint-data");
@@ -439,7 +444,7 @@ fn moraine_index_maintained_on_bulk_insert() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // A bulk INSERT after create is maintained by the staged commit.
     run("INSERT INTO lake.main.t SELECT i, 'y' FROM range(100, 200) t(i);");
@@ -504,7 +509,7 @@ fn moraine_index_maintained_on_bulk_insert() {
 /// residences — an inlined row and a row in a flushed Parquet file —
 /// and the replace-in-one-transaction shape a writer depends on.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_entries_are_removed_by_delete() {
     let store = TempDir::new("index-delete-store");
     let data = TempDir::new("index-delete-data");
@@ -514,7 +519,7 @@ fn moraine_index_entries_are_removed_by_delete() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // A row in the flushed Parquet file: deleting it frees its value.
     run("DELETE FROM lake.main.t WHERE a = 42;");
@@ -583,7 +588,7 @@ fn moraine_index_entries_are_removed_by_delete() {
 /// the index with `DATA_PATH` alone, and even with no data-path option at
 /// all (DuckLake reads the root moraine serves).
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_data_path_persists_across_attach() {
     let store = TempDir::new("index-persist-store");
     let data = TempDir::new("index-persist-data");
@@ -593,7 +598,7 @@ fn moraine_index_data_path_persists_across_attach() {
     let create = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
     create("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     create("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    create("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    create("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // Re-attach with DATA_PATH only (no META_DATA_PATH): a bulk INSERT
     // (a Parquet file, not inline) is maintained by scoped-reading it from
@@ -645,7 +650,7 @@ fn moraine_index_data_path_persists_across_attach() {
 /// clear error, not a crash — the handle downcast behind the index
 /// functions is unchecked, so the kind is verified first.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_functions_reject_a_non_moraine_catalog() {
     let store = TempDir::new("index-badcat-store");
     let data = TempDir::new("index-badcat-data");
@@ -655,7 +660,7 @@ fn moraine_index_functions_reject_a_non_moraine_catalog() {
         store.path(),
         data.path(),
         "",
-        "CALL moraine_index_create('memory', 'main', 't', 'by_a', ['a'], true);",
+        "SELECT * FROM moraine_indexes('memory', 'main', 't');",
     );
     assert!(
         !out.status.success(),
@@ -676,7 +681,7 @@ fn moraine_index_functions_reject_a_non_moraine_catalog() {
 /// looks up, and an inline duplicate of it is rejected — proving the
 /// inline Arrow encoding and the Parquet encoding derive the same key.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_uuid_across_paths_and_lookup() {
     const KNOWN: &str = "550e8400-e29b-41d4-a716-446655440000";
     let store = TempDir::new("index-uuid-store");
@@ -692,7 +697,7 @@ fn moraine_index_uuid_across_paths_and_lookup() {
              CASE WHEN i = 0 THEN '{KNOWN}'::UUID ELSE gen_random_uuid() END, 'x' \
          FROM range(20) t(i);"
     ));
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_id', ['id'], true);");
+    run("CREATE UNIQUE INDEX by_id ON lake.main.t(id);");
 
     // The Parquet-stored UUID is found by an equality lookup.
     let hit = csv_rows(&run(&format!(
@@ -733,7 +738,7 @@ fn moraine_index_uuid_across_paths_and_lookup() {
 /// path must derive the same millisecond count — so backfill succeeds and
 /// a cross-path duplicate is rejected.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_millisecond_timestamp() {
     let store = TempDir::new("index-ts-store");
     let data = TempDir::new("index-ts-data");
@@ -748,7 +753,7 @@ fn moraine_index_millisecond_timestamp() {
          FROM range(20) t(i);");
     // Before the fix this failed: the scoped read downcast the millisecond
     // column as microseconds.
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_ts', ['ts'], true);");
+    run("CREATE UNIQUE INDEX by_ts ON lake.main.t(ts);");
 
     // An inline (single-row) INSERT duplicating row 0's timestamp is
     // rejected: the inline path derives the same millisecond key.
@@ -769,7 +774,7 @@ fn moraine_index_millisecond_timestamp() {
 /// DuckDB stores it as a lossy double in Parquet, so it cannot be a
 /// faithful equality index (a silently wrong one would be worse).
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_rejects_hugeint() {
     let store = TempDir::new("index-hugeint-store");
     let data = TempDir::new("index-hugeint-data");
@@ -784,7 +789,7 @@ fn moraine_index_rejects_hugeint() {
         store.path(),
         data.path(),
         &meta,
-        "CALL moraine_index_create('lake', 'main', 't', 'by_big', ['big'], true);",
+        "CREATE UNIQUE INDEX by_big ON lake.main.t(big);",
     );
     assert!(
         !out.status.success(),
@@ -803,7 +808,7 @@ fn moraine_index_rejects_hugeint() {
 /// an empty table — but a later bulk INSERT is refused rather than
 /// silently leaving the index under-covered.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_bulk_insert_without_a_data_store_is_refused() {
     let store = TempDir::new("index-nostore-store");
     let data = TempDir::new("index-nostore-data");
@@ -814,7 +819,7 @@ fn moraine_index_bulk_insert_without_a_data_store_is_refused() {
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     // An index on the still-empty table needs no scoped read, so it is
     // created fine.
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // A bulk INSERT registers a Parquet file that would need scoped-reading
     // to maintain the index; with no store, the commit is refused.
@@ -839,7 +844,7 @@ fn moraine_index_bulk_insert_without_a_data_store_is_refused() {
 /// UPDATE and both compaction shapes write per-row-id files; the index
 /// tracks every move, and a rebuilt index backfills them.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_survives_update_and_compaction() {
     let store = TempDir::new("index-rewrite-store");
     let data = TempDir::new("index-rewrite-data");
@@ -854,7 +859,7 @@ fn moraine_index_survives_update_and_compaction() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // UPDATE writes a per-row-id file (delete plus re-insert under
     // preserved ids); the unchanged key still resolves exactly once.
@@ -908,8 +913,8 @@ fn moraine_index_survives_update_and_compaction() {
     assert_eq!(lookup_count(7), vec![vec!["1".to_string()]]);
 
     // Rebuild: backfill must read the per-row-id files.
-    run("CALL moraine_index_drop('lake', 'main', 't', 'by_a');");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("DROP INDEX lake.main.by_a;");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     assert_eq!(lookup_count(150), vec![vec!["1".to_string()]]);
     assert_eq!(
         lookup_count(1),
@@ -940,7 +945,7 @@ fn total_files_read(plan: &str) -> u64 {
 /// filters arrive after DuckLake has built its file list, and null-safe
 /// equality generates none at all.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_located_join_reads_only_the_file_holding_the_row() {
     let store = TempDir::new("index-locate-prune-store");
     let data = TempDir::new("index-locate-prune-data");
@@ -996,7 +1001,7 @@ fn a_located_join_reads_only_the_file_holding_the_row() {
 /// restriction must admit both, or the scan reads only the copy DuckLake
 /// then adjudicates away and the join returns nothing.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_located_join_follows_a_row_updated_out_of_its_file() {
     let store = TempDir::new("index-locate-inline-store");
     let data = TempDir::new("index-locate-inline-data");
@@ -1008,7 +1013,7 @@ fn a_located_join_follows_a_row_updated_out_of_its_file() {
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'from-file' FROM range(100) t(i);");
     run("CALL ducklake_flush_inlined_data('lake');");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     run("UPDATE lake.main.t SET b = 'now-inlined' WHERE a = 42;");
 
     assert_eq!(
@@ -1040,7 +1045,7 @@ fn a_located_join_follows_a_row_updated_out_of_its_file() {
 /// in the plan, so a reused plan would answer with another key's row rather
 /// than fail.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_prepared_located_join_resolves_each_key_it_is_executed_with() {
     let store = TempDir::new("index-locate-prepared-store");
     let data = TempDir::new("index-locate-prepared-data");
@@ -1058,7 +1063,7 @@ fn a_prepared_located_join_resolves_each_key_it_is_executed_with() {
             start + 100
         ));
     }
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     // Update files spanning the whole id range, so a plan that resolved
     // nothing would have every file to read.
     for key in [10, 11, 12] {
@@ -1118,7 +1123,7 @@ fn populate_files_spanning_row_ids(run: &dyn Fn(&str) -> String) {
             start + 100
         ));
     }
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     for key in [10, 11, 12] {
         run(&format!(
             "UPDATE lake.main.t SET b = 'updated' WHERE a IN ({key}, {}, {});",
@@ -1132,7 +1137,7 @@ fn populate_files_spanning_row_ids(run: &dyn Fn(&str) -> String) {
 /// than a comparison join, so the located restriction must reach that shape
 /// too: without it the delete reads every file the row-id statistics admit.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_located_delete_reads_only_the_file_holding_the_row() {
     let store = TempDir::new("index-locate-delete-store");
     let data = TempDir::new("index-locate-delete-data");
@@ -1165,7 +1170,7 @@ fn a_located_delete_reads_only_the_file_holding_the_row() {
 /// An UPDATE binds its FROM join the same way a DELETE binds USING, and
 /// needs the same restriction.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_located_update_reads_only_the_file_holding_the_row() {
     let store = TempDir::new("index-locate-update-store");
     let data = TempDir::new("index-locate-update-data");
@@ -1199,7 +1204,7 @@ fn a_located_update_reads_only_the_file_holding_the_row() {
 /// An EXISTS probe flattens to a semi join, which a hash join's runtime
 /// filters never reach; the located restriction is all the pruning it gets.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_located_exists_probe_reads_only_the_file_holding_the_row() {
     let store = TempDir::new("index-locate-exists-store");
     let data = TempDir::new("index-locate-exists-data");
@@ -1233,7 +1238,7 @@ fn a_located_exists_probe_reads_only_the_file_holding_the_row() {
 /// checked against each file's constant id rather than per row, so it stays
 /// worthwhile at widths where a row-id list would be a scan in disguise.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn a_wide_located_probe_still_prunes_by_file_id() {
     let store = TempDir::new("index-locate-wide-store");
     let data = TempDir::new("index-locate-wide-data");
@@ -1251,7 +1256,7 @@ fn a_wide_located_probe_still_prunes_by_file_id() {
         write!(inserts, "INSERT INTO lake.main.t VALUES ({i}, 'x');").unwrap();
     }
     run(&inserts);
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // The keys span the whole table with a gap in the middle, so a min/max
     // row-id filter admits every file and only file identity can exclude
@@ -1286,7 +1291,7 @@ fn a_wide_located_probe_still_prunes_by_file_id() {
 /// catalog, so resolution matches attached databases on path — the same
 /// resolver the maintenance functions use.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_functions_resolve_a_custom_metadata_catalog() {
     let store = TempDir::new("index-custom-meta-store");
     let data = TempDir::new("index-custom-meta-data");
@@ -1298,7 +1303,7 @@ fn moraine_index_functions_resolve_a_custom_metadata_catalog() {
 
     run("CREATE TABLE lake.main.t(a BIGINT);\
          INSERT INTO lake.main.t SELECT i FROM range(6) t(i);\
-         SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],true);");
+         CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // Addressed by the lake name, whose metadata catalog shares no name
     // with it.
@@ -1323,7 +1328,7 @@ fn moraine_index_functions_resolve_a_custom_metadata_catalog() {
         vec![vec!["by_a".to_string()]]
     );
 
-    run("SELECT * FROM moraine_index_drop('lake','main','t','by_a');");
+    run("DROP INDEX lake.main.by_a;");
     assert!(
         csv_rows(&run(
             "SELECT index_name FROM moraine_indexes('lake','main','t');"
@@ -1338,8 +1343,8 @@ fn moraine_index_functions_resolve_a_custom_metadata_catalog() {
 /// introspection view reports it built, and a later duplicate is refused
 /// exactly as a single-commit build's index would refuse it.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_index_create_staged_builds_over_existing_data() {
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn native_index_create_staged_builds_over_existing_data() {
     let store = TempDir::new("index-staged-store");
     let data = TempDir::new("index-staged-data");
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
@@ -1347,7 +1352,7 @@ fn moraine_index_create_staged_builds_over_existing_data() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(500) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, staged := true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a) WITH (staged = true);");
 
     // The build finished: not building, and the backfilled rows resolve.
     assert_eq!(
@@ -1413,7 +1418,7 @@ fn moraine_index_create_staged_builds_over_existing_data() {
 /// the table carries no index, which is why the uninindexed flush tests in
 /// `inline.rs` pass either way.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn flushing_an_indexed_table_with_deleted_inlined_rows() {
     let store = TempDir::new("index-flush-store");
     let data = TempDir::new("index-flush-data");
@@ -1421,7 +1426,7 @@ fn flushing_an_indexed_table_with_deleted_inlined_rows() {
     let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
 
     // Under the inlining limit, so these land as inlined rows rather than
     // a Parquet file.
@@ -1486,7 +1491,7 @@ fn flushing_an_indexed_table_with_deleted_inlined_rows() {
 /// returns row ids directly, so a leaked entry still appears there even
 /// though the ordinary DuckLake join would filter it as a missing row.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_entries_survive_the_data_file_lifecycle() {
     let store = TempDir::new("index-lifecycle-store");
     let data = TempDir::new("index-lifecycle-data");
@@ -1501,7 +1506,7 @@ fn moraine_index_entries_survive_the_data_file_lifecycle() {
 
     run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
     run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a);");
     run("DELETE FROM lake.main.t WHERE a IN (1, 2, 3);");
 
     // The rewrite ends the source into history and writes a replacement
@@ -1545,8 +1550,8 @@ fn moraine_index_entries_survive_the_data_file_lifecycle() {
 ///
 /// Observed through the snapshot count: each step is its own commit.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_index_create_takes_a_step_size() {
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
+fn native_index_create_takes_a_step_size() {
     let store = TempDir::new("index-step-store");
     let data = TempDir::new("index-step-data");
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
@@ -1562,10 +1567,7 @@ fn moraine_index_create_takes_a_step_size() {
     run("INSERT INTO lake.main.t SELECT i FROM range(400) t(i);");
     let before = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
 
-    run(
-        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, \
-         staged := true, step_entries := 100);",
-    );
+    run("CREATE UNIQUE INDEX by_a ON lake.main.t(a) WITH (staged = true, step_entries = 100);");
     let after = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
 
     // The definition commit, then 400 entries in steps of 100.
@@ -1590,10 +1592,7 @@ fn moraine_index_create_takes_a_step_size() {
     run("CREATE TABLE lake.main.u(a BIGINT);");
     run("INSERT INTO lake.main.u SELECT i FROM range(5) t(i);");
     let before = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
-    run(
-        "CALL moraine_index_create('lake', 'main', 'u', 'by_a', ['a'], true, \
-         staged := true, step_bytes := 1);",
-    );
+    run("CREATE UNIQUE INDEX by_u ON lake.main.u(a) WITH (staged = true, step_bytes = 1);");
     let after = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
     assert_eq!(after - before, 1 + 5, "one commit per entry");
 
@@ -1602,8 +1601,7 @@ fn moraine_index_create_takes_a_step_size() {
         store.path(),
         data.path(),
         &meta,
-        "CALL moraine_index_create('lake', 'main', 't', 'by_b', ['a'], true, \
-         staged := true, step_entries := 0);",
+        "CREATE UNIQUE INDEX by_b ON lake.main.t(a) WITH (staged = true, step_entries = 0);",
     );
     assert!(!out.status.success(), "a zero step must fail");
     let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
@@ -1617,7 +1615,7 @@ fn moraine_index_create_takes_a_step_size() {
 /// of the data commit, then catches it up in bounded post-commit steps before
 /// returning. The index never serves a partial answer.
 #[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
+#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
 fn moraine_index_deferred_maintenance_catches_up_after_sql_insert() {
     let store = TempDir::new("index-deferred-store");
     let data = TempDir::new("index-deferred-data");
@@ -1625,10 +1623,7 @@ fn moraine_index_deferred_maintenance_catches_up_after_sql_insert() {
     let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
 
     run("CREATE TABLE lake.main.t(a BIGINT);");
-    run(
-        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], false, \
-         maintenance := 'deferred');",
-    );
+    run("CREATE INDEX by_a ON lake.main.t(a) WITH (maintenance = 'deferred');");
     let schema_rows = csv_rows(&run(
         "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_schema_versions;",
     ));
@@ -1679,416 +1674,10 @@ fn moraine_index_deferred_maintenance_catches_up_after_sql_insert() {
         store.path(),
         data.path(),
         &meta,
-        "CALL moraine_index_create('lake', 'main', 't', 'unique_by_a', ['a'], true, \
-         maintenance := 'deferred');",
+        "CREATE UNIQUE INDEX unique_by_a ON lake.main.t(a) WITH (maintenance = 'deferred');",
     );
     assert!(
         stderr.contains("non-unique"),
         "deferred uniqueness cannot be sound: {stderr}"
-    );
-}
-
-/// `moraine_delete_located` resolves already-located `(row_id,
-/// data_file_id)` pairs — as an index lookup reports them — to exact file
-/// positions and deletes them without a scan, landing the delete through a
-/// shim-written delete file. The returned counts row, the row count drop,
-/// and a prior-snapshot read together are this feature's basic contract.
-#[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_delete_located_removes_rows_without_a_scan() {
-    let store = TempDir::new("delete-located-store");
-    let data = TempDir::new("delete-located-data");
-    let meta = format!(
-        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
-        data.path().display()
-    );
-    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
-    populate_files_spanning_row_ids(&run);
-
-    let before_snapshot = csv_rows(&run(
-        "USE lake; SELECT CAST(max(snapshot_id) AS VARCHAR) FROM snapshots();",
-    ))[0][0]
-        .clone();
-
-    // a = 50 and a = 150 sit in their original (unrewritten) files, one
-    // each — the lookup's own answer becomes the `rows` list literal.
-    let located = csv_rows(&run(
-        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 50) \
-         UNION ALL \
-         SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 150) \
-         ORDER BY row_id;",
-    ));
-    assert_eq!(
-        located.len(),
-        2,
-        "expected exactly one location each for a=50 and a=150: {located:?}"
-    );
-    let rows_literal = located
-        .iter()
-        .map(|row| format!("{{row_id: {}, data_file_id: {}}}", row[0], row[1]))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let counts = csv_rows(&run(&format!(
-        "SELECT * FROM moraine_delete_located('lake', 'main', 't', [{rows_literal}]);"
-    )));
-    assert_eq!(
-        counts,
-        vec![vec!["2".to_string(), "0".to_string(), "2".to_string()]],
-        "two file-backed rows deleted, no inline rows, one delete file per data file"
-    );
-
-    assert_eq!(
-        csv_rows(&run(
-            "SELECT count(*) FILTER (WHERE a IN (50, 150)), count(*) FROM lake.main.t;"
-        )),
-        vec![vec!["0".to_string(), "298".to_string()]],
-        "the located delete removed exactly its two rows"
-    );
-
-    assert_eq!(
-        csv_rows(&run(&format!(
-            "SELECT count(*) FILTER (WHERE a IN (50, 150)) FROM lake.main.t AT (VERSION => {before_snapshot});"
-        ))),
-        vec![vec!["2".to_string()]],
-        "a read at the snapshot before the delete still sees both rows"
-    );
-}
-
-/// A second `moraine_delete_located` call against a data file that already
-/// carries a live delete file merges into it rather than adding a second
-/// one, and the first call's deletion is still respected — the union
-/// property a naive overwrite would violate.
-#[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_delete_located_merges_an_existing_delete_file() {
-    let store = TempDir::new("delete-located-merge-store");
-    let data = TempDir::new("delete-located-merge-data");
-    let meta = format!(
-        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
-        data.path().display()
-    );
-    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
-    populate_files_spanning_row_ids(&run);
-
-    // a = 60 and a = 61 both sit in the first original (unrewritten) file:
-    // neither key was among the UPDATEs that relocated rows elsewhere.
-    let locate = |value: i64| {
-        let located = csv_rows(&run(&format!(
-            "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', {value});"
-        )));
-        assert_eq!(located.len(), 1, "expected one location for a = {value}");
-        format!(
-            "{{row_id: {}, data_file_id: {}}}",
-            located[0][0], located[0][1]
-        )
-    };
-    let data_file_id: i64 = csv_rows(&run(
-        "SELECT data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 60);",
-    ))[0][0]
-        .parse()
-        .expect("a data file id");
-
-    let first_pair = locate(60);
-    let first_counts = csv_rows(&run(&format!(
-        "SELECT * FROM moraine_delete_located('lake', 'main', 't', [{first_pair}]);"
-    )));
-    assert_eq!(
-        first_counts,
-        vec![vec!["1".to_string(), "0".to_string(), "1".to_string()]],
-        "the first call writes one delete file for the one row it deleted"
-    );
-
-    let second_pair = locate(61);
-    let second_counts = csv_rows(&run(&format!(
-        "SELECT * FROM moraine_delete_located('lake', 'main', 't', [{second_pair}]);"
-    )));
-    assert_eq!(
-        second_counts,
-        vec![vec!["1".to_string(), "0".to_string(), "1".to_string()]],
-        "the second call also writes exactly one delete file, merged into the same file's slot"
-    );
-
-    assert_eq!(
-        csv_rows(&run(
-            "SELECT count(*) FILTER (WHERE a IN (60, 61)), count(*) FROM lake.main.t;"
-        )),
-        vec![vec!["0".to_string(), "298".to_string()]],
-        "both rows stay deleted after the second call — the union property"
-    );
-
-    let live_delete_files = csv_rows(&run_standalone_sql(
-        store.path(),
-        &format!(
-            "SELECT count(*) FROM m.ducklake_delete_file \
-             WHERE end_snapshot IS NULL AND data_file_id = {data_file_id};"
-        ),
-    ));
-    assert_eq!(
-        live_delete_files,
-        vec![vec!["1".to_string()]],
-        "the merge leaves exactly one live delete file for the data file, not two"
-    );
-}
-
-/// Default inlining leaves a small insert as an inlined row (a NULL
-/// `data_file_id` from the lookup), and `moraine_delete_located` deletes it
-/// through the inline path rather than the file path.
-#[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_delete_located_deletes_an_inlined_row() {
-    let store = TempDir::new("delete-located-inline-store");
-    let data = TempDir::new("delete-located-inline-data");
-    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
-    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
-
-    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
-    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
-    // Under the compiled default inline limit, so this insert stays
-    // inlined rather than landing as a Parquet file.
-    run("INSERT INTO lake.main.t VALUES (500, 'z');");
-
-    let located = csv_rows(&run(
-        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 500);",
-    ));
-    assert_eq!(
-        located.len(),
-        1,
-        "expected exactly one location for the inlined row: {located:?}"
-    );
-    assert_eq!(
-        located[0][1], "NULL",
-        "the inlined row's lookup names no data file"
-    );
-    let row_id = &located[0][0];
-
-    let counts = csv_rows(&run(&format!(
-        "SELECT * FROM moraine_delete_located('lake', 'main', 't', \
-         [{{row_id: {row_id}, data_file_id: NULL}}]);"
-    )));
-    assert_eq!(
-        counts,
-        vec![vec!["0".to_string(), "1".to_string(), "0".to_string()]],
-        "the inlined row is deleted through the inline path, not the file path"
-    );
-
-    assert_eq!(
-        csv_rows(&run("SELECT count(*) FROM lake.main.t;")),
-        vec![vec!["0".to_string()]],
-        "the inlined row is gone"
-    );
-}
-
-/// A pair naming a data file that does not hold the row it names is
-/// exact-or-failed: the call errors, deletes nothing, and mints no
-/// snapshot.
-#[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_delete_located_refuses_a_wrong_location() {
-    let store = TempDir::new("delete-located-wrong-store");
-    let data = TempDir::new("delete-located-wrong-data");
-    let meta = format!(
-        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
-        data.path().display()
-    );
-    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
-    populate_files_spanning_row_ids(&run);
-
-    let location_a = csv_rows(&run(
-        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 50);",
-    ));
-    let location_b = csv_rows(&run(
-        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 150);",
-    ));
-    assert_eq!(location_a.len(), 1, "expected one location for a = 50");
-    assert_eq!(location_b.len(), 1, "expected one location for a = 150");
-    assert_ne!(
-        location_a[0][1], location_b[0][1],
-        "the two rows must live in different files for this pair to be wrong"
-    );
-
-    let before_snapshots = csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');"));
-
-    let stderr = run_ducklake_sql_expect_err_with_options(
-        store.path(),
-        data.path(),
-        &meta,
-        &format!(
-            "USE lake; SELECT * FROM moraine_delete_located('lake', 'main', 't', \
-             [{{row_id: {}, data_file_id: {}}}]);",
-            location_a[0][0], location_b[0][1]
-        ),
-    );
-    assert!(
-        stderr
-            .to_lowercase()
-            .contains("could not be positioned against data file"),
-        "expected the exact-or-failed positioning error, got: {stderr}"
-    );
-
-    assert_eq!(
-        csv_rows(&run("SELECT count(*) FROM lake.main.t;")),
-        vec![vec!["300".to_string()]],
-        "the refused call deleted nothing"
-    );
-    assert_eq!(
-        csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');")),
-        before_snapshots,
-        "the refused call minted no snapshot"
-    );
-}
-
-/// A `rows` entry's fields, named in the opposite order from the struct
-/// literal's usual `(row_id, data_file_id)`, must still resolve by name:
-/// mapping positionally would delete a different row than the one named.
-#[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_delete_located_accepts_swapped_field_order() {
-    let store = TempDir::new("delete-located-swapped-store");
-    let data = TempDir::new("delete-located-swapped-data");
-    let meta = format!(
-        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
-        data.path().display()
-    );
-    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
-    populate_files_spanning_row_ids(&run);
-
-    let located = csv_rows(&run(
-        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 50);",
-    ));
-    assert_eq!(located.len(), 1, "expected one location for a = 50");
-    let row_id = &located[0][0];
-    let data_file_id = &located[0][1];
-
-    let counts = csv_rows(&run(&format!(
-        "SELECT * FROM moraine_delete_located('lake', 'main', 't', \
-         [{{data_file_id: {data_file_id}, row_id: {row_id}}}]);"
-    )));
-    assert_eq!(
-        counts,
-        vec![vec!["1".to_string(), "0".to_string(), "1".to_string()]],
-        "the swapped-order fields still resolved to exactly one deleted row"
-    );
-
-    assert_eq!(
-        csv_rows(&run(
-            "SELECT count(*) FILTER (WHERE a = 50), count(*) FROM lake.main.t;"
-        )),
-        vec![vec!["0".to_string(), "299".to_string()]],
-        "the swapped-field call deleted row a=50 and only that row"
-    );
-}
-
-/// A NULL `row_id` field is a clean rejection, mirroring the existing NULL
-/// `data_file_id` guard.
-#[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_delete_located_refuses_a_null_row_id() {
-    let store = TempDir::new("delete-located-nullrow-store");
-    let data = TempDir::new("delete-located-nullrow-data");
-    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
-    run_ducklake_sql_with_options(
-        store.path(),
-        data.path(),
-        &meta,
-        "CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);",
-    );
-    run_ducklake_sql_with_options(
-        store.path(),
-        data.path(),
-        &meta,
-        "INSERT INTO lake.main.t VALUES (1, 'x');",
-    );
-
-    let stderr = run_ducklake_sql_expect_err_with_options(
-        store.path(),
-        data.path(),
-        &meta,
-        "SELECT * FROM moraine_delete_located('lake', 'main', 't', \
-         [{row_id: NULL, data_file_id: NULL}]);",
-    );
-    assert!(
-        stderr.to_lowercase().contains("row_id"),
-        "expected a clean row_id rejection, got: {stderr}"
-    );
-}
-
-/// A `rows` list whose entries are all already dead (already carried by the
-/// data file's registered delete file) reports zero for every count and
-/// mints no snapshot — the diff against the existing delete file's
-/// positions must leave nothing newly dead.
-#[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_delete_located_of_only_already_dead_pairs_mints_no_snapshot() {
-    let store = TempDir::new("delete-located-stale-store");
-    let data = TempDir::new("delete-located-stale-data");
-    let meta = format!(
-        ", META_DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0",
-        data.path().display()
-    );
-    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
-    populate_files_spanning_row_ids(&run);
-
-    let located = csv_rows(&run(
-        "SELECT row_id, data_file_id FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 60);",
-    ));
-    assert_eq!(located.len(), 1, "expected one location for a = 60");
-    let pair = format!(
-        "{{row_id: {}, data_file_id: {}}}",
-        located[0][0], located[0][1]
-    );
-
-    let first_counts = csv_rows(&run(&format!(
-        "SELECT * FROM moraine_delete_located('lake', 'main', 't', [{pair}]);"
-    )));
-    assert_eq!(
-        first_counts,
-        vec![vec!["1".to_string(), "0".to_string(), "1".to_string()]],
-        "the first call deletes the row"
-    );
-
-    let before_snapshots = csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');"));
-    let repeat_counts = csv_rows(&run(&format!(
-        "SELECT * FROM moraine_delete_located('lake', 'main', 't', [{pair}]);"
-    )));
-    assert_eq!(
-        repeat_counts,
-        vec![vec!["0".to_string(), "0".to_string(), "0".to_string()]],
-        "repeating an already-dead pair reports zero for every count"
-    );
-    assert_eq!(
-        csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');")),
-        before_snapshots,
-        "a call whose pairs are all already dead mints no snapshot"
-    );
-}
-
-/// An empty `rows` list mints no snapshot: there is nothing to write or
-/// commit, so the call must not pay for either.
-#[test]
-#[ignore = "needs the downloaded DuckDB CLI and packaged Moraine extension"]
-fn moraine_delete_located_of_an_empty_list_mints_no_snapshot() {
-    let store = TempDir::new("delete-located-empty-store");
-    let data = TempDir::new("delete-located-empty-data");
-    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
-    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
-
-    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
-    run("INSERT INTO lake.main.t VALUES (1, 'x');");
-
-    let before_snapshots = csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');"));
-    let counts = csv_rows(&run(
-        "SELECT * FROM moraine_delete_located('lake', 'main', 't', \
-         []::STRUCT(row_id BIGINT, data_file_id UBIGINT)[]);",
-    ));
-    assert_eq!(
-        counts,
-        vec![vec!["0".to_string(), "0".to_string(), "0".to_string()]],
-        "an empty rows list reports zero for every count"
-    );
-    assert_eq!(
-        csv_rows(&run("SELECT count(*) FROM ducklake_snapshots('lake');")),
-        before_snapshots,
-        "an empty rows list mints no snapshot"
     );
 }

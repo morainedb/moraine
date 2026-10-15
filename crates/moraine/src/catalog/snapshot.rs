@@ -132,12 +132,6 @@ fn index_identity(value: &IndexValue) -> (u64, u64, &str) {
     (value.index_id, value.table_id, &value.index_name)
 }
 
-/// Ensures exactly one trailing `/`, so directory components concatenate
-/// without doubling or losing a separator.
-fn normalize_directory(path: &str) -> String {
-    format!("{}/", path.trim_end_matches('/'))
-}
-
 /// Inserts into a table-scoped nested map.
 fn put_nested<K: Ord + Clone, V: Clone>(
     map: &mut OrdMap<u64, OrdMap<K, V>>,
@@ -577,6 +571,45 @@ impl CatalogSnapshot {
             .map(index_info)
     }
 
+    /// Resolves a case-insensitive index name within a schema.
+    ///
+    /// # Errors
+    /// Returns [`Error::Constraint`] when a legacy catalog has ambiguous names.
+    pub fn index_by_schema_name(&self, schema: SchemaId, name: &str) -> Result<Option<IndexInfo>> {
+        let mut found = None;
+        for table in self
+            .tables
+            .values()
+            .filter(|table| table.schema_id == schema.get())
+        {
+            if let Some(indexes) = self.indexes.get(&table.table_id) {
+                for index in indexes
+                    .values()
+                    .filter(|index| index.index_name.eq_ignore_ascii_case(name))
+                {
+                    if found.is_some() {
+                        return Err(Error::Constraint(format!(
+                            "index {name} is ambiguous in schema {schema}; use a table-qualified index operation"
+                        )));
+                    }
+                    found = Some(index_info(index));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The table's ready equality index on exactly `columns`, by field id in
+    /// that order, for a reader deciding whether a filter can be answered
+    /// from an index. Indexes still building, maintaining or poisoned refuse
+    /// lookups, so they are not returned.
+    #[must_use]
+    pub fn index_on_columns(&self, table: TableId, columns: &[ColumnId]) -> Option<IndexInfo> {
+        self.indexes_of(table)
+            .into_iter()
+            .find(|index| index.state == IndexState::Ready && index.columns.as_slice() == columns)
+    }
+
     /// The table's data directory (`<schema path><table path>`), itself
     /// relative to `DATA_PATH` — the prefix a relative data-file path
     /// resolves under.
@@ -589,49 +622,6 @@ impl CatalogSnapshot {
             Error::Corruption(format!("table {table} references a missing schema"))
         })?;
         Ok(format!("{}{}", schema_value.path, table_value.path))
-    }
-
-    /// The absolute directory a table's files resolve under: `DATA_PATH`
-    /// joined with the schema and table path components, as DuckLake's own
-    /// reader resolves a `path_is_relative` file.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::NotFound`] for a missing table, [`Error::Constraint`] for
-    /// a lake without a recorded `DATA_PATH`, [`Error::Unsupported`] for
-    /// an absolute (operator-relocated) schema or table path.
-    pub fn table_write_directory(&self, table: TableId) -> Result<String> {
-        let table_value = self
-            .tables
-            .get(&table.get())
-            .ok_or_else(|| Error::NotFound(format!("table {table}")))?;
-        let schema_value = self.schemas.get(&table_value.schema_id).ok_or_else(|| {
-            Error::Corruption(format!("table {table} references a missing schema"))
-        })?;
-        if !schema_value.path_is_relative {
-            return Err(Error::Unsupported(format!(
-                "schema \"{}\" has an absolute path, which a table write directory does not \
-                 support",
-                schema_value.schema_name
-            )));
-        }
-        if !table_value.path_is_relative {
-            return Err(Error::Unsupported(format!(
-                "table \"{}\" has an absolute path, which a table write directory does not \
-                 support",
-                table_value.table_name
-            )));
-        }
-        let data_path = self
-            .data_path()
-            .ok_or_else(|| Error::Constraint("the lake has no recorded DATA_PATH".to_owned()))?;
-
-        Ok(normalize_directory(&format!(
-            "{}{}{}",
-            normalize_directory(&data_path),
-            normalize_directory(&schema_value.path),
-            normalize_directory(&table_value.path),
-        )))
     }
 
     /// One equality index by id within a table.
@@ -1112,6 +1102,15 @@ impl CatalogSnapshot {
         );
     }
 
+    pub(crate) fn remove_mapping(&mut self, table_id: u64, mapping_id: u64) {
+        remove_nested(
+            &mut self.mappings,
+            &mut self.nested_entity_count,
+            table_id,
+            &mapping_id,
+        );
+    }
+
     pub(crate) fn remove_tag(&mut self, object_id: u64) {
         self.tags.remove(&object_id);
     }
@@ -1253,6 +1252,7 @@ pub(crate) fn index_info(value: &IndexValue) -> IndexInfo {
         },
         state,
         build_cursor: value.build_cursor_row_id,
+        verified_at_snapshot: value.verified_at_snapshot.map(SnapshotId::new),
         build_file_cursor: value.build_cursor_file.map(DataFileId::new),
         build_position_cursor: value.build_cursor_position,
     }
@@ -1372,6 +1372,7 @@ mod tests {
             footer_size: 4,
             encryption_key: None,
             partial_max: None,
+            row_group_count: None,
         };
         let ids = |view: &CatalogSnapshot, data_file_id| -> Vec<u64> {
             view.delete_files_targeting(1, data_file_id)
@@ -1438,6 +1439,86 @@ mod tests {
         );
     }
 
+    /// A filter finds an index by the columns it covers, in order, and only
+    /// a ready one: the others refuse lookups.
+    #[test]
+    fn an_index_is_found_by_its_columns_when_it_is_ready() {
+        let mut state = CatalogSnapshot::default();
+        state.put_index(IndexValue {
+            table_id: 1,
+            index_id: 2,
+            index_name: "by_key".into(),
+            column_ids: vec![7],
+            ..Default::default()
+        });
+        state.put_index(IndexValue {
+            table_id: 1,
+            index_id: 3,
+            index_name: "by_pair".into(),
+            column_ids: vec![7, 8],
+            build_state: Some("building".into()),
+            ..Default::default()
+        });
+        let table = TableId::new(1);
+        let column = |id| ColumnId::new(id);
+
+        assert_eq!(
+            state
+                .index_on_columns(table, &[column(7)])
+                .map(|index| index.name),
+            Some("by_key".to_string())
+        );
+        // A building index refuses lookups, so it is not offered.
+        assert!(
+            state
+                .index_on_columns(table, &[column(7), column(8)])
+                .is_none()
+        );
+        // Column order is part of the match, and an unindexed column has none.
+        assert!(state.index_on_columns(table, &[column(8)]).is_none());
+        assert!(
+            state
+                .index_on_columns(TableId::new(2), &[column(7)])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_index_names_require_table_qualification_when_ambiguous() {
+        let mut state = CatalogSnapshot::default();
+        for table in [1, 2] {
+            state.put_table(TableValue {
+                table_id: table,
+                schema_id: 0,
+                table_name: format!("table_{table}"),
+                ..Default::default()
+            });
+            state.put_index(IndexValue {
+                table_id: table,
+                index_id: table + 2,
+                index_name: "by_key".into(),
+                ..Default::default()
+            });
+        }
+        assert!(matches!(
+            state.index_by_schema_name(SchemaId::new(0), "BY_KEY"),
+            Err(Error::Constraint(_))
+        ));
+        assert_eq!(
+            state.index_by_name(TableId::new(1), "by_key").unwrap().id,
+            IndexId::new(3)
+        );
+        state.delete_index(1, 3);
+        assert_eq!(
+            state
+                .index_by_schema_name(SchemaId::new(0), "by_key")
+                .unwrap()
+                .unwrap()
+                .id,
+            IndexId::new(4)
+        );
+    }
+
     #[test]
     fn index_owners_follow_replacement_and_cascading_deletion() {
         let mut state = CatalogSnapshot::default();
@@ -1476,6 +1557,7 @@ mod tests {
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
             deleted_data_file_ids: Vec::new(),
+            deletes_untargeted_files: false,
         }
     }
 
@@ -1543,6 +1625,7 @@ mod tests {
             mapping_id: None,
             partial_max: None,
             partition_values: vec![],
+            row_group_count: None,
         }
     }
 
@@ -1557,6 +1640,7 @@ mod tests {
             dialect: "duckdb".into(),
             sql: format!("select * from {name}"),
             column_aliases: None,
+            column_tags: Vec::new(),
         }
     }
 
@@ -1727,6 +1811,8 @@ mod tests {
             min_value: Some("9".into()),
             max_value: Some("10".into()),
             extra_stats: None,
+            min_is_exact: None,
+            max_is_exact: None,
         });
         // Verbatim strings: '9'/'10' come back untouched, never compared.
         let stats = view
@@ -1750,6 +1836,7 @@ mod tests {
             footer_size: 4,
             encryption_key: None,
             partial_max: None,
+            row_group_count: None,
         });
         assert_eq!(
             view.delete_files_of(TableId::new(1))[0].data_file_id,
@@ -1768,6 +1855,8 @@ mod tests {
             contains_nan: None,
             extra_stats: None,
             variant_stats: vec![],
+            min_is_exact: None,
+            max_is_exact: None,
         });
 
         // Dropping the table clears every per-table map except
@@ -1874,6 +1963,7 @@ mod tests {
             poisoned: None,
             ducklake_index_id: None,
             deferred_maintenance: None,
+            verified_at_snapshot: None,
         }
     }
 
@@ -2013,69 +2103,5 @@ mod tests {
             !view.options.contains_key(&(2, 1)),
             "table options die with the table"
         );
-    }
-
-    #[test]
-    fn table_write_directory_joins_data_path_with_schema_and_table_paths() {
-        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
-        view.put_schema(schema_rec(0, "s", 1, None));
-        view.put_table(table_rec(1, 0, "t", 1));
-        view.set_option_record(
-            (0, 0),
-            OptionScopeValue {
-                options: [("data_path".to_owned(), "/lake/data".to_owned())].into(),
-            },
-        );
-
-        let directory = view.table_write_directory(TableId::new(1)).unwrap();
-
-        assert_eq!(directory, "/lake/data/s/t/");
-    }
-
-    #[test]
-    fn table_write_directory_rejects_a_missing_data_path() {
-        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
-        view.put_schema(schema_rec(0, "s", 1, None));
-        view.put_table(table_rec(1, 0, "t", 1));
-
-        let error = view.table_write_directory(TableId::new(1)).unwrap_err();
-
-        assert!(matches!(error, Error::Constraint(_)), "{error:?}");
-    }
-
-    #[test]
-    fn table_write_directory_rejects_an_absolute_schema_or_table_path() {
-        let mut view = CatalogSnapshot::build(snap(1), &[], &[], None);
-        view.put_schema(SchemaValue {
-            path_is_relative: false,
-            ..schema_rec(0, "s", 1, None)
-        });
-        view.put_table(table_rec(1, 0, "t", 1));
-        view.set_option_record(
-            (0, 0),
-            OptionScopeValue {
-                options: [("data_path".to_owned(), "/lake/data".to_owned())].into(),
-            },
-        );
-
-        let error = view.table_write_directory(TableId::new(1)).unwrap_err();
-        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
-
-        view.put_schema(schema_rec(0, "s", 1, None));
-        view.put_table(TableValue {
-            path_is_relative: false,
-            ..table_rec(1, 0, "t", 1)
-        });
-        let error = view.table_write_directory(TableId::new(1)).unwrap_err();
-        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
-    }
-
-    #[test]
-    fn table_write_directory_rejects_an_unknown_table() {
-        let view = CatalogSnapshot::build(snap(1), &[], &[], None);
-
-        let error = view.table_write_directory(TableId::new(99)).unwrap_err();
-
-        assert!(matches!(error, Error::NotFound(_)), "{error:?}");
     }
 }

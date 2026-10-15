@@ -12,7 +12,7 @@ use object_store::memory::InMemory;
 use super::*;
 use crate::{CatalogOptions, ColumnDef, IndexEntry, InlineChunk};
 
-fn chunk(values: Vec<i64>) -> InlineChunk {
+pub(in crate::catalog::handle) fn chunk(values: Vec<i64>) -> InlineChunk {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
     let count = values.len();
     let batch =

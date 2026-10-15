@@ -25,11 +25,9 @@ use crate::{
         census::{self as store_census, SegmentSize},
         compaction::{self as store_compaction, MergeEnd},
         handle::{ReadHandle, ScanShape},
-        inline as store_inline,
-        key::{
-            EntityKey, EntityKind, IndexKey, IndexKind, Key, Subspace, history_entity_kind_prefix,
-            index_index_prefix, index_kind_prefix, subspace_prefix,
-        },
+        index_entries as store_index_entries, inline as store_inline,
+        key::{EntityKey, EntityKind, IndexKind, Key, Subspace, index_index_prefix},
+        read as store_read,
     },
     telemetry::milliseconds,
     transaction::{commit, maintenance_status, staged::inline::inline_schema_undrop_write},
@@ -376,8 +374,8 @@ fn assemble_census(
         let mut subspaces: Vec<SubspaceCensus> = Subspace::ALL
             .into_iter()
             .map(|subspace| {
-                let prefix = subspace_prefix(subspace);
-                let mut measured = measure(SubspaceName::from(subspace), physical.segment(&prefix));
+                let mut measured =
+                    measure(SubspaceName::from(subspace), physical.segment(subspace));
                 measured.live = live
                     .iter()
                     .find(|(counted, _)| *counted == subspace)
@@ -445,41 +443,17 @@ impl Catalog {
 
 impl ReadOnlyCatalog {
     /// The lowest index id at or after `from` holding an entry of `kind`,
-    /// or `None` past the last one. The scan stops at the first live key
-    /// but must read ahead: a swept index leaves its whole range as
-    /// tombstones ahead of that key until a store merge drops them.
+    /// or `None` past the last one.
     pub(crate) async fn first_index_id_from(
         &self,
         kind: IndexKind,
         from: u64,
     ) -> Result<Option<u64>> {
-        let kind_prefix = index_kind_prefix(kind);
-        let start = index_index_prefix(kind, from);
-        // `scan_prefix` takes its bounds as a suffix of the prefix.
-        let suffix = start[kind_prefix.len()..].to_vec();
-
         let session = self.begin_read().await?;
-        let first = session
-            .handle()
-            .scan_prefix(kind_prefix, suffix.., ScanShape::Bulk)
-            .await
-            .map_err(Error::from)?
-            .next()
-            .await
-            .map_err(Error::from)?;
+        let first = store_index_entries::first_index_id_from(session.handle(), kind, from).await;
         session.finish();
 
-        let Some(entry) = first else {
-            return Ok(None);
-        };
-        match Key::decode(&entry.key)? {
-            Key::Index(IndexKey::Unique { index_id, .. } | IndexKey::Multi { index_id, .. }) => {
-                Ok(Some(index_id))
-            }
-            other => Err(Error::Corruption(format!(
-                "key in the index subspace decoded as {other:?}"
-            ))),
-        }
+        first
     }
 }
 
@@ -728,7 +702,7 @@ impl Catalog {
         let target = match &request.target {
             CompactionTarget::WholeStore => None,
             CompactionTarget::Subspace(name) => match name.subspace() {
-                Some(subspace) => Some(subspace_prefix(subspace)),
+                Some(subspace) => Some(subspace),
                 None => {
                     return Err(Error::Configuration(format!(
                         "{name} is not a subspace this build can merge"
@@ -741,7 +715,7 @@ impl Catalog {
         let submitted = store_compaction::submit_full_merge(
             &self.location.path,
             Arc::clone(&self.location.object_store),
-            target.as_deref(),
+            target,
         )
         .await?;
 
@@ -798,9 +772,8 @@ impl Catalog {
         // Every subspace the request covered but nothing was submitted for
         // is reported rather than dropped, so two calls stay comparable.
         for measured in &before.subspaces {
-            let covered = target
-                .as_ref()
-                .is_none_or(|prefix| SubspaceName::of_prefix(prefix) == measured.subspace);
+            let covered =
+                target.is_none_or(|subspace| SubspaceName::from(subspace) == measured.subspace);
             if !covered || merges.iter().any(|m| m.subspace == measured.subspace) {
                 continue;
             }
@@ -841,29 +814,23 @@ impl Catalog {
     /// file through.
     async fn historical_data_files(&self) -> Result<HashSet<(u64, u64)>> {
         let session = self.begin_read().await?;
-        // One kind's prefix, not the whole subspace: every other kind's
-        // history would be read and decoded only to be discarded below.
-        let mut iter = session
-            .handle()
-            .scan_prefix(
-                history_entity_kind_prefix(EntityKind::File),
-                ..,
-                ScanShape::Bulk,
-            )
-            .await?;
-
         let mut seen = HashSet::new();
-        while let Some(entry) = iter.next().await? {
-            if let Ok(Key::History(history)) = Key::decode(&entry.key)
-                && let EntityKey::File {
+        // One kind, not the whole subspace: every other kind's history
+        // would be read and decoded only to be discarded.
+        let visited =
+            store_read::visit_history_keys(session.handle(), EntityKind::File, |history| {
+                if let EntityKey::File {
                     table_id,
                     data_file_id,
                 } = history.entity
-            {
-                seen.insert((table_id, data_file_id));
-            }
-        }
+                {
+                    seen.insert((table_id, data_file_id));
+                }
+            })
+            .await;
         session.finish();
+        visited?;
+
         Ok(seen)
     }
 
@@ -873,24 +840,17 @@ impl Catalog {
         let mut seen: HashSet<u64> = self.snapshot().await?.tables.keys().copied().collect();
 
         let session = self.begin_read().await?;
-        // One kind's prefix, not the whole subspace: every other kind's
-        // history would be read and decoded only to be discarded.
-        let mut iter = session
-            .handle()
-            .scan_prefix(
-                history_entity_kind_prefix(EntityKind::Table),
-                ..,
-                ScanShape::Bulk,
-            )
-            .await?;
-        while let Some(entry) = iter.next().await? {
-            if let Ok(Key::History(history)) = Key::decode(&entry.key)
-                && let EntityKey::Table { table_id } = history.entity
-            {
-                seen.insert(table_id);
-            }
-        }
+        // One kind, not the whole subspace: every other kind's history
+        // would be read and decoded only to be discarded.
+        let visited =
+            store_read::visit_history_keys(session.handle(), EntityKind::Table, |history| {
+                if let EntityKey::Table { table_id } = history.entity {
+                    seen.insert(table_id);
+                }
+            })
+            .await;
         session.finish();
+        visited?;
 
         Ok(seen)
     }

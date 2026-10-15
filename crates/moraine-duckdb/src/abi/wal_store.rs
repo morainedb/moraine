@@ -110,11 +110,11 @@ pub(super) fn refuse_wal_store_in_data_path(
 /// log changed stores — `false` means it was already on `to`.
 ///
 /// Takes the store's writer twice, so no attach may hold it: an attach
-/// that does is fenced, exactly as by [`super::moraine_migrate`]. The
-/// first open drains the log it finds into a sorted-string table, so an
-/// interrupted move leaves the catalog openable — against one store or the
-/// other, with nothing lost — and can be run again. Every attach after a
-/// move names `to`.
+/// that does is fenced, exactly as by
+/// [`super::moraine_migrate_with_wal_store`]. The first open drains the log it
+/// finds into a sorted-string table, so an interrupted move leaves the catalog
+/// openable — against one store or the other, with nothing lost — and can be
+/// run again. Every attach after a move names `to`.
 ///
 /// `from` naming a store other than the recorded one is refused, and the
 /// message names the recorded one, which is how an operator who has lost

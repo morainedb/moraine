@@ -2,6 +2,17 @@
 //! from the wire types so on-disk field evolution never becomes a public
 //! breaking change.
 
+/// The DuckLake catalog version this build serves, recorded in a store's
+/// global `version` option when it is created. A store written before that
+/// was recorded carries no row and reads as this same version.
+pub const CATALOG_VERSION: &str = "1.0";
+
+/// The DuckLake catalog version this build can raise a store to: the
+/// newest shape it serves. Raising is one-way — a DuckLake that requires
+/// an older version refuses the raised store — so it is never the version
+/// a store is created with.
+pub const MAX_CATALOG_VERSION: &str = "1.1-dev1";
+
 /// Declares a newtype id over the catalog's `u64` id space.
 macro_rules! id_type {
     ($(#[$doc:meta])* $name:ident) => {
@@ -603,6 +614,11 @@ pub struct IndexInfo {
     pub maintenance: IndexMaintenance,
     /// The build lifecycle state.
     pub state: IndexState,
+    /// The snapshot a clean verifier pass agreed with the rows at. `None`
+    /// means no pass has agreed since the definition last changed — a
+    /// rebuild or a repair withdraws it, ordinary maintained writes do
+    /// not.
+    pub verified_at_snapshot: Option<SnapshotId>,
     /// Row-id watermark for manual steps and older builds. Streamed inline
     /// steps leave it unchanged until the inline leg completes, using a
     /// separate source checkpoint. Always `None` on a single-commit index.

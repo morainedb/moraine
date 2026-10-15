@@ -199,7 +199,7 @@ pub unsafe extern "C" fn moraine_arrow_encode_schema(
 /// little-endian `u32` message length, the record-batch flatbuffer
 /// message, then the arrow data buffers, without a schema message (stored
 /// once per version by [`moraine_arrow_encode_schema`] and supplied back
-/// at decode by [`moraine_arrow_decode_body`]).
+/// at decode by [`moraine_arrow_decode_inline_chunk_with_schema`]).
 ///
 /// Dictionary-encoded columns are rejected: the body carries no dictionary
 /// messages.
@@ -249,41 +249,6 @@ pub unsafe extern "C" fn moraine_arrow_encode_chunk(
     };
     // SAFETY: out/err validity is this function's own safety contract.
     unsafe { write_bytes_result(out, err, attempt) }
-}
-
-/// Decodes a chunk body from [`moraine_arrow_encode_chunk`] against the
-/// schema stored for its version (`schema_ipc` is that version's schema-only
-/// IPC stream). Produces exported C Data Interface structs the shim feeds to
-/// DuckDB's Arrow import; the caller (via DuckDB's importer) owns releasing
-/// them.
-///
-/// # Safety
-/// `schema_ipc`/`body` point to `schema_ipc_len`/`body_len` readable bytes;
-/// `out_schema`/`out_array` are writable slots the caller releases; `err` is
-/// writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_arrow_decode_body(
-    schema_ipc: *const u8,
-    schema_ipc_len: usize,
-    body: *const u8,
-    body_len: usize,
-    out_schema: *mut FFI_ArrowSchema,
-    out_array: *mut FFI_ArrowArray,
-    err: *mut MoraineError,
-) -> i32 {
-    let attempt = || -> Result<(FFI_ArrowArray, FFI_ArrowSchema), AbiError> {
-        if schema_ipc.is_null() || body.is_null() {
-            return Err(AbiError::invalid_argument("null schema or body"));
-        }
-        // SAFETY: caller guarantees `schema_ipc_len` bytes are readable at
-        // `schema_ipc`.
-        let schema_bytes = unsafe { std::slice::from_raw_parts(schema_ipc, schema_ipc_len) };
-        // SAFETY: caller guarantees `body_len` bytes are readable at `body`.
-        let body = Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body, body_len) });
-        decode_inline_body(decode_inline_schema(schema_bytes)?, body)
-    };
-    // SAFETY: out/err validity is this function's own safety contract.
-    unsafe { write_ffi_result(out_schema, out_array, err, attempt) }
 }
 
 /// A parsed inline schema, opaque to C: the schema-only IPC stream of one
@@ -387,41 +352,10 @@ fn decode_inline_body(
 }
 
 /// Decodes and consumes one chunk returned by
-/// [`crate::inline::moraine_inline_scan_next`]; its store-backed allocation
-/// becomes Arrow's data buffer without a copy.
-///
-/// # Safety
-///
-/// `schema_ipc` points to `schema_ipc_len` readable bytes. `chunk` points to
-/// one unconsumed [`MoraineInlineChunk`]. `out_schema`/`out_array` are writable
-/// slots the caller releases; `err` is writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_arrow_decode_inline_chunk(
-    schema_ipc: *const u8,
-    schema_ipc_len: usize,
-    chunk: *mut MoraineInlineChunk,
-    out_schema: *mut FFI_ArrowSchema,
-    out_array: *mut FFI_ArrowArray,
-    err: *mut MoraineError,
-) -> i32 {
-    let attempt = || -> Result<(FFI_ArrowArray, FFI_ArrowSchema), AbiError> {
-        if schema_ipc.is_null() || chunk.is_null() {
-            return Err(AbiError::invalid_argument("null schema or inline chunk"));
-        }
-        // SAFETY: caller guarantees the schema slice is readable.
-        let schema_bytes = unsafe { std::slice::from_raw_parts(schema_ipc, schema_ipc_len) };
-        let schema = decode_inline_schema(schema_bytes)?;
-        // SAFETY: caller guarantees `chunk` is one live, unconsumed value.
-        let body = unsafe { (&mut *chunk).take_bytes() }?;
-        decode_inline_body(schema, body)
-    };
-    // SAFETY: out/err validity is this function's own safety contract.
-    unsafe { write_ffi_result(out_schema, out_array, err, attempt) }
-}
-
-/// [`moraine_arrow_decode_inline_chunk`] against a schema parsed once by
-/// [`moraine_arrow_schema_decode`]; the handle stays owned by the caller
-/// and may be reused for every chunk of that schema version.
+/// [`crate::inline::moraine_inline_scan_next`] against a schema parsed once
+/// by [`moraine_arrow_schema_decode`]; the handle stays owned by the caller
+/// and may be reused for every chunk of that schema version. The chunk's
+/// store-backed allocation becomes Arrow's data buffer without a copy.
 ///
 /// # Safety
 ///
@@ -574,14 +508,28 @@ mod tests {
         let mut err = MoraineError::default();
         let (schema_bytes, mut chunk) = encode_schema_and_body(source);
 
-        let mut out_schema = FFI_ArrowSchema::empty();
-        let mut out_array = FFI_ArrowArray::empty();
-        // SAFETY: the schema buffer and owned chunk are valid; the
-        // out-pointers are writable slots this call fills with owned structs.
+        let mut handle: *mut MoraineArrowSchema = ptr::null_mut();
+        // SAFETY: the schema buffer and out slot are valid.
         let code = unsafe {
-            moraine_arrow_decode_inline_chunk(
+            moraine_arrow_schema_decode(
                 schema_bytes.data,
                 schema_bytes.len,
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, 0, "decode schema failed");
+        // SAFETY: the schema buffer came from the encode call above and is
+        // freed once.
+        unsafe { moraine_arrow_bytes_free(schema_bytes) };
+
+        let mut out_schema = FFI_ArrowSchema::empty();
+        let mut out_array = FFI_ArrowArray::empty();
+        // SAFETY: the handle is live, the chunk is unconsumed, and the
+        // out-pointers are writable slots this call fills with owned structs.
+        let code = unsafe {
+            moraine_arrow_decode_inline_chunk_with_schema(
+                handle,
                 &raw mut chunk,
                 &raw mut out_schema,
                 &raw mut out_array,
@@ -589,9 +537,9 @@ mod tests {
             )
         };
         assert_eq!(code, 0, "decode body failed");
-        // SAFETY: the schema buffer came from the encode call above and is
-        // freed once. The body now belongs to `out_array`.
-        unsafe { moraine_arrow_bytes_free(schema_bytes) };
+        // SAFETY: the handle came from the decode call above; freed once.
+        // The body now belongs to `out_array`.
+        unsafe { moraine_arrow_schema_free(handle) };
         (out_array, out_schema)
     }
 
@@ -675,32 +623,9 @@ mod tests {
         // SAFETY: the handle came from the decode call above; freed once.
         unsafe { moraine_arrow_schema_free(handle) };
 
-        // The one-shot path re-parses the schema per chunk; both must agree.
-        let mut expected = Vec::new();
-        for batch in &batches {
-            let (fresh_schema_bytes, mut fresh) = encode_schema_and_body(batch);
-            // SAFETY: minted by the encoder above and freed once.
-            unsafe { moraine_arrow_bytes_free(fresh_schema_bytes) };
-            let mut out_schema = FFI_ArrowSchema::empty();
-            let mut out_array = FFI_ArrowArray::empty();
-            // SAFETY: schema buffer readable, chunk live, out slots writable.
-            let code = unsafe {
-                moraine_arrow_decode_inline_chunk(
-                    schema_bytes.data,
-                    schema_bytes.len,
-                    &raw mut fresh,
-                    &raw mut out_schema,
-                    &raw mut out_array,
-                    &raw mut err,
-                )
-            };
-            assert_eq!(code, 0, "one-shot decode failed");
-            expected.push(import(out_array, &out_schema));
-        }
         // SAFETY: minted by the encoder and freed once.
         unsafe { moraine_arrow_bytes_free(schema_bytes) };
 
-        assert_eq!(decoded, expected);
         assert_eq!(decoded[0].num_rows(), 2);
         assert_eq!(decoded[1].num_rows(), 3);
     }
