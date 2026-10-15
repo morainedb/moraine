@@ -140,6 +140,18 @@ typedef struct MoraineWalStore {
   const struct MoraineS3Config *s3;
 } MoraineWalStore;
 
+// Mirrors the C `MoraineCommitLog`: how an attach takes part in a commit
+// log, when a provider is registered for the process. Ignored without
+// one.
+typedef struct MoraineCommitLog {
+  // Whether a read-only attach tails the log rather than following the
+  // folded store.
+  bool tail;
+  // How often a committer's reader polls for slots, in milliseconds;
+  // `0` keeps the catalog's default.
+  uint64_t poll_interval_ms;
+} MoraineCommitLog;
+
 // A C-side cancellation probe polled while a cancellable call's core
 // future is pending; returning `true` cancels the call. `None` disables
 // the pull channel for that call. Mirrors `MoraineInterruptProbe` in
@@ -293,6 +305,8 @@ typedef struct MoraineMaintenanceStatusRow {
   char *status;
   // Human-readable outcome detail, owned.
   char *detail;
+  // Whether the pass left work for a later one.
+  bool work_pending;
 } MoraineMaintenanceStatusRow;
 
 // One subspace's row of a store census, as returned by
@@ -1339,6 +1353,36 @@ void moraine_error_free(char *message);
 // from any thread. `out` must be a valid, writable `*mut *mut
 // MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
 // [`MoraineError`]. All for the duration of this call.
+int32_t moraine_attach_with_commit_log(const char *path,
+                                       const struct MoraineS3Config *s3,
+                                       bool read_only,
+                                       bool encrypted,
+                                       uint64_t flush_interval_ms,
+                                       bool flush_on_commit,
+                                       const char *cache_dir,
+                                       uint64_t cache_size_bytes,
+                                       uint64_t cache_memory_bytes,
+                                       uint32_t cache_auxiliary_percent,
+                                       uint8_t cache_preload,
+                                       bool cache_puts,
+                                       bool cache_compaction_puts,
+                                       const char *data_path,
+                                       const struct MoraineWalStore *wal,
+                                       const struct MoraineCommitLog *commit_log,
+                                       const char *checkpoint,
+                                       uint64_t host_threads,
+                                       MoraineInterruptProbe probe,
+                                       void *probe_ctx,
+                                       struct MoraineCatalogHandle **out,
+                                       struct MoraineError *err);
+
+// Opens a catalog that takes no part in a commit log beyond the process
+// default: [`moraine_attach_with_commit_log`] with no `commit_log`.
+//
+// # Safety
+//
+// All pointer and callback requirements are identical to
+// [`moraine_attach_with_commit_log`].
 int32_t moraine_attach_with_wal_store(const char *path,
                                       const struct MoraineS3Config *s3,
                                       bool read_only,
@@ -1785,7 +1829,9 @@ int32_t moraine_maintain(struct MoraineCatalogHandle *handle,
                          void *probe_ctx,
                          struct MoraineError *err);
 
-// Durably records one completed maintenance pass.
+// Durably records one completed maintenance pass. `work_pending` says
+// whether the pass left work for a later one: a step that failed, or a
+// merge still pending.
 //
 // # Safety
 //
@@ -1798,6 +1844,7 @@ int32_t moraine_maintenance_status_record(struct MoraineCatalogHandle *handle,
                                           const char *trigger,
                                           const struct MoraineMaintenanceStatusStepInput *steps,
                                           size_t steps_len,
+                                          bool work_pending,
                                           struct MoraineError *err);
 
 // Lists durable maintenance status, newest pass first and step order within

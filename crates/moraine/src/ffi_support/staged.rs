@@ -24,7 +24,7 @@ pub async fn staged_begin(
     data_prefix: String,
     read_view: Option<std::sync::Arc<crate::catalog::CatalogSnapshot>>,
 ) -> Result<StagedTransaction> {
-    let db_tx = catalog.begin_write_tx().await?;
+    let db_tx = catalog.begin_commit_session().await?;
     Ok(StagedTransaction::begin(
         db_tx,
         catalog.projections().clone(),

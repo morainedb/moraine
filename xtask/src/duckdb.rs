@@ -239,7 +239,7 @@ pub fn build_and_package_extension(
         bundled.vcpkg_toolchain().display()
     );
     let compilers = cpp_compilers()?;
-    let extension_flags = match &compilers {
+    let mut extension_flags = match &compilers {
         Some(compilers) => format!(
             "-DDUCKLAKE_PATCH_SOURCE={} -DCMAKE_C_COMPILER={} -DCMAKE_CXX_COMPILER={}",
             bundled.source.display(),
@@ -248,6 +248,14 @@ pub fn build_and_package_extension(
         ),
         None => format!("-DDUCKLAKE_PATCH_SOURCE={}", bundled.source.display()),
     };
+    // A wrapping crate's manifest, when a build links one in place of the
+    // open core; the cmake tree calls its load hook.
+    if let Some(manifest) = std::env::var_os("MORAINE_ENTERPRISE_MANIFEST") {
+        let manifest = std::path::absolute(&manifest)
+            .with_context(|| format!("resolving {}", Path::new(&manifest).display()))?;
+        extension_flags.push_str(" -DMORAINE_ENTERPRISE_MANIFEST=");
+        extension_flags.push_str(&manifest.display().to_string());
+    }
     // CMake clears its cache and reconfigures when an existing build tree
     // changes compiler. That internal reconfigure drops the extension-config
     // argument, so run the idempotent Make target again to restore it. A fresh

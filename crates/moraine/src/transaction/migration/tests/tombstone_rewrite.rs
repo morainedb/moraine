@@ -16,6 +16,7 @@ async fn old_store(format: u64, rows: u64) -> Arc<InMemory> {
         value::encode_value(&proto::FormatValue {
             format_version: format,
             writer_version: "old-writer".to_owned(),
+            commit_log_batch_origin: None,
         }),
     )
     .unwrap();

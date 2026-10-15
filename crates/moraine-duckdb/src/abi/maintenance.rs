@@ -135,9 +135,13 @@ pub struct MoraineMaintenanceStatusRow {
     pub status: *mut c_char,
     /// Human-readable outcome detail, owned.
     pub detail: *mut c_char,
+    /// Whether the pass left work for a later one.
+    pub work_pending: bool,
 }
 
-/// Durably records one completed maintenance pass.
+/// Durably records one completed maintenance pass. `work_pending` says
+/// whether the pass left work for a later one: a step that failed, or a
+/// merge still pending.
 ///
 /// # Safety
 ///
@@ -152,6 +156,7 @@ pub unsafe extern "C" fn moraine_maintenance_status_record(
     trigger: *const c_char,
     steps: *const MoraineMaintenanceStatusStepInput,
     steps_len: usize,
+    work_pending: bool,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<(), AbiError> {
@@ -183,7 +188,8 @@ pub unsafe extern "C" fn moraine_maintenance_status_record(
             })
             .collect::<Result<Vec<_>, AbiError>>()?;
         let started_at = moraine::Timestamp::from_micros(started_at_micros);
-        let pass = moraine::MaintenanceStatusPass::new(started_at, trigger, status_steps);
+        let pass = moraine::MaintenanceStatusPass::new(started_at, trigger, status_steps)
+            .with_work_pending(work_pending);
 
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
@@ -220,6 +226,7 @@ pub unsafe extern "C" fn moraine_maintenance_status_rows(
                 .flat_map(|pass| {
                     let started_at_micros = pass.started_at.as_micros();
                     let trigger = pass.trigger;
+                    let work_pending = pass.work_pending;
                     pass.steps.into_iter().map(move |step| {
                         Ok((
                             started_at_micros,
@@ -227,21 +234,25 @@ pub unsafe extern "C" fn moraine_maintenance_status_rows(
                             to_c_string(step.step)?,
                             to_c_string(step.status)?,
                             to_c_string(step.detail)?,
+                            work_pending,
                         ))
                     })
                 })
                 .collect::<Result<Vec<_>, AbiError>>()?;
             Ok(owned
                 .into_iter()
-                .map(|(started_at_micros, trigger, step, status, detail)| {
-                    MoraineMaintenanceStatusRow {
-                        started_at_micros,
-                        trigger: trigger.into_raw(),
-                        step: step.into_raw(),
-                        status: status.into_raw(),
-                        detail: detail.into_raw(),
-                    }
-                })
+                .map(
+                    |(started_at_micros, trigger, step, status, detail, work_pending)| {
+                        MoraineMaintenanceStatusRow {
+                            started_at_micros,
+                            trigger: trigger.into_raw(),
+                            step: step.into_raw(),
+                            status: status.into_raw(),
+                            detail: detail.into_raw(),
+                            work_pending,
+                        }
+                    },
+                )
                 .collect())
         };
 

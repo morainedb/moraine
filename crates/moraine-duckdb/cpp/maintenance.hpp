@@ -24,6 +24,9 @@ struct MaintenanceStep {
 	std::string step;
 	std::string status;
 	std::string detail;
+	// Whether the step left work for a later pass beyond a failure: a
+	// merge still pending when the step returned.
+	bool work_pending = false;
 };
 
 // A DuckLake step the attach configured, with the arguments to pass.

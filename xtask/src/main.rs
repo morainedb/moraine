@@ -54,6 +54,7 @@ fn main() -> anyhow::Result<()> {
     let task = std::env::args().nth(1);
     match task.as_deref() {
         Some("e2e") => e2e::e2e(),
+        Some("build-extension") => e2e::build_extension(),
         Some("bench") => bench::bench(&arguments),
         Some("clickbench") => clickbench::run(&arguments),
         Some("commit-bench") => commit_bench::run(&arguments),
@@ -70,13 +71,13 @@ fn main() -> anyhow::Result<()> {
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
         Some(other) => {
             bail!(
-                "unknown task `{other}`; available: e2e, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
+                "unknown task `{other}`; available: e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
                  check-patch-pins, check-release-assets, validate-release-artifact, \
                  bump-duckdb, ducklake-patch"
             )
         }
         None => bail!(
-            "usage: cargo xtask <task>; available: e2e, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
+            "usage: cargo xtask <task>; available: e2e, build-extension, bench, clickbench, commit-bench, locate-bench, filter-bench, reader-bench, session-bench, s3, check-pins, \
              check-patch-pins, check-release-assets, validate-release-artifact, \
              bump-duckdb, ducklake-patch"
         ),

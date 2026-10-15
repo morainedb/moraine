@@ -7,6 +7,7 @@ pub(crate) mod inline;
 pub(crate) mod maintenance_status;
 pub(crate) mod migration;
 pub(crate) mod operations;
+pub(crate) mod session;
 pub(crate) mod staged;
 mod verbs;
 pub(crate) mod wal_move;

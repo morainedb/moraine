@@ -46,8 +46,10 @@
 //! over the writer, so only one process may hold a given store attached
 //! that way; a second read-write attach fences the first's writer rather
 //! than failing itself. `READ_ONLY` opens a reader instead, which never
-//! fences the live writer, so any number may attach alongside it. See
-//! `README.md` for the pinned build shape.
+//! fences the live writer, so any number may attach alongside it. With a
+//! commit-log provider registered, which only a build wrapping this core
+//! does, a read-write attach commits through the log instead and any
+//! number may write. See `README.md` for the pinned build shape.
 //!
 //! # Write-cache admission
 //!

@@ -152,6 +152,17 @@ impl ManifestBytes {
     }
 }
 
+/// The manifest's replay point: the last WAL id whose rows are in the tree.
+pub(crate) async fn replay_point(path: &str, object_store: Arc<dyn ObjectStore>) -> Result<u64> {
+    AdminBuilder::new(path, object_store)
+        .build()
+        .read_manifest(None)
+        .await
+        .map_err(Error::from)?
+        .map(|manifest| manifest.replay_after_wal_id())
+        .ok_or_else(|| Error::Corruption("the store has no manifest".to_string()))
+}
+
 /// The manifest's byte totals, from one manifest read.
 pub(crate) async fn manifest_bytes(
     path: &str,

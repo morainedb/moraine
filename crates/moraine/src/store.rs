@@ -21,7 +21,6 @@ pub(crate) mod retry;
 pub(crate) mod segment;
 pub(crate) mod value;
 pub(crate) mod wal_store;
-pub(crate) mod write;
 
 /// Key and value bytes staged onto one write batch, before the store's own
 /// per-entry framing.

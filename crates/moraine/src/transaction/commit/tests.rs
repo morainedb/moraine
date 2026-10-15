@@ -4,6 +4,7 @@ use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
 
 use super::*;
+use crate::{store::handle::ReadHandle, transaction::session::CommitSession};
 
 mod allocation;
 mod durability;
@@ -104,6 +105,7 @@ async fn a_store_with_an_unreadable_manifest_refuses_to_open() {
         None,
         None,
         std::time::Duration::ZERO,
+        false,
     )
     .await
     .err()
@@ -125,6 +127,7 @@ async fn unknown_format_is_refused() {
         &value::encode_value(&proto::FormatValue {
             format_version: MAX_FORMAT_VERSION + 1,
             writer_version: "future".into(),
+            commit_log_batch_origin: None,
         }),
     )
     .await
@@ -139,6 +142,7 @@ async fn unknown_format_is_refused() {
         None,
         None,
         std::time::Duration::ZERO,
+        false,
     )
     .await
     .err()
@@ -172,6 +176,7 @@ async fn migration_marker_is_refused() {
         None,
         None,
         std::time::Duration::ZERO,
+        false,
     )
     .await
     .err()
@@ -198,6 +203,7 @@ async fn older_format_refuses_toward_migrate() {
         &value::encode_value(&proto::FormatValue {
             format_version: 0,
             writer_version: "t".into(),
+            commit_log_batch_origin: None,
         }),
     )
     .await
@@ -210,6 +216,7 @@ async fn older_format_refuses_toward_migrate() {
         None,
         None,
         std::time::Duration::ZERO,
+        false,
     )
     .await
     .err()
@@ -3281,7 +3288,10 @@ async fn maintain_resumes_each_batch_where_the_last_one_stopped() {
 }
 
 /// A dead range is scanned once however small the batch: a scan per
-/// batch pays a seek and a fresh read-ahead for every commit.
+/// batch pays a seek and a fresh read-ahead for every commit, dozens of
+/// reads per batch over this range. Each batch is a head-preserving
+/// commit that reads the head once, served from the memtable or the cache
+/// except under eviction, so the bound allows one read per batch.
 #[tokio::test]
 async fn maintain_streams_a_dead_range_in_one_scan() {
     use crate::catalog::{Catalog, CatalogOptions, ColumnDef, MaintenanceRequest};
@@ -3329,11 +3339,11 @@ async fn maintain_streams_a_dead_range_in_one_scan() {
     catalog.close().await.unwrap();
 
     assert_eq!(report.index_entries_reclaimed, DEAD_ENTRIES);
-    let bound = DEAD_ENTRIES / 32;
+    let bound = DEAD_ENTRIES + DEAD_ENTRIES / 32;
     assert!(
         reads < bound,
         "a sweep in {DEAD_ENTRIES} batches issued {reads} reads over a range of a few dozen \
-         blocks: the range is being scanned once per batch"
+         blocks, more than one per batch: the range is being scanned once per batch"
     );
 }
 
@@ -4617,7 +4627,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
 
     // The attempt opens and reads its premises.
     let attempt = catalog.begin_write_tx().await.unwrap();
-    let base = head_view_for(&attempt, catalog.projections())
+    let base = head_view_for(ReadHandle::Tx(&attempt), catalog.projections())
         .await
         .unwrap();
     let head_before = base.snapshot.snapshot_id;
@@ -4633,7 +4643,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
         .await
         .unwrap();
 
-    let reread = head_view_for(&attempt, catalog.projections())
+    let reread = head_view_for(ReadHandle::Tx(&attempt), catalog.projections())
         .await
         .unwrap();
     assert_eq!(
@@ -4653,7 +4663,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
     staged.push(head_stamp(head_before + 1, base.batch_seq));
     let staged_bytes = stage_writes(&attempt, &staged).unwrap();
     let landed = commit_batch(
-        Arc::new(attempt),
+        Arc::new(CommitSession::folder(attempt)),
         HeadTransition {
             before: head_before,
             after: head_before + 1,
@@ -4661,7 +4671,10 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
         &staged,
         staged_bytes,
         HeadViewUpdate::Rebuild(Arc::clone(&base)),
-        catalog.projections(),
+        Landing {
+            projections: catalog.projections(),
+            log: None,
+        },
         &CommitDurability::OnFlushInterval,
     )
     .await
@@ -4676,7 +4689,9 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
     // And a fresh attempt does see it, so the loss is the only outcome the
     // interleaving admits — not a permanent wedge.
     let retry = catalog.begin_write_tx().await.unwrap();
-    let fresh = head_view_for(&retry, catalog.projections()).await.unwrap();
+    let fresh = head_view_for(ReadHandle::Tx(&retry), catalog.projections())
+        .await
+        .unwrap();
     assert_eq!(fresh.snapshot.snapshot_id, head_before + 1);
     assert_eq!(
         fresh
@@ -4847,15 +4862,20 @@ async fn a_read_only_pass_that_straddles_a_commit_is_discarded_and_re_run() {
 /// The store state a retry meets when its base predates an expiry: three
 /// commits, with the middle one's snapshot record reclaimed as expiry past
 /// the retention horizon leaves it.
-async fn catalog_with_a_reclaimed_snapshot()
--> (Db, Arc<std::sync::RwLock<ProjectionCache>>, Arc<Coalescer>) {
+async fn catalog_with_a_reclaimed_snapshot() -> (
+    Store,
+    Db,
+    Arc<std::sync::RwLock<ProjectionCache>>,
+    Arc<Coalescer>,
+) {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let (db, _, _, _) = open_initialized(
+    let (db, _, _, pacer) = open_initialized(
         StoreBuilder::new("", object_store),
         false,
         None,
         None,
         std::time::Duration::ZERO,
+        false,
     )
     .await
     .unwrap();
@@ -4863,11 +4883,17 @@ async fn catalog_with_a_reclaimed_snapshot()
     let coalescer = Arc::new(Coalescer::new(
         Arc::clone(&projections),
         CommitDurability::OnFlushInterval,
+        None,
     ));
+    let store = Store::Writer {
+        db: db.clone(),
+        pacer,
+        commit_log: None,
+    };
 
     for name in ["a", "b", "c"] {
         commit_cycle(
-            &db,
+            &store,
             &[|tx: &mut Transaction| tx.create_schema(name).map(|_| ())],
             &coalescer,
         )
@@ -4880,7 +4906,7 @@ async fn catalog_with_a_reclaimed_snapshot()
         .unwrap();
     tx.commit().await.unwrap();
 
-    (db, projections, coalescer)
+    (store, db, projections, coalescer)
 }
 
 /// A retry whose base predates a concurrent expiry classifies against a
@@ -4891,11 +4917,11 @@ async fn catalog_with_a_reclaimed_snapshot()
 /// damaged store.
 #[tokio::test]
 async fn a_retry_across_a_reclaimed_snapshot_conflicts_rather_than_corrupting() {
-    let (db, _projections, _coalescer) = catalog_with_a_reclaimed_snapshot().await;
+    let (store, db, _projections, _coalescer) = catalog_with_a_reclaimed_snapshot().await;
 
     // What a losing attempt that read head 1 classifies: everything that
     // landed above it, reclaimed record included.
-    let intervening = intervening_changes(&db, 1).await.unwrap();
+    let intervening = intervening_changes(&store, 1).await.unwrap();
     let ids: Vec<u64> = intervening.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids, vec![2, 3]);
 
@@ -4950,9 +4976,7 @@ async fn a_mixed_delete_commit_classifies_at_table_grain_from_its_record() {
         .unwrap();
 
     let store = catalog.store();
-    let intervening = intervening_changes(store.writer_db().unwrap(), head_before)
-        .await
-        .unwrap();
+    let intervening = intervening_changes(&store, head_before).await.unwrap();
     let (_, theirs) = &intervening[0];
     assert!(theirs.deleted_data_file_ids.contains(&file.get()));
     assert!(
@@ -4977,11 +5001,11 @@ async fn a_mixed_delete_commit_classifies_at_table_grain_from_its_record() {
 /// materialization resolves head, and head is not what expiry reclaimed.
 #[tokio::test]
 async fn a_verb_commit_rematerializes_over_a_reclaimed_snapshot() {
-    let (db, projections, coalescer) = catalog_with_a_reclaimed_snapshot().await;
+    let (store, db, projections, coalescer) = catalog_with_a_reclaimed_snapshot().await;
     invalidate_head_view(&projections);
 
     commit_cycle(
-        &db,
+        &store,
         &[|tx: &mut Transaction| tx.create_schema("d").map(|_| ())],
         &coalescer,
     )
@@ -5106,7 +5130,9 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
     };
 
     let base = catalog.snapshot().await.unwrap();
-    let db_tx = Arc::new(catalog.begin_write_tx().await.unwrap());
+    let db_tx = Arc::new(CommitSession::folder(
+        catalog.begin_write_tx().await.unwrap(),
+    ));
     let prepared = prepare_and_stage(
         &db_tx,
         catalog.projections(),
@@ -5150,5 +5176,178 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
     );
 
     drop(db_tx);
+    catalog.close().await.unwrap();
+}
+
+/// A folder holding the store, with a two-column table, over `provider`.
+async fn folder_with_table(
+    backing: Arc<dyn ObjectStore>,
+    provider: Arc<crate::commit_log::test_log::TestProvider>,
+) -> (crate::catalog::Catalog, crate::catalog::TableId) {
+    use crate::catalog::{Catalog, ColumnDef};
+    let folder = Catalog::open(backing, log_options(provider)).await.unwrap();
+    assert!(folder.holds_store(), "the first open adopts and holds");
+    let table = std::cell::Cell::new(None);
+    folder
+        .commit(|tx| {
+            let schema = tx.create_schema("s")?;
+            let column = |name: &str| ColumnDef {
+                name: name.into(),
+                column_type: "BIGINT".into(),
+                nulls_allowed: true,
+                default_value: None,
+                children: Vec::new(),
+            };
+            let created = tx.create_table(schema, "t", &[column("a"), column("b")])?;
+            table.set(Some(created));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    (folder, table.get().unwrap())
+}
+
+fn log_options(
+    provider: Arc<crate::commit_log::test_log::TestProvider>,
+) -> crate::catalog::CatalogOptions {
+    crate::catalog::CatalogOptions {
+        commit_log: Some(provider),
+        commit_log_poll_interval: std::time::Duration::from_millis(10),
+        commit_log_fold_poll: std::time::Duration::from_millis(10),
+        ..crate::catalog::CatalogOptions::default()
+    }
+}
+
+/// Polls `check` until it holds or five seconds pass.
+async fn settles(mut check: impl AsyncFnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if check().await {
+            return true;
+        }
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A committer that holds no store sweeps a dropped index through the log:
+/// every batch is a head-preserving slot, the head snapshot stands, and
+/// the folder folds the deletes into the store it holds.
+#[tokio::test]
+async fn a_committer_sweeps_a_dropped_index_through_the_log() {
+    use crate::{
+        catalog::{Catalog, MaintenanceRequest},
+        commit_log::test_log::TestProvider,
+    };
+    let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let provider = Arc::new(TestProvider::default());
+    let (folder, table) = folder_with_table(Arc::clone(&backing), Arc::clone(&provider)).await;
+    register_three_row_file(&folder, table).await;
+    let index = indexed(&folder, table, "by_a", 3).await;
+    folder.commit(|tx| tx.drop_index(index)).await.unwrap();
+    let head_before = folder.snapshot().await.unwrap().snapshot.snapshot_id;
+    assert_eq!(index_entry_count(&folder).await, 3);
+
+    let committer = Catalog::open(
+        Arc::clone(&backing),
+        log_options(Arc::new(provider.sharing())),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !committer.holds_store(),
+        "a second open commits over a reader"
+    );
+    let request = MaintenanceRequest {
+        batch_size: 2,
+        pace: std::time::Duration::ZERO,
+        ..MaintenanceRequest::default()
+    };
+    let swept = committer.maintain(request).await.unwrap();
+    assert_eq!(swept.indexes_swept, 1);
+    assert_eq!(swept.index_entries_reclaimed, 3);
+
+    assert!(
+        settles(async || index_entry_count(&folder).await == 0).await,
+        "the folder folds the sweep's slots into its store"
+    );
+    assert_eq!(
+        folder.snapshot().await.unwrap().snapshot.snapshot_id,
+        head_before,
+        "a sweep preserves the head snapshot"
+    );
+
+    committer.close().await.unwrap();
+    folder.close().await.unwrap();
+}
+
+/// A committer records a pass through the log, and the record carries the
+/// head it was recorded against.
+#[tokio::test]
+async fn a_committer_records_a_pass_against_the_head() {
+    use crate::{
+        catalog::{Catalog, MaintenanceStatusPass, Timestamp},
+        commit_log::test_log::TestProvider,
+    };
+    let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let provider = Arc::new(TestProvider::default());
+    let (folder, _table) = folder_with_table(Arc::clone(&backing), Arc::clone(&provider)).await;
+    let head = folder.snapshot().await.unwrap().snapshot.snapshot_id;
+
+    let committer = Catalog::open(
+        Arc::clone(&backing),
+        log_options(Arc::new(provider.sharing())),
+    )
+    .await
+    .unwrap();
+    let pass = MaintenanceStatusPass::new(Timestamp::from_micros(7), "manual", Vec::new())
+        .with_work_pending(true);
+    committer.record_maintenance_pass(pass).await.unwrap();
+
+    assert!(
+        settles(async || !folder.maintenance_status().await.unwrap().is_empty()).await,
+        "the folder folds the record"
+    );
+    let recorded = folder.maintenance_status().await.unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].trigger, "manual");
+    assert_eq!(recorded[0].head_snapshot_id, head);
+    assert!(recorded[0].work_pending);
+    assert_eq!(folder.snapshot().await.unwrap().snapshot.snapshot_id, head);
+
+    committer.close().await.unwrap();
+    folder.close().await.unwrap();
+}
+
+/// The census read without a handle is the manifest leg of the census an
+/// open handle reads.
+#[tokio::test]
+async fn store_census_of_reads_the_manifest_leg_without_opening() {
+    use crate::catalog::{Catalog, CatalogOptions, CensusRequest};
+    let backing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let options = CatalogOptions {
+        path: "lake".to_string(),
+        ..CatalogOptions::default()
+    };
+    let catalog = Catalog::open(Arc::clone(&backing), options.clone())
+        .await
+        .unwrap();
+    catalog
+        .commit(|tx| tx.create_schema("s").map(|_| ()))
+        .await
+        .unwrap();
+    catalog.flush_memtable().await.unwrap();
+    let opened = catalog
+        .store_census(CensusRequest::default())
+        .await
+        .unwrap();
+
+    let unopened = Catalog::store_census_of(Arc::clone(&backing), &options)
+        .await
+        .unwrap();
+    assert_eq!(unopened.subspaces, opened.subspaces);
+    assert!(unopened.subspaces.iter().any(|subspace| subspace.bytes > 0));
     catalog.close().await.unwrap();
 }

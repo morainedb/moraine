@@ -15,7 +15,10 @@ use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{layer::Context, prelude::*};
 
 use super::{inline::inline_schema_collapse_target, *};
-use crate::catalog::{Catalog, CatalogOptions, inline::InlineScanKind};
+use crate::{
+    catalog::{Catalog, CatalogOptions, inline::InlineScanKind},
+    transaction::session::CommitSession,
+};
 
 mod batching;
 mod body_ownership;
@@ -110,9 +113,12 @@ fn file_column_stats_row(
 }
 
 async fn open() -> Catalog {
-    Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap()
+    Box::pin(Catalog::open(
+        Arc::new(InMemory::new()),
+        CatalogOptions::default(),
+    ))
+    .await
+    .unwrap()
 }
 
 #[derive(Clone, Default)]
@@ -1946,7 +1952,7 @@ async fn commit_reports_the_deferred_indexes_it_leaves_maintaining() {
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin(
-        db_tx,
+        CommitSession::folder(db_tx),
         Arc::clone(catalog.projections()),
         Some(catalog.store()),
         Some(DataStore::new(store)),
@@ -6544,10 +6550,12 @@ async fn merge_of_a_partitioned_table_deletes_parent_and_partition_values() {
         result
     }
 
-    merge_with(false)
+    // Boxed: each run drives a whole staged commit, whose future outgrows
+    // the stack budget the lint allows.
+    Box::pin(merge_with(false))
         .await
         .expect("merge with the parent deleted before its partition value");
-    merge_with(true)
+    Box::pin(merge_with(true))
         .await
         .expect("merge with the partition value deleted before its parent");
 }

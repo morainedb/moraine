@@ -34,6 +34,11 @@ void RegisterMoraineMoveWalFunction(duckdb::ExtensionLoader &loader);
 void RegisterMoraineCheckpointFunctions(duckdb::ExtensionLoader &loader);
 } // namespace moraine_duckdb
 
+#ifdef MORAINE_ENTERPRISE
+// Exported by the crate an enterprise build links in place of the open core.
+extern "C" void moraine_enterprise_init(void);
+#endif
+
 namespace duckdb {
 
 // Registers the bundled DuckLake and records it as the loaded `ducklake`
@@ -59,6 +64,10 @@ static void LoadBundledDuckLake(ExtensionLoader &loader) {
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+#ifdef MORAINE_ENTERPRISE
+	// The wrapping crate's registrations, before any attach can need them.
+	moraine_enterprise_init();
+#endif
 	// DuckLake first: moraine's attach type resolves the storage extension
 	// it registers.
 	LoadBundledDuckLake(loader);

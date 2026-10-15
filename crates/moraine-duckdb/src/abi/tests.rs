@@ -831,6 +831,7 @@ fn maintenance_status_roundtrips_through_the_abi() {
             trigger.as_ptr(),
             inputs.as_ptr(),
             inputs.len(),
+            true,
             &raw mut err,
         )
     };
@@ -847,6 +848,7 @@ fn maintenance_status_roundtrips_through_the_abi() {
     // SAFETY: the successful list call returned one valid row.
     let row = unsafe { &*rows };
     assert_eq!(row.started_at_micros, 123);
+    assert!(row.work_pending, "the record carries what the caller said");
     for (actual, expected) in [
         (row.trigger, "scheduled"),
         (row.step, "sweep_indexes"),

@@ -106,10 +106,13 @@ pub(crate) fn preload_shortfall(store_bytes: u64, cache_size: Option<u64>) -> Op
 /// [`open_reader`](Self::open_reader) — carrying the shared open
 /// configuration: the WAL flush cadence (writer only) and the on-disk object
 /// cache.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct StoreBuilder<'a> {
     path: &'a str,
     object_store: Arc<dyn ObjectStore>,
     wal_object_store: Option<Arc<dyn ObjectStore>>,
+    commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
+    commit_log_tail: bool,
     flush_interval: Option<Duration>,
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
@@ -120,6 +123,7 @@ pub(crate) struct StoreBuilder<'a> {
     cache_preload: Option<CachePreload>,
     cache_puts: bool,
     cache_compaction_puts: bool,
+    external_compaction: bool,
     checkpoint: Option<Uuid>,
     /// The manifest's per-segment sizes, when the attach read them; they
     /// decide how a preload reaches each subspace's first entry.
@@ -136,6 +140,8 @@ impl<'a> StoreBuilder<'a> {
             path,
             object_store: retry::Store::wrap(object_store),
             wal_object_store: None,
+            commit_log: None,
+            commit_log_tail: false,
             flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
@@ -146,6 +152,7 @@ impl<'a> StoreBuilder<'a> {
             cache_preload: None,
             cache_puts: true,
             cache_compaction_puts: true,
+            external_compaction: false,
             checkpoint: None,
             warm_segments: Vec::new(),
         }
@@ -161,6 +168,33 @@ impl<'a> StoreBuilder<'a> {
     ) -> Self {
         self.wal_object_store = wal_object_store.map(retry::Store::wrap);
         self
+    }
+
+    /// Opens the store over `provider`'s write-ahead-log plugs, so a
+    /// bucket-resident commit log is the store's log: a writer replays it
+    /// on open and reports its folds through the plug, and a reader follows
+    /// the folded store or tails the log.
+    pub(crate) fn commit_log(
+        mut self,
+        provider: Option<Arc<dyn crate::CommitLogProvider>>,
+    ) -> Self {
+        self.commit_log = provider;
+        self
+    }
+
+    /// Makes a reader over a commit log tail the log rather than follow the
+    /// folded store. Reader only.
+    pub(crate) fn commit_log_tail(mut self, tail: bool) -> Self {
+        self.commit_log_tail = tail;
+        self
+    }
+
+    /// The store the log lives on: the separate log store when one is
+    /// configured, else the store itself.
+    pub(crate) fn log_store(&self) -> Arc<dyn ObjectStore> {
+        self.wal_object_store
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.object_store), Arc::clone)
     }
 
     /// Sets how often a read-only handle polls for new state. Reader only —
@@ -257,6 +291,13 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
+    /// Leaves compaction and collection to another process: the writer
+    /// starts neither SlateDB's compactor nor its collector.
+    pub(crate) fn external_compaction(mut self, external: bool) -> Self {
+        self.external_compaction = external;
+        self
+    }
+
     /// Pins the reader to an existing checkpoint instead of the latest
     /// manifest. Reader only, and the only zero-write open.
     pub(crate) fn checkpoint(mut self, checkpoint: Option<Uuid>) -> Self {
@@ -278,6 +319,9 @@ impl<'a> StoreBuilder<'a> {
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)));
         if let Some(wal) = &self.wal_object_store {
             builder = builder.with_wal_object_store(Arc::clone(wal));
+        }
+        if let Some(provider) = &self.commit_log {
+            builder = builder.with_wal_writer(provider.writer_init(self.log_store(), self.path));
         }
 
         let location = self.location();
@@ -330,6 +374,13 @@ impl<'a> StoreBuilder<'a> {
         }
         if let Some(checkpoint) = self.checkpoint {
             builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
+        }
+        if let Some(provider) = &self.commit_log {
+            builder = builder.with_wal_reader(provider.reader(
+                self.log_store(),
+                self.path,
+                self.commit_log_tail,
+            ));
         }
 
         let reader = builder.build().await.map_err(Error::from)?;
@@ -388,12 +439,18 @@ impl<'a> StoreBuilder<'a> {
     /// SlateDB settings for a writer. The in-process compactor writes its
     /// SSTs with these too, so the filter threshold holds across a merge.
     fn settings(&self) -> Settings {
-        Settings {
+        let mut settings = Settings {
             flush_interval: self.flush_interval,
             manifest_poll_interval: WRITER_MANIFEST_POLL_INTERVAL,
             min_filter_keys: MIN_FILTER_KEYS,
             ..Default::default()
+        };
+        if self.external_compaction {
+            settings.compactor_options = None;
+            settings.garbage_collector_options = None;
         }
+
+        settings
     }
 
     fn location(&self) -> cache::StoreLocation {
@@ -616,6 +673,22 @@ mod tests {
     fn writer_settings_pass_slatedb_validation() {
         let settings = StoreBuilder::new("s", memory_store()).settings();
         settings.validate().unwrap();
+    }
+
+    /// A writer under external compaction starts neither SlateDB's
+    /// compactor nor its collector, and the settings still validate.
+    #[test]
+    fn external_compaction_turns_off_the_compactor_and_the_collector() {
+        let settings = StoreBuilder::new("s", memory_store())
+            .external_compaction(true)
+            .settings();
+        assert!(settings.compactor_options.is_none());
+        assert!(settings.garbage_collector_options.is_none());
+        settings.validate().unwrap();
+
+        let settings = StoreBuilder::new("s", memory_store()).settings();
+        assert!(settings.compactor_options.is_some());
+        assert!(settings.garbage_collector_options.is_some());
     }
 
     /// A commit-shaped transaction spanning several subspaces lands

@@ -418,6 +418,10 @@ message GcFileValue {
 message FormatValue {
   uint64 format_version = 1;
   string writer_version = 2;
+  // The head's batch counter when the store adopted the commit log: slot k
+  // carries the head stamp at counter origin + k - 1, so a committer races
+  // the slot the counter it prepared against implies. Set on format 10.
+  optional uint64 commit_log_batch_origin = 3;
 }
 
 // sys/head: latest committed snapshot id, and the count of batches that
@@ -451,6 +455,12 @@ message MaintenanceStatusPassValue {
   int64 started_at_micros = 1;
   string trigger = 2;
   repeated MaintenanceStatusStepValue steps = 3;
+  // The head the pass was recorded against: its snapshot and the batch
+  // counter the record's own head stamp advanced from.
+  uint64 head_snapshot_id = 4;
+  uint64 head_batch_seq = 5;
+  // Whether the pass left work for a later one.
+  bool work_pending = 6;
 }
 
 // sys/maintenance_status: the bounded durable history of completed passes.

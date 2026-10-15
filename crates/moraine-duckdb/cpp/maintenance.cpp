@@ -557,13 +557,19 @@ void MaintenanceScheduler::RecordPass(duckdb::timestamp_t started_at, const char
 	try {
 		std::vector<MoraineMaintenanceStatusStepInput> steps;
 		steps.reserve(report.size());
+		// A failed step is redone by the next pass; a pending merge is
+		// finished by whichever compactor serves the lake. Either leaves
+		// work for a later pass to look at.
+		bool work_pending = false;
 		for (auto &step : report) {
 			steps.push_back(MoraineMaintenanceStatusStepInput {step.step.c_str(), step.status.c_str(),
 			                                                   step.detail.c_str()});
+			work_pending = work_pending || step.status == "failed" || step.work_pending;
 		}
 
 		MoraineError err {};
-		auto code = moraine_maintenance_status_record(handle_, started_at.value, trigger, steps.data(), steps.size(), &err);
+		auto code = moraine_maintenance_status_record(handle_, started_at.value, trigger, steps.data(), steps.size(),
+		                                              work_pending, &err);
 		if (code == MORAINE_OK) {
 			return;
 		}
@@ -692,11 +698,13 @@ MaintenanceStep MaintenanceScheduler::RunStoreMerge() {
 	// others says which was which rather than reporting a total.
 	std::string detail;
 	uint64_t reclaimed = 0;
+	bool pending = false;
 	for (auto &merge : merges) {
 		if (!detail.empty()) {
 			detail += ", ";
 		}
 		detail += std::string(merge.subspace) + ": " + merge.outcome;
+		pending = pending || std::string(merge.outcome) == "pending";
 		if (merge.detail != nullptr && *merge.detail != '\0') {
 			detail += " (" + std::string(merge.detail) + ")";
 		}
@@ -707,7 +715,7 @@ MaintenanceStep MaintenanceScheduler::RunStoreMerge() {
 	if (reclaimed > 0) {
 		detail += "; reclaimed " + std::to_string(reclaimed) + " bytes";
 	}
-	return MaintenanceStep {"compact_store", "ran", detail};
+	return MaintenanceStep {"compact_store", "ran", detail, pending};
 }
 
 namespace {
@@ -739,6 +747,7 @@ struct ReportRow {
 	duckdb::timestamp_t started_at;
 	std::string trigger;
 	MaintenanceStep step;
+	bool work_pending = false;
 };
 
 struct MaintenanceGlobalState : public duckdb::GlobalTableFunctionState {
@@ -769,10 +778,13 @@ duckdb::unique_ptr<duckdb::FunctionData> StatusBind(duckdb::ClientContext &conte
                                                     duckdb::vector<duckdb::Identifier> &names) {
 	auto bind_data = MaintenanceBind(context, input, return_types, names);
 	bind_data->Cast<MaintenanceBindData>().status_only = true;
-	// Retained passes carry when they ran and what drove them.
+	// Retained passes carry when they ran, what drove them, and whether
+	// they left work for a later one.
 	return_types.insert(return_types.begin(),
 	                    {duckdb::LogicalType::TIMESTAMP, duckdb::LogicalType::VARCHAR});
 	names.insert(names.begin(), {"started_at", "trigger"});
+	return_types.push_back(duckdb::LogicalType::BOOLEAN);
+	names.push_back("work_pending");
 	return bind_data;
 }
 
@@ -794,7 +806,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MaintenanceInitGlobal(duckd
 		for (auto &row : rows) {
 			state->rows.push_back(ReportRow {
 			    duckdb::timestamp_t(row.started_at_micros), std::string(row.trigger),
-			    MaintenanceStep {std::string(row.step), std::string(row.status), std::string(row.detail)}});
+			    MaintenanceStep {std::string(row.step), std::string(row.status), std::string(row.detail)},
+			    row.work_pending});
 		}
 		return state;
 	}
@@ -827,7 +840,10 @@ void MaintenanceImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, 
 		}
 		output.SetValue(column++, count, duckdb::Value(row.step.step));
 		output.SetValue(column++, count, duckdb::Value(row.step.status));
-		output.SetValue(column, count, duckdb::Value(row.step.detail));
+		output.SetValue(column++, count, duckdb::Value(row.step.detail));
+		if (state.with_pass_columns) {
+			output.SetValue(column, count, duckdb::Value::BOOLEAN(row.work_pending));
+		}
 		state.emitted++;
 		count++;
 	}

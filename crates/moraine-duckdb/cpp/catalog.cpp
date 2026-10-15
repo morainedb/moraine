@@ -849,6 +849,15 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// the catalog records it: a later attach naming a different store, or
 	// none, is refused.
 	std::string wal_path;
+	// When the process has a commit-log provider registered, a read-write
+	// attach is a committer and a read-only attach is a reader.
+	// `COMMIT_LOG_TAIL` makes a read-only attach tail the log;
+	// `COMMIT_LOG_POLL_INTERVAL_MS` is how often a committer's reader polls
+	// for slots. Both are ignored without a registered provider.
+	MoraineCommitLog commit_log {};
+	commit_log.tail = false;
+	commit_log.poll_interval_ms = 0;
+	bool commit_log_given = false;
 	// `MAINTENANCE_*` configures the scheduled pass: the cadence, and
 	// which of DuckLake's own maintenance functions it runs. Every step
 	// that mutates the lake is opt-in, so an attach naming none schedules
@@ -903,6 +912,12 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			}
 		} else if (name == "checkpoint") {
 			checkpoint = option.second.GetValue<std::string>();
+		} else if (name == "commit_log_tail") {
+			commit_log.tail = option.second.GetValue<bool>();
+			commit_log_given = true;
+		} else if (name == "commit_log_poll_interval_ms") {
+			commit_log.poll_interval_ms = option.second.GetValue<uint64_t>();
+			commit_log_given = true;
 		}
 	}
 	// The backing strings must outlive the attach call, so they live
@@ -923,15 +938,15 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// the machine on top of DuckDB's. The ABI clamps it; read once here,
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
-	auto code = moraine_attach_with_wal_store(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
-	                           flush_on_commit,
-	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_memory_bytes,
-	                           static_cast<uint32_t>(cache_auxiliary_percent),
-	                           cache_preload, cache_puts, cache_compaction_puts,
-	                           data_path.empty() ? nullptr : data_path.c_str(),
-	                           wal_path.empty() ? nullptr : &wal,
-	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
-	                           moraine_shim_is_interrupted, &context, &handle, &err);
+	auto code = moraine_attach_with_commit_log(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted,
+	                                           flush_interval_ms, flush_on_commit,
+	                                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes,
+	                                           cache_memory_bytes, static_cast<uint32_t>(cache_auxiliary_percent),
+	                                           cache_preload, cache_puts, cache_compaction_puts,
+	                                           data_path.empty() ? nullptr : data_path.c_str(),
+	                                           wal_path.empty() ? nullptr : &wal, commit_log_given ? &commit_log : nullptr,
+	                                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
+	                                           moraine_shim_is_interrupted, &context, &handle, &err);
 	// Drained on both exits: the open's own events (and a failed open's)
 	// would otherwise sit buffered until some later commit — or forever, on
 	// a read-only attach that never commits.

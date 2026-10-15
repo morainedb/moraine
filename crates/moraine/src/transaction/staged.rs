@@ -28,7 +28,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use slatedb::{Db, DbTransaction};
+#[cfg(test)]
+use slatedb::DbTransaction;
 use tracing::{debug, warn};
 
 use crate::{
@@ -51,6 +52,7 @@ use crate::{
             IndexMaintenanceMetrics, StagedEntries, StagedIndexEntry, apply_deferred_maintenance,
             apply_poison, stage_index_entry_stream,
         },
+        session::CommitSession,
     },
 };
 
@@ -417,7 +419,7 @@ fn corrupt_row(table: TableKind, detail: impl std::fmt::Display) -> Error {
 /// discards them.
 pub struct StagedTransaction {
     diagnostic_id: u64,
-    db_tx: Arc<DbTransaction>,
+    db_tx: Arc<CommitSession>,
     ops: Vec<RowOperation>,
     /// The committed records at this transaction's read point, read once
     /// per requested kind and shared by later reads of that kind.
@@ -458,7 +460,7 @@ impl StagedTransaction {
     /// shared maintained-projection state).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
-        db_tx: DbTransaction,
+        db_tx: CommitSession,
         projections: Arc<std::sync::RwLock<ProjectionCache>>,
         store: Option<Arc<Store>>,
         data_store: Option<DataStore>,
@@ -496,7 +498,7 @@ impl StagedTransaction {
     #[cfg(test)]
     pub(crate) fn begin_detached(catalog: &crate::Catalog, db_tx: DbTransaction) -> Self {
         Self::begin(
-            db_tx,
+            CommitSession::folder(db_tx),
             Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
             Some(catalog.store()),
             None,
@@ -514,7 +516,7 @@ impl StagedTransaction {
     #[cfg(test)]
     pub(crate) fn begin_detached_on(catalog: &crate::Catalog, db_tx: DbTransaction) -> Self {
         Self::begin(
-            db_tx,
+            CommitSession::folder(db_tx),
             Arc::clone(catalog.projections()),
             Some(catalog.store()),
             None,
@@ -535,7 +537,7 @@ impl StagedTransaction {
         data_store: DataStore,
     ) -> Self {
         Self::begin(
-            db_tx,
+            CommitSession::folder(db_tx),
             Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
             Some(catalog.store()),
             Some(data_store),
@@ -617,7 +619,7 @@ impl StagedTransaction {
         self.committed_snapshots
             .get_or_try_init(|| async {
                 let started = Instant::now();
-                let records = read::scan_snapshots(ReadHandle::Tx(&self.db_tx)).await?;
+                let records = read::scan_snapshots(self.db_tx.handle()).await?;
                 debug!(
                     transaction_id = self.diagnostic_id,
                     records = records.len(),
@@ -634,7 +636,7 @@ impl StagedTransaction {
     /// cache when it stands there.
     async fn head_view(&self) -> Result<Arc<CatalogSnapshot>> {
         self.head_view
-            .get_or_try_init(|| commit::head_view_for(&self.db_tx, &self.projections))
+            .get_or_try_init(|| commit::head_view_for(self.db_tx.handle(), &self.projections))
             .await
             .cloned()
     }
@@ -684,17 +686,12 @@ impl StagedTransaction {
 
                 let started = Instant::now();
                 let records = match scope {
-                    Some(table_id) => read::scan_entity_kind_of(
-                        ReadHandle::Tx(&self.db_tx),
-                        kind,
-                        versions,
-                        table_id,
-                    )
-                    .await?
-                    .unwrap_or_default(),
-                    None => {
-                        read::scan_entity_kind(ReadHandle::Tx(&self.db_tx), kind, versions).await?
+                    Some(table_id) => {
+                        read::scan_entity_kind_of(self.db_tx.handle(), kind, versions, table_id)
+                            .await?
+                            .unwrap_or_default()
                     }
+                    None => read::scan_entity_kind(self.db_tx.handle(), kind, versions).await?,
                 };
                 let history_records = records
                     .iter()
@@ -728,7 +725,7 @@ impl StagedTransaction {
         if filter_snapshot.is_none() {
             return Ok(read::Versions::LiveAndEnded);
         }
-        let head = read::read_head(ReadHandle::Tx(&self.db_tx))
+        let head = read::read_head(self.db_tx.handle())
             .await?
             .map(|head| head.snapshot_id);
 
@@ -1273,7 +1270,7 @@ impl StagedTransaction {
         self.committed_schema_versions
             .get_or_try_init(|| async {
                 let started = Instant::now();
-                let records = read::scan_schema_versions(ReadHandle::Tx(&self.db_tx)).await?;
+                let records = read::scan_schema_versions(self.db_tx.handle()).await?;
                 debug!(
                     transaction_id = self.diagnostic_id,
                     records = records.len(),
@@ -1350,6 +1347,10 @@ impl StagedTransaction {
             .as_deref()
             .map(Store::commit_durability)
             .unwrap_or_default();
+        let commit_log = catalog_store
+            .as_deref()
+            .and_then(Store::commit_log)
+            .cloned();
         let staged_rows = ops.len();
         let staged_cost = staged_cost(&ops);
         if staged_cost > MAX_STAGED_COST_PER_COMMIT {
@@ -1374,7 +1375,13 @@ impl StagedTransaction {
         let phase_started = Instant::now();
         let base = match head_view.into_inner() {
             Some(base) => Ok(base),
-            None => reporting_phase("head-view", commit::head_view_for(&db_tx, &projections)).await,
+            None => {
+                reporting_phase(
+                    "head-view",
+                    commit::head_view_for(db_tx.handle(), &projections),
+                )
+                .await
+            }
         };
         let base = match base {
             Ok(base) => base,
@@ -1411,8 +1418,8 @@ impl StagedTransaction {
         } else {
             None
         };
-        let writer = catalog_store.as_deref().and_then(Store::writer_db);
-        if let (Some(ours), Some(commits), Some(db)) = (ours, commits.as_ref(), writer) {
+        let store = catalog_store.as_deref();
+        if let (Some(ours), Some(commits), Some(db)) = (ours, commits.as_ref(), store) {
             // The transaction's own read view is spent: the batch's carries
             // the writes. The rows were stamped against the view the caller
             // read, which may predate this transaction's own.
@@ -1524,7 +1531,10 @@ impl StagedTransaction {
                     writes,
                     staged_bytes,
                     head_view_update,
-                    Arc::clone(&projections),
+                    commit::OwnedLanding {
+                        projections: Arc::clone(&projections),
+                        log: commit_log.clone(),
+                    },
                     durability.clone(),
                 ),
             )
@@ -1559,18 +1569,14 @@ impl StagedTransaction {
                     // rows are DuckLake's, and the race is DuckLake's.
                     if !mints_snapshot && attempt < MAX_HEAD_PRESERVING_ATTEMPTS {
                         attempt += 1;
-                        let Some(db) = catalog_store.as_deref().and_then(Store::writer_db) else {
+                        let Some(store) = catalog_store.as_deref() else {
                             return Err(staged_lost_race(result_id, staged_rows));
                         };
                         tokio::time::sleep(commit::retry_backoff(attempt)).await;
-                        db_tx = Arc::new(
-                            db.begin(slatedb::IsolationLevel::Snapshot)
-                                .await
-                                .map_err(Error::from)?,
-                        );
+                        db_tx = Arc::new(store.begin_commit_session().await?);
                         base = reporting_phase(
                             "head-view",
-                            commit::head_view_for(&db_tx, &projections),
+                            commit::head_view_for(db_tx.handle(), &projections),
                         )
                         .await?;
                         debug!(
@@ -1631,7 +1637,7 @@ struct RowsStaged {
 /// the entity diff, the head stamp, and the batch. Nothing is rolled back
 /// on an error; the transaction is the caller's.
 async fn stage_rows(
-    db_tx: &Arc<DbTransaction>,
+    db_tx: &Arc<CommitSession>,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     rebase: &Rebase,
@@ -1772,7 +1778,7 @@ impl commit::StageOnto for StagedMember {
     async fn stage_onto(
         &self,
         batch: &mut commit::Batch,
-        db: &Db,
+        db: &Store,
         _projections: &std::sync::RwLock<ProjectionCache>,
     ) -> Result<commit::Staging> {
         batch.count_member();
@@ -1913,13 +1919,13 @@ fn translate_batch(
 /// entries stage directly and never join `writes`). The caller has already
 /// stamped the head.
 fn stage_batch(
-    db_tx: &DbTransaction,
+    db_tx: &CommitSession,
     writes: &mut Vec<commit::StagedWrite>,
     inline_writes: Vec<commit::StagedWrite>,
     entry_bytes: u64,
 ) -> Result<StagedBytes> {
     writes.extend(inline_writes);
-    let mut staged = commit::stage_writes(db_tx, writes)?;
+    let mut staged = commit::stage_writes_on(db_tx, writes)?;
     staged.0 = staged.0.saturating_add(entry_bytes);
     Ok(staged)
 }
@@ -2099,7 +2105,7 @@ async fn staged_lost_race_against(
     staged_rows: usize,
 ) -> Error {
     let bare = || staged_lost_race(result_id, staged_rows);
-    let (Some(db), Some(changes_made)) = (store.and_then(Store::writer_db), changes_made) else {
+    let (Some(db), Some(changes_made)) = (store, changes_made) else {
         return bare();
     };
     let ours = crate::transaction::operations::ChangeSet::parse(changes_made);
