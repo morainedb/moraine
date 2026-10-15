@@ -623,6 +623,28 @@ fn commit_log_provider(options: &CatalogOptions) -> Option<Arc<dyn crate::Commit
         .or_else(crate::commit_log::registered_commit_log)
 }
 
+/// Leaves the store a holder has flushed, the log truncated, and the store
+/// closed. A fence met here means another process took the store: every
+/// slot is durable in the log and the folds held in memory go with the
+/// store, so the handle demotes and nothing is reported.
+async fn release_held_store(commit_log: &LogCommitter) -> Result<()> {
+    let fenced = match commit_log.flush_now().await {
+        Ok(()) => false,
+        Err(Error::Fenced(_)) => {
+            info!("fenced at close: another process took the store");
+            true
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(db) = commit_log.demote().await else {
+        return Ok(());
+    };
+    match db.close().await.map_err(Error::from) {
+        Err(Error::Fenced(_)) if fenced => Ok(()),
+        closed => closed,
+    }
+}
+
 fn wal_object_store(options: &CatalogOptions) -> Option<Arc<dyn ObjectStore>> {
     options
         .wal_store
@@ -1432,12 +1454,7 @@ impl ReadOnlyCatalog {
             } => {
                 reader.close().await.map_err(Error::from)?;
                 if commit_log.holds_store() {
-                    // A holder leaves the fold flushed and the log truncated.
-                    commit_log.flush_now().await?;
-                    if let Some(db) = commit_log.demote().await {
-                        db.close().await.map_err(Error::from)?;
-                    }
-                    return Ok(());
+                    return release_held_store(commit_log).await;
                 }
                 // The last one out leaves the tail short for the next in.
                 let threshold = sprint.options.commit_log_sprint_slots;
@@ -1860,13 +1877,14 @@ impl Catalog {
             .await?;
 
         let (db, log) = take_store(object_store, &options).await?;
-        if let Some(log) = &log {
-            let _held = log.guard.lock().await;
-            log.fold_tail().await?;
-            log.flush_now().await?;
-            log.demote().await;
+        match &log {
+            Some(log) => {
+                let _held = log.guard.lock().await;
+                log.fold_tail().await?;
+                release_held_store(log).await?;
+            }
+            None => db.close().await.map_err(Error::from)?,
         }
-        db.close().await.map_err(Error::from)?;
 
         Ok(behind)
     }
