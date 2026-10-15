@@ -835,65 +835,6 @@ fn unique_violation(index_id: u64, claimant: u64, holder: u64, collided: Collide
     })
 }
 
-/// Deletes up to `limit` orphaned entries of one dropped index inside an
-/// open transaction, returning how many deletes were staged.
-pub(crate) async fn reclaim_entries(
-    tx: &slatedb::DbTransaction,
-    index_id: u64,
-    limit: usize,
-    staged: &mut StagedBytes,
-) -> Result<usize> {
-    let mut deleted = 0;
-    for kind in [IndexKind::Unique, IndexKind::Multi] {
-        if deleted >= limit {
-            break;
-        }
-        let (batch, _) =
-            reclaim_entries_from(tx, kind, index_id, limit - deleted, None, staged).await?;
-        deleted += batch;
-    }
-
-    Ok(deleted)
-}
-
-/// Deletes up to `limit` entries of one dropped index of one kind,
-/// resuming at `start_from` when given, and returns how many were staged
-/// alongside the last key deleted.
-pub(crate) async fn reclaim_entries_from(
-    tx: &slatedb::DbTransaction,
-    kind: IndexKind,
-    index_id: u64,
-    limit: usize,
-    start_from: Option<&[u8]>,
-    staged: &mut StagedBytes,
-) -> Result<(usize, Option<Vec<u8>>)> {
-    let prefix = index_index_prefix(kind, index_id);
-    // `scan_prefix` takes its bounds as a suffix of the prefix.
-    let suffix = match start_from {
-        Some(key) if key.len() >= prefix.len() => key[prefix.len()..].to_vec(),
-        _ => Vec::new(),
-    };
-
-    let mut iter = ReadHandle::Tx(tx)
-        .scan_prefix(prefix, suffix.., ScanShape::Bulk)
-        .await?;
-    let mut deleted = 0;
-    let mut last: Option<Bytes> = None;
-    while deleted < limit {
-        match iter.next().await? {
-            Some(entry) => {
-                staged.add(entry.key.len(), 0);
-                last = Some(entry.key.clone());
-                tx.delete(entry.key)?;
-                deleted += 1;
-            }
-            None => break,
-        }
-    }
-
-    Ok((deleted, last.map(|key| key.to_vec())))
-}
-
 /// Drains a scan over `multi` entries into their row ids, which live in
 /// the key. `context` names the scan in a corruption error.
 async fn collect_multi_row_ids(iter: &mut slatedb::DbIterator, context: &str) -> Result<Vec<u64>> {

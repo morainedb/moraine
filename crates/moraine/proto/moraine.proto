@@ -421,6 +421,12 @@ message MaintenanceStatusPassValue {
   int64 started_at_micros = 1;
   string trigger = 2;
   repeated MaintenanceStatusStepValue steps = 3;
+  // The head the pass was recorded against: its snapshot and the batch
+  // counter the record's own head stamp advanced from.
+  uint64 head_snapshot_id = 4;
+  uint64 head_batch_seq = 5;
+  // Whether the pass left work for a later one.
+  bool work_pending = 6;
 }
 
 // sys/maintenance_status: the bounded durable history of completed passes.

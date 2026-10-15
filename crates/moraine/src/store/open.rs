@@ -106,6 +106,7 @@ pub(crate) fn preload_shortfall(store_bytes: u64, cache_size: Option<u64>) -> Op
 /// [`open_reader`](Self::open_reader) — carrying the shared open
 /// configuration: the WAL flush cadence (writer only) and the on-disk object
 /// cache.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct StoreBuilder<'a> {
     path: &'a str,
     object_store: Arc<dyn ObjectStore>,
@@ -122,6 +123,7 @@ pub(crate) struct StoreBuilder<'a> {
     cache_preload: Option<CachePreload>,
     cache_puts: bool,
     cache_compaction_puts: bool,
+    external_compaction: bool,
     checkpoint: Option<Uuid>,
     /// The manifest's per-segment sizes, when the attach read them; they
     /// decide how a preload reaches each subspace's first entry.
@@ -150,6 +152,7 @@ impl<'a> StoreBuilder<'a> {
             cache_preload: None,
             cache_puts: true,
             cache_compaction_puts: true,
+            external_compaction: false,
             checkpoint: None,
             warm_segments: Vec::new(),
         }
@@ -285,6 +288,13 @@ impl<'a> StoreBuilder<'a> {
     /// Sets compaction-output admission independently of flush admission.
     pub(crate) fn cache_compaction_puts(mut self, enabled: bool) -> Self {
         self.cache_compaction_puts = enabled;
+        self
+    }
+
+    /// Leaves compaction and collection to another process: the writer
+    /// starts neither SlateDB's compactor nor its collector.
+    pub(crate) fn external_compaction(mut self, external: bool) -> Self {
+        self.external_compaction = external;
         self
     }
 
@@ -429,12 +439,18 @@ impl<'a> StoreBuilder<'a> {
     /// SlateDB settings for a writer. The in-process compactor writes its
     /// SSTs with these too, so the filter threshold holds across a merge.
     fn settings(&self) -> Settings {
-        Settings {
+        let mut settings = Settings {
             flush_interval: self.flush_interval,
             manifest_poll_interval: WRITER_MANIFEST_POLL_INTERVAL,
             min_filter_keys: MIN_FILTER_KEYS,
             ..Default::default()
+        };
+        if self.external_compaction {
+            settings.compactor_options = None;
+            settings.garbage_collector_options = None;
         }
+
+        settings
     }
 
     fn location(&self) -> cache::StoreLocation {
@@ -657,6 +673,22 @@ mod tests {
     fn writer_settings_pass_slatedb_validation() {
         let settings = StoreBuilder::new("s", memory_store()).settings();
         settings.validate().unwrap();
+    }
+
+    /// A writer under external compaction starts neither SlateDB's
+    /// compactor nor its collector, and the settings still validate.
+    #[test]
+    fn external_compaction_turns_off_the_compactor_and_the_collector() {
+        let settings = StoreBuilder::new("s", memory_store())
+            .external_compaction(true)
+            .settings();
+        assert!(settings.compactor_options.is_none());
+        assert!(settings.garbage_collector_options.is_none());
+        settings.validate().unwrap();
+
+        let settings = StoreBuilder::new("s", memory_store()).settings();
+        assert!(settings.compactor_options.is_some());
+        assert!(settings.garbage_collector_options.is_some());
     }
 
     /// A commit-shaped transaction spanning several subspaces lands

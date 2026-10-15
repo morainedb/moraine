@@ -1,12 +1,11 @@
 //! Durable, bounded maintenance-pass status.
 
-use slatedb::ErrorKind;
+use std::sync::Arc;
 
 use crate::{
     Catalog, MaintenanceStatusPass, MaintenanceStatusStep, ReadOnlyCatalog, Timestamp,
     error::{Error, Result},
     store::{
-        handle::ReadHandle,
         key::{Key, SysKey},
         proto::{MaintenanceStatusPassValue, MaintenanceStatusStepValue},
         read, value,
@@ -31,43 +30,63 @@ pub(crate) async fn read(catalog: &ReadOnlyCatalog) -> Result<Vec<MaintenanceSta
         .collect())
 }
 
-/// Appends one pass and durably retains the newest bounded window.
-pub(crate) async fn record(catalog: &Catalog, pass: MaintenanceStatusPass) -> Result<()> {
-    let encoded = encode_pass(pass);
-    let durability = catalog.store().commit_durability();
+/// Appends one pass and durably retains the newest bounded window, as a
+/// head-preserving commit stamped with the head it was recorded against.
+pub(crate) async fn record(catalog: &Catalog, mut pass: MaintenanceStatusPass) -> Result<()> {
+    let store = catalog.store();
+    let durability = store.commit_durability();
 
     for attempt in 0..MAX_COMMIT_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(commit::retry_backoff(attempt)).await;
         }
 
-        let tx = catalog.begin_write_tx().await?;
+        let session = store.begin_commit_session().await?;
+        let base = commit::head_view_for(session.handle(), catalog.projections()).await?;
         let (status, stamp) = futures::try_join!(
-            read::read_maintenance_status(ReadHandle::Tx(&tx)),
+            read::read_maintenance_status(session.handle()),
             commit::format_stamp_to(
-                ReadHandle::Tx(&tx),
+                session.handle(),
                 catalog.projections(),
                 FORMAT_WITH_MAINTENANCE_STATUS
             ),
         )?;
+        pass.head_snapshot_id = base.snapshot.snapshot_id;
+        pass.head_batch_seq = base.batch_seq;
         let mut status = status.unwrap_or_default();
-        status.passes.push(encoded.clone());
+        status.passes.push(encode_pass(pass.clone()));
         if status.passes.len() > RETAINED_PASSES {
             let remove = status.passes.len() - RETAINED_PASSES;
             status.passes.drain(..remove);
         }
 
+        let head = base.snapshot.snapshot_id;
         let mut writes: Vec<StagedWrite> = vec![(
             Key::Sys(SysKey::MaintenanceStatus).encode(),
             Some(value::encode_value(&status)),
         )];
         writes.extend(stamp);
-        let staged = commit::stage_writes(&tx, &writes)?;
+        writes.push(commit::head_stamp(head, base.batch_seq));
+        let staged = commit::stage_writes_on(&session, &writes)?;
 
-        match commit::commit_durable(tx, "maintenance status", staged, &durability).await {
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == ErrorKind::Transaction => {}
-            Err(error) => return Err(Error::from(error)),
+        let landed = commit::commit_batch(
+            Arc::new(session),
+            commit::HeadTransition {
+                before: head,
+                after: head,
+            },
+            &writes,
+            staged,
+            commit::HeadViewUpdate::Rebuild(base),
+            commit::Landing {
+                projections: catalog.projections(),
+                log: store.commit_log(),
+            },
+            &durability,
+        )
+        .await?;
+        if matches!(landed, commit::Landed::Committed(_)) {
+            return Ok(());
         }
     }
 
@@ -80,6 +99,9 @@ fn encode_pass(pass: MaintenanceStatusPass) -> MaintenanceStatusPassValue {
     MaintenanceStatusPassValue {
         started_at_micros: pass.started_at.as_micros(),
         trigger: pass.trigger,
+        head_snapshot_id: pass.head_snapshot_id,
+        head_batch_seq: pass.head_batch_seq,
+        work_pending: pass.work_pending,
         steps: pass
             .steps
             .into_iter()
@@ -93,12 +115,16 @@ fn encode_pass(pass: MaintenanceStatusPass) -> MaintenanceStatusPassValue {
 }
 
 fn decode_pass(pass: MaintenanceStatusPassValue) -> MaintenanceStatusPass {
-    MaintenanceStatusPass::new(
+    let mut decoded = MaintenanceStatusPass::new(
         Timestamp::from_micros(pass.started_at_micros),
         pass.trigger,
         pass.steps
             .into_iter()
             .map(|step| MaintenanceStatusStep::new(step.step, step.status, step.detail))
             .collect(),
-    )
+    );
+    decoded.head_snapshot_id = pass.head_snapshot_id;
+    decoded.head_batch_seq = pass.head_batch_seq;
+    decoded.work_pending = pass.work_pending;
+    decoded
 }

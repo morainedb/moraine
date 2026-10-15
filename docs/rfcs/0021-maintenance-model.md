@@ -182,6 +182,16 @@ substantive mechanism, the sweep, lives in the core behind
 `Catalog::maintain`. The core keeps its no-threads charter (RFC 0003); the
 thread is shim-side.
 
+**Under a commit log the writer need not schedule itself.** A read-write
+open over a commit log (RFC 0024) is a committer that fences nothing, so a
+separate process may attach, run the same pass through the same trigger,
+and detach while the application keeps committing. Every step then lands
+as a slot: the DuckLake steps as the commits they are, the sweep and the
+status record as head-preserving batches, and the store merge as a
+submission the process compacting the lake executes. The pass needs no
+held store. Which process runs it, and when, is that deployment's
+decision; an attach that configures no interval still schedules nothing.
+
 ### The sequence
 
 Each pass runs these steps in order, skipping any the attach did not
@@ -402,9 +412,10 @@ Three properties the scheduler must hold:
   state.
 - **Failures are visible.** An unattended pass has no one to return an
   error to, so `moraine_maintenance_status` serves the **last 16 passes**,
-  newest first, each carrying `started_at` and whether it was `scheduled`
-  or `manual`, then one row per step: `step`, `status` (`ran` / `skipped`
-  / `failed`), and `detail`. Retaining a window rather than only the
+  newest first, each carrying `started_at`, whether it was `scheduled`
+  or `manual`, and `work_pending` — whether a step failed or a merge was
+  still pending when the pass ended — then one row per step: `step`,
+  `status` (`ran` / `skipped` / `failed`), and `detail`. Retaining a window rather than only the
   newest pass is load-bearing — with one slot a failure is erased by the
   next success, and a short interval would hide strictly more than a long
   one. Sixteen is the binding cap: at nine fixed steps it is at most 144
@@ -577,6 +588,16 @@ writer. Beyond the head record the two write disjoint keys — the sweep
 touches only dead index ids — so a lost race costs a retry of one batch and
 never a redo of the scan.
 
+**On a commit log each batch is a slot**, and every slot is a round every
+other committer races, so a sweep of many batches is contention for the
+applications writing the lake. Two things bound it: the batch is large,
+65536 deletes by default, so a sweep of tens of millions of entries is a
+few hundred slots; and the sweep waits `pace` between batches, one second
+by default, so an application commit rarely meets one. A store without a
+commit log writes its batches directly and paces nothing. The same shape
+carries the file-statistics and inlined-table sweeps and the status
+record, so a committer that holds no store runs the whole pass.
+
 **The range is read once.** The sweep opens one bulk scan over the dead
 range, with the core read profile's read-ahead, and drains it into commits
 of `batch_size` deletes. The scan's snapshot predates every delete it
@@ -623,10 +644,14 @@ result. The poll cadence derives from the compactor's own poll interval
 rather than being configured; a knob there would be a knob about SlateDB's
 scheduler, which RFC 0003 keeps out.
 
-**Read-write only.** Submission alone needs no writer — `Admin` opens no `Db`
-and fences nothing — but execution does, since the compactor that promotes a
-`Submitted` entry lives in the writer process. A read-only catalog would
-queue work nothing would run and then wait out its timeout, so it refuses
+**Any read-write handle submits; the process compacting the lake
+executes.** Submission needs no writer — `Admin` opens no `Db` and fences
+nothing — and execution belongs to whichever compactor serves the store:
+the writer's own, or the standalone one a deployment runs when its writers
+open with `external_compaction` and compact nothing themselves. A committer
+over a commit log therefore submits like a writer and waits like one, and
+a merge that outlives its wait is reported pending, not cancelled. A
+read-only catalog would queue work and wait out its timeout, so it refuses
 with `Constraint`, like every other write-path verb.
 
 A tree with no compacted sorted runs is reported skipped rather than failed —
@@ -729,7 +754,8 @@ the census is a prerequisite, not merely post-hoc reporting (`BENCHMARK.md`,
 ```rust
 pub struct MaintenanceRequest {
     pub sweep_orphaned_index_entries: bool,  // default true
-    pub batch_size: usize,                   // default 8192
+    pub batch_size: usize,                   // default 65536
+    pub pace: Duration,                      // default 1s; commit-log stores only
 }
 
 pub struct MaintenanceReport {
@@ -754,6 +780,9 @@ pub struct MaintenanceStatusPass {
     pub started_at: Timestamp,
     pub trigger: String,
     pub steps: Vec<MaintenanceStatusStep>,
+    pub head_snapshot_id: u64,  // set when recorded
+    pub head_batch_seq: u64,    // set when recorded
+    pub work_pending: bool,     // the caller's: files still scheduled, a merge pending
 }
 
 pub struct MaintenanceStatusStep {
@@ -909,6 +938,10 @@ Core:
   batch, and no `ducklake_snapshot` record written.
 - **No writer conflict.** A sweep interleaved with commits landing entries
   for a *live* index completes, and both ranges end up correct.
+- **A committer sweeps through the log.** Over a commit log, a handle that
+  holds no store reclaims a dropped index; the holder folds the batches,
+  the head snapshot stands, and a pass it records carries the head it was
+  recorded against.
 - **Discovery seeks by id.** From any starting id, the scan returns the
   lowest index at or after it and `None` past the last — the property that
   makes skipping a live index one seek rather than a walk of its entries.

@@ -349,6 +349,14 @@ pub struct CatalogOptions {
     /// as soon as the merge lands; `false` keeps a large merge from
     /// displacing read-hot blocks.
     pub cache_compaction_puts: bool,
+    /// Whether another process compacts and collects this store. When set,
+    /// a writer opens with SlateDB's in-process compactor and garbage
+    /// collector off, and a standalone compactor and collector run against
+    /// the store instead. Every writer of such a store must set it: a
+    /// writer's own compactor and a standalone one fence each other through
+    /// the compactor epoch, and the fenced side closes its store. Defaults
+    /// to `false`.
+    pub external_compaction: bool,
     /// The lake's data root (DuckLake's `DATA_PATH`). Creation-time only:
     /// recorded as the stored global `data_path` option when a fresh store
     /// bootstraps, so a later open can read it back
@@ -401,6 +409,7 @@ impl Default for CatalogOptions {
             cache_preload: None,
             cache_puts: true,
             cache_compaction_puts: true,
+            external_compaction: false,
             data_path: None,
             reader_poll_interval: Duration::from_secs(10),
             checkpoint: None,
@@ -458,6 +467,7 @@ async fn open_writer_store(
             .warm_segments(warm_segments.clone())
             .cache_puts(options.cache_puts)
             .cache_compaction_puts(options.cache_compaction_puts)
+            .external_compaction(external_compaction(options))
     };
     let log_store = store_builder(None).log_store();
     let committer = match &provider {
@@ -500,7 +510,6 @@ async fn open_writer_store(
                 batch_origin: 0,
                 guard: Arc::new(tokio::sync::Mutex::new(())),
                 folds_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                own_rows_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 flushing: flushing_for(provider.as_ref(), options, &object_store, &log_store),
             };
             if format >= FORMAT_WITH_COMMIT_LOG {
@@ -643,6 +652,13 @@ async fn release_held_store(commit_log: &LogCommitter) -> Result<()> {
         Err(Error::Fenced(_)) if fenced => Ok(()),
         closed => closed,
     }
+}
+
+/// Whether a writer leaves compaction and collection to another process:
+/// asked for on the options, or declared by the provider its log rides.
+fn external_compaction(options: &CatalogOptions) -> bool {
+    options.external_compaction
+        || commit_log_provider(options).is_some_and(|provider| provider.external_compaction())
 }
 
 fn wal_object_store(options: &CatalogOptions) -> Option<Arc<dyn ObjectStore>> {
@@ -1486,6 +1502,16 @@ impl ReadOnlyCatalog {
 }
 
 impl Catalog {
+    /// Refuses a read-only handle; a writer and a committer both pass.
+    fn require_writes(&self) -> Result<()> {
+        match self.store.as_ref() {
+            Store::Reader(_) => Err(Error::Constraint(
+                "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+            Store::Writer { .. } | Store::Committer { .. } => Ok(()),
+        }
+    }
+
     /// The store this handle writes into directly: the writer's own, or the
     /// one a committer holds.
     fn writer(&self) -> Result<Db> {
@@ -1710,7 +1736,6 @@ impl Catalog {
             batch_origin,
             guard: Arc::new(tokio::sync::Mutex::new(())),
             folds_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            own_rows_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             flushing: flushing_for(provider.as_ref(), &options, &object_store, &log_store),
         };
         if let Some(db) = adopting {
@@ -1780,66 +1805,61 @@ impl Catalog {
             .is_some_and(LogCommitter::holds_store)
     }
 
-    /// Makes room for `rows` the folder is about to write for itself outside
-    /// a slot. Such rows take sequence numbers between the last replayed
-    /// slot and the next, and a replay skips rows below what the tree
-    /// already holds, so when the headroom runs short this commits an empty
-    /// head-preserving slot first, which moves the next slot's number up by
-    /// one slot's worth. Nothing to do on a store with no commit log.
-    pub(crate) async fn reserve_own_rows(&self, rows: u64) -> Result<()> {
-        let Some(log) = self.store.commit_log().filter(|log| log.holds_store()) else {
-            return Ok(());
-        };
-        let mut advanced = 0;
-        while !log.has_headroom(rows) {
-            self.advance_log_slot().await?;
-            advanced += 1;
-        }
-        if advanced > 0 {
-            info!(
-                rows,
-                advanced, "advanced the commit log ahead of the folder's own rows"
-            );
-        }
-        log.note_own_rows(rows);
-
-        Ok(())
-    }
-
-    /// Commits an empty head-preserving batch as a slot: the head keeps its
-    /// snapshot and its batch counter moves by one, so every committer's
-    /// next offer races past it.
-    async fn advance_log_slot(&self) -> Result<()> {
+    /// Commits `writes` as one head-preserving batch: the head keeps its
+    /// snapshot and its batch counter moves by one, so a reader learns state
+    /// moved and, on a commit log, the batch lands as a slot of its own.
+    /// Retries a lost race against a fresh head. Returns once the store has
+    /// the batch, not once it is durable: on a log the slot already is, and
+    /// on a store of its own the batch sits in the memtable until the next
+    /// flush. For rows idempotent to rewrite, the sweeps, where a batch
+    /// lost to a crash is rediscovered.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RetryBudgetExhausted`] after
+    /// [`MAX_COMMIT_ATTEMPTS`](commit::MAX_COMMIT_ATTEMPTS) lost races, or
+    /// the store's error.
+    pub(crate) async fn commit_own_rows(&self, writes: Vec<commit::StagedWrite>) -> Result<()> {
         for _ in 0..commit::MAX_COMMIT_ATTEMPTS {
             let session = self.store.begin_commit_session().await?;
             let base = commit::head_view_for(session.handle(), &self.projections).await?;
             let head = base.snapshot.snapshot_id;
-            let writes = vec![commit::head_stamp(head, base.batch_seq)];
-            let staged = commit::stage_writes_on(&session, &writes)?;
-            let landed = commit::commit_batch(
+            let mut batch = writes.clone();
+            batch.push(commit::head_stamp(head, base.batch_seq));
+            let staged = commit::stage_writes_on(&session, &batch)?;
+            let heads = commit::HeadTransition {
+                before: head,
+                after: head,
+            };
+            let landing = commit::Landing {
+                projections: &self.projections,
+                log: self.store.commit_log(),
+            };
+            let submitted = commit::submit_batch(
                 Arc::new(session),
-                commit::HeadTransition {
-                    before: head,
-                    after: head,
-                },
-                &writes,
+                heads,
+                &batch,
                 staged,
                 commit::HeadViewUpdate::Rebuild(base),
-                commit::Landing {
-                    projections: &self.projections,
-                    log: self.store.commit_log(),
-                },
-                &self.store.commit_durability(),
+                landing,
             )
             .await?;
-            if matches!(landed, commit::Landed::Committed(_)) {
-                return Ok(());
+            match submitted {
+                commit::Submission::LostRace => {}
+                // The batch is in the store; nothing waits on its flush.
+                commit::Submission::Submitted(_) => return Ok(()),
             }
         }
 
         Err(Error::RetryBudgetExhausted(
-            "could not advance the commit log past the folder's own rows".to_string(),
+            "a head-preserving batch lost every race it ran".to_string(),
         ))
+    }
+
+    /// Whether this handle commits through a commit log, where a batch of
+    /// its own contends with every other committer's.
+    pub(crate) fn commits_through_log(&self) -> bool {
+        self.store.commit_log().is_some()
     }
 
     /// Takes the store for one fold: opens it, which replays every unfolded
@@ -1998,6 +2018,7 @@ impl Catalog {
             )
             .cache_puts(options.cache_puts)
             .cache_compaction_puts(options.cache_compaction_puts)
+            .external_compaction(external_compaction(&options))
             .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
 
@@ -2109,6 +2130,7 @@ impl Catalog {
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts)
             .cache_compaction_puts(options.cache_compaction_puts)
+            .external_compaction(external_compaction(&options))
             .open_writer()
             .await?;
 
@@ -2211,6 +2233,7 @@ impl Catalog {
                 .cache_size(options.cache_size)
                 .cache_memory(options.cache_memory)
                 .cache_auxiliary_percent(options.cache_auxiliary_percent)
+                .external_compaction(external_compaction(&options))
         };
 
         crate::transaction::wal_move::run(
