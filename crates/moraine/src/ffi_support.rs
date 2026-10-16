@@ -1701,7 +1701,7 @@ mod tests {
             transaction::commit,
         };
 
-        let tx = catalog.begin_write_tx().await.unwrap();
+        let tx = catalog.begin_write_tx().unwrap();
         let head = read::read_head(ReadHandle::Tx(&tx)).await.unwrap().unwrap();
         tx.put(
             Key::Sys(SysKey::Migration).encode(),
@@ -1792,9 +1792,7 @@ mod tests {
         use crate::transaction::staged::{Cell, RowOperation, TableKind};
 
         let head = catalog.snapshot().await.unwrap().current_snapshot().id;
-        let mut tx = staged::staged_begin(catalog, None, String::new(), None)
-            .await
-            .unwrap();
+        let mut tx = staged::staged_begin(catalog, None, String::new(), None).unwrap();
         for snapshot in dump_snapshots(catalog).await.unwrap() {
             if snapshot.snapshot_id == head.get() {
                 continue;
@@ -1931,7 +1929,7 @@ mod tests {
         let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
             .await
             .unwrap();
-        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let db_tx = catalog.begin_write_tx().unwrap();
         let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
         tx.stage(RowOperation::Insert {
             table: TableKind::ColumnMapping,

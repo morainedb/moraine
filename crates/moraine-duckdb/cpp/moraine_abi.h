@@ -3509,10 +3509,10 @@ void moraine_unregister_log_sink(const struct MoraineCatalogHandle *handle);
 // Opens a staged-row transaction at the current head and writes the
 // resulting handle to `*out`.
 //
-// Cancellable: races the head read against `probe` (polled
-// immediately, then ~100 ms; a null `probe` disables polling). If a
-// cancellation wins, returns [`codes::INTERRUPTED`], `*out` is left
-// unwritten, and nothing is staged.
+// Refuses a caller that has already cancelled with
+// [`codes::INTERRUPTED`], leaving `*out` unwritten and nothing staged.
+// Opening the transaction reaches no object store, so `probe` is read
+// once rather than raced.
 //
 // # Safety
 //

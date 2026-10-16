@@ -174,10 +174,7 @@ impl Store {
     ///
     /// [`Error::Constraint`] for a read-only store; the store's error if its
     /// transaction cannot begin.
-    // `Db::begin` is synchronous in the slatedb this build carries; the
-    // asyncness stays until the callers are converted with it.
-    #[allow(clippy::unused_async)]
-    pub(crate) async fn begin_commit_session(&self) -> Result<CommitSession> {
+    pub(crate) fn begin_commit_session(&self) -> Result<CommitSession> {
         match self {
             Self::Writer { db, .. } => Ok(CommitSession::folder(
                 db.begin(IsolationLevel::Snapshot).map_err(Error::from)?,
@@ -1975,7 +1972,7 @@ impl Catalog {
         await_durable: bool,
     ) -> Result<()> {
         for _ in 0..commit::MAX_COMMIT_ATTEMPTS {
-            let session = self.store.begin_commit_session().await?;
+            let session = self.store.begin_commit_session()?;
             let base = commit::head_view_for(session.handle(), &self.projections).await?;
             let head = base.snapshot.snapshot_id;
             let mut batch = writes.clone();
@@ -2524,10 +2521,7 @@ impl Catalog {
         Arc::clone(&self.store)
     }
 
-    // `Db::begin` is synchronous in the slatedb this build carries; the
-    // asyncness stays until the callers are converted with it.
-    #[allow(clippy::unused_async)]
-    pub(crate) async fn begin_write_tx(&self) -> Result<DbTransaction> {
+    pub(crate) fn begin_write_tx(&self) -> Result<DbTransaction> {
         self.writer()?
             .begin(IsolationLevel::Snapshot)
             .map_err(Error::from)
@@ -2539,8 +2533,8 @@ impl Catalog {
     /// # Errors
     ///
     /// As [`Store::begin_commit_session`].
-    pub(crate) async fn begin_commit_session(&self) -> Result<CommitSession> {
-        self.store.begin_commit_session().await
+    pub(crate) fn begin_commit_session(&self) -> Result<CommitSession> {
+        self.store.begin_commit_session()
     }
 
     /// Writes the memtable out as a sorted-string table, so a test can put

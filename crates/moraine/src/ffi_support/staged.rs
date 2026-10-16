@@ -18,13 +18,13 @@ use crate::{catalog::Catalog, data_file::DataStore, error::Result};
 ///
 /// Returns an error if the underlying store transaction cannot be opened.
 #[doc(hidden)]
-pub async fn staged_begin(
+pub fn staged_begin(
     catalog: &Catalog,
     data_store: Option<DataStore>,
     data_prefix: String,
     read_view: Option<std::sync::Arc<crate::catalog::CatalogSnapshot>>,
 ) -> Result<StagedTransaction> {
-    let db_tx = catalog.begin_commit_session().await?;
+    let db_tx = catalog.begin_commit_session()?;
     Ok(StagedTransaction::begin(
         db_tx,
         catalog.projections().clone(),

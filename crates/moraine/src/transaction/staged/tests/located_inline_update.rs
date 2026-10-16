@@ -41,7 +41,7 @@ fn preserved_runs(selected: &[u64]) -> Vec<(u64, Vec<i64>)> {
 /// Stages the update's tombstones and re-inserts for `selected` at
 /// snapshot 7 and commits, failing if the commit takes over a minute.
 async fn commit_update(catalog: &Catalog, selected: &[u64], tombstones: bool, reinserts: bool) {
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let mut tx = StagedTransaction::begin_detached(catalog, db_tx);
     if tombstones {
         for &row_id in selected {

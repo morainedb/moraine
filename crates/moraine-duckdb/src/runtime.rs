@@ -309,6 +309,22 @@ async fn warm_all_tables(catalog: &ReadOnlyCatalog) {
 ///
 /// `probe`, if `Some`, must be safe to call with `probe_ctx` from any
 /// thread for the duration of this call.
+/// Whether `probe` already says the caller has cancelled. For an entry
+/// point that reaches no object store and so has nothing to race the
+/// probe against, but must still refuse work a cancelled caller asked
+/// for.
+///
+/// # Safety
+///
+/// `probe`, if non-null, must be safe to call with `probe_ctx`.
+pub(crate) unsafe fn already_cancelled(
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+) -> bool {
+    // SAFETY: caller contract — `probe` is callable with `probe_ctx`.
+    probe.is_some_and(|probe| unsafe { probe(probe_ctx) })
+}
+
 pub(crate) unsafe fn block_on_cancellable_in<T, E>(
     runtime: &Runtime,
     probe: MoraineInterruptProbe,

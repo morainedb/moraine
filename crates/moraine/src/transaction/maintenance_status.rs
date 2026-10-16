@@ -41,7 +41,7 @@ pub(crate) async fn record(catalog: &Catalog, mut pass: MaintenanceStatusPass) -
             tokio::time::sleep(commit::retry_backoff(attempt)).await;
         }
 
-        let session = store.begin_commit_session().await?;
+        let session = store.begin_commit_session()?;
         let base = commit::head_view_for(session.handle(), catalog.projections()).await?;
         let status = read::read_maintenance_status(session.handle()).await?;
         pass.head_snapshot_id = base.snapshot.snapshot_id;

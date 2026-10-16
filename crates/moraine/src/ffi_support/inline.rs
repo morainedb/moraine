@@ -320,7 +320,7 @@ mod tests {
     #[tokio::test]
     async fn scan_inline_materializes_rows_with_chunk_bodies() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let db_tx = catalog.begin_write_tx().unwrap();
         let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
 
         tx.stage(RowOperation::InlineSchema {
@@ -354,7 +354,7 @@ mod tests {
         });
         tx.commit().await.unwrap();
 
-        let db_tx2 = catalog.begin_write_tx().await.unwrap();
+        let db_tx2 = catalog.begin_write_tx().unwrap();
         let mut inline_delete = StagedTransaction::begin_detached(&catalog, db_tx2);
         inline_delete.stage(RowOperation::InlineInlineDelete {
             table_id: 1,
@@ -409,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn inline_scan_windows_carry_only_the_bodies_their_rows_reference() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let db_tx = catalog.begin_write_tx().unwrap();
         let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
 
         tx.stage(RowOperation::InlineSchema {
@@ -496,7 +496,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_free_inline_scan_names_its_chunks_without_reading_them() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let db_tx = catalog.begin_write_tx().unwrap();
         let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
 
         tx.stage(RowOperation::InlineSchema {
@@ -555,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_schema_version_deregisters_but_stays_resolvable() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let db_tx = catalog.begin_write_tx().unwrap();
         let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
 
         for (schema_version, schema) in [(0u64, b"schema-v0"), (1, b"schema-v1")] {
@@ -588,7 +588,7 @@ mod tests {
             vec![(1, 0), (1, 1)]
         );
 
-        let db_tx2 = catalog.begin_write_tx().await.unwrap();
+        let db_tx2 = catalog.begin_write_tx().unwrap();
         let mut flush = StagedTransaction::begin_detached(&catalog, db_tx2);
         flush.stage(RowOperation::InlineFlushDelete {
             table_id: 1,
@@ -639,7 +639,7 @@ mod tests {
     async fn restaging_a_dropped_schema_version_registers_it_again() {
         let catalog = open().await;
 
-        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let db_tx = catalog.begin_write_tx().unwrap();
         let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
         tx.stage(RowOperation::InlineSchema {
             table_id: 1,
@@ -657,7 +657,7 @@ mod tests {
         tx.commit().await.unwrap();
         assert!(inline_table_registered(&catalog, 1, 0).await.unwrap());
 
-        let db_tx2 = catalog.begin_write_tx().await.unwrap();
+        let db_tx2 = catalog.begin_write_tx().unwrap();
         let mut drop_tx = StagedTransaction::begin_detached(&catalog, db_tx2);
         drop_tx.stage(RowOperation::InlineSchemaDrop {
             table_id: 1,
@@ -677,7 +677,7 @@ mod tests {
             "the retained schema record does not keep the version registered"
         );
 
-        let db_tx3 = catalog.begin_write_tx().await.unwrap();
+        let db_tx3 = catalog.begin_write_tx().unwrap();
         let mut recreate = StagedTransaction::begin_detached(&catalog, db_tx3);
         recreate.stage(RowOperation::InlineSchema {
             table_id: 1,
@@ -717,7 +717,7 @@ mod tests {
         };
 
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let db_tx = catalog.begin_write_tx().unwrap();
         let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
         tx.stage(RowOperation::InlineInsert {
             table_id: 1,
@@ -747,7 +747,7 @@ mod tests {
         );
 
         // The divergence: a chunk with no locator, behind the memo's back.
-        let tx = catalog.begin_write_tx().await.unwrap();
+        let tx = catalog.begin_write_tx().unwrap();
         tx.put(
             Key::Inline(InlineKey::Live(InlineOperation::Insert {
                 table_id: 1,
@@ -785,7 +785,7 @@ mod tests {
     #[tokio::test]
     async fn scan_inline_filtered_to_a_version_hauls_only_its_bodies() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let db_tx = catalog.begin_write_tx().unwrap();
         let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
 
         tx.stage(RowOperation::InlineInsert {
@@ -840,7 +840,7 @@ mod tests {
     #[tokio::test]
     async fn inline_file_deletes_read_back_in_key_order() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let db_tx = catalog.begin_write_tx().unwrap();
         let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
 
         tx.stage(RowOperation::InlineFileDelete {
@@ -880,7 +880,7 @@ mod tests {
 
         // Table 1 carries two versions, both holding rows; table 2 carries
         // one, which its flush will empty.
-        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let db_tx = catalog.begin_write_tx().unwrap();
         let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
         for (table_id, schema_version) in [(1u64, 0u64), (1, 1), (2, 0)] {
             tx.stage(RowOperation::InlineSchema {
@@ -910,7 +910,7 @@ mod tests {
         // Table 2's version is flushed and then deregistered, which is the
         // ordinary path. Table 1 version 0 is deregistered with its rows
         // still live, which is the stranding.
-        let db_tx2 = catalog.begin_write_tx().await.unwrap();
+        let db_tx2 = catalog.begin_write_tx().unwrap();
         let mut flush = StagedTransaction::begin_detached(&catalog, db_tx2);
         flush.stage(RowOperation::InlineFlushDelete {
             table_id: 2,

@@ -186,7 +186,7 @@ async fn remove_middle_chunk(
     session: &crate::store::handle::ReadSession,
     table: TableId,
 ) {
-    let tx = writer.begin_write_tx().await.unwrap();
+    let tx = writer.begin_write_tx().unwrap();
     let mut head = commit::read_head_value(ReadHandle::Tx(&tx)).await.unwrap();
     head.batch_seq += 1;
     tx.delete(
@@ -344,7 +344,7 @@ async fn a_manifest_that_moves_on_every_pass_exhausts_the_read_budget() {
     let result = crate::store::read::consistent(session.handle(), || async {
         attempts.set(attempts.get() + 1);
         let writer = Catalog::open(store.clone(), options.clone()).await?;
-        let tx = writer.begin_write_tx().await?;
+        let tx = writer.begin_write_tx()?;
         let mut head = commit::read_head_value(ReadHandle::Tx(&tx)).await?;
         head.batch_seq += 1;
         tx.put(Key::Sys(SysKey::Head).encode(), value::encode_value(&head))?;

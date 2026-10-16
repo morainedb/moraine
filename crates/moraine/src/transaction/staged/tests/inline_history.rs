@@ -3,8 +3,7 @@
 use super::*;
 
 async fn commit_inline(catalog: &Catalog, snapshot: u64, operations: Vec<RowOperation>) {
-    let mut tx =
-        StagedTransaction::begin_detached(catalog, catalog.begin_write_tx().await.unwrap());
+    let mut tx = StagedTransaction::begin_detached(catalog, catalog.begin_write_tx().unwrap());
     for operation in operations {
         tx.stage(operation);
     }
@@ -124,7 +123,7 @@ async fn flushing_one_schema_preserves_the_other_versions_tombstone() {
             }],
         )
         .await;
-        let read = catalog.begin_write_tx().await.unwrap();
+        let read = catalog.begin_write_tx().unwrap();
         let ends: Vec<u64> = store_inline::scan_inline_deletes(ReadHandle::Tx(&read), 1)
             .await
             .unwrap()
@@ -148,7 +147,7 @@ async fn dropping_an_inline_table_removes_its_tombstone_history() {
     commit_inline(&catalog, 2, vec![deletion(2), insertion(2)]).await;
     commit_inline(&catalog, 3, vec![deletion(3)]).await;
     commit_inline(&catalog, 4, vec![RowOperation::InlineDrop { table_id: 1 }]).await;
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     assert!(
         store_inline::scan_inline_deletes(ReadHandle::Tx(&tx), 1)
             .await

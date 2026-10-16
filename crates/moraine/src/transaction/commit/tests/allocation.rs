@@ -175,7 +175,7 @@ async fn snapshot_refresh() {
             .commit(|tx| tx.update_table_stats(ids[0], 9, 90))
             .await
             .unwrap();
-        let tx = catalog.begin_write_tx().await.unwrap();
+        let tx = catalog.begin_write_tx().unwrap();
         let handle = ReadHandle::Tx(&tx);
         // Prime store blocks for both paths; each sample still constructs a fresh view.
         std::hint::black_box(materialize(handle, None).await.unwrap());

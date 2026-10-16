@@ -183,7 +183,7 @@ async fn broad_predicates_decline_instead_of_collecting_all_matches() {
         .unwrap()
         .indexes_of(table)
         .remove(0);
-    let transaction = catalog.begin_write_tx().await.unwrap();
+    let transaction = catalog.begin_write_tx().unwrap();
     for value in [Some(number(1)), None] {
         for row_id in 100..5100 {
             let (key, _) = crate::store::index_encoding::encode_ordered_index_entry(

@@ -462,7 +462,7 @@ async fn open_attempt(
         writer_open_ms = crate::telemetry::milliseconds(started.elapsed()),
         "opened the store read-write"
     );
-    let tx = begin_snapshot(&db).await?;
+    let tx = begin_snapshot(&db)?;
 
     match validate_format(ReadHandle::Tx(&tx), log_resident).await {
         Ok(Some(format)) => {
@@ -505,7 +505,7 @@ async fn open_attempt(
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
-            let tx = begin_snapshot(&db).await?;
+            let tx = begin_snapshot(&db)?;
             let validated = validate_format(ReadHandle::Tx(&tx), log_resident).await;
             let agreed = validate_wal_store(ReadHandle::Tx(&tx), wal_path).await;
             tx.rollback();
@@ -529,10 +529,7 @@ async fn open_attempt(
 
 /// Begins a snapshot-isolated transaction for an open attempt. A fence
 /// caught here is fatal: nothing has been staged yet.
-// `Db::begin` is synchronous in the slatedb this build carries; the
-// asyncness stays until the callers are converted with it.
-#[allow(clippy::unused_async)]
-async fn begin_snapshot(db: &Db) -> std::result::Result<DbTransaction, OpenFailure> {
+fn begin_snapshot(db: &Db) -> std::result::Result<DbTransaction, OpenFailure> {
     db.begin(IsolationLevel::Snapshot)
         .map_err(|err| OpenFailure::Fatal(Error::from(err)))
 }

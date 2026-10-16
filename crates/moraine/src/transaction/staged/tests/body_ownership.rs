@@ -33,8 +33,7 @@ async fn staged_body_owner_is_released_on_every_transaction_outcome() {
             },
             drops: drops.clone(),
         });
-        let mut tx =
-            StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().await.unwrap());
+        let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap());
         tx.stage(RowOperation::InlineSchema {
             table_id: 1,
             schema_version: 0,

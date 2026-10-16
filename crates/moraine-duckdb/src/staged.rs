@@ -159,10 +159,10 @@ unsafe fn decode_cells(cells: *const MoraineCell, len: usize) -> Result<Vec<Cell
 /// Opens a staged-row transaction at the current head and writes the
 /// resulting handle to `*out`.
 ///
-/// Cancellable: races the head read against `probe` (polled
-/// immediately, then ~100 ms; a null `probe` disables polling). If a
-/// cancellation wins, returns [`codes::INTERRUPTED`], `*out` is left
-/// unwritten, and nothing is staged.
+/// Refuses a caller that has already cancelled with
+/// [`codes::INTERRUPTED`], leaving `*out` unwritten and nothing staged.
+/// Opening the transaction reaches no object store, so `probe` is read
+/// once rather than raced.
 ///
 /// # Safety
 ///
@@ -195,20 +195,20 @@ pub unsafe extern "C" fn moraine_tx_begin(
         // SAFETY: caller contract for `snapshot`: null, or a live handle.
         let read_view =
             unsafe { snapshot.as_ref() }.map(|snapshot| std::sync::Arc::clone(&snapshot.snapshot));
+        // Opening the transaction reaches no object store, so there is
+        // nothing to race the probe against — only a caller who has
+        // already cancelled to refuse.
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
-        let tx = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                staged_begin(
-                    handle_ref.catalog.writer()?,
-                    handle_ref.data_store.clone(),
-                    handle_ref.data_prefix.clone(),
-                    read_view,
-                ),
-            )
-        }?;
+        if unsafe { crate::runtime::already_cancelled(probe, probe_ctx) } {
+            return Err(AbiError::interrupted());
+        }
+        let tx = staged_begin(
+            handle_ref.catalog.writer()?,
+            handle_ref.data_store.clone(),
+            handle_ref.data_prefix.clone(),
+            read_view,
+        )?;
         Ok(Box::new(MoraineTxHandle {
             catalog: handle,
             tx: Mutex::new(tx),
