@@ -282,8 +282,12 @@ moves the counter outside a slot.
   which then demotes and reports nothing. The first committer
   to find an unadopted log takes the store and adopts it. The threshold sits well above the flush count, so a holder
   doing its job is never taken from. Whether a committer does this at all
-  is one option, not two interacting ones: `Folding::Holding` is the
-  above, and `Folding::Never` takes nothing — it adopts an unadopted log
+  is one option, not two interacting ones, and a provider whose
+  deployment folds elsewhere settles it for every application over it,
+  exactly as one that compacts elsewhere does: a scheduled fold and a
+  committer's sprint fence each other, so a lake served by one wants no
+  committer taking the store. `Folding::Holding` is the above, and
+  `Folding::Never` takes nothing — it adopts an unadopted log
   and gives the store straight back, and does not sprint at close either,
   for a process that should carry no store while it serves. Folding at
   close only was considered and rejected: a serving process closes at a

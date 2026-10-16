@@ -158,6 +158,7 @@ pub(crate) struct TestProvider {
     pub(crate) log: Arc<TestLog>,
     cursor: Arc<Cursor>,
     external_compaction: bool,
+    external_folding: bool,
     /// The row sequences one slot reserves.
     stride: u64,
 }
@@ -168,6 +169,7 @@ impl Default for TestProvider {
             log: Arc::default(),
             cursor: Arc::default(),
             external_compaction: false,
+            external_folding: false,
             stride: SEQUENCE_STRIDE,
         }
     }
@@ -189,6 +191,7 @@ impl TestProvider {
             log: Arc::clone(&self.log),
             cursor: Arc::new(Cursor::default()),
             external_compaction: self.external_compaction,
+            external_folding: self.external_folding,
             stride: self.stride,
         }
     }
@@ -197,6 +200,14 @@ impl TestProvider {
     pub(crate) fn externally_compacted(self) -> Self {
         Self {
             external_compaction: true,
+            ..self
+        }
+    }
+
+    /// A provider whose deployment folds in another process.
+    pub(crate) fn folded_elsewhere(self) -> Self {
+        Self {
+            external_folding: true,
             ..self
         }
     }
@@ -229,6 +240,10 @@ impl TestProvider {
 impl CommitLogProvider for TestProvider {
     fn external_compaction(&self) -> bool {
         self.external_compaction
+    }
+
+    fn external_folding(&self) -> bool {
+        self.external_folding
     }
 
     fn writer_init(&self, _log_store: Arc<dyn ObjectStore>, _path: &str) -> Box<dyn WriterInit> {

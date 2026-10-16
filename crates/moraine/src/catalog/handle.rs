@@ -346,7 +346,10 @@ pub struct CatalogOptions {
     /// mid-replay is not pulled out from under. Defaults to five minutes.
     pub commit_log_retention: Duration,
     /// When this committer takes the store to fold the log into it.
-    /// Defaults to [`Folding::default`].
+    /// Defaults to [`Folding::default`], and is overruled by a
+    /// [`CommitLogProvider`](crate::CommitLogProvider) whose deployment
+    /// folds elsewhere: a lake served by a scheduled fold wants no
+    /// committer taking the store, and the two would fence each other.
     pub commit_log_folding: Folding,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
@@ -634,7 +637,7 @@ struct Taker {
 #[async_trait::async_trait]
 impl crate::commit_log::StoreTaker for Taker {
     async fn take_if_stalled(&self, log: &LogCommitter) -> Result<bool> {
-        let Some(threshold) = self.options.commit_log_folding.slots() else {
+        let Some(threshold) = folding(&self.options).slots() else {
             return Ok(false);
         };
         let replay_point =
@@ -720,6 +723,15 @@ async fn release_held_store(commit_log: &LogCommitter) -> Result<()> {
 fn external_compaction(options: &CatalogOptions) -> bool {
     options.external_compaction
         || commit_log_provider(options).is_some_and(|provider| provider.external_compaction())
+}
+
+/// When this open folds, which a provider whose deployment folds
+/// elsewhere settles for every application over it.
+fn folding(options: &CatalogOptions) -> Folding {
+    if commit_log_provider(options).is_some_and(|provider| provider.external_folding()) {
+        return Folding::Never;
+    }
+    options.commit_log_folding
 }
 
 fn wal_object_store(options: &CatalogOptions) -> Option<Arc<dyn ObjectStore>> {
@@ -1536,7 +1548,7 @@ impl ReadOnlyCatalog {
                     return release_held_store(commit_log).await;
                 }
                 // The last one out leaves the tail short for the next in.
-                let Some(threshold) = sprint.options.commit_log_folding.slots() else {
+                let Some(threshold) = folding(&sprint.options).slots() else {
                     return Ok(());
                 };
                 if commit_log
@@ -1869,7 +1881,7 @@ impl Catalog {
         if let Some(db) = adopting {
             log.promote(db, options.commit_log_fold_poll);
             // A committer that does not fold adopts and gives the store back.
-            if options.commit_log_folding == Folding::Never {
+            if folding(&options) == Folding::Never {
                 release_held_store(&log).await?;
             }
         }
@@ -2107,7 +2119,7 @@ impl Catalog {
         else {
             return Ok(None);
         };
-        let Some(threshold) = sprint.options.commit_log_folding.slots() else {
+        let Some(threshold) = folding(&sprint.options).slots() else {
             return Ok(None);
         };
         let replay_point =

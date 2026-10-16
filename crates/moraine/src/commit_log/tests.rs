@@ -1355,3 +1355,51 @@ async fn a_committer_reading_steadily_sees_a_peers_commit_at_once() {
     first.close().await.unwrap();
     second.close().await.unwrap();
 }
+
+/// A provider whose deployment folds elsewhere settles it for every
+/// application over it: a committer takes the store for nothing, folds
+/// nothing at close, and the tail is a scheduled fold's to drain.
+#[tokio::test]
+async fn a_provider_that_folds_elsewhere_keeps_committers_off_the_store() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default().folded_elsewhere());
+    let options = || CatalogOptions {
+        commit_log: Some(provider.clone()),
+        // Asked for holding, and overruled: the deployment folds.
+        commit_log_folding: crate::Folding::Holding { slots: 1 },
+        commit_log_poll_interval: std::time::Duration::from_millis(10),
+        ..options_at("lake")
+    };
+
+    let committer = Catalog::open(object_store.clone(), options())
+        .await
+        .unwrap();
+    assert!(!committer.holds_store(), "adopting gives the store back");
+    for name in ["a", "b", "c"] {
+        committer
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+        assert!(!committer.holds_store());
+    }
+    let behind = committer.unfolded_slots().await.unwrap();
+    committer.close().await.unwrap();
+    assert_eq!(
+        provider.folded_sequence(),
+        1,
+        "no close sprinted: {behind:?} slots were left"
+    );
+
+    // What a scheduled fold is for.
+    let folded = Catalog::fold_sprint(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(folded, 3, "the sprint drained what the committers left");
+}

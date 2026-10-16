@@ -209,6 +209,19 @@ pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
     fn external_compaction(&self) -> bool {
         false
     }
+
+    /// Whether another process folds the log into the stores opened over
+    /// this provider. A committer then takes the store for nothing,
+    /// whatever its [`CatalogOptions::commit_log_folding`] says, exactly
+    /// as [`external_compaction`](Self::external_compaction) keeps it
+    /// from compacting: a sprint and a resident folder fence each other,
+    /// and a process that commits from anywhere should carry neither a
+    /// store nor the work of one. Defaults to `false`.
+    ///
+    /// [`CatalogOptions::commit_log_folding`]: crate::CatalogOptions::commit_log_folding
+    fn external_folding(&self) -> bool {
+        false
+    }
 }
 
 static REGISTERED: OnceLock<Arc<dyn CommitLogProvider>> = OnceLock::new();
