@@ -111,6 +111,11 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 fixed cut. The interval is ignored with one, and on a read-write attach
 without a commit log, which reads its own writes.
 
+On a committer — a read-write attach that *does* have a commit log — the
+interval means something else: how long a query keeps the log watched,
+not how stale a read may be. Freshness there is
+`COMMIT_LOG_POLL_INTERVAL_MS`, since every poll inside the window lists.
+
 **Creating or writing an S3 lake requires `READ_WRITE`.** DuckDB opens any
 attach whose path starts with a remote prefix (`s3://`, `gcs://`, `azure://`,
 …) read-only by default, and a read-only attach cannot create a catalog. To

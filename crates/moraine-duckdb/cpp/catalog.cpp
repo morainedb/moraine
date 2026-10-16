@@ -828,8 +828,10 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// time, so the open writes nothing at all; the ABI refuses it on a
 	// read-write attach.
 	// `READER_POLL_INTERVAL_MS` is how often a read-only attach looks for
-	// what a writer has committed, and so how stale its reads may be.
-	// Longer is cheaper and staler, for a dashboard attached for the day.
+	// what a writer has committed, and so how stale its reads may be;
+	// longer is cheaper and staler, for a dashboard attached for the day.
+	// On a committer it is instead how long a query keeps the commit log
+	// watched, the poll above being the freshness there.
 	bool encrypted = false;
 	uint64_t flush_interval_ms = 0;
 	bool flush_on_commit = false;

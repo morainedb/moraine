@@ -1331,8 +1331,11 @@ void moraine_error_free(char *message);
 // `reader_poll_interval_ms` is how often a read-only attach polls object
 // storage for what a writer has committed since it last looked, and so
 // its freshness bound; `0` keeps the catalog's default. Longer is
-// cheaper and staler, for a dashboard that attaches for the day. A
-// `checkpoint` attach polls for nothing and ignores it.
+// cheaper and staler, for a dashboard that attaches for the day. On a
+// committer over a commit log it is instead how long a read keeps the
+// log watched, within which every poll lists and reads are as fresh as
+// the commit-log poll. A `checkpoint` attach polls for nothing and
+// ignores it.
 //
 // `host_threads` is how many execution threads the calling host runs;
 // the handle's worker pool is that count clamped to `[2, 8]`, with `0`
