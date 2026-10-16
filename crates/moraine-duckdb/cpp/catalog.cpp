@@ -931,12 +931,12 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 		} else if (name == "commit_log_folding") {
 			// Spelled as a role rather than a flag: 'holding' takes the
 			// store when the tail is long, 'never' leaves the tail to a
-			// folder of its own.
+			// folder of its own. Unset follows the deployment.
 			auto when = duckdb::StringUtil::Lower(option.second.GetValue<std::string>());
 			if (when == "holding") {
-				commit_log.folding = 0;
-			} else if (when == "never") {
 				commit_log.folding = 1;
+			} else if (when == "never") {
+				commit_log.folding = 2;
 			} else {
 				throw duckdb::InvalidInputException(
 				    "moraine: COMMIT_LOG_FOLDING must be 'holding' or 'never'; got \"%s\"", when);

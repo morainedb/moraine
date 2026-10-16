@@ -389,7 +389,7 @@ async fn a_committer_told_of_an_unapplied_slot_applies_it_before_offering() {
         object_store,
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
-            commit_log_folding: crate::Folding::Never,
+            commit_log_folding: Some(crate::Folding::Never),
             ..options_at("lake")
         },
     )
@@ -421,7 +421,7 @@ async fn a_committer_told_of_an_unapplied_slot_applies_it_before_offering() {
 /// memtable out and truncates the log: a reader following the folded store
 /// alone sees the commits, and the slots below the replay point are gone.
 #[tokio::test]
-async fn the_folder_flushes_and_truncates_after_enough_folded_slots() {
+async fn folder_flushes_and_truncates_after_enough_folded_slots() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
@@ -574,7 +574,7 @@ async fn a_committer_sprints_at_close_when_the_tail_is_long() {
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
             commit_log_poll_interval: std::time::Duration::from_millis(10),
-            commit_log_folding: crate::Folding::Holding { slots: 1 },
+            commit_log_folding: Some(crate::Folding::Holding { slots: 1 }),
             ..options_at("lake")
         },
     )
@@ -710,7 +710,7 @@ async fn a_committer_takes_the_store_when_the_tail_is_long_or_the_log_unadopted(
         CatalogOptions {
             commit_log: Some(late.clone()),
             commit_log_poll_interval: std::time::Duration::from_millis(10),
-            commit_log_folding: crate::Folding::Holding { slots: 1 },
+            commit_log_folding: Some(crate::Folding::Holding { slots: 1 }),
             ..options_at("lake")
         },
     )
@@ -1132,7 +1132,7 @@ async fn a_committer_that_does_not_fold_never_takes_the_store() {
         commit_log: Some(provider),
         commit_log_poll_interval: std::time::Duration::from_millis(10),
         reader_poll_interval: std::time::Duration::from_millis(10),
-        commit_log_folding: crate::Folding::Never,
+        commit_log_folding: Some(crate::Folding::Never),
         ..options_at("lake")
     };
 
@@ -1242,7 +1242,7 @@ async fn a_committer_reports_how_far_behind_the_folded_store_is() {
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
-            commit_log_folding: crate::Folding::Never,
+            commit_log_folding: Some(crate::Folding::Never),
             ..options_at("lake")
         },
     )
@@ -1280,7 +1280,7 @@ async fn a_committer_reports_how_far_behind_the_folded_store_is() {
         object_store,
         CatalogOptions {
             commit_log: Some(provider),
-            commit_log_folding: crate::Folding::Never,
+            commit_log_folding: Some(crate::Folding::Never),
             ..options_at("lake")
         },
     )
@@ -1366,12 +1366,13 @@ async fn a_provider_that_folds_elsewhere_keeps_committers_off_the_store() {
     let provider = Arc::new(TestProvider::default().folded_elsewhere());
     let options = || CatalogOptions {
         commit_log: Some(provider.clone()),
-        // Asked for holding, and overruled: the deployment folds.
-        commit_log_folding: crate::Folding::Holding { slots: 1 },
+        // Unset: the deployment's lead, which is to fold elsewhere.
+        commit_log_folding: None,
         commit_log_poll_interval: std::time::Duration::from_millis(10),
         ..options_at("lake")
     };
 
+    let folder_store = object_store.clone();
     let committer = Catalog::open(object_store.clone(), options())
         .await
         .unwrap();
@@ -1402,4 +1403,27 @@ async fn a_provider_that_folds_elsewhere_keeps_committers_off_the_store() {
     .await
     .unwrap();
     assert_eq!(folded, 3, "the sprint drained what the committers left");
+
+    // A process that says it is the sprinter is not overruled: it sprints
+    // on the way out, where one following the deployment left the tail.
+    let sprinter = Catalog::open(
+        folder_store,
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            commit_log_folding: Some(crate::Folding::Holding { slots: 0 }),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    sprinter
+        .commit(|tx| tx.create_schema("d").map(|_| ()))
+        .await
+        .unwrap();
+    sprinter.close().await.unwrap();
+    assert_eq!(
+        provider.folded_sequence(),
+        5,
+        "asking to fold overrules the deployment"
+    );
 }

@@ -346,11 +346,12 @@ pub struct CatalogOptions {
     /// mid-replay is not pulled out from under. Defaults to five minutes.
     pub commit_log_retention: Duration,
     /// When this committer takes the store to fold the log into it.
-    /// Defaults to [`Folding::default`], and is overruled by a
-    /// [`CommitLogProvider`](crate::CommitLogProvider) whose deployment
-    /// folds elsewhere: a lake served by a scheduled fold wants no
-    /// committer taking the store, and the two would fence each other.
-    pub commit_log_folding: Folding,
+    /// `None`, the default, follows the deployment: never where the
+    /// [`CommitLogProvider`](crate::CommitLogProvider) folds elsewhere,
+    /// since a scheduled fold and a committer's sprint fence each other,
+    /// and [`Folding::default`] otherwise. `Some` insists, which is what
+    /// a process meant to be the folder says.
+    pub commit_log_folding: Option<Folding>,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -463,7 +464,7 @@ impl Default for CatalogOptions {
             commit_log_flush_slots: 256,
             commit_log_fold_poll: Duration::from_secs(2),
             commit_log_retention: Duration::from_mins(5),
-            commit_log_folding: Folding::default(),
+            commit_log_folding: None,
             cache_dir: None,
             cache_identity: None,
             cache_size: None,
@@ -725,13 +726,18 @@ fn external_compaction(options: &CatalogOptions) -> bool {
         || commit_log_provider(options).is_some_and(|provider| provider.external_compaction())
 }
 
-/// When this open folds, which a provider whose deployment folds
-/// elsewhere settles for every application over it.
+/// When this open folds: what it asked for, else what the deployment
+/// its provider describes does.
 fn folding(options: &CatalogOptions) -> Folding {
-    if commit_log_provider(options).is_some_and(|provider| provider.external_folding()) {
-        return Folding::Never;
+    match options.commit_log_folding {
+        Some(folding) => folding,
+        None if commit_log_provider(options)
+            .is_some_and(|provider| provider.external_folding()) =>
+        {
+            Folding::Never
+        }
+        None => Folding::default(),
     }
-    options.commit_log_folding
 }
 
 fn wal_object_store(options: &CatalogOptions) -> Option<Arc<dyn ObjectStore>> {
