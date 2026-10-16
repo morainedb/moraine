@@ -29,7 +29,7 @@ prost = "0.14"
 prost-build = "0.14"
 protox = "0.10"
 proptest = "1"
-proptest-derive = "0.8"
+proptest-derive = "0.9"
 roaring = "0.11"
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
 serde = { version = "1", features = ["derive"] }
