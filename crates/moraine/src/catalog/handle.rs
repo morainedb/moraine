@@ -331,12 +331,11 @@ pub struct CatalogOptions {
     /// [`reader_poll_interval`](Self::reader_poll_interval). Defaults to
     /// `false`.
     pub commit_log_tail: bool,
-    /// How often a committer's reader polls; it bounds how long a commit
-    /// waits to see its own slot, and so is far shorter than any read
-    /// needs. The poll lists the log only while a commit waits or a read
-    /// has asked, which reads do no more often than
-    /// [`reader_poll_interval`](Self::reader_poll_interval); an idle
-    /// committer lists nothing. Defaults to 50ms.
+    /// How often a committer's reader polls. It bounds how long a commit
+    /// waits to see its own slot and how far behind a peer's a read can
+    /// be, so it is the freshness a committer reads at. The poll lists
+    /// the log while a commit waits or a read has it watched, and
+    /// otherwise touches nothing. Defaults to 50ms.
     pub commit_log_poll_interval: Duration,
     /// How many slots the folder folds before it writes its memtable out
     /// and truncates the log below the replay point. A cold open replays
@@ -427,13 +426,14 @@ pub struct CatalogOptions {
     /// fresher reads and more (on S3, billed) manifest and log reads.
     /// Defaults to 10 seconds.
     ///
-    /// It is a committer's bound too, though a committer polls at
-    /// [`commit_log_poll_interval`](Self::commit_log_poll_interval): the
-    /// faster poll is for a commit to see its own slot, and the log is
-    /// listed for a read only once this long has passed since the last
-    /// listing. A read that finds the last listing older than that waits
-    /// for a fresh one rather than be served what it left, so an idle
-    /// committer costs nothing and still reads within the bound.
+    /// On a committer it is instead how long a read keeps the log
+    /// watched: within it every poll lists, so reads are as fresh as
+    /// [`commit_log_poll_interval`](Self::commit_log_poll_interval), and
+    /// past it nothing lists at all. A read arriving after the window has
+    /// lapsed waits for one listing before it is served, so a committer
+    /// that stops reading costs nothing and the read that wakes it is
+    /// still current. Longer watches a quiet session's log for longer;
+    /// shorter stops sooner and makes a waking read more likely.
     ///
     /// Ignored by a [`Catalog::open`] without a commit log, which reads
     /// its own writes, and by a catalog pinned to a
@@ -577,7 +577,7 @@ async fn open_writer_store(
                 folds_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 flushing: flushing_for(provider.as_ref(), options, &object_store, &log_store),
                 // A folder reads through the store it holds; nothing lists.
-                demand: ReadDemand::new(Duration::ZERO),
+                demand: ReadDemand::new(Duration::ZERO, Duration::ZERO),
             };
             if format >= FORMAT_WITH_COMMIT_LOG {
                 log.batch_origin = commit::batch_origin(ReadHandle::Writer(&db)).await?;
@@ -1843,10 +1843,14 @@ impl Catalog {
             Some(Box::pin(take_store_only(Arc::clone(&object_store), &options)).await?)
         };
 
-        // The reader ticks at the commit-log poll, so a commit sees its slot
-        // within it; reads alone list no more often than the reader
-        // interval, and wait for a listing when the last is older than it.
-        let demand = ReadDemand::new(options.reader_poll_interval);
+        // The reader ticks at the commit-log poll, so a commit sees its own
+        // slot and a peer's within it; a read keeps the log watched for the
+        // reader interval, and waits for a listing when the last one is
+        // older than a couple of ticks.
+        let demand = ReadDemand::new(
+            options.reader_poll_interval,
+            options.commit_log_poll_interval.saturating_mul(2),
+        );
         let mut inner = Self::open_reader_catalog(
             Arc::clone(&object_store),
             CatalogOptions {

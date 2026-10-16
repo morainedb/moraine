@@ -1,9 +1,8 @@
 //! What a committer's plug consults before it lists the log. A committer's
 //! reader ticks at the commit poll so a commit sees its own slot quickly,
-//! which is far faster than any read needs peers' slots; the log is listed
-//! only when a read has asked for state fresher than the last listing
-//! left, or a commit is waiting to see its slot. An idle committer lists
-//! nothing.
+//! and a peer's slot is what a read needs soonest, so a session that is
+//! reading keeps every tick listing. One that stops reading stops
+//! listing, and an idle committer lists nothing at all.
 
 use std::{
     sync::{
@@ -17,6 +16,16 @@ use async_trait::async_trait;
 use slatedb::wal::{WalError, WalFileRange, WalIterator, WalReader};
 use tokio::sync::watch;
 
+/// When reads last wanted the log watched, and when a listing last
+/// answered.
+#[derive(Debug, Default)]
+struct Clock {
+    /// Every tick lists until this passes.
+    active_until: Option<Instant>,
+    /// When the last listing ran.
+    listed_at: Option<Instant>,
+}
+
 /// Who wants the log listed, how recently it was, and how far the reader
 /// has replayed what a listing found.
 pub(crate) struct ReadDemand {
@@ -28,37 +37,52 @@ pub(crate) struct ReadDemand {
     replayed: watch::Sender<u64>,
     /// Commits waiting to see their slot; while any, every tick lists.
     urgent: AtomicU64,
-    listed_at: Mutex<Option<Instant>>,
-    /// The least time between listings reads alone may cause, and the
-    /// staleness a read tolerates before it waits for one.
-    floor: Duration,
+    clock: Mutex<Clock>,
+    /// How long a read keeps the log watched after it.
+    window: Duration,
+    /// How old the last listing may be before a read waits for a fresh
+    /// one. Longer than a tick, so a watched log is never waited on.
+    stale_after: Duration,
 }
 
 impl ReadDemand {
-    /// A demand owing its first listing to the open's own replay; reads
-    /// alone cause one at most every `floor`.
-    pub(crate) fn new(floor: Duration) -> Arc<Self> {
+    /// A demand owing its first listing to the open's own replay, which
+    /// watches the log for `window` after every read.
+    pub(crate) fn new(window: Duration, stale_after: Duration) -> Arc<Self> {
         Arc::new(Self {
             asked: AtomicU64::new(1),
             answered: AtomicU64::new(0),
             replayed: watch::Sender::new(0),
             urgent: AtomicU64::new(0),
-            listed_at: Mutex::new(None),
-            floor,
+            clock: Mutex::new(Clock::default()),
+            window,
+            stale_after,
         })
     }
 
-    /// Lists before the caller reads when the last listing is older than
-    /// the floor, returning once the reader has replayed what it found,
-    /// so no read is served state staler than the floor however long the
-    /// catalog sat idle. Within the floor it returns at once. A listing
-    /// that does not arrive within `timeout` is given up on and the read
-    /// goes ahead stale.
+    /// Watches the log for the window, and waits for a listing first
+    /// unless it was being watched already, where every tick has been
+    /// listing and the reader is a tick behind at worst. Only a session
+    /// that stopped reading waits. A listing that does not arrive within
+    /// `timeout` is given up on and the read goes ahead stale.
     pub(crate) async fn catch_up(self: &Arc<Self>, timeout: Duration) {
         let asked = self.asked.fetch_add(1, Ordering::AcqRel) + 1;
-        if self.wanted().is_none() {
+        let now = Instant::now();
+        let watched = {
+            let mut clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+            // Already inside the window, so every tick has been listing —
+            // unless the poll is wedged, which the staleness bound catches.
+            let watched = clock.active_until.is_some_and(|until| now < until)
+                && clock
+                    .listed_at
+                    .is_some_and(|at| now.saturating_duration_since(at) < self.stale_after);
+            clock.active_until = Some(now + self.window);
+            watched
+        };
+        if watched {
             return;
         }
+
         let _urgent = self.urgent();
         let mut replayed = self.replayed.subscribe();
         let _ = tokio::time::timeout(timeout, replayed.wait_for(|done| *done >= asked)).await;
@@ -77,25 +101,23 @@ impl ReadDemand {
         if self.urgent.load(Ordering::Acquire) > 0 {
             return Some(asked);
         }
-        if asked <= self.answered.load(Ordering::Acquire) {
-            return None;
+        let clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+        if clock.listed_at.is_none() {
+            // The open's own replay, which nothing has read for yet.
+            return Some(asked);
         }
-        let listed_at = self
-            .listed_at
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        match *listed_at {
-            Some(at) if at.elapsed() < self.floor => None,
-            _ => Some(asked),
+        match clock.active_until {
+            Some(until) if Instant::now() < until => Some(asked),
+            _ => None,
         }
     }
 
     fn answered(&self, asked: u64) {
         self.answered.fetch_max(asked, Ordering::AcqRel);
-        *self
-            .listed_at
+        self.clock
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+            .unwrap_or_else(PoisonError::into_inner)
+            .listed_at = Some(Instant::now());
     }
 
     /// Publishes the last answered ask as replayed. Called as a poll asks
@@ -168,48 +190,55 @@ impl WalReader for DemandedReader {
 mod tests {
     use super::*;
 
-    /// Reads alone cause one listing per ask, spaced by the floor; a wait
-    /// lists every time until it ends.
-    #[test]
-    fn a_demand_lists_for_asks_within_the_floor_and_always_while_urgent() {
-        let demand = ReadDemand::new(Duration::from_mins(1));
+    const WINDOW: Duration = Duration::from_millis(100);
+    const STALE: Duration = Duration::from_millis(20);
+
+    /// A read watches the log for the window; past it, nothing lists.
+    #[tokio::test]
+    async fn a_read_watches_the_log_for_the_window_and_no_longer() {
+        let demand = ReadDemand::new(WINDOW, STALE);
         assert_eq!(demand.wanted(), Some(1), "the open's replay is owed");
         demand.answered(1);
-        assert_eq!(demand.wanted(), None, "nothing asked since");
+        assert_eq!(demand.wanted(), None, "and nothing has read since");
 
-        demand.asked.fetch_add(1, Ordering::AcqRel);
-        assert_eq!(demand.wanted(), None, "a read inside the floor waits");
-
-        let urgent = demand.urgent();
-        assert_eq!(demand.wanted(), Some(2), "a waiting commit lists at once");
+        // No plug answers here, so the read gives up rather than wait out
+        // the window it is about to be measured against.
+        demand.catch_up(Duration::from_millis(5)).await;
+        assert_eq!(demand.wanted(), Some(2), "a read watches the log");
         demand.answered(2);
-        assert_eq!(demand.wanted(), Some(2), "and again, until served");
-        drop(urgent);
-        assert_eq!(demand.wanted(), None, "the ask was answered on the way");
+        assert_eq!(
+            demand.wanted(),
+            Some(2),
+            "and keeps watching it, listing every tick"
+        );
+
+        tokio::time::sleep(WINDOW * 2).await;
+        assert_eq!(demand.wanted(), None, "the window passed");
     }
 
-    /// A read inside the floor is served the listing a previous read
-    /// caused, without waiting for one of its own.
+    /// A read inside the window waits for nothing: the log is being
+    /// listed every tick already.
     #[tokio::test]
-    async fn a_read_inside_the_floor_waits_for_nothing() {
-        let demand = ReadDemand::new(Duration::from_mins(1));
+    async fn a_read_on_a_watched_log_waits_for_nothing() {
+        let demand = ReadDemand::new(WINDOW, STALE);
         demand.answered(1);
 
-        demand.catch_up(Duration::from_mins(1)).await;
+        demand.catch_up(Duration::from_secs(5)).await;
     }
 
-    /// A read past the floor waits for a listing and for the reader to
-    /// replay it, which the poll after the listing reports.
+    /// A read whose last listing is older than the staleness bound — a
+    /// session that stopped reading — waits for a listing and for the
+    /// reader to replay it.
     #[tokio::test]
-    async fn a_read_past_the_floor_waits_for_the_listing_it_causes() {
-        let demand = ReadDemand::new(Duration::ZERO);
+    async fn a_read_after_the_window_waits_for_a_fresh_listing() {
+        let demand = ReadDemand::new(WINDOW, STALE);
         demand.answered(1);
+        tokio::time::sleep(STALE * 2).await;
 
         let reading = tokio::spawn({
             let demand = Arc::clone(&demand);
-            async move { demand.catch_up(Duration::from_mins(1)).await }
+            async move { demand.catch_up(Duration::from_secs(5)).await }
         });
-        // The poll that lists, then the poll that reports it replayed.
         let asked = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(asked) = demand.wanted()
@@ -223,21 +252,36 @@ mod tests {
         .await
         .expect("the read asks for a listing");
         assert!(!reading.is_finished(), "and waits for it");
+
         demand.answered(asked);
         demand.settle();
-
         tokio::time::timeout(Duration::from_secs(5), reading)
             .await
             .expect("the read is released by the replay")
             .expect("the reading task did not panic");
     }
 
+    /// A commit waiting for its slot lists every tick whatever the reads
+    /// have done, and rests once the guard drops.
+    #[tokio::test]
+    async fn a_waiting_commit_lists_whatever_the_reads_have_done() {
+        let demand = ReadDemand::new(WINDOW, STALE);
+        demand.answered(1);
+        assert_eq!(demand.wanted(), None, "nothing has read");
+
+        let urgent = demand.urgent();
+        assert_eq!(demand.wanted(), Some(1));
+        demand.answered(1);
+        assert_eq!(demand.wanted(), Some(1), "and again, until served");
+        drop(urgent);
+        assert_eq!(demand.wanted(), None);
+    }
+
     /// A read gives up on a listing that does not arrive and goes ahead
     /// stale rather than failing.
     #[tokio::test]
     async fn a_read_gives_up_on_a_listing_that_never_lands() {
-        let demand = ReadDemand::new(Duration::ZERO);
-        demand.answered(1);
+        let demand = ReadDemand::new(WINDOW, STALE);
 
         demand.catch_up(Duration::from_millis(10)).await;
     }

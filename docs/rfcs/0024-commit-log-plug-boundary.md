@@ -254,13 +254,16 @@ moves the counter outside a slot.
   needs a peer's. Listing on every such poll is the expensive part, and
   the clock is the wrong thing to drive it, so the plug lists only when
   something wants what a listing finds: a commit waiting to see its slot,
-  which keeps every poll listing until it is served, or a read that has
-  asked. Reads ask no more often than `reader_poll_interval`, and a read
-  that finds the last listing older than that holds the demand urgent and
-  waits for a fresh one, so `reader_poll_interval` is the staleness bound
-  it is on a reader, whatever the commit poll is and however long the
-  catalog sat idle. A read within the bound waits for nothing, and an idle
-  committer lists nothing at all. Between listings the plug reports the
+  which keeps every poll listing until it is served, or a read, which
+  keeps the log watched for `reader_poll_interval` after it. Within that
+  window every poll lists, so a session being read sees a peer's slot as
+  quickly as its own — the commit poll, unchanged — and past it nothing
+  lists at all. A read arriving after the window has lapsed holds the
+  demand urgent and waits for one listing before it is served, so a
+  committer that stops reading costs nothing and the read that wakes it
+  is still current. The window is what a read extends, not a rate it is
+  throttled to: throttling reads would make a peer's commit invisible for
+  as long as the bound, which two attaches over one lake notice at once. Between listings the plug reports the
   end it last saw, which the reader has replayed already; each poll
   publishes the previous poll's listing as replayed, the reader running
   its polls one after another. The gate is moraine's, wrapped around the

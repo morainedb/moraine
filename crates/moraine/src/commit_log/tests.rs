@@ -1094,14 +1094,15 @@ async fn a_committer_lists_while_a_commit_awaits_its_slot_then_rests() {
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
             commit_log_poll_interval: std::time::Duration::from_millis(10),
-            // Reads alone may not list more often than this.
-            reader_poll_interval: std::time::Duration::from_mins(1),
+            // How long a read keeps the log watched for.
+            reader_poll_interval: std::time::Duration::from_millis(50),
             ..options_at("lake")
         },
     )
     .await
     .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Past the window the open's own reads opened.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let idle = committer_provider.polls();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(
@@ -1128,6 +1129,7 @@ async fn a_committer_lists_while_a_commit_awaits_its_slot_then_rests() {
         "the committer reads its own commit"
     );
 
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let settled = committer_provider.polls();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(
@@ -1317,4 +1319,59 @@ async fn a_catalog_without_a_log_reports_no_tail() {
         .unwrap();
     assert_eq!(catalog.unfolded_slots().await.unwrap(), None);
     catalog.close().await.unwrap();
+}
+
+/// Two committers over one lake each read what the other just committed,
+/// at the commit poll rather than the reader interval: a peer's slot is
+/// what a reader needs soonest, and a session reading at all keeps
+/// watching for one.
+#[tokio::test]
+async fn a_committer_reading_steadily_sees_a_peers_commit_at_once() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+    let options = |provider: Arc<TestProvider>| CatalogOptions {
+        commit_log: Some(provider),
+        commit_log_poll_interval: std::time::Duration::from_millis(10),
+        ..options_at("lake")
+    };
+
+    let first = Catalog::open(object_store.clone(), options(provider.clone()))
+        .await
+        .unwrap();
+    first
+        .commit(|tx| tx.create_schema("from_first").map(|_| ()))
+        .await
+        .unwrap();
+
+    let second = Catalog::open(object_store, options(Arc::new(provider.sharing())))
+        .await
+        .unwrap();
+    assert!(
+        second
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("from_first")
+            .is_some(),
+        "the second committer opens on what the first committed"
+    );
+    second
+        .commit(|tx| tx.create_schema("from_second").map(|_| ()))
+        .await
+        .unwrap();
+
+    // The first read after a peer's commit, with no idling in between.
+    assert!(
+        first
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("from_second")
+            .is_some(),
+        "a reading committer sees its peer's commit without waiting out \
+         the reader interval"
+    );
+    first.close().await.unwrap();
+    second.close().await.unwrap();
 }

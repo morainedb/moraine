@@ -211,11 +211,12 @@ read-only attach is a reader and never commits.
 lands rather than once a folder has folded it, at a listing per
 `READER_POLL_INTERVAL_MS`. `COMMIT_LOG_POLL_INTERVAL_MS` is how often a
 committer's reader polls; it bounds how long a commit waits to see its own
-slot, which is far shorter than a query needs, so the poll lists the log
-only while a commit waits or a query has asked — no more often than
-`READER_POLL_INTERVAL_MS`, which stays the freshness bound either way. An
-idle committer lists nothing, and a query after an idle spell waits for a
-listing rather than be served what the last one left. All three are ignored
+slot and how far behind a peer's a query can be. The poll lists the log
+while a commit waits or a query has it watched, which a query keeps up for
+`READER_POLL_INTERVAL_MS` after it, and otherwise touches nothing. So an
+attach being queried sees another attach's commits at the poll, an attach
+left idle lists nothing, and the query that wakes it waits for one listing
+rather than be served what the last one left. All three are ignored
 without a registered provider, and the tail length `'holding'` acts on
 reaches the library API only.
 
