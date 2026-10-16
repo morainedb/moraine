@@ -1248,3 +1248,73 @@ async fn a_committer_that_does_not_fold_never_takes_the_store() {
     }
     caught_up.close().await.unwrap();
 }
+
+/// The unfolded tail is readable without folding it, so a lake whose
+/// committers fold nothing can be watched rather than only discovered.
+#[tokio::test]
+async fn a_committer_reports_how_far_behind_the_folded_store_is() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+    let committer = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            commit_log_folding: crate::Folding::Never,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    let behind = committer.unfolded_slots().await.unwrap();
+
+    for name in ["a", "b", "c"] {
+        committer
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        committer.unfolded_slots().await.unwrap(),
+        behind.map(|slots| slots + 3),
+        "three commits, three more slots the store lacks"
+    );
+
+    // A sprint drains it, and what the sprint reports is what was behind.
+    let behind = committer.unfolded_slots().await.unwrap().unwrap();
+    committer.close().await.unwrap();
+    let folded = Catalog::fold_sprint(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(folded, behind, "the sprint folded exactly what was behind");
+
+    let drained = Catalog::open(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(provider),
+            commit_log_folding: crate::Folding::Never,
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(drained.unfolded_slots().await.unwrap(), Some(0));
+    drained.close().await.unwrap();
+}
+
+/// A catalog with no commit log has no tail to be behind.
+#[tokio::test]
+async fn a_catalog_without_a_log_reports_no_tail() {
+    let object_store = Arc::new(InMemory::new());
+    let catalog = Catalog::open(object_store, options_at("lake"))
+        .await
+        .unwrap();
+    assert_eq!(catalog.unfolded_slots().await.unwrap(), None);
+    catalog.close().await.unwrap();
+}

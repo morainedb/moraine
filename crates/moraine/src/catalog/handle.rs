@@ -2081,6 +2081,29 @@ impl Catalog {
         Ok(behind)
     }
 
+    /// How many slots the folded store lacks: what a cold open would
+    /// replay, and what a sprint would fold. `None` without a commit log,
+    /// where there is no tail to be behind. One listing, and it folds
+    /// nothing — for a host watching a lake whose committers fold nothing
+    /// themselves, where the tail grows until something drains it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's error if the manifest or the log cannot be
+    /// read.
+    pub async fn unfolded_slots(&self) -> Result<Option<u64>> {
+        let Store::Committer {
+            commit_log, sprint, ..
+        } = self.store.as_ref()
+        else {
+            return Ok(None);
+        };
+        let replay_point =
+            census::replay_point(&sprint.options.path, Arc::clone(&sprint.object_store)).await?;
+
+        commit_log.committer.unfolded(replay_point).await.map(Some)
+    }
+
     /// Sprints now if the unfolded tail is past the threshold, for a host
     /// that just lost a race and would rather fold than let the next
     /// arrival pay. Only a committer sprints; the folder is already folding.

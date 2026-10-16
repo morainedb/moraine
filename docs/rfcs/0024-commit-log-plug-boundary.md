@@ -297,7 +297,11 @@ moves the counter outside a slot.
   the moment a shutdown has least time for it, and the sprint fences
   whichever process is folding, so a rolling fleet would fence the folder
   once per pod. A fleet that does not fold needs a folder, not a later
-  moment to fold at. There is no role to select:
+  moment to fold at. What a lake that folds nothing costs is visible
+  rather than discovered: `Catalog::unfolded_slots` reports how many slots
+  the folded store lacks, in one listing and folding nothing, so a host
+  can watch a tail it has opted out of draining. There is no role to
+  select:
   `Catalog::take_store` takes the store on request, and
   `Catalog::fold_sprint` takes it for one fold and closes, for a job with
   no session to keep. Maintenance takes nothing: its batches are slots. A
