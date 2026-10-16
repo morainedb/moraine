@@ -206,8 +206,9 @@ merge is a submission.
 **The extension.** A read-write attach with a registered provider is a
 committer; a read-only attach is a reader. `COMMIT_LOG_TAIL` makes a
 read-only attach tail the log, `COMMIT_LOG_POLL_INTERVAL_MS` sets the
-committer's poll, and `COMMIT_LOG_FOLDING` names whether the committer
-takes the store: `holding`, at the library's default tail, or `never`. They reach the core through
+committer's poll. The fold cadence reaches the library API only: every
+attach folds, because a lake that nothing folds grows a log without
+bound. They reach the core through
 `moraine_attach_with_commit_log`, whose `commit_log` argument the older
 attach entry points pass as null. Without a registered provider all three
 are ignored. `READER_POLL_INTERVAL_MS`, beside them, is the freshness
@@ -268,44 +269,33 @@ moves the counter outside a slot.
   what its reader was served. Its own win is folded the same way: read
   back from the log together with any gap before it, so the cursor never
   passes a slot the store lacks.
-- **Taking and holding the store.** Every attach is a committer. A
-  committer that finds the unfolded tail — counted past the manifest's
-  replay point, which moraine reads itself, since the reader plug sees
-  only its own in-memory watermark — past its `Folding`'s tail takes
-  the store: it opens it as the folder, which replays the tail, and keeps
-  it, folding its own wins and peers' slots into it while still reading
-  through its tailing reader. It checks at attach and after every loss,
-  where the tail's length is already known. A holder that another process
-  fences gives the store up and carries on committing; nothing is lost,
-  since every slot is durable, and the fence shows at the holder's next
-  flush, whether its own commit's, the idle poll's, or the one at close,
-  which then demotes and reports nothing. The first committer
-  to find an unadopted log takes the store and adopts it. The threshold sits well above the flush count, so a holder
-  doing its job is never taken from. A loss is where the tail's length
-  comes for free, since the slots lost to arrive with it, but a lake with
-  one active committer has no losses — so a win measures it too, every
-  few hundred, and a committer that only ever wins still finds a tail to
-  fold. Nothing beyond the processes already committing is needed.
-  Whether a committer folds at all is one option, not two interacting
-  ones: `Folding::Holding` is the above, and `Folding::Never` takes
-  nothing — it adopts an unadopted log
-  and gives the store straight back, and does not sprint at close either,
-  for a process that should carry no store while it serves. Folding at
-  close only was considered and rejected: a serving process closes at a
-  deploy, which is no cadence to bound a tail by, it moves the replay to
-  the moment a shutdown has least time for it, and the sprint fences
-  whichever process is folding, so a rolling fleet would fence the folder
-  once per pod. A fleet that does not fold needs a folder, not a later
-  moment to fold at. What a lake that folds nothing costs is visible
-  rather than discovered: `Catalog::unfolded_slots` reports how many slots
-  the folded store lacks, in one listing and folding nothing, so a host
-  can watch a tail it has opted out of draining. There is no role to
-  select:
-  `Catalog::take_store` takes the store on request, and
-  `Catalog::fold_sprint` takes it for one fold and closes, for a job with
-  no session to keep. Maintenance takes nothing: its batches are slots. A
-  committer that never took the store sprints at close if the tail is
-  long. A read-only open is a reader and never commits.
+- **Folding is a cadence, not a role.** Every
+  `commit_log_fold_slots` slots, the committer that lands one folds: it
+  opens the store, applies every slot the store lacks, writes it out,
+  truncates the log below the replay point, and closes. The sequence it
+  just won is the whole trigger, so nothing is measured and nothing is
+  listed to decide, and the work falls where the commits are. A fold that
+  fails is logged and let go — the commit has landed and its slot is
+  durable, the next multiple folds what this one did not, and a process
+  without permission to write the store simply never succeeds at one.
+  Nothing is elected, nothing is resident, and a lake needs no process
+  beyond the ones already committing to it. Delta Lake's checkpoints are
+  the same shape: the writer that lands the nth commit writes the
+  checkpoint, and a checkpoint that fails does not fail the commit.
+
+  Acquiring the store and keeping it was tried first and is worse in
+  every deployment that has more than one writer: it elects an arbitrary
+  pod to be stateful, it has no liveness story, two of them fence each
+  other, and the acquisition lands inline on whichever commit happened to
+  lose a race. A process can still take the store outright with
+  `Catalog::take_store`, which holds it until close, for a job that
+  writes into the store directly rather than through slots;
+  `Catalog::fold_sprint` is the fold alone, for a scheduled drain; and
+  `Catalog::unfolded_slots` reports how far behind the store is, in one
+  listing and folding nothing. None of the three is on the commit path.
+  Adoption is a fold too: the first committer to find an unadopted log
+  stamps it and gives the store straight back. A read-only open is a
+  reader and never commits.
 
 ### The folder's own rows
 
@@ -321,12 +311,12 @@ operator's verb, well inside the headroom any fold leaves.
 ### What remains
 
 **End to end.** Two DuckDB processes on one local store, one holding and
-one committing, each seeing the other's slots and a pass from the second
+one folding, each seeing the other's slots and a pass from the second
 fencing neither, run in the library's repository against the extension it
 builds. The same against a bucket, and the attach option's C++ side, which
 has compiled only by inspection, remain. The flush, retention, and sprint
-thresholds reach the library API only; the extension's attach exposes
-tailing, both polls, and holding.
+thresholds reach the library API only, the fold cadence with them; the
+extension's attach exposes tailing and both polls.
 
 ## Alternatives considered
 

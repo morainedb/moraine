@@ -242,12 +242,6 @@ pub(crate) fn mint_transaction_id() -> [u8; 16] {
 /// served a sequence before it reads again.
 pub(crate) const READER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How many wins a committer makes before it measures its tail again.
-/// A loss measures it for free, so this is what a committer that keeps
-/// winning falls back on; it matches the folder's flush cadence, so a
-/// check lands about as often as an L0 would.
-const WINS_BETWEEN_TAIL_CHECKS: u64 = 256;
-
 /// How long a commit waits between refreshes while its slot is not yet
 /// served, so a peer's slot landing between them is not spun on.
 const SLOT_REFRESH_BACKOFF: Duration = Duration::from_millis(2);
@@ -265,7 +259,9 @@ pub(crate) struct LogCommitter {
     pub(crate) reads: ReadSide,
     /// How this process takes the store when the tail is long; `None` for
     /// a process that holds it from its open.
-    pub(crate) taker: Option<Arc<dyn StoreTaker>>,
+    pub(crate) folder: Option<Arc<dyn StoreFolder>>,
+    /// Every this many slots, the committer that lands one folds.
+    pub(crate) fold_every: u64,
     /// The head's batch counter when the log was adopted; slot `k` carries
     /// the stamp at `batch_origin + k - 1`.
     pub(crate) batch_origin: u64,
@@ -282,9 +278,6 @@ pub(crate) struct LogCommitter {
     /// commit waits to see its slot. `None` on a folder, which reads the
     /// store it holds.
     pub(crate) reader: Option<Arc<slatedb::DbReader>>,
-    /// Wins since this process last measured the tail, so a committer
-    /// that only ever wins still checks.
-    pub(crate) wins_since_check: Arc<AtomicU64>,
 }
 
 /// The store a process holds, and the idle poll folding into it.
@@ -303,14 +296,14 @@ pub(crate) enum ReadSide {
     Reader,
 }
 
-/// Opens the store for a process that found the tail long, so it can hold
-/// and fold it. Implemented by the catalog, which owns the open.
+/// Folds the log into the store once and lets go. Implemented by the
+/// catalog, which owns the open.
 #[async_trait]
-pub(crate) trait StoreTaker: Send + Sync {
-    /// Takes the store if the unfolded tail is past the threshold, handing
-    /// it to `log` through [`LogCommitter::promote`]. Returns whether it
-    /// did.
-    async fn take_if_stalled(&self, log: &LogCommitter) -> Result<bool>;
+pub(crate) trait StoreFolder: Send + Sync {
+    /// Opens the store, applies every slot it lacks, writes it out,
+    /// truncates the log below it, and closes. Returns how many slots the
+    /// store was behind.
+    async fn fold_now(&self) -> Result<u64>;
 }
 
 /// The idle poll task and the switch that stops it.
@@ -480,36 +473,28 @@ impl LogCommitter {
         let _ = holder.db.close().await;
     }
 
-    /// As [`take_if_stalled`](Self::take_if_stalled), but only every
-    /// `WINS_BETWEEN_TAIL_CHECKS` wins. A loss measures the tail for
-    /// free, since the slots lost to come back with it; a win must pay a
-    /// manifest read and a listing to learn it. So a winner checks
-    /// rarely rather than never — a committer that never loses a race
-    /// would otherwise never find its tail long, and nothing would fold.
-    pub(crate) async fn take_if_stalled_on_a_win(&self) {
-        if self.holds_store() {
-            return;
-        }
-        let wins = self.wins_since_check.fetch_add(1, Ordering::AcqRel) + 1;
-        if wins < WINS_BETWEEN_TAIL_CHECKS {
-            return;
-        }
-        self.wins_since_check.store(0, Ordering::Release);
-        self.take_if_stalled().await;
-    }
-
-    /// Takes the store if the tail is long and this process can: a process
-    /// that already holds it, or opened without a taker, does nothing.
-    pub(crate) async fn take_if_stalled(&self) {
-        let Some(taker) = &self.taker else {
+    /// Folds after the slot the caller just landed, when that slot is the
+    /// one this lake's cadence names. The sequence is the whole trigger,
+    /// so nothing is measured and nothing is listed to decide: whichever
+    /// committer lands slot `n * fold_every` does that fold.
+    ///
+    /// A fold that fails is logged and let go. The commit has landed and
+    /// its slot is durable, the next multiple folds what this one did
+    /// not, and a process not permitted to fold simply never succeeds at
+    /// one.
+    pub(crate) async fn fold_if_due(&self, sequence: u64) {
+        let Some(folder) = &self.folder else {
             return;
         };
-        if self.holds_store() {
+        if self.fold_every != 0 && !sequence.is_multiple_of(self.fold_every) {
             return;
         }
-        match taker.take_if_stalled(self).await {
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "could not take the store; committing on"),
+        match folder.fold_now().await {
+            Ok(0) => {}
+            Ok(slots) => tracing::debug!(sequence, slots, "folded the log into the store"),
+            Err(error) => {
+                tracing::warn!(sequence, %error, "the fold failed; the next one folds this too");
+            }
         }
     }
 

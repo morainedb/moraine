@@ -199,19 +199,15 @@ when the lake already has one, and `wal_path => NULL` moves the log back
 into the catalog store.
 
 
-**`COMMIT_LOG_TAIL`, `COMMIT_LOG_POLL_INTERVAL_MS`, and
-`COMMIT_LOG_FOLDING` — reading a commit log.** When the process has a
-commit-log provider registered, every commit is a slot in a log beside the
-catalog. A read-write attach is a committer: it commits from anywhere, and
-folding those slots into the store is a chore it picks up rather than a
-role it is given. `COMMIT_LOG_FOLDING` says whether it does. `'holding'`, the default,
-takes the store when the tail grows long or the log is not yet adopted
-and keeps it, giving it back if another process takes it, and sprints at
-detach if it never took it — so a lake needs no process beyond the ones
-already committing to it. `'never'` takes nothing and folds nothing, for
-a deployment whose attaches are too short-lived to be the folder; it
-needs something else to fold, since an unfolded tail only grows. A
-read-only attach is a reader and never commits.
+**`COMMIT_LOG_TAIL` and `COMMIT_LOG_POLL_INTERVAL_MS` — reading a commit
+log.** When the process has a commit-log provider registered, every commit
+is a slot in a log beside the catalog. A read-write attach is a committer:
+it commits from anywhere, and folding those slots into the store — so the
+log can be truncated and a reader following the folded store stays current
+— is something every committer does on a cadence. Whichever one lands the
+nth slot folds it: no process is the folder, none is configured to be, and
+nothing has to be running for a lake to stay folded. The cadence reaches
+the library API only. A read-only attach is a reader and never commits.
 
 `COMMIT_LOG_TAIL true` makes a read-only attach tail the log and see a commit once its slot
 lands rather than once a folder has folded it, at a listing per

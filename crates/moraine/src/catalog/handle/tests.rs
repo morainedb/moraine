@@ -716,7 +716,10 @@ async fn a_provider_can_declare_external_compaction() {
         ..CatalogOptions::default()
     };
     let catalog = Catalog::open(object_store.clone(), options).await.unwrap();
-    assert!(catalog.holds_store(), "the first open adopts and holds");
+    assert!(
+        !catalog.holds_store(),
+        "the open adopts and gives the store straight back"
+    );
     catalog.close().await.unwrap();
     assert_eq!(compactions_objects(&object_store, "declared").await, 0);
 

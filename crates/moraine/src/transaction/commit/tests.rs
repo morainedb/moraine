@@ -5184,7 +5184,8 @@ async fn folder_with_table(
 ) -> (crate::catalog::Catalog, crate::catalog::TableId) {
     use crate::catalog::{Catalog, ColumnDef};
     let folder = Catalog::open(backing, log_options(provider)).await.unwrap();
-    assert!(folder.holds_store(), "the first open adopts and holds");
+    // Committers fold and let go, so this one takes the store explicitly.
+    assert!(folder.take_store().await.unwrap());
     let table = std::cell::Cell::new(None);
     folder
         .commit(|tx| {

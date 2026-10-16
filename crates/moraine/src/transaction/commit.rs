@@ -630,9 +630,9 @@ async fn settle_win(
     if !log.await_served(sequence).await {
         invalidate_head_view(projections);
     }
-    // A winner checks its tail too, at intervals: a committer that never
-    // loses a race would otherwise never find one to fold.
-    log.take_if_stalled_on_a_win().await;
+    // The slot just landed names whether this committer folds: the
+    // cadence is arithmetic on the sequence, so nothing is measured.
+    log.fold_if_due(sequence).await;
 
     Ok(())
 }
@@ -670,8 +670,6 @@ async fn offer_batch(
                 return Offered::Failed(err);
             }
             invalidate_head_view(projections);
-            // A loss is where the tail's length is known for free.
-            log.take_if_stalled().await;
             Offered::Lost
         }
         Err(err) => {
