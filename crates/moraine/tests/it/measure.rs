@@ -366,7 +366,7 @@ async fn measure_attach_cost_under_get_latency() {
     );
 
     let store = Arc::new(InMemory::new());
-    churn_into_ssts(&store, TABLES, COLS_PER_TABLE, ROUNDS).await;
+    Box::pin(churn_into_ssts(&store, TABLES, COLS_PER_TABLE, ROUNDS)).await;
 
     for merged in [false, true] {
         if merged {

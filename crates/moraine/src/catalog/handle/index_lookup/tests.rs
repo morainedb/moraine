@@ -12,10 +12,7 @@ use crate::{
 async fn range_and_null_scans_recheck_a_definition_removed_during_the_pass() {
     for null_lookup in [false, true] {
         let store = Arc::new(InMemory::new());
-        let options = CatalogOptions {
-            reader_poll_interval: Duration::from_millis(10),
-            ..Default::default()
-        };
+        let options = CatalogOptions::default();
         let writer = Catalog::open(store.clone(), options.clone()).await.unwrap();
         let ids = Cell::new(None);
         writer
@@ -57,13 +54,13 @@ async fn range_and_null_scans_recheck_a_definition_removed_during_the_pass() {
                 attempts.set(attempts.get() + 1);
                 let head = writer.commit(|tx| tx.drop_index(index)).await?;
                 writer.close().await?;
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while commit::read_head_value(handle).await.unwrap().snapshot_id != head.get() {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .unwrap();
+                // Bring the pass's own handle up to the drop, rather than
+                // waiting for a poll to happen to do it.
+                handle.refresh().await.unwrap();
+                assert_eq!(
+                    commit::read_head_value(handle).await.unwrap().snapshot_id,
+                    head.get()
+                );
                 if null_lookup {
                     let key = encode_ordered_values(&[None], &info.directions, &info.nulls)?;
                     index_maintenance::null_prefix_row_ids(

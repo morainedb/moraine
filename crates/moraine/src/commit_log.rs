@@ -708,6 +708,7 @@ impl LogCommitter {
     }
 }
 
+pub(crate) mod asked;
 #[cfg(test)]
 pub(crate) mod test_log;
 #[cfg(test)]

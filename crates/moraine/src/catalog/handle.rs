@@ -961,6 +961,10 @@ pub struct ReadOnlyCatalog {
     /// store leaves it to the reader's own poll. Shared by every clone
     /// of the handle, so they pace each other.
     refresh: Arc<Refresh>,
+    /// What a read-only reader over a commit log lists it for: a read
+    /// asks, and the next poll lists. `None` where there is no log to
+    /// list, or where reads refresh instead.
+    asked: Option<Arc<crate::commit_log::asked::Asked>>,
 }
 
 impl std::fmt::Debug for ReadOnlyCatalog {
@@ -1485,6 +1489,9 @@ impl ReadOnlyCatalog {
                 ReadSession::Tx(db.begin(IsolationLevel::Snapshot).map_err(Error::from)?)
             }
             Store::Reader(reader) | Store::Committer { reader, .. } => {
+                if let Some(asked) = &self.asked {
+                    asked.ask();
+                }
                 if self.refresh.due() {
                     // Refreshed rather than polled for, so the read is
                     // served the log as it stands.
@@ -1779,6 +1786,7 @@ impl Catalog {
                 )),
                 projections,
                 refresh: Arc::new(Refresh::never()),
+                asked: None,
             },
         })
     }
@@ -2152,6 +2160,10 @@ impl Catalog {
         options: CatalogOptions,
         refresh: Arc<Refresh>,
     ) -> Result<ReadOnlyCatalog> {
+        // A read-only tail is listed for a read; a committer refreshes
+        // instead, and a store with no log has nothing to list.
+        let asked = (!refresh.on && options.commit_log_tail && options.commit_log.is_some())
+            .then(|| Arc::new(crate::commit_log::asked::Asked::default()));
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
         let started = Instant::now();
         let located = Arc::clone(&object_store);
@@ -2184,6 +2196,7 @@ impl Catalog {
             .cache_compaction_puts(options.cache_compaction_puts)
             .external_compaction(external_compaction(&options))
             .poll_interval(options.reader_poll_interval)
+            .read_asked(asked.clone())
             .checkpoint(checkpoint);
 
         let (reader, cache, format) = commit::open_reader_initialized(
@@ -2236,6 +2249,7 @@ impl Catalog {
             )),
             projections,
             refresh,
+            asked,
         })
     }
 

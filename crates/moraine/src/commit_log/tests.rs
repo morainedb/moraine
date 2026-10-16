@@ -756,50 +756,6 @@ async fn a_store_stamped_for_the_log_is_refused_without_a_provider() {
     }
 }
 
-/// A read-only tailing reader follows its own clock, listing for a peer's
-/// slot with nothing having asked: the gate is a committer's alone.
-#[tokio::test]
-async fn a_tailing_reader_follows_its_clock_unasked() {
-    let object_store = Arc::new(InMemory::new());
-    bootstrapped(object_store.clone(), "lake").await;
-    let provider = Arc::new(TestProvider::default());
-    let folder = Catalog::open(
-        object_store.clone(),
-        CatalogOptions {
-            commit_log: Some(provider.clone()),
-            ..options_at("lake")
-        },
-    )
-    .await
-    .unwrap();
-    folder.close().await.unwrap();
-
-    let reader_provider = Arc::new(provider.sharing());
-    let reader = Catalog::open_read_only(
-        object_store,
-        CatalogOptions {
-            commit_log: Some(reader_provider.clone()),
-            commit_log_tail: true,
-            reader_poll_interval: std::time::Duration::from_millis(10),
-            ..options_at("lake")
-        },
-    )
-    .await
-    .unwrap();
-
-    provider
-        .log
-        .land(2, peer_slot(&provider, 2, b"\xffpeer", b"landed"));
-    assert!(
-        reader_provider
-            .committer(Arc::new(InMemory::new()), "lake")
-            .await_served(2, std::time::Duration::from_secs(5))
-            .await,
-        "the clock served the slot, unasked"
-    );
-    reader.close().await.unwrap();
-}
-
 /// A committer idle longer than its reader interval lists before it reads,
 /// so a read is served state no staler than that interval however long the
 /// catalog went unused.
@@ -1090,5 +1046,63 @@ async fn the_committer_that_lands_the_nth_slot_folds() {
         "and the fold let the store go again"
     );
 
+    committer.close().await.unwrap();
+}
+
+/// A read-only tailing catalog lists the log for a read, not for its
+/// clock: one nothing reads lists nothing, and a read is served the
+/// listing its poll makes, which is the staleness the interval promised.
+#[tokio::test]
+async fn a_read_only_tail_lists_for_a_read_and_not_for_its_clock() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+    let committer = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+
+    let reader_provider = Arc::new(provider.sharing());
+    let reader = Catalog::open_read_only(
+        object_store,
+        CatalogOptions {
+            commit_log: Some(reader_provider.clone()),
+            commit_log_tail: true,
+            reader_poll_interval: std::time::Duration::from_millis(10),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let idle = reader_provider.polls();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        reader_provider.polls(),
+        idle,
+        "nothing read it, so its ticks listed nothing"
+    );
+
+    committer
+        .commit(|tx| tx.create_schema("landed").map(|_| ()))
+        .await
+        .unwrap();
+    // A read asks; the tick it asked for lists, and the slot is served.
+    reader.snapshot().await.unwrap();
+    assert!(
+        reader_provider
+            .committer(Arc::new(InMemory::new()), "lake")
+            .await_served(2, std::time::Duration::from_secs(5))
+            .await,
+        "the read's listing served the slot"
+    );
+    assert!(reader_provider.polls() > idle);
+
+    reader.close().await.unwrap();
     committer.close().await.unwrap();
 }

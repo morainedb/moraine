@@ -249,19 +249,21 @@ moves the counter outside a slot.
   tail past its fold cursor and folds what peers landed, under a guard
   that also spans its own offer and local commit, so the poll never folds
   a slot it is in the middle of committing itself.
-- **A committer refreshes, it does not poll.** A read refreshes the
-  reader before it is served, so the log is listed when a read asks and
-  the read is served what that listing found. A commit awaiting its own
-  slot refreshes until the plug reports it served, so its wait is round
-  trips rather than ticks of a clock. Nothing between reads lists
-  anything: an idle committer makes no request of the log at all, and the
-  reader's own poll remains only to keep the checkpoint it holds from
-  expiring, which is what `reader_poll_interval` sets on a committer.
-  Gating a timer was tried first and is not enough: a gate can only ask
-  the next tick to list, so either a peer's commit stays invisible for as
-  long as the gate's bound or every read waits out a tick. Refreshing
-  removes the choice. It rests on `DbReader::refresh`, which this build
-  carries from an unmerged upstream change.
+- **A committer refreshes, a reader asks.** A committer's read
+  refreshes the reader before it is served, so the log is listed when a
+  read asks and the read is served what that listing found; a commit
+  awaiting its own slot refreshes until the plug reports it served, so
+  its wait is round trips rather than ticks. Nothing between reads lists
+  anything, and an idle committer makes no request of the log at all.
+
+  A read-only tailing reader wants the same saving and not the same
+  freshness: its poll interval is the staleness it promised, so a read
+  sets a flag and the next tick lists, which costs a tick it was already
+  going to wait. One nothing reads lists nothing. Refreshing before
+  every read instead was tried and is wrong here — it doubles the
+  requests of a reader that is polling anyway, and the saving only
+  arrives if the clock stops, which also stops an in-progress pass
+  seeing a commit land.
 
 - **The fold cursor, not the served point.** A holder that reads through
   its own tailing reader is served a slot before the store it holds has
