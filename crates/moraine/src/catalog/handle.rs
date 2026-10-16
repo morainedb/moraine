@@ -217,6 +217,57 @@ impl Store {
     }
 }
 
+/// When a read refreshes the reader it is served from, rather than
+/// waiting for the reader's own poll to notice.
+struct Refresh {
+    /// The least time between refreshes reads may cause. Zero refreshes
+    /// before every read.
+    every: Duration,
+    last: std::sync::Mutex<Option<Instant>>,
+    /// Whether reads refresh at all.
+    on: bool,
+}
+
+impl Refresh {
+    /// Refreshes before every read: what a committer wants, where a
+    /// peer's slot is worth a round trip.
+    fn always() -> Self {
+        Self {
+            every: Duration::ZERO,
+            last: std::sync::Mutex::new(None),
+            on: true,
+        }
+    }
+
+    /// Never refreshes: the reader's own poll is the only thing that
+    /// moves it, which is what a store with no log to list wants.
+    fn never() -> Self {
+        Self {
+            every: Duration::ZERO,
+            last: std::sync::Mutex::new(None),
+            on: false,
+        }
+    }
+
+    /// Whether this read refreshes, counting it if so.
+    fn due(&self) -> bool {
+        if !self.on {
+            return false;
+        }
+        let now = Instant::now();
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|at| now.saturating_duration_since(at) < self.every) {
+            return false;
+        }
+        *last = Some(now);
+
+        true
+    }
+}
+
 /// Options for opening a catalog.
 ///
 /// # Examples
@@ -905,9 +956,11 @@ pub struct ReadOnlyCatalog {
     commits: Arc<commit::Coalescer>,
     // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
-    /// Whether a read refreshes the reader before it is served: a
-    /// committer does, so a peer's slot is never a tick away.
-    refresh_on_read: bool,
+    /// How a read keeps up with the store. A committer refreshes before
+    /// every read, so a peer's slot is never a tick away; every other
+    /// store leaves it to the reader's own poll. Shared by every clone
+    /// of the handle, so they pace each other.
+    refresh: Arc<Refresh>,
 }
 
 impl std::fmt::Debug for ReadOnlyCatalog {
@@ -1432,7 +1485,7 @@ impl ReadOnlyCatalog {
                 ReadSession::Tx(db.begin(IsolationLevel::Snapshot).map_err(Error::from)?)
             }
             Store::Reader(reader) | Store::Committer { reader, .. } => {
-                if self.refresh_on_read {
+                if self.refresh.due() {
                     // Refreshed rather than polled for, so the read is
                     // served the log as it stands.
                     reader.refresh().await.map_err(Error::from)?;
@@ -1725,7 +1778,7 @@ impl Catalog {
                     commit_log,
                 )),
                 projections,
-                refresh_on_read: false,
+                refresh: Arc::new(Refresh::never()),
             },
         })
     }
@@ -1764,7 +1817,7 @@ impl Catalog {
                 commit_log_tail: true,
                 ..options.clone()
             },
-            true,
+            Arc::new(Refresh::always()),
         )
         .await?;
         let Some(Store::Reader(reader)) = Arc::into_inner(inner.store) else {
@@ -2087,17 +2140,17 @@ impl Catalog {
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
     ) -> Result<ReadOnlyCatalog> {
-        Self::open_reader_catalog(object_store, options, false).await
+        Self::open_reader_catalog(object_store, options, Arc::new(Refresh::never())).await
     }
 
     /// [`open_read_only`](Self::open_read_only), refreshing the reader
-    /// before every read when `refresh_on_read` — what a committer wants,
+    /// before every read when `every` is zero — what a committer wants,
     /// where a peer's slot is worth a round trip. A reader without it
     /// follows its own poll.
     async fn open_reader_catalog(
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
-        refresh_on_read: bool,
+        refresh: Arc<Refresh>,
     ) -> Result<ReadOnlyCatalog> {
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
         let started = Instant::now();
@@ -2182,7 +2235,7 @@ impl Catalog {
                 None,
             )),
             projections,
-            refresh_on_read,
+            refresh,
         })
     }
 
