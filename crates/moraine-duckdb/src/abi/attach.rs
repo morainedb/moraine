@@ -822,9 +822,8 @@ pub struct MoraineCommitLog {
     /// How often a committer's reader polls for slots, in milliseconds;
     /// `0` keeps the catalog's default.
     pub poll_interval_ms: u64,
-    /// Whether a committer folds the log into the store: `0` follows the
-    /// deployment the provider describes, `1` takes the store when the
-    /// tail is long and holds it, `2` never folds.
+    /// Whether a committer folds the log into the store: `0` takes the
+    /// store when the tail is long and holds it, `1` never folds.
     pub folding: u8,
 }
 
@@ -849,18 +848,17 @@ fn apply_commit_log(
 }
 
 /// The folding an ABI code names, at the library's default tail: `0`
-/// follows the deployment, `1` holds the store while attached, `2`
-/// never folds. Any other value is an error.
-fn folding_option(folding: u8) -> Result<Option<moraine::Folding>, AbiError> {
+/// holds the store when the tail is long, `1` never folds. Any other
+/// value is an error.
+fn folding_option(folding: u8) -> Result<moraine::Folding, AbiError> {
     match folding {
-        0 => Ok(None),
-        1 => Ok(Some(moraine::Folding::Holding {
+        0 => Ok(moraine::Folding::Holding {
             slots: moraine::Folding::DEFAULT_SLOTS,
-        })),
-        2 => Ok(Some(moraine::Folding::Never)),
+        }),
+        1 => Ok(moraine::Folding::Never),
         other => Err(AbiError::invalid_argument(format!(
-            "commit_log_folding {other} names no folding: 0 follows the deployment, 1 holds \
-             the store when the tail is long, 2 never folds"
+            "commit_log_folding {other} names no folding: 0 holds the store when the tail is \
+             long, 1 never folds"
         ))),
     }
 }

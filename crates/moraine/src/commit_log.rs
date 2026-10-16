@@ -209,19 +209,6 @@ pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
     fn external_compaction(&self) -> bool {
         false
     }
-
-    /// Whether another process folds the log into the stores opened over
-    /// this provider. A committer then takes the store for nothing,
-    /// whatever its [`CatalogOptions::commit_log_folding`] says, exactly
-    /// as [`external_compaction`](Self::external_compaction) keeps it
-    /// from compacting: a sprint and a resident folder fence each other,
-    /// and a process that commits from anywhere should carry neither a
-    /// store nor the work of one. Defaults to `false`.
-    ///
-    /// [`CatalogOptions::commit_log_folding`]: crate::CatalogOptions::commit_log_folding
-    fn external_folding(&self) -> bool {
-        false
-    }
 }
 
 static REGISTERED: OnceLock<Arc<dyn CommitLogProvider>> = OnceLock::new();
@@ -254,6 +241,12 @@ pub(crate) fn mint_transaction_id() -> [u8; 16] {
 /// How long a committer over a tailing reader waits for the reader to be
 /// served a sequence before it reads again.
 pub(crate) const READER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many wins a committer makes before it measures its tail again.
+/// A loss measures it for free, so this is what a committer that keeps
+/// winning falls back on; it matches the folder's flush cadence, so a
+/// check lands about as often as an L0 would.
+const WINS_BETWEEN_TAIL_CHECKS: u64 = 256;
 
 /// How long a commit waits between refreshes while its slot is not yet
 /// served, so a peer's slot landing between them is not spun on.
@@ -289,6 +282,9 @@ pub(crate) struct LogCommitter {
     /// commit waits to see its slot. `None` on a folder, which reads the
     /// store it holds.
     pub(crate) reader: Option<Arc<slatedb::DbReader>>,
+    /// Wins since this process last measured the tail, so a committer
+    /// that only ever wins still checks.
+    pub(crate) wins_since_check: Arc<AtomicU64>,
 }
 
 /// The store a process holds, and the idle poll folding into it.
@@ -482,6 +478,24 @@ impl LogCommitter {
         }
         tracing::warn!("another process took the store; back to committing");
         let _ = holder.db.close().await;
+    }
+
+    /// As [`take_if_stalled`](Self::take_if_stalled), but only every
+    /// `WINS_BETWEEN_TAIL_CHECKS` wins. A loss measures the tail for
+    /// free, since the slots lost to come back with it; a win must pay a
+    /// manifest read and a listing to learn it. So a winner checks
+    /// rarely rather than never — a committer that never loses a race
+    /// would otherwise never find its tail long, and nothing would fold.
+    pub(crate) async fn take_if_stalled_on_a_win(&self) {
+        if self.holds_store() {
+            return;
+        }
+        let wins = self.wins_since_check.fetch_add(1, Ordering::AcqRel) + 1;
+        if wins < WINS_BETWEEN_TAIL_CHECKS {
+            return;
+        }
+        self.wins_since_check.store(0, Ordering::Release);
+        self.take_if_stalled().await;
     }
 
     /// Takes the store if the tail is long and this process can: a process

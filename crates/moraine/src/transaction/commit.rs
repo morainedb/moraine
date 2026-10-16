@@ -630,6 +630,9 @@ async fn settle_win(
     if !log.await_served(sequence).await {
         invalidate_head_view(projections);
     }
+    // A winner checks its tail too, at intervals: a committer that never
+    // loses a race would otherwise never find one to fold.
+    log.take_if_stalled_on_a_win().await;
 
     Ok(())
 }

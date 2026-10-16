@@ -389,7 +389,7 @@ async fn a_committer_told_of_an_unapplied_slot_applies_it_before_offering() {
         object_store,
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
-            commit_log_folding: Some(crate::Folding::Never),
+            commit_log_folding: crate::Folding::Never,
             ..options_at("lake")
         },
     )
@@ -574,7 +574,7 @@ async fn a_committer_sprints_at_close_when_the_tail_is_long() {
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
             commit_log_poll_interval: std::time::Duration::from_millis(10),
-            commit_log_folding: Some(crate::Folding::Holding { slots: 1 }),
+            commit_log_folding: crate::Folding::Holding { slots: 1 },
             ..options_at("lake")
         },
     )
@@ -710,7 +710,7 @@ async fn a_committer_takes_the_store_when_the_tail_is_long_or_the_log_unadopted(
         CatalogOptions {
             commit_log: Some(late.clone()),
             commit_log_poll_interval: std::time::Duration::from_millis(10),
-            commit_log_folding: Some(crate::Folding::Holding { slots: 1 }),
+            commit_log_folding: crate::Folding::Holding { slots: 1 },
             ..options_at("lake")
         },
     )
@@ -1132,7 +1132,7 @@ async fn a_committer_that_does_not_fold_never_takes_the_store() {
         commit_log: Some(provider),
         commit_log_poll_interval: std::time::Duration::from_millis(10),
         reader_poll_interval: std::time::Duration::from_millis(10),
-        commit_log_folding: Some(crate::Folding::Never),
+        commit_log_folding: crate::Folding::Never,
         ..options_at("lake")
     };
 
@@ -1242,7 +1242,7 @@ async fn a_committer_reports_how_far_behind_the_folded_store_is() {
         object_store.clone(),
         CatalogOptions {
             commit_log: Some(provider.clone()),
-            commit_log_folding: Some(crate::Folding::Never),
+            commit_log_folding: crate::Folding::Never,
             ..options_at("lake")
         },
     )
@@ -1280,7 +1280,7 @@ async fn a_committer_reports_how_far_behind_the_folded_store_is() {
         object_store,
         CatalogOptions {
             commit_log: Some(provider),
-            commit_log_folding: Some(crate::Folding::Never),
+            commit_log_folding: crate::Folding::Never,
             ..options_at("lake")
         },
     )
@@ -1356,74 +1356,49 @@ async fn a_committer_reading_steadily_sees_a_peers_commit_at_once() {
     second.close().await.unwrap();
 }
 
-/// A provider whose deployment folds elsewhere settles it for every
-/// application over it: a committer takes the store for nothing, folds
-/// nothing at close, and the tail is a scheduled fold's to drain.
+/// A committer that never loses a race still finds its tail: a win
+/// measures it too, every so often, so a lake with one writer folds
+/// without anything else running.
 #[tokio::test]
-async fn a_provider_that_folds_elsewhere_keeps_committers_off_the_store() {
+async fn a_committer_that_only_wins_still_folds_its_tail() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
-    let provider = Arc::new(TestProvider::default().folded_elsewhere());
-    let options = || CatalogOptions {
-        commit_log: Some(provider.clone()),
-        // Unset: the deployment's lead, which is to fold elsewhere.
-        commit_log_folding: None,
-        commit_log_poll_interval: std::time::Duration::from_millis(10),
-        ..options_at("lake")
-    };
+    let provider = Arc::new(TestProvider::default());
+    let folder = Catalog::open(
+        object_store.clone(),
+        CatalogOptions {
+            commit_log: Some(provider.clone()),
+            ..options_at("lake")
+        },
+    )
+    .await
+    .unwrap();
+    folder.close().await.unwrap();
 
-    let folder_store = object_store.clone();
-    let committer = Catalog::open(object_store.clone(), options())
-        .await
-        .unwrap();
-    assert!(!committer.holds_store(), "adopting gives the store back");
-    for name in ["a", "b", "c"] {
-        committer
-            .commit(|tx| tx.create_schema(name).map(|_| ()))
-            .await
-            .unwrap();
-        assert!(!committer.holds_store());
-    }
-    let behind = committer.unfolded_slots().await.unwrap();
-    committer.close().await.unwrap();
-    assert_eq!(
-        provider.folded_sequence(),
-        1,
-        "no close sprinted: {behind:?} slots were left"
-    );
-
-    // What a scheduled fold is for.
-    let folded = Catalog::fold_sprint(
+    // The only committer on the lake, so every commit of its own wins.
+    let only = Arc::new(provider.sharing());
+    let committer = Catalog::open(
         object_store,
         CatalogOptions {
-            commit_log: Some(provider.clone()),
+            commit_log: Some(only),
+            commit_log_folding: crate::Folding::Holding { slots: 0 },
+            commit_log_poll_interval: std::time::Duration::from_millis(10),
             ..options_at("lake")
         },
     )
     .await
     .unwrap();
-    assert_eq!(folded, 3, "the sprint drained what the committers left");
+    assert!(!committer.holds_store(), "an adopted log is not taken");
 
-    // A process that says it is the sprinter is not overruled: it sprints
-    // on the way out, where one following the deployment left the tail.
-    let sprinter = Catalog::open(
-        folder_store,
-        CatalogOptions {
-            commit_log: Some(provider.clone()),
-            commit_log_folding: Some(crate::Folding::Holding { slots: 0 }),
-            ..options_at("lake")
-        },
-    )
-    .await
-    .unwrap();
-    sprinter
-        .commit(|tx| tx.create_schema("d").map(|_| ()))
-        .await
-        .unwrap();
-    sprinter.close().await.unwrap();
-    assert_eq!(
-        provider.folded_sequence(),
-        5,
-        "asking to fold overrules the deployment"
+    for index in 0..crate::commit_log::WINS_BETWEEN_TAIL_CHECKS {
+        committer
+            .commit(|tx| tx.create_schema(&format!("s{index}")).map(|_| ()))
+            .await
+            .unwrap();
+    }
+    assert!(
+        committer.holds_store(),
+        "a run of wins measured the tail and found it long"
     );
+    committer.close().await.unwrap();
 }

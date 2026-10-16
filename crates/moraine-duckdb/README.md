@@ -204,15 +204,13 @@ into the catalog store.
 commit-log provider registered, every commit is a slot in a log beside the
 catalog. A read-write attach is a committer: it commits from anywhere, and
 folding those slots into the store is a chore it picks up rather than a
-role it is given. `COMMIT_LOG_FOLDING` says whether it does, and left unset it follows the
-deployment: a provider whose lakes are folded by a maintenance service
-means `'never'` for every attach over it, as it already does for
-compaction. `'holding'` takes the store when the tail grows long or the
-log is not yet adopted and keeps it, giving it back if another process
-takes it, and sprints at detach if it never took it — which is what a
-process meant to be the folder asks for. `'never'` takes nothing and
-folds nothing, which needs something else to be folding, since an
-unfolded tail only grows. A
+role it is given. `COMMIT_LOG_FOLDING` says whether it does. `'holding'`, the default,
+takes the store when the tail grows long or the log is not yet adopted
+and keeps it, giving it back if another process takes it, and sprints at
+detach if it never took it — so a lake needs no process beyond the ones
+already committing to it. `'never'` takes nothing and folds nothing, for
+a deployment whose attaches are too short-lived to be the folder; it
+needs something else to fold, since an unfolded tail only grows. A
 read-only attach is a reader and never commits.
 
 `COMMIT_LOG_TAIL true` makes a read-only attach tail the log and see a commit once its slot

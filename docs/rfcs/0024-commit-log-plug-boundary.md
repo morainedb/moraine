@@ -281,13 +281,14 @@ moves the counter outside a slot.
   flush, whether its own commit's, the idle poll's, or the one at close,
   which then demotes and reports nothing. The first committer
   to find an unadopted log takes the store and adopts it. The threshold sits well above the flush count, so a holder
-  doing its job is never taken from. Whether a committer does this at all
-  is one option, not two interacting ones, and a provider whose
-  deployment folds elsewhere settles it for every application over it,
-  exactly as one that compacts elsewhere does: a scheduled fold and a
-  committer's sprint fence each other, so a lake served by one wants no
-  committer taking the store. `Folding::Holding` is the above, and
-  `Folding::Never` takes nothing — it adopts an unadopted log
+  doing its job is never taken from. A loss is where the tail's length
+  comes for free, since the slots lost to arrive with it, but a lake with
+  one active committer has no losses — so a win measures it too, every
+  few hundred, and a committer that only ever wins still finds a tail to
+  fold. Nothing beyond the processes already committing is needed.
+  Whether a committer folds at all is one option, not two interacting
+  ones: `Folding::Holding` is the above, and `Folding::Never` takes
+  nothing — it adopts an unadopted log
   and gives the store straight back, and does not sprint at close either,
   for a process that should carry no store while it serves. Folding at
   close only was considered and rejected: a serving process closes at a

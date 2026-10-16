@@ -346,12 +346,9 @@ pub struct CatalogOptions {
     /// mid-replay is not pulled out from under. Defaults to five minutes.
     pub commit_log_retention: Duration,
     /// When this committer takes the store to fold the log into it.
-    /// `None`, the default, follows the deployment: never where the
-    /// [`CommitLogProvider`](crate::CommitLogProvider) folds elsewhere,
-    /// since a scheduled fold and a committer's sprint fence each other,
-    /// and [`Folding::default`] otherwise. `Some` insists, which is what
-    /// a process meant to be the folder says.
-    pub commit_log_folding: Option<Folding>,
+    /// Defaults to [`Folding::default`], which folds: a lake needs no
+    /// process beyond the ones already committing to it.
+    pub commit_log_folding: Folding,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -464,7 +461,7 @@ impl Default for CatalogOptions {
             commit_log_flush_slots: 256,
             commit_log_fold_poll: Duration::from_secs(2),
             commit_log_retention: Duration::from_mins(5),
-            commit_log_folding: None,
+            commit_log_folding: Folding::default(),
             cache_dir: None,
             cache_identity: None,
             cache_size: None,
@@ -577,6 +574,7 @@ async fn open_writer_store(
                 flushing: flushing_for(provider.as_ref(), options, &object_store, &log_store),
                 // A folder reads through the store it holds, not a reader.
                 reader: None,
+                wins_since_check: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             };
             if format >= FORMAT_WITH_COMMIT_LOG {
                 log.batch_origin = commit::batch_origin(ReadHandle::Writer(&db)).await?;
@@ -638,7 +636,7 @@ struct Taker {
 #[async_trait::async_trait]
 impl crate::commit_log::StoreTaker for Taker {
     async fn take_if_stalled(&self, log: &LogCommitter) -> Result<bool> {
-        let Some(threshold) = folding(&self.options).slots() else {
+        let Some(threshold) = self.options.commit_log_folding.slots() else {
             return Ok(false);
         };
         let replay_point =
@@ -724,20 +722,6 @@ async fn release_held_store(commit_log: &LogCommitter) -> Result<()> {
 fn external_compaction(options: &CatalogOptions) -> bool {
     options.external_compaction
         || commit_log_provider(options).is_some_and(|provider| provider.external_compaction())
-}
-
-/// When this open folds: what it asked for, else what the deployment
-/// its provider describes does.
-fn folding(options: &CatalogOptions) -> Folding {
-    match options.commit_log_folding {
-        Some(folding) => folding,
-        None if commit_log_provider(options)
-            .is_some_and(|provider| provider.external_folding()) =>
-        {
-            Folding::Never
-        }
-        None => Folding::default(),
-    }
 }
 
 fn wal_object_store(options: &CatalogOptions) -> Option<Arc<dyn ObjectStore>> {
@@ -1554,7 +1538,7 @@ impl ReadOnlyCatalog {
                     return release_held_store(commit_log).await;
                 }
                 // The last one out leaves the tail short for the next in.
-                let Some(threshold) = folding(&sprint.options).slots() else {
+                let Some(threshold) = sprint.options.commit_log_folding.slots() else {
                     return Ok(());
                 };
                 if commit_log
@@ -1883,11 +1867,12 @@ impl Catalog {
             folds_since_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             flushing: flushing_for(provider.as_ref(), &options, &object_store, &log_store),
             reader: Some(Arc::clone(&reader)),
+            wins_since_check: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         if let Some(db) = adopting {
             log.promote(db, options.commit_log_fold_poll);
             // A committer that does not fold adopts and gives the store back.
-            if folding(&options) == Folding::Never {
+            if options.commit_log_folding == Folding::Never {
                 release_held_store(&log).await?;
             }
         }
@@ -2125,7 +2110,7 @@ impl Catalog {
         else {
             return Ok(None);
         };
-        let Some(threshold) = folding(&sprint.options).slots() else {
+        let Some(threshold) = sprint.options.commit_log_folding.slots() else {
             return Ok(None);
         };
         let replay_point =
