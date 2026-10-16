@@ -219,6 +219,58 @@ impl Store {
     }
 }
 
+/// Whether a committer folds the log into the store, which taking the
+/// store requires and only one process at a time may do.
+///
+/// Folding is a chore rather than a role: a committer picks the store up
+/// when the tail is long enough to be worth it, and puts it down when
+/// another process takes it. A process that should carry no store —
+/// a stateless fleet writing one lake, where a folder of its own keeps
+/// the store current — says so here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Folding {
+    /// Takes the store when the tail is past `slots`, or when the log is
+    /// unadopted, and holds it, folding peers' slots on
+    /// [`CatalogOptions::commit_log_fold_poll`] until another process
+    /// takes it away. One that never took it sprints at close instead,
+    /// leaving the tail short for the next process in.
+    Holding {
+        /// How long the unfolded tail may grow before the store is worth
+        /// taking. Well above
+        /// [`CatalogOptions::commit_log_flush_slots`], so a folder doing
+        /// its job is never fenced by one; zero takes it for any tail at
+        /// all.
+        slots: u64,
+    },
+    /// Never folds, and never takes the store: an adopted log is given
+    /// straight back, and the tail is a holder's or a scheduled sprint's
+    /// to drain. Left to itself it grows, and every cold open replays it.
+    Never,
+}
+
+impl Folding {
+    /// The tail length the default folding takes the store at.
+    pub const DEFAULT_SLOTS: u64 = 1024;
+
+    /// The tail past which this folding takes the store, while open or
+    /// for the sprint at close.
+    pub(crate) fn slots(self) -> Option<u64> {
+        match self {
+            Self::Holding { slots } => Some(slots),
+            Self::Never => None,
+        }
+    }
+}
+
+impl Default for Folding {
+    /// Holds the store for a tail past [`Folding::DEFAULT_SLOTS`].
+    fn default() -> Self {
+        Self::Holding {
+            slots: Self::DEFAULT_SLOTS,
+        }
+    }
+}
+
 /// Options for opening a catalog.
 ///
 /// # Examples
@@ -297,18 +349,9 @@ pub struct CatalogOptions {
     /// How old a slot must be before truncation may delete it, so a reader
     /// mid-replay is not pulled out from under. Defaults to five minutes.
     pub commit_log_retention: Duration,
-    /// How long the unfolded tail may grow before a committer, on closing,
-    /// takes the store and folds it: a sprint. Well above
-    /// [`commit_log_flush_slots`](Self::commit_log_flush_slots), so a folder
-    /// doing its job is never fenced by one. Zero never sprints. Defaults
-    /// to 1024.
-    pub commit_log_sprint_slots: u64,
-    /// Whether a committer holds the store while open: takes it when the
-    /// tail is past [`commit_log_sprint_slots`](Self::commit_log_sprint_slots)
-    /// or the log is unadopted, and folds peers' slots into it on a poll.
-    /// `false` gives an adopted store straight back and leaves a long tail
-    /// to the sprint at close. Defaults to `true`.
-    pub commit_log_hold: bool,
+    /// When this committer takes the store to fold the log into it.
+    /// Defaults to [`Folding::default`].
+    pub commit_log_folding: Folding,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
     /// process to open them. When set, warm queries skip repeat object-store
@@ -422,8 +465,7 @@ impl Default for CatalogOptions {
             commit_log_flush_slots: 256,
             commit_log_fold_poll: Duration::from_secs(2),
             commit_log_retention: Duration::from_mins(5),
-            commit_log_sprint_slots: 1024,
-            commit_log_hold: true,
+            commit_log_folding: Folding::default(),
             cache_dir: None,
             cache_identity: None,
             cache_size: None,
@@ -597,10 +639,9 @@ struct Taker {
 #[async_trait::async_trait]
 impl crate::commit_log::StoreTaker for Taker {
     async fn take_if_stalled(&self, log: &LogCommitter) -> Result<bool> {
-        let threshold = self.options.commit_log_sprint_slots;
-        if threshold == 0 || !self.options.commit_log_hold {
+        let Some(threshold) = self.options.commit_log_folding.slots() else {
             return Ok(false);
-        }
+        };
         let replay_point =
             census::replay_point(&self.options.path, Arc::clone(&self.object_store)).await?;
         if log.committer.unfolded(replay_point).await? <= threshold {
@@ -1504,19 +1545,20 @@ impl ReadOnlyCatalog {
                     return release_held_store(commit_log).await;
                 }
                 // The last one out leaves the tail short for the next in.
-                let threshold = sprint.options.commit_log_sprint_slots;
-                if threshold > 0
-                    && commit_log
-                        .committer
-                        .unfolded(
-                            census::replay_point(
-                                &sprint.options.path,
-                                Arc::clone(&sprint.object_store),
-                            )
-                            .await?,
+                let Some(threshold) = sprint.options.commit_log_folding.slots() else {
+                    return Ok(());
+                };
+                if commit_log
+                    .committer
+                    .unfolded(
+                        census::replay_point(
+                            &sprint.options.path,
+                            Arc::clone(&sprint.object_store),
                         )
-                        .await?
-                        > threshold
+                        .await?,
+                    )
+                    .await?
+                    > threshold
                 {
                     // Boxed: the sprint opens and closes a catalog of its own.
                     let folded = Box::pin(Catalog::fold_sprint(
@@ -1837,7 +1879,8 @@ impl Catalog {
         };
         if let Some(db) = adopting {
             log.promote(db, options.commit_log_fold_poll);
-            if !options.commit_log_hold {
+            // A committer that does not fold adopts and gives the store back.
+            if options.commit_log_folding == Folding::Never {
                 release_held_store(&log).await?;
             }
         }
@@ -1995,7 +2038,7 @@ impl Catalog {
     /// slot, folds whatever lands meanwhile, writes the memtable out,
     /// truncates the log, and closes. Returns how many slots the store was
     /// behind. A committer runs this on closing when the tail is past
-    /// [`CatalogOptions::commit_log_sprint_slots`]; a scheduled job runs it
+    /// its [`Folding`]'s tail; a scheduled job runs it
     /// on a timer. Fences a process holding the store, which then drops
     /// back to committing.
     ///
@@ -2052,10 +2095,9 @@ impl Catalog {
         else {
             return Ok(None);
         };
-        let threshold = sprint.options.commit_log_sprint_slots;
-        if threshold == 0 {
+        let Some(threshold) = sprint.options.commit_log_folding.slots() else {
             return Ok(None);
-        }
+        };
         let replay_point =
             census::replay_point(&sprint.options.path, Arc::clone(&sprint.object_store)).await?;
         if commit_log.committer.unfolded(replay_point).await? <= threshold {

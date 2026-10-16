@@ -749,7 +749,7 @@ pub unsafe extern "C" fn moraine_attach_with_commit_log(
         options.wal_store.clone_from(&wal_store);
         // SAFETY: `commit_log` validity is this function's own safety
         // contract.
-        apply_commit_log(&mut options, unsafe { commit_log.as_ref() });
+        apply_commit_log(&mut options, unsafe { commit_log.as_ref() })?;
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let opened = unsafe {
@@ -819,23 +819,44 @@ pub struct MoraineCommitLog {
     /// How often a committer's reader polls for slots, in milliseconds;
     /// `0` keeps the catalog's default.
     pub poll_interval_ms: u64,
-    /// Whether a committer holds the store while attached, taking it when
-    /// the tail is long; `false` leaves folding to the sprint at detach.
-    pub hold: bool,
+    /// Whether a committer folds the log into the store: `0` takes the
+    /// store when the tail is long and holds it, `1` never folds.
+    pub folding: u8,
 }
 
 /// Applies `commit_log` to `options`. A read-write attach that finds a
 /// registered provider is a committer, which takes the store itself when
 /// the tail is long; a read-only attach is a reader.
-fn apply_commit_log(options: &mut CatalogOptions, commit_log: Option<&MoraineCommitLog>) {
+fn apply_commit_log(
+    options: &mut CatalogOptions,
+    commit_log: Option<&MoraineCommitLog>,
+) -> Result<(), AbiError> {
     let Some(commit_log) = commit_log else {
-        return;
+        return Ok(());
     };
     options.commit_log_tail = commit_log.tail;
-    options.commit_log_hold = commit_log.hold;
+    options.commit_log_folding = folding_option(commit_log.folding)?;
     if commit_log.poll_interval_ms > 0 {
         options.commit_log_poll_interval =
             std::time::Duration::from_millis(commit_log.poll_interval_ms);
+    }
+
+    Ok(())
+}
+
+/// The folding an ABI code names, at the library's default tail: `0`
+/// holds the store while attached, `1` never folds. Any other value is
+/// an error.
+fn folding_option(folding: u8) -> Result<moraine::Folding, AbiError> {
+    match folding {
+        0 => Ok(moraine::Folding::Holding {
+            slots: moraine::Folding::DEFAULT_SLOTS,
+        }),
+        1 => Ok(moraine::Folding::Never),
+        other => Err(AbiError::invalid_argument(format!(
+            "commit_log_folding {other} names no folding: 0 holds the store when the tail is \
+             long, 1 never folds"
+        ))),
     }
 }
 

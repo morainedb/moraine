@@ -150,9 +150,9 @@ typedef struct MoraineCommitLog {
   // How often a committer's reader polls for slots, in milliseconds;
   // `0` keeps the catalog's default.
   uint64_t poll_interval_ms;
-  // Whether a committer holds the store while attached, taking it when
-  // the tail is long; `false` leaves folding to the sprint at detach.
-  bool hold;
+  // Whether a committer folds the log into the store: `0` takes the
+  // store when the tail is long and holds it, `1` never folds.
+  uint8_t folding;
 } MoraineCommitLog;
 
 // A C-side cancellation probe polled while a cancellable call's core

@@ -391,7 +391,7 @@ async fn a_committer_told_of_a_slot_it_has_not_applied_still_loses_to_it() {
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
             commit_log_poll_interval: std::time::Duration::from_secs(200),
-            commit_log_sprint_slots: 0,
+            commit_log_folding: crate::Folding::Never,
             ..options_at("lake")
         },
     )
@@ -593,7 +593,7 @@ async fn a_committer_sprints_at_close_when_the_tail_is_long() {
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
             commit_log_poll_interval: std::time::Duration::from_millis(10),
-            commit_log_sprint_slots: 1,
+            commit_log_folding: crate::Folding::Holding { slots: 1 },
             ..options_at("lake")
         },
     )
@@ -729,7 +729,7 @@ async fn a_committer_takes_the_store_when_the_tail_is_long_or_the_log_unadopted(
         CatalogOptions {
             commit_log: Some(late.clone()),
             commit_log_poll_interval: std::time::Duration::from_millis(10),
-            commit_log_sprint_slots: 1,
+            commit_log_folding: crate::Folding::Holding { slots: 1 },
             ..options_at("lake")
         },
     )
@@ -1138,26 +1138,25 @@ async fn a_committer_lists_while_a_commit_awaits_its_slot_then_rests() {
     committer.close().await.unwrap();
 }
 
-/// A committer opened without holding never takes the store while open: it
-/// adopts an unadopted log and gives the store straight back, leaves a long
-/// tail to the sprint at close, and commits throughout, lost races included.
+/// A committer that does not fold never takes the store: it adopts an
+/// unadopted log and gives it straight back, commits throughout, lost
+/// races included, and leaves the whole tail for a folder of its own.
 #[tokio::test]
-async fn a_committer_that_does_not_hold_leaves_folding_to_the_sprint() {
+async fn a_committer_that_does_not_fold_never_takes_the_store() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
-    let unheld = |provider: Arc<TestProvider>| CatalogOptions {
+    let unfolding = |provider: Arc<TestProvider>| CatalogOptions {
         commit_log: Some(provider),
-        commit_log_hold: false,
         commit_log_poll_interval: std::time::Duration::from_millis(10),
         reader_poll_interval: std::time::Duration::from_millis(10),
-        commit_log_sprint_slots: 1,
+        commit_log_folding: crate::Folding::Never,
         ..options_at("lake")
     };
 
     // Adopting takes the store and gives it straight back; the tail of
-    // three commits is left for a sprint, not folded.
-    let first = Catalog::open(object_store.clone(), unheld(provider.clone()))
+    // three commits is left where it lands.
+    let first = Catalog::open(object_store.clone(), unfolding(provider.clone()))
         .await
         .unwrap();
     assert!(
@@ -1181,12 +1180,12 @@ async fn a_committer_that_does_not_hold_leaves_folding_to_the_sprint() {
     // A long tail at attach is not taken; a lost race to a peer's commit is
     // folded through the reader, and still not taken.
     let late = Arc::new(provider.sharing());
-    let second = Catalog::open(object_store.clone(), unheld(late.clone()))
+    let second = Catalog::open(object_store.clone(), unfolding(late.clone()))
         .await
         .unwrap();
     assert!(!second.holds_store(), "a long tail is not taken at attach");
     let peer = Arc::new(provider.sharing());
-    let third = Catalog::open(object_store.clone(), unheld(peer.clone()))
+    let third = Catalog::open(object_store.clone(), unfolding(peer.clone()))
         .await
         .unwrap();
     third
@@ -1208,24 +1207,44 @@ async fn a_committer_that_does_not_hold_leaves_folding_to_the_sprint() {
     assert!(!third.holds_store());
     assert_eq!(provider.log.slots().len(), 6);
 
-    // The first close past the threshold sprints; the folded store is
-    // current for a reader that follows it alone.
+    // No close sprints, so the folded store stands where adoption left it
+    // and a reader following it alone sees none of the five commits.
     third.close().await.unwrap();
     second.close().await.unwrap();
     first.close().await.unwrap();
-    let folded_only = Catalog::open_read_only(
-        object_store,
+    assert_eq!(provider.folded_sequence(), 1, "no close folded the tail");
+    let folded_only = |provider: Arc<TestProvider>| {
+        Catalog::open_read_only(
+            object_store.clone(),
+            CatalogOptions {
+                commit_log: Some(provider),
+                commit_log_tail: false,
+                ..options_at("lake")
+            },
+        )
+    };
+    let behind = folded_only(Arc::new(provider.sharing())).await.unwrap();
+    let snapshot = behind.snapshot().await.unwrap();
+    for name in ["a", "b", "c", "d", "e"] {
+        assert!(snapshot.schema_by_name(name).is_none(), "{name} was folded");
+    }
+    behind.close().await.unwrap();
+
+    // A sprint is what drains it, and the folded store is current after.
+    let folded = Catalog::fold_sprint(
+        object_store.clone(),
         CatalogOptions {
-            commit_log: Some(provider),
-            commit_log_tail: false,
+            commit_log: Some(provider.clone()),
             ..options_at("lake")
         },
     )
     .await
     .unwrap();
-    let snapshot = folded_only.snapshot().await.unwrap();
+    assert_eq!(folded, 5, "the sprint folded every slot past the adoption");
+    let caught_up = folded_only(provider).await.unwrap();
+    let snapshot = caught_up.snapshot().await.unwrap();
     for name in ["a", "b", "c", "d", "e"] {
         assert!(snapshot.schema_by_name(name).is_some(), "{name} was folded");
     }
-    folded_only.close().await.unwrap();
+    caught_up.close().await.unwrap();
 }

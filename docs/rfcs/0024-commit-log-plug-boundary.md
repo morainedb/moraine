@@ -206,8 +206,8 @@ merge is a submission.
 **The extension.** A read-write attach with a registered provider is a
 committer; a read-only attach is a reader. `COMMIT_LOG_TAIL` makes a
 read-only attach tail the log, `COMMIT_LOG_POLL_INTERVAL_MS` sets the
-committer's poll, and `COMMIT_LOG_HOLD false` keeps a committer from
-taking the store while attached. They reach the core through
+committer's poll, and `COMMIT_LOG_FOLDING` names whether the committer
+takes the store: `holding`, at the library's default tail, or `never`. They reach the core through
 `moraine_attach_with_commit_log`, whose `commit_log` argument the older
 attach entry points pass as null. Without a registered provider all three
 are ignored. `READER_POLL_INTERVAL_MS`, beside them, is the freshness
@@ -277,7 +277,7 @@ moves the counter outside a slot.
 - **Taking and holding the store.** Every attach is a committer. A
   committer that finds the unfolded tail — counted past the manifest's
   replay point, which moraine reads itself, since the reader plug sees
-  only its own in-memory watermark — past `commit_log_sprint_slots` takes
+  only its own in-memory watermark — past its `Folding`'s tail takes
   the store: it opens it as the folder, which replays the tail, and keeps
   it, folding its own wins and peers' slots into it while still reading
   through its tailing reader. It checks at attach and after every loss,
@@ -287,11 +287,17 @@ moves the counter outside a slot.
   flush, whether its own commit's, the idle poll's, or the one at close,
   which then demotes and reports nothing. The first committer
   to find an unadopted log takes the store and adopts it. The threshold sits well above the flush count, so a holder
-  doing its job is never taken from. A committer opened with
-  `commit_log_hold` off never takes the store while open: it adopts an
-  unadopted log and gives the store straight back, and a long tail is left
-  to the sprint at close or to maintenance, for a process that should not
-  carry a store and its poll. There is no role to select:
+  doing its job is never taken from. Whether a committer does this at all
+  is one option, not two interacting ones: `Folding::Holding` is the
+  above, and `Folding::Never` takes nothing — it adopts an unadopted log
+  and gives the store straight back, and does not sprint at close either,
+  for a process that should carry no store while it serves. Folding at
+  close only was considered and rejected: a serving process closes at a
+  deploy, which is no cadence to bound a tail by, it moves the replay to
+  the moment a shutdown has least time for it, and the sprint fences
+  whichever process is folding, so a rolling fleet would fence the folder
+  once per pod. A fleet that does not fold needs a folder, not a later
+  moment to fold at. There is no role to select:
   `Catalog::take_store` takes the store on request, and
   `Catalog::fold_sprint` takes it for one fold and closes, for a job with
   no session to keep. Maintenance takes nothing: its batches are slots. A

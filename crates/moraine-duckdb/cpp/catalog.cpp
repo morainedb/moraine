@@ -857,12 +857,12 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// attach is a committer and a read-only attach is a reader.
 	// `COMMIT_LOG_TAIL` makes a read-only attach tail the log;
 	// `COMMIT_LOG_POLL_INTERVAL_MS` is how often a committer's reader polls
-	// for slots; `COMMIT_LOG_HOLD false` keeps a committer from taking the
-	// store while attached. All are ignored without a registered provider.
+	// for slots; `COMMIT_LOG_FOLDING` is whether a committer folds the log
+	// into the store. All are ignored without a registered provider.
 	MoraineCommitLog commit_log {};
 	commit_log.tail = false;
 	commit_log.poll_interval_ms = 0;
-	commit_log.hold = true;
+	commit_log.folding = 0;
 	bool commit_log_given = false;
 	// `MAINTENANCE_*` configures the scheduled pass: the cadence, and
 	// which of DuckLake's own maintenance functions it runs. Every step
@@ -926,8 +926,19 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 		} else if (name == "commit_log_poll_interval_ms") {
 			commit_log.poll_interval_ms = option.second.GetValue<uint64_t>();
 			commit_log_given = true;
-		} else if (name == "commit_log_hold") {
-			commit_log.hold = option.second.GetValue<bool>();
+		} else if (name == "commit_log_folding") {
+			// Spelled as a role rather than a flag: 'holding' takes the
+			// store when the tail is long, 'never' leaves the tail to a
+			// folder of its own.
+			auto when = duckdb::StringUtil::Lower(option.second.GetValue<std::string>());
+			if (when == "holding") {
+				commit_log.folding = 0;
+			} else if (when == "never") {
+				commit_log.folding = 1;
+			} else {
+				throw duckdb::InvalidInputException(
+				    "moraine: COMMIT_LOG_FOLDING must be 'holding' or 'never'; got \"%s\"", when);
+			}
 			commit_log_given = true;
 		}
 	}
