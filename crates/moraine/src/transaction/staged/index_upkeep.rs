@@ -1569,7 +1569,7 @@ mod tests {
             false,
         )]);
         let schema_ipc = super::super::tests::inline_schema_ipc(&schema);
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         tx.put(
             Key::Inline(InlineKey::Schema {
                 table_id: 7,
@@ -1586,7 +1586,7 @@ mod tests {
 
         let pending = HashMap::new();
         let cache = InlineSchemaCache::new(&pending);
-        let tx = CommitSession::folder(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = CommitSession::folder(db.begin(IsolationLevel::Snapshot).unwrap());
         cache.prefetch(&tx, [(7, 1), (7, 2)]).await;
 
         let decoded = cache.get(&tx, 7, 1).await.unwrap();

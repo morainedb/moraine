@@ -358,11 +358,11 @@ async fn a_committer_over_a_reader_commits_through_the_log() {
     folder.close().await.unwrap();
 }
 
-/// A committer whose plug reports a slot served before its reader has
-/// applied it races the slot its stale head implies, and loses, rather
-/// than the one past what it was told it had seen, which it would win.
+/// A committer told a slot is served that its reader has not applied
+/// refreshes before it offers, so it lands past that slot rather than
+/// racing the sequence the slot already holds.
 #[tokio::test]
-async fn a_committer_told_of_a_slot_it_has_not_applied_still_loses_to_it() {
+async fn a_committer_told_of_an_unapplied_slot_applies_it_before_offering() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
@@ -382,26 +382,19 @@ async fn a_committer_told_of_a_slot_it_has_not_applied_still_loses_to_it() {
         .unwrap();
     folder.close().await.unwrap();
 
-    // The committer's reader never polls again, so it never applies what
-    // lands after its open; and it never takes the store, so the rule under
-    // test is the only thing that can save it.
+    // The committer never takes the store, so only its own reading can
+    // save it from offering against a state it has not caught up to.
     let committer_provider = Arc::new(provider.sharing());
     let committer = Catalog::open(
         object_store,
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
-            commit_log_poll_interval: std::time::Duration::from_secs(200),
             commit_log_folding: crate::Folding::Never,
             ..options_at("lake")
         },
     )
     .await
     .unwrap();
-
-    // The open's replay is the reader's only listing: nothing asks, and
-    // the poll is too slow for the commit's wait to list within the test.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(committer_provider.polls(), 1, "only the open listed");
 
     // A peer lands slot 3 and the plug reports it served, applied or not.
     provider
@@ -413,25 +406,13 @@ async fn a_committer_told_of_a_slot_it_has_not_applied_still_loses_to_it() {
         .commit(|tx| tx.create_schema("b").map(|_| ()))
         .await;
     assert!(
-        outcome.is_err(),
-        "a stale committer must not win: {outcome:?}; holds={} folded={} slots={:?} head={:?}",
-        committer.holds_store(),
-        committer_provider.folded_sequence(),
-        provider
-            .log
-            .slots()
-            .iter()
-            .map(|(sequence, _)| *sequence)
-            .collect::<Vec<_>>(),
-        committer
-            .snapshot()
-            .await
-            .map(|s| s.current_snapshot().id.get()),
+        outcome.is_ok(),
+        "the refresh before the offer applies the slot: {outcome:?}"
     );
     assert_eq!(
         provider.log.slots().last().map(|(sequence, _)| *sequence),
-        Some(3),
-        "nothing landed past the slot the committer had not applied"
+        Some(4),
+        "and the commit lands past the slot it was told of"
     );
     committer.close().await.unwrap();
 }
@@ -1070,10 +1051,11 @@ async fn a_committer_idle_past_its_interval_lists_before_it_reads() {
     idle.close().await.unwrap();
 }
 
-/// A committer's plug lists every tick while a commit waits to see its
-/// slot, so the wait is bounded by the poll, and rests once it is served.
+/// Nothing lists the log on a clock: an idle committer makes no request
+/// at all, a commit's wait refreshes until its slot is served, and the
+/// committer reads its own commit straight after.
 #[tokio::test]
-async fn a_committer_lists_while_a_commit_awaits_its_slot_then_rests() {
+async fn an_idle_committer_lists_nothing_and_a_commit_refreshes_until_served() {
     let object_store = Arc::new(InMemory::new());
     bootstrapped(object_store.clone(), "lake").await;
     let provider = Arc::new(TestProvider::default());
@@ -1093,22 +1075,21 @@ async fn a_committer_lists_while_a_commit_awaits_its_slot_then_rests() {
         object_store,
         CatalogOptions {
             commit_log: Some(committer_provider.clone()),
-            commit_log_poll_interval: std::time::Duration::from_millis(10),
-            // How long a read keeps the log watched for.
-            reader_poll_interval: std::time::Duration::from_millis(50),
             ..options_at("lake")
         },
     )
     .await
     .unwrap();
-    // Past the window the open's own reads opened.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // The reader's first poll fires on open rather than after the
+    // interval; let it pass before the count is a baseline.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let idle = committer_provider.polls();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(
         committer_provider.polls(),
         idle,
-        "an idle committer never lists the log"
+        "an idle committer lists nothing: its poll keeps a checkpoint \
+         alive, not a view"
     );
 
     committer
@@ -1117,7 +1098,7 @@ async fn a_committer_lists_while_a_commit_awaits_its_slot_then_rests() {
         .unwrap();
     assert!(
         committer_provider.polls() > idle,
-        "the commit's wait listed until its slot was served"
+        "the commit's wait refreshed until its slot was served"
     );
     assert!(
         committer
@@ -1129,7 +1110,6 @@ async fn a_committer_lists_while_a_commit_awaits_its_slot_then_rests() {
         "the committer reads its own commit"
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let settled = committer_provider.polls();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(

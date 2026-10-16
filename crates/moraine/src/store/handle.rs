@@ -369,7 +369,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         for table_id in [3_u64, 7, 9] {
             tx.put(Key::current(EntityKey::Table { table_id }).encode(), b"t")
                 .unwrap();
@@ -414,7 +414,7 @@ mod tests {
         let write = tx.commit().await.unwrap().unwrap();
         write.await_durable().await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let handle = ReadHandle::Tx(&tx);
         let prefix = key::subspace_prefix(Subspace::Current);
         let plain = handle

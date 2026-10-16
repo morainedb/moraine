@@ -264,10 +264,7 @@ pub(crate) async fn flush_memtable(db: &Db) -> Result<()> {
 /// open the writer themselves rather than through
 /// [`open_initialized`].
 pub(crate) async fn verify_wal_store(db: &Db, configured: Option<&str>) -> Result<()> {
-    let tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
+    let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
     let checked = validate_wal_store(ReadHandle::Tx(&tx), configured).await;
     tx.rollback();
     checked
@@ -532,9 +529,11 @@ async fn open_attempt(
 
 /// Begins a snapshot-isolated transaction for an open attempt. A fence
 /// caught here is fatal: nothing has been staged yet.
+// `Db::begin` is synchronous in the slatedb this build carries; the
+// asyncness stays until the callers are converted with it.
+#[allow(clippy::unused_async)]
 async fn begin_snapshot(db: &Db) -> std::result::Result<DbTransaction, OpenFailure> {
     db.begin(IsolationLevel::Snapshot)
-        .await
         .map_err(|err| OpenFailure::Fatal(Error::from(err)))
 }
 

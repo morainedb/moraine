@@ -45,7 +45,7 @@ async fn a_durable_commit_returns_its_own_outcome() {
         .await
         .unwrap();
 
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     tx.put(Key::Sys(SysKey::Head).encode(), b"head").unwrap();
     assert!(
         commit_durable(
@@ -245,7 +245,7 @@ async fn materialize_gate_refuses_on_marker() {
         .open_writer()
         .await
         .unwrap();
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     tx.put(
         Key::Sys(SysKey::Head).encode(),
         value::encode_value(&proto::HeadValue {
@@ -271,7 +271,7 @@ async fn materialize_gate_refuses_on_marker() {
         .await
         .unwrap();
 
-    let read = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let read = db.begin(IsolationLevel::Snapshot).unwrap();
     let err = materialize(ReadHandle::Tx(&read), None)
         .await
         .err()
@@ -4901,7 +4901,7 @@ async fn catalog_with_a_reclaimed_snapshot() -> (
         .unwrap();
     }
 
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     tx.delete(Key::Snapshot { snapshot_id: 2 }.encode())
         .unwrap();
     tx.commit().await.unwrap();
@@ -5012,7 +5012,7 @@ async fn a_verb_commit_rematerializes_over_a_reclaimed_snapshot() {
     .await
     .unwrap();
 
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     let handle = ReadHandle::Tx(&tx);
     let view = materialize(handle, None).await.unwrap();
     assert_eq!(view.snapshot.snapshot_id, 4);

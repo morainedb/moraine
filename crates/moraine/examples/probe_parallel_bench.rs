@@ -194,7 +194,7 @@ async fn main() -> Result<(), Failure> {
             .map(|i| key(5_000_000 + i * 7919))
             .collect();
         for micros in [0_u64, 100, 1_000, 12_000] {
-            let transaction = Arc::new(db.begin(IsolationLevel::Snapshot).await?);
+            let transaction = Arc::new(db.begin(IsolationLevel::Snapshot)?);
             let one = buffered(&transaction, &keys, micros).await?;
             let per = spawned(&transaction, &keys, micros).await?;
             let eight = chunked(&transaction, &keys, micros, 8).await?;
@@ -221,7 +221,7 @@ async fn contended(db: &Db) -> Result<(), Failure> {
         let keys: Vec<Vec<u8>> = (0..probes as u64)
             .map(|i| key(5_000_000 + i * 7919))
             .collect();
-        let transaction = Arc::new(db.begin(IsolationLevel::Snapshot).await?);
+        let transaction = Arc::new(db.begin(IsolationLevel::Snapshot)?);
         let mut one = Vec::new();
         let mut eight = Vec::new();
         for _ in 0..10 {
@@ -241,7 +241,7 @@ async fn contended(db: &Db) -> Result<(), Failure> {
     println!("against a transaction already holding staged writes, 12ms a probe\n");
     let keys: Vec<Vec<u8>> = (0..256_u64).map(|i| key(5_000_000 + i * 7919)).collect();
     for staged in [0usize, 10_000, 100_000] {
-        let transaction = Arc::new(db.begin(IsolationLevel::Snapshot).await?);
+        let transaction = Arc::new(db.begin(IsolationLevel::Snapshot)?);
         staged_writes(&transaction, staged)?;
         let one = buffered(&transaction, &keys, 12_000).await?;
         let eight = chunked(&transaction, &keys, 12_000, 8).await?;
@@ -254,7 +254,7 @@ async fn contended(db: &Db) -> Result<(), Failure> {
 
     println!("\nwith the commit task staging puts while the probes run\n");
     for staged in [0usize, 100_000] {
-        let transaction = Arc::new(db.begin(IsolationLevel::Snapshot).await?);
+        let transaction = Arc::new(db.begin(IsolationLevel::Snapshot)?);
         staged_writes(&transaction, staged)?;
         let writer = Arc::clone(&transaction);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -276,7 +276,7 @@ async fn contended(db: &Db) -> Result<(), Failure> {
 
     println!("\nsharded: each task keeps today's buffer_unordered over its share\n");
     let keys: Vec<Vec<u8>> = (0..256_u64).map(|i| key(5_000_000 + i * 7919)).collect();
-    let transaction = Arc::new(db.begin(IsolationLevel::Snapshot).await?);
+    let transaction = Arc::new(db.begin(IsolationLevel::Snapshot)?);
     for (name, cost) in [
         ("uniform 12ms", (|_| 12_000) as fn(usize) -> u64),
         (

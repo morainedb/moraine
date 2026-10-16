@@ -750,7 +750,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
 
         for (table_id, row_id_start, row_id_end, chunk_seq) in [
             (7, 0, 9, 0),
@@ -796,7 +796,7 @@ mod tests {
         }
         tx.commit().await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let selected =
             find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 7, &[105, 1_005], None)
                 .await
@@ -828,7 +828,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
 
         for (table_id, row_id_start, row_count, chunk_seq) in
             [(7, 0, 10, 0), (7, 10, 5, 1), (7, 40, 1, 2), (8, 0, 3, 0)]
@@ -852,7 +852,7 @@ mod tests {
         }
         tx.commit().await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let headers = scan_inline_chunk_headers(ReadHandle::Tx(&tx), 7)
             .await
             .unwrap();
@@ -887,7 +887,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
 
         // A wide chunk, a single-row chunk re-inlined inside it (sharing its
         // end), and a distant chunk the bound should exclude.
@@ -929,7 +929,7 @@ mod tests {
         }
         tx.commit().await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
 
         // Row 100 sits in both the wide chunk and the re-inlined one; the
         // bound must admit both.
@@ -958,7 +958,7 @@ mod tests {
         // Proof the bound truncates rather than merely agreeing: an
         // inverted locator far past it is refused by a full walk and never
         // reached by a bounded one.
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         tx.put(
             Key::Inline(InlineKey::ChunkLocator {
                 table_id: 7,
@@ -978,7 +978,7 @@ mod tests {
         .unwrap();
         tx.commit().await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         assert!(
             find_inline_chunk_locators_for_rows(ReadHandle::Tx(&tx), 7, &[100], None)
                 .await
@@ -1045,7 +1045,7 @@ mod tests {
         let inline_delete = InlineInlineDeleteValue { end_snapshot: 9 };
         let file_delete = InlineFileDeleteValue { begin_snapshot: 4 };
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         tx.put(
             Key::Inline(InlineKey::Schema {
                 table_id: 7,
@@ -1138,7 +1138,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
 
         let chunks = scan_inline_chunks(ReadHandle::Tx(&tx), 7).await.unwrap();
         assert_eq!(
@@ -1242,7 +1242,7 @@ mod tests {
             same_as_version: None,
         };
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         for (table_id, schema_version, value) in [
             (1, 0, &table_one_v0),
             (1, 1, &table_one_v1),
@@ -1266,7 +1266,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let all = scan_all_inline_schemas(ReadHandle::Tx(&tx)).await.unwrap();
         assert_eq!(
             all,
@@ -1290,7 +1290,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         for (table_id, schema_version, value) in [
             (
                 1,
@@ -1335,7 +1335,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         assert_eq!(
             scan_inline_schemas_resolved(ReadHandle::Tx(&tx), 1)
                 .await
@@ -1370,7 +1370,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         tx.put(
             Key::Inline(InlineKey::Schema {
                 table_id: 1,
@@ -1400,7 +1400,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let keys = scan_all_inline_schema_keys(ReadHandle::Tx(&tx))
             .await
             .unwrap();

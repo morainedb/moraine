@@ -232,7 +232,7 @@ async fn main() -> Result<(), Failure> {
 
         let (build, drain) = split(Handle::Db(&db), scattered).await?;
 
-        let transaction = db.begin(IsolationLevel::Snapshot).await?;
+        let transaction = db.begin(IsolationLevel::Snapshot)?;
         let tx_unordered = unordered(Handle::Tx(&transaction), scattered).await?;
         drop(transaction);
 

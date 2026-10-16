@@ -181,7 +181,7 @@ async fn grouped_probe_results_are_exact() {
 #[tokio::test]
 async fn exact_batched_reads_preserve_pinned_deletes_and_updates() {
     let (db, cache, objects) = fixture(512).await;
-    let pinned = db.begin(slatedb::IsolationLevel::Snapshot).await.unwrap();
+    let pinned = db.begin(slatedb::IsolationLevel::Snapshot).unwrap();
     let key = |row_id| {
         Key::Index(IndexKey::Multi {
             index_id: 1,

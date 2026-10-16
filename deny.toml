@@ -36,3 +36,8 @@ ignore = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+# `DbReader::refresh()` — slatedb/slatedb#2080, open upstream and carried
+# from the author's fork until it lands. Drops with the patch in the
+# workspace manifest.
+allow-git = ["https://github.com/phytal/slatedb"]

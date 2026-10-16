@@ -113,10 +113,7 @@ pub(crate) async fn raise_format(
     durability: &CommitDurability,
     dry_run: bool,
 ) -> Result<FormatRaise> {
-    let tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
+    let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
 
     let read = async {
         let format = read::read_format(ReadHandle::Tx(&tx))
@@ -289,10 +286,7 @@ async fn start(db: &Db, unit: &MigrationUnit) -> Result<()> {
             tokio::time::sleep(commit::retry_backoff(attempt)).await;
         }
 
-        let tx = db
-            .begin(IsolationLevel::Snapshot)
-            .await
-            .map_err(Error::from)?;
+        let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
         let staged = match stage_start(&tx, unit).await {
             Ok(staged) => staged,
             Err(error) => {
@@ -340,10 +334,7 @@ async fn stage_start(tx: &DbTransaction, unit: &MigrationUnit) -> Result<StagedB
 
 /// The finish batch: the format flip and the marker clear, together.
 async fn finish(db: &Db, unit: &MigrationUnit) -> Result<()> {
-    let tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
+    let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
 
     let format = Key::Sys(SysKey::Format).encode();
     let stamp = value::encode_value(&proto::FormatValue {
@@ -383,10 +374,7 @@ async fn run_unit(db: &Db, unit: &MigrationUnit, resume: Option<Vec<u8>>) -> Res
     };
 
     loop {
-        let tx = db
-            .begin(IsolationLevel::Snapshot)
-            .await
-            .map_err(Error::from)?;
+        let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
 
         let outcome = match (unit.step)(&tx, &cursor).await {
             Ok(outcome) => outcome,
@@ -439,10 +427,7 @@ async fn run_unit(db: &Db, unit: &MigrationUnit, resume: Option<Vec<u8>>) -> Res
 /// newest format is left untouched and reported as such. Epoch fencing on
 /// the writer means exactly one migrator runs.
 pub(crate) async fn run(db: &Db) -> Result<MigrationReport> {
-    let tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
+    let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
     let (format, marker) = futures::join!(
         read::read_format(ReadHandle::Tx(&tx)),
         read::read_migration(ReadHandle::Tx(&tx)),

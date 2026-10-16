@@ -242,6 +242,10 @@ pub(crate) fn mint_transaction_id() -> [u8; 16] {
 /// served a sequence before it reads again.
 pub(crate) const READER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a commit waits between refreshes while its slot is not yet
+/// served, so a peer's slot landing between them is not spun on.
+const SLOT_REFRESH_BACKOFF: Duration = Duration::from_millis(2);
+
 /// The log's commit side bound to a process's store: offers go to the
 /// committer, and slots other committers won are applied to `db` when this
 /// process is the folder, or awaited from the tailing reader when it is not.
@@ -268,9 +272,10 @@ pub(crate) struct LogCommitter {
     pub(crate) folds_since_open: Arc<AtomicU64>,
     /// How a holder flushes and truncates.
     pub(crate) flushing: Flushing,
-    /// What this process's reader lists the log for; a commit awaiting its
-    /// slot holds it urgent.
-    pub(crate) demand: Arc<demand::ReadDemand>,
+    /// The reader this process reads the log through, refreshed while a
+    /// commit waits to see its slot. `None` on a folder, which reads the
+    /// store it holds.
+    pub(crate) reader: Option<Arc<slatedb::DbReader>>,
 }
 
 /// The store a process holds, and the idle poll folding into it.
@@ -569,12 +574,7 @@ impl LogCommitter {
         if self.reads == ReadSide::Store {
             return true;
         }
-        // The reader's plug lists every tick until the slot is served.
-        let _urgent = self.demand.urgent();
-        let served = self
-            .committer
-            .await_served(sequence, READER_CATCHUP_TIMEOUT)
-            .await;
+        let served = self.await_refreshed(sequence).await;
         if !served {
             tracing::warn!(
                 sequence,
@@ -582,6 +582,34 @@ impl LogCommitter {
             );
         }
         served
+    }
+
+    /// Refreshes the reader until it has been served every slot through
+    /// `sequence`, or the catch-up timeout passes. Each refresh lists the
+    /// log and replays what it finds, so the wait is round trips rather
+    /// than ticks of a clock.
+    async fn await_refreshed(&self, sequence: u64) -> bool {
+        let Some(reader) = &self.reader else {
+            return self
+                .committer
+                .await_served(sequence, READER_CATCHUP_TIMEOUT)
+                .await;
+        };
+        let deadline = std::time::Instant::now() + READER_CATCHUP_TIMEOUT;
+        loop {
+            if let Err(error) = reader.refresh().await {
+                tracing::warn!(%error, "refreshing the reader failed; retrying");
+            }
+            // The plug reports a slot served as it hands the rows over, so
+            // this is true by the time the refresh that found it returns.
+            if self.committer.await_served(sequence, Duration::ZERO).await {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(SLOT_REFRESH_BACKOFF).await;
+        }
     }
 
     /// Applies one slot's writes to the store this process holds, waiting
@@ -668,7 +696,6 @@ impl LogCommitter {
     }
 }
 
-pub(crate) mod demand;
 #[cfg(test)]
 pub(crate) mod test_log;
 #[cfg(test)]

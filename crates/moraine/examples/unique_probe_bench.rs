@@ -119,7 +119,7 @@ async fn scenario(
     deletes: u64,
     absent: bool,
 ) -> Result<(), Failure> {
-    let transaction = db.begin(IsolationLevel::Snapshot).await?;
+    let transaction = db.begin(IsolationLevel::Snapshot)?;
     for i in 0..puts {
         transaction.put(key(committed + 1_000_000 + i), b"v")?;
     }
@@ -163,7 +163,7 @@ async fn probe_under_load(
         }));
     }
 
-    let transaction = db.begin(IsolationLevel::Snapshot).await?;
+    let transaction = db.begin(IsolationLevel::Snapshot)?;
     let measured = probe_batch(&transaction, keys).await;
     stop.store(true, Ordering::Relaxed);
     for task in load {
@@ -197,7 +197,7 @@ async fn probe_under_writes(
         })
     };
 
-    let transaction = db.begin(IsolationLevel::Snapshot).await?;
+    let transaction = db.begin(IsolationLevel::Snapshot)?;
     let measured = probe_batch(&transaction, keys).await;
     stop.store(true, Ordering::Relaxed);
     let _ = writer.await;
@@ -344,7 +344,7 @@ async fn main() -> Result<(), Failure> {
         .collect();
 
     println!("against a store with a {latency:?} GET:");
-    let transaction = slow_db.begin(IsolationLevel::Snapshot).await?;
+    let transaction = slow_db.begin(IsolationLevel::Snapshot)?;
     probe_batch(&transaction, &cold_absent)
         .await?
         .report("  warm caches, buffer_unordered");
@@ -363,7 +363,7 @@ async fn main() -> Result<(), Failure> {
         let measured = if spawned {
             probe_spawned(&reopened, &cold_absent).await?
         } else {
-            let transaction = reopened.begin(IsolationLevel::Snapshot).await?;
+            let transaction = reopened.begin(IsolationLevel::Snapshot)?;
             let measured = probe_batch(&transaction, &cold_absent).await?;
             drop(transaction);
             measured

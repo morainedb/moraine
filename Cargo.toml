@@ -70,3 +70,13 @@ split-debuginfo = "unpacked" # Keeps debug data separate from binaries
 
 [profile.dev.package."*"]
 opt-level = 3 # Compiles dependencies with high optimization once
+
+# `DbReader::refresh()` — slatedb/slatedb#2080, open upstream and carried
+# here until it lands. The committer's reads need the reader to refresh
+# when they ask, not at its next tick; without it a read can only set a
+# flag the poller reads later. Both crates come from one revision: the
+# metrics traits in `slatedb-common` must be the ones `slatedb` was built
+# against.
+[patch.crates-io]
+slatedb = { git = "https://github.com/phytal/slatedb", rev = "9717227cc4c17bcf2c07ae096286ca5b76ee9683" }
+slatedb-common = { git = "https://github.com/phytal/slatedb", rev = "9717227cc4c17bcf2c07ae096286ca5b76ee9683" }

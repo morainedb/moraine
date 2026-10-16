@@ -248,29 +248,20 @@ moves the counter outside a slot.
   tail past its fold cursor and folds what peers landed, under a guard
   that also spans its own offer and local commit, so the poll never folds
   a slot it is in the middle of committing itself.
-- **A committer lists on demand, and waits when it must.** A committer's
-  reader is polled at `commit_log_poll_interval`, tens of milliseconds, so
-  that a commit sees its own slot promptly — far faster than any read
-  needs a peer's. Listing on every such poll is the expensive part, and
-  the clock is the wrong thing to drive it, so the plug lists only when
-  something wants what a listing finds: a commit waiting to see its slot,
-  which keeps every poll listing until it is served, or a read, which
-  keeps the log watched for `reader_poll_interval` after it. Within that
-  window every poll lists, so a session being read sees a peer's slot as
-  quickly as its own — the commit poll, unchanged — and past it nothing
-  lists at all. A read arriving after the window has lapsed holds the
-  demand urgent and waits for one listing before it is served, so a
-  committer that stops reading costs nothing and the read that wakes it
-  is still current. The window is what a read extends, not a rate it is
-  throttled to: throttling reads would make a peer's commit invisible for
-  as long as the bound, which two attaches over one lake notice at once. Between listings the plug reports the
-  end it last saw, which the reader has replayed already; each poll
-  publishes the previous poll's listing as replayed, the reader running
-  its polls one after another. The gate is moraine's, wrapped around the
-  provider's reader, so the boundary is unchanged, and it is a committer's
-  alone: a read-only reader polls at its own interval, which is its
-  freshness bound already, and lists on the clock as before. SlateDB's own
-  manifest read on each poll is not gated here.
+- **A committer refreshes, it does not poll.** A read refreshes the
+  reader before it is served, so the log is listed when a read asks and
+  the read is served what that listing found. A commit awaiting its own
+  slot refreshes until the plug reports it served, so its wait is round
+  trips rather than ticks of a clock. Nothing between reads lists
+  anything: an idle committer makes no request of the log at all, and the
+  reader's own poll remains only to keep the checkpoint it holds from
+  expiring, which is what `reader_poll_interval` sets on a committer.
+  Gating a timer was tried first and is not enough: a gate can only ask
+  the next tick to list, so either a peer's commit stays invisible for as
+  long as the gate's bound or every read waits out a tick. Refreshing
+  removes the choice. It rests on `DbReader::refresh`, which this build
+  carries from an unmerged upstream change.
+
 - **The fold cursor, not the served point.** A holder that reads through
   its own tailing reader is served a slot before the store it holds has
   folded it, so everything it folds starts at the fold cursor, never at
