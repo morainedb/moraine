@@ -1106,3 +1106,32 @@ async fn a_read_only_tail_lists_for_a_read_and_not_for_its_clock() {
     reader.close().await.unwrap();
     committer.close().await.unwrap();
 }
+
+/// A fold slower than the overrun is reported and then waited for, not
+/// abandoned: a slow fold still folds, and only a stopped one is a
+/// problem the report is there to name.
+#[tokio::test(start_paused = true)]
+async fn a_fold_past_the_overrun_is_reported_and_still_awaited() {
+    struct Slow(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl super::StoreFolder for Slow {
+        async fn fold_now(&self) -> crate::Result<u64> {
+            tokio::time::sleep(super::FOLD_OVERRUN * 4).await;
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+
+            Ok(7)
+        }
+    }
+
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let folded = super::fold_reporting_an_overrun(&Slow(Arc::clone(&finished)), 16)
+        .await
+        .unwrap();
+
+    assert_eq!(folded, 7, "the fold's own answer is what comes back");
+    assert!(
+        finished.load(std::sync::atomic::Ordering::Acquire),
+        "the fold was abandoned at the overrun rather than waited for"
+    );
+}
