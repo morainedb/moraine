@@ -4,6 +4,12 @@ description = "A SlateDB-backed catalog for DuckLake"
 readme = "../../README.md"
 keywords = ["duckdb", "ducklake", "slatedb", "catalog", "lakehouse"]
 categories = ["database-implementations"]
+# Held back from crates.io while the workspace patches slatedb. A registry
+# build resolves the published slatedb, which has neither the synchronous
+# `begin` nor `DbReader::refresh()`, so the crate would not compile for
+# anyone who installed it. Publishing resumes when slatedb/slatedb#2080 is
+# released; 0.7.0 remains the newest version on the registry until then.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
