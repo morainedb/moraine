@@ -223,3 +223,123 @@ async fn idle_attaches_do_not_evict_an_active_working_set() {
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+const BURST_CHILD: &str = "MORAINE_CACHE_BURST_CHILD";
+
+async fn burst_scenario() {
+    let config = CacheConfig {
+        auxiliary_percent: None,
+        memory: Some(8 * 1024 * 1024),
+        dir: None,
+        disk_size: None,
+    };
+    let objects = Arc::new(object_store::memory::InMemory::new());
+    let identity = crate::CacheIdentity::new("burst-test");
+    let settings = Settings {
+        flush_interval: None,
+        compactor_options: None,
+        manifest_poll_interval: Duration::from_mins(1),
+        ..Settings::default()
+    };
+    let open = async |path: String| {
+        let location = StoreLocation {
+            identity,
+            path: path.clone(),
+        };
+        let counters = store_counters();
+        let db = Db::builder(path.as_str(), objects.clone())
+            .with_settings(settings.clone())
+            .with_block_cache_policy(flush_policy(true))
+            .with_db_cache(
+                shared(&config, location, store_counters()).await.unwrap(),
+                1,
+            )
+            .with_metrics_recorder(recorder(counters.clone()))
+            .build()
+            .await
+            .unwrap();
+        (db, counters)
+    };
+
+    // Two incumbents take the budget while little competes, and fill what
+    // they take: a store whose own working set nearly fills its capacity
+    // has almost nothing a newcomer may reclaim from it without evicting
+    // live blocks, which is the case the burst below has to resolve.
+    let (incumbent, incumbent_counters) = open("incumbent".to_string()).await;
+    write(&incumbent, 1).await;
+    probe(&incumbent, &incumbent_counters, 1, "incumbent warm").await;
+    write(&incumbent, 2).await;
+    probe(&incumbent, &incumbent_counters, 2, "incumbent updated").await;
+
+    let mut newcomers = Vec::new();
+    for number in 0..8 {
+        newcomers.push(open(format!("newcomer-{number}")).await);
+    }
+    let (second, second_counters) = &newcomers[0];
+    write(second, 3).await;
+    probe(second, second_counters, 3, "second incumbent warm").await;
+    probe(&incumbent, &incumbent_counters, 2, "incumbent refill").await;
+    let newcomers = &newcomers[1..];
+
+    // Every newcomer demands at once, so the reclaim that serves one runs
+    // against the reclaims serving the rest.
+    for round in 0..3 {
+        futures::future::join_all(newcomers.iter().map(|(db, _)| write(db, 4 + round))).await;
+        assert_budget();
+    }
+
+    // A quarter of an even split: far enough below what a settled store
+    // holds to survive the wobble, far enough above zero to catch a store
+    // the burst left with nothing.
+    {
+        let caches = caches();
+        assert_eq!(
+            caches.stores.len(),
+            9,
+            "the split below is asserted over whatever stores the cache holds, \
+             so an empty or short set would assert nothing"
+        );
+        let floor = caches.config.as_ref().unwrap().slots().1 / as_bytes(caches.stores.len() * 4);
+        let mut split = caches
+            .stores
+            .values()
+            .map(|store| {
+                (
+                    store.capacity.load(Ordering::Relaxed),
+                    as_bytes(store.tier.usage()),
+                )
+            })
+            .collect::<Vec<_>>();
+        split.sort_unstable();
+        assert!(
+            split.iter().all(|(capacity, _)| *capacity >= floor),
+            "a store came away from the burst below {floor} bytes: {split:?}"
+        );
+    }
+
+    for (db, _) in newcomers {
+        db.close().await.unwrap();
+    }
+    second.close().await.unwrap();
+    incumbent.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_concurrent_burst_settles_into_a_fair_split() {
+    if std::env::var(BURST_CHILD).is_ok() {
+        burst_scenario().await;
+        return;
+    }
+    let name = "store::cache::allocation_tests::a_concurrent_burst_settles_into_a_fair_split";
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(BURST_CHILD, "1")
+        .output()
+        .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
