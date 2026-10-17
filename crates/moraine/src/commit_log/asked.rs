@@ -34,7 +34,11 @@ impl Asked {
 pub(crate) struct AskedReader {
     inner: Arc<dyn WalReader>,
     asked: Arc<Asked>,
+    /// The end the last listing found, and whether one has happened.
+    /// Separate, so a log that is genuinely empty is not mistaken for
+    /// one nobody has listed yet.
     known_end: AtomicU64,
+    listed: AtomicBool,
 }
 
 impl AskedReader {
@@ -43,6 +47,7 @@ impl AskedReader {
             inner,
             asked,
             known_end: AtomicU64::new(0),
+            listed: AtomicBool::new(false),
         }
     }
 }
@@ -55,15 +60,15 @@ impl WalReader for AskedReader {
 
     async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError> {
         // The open's own replay is owed one, whatever has read yet.
-        let first = self.known_end.load(Ordering::Acquire) == 0;
-        if !first && !self.asked.take() {
+        if self.listed.load(Ordering::Acquire) && !self.asked.take() {
             return Ok(self
                 .known_end
                 .load(Ordering::Acquire)
                 .max(replay_after_wal_id));
         }
         let end = self.inner.last_wal_file_id(replay_after_wal_id).await?;
-        self.known_end.fetch_max(end.max(1), Ordering::AcqRel);
+        self.known_end.fetch_max(end, Ordering::AcqRel);
+        self.listed.store(true, Ordering::Release);
 
         Ok(end.max(replay_after_wal_id))
     }

@@ -217,57 +217,6 @@ impl Store {
     }
 }
 
-/// When a read refreshes the reader it is served from, rather than
-/// waiting for the reader's own poll to notice.
-struct Refresh {
-    /// The least time between refreshes reads may cause. Zero refreshes
-    /// before every read.
-    every: Duration,
-    last: std::sync::Mutex<Option<Instant>>,
-    /// Whether reads refresh at all.
-    on: bool,
-}
-
-impl Refresh {
-    /// Refreshes before every read: what a committer wants, where a
-    /// peer's slot is worth a round trip.
-    fn always() -> Self {
-        Self {
-            every: Duration::ZERO,
-            last: std::sync::Mutex::new(None),
-            on: true,
-        }
-    }
-
-    /// Never refreshes: the reader's own poll is the only thing that
-    /// moves it, which is what a store with no log to list wants.
-    fn never() -> Self {
-        Self {
-            every: Duration::ZERO,
-            last: std::sync::Mutex::new(None),
-            on: false,
-        }
-    }
-
-    /// Whether this read refreshes, counting it if so.
-    fn due(&self) -> bool {
-        if !self.on {
-            return false;
-        }
-        let now = Instant::now();
-        let mut last = self
-            .last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.is_some_and(|at| now.saturating_duration_since(at) < self.every) {
-            return false;
-        }
-        *last = Some(now);
-
-        true
-    }
-}
-
 /// Options for opening a catalog.
 ///
 /// # Examples
@@ -956,11 +905,10 @@ pub struct ReadOnlyCatalog {
     commits: Arc<commit::Coalescer>,
     // `None` on a read-only handle.
     writer_status: Option<watch::Receiver<DbStatus>>,
-    /// How a read keeps up with the store. A committer refreshes before
-    /// every read, so a peer's slot is never a tick away; every other
-    /// store leaves it to the reader's own poll. Shared by every clone
-    /// of the handle, so they pace each other.
-    refresh: Arc<Refresh>,
+    /// Whether a read brings the reader up to the store before it runs.
+    /// A committer does, so a peer's slot is never a tick away; every
+    /// other store leaves it to the reader's own poll.
+    refresh_on_read: bool,
     /// What a read-only reader over a commit log lists it for: a read
     /// asks, and the next poll lists. `None` where there is no log to
     /// list, or where reads refresh instead.
@@ -1492,7 +1440,7 @@ impl ReadOnlyCatalog {
                 if let Some(asked) = &self.asked {
                     asked.ask();
                 }
-                if self.refresh.due() {
+                if self.refresh_on_read {
                     // Refreshed rather than polled for, so the read is
                     // served the log as it stands.
                     reader.refresh().await.map_err(Error::from)?;
@@ -1785,7 +1733,7 @@ impl Catalog {
                     commit_log,
                 )),
                 projections,
-                refresh: Arc::new(Refresh::never()),
+                refresh_on_read: false,
                 asked: None,
             },
         })
@@ -1825,7 +1773,7 @@ impl Catalog {
                 commit_log_tail: true,
                 ..options.clone()
             },
-            Arc::new(Refresh::always()),
+            true,
         )
         .await?;
         let Some(Store::Reader(reader)) = Arc::into_inner(inner.store) else {
@@ -2084,9 +2032,7 @@ impl Catalog {
         else {
             return Ok(None);
         };
-        let Some(threshold) = Some(sprint.options.commit_log_fold_slots) else {
-            return Ok(None);
-        };
+        let threshold = sprint.options.commit_log_fold_slots;
         let replay_point =
             census::replay_point(&sprint.options.path, Arc::clone(&sprint.object_store)).await?;
         if commit_log.committer.unfolded(replay_point).await? <= threshold {
@@ -2148,21 +2094,21 @@ impl Catalog {
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
     ) -> Result<ReadOnlyCatalog> {
-        Self::open_reader_catalog(object_store, options, Arc::new(Refresh::never())).await
+        Self::open_reader_catalog(object_store, options, false).await
     }
 
     /// [`open_read_only`](Self::open_read_only), refreshing the reader
-    /// before every read when `every` is zero — what a committer wants,
-    /// where a peer's slot is worth a round trip. A reader without it
-    /// follows its own poll.
+    /// before every read when `refresh_on_read` — what a committer
+    /// wants, where a peer's slot is worth a round trip. A reader
+    /// without it follows its own poll.
     async fn open_reader_catalog(
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
-        refresh: Arc<Refresh>,
+        refresh_on_read: bool,
     ) -> Result<ReadOnlyCatalog> {
         // A read-only tail is listed for a read; a committer refreshes
         // instead, and a store with no log has nothing to list.
-        let asked = (!refresh.on && options.commit_log_tail && options.commit_log.is_some())
+        let asked = (!refresh_on_read && options.commit_log_tail && options.commit_log.is_some())
             .then(|| Arc::new(crate::commit_log::asked::Asked::default()));
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
         let started = Instant::now();
@@ -2248,7 +2194,7 @@ impl Catalog {
                 None,
             )),
             projections,
-            refresh,
+            refresh_on_read,
             asked,
         })
     }
