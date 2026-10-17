@@ -270,15 +270,6 @@ pub struct CatalogOptions {
     /// the one [`register_commit_log`](crate::register_commit_log) holds for
     /// the process. `None` (the default) falls back to the registered
     /// provider, and to the store's own log when none is registered.
-    ///
-    /// A provider may declare that compaction belongs to another process
-    /// ([`CommitLogProvider::external_compaction`](crate::CommitLogProvider::external_compaction)).
-    /// Where it does, a lake with no compactor serving it stops folding
-    /// rather than stopping: each fold writes a file nothing merges, and
-    /// once the store is at its limit the fold is skipped with a warning.
-    /// Commits carry on, the log grows instead of being truncated, cold
-    /// opens replay further, and readers that follow folded state fall
-    /// behind. A compactor clears it and folding resumes.
     pub commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
     /// Whether a read-only open over a commit log tails the log, seeing a
     /// commit once its slot lands rather than once a folder has folded
@@ -313,12 +304,6 @@ pub struct CatalogOptions {
     /// that trails less; larger is rarer and lumpier, and the process
     /// that lands the slot pays. Zero folds after every commit.
     /// Defaults to 1024.
-    ///
-    /// This paces the folds; it does not bound how many the store can
-    /// take. Each one writes a file that only a compactor merges away,
-    /// so where the provider leaves compaction to another process a
-    /// larger interval buys time before folding stops, not more folds —
-    /// see [`commit_log`](Self::commit_log).
     pub commit_log_fold_slots: u64,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
@@ -2024,11 +2009,6 @@ impl Catalog {
     /// has not opened. `None` without a commit-log provider, where
     /// there is no tail to be behind.
     ///
-    /// One manifest read and one listing. A host watching lakes it does
-    /// not write to reads this: a figure that climbs and does not come
-    /// back down is a lake whose folds are being skipped, which is what
-    /// a missing compactor looks like from outside.
-    ///
     /// # Errors
     ///
     /// Returns the store's error if the manifest or the log cannot be
@@ -2040,6 +2020,7 @@ impl Catalog {
         let Some(provider) = commit_log_provider(options) else {
             return Ok(None);
         };
+
         let log_store = StoreBuilder::new(&options.path, Arc::clone(&object_store))
             .wal_object_store(
                 options
