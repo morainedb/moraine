@@ -27,7 +27,7 @@ fn table_stats_row(table_id: u64, record_count: u64, next_row_id: u64, bytes: u6
 /// allocated from 1.
 async fn catalog_with_two_tables() -> Catalog {
     let catalog = open().await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
     for (table_id, name) in [(1, "t"), (2, "u")] {
         tx.stage(RowOperation::Insert {
@@ -90,15 +90,15 @@ fn stage_append(
     });
 }
 
-async fn begin(catalog: &Catalog) -> StagedTransaction {
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+fn begin(catalog: &Catalog) -> StagedTransaction {
+    let db_tx = catalog.begin_write_tx().unwrap();
     StagedTransaction::begin_detached_on(catalog, db_tx)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_appends_to_disjoint_tables_both_land() {
     let catalog = catalog_with_two_tables().await;
-    let (mut a, mut b) = (begin(&catalog).await, begin(&catalog).await);
+    let (mut a, mut b) = (begin(&catalog), begin(&catalog));
     stage_append(&mut a, 1, 1, 1, 0);
     stage_append(&mut b, 2, 1, 1, 0);
 
@@ -136,7 +136,7 @@ async fn concurrent_appends_to_disjoint_tables_both_land() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_appends_to_one_table_rebase_row_ids_and_stats() {
     let concurrent = catalog_with_two_tables().await;
-    let (mut a, mut b) = (begin(&concurrent).await, begin(&concurrent).await);
+    let (mut a, mut b) = (begin(&concurrent), begin(&concurrent));
     stage_append(&mut a, 1, 1, 1, 0);
     stage_append(&mut b, 1, 1, 1, 0);
     let (a, b) = tokio::join!(a.commit(), b.commit());
@@ -144,10 +144,10 @@ async fn concurrent_appends_to_one_table_rebase_row_ids_and_stats() {
     b.unwrap();
 
     let sequential = catalog_with_two_tables().await;
-    let mut first = begin(&sequential).await;
+    let mut first = begin(&sequential);
     stage_append(&mut first, 1, 1, 1, 0);
     first.commit().await.unwrap();
-    let mut second = begin(&sequential).await;
+    let mut second = begin(&sequential);
     stage_append(&mut second, 1, 2, 2, 10);
     second.commit().await.unwrap();
 
@@ -179,10 +179,10 @@ async fn concurrent_appends_to_one_table_rebase_row_ids_and_stats() {
 #[tokio::test]
 async fn an_append_begun_before_a_landed_append_rebases_onto_it() {
     let catalog = catalog_with_two_tables().await;
-    let mut early = begin(&catalog).await;
+    let mut early = begin(&catalog);
     stage_append(&mut early, 1, 1, 1, 0);
 
-    let mut landed = begin(&catalog).await;
+    let mut landed = begin(&catalog);
     stage_append(&mut landed, 1, 1, 1, 0);
     assert_eq!(landed.commit().await.unwrap().get(), 2);
 
@@ -202,7 +202,7 @@ async fn an_append_begun_before_a_landed_append_rebases_onto_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conflicting_members_decline_the_batch_rather_than_aborting_it() {
     let catalog = catalog_with_two_tables().await;
-    let mut seed = begin(&catalog).await;
+    let mut seed = begin(&catalog);
     stage_append(&mut seed, 1, 1, 1, 0);
     seed.commit().await.unwrap();
 
@@ -234,7 +234,7 @@ async fn conflicting_members_decline_the_batch_rather_than_aborting_it() {
             cells: snapshot_changes_row(head + 1, "deleted_from_table:1"),
         });
     };
-    let (mut a, mut b) = (begin(&catalog).await, begin(&catalog).await);
+    let (mut a, mut b) = (begin(&catalog), begin(&catalog));
     stage_delete(&mut a, 2, 2);
     stage_delete(&mut b, 2, 2);
 
@@ -273,7 +273,7 @@ async fn concurrent_inline_inserts_into_an_indexed_table_rebase_their_entries() 
         let catalog = &catalog;
         async move {
             let (_, batch) = bigint_batch(values);
-            let mut tx = begin(catalog).await;
+            let mut tx = begin(catalog);
             tx.stage(RowOperation::InlineInsert {
                 table_id: 1,
                 schema_version: 0,
@@ -343,7 +343,7 @@ async fn concurrent_inline_inserts_into_an_indexed_table_rebase_their_entries() 
 /// the statistics row every DuckLake insert carries.
 async fn seed_inline_rows(catalog: &Catalog, snapshot_id: u64) {
     let (schema, seed) = bigint_batch(&[10, 20]);
-    let mut tx = begin(catalog).await;
+    let mut tx = begin(catalog);
     tx.stage(RowOperation::InlineSchema {
         table_id: 1,
         schema_version: 0,
@@ -379,7 +379,7 @@ async fn a_burst_of_sixty_four_members_all_land() {
     const WRITERS: u64 = 64;
 
     let catalog = open().await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
     let mut created = Vec::new();
     for table_id in 1..=WRITERS {
@@ -411,14 +411,14 @@ async fn a_burst_of_sixty_four_members_all_land() {
         let head = catalog.snapshot().await.unwrap().snapshot.snapshot_id;
         let mut members = Vec::new();
         for table_id in 1..=WRITERS {
-            let mut tx = begin(&catalog).await;
+            let mut tx = begin(&catalog);
             stage_append(&mut tx, table_id, head, head, round * 10);
             members.push(tx.commit());
         }
         // A commit the batch refuses lands alone in the middle of the
         // burst, as a writer's first insert does under DuckLake.
         let lone = async {
-            let mut tx = begin(&catalog).await;
+            let mut tx = begin(&catalog);
             tx.stage(RowOperation::InlineSchema {
                 table_id: 1,
                 schema_version: 0,
@@ -459,14 +459,13 @@ async fn a_member_rebases_from_the_view_it_read_not_the_one_its_transaction_open
     let read = catalog.snapshot().await.unwrap();
     assert_eq!(read.snapshot.snapshot_id, 1);
 
-    let mut other = begin(&catalog).await;
+    let mut other = begin(&catalog);
     stage_append(&mut other, 2, 1, 1, 0);
     assert_eq!(other.commit().await.unwrap().get(), 2);
 
     // Rows authored against head 1 on a transaction opened at head 2.
     let mut tx =
         crate::ffi_support::staged::staged_begin(&catalog, None, String::new(), Some(read))
-            .await
             .unwrap();
     stage_append(&mut tx, 1, 1, 1, 0);
     assert_eq!(tx.commit().await.unwrap().get(), 3);
@@ -479,7 +478,7 @@ async fn a_member_rebases_from_the_view_it_read_not_the_one_its_transaction_open
 
     // Without the view it read, the same shape is a lost race for DuckLake
     // to re-drive, and nothing else's batch pays for it.
-    let mut late = begin(&catalog).await;
+    let mut late = begin(&catalog);
     stage_append(&mut late, 2, 2, 2, 10);
     assert!(matches!(
         late.commit().await.unwrap_err(),
@@ -497,7 +496,7 @@ async fn a_head_preserving_commit_re_drives_its_own_lost_race() {
     let catalog = catalog_with_two_tables().await;
 
     // Opened before the winner lands.
-    let mut maintenance = begin(&catalog).await;
+    let mut maintenance = begin(&catalog);
     maintenance.stage(RowOperation::Insert {
         table: TableKind::FilesScheduledForDeletion,
         cells: vec![
@@ -508,7 +507,7 @@ async fn a_head_preserving_commit_re_drives_its_own_lost_race() {
         ],
     });
 
-    let mut winner = begin(&catalog).await;
+    let mut winner = begin(&catalog);
     stage_append(&mut winner, 1, 1, 1, 0);
     assert_eq!(winner.commit().await.unwrap().get(), 2);
 
@@ -533,7 +532,7 @@ async fn the_batch_yields_to_a_commit_it_could_not_take_after_it_lost() {
     let catalog = catalog_with_two_tables().await;
 
     // DDL, authored against head 1, on a transaction opened at head 1.
-    let mut ddl = begin(&catalog).await;
+    let mut ddl = begin(&catalog);
     ddl.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(3, 0, "w", 2, None),
@@ -547,7 +546,7 @@ async fn the_batch_yields_to_a_commit_it_could_not_take_after_it_lost() {
         cells: snapshot_changes_row(2, r#"created_table:"main"."w""#),
     });
 
-    let mut winner = begin(&catalog).await;
+    let mut winner = begin(&catalog);
     stage_append(&mut winner, 1, 1, 1, 0);
     assert_eq!(winner.commit().await.unwrap().get(), 2);
     assert!(matches!(
@@ -557,7 +556,7 @@ async fn the_batch_yields_to_a_commit_it_could_not_take_after_it_lost() {
 
     // The next data commit waits out the yield before it stages.
     let started = std::time::Instant::now();
-    let mut next = begin(&catalog).await;
+    let mut next = begin(&catalog);
     stage_append(&mut next, 2, 2, 2, 0);
     assert_eq!(next.commit().await.unwrap().get(), 3);
     assert!(
@@ -569,7 +568,7 @@ async fn the_batch_yields_to_a_commit_it_could_not_take_after_it_lost() {
     // The same DDL on a transaction opened after the winner: its rows read
     // as a lost race before anything is staged, and the batch yields to
     // that too.
-    let mut late = begin(&catalog).await;
+    let mut late = begin(&catalog);
     late.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(3, 0, "w", 3, None),
@@ -587,7 +586,7 @@ async fn the_batch_yields_to_a_commit_it_could_not_take_after_it_lost() {
         Error::CommitConflict(_)
     ));
     let started = std::time::Instant::now();
-    let mut next = begin(&catalog).await;
+    let mut next = begin(&catalog);
     stage_append(&mut next, 1, 3, 3, 10);
     assert_eq!(next.commit().await.unwrap().get(), 4);
     assert!(

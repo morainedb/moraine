@@ -138,6 +138,24 @@ impl ReadHandle<'_> {
         matches!(self, Self::Tx(_))
     }
 
+    /// Brings a reader up to the store as it stands, so a pass can see
+    /// state that landed after it began. A snapshot-isolated handle and
+    /// the writer's own have nothing to bring forward and do nothing.
+    ///
+    /// For a test that drives a pass across a commit deterministically,
+    /// where production leaves drift to the reader's own poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's error if the refresh cannot be completed.
+    #[cfg(test)]
+    pub(crate) async fn refresh(&self) -> Result<(), slatedb::Error> {
+        match self {
+            Self::Reader(reader) => reader.refresh().await,
+            Self::Tx(_) | Self::Writer(_) => Ok(()),
+        }
+    }
+
     /// Scan keys sharing `prefix`, restricted to `subrange`, with the
     /// admission behaviour `shape` names.
     pub(crate) async fn scan_prefix<P, T>(
@@ -369,7 +387,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         for table_id in [3_u64, 7, 9] {
             tx.put(Key::current(EntityKey::Table { table_id }).encode(), b"t")
                 .unwrap();
@@ -414,7 +432,7 @@ mod tests {
         let write = tx.commit().await.unwrap().unwrap();
         write.await_durable().await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let handle = ReadHandle::Tx(&tx);
         let prefix = key::subspace_prefix(Subspace::Current);
         let plain = handle

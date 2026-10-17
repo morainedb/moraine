@@ -242,6 +242,10 @@ pub(crate) fn mint_transaction_id() -> [u8; 16] {
 /// served a sequence before it reads again.
 pub(crate) const READER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a commit waits between refreshes while its slot is not yet
+/// served, so a peer's slot landing between them is not spun on.
+const SLOT_REFRESH_BACKOFF: Duration = Duration::from_millis(2);
+
 /// The log's commit side bound to a process's store: offers go to the
 /// committer, and slots other committers won are applied to `db` when this
 /// process is the folder, or awaited from the tailing reader when it is not.
@@ -255,7 +259,9 @@ pub(crate) struct LogCommitter {
     pub(crate) reads: ReadSide,
     /// How this process takes the store when the tail is long; `None` for
     /// a process that holds it from its open.
-    pub(crate) taker: Option<Arc<dyn StoreTaker>>,
+    pub(crate) folder: Option<Arc<dyn StoreFolder>>,
+    /// Every this many slots, the committer that lands one folds.
+    pub(crate) fold_every: u64,
     /// The head's batch counter when the log was adopted; slot `k` carries
     /// the stamp at `batch_origin + k - 1`.
     pub(crate) batch_origin: u64,
@@ -268,6 +274,10 @@ pub(crate) struct LogCommitter {
     pub(crate) folds_since_open: Arc<AtomicU64>,
     /// How a holder flushes and truncates.
     pub(crate) flushing: Flushing,
+    /// The reader this process reads the log through, refreshed while a
+    /// commit waits to see its slot. `None` on a folder, which reads the
+    /// store it holds.
+    pub(crate) reader: Option<Arc<slatedb::DbReader>>,
 }
 
 /// The store a process holds, and the idle poll folding into it.
@@ -286,14 +296,14 @@ pub(crate) enum ReadSide {
     Reader,
 }
 
-/// Opens the store for a process that found the tail long, so it can hold
-/// and fold it. Implemented by the catalog, which owns the open.
+/// Folds the log into the store once and lets go. Implemented by the
+/// catalog, which owns the open.
 #[async_trait]
-pub(crate) trait StoreTaker: Send + Sync {
-    /// Takes the store if the unfolded tail is past the threshold, handing
-    /// it to `log` through [`LogCommitter::promote`]. Returns whether it
-    /// did.
-    async fn take_if_stalled(&self, log: &LogCommitter) -> Result<bool>;
+pub(crate) trait StoreFolder: Send + Sync {
+    /// Opens the store, applies every slot it lacks, writes it out,
+    /// truncates the log below it, and closes. Returns how many slots the
+    /// store was behind.
+    async fn fold_now(&self) -> Result<u64>;
 }
 
 /// The idle poll task and the switch that stops it.
@@ -463,18 +473,28 @@ impl LogCommitter {
         let _ = holder.db.close().await;
     }
 
-    /// Takes the store if the tail is long and this process can: a process
-    /// that already holds it, or opened without a taker, does nothing.
-    pub(crate) async fn take_if_stalled(&self) {
-        let Some(taker) = &self.taker else {
+    /// Folds after the slot the caller just landed, when that slot is the
+    /// one this lake's cadence names. The sequence is the whole trigger,
+    /// so nothing is measured and nothing is listed to decide: whichever
+    /// committer lands slot `n * fold_every` does that fold.
+    ///
+    /// A fold that fails is logged and let go. The commit has landed and
+    /// its slot is durable, the next multiple folds what this one did
+    /// not, and a process not permitted to fold simply never succeeds at
+    /// one.
+    pub(crate) async fn fold_if_due(&self, sequence: u64) {
+        let Some(folder) = &self.folder else {
             return;
         };
-        if self.holds_store() {
+        if self.fold_every != 0 && !sequence.is_multiple_of(self.fold_every) {
             return;
         }
-        match taker.take_if_stalled(self).await {
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "could not take the store; committing on"),
+        match folder.fold_now().await {
+            Ok(0) => {}
+            Ok(slots) => tracing::debug!(sequence, slots, "folded the log into the store"),
+            Err(error) => {
+                tracing::warn!(sequence, %error, "the fold failed; the next one folds this too");
+            }
         }
     }
 
@@ -566,10 +586,7 @@ impl LogCommitter {
         if self.reads == ReadSide::Store {
             return true;
         }
-        let served = self
-            .committer
-            .await_served(sequence, READER_CATCHUP_TIMEOUT)
-            .await;
+        let served = self.await_refreshed(sequence).await;
         if !served {
             tracing::warn!(
                 sequence,
@@ -577,6 +594,34 @@ impl LogCommitter {
             );
         }
         served
+    }
+
+    /// Refreshes the reader until it has been served every slot through
+    /// `sequence`, or the catch-up timeout passes. Each refresh lists the
+    /// log and replays what it finds, so the wait is round trips rather
+    /// than ticks of a clock.
+    async fn await_refreshed(&self, sequence: u64) -> bool {
+        let Some(reader) = &self.reader else {
+            return self
+                .committer
+                .await_served(sequence, READER_CATCHUP_TIMEOUT)
+                .await;
+        };
+        let deadline = std::time::Instant::now() + READER_CATCHUP_TIMEOUT;
+        loop {
+            if let Err(error) = reader.refresh().await {
+                tracing::warn!(%error, "refreshing the reader failed; retrying");
+            }
+            // The plug reports a slot served as it hands the rows over, so
+            // this is true by the time the refresh that found it returns.
+            if self.committer.await_served(sequence, Duration::ZERO).await {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(SLOT_REFRESH_BACKOFF).await;
+        }
     }
 
     /// Applies one slot's writes to the store this process holds, waiting
@@ -663,6 +708,7 @@ impl LogCommitter {
     }
 }
 
+pub(crate) mod asked;
 #[cfg(test)]
 pub(crate) mod test_log;
 #[cfg(test)]

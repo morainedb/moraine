@@ -1032,7 +1032,7 @@ mod tests {
             .await
             .unwrap();
         let tx = Arc::new(CommitSession::folder(
-            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+            db.begin(IsolationLevel::Snapshot).unwrap(),
         ));
         let key = Bytes::from_static(b"absent value");
         let entries = stream::once(async {
@@ -1071,7 +1071,7 @@ mod tests {
             .await
             .unwrap();
         let tx = Arc::new(CommitSession::folder(
-            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+            db.begin(IsolationLevel::Snapshot).unwrap(),
         ));
 
         // More than one shard's worth, so the window spawns.
@@ -1106,7 +1106,7 @@ mod tests {
             .await
             .unwrap();
         let tx = Arc::new(CommitSession::folder(
-            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+            db.begin(IsolationLevel::Snapshot).unwrap(),
         ));
         let entries = stream::iter([3u64, 4].map(|row_id| {
             Ok(StagedIndexEntry {
@@ -1157,7 +1157,7 @@ mod tests {
             .await
             .unwrap();
         let tx = Arc::new(CommitSession::folder(
-            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+            db.begin(IsolationLevel::Snapshot).unwrap(),
         ));
         let entries = stream::iter((0..ENTRIES).map(|position| {
             let row_id = u64::try_from(position).unwrap();
@@ -1197,7 +1197,7 @@ mod tests {
         let key = Bytes::from_static(b"one value");
 
         let tx = Arc::new(CommitSession::folder(
-            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+            db.begin(IsolationLevel::Snapshot).unwrap(),
         ));
         tx.put(key.clone(), 3u64.to_be_bytes()).unwrap();
         Arc::into_inner(tx).unwrap().commit().await.unwrap();
@@ -1218,7 +1218,7 @@ mod tests {
         };
 
         let tx = Arc::new(CommitSession::folder(
-            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+            db.begin(IsolationLevel::Snapshot).unwrap(),
         ));
         let staged = stage_index_entry_stream(&tx, deletion(0, key.clone()), stream::empty(), 0)
             .await
@@ -1228,7 +1228,7 @@ mod tests {
         Arc::into_inner(tx).unwrap().commit().await.unwrap();
 
         let tx = Arc::new(CommitSession::folder(
-            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+            db.begin(IsolationLevel::Snapshot).unwrap(),
         ));
         assert!(
             tx.handle().get(key.clone()).await.unwrap().is_some(),
@@ -1241,7 +1241,7 @@ mod tests {
         Arc::into_inner(tx).unwrap().commit().await.unwrap();
 
         let tx = Arc::new(CommitSession::folder(
-            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+            db.begin(IsolationLevel::Snapshot).unwrap(),
         ));
         assert!(tx.handle().get(key).await.unwrap().is_none());
         drop(tx);
@@ -1260,13 +1260,13 @@ mod tests {
         let key = Bytes::from_static(b"held value");
 
         let tx = Arc::new(CommitSession::folder(
-            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+            db.begin(IsolationLevel::Snapshot).unwrap(),
         ));
         tx.put(key.clone(), 3u64.to_be_bytes()).unwrap();
         Arc::into_inner(tx).unwrap().commit().await.unwrap();
 
         let tx = Arc::new(CommitSession::folder(
-            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+            db.begin(IsolationLevel::Snapshot).unwrap(),
         ));
         let deletion_key = key.clone();
         let deletion = stream::once(async move {
@@ -1303,12 +1303,12 @@ mod tests {
         let key = Bytes::from_static(b"delete-before-add");
         // The entry the deletion removes: a unique deletion is staged only
         // for the row the committed entry names.
-        let seed = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let seed = db.begin(IsolationLevel::Snapshot).unwrap();
         seed.put(key.clone(), 7_u64.to_be_bytes()).unwrap();
         seed.commit().await.unwrap();
 
         let tx = Arc::new(CommitSession::folder(
-            db.begin(IsolationLevel::Snapshot).await.unwrap(),
+            db.begin(IsolationLevel::Snapshot).unwrap(),
         ));
         let (release_deletion, deletion_released) = tokio::sync::oneshot::channel();
         let deletion_key = key.clone();

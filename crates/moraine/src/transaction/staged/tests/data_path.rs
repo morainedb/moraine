@@ -12,7 +12,7 @@ async fn indexed_files_and_deletes_resolve_trailing_data_prefixes() {
         let size = write_parquet(&store, "org-123/main/t/data.parquet", &batch).await;
         let mut tx = StagedTransaction::begin_detached_with_store(
             &catalog,
-            catalog.begin_write_tx().await.unwrap(),
+            catalog.begin_write_tx().unwrap(),
             DataStore::new(store.clone()),
         );
         tx.data_prefix = prefix.to_owned();
@@ -41,7 +41,7 @@ async fn indexed_files_and_deletes_resolve_trailing_data_prefixes() {
             .unwrap();
         let mut tx = StagedTransaction::begin_detached_with_store(
             &catalog,
-            catalog.begin_write_tx().await.unwrap(),
+            catalog.begin_write_tx().unwrap(),
             DataStore::new(store.clone()),
         );
         tx.data_prefix = prefix.to_owned();

@@ -728,7 +728,7 @@ fn indexed_value(v: i128) -> IndexKeyValue {
 /// already enforces.
 #[tokio::test]
 async fn an_uncovered_inline_insert_into_an_indexed_table_is_refused() {
-    let (catalog, table, _) = indexed().await;
+    let (catalog, table, _) = Box::pin(indexed()).await;
     let err = catalog
         .commit(|tx| {
             tx.inline_insert(table, &chunk("a", 1), &[])?;
@@ -749,7 +749,7 @@ async fn an_uncovered_inline_insert_into_an_indexed_table_is_refused() {
 /// entry, so the index never reports a row the table no longer has.
 #[tokio::test]
 async fn a_covered_inlined_row_is_findable_until_it_is_tombstoned() {
-    let (catalog, table, index) = indexed().await;
+    let (catalog, table, index) = Box::pin(indexed()).await;
     catalog
         .commit(move |tx| {
             tx.inline_insert(
@@ -803,7 +803,7 @@ async fn a_covered_inlined_row_is_findable_until_it_is_tombstoned() {
 /// strip a live row's entry.
 #[tokio::test]
 async fn an_inline_delete_refuses_a_removal_for_another_row() {
-    let (catalog, table, index) = indexed().await;
+    let (catalog, table, index) = Box::pin(indexed()).await;
     let err = catalog
         .commit(move |tx| {
             tx.inline_delete(

@@ -192,7 +192,7 @@ mod tests {
     /// Seeds unique entries for rows 10 and 11 and a multi-shaped one for
     /// row 12 under index 3, plus one unique entry under index 5.
     async fn seed(db: &Db) {
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         tx.put(
             encode_index_entry(3, true, &canon("a"), 0),
             encode_row_id(10),
@@ -233,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn a_unique_entry_without_a_row_id_is_corruption() {
         let db = open("index-entries/corrupt").await;
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         tx.put(encode_index_entry(3, true, &canon("a"), 0), [1, 2, 3])
             .unwrap();
         tx.commit().await.unwrap();

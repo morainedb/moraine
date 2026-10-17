@@ -264,10 +264,7 @@ pub(crate) async fn flush_memtable(db: &Db) -> Result<()> {
 /// open the writer themselves rather than through
 /// [`open_initialized`].
 pub(crate) async fn verify_wal_store(db: &Db, configured: Option<&str>) -> Result<()> {
-    let tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
+    let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
     let checked = validate_wal_store(ReadHandle::Tx(&tx), configured).await;
     tx.rollback();
     checked
@@ -465,7 +462,7 @@ async fn open_attempt(
         writer_open_ms = crate::telemetry::milliseconds(started.elapsed()),
         "opened the store read-write"
     );
-    let tx = begin_snapshot(&db).await?;
+    let tx = begin_snapshot(&db)?;
 
     match validate_format(ReadHandle::Tx(&tx), log_resident).await {
         Ok(Some(format)) => {
@@ -508,7 +505,7 @@ async fn open_attempt(
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
-            let tx = begin_snapshot(&db).await?;
+            let tx = begin_snapshot(&db)?;
             let validated = validate_format(ReadHandle::Tx(&tx), log_resident).await;
             let agreed = validate_wal_store(ReadHandle::Tx(&tx), wal_path).await;
             tx.rollback();
@@ -532,9 +529,8 @@ async fn open_attempt(
 
 /// Begins a snapshot-isolated transaction for an open attempt. A fence
 /// caught here is fatal: nothing has been staged yet.
-async fn begin_snapshot(db: &Db) -> std::result::Result<DbTransaction, OpenFailure> {
+fn begin_snapshot(db: &Db) -> std::result::Result<DbTransaction, OpenFailure> {
     db.begin(IsolationLevel::Snapshot)
-        .await
         .map_err(|err| OpenFailure::Fatal(Error::from(err)))
 }
 
@@ -634,6 +630,9 @@ async fn settle_win(
     if !log.await_served(sequence).await {
         invalidate_head_view(projections);
     }
+    // The slot just landed names whether this committer folds: the
+    // cadence is arithmetic on the sequence, so nothing is measured.
+    log.fold_if_due(sequence).await;
 
     Ok(())
 }
@@ -671,8 +670,6 @@ async fn offer_batch(
                 return Offered::Failed(err);
             }
             invalidate_head_view(projections);
-            // A loss is where the tail's length is known for free.
-            log.take_if_stalled().await;
             Offered::Lost
         }
         Err(err) => {

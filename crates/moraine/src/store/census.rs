@@ -535,7 +535,7 @@ mod tests {
         }
         db.write(batch).await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let tally = scan_live(ReadHandle::Tx(&tx), Subspace::Current)
             .await
             .unwrap();
@@ -571,7 +571,7 @@ mod tests {
         }
         db.write(batch).await.unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let tally = scan_live(ReadHandle::Tx(&tx), Subspace::Current)
             .await
             .unwrap();
@@ -588,7 +588,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let tally = scan_live(ReadHandle::Tx(&tx), Subspace::Index)
             .await
             .unwrap();

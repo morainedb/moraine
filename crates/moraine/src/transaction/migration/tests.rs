@@ -40,7 +40,7 @@ async fn seeded_store() -> Arc<InMemory> {
     catalog.close().await.unwrap();
 
     let db = open_migrator(&object_store).await;
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     tx.put(
         Key::Sys(SysKey::Format).encode(),
         value::encode_value(&proto::FormatValue {
@@ -91,7 +91,7 @@ async fn open_migrator(object_store: &Arc<InMemory>) -> Db {
 /// The two durable facts a reopen reads: the format stamp and the marker.
 async fn durable_state(object_store: &Arc<InMemory>) -> (u64, Option<proto::MigrationValue>) {
     let db = open_migrator(object_store).await;
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     let format = read::read_format(ReadHandle::Tx(&tx))
         .await
         .unwrap()
@@ -106,7 +106,7 @@ async fn durable_state(object_store: &Arc<InMemory>) -> (u64, Option<proto::Migr
 /// Every option record as `(scope_kind, scope_id)`, in ascending order.
 async fn option_scopes(object_store: &Arc<InMemory>) -> Vec<(u64, u64)> {
     let db = open_migrator(object_store).await;
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     let records = scan_current_entities(ReadHandle::Tx(&tx)).await.unwrap();
     tx.rollback();
     db.close().await.unwrap();
@@ -518,7 +518,7 @@ async fn a_mid_migration_store_never_reaches_the_raise() {
         .open_writer()
         .await
         .unwrap();
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     tx.put(
         Key::Sys(SysKey::Migration).encode(),
         value::encode_value(&proto::MigrationValue {

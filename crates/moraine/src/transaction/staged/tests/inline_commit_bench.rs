@@ -42,8 +42,7 @@ async fn indexed_inline_commit_benchmark() {
             .collect();
 
         let started = std::time::Instant::now();
-        let mut tx =
-            StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().await.unwrap());
+        let mut tx = StagedTransaction::begin_detached(&catalog, catalog.begin_write_tx().unwrap());
         if commit == 0 {
             tx.stage(RowOperation::InlineSchema {
                 table_id: 1,

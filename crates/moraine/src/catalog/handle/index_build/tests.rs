@@ -182,7 +182,7 @@ async fn inline_resume_skips_completed_chunks_without_a_row_watermark() {
         "a row watermark would skip the lower ids in the remaining source"
     );
 
-    let transaction = catalog.begin_write_tx().await.unwrap();
+    let transaction = catalog.begin_write_tx().unwrap();
     transaction
         .put(
             Key::Inline(InlineKey::Live(InlineOperation::Insert {

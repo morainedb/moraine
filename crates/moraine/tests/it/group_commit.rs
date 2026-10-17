@@ -524,7 +524,6 @@ mod staged_rows {
         let (catalog, store) = counted().await;
         let mut tx =
             moraine::ffi_support::staged::staged_begin(&catalog, None, String::new(), None)
-                .await
                 .unwrap();
         let mut created = Vec::new();
         for table_id in 1..=TABLES {
@@ -562,7 +561,6 @@ async fn concurrent_staged_commits_coalesce_without_being_asked() {
     for table_id in 1..=TABLES {
         let mut tx =
             moraine::ffi_support::staged::staged_begin(&catalog, None, String::new(), None)
-                .await
                 .unwrap();
         stage_append(&mut tx, table_id, table_id, table_id);
         tx.commit().await.unwrap();
@@ -581,7 +579,6 @@ async fn concurrent_staged_commits_coalesce_without_being_asked() {
     for table_id in 1..=TABLES {
         let mut tx =
             moraine::ffi_support::staged::staged_begin(&catalog, None, String::new(), None)
-                .await
                 .unwrap();
         stage_append(&mut tx, table_id, 1, 1);
         transactions.push(tx);

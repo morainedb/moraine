@@ -19,7 +19,7 @@ async fn manual_flush_store(object_store: Arc<InMemory>) -> Db {
 async fn durable_commit_waits_for_wal_flush() {
     let object_store = Arc::new(InMemory::new());
     let db = manual_flush_store(Arc::clone(&object_store)).await;
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     tx.put(b"key", b"value").unwrap();
     let mut commit = Box::pin(commit_durable(
         tx,
@@ -57,7 +57,7 @@ async fn durable_commit_waits_for_wal_flush() {
 #[tokio::test]
 async fn durable_commit_reports_close_before_flush() {
     let db = manual_flush_store(Arc::new(InMemory::new())).await;
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     tx.put(b"key", b"value").unwrap();
     let mut commit = Box::pin(commit_durable(
         tx,
@@ -87,7 +87,7 @@ async fn durable_commit_reports_close_before_flush() {
 #[tokio::test]
 async fn empty_durable_commit_completes_without_flush() {
     let db = manual_flush_store(Arc::new(InMemory::new())).await;
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         commit_durable(

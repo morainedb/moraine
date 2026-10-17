@@ -10,7 +10,7 @@ async fn old_store(format: u64, rows: u64) -> Arc<InMemory> {
         .unwrap();
     catalog.close().await.unwrap();
     let db = open_migrator(&store).await;
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     tx.put(
         Key::Sys(SysKey::Format).encode(),
         value::encode_value(&proto::FormatValue {
@@ -62,7 +62,7 @@ async fn old_store(format: u64, rows: u64) -> Arc<InMemory> {
 
 async fn assert_rewritten(store: &Arc<InMemory>, rows: u64) {
     let db = open_migrator(store).await;
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     for row_id in 0..rows {
         assert!(
             tx.get(

@@ -39,7 +39,7 @@ fn snapshot_changes_row(id: u64, changes_made: &str) -> Vec<Cell> {
 
 /// Commits one staged batch minting `snapshot`, carrying `ops`.
 async fn commit_staged(catalog: &Catalog, snapshot: u64, changes: &str, ops: Vec<RowOperation>) {
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let mut tx = StagedTransaction::begin_detached_on(catalog, db_tx);
     for op in ops {
         tx.stage(op);
@@ -93,7 +93,7 @@ async fn recent_rows_serves_from_a_directory_verified_complete() {
     );
 
     // The divergence: a chunk with no locator, behind the memo's back.
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     tx.put(
         Key::Inline(InlineKey::Live(InlineOperation::Insert {
             table_id: 1,
@@ -280,7 +280,7 @@ async fn recent_rows_reads_only_the_chunks_live_rows_reference() {
 
     // Remove the dead chunk's body, leaving its locator: only a read that
     // skips unreferenced chunks survives this.
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     tx.delete(
         Key::Inline(InlineKey::Live(InlineOperation::Insert {
             table_id: 1,
@@ -449,7 +449,7 @@ async fn recent_row_does_not_fetch_unrequested_live_chunks() {
             .offset_in_chunk,
         1
     );
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     tx.delete(
         Key::Inline(InlineKey::Live(InlineOperation::Insert {
             table_id: 1,
@@ -716,7 +716,10 @@ async fn a_provider_can_declare_external_compaction() {
         ..CatalogOptions::default()
     };
     let catalog = Catalog::open(object_store.clone(), options).await.unwrap();
-    assert!(catalog.holds_store(), "the first open adopts and holds");
+    assert!(
+        !catalog.holds_store(),
+        "the open adopts and gives the store straight back"
+    );
     catalog.close().await.unwrap();
     assert_eq!(compactions_objects(&object_store, "declared").await, 0);
 

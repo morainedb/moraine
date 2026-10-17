@@ -301,6 +301,22 @@ async fn warm_all_tables(catalog: &ReadOnlyCatalog) {
     }
 }
 
+/// Whether `probe` already says the caller has cancelled. For an entry
+/// point that reaches no object store and so has nothing to race the
+/// probe against, but must still refuse work a cancelled caller asked
+/// for.
+///
+/// # Safety
+///
+/// `probe`, if `Some`, must be safe to call with `probe_ctx`.
+pub(crate) unsafe fn already_cancelled(
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+) -> bool {
+    // SAFETY: caller contract — `probe` is callable with `probe_ctx`.
+    probe.is_some_and(|probe| unsafe { probe(probe_ctx) })
+}
+
 /// Runs `future` on `runtime` unless `probe` cancels it first. Cancellation
 /// is per call, not per handle: concurrent calls on one handle cancel
 /// independently.

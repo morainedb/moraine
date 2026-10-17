@@ -87,10 +87,7 @@ async fn drain_recorded_log(
     current_name: Option<&str>,
     next_name: Option<&str>,
 ) -> Result<Option<String>> {
-    let tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
+    let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
     let read = async {
         let format = commit::validate_format(ReadHandle::Tx(&tx), false).await?;
         if format.is_none() {
@@ -138,10 +135,7 @@ fn refuse_log_store_in_data_path(next: Option<&str>, data_path: Option<&str>) ->
 /// Records `name` as the catalog's log store, in the log store `db` was
 /// opened against, and writes it out as a sorted-string table.
 async fn record_log_store(db: &Db, name: Option<&str>) -> Result<()> {
-    let tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
+    let tx = db.begin(IsolationLevel::Snapshot).map_err(Error::from)?;
 
     // The global record carries every catalog-wide option, so it is read,
     // amended, and written whole.

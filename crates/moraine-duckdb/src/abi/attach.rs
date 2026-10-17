@@ -614,6 +614,15 @@ pub(super) fn cache_preload_option(
 /// serves a fixed cut. Null or empty follows the latest manifest; a non-null
 /// value with `read_only` false is [`codes::INVALID_ARGUMENT`].
 ///
+/// `reader_poll_interval_ms` is how often a read-only attach polls object
+/// storage for what a writer has committed since it last looked, and so
+/// its freshness bound; `0` keeps the catalog's default. Longer is
+/// cheaper and staler, for a dashboard that attaches for the day. On a
+/// committer over a commit log it buys no freshness — every read
+/// refreshes the reader — and only sets how often the reader polls to
+/// keep its checkpoint alive. A `checkpoint` attach polls for nothing
+/// and ignores it.
+///
 /// `host_threads` is how many execution threads the calling host runs;
 /// the handle's worker pool is that count clamped to `[2, 8]`, with `0`
 /// taking the floor. The size is fixed for the handle's life.
@@ -637,12 +646,13 @@ pub(super) fn cache_preload_option(
 /// `path` is null or a NUL-terminated C string and whose `s3` is null or a
 /// valid [`MoraineS3Config`].
 /// `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
-/// `cache_compaction_puts`, `flush_on_commit`, and `host_threads` are
-/// unconstrained. `probe`, if non-null, must be safe to call with `probe_ctx`
-/// from any thread. `out` must be a valid, writable `*mut *mut
-/// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
+/// `cache_compaction_puts`, `flush_on_commit`, `reader_poll_interval_ms`,
+/// and `host_threads` are unconstrained. `probe`, if non-null, must be safe to
+/// call with `probe_ctx` from any thread. `out` must be a valid, writable `*mut
+/// *mut MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
 /// [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_lines)]
 pub unsafe extern "C" fn moraine_attach_with_commit_log(
     path: *const c_char,
     s3: *const MoraineS3Config,
@@ -650,6 +660,7 @@ pub unsafe extern "C" fn moraine_attach_with_commit_log(
     encrypted: bool,
     flush_interval_ms: u64,
     flush_on_commit: bool,
+    reader_poll_interval_ms: u64,
     cache_dir: *const c_char,
     cache_size_bytes: u64,
     cache_memory_bytes: u64,
@@ -719,6 +730,10 @@ pub unsafe extern "C" fn moraine_attach_with_commit_log(
         options.flush_interval =
             flush_interval_option(flush_interval_ms).unwrap_or(options.flush_interval);
         options.flush_on_commit = flush_on_commit;
+        if reader_poll_interval_ms > 0 {
+            options.reader_poll_interval =
+                std::time::Duration::from_millis(reader_poll_interval_ms);
+        }
         set_cache_options(
             &mut options,
             &CacheArguments {
@@ -864,6 +879,7 @@ pub unsafe extern "C" fn moraine_attach_with_wal_store(
             encrypted,
             flush_interval_ms,
             flush_on_commit,
+            0,
             cache_dir,
             cache_size_bytes,
             cache_memory_bytes,

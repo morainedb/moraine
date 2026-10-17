@@ -166,7 +166,7 @@ fn entry_key(info: &crate::IndexInfo, value: i64, row_id: u64) -> bytes::Bytes {
 #[tokio::test]
 async fn an_entry_no_row_requires_is_dead() {
     let (catalog, table, info, store) = indexed_table().await;
-    let transaction = catalog.begin_write_tx().await.unwrap();
+    let transaction = catalog.begin_write_tx().unwrap();
     transaction
         .put(entry_key(&info, 999, 7), 7u64.to_be_bytes())
         .unwrap();
@@ -201,7 +201,7 @@ async fn dead_multi_entries_report_their_rows() {
             77,
         )
         .unwrap();
-        let transaction = catalog.begin_write_tx().await.unwrap();
+        let transaction = catalog.begin_write_tx().unwrap();
         transaction.put(key, []).unwrap();
         transaction.commit().await.unwrap();
         let report = catalog
@@ -218,7 +218,7 @@ async fn dead_multi_entries_report_their_rows() {
 #[tokio::test]
 async fn a_row_without_its_entry_is_missing() {
     let (catalog, table, info, store) = indexed_table().await;
-    let transaction = catalog.begin_write_tx().await.unwrap();
+    let transaction = catalog.begin_write_tx().unwrap();
     transaction.delete(entry_key(&info, 30, 2)).unwrap();
     transaction.commit().await.unwrap();
 
@@ -241,7 +241,7 @@ async fn a_row_without_its_entry_is_missing() {
 #[tokio::test]
 async fn an_entry_naming_the_wrong_row_is_mismatched() {
     let (catalog, table, info, store) = indexed_table().await;
-    let transaction = catalog.begin_write_tx().await.unwrap();
+    let transaction = catalog.begin_write_tx().unwrap();
     transaction
         .put(entry_key(&info, 30, 2), 41u64.to_be_bytes())
         .unwrap();
@@ -661,7 +661,7 @@ async fn certifying_records_only_a_clean_pass() {
 
     // A fabricated dead entry withdraws the certificate rather than
     // leaving a stale one in place.
-    let transaction = catalog.begin_write_tx().await.unwrap();
+    let transaction = catalog.begin_write_tx().unwrap();
     transaction
         .put(entry_key(&info, 999, 7), 7u64.to_be_bytes())
         .unwrap();

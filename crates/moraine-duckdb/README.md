@@ -93,6 +93,29 @@ lease is told from one given no lifetime, which pins its objects until
 deleted — and
 `moraine_delete_checkpoint('<store>', '<id>')` releases one.
 
+**`READER_POLL_INTERVAL_MS` — how fresh a read-only attach is, and what
+that costs.** A follow-latest reader polls object storage for what the
+writer has committed since it last looked, every 10 seconds by default,
+and serves its cached view for exactly that long. Each poll is a billed
+request or two, so an attach left open all day is a small standing cost
+whether or not anything queries it. Lengthen the interval for a dashboard
+that tolerates minute-old numbers:
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_ONLY,
+   META_READER_POLL_INTERVAL_MS 60000);
+```
+
+`CHECKPOINT` is the zero end of the same trade: no poll at all, and a
+fixed cut. The interval is ignored with one, and on a read-write attach
+without a commit log, which reads its own writes.
+
+On a committer — a read-write attach that *does* have a commit log — the
+interval buys no freshness at all: every query refreshes. It sets how
+often the reader polls to keep its checkpoint alive, so longer is simply
+cheaper, within SlateDB's checkpoint lifetime.
+
 **Creating or writing an S3 lake requires `READ_WRITE`.** DuckDB opens any
 attach whose path starts with a remote prefix (`s3://`, `gcs://`, `azure://`,
 …) read-only by default, and a read-only attach cannot create a catalog. To
@@ -179,18 +202,25 @@ into the catalog store.
 **`COMMIT_LOG_TAIL` and `COMMIT_LOG_POLL_INTERVAL_MS` — reading a commit
 log.** When the process has a commit-log provider registered, every commit
 is a slot in a log beside the catalog. A read-write attach is a committer:
-it commits from anywhere, and takes the store to fold the log when the tail
-grows long or the log is not yet adopted, giving it back if another process
-takes it. A read-only attach is a reader and never commits. `COMMIT_LOG_TAIL
-true` makes a read-only attach tail the log and see a commit the moment its
-slot lands, at a listing per poll, rather than follow the folded store.
-`COMMIT_LOG_POLL_INTERVAL_MS` is how often a committer's reader polls for
-slots other committers landed; it also bounds how long a commit waits to
-see its own. Both are ignored without a registered provider. This
-repository registers none; a build that links a wrapping crate in place of
-the open core (`MORAINE_ENTERPRISE_MANIFEST` to cmake, or the same name in
-the environment of `cargo xtask build-extension`) has that crate register
-one when the extension loads.
+it commits from anywhere, and folding those slots into the store — so the
+log can be truncated and a reader following the folded store stays current
+— is something every committer does on a cadence. Whichever one lands the
+nth slot folds it: no process is the folder, none is configured to be, and
+nothing has to be running for a lake to stay folded. The cadence reaches
+the library API only. A read-only attach is a reader and never commits.
+
+`COMMIT_LOG_TAIL true` makes a read-only attach tail the log and see a commit once its slot
+lands rather than once a folder has folded it, at a listing per
+`READER_POLL_INTERVAL_MS`. A committer does not poll the log at all: every query refreshes its
+reader first and is served what that refresh found, so another attach's
+commits are visible to the next query rather than a tick later, and an
+attach nobody queries makes no request. `COMMIT_LOG_POLL_INTERVAL_MS`
+only paces the refreshes a commit makes while waiting to see its own
+slot, and `READER_POLL_INTERVAL_MS` on a committer keeps the reader's
+checkpoint alive rather than its view fresh. All three are ignored
+without a registered provider, and the tail length `'holding'` acts on
+reaches the library API only.
+
 **`CACHE_DIR` — on-disk object cache for S3 catalogs.** Each query reads the
 catalog metadata from the store; on S3 that is network latency every time, and
 the in-memory caches start empty in each new process. Point SlateDB's disk

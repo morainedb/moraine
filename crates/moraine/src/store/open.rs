@@ -113,6 +113,9 @@ pub(crate) struct StoreBuilder<'a> {
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
     commit_log_tail: bool,
+    /// What a read-only reader lists the log for; without one the plug
+    /// lists on every poll.
+    read_asked: Option<Arc<crate::commit_log::asked::Asked>>,
     flush_interval: Option<Duration>,
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
@@ -142,6 +145,7 @@ impl<'a> StoreBuilder<'a> {
             wal_object_store: None,
             commit_log: None,
             commit_log_tail: false,
+            read_asked: None,
             flush_interval: Some(DEFAULT_FLUSH_INTERVAL),
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
@@ -186,6 +190,16 @@ impl<'a> StoreBuilder<'a> {
     /// folded store. Reader only.
     pub(crate) fn commit_log_tail(mut self, tail: bool) -> Self {
         self.commit_log_tail = tail;
+        self
+    }
+
+    /// Lists the log through the reader plug only on a poll a read asked
+    /// for; `None` lists on every poll.
+    pub(crate) fn read_asked(
+        mut self,
+        asked: Option<Arc<crate::commit_log::asked::Asked>>,
+    ) -> Self {
+        self.read_asked = asked;
         self
     }
 
@@ -336,7 +350,6 @@ impl<'a> StoreBuilder<'a> {
         if let Some(preload) = self.cache_preload {
             let tx = db
                 .begin(slatedb::IsolationLevel::Snapshot)
-                .await
                 .map_err(Error::from)?;
             warm(preload, ReadHandle::Tx(&tx), &counters, &self.warm_segments).await;
             tx.rollback();
@@ -376,11 +389,15 @@ impl<'a> StoreBuilder<'a> {
             builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
         }
         if let Some(provider) = &self.commit_log {
-            builder = builder.with_wal_reader(provider.reader(
-                self.log_store(),
-                self.path,
-                self.commit_log_tail,
-            ));
+            let reader = provider.reader(self.log_store(), self.path, self.commit_log_tail);
+            let reader: Arc<dyn slatedb::wal::WalReader> = match &self.read_asked {
+                Some(asked) => Arc::new(crate::commit_log::asked::AskedReader::new(
+                    reader,
+                    Arc::clone(asked),
+                )),
+                None => reader,
+            };
+            builder = builder.with_wal_reader(reader);
         }
 
         let reader = builder.build().await.map_err(Error::from)?;
@@ -705,7 +722,7 @@ mod tests {
         let snapshot = Key::Snapshot { snapshot_id: 1 }.encode();
         let table = Key::current(key::EntityKey::Table { table_id: 7 }).encode();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         tx.put(&head, b"head").unwrap();
         tx.put(&snapshot, b"snap").unwrap();
         tx.put(&table, b"table").unwrap();

@@ -15,7 +15,7 @@ async fn commit_flush_draining(
     size: ParquetSize,
     drains: usize,
 ) -> Result<()> {
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let object_store: Arc<dyn object_store::ObjectStore> = store.clone();
     let mut tx =
         StagedTransaction::begin_detached_with_store(catalog, db_tx, DataStore::new(object_store));
@@ -52,7 +52,7 @@ async fn commit_flush(
 }
 
 async fn chunk_count(catalog: &Catalog) -> usize {
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap()
@@ -170,7 +170,7 @@ async fn register_dense_and_sparse_sources(catalog: &Catalog) -> Arc<InMemory> {
     let mut sparse = indexed_data_file_row_at(2, "b.parquet", 2, sparse_size, 3);
     sparse[15] = Cell::U64(3);
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let mut tx =
         StagedTransaction::begin_detached_with_store(catalog, db_tx, DataStore::new(store.clone()));
     tx.stage(RowOperation::Insert {
@@ -197,7 +197,7 @@ async fn register_dense_and_sparse_sources(catalog: &Catalog) -> Arc<InMemory> {
 /// backdated to snapshot 3, the sources hard-deleted and scheduled,
 /// snapshot 4 minted.
 async fn commit_merge(catalog: &Catalog, store: &Arc<InMemory>, output: Vec<Cell>) -> Result<()> {
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let object_store: Arc<dyn object_store::ObjectStore> = store.clone();
     let mut tx =
         StagedTransaction::begin_detached_with_store(catalog, db_tx, DataStore::new(object_store));
@@ -302,7 +302,7 @@ async fn commit_rewrite(catalog: &Catalog, store: &Arc<InMemory>, row_ids: &[i64
     let size = write_parquet_with_row_ids(store, "main/t/rewrite.parquet", &values, row_ids).await;
     let count = u64::try_from(row_ids.len()).unwrap();
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let object_store: Arc<dyn object_store::ObjectStore> = store.clone();
     let mut tx =
         StagedTransaction::begin_detached_with_store(catalog, db_tx, DataStore::new(object_store));

@@ -373,7 +373,7 @@ mod tests {
         // Behind a flush that carried a sibling: the claim that waits.
         pacer.state().record_carried(2);
 
-        let tx = db.begin(slatedb::IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(slatedb::IsolationLevel::Snapshot).unwrap();
         tx.put(b"key", b"value").unwrap();
         let handle = tx.commit().await.unwrap().unwrap();
 
@@ -509,7 +509,7 @@ mod tests {
         let handles = {
             let mut handles = Vec::new();
             for key in [b"a", b"b"] {
-                let tx = db.begin(slatedb::IsolationLevel::Snapshot).await.unwrap();
+                let tx = db.begin(slatedb::IsolationLevel::Snapshot).unwrap();
                 tx.put(key, b"value").unwrap();
                 handles.push(tx.commit().await.unwrap().unwrap());
             }
@@ -712,7 +712,7 @@ mod tests {
         let pacer = FlushPacer::new(db.clone(), SPACING);
 
         let commit = async |key: &'static [u8]| {
-            let tx = db.begin(slatedb::IsolationLevel::Snapshot).await.unwrap();
+            let tx = db.begin(slatedb::IsolationLevel::Snapshot).unwrap();
             tx.put(key, b"v").unwrap();
             tx.commit().await.unwrap().unwrap()
         };

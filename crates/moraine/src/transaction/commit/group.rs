@@ -158,7 +158,7 @@ where
 
 impl Batch {
     async fn open(db: &Store, projections: &std::sync::RwLock<ProjectionCache>) -> Result<Self> {
-        let db_tx = db.begin_commit_session().await?;
+        let db_tx = db.begin_commit_session()?;
         let base = match head_view_for(db_tx.handle(), projections).await {
             Ok(base) => base,
             Err(err) => {

@@ -653,7 +653,7 @@ impl Catalog {
             return Ok(stranded);
         }
 
-        let tx = self.begin_write_tx().await?;
+        let tx = self.begin_write_tx()?;
         for &(table_id, schema_version) in &stranded {
             let (key, _) = inline_schema_undrop_write(table_id, schema_version);
             tx.delete(key).map_err(Error::from)?;
@@ -1044,7 +1044,7 @@ mod tests {
     /// Writes one raw inline key. The scans behind the repair read keys
     /// alone, so the value only has to exist.
     async fn put(catalog: &Catalog, key: Key) {
-        let tx = catalog.begin_write_tx().await.unwrap();
+        let tx = catalog.begin_write_tx().unwrap();
         tx.put(key.encode(), b"x").unwrap();
         tx.commit().await.unwrap();
     }
@@ -1126,7 +1126,7 @@ mod tests {
         )
         .await;
 
-        let tx = catalog.begin_write_tx().await.unwrap();
+        let tx = catalog.begin_write_tx().unwrap();
         let (stranded, scan) = stranded_inline_schemas(ReadHandle::Tx(&tx)).await.unwrap();
 
         assert_eq!(stranded, vec![(1, 0)]);
@@ -1150,7 +1150,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = catalog.begin_write_tx().await.unwrap();
+        let tx = catalog.begin_write_tx().unwrap();
         let (stranded, scan) = stranded_inline_schemas(ReadHandle::Tx(&tx)).await.unwrap();
 
         assert!(stranded.is_empty());

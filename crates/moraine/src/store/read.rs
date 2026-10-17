@@ -719,7 +719,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let entity = EntityKey::File {
             table_id: 1,
             data_file_id: 2,
@@ -772,7 +772,7 @@ mod tests {
             ..schema.clone()
         };
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         tx.put(Key::Sys(SysKey::Head).encode(), value::encode_value(&head))
             .unwrap();
         tx.put(
@@ -865,7 +865,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         assert_eq!(read_head(ReadHandle::Tx(&tx)).await.unwrap(), Some(head));
         assert_eq!(read_format(ReadHandle::Tx(&tx)).await.unwrap(), None);
         assert_eq!(read_migration(ReadHandle::Tx(&tx)).await.unwrap(), None);
@@ -929,7 +929,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         for table_id in [3_u64, 7, 9] {
             tx.put(
                 Key::current(EntityKey::Table { table_id }).encode(),
@@ -976,7 +976,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let handle = ReadHandle::Tx(&tx);
         let single = |subspace| {
             scan_decode(
@@ -1035,7 +1035,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         for data_file_id in 0..FILES {
             tx.put(
                 Key::current(EntityKey::File {
@@ -1082,7 +1082,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let handle = ReadHandle::Tx(&tx);
         let prefix = subspace_prefix(Subspace::Current);
         let splits = SPLIT_SCAN_KINDS.map(current_entity_kind_prefix);
@@ -1146,7 +1146,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
 
         // One live file and one ended in snapshot 4.
         let live = DataFileValue {
@@ -1218,7 +1218,7 @@ mod tests {
             next_row_id: 10,
             file_size_bytes: 1024,
         };
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         tx.put(
             Key::history(EntityKey::TableStats { table_id: 7 }, 2).encode(),
             value::encode_value(&stats),
@@ -1232,7 +1232,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let err = scan_history_entities(ReadHandle::Tx(&tx))
             .await
             .unwrap_err();
@@ -1255,7 +1255,7 @@ mod tests {
             map_type: "map_by_name".into(),
             name_mappings: vec![],
         };
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         tx.put(
             Key::history(
                 EntityKey::Mapping {
@@ -1276,7 +1276,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         let err = scan_history_entities(ReadHandle::Tx(&tx))
             .await
             .unwrap_err();

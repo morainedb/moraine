@@ -296,7 +296,7 @@ mod tests {
             .open_writer()
             .await
             .unwrap();
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         tx.put(
             Key::Inline(InlineKey::Schema {
                 table_id: 7,
@@ -323,7 +323,7 @@ mod tests {
             schema(3, b"v3"),
         ];
 
-        let tx = CommitSession::folder(db.begin(IsolationLevel::Snapshot).await.unwrap());
+        let tx = CommitSession::folder(db.begin(IsolationLevel::Snapshot).unwrap());
         let projections = std::sync::RwLock::new(ProjectionCache::empty());
         let writes = stage_inline_writes(&tx, &projections, &ops).await.unwrap();
         assert_eq!(

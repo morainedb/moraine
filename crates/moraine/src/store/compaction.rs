@@ -216,7 +216,7 @@ mod tests {
         );
         assert_eq!(after.sorted_runs, 1, "{after:?}");
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         for schema_id in 0..CHURN_KEYS {
             let value = tx
                 .get(Key::current(EntityKey::Schema { schema_id }).encode())
@@ -260,7 +260,7 @@ mod tests {
         // tombstones leaves the bottom run holding no SST at all.
         assert_eq!(current.sorted_run_ssts, 0, "{current:?}");
 
-        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).unwrap();
         for schema_id in 0..CHURN_KEYS {
             assert!(
                 tx.get(Key::current(EntityKey::Schema { schema_id }).encode())

@@ -45,7 +45,7 @@ async fn a_durable_commit_returns_its_own_outcome() {
         .await
         .unwrap();
 
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     tx.put(Key::Sys(SysKey::Head).encode(), b"head").unwrap();
     assert!(
         commit_durable(
@@ -245,7 +245,7 @@ async fn materialize_gate_refuses_on_marker() {
         .open_writer()
         .await
         .unwrap();
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     tx.put(
         Key::Sys(SysKey::Head).encode(),
         value::encode_value(&proto::HeadValue {
@@ -271,7 +271,7 @@ async fn materialize_gate_refuses_on_marker() {
         .await
         .unwrap();
 
-    let read = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let read = db.begin(IsolationLevel::Snapshot).unwrap();
     let err = materialize(ReadHandle::Tx(&read), None)
         .await
         .err()
@@ -597,7 +597,7 @@ async fn verb_ddl_records_schema_changed_table_ids() {
         .await
         .unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let ddl = read::read_snapshot(ReadHandle::Tx(&tx), 1)
         .await
         .unwrap()
@@ -641,7 +641,7 @@ async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::cat
 /// Writes the marker exactly as a migration's start batch does: the marker
 /// and the head stamp that carries it, in one batch.
 async fn plant_migration_marker(catalog: &crate::catalog::Catalog) {
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let head = read::read_head(ReadHandle::Tx(&tx)).await.unwrap().unwrap();
     tx.put(
         Key::Sys(SysKey::Migration).encode(),
@@ -699,7 +699,7 @@ fn null_entry(row_id: u64) -> crate::catalog::IndexEntry {
 }
 
 async fn read_format_version(catalog: &crate::catalog::Catalog) -> u64 {
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let format = read::read_format(ReadHandle::Tx(&tx)).await.unwrap();
     tx.rollback();
     format.map_or(FORMAT_VERSION, |f| f.format_version)
@@ -746,7 +746,7 @@ async fn create_index_persists_definition_and_entries_without_changing_format() 
     assert_eq!(read_format_version(&catalog).await, MIN_FORMAT_VERSION);
 
     // Both backfill rows produced a stored entry.
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let mut iter = ReadHandle::Tx(&tx)
         .scan_prefix(
             index_index_prefix(IndexKind::Unique, index_id.get()),
@@ -2573,7 +2573,7 @@ async fn scan_index_entries(
     index: crate::catalog::IndexId,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     use crate::store::key::{IndexKind, index_index_prefix};
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let mut entries = Vec::new();
     for kind in [IndexKind::Unique, IndexKind::Multi] {
         let mut iter = ReadHandle::Tx(&tx)
@@ -2988,7 +2988,7 @@ async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
     assert_eq!(catalog.reclaim_index_entries(index, 100).await.unwrap(), 0);
 
     // The index range is empty afterward.
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let mut iter = ReadHandle::Tx(&tx)
         .scan_prefix(
             index_index_prefix(IndexKind::Unique, index.get()),
@@ -3034,7 +3034,7 @@ async fn indexed(
 /// Counts every entry left in the `index` subspace, across both kinds.
 async fn index_entry_count(catalog: &crate::catalog::Catalog) -> usize {
     use crate::store::key::{IndexKind, index_kind_prefix};
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let mut total = 0;
     for kind in [IndexKind::Unique, IndexKind::Multi] {
         let mut iter = ReadHandle::Tx(&tx)
@@ -3756,7 +3756,7 @@ async fn folded_head_view_matches_a_fresh_scan() {
 
     catalog.commit(|tx| tx.drop_table(doomed)).await.unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let stamp = read::read_head(ReadHandle::Tx(&tx)).await.unwrap().unwrap();
     let head = stamp.snapshot_id;
     let fresh = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
@@ -3902,7 +3902,7 @@ async fn the_migration_check_is_skipped_at_a_head_already_found_clear() {
     let (catalog, _) = seeded_catalog(1).await;
     let projections = catalog.projections();
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let head = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
     refuse_mid_migration_at(ReadHandle::Tx(&db_tx), projections, &head)
         .await
@@ -3911,7 +3911,7 @@ async fn the_migration_check_is_skipped_at_a_head_already_found_clear() {
     drop(db_tx);
 
     // Planted behind the stamp's back: same head, marker present.
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     tx.put(
         Key::Sys(SysKey::Migration).encode(),
         value::encode_value(&proto::MigrationValue {
@@ -3923,7 +3923,7 @@ async fn the_migration_check_is_skipped_at_a_head_already_found_clear() {
     .unwrap();
     catalog.commit_write_tx(tx).await.unwrap();
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let served = refuse_mid_migration_at(ReadHandle::Tx(&db_tx), projections, &head).await;
     assert!(served.is_ok(), "the stamp answered without reading");
 
@@ -3956,7 +3956,7 @@ async fn a_read_session_skips_the_migration_check_at_a_stamped_head() {
     // Planted behind the stamp's back: marker present, head unmoved. A
     // session that still opens proves the check was answered from the
     // stamp rather than read.
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     tx.put(
         Key::Sys(SysKey::Migration).encode(),
         value::encode_value(&proto::MigrationValue {
@@ -3985,13 +3985,13 @@ async fn a_read_session_skips_the_migration_check_at_a_stamped_head() {
 async fn a_migration_start_moves_the_head() {
     let (catalog, _) = seeded_catalog(2).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let before = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
     drop(db_tx);
 
     plant_migration_marker(&catalog).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let after = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
     drop(db_tx);
 
@@ -4013,7 +4013,7 @@ async fn a_landed_commit_stamps_its_own_head_clear() {
         .await
         .unwrap();
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let db_tx = catalog.begin_write_tx().unwrap();
     let head = read_head_value(ReadHandle::Tx(&db_tx)).await.unwrap();
     drop(db_tx);
 
@@ -4112,7 +4112,7 @@ async fn every_batch_moves_the_head_stamp() {
     let stamp = |catalog: &crate::catalog::Catalog| {
         let catalog = catalog.clone();
         async move {
-            let tx = catalog.begin_write_tx().await.unwrap();
+            let tx = catalog.begin_write_tx().unwrap();
             let head = read_head_value(ReadHandle::Tx(&tx)).await.unwrap();
             tx.rollback();
             head
@@ -4149,7 +4149,7 @@ async fn every_batch_moves_the_head_stamp() {
 async fn an_incremental_refresh_matches_a_full_rematerialization() {
     let (catalog, tables) = seeded_catalog(12).await;
 
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let base = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
     tx.rollback();
 
@@ -4193,7 +4193,7 @@ async fn an_incremental_refresh_matches_a_full_rematerialization() {
         .unwrap();
     catalog.commit(|tx| tx.drop_table(tables[2])).await.unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let handle = ReadHandle::Tx(&tx);
     let head = read_head_value(handle).await.unwrap();
     let refreshed = refresh(handle, &base)
@@ -4234,7 +4234,7 @@ async fn a_refresh_declines_a_gap_a_maintenance_batch_landed_in() {
 
     let (catalog, tables) = seeded_catalog(8).await;
 
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let base = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
     tx.rollback();
 
@@ -4250,7 +4250,7 @@ async fn a_refresh_declines_a_gap_a_maintenance_batch_landed_in() {
         .await
         .unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let handle = ReadHandle::Tx(&tx);
     let refreshed = refresh(handle, &base).await.unwrap();
     tx.rollback();
@@ -4271,7 +4271,7 @@ async fn a_refresh_declines_a_gap_a_maintenance_batch_landed_in() {
 async fn a_refresh_declines_a_gap_swept_out_of_the_changelog_window() {
     let (catalog, tables) = seeded_wide_catalog(4, 2).await;
 
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let base = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
     tx.rollback();
 
@@ -4286,7 +4286,7 @@ async fn a_refresh_declines_a_gap_swept_out_of_the_changelog_window() {
             .unwrap();
     }
 
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let handle = ReadHandle::Tx(&tx);
     let head = read_head_value(handle).await.unwrap();
     // The backstop is lifted so this proves the *window* declines the gap,
@@ -4325,7 +4325,7 @@ async fn a_refresh_declines_a_gap_swept_out_of_the_changelog_window() {
 async fn a_refresh_declines_churn_that_outruns_the_catalog() {
     let (catalog, tables) = seeded_catalog(1).await;
 
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let base = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
     tx.rollback();
 
@@ -4339,7 +4339,7 @@ async fn a_refresh_declines_churn_that_outruns_the_catalog() {
             .unwrap();
     }
 
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let handle = ReadHandle::Tx(&tx);
     let refreshed = refresh(handle, &base).await.unwrap();
     tx.rollback();
@@ -4389,7 +4389,7 @@ async fn measure_refresh_versus_rematerialization() {
         for commits in [1usize, 4, 16, 32, 64] {
             let (catalog, table_ids) = seeded_wide_catalog(tables, COLUMNS).await;
 
-            let tx = catalog.begin_write_tx().await.unwrap();
+            let tx = catalog.begin_write_tx().unwrap();
             let base = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
             tx.rollback();
             let entities = base.live_entity_count();
@@ -4411,7 +4411,7 @@ async fn measure_refresh_versus_rematerialization() {
                     .unwrap();
             }
 
-            let tx = catalog.begin_write_tx().await.unwrap();
+            let tx = catalog.begin_write_tx().unwrap();
             let handle = ReadHandle::Tx(&tx);
             let head = read_head_value(handle).await.unwrap();
 
@@ -4513,7 +4513,7 @@ async fn measure_changelog_read_cost() {
                 .unwrap();
         }
 
-        let tx = catalog.begin_write_tx().await.unwrap();
+        let tx = catalog.begin_write_tx().unwrap();
         let handle = ReadHandle::Tx(&tx);
         let snapshots = read::scan_snapshots(handle).await.unwrap();
         let snapshot_bytes: usize = snapshots.iter().map(|r| value::encode_value(r).len()).sum();
@@ -4598,7 +4598,7 @@ async fn seeded_wide_catalog(
 /// churn a replay across that gap would pay for.
 #[allow(clippy::unwrap_used)]
 async fn churn_above(catalog: &crate::catalog::Catalog, from: u64, head: u64) -> usize {
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let tx = catalog.begin_write_tx().unwrap();
     let handle = ReadHandle::Tx(&tx);
     let mut keys = BTreeSet::new();
     for snapshot_id in (from + 1)..=head {
@@ -4626,7 +4626,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
     let (catalog, tables) = seeded_wide_catalog(3, 2).await;
 
     // The attempt opens and reads its premises.
-    let attempt = catalog.begin_write_tx().await.unwrap();
+    let attempt = catalog.begin_write_tx().unwrap();
     let base = head_view_for(ReadHandle::Tx(&attempt), catalog.projections())
         .await
         .unwrap();
@@ -4688,7 +4688,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
 
     // And a fresh attempt does see it, so the loss is the only outcome the
     // interleaving admits — not a permanent wedge.
-    let retry = catalog.begin_write_tx().await.unwrap();
+    let retry = catalog.begin_write_tx().unwrap();
     let fresh = head_view_for(ReadHandle::Tx(&retry), catalog.projections())
         .await
         .unwrap();
@@ -4714,7 +4714,7 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
 async fn a_commit_landing_mid_materialization_is_invisible_to_the_whole_pass() {
     let (catalog, tables) = seeded_wide_catalog(3, 2).await;
 
-    let pass = catalog.begin_write_tx().await.unwrap();
+    let pass = catalog.begin_write_tx().unwrap();
     let handle = ReadHandle::Tx(&pass);
 
     // The first read of a materialization.
@@ -4773,7 +4773,7 @@ async fn a_commit_landing_mid_materialization_is_invisible_to_the_whole_pass() {
 
     // A fresh pass sees the whole commit, so what the held one showed was
     // one state and not a stale accident.
-    let next = catalog.begin_write_tx().await.unwrap();
+    let next = catalog.begin_write_tx().unwrap();
     let fresh = materialize(ReadHandle::Tx(&next), None).await.unwrap();
     next.rollback();
     assert!(fresh.table_by_name(schema, "mid").is_some());
@@ -4901,7 +4901,7 @@ async fn catalog_with_a_reclaimed_snapshot() -> (
         .unwrap();
     }
 
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     tx.delete(Key::Snapshot { snapshot_id: 2 }.encode())
         .unwrap();
     tx.commit().await.unwrap();
@@ -5012,7 +5012,7 @@ async fn a_verb_commit_rematerializes_over_a_reclaimed_snapshot() {
     .await
     .unwrap();
 
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).unwrap();
     let handle = ReadHandle::Tx(&tx);
     let view = materialize(handle, None).await.unwrap();
     assert_eq!(view.snapshot.snapshot_id, 4);
@@ -5066,7 +5066,7 @@ async fn a_marker_from_the_writer_that_fenced_us_never_reads_as_a_migration() {
     let migrator = Catalog::open(store.clone(), CatalogOptions::default())
         .await
         .unwrap();
-    let tx = migrator.begin_write_tx().await.unwrap();
+    let tx = migrator.begin_write_tx().unwrap();
     tx.put(
         Key::Sys(SysKey::Migration).encode(),
         value::encode_value(&proto::MigrationValue {
@@ -5130,9 +5130,7 @@ async fn a_staged_batch_reports_the_bytes_it_holds() {
     };
 
     let base = catalog.snapshot().await.unwrap();
-    let db_tx = Arc::new(CommitSession::folder(
-        catalog.begin_write_tx().await.unwrap(),
-    ));
+    let db_tx = Arc::new(CommitSession::folder(catalog.begin_write_tx().unwrap()));
     let prepared = prepare_and_stage(
         &db_tx,
         catalog.projections(),
@@ -5186,7 +5184,8 @@ async fn folder_with_table(
 ) -> (crate::catalog::Catalog, crate::catalog::TableId) {
     use crate::catalog::{Catalog, ColumnDef};
     let folder = Catalog::open(backing, log_options(provider)).await.unwrap();
-    assert!(folder.holds_store(), "the first open adopts and holds");
+    // Committers fold and let go, so this one takes the store explicitly.
+    assert!(folder.take_store().await.unwrap());
     let table = std::cell::Cell::new(None);
     folder
         .commit(|tx| {
