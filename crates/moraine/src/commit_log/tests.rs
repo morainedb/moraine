@@ -1106,3 +1106,68 @@ async fn a_read_only_tail_lists_for_a_read_and_not_for_its_clock() {
     reader.close().await.unwrap();
     committer.close().await.unwrap();
 }
+
+/// A fold slower than the overrun is reported and then waited for, not
+/// abandoned: a slow fold still folds, and only a stopped one is a
+/// problem the report is there to name.
+#[tokio::test(start_paused = true)]
+async fn a_fold_past_the_overrun_is_reported_and_still_awaited() {
+    struct Slow(Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl super::StoreFolder for Slow {
+        async fn fold_now(&self) -> crate::Result<u64> {
+            tokio::time::sleep(super::FOLD_OVERRUN * 4).await;
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+
+            Ok(7)
+        }
+    }
+
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let folded = super::fold_reporting_an_overrun(&Slow(Arc::clone(&finished)), 16)
+        .await
+        .unwrap();
+
+    assert_eq!(folded, 7, "the fold's own answer is what comes back");
+    assert!(
+        finished.load(std::sync::atomic::Ordering::Acquire),
+        "the fold was abandoned at the overrun rather than waited for"
+    );
+}
+
+/// The tail a watcher sees from outside is the one the lake has: asked
+/// statically, without opening the lake, and without folding anything.
+#[tokio::test]
+async fn the_unfolded_tail_can_be_read_without_opening_the_lake() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+    let options = CatalogOptions {
+        commit_log: Some(provider.clone()),
+        commit_log_fold_slots: 0,
+        ..options_at("lake")
+    };
+
+    // No provider, no tail to be behind.
+    assert_eq!(
+        Catalog::unfolded_slots_of(object_store.clone(), &options_at("lake"))
+            .await
+            .unwrap(),
+        None
+    );
+
+    let committer = Catalog::open(object_store.clone(), options.clone())
+        .await
+        .unwrap();
+    let outside = Catalog::unfolded_slots_of(object_store.clone(), &options)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        Some(outside),
+        committer.unfolded_slots().await.unwrap(),
+        "the figure from outside is the one the lake reports for itself"
+    );
+    committer.close().await.unwrap();
+}

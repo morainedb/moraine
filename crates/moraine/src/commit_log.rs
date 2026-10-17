@@ -205,6 +205,12 @@ pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
     /// would make it; the two fence each other otherwise. Defaults to
     /// `false`.
     ///
+    /// Returning `true` makes that process load-bearing. Each fold
+    /// writes a file only a compactor merges away, so with none running
+    /// the store reaches its limit of unmerged files and folding stops
+    /// until one does. Commits are unaffected; the log grows in place of
+    /// the fold, and the folded state falls behind.
+    ///
     /// [`CatalogOptions::external_compaction`]: crate::CatalogOptions::external_compaction
     fn external_compaction(&self) -> bool {
         false
@@ -241,6 +247,13 @@ pub(crate) fn mint_transaction_id() -> [u8; 16] {
 /// How long a committer over a tailing reader waits for the reader to be
 /// served a sequence before it reads again.
 pub(crate) const READER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a fold may run before the commit that triggered it says so.
+/// It keeps waiting after that: the point is that a fold which has
+/// stopped making progress leaves a trace, since the usual cause is a
+/// store that has stopped accepting writes and will not start again on
+/// its own.
+const FOLD_OVERRUN: Duration = Duration::from_secs(30);
 
 /// How long a commit waits between refreshes while its slot is not yet
 /// served, so a peer's slot landing between them is not spun on.
@@ -489,7 +502,7 @@ impl LogCommitter {
         if self.fold_every != 0 && !sequence.is_multiple_of(self.fold_every) {
             return;
         }
-        match folder.fold_now().await {
+        match fold_reporting_an_overrun(folder.as_ref(), sequence).await {
             Ok(0) => {}
             Ok(slots) => tracing::debug!(sequence, slots, "folded the log into the store"),
             Err(error) => {
@@ -706,6 +719,28 @@ impl LogCommitter {
 
         Ok(())
     }
+}
+
+/// The fold, saying so if it outlasts [`FOLD_OVERRUN`] and then
+/// waiting for it anyway. A fold that stops rather than slows is
+/// almost always a store at its L0 limit with nothing compacting it,
+/// which is silent otherwise: the commit simply never returns.
+async fn fold_reporting_an_overrun(folder: &dyn StoreFolder, sequence: u64) -> Result<u64> {
+    let fold = folder.fold_now();
+    tokio::pin!(fold);
+    if let Ok(outcome) = tokio::time::timeout(FOLD_OVERRUN, &mut fold).await {
+        return outcome;
+    }
+    tracing::error!(
+        sequence,
+        waited_s = FOLD_OVERRUN.as_secs(),
+        "the fold has not finished, and the commit that triggered it is waiting. A store on \
+         a commit log is compacted by another process; with none running, each fold leaves a \
+         file behind and the store stops accepting writes once enough have piled up. Check \
+         that a compactor is serving this lake."
+    );
+
+    fold.await
 }
 
 pub(crate) mod asked;
