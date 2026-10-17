@@ -273,11 +273,12 @@ pub struct CatalogOptions {
     ///
     /// A provider may declare that compaction belongs to another process
     /// ([`CommitLogProvider::external_compaction`](crate::CommitLogProvider::external_compaction)).
-    /// Where it does, **a compactor must run against the lake**: no
-    /// writer over the log compacts, every fold writes an L0 file and
-    /// closes, and once eight have accumulated the store stops accepting
-    /// writes and does not recover on its own. Eight folds, whatever
-    /// [`commit_log_fold_slots`](Self::commit_log_fold_slots) is.
+    /// Where it does, a lake with no compactor serving it stops folding
+    /// rather than stopping: each fold writes a file nothing merges, and
+    /// once the store is at its limit the fold is skipped with a warning.
+    /// Commits carry on, the log grows instead of being truncated, cold
+    /// opens replay further, and readers that follow folded state fall
+    /// behind. A compactor clears it and folding resumes.
     pub commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
     /// Whether a read-only open over a commit log tails the log, seeing a
     /// commit once its slot lands rather than once a folder has folded
@@ -314,10 +315,10 @@ pub struct CatalogOptions {
     /// Defaults to 1024.
     ///
     /// This paces the folds; it does not bound how many the store can
-    /// take. Each one writes an L0 file, and where the provider leaves
-    /// compaction to another process, that process is what keeps them
-    /// from piling up — see [`commit_log`](Self::commit_log). A larger
-    /// interval buys time before the eighth fold, not more than eight.
+    /// take. Each one writes a file that only a compactor merges away,
+    /// so where the provider leaves compaction to another process a
+    /// larger interval buys time before folding stops, not more folds —
+    /// see [`commit_log`](Self::commit_log).
     pub commit_log_fold_slots: u64,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
@@ -1995,6 +1996,28 @@ impl Catalog {
             .committer(log_store, &options.path)
             .unfolded(replay_point)
             .await?;
+
+        // A fold writes an L0 file, and where the provider leaves
+        // compaction to another process nothing merges those away. A
+        // store already at its limit would stall on that write and never
+        // come back, taking the commit that triggered the fold with it.
+        // Fold nothing instead: the slots are durable, the log grows
+        // rather than the writer stopping, and the first fold after a
+        // compactor runs picks up everything this one left.
+        let ceiling = slatedb::config::Settings::default().l0_max_ssts;
+        let l0_files = census::l0_files(&options.path, Arc::clone(&object_store)).await?;
+        if usize::try_from(l0_files).unwrap_or(usize::MAX) + 1 >= ceiling {
+            warn!(
+                l0_files,
+                ceiling,
+                behind,
+                "not folding: the store is at its limit of unmerged files and nothing has \
+                 compacted it. Commits carry on and the log grows until a compactor serves \
+                 this lake."
+            );
+
+            return Ok(0);
+        }
 
         let (db, log) = take_store(object_store, &options).await?;
         match &log {

@@ -205,11 +205,11 @@ pub trait CommitLogProvider: fmt::Debug + Send + Sync + 'static {
     /// would make it; the two fence each other otherwise. Defaults to
     /// `false`.
     ///
-    /// Returning `true` makes that process a requirement, not a choice.
-    /// Each fold writes an L0 file and closes, so with nothing compacting
-    /// them the eighth fold reaches SlateDB's L0 limit and the store
-    /// stops accepting writes, permanently and with no error until a
-    /// compactor runs.
+    /// Returning `true` makes that process load-bearing. Each fold
+    /// writes a file only a compactor merges away, so with none running
+    /// the store reaches its limit of unmerged files and folding stops
+    /// until one does. Commits are unaffected; the log grows in place of
+    /// the fold, and the folded state falls behind.
     ///
     /// [`CatalogOptions::external_compaction`]: crate::CatalogOptions::external_compaction
     fn external_compaction(&self) -> bool {

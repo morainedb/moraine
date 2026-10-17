@@ -163,6 +163,24 @@ pub(crate) async fn replay_point(path: &str, object_store: Arc<dyn ObjectStore>)
         .ok_or_else(|| Error::Corruption("the store has no manifest".to_string()))
 }
 
+/// The most L0 files any one of the manifest's trees holds. A tree stops
+/// accepting writes at the store's `l0_max_ssts`, so this is the headroom
+/// a write has to fit under, and the maximum is what binds.
+pub(crate) async fn l0_files(path: &str, object_store: Arc<dyn ObjectStore>) -> Result<u32> {
+    let view = AdminBuilder::new(path, object_store)
+        .build()
+        .read_compactor_state_view()
+        .await
+        .map_err(Error::from)?;
+
+    Ok(census_of_manifest(view.manifest())
+        .segments
+        .iter()
+        .map(|segment| segment.l0_ssts)
+        .max()
+        .unwrap_or(0))
+}
+
 /// The manifest's byte totals, from one manifest read.
 pub(crate) async fn manifest_bytes(
     path: &str,
