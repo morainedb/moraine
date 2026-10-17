@@ -1,9 +1,22 @@
 [workspace]
 changelog_update = true
-semver_check = true
+# Off while the workspace patches slatedb. The check builds each crate in a
+# scratch project, which does not inherit `[patch.crates-io]` and so compiles
+# against the published slatedb the patch exists to replace — it cannot pass,
+# for a reason it is not reporting. Back on with publishing, when
+# slatedb/slatedb#2080 is released.
+semver_check = false
 
 [[package]]
 name = "moraine"
+# Not published while the workspace patches slatedb; see the crate's
+# `publish = false`. Releases still cut tags and a changelog, and the
+# extension still ships.
+publish = false
+# What makes release-plz consider an unpublishable crate at all: the last
+# released version is read off a git tag rather than the registry, which
+# has stopped moving.
+git_only = true
 # The extension release references the released commit; the crate tag is fixed.
 git_tag_name = "v{{ version }}"
 # Single workspace changelog: moraine owns the one CHANGELOG.md at the repo root
