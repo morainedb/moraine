@@ -270,6 +270,14 @@ pub struct CatalogOptions {
     /// the one [`register_commit_log`](crate::register_commit_log) holds for
     /// the process. `None` (the default) falls back to the registered
     /// provider, and to the store's own log when none is registered.
+    ///
+    /// A provider may declare that compaction belongs to another process
+    /// ([`CommitLogProvider::external_compaction`](crate::CommitLogProvider::external_compaction)).
+    /// Where it does, **a compactor must run against the lake**: no
+    /// writer over the log compacts, every fold writes an L0 file and
+    /// closes, and once eight have accumulated the store stops accepting
+    /// writes and does not recover on its own. Eight folds, whatever
+    /// [`commit_log_fold_slots`](Self::commit_log_fold_slots) is.
     pub commit_log: Option<Arc<dyn crate::CommitLogProvider>>,
     /// Whether a read-only open over a commit log tails the log, seeing a
     /// commit once its slot lands rather than once a folder has folded
@@ -304,6 +312,12 @@ pub struct CatalogOptions {
     /// that trails less; larger is rarer and lumpier, and the process
     /// that lands the slot pays. Zero folds after every commit.
     /// Defaults to 1024.
+    ///
+    /// This paces the folds; it does not bound how many the store can
+    /// take. Each one writes an L0 file, and where the provider leaves
+    /// compaction to another process, that process is what keeps them
+    /// from piling up — see [`commit_log`](Self::commit_log). A larger
+    /// interval buys time before the eighth fold, not more than eight.
     pub commit_log_fold_slots: u64,
     /// Local directory under which each store's block cache and the parsed
     /// Parquet metadata cache keep their disk tiers, recovered by the next
