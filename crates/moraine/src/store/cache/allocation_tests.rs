@@ -144,13 +144,27 @@ async fn scenario(disk: bool, admission: bool, root: &Path) {
     assert_eq!(probe(&db, &counters, 2, "two busy stores warm").await, 0);
     assert_budget();
 
-    futures::future::join_all(idle[1..].iter().map(|(writer, _)| write(writer, 4))).await;
+    // One at a time: the allocator hands out capacity as each insert asks
+    // for it, and a concurrent burst leaves some askers with none at all,
+    // so the store under test is never squeezed and the probe measures a
+    // working set nothing competed for.
+    for (writer, _) in &idle[1..] {
+        write(writer, 4).await;
+    }
     assert_budget();
     let eviction_reads = probe(&db, &counters, 2, "all stores busy").await;
     if !disk {
+        // A probe that read nothing changed nothing, so the cache still
+        // holds what it held when the probe ran: the capacities below are
+        // the ones that failed to squeeze it.
         assert!(
             eviction_reads > 0,
-            "oversubscribed stores never evicted blocks"
+            "oversubscribed stores never evicted blocks; (capacity, usage) per store: {:?}",
+            caches()
+                .stores
+                .values()
+                .map(|store| (store.capacity.load(Ordering::Relaxed), store.tier.usage()))
+                .collect::<Vec<_>>()
         );
     }
     assert_budget();
