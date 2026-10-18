@@ -1963,24 +1963,34 @@ impl Catalog {
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
     ) -> Result<u64> {
-        let Some(provider) = commit_log_provider(&options) else {
+        let Some(behind) = Self::unfolded_slots_of(Arc::clone(&object_store), &options).await?
+        else {
             return Err(Error::Configuration(
                 "a fold sprint needs a commit-log provider".to_string(),
             ));
         };
-        let log_store = StoreBuilder::new(&options.path, Arc::clone(&object_store))
-            .wal_object_store(
-                options
-                    .wal_store
-                    .as_ref()
-                    .map(|wal| Arc::clone(wal.object_store())),
-            )
-            .log_store();
-        let replay_point = census::replay_point(&options.path, Arc::clone(&object_store)).await?;
-        let behind = provider
-            .committer(log_store, &options.path)
-            .unfolded(replay_point)
-            .await?;
+
+        // A fold writes an L0 file, and where the provider leaves
+        // compaction to another process nothing merges those away. A
+        // store already at its limit would stall on that write and never
+        // come back, taking the commit that triggered the fold with it.
+        // Fold nothing instead: the slots are durable, the log grows
+        // rather than the writer stopping, and the first fold after a
+        // compactor runs picks up everything this one left.
+        let ceiling = slatedb::config::Settings::default().l0_max_ssts;
+        let l0_files = census::l0_files(&options.path, Arc::clone(&object_store)).await?;
+        if usize::try_from(l0_files).unwrap_or(usize::MAX) + 1 >= ceiling {
+            warn!(
+                l0_files,
+                ceiling,
+                behind,
+                "not folding: the store is at its limit of unmerged files and nothing has \
+                 compacted it. Commits carry on and the log grows until a compactor serves \
+                 this lake."
+            );
+
+            return Ok(0);
+        }
 
         let (db, log) = take_store(object_store, &options).await?;
         match &log {
@@ -1993,6 +2003,39 @@ impl Catalog {
         }
 
         Ok(behind)
+    }
+
+    /// How many slots the folded store lacks, for a lake this process
+    /// has not opened. `None` without a commit-log provider, where
+    /// there is no tail to be behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's error if the manifest or the log cannot be
+    /// read.
+    pub async fn unfolded_slots_of(
+        object_store: Arc<dyn ObjectStore>,
+        options: &CatalogOptions,
+    ) -> Result<Option<u64>> {
+        let Some(provider) = commit_log_provider(options) else {
+            return Ok(None);
+        };
+
+        let log_store = StoreBuilder::new(&options.path, Arc::clone(&object_store))
+            .wal_object_store(
+                options
+                    .wal_store
+                    .as_ref()
+                    .map(|wal| Arc::clone(wal.object_store())),
+            )
+            .log_store();
+        let replay_point = census::replay_point(&options.path, object_store).await?;
+
+        provider
+            .committer(log_store, &options.path)
+            .unfolded(replay_point)
+            .await
+            .map(Some)
     }
 
     /// How many slots the folded store lacks: what a cold open would
