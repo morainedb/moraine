@@ -61,7 +61,9 @@ use crate::{
         proto::HeadValue,
     },
     transaction::{
-        MigrationReport, Transaction, commit, commit::FORMAT_WITH_COMMIT_LOG, migration,
+        MigrationReport, Transaction, commit,
+        commit::{FORMAT_WITH_COMMIT_LOG, MAX_FORMAT_VERSION},
+        migration,
         session::CommitSession,
     },
 };
@@ -215,6 +217,17 @@ impl Store {
             Self::Reader(_) | Self::Committer { .. } => commit::CommitDurability::OnFlushInterval,
         }
     }
+}
+
+/// What [`Catalog::demote`] left: the slots it folded on the way, and
+/// the format the store now carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Demoted {
+    /// Slots folded into the store before it was stamped.
+    pub folded: u64,
+    /// The format the store was stamped at: the one below the log's.
+    pub format: u64,
 }
 
 /// Options for opening a catalog.
@@ -2003,6 +2016,135 @@ impl Catalog {
         }
 
         Ok(behind)
+    }
+
+    /// Takes a lake off its commit log, so a binary without the log's
+    /// provider can open it again.
+    ///
+    /// Adoption stamped the store at the log-resident format and put its
+    /// commits in the log; a binary without the provider refuses such a
+    /// store rather than commit past a log it cannot read. This is the
+    /// way back: take the store, fold every slot, stamp it at the format
+    /// below the log's, write that out, and let go. The provider's own
+    /// log is then dead weight the provider removes — the base object
+    /// and any slot — since this crate cannot reach into a log it only
+    /// knows through plugs.
+    ///
+    /// Stop every committer first. Taking the store fences them off the
+    /// store, but not off the log: a slot landing after the fold is a
+    /// commit this would leave behind, so a tail that is not empty after
+    /// the fold is refused rather than folded again and raced.
+    ///
+    /// A store already below the log's format is left as it is, with
+    /// nothing folded and without taking it, so an interrupted demote
+    /// can be run again. Demoting is one way where the provider numbers
+    /// its slots above a store's own rows: a demoted store has rows up
+    /// there, and such a provider refuses to adopt it again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Configuration`] without a commit-log provider — the lake
+    /// was adopted with one and must be left with it; [`Error::Constraint`]
+    /// if the store is at its limit of unmerged files, since the stamp is
+    /// one more write and would stall, or if a committer landed a slot
+    /// after the fold; otherwise the store's error.
+    pub async fn demote(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+    ) -> Result<Demoted> {
+        if commit_log_provider(&options).is_none() {
+            return Err(Error::Configuration(
+                "demoting needs the commit-log provider the lake was adopted with".to_string(),
+            ));
+        }
+
+        // Read before taking: an open with the provider adopts a store
+        // below the log's format, which a demoted store must not be again.
+        let (reader, _counters) = StoreBuilder::new(&options.path, Arc::clone(&object_store))
+            .wal_object_store(
+                options
+                    .wal_store
+                    .as_ref()
+                    .map(|wal| Arc::clone(wal.object_store())),
+            )
+            .open_reader()
+            .await?;
+        let format = crate::store::read::read_format(ReadHandle::Reader(&reader)).await?;
+        reader.close().await.map_err(Error::from)?;
+        match format {
+            None => {
+                return Err(Error::NotFound(format!(
+                    "no catalog at {}: nothing to demote",
+                    options.path
+                )));
+            }
+            Some(format) if format.format_version < FORMAT_WITH_COMMIT_LOG => {
+                return Ok(Demoted {
+                    folded: 0,
+                    format: format.format_version,
+                });
+            }
+            Some(_) => {}
+        }
+
+        // The stamp is one more write and a flush. A store at its limit
+        // would stall on it and never come back.
+        let ceiling = slatedb::config::Settings::default().l0_max_ssts;
+        let l0_files = census::l0_files(&options.path, Arc::clone(&object_store)).await?;
+        if usize::try_from(l0_files).unwrap_or(usize::MAX) + 1 >= ceiling {
+            return Err(Error::Constraint(format!(
+                "the store holds {l0_files} unmerged files against a limit of {ceiling}; \
+                 compact it before demoting, or the stamp cannot be written"
+            )));
+        }
+
+        let (db, log) = take_store(object_store, &options).await?;
+        let Some(log) = log else {
+            db.close().await.map_err(Error::from)?;
+            return Err(Error::Configuration(
+                "the store opened without a commit log to leave".to_string(),
+            ));
+        };
+        let _held = log.guard.lock().await;
+
+        let folded = log.fold_tail().await?;
+        let landed = log.committer.tail().await?;
+        if let Some((sequence, _)) = landed.first() {
+            release_held_store(&log).await?;
+            return Err(Error::Constraint(format!(
+                "slot {sequence} landed after the fold: a committer is still writing this \
+                 lake; stop every committer before demoting"
+            )));
+        }
+
+        // The format below the log's, with no batch origin: what the
+        // bootstrap writes for a store that was never adopted.
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put(
+            crate::store::key::Key::Sys(crate::store::key::SysKey::Format).encode(),
+            crate::store::value::encode_value(&crate::store::proto::FormatValue {
+                format_version: MAX_FORMAT_VERSION,
+                writer_version: env!("CARGO_PKG_VERSION").to_string(),
+                commit_log_batch_origin: None,
+            }),
+        );
+        drop(
+            db.write_with_options(batch, &slatedb::config::WriteOptions::default())
+                .await
+                .map_err(Error::from)?,
+        );
+        commit::flush_memtable(&db).await?;
+        release_held_store(&log).await?;
+        info!(
+            folded,
+            format = MAX_FORMAT_VERSION,
+            "demoted the lake off its commit log"
+        );
+
+        Ok(Demoted {
+            folded,
+            format: MAX_FORMAT_VERSION,
+        })
     }
 
     /// How many slots the folded store lacks, for a lake this process

@@ -1171,3 +1171,66 @@ async fn the_unfolded_tail_can_be_read_without_opening_the_lake() {
     );
     committer.close().await.unwrap();
 }
+
+/// Demoting takes a lake off its log: the slots are folded, the stamp
+/// drops below the log's format, and a binary with no provider — which
+/// refused the lake before — opens it and reads what was committed.
+#[tokio::test]
+async fn a_demoted_lake_opens_without_its_provider() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    let provider = Arc::new(TestProvider::default());
+    let adopted = CatalogOptions {
+        commit_log: Some(provider.clone()),
+        ..options_at("lake")
+    };
+
+    let committer = Catalog::open(object_store.clone(), adopted.clone())
+        .await
+        .unwrap();
+    for name in ["a", "b"] {
+        committer
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+    committer.close().await.unwrap();
+
+    // Adopted, so a plain open is refused.
+    assert!(matches!(
+        Catalog::open(object_store.clone(), options_at("lake")).await,
+        Err(crate::Error::Migration(_))
+    ));
+
+    let demoted = Box::pin(Catalog::demote(object_store.clone(), adopted.clone()))
+        .await
+        .unwrap();
+    assert_eq!(demoted.format, FORMAT_WITH_COMMIT_LOG - 1);
+
+    // Again is a no-op, so a demote interrupted after the stamp can be rerun.
+    let again = Box::pin(Catalog::demote(object_store.clone(), adopted.clone()))
+        .await
+        .unwrap();
+    assert_eq!(again.folded, 0);
+
+    // A plain open now succeeds, and sees what was committed through the log.
+    let plain = Catalog::open(object_store.clone(), options_at("lake"))
+        .await
+        .unwrap();
+    let snapshot = plain.snapshot().await.unwrap();
+    assert!(snapshot.schema_by_name("a").is_some());
+    assert!(snapshot.schema_by_name("b").is_some());
+    plain.close().await.unwrap();
+}
+
+/// Demoting without the provider is refused: the lake was adopted with
+/// one, and only it can fold the log.
+#[tokio::test]
+async fn demoting_needs_the_provider() {
+    let object_store = Arc::new(InMemory::new());
+    bootstrapped(object_store.clone(), "lake").await;
+    assert!(matches!(
+        Box::pin(Catalog::demote(object_store, options_at("lake"))).await,
+        Err(crate::Error::Configuration(_))
+    ));
+}
