@@ -216,7 +216,8 @@ pub(crate) async fn validate_format(
             } else {
                 Err(Error::Migration(format!(
                     "store format {FORMAT_WITH_COMMIT_LOG} keeps its commits in a bucket-resident \
-                     commit log; opening it needs the commit-log library linked in and registered"
+                     commit log; opening it needs the commit-log library linked in and \
+                     registered, or the lake demoted off its log by a binary that has it"
                 )))
             }
         }
