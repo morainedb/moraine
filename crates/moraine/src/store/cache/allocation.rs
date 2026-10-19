@@ -34,7 +34,15 @@ impl StoreCache {
         let _caches = caches();
         if self.attached.load(Ordering::Acquire) == 0 {
             self.resize(0);
+            self.admitting.store(0, Ordering::Relaxed);
         }
+    }
+
+    /// Whether the store is after capacity: it holds entries, or holds a
+    /// grant whose entry is still to land.
+    fn busy(&self) -> bool {
+        self.attached.load(Ordering::Acquire) > 0
+            && (self.tier.usage() > 0 || self.admitting.load(Ordering::Relaxed) > 0)
     }
 
     /// Grows before admission, amortizing pressure checks over admitted bytes.
@@ -82,10 +90,7 @@ impl StoreCache {
             .filter(|store| store.capacity() > 0 && !std::ptr::eq(self, store.as_ref()))
             .collect();
         donors.sort_by_key(|store| store.tier.usage());
-        let busy = 1 + donors
-            .iter()
-            .filter(|store| store.attached.load(Ordering::Acquire) > 0 && store.tier.usage() > 0)
-            .count();
+        let busy = 1 + donors.iter().filter(|store| store.busy()).count();
         let fair = budget / as_bytes(busy);
         let growth = capacity
             .saturating_mul(2)
@@ -98,12 +103,16 @@ impl StoreCache {
         }
 
         // Reclaim unused allowance before evicting any other working set.
+        // A grant counts as used until its entry lands: usage shows nothing
+        // of it yet, and taking it back would drop that entry on arrival.
         for donor in &donors {
             if available >= target - capacity {
                 break;
             }
             let occupied = as_bytes(donor.tier.usage());
-            let protected = occupied.saturating_add(occupied / 3);
+            let protected = occupied
+                .saturating_add(occupied / 3)
+                .max(donor.admitting.load(Ordering::Relaxed));
             reclaim(donor, protected, target - capacity, &mut available);
         }
 
@@ -114,6 +123,7 @@ impl StoreCache {
                 reclaim(donor, fair, fair_target - capacity, &mut available);
             }
         }
+        self.admitting.store(entry_capacity, Ordering::Relaxed);
         self.resize(target.min(capacity + available));
     }
 }

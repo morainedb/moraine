@@ -144,13 +144,10 @@ async fn scenario(disk: bool, admission: bool, root: &Path) {
     assert_eq!(probe(&db, &counters, 2, "two busy stores warm").await, 0);
     assert_budget();
 
-    // One at a time: the allocator hands out capacity as each insert asks
-    // for it, and a concurrent burst leaves some askers with none at all,
-    // so the store under test is never squeezed and the probe measures a
-    // working set nothing competed for.
-    for (writer, _) in &idle[1..] {
-        write(writer, 4).await;
-    }
+    // All at once: each store's grant precedes its insert, and a reclaim
+    // that ran in between used to take the grant back and leave that
+    // store with nothing, so the store under test was never squeezed.
+    futures::future::join_all(idle[1..].iter().map(|(writer, _)| write(writer, 4))).await;
     assert_budget();
     let eviction_reads = probe(&db, &counters, 2, "all stores busy").await;
     if !disk {
@@ -222,6 +219,83 @@ async fn idle_attaches_do_not_evict_an_active_working_set() {
         );
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+const GRANT_CHILD: &str = "MORAINE_CACHE_GRANT_CHILD";
+
+/// Two stores reserve before either inserts, as the insert path does: the
+/// second's reclaim runs while the first's grant has no usage behind it.
+async fn fresh_grant_scenario() {
+    let config = CacheConfig {
+        auxiliary_percent: None,
+        memory: Some(8 * 1024 * 1024),
+        dir: None,
+        disk_size: None,
+    };
+    let identity = crate::CacheIdentity::new("grant-test");
+    let location = |path: &str| StoreLocation {
+        identity,
+        path: path.to_owned(),
+    };
+    let _first = shared(&config, location("first"), store_counters())
+        .await
+        .unwrap();
+    let _second = shared(&config, location("second"), store_counters())
+        .await
+        .unwrap();
+    let (first, second) = {
+        let caches = caches();
+        (
+            Arc::clone(&caches.stores[&location("first")]),
+            Arc::clone(&caches.stores[&location("second")]),
+        )
+    };
+
+    let block = 64 * 1024;
+    let needed = as_bytes(block) * as_bytes(CACHE_SHARDS * 2);
+    first.reserve(as_bytes(block));
+    assert!(
+        first.capacity.load(Ordering::Relaxed) >= needed,
+        "the first grant admits the block it was asked for"
+    );
+
+    second.reserve(as_bytes(block));
+    let (first_capacity, second_capacity) = (
+        first.capacity.load(Ordering::Relaxed),
+        second.capacity.load(Ordering::Relaxed),
+    );
+    assert!(
+        first_capacity >= needed,
+        "the peer's reserve took the grant before its insert landed: first {first_capacity}, \
+         second {second_capacity}"
+    );
+    assert!(
+        second_capacity >= needed,
+        "the second store still gets what its block needs: {second_capacity}"
+    );
+    assert_budget();
+}
+
+/// A grant whose insert has not landed is not reclaimed to nothing: the
+/// unused-allowance pass leaves a store what its latest entry needs.
+#[tokio::test]
+async fn a_fresh_grant_survives_a_peer_reclaim() {
+    if std::env::var(GRANT_CHILD).is_ok() {
+        fresh_grant_scenario().await;
+        return;
+    }
+    let name = "store::cache::allocation_tests::a_fresh_grant_survives_a_peer_reclaim";
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(GRANT_CHILD, "1")
+        .output()
+        .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 const BURST_CHILD: &str = "MORAINE_CACHE_BURST_CHILD";

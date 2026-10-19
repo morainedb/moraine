@@ -898,6 +898,10 @@ struct StoreCache {
     attached: AtomicU64,
     capacity: AtomicU64,
     pressure: AtomicU64,
+    /// What the latest grant's entry needs admitted. A grant precedes its
+    /// insert, so until usage shows it this is the floor a reclaim of
+    /// unused allowance leaves the store.
+    admitting: AtomicU64,
     budget: Option<u64>,
 }
 
@@ -1337,6 +1341,7 @@ async fn open_store_cache(settled: &CacheConfig, location: StoreLocation) -> Arc
         attached: AtomicU64::new(0),
         capacity: AtomicU64::new(capacity),
         pressure: AtomicU64::new(0),
+        admitting: AtomicU64::new(0),
         budget: Some(shared_bytes),
     });
     caches().stores.insert(location, Arc::clone(&store));
@@ -1479,6 +1484,7 @@ impl TestCache {
                 attached: AtomicU64::new(1),
                 capacity: AtomicU64::new(memory),
                 pressure: AtomicU64::new(0),
+                admitting: AtomicU64::new(0),
                 budget: None,
             }),
             counters: Arc::clone(&counters),
