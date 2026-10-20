@@ -1129,6 +1129,38 @@ typedef struct MoraineFileColumnStatsRow {
   bool max_is_exact;
 } MoraineFileColumnStatsRow;
 
+// One `ducklake_file_variant_stats` row, as returned by
+// [`moraine_dump_file_variant_stats`] — flattened from the embedded
+// entries of the column's statistics record.
+typedef struct MoraineFileVariantStatsRow {
+  // `data_file_id`.
+  uint64_t data_file_id;
+  // `table_id`.
+  uint64_t table_id;
+  // `column_id`.
+  uint64_t column_id;
+  // `variant_path`, owned.
+  char *variant_path;
+  // `shredded_type`, owned.
+  char *shredded_type;
+  // `column_size_bytes`.
+  uint64_t column_size_bytes;
+  // `value_count`.
+  uint64_t value_count;
+  // `null_count`.
+  uint64_t null_count;
+  // `min_value`, owned, null if absent.
+  char *min_value;
+  // `max_value`, owned, null if absent.
+  char *max_value;
+  // Whether `contains_nan` is present.
+  bool has_contains_nan;
+  // `contains_nan`, valid iff `has_contains_nan`.
+  bool contains_nan;
+  // `extra_stats`, owned, null if absent.
+  char *extra_stats;
+} MoraineFileVariantStatsRow;
+
 // One `ducklake_tag` row, as returned by [`moraine_dump_tags`] —
 // flattened from the object's container record; ended entries included,
 // lifecycle carried verbatim.
@@ -3192,6 +3224,47 @@ int32_t moraine_dump_file_column_stats_of(struct MoraineCatalogHandle *handle,
 // [`moraine_dump_file_column_stats`] call wrote, not yet freed.
 void moraine_dump_file_column_stats_free(struct MoraineFileColumnStatsRow *items, size_t len);
 
+// Dumps every `ducklake_file_variant_stats` row into
+// `*out_items`/`*out_len`.
+//
+// # Safety
+//
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
+int32_t moraine_dump_file_variant_stats(struct MoraineCatalogHandle *handle,
+                                        struct MoraineFileVariantStatsRow **out_items,
+                                        size_t *out_len,
+                                        MoraineInterruptProbe probe,
+                                        void *probe_ctx,
+                                        struct MoraineError *err);
+
+// Dumps one table's `ducklake_file_variant_stats` rows into
+// `*out_items`/`*out_len`, in the order
+// [`moraine_dump_file_variant_stats`] would emit them. Free with
+// [`moraine_dump_file_variant_stats_free`].
+//
+// # Safety
+//
+// As [`moraine_dump_file_variant_stats`].
+int32_t moraine_dump_file_variant_stats_of(struct MoraineCatalogHandle *handle,
+                                           uint64_t table_id,
+                                           struct MoraineFileVariantStatsRow **out_items,
+                                           size_t *out_len,
+                                           MoraineInterruptProbe probe,
+                                           void *probe_ctx,
+                                           struct MoraineError *err);
+
+// Frees the array returned by [`moraine_dump_file_variant_stats`].
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_file_variant_stats`] call wrote, not yet freed.
+void moraine_dump_file_variant_stats_free(struct MoraineFileVariantStatsRow *items, size_t len);
+
 // Dumps every `ducklake_tag` row into `*out_items`/`*out_len`.
 //
 // # Safety
@@ -3973,6 +4046,36 @@ int32_t moraine_tx_dump_partition_columns(struct MoraineTxHandle *tx,
 // duration of this call.
 int32_t moraine_tx_dump_file_partition_values(struct MoraineTxHandle *tx,
                                               struct MoraineFilePartitionValueRow **out_items,
+                                              size_t *out_len,
+                                              struct MoraineError *err);
+
+// Dumps every `ducklake_file_variant_stats` row as this transaction
+// sees it: committed rows at the transaction's read point with its own
+// staged rows over them. Freed with
+// `moraine_dump_file_variant_stats_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_file_variant_stats(struct MoraineTxHandle *tx,
+                                           struct MoraineFileVariantStatsRow **out_items,
+                                           size_t *out_len,
+                                           struct MoraineError *err);
+
+// As [`moraine_tx_dump_file_variant_stats`], narrowed to one table: the
+// rows the whole dump would show for `table_id`, staged rows included.
+// Freed with `moraine_dump_file_variant_stats_free`.
+//
+// # Safety
+//
+// As [`moraine_tx_dump_file_variant_stats`].
+int32_t moraine_tx_dump_file_variant_stats_of(struct MoraineTxHandle *tx,
+                                              uint64_t table_id,
+                                              struct MoraineFileVariantStatsRow **out_items,
                                               size_t *out_len,
                                               struct MoraineError *err);
 

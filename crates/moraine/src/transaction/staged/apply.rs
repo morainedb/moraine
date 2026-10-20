@@ -10,12 +10,12 @@ use super::{
     decode::{
         Cursor, StatsKey, decode_column, decode_column_mapping, decode_column_tag_row,
         decode_data_file, decode_delete_file, decode_delete_key, decode_end,
-        decode_file_column_stats, decode_file_partition_value, decode_gc_file_row,
-        decode_hard_delete, decode_macro, decode_macro_impl, decode_macro_parameter,
-        decode_metadata, decode_metadata_key, decode_name_mapping, decode_partition_column,
-        decode_partition_info, decode_schema, decode_sort_expression, decode_sort_info,
-        decode_table, decode_table_column_stats, decode_table_stats, decode_tag_row, decode_view,
-        decode_view_column_tag_row, table_value,
+        decode_file_column_stats, decode_file_partition_value, decode_file_variant_stats,
+        decode_gc_file_row, decode_hard_delete, decode_macro, decode_macro_impl,
+        decode_macro_parameter, decode_metadata, decode_metadata_key, decode_name_mapping,
+        decode_partition_column, decode_partition_info, decode_schema, decode_sort_expression,
+        decode_sort_info, decode_table, decode_table_column_stats, decode_table_stats,
+        decode_tag_row, decode_view, decode_view_column_tag_row, table_value,
     },
     proto,
     rebase::Rebase,
@@ -30,6 +30,7 @@ pub(super) struct ChildRows {
     pub(super) partition_columns: HashMap<u64, Vec<proto::PartitionColumn>>,
     pub(super) sort_expressions: HashMap<u64, Vec<proto::SortExpression>>,
     pub(super) file_partition_values: HashMap<(u64, u64), Vec<proto::FilePartitionValue>>,
+    pub(super) file_variant_stats: HashMap<(u64, u64, u64), Vec<proto::FileVariantStats>>,
     pub(super) macro_implementations: HashMap<u64, Vec<proto::MacroImplementation>>,
     pub(super) macro_parameters: HashMap<(u64, u64), Vec<proto::MacroParameter>>,
     pub(super) name_mappings: HashMap<u64, Vec<proto::NameMapping>>,
@@ -95,6 +96,16 @@ pub(super) fn collect_child_rows(ops: &[RowOperation], rebase: &Rebase) -> Resul
                         .or_default()
                         .push(value);
                 }
+                TableKind::FileVariantStats => {
+                    let ((table_id, data_file_id, column_id), value) =
+                        decode_file_variant_stats(cells)?;
+                    let column = (table_id, rebase.file_id(data_file_id), column_id);
+                    children
+                        .file_variant_stats
+                        .entry(column)
+                        .or_default()
+                        .push(value);
+                }
                 TableKind::MacroImpl => {
                     let (macro_id, implementation) = decode_macro_impl(cells)?;
                     children
@@ -134,6 +145,10 @@ pub(super) fn collect_child_rows(ops: &[RowOperation], rebase: &Rebase) -> Resul
 
     for values in children.file_partition_values.values_mut() {
         values.sort_by_key(|v| v.partition_key_index);
+    }
+
+    for stats in children.file_variant_stats.values_mut() {
+        stats.sort_by(|left, right| left.variant_path.cmp(&right.variant_path));
     }
 
     for implementations in children.macro_implementations.values_mut() {
@@ -464,12 +479,14 @@ fn apply_tag_insert(
     Ok(())
 }
 
-/// Applies one unversioned statistics insert.
+/// Applies one unversioned statistics insert, folding in the variant
+/// entries staged for the column it describes.
 fn apply_stats_insert(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
     rebase: &Rebase,
+    children: &mut ChildRows,
     touched: &mut Touched,
 ) -> Result<()> {
     match table {
@@ -493,6 +510,10 @@ fn apply_stats_insert(
         TableKind::FileColumnStats => {
             let mut value = decode_file_column_stats(cells)?;
             rebase.file_column_stats(&mut value);
+            value.variant_stats = children
+                .file_variant_stats
+                .remove(&(value.table_id, value.data_file_id, value.column_id))
+                .unwrap_or_default();
             touched.touch(EntityKey::FileColumnStats {
                 table_id: value.table_id,
                 data_file_id: value.data_file_id,
@@ -523,6 +544,7 @@ pub(super) fn apply_insert(
         | TableKind::PartitionColumn
         | TableKind::SortExpression
         | TableKind::FilePartitionValue
+        | TableKind::FileVariantStats
         | TableKind::MacroImpl
         | TableKind::MacroParameters
         | TableKind::NameMapping => {}
@@ -557,10 +579,6 @@ pub(super) fn apply_insert(
         }
         TableKind::Column => {
             let mut value = decode_column(cells)?;
-            crate::catalog::inline_policy::ensure_inlinable(
-                &value.column_name,
-                &value.column_type,
-            )?;
             // Column tags outlive column versions: a new version carries
             // the prior version's entries forward.
             if let Some(prior) = base
@@ -605,7 +623,7 @@ pub(super) fn apply_insert(
         TableKind::Macro => apply_macro_insert(state, cells, children, touched)?,
         TableKind::ColumnMapping => apply_mapping_insert(state, cells, children, touched)?,
         TableKind::TableStats | TableKind::TableColumnStats | TableKind::FileColumnStats => {
-            apply_stats_insert(state, table, cells, rebase, touched)?;
+            apply_stats_insert(state, table, cells, rebase, children, touched)?;
         }
         TableKind::FilesScheduledForDeletion => {
             let value = decode_gc_file_row(cells)?;
@@ -985,6 +1003,7 @@ pub(super) fn apply_delete(
         TableKind::TableStats | TableKind::TableColumnStats | TableKind::FileColumnStats => {
             apply_stats_delete(state, table, cells, touched)
         }
+        TableKind::FileVariantStats => apply_variant_stats_delete(state, cells, touched),
         TableKind::FilesScheduledForDeletion => apply_schedule_delete(state, table, cells, touched),
         // The paired `ducklake_snapshot_changes` delete stages nothing.
         TableKind::Snapshot => {
@@ -1226,6 +1245,28 @@ pub(super) fn apply_embedded_delete(
 
 /// Removes a statistics row; an absent row is a no-op, since dead-table
 /// cleanup deletes by table id without reading first.
+/// Applies a delete against `ducklake_file_variant_stats`, keyed by the
+/// file whose entries go. They live inside their column's statistics
+/// record, so each affected record is edited where it stands.
+fn apply_variant_stats_delete(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    touched: &mut Touched,
+) -> Result<()> {
+    let mut c = Cursor::new(TableKind::FileVariantStats, cells);
+    let data_file_id = c.u64()?;
+    let table_id = c.u64()?;
+    c.finish()?;
+    for column_id in state.clear_file_variant_stats(table_id, data_file_id) {
+        touched.touch(EntityKey::FileColumnStats {
+            table_id,
+            data_file_id,
+            column_id,
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn apply_stats_delete(
     state: &mut CatalogSnapshot,
     table: TableKind,

@@ -734,21 +734,6 @@ pub fn run_ducklake_read_only_sql_expect_err(
     combined_output(&output)
 }
 
-/// As [`run_ducklake_sql`], but returns combined stdout+stderr without
-/// asserting success — for statements expected to raise a moraine error.
-pub fn run_ducklake_sql_capturing(store_dir: &Path, data_path: &Path, sql: &str) -> String {
-    let output = run_session(
-        &Attach::Moraine {
-            store_dir,
-            data_path,
-            options: "",
-            read_only: false,
-        },
-        sql,
-    );
-    combined_output(&output)
-}
-
 /// Every `.parquet` file under `dir`, recursively.
 pub fn parquet_files_under(dir: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();

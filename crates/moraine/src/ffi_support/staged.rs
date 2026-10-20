@@ -99,6 +99,74 @@ pub async fn visible_file_partition_value_rows(
     Ok(rows)
 }
 
+/// `ducklake_file_variant_stats` rows as `tx` sees them.
+///
+/// # Errors
+///
+/// Returns an error if the scan fails or a staged row is malformed.
+#[doc(hidden)]
+pub async fn visible_file_variant_stats_rows(
+    tx: &StagedTransaction,
+) -> Result<Vec<crate::ffi_support::FileVariantStatsRow>> {
+    let columns = tx.visible_file_column_stats().await?;
+    let mut rows = crate::ffi_support::file_variant_stats_rows_from(columns);
+    rows.extend(tx.staged_file_variant_stats()?.into_iter().map(
+        |((table_id, data_file_id, column_id), value)| crate::ffi_support::FileVariantStatsRow {
+            data_file_id,
+            table_id,
+            column_id,
+            variant_path: value.variant_path,
+            shredded_type: value.shredded_type,
+            column_size_bytes: value.column_size_bytes,
+            value_count: value.value_count,
+            null_count: value.null_count,
+            min_value: value.min_value,
+            max_value: value.max_value,
+            contains_nan: value.contains_nan,
+            extra_stats: value.extra_stats,
+        },
+    ));
+
+    Ok(rows)
+}
+
+/// As [`visible_file_variant_stats_rows`], narrowed to one table.
+///
+/// # Errors
+///
+/// As [`visible_file_variant_stats_rows`].
+#[doc(hidden)]
+pub async fn visible_file_variant_stats_rows_of(
+    tx: &StagedTransaction,
+    table_id: u64,
+) -> Result<Vec<crate::ffi_support::FileVariantStatsRow>> {
+    let columns = tx.visible_file_column_stats_of(table_id).await?;
+    let mut rows = crate::ffi_support::file_variant_stats_rows_from(columns);
+    rows.extend(
+        tx.staged_file_variant_stats()?
+            .into_iter()
+            .filter(|((table, _, _), _)| *table == table_id)
+            .map(|((table_id, data_file_id, column_id), value)| {
+                crate::ffi_support::FileVariantStatsRow {
+                    data_file_id,
+                    table_id,
+                    column_id,
+                    variant_path: value.variant_path,
+                    shredded_type: value.shredded_type,
+                    column_size_bytes: value.column_size_bytes,
+                    value_count: value.value_count,
+                    null_count: value.null_count,
+                    min_value: value.min_value,
+                    max_value: value.max_value,
+                    contains_nan: value.contains_nan,
+                    extra_stats: value.extra_stats,
+                }
+            }),
+    );
+
+    Ok(rows)
+}
+
 /// `ducklake_sort_expression` rows as `tx` sees them.
 ///
 /// # Errors

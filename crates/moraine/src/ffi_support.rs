@@ -1277,6 +1277,92 @@ pub async fn dump_file_partition_value_rows(
     ))
 }
 
+/// One `ducklake_file_variant_stats` row, flattened from the record of
+/// the column it describes.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileVariantStatsRow {
+    /// The data file the stats describe.
+    pub data_file_id: u64,
+    /// The file's table.
+    pub table_id: u64,
+    /// The column the stats describe.
+    pub column_id: u64,
+    /// Path to the shredded field within the variant.
+    pub variant_path: String,
+    /// The shredded field's type, as DuckLake names it.
+    pub shredded_type: String,
+    /// `column_size_bytes`.
+    pub column_size_bytes: u64,
+    /// `value_count`.
+    pub value_count: u64,
+    /// `null_count`.
+    pub null_count: u64,
+    /// `min_value`, absent when unknown.
+    pub min_value: Option<String>,
+    /// `max_value`, absent when unknown.
+    pub max_value: Option<String>,
+    /// `contains_nan`, absent when unknown.
+    pub contains_nan: Option<bool>,
+    /// `extra_stats`, absent when unknown.
+    pub extra_stats: Option<String>,
+}
+
+/// The `FileVariantStats` entries carried by `parents`, flattened.
+#[doc(hidden)]
+#[must_use]
+pub fn file_variant_stats_rows_from(
+    parents: Vec<FileColumnStatsRecord>,
+) -> Vec<FileVariantStatsRow> {
+    parents
+        .into_iter()
+        .flat_map(|column| {
+            let (data_file_id, table_id, column_id) =
+                (column.data_file_id, column.table_id, column.column_id);
+            column
+                .variant_stats
+                .into_iter()
+                .map(move |value| FileVariantStatsRow {
+                    data_file_id,
+                    table_id,
+                    column_id,
+                    variant_path: value.variant_path,
+                    shredded_type: value.shredded_type,
+                    column_size_bytes: value.column_size_bytes,
+                    value_count: value.value_count,
+                    null_count: value.null_count,
+                    min_value: value.min_value,
+                    max_value: value.max_value,
+                    contains_nan: value.contains_nan,
+                    extra_stats: value.extra_stats,
+                })
+        })
+        .collect()
+}
+
+/// Every `ducklake_file_variant_stats` row. Unversioned, as
+/// [`dump_file_column_stats`].
+#[doc(hidden)]
+pub async fn dump_file_variant_stats_rows(
+    catalog: &ReadOnlyCatalog,
+) -> Result<Vec<FileVariantStatsRow>> {
+    Ok(file_variant_stats_rows_from(
+        dump_file_column_stats(catalog).await?,
+    ))
+}
+
+/// One table's `ducklake_file_variant_stats` rows, in the order
+/// [`dump_file_variant_stats_rows`] would emit them.
+#[doc(hidden)]
+pub async fn dump_file_variant_stats_rows_of(
+    catalog: &ReadOnlyCatalog,
+    table_id: u64,
+) -> Result<Vec<FileVariantStatsRow>> {
+    Ok(file_variant_stats_rows_from(
+        dump_file_column_stats_of(catalog, table_id).await?,
+    ))
+}
+
 /// One `ducklake_sort_expression` row, flattened from its spec's record.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]

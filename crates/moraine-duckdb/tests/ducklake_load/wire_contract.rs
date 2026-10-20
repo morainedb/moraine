@@ -264,11 +264,10 @@ fn ducklakes_catalog_access_set_is_pinned() {
          staged-row translation."
     );
 
-    // `ducklake_file_variant_stats` is conspicuously absent, and stays so:
+    // `ducklake_file_variant_stats` is absent from this workload because
     // DuckLake writes it only for a column whose extra stats are VARIANT,
-    // and moraine refuses a VARIANT column at creation. The always-empty
-    // stand-in is therefore exactly right until VARIANT itself is
-    // supported, not an oversight.
+    // and none here is one. A table carrying a variant does reach it —
+    // see `variant_columns_inline_flush_and_carry_their_statistics`.
     assert!(
         !observed
             .iter()

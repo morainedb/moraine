@@ -337,6 +337,30 @@ pub(super) fn decode_file_column_stats(cells: &[Cell]) -> Result<proto::FileColu
     Ok(value)
 }
 
+/// Decodes one `ducklake_file_variant_stats` row into the column it
+/// describes and the entry folded into that column's record.
+pub(super) fn decode_file_variant_stats(
+    cells: &[Cell],
+) -> Result<((u64, u64, u64), proto::FileVariantStats)> {
+    let mut c = Cursor::new(TableKind::FileVariantStats, cells);
+    let data_file_id = c.u64()?;
+    let table_id = c.u64()?;
+    let column_id = c.u64()?;
+    let value = proto::FileVariantStats {
+        variant_path: c.string()?,
+        shredded_type: c.string()?,
+        column_size_bytes: c.u64()?,
+        value_count: c.u64()?,
+        null_count: c.u64()?,
+        min_value: c.opt_string()?,
+        max_value: c.opt_string()?,
+        contains_nan: c.opt_bool()?,
+        extra_stats: c.opt_string()?,
+    };
+    c.finish()?;
+    Ok(((table_id, data_file_id, column_id), value))
+}
+
 pub(super) fn decode_partition_info(cells: &[Cell]) -> Result<proto::PartitionValue> {
     let mut c = Cursor::new(TableKind::PartitionInfo, cells);
     let value = proto::PartitionValue {
@@ -585,6 +609,7 @@ pub(super) fn decode_end(table: TableKind, cells: &[Cell]) -> Result<(EntityKey,
         | TableKind::FileColumnStats
         | TableKind::PartitionColumn
         | TableKind::FilePartitionValue
+        | TableKind::FileVariantStats
         | TableKind::SortExpression
         | TableKind::Tag
         | TableKind::ColumnTag

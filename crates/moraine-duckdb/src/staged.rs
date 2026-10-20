@@ -31,13 +31,14 @@ use crate::{
     dumps::{
         MoraineColumnMappingRow, MoraineColumnRow, MoraineColumnTagRow, MoraineDataFileRow,
         MoraineDeleteFileRow, MoraineFileColumnStatsRow, MoraineFilePartitionValueRow,
-        MoraineMacroImplRow, MoraineMacroParameterRow, MoraineMacroRow, MoraineNameMappingRow,
-        MoraineOptionRow, MorainePartitionColumnRow, MorainePartitionInfoRow,
-        MoraineScheduledDeletionRow, MoraineSchemaRow, MoraineSchemaVersionRow, MoraineSnapshotRow,
-        MoraineSortExpressionRow, MoraineSortInfoRow, MoraineTableColumnStatsRow, MoraineTableRow,
-        MoraineTableStatsRow, MoraineTagRow, MoraineViewColumnTagRow, MoraineViewRow, column_rows,
-        column_tag_rows, data_file_rows, delete_file_rows, file_column_stats_rows,
-        file_partition_value_rows, macro_impl_rows, macro_parameter_rows, macro_rows, mapping_rows,
+        MoraineFileVariantStatsRow, MoraineMacroImplRow, MoraineMacroParameterRow, MoraineMacroRow,
+        MoraineNameMappingRow, MoraineOptionRow, MorainePartitionColumnRow,
+        MorainePartitionInfoRow, MoraineScheduledDeletionRow, MoraineSchemaRow,
+        MoraineSchemaVersionRow, MoraineSnapshotRow, MoraineSortExpressionRow, MoraineSortInfoRow,
+        MoraineTableColumnStatsRow, MoraineTableRow, MoraineTableStatsRow, MoraineTagRow,
+        MoraineViewColumnTagRow, MoraineViewRow, column_rows, column_tag_rows, data_file_rows,
+        delete_file_rows, file_column_stats_rows, file_partition_value_rows,
+        file_variant_stats_rows, macro_impl_rows, macro_parameter_rows, macro_rows, mapping_rows,
         name_mapping_rows, option_rows, partition_column_rows, partition_info_rows,
         scheduled_deletion_rows, schema_rows, schema_version_rows, snapshot_rows,
         sort_expression_rows, sort_info_rows, table_column_stats_rows, table_rows,
@@ -1097,6 +1098,61 @@ pub unsafe extern "C" fn moraine_tx_dump_file_partition_values(
         err,
         staged::visible_file_partition_value_rows,
         file_partition_value_rows
+    )
+}
+
+/// Dumps every `ducklake_file_variant_stats` row as this transaction
+/// sees it: committed rows at the transaction's read point with its own
+/// staged rows over them. Freed with
+/// `moraine_dump_file_variant_stats_free`.
+///
+/// # Safety
+///
+/// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+/// not yet committed or rolled back; its catalog must still be attached.
+/// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+/// non-null, must be a valid, writable [`MoraineError`]. All for the
+/// duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_file_variant_stats(
+    tx: *mut MoraineTxHandle,
+    out_items: *mut *mut MoraineFileVariantStatsRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        staged::visible_file_variant_stats_rows,
+        file_variant_stats_rows
+    )
+}
+
+/// As [`moraine_tx_dump_file_variant_stats`], narrowed to one table: the
+/// rows the whole dump would show for `table_id`, staged rows included.
+/// Freed with `moraine_dump_file_variant_stats_free`.
+///
+/// # Safety
+///
+/// As [`moraine_tx_dump_file_variant_stats`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_file_variant_stats_of(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    out_items: *mut *mut MoraineFileVariantStatsRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    tx_dump_body!(
+        tx,
+        out_items,
+        out_len,
+        err,
+        staged::visible_file_variant_stats_rows_of,
+        file_variant_stats_rows,
+        table_id
     )
 }
 

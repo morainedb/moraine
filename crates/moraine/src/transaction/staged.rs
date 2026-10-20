@@ -180,11 +180,18 @@ pub enum TableKind {
     /// adds it, so it is last: a kind's position is its wire
     /// discriminant.
     ViewColumnTag,
+    /// `ducklake_file_variant_stats` — entries folded into the
+    /// `ducklake_file_column_stats` record of the column they describe.
+    FileVariantStats,
 }
+
+/// The column one `ducklake_file_variant_stats` row describes:
+/// `(table_id, data_file_id, column_id)`.
+pub type StatsColumn = (u64, u64, u64);
 
 impl TableKind {
     /// Every kind, in wire-discriminant order (`ALL[i] as i32 == i`).
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::Snapshot,
         Self::SnapshotChanges,
         Self::Schema,
@@ -212,6 +219,7 @@ impl TableKind {
         Self::NameMapping,
         Self::Metadata,
         Self::ViewColumnTag,
+        Self::FileVariantStats,
     ];
 }
 
@@ -1159,6 +1167,19 @@ impl StagedTransaction {
         self.staged_children(
             TableKind::FilePartitionValue,
             decode::decode_file_partition_value,
+        )
+    }
+
+    /// The `ducklake_file_variant_stats` rows this transaction staged,
+    /// each with the column it describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a staged row is malformed.
+    pub fn staged_file_variant_stats(&self) -> Result<Vec<(StatsColumn, proto::FileVariantStats)>> {
+        self.staged_children(
+            TableKind::FileVariantStats,
+            decode::decode_file_variant_stats,
         )
     }
 

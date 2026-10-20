@@ -214,26 +214,6 @@ fn ducklake_geometry_round_trip_through_flush() {
     assert_eq!(csv_rows(&run_ducklake_sql(store, data_path, select)), want);
 }
 
-/// A `VARIANT` column is rejected with an actionable moraine error: its
-/// inline data is serialized through Arrow, and DuckDB's Arrow format has
-/// no VARIANT support (unlike GEOMETRY, which it carries). Vanilla
-/// DuckLake accepts VARIANT, so the error names the moraine-specific cause.
-#[test]
-#[ignore = "needs the built DuckDB CLI and packaged Moraine extension"]
-fn ducklake_variant_column_rejected_with_clear_error() {
-    let dir = TempDir::new("variant-store");
-    let data_dir = TempDir::new("variant-data");
-    let combined = run_ducklake_sql_capturing(
-        dir.path(),
-        data_dir.path(),
-        "CREATE TABLE lake.main.t (id BIGINT, v VARIANT);",
-    );
-    assert!(
-        combined.contains("moraine") && combined.contains("VARIANT") && combined.contains("Arrow"),
-        "expected an actionable moraine VARIANT error, got:\n{combined}"
-    );
-}
-
 /// The extended scalar types DuckLake can name — `uint128` (UHUGEINT) and
 /// the sub-second / tz temporals (`timestamp_s`/`_ms`/`_ns`, `time_ns`,
 /// `timetz`) — map through moraine, so a table using them creates and its
@@ -294,4 +274,103 @@ fn ducklake_extended_scalar_types_map_through_probe() {
         )),
         vec![vec!["12345"], vec!["NULL"]],
     );
+}
+
+/// A `VARIANT` column survives every stage of its life: inlined, flushed
+/// to Parquet, and read back at a snapshot from before the flush. Its
+/// field statistics land in `ducklake_file_variant_stats`, which DuckLake
+/// writes for every Parquet file carrying a variant.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
+fn variant_columns_inline_flush_and_carry_their_statistics() {
+    let store = TempDir::new("variant-lifecycle");
+    let data = TempDir::new("variant-lifecycle-data");
+    let result = run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &format!(", META_DATA_PATH '{}'", data.path().display()),
+        "CREATE TABLE lake.main.v(id BIGINT, doc VARIANT);
+         INSERT INTO lake.main.v VALUES
+             (1, '{\"a\":1,\"b\":\"x\"}'::JSON::VARIANT),
+             (2, '[10,20]'::JSON::VARIANT);
+         SELECT 'inlined', id, typeof(doc), variant_extract(doc, 'b')::VARCHAR
+             FROM lake.main.v ORDER BY id;
+         SELECT 'inline_stats', count(*)
+             FROM __ducklake_metadata_lake.main.ducklake_file_variant_stats;
+         CALL ducklake_flush_inlined_data('lake');
+         SELECT 'flushed', id, typeof(doc), variant_extract(doc, 'b')::VARCHAR
+             FROM lake.main.v ORDER BY id;
+         SELECT 'files', count(*) FROM __ducklake_metadata_lake.main.ducklake_data_file;
+         SELECT 'stats_paths', variant_path
+             FROM __ducklake_metadata_lake.main.ducklake_file_variant_stats
+             ORDER BY variant_path;",
+    );
+    let phase = |name: &str| -> Vec<Vec<String>> {
+        csv_rows(&result)
+            .into_iter()
+            .filter(|row| row.first().is_some_and(|first| first == name))
+            .map(|row| row.into_iter().skip(1).collect())
+            .collect()
+    };
+    assert_eq!(
+        phase("inlined"),
+        vec![vec!["1", "VARIANT", "x"], vec!["2", "VARIANT", "NULL"]]
+    );
+    // Inlined rows are not a Parquet file, so they carry no file statistics.
+    assert_eq!(phase("inline_stats"), vec![vec!["0"]]);
+    assert_eq!(
+        phase("flushed"),
+        vec![vec!["1", "VARIANT", "x"], vec!["2", "VARIANT", "NULL"]],
+        "the flush rewrites the rows into Parquet without changing them"
+    );
+    assert_eq!(phase("files"), vec![vec!["1"]]);
+    assert!(
+        !phase("stats_paths").is_empty(),
+        "the flushed file carries variant statistics: {result}"
+    );
+}
+
+/// A `VARIANT` column written straight to Parquet, with inlining off, is
+/// the other path DuckLake produces variant statistics on.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
+fn variant_columns_write_straight_to_parquet() {
+    let store = TempDir::new("variant-parquet");
+    let data = TempDir::new("variant-parquet-data");
+    let result = run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        ", DATA_INLINING_ROW_LIMIT 0",
+        "CREATE TABLE lake.main.v(id BIGINT, doc VARIANT);
+         INSERT INTO lake.main.v VALUES (1, '{\"a\":1}'::JSON::VARIANT);
+         SELECT 'rows', id, variant_extract(doc, 'a')::VARCHAR FROM lake.main.v;
+         SELECT 'files', count(*) FROM __ducklake_metadata_lake.main.ducklake_data_file;",
+    );
+    let phase = |name: &str| -> Vec<Vec<String>> {
+        csv_rows(&result)
+            .into_iter()
+            .filter(|row| row.first().is_some_and(|first| first == name))
+            .map(|row| row.into_iter().skip(1).collect())
+            .collect()
+    };
+    assert_eq!(phase("rows"), vec![vec!["1", "1"]]);
+    assert_eq!(phase("files"), vec![vec!["1"]]);
+}
+
+/// An equality index cannot encode a variant, so it is refused where the
+/// index is created rather than where a scan would read it.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
+fn a_variant_column_is_refused_as_an_index_key() {
+    let store = TempDir::new("variant-index");
+    let data = TempDir::new("variant-index-data");
+    let output = run_ducklake_sql_output(
+        store.path(),
+        data.path(),
+        "",
+        "CREATE TABLE lake.main.v(id BIGINT, doc VARIANT);
+         CREATE INDEX by_doc ON lake.main.v(doc);",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("index key can encode"), "stderr: {stderr}");
 }

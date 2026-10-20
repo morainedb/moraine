@@ -7,7 +7,6 @@ implementation gaps, not supported attach modes.
 
 ## Next capabilities
 
-- [ ] `VARIANT` inlining and variant statistics.
 - [ ] Signed community-extension distribution.
 
 ## Foundations
@@ -53,7 +52,7 @@ build stays complete on the single-writer path without it.
 ## Catalog & schema
 - [x] Schemas, tables, and views
 - [x] Schema evolution: `ADD`/`RENAME`/`DROP COLUMN` and `ALTER COLUMN … TYPE` promotion, over inlined and flushed data (RFC 0012)
-- [x] All DuckLake scalar and nested `LIST`/`STRUCT`/`MAP` types, inline and post-flush; `VARIANT` pending (RFC 0005)
+- [x] All DuckLake scalar and nested `LIST`/`STRUCT`/`MAP` types, inline and post-flush, `VARIANT` included (RFC 0005)
 - [x] Column and name mapping for externally written Parquet, including hive-partitioned foreign files (RFC 0018)
 - [x] Scalar and table macros with parameters, overloads, defaults, and `CREATE OR REPLACE`/`DROP` (RFC 0019)
 
@@ -63,7 +62,7 @@ build stays complete on the single-writer path without it.
 - [x] Data inlining: inlined inserts/deletes plus flush, on by default (RFC 0005)
 - [x] Partitioning: definitions, per-file values, and partition-pruned reads (RFC 0013)
 - [x] Sort orders, set/changed/reset, with history (RFC 0013)
-- [x] Statistics for pruning: table, column, and per-file (`table_stats`, `table_column_stats`, `file_column_stats`); variant stats pending
+- [x] Statistics for pruning: table, column, and per-file (`table_stats`, `table_column_stats`, `file_column_stats`), with a variant column's per-path statistics folded into its column's record
 
 ## Transactions & time travel
 - [x] Multi-statement, cross-table ACID transactions with conflict detection; lost races surface as conflicts for DuckLake's retry (RFC 0004)
