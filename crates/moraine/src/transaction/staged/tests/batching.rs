@@ -251,6 +251,32 @@ async fn conflicting_members_decline_the_batch_rather_than_aborting_it() {
     assert_eq!(catalog.snapshot().await.unwrap().snapshot.snapshot_id, 3);
 }
 
+/// Two more inlined rows for table 1, appended after the two `head`
+/// already holds: what DuckLake stamps for a second insert.
+fn stage_inline_insert(tx: &mut StagedTransaction, head: u64, values: &[i64]) {
+    let (_, batch) = bigint_batch(values);
+    tx.stage(RowOperation::InlineInsert {
+        table_id: 1,
+        schema_version: 0,
+        begin_snapshot: head + 1,
+        row_id_start: 2,
+        row_count: 2,
+        arrow_body: inline_body(&batch).into(),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::TableStats,
+        cells: table_stats_row(1, 4, 4, 128),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(head + 1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(head + 1, "inlined_insert:1"),
+    });
+}
+
 /// Index upkeep derives entries from the rows the rebase moved: two
 /// concurrent inline inserts into an indexed table land with disjoint,
 /// dense row ids, and every value is findable under the id it got.
@@ -269,35 +295,15 @@ async fn concurrent_inline_inserts_into_an_indexed_table_rebase_their_entries() 
     seed_inline_rows(&catalog, head + 1).await;
     let head = head + 1;
 
-    let member = |values: &'static [i64]| {
-        let catalog = &catalog;
-        async move {
-            let (_, batch) = bigint_batch(values);
-            let mut tx = begin(catalog);
-            tx.stage(RowOperation::InlineInsert {
-                table_id: 1,
-                schema_version: 0,
-                begin_snapshot: head + 1,
-                row_id_start: 2,
-                row_count: 2,
-                arrow_body: inline_body(&batch).into(),
-            });
-            tx.stage(RowOperation::Insert {
-                table: TableKind::TableStats,
-                cells: table_stats_row(1, 4, 4, 128),
-            });
-            tx.stage(RowOperation::Insert {
-                table: TableKind::Snapshot,
-                cells: snapshot_row(head + 1, 1, 2),
-            });
-            tx.stage(RowOperation::Insert {
-                table: TableKind::SnapshotChanges,
-                cells: snapshot_changes_row(head + 1, "inlined_insert:1"),
-            });
-            tx.commit().await
-        }
-    };
-    let (a, b) = tokio::join!(member(&[30, 40]), member(&[50, 60]));
+    // Both transactions open before either commits, so both stamp their
+    // rows against `head` whichever order the commits run in: opened
+    // inside the join, the second reads the first's head and stamps a
+    // snapshot id at it, which is a lost race rather than a rebase.
+    let (mut a, mut b) = (begin(&catalog), begin(&catalog));
+    stage_inline_insert(&mut a, head, &[30, 40]);
+    stage_inline_insert(&mut b, head, &[50, 60]);
+
+    let (a, b) = tokio::join!(a.commit(), b.commit());
     let mut ids = vec![a.unwrap().get(), b.unwrap().get()];
     ids.sort_unstable();
     assert_eq!(ids, [head + 1, head + 2]);
@@ -334,6 +340,51 @@ async fn concurrent_inline_inserts_into_an_indexed_table_rebase_their_entries() 
         [2, 3, 4, 5],
         "the loser's rows moved past the winner's"
     );
+    assert_eq!(index_entry_count(&catalog, false, index_id).await, 6);
+    let stats = catalog.snapshot().await.unwrap().table_stats[&1];
+    assert_eq!((stats.record_count, stats.next_row_id), (6, 6));
+}
+
+/// The rebase moves index entries off a head that landed while the commit
+/// was open, not only off a member ahead of it on the same batch.
+#[tokio::test]
+async fn an_inline_insert_begun_before_a_landed_one_rebases_its_entries() {
+    use crate::{
+        catalog::{IndexId, TableId},
+        store::index_encoding::{IndexKeyValue, IntWidth},
+    };
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+    let head = catalog.snapshot().await.unwrap().snapshot.snapshot_id;
+    seed_inline_rows(&catalog, head + 1).await;
+    let head = head + 1;
+
+    let (mut early, mut landed) = (begin(&catalog), begin(&catalog));
+    stage_inline_insert(&mut early, head, &[50, 60]);
+    stage_inline_insert(&mut landed, head, &[30, 40]);
+
+    assert_eq!(landed.commit().await.unwrap().get(), head + 1);
+    assert_eq!(early.commit().await.unwrap().get(), head + 2);
+
+    let lookup = |value: i128| {
+        let catalog = &catalog;
+        async move {
+            catalog
+                .index_lookup(
+                    TableId::new(1),
+                    IndexId::new(index_id),
+                    &[IndexKeyValue::Int {
+                        value,
+                        width: IntWidth::I64,
+                    }],
+                )
+                .await
+                .unwrap()
+        }
+    };
+    for (value, row_id) in [(30, 2), (40, 3), (50, 4), (60, 5)] {
+        assert_eq!(lookup(value).await, [row_id], "value {value}");
+    }
     assert_eq!(index_entry_count(&catalog, false, index_id).await, 6);
     let stats = catalog.snapshot().await.unwrap().table_stats[&1];
     assert_eq!((stats.record_count, stats.next_row_id), (6, 6));
