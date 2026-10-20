@@ -91,11 +91,12 @@ build stays complete on the single-writer path without it.
   intervals, retaining conservative handling for arbitrary row-ID files.
 - [ ] Reduce metadata-query overhead in DuckDB/DuckLake. Measured: DuckLake's
   metadata SQL is 14.5 ms of a 23-25 ms one-row commit, against 3.3 ms of
-  moraine's own commit work, and two statements carry 69% of it — the
-  per-column file-list query DuckLake plans each scan from, and the snapshot
-  insert ([measurement](metadata-query-overhead.md)). The cost is per commit
-  rather than per file. Native metadata tables would still require a separate
-  storage design.
+  moraine's own commit work ([measurement](metadata-query-overhead.md)). It is
+  SQL front-end cost, not storage: parse, bind and optimize are 2.5 ms of a
+  2.7 ms statement, execution 0.2 ms, and a prepared statement saves only the
+  parse because DuckDB re-binds per execution. Native metadata tables would
+  move the 0.2 ms; the leverage is in not re-planning generated SQL every
+  commit, on DuckLake's side of the boundary.
 
 
 ## Hardening & release

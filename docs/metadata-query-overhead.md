@@ -73,16 +73,69 @@ per column of the target table — two calls here for a two-column table,
 which is why its call count is 2 and not 1, and which means its cost grows
 with column count rather than with file count.
 
+## Why those statements are slow
+
+None of it is data access. The same workload against a local-filesystem
+store costs 14.31 ms per commit against the S3-backed 14.48, and
+`commit-bench` records zero GETs per commit: catalog reads are served from
+moraine's in-memory projections, so there is nothing to wait for.
+
+Nor is it data volume. `EXPLAIN ANALYZE` on the file-list query reports
+every operator at 0µs over 1 to 3 rows, while the statement as a whole
+takes 3.1 ms.
+
+The time is DuckDB's SQL front-end. Profiling the same query in detail:
+
+| Phase | Fresh statement | Prepared `EXECUTE` |
+| --- | ---: | ---: |
+| Parse | 0.78 ms | 0.02 ms |
+| Plan (bind) | 0.98 ms | 0.99 ms |
+| Optimize | 0.66 ms | 0.55 ms |
+| Physical plan | 0.05 ms | 0.03 ms |
+| **Execute** | **0.21 ms** | **0.14 ms** |
+
+About 92% of the statement is turning roughly a kilobyte of generated SQL
+into a plan, to then run a query that returns one row.
+
+Preparing the statement does not fix it. Over 500 iterations, re-planning
+each time costs 2.69 ms per query and a prepared `EXECUTE` 2.12 ms — 21%
+off, which is the parse and nothing else. DuckDB re-binds and re-optimizes
+on every execution, and binding is the single largest phase.
+
+The front-end cost tracks how many metadata tables a statement names,
+which is why the file-list query is the most expensive one:
+
+| Moraine tables in the query | Front-end | Execute |
+| ---: | ---: | ---: |
+| 1 | 0.65 ms | 0.01 ms |
+| 2 | 0.84 ms | 0.06 ms |
+| 3 | 1.43 ms | 0.08 ms |
+
+Eight such statements per commit is the 14.5 ms.
+
 ## What this says about the roadmap item
 
 The premise holds: metadata queries really are the largest single
 component of a small commit, and larger than everything moraine does for
-itself. But the cost is concentrated rather than diffuse, which changes
-what is worth building. Two statements carry 69% of it, and the biggest is
-a *read* DuckLake issues to plan the `UPDATE`'s scan — not part of writing
-the commit at all.
+itself. Two statements carry 69% of it, and the biggest is a *read*
+DuckLake issues to plan the `UPDATE`'s scan — not part of writing the
+commit at all.
 
-Two caveats bound these numbers. A local endpoint understates the durable
-and request components, so against real S3 the metadata share falls even
-though its absolute ~14.5 ms would not. And the file-list query's cost
-tracks column count, so a wide table pays more than this two-column one.
+But the item's proposed remedy does not follow from the measurement.
+Native metadata tables are a storage change, and storage is not what the
+commit waits on: execution over the rows is 0.14–0.21 ms of a 2.7 ms
+statement. Serving the same SQL surface from a different store would move
+that fifth of a millisecond and leave the other 2.5 ms — parse, bind,
+optimize — exactly where it is. The leverage is in not re-planning the
+same generated SQL on every commit, which is DuckLake's and DuckDB's side
+of the boundary rather than moraine's: a bind-stable cached plan, or a
+catalog call that never becomes SQL text at all.
+
+Three caveats bound these numbers. A local endpoint understates the
+durable and request components, so against real S3 the metadata share
+falls even though its absolute ~14.5 ms would not. The file-list query's
+cost tracks column count, so a wide table pays more than this two-column
+one. And this lake is small — 16 files, 1,600 rows — so execution is near
+its floor; a lake large enough for real scan work shifts the balance back
+toward execution, which is visible already in the 13.4 → 14.1 ms step
+from 16 to 128 files.
