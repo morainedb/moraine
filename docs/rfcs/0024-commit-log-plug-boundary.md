@@ -33,10 +33,6 @@ Non-goals:
 
 - The protocol. Envelopes, the slot race, hole detection, truncation, and
   the fold loops are the library's; this RFC never names a slot.
-- The committer. Writing slots instead of the store's own log changes the
-  commit path, the in-process coalescer, and id allocation. That lands as
-  its own change under this boundary; until it does, a read-write open
-  with a provider is refused.
 - Extension signing and distribution. An enterprise extension loads under
   DuckDB's unsigned-extension setting from a private repository; that is
   the enterprise repository's concern.

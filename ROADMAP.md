@@ -1,17 +1,12 @@
 # Roadmap
 
-Moraine is in the **v0.6 release series**. This checklist records implemented
-DuckLake catalog coverage and remaining work; v0.1 is no longer a release
-target. Catalog features are validated against real DuckLake SQL in the e2e
-suite. Unchecked items are implementation gaps, not supported attach modes.
+Moraine is in the **v0.7 release series**. This checklist records implemented
+DuckLake catalog coverage and remaining work. Catalog features are validated
+against real DuckLake SQL in the e2e suite. Unchecked items are
+implementation gaps, not supported attach modes.
 
 ## Next capabilities
 
-- [ ] Independent multi-process writers. The current topology is one fenced
-  SlateDB writer with many readers. A conditional-PUT log, its fold through
-  SlateDB's pluggable write-ahead log, durable transaction-id resolution, and
-  a topology migration are not implemented. The replacement topology and
-  the log itself live in a separate library.
 - [ ] `VARIANT` inlining and variant statistics.
 - [ ] Signed community-extension distribution.
 
@@ -32,6 +27,28 @@ suite. Unchecked items are implementation gaps, not supported attach modes.
 - [x] Read-write and read-only attach; read-only never fences the live writer (RFC 0017)
 - [x] Full DuckLake SQL against moraine as the catalog: `ATTACH`, `CREATE`/`INSERT`/`UPDATE`/`DELETE`/rename/`DROP`, `SELECT`/`COUNT`/time travel
 - [x] Query interruption: Ctrl-C aborts a blocked read; submitted commits survive cancellation, which reports an unknown outcome (RFC 0006)
+
+### Multi-process writers
+Moraine's own topology is one fenced SlateDB writer with many readers. A
+bucket-resident commit log — slot objects written with create-if-absent
+conditional puts, folded into the store — replaces it. The log lives in a
+separate library under its own license and is never a dependency of this
+repository; what moraine owns is the boundary it plugs into, and the open
+build stays complete on the single-writer path without it.
+
+- [x] The provider boundary: SlateDB write-ahead-log plugs, the committer,
+  the log's garbage-collection plug, a process registry plus a per-open
+  override, and the format stamp a provider-less binary refuses (RFC 0024)
+- [x] The folder path: adoption at open, staged writes offered to the log
+  before they commit locally, a lost race folded before the retry lands
+- [x] Committers over a tailing reader: every read-write open past the one
+  holding the store commits through the log, taking the store when the tail
+  grows long
+- [x] Folding on a cadence, a maintenance pass from any committer, and
+  `demote` to take a lake back off its log
+- [x] Attach options reaching all of it from the extension
+  (`COMMIT_LOG_TAIL`, `COMMIT_LOG_POLL_INTERVAL_MS`), ignored with no
+  provider registered
 
 ## Catalog & schema
 - [x] Schemas, tables, and views
@@ -84,3 +101,8 @@ suite. Unchecked items are implementation gaps, not supported attach modes.
 - [x] Release pipeline: versioned tags drive crate publishing and extension artifacts
 - [x] Extension distribution: per-DuckDB-version, per-platform builds attached to GitHub releases (unsigned)
 - [ ] Signed distribution via a duckdb/community-extensions submission
+- [ ] Resume crates.io publishing, held while the workspace patches slatedb:
+  a registry build resolves the published slatedb, which has no
+  `DbReader::refresh()`. Tags, the changelog and the extension binaries are
+  unaffected, and 0.7.0 stays the newest version on the registry until the
+  patch is released upstream.
