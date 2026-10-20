@@ -89,10 +89,13 @@ build stays complete on the single-writer path without it.
   whole-operation peak-memory measurement.
 - [x] Small row lookups select requested inline ranges and use cached file
   intervals, retaining conservative handling for arbitrary row-ID files.
-- [ ] Reduce metadata-query overhead in DuckDB/DuckLake. Earlier profiling
-  attributed much of single-row commit latency to metadata table functions;
-  native metadata tables would require a separate storage design and fresh
-  end-to-end measurements.
+- [ ] Reduce metadata-query overhead in DuckDB/DuckLake. Measured: DuckLake's
+  metadata SQL is 14.5 ms of a 23-25 ms one-row commit, against 3.3 ms of
+  moraine's own commit work, and two statements carry 69% of it — the
+  per-column file-list query DuckLake plans each scan from, and the snapshot
+  insert ([measurement](metadata-query-overhead.md)). The cost is per commit
+  rather than per file. Native metadata tables would still require a separate
+  storage design.
 
 
 ## Hardening & release
