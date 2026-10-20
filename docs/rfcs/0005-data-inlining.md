@@ -34,9 +34,6 @@ Non-goals:
 - Auto-flush policy. moraine exposes the flush mechanism; the caller owns when
   to invoke it as part of its write and maintenance policy. No moraine-chosen
   threshold or scheduler is part of this design.
-- Inlining `VARIANT` columns. Arrow cannot represent the type, so a
-  `VARIANT` column is refused rather than inlined; carrying it would mean a
-  second, non-Arrow value format.
 
 ## Background
 
@@ -69,6 +66,17 @@ DuckLake v1.0 models inlined data as catalog tables:
 SQL catalogs store nested types as `VARCHAR` because they are limited to
 their host's type system. Moraine controls its value format and does not
 inherit that limitation.
+
+`VARIANT` inlines like any other type. DuckDB carries it over Arrow as the
+canonical `arrow.parquet.variant` extension — a `struct<metadata: binary,
+value: binary>` holding the Variant spec's own binary encoding — so the
+chunk body stays Arrow IPC and needs no second value format. Both
+directions of the shim's conversion go through DuckDB's own Arrow layer,
+which is where that extension is implemented. Two limits come with it: a
+*shredded* variant (one carrying a `typed_value`) is refused by DuckDB's
+Arrow reader, which bounds what the Parquet side can hand back; and a
+`VARIANT` column cannot be an equality-index key, since it holds no
+single scalar to encode.
 
 ## Design
 
@@ -285,11 +293,9 @@ values and inlines types moraine cannot.
 
 `GEOMETRY` is inlinable when `spatial` is loaded, because spatial registers
 the Arrow extension type; values survive both the inline keyspace and the
-flush. `VARIANT` has no Arrow representation at all, so moraine refuses the
-column at `CREATE TABLE` with an error naming moraine, the type, and Arrow
-as the cause — a refusal, not a silent Parquet fallback, because the table
-would otherwise appear to work until its first insert. Scalars, `BLOB`,
-`UUID`, `DECIMAL` and nested `LIST`/`STRUCT`/`MAP` all inline.
+flush. `VARIANT` needs nothing loaded — DuckDB registers its Arrow
+extension itself. Scalars, `BLOB`, `UUID`, `DECIMAL` and nested
+`LIST`/`STRUCT`/`MAP` all inline.
 
 Arrow IPC is the value format because inlined data is *row data*, not
 metadata: it carries the table's actual types — including nested

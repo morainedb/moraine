@@ -7210,7 +7210,7 @@ fn table_kind_wire_order_is_pinned() {
         assert_eq!(*kind as usize, index, "{kind:?}");
         assert_eq!(TableKind::try_from(*kind as i32), Ok(*kind));
     }
-    assert_eq!(TableKind::try_from(27), Err(27));
+    assert_eq!(TableKind::try_from(28), Err(28));
     assert_eq!(TableKind::try_from(-1), Err(-1));
 
     for kind in TableKind::ALL {
@@ -7230,6 +7230,7 @@ fn table_kind_wire_order_is_pinned() {
             | TableKind::PartitionInfo
             | TableKind::PartitionColumn
             | TableKind::FilePartitionValue
+            | TableKind::FileVariantStats
             | TableKind::SortInfo
             | TableKind::SortExpression
             | TableKind::Tag
@@ -7461,26 +7462,63 @@ async fn a_snapshot_id_that_does_not_advance_the_head_is_refused() {
     }
 }
 
-/// The column-type policy is the core's, so the staged path refuses a
-/// `VARIANT` column at the commit that creates it — the same refusal the
-/// verb path raises, and typed `Unsupported` rather than a constraint so
-/// the bridge maps it to "not implemented".
+/// A `VARIANT` column lands through the staged path like any other: the
+/// type is storable, and its per-path statistics fold into the record of
+/// the column they describe rather than becoming entities of their own.
 #[tokio::test]
-async fn a_variant_column_is_refused_as_unsupported() {
+async fn a_variant_column_lands_with_its_field_statistics() {
     let catalog = open().await;
     let db_tx = catalog.begin_write_tx().unwrap();
-    let mut tx = StagedTransaction::begin_detached(&catalog, db_tx);
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
 
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
     });
     let mut column = column_row(1, 1, "v", 0);
-    column[6] = Cell::Str("VARIANT".to_string());
+    column[6] = Cell::Str("variant".to_string());
     tx.stage(RowOperation::Insert {
         table: TableKind::Column,
         cells: column,
     });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: data_file_row(1, 1, 1),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::FileColumnStats,
+        cells: vec![
+            Cell::U64(1),
+            Cell::U64(1),
+            Cell::U64(1),
+            Cell::U64(64),
+            Cell::U64(2),
+            Cell::U64(0),
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+        ],
+    });
+    for path in ["$.b", "$.a"] {
+        tx.stage(RowOperation::Insert {
+            table: TableKind::FileVariantStats,
+            cells: vec![
+                Cell::U64(1),
+                Cell::U64(1),
+                Cell::U64(1),
+                Cell::Str(path.to_owned()),
+                Cell::Str("BIGINT".to_owned()),
+                Cell::U64(16),
+                Cell::U64(2),
+                Cell::U64(0),
+                Cell::Str("1".to_owned()),
+                Cell::Str("9".to_owned()),
+                Cell::Bool(false),
+                Cell::Null,
+            ],
+        });
+    }
     tx.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
         cells: snapshot_row(1, 1, 2),
@@ -7489,18 +7527,19 @@ async fn a_variant_column_is_refused_as_unsupported() {
         table: TableKind::SnapshotChanges,
         cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
     });
+    tx.commit().await.unwrap();
 
-    let err = tx.commit().await.unwrap_err();
-    assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
-    // Nothing landed: the whole commit aborts, table included.
-    assert!(
-        catalog
-            .snapshot()
-            .await
-            .unwrap()
-            .table_by_name(crate::catalog::SchemaId::new(0), "t")
-            .is_none()
-    );
+    let rows = crate::ffi_support::dump_file_variant_stats_rows(&catalog)
+        .await
+        .unwrap();
+    let paths: Vec<&str> = rows.iter().map(|row| row.variant_path.as_str()).collect();
+    assert_eq!(paths, ["$.a", "$.b"], "entries are ordered by path");
+    assert!(rows.iter().all(|row| row.data_file_id == 1
+        && row.table_id == 1
+        && row.column_id == 1
+        && row.shredded_type == "BIGINT"
+        && row.min_value.as_deref() == Some("1")));
+    catalog.close().await.unwrap();
 }
 
 /// Options arrive as `ducklake_metadata` rows and mint no snapshot:

@@ -7,7 +7,6 @@ implementation gaps, not supported attach modes.
 
 ## Next capabilities
 
-- [ ] `VARIANT` inlining and variant statistics.
 - [ ] Signed community-extension distribution.
 
 ## Foundations
@@ -53,7 +52,7 @@ build stays complete on the single-writer path without it.
 ## Catalog & schema
 - [x] Schemas, tables, and views
 - [x] Schema evolution: `ADD`/`RENAME`/`DROP COLUMN` and `ALTER COLUMN … TYPE` promotion, over inlined and flushed data (RFC 0012)
-- [x] All DuckLake scalar and nested `LIST`/`STRUCT`/`MAP` types, inline and post-flush; `VARIANT` pending (RFC 0005)
+- [x] All DuckLake scalar and nested `LIST`/`STRUCT`/`MAP` types, inline and post-flush, `VARIANT` included (RFC 0005)
 - [x] Column and name mapping for externally written Parquet, including hive-partitioned foreign files (RFC 0018)
 - [x] Scalar and table macros with parameters, overloads, defaults, and `CREATE OR REPLACE`/`DROP` (RFC 0019)
 
@@ -63,7 +62,7 @@ build stays complete on the single-writer path without it.
 - [x] Data inlining: inlined inserts/deletes plus flush, on by default (RFC 0005)
 - [x] Partitioning: definitions, per-file values, and partition-pruned reads (RFC 0013)
 - [x] Sort orders, set/changed/reset, with history (RFC 0013)
-- [x] Statistics for pruning: table, column, and per-file (`table_stats`, `table_column_stats`, `file_column_stats`); variant stats pending
+- [x] Statistics for pruning: table, column, and per-file (`table_stats`, `table_column_stats`, `file_column_stats`), with a variant column's per-path statistics folded into its column's record
 
 ## Transactions & time travel
 - [x] Multi-statement, cross-table ACID transactions with conflict detection; lost races surface as conflicts for DuckLake's retry (RFC 0004)
@@ -99,16 +98,12 @@ build stays complete on the single-writer path without it.
   commit, on DuckLake's side of the boundary. That holds for small lakes:
   the front-end is flat at ~2 ms while execution grows with file count, and
   the two meet at roughly five thousand files.
-- [ ] Report a catalog version, once DuckDB can use one.
-  `MoraineCatalog::GetCatalogVersion` returns an invalid `optional_idx`
-  unless an index-dependency state is registered, and
-  `PreparedStatementData::RequireRebind` reads that as "identity unknown"
-  and re-plans. Latent today: DuckDB re-binds and re-optimizes a prepared
-  statement on every execution whenever it reads any catalog at all, its own
-  included, so moraine's answer changes nothing yet. Blocked on the DuckDB
-  side, and on a test that can tell plan reuse from re-planning; reporting a
-  version soundly means advancing it for transaction-local staged writes
-  too, which is why the index path guards it as narrowly as it does
+- [x] Report a catalog version DuckDB can compare: the transaction's pinned
+  store revision, where the index path has no narrower answer, and nothing
+  where the revision would not describe what the transaction sees. No
+  measurable gain yet — DuckDB re-plans a prepared statement on every
+  execution whenever it reads any catalog, its own included — so this only
+  stops moraine being the reason plan reuse cannot happen
   ([measurement](metadata-query-overhead.md)).
 
 

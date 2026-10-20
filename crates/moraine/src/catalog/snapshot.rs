@@ -1088,6 +1088,31 @@ impl CatalogSnapshot {
         );
     }
 
+    /// Drops the variant entries every column of `data_file_id` carries,
+    /// returning the columns that held any. A delete against
+    /// `ducklake_file_variant_stats` reaches rows that live inside their
+    /// column's record, so it edits those records rather than removing any.
+    pub(crate) fn clear_file_variant_stats(
+        &mut self,
+        table_id: u64,
+        data_file_id: u64,
+    ) -> Vec<u64> {
+        let Some(per_table) = self.file_column_stats.get_mut(&table_id) else {
+            return Vec::new();
+        };
+        let columns: Vec<u64> = per_table
+            .iter()
+            .filter(|((file, _), value)| *file == data_file_id && !value.variant_stats.is_empty())
+            .map(|((_, column_id), _)| *column_id)
+            .collect();
+        for column_id in &columns {
+            if let Some(value) = per_table.get_mut(&(data_file_id, *column_id)) {
+                value.variant_stats.clear();
+            }
+        }
+        columns
+    }
+
     pub(crate) fn remove_file_column_stats(
         &mut self,
         table_id: u64,

@@ -3,7 +3,7 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::{dump_rows, free_rows, opt_bool, opt_c_string, opt_into_raw};
+use super::{dump_rows, free_rows, opt_bool, opt_c_string, opt_into_raw, to_c_string};
 use crate::{
     abi::free_c_string,
     error::{AbiError, MoraineError},
@@ -390,6 +390,181 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats_free(
     // SAFETY: forwarded caller contract.
     unsafe {
         free_rows(items, len, |d| {
+            free_c_string(d.min_value);
+            free_c_string(d.max_value);
+            free_c_string(d.extra_stats);
+        });
+    }
+}
+
+/// One `ducklake_file_variant_stats` row, as returned by
+/// [`moraine_dump_file_variant_stats`] — flattened from the embedded
+/// entries of the column's statistics record.
+#[repr(C)]
+pub struct MoraineFileVariantStatsRow {
+    /// `data_file_id`.
+    pub data_file_id: u64,
+    /// `table_id`.
+    pub table_id: u64,
+    /// `column_id`.
+    pub column_id: u64,
+    /// `variant_path`, owned.
+    pub variant_path: *mut c_char,
+    /// `shredded_type`, owned.
+    pub shredded_type: *mut c_char,
+    /// `column_size_bytes`.
+    pub column_size_bytes: u64,
+    /// `value_count`.
+    pub value_count: u64,
+    /// `null_count`.
+    pub null_count: u64,
+    /// `min_value`, owned, null if absent.
+    pub min_value: *mut c_char,
+    /// `max_value`, owned, null if absent.
+    pub max_value: *mut c_char,
+    /// Whether `contains_nan` is present.
+    pub has_contains_nan: bool,
+    /// `contains_nan`, valid iff `has_contains_nan`.
+    pub contains_nan: bool,
+    /// `extra_stats`, owned, null if absent.
+    pub extra_stats: *mut c_char,
+}
+
+/// Converts core `ducklake_file_variant_stats` rows into the C row shape.
+/// Shared by the committed dump and the transaction-aware one, so the two
+/// can never drift in what they report.
+pub(crate) fn file_variant_stats_rows(
+    rows: Vec<moraine::ffi_support::FileVariantStatsRow>,
+) -> Result<Vec<MoraineFileVariantStatsRow>, AbiError> {
+    let owned = rows
+        .into_iter()
+        .map(|mut row| {
+            let variant_path = to_c_string(std::mem::take(&mut row.variant_path))?;
+            let shredded_type = to_c_string(std::mem::take(&mut row.shredded_type))?;
+            let min_value = opt_c_string(row.min_value.as_deref())?;
+            let max_value = opt_c_string(row.max_value.as_deref())?;
+            let extra_stats = opt_c_string(row.extra_stats.as_deref())?;
+            Ok((
+                row,
+                variant_path,
+                shredded_type,
+                min_value,
+                max_value,
+                extra_stats,
+            ))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(
+            |(row, variant_path, shredded_type, min_value, max_value, extra_stats)| {
+                let (has_contains_nan, contains_nan) = opt_bool(row.contains_nan);
+                MoraineFileVariantStatsRow {
+                    data_file_id: row.data_file_id,
+                    table_id: row.table_id,
+                    column_id: row.column_id,
+                    variant_path: variant_path.into_raw(),
+                    shredded_type: shredded_type.into_raw(),
+                    column_size_bytes: row.column_size_bytes,
+                    value_count: row.value_count,
+                    null_count: row.null_count,
+                    min_value: opt_into_raw(min_value),
+                    max_value: opt_into_raw(max_value),
+                    has_contains_nan,
+                    contains_nan,
+                    extra_stats: opt_into_raw(extra_stats),
+                }
+            },
+        )
+        .collect())
+}
+
+/// Dumps every `ducklake_file_variant_stats` row into
+/// `*out_items`/`*out_len`.
+///
+/// # Safety
+///
+/// The shared dump-entry contract (`dump_rows`): a live `handle` from
+/// [`moraine_attach_with_wal_store`](crate::abi::moraine_attach_with_wal_store), valid writable
+/// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+/// thread, and a null-or-writable `err`, all for the duration of the
+/// call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_file_variant_stats(
+    handle: *mut MoraineCatalogHandle,
+    out_items: *mut *mut MoraineFileVariantStatsRow,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            moraine::ffi_support::dump_file_variant_stats_rows,
+            file_variant_stats_rows,
+        )
+    }
+}
+
+/// Dumps one table's `ducklake_file_variant_stats` rows into
+/// `*out_items`/`*out_len`, in the order
+/// [`moraine_dump_file_variant_stats`] would emit them. Free with
+/// [`moraine_dump_file_variant_stats_free`].
+///
+/// # Safety
+///
+/// As [`moraine_dump_file_variant_stats`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_file_variant_stats_of(
+    handle: *mut MoraineCatalogHandle,
+    table_id: u64,
+    out_items: *mut *mut MoraineFileVariantStatsRow,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            async |catalog| {
+                moraine::ffi_support::dump_file_variant_stats_rows_of(catalog, table_id).await
+            },
+            file_variant_stats_rows,
+        )
+    }
+}
+
+/// Frees the array returned by [`moraine_dump_file_variant_stats`].
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_file_variant_stats`] call wrote, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_file_variant_stats_free(
+    items: *mut MoraineFileVariantStatsRow,
+    len: usize,
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |d| {
+            free_c_string(d.variant_path);
+            free_c_string(d.shredded_type);
             free_c_string(d.min_value);
             free_c_string(d.max_value);
             free_c_string(d.extra_stats);

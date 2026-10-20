@@ -297,7 +297,7 @@ outcomes are shared by both doors.
 | `AlreadyExists` / `Constraint` | logical conflict (duplicate name, constraint violation) | no — abort |
 | `Store(#[source])` | underlying object-store / SlateDB I/O failure | no |
 | `Corruption` | value decode failure or unknown `sys/format` version (RFC 0002) | no |
-| `Unsupported` | a DuckLake feature moraine does not yet implement (e.g. VARIANT inlining, RFC 0005) | no |
+| `Unsupported` | a DuckLake feature moraine does not yet implement | no |
 | `SnapshotExpired` | a held/requested snapshot fell below the RFC 0007 retention horizon (RFC 0009) — re-resolve from head | no |
 | `Interrupted` | operation cancelled or interrupted before it could report a result | no |
 | `CommitOutcomeUnknown` | a submitted commit was not acknowledged; retain external files and reconcile the operation before resubmitting (RFC 0010) | no |
@@ -391,21 +391,15 @@ Notes:
   committed (RFC 0013). `clear_sorting` is a genuine clear, unlike
   `clear_partitioning`, whose DuckLake counterpart lands a live spec with
   no columns.
-- Every verb that puts a column type into the catalog — `create_table`,
-  `add_column`, `alter_column` — enforces the RFC 0005 type policy and raises
-  `Unsupported` for a type moraine cannot store. The rule is the core's, and
-  the staged path enforces the same one at the same boundary, so a `VARIANT`
-  column is refused where it enters the catalog rather than at the first
-  insert that would need it. The shim keeps its own refusal at the Arrow
-  conversion, and it is not redundant: DuckLake builds the inlined data table
-  while flushing the `CREATE TABLE`, *before* the `ducklake_column` rows the
-  core validates reach a commit, so removing it leaves the user with DuckDB's
-  bare "Unsupported Arrow type VARIANT". Measured by deleting it and running
-  the e2e suite. This is also why `register_data_file` carries no variant
-  statistics: `ducklake_file_variant_stats` describes the shredded paths of
-  a `VARIANT` column, and no such column can reach the catalog to have any.
-  The field stays in the stored record for row-faithfulness, and arrives on
-  the verb surface with `VARIANT` support or not at all.
+- Every DuckLake column type is storable, `VARIANT` included, so no verb
+  refuses one. An equality index is the one place a type is still turned
+  away: `create_index` raises `Constraint` for a 128-bit integer, which
+  Parquet narrows to a lossy double, and for a `VARIANT`, which holds no
+  single scalar an index key could encode. `register_data_file` still
+  carries no variant statistics — `ducklake_file_variant_stats` describes
+  the shredded paths a Parquet writer found, which the registering caller
+  does not have; they reach the catalog through the staged-row path that
+  DuckLake's own writes take.
 - `flush_inlined_data` registers the files it drains into, rather than leaving
   them to `register_data_file`. A flushed file is not an ordinary
   registration: its rows keep the ids they were inlined under and its record

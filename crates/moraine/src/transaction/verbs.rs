@@ -14,7 +14,7 @@ use crate::{
         DataFileId, DeleteFile, DeleteFileId, FileIndexEntry, FileIndexRemoval, FlushedDataFile,
         IndexDef, IndexEntry, IndexId, IndexMaintenance, IndexState, InlineChunk, MacroId,
         MacroImplementationDef, OptionScope, PartitionColumnDef, PartitionId, SchemaId, SnapshotId,
-        SortId, SortKeyDef, TableId, TagTarget, ViewId, inline_policy::ensure_inlinable,
+        SortId, SortKeyDef, TableId, TagTarget, ViewId,
     },
     error::{Error, Result},
     store::{
@@ -572,9 +572,6 @@ impl Transaction {
             nulls_allowed,
             default_value,
         } = alteration;
-        if let Some(new_type) = &column_type {
-            ensure_inlinable(&value.column_name, new_type)?;
-        }
         // The index encoding is type-bound, so a type change on an indexed
         // column would invalidate its entries.
         if column_type.is_some() && self.column_is_indexed(table, column) {
@@ -2528,12 +2525,11 @@ fn new_column(
 }
 
 /// Validates every node of `defs`: names non-empty and unique among
-/// siblings, types storable.
+/// siblings.
 fn validate_column_defs(defs: &[ColumnDef]) -> Result<()> {
     let mut seen = HashSet::with_capacity(defs.len());
     for def in defs {
         nonempty_name("column", &def.name)?;
-        ensure_inlinable(&def.name, &def.column_type)?;
         if !seen.insert(&def.name) {
             return Err(Error::Constraint(format!("duplicate column {}", def.name)));
         }

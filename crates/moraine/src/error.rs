@@ -42,8 +42,8 @@ pub enum Error {
     #[error("constraint violation: {0}")]
     Constraint(String),
 
-    /// A DuckLake feature moraine does not implement (e.g. inlining a
-    /// `VARIANT` column). Terminal: re-running cannot help.
+    /// A DuckLake feature moraine does not implement. Terminal:
+    /// re-running cannot help.
     #[error("unsupported: {0}")]
     Unsupported(String),
 

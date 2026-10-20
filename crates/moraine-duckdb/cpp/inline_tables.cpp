@@ -111,18 +111,6 @@ MoraineArrowBytes EncodeInlineSchema(duckdb::ClientContext &context,
 	types.reserve(user_columns.size());
 	names.reserve(user_columns.size());
 	for (auto &col : user_columns) {
-		// The core refuses this column too, but not in time: DuckLake builds the
-		// inlined data table while flushing the CREATE TABLE, before the
-		// `ducklake_column` rows the core validates reach a commit. Without this
-		// refusal the user sees DuckDB's bare "Unsupported Arrow type VARIANT"
-		// instead, which names neither moraine nor a way forward.
-		if (col.type.id() == duckdb::LogicalTypeId::VARIANT) {
-			throw duckdb::NotImplementedException(
-			    "moraine: column \"%s\" is VARIANT, which moraine cannot store — its inline "
-			    "data is serialized through Arrow, and DuckDB's Arrow format has no VARIANT "
-			    "support. Use JSON (or another type) instead.",
-			    col.name);
-		}
 		types.push_back(col.type);
 		names.push_back(col.name);
 	}

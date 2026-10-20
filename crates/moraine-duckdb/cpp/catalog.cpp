@@ -339,6 +339,8 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type) {
 		// DuckLake's `json`: VARCHAR carrying a `JSON` alias, matched on the
 		// alias (not the id) by `DuckLakeColumnType`'s inverse.
 		return duckdb::LogicalType::JSON();
+	} else if (upper == "VARIANT") {
+		return duckdb::LogicalType::VARIANT();
 	} else if (upper == "GEOMETRY") {
 		// Requires the `spatial` extension at runtime for geometry values; the
 		// type itself, and its Arrow inline encoding, resolve without it.

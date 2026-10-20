@@ -178,6 +178,8 @@ duckdb::Value DuckLakeColumnType(const char *sql_type) {
 		return duckdb::Value("blob");
 	case duckdb::LogicalTypeId::UUID:
 		return duckdb::Value("uuid");
+	case duckdb::LogicalTypeId::VARIANT:
+		return duckdb::Value("variant");
 	case duckdb::LogicalTypeId::GEOMETRY:
 		return duckdb::Value("geometry");
 	default:
@@ -673,6 +675,33 @@ std::vector<duckdb::Value> FileColumnStatsShapeAt(const MoraineFileColumnStatsRo
 	return values;
 }
 
+// One `ducklake_file_variant_stats` record's column list, shared by the
+// committed dump and the transaction-aware one.
+std::vector<duckdb::Value> FileVariantStatsShape(const MoraineFileVariantStatsRow &r) {
+	return {
+	    Bigint(r.data_file_id),     Bigint(r.table_id),       Bigint(r.column_id),
+	    Varchar(r.variant_path),    Varchar(r.shredded_type), Bigint(r.column_size_bytes),
+	    Bigint(r.value_count),      Bigint(r.null_count),     OptVarchar(r.min_value),
+	    OptVarchar(r.max_value),    OptBoolean(r.has_contains_nan, r.contains_nan),
+	    OptVarchar(r.extra_stats),
+	};
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideFileVariantStats(MoraineCatalogHandle *handle,
+                                                                MoraineInterruptProbe probe, void *probe_ctx) {
+	return DumpRows<MoraineFileVariantStatsRow>(handle, probe, probe_ctx, moraine_dump_file_variant_stats,
+	                                            moraine_dump_file_variant_stats_free, FileVariantStatsShape);
+}
+
+// One table's variant statistics, in the order `ProvideFileVariantStats`
+// emits them.
+std::vector<std::vector<duckdb::Value>> ProvideFileVariantStatsOf(MoraineCatalogHandle *handle, uint64_t table_id,
+                                                                  MoraineInterruptProbe probe, void *probe_ctx) {
+	return DumpRows<MoraineFileVariantStatsRow>(handle, probe, probe_ctx, moraine_dump_file_variant_stats_of,
+	                                            moraine_dump_file_variant_stats_free, FileVariantStatsShape,
+	                                            table_id);
+}
+
 std::vector<std::vector<duckdb::Value>> ProvideExtendedFileColumnStats(MoraineCatalogHandle *handle,
                                                    MoraineInterruptProbe probe, void *probe_ctx) {
 	return DumpRows<MoraineFileColumnStatsRow>(handle, probe, probe_ctx, moraine_dump_file_column_stats, moraine_dump_file_column_stats_free, ExtendedFileColumnStatsShape);
@@ -731,15 +760,6 @@ std::vector<std::vector<duckdb::Value>> ProvideSchemaVersions(MoraineCatalogHand
                                                               void *probe_ctx) {
 	return DumpRows<MoraineSchemaVersionRow>(handle, probe, probe_ctx, moraine_dump_schema_versions,
 	                                         moraine_dump_schema_versions_free, SchemaVersionShape);
-}
-
-// Always-empty stand-in for a `ducklake_*` table covering a feature the
-// store doesn't model (variant statistics). The table must still exist
-// as a SQL table: DuckLake's attach/snapshot-load query joins every one
-// of them unconditionally, so a missing table is a bind-time Catalog
-// Error even where the query would return zero rows for it.
-std::vector<std::vector<duckdb::Value>> ProvideEmpty(MoraineCatalogHandle *, MoraineInterruptProbe, void *) {
-	return {};
 }
 
 // One `ducklake_partition_info` record's column list, shared by the committed
@@ -1482,8 +1502,6 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        0,
 	        /* delete key: data_file_id, table_id */ {0, 1},
 	    },
-	    // An always-empty stand-in (see `ProvideEmpty`): no dump ABI call
-	    // backs it — the store models no variant stats.
 	    {
 	        "ducklake_file_variant_stats",
 	        {
@@ -1500,7 +1518,19 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"contains_nan", "BOOLEAN", false},
 	            {"extra_stats", "VARCHAR", false},
 	        },
-	        ProvideEmpty,
+	        ProvideFileVariantStats,
+	        UnversionedTxProviders<MoraineFileVariantStatsRow>(moraine_dump_file_variant_stats_free,
+	                                                          FileVariantStatsShape,
+	                                                          moraine_tx_dump_file_variant_stats,
+	                                                          moraine_tx_dump_file_variant_stats_of),
+	        27,
+	        {},
+	        0,
+	        /* delete key: data_file_id, table_id */ {0, 1},
+	        /* overlay updates */ false,
+	        /* scope column: table_id */ 1,
+	        /* live_narrowable */ false,
+	        ProvideFileVariantStatsOf,
 	    },
 	    {
 	        "ducklake_files_scheduled_for_deletion",

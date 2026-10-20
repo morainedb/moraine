@@ -7,7 +7,6 @@ mod census;
 mod handle;
 pub(crate) mod index_policy;
 pub(crate) mod inline;
-pub(crate) mod inline_policy;
 pub(crate) mod projection;
 mod schema_projection;
 mod snapshot;
