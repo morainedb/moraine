@@ -194,7 +194,7 @@ re-bind and re-optimize on every execution, and preparing buys back only
 the parse: measured over 300 executions, 2.09 ms falls to 1.56 ms for the
 native join and 2.56 ms to 2.04 ms for moraine's.
 
-Moraine does have a latent defect of its own here.
+Moraine had a defect of its own alongside it, since fixed.
 `PreparedStatementData::RequireRebind` asks `CheckCatalogIdentity` for
 every database a statement reads, and that function opens with:
 
@@ -205,20 +205,18 @@ if (!catalog_identity.catalog_version.IsValid()) {
 }
 ```
 
-A `false` return means "identity does not match". Moraine's
-`MoraineCatalog::GetCatalogVersion` delegates to `IndexCatalogVersion`,
-which returns an invalid `optional_idx` unless an index-dependency state
-is registered for the catalog, its association is unambiguous, the
-transaction is clean, and the snapshot revision reads — so ordinarily
-moraine reports no version and fails that check unconditionally.
+A `false` return means "identity does not match", so a catalog reporting
+no version fails the check unconditionally — which moraine did, because
+`GetCatalogVersion` answered only through the index path and that path
+returns an invalid `optional_idx` unless an index-dependency state is
+registered. It now falls back to the transaction's pinned store
+revision, which advances with every commit, and still reports nothing
+for the two cases where the revision does not describe what the
+transaction sees: staged writes held by the transaction, and a
+manifest-following reader that pins no revision.
 
-Fixing it changes nothing measurable while DuckDB rebinds anyway, and
-reporting a version is not a one-line change: the value has to advance
-whenever anything a new transaction would see has changed, transaction-
-local staged writes included, and the conditions guarding the index path
-today exist for exactly that reason. It is worth doing after the DuckDB
-side, not before, and with a test that can tell the two behaviours
-apart — which today nothing can.
+Nothing measurable moved, because DuckDB re-plans regardless. The point
+is only that moraine is no longer the reason it cannot.
 
 ## What this says about the roadmap item
 
