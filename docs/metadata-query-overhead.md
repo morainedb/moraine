@@ -113,6 +113,13 @@ which is why the file-list query is the most expensive one:
 
 Eight such statements per commit is the 14.5 ms.
 
+Roughly half of the per-statement floor is moraine's own. Timing 500
+iterations of the simplest possible query gives about 0.41 ms against a
+native in-memory DuckDB table and about 0.73 ms against a moraine
+metadata table, so the binder spends something like 0.3 ms resolving one
+metadata table function before any row is read. That part is on this side
+of the boundary; what it is doing has not been profiled.
+
 ## What this says about the roadmap item
 
 The premise holds: metadata queries really are the largest single

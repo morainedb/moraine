@@ -97,6 +97,14 @@ build stays complete on the single-writer path without it.
   parse because DuckDB re-binds per execution. Native metadata tables would
   move the 0.2 ms; the leverage is in not re-planning generated SQL every
   commit, on DuckLake's side of the boundary.
+- [ ] Take the metadata-overhead measurement further before any design rests
+  on it. Where does execution overtake planning as a lake grows — this one
+  is 16 files and 1,600 rows, and 16 → 128 files already moves the total
+  13.4 → 14.1 ms. What does moraine's own table-function bind spend its time
+  on: the simplest statement costs ~0.41 ms against a native DuckDB table
+  and ~0.73 ms against a moraine metadata table, and that ~0.3 ms gap is the
+  part this repository controls. And can DuckLake be made to re-plan less,
+  given a prepared statement still re-binds on every execution.
 
 
 ## Hardening & release
