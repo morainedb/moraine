@@ -175,9 +175,28 @@ Not by preparing the statement, which was the obvious first idea.
 as over moraine's, so going through `PREPARE`/`EXECUTE` in SQL re-binds
 and re-optimizes either way.
 
-DuckDB's rule for reusing a prepared plan is in
-`PreparedStatementData::RequireRebind`, which asks `CheckCatalogIdentity`
-for every database the statement reads. That function opens with:
+Nor by anything on moraine's side, which took a C harness against the
+client API to establish — the CLI cannot hold a prepared statement across
+executions.
+
+`Planner::PrepareSQLStatement` has exactly two callers: the `PREPARE`
+statement, and the rebind branch of `Binder::Bind(ExecuteStatement &)`.
+Its presence in a profile of a thousand executions therefore means the
+plan was thrown away and rebuilt every time. It is present for a
+three-table join over moraine's metadata tables, present for the same
+join over plain in-memory DuckDB tables, and present for
+`SELECT count(*)` over one in-memory table. It is absent for
+`PREPARE p AS SELECT 42`.
+
+So a prepared statement reuses its plan only while it reads no catalog at
+all. Reading any catalog — moraine's or DuckDB's own — costs a full
+re-bind and re-optimize on every execution, and preparing buys back only
+the parse: measured over 300 executions, 2.09 ms falls to 1.56 ms for the
+native join and 2.56 ms to 2.04 ms for moraine's.
+
+Moraine does have a latent defect of its own here.
+`PreparedStatementData::RequireRebind` asks `CheckCatalogIdentity` for
+every database a statement reads, and that function opens with:
 
 ```cpp
 // some catalogs don't support catalog version, we can't check identity in that case
@@ -186,22 +205,20 @@ if (!catalog_identity.catalog_version.IsValid()) {
 }
 ```
 
-A `false` return means "identity does not match", so a catalog that
-reports no version forces a rebind on every execution. Moraine's
+A `false` return means "identity does not match". Moraine's
 `MoraineCatalog::GetCatalogVersion` delegates to `IndexCatalogVersion`,
 which returns an invalid `optional_idx` unless an index-dependency state
-happens to be registered for the catalog, its association is
-unambiguous, the transaction is clean, and the snapshot revision reads —
-so in the ordinary case moraine reports no version at all.
+is registered for the catalog, its association is unambiguous, the
+transaction is clean, and the snapshot revision reads — so ordinarily
+moraine reports no version and fails that check unconditionally.
 
-That is a real difference against a native catalog, and it is on this
-side of the boundary. It does not help the commit path: DuckLake issues
-fresh SQL text rather than reusing prepared statements, and a commit
-changes the catalog anyway, so a plan could not survive to be reused. It
-would matter to a client holding prepared statements against a lake that
-is not changing — a reader fleet rather than a writer. Confirming it
-needs a client-API prepared statement, which the CLI cannot express, and
-that has not been done.
+Fixing it changes nothing measurable while DuckDB rebinds anyway, and
+reporting a version is not a one-line change: the value has to advance
+whenever anything a new transaction would see has changed, transaction-
+local staged writes included, and the conditions guarding the index path
+today exist for exactly that reason. It is worth doing after the DuckDB
+side, not before, and with a test that can tell the two behaviours
+apart — which today nothing can.
 
 ## What this says about the roadmap item
 

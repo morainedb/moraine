@@ -99,16 +99,16 @@ build stays complete on the single-writer path without it.
   commit, on DuckLake's side of the boundary. That holds for small lakes:
   the front-end is flat at ~2 ms while execution grows with file count, and
   the two meet at roughly five thousand files.
-- [ ] Report no catalog version only when there is none to report.
+- [ ] Report a catalog version, once DuckDB can use one.
   `MoraineCatalog::GetCatalogVersion` returns an invalid `optional_idx`
-  whenever no index-dependency state is registered, and DuckDB reads that as
-  "identity unknown" and re-binds a prepared statement on every execution
-  (`PreparedStatementData::RequireRebind`). A client holding prepared
-  statements against an unchanging lake therefore re-plans every time, where
-  a native catalog would not. No effect on commits — DuckLake issues fresh
-  SQL and a commit moves the version anyway — so this is a reader-fleet
-  change, and it is unverified: confirming it needs a client-API prepared
-  statement, which the CLI cannot express
+  unless an index-dependency state is registered, and
+  `PreparedStatementData::RequireRebind` reads that as "identity unknown"
+  and re-plans. Latent today: DuckDB re-binds and re-optimizes a prepared
+  statement on every execution whenever it reads any catalog at all, its own
+  included, so moraine's answer changes nothing yet. Blocked on the DuckDB
+  side, and on a test that can tell plan reuse from re-planning; reporting a
+  version soundly means advancing it for transaction-local staged writes
+  too, which is why the index path guards it as narrowly as it does
   ([measurement](metadata-query-overhead.md)).
 
 
