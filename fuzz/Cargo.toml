@@ -47,3 +47,9 @@ path = "fuzz_targets/crash_recovery.rs"
 test = false
 doc = false
 bench = false
+
+# The same fork the root workspace builds against; a `[patch]` there does
+# not reach this workspace, and moraine no longer compiles without it.
+[patch.crates-io]
+slatedb = { git = "https://github.com/phytal/slatedb", rev = "9717227cc4c17bcf2c07ae096286ca5b76ee9683" }
+slatedb-common = { git = "https://github.com/phytal/slatedb", rev = "9717227cc4c17bcf2c07ae096286ca5b76ee9683" }
