@@ -390,3 +390,40 @@ fn prepared_index_reads_reuse_probes_inside_a_writing_transaction() {
         assert_eq!(hits, vec!["3", "2", "2"], "limit={limit}: {output}");
     }
 }
+
+/// A prepared statement sees catalog changes that land after it was
+/// prepared, on both the metadata tables and a user table. The catalog
+/// version moraine reports is what DuckDB compares to decide whether a
+/// cached plan still describes the catalog, so a version that failed to
+/// move would serve this test stale counts.
+#[test]
+#[ignore = "needs the built DuckDB CLI and packaged extensions"]
+fn prepared_reads_see_catalog_changes_that_land_after_them() {
+    let store = TempDir::new("prepared-catalog-version");
+    let data = TempDir::new("prepared-catalog-version-data");
+    let result = run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(a BIGINT);
+         PREPARE tables AS SELECT 'tables', count(*)
+             FROM __ducklake_metadata_lake.main.ducklake_table;
+         PREPARE rows AS SELECT 'rows', count(*) FROM lake.main.t;
+         EXECUTE tables;
+         EXECUTE rows;
+         INSERT INTO lake.main.t VALUES (1);
+         EXECUTE tables;
+         EXECUTE rows;
+         CREATE TABLE lake.main.u(b BIGINT);
+         EXECUTE tables;
+         EXECUTE rows;",
+    );
+    let counts = |phase: &str| -> Vec<String> {
+        csv_rows(&result)
+            .into_iter()
+            .filter(|row| row.first().is_some_and(|first| first == phase))
+            .filter_map(|row| row.into_iter().nth(1))
+            .collect()
+    };
+    assert_eq!(counts("tables"), ["1", "1", "2"]);
+    assert_eq!(counts("rows"), ["0", "1", "1"]);
+}

@@ -89,10 +89,27 @@ build stays complete on the single-writer path without it.
   whole-operation peak-memory measurement.
 - [x] Small row lookups select requested inline ranges and use cached file
   intervals, retaining conservative handling for arbitrary row-ID files.
-- [ ] Reduce metadata-query overhead in DuckDB/DuckLake. Earlier profiling
-  attributed much of single-row commit latency to metadata table functions;
-  native metadata tables would require a separate storage design and fresh
-  end-to-end measurements.
+- [ ] Reduce metadata-query overhead in DuckDB/DuckLake. Measured: DuckLake's
+  metadata SQL is 14.5 ms of a 23-25 ms one-row commit, against 3.3 ms of
+  moraine's own commit work ([measurement](metadata-query-overhead.md)). It is
+  SQL front-end cost, not storage: parse, bind and optimize are 2.5 ms of a
+  2.7 ms statement, execution 0.2 ms, and a prepared statement saves only the
+  parse because DuckDB re-binds per execution. Native metadata tables would
+  move the 0.2 ms; the leverage is in not re-planning generated SQL every
+  commit, on DuckLake's side of the boundary. That holds for small lakes:
+  the front-end is flat at ~2 ms while execution grows with file count, and
+  the two meet at roughly five thousand files.
+- [ ] Report a catalog version, once DuckDB can use one.
+  `MoraineCatalog::GetCatalogVersion` returns an invalid `optional_idx`
+  unless an index-dependency state is registered, and
+  `PreparedStatementData::RequireRebind` reads that as "identity unknown"
+  and re-plans. Latent today: DuckDB re-binds and re-optimizes a prepared
+  statement on every execution whenever it reads any catalog at all, its own
+  included, so moraine's answer changes nothing yet. Blocked on the DuckDB
+  side, and on a test that can tell plan reuse from re-planning; reporting a
+  version soundly means advancing it for transaction-local staged writes
+  too, which is why the index path guards it as narrowly as it does
+  ([measurement](metadata-query-overhead.md)).
 
 
 ## Hardening & release

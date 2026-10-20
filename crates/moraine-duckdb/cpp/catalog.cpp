@@ -31,8 +31,31 @@
 
 namespace moraine_duckdb {
 
+// What DuckDB compares to decide whether a cached plan still describes
+// this catalog. The index path answers first: it resolves the DuckLake
+// metadata connection's transaction rather than this context's. Failing
+// that, the transaction's pinned store revision stands in, which advances
+// with every commit. A transaction holding staged writes sees a catalog
+// that revision does not describe — the rule `ReadHandle` applies — and a
+// manifest-following reader pins no revision at all; both report nothing.
 duckdb::optional_idx MoraineCatalog::GetCatalogVersion(duckdb::ClientContext &context) {
-	return IndexCatalogVersion(context, *this);
+	auto indexed = IndexCatalogVersion(context, *this);
+	if (indexed.IsValid()) {
+		return indexed;
+	}
+	auto catalog_transaction = GetCatalogTransaction(context);
+	if (!catalog_transaction.transaction) {
+		return {};
+	}
+	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
+	if (transaction.StagedTxIfOpen()) {
+		return {};
+	}
+	uint64_t revision = 0;
+	if (!moraine_snapshot_read_revision(transaction.Snapshot(), &revision)) {
+		return {};
+	}
+	return duckdb::optional_idx(revision);
 }
 
 // Reconstructs a column's DuckDB `LogicalType` from a table's flat,
