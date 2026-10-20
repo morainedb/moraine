@@ -113,12 +113,40 @@ which is why the file-list query is the most expensive one:
 
 Eight such statements per commit is the 14.5 ms.
 
-Roughly half of the per-statement floor is moraine's own. Timing 500
-iterations of the simplest possible query gives about 0.41 ms against a
-native in-memory DuckDB table and about 0.73 ms against a moraine
-metadata table, so the binder spends something like 0.3 ms resolving one
-metadata table function before any row is read. That part is on this side
-of the boundary; what it is doing has not been profiled.
+## How much of it is moraine's
+
+Almost none, which took a wrong turn to establish.
+
+Timing 500 iterations of the simplest possible query gives about 0.41 ms
+against a native in-memory DuckDB table and about 0.73 ms against a
+moraine metadata table. Under `perf` that 0.33 ms per statement is real:
+233 ms of CPU for the native run against 400 ms for the moraine one, with
+`MoraineSchemaEntry::EnsureTablesLoaded` at 13% of the moraine run and
+`PopulateMetadataTables` at 11%. Those build 29 synthetic `ducklake_*`
+table entries carrying 196 column definitions, each column routed through
+`MapColumnType`'s string match, and they run on the first table lookup of
+a *transaction*.
+
+That last word is what makes the microbenchmark misleading. Each of its
+500 statements was its own autocommit transaction, so it paid the
+population 500 times. DuckLake's metadata connection holds one
+transaction across the statements of a commit, so the real workload pays
+it once per commit and `PopulateMetadataTables` never reaches 2% of it.
+
+Profiling the commit workload itself — 100 one-row `UPDATE`s, 2,064 ms of
+CPU, so about 20.6 ms per commit — puts moraine almost nowhere:
+
+| Category | Share | Per commit |
+| --- | ---: | ---: |
+| DuckDB core | 56.5% | 11.7 ms |
+| Allocator and `memcpy` | 20.8% | 4.3 ms |
+| libc, kernel, refcounting | 17.7% | 3.6 ms |
+| SlateDB reads and the async bridge | 2.4% | 0.49 ms |
+| Moraine's own code | 1.5% | 0.30 ms |
+
+Moraine's code and its reads together are under 4% of a commit. There is
+no material win on this path inside this repository, and the per-statement
+gap above does not recur in practice.
 
 ## What this says about the roadmap item
 

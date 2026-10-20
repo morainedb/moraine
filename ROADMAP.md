@@ -100,11 +100,10 @@ build stays complete on the single-writer path without it.
 - [ ] Take the metadata-overhead measurement further before any design rests
   on it. Where does execution overtake planning as a lake grows — this one
   is 16 files and 1,600 rows, and 16 → 128 files already moves the total
-  13.4 → 14.1 ms. What does moraine's own table-function bind spend its time
-  on: the simplest statement costs ~0.41 ms against a native DuckDB table
-  and ~0.73 ms against a moraine metadata table, and that ~0.3 ms gap is the
-  part this repository controls. And can DuckLake be made to re-plan less,
-  given a prepared statement still re-binds on every execution.
+  13.4 → 14.1 ms. And can DuckLake be made to re-plan less, given a prepared
+  statement still re-binds on every execution. Profiling has already closed
+  the third question: moraine's own code is 1.5% of a commit's CPU and its
+  SlateDB reads 2.4%, so there is no material win on this path here.
 
 
 ## Hardening & release
