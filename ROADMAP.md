@@ -96,14 +96,20 @@ build stays complete on the single-writer path without it.
   2.7 ms statement, execution 0.2 ms, and a prepared statement saves only the
   parse because DuckDB re-binds per execution. Native metadata tables would
   move the 0.2 ms; the leverage is in not re-planning generated SQL every
-  commit, on DuckLake's side of the boundary.
-- [ ] Take the metadata-overhead measurement further before any design rests
-  on it. Where does execution overtake planning as a lake grows — this one
-  is 16 files and 1,600 rows, and 16 → 128 files already moves the total
-  13.4 → 14.1 ms. And can DuckLake be made to re-plan less, given a prepared
-  statement still re-binds on every execution. Profiling has already closed
-  the third question: moraine's own code is 1.5% of a commit's CPU and its
-  SlateDB reads 2.4%, so there is no material win on this path here.
+  commit, on DuckLake's side of the boundary. That holds for small lakes:
+  the front-end is flat at ~2 ms while execution grows with file count, and
+  the two meet at roughly five thousand files.
+- [ ] Report no catalog version only when there is none to report.
+  `MoraineCatalog::GetCatalogVersion` returns an invalid `optional_idx`
+  whenever no index-dependency state is registered, and DuckDB reads that as
+  "identity unknown" and re-binds a prepared statement on every execution
+  (`PreparedStatementData::RequireRebind`). A client holding prepared
+  statements against an unchanging lake therefore re-plans every time, where
+  a native catalog would not. No effect on commits — DuckLake issues fresh
+  SQL and a commit moves the version anyway — so this is a reader-fleet
+  change, and it is unverified: confirming it needs a client-API prepared
+  statement, which the CLI cannot express
+  ([measurement](metadata-query-overhead.md)).
 
 
 ## Hardening & release

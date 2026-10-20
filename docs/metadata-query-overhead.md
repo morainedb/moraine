@@ -148,6 +148,61 @@ Moraine's code and its reads together are under 4% of a commit. There is
 no material win on this path inside this repository, and the per-statement
 gap above does not recur in practice.
 
+## Where execution overtakes planning
+
+Growing the lake and re-profiling the same file-list query, medians of
+five runs each:
+
+| Files | Front-end | Execute | Execute share |
+| ---: | ---: | ---: | ---: |
+| 16 | 2.18 ms | 0.16 ms | 6.8% |
+| 128 | 2.00 ms | 0.21 ms | 9.3% |
+| 512 | 1.99 ms | 0.33 ms | 14.3% |
+| 2,048 | 2.07 ms | 0.82 ms | 28.3% |
+
+The front-end is flat — it depends on the SQL text, which does not change
+— while execution grows with the file count, by roughly 2.5× for each 4×
+of files in the upper range. Extrapolating that slope, the two meet at
+somewhere around five thousand files for this two-column table. Below
+that, planning dominates; above it, the balance tips and a storage-side
+improvement starts to matter.
+
+## Whether the re-planning can be avoided
+
+Not by preparing the statement, which was the obvious first idea.
+`perf` on 300 SQL-level `EXECUTE`s shows `Binder::BindNode` and
+`Planner::Optimize` in the profile over a native DuckDB table as readily
+as over moraine's, so going through `PREPARE`/`EXECUTE` in SQL re-binds
+and re-optimizes either way.
+
+DuckDB's rule for reusing a prepared plan is in
+`PreparedStatementData::RequireRebind`, which asks `CheckCatalogIdentity`
+for every database the statement reads. That function opens with:
+
+```cpp
+// some catalogs don't support catalog version, we can't check identity in that case
+if (!catalog_identity.catalog_version.IsValid()) {
+    return false;
+}
+```
+
+A `false` return means "identity does not match", so a catalog that
+reports no version forces a rebind on every execution. Moraine's
+`MoraineCatalog::GetCatalogVersion` delegates to `IndexCatalogVersion`,
+which returns an invalid `optional_idx` unless an index-dependency state
+happens to be registered for the catalog, its association is
+unambiguous, the transaction is clean, and the snapshot revision reads —
+so in the ordinary case moraine reports no version at all.
+
+That is a real difference against a native catalog, and it is on this
+side of the boundary. It does not help the commit path: DuckLake issues
+fresh SQL text rather than reusing prepared statements, and a commit
+changes the catalog anyway, so a plan could not survive to be reused. It
+would matter to a client holding prepared statements against a lake that
+is not changing — a reader fleet rather than a writer. Confirming it
+needs a client-API prepared statement, which the CLI cannot express, and
+that has not been done.
+
 ## What this says about the roadmap item
 
 The premise holds: metadata queries really are the largest single
